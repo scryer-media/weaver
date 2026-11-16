@@ -195,6 +195,139 @@ async fn empty_pool_tests_are_refused_before_planning() {
     runtime.shutdown().await;
 }
 
+// A drafted route on a DNS profile it cannot answer on is refused by its
+// test as its save would refuse it, naming no route: a draft has no holder.
+#[tokio::test]
+async fn a_test_refuses_a_route_its_dns_profile_cannot_answer_on() {
+    use crate::proxies::{DnsTrust, DnsWho, StoredDns};
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let tunnel = |id: u32, dns_servers: Vec<IpAddr>| ProxyProfile {
+        id,
+        kind: ProxyKind::WireGuard,
+        dns_servers,
+        ..socks(id, port)
+    };
+    let runtime = runtime_with(
+        vec![
+            socks(1, port),
+            tunnel(2, vec![ip("10.0.0.53")]),
+            tunnel(3, vec![]),
+        ],
+        vec![],
+        vec![],
+    );
+    const ASKED: u32 = 3;
+    const VALIDATED: u32 = 4;
+    const FALLBACK: u32 = 5;
+    let profile = |id: u32, trust: DnsTrust, system_fallback: bool| crate::proxies::DnsProfile {
+        trust,
+        system_fallback,
+        ..dns_profile(id, DnsWho::Proxy, None)
+    };
+    store_dns(
+        &runtime,
+        StoredDns {
+            profiles: HashMap::from([
+                (ASKED, profile(ASKED, DnsTrust::AsSent, false)),
+                (VALIDATED, profile(VALIDATED, DnsTrust::Validate, false)),
+                (FALLBACK, profile(FALLBACK, DnsTrust::Validate, true)),
+            ]),
+            ..Default::default()
+        },
+    );
+    let refused = |path: LegPath, dns: u32| {
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .test_via(
+                    &draft(path),
+                    dns,
+                    TestSubject::Route,
+                    Some(("127.0.0.1".into(), 9)),
+                )
+                .await
+                .err()
+        }
+    };
+    let rung = |id: u32| ladder(vec![Rung::Proxy { id }]);
+    // Validating a SOCKS5 proxy's answers, even with the host to fall back
+    // to on a leg with no proxy.
+    for dns in [VALIDATED, FALLBACK] {
+        assert_eq!(
+            refused(rung(1), dns).await,
+            Some(NetworkRefusal::DnsProfileNeedsWireGuard { routes: vec![] })
+        );
+    }
+    // The proxy answering on a leg with no proxy, and nothing to fall back
+    // to; with a fallback, only the validation is refused.
+    assert_eq!(
+        refused(LegPath::Direct, ASKED).await,
+        Some(NetworkRefusal::DnsProfileNeedsProxy { routes: vec![] })
+    );
+    assert_eq!(
+        refused(LegPath::Direct, FALLBACK).await,
+        Some(NetworkRefusal::DnsProfileNeedsWireGuard { routes: vec![] })
+    );
+    // The proxy answering at a tunnel that lists no DNS servers.
+    assert_eq!(
+        refused(rung(3), ASKED).await,
+        Some(NetworkRefusal::DnsProfileNeedsTunnelDns {
+            proxies: vec![3],
+            routes: vec![]
+        })
+    );
+    // A proxy under test tops each path, so it answers on a direct leg
+    // beneath it, and validating its answers is refused when it is not
+    // WireGuard. Its closed port fails the dial a test that runs makes.
+    let proxied = |dns: u32| {
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .test_via(
+                    &draft(LegPath::Direct),
+                    dns,
+                    TestSubject::Proxy(1),
+                    Some(("127.0.0.1".into(), 9)),
+                )
+                .await
+        }
+    };
+    assert_eq!(
+        proxied(VALIDATED).await.err(),
+        Some(NetworkRefusal::DnsProfileNeedsWireGuard { routes: vec![] })
+    );
+    let tests = proxied(ASKED).await.unwrap();
+    assert_eq!(tests.len(), 1);
+    assert!(tests[0].outcome.is_err(), "{:?}", tests[0].outcome);
+    // A tunnel with DNS servers answers, validated or not; the proxy's
+    // answers as sent and the system's are taken on any rung, and the
+    // system's on a leg with no proxy.
+    let config = runtime.configuration.read().unwrap().clone();
+    for (path, dns) in [
+        (rung(2), VALIDATED),
+        (rung(2), ASKED),
+        (rung(1), ASKED),
+        (rung(1), SYSTEM_DNS_PROFILE_ID),
+        (LegPath::Direct, SYSTEM_DNS_PROFILE_ID),
+    ] {
+        let profile = config.dns.profile(dns).unwrap();
+        assert_eq!(
+            crate::proxies::dns_persistence::validate_draft_route_dns(
+                &draft(path.clone()),
+                &profile,
+                &config.profiles,
+                &config.pools,
+                &config.dns,
+            ),
+            Ok(()),
+            "{path:?} on {dns}"
+        );
+    }
+    runtime.shutdown().await;
+}
+
 #[test]
 fn every_path_through_a_route_is_tried_once() {
     let pools = HashMap::from([(

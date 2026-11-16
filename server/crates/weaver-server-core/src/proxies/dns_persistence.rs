@@ -357,9 +357,7 @@ pub(super) async fn validate_route_dns(
         profile.select_as(DnsProfileKind::ProxyName)?;
     }
     let routes = routes_with_dns(tx).await?;
-    let mut needs_proxy = Vec::new();
-    let mut needs_wireguard = Vec::new();
-    let mut needs_tunnel_dns = (Vec::new(), Vec::new());
+    let mut faults = RouteDnsFaults::default();
     for (holder, route, id) in &routes {
         let Some(profile) = stored.profile(*id) else {
             return Err(NetworkRefusal::DnsProfileNotFound.into());
@@ -368,62 +366,127 @@ pub(super) async fn validate_route_dns(
         if touches {
             profile.select_as(DnsProfileKind::Route)?;
         }
-        for (carrier, carried) in carriers_without_dns(route, profiles, &stored) {
-            if touches || touched == Touched::Profile(carried) {
-                let (proxies, routes) = &mut needs_tunnel_dns;
-                if !proxies.contains(&carrier) {
-                    proxies.push(carrier);
-                }
-                if !routes.contains(holder) {
-                    routes.push(*holder);
-                }
-            }
+        faults.carriers(Some(*holder), route, profiles, &stored, |carried| {
+            touches || touched == Touched::Profile(carried)
+        });
+        if touches {
+            faults.route(Some(*holder), route, &profile, profiles, pools);
         }
-        if touches && profile.who == DnsWho::Proxy {
-            if !profile.system_fallback && has_proxyless_stage(route) {
-                needs_proxy.push(*holder);
-            }
-            if profile.trust == DnsTrust::Validate
-                && reaches_other_than_wireguard(route, profiles, pools)
-            {
-                needs_wireguard.push(*holder);
-            }
-            let silent = wireguard_without_dns(route, profiles, pools);
-            if !silent.is_empty() {
-                let (proxies, routes) = &mut needs_tunnel_dns;
-                for id in silent {
-                    if !proxies.contains(&id) {
-                        proxies.push(id);
-                    }
-                }
-                if !routes.contains(holder) {
-                    routes.push(*holder);
-                }
+    }
+    faults.refusal().map_err(Into::into)
+}
+
+// Refuse drafted `route` on DNS `profile` as a save of it would be refused,
+// before anything is dialled through it. A draft has no holder, so each
+// refusal names no route.
+pub(super) fn validate_draft_route_dns(
+    route: &Route,
+    profile: &DnsProfile,
+    profiles: &HashMap<u32, ProxyProfile>,
+    pools: &HashMap<u32, ProxyPool>,
+    stored: &StoredDns,
+) -> Result<(), NetworkRefusal> {
+    let mut faults = RouteDnsFaults::default();
+    faults.carriers(None, route, profiles, stored, |_| true);
+    faults.route(None, route, profile, profiles, pools);
+    faults.refusal()
+}
+
+// What routes on their DNS profiles cannot answer, gathered over every route
+// a check asks about. Each fault holds the routes at fault that have a
+// holder; a draft is at fault with none.
+#[derive(Default)]
+struct RouteDnsFaults {
+    needs_proxy: Option<Vec<Consumer>>,
+    needs_wireguard: Option<Vec<Consumer>>,
+    tunnel_proxies: Vec<u32>,
+    tunnel_routes: Vec<Consumer>,
+}
+
+impl RouteDnsFaults {
+    fn at_fault(list: &mut Option<Vec<Consumer>>, holder: Option<Consumer>) {
+        let list = list.get_or_insert_with(Vec::new);
+        if let Some(holder) = holder
+            && !list.contains(&holder)
+        {
+            list.push(holder);
+        }
+    }
+
+    fn tunnel(&mut self, proxy: u32, holder: Option<Consumer>) {
+        if !self.tunnel_proxies.contains(&proxy) {
+            self.tunnel_proxies.push(proxy);
+        }
+        if let Some(holder) = holder
+            && !self.tunnel_routes.contains(&holder)
+        {
+            self.tunnel_routes.push(holder);
+        }
+    }
+
+    // Add the WireGuard carriers with no tunnel DNS in `route`'s chains
+    // whose carried proxy's profile `counts`.
+    fn carriers(
+        &mut self,
+        holder: Option<Consumer>,
+        route: &Route,
+        profiles: &HashMap<u32, ProxyProfile>,
+        stored: &StoredDns,
+        counts: impl Fn(u32) -> bool,
+    ) {
+        for (carrier, carried) in carriers_without_dns(route, profiles, stored) {
+            if counts(carried) {
+                self.tunnel(carrier, holder);
             }
         }
     }
-    if !needs_proxy.is_empty() {
-        return Err(NetworkRefusal::DnsProfileNeedsProxy {
-            routes: needs_proxy,
+
+    // Add the faults of `route` on `profile`: the proxy answering on a stage
+    // with no proxy, unless the profile lets the host answer there;
+    // validating the proxy's answers on a stage that does not end at
+    // WireGuard; and the proxy answering at a WireGuard proxy that lists no
+    // DNS servers.
+    fn route(
+        &mut self,
+        holder: Option<Consumer>,
+        route: &Route,
+        profile: &DnsProfile,
+        profiles: &HashMap<u32, ProxyProfile>,
+        pools: &HashMap<u32, ProxyPool>,
+    ) {
+        if profile.who != DnsWho::Proxy {
+            return;
         }
-        .into());
-    }
-    if !needs_wireguard.is_empty() {
-        return Err(NetworkRefusal::DnsProfileNeedsWireGuard {
-            routes: needs_wireguard,
+        if !profile.system_fallback && has_proxyless_stage(route) {
+            Self::at_fault(&mut self.needs_proxy, holder);
         }
-        .into());
-    }
-    let (mut proxies, routes_at_fault) = needs_tunnel_dns;
-    if !proxies.is_empty() {
-        proxies.sort_unstable();
-        return Err(NetworkRefusal::DnsProfileNeedsTunnelDns {
-            proxies,
-            routes: routes_at_fault,
+        if profile.trust == DnsTrust::Validate
+            && reaches_other_than_wireguard(route, profiles, pools)
+        {
+            Self::at_fault(&mut self.needs_wireguard, holder);
         }
-        .into());
+        for id in wireguard_without_dns(route, profiles, pools) {
+            self.tunnel(id, holder);
+        }
     }
-    Ok(())
+
+    fn refusal(self) -> Result<(), NetworkRefusal> {
+        if let Some(routes) = self.needs_proxy {
+            return Err(NetworkRefusal::DnsProfileNeedsProxy { routes });
+        }
+        if let Some(routes) = self.needs_wireguard {
+            return Err(NetworkRefusal::DnsProfileNeedsWireGuard { routes });
+        }
+        let mut proxies = self.tunnel_proxies;
+        if !proxies.is_empty() {
+            proxies.sort_unstable();
+            return Err(NetworkRefusal::DnsProfileNeedsTunnelDns {
+                proxies,
+                routes: self.tunnel_routes,
+            });
+        }
+        Ok(())
+    }
 }
 
 async fn next_id(tx: &mut SqlTx<'_>, table: &str) -> Result<u32, StateError> {
@@ -487,15 +550,30 @@ impl Database {
 
     /// Every profile, the built-in System profile first, then by id.
     pub fn list_dns_profiles(&self) -> Result<Vec<DnsProfile>, StateError> {
+        self.list_dns_profiles_of(None)
+    }
+
+    /// The profiles something taking `kind` may select, in the order of
+    /// `list_dns_profiles`: the built-in System profile, then the saved
+    /// profiles of that kind. `None` is every profile.
+    pub fn list_dns_profiles_of(
+        &self,
+        kind: Option<DnsProfileKind>,
+    ) -> Result<Vec<DnsProfile>, StateError> {
         let store = self.datastore();
         self.run_sql_blocking_read(async move {
             let mut profiles = vec![DnsProfile::system()];
-            for row in SqlRuntime::fetch_all(
-                store.read_exec(),
-                "SELECT id, name, kind, who, transit, trust, server_list_id, system_fallback FROM dns_profiles ORDER BY id",
-                &[],
-            )
-            .await?
+            let (sql, args) = match kind {
+                None => (
+                    "SELECT id, name, kind, who, transit, trust, server_list_id, system_fallback FROM dns_profiles ORDER BY id",
+                    Vec::new(),
+                ),
+                Some(kind) => (
+                    "SELECT id, name, kind, who, transit, trust, server_list_id, system_fallback FROM dns_profiles WHERE kind = {} ORDER BY id",
+                    vec![SqlArg::Text(super::kind_text(kind).into())],
+                ),
+            };
+            for row in SqlRuntime::fetch_all(store.read_exec(), sql, &args).await?
             {
                 profiles.push(profile_row(&row)?);
             }

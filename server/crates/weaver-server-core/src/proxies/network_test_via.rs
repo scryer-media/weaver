@@ -324,7 +324,8 @@ impl NetworkRuntime {
         // reach a WireGuard proxy by a path other than the one a saved route
         // holds it on, or the two sessions take the endpoint from each other.
         let mut routes: Vec<Route> = config.policies.values().map(RoutingPolicy::route).collect();
-        routes.push(Route {
+        // Each path with the proxy under test on top of it, as a chain holds it.
+        let tested = Route {
             legs: paths
                 .iter()
                 .flat_map(|(_, egress_id, carriers)| {
@@ -347,8 +348,23 @@ impl NetworkRuntime {
                 })
                 .collect(),
             failover: Failover::default(),
-        });
+        };
+        routes.push(tested.clone());
         validate_wireguard_paths(&routes, &config.profiles, &config.pools)?;
+        // Names are answered on the route the test rides, the draft alone
+        // or with the proxy under test on top of each path: refused as a
+        // save of that route would refuse it, before anything is dialled.
+        crate::proxies::dns_persistence::validate_draft_route_dns(
+            if subject == TestSubject::Route {
+                route
+            } else {
+                &tested
+            },
+            &resolved_by,
+            &config.profiles,
+            &config.pools,
+            &config.dns,
+        )?;
         // A pool carries the target through the member it picks.
         let pool = match subject {
             TestSubject::Pool(id) if targeted => Some(id),

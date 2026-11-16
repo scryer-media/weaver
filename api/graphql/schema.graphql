@@ -3578,9 +3578,11 @@ type QueryRoot {
 	"""
 	dnsServerLists: [DnsServerList!]!
 	"""
-	Every profile, the built-in System profile first, then by id.
+	Every profile, the built-in System profile first, then by id. With
+	`kind`, the profiles something of that kind may select: System, then
+	the saved profiles of that kind.
 	"""
-	dnsProfiles: [DnsProfile!]!
+	dnsProfiles(kind: DnsProfileKind): [DnsProfile!]!
 	networking: Networking!
 	egressInterfaces: [EgressInterface!]!
 	discoverNetworkInterfaces: [DiscoveredNetworkInterface!]!

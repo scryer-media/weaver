@@ -848,6 +848,94 @@ async fn a_test_says_the_wire_and_trust_of_its_dns_servers() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// A drafted route that its save would refuse is refused by its test the
+// same way, before anything is dialled: only a WireGuard proxy's answers can
+// be validated, so validating a SOCKS5 proxy's is refused.
+#[tokio::test]
+async fn a_test_refuses_a_route_its_save_would_refuse_before_dialling() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let h = harness().await;
+    let code = |result: &async_graphql::Response| {
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        let error = serde_json::to_value(&result.errors[0]).unwrap();
+        (
+            error["extensions"]["code"].as_str().unwrap().to_owned(),
+            error["extensions"]["params"].clone(),
+        )
+    };
+    // The proxy counts each connection it is dialled with, and closes it
+    // before the dial can go further. A dial waits on its reply, so a test
+    // that dialled it has been counted by the time the test answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counted = dials.clone();
+    let proxy_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let result = h
+        .execute(&format!(
+            r#"mutation {{ saveProxyProfile(input: {{
+        name: "gateway", kind: SOCKS5, enabled: true, host: "127.0.0.1", port: {proxy_port}
+    }}) {{ id }} saveDnsProfile(input: {{
+        name: "validated", kind: ROUTE, who: PROXY, trust: VALIDATE
+    }}) {{ id }} }}"#
+        ))
+        .await;
+    assert_no_errors(&result);
+    let proxy = response_data(&result)["saveProxyProfile"]["id"]
+        .as_u64()
+        .unwrap();
+    let profile = response_data(&result)["saveDnsProfile"]["id"]
+        .as_u64()
+        .unwrap();
+    let route = |profile: u64| {
+        format!(
+            "{{ legs: [{{ egressId: 0, weight: 100, path: {{ ladder: {{ rungs: [{{ proxy: {proxy} }}], directFallback: false }} }} }}], dnsProfileId: {profile} }}"
+        )
+    };
+    let test_via = |profile: u64| {
+        format!(
+            r#"mutation {{ testVia(route: {}, target: {{ host: "127.0.0.1", port: 9 }}) {{ success code }} }}"#,
+            route(profile)
+        )
+    };
+
+    // The save is refused, and names the route it refuses.
+    let (saved, params) = code(
+        &h.execute(&format!(
+            "mutation {{ saveNetworkRoute(kind: OUTBOUND, id: 0, input: {}) {{ consumer }} }}",
+            route(profile)
+        ))
+        .await,
+    );
+    assert_eq!(saved, "DNS_PROFILE_NEEDS_WIREGUARD");
+    assert_eq!(params["routes"].as_array().unwrap().len(), 1, "{params}");
+
+    // The test is refused with the same code, naming no route: a draft has
+    // no holder. Nothing was dialled.
+    assert_eq!(
+        code(&h.execute(&test_via(profile)).await),
+        (
+            "DNS_PROFILE_NEEDS_WIREGUARD".to_owned(),
+            serde_json::json!({ "routes": [] })
+        )
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
+
+    // The same route on the host's names is tested, and dials the proxy.
+    let result = h.execute(&test_via(0)).await;
+    assert_no_errors(&result);
+    assert_eq!(response_data(&result)["testVia"][0]["success"], false);
+    assert!(dials.load(Ordering::SeqCst) > 0);
+    proxy_task.abort();
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 // A pool under test carries a target through the member it picks, and is
 // tried member by member without one; the old pool test stays member by
 // member.
@@ -1209,4 +1297,99 @@ async fn a_proxy_selects_a_proxy_name_profile_for_its_own_address() {
         serde_json::json!({ "routes": [], "proxies": [proxy] })
     );
     h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+// `dnsProfiles(kind:)` gives what something of that kind may select: System,
+// then the saved profiles of that kind by id. Without a kind it gives every
+// profile in the same order.
+#[tokio::test]
+async fn dns_profiles_of_one_kind_are_system_then_that_kind() {
+    let h = harness().await;
+    let result = h
+        .execute(
+            r#"mutation { saveDnsServerList(input: { name: "Resolvers", servers: [{ wire: PLAIN, address: "192.0.2.53" }] }) { id } }"#,
+        )
+        .await;
+    assert_no_errors(&result);
+    let list = response_data(&result)["saveDnsServerList"]["id"]
+        .as_u64()
+        .unwrap();
+    let mut saved = Vec::new();
+    // Interleaved, so an order by kind and an order by id differ.
+    for kind in ["PROXY_NAME", "ROUTE", "PROXY_NAME", "ROUTE"] {
+        let result = h
+            .execute(&format!(
+                r#"mutation {{ saveDnsProfile(input: {{
+            name: "listed", kind: {kind}, who: WEAVER, transit: EGRESS, trust: AS_SENT, serverListId: {list}
+        }}) {{ id }} }}"#
+            ))
+            .await;
+        assert_no_errors(&result);
+        saved.push((
+            response_data(&result)["saveDnsProfile"]["id"]
+                .as_u64()
+                .unwrap(),
+            kind,
+        ));
+    }
+    let read = |query: &'static str| {
+        let h = &h;
+        async move {
+            let result = h.execute(query).await;
+            assert_no_errors(&result);
+            response_data(&result)["dnsProfiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|profile| {
+                    (
+                        profile["id"].as_u64().unwrap(),
+                        profile["kind"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let expected = |kind: Option<&str>| {
+        std::iter::once((0, "ROUTE".to_owned()))
+            .chain(
+                saved
+                    .iter()
+                    .filter(|(_, saved)| kind.is_none_or(|kind| kind == *saved))
+                    .map(|(id, kind)| (*id, (*kind).to_owned())),
+            )
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(read("{ dnsProfiles { id kind } }").await, expected(None));
+    assert_eq!(
+        read("{ dnsProfiles(kind: ROUTE) { id kind } }").await,
+        expected(Some("ROUTE"))
+    );
+    assert_eq!(
+        read("{ dnsProfiles(kind: PROXY_NAME) { id kind } }").await,
+        expected(Some("PROXY_NAME"))
+    );
+    // One read of each kind in one request, as the DNS page sends it.
+    let result = h
+        .execute(
+            "{ names: dnsProfiles(kind: PROXY_NAME) { id usedByProxies } routes: dnsProfiles(kind: ROUTE) { id usedByRoutes } }",
+        )
+        .await;
+    assert_no_errors(&result);
+    let ids = |key: &str| {
+        response_data(&result)[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|profile| profile["id"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let ids_of = |kind: &str| {
+        expected(Some(kind))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids("names"), ids_of("PROXY_NAME"));
+    assert_eq!(ids("routes"), ids_of("ROUTE"));
 }

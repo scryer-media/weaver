@@ -514,13 +514,20 @@ impl DnsQuery {
             spawn_blocking_db("dns.lists", move || db.list_dns_server_lists()).await?,
         ))
     }
-    /// Every profile, the built-in System profile first, then by id.
+    /// Every profile, the built-in System profile first, then by id. With
+    /// `kind`, the profiles something of that kind may select: System, then
+    /// the saved profiles of that kind.
     #[graphql(guard = "AdminGuard")]
-    async fn dns_profiles(&self, ctx: &Context<'_>) -> Result<Vec<DnsProfile>> {
+    async fn dns_profiles(
+        &self,
+        ctx: &Context<'_>,
+        kind: Option<DnsProfileKind>,
+    ) -> Result<Vec<DnsProfile>> {
         let db = ctx.data::<Database>()?.clone();
         let counts = RouteCounts::default();
+        let kind = kind.map(core::DnsProfileKind::from);
         Ok(
-            spawn_blocking_db("dns.profiles", move || db.list_dns_profiles())
+            spawn_blocking_db("dns.profiles", move || db.list_dns_profiles_of(kind))
                 .await?
                 .into_iter()
                 .map(|saved| profile(saved, counts.clone()))

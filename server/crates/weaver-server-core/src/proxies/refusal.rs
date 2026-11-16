@@ -790,11 +790,15 @@ impl std::fmt::Display for RouteHolder {
     }
 }
 
-// The owners of several routes, as a refusal names them.
+// The owners of several routes, as a refusal names them; a drafted route,
+// which has no owner yet, as the route.
 struct RouteHolders<'a>(&'a [Consumer]);
 
 impl std::fmt::Display for RouteHolders<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("the route");
+        }
         for (index, holder) in self.0.iter().enumerate() {
             if index > 0 {
                 f.write_str(", ")?;

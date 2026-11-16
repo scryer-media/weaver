@@ -663,3 +663,37 @@ fn a_named_proxy_carried_by_a_wireguard_proxy_with_no_dns_is_refused_naming_the_
     saved.revision += 1;
     db.save_proxy_profile(&saved).unwrap();
 }
+
+// A read of one kind is System, then the saved profiles of that kind by id;
+// a read of every kind is the same profiles in the same order.
+#[test]
+fn profiles_of_one_kind_are_system_then_that_kind() {
+    let db = Database::open_in_memory().unwrap();
+    let list = plain_list(&db, "Listed", &["192.0.2.53:53"]);
+    let first_name = proxy_name_on(&db, list.id).id;
+    let route = weaver_on(&db, "Route", list.id, DnsTrust::AsSent).id;
+    let second_name = proxy_name_on(&db, list.id).id;
+    let ids = |kind: Option<DnsProfileKind>| {
+        db.list_dns_profiles_of(kind)
+            .unwrap()
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(None),
+        vec![SYSTEM_DNS_PROFILE_ID, first_name, route, second_name]
+    );
+    assert_eq!(
+        db.list_dns_profiles().unwrap(),
+        db.list_dns_profiles_of(None).unwrap()
+    );
+    assert_eq!(
+        ids(Some(DnsProfileKind::Route)),
+        vec![SYSTEM_DNS_PROFILE_ID, route]
+    );
+    assert_eq!(
+        ids(Some(DnsProfileKind::ProxyName)),
+        vec![SYSTEM_DNS_PROFILE_ID, first_name, second_name]
+    );
+}
