@@ -213,6 +213,10 @@ pub struct Globals {
     pub hardware_profile_in_force: Option<crate::jobs::handle::HardwareProfileInForce>,
     pub scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub random_read_iops: Option<f64>,
+    pub storage_classification: Option<(
+        crate::runtime::system_profile::StorageClass,
+        crate::runtime::system_profile::FilesystemType,
+    )>,
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
     pub nntp_active: Option<crate::jobs::handle::NntpRuntimeActivation>,
