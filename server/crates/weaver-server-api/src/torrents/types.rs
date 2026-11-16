@@ -3,6 +3,7 @@
 
 use async_graphql::{ComplexObject, Context, Enum, InputObject, Result, SimpleObject};
 use weaver_server_core::auth::CallerScope;
+use weaver_server_core::jobs::handle::HoldOrigin;
 use weaver_server_core::proxies::{TorrentRouteFault, TorrentScope};
 use weaver_server_core::settings::Seeding;
 use weaver_server_core::torrents::net::Exposure;
@@ -11,9 +12,10 @@ use weaver_server_core::torrents::service::{
 };
 use weaver_server_core::torrents::sessions::TorrentRouteReason;
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
+use weaver_server_core::torrents::status::Stated;
 use weaver_server_core::torrents::{
-    ConnectionKind, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TorrentVersion, TrackerStatus, redacted_tracker_url,
+    ConnectionKind, Encryption, FetchPhase, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
+    TorrentState, TorrentTracker, TorrentVersion, TrackerStatus, redacted_tracker_url,
 };
 
 use crate::networking::ResolvedBy;
@@ -311,6 +313,46 @@ pub struct TorrentRouteGql {
     pub exposure: Option<TorrentExposureGql>,
 }
 
+/// Why a torrent is in its state, as the server states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentStatedReason")]
+pub enum TorrentStatedReasonGql {
+    /// Kept from starting for room on its disk, as a usenet job waits.
+    DiskSpace,
+    /// A write found no room: it fetches nothing and keeps seeding.
+    DiskFull,
+    /// Stopped once its seeding goal was met.
+    GoalMet,
+    /// Held in the queue by the operator's pause.
+    HeldManual,
+    /// Held in the queue by the schedule.
+    HeldScheduled,
+    /// Held in the queue while a speed test runs.
+    HeldSpeedTest,
+    /// Fetching its metadata from its trackers.
+    FetchTrackers,
+    /// Fetching its metadata from its trackers, the DHT and local discovery.
+    FetchDiscovery,
+    /// Fetching its metadata, with no peers named that may serve it.
+    FetchWaiting,
+}
+
+impl From<Stated> for TorrentStatedReasonGql {
+    fn from(stated: Stated) -> Self {
+        match stated {
+            Stated::DiskSpace => Self::DiskSpace,
+            Stated::DiskFull => Self::DiskFull,
+            Stated::GoalMet => Self::GoalMet,
+            Stated::Held(HoldOrigin::Manual) => Self::HeldManual,
+            Stated::Held(HoldOrigin::Scheduled) => Self::HeldScheduled,
+            Stated::Held(HoldOrigin::SpeedTest) => Self::HeldSpeedTest,
+            Stated::Fetching(FetchPhase::Trackers) => Self::FetchTrackers,
+            Stated::Fetching(FetchPhase::Discovery) => Self::FetchDiscovery,
+            Stated::Fetching(FetchPhase::Waiting) => Self::FetchWaiting,
+        }
+    }
+}
+
 /// Why a torrent route's session is unavailable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
 #[graphql(name = "TorrentRouteReason")]
@@ -552,8 +594,12 @@ pub struct Torrent {
     /// Which hashes verify its pieces, once its metainfo is in hand.
     pub version: Option<TorrentVersionGql>,
     pub state: TorrentStateGql,
-    /// Why the torrent is in its state, when there is a reason to give. While
-    /// its route holds it, the cause behind `routeReason`, when one is known.
+    /// Why the torrent is in its state, when the server states the reason
+    /// itself.
+    pub stated: Option<TorrentStatedReasonGql>,
+    /// Why the torrent is in its state, in free words (an error, an
+    /// unpacking refusal), when that is the reason. While its route holds
+    /// it, the cause behind `routeReason`, when one is known.
     pub detail: Option<String>,
     /// Why its route holds it, while its state comes from that hold.
     pub route_reason: Option<TorrentRouteReasonGql>,
@@ -678,6 +724,7 @@ impl From<TorrentView> for Torrent {
             infohash_v2: view.infohash_v2.clone(),
             version: view.version.map(Into::into),
             state: view.state.into(),
+            stated: view.stated.map(Into::into),
             detail: view.detail,
             route_reason: view.route_reason.map(Into::into),
             category: view.category,
@@ -923,5 +970,31 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    // Each reason the server states reads in GraphQL as its own name, one
+    // per reason.
+    #[test]
+    fn a_stated_reason_reads_as_its_name() {
+        let names = Stated::ALL.map(|stated| {
+            match async_graphql::InputType::to_value(&TorrentStatedReasonGql::from(stated)) {
+                async_graphql::Value::Enum(name) => name.to_string(),
+                other => panic!("{other:?}"),
+            }
+        });
+        assert_eq!(
+            names,
+            [
+                "DISK_SPACE",
+                "DISK_FULL",
+                "GOAL_MET",
+                "HELD_MANUAL",
+                "HELD_SCHEDULED",
+                "HELD_SPEED_TEST",
+                "FETCH_TRACKERS",
+                "FETCH_DISCOVERY",
+                "FETCH_WAITING",
+            ]
+        );
     }
 }

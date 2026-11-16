@@ -1298,7 +1298,12 @@ fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
         remaining_bytes: view.wanted_bytes.saturating_sub(view.wanted_have_bytes),
         category: view.category,
         output_dir: view.storage_dir,
-        wait_reason: view.detail,
+        // A reason the service states goes by its key, a code the
+        // downloads list puts in words; free words go as they are.
+        wait_reason: view
+            .stated
+            .map(|stated| stated.key().to_owned())
+            .or(view.detail),
         created_at_ms: view.added_at_ms,
         metadata: view.metadata,
         shortfall: None,

@@ -491,17 +491,12 @@ impl TorrentJobSection {
         let view = &held.view;
         let mut section = Self::empty(JobSource::Queue, known_status(view.state.as_str()));
         section.state = Some(view.state.as_str());
-        section.why = view
-            .stated
-            .map(status::Stated::key)
-            .or_else(|| view.detail.as_deref().map(why));
+        section.why = why(view.stated, view.detail.as_deref());
         section.route_reason = view.route_reason.map(route_reason);
         section.paused_by = view.paused_by.map(HoldOrigin::reason);
-        // A stop for any reason but its met goal is the torrent's failure.
+        // A stop with words of its own is the torrent's failure; a met goal
+        // is stated, with none.
         section.failure = match (view.state, view.detail.as_deref()) {
-            (TorrentState::Stopped, Some(_)) if view.stated == Some(status::Stated::GoalMet) => {
-                None
-            }
             (TorrentState::Stopped, Some(detail)) => Some(FailureVerdict::classify(detail)),
             _ => None,
         };
@@ -846,39 +841,18 @@ impl TorrentJobSection {
     }
 }
 
-// The reason in a state's words, as a constant, for words the service
-// does not state itself: the cause they name.
-fn why(detail: &str) -> &'static str {
-    if detail == status::TORRENTS_OFF {
-        return "torrents_off";
+// The state's reason, as a constant: the key of a reason the service
+// states, else the failure the free words name.
+fn why(stated: Option<status::Stated>, detail: Option<&str>) -> Option<&'static str> {
+    match (stated, detail) {
+        (Some(stated), _) => Some(stated.key()),
+        (None, Some(detail)) => Some(FailureVerdict::classify(detail).as_str()),
+        (None, None) => None,
     }
-    for origin in [
-        HoldOrigin::Manual,
-        HoldOrigin::Scheduled,
-        HoldOrigin::SpeedTest,
-    ] {
-        if detail == origin.reason() {
-            return origin.reason();
-        }
-    }
-    for phase in [
-        FetchPhase::Trackers,
-        FetchPhase::Discovery,
-        FetchPhase::Waiting,
-    ] {
-        if detail == phase.to_string() {
-            return fetch_phase(phase);
-        }
-    }
-    FailureVerdict::classify(detail).as_str()
 }
 
 fn fetch_phase(phase: FetchPhase) -> &'static str {
-    match phase {
-        FetchPhase::Trackers => "fetch_trackers",
-        FetchPhase::Discovery => "fetch_discovery",
-        FetchPhase::Waiting => "fetch_waiting",
-    }
+    status::Stated::Fetching(phase).key()
 }
 
 fn route_reason(reason: TorrentRouteReason) -> &'static str {

@@ -351,11 +351,8 @@ async fn a_forced_torrent_seeds_past_its_goal() {
     assert_eq!(intent(&rig), TorrentIntent::Stopped);
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(
-        (view.state, view.detail.as_deref()),
-        (
-            TorrentState::Stopped,
-            Some(status::Stated::GoalMet.as_str())
-        )
+        (view.state, view.stated, view.detail.as_deref()),
+        (TorrentState::Stopped, Some(status::Stated::GoalMet), None)
     );
 }
 
@@ -404,11 +401,15 @@ async fn the_global_pause_reaches_the_torrents() {
         let service = rig.service.clone();
         async move {
             let view = service.torrent(job_id).await.unwrap();
-            (view.state, view.detail)
+            (view.state, view.stated)
         }
     };
-    let held =
-        |job_id| async move { matches!(state(job_id).await, (TorrentState::Queued, Some(_))) };
+    let held = |job_id| async move {
+        matches!(
+            state(job_id).await,
+            (TorrentState::Queued, Some(status::Stated::Held(_)))
+        )
+    };
     let scheduled = |scope, owner| Hold {
         origin: HoldOrigin::Scheduled,
         scope,

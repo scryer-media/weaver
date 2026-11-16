@@ -23,34 +23,56 @@ use crate::torrents::{
 /// are turned off.
 pub const TORRENTS_OFF: &str = "torrents are off";
 
-/// A reason the service gives a torrent's state in words of its own. The
-/// view carries it beside the words, so nothing reads it back from them; the
-/// API sends the words, the support bundle the key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A reason the service gives a torrent's state itself, carried typed, never
+/// as words: the API sends it as an enum for the web to put in words, the
+/// support bundle and the torrent's job row by its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stated {
+    /// Kept from starting for room on its disk, as a usenet job waits.
+    DiskSpace,
     /// A write found no room: it fetches nothing and keeps seeding.
     DiskFull,
     /// Stopped once its seeding goal was met.
     GoalMet,
+    /// Held in the queue by a hold from this origin.
+    Held(HoldOrigin),
+    /// Fetching its metadata, asking for peers where this phase asks.
+    Fetching(FetchPhase),
 }
 
 impl Stated {
-    pub const ALL: [Self; 2] = [Self::DiskFull, Self::GoalMet];
+    pub const ALL: [Self; 9] = [
+        Self::DiskSpace,
+        Self::DiskFull,
+        Self::GoalMet,
+        Self::Held(HoldOrigin::Manual),
+        Self::Held(HoldOrigin::Scheduled),
+        Self::Held(HoldOrigin::SpeedTest),
+        Self::Fetching(FetchPhase::Trackers),
+        Self::Fetching(FetchPhase::Discovery),
+        Self::Fetching(FetchPhase::Waiting),
+    ];
 
-    /// Its words, and its key in the support bundle.
-    const fn text(self) -> (&'static str, &'static str) {
+    /// Its key in the support bundle, and the wait reason its torrent's job
+    /// gives: a wait for room and a hold give what a usenet job waiting for
+    /// the same gives.
+    pub const fn key(self) -> &'static str {
         match self {
-            Self::DiskFull => ("Waiting: disk full", "disk_full"),
-            Self::GoalMet => ("Seeding goal met", "goal_met"),
+            Self::DiskSpace => crate::jobs::handle::DISK_SPACE_WAIT_REASON,
+            Self::DiskFull => "disk_full",
+            Self::GoalMet => "goal_met",
+            Self::Held(origin) => origin.reason(),
+            Self::Fetching(FetchPhase::Trackers) => "fetch_trackers",
+            Self::Fetching(FetchPhase::Discovery) => "fetch_discovery",
+            Self::Fetching(FetchPhase::Waiting) => "fetch_waiting",
         }
     }
+}
 
-    pub const fn as_str(self) -> &'static str {
-        self.text().0
-    }
-
-    pub const fn key(self) -> &'static str {
-        self.text().1
+// Its key names it whole: two reasons with one key are one reason.
+impl std::hash::Hash for Stated {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
     }
 }
 
@@ -185,7 +207,8 @@ pub enum Why {
 /// A torrent's reason taken apart for its view.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WhyParts {
-    /// The words, a stated reason's included, or the route's diagnostic.
+    /// Free words (an error, an unpacking refusal), or the route's
+    /// diagnostic; never a stated reason's.
     pub detail: Option<String>,
     pub stated: Option<Stated>,
     pub route_reason: Option<TorrentRouteReason>,
@@ -199,9 +222,8 @@ impl Why {
                 ..WhyParts::default()
             },
             Some(Self::Stated(stated)) => WhyParts {
-                detail: Some(stated.as_str().to_owned()),
                 stated: Some(stated),
-                route_reason: None,
+                ..WhyParts::default()
             },
             Some(Self::Route(reason, diagnostic)) => WhyParts {
                 detail: diagnostic,
@@ -269,7 +291,6 @@ impl Observed {
 
 /// The state and the reason behind it, when there is one to give.
 pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
-    let detail = |text: &str| Some(text.into());
     // A torrent starting from what was saved shows that before anything
     // else, a move or a stop included (qBittorrent
     // `TorrentImpl::updateState`, torrentimpl.cpp:1291-1293, decides
@@ -316,7 +337,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     // A hold on the queue leaves the torrent as it was asked to be, and
     // holds it in the queue, as it does any other job; the hold says whose.
     if let Some(origin) = seen.paused_by {
-        return (TorrentState::Queued, detail(origin.reason()));
+        return (TorrentState::Queued, Some(Stated::Held(origin).into()));
     }
     if let Some(held) = &seen.held {
         return (
@@ -327,7 +348,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     if !seen.has_metadata {
         return (
             TorrentState::FetchingMetadata,
-            seen.fetch.map(|phase| phase.to_string().into()),
+            seen.fetch.map(|phase| Stated::Fetching(phase).into()),
         );
     }
     if seen.queued {
@@ -336,10 +357,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     // Kept from starting for room on its disk, it waits in the queue and
     // says so as a usenet job does. Waiting in upload mode is told below.
     if seen.disk_space && !matches!(seen.engine, Engine::Live { .. }) {
-        return (
-            TorrentState::Queued,
-            detail(crate::jobs::handle::DISK_SPACE_WAIT_REASON),
-        );
+        return (TorrentState::Queued, Some(Stated::DiskSpace.into()));
     }
     match &seen.engine {
         // In no session yet: it waits for one to take it.
@@ -353,10 +371,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         // Waiting for room, it says so as a usenet job does.
         Engine::Live {
             upload_mode: true, ..
-        } if seen.disk_space => (
-            TorrentState::Stalled,
-            detail(crate::jobs::handle::DISK_SPACE_WAIT_REASON),
-        ),
+        } if seen.disk_space => (TorrentState::Stalled, Some(Stated::DiskSpace.into())),
         Engine::Live {
             upload_mode: true, ..
         } => (TorrentState::Stalled, Some(Stated::DiskFull.into())),
@@ -751,33 +766,56 @@ mod tests {
         }
     }
 
-    // Each reason the service states reads back as itself, and its words
-    // and key stay what the API and the support bundle have always sent.
+    // Each reason the service states has a key of its own, one a usenet
+    // job waiting for the same gives, and reaches the view typed, with no
+    // words beside it.
     #[test]
-    fn a_stated_reason_keeps_its_words_and_key_beside_them() {
+    fn a_stated_reason_keeps_its_key_and_reaches_the_view_without_words() {
         assert_eq!(
-            Stated::ALL.map(|stated| (stated.as_str(), stated.key())),
+            Stated::ALL.map(Stated::key),
             [
-                ("Waiting: disk full", "disk_full"),
-                ("Seeding goal met", "goal_met"),
+                "disk_space",
+                "disk_full",
+                "goal_met",
+                "paused",
+                "scheduled",
+                "speed test",
+                "fetch_trackers",
+                "fetch_discovery",
+                "fetch_waiting",
             ]
         );
+        assert_eq!(
+            Stated::DiskSpace.key(),
+            crate::jobs::handle::DISK_SPACE_WAIT_REASON
+        );
+        for origin in [
+            HoldOrigin::Manual,
+            HoldOrigin::Scheduled,
+            HoldOrigin::SpeedTest,
+        ] {
+            assert_eq!(Stated::Held(origin).key(), origin.reason());
+        }
+        let keys: std::collections::HashSet<_> = Stated::ALL.map(Stated::key).into();
+        assert_eq!(keys.len(), Stated::ALL.len());
         assert_eq!(TORRENTS_OFF, "torrents are off");
-        // The view carries the reason beside its words.
         for stated in Stated::ALL {
             assert_eq!(
                 Why::split(Some(stated.into())),
                 WhyParts {
-                    detail: Some(stated.as_str().to_owned()),
+                    detail: None,
                     stated: Some(stated),
                     route_reason: None,
                 }
             );
         }
-        // Words that read like a stated reason are not one.
+        // Words that read like a stated reason's key are free words.
         assert_eq!(
-            Why::split(Some(Stated::GoalMet.as_str().into())).stated,
-            None
+            Why::split(Some(Stated::GoalMet.key().into())),
+            WhyParts {
+                detail: Some("goal_met".to_owned()),
+                ..WhyParts::default()
+            }
         );
     }
 
@@ -833,10 +871,10 @@ mod tests {
     // A magnet fetching its metadata says where it asks for peers.
     #[test]
     fn a_fetch_names_where_it_asks_for_peers() {
-        for (phase, detail) in [
-            (FetchPhase::Trackers, "trackers"),
-            (FetchPhase::Discovery, "trackers, DHT, LSD"),
-            (FetchPhase::Waiting, "no peers from trackers"),
+        for phase in [
+            FetchPhase::Trackers,
+            FetchPhase::Discovery,
+            FetchPhase::Waiting,
         ] {
             assert_eq!(
                 project(&Observed {
@@ -844,7 +882,10 @@ mod tests {
                     fetch: Some(phase),
                     ..seen(Engine::Absent)
                 }),
-                (TorrentState::FetchingMetadata, Some(detail.into()))
+                (
+                    TorrentState::FetchingMetadata,
+                    Some(Stated::Fetching(phase).into())
+                )
             );
         }
     }
@@ -1078,7 +1119,10 @@ mod tests {
                 held: Some(Held::RouteDown(RouteFailure::leg_down(String::new()))),
                 ..seen(Engine::Paused { finished: true })
             }),
-            (TorrentState::Queued, Some("speed test".into()))
+            (
+                TorrentState::Queued,
+                Some(Stated::Held(HoldOrigin::SpeedTest).into())
+            )
         );
         assert_eq!(
             project(&Observed {
@@ -1134,10 +1178,7 @@ mod tests {
                     upload_mode: true,
                 })
             }),
-            (
-                TorrentState::Stalled,
-                Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.into())
-            )
+            (TorrentState::Stalled, Some(Stated::DiskSpace.into()))
         );
         // Kept from starting for room on its disk, it waits in the queue.
         assert_eq!(
@@ -1145,10 +1186,7 @@ mod tests {
                 disk_space: true,
                 ..seen(Engine::Paused { finished: false })
             }),
-            (
-                TorrentState::Queued,
-                Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.into())
-            )
+            (TorrentState::Queued, Some(Stated::DiskSpace.into()))
         );
         assert_eq!(
             project(&Observed {

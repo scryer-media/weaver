@@ -1940,6 +1940,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         infohash
         infohashV2
         state
+        stated
         detail
         routeReason
         category
