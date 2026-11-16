@@ -3,9 +3,12 @@
 
 // DNS over HTTPS (RFC 8484): HTTP/2 streams on one connection, or HTTP/1.1
 // queries one at a time per connection, as the server's handshake says.
-use super::{Asked, Exchange, Next, Queue, Reply, SENDS, Session, Wires, handshake, sent, turns};
+use super::{
+    Asked, Exchange, Link, Next, Queue, REUSED_WAIT, Reply, SENDS, Session, Wires, handshake, sent,
+    turns,
+};
 use crate::dns::{Carrier, DnsServer, Exchanged, Wire};
-use https::Connection;
+pub(super) use https::Connection;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -48,24 +51,52 @@ pub(super) struct Doh<'a> {
     // only what waits on it. `old` is a spent connection whose streams still
     // out run on beside `two`, and beside `dialling`, the new connection
     // being made, kept across calls.
+    // `kept` while `two` is one a naming kept and nothing has answered on it
+    // in this talk: found gone, silent for `REUSED_WAIT`, or holding more
+    // than one exchange may read, its streams go again on a new connection,
+    // as if never sent, and it is dropped unread. Over HTTP/1.1, `kept`
+    // until the connection a naming kept is taken for a query.
     two: Option<Box<Connection>>,
     old: Option<Box<Connection>>,
     dialling: Option<Dialling<'a>>,
     spent: bool,
     wary: bool,
+    kept: bool,
     out: BTreeMap<usize, Asked>,
     // HTTP/1.1, once a connection said so. Each lane asks in turn, one
     // query out at a time, on a connection that is free, or on a new one
     // when none is: so a query that stays silent holds up only its own
     // lane, and the talk opens at most one connection per lane. Each free
-    // connection says whether it has answered before. `undialled` once a
-    // new connection could not be made: from then on a query waits for one
-    // of the talk's connections to come free, and a new one is dialled only
-    // when the talk has none out.
+    // connection says whether it has answered before; a kept one has. Until
+    // the server has answered the talk, as on a kept connection, only one
+    // query is out. `undialled` once a new connection could not be made:
+    // from then on a query waits for one of the talk's connections to come
+    // free, and a new one is dialled only when the talk has none out.
     one: bool,
     idle: Vec<(Box<Connection>, bool)>,
     calls: Vec<(Asked, OneCall<'a>)>,
     undialled: bool,
+}
+
+impl Doh<'_> {
+    // A talk on the connection a naming kept, when it kept one, over the
+    // HTTP it speaks; or on a new one dialled for the first query.
+    pub(super) fn on(kept: Option<Link>) -> Self {
+        match kept {
+            Some(Link::Doh(connection)) if connection.multiplexes() => Self {
+                two: Some(connection),
+                kept: true,
+                ..Self::default()
+            },
+            Some(Link::Doh(connection)) => Self {
+                one: true,
+                idle: vec![(connection, true)],
+                kept: true,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
 }
 
 impl<'a> Exchange<'a> for Doh<'a> {
@@ -147,6 +178,7 @@ impl<'a> Exchange<'a> for Doh<'a> {
                 Some(connection) if connection.multiplexes() => {
                     self.two = Some(connection);
                     self.spent = false;
+                    self.kept = false;
                 }
                 Some(connection) => {
                     self.one = true;
@@ -169,6 +201,33 @@ impl<'a> Exchange<'a> for Doh<'a> {
                 None => {}
             }
         }
+    }
+
+    // HTTP/2: the one connection, when it still runs, the server has not
+    // sent it away, and no stream is out on it; never a spent connection
+    // or one of a wary talk, nor while another is dialled or drains.
+    // Streams are apart, and none is out, so nothing later lookups read on
+    // it is this one's. HTTP/1.1: a free connection. One is free only when
+    // the response to its last query was read whole and the server keeps it
+    // alive, and HTTP/1.1 answers one request at a time on a connection, so
+    // it owes nothing.
+    fn leave(&mut self) -> Option<Link> {
+        if self.one {
+            return self.idle.pop().map(|(connection, _)| Link::Doh(connection));
+        }
+        let healthy = self.old.is_none()
+            && self.dialling.is_none()
+            && self.out.is_empty()
+            && !self.spent
+            && !self.wary
+            && self
+                .two
+                .as_ref()
+                .is_some_and(|two| two.open() && !two.carrying() && !two.overran());
+        if !healthy {
+            return None;
+        }
+        self.two.take().map(Link::Doh)
     }
 }
 
@@ -196,9 +255,17 @@ impl<'a> Doh<'a> {
         {
             if !connection.carrying() {
                 self.two = None;
+                self.kept = false;
             } else if self.old.is_none() && !queue.waiting.is_empty() {
                 self.old = self.two.take();
+                self.kept = false;
             }
+        }
+        // A kept connection reads what the server sent while it was kept
+        // before its first stream: one that read too much, or was sent away
+        // meanwhile, is dropped as one found gone.
+        if self.kept && self.out.is_empty() && self.two.as_mut().is_some_and(|two| !two.settle()) {
+            self.gone(queue);
         }
         if self.two.is_none() && !queue.waiting.is_empty() {
             return None;
@@ -248,7 +315,21 @@ impl<'a> Doh<'a> {
                 };
             }
             (true, false) => {
-                let (key, reply) = self.two.as_mut()?.next().await?;
+                let two = self.two.as_mut()?;
+                // A kept connection that has not answered yet gets a short
+                // wait of its own: silent past it, it is taken as gone.
+                let ended = if self.kept {
+                    match tokio::time::timeout(REUSED_WAIT, two.next()).await {
+                        Ok(ended) => ended,
+                        Err(_) => {
+                            self.gone(queue);
+                            return None;
+                        }
+                    }
+                } else {
+                    two.next().await
+                };
+                let (key, reply) = ended?;
                 (key, reply, true)
             }
             (false, true) => {
@@ -281,6 +362,18 @@ impl<'a> Doh<'a> {
         reply: Reply,
         on_two: bool,
     ) -> Option<Option<(usize, Reply)>> {
+        if on_two && self.kept {
+            // A kept connection found gone before anything answered on it:
+            // every stream out was on it, and each goes again on a new
+            // connection, its send not counted. The talk goes on as one
+            // that dialled nothing yet.
+            if matches!(reply, Err(Exchanged::Closed)) {
+                self.gone(queue);
+                return None;
+            }
+            self.kept = false;
+            *queue.reached = true;
+        }
         if on_two {
             // A stream that found the connection gone may end before this
             // side sees the connection end.
@@ -304,6 +397,19 @@ impl<'a> Doh<'a> {
                 Some(Some((key, Err(Exchanged::Closed))))
             }
             reply => Some(Some((key, reply))),
+        }
+    }
+
+    // The kept HTTP/2 connection, found gone before anything answered on it,
+    // is dropped unread. Every stream out was on it, and each goes again on
+    // a new connection, its send not counted. The talk goes on as one that
+    // dialled nothing yet.
+    fn gone(&mut self, queue: &mut Queue<'_, 'a>) {
+        self.two = None;
+        self.kept = false;
+        for mut asked in std::mem::take(&mut self.out).into_values().rev() {
+            asked.sends -= 1;
+            queue.waiting.push_front(asked);
         }
     }
 
@@ -334,17 +440,22 @@ impl<'a> Doh<'a> {
             let mut held = Vec::new();
             for asked in given {
                 let taken = https.idle.pop();
-                // No new connection while one could not be made and another
-                // is still out: the query waits for that one to come free.
-                if taken.is_none() && https.undialled && !https.calls.is_empty() {
+                // No new connection while one could not be made, or the
+                // server has not answered the talk, and another is still
+                // out: the query waits for that one to come free.
+                if taken.is_none()
+                    && (https.undialled || !*queue.reached)
+                    && !https.calls.is_empty()
+                {
                     held.push(asked);
                     continue;
                 }
+                let kept = taken.is_some() && std::mem::take(&mut https.kept);
                 let call: OneCall<'a> = Box::pin(one_call(
                     provider,
                     wires,
                     server,
-                    counts,
+                    (counts, kept),
                     taken,
                     asked.packet.clone(),
                 ));
@@ -368,11 +479,16 @@ impl<'a> Doh<'a> {
             .await;
             match ended {
                 Ok((connection, reply)) => {
+                    *queue.reached = true;
                     if let Some(connection) = connection {
                         https.idle.push((connection, true));
                     }
                     return Ok(Some((asked.key, reply)));
                 }
+                // The talk's first dial, after the kept connection it began
+                // on was found gone, failed: as a talk's first dial does, it
+                // ends the talk.
+                Err(failed) if !*queue.reached => return Err(failed),
                 // A dial that failed while another connection is out or
                 // free: the query waits for one of those.
                 Err(_) if !https.calls.is_empty() || !https.idle.is_empty() => {
@@ -387,14 +503,18 @@ impl<'a> Doh<'a> {
 
 // One query over HTTP/1.1, on the free connection `taken` when there is one,
 // else on a new one. A connection that answered before and is found closed
-// before any byte of the reply is replaced once. The connection comes back
-// with the reply while it stays open. A dial that fails ends the call with
-// its failure, the query not sent on it.
+// before any byte of the reply is replaced once; so is the connection a
+// naming kept, when `kept`, once it fails in any way before a response, or
+// stays silent for `REUSED_WAIT`: what it said while kept (a 408 written
+// before the server closed it) is not this query's answer, and it is
+// dropped unread. The connection comes back with the reply while it stays
+// open. A dial that fails ends the call with its failure, the query not
+// sent on it. Each write of the query counts as one sent, when `counts`.
 async fn one_call(
     provider: &dyn Carrier,
     wires: &Wires,
     server: &DnsServer,
-    counts: bool,
+    (counts, mut kept): (bool, bool),
     mut taken: Option<(Box<Connection>, bool)>,
     packet: Vec<u8>,
 ) -> Result<(Option<Box<Connection>>, Reply), Exchanged> {
@@ -407,8 +527,18 @@ async fn one_call(
             None => (doh(provider, wires, server, || {}).await?, false),
         };
         sent(counts, 1);
-        match connection.exchange(server, path, &packet).await {
+        let exchanged = connection.exchange(server, path, &packet);
+        let reused = std::mem::take(&mut kept);
+        let outcome = if reused {
+            tokio::time::timeout(REUSED_WAIT, exchanged)
+                .await
+                .unwrap_or(Err(Exchanged::Closed))
+        } else {
+            exchanged.await
+        };
+        match outcome {
             Ok((reply, open)) => return Ok((open.then_some(connection), Ok(reply))),
+            Err(_) if reused => {}
             Err(Exchanged::Closed) if used => {}
             Err(failed) => return Ok((None, Err(failed))),
         }

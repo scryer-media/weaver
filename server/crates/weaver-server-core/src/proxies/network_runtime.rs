@@ -1111,9 +1111,9 @@ impl NetworkRuntime {
             None => Default::default(),
         };
         let stage: Arc<dyn Dialer> = match profile.kind {
-            ProxyKind::Socks5 | ProxyKind::HttpConnect => Arc::new(TransportHop {
+            ProxyKind::Socks5 | ProxyKind::HttpConnect => Arc::new(TransportHop::new(
                 id,
-                spec: TransportProxy {
+                TransportProxy {
                     kind: if profile.kind == ProxyKind::Socks5 {
                         TransportKind::Socks5
                     } else {
@@ -1125,11 +1125,11 @@ impl NetworkRuntime {
                     password: profile.secrets.password.clone(),
                 },
                 inner,
-                timeout: profile.timeout(),
-                naming: Naming::Refused(UNSCOPED_NAMES.into()),
-                endpoint_names: names.clone(),
-                failure: failure(),
-            }),
+                profile.timeout(),
+                Naming::Refused(UNSCOPED_NAMES.into()),
+                names.clone(),
+                failure(),
+            )),
             _ => {
                 let provider: Arc<dyn TunnelProvider> = match profile.kind {
                     ProxyKind::Ssh => {

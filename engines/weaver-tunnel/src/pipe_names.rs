@@ -6,7 +6,8 @@
 // whose DNS settings differ, so each stage asks the route that is dialling
 // through it how a name is to be resolved. A change of a route's DNS setting
 // replaces the names it dials with, and the answers held for the old setting
-// go with them; no stage is rebuilt and no connection ends.
+// go with them, as do the DNS connections their lookups kept open between
+// lookups; no stage is rebuilt, and no connection a dial made ends.
 use std::{
     collections::HashMap,
     future::Future,
@@ -79,8 +80,9 @@ struct Inner {
     // What each path's TLS sessions and validator trust: None for the
     // built-in roots, built only when a lookup first needs them.
     roots: Option<Arc<TrustRoots>>,
-    // The answers and TLS sessions of each path names are asked on, kept
-    // apart so no answer is shared between legs on different paths.
+    // The answers, TLS sessions, kept DNS connections and DNSSEC validator
+    // of each path names are asked on, kept apart so nothing is shared
+    // between legs on different paths.
     held: Mutex<HashMap<String, Held>>,
 }
 

@@ -8,12 +8,9 @@
 // negative answer all live here.
 use super::{
     Carrier, DnsServer, DnsSessions, FAMILIES, Found, Stage, Trust, Wire,
-    exchange::{Session, Wires},
+    exchange::Session,
     failure::{Exchanged, Failed, Unanswered, Worst},
-    judge::{
-        asked,
-        validating::{self, Dnssec},
-    },
+    judge::{asked, validating},
     resolver::{Answer, Resolver},
 };
 use crate::{
@@ -150,15 +147,7 @@ pub(super) async fn resolve_routed(
         dialer,
         failure: Mutex::new(None),
     };
-    let (resolved, account) = resolve_judged(
-        &stage,
-        sessions.wires(),
-        sessions.dnssec(),
-        servers,
-        trust,
-        host,
-    )
-    .await;
+    let (resolved, account) = resolve_judged(&stage, sessions, servers, trust, host).await;
     metrics::record_resolution(
         metrics::Resolver::Routed,
         resolved
@@ -179,12 +168,45 @@ pub(super) async fn resolve_routed(
 // `AsSent` for an answer it returns, positive or negative. Under
 // `Validate`, `Validated` or `Unsigned` for an answer it returns, and
 // `Bogus` for a lookup that failed for want of one that passed the check.
-// Nothing otherwise.
+// Nothing otherwise. Each server is asked with the naming's own `sessions`:
+// its TLS sessions and DNSSEC validator, and on the connection it keeps for
+// the server, when it keeps one dialled through `provider`'s stage, leaving
+// its own there.
 pub(super) async fn resolve_judged(
     provider: &dyn Carrier,
-    wires: &Wires,
-    dnssec: &Dnssec,
+    sessions: &DnsSessions,
     servers: &[DnsServer],
+    trust: Trust,
+    host: &str,
+) -> (Result<Lookup, Unanswered>, Account) {
+    // An encrypted wire keeps one connection to the server for both
+    // families, every alias followed and every DNSSEC query, and leaves it
+    // to the naming for its next lookup.
+    let session = |server| Session::keeping(provider, Keeping(sessions), server);
+    walk(session, sessions.dnssec(), servers, trust, host).await
+}
+
+// A lookup as `resolve_judged` makes it, with `wires` and `dnssec`, that
+// keeps no connection and takes none, for a test of what is asked.
+#[cfg(test)]
+pub(super) async fn resolve_unkept(
+    provider: &dyn Carrier,
+    wires: &super::exchange::Wires,
+    dnssec: &validating::Dnssec,
+    servers: &[DnsServer],
+    trust: Trust,
+    host: &str,
+) -> (Result<Lookup, Unanswered>, Account) {
+    let session = |server| Session::new(provider, wires, server);
+    walk(session, dnssec, servers, trust, host).await
+}
+
+// Asks `servers` in order for `host`, each in the session `session` opens
+// for it.
+async fn walk<'a>(
+    session: impl Fn(&'a DnsServer) -> Session<'a>,
+    dnssec: &validating::Dnssec,
+    servers: &'a [DnsServer],
     trust: Trust,
     host: &str,
 ) -> (Result<Lookup, Unanswered>, Account) {
@@ -199,9 +221,7 @@ pub(super) async fn resolve_judged(
         if walk.never_in_plain(server) {
             continue;
         }
-        // An encrypted wire keeps one connection to the server for both
-        // families, every alias followed and every DNSSEC query.
-        let mut session = Session::new(provider, wires, server);
+        let mut session = session(server);
         // Set as soon as the server answers a dial, so a server cut off by
         // its time limit still says it was reached.
         let mut reached = false;
@@ -217,6 +237,17 @@ pub(super) async fn resolve_judged(
         walk.hold(&said);
     }
     walk.end(host, servers, trust)
+}
+
+// A naming's own lookup: the one asker that takes a connection the naming
+// keeps and leaves its own to it. Only this module makes one, so a server
+// test, which asks each server once, never keeps or reuses a connection.
+pub(super) struct Keeping<'a>(&'a DnsSessions);
+
+impl<'a> Keeping<'a> {
+    pub(super) fn sessions(&self) -> &'a DnsSessions {
+        self.0
+    }
 }
 
 // What the servers asked so far for one lookup have come to, as the list

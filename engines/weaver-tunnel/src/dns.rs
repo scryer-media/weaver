@@ -10,16 +10,16 @@ use crate::{
     resolution::Lookup,
 };
 #[cfg(test)]
-use exchange::{Session, Wires};
+use exchange::{IDLE, REUSED_WAIT, Session, Wires};
 #[cfg(test)]
 use failure::Unanswered;
 use failure::{Exchanged, Failed};
 #[cfg(test)]
 use judge::validating::Dnssec;
 pub(crate) use list::ListResolver;
-#[cfg(test)]
-use list::resolve_judged;
 pub use list::resolve_through;
+#[cfg(test)]
+use list::{resolve_judged, resolve_unkept};
 #[cfg(test)]
 use message::u16_at;
 use model::{Carrier, FAMILIES, Found, SERVER_TIMEOUT, Stage};
@@ -64,8 +64,10 @@ async fn resolve(
     trust: Trust,
     host: &str,
 ) -> Result<Lookup, Unanswered> {
-    let dnssec = Dnssec::new(None);
-    resolve_judged(provider, wires, &dnssec, servers, trust, host)
+    // A naming of its own, as a cold lookup has: it keeps what it leaves
+    // for no later lookup here.
+    let sessions = DnsSessions::of(wires.clone(), Dnssec::new(None));
+    resolve_judged(provider, &sessions, servers, trust, host)
         .await
         .0
 }

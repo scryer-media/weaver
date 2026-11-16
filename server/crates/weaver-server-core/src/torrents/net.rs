@@ -1564,27 +1564,27 @@ mod tests {
     // A SOCKS5 hop on the leg's egress, or an HTTP CONNECT one, aimed at
     // `endpoint`.
     fn proxy_hop(kind: TransportKind, endpoint: SocketAddr) -> Arc<dyn Dialer> {
-        Arc::new(TransportHop {
-            id: 1,
-            spec: TransportProxy {
+        Arc::new(TransportHop::new(
+            1,
+            TransportProxy {
                 kind,
                 host: endpoint.ip().to_string(),
                 port: endpoint.port(),
                 username: None,
                 password: None,
             },
-            inner: Arc::new(weaver_tunnel::pipe::Egress::new(
+            Arc::new(weaver_tunnel::pipe::Egress::new(
                 4,
                 weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
                 std::time::Duration::from_secs(30),
             )),
-            timeout: std::time::Duration::from_secs(30),
-            naming: weaver_tunnel::pipe::Naming::Proxy,
-            endpoint_names: std::sync::Arc::new(weaver_tunnel::pipe::NamesSlot::new(
+            std::time::Duration::from_secs(30),
+            weaver_tunnel::pipe::Naming::Proxy,
+            std::sync::Arc::new(weaver_tunnel::pipe::NamesSlot::new(
                 weaver_tunnel::pipe::Names::new(weaver_tunnel::pipe::DnsChoice::System, None),
             )),
-            failure: Default::default(),
-        })
+            Default::default(),
+        ))
     }
 
     // A ladder leg on `rung`, as the runtime builds one.

@@ -128,11 +128,11 @@ fn serving(
     }
 }
 
-// What a test recording says of a validated lookup through `servers`.
+// What a test recording says of a validated lookup through `servers`, by
+// the naming whose sessions are `sessions`.
 async fn checked(
     carrier: &Servers,
-    wires: &Wires,
-    dnssec: &Dnssec,
+    sessions: &DnsSessions,
     servers: &[DnsServer],
     host: &str,
 ) -> record::HostResolution {
@@ -141,7 +141,7 @@ async fn checked(
         .scope(async {
             record::asking(host, || record::Asker::servers(servers, Trust::Validate));
             let (resolved, _) =
-                resolve_judged(carrier, wires, dnssec, servers, Trust::Validate, host).await;
+                resolve_judged(carrier, sessions, servers, Trust::Validate, host).await;
             if let Ok(lookup) = resolved {
                 record::found(host, &lookup.addresses);
             }
@@ -208,13 +208,12 @@ async fn a_signed_answer_validates_on_every_wire() {
         .into_iter()
         .zip(connections)
     {
-        let dnssec = trusting(&resolver, NOW);
+        let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
         let before = counted();
         let sent = crate::metrics::dnssec_queries();
         let resolution = checked(
             &servers,
-            &wires,
-            &dnssec,
+            &sessions,
             std::slice::from_ref(&listed),
             "www.example.com",
         )
@@ -308,18 +307,12 @@ async fn a_signed_answer_validates_on_a_runtime_with_one_thread() {
     let servers = Servers::new(Speaks::Dot { close_after: None }, serving(&resolver, &[]))
         .plain_at("192.0.2.53");
     let wires = Authority::new().wires();
-    let dnssec = trusting(&resolver, NOW);
-    let resolution = checked(&servers, &wires, &dnssec, &[first()], "www.example.com").await;
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
+    let resolution = checked(&servers, &sessions, &[first()], "www.example.com").await;
     assert_eq!(resolution.addresses, seven());
     assert_eq!(resolution.trust, Some(TrustOutcome::Validated));
     let in_a_set = tokio::task::LocalSet::new()
-        .run_until(checked(
-            &servers,
-            &wires,
-            &dnssec,
-            &[first()],
-            "www.example.com",
-        ))
+        .run_until(checked(&servers, &sessions, &[first()], "www.example.com"))
         .await;
     assert_eq!(in_a_set.addresses, seven());
     assert_eq!(in_a_set.trust, Some(TrustOutcome::Validated));
@@ -364,9 +357,9 @@ async fn a_family_that_fails_the_check_is_counted_bogus_when_the_other_answers()
     };
     let servers = Servers::new(Speaks::Dot { close_after: None }, answer).plain_at("192.0.2.53");
     let wires = Authority::new().wires();
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let before = counted();
-    let resolution = checked(&servers, &wires, &dnssec, &[first()], "www.example.com").await;
+    let resolution = checked(&servers, &sessions, &[first()], "www.example.com").await;
     assert_eq!(resolution.addresses, seven());
     assert_eq!(resolution.trust, Some(TrustOutcome::Validated));
     assert_eq!(resolution.error, None);
@@ -390,9 +383,9 @@ async fn each_dnssec_query_is_counted_as_it_goes_out() {
     let silent = Servers::new(Speaks::Dot { close_after: None }, serving(&resolver, &[]))
         .silent_at("192.0.2.53");
     let wires = Authority::new().wires();
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let sent = crate::metrics::dnssec_queries();
-    let resolution = checked(&silent, &wires, &dnssec, &[first()], "www.example.com").await;
+    let resolution = checked(&silent, &sessions, &[first()], "www.example.com").await;
     assert!(resolution.addresses.is_empty());
     let dials = silent.dials().len();
     assert!(dials >= 2);
@@ -411,13 +404,12 @@ async fn each_dnssec_query_is_counted_as_it_goes_out() {
     )
     .at("192.0.2.53", authority.server(&["192.0.2.53"], b"h2"));
     let wires = authority.wires();
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let sent = crate::metrics::dnssec_queries();
     let listed = doh("192.0.2.53:443");
     let resolution = checked(
         &servers,
-        &wires,
-        &dnssec,
+        &sessions,
         std::slice::from_ref(&listed),
         "www.example.com",
     )
@@ -444,13 +436,12 @@ async fn dot_validates_through_a_server_that_closes_after_every_reply() {
     )
     .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"));
     let wires = authority.wires();
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let listed = dot("192.0.2.53", None);
     let sent = crate::metrics::dnssec_queries();
     let resolution = checked(
         &servers,
-        &wires,
-        &dnssec,
+        &sessions,
         std::slice::from_ref(&listed),
         "www.example.com",
     )
@@ -478,11 +469,10 @@ async fn each_reply_carries_the_id_its_query_went_out_with() {
         sent
     };
     for (servers, wires, listed) in every_wire(off) {
-        let dnssec = trusting(&resolver, NOW);
+        let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
         let resolution = checked(
             &servers,
-            &wires,
-            &dnssec,
+            &sessions,
             std::slice::from_ref(&listed),
             "www.example.com",
         )
@@ -512,13 +502,13 @@ async fn an_unsigned_zone_resolves_unsigned() {
     let servers = Servers::new(Speaks::Dot { close_after: None }, serving(&resolver, &[]))
         .plain_at("192.0.2.53");
     let wires = Authority::new().wires();
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let before = counted();
     for (host, address) in [
         ("www.plain.com", "192.0.2.8"),
         ("nas.home.arpa", "192.0.2.9"),
     ] {
-        let resolution = checked(&servers, &wires, &dnssec, &[first()], host).await;
+        let resolution = checked(&servers, &sessions, &[first()], host).await;
         assert_eq!(
             resolution.addresses,
             [address.parse::<IpAddr>().unwrap()],
@@ -539,12 +529,11 @@ async fn a_tampered_answer_is_bogus_and_resolves_nothing_on_every_wire() {
     for (servers, wires, listed) in
         every_wire(serving(&resolver, &[("192.0.2.53", Serves::Tampered)]))
     {
-        let dnssec = trusting(&resolver, NOW);
+        let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
         let before = counted();
         let resolution = checked(
             &servers,
-            &wires,
-            &dnssec,
+            &sessions,
             std::slice::from_ref(&listed),
             "www.example.com",
         )
@@ -566,11 +555,10 @@ async fn a_server_that_strips_signatures_leaves_dnssec_unavailable() {
     for (servers, wires, listed) in
         every_wire(serving(&resolver, &[("192.0.2.53", Serves::Stripped)]))
     {
-        let dnssec = trusting(&resolver, NOW);
+        let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
         let resolution = checked(
             &servers,
-            &wires,
-            &dnssec,
+            &sessions,
             std::slice::from_ref(&listed),
             "www.example.com",
         )
@@ -598,9 +586,9 @@ async fn the_next_server_is_asked_after_one_that_stripped_its_answer() {
     .plain_at("192.0.2.53")
     .plain_at("192.0.2.54");
     let wires = Authority::new().wires();
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let listed = [first(), DnsServer::plain("192.0.2.54".parse().unwrap())];
-    let resolution = checked(&servers, &wires, &dnssec, &listed, "www.example.com").await;
+    let resolution = checked(&servers, &sessions, &listed, "www.example.com").await;
     assert_eq!(resolution.addresses, seven());
     assert_eq!(resolution.trust, Some(TrustOutcome::Validated));
     assert!(
@@ -637,11 +625,11 @@ async fn a_name_proved_bogus_is_held_only_against_the_server_that_gave_it() {
         .plain_at("192.0.2.53")
         .plain_at("192.0.2.54");
     let wires = Authority::new().wires();
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let listed = [first(), DnsServer::plain("192.0.2.54".parse().unwrap())];
     let address = name_query(name("www.example.com."), RecordType::A);
     let before = counted();
-    let resolution = checked(&servers, &wires, &dnssec, &listed, "www.example.com").await;
+    let resolution = checked(&servers, &sessions, &listed, "www.example.com").await;
     assert_eq!(resolution.addresses, seven());
     assert_eq!(resolution.trust, Some(TrustOutcome::Validated));
     assert_eq!(since(&before), [TrustOutcome::Validated]);
@@ -655,7 +643,7 @@ async fn a_name_proved_bogus_is_held_only_against_the_server_that_gave_it() {
     );
     // The first server again, inside the hold.
     let mark = asked.lock().unwrap().len();
-    let resolution = checked(&servers, &wires, &dnssec, &[first()], "www.example.com").await;
+    let resolution = checked(&servers, &sessions, &[first()], "www.example.com").await;
     assert!(resolution.addresses.is_empty());
     assert_eq!(
         resolution.error,
@@ -675,8 +663,8 @@ async fn an_expired_signature_says_the_clock_may_be_wrong() {
     let servers = Servers::new(Speaks::Dot { close_after: None }, serving(&resolver, &[]))
         .plain_at("192.0.2.53");
     let wires = Authority::new().wires();
-    let dnssec = trusting(&resolver, LATE);
-    let resolution = checked(&servers, &wires, &dnssec, &[first()], "www.example.com").await;
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, LATE));
+    let resolution = checked(&servers, &sessions, &[first()], "www.example.com").await;
     assert!(resolution.addresses.is_empty());
     assert_eq!(
         resolution.error,
@@ -696,12 +684,12 @@ async fn a_plain_server_after_an_encrypted_one_is_never_asked_under_validate() {
         .at("192.0.2.53", stranger.server(&["192.0.2.53"], b"dot"))
         .plain_at("192.0.2.54");
     let wires = trusted.wires();
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let listed = [
         dot("192.0.2.53", None),
         DnsServer::plain("192.0.2.54".parse().unwrap()),
     ];
-    let resolution = checked(&servers, &wires, &dnssec, &listed, "www.example.com").await;
+    let resolution = checked(&servers, &sessions, &listed, "www.example.com").await;
     assert!(resolution.addresses.is_empty());
     assert_eq!(
         resolution.error.map(|error| error.failure),
@@ -823,7 +811,7 @@ async fn a_validated_lookup_takes_these_round_trips_on_each_wire() {
             let answered = servers.answered().iter().sum::<usize>();
             let (dialled, waited) = (servers.dials().len(), servers.waits());
             let started = tokio::time::Instant::now();
-            let (resolved, _) = resolve_judged(
+            let (resolved, _) = resolve_unkept(
                 &servers,
                 &wires,
                 &dnssec,
@@ -874,12 +862,11 @@ async fn a_cold_check_at_the_next_server_has_a_whole_time_limit_of_its_own() {
         .silent_at("192.0.2.53")
         .at("192.0.2.54", authority.server(&["192.0.2.54"], b"dot"))
         .delayed(RTT);
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(authority.wires(), trusting(&resolver, NOW));
     let started = tokio::time::Instant::now();
     let (resolved, account) = resolve_judged(
         &servers,
-        &authority.wires(),
-        &dnssec,
+        &sessions,
         &[dot("192.0.2.53", None), dot("192.0.2.54", None)],
         Trust::Validate,
         "www.example.com",
@@ -934,12 +921,11 @@ async fn a_silent_family_leaves_the_others_answer_on_every_wire_under_either_tru
     for trust in [Trust::AsSent, Trust::Validate] {
         for silent in [RecordType::A, RecordType::AAAA] {
             for (servers, wires, listed) in every_wire(silent_for(&resolver, silent)) {
-                let dnssec = trusting(&resolver, NOW);
+                let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
                 let started = tokio::time::Instant::now();
                 let (resolved, account) = resolve_judged(
                     &servers,
-                    &wires,
-                    &dnssec,
+                    &sessions,
                     std::slice::from_ref(&listed),
                     trust,
                     "www.example.com",
@@ -1038,12 +1024,11 @@ async fn a_lookup_ends_once_both_checks_have_their_verdicts_on_every_wire() {
     };
     // The wires in turn: plain, DNS over TLS, HTTP/1.1, HTTP/2.
     for (wire, (servers, wires, listed)) in every_wire(answer).into_iter().enumerate() {
-        let dnssec = trusting(&resolver, NOW);
+        let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
         let started = tokio::time::Instant::now();
         let resolution = checked(
             &servers,
-            &wires,
-            &dnssec,
+            &sessions,
             std::slice::from_ref(&listed),
             "www.example.com",
         )
@@ -1080,12 +1065,11 @@ async fn a_finished_check_leaves_its_unsent_queries_unsent_while_the_other_runs(
     };
     // The wires in turn: plain, DNS over TLS, HTTP/1.1, HTTP/2.
     let (servers, wires, listed) = every_wire(answer).swap_remove(2);
-    let dnssec = trusting(&resolver, NOW);
+    let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
     let started = tokio::time::Instant::now();
     let resolution = checked(
         &servers,
-        &wires,
-        &dnssec,
+        &sessions,
         std::slice::from_ref(&listed),
         "www.example.com",
     )
@@ -1127,12 +1111,11 @@ async fn a_check_that_fails_part_way_or_at_tls_moves_to_the_next_server() {
     });
     let wires = trusted.wires();
     for first in ["192.0.2.53", "192.0.2.55"] {
-        let dnssec = trusting(&resolver, NOW);
+        let sessions = DnsSessions::of(wires.clone(), trusting(&resolver, NOW));
         let dialled = servers.dials().len();
         let (resolved, account) = resolve_judged(
             &servers,
-            &wires,
-            &dnssec,
+            &sessions,
             &[dot(first, None), dot("192.0.2.54", None)],
             Trust::Validate,
             "www.example.com",
@@ -1165,14 +1148,13 @@ async fn a_held_chain_never_makes_a_tampered_answer_pass() {
     let (servers, trusted) =
         three_over_tls(serving(&resolver, &[("192.0.2.54", Serves::Tampered)]));
     let wires = trusted.wires();
-    let dnssec = trusting(&resolver, NOW);
-    let (carrier, wires, dnssec) = (&servers, &wires, &dnssec);
+    let sessions = DnsSessions::of(wires, trusting(&resolver, NOW));
+    let (carrier, sessions) = (&servers, &sessions);
     let lookup = |server: &'static str| async move {
         let listed = [dot(server, None)];
         resolve_judged(
             carrier,
-            wires,
-            dnssec,
+            sessions,
             &listed,
             Trust::Validate,
             "www.example.com",
@@ -1234,6 +1216,26 @@ async fn a_dns_setting_change_empties_the_held_chain() {
     let cold = through_naming(&naming, &servers, "api.example.com").await;
     assert_eq!(cold.trust, Some(TrustOutcome::Validated));
     assert_eq!(asked(&servers) - before, 7);
+}
+
+// Validated lookups by one naming ask on the connection the last one left:
+// the cold check and its queries asked ahead share the first lookup's one
+// connection, and the next lookup dials nothing.
+#[tokio::test(start_paused = true)]
+async fn validated_lookups_ask_on_the_connection_the_last_one_left() {
+    let resolver = dual();
+    let (servers, trusted) = three_over_tls(serving(&resolver, &[]));
+    let rooted = roots(trusted.store(), &resolver, NOW);
+    let naming = proxy_servers_trusting(vec![dot("192.0.2.53", None)], Trust::Validate, &rooted);
+    let first = through_naming(&naming, &servers, "www.example.com").await;
+    assert_eq!(first.trust, Some(TrustOutcome::Validated));
+    assert_eq!(servers.dials().len(), 1);
+    assert_eq!(servers.answered(), [7]);
+    let second = through_naming(&naming, &servers, "api.example.com").await;
+    assert_eq!(second.trust, Some(TrustOutcome::Validated));
+    assert!(!second.cached);
+    assert_eq!(servers.dials().len(), 1);
+    assert_eq!(servers.answered(), [9]);
 }
 
 // What a negative reply's authority section keeps of its SOA.
@@ -1302,16 +1304,9 @@ async fn a_validated_negative_answer_holds_by_its_soa_and_for_no_time_without_on
             bytes
         })
         .plain_at("192.0.2.53");
-        let dnssec = trusting(&resolver, NOW);
-        let (resolved, account) = resolve_judged(
-            &servers,
-            &Authority::new().wires(),
-            &dnssec,
-            &[first()],
-            Trust::Validate,
-            host,
-        )
-        .await;
+        let sessions = DnsSessions::of(Authority::new().wires(), trusting(&resolver, NOW));
+        let (resolved, account) =
+            resolve_judged(&servers, &sessions, &[first()], Trust::Validate, host).await;
         let lookup = resolved.unwrap();
         assert!(lookup.addresses.is_empty(), "{host} {soa:?}");
         assert!(lookup.nonexistent, "{host} {soa:?}");

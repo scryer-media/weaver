@@ -9,7 +9,7 @@ use crate::pipe::Naming;
 use crate::resolution::record::{LookupError, Recording};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
@@ -23,6 +23,7 @@ use tokio_rustls::{
 };
 
 mod dnssec;
+mod kept;
 
 // A certificate authority the tests trust, or one they do not.
 struct Authority {
@@ -259,10 +260,24 @@ struct Servers {
     // Client streams being dialled or open now, and the most at once.
     open: Arc<AtomicUsize>,
     most_open: Arc<AtomicUsize>,
-    // A permit for each HTTP/2 stream held unanswered, and for each HTTP/2
-    // connection that has ended.
+    // A permit for each HTTP/2 stream held unanswered, and for each
+    // connection that has ended on the server's side after its TLS
+    // handshake.
     holding: Arc<tokio::sync::Semaphore>,
     ended: Arc<tokio::sync::Semaphore>,
+    // The server's side of each TLS connection, to close it at will.
+    served: Mutex<Vec<tokio::task::AbortHandle>>,
+    // Each connection's switch that makes it take queries and answer none.
+    muted: Mutex<Vec<Arc<AtomicBool>>>,
+    // Each HTTP/1.1 connection's signal to answer 408 while it waits for a
+    // request, and close.
+    hung: Mutex<Vec<Arc<tokio::sync::Notify>>>,
+    // DNS over TLS, once set: each reply goes after the reply sent before
+    // it on its connection, sent again, as a server that repeats itself.
+    repeating: Arc<AtomicBool>,
+    // What is kept open through these servers, as through the stage a
+    // lookup asks them through.
+    keeper: crate::pipe::Keeper,
 }
 
 // One client stream counted from its dial until it is dropped.
@@ -419,6 +434,31 @@ impl Servers {
             most_open: Arc::default(),
             holding: Arc::new(tokio::sync::Semaphore::new(0)),
             ended: Arc::new(tokio::sync::Semaphore::new(0)),
+            served: Mutex::default(),
+            muted: Mutex::default(),
+            hung: Mutex::default(),
+            repeating: Arc::default(),
+            keeper: crate::pipe::Keeper::default(),
+        }
+    }
+    // From now on each DNS over TLS reply goes after the one before it on
+    // its connection, sent again.
+    fn repeat_from_now(&self) {
+        self.repeating.store(true, Ordering::Relaxed);
+    }
+    // Every connection open now takes queries from now on and answers none,
+    // staying open; a connection dialled later answers.
+    fn mute_open(&self) {
+        for muted in self.muted.lock().unwrap().iter() {
+            muted.store(true, Ordering::Relaxed);
+        }
+    }
+    // Every HTTP/1.1 connection open now, waiting for its next request,
+    // answers 408 Request Timeout unasked and closes, as a server does when
+    // a connection sits idle past its timeout.
+    fn hang_up_open(&self) {
+        for hung in self.hung.lock().unwrap().iter() {
+            hung.notify_one();
         }
     }
     fn unreached_at(mut self, dial: usize) -> Self {
@@ -489,12 +529,30 @@ impl Servers {
     fn dials(&self) -> Vec<SocketAddr> {
         self.log.lock().unwrap().dials.clone()
     }
+    // Client streams being dialled or open now.
+    fn open_now(&self) -> usize {
+        self.open.load(Ordering::Relaxed)
+    }
+    // The server closes every TLS connection it holds, saying nothing.
+    fn close_all(&self) {
+        for served in self.served.lock().unwrap().drain(..) {
+            served.abort();
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl Carrier for Servers {
+    fn keepers(&self) -> Vec<crate::pipe::KeeperRef> {
+        vec![self.keeper.handle()]
+    }
+
     async fn open(&self, server: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         let (client, inner) = tokio::io::duplex(65536);
+        let muted = Arc::new(AtomicBool::new(false));
+        self.muted.lock().unwrap().push(muted.clone());
+        let hung = Arc::new(tokio::sync::Notify::new());
+        self.hung.lock().unwrap().push(hung.clone());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let queries = Arc::new(AtomicUsize::new(0));
         let dial = {
@@ -541,7 +599,7 @@ impl Carrier for Servers {
         let asked = server.address.ip();
         let answer = self.answer.clone();
         let replies = self.replies.clone();
-        let closing = self.closing;
+        let (closing, repeating) = (self.closing, self.repeating.clone());
         if self.silent.contains(&asked) {
             self.held.lock().unwrap().push(inner);
             return Ok(client);
@@ -553,9 +611,9 @@ impl Carrier for Servers {
                     &mut stream,
                     asked,
                     &*answer,
-                    (None, closing),
+                    (None, closing, &repeating),
                     None,
-                    &queries,
+                    (&queries, &muted),
                 )
                 .await;
             });
@@ -575,83 +633,99 @@ impl Carrier for Servers {
             self.ended.clone(),
             self.dialled.clone(),
         );
-        tokio::spawn(async move {
+        let served = tokio::spawn(async move {
             let Ok(mut tls) = acceptor.accept(Tap { inner, seen }).await else {
                 return;
             };
-            match speaks {
-                Speaks::Dot { close_after } => {
-                    framed_replies(
-                        &mut tls,
-                        asked,
-                        &*answer,
-                        (close_after, closing),
-                        replies.as_deref(),
-                        &queries,
-                    )
-                    .await
-                }
-                Speaks::Doh { respond, dribble } => loop {
-                    let Some(seen) = read_request(&mut tls).await else {
-                        return;
-                    };
-                    // Past the last reply, the connection closes unanswered
-                    // and without saying so before.
-                    if replies.as_deref().is_some_and(|left| {
-                        left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                            left.checked_sub(1)
-                        })
-                        .is_err()
-                    }) {
-                        return;
+            let served = async move {
+                match speaks {
+                    Speaks::Dot { close_after } => {
+                        framed_replies(
+                            &mut tls,
+                            asked,
+                            &*answer,
+                            (close_after, closing, &repeating),
+                            replies.as_deref(),
+                            (&queries, &muted),
+                        )
+                        .await
                     }
-                    queries.fetch_add(1, Ordering::Relaxed);
-                    let body = seen.body.clone();
-                    log.lock().unwrap().requests.push(seen);
-                    let reply = answer(asked, u16_at(&body, body.len() - 4).unwrap(), &body);
-                    // No reply made: the request is never answered, and the
-                    // connection stays open.
-                    if reply.is_empty() {
-                        let _held = tls;
-                        return std::future::pending().await;
-                    }
-                    let response = respond(&body, reply);
-                    let sent = if dribble {
-                        let mut sent = Ok(());
-                        for byte in &response {
-                            sent = sent.and(tls.write_all(&[*byte]).await);
-                            sent = sent.and(tls.flush().await);
+                    Speaks::Doh { respond, dribble } => loop {
+                        let next = tokio::select! {
+                            seen = read_request(&mut tls) => Some(seen),
+                            () = hung.notified() => None,
+                        };
+                        let Some(next) = next else {
+                            let timeout = http("408 Request Timeout", &["Connection: close"], b"");
+                            let _ = tls.write_all(&timeout).await;
+                            let _ = tls.flush().await;
+                            let _ = tls.shutdown().await;
+                            return;
+                        };
+                        let Some(seen) = next else {
+                            return;
+                        };
+                        // Past the last reply, the connection closes unanswered
+                        // and without saying so before.
+                        if replies.as_deref().is_some_and(|left| {
+                            left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                                left.checked_sub(1)
+                            })
+                            .is_err()
+                        }) {
+                            return;
                         }
-                        sent
-                    } else {
-                        tls.write_all(&response).await.and(tls.flush().await)
-                    };
-                    let closes = response
-                        .to_ascii_lowercase()
-                        .windows(17)
-                        .any(|bytes| bytes == b"connection: close");
-                    if sent.is_err() || closes {
-                        return;
+                        queries.fetch_add(1, Ordering::Relaxed);
+                        let body = seen.body.clone();
+                        log.lock().unwrap().requests.push(seen);
+                        let reply = answer(asked, u16_at(&body, body.len() - 4).unwrap(), &body);
+                        // No reply made, or the connection muted: the request is
+                        // never answered, and the connection stays open.
+                        if reply.is_empty() || muted.load(Ordering::Relaxed) {
+                            let _held = tls;
+                            return std::future::pending().await;
+                        }
+                        let response = respond(&body, reply);
+                        let sent = if dribble {
+                            let mut sent = Ok(());
+                            for byte in &response {
+                                sent = sent.and(tls.write_all(&[*byte]).await);
+                                sent = sent.and(tls.flush().await);
+                            }
+                            sent
+                        } else {
+                            tls.write_all(&response).await.and(tls.flush().await)
+                        };
+                        let closes = response
+                            .to_ascii_lowercase()
+                            .windows(17)
+                            .any(|bytes| bytes == b"connection: close");
+                        if sent.is_err() || closes {
+                            return;
+                        }
+                    },
+                    Speaks::H2 {
+                        respond,
+                        goaway_after,
+                        misstep,
+                    } => {
+                        serve_h2(
+                            tls,
+                            asked,
+                            answer,
+                            (respond, misstep),
+                            goaway_after.is_some_and(|connections| dial < connections),
+                            (queries, log, holding, dialled),
+                            muted,
+                        )
+                        .await;
                     }
-                },
-                Speaks::H2 {
-                    respond,
-                    goaway_after,
-                    misstep,
-                } => {
-                    serve_h2(
-                        tls,
-                        asked,
-                        answer,
-                        (respond, misstep),
-                        goaway_after.is_some_and(|connections| dial < connections),
-                        (queries, log, holding, dialled),
-                    )
-                    .await;
-                    ended.add_permits(1);
                 }
-            }
+            };
+            served.await;
+            ended.add_permits(1);
         });
+        self.served.lock().unwrap().push(served.abort_handle());
         Ok(client)
     }
 }
@@ -670,6 +744,7 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
         Arc<tokio::sync::Semaphore>,
         Arc<tokio::sync::Semaphore>,
     ),
+    muted: Arc<AtomicBool>,
 ) {
     let Ok(mut connection) = h2::server::handshake(stream).await else {
         return;
@@ -729,12 +804,13 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
             send.send_reset(h2::Reason::REFUSED_STREAM);
             continue;
         }
-        let (answer, respond, queries, log, holding) = (
+        let (answer, respond, queries, log, holding, muted) = (
             answer.clone(),
             respond.clone(),
             queries.clone(),
             log.clone(),
             holding.clone(),
+            muted.clone(),
         );
         tokio::spawn(async move {
             let (parts, mut body) = request.into_parts();
@@ -793,8 +869,9 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             let reply = answer(asked, u16_at(&query, query.len() - 4).unwrap(), &query);
-            // No reply made: the stream is held open and never answered.
-            if reply.is_empty() {
+            // No reply made, or the connection muted: the stream is held
+            // open and never answered.
+            if reply.is_empty() || muted.load(Ordering::Relaxed) {
                 let _held = send;
                 holding.add_permits(1);
                 return std::future::pending().await;
@@ -811,15 +888,18 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
 
 // DNS over TCP replies to each query read, until the client goes, the
 // connection has answered `close_after`, or no `replies` are left. With
-// `closing`, a query given no reply closes the connection.
+// `closing`, a query given no reply closes the connection. Once
+// `repeating`, each reply goes after the one sent before it, sent again.
+// Once `muted`, queries are read and none answered.
 async fn framed_replies<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     asked: IpAddr,
     answer: &Answer,
-    (close_after, closing): (Option<usize>, bool),
+    (close_after, closing, repeating): (Option<usize>, bool, &AtomicBool),
     replies: Option<&AtomicUsize>,
-    queries: &AtomicUsize,
+    (queries, muted): (&AtomicUsize, &AtomicBool),
 ) {
+    let mut before: Vec<u8> = Vec::new();
     loop {
         if close_after.is_some_and(|after| queries.load(Ordering::Relaxed) >= after) {
             return;
@@ -846,11 +926,16 @@ async fn framed_replies<S: AsyncRead + AsyncWrite + Unpin>(
         if reply.is_empty() && closing {
             return;
         }
-        if reply.is_empty() {
+        if reply.is_empty() || muted.load(Ordering::Relaxed) {
             continue;
         }
-        let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
-        framed.extend(reply);
+        let mut this = (reply.len() as u16).to_be_bytes().to_vec();
+        this.extend(reply);
+        let mut framed = std::mem::replace(&mut before, this.clone());
+        if !repeating.load(Ordering::Relaxed) {
+            framed.clear();
+        }
+        framed.extend_from_slice(&this);
         if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
             return;
         }
@@ -2404,16 +2489,24 @@ async fn tls_sessions_resume_through_a_naming_and_its_clones_and_never_across_tw
         // A name apiece, so none is answered from what the naming holds.
         // Each lookup's first connection is the one held to account: a
         // second one in the same lookup, as HTTP/1.1 opens for the other
-        // family, may resume the first's session.
+        // family, may resume the first's session. Each lookup's connections
+        // are closed, the one kept idle past `IDLE`, before the next, so
+        // every lookup dials.
+        let per_lookup: u32 = if alpn == b"http/1.1" { 2 } else { 1 };
         let mut firsts = Vec::new();
         for (naming, host) in [(&first, "a.test"), (&clone, "b.test"), (&second, "c.test")] {
             firsts.push(servers.dials().len());
             let resolution = through_naming(naming, &servers, host).await;
             assert_eq!(resolution.addresses, seven(), "{listed} {host}");
+            servers
+                .ended
+                .acquire_many(per_lookup)
+                .await
+                .unwrap()
+                .forget();
         }
         let sent = servers.sent();
-        let per_lookup = if alpn == b"http/1.1" { 2 } else { 1 };
-        assert_eq!(sent.len(), 3 * per_lookup, "{listed}");
+        assert_eq!(sent.len(), 3 * per_lookup as usize, "{listed}");
         assert!(!offers_a_session(&sent[firsts[0]]), "{listed}");
         // The clone resumes the first naming's session.
         assert!(offers_a_session(&sent[firsts[1]]), "{listed}");

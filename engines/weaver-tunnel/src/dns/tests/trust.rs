@@ -75,6 +75,10 @@ impl Dialer for Through<'_> {
     fn describe(&self) -> String {
         "through".into()
     }
+    // The hop stands for the carrier, and keeps what the carrier keeps.
+    fn keepers(&self) -> Vec<crate::pipe::KeeperRef> {
+        self.0.keepers()
+    }
 }
 
 // How long a test naming's lookup may take, far above any lookup's own.

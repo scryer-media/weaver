@@ -4,13 +4,20 @@
 // The connection one server's queries ride during one lookup. Plain DNS
 // opens a stream per query. DNS over TLS (RFC 7858) and over HTTPS (RFC
 // 8484) wrap the stream the stage dials in TLS, and keep that one
-// connection for the lookup's queries while the server keeps it open.
-use super::{Carrier, DnsServer, Exchanged, Wire};
+// connection for the lookup's queries while the server keeps it open. A
+// lookup on a naming that keeps connections takes the one its last lookup
+// to the server left, and leaves its own healthy one for the next.
+use super::{Carrier, DnsServer, Exchanged, Wire, list::Keeping};
 use crate::TunnelStream;
+use crate::pipe::KeeperRef;
 use doh::Doh;
 use dot::Dot;
+#[cfg(test)]
+pub(super) use kept::IDLE;
+pub(super) use kept::Kept;
+use kept::Link;
 use plain::PlainTcp;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16};
@@ -26,6 +33,7 @@ use tokio_rustls::{
 
 mod doh;
 mod dot;
+mod kept;
 mod plain;
 
 static NEXT_ID: AtomicU16 = AtomicU16::new(1);
@@ -36,7 +44,8 @@ pub(super) const REPLY_CAP: usize = 16384;
 // TLS sessions one naming keeps for resumption.
 const SESSIONS: usize = 32;
 
-// The TLS settings of each encrypted wire.
+// The TLS settings of each encrypted wire. A clone shares the session store.
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct Wires {
     dot: Arc<ClientConfig>,
     doh: Arc<ClientConfig>,
@@ -91,17 +100,45 @@ pub(super) struct Session<'a> {
     provider: &'a dyn Carrier,
     wires: &'a Wires,
     server: &'a DnsServer,
+    // The naming's kept connections, which the talk takes its first from
+    // and leaves its own to. None for a server asked once, as a probe asks.
+    kept: Option<&'a Kept>,
+    // The stages a connection to the server rides, the dialling one first:
+    // a kept connection is taken only when dialled through that same stage
+    // instance, and is left tied to them all.
+    rides: Vec<KeeperRef>,
     // Each query sent is counted as a DNSSEC query.
     counts: bool,
 }
 
 impl<'a> Session<'a> {
+    // A server asked once: nothing is taken from or left to a naming.
     pub(super) fn new(provider: &'a dyn Carrier, wires: &'a Wires, server: &'a DnsServer) -> Self {
         Self {
             provider,
             wires,
             server,
+            kept: None,
+            rides: Vec::new(),
             counts: false,
+        }
+    }
+
+    // A server asked for a naming's lookup, on the connection the naming
+    // kept for it when there is one, leaving the talk's own healthy one to
+    // the naming when it ends. Only a naming's lookup (`list.rs`) has the
+    // `Keeping` this takes, so a server test never keeps a connection or
+    // reuses one.
+    pub(super) fn keeping(
+        provider: &'a dyn Carrier,
+        keeping: Keeping<'a>,
+        server: &'a DnsServer,
+    ) -> Self {
+        let sessions = keeping.sessions();
+        Self {
+            kept: Some(sessions.kept()),
+            rides: provider.keepers(),
+            ..Self::new(provider, sessions.wires(), server)
         }
     }
 
@@ -142,21 +179,21 @@ impl<'a> Session<'a> {
 
     // A talk with the server: queries given one at a time, each sent as it
     // is given while others are still out, and each reply handed back as it
-    // comes. `reached` is set once the server answers a dial. The talk's
-    // connections are its own, and go when it is dropped.
+    // comes. `reached` is set once the server answers a dial, or a kept
+    // connection answers. The talk's connections are its own, and go when
+    // it is dropped, but for one it leaves healthy to the naming that keeps
+    // connections.
     pub(super) fn talk<'s>(&'s mut self, reached: &'s mut bool) -> Talk<'s, 'a> {
+        let kept = self
+            .kept
+            .and_then(|kept| kept.take(self.server, self.rides.first()));
         let exchange = match self.server.wire {
             Wire::Plain => Wired::Plain(PlainTcp {
                 calls: Vec::new(),
                 dialled: Arc::new(AtomicBool::new(false)),
             }),
-            Wire::Tls { .. } => Wired::Dot(Dot {
-                stream: None,
-                answered: 0,
-                out: BTreeMap::new(),
-                wary: false,
-            }),
-            Wire::Https { .. } => Wired::Doh(Box::default()),
+            Wire::Tls { .. } => Wired::Dot(Dot::on(kept)),
+            Wire::Https { .. } => Wired::Doh(Box::new(Doh::on(kept))),
         };
         Talk {
             queue: Queue {
@@ -264,6 +301,19 @@ fn sent(counts: bool, queries: usize) {
     }
 }
 
+// How long the first reply on a connection a naming kept is waited for
+// before the connection is taken as gone, as one found closed is: one
+// redial, no failure charged, the same queries. A connection that died
+// without a close (NAT or tunnel state dropped, a peer gone) never says so,
+// and would hold the lookup for all of `SERVER_TIMEOUT` and charge the
+// server a time-out. On a warm connection, with no dial or handshake first,
+// a server answers in a round trip plus its own lookup time; 2 s is far past
+// that for a server in use. After the wait the redial has what is left of
+// `SERVER_TIMEOUT` for its dial, handshake and reply. A lookup that cannot
+// finish in that, as a validated one with a slow chain may not, fails over
+// to the next server, as a cold lookup that slow does.
+pub(in crate::dns) const REUSED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 // The times one query goes out on a kept connection, DNS over TLS or an
 // HTTP/2 stream: the first, and up to two more after the connection went
 // with it unanswered, or its stream was refused. Queries out together can
@@ -272,8 +322,8 @@ fn sent(counts: bool, queries: usize) {
 const SENDS: u8 = 3;
 
 // A query given to a talk, the lanes that want it, lowest first, whether
-// one of them cannot go on without its reply, the lane it goes out in, and
-// how many times it has gone out.
+// one of them cannot go on without its reply, the lane it goes out in, how
+// many times it has gone out.
 struct Asked {
     key: usize,
     lanes: Vec<usize>,
@@ -355,6 +405,11 @@ trait Exchange<'a> {
     // first dial ends the talk with that failure; a later dial that fails
     // fails only its own queries.
     fn next(&mut self, queue: &mut Queue<'_, 'a>) -> impl Future<Output = Next> + Send;
+
+    // The connection to leave to the naming as the talk ends: one that is
+    // healthy and owes no reply, so nothing a later lookup reads on it can
+    // belong to this one. None for any other.
+    fn leave(&mut self) -> Option<Link>;
 }
 
 // The exchange a talk drives, one per wire.
@@ -482,6 +537,25 @@ impl Talk<'_, '_> {
             Wired::Plain(plain) => plain.next(queue).await,
             Wired::Dot(dot) => dot.next(queue).await,
             Wired::Doh(doh) => doh.next(queue).await,
+        }
+    }
+}
+
+// A talk that ends, done or dropped part way, leaves its healthy connection
+// to the naming that keeps connections.
+impl Drop for Talk<'_, '_> {
+    fn drop(&mut self) {
+        let session = self.queue.session;
+        let Some(kept) = session.kept else {
+            return;
+        };
+        let left = match &mut self.exchange {
+            Wired::Plain(plain) => plain.leave(),
+            Wired::Dot(dot) => dot.leave(),
+            Wired::Doh(doh) => doh.leave(),
+        };
+        if let Some(link) = left {
+            kept.keep(session.server, link, &session.rides);
         }
     }
 }

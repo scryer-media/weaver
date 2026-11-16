@@ -3,8 +3,8 @@
 
 // DNS over TLS (RFC 7858): one connection kept for a lookup's queries.
 use super::{
-    Asked, Exchange, NEXT_ID, Next, Queue, Reply, SENDS, Session, Tls, Wires, closed, framed,
-    handshake, reply,
+    Asked, Exchange, Link, NEXT_ID, Next, Queue, REUSED_WAIT, Reply, SENDS, Session, Tls, Wires,
+    closed, framed, handshake, reply,
 };
 use crate::dns::{Carrier, DnsServer, Exchanged};
 use std::collections::BTreeMap;
@@ -25,12 +25,38 @@ async fn dot(
 // DNS over TLS: one connection, the queries written on it by id, and the
 // replies read in whatever order they come. `answered` counts the replies
 // the connection has given. `wary` once a connection that answered closed
-// with queries out: from then on one query is out at a time.
+// with queries out: from then on one query is out at a time. `kept` while
+// the connection is one a naming kept and it has given this talk no reply:
+// found dead, or silent for `REUSED_WAIT`, its queries go again on a new
+// connection, as if never sent, and the kept one is dropped unread.
+// `stray` once a reply came that no query out could take, so the
+// connection may still owe one: it is not kept.
 pub(super) struct Dot {
-    pub(super) stream: Option<Box<Tls>>,
-    pub(super) answered: usize,
-    pub(super) out: BTreeMap<[u8; 2], Asked>,
-    pub(super) wary: bool,
+    stream: Option<Box<Tls>>,
+    answered: usize,
+    out: BTreeMap<[u8; 2], Asked>,
+    wary: bool,
+    kept: bool,
+    stray: bool,
+}
+
+impl Dot {
+    // A talk on the connection a naming kept, when it kept one, or on a new
+    // one dialled for the first query.
+    pub(super) fn on(kept: Option<Link>) -> Self {
+        let stream = match kept {
+            Some(Link::Dot(stream)) => Some(stream),
+            _ => None,
+        };
+        Self {
+            kept: stream.is_some(),
+            stream,
+            answered: 0,
+            out: BTreeMap::new(),
+            wary: false,
+            stray: false,
+        }
+    }
 }
 
 impl<'a> Exchange<'a> for Dot {
@@ -112,26 +138,55 @@ impl<'a> Exchange<'a> for Dot {
                 self.out.insert(id, asked);
             }
             queue.session.sent(sending);
-            let wrote = framed.is_empty()
-                || (connection.write_all(&framed).await.is_ok()
-                    && connection.flush().await.is_ok());
-            let read = if wrote {
-                reply(connection.as_mut()).await
+            let exchanged = async {
+                let wrote = framed.is_empty()
+                    || (connection.write_all(&framed).await.is_ok()
+                        && connection.flush().await.is_ok());
+                if wrote {
+                    reply(connection.as_mut()).await
+                } else {
+                    Err(Exchanged::Closed)
+                }
+            };
+            // A kept connection that has not answered yet gets a short wait
+            // of its own: silent past it, it is taken as gone.
+            let read = if self.kept {
+                tokio::time::timeout(REUSED_WAIT, exchanged)
+                    .await
+                    .unwrap_or(Err(Exchanged::Closed))
             } else {
-                Err(Exchanged::Closed)
+                exchanged.await
             };
             match read {
                 Ok(bytes) => {
                     let Some(asked) = self.out.remove(&[bytes[0], bytes[1]]) else {
+                        self.stray = true;
                         continue;
                     };
                     self.answered += 1;
+                    self.kept = false;
+                    *queue.reached = true;
                     let reply = if asks(&asked.packet, &bytes) {
                         Ok(bytes)
                     } else {
+                        self.stray = true;
                         Err(Exchanged::Invalid)
                     };
                     return Ok(Some((asked.key, reply)));
+                }
+                // The kept connection was gone, or silent, before it
+                // answered: it is dropped, so nothing it says later is read,
+                // its queries go again on a new one, their sends not
+                // counted against `SENDS` (each write still counts as a
+                // query sent), and the talk goes on as one that dialled
+                // nothing yet.
+                Err(_) if self.kept => {
+                    self.stream = None;
+                    self.kept = false;
+                    for mut asked in std::mem::take(&mut self.out).into_values().rev() {
+                        asked.sends -= 1;
+                        queue.waiting.push_front(asked);
+                    }
                 }
                 Err(Exchanged::Closed) if self.answered > 0 => {
                     self.stream = None;
@@ -152,6 +207,19 @@ impl<'a> Exchange<'a> for Dot {
                 }
             }
         }
+    }
+
+    // The connection, when every query written on it has had its own reply
+    // and no other reply came: it owes nothing, so a reply read on it later
+    // can only answer a later query. A query is out from before its write
+    // until its reply is read whole, so a talk dropped part way through
+    // either has one out, and its connection is not kept. A wary talk's
+    // connection is not kept either.
+    fn leave(&mut self) -> Option<Link> {
+        if !self.out.is_empty() || self.wary || self.stray {
+            return None;
+        }
+        self.stream.take().map(Link::Dot)
     }
 }
 

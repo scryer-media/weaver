@@ -36,8 +36,10 @@ const SOA: u16 = 6;
 // SERVER_TIMEOUT, so the others hold the share for at most 39 x 5 s =
 // 195 s in all. A socket that frees wakes every waiter at once, and any of
 // them, or a probe that starts later, may take it, so a probe can be passed
-// by every other in the test. One still waiting past that is held up by
-// something other than the test.
+// by every other in the test. A DNS connection a naming keeps between
+// lookups never holds a socket a probe waits for: a claim the share would
+// refuse closes it first (`SessionSockets`). One still waiting past that is
+// held up by something other than the test.
 pub(super) const SOCKET_WAIT: Duration =
     Duration::from_secs(SERVER_TIMEOUT.as_secs() * (10 * 4 - 1));
 

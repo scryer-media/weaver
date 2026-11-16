@@ -6,8 +6,10 @@
 // hyper's client connection reads and writes the messages; it opens nothing
 // and resolves nothing. Its connection, and the HTTP/2 work it hands to an
 // executor, are polled here inside each exchange and never spawned, so they
-// do no work outside a lookup and go when the lookup drops them. Every part
-// of a reply is read under a fixed cap.
+// do no work outside a lookup. A connection a naming keeps between lookups
+// is not polled while kept: what the server sends meanwhile waits in the
+// stream until the next lookup takes it, and the connection goes when the
+// naming closes it. Every part of a reply is read under a fixed cap.
 use crate::dns::{
     DnsServer, Exchanged,
     exchange::{REPLY_CAP, Tls},
@@ -51,10 +53,12 @@ const EXCHANGE_READ: usize = REPLY_CAP + HEAD_CAP * (INTERIM + 1) + READ;
 
 // One connection to the server. `read` counts the bytes the server sent, so
 // a failed HTTP/1.1 exchange can tell a connection found dead from a reply
-// cut short.
-pub(super) struct Connection {
+// cut short. `overran` once HTTP/2 streams read more than they may: the
+// connection is not kept.
+pub(in crate::dns::exchange) struct Connection {
     http: Http,
     read: Arc<AtomicUsize>,
+    overran: bool,
 }
 
 // The connection futures hyper hands back, kept until they end.
@@ -114,7 +118,11 @@ impl Connection {
                 driver: Some(Box::pin(driver)),
             }
         };
-        Ok(Self { http, read })
+        Ok(Self {
+            http,
+            read,
+            overran: false,
+        })
     }
 
     // The reply to `packet`, and whether the connection may carry the next
@@ -199,6 +207,7 @@ impl Connection {
                         }
                         tasks.run(running, cx);
                         if self.read.load(Ordering::Relaxed) - before > EXCHANGE_READ {
+                            self.overran = true;
                             return Poll::Ready(Err(Exchanged::Invalid));
                         }
                         call.as_mut().poll(cx)
@@ -253,6 +262,38 @@ impl Connection {
         Ok(())
     }
 
+    // Reads what an HTTP/2 connection kept between lookups has waiting,
+    // without waiting for more, before a stream is started on it: frames the
+    // server sent while it was kept (settings, pings, a window update, a
+    // goaway) count against no stream's bound. Says whether the connection
+    // may still be used: it read no more than one exchange may, and it is
+    // still open.
+    pub(super) fn settle(&mut self) -> bool {
+        let Http::Two {
+            driver,
+            tasks,
+            running,
+            ..
+        } = &mut self.http
+        else {
+            return true;
+        };
+        let before = self.read.load(Ordering::Relaxed);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        if let Some(connection) = driver.as_mut()
+            && connection.as_mut().poll(&mut cx).is_ready()
+        {
+            *driver = None;
+        }
+        tasks.run(running, &mut cx);
+        self.read.load(Ordering::Relaxed) - before <= EXCHANGE_READ && self.open()
+    }
+
+    // Whether HTTP/2 streams on this connection read more than they may.
+    pub(super) fn overran(&self) -> bool {
+        self.overran
+    }
+
     // Whether any stream started is still out.
     pub(super) fn carrying(&self) -> bool {
         matches!(&self.http, Http::Two { streams, .. } if !streams.calls.is_empty())
@@ -280,7 +321,7 @@ impl Connection {
         if streams.calls.is_empty() {
             return None;
         }
-        let read = &self.read;
+        let (read, overran) = (&self.read, &mut self.overran);
         poll_fn(|cx| {
             if let Some(connection) = driver.as_mut()
                 && connection.as_mut().poll(cx).is_ready()
@@ -289,6 +330,7 @@ impl Connection {
             }
             tasks.run(running, cx);
             if read.load(Ordering::Relaxed) - streams.since > streams.bound {
+                *overran = true;
                 let (key, _) = streams.calls.swap_remove(0);
                 return Poll::Ready(Some((key, Err(Exchanged::Invalid))));
             }

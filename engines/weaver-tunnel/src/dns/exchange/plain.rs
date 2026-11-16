@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Plain DNS over TCP: a stream of its own for each query.
-use super::{Exchange, NEXT_ID, Next, Queue, Reply, Session, framed, io_reason, sent};
+use super::{Exchange, Link, NEXT_ID, Next, Queue, Reply, Session, framed, io_reason, sent};
 use crate::dns::Exchanged;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -94,6 +94,11 @@ impl<'a> Exchange<'a> for PlainTcp<'a> {
                 ended => return Ok(ended),
             }
         }
+    }
+
+    // A stream per query: nothing to keep.
+    fn leave(&mut self) -> Option<Link> {
+        None
     }
 }
 

@@ -159,9 +159,9 @@ async fn connect_proxy(
 }
 
 fn hop(id: u32, endpoint: SocketAddr, inner: Arc<dyn Dialer>) -> Arc<TransportHop> {
-    Arc::new(TransportHop {
+    Arc::new(TransportHop::new(
         id,
-        spec: TransportProxy {
+        TransportProxy {
             kind: crate::transport::TransportKind::HttpConnect,
             host: endpoint.ip().to_string(),
             port: endpoint.port(),
@@ -169,14 +169,14 @@ fn hop(id: u32, endpoint: SocketAddr, inner: Arc<dyn Dialer>) -> Arc<TransportHo
             password: None,
         },
         inner,
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
             crate::pipe::DnsChoice::System,
             None,
         ))),
-        failure: Default::default(),
-    })
+        Default::default(),
+    ))
 }
 
 #[tokio::test]
@@ -375,24 +375,24 @@ async fn a_socks_reply_names_the_hop_that_refused() {
         reply: Mutex::new(&[5, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0]),
         far: Default::default(),
     });
-    let first = Arc::new(TransportHop {
-        id: 7,
-        spec: TransportProxy {
+    let first = Arc::new(TransportHop::new(
+        7,
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: "192.0.2.1".into(),
             port: 1080,
             username: None,
             password: None,
         },
-        inner: stage,
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        stage,
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
             crate::pipe::DnsChoice::System,
             None,
         ))),
-        failure: Default::default(),
-    });
+        Default::default(),
+    ));
     let chain = hop(8, "192.0.2.2:8080".parse().unwrap(), first.clone());
     let target = target("192.0.2.9:119".parse().unwrap());
     assert!(matches!(
@@ -619,14 +619,12 @@ async fn a_wait_on_a_live_proxy_is_the_destinations() {
         far: Default::default(),
     });
     let turns = Arc::new(Turns::default());
-    let http = TransportHop {
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
-            crate::pipe::DnsChoice::System,
-            None,
-        ))),
-        failure: HopFailure::watched(turns.clone()),
-        ..Arc::into_inner(hop(7, "192.0.2.1:8080".parse().unwrap(), stage.clone())).unwrap()
-    };
+    let mut http =
+        Arc::into_inner(hop(7, "192.0.2.1:8080".parse().unwrap(), stage.clone())).unwrap();
+    http.endpoint_names = std::sync::Arc::new(crate::pipe::NamesSlot::new(
+        crate::pipe::Names::new(crate::pipe::DnsChoice::System, None),
+    ));
+    http.failure = HopFailure::watched(turns.clone());
     let target = target("192.0.2.9:119".parse().unwrap());
     assert!(http.dial(&target).await.is_ok());
     *stage.reply.lock().unwrap() = b"";
@@ -648,24 +646,24 @@ async fn a_wait_on_a_live_proxy_is_the_destinations() {
         reply: Mutex::new(&[5, 0]),
         far: Default::default(),
     });
-    let socks = TransportHop {
-        id: 9,
-        spec: TransportProxy {
+    let socks = TransportHop::new(
+        9,
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: "192.0.2.3".into(),
             port: 1080,
             username: None,
             password: None,
         },
-        inner: greeted,
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        greeted,
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
             crate::pipe::DnsChoice::System,
             None,
         ))),
-        failure: Default::default(),
-    };
+        Default::default(),
+    );
     assert!(matches!(
         socks.dial(&target).await,
         Err(DialError::Destination(_))
@@ -1525,9 +1523,9 @@ fn named_hop_on(
     inner: Arc<dyn Dialer>,
     endpoint: crate::pipe::DnsChoice,
 ) -> Arc<TransportHop> {
-    Arc::new(TransportHop {
+    Arc::new(TransportHop::new(
         id,
-        spec: TransportProxy {
+        TransportProxy {
             kind: crate::transport::TransportKind::HttpConnect,
             host: host.into(),
             port,
@@ -1535,13 +1533,13 @@ fn named_hop_on(
             password: None,
         },
         inner,
-        timeout: Duration::from_secs(30),
+        Duration::from_secs(30),
         naming,
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
             endpoint, None,
         ))),
-        failure: Default::default(),
-    })
+        Default::default(),
+    ))
 }
 
 // A proxy name profile asking the servers at ROUTED_DNS.
@@ -2370,24 +2368,24 @@ async fn only_a_path_ending_in_wireguard_takes_connections() {
     assert!(stacked.inbound().is_some());
 
     // SOCKS and HTTP CONNECT over WireGuard: no listener.
-    let socks = Arc::new(TransportHop {
-        id: 7,
-        spec: TransportProxy {
+    let socks = Arc::new(TransportHop::new(
+        7,
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: "192.0.2.1".into(),
             port: 1080,
             username: None,
             password: None,
         },
-        inner: wireguard.clone(),
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        wireguard.clone(),
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
             crate::pipe::DnsChoice::System,
             None,
         ))),
-        failure: Default::default(),
-    });
+        Default::default(),
+    ));
     assert!(socks.inbound().is_none());
     let connect = hop(8, "192.0.2.2:8080".parse().unwrap(), wireguard.clone());
     assert!(connect.inbound().is_none());
@@ -2918,14 +2916,12 @@ async fn a_watched_proxy_hop_turns_failing_when_its_proxy_goes() {
     let origin_address = origin.local_addr().unwrap();
     let (proxy, proxy_task) = connect_proxy(origin_address.to_string(), origin_address).await;
     let turns = Arc::new(Turns::default());
-    let hop = TransportHop {
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
-            crate::pipe::DnsChoice::System,
-            None,
-        ))),
-        failure: HopFailure::watched(turns.clone()),
-        ..Arc::into_inner(hop(7, proxy, bottom())).unwrap()
-    };
+    let mut hop = Arc::into_inner(hop(7, proxy, bottom())).unwrap();
+    hop.endpoint_names = std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        crate::pipe::DnsChoice::System,
+        None,
+    )));
+    hop.failure = HopFailure::watched(turns.clone());
     let dialed = hop.dial(&target(origin_address)).await.unwrap();
     let (peer, _) = origin.accept().await.unwrap();
     assert_eq!(turns.taken(), vec![None]);
@@ -2976,24 +2972,24 @@ async fn a_socks5_proxy_silent_at_its_greeting_is_failing() {
         far: Default::default(),
     });
     let turns = Arc::new(Turns::default());
-    let socks = TransportHop {
-        id: 9,
-        spec: TransportProxy {
+    let socks = TransportHop::new(
+        9,
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: "192.0.2.3".into(),
             port: 1080,
             username: None,
             password: None,
         },
-        inner: stage.clone(),
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        stage.clone(),
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
             crate::pipe::DnsChoice::System,
             None,
         ))),
-        failure: HopFailure::watched(turns.clone()),
-    };
+        HopFailure::watched(turns.clone()),
+    );
     let target = target("192.0.2.9:119".parse().unwrap());
     assert!(matches!(
         socks.dial(&target).await,
@@ -3215,9 +3211,9 @@ fn host_lookups() -> u64 {
 // A SOCKS5 hop at `host`:`port` above `inner`, its own address on the
 // host's profile.
 fn socks_on_host(id: u32, host: &str, port: u16, inner: Arc<dyn Dialer>) -> Arc<TransportHop> {
-    Arc::new(TransportHop {
+    Arc::new(TransportHop::new(
         id,
-        spec: TransportProxy {
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: host.into(),
             port,
@@ -3225,14 +3221,14 @@ fn socks_on_host(id: u32, host: &str, port: u16, inner: Arc<dyn Dialer>) -> Arc<
             password: None,
         },
         inner,
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
             crate::pipe::DnsChoice::System,
             None,
         ))),
-        failure: Default::default(),
-    })
+        Default::default(),
+    ))
 }
 
 // A proxy on the host's profile whose address is a name: carried by another

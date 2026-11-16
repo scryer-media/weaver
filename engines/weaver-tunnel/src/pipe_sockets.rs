@@ -8,11 +8,18 @@
 // probes) and HTTP (trackers, web seeds, feeds) each get a share of them, so
 // one kind can never take the sockets another needs. Every stream or socket the session hands out holds
 // one permit of its share until it is dropped.
+//
+// A connection kept open for later (a naming's DNS connection between
+// lookups) holds a permit too, but only of room nothing else wants: a claim
+// the share would refuse closes kept connections of the classes that would
+// make room first, and takes the room they free. So what is kept never makes
+// a lookup, a server test or a carrier fail or wait for a socket it would
+// have got with nothing kept; at most it costs the next lookup one dial.
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-use super::Purpose;
+use super::{Keeper, Purpose};
 
 // Which share a socket counts against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -177,10 +184,12 @@ impl Drop for SocketPermit {
 }
 
 // A session's shares. A session without them, any but a WireGuard one,
-// holds its sockets to no share at all.
+// holds its sockets to no share at all. The session's keeper lives here, so
+// the share can close what is kept when it runs short.
 #[derive(Default)]
 pub struct SessionSockets {
     shares: Option<Arc<Shares>>,
+    keeper: Keeper,
 }
 
 impl SessionSockets {
@@ -193,7 +202,34 @@ impl SessionSockets {
                 }),
                 freed: CLASSES.map(|_| Arc::new(Notify::new())),
             })),
+            keeper: Keeper::default(),
         }
+    }
+
+    // What the session keeps open for later.
+    pub fn keeper(&self) -> &Keeper {
+        &self.keeper
+    }
+
+    // Which kept sockets would make room for a claim of `class` the share
+    // refuses now: one of `class` itself, or of a share that holds more than
+    // its size while another grows.
+    fn reclaimable(inner: &Shares, class: SocketClass) -> impl Fn(SocketClass) -> bool {
+        let over: Vec<SocketClass> = {
+            let ledger = inner.ledger();
+            CLASSES
+                .into_iter()
+                .filter(|other| ledger.held[index(*other)] > ledger.size[index(*other)])
+                .collect()
+        };
+        move |kept| kept == class || over.contains(&kept)
+    }
+
+    // Closes one kept connection that would make room for a claim of
+    // `class`. Says whether one closed; its permit is back in the ledger
+    // when this returns.
+    fn reclaim(&self, inner: &Shares, class: SocketClass) -> bool {
+        self.keeper.reclaim(Self::reclaimable(inner, class))
     }
 
     // Resize every share at once. Sockets already open stay open. A share
@@ -236,7 +272,8 @@ impl SessionSockets {
         self.room(class).is_ok()
     }
 
-    // A socket free in `class`'s share now, or the signal that one is freed.
+    // A socket free in `class`'s share now, counting one a kept connection
+    // would free when `take` closes it, or the signal that one is freed.
     pub fn room(&self, class: SocketClass) -> Result<(), Arc<Notify>> {
         let Some(inner) = &self.shares else {
             return Ok(());
@@ -244,10 +281,16 @@ impl SessionSockets {
         let i = index(class);
         let ledger = inner.ledger();
         if ledger.held[i] < ledger.limits()[i] {
-            Ok(())
-        } else {
-            Err(Arc::clone(&inner.freed[i]))
+            return Ok(());
         }
+        drop(ledger);
+        // Room a kept connection would give back counts, but nothing closes
+        // here: a caller may ask while it holds a lock a closer takes. Only
+        // `take` closes one.
+        if self.keeper.could_reclaim(Self::reclaimable(inner, class)) {
+            return Ok(());
+        }
+        Err(Arc::clone(&inner.freed[i]))
     }
 
     // A permit of `class`'s share, or the signal that one is freed when the
@@ -257,15 +300,20 @@ impl SessionSockets {
             return Ok(None);
         };
         let i = index(class);
-        let mut ledger = inner.ledger();
-        if ledger.held[i] >= ledger.limits()[i] {
-            return Err(Arc::clone(&inner.freed[i]));
+        loop {
+            let mut ledger = inner.ledger();
+            if ledger.held[i] < ledger.limits()[i] {
+                ledger.held[i] += 1;
+                return Ok(Some(SocketPermit {
+                    shares: Arc::clone(inner),
+                    class: i,
+                }));
+            }
+            drop(ledger);
+            if !self.reclaim(inner, class) {
+                return Err(Arc::clone(&inner.freed[i]));
+            }
         }
-        ledger.held[i] += 1;
-        Ok(Some(SocketPermit {
-            shares: Arc::clone(inner),
-            class: i,
-        }))
     }
 
     // Sockets of `class` open now.
@@ -279,6 +327,8 @@ impl SessionSockets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipe::KeptRegistration;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const SHARES: SocketShares = SocketShares {
         nntp: 2,
@@ -347,6 +397,119 @@ mod tests {
             .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
             .collect();
         assert!(sockets.take(SocketClass::Nntp).is_err());
+    }
+
+    // `count` kept connections of `class`, each holding a permit, and the
+    // switch each one's closer turns.
+    fn kept(
+        sockets: &SessionSockets,
+        class: SocketClass,
+        count: usize,
+    ) -> (Vec<KeptRegistration>, Vec<Arc<AtomicBool>>) {
+        let handle = sockets.keeper().handle();
+        let closed: Vec<_> = (0..count)
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+        let kept = closed
+            .iter()
+            .map(|closed| {
+                let permit = sockets.take(class).unwrap().unwrap();
+                let closed = closed.clone();
+                handle
+                    .hold(
+                        class,
+                        Box::new(move || {
+                            drop(permit);
+                            closed.store(true, Ordering::Relaxed);
+                        }),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        (kept, closed)
+    }
+
+    // Kept connections fill the reserve share: a claim of it closes the
+    // oldest kept one and takes its room, at once, and a claim no kept
+    // connection would make room for is refused as before.
+    #[test]
+    fn a_claim_closes_a_kept_connection_before_the_share_refuses() {
+        let sockets = SessionSockets::new(SocketShares { core: 2, ..SHARES });
+        let (kept, closed) = kept(&sockets, SocketClass::ReserveCore, 2);
+        assert_eq!(sockets.held(SocketClass::ReserveCore), 2);
+        assert!(sockets.take(SocketClass::Nntp).unwrap().is_some());
+
+        let cold = sockets.take(SocketClass::ReserveCore).unwrap().unwrap();
+        let closed_now = |at: usize| closed[at].load(Ordering::Relaxed);
+        assert!(closed_now(0));
+        assert!(!closed_now(1));
+        assert_eq!(sockets.keeper().holding(), 1);
+        let second = sockets.take(SocketClass::ReserveCore).unwrap().unwrap();
+        assert!(closed_now(1));
+        assert_eq!(sockets.keeper().holding(), 0);
+        assert!(sockets.take(SocketClass::ReserveCore).is_err());
+        drop((kept, cold, second));
+    }
+
+    // Asking for room counts what a kept connection would give back, and
+    // closes nothing: a caller may ask under a lock a closer takes.
+    #[test]
+    fn asking_for_room_closes_nothing() {
+        let sockets = SessionSockets::new(SocketShares { core: 1, ..SHARES });
+        let (kept, closed) = kept(&sockets, SocketClass::ReserveCore, 1);
+        assert!(sockets.has_room(SocketClass::ReserveCore));
+        assert!(sockets.room(SocketClass::ReserveCore).is_ok());
+        assert!(!closed[0].load(Ordering::Relaxed));
+        assert_eq!(sockets.keeper().holding(), 1);
+        assert_eq!(sockets.held(SocketClass::ReserveCore), 1);
+        // A share no kept connection would make room in is still full.
+        let busy = sockets.take(SocketClass::Torrent).unwrap().unwrap();
+        assert!(!sockets.has_room(SocketClass::Torrent));
+        assert!(!closed[0].load(Ordering::Relaxed));
+        drop((kept, busy));
+    }
+
+    // A share shrunk below what it keeps open holds the room another share
+    // grew into: a claim of the grown share closes a kept connection of the
+    // shrunk one, and takes the room it frees.
+    #[test]
+    fn a_claim_closes_a_kept_connection_of_a_share_over_its_size() {
+        let sockets = SessionSockets::new(SocketShares { core: 2, ..SHARES });
+        let (kept, closed) = kept(&sockets, SocketClass::ReserveCore, 2);
+        sockets.set_shares(SocketShares {
+            nntp: 4,
+            core: 0,
+            ..SHARES
+        });
+        let busy: Vec<_> = (0..2)
+            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
+            .collect();
+        assert!(sockets.has_room(SocketClass::Nntp));
+        assert!(!closed[0].load(Ordering::Relaxed));
+        let third = sockets.take(SocketClass::Nntp).unwrap().unwrap();
+        assert!(closed[0].load(Ordering::Relaxed));
+        assert!(!closed[1].load(Ordering::Relaxed));
+        assert_eq!(sockets.held(SocketClass::ReserveCore), 1);
+        let fourth = sockets.take(SocketClass::Nntp).unwrap().unwrap();
+        assert!(closed[1].load(Ordering::Relaxed));
+        assert!(sockets.take(SocketClass::Nntp).is_err());
+        drop((kept, busy, third, fourth));
+    }
+
+    // A keeper cut closes everything it keeps.
+    #[test]
+    fn a_cut_closes_what_is_kept() {
+        let sockets = SessionSockets::new(SHARES);
+        let permit = sockets.take(SocketClass::ReserveCore).unwrap().unwrap();
+        let _held = sockets
+            .keeper()
+            .handle()
+            .hold(SocketClass::ReserveCore, Box::new(move || drop(permit)))
+            .unwrap();
+        assert_eq!(sockets.held(SocketClass::ReserveCore), 1);
+        sockets.keeper().cut();
+        assert_eq!(sockets.held(SocketClass::ReserveCore), 0);
+        assert_eq!(sockets.keeper().holding(), 0);
     }
 
     #[test]

@@ -11,6 +11,10 @@ mod datagram;
 mod identity;
 #[path = "pipe_inbound.rs"]
 mod inbound;
+#[path = "pipe_keepers.rs"]
+mod keepers;
+pub(crate) use keepers::Registration as KeptRegistration;
+pub use keepers::{Keeper, KeeperRef};
 #[path = "pipe_names.rs"]
 mod names;
 pub use names::{DnsChoice, DnsTransit, Names, NamesSlot};
@@ -147,8 +151,9 @@ pub enum Naming {
         trust: Trust,
         egress: Arc<dyn Dialer>,
         answers: Arc<ResolutionCache<DialError>>,
-        // The TLS sessions these servers are resumed with, held apart from
-        // every other naming's.
+        // The TLS sessions these servers are resumed with, the connections
+        // kept to them between lookups and the DNSSEC validator, held apart
+        // from every other naming's.
         sessions: Arc<crate::dns::DnsSessions>,
     },
     // The proxy is handed the name and resolves it.
@@ -870,6 +875,14 @@ pub trait Dialer: Send + Sync {
     fn session_activity(&self) -> Option<Arc<tokio::sync::RwLock<()>>> {
         None
     }
+    // The keepers of this stage and of every stage beneath it whose sockets
+    // a dial through it holds, this stage's first. What is kept open after a
+    // dial through this stage (a naming's DNS connection) registers with
+    // each, and is handed back only to a dial through this same stage
+    // instance. None keeps nothing.
+    fn keepers(&self) -> Vec<KeeperRef> {
+        Vec::new()
+    }
     fn budget(&self) -> Duration;
     async fn shutdown(&self) {}
     fn describe(&self) -> String;
@@ -882,6 +895,7 @@ pub struct Egress {
     // How a name dialled straight out of this egress is resolved when no
     // route's names are in scope. None is the host's own DNS.
     naming: Option<Naming>,
+    keeper: Keeper,
 }
 
 impl Egress {
@@ -893,6 +907,7 @@ impl Egress {
             binding,
             timeout,
             naming: None,
+            keeper: Keeper::default(),
         }
     }
     // This egress, resolving the names dialled straight out of it as
@@ -1081,6 +1096,7 @@ impl Dialer for Egress {
                     binding: self.binding.clone(),
                     timeout: remaining / (peers.len() - index) as u32,
                     naming: None,
+                    keeper: Keeper::default(),
                 };
                 match attempt.connect_address(*peer).await {
                     Ok(stream) => {
@@ -1138,6 +1154,9 @@ impl Dialer for Egress {
     fn source_toward(&self, to: SocketAddr) -> Option<io::Result<IpAddr>> {
         Some(self.binding.source_toward(to))
     }
+    fn keepers(&self) -> Vec<KeeperRef> {
+        vec![self.keeper.handle()]
+    }
     fn budget(&self) -> Duration {
         self.timeout
     }
@@ -1158,9 +1177,32 @@ pub struct TransportHop {
     // is looked up with, whichever route dials.
     pub endpoint_names: Arc<NamesSlot>,
     pub failure: HopFailure,
+    // What is kept open through this hop instance; dropped with it.
+    keeper: Keeper,
 }
 
 impl TransportHop {
+    pub fn new(
+        id: u32,
+        spec: TransportProxy,
+        inner: Arc<dyn Dialer>,
+        timeout: Duration,
+        naming: Naming,
+        endpoint_names: Arc<NamesSlot>,
+        failure: HopFailure,
+    ) -> Self {
+        Self {
+            id,
+            spec,
+            inner,
+            timeout,
+            naming,
+            endpoint_names,
+            failure,
+            keeper: Keeper::default(),
+        }
+    }
+
     // The naming a name dialled through this hop is resolved by: the names
     // of the route dialling, else the hop's own.
     fn naming_now(&self) -> Naming {
@@ -1344,14 +1386,24 @@ impl Dialer for TransportHop {
         let relay = Arc::clone(&self.inner).relay_datagrams()?;
         Some(Arc::new(socks5_udp::Socks5Datagrams::new(self, relay)))
     }
+    fn keepers(&self) -> Vec<KeeperRef> {
+        let mut keepers = vec![self.keeper.handle()];
+        keepers.extend(self.inner.keepers());
+        keepers
+    }
+    // A hop retired keeps nothing open through it.
+    async fn retire(&self) {
+        self.keeper.cut();
+    }
     fn budget(&self) -> Duration {
         self.inner
             .budget()
             .saturating_add(self.timeout)
             .saturating_add(self.timeout)
     }
-    // No shutdown: a stream proxy hop holds nothing of its own, and the
-    // stage beneath belongs to whoever built it.
+    // No shutdown: a stream proxy hop holds nothing of its own but what it
+    // keeps, which goes with it, and the stage beneath belongs to whoever
+    // built it.
     fn describe(&self) -> String {
         format!("{} → proxy {}", self.inner.describe(), self.id)
     }
@@ -1628,7 +1680,11 @@ impl Dialer for SessionHop {
         // may retire it only when every channel on the canonical path is idle.
         self.retire_idle().await;
     }
+    // What the session keeps open for later is not activity: it closes
+    // first, so it never holds a session up that would otherwise retire,
+    // nor its share of the WireGuard budget.
     async fn retire_idle(&self) -> bool {
+        self.sockets.keeper().cut();
         if let Ok(_activity) = self.activity.try_write() {
             if let Some(kind) = self.provider.kind() {
                 crate::metrics::record_session_retirement(kind);
@@ -1870,12 +1926,20 @@ impl Dialer for SessionHop {
     // session shared with other routes, or one a probe runtime borrowed;
     // whoever owns it shuts it down.
     async fn shutdown(&self) {
+        self.sockets.keeper().cut();
         self.provider.shutdown().await;
         self.capacity.release();
         identity::release(self);
     }
     fn session_activity(&self) -> Option<Arc<tokio::sync::RwLock<()>>> {
         Some(self.activity.clone())
+    }
+    // The session's keeper lives with its socket share, which closes what
+    // is kept when the share runs short.
+    fn keepers(&self) -> Vec<KeeperRef> {
+        let mut keepers = vec![self.sockets.keeper().handle()];
+        keepers.extend(self.inner.keepers());
+        keepers
     }
     fn describe(&self) -> String {
         format!("{} → proxy {}", self.inner.describe(), self.id)

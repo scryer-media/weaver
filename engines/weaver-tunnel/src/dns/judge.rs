@@ -73,7 +73,9 @@ impl Asking<'_, '_, '_> {
 // gives the judge each reply as it comes, until the judge is done or the
 // talk has nothing given or out. `reached` is set once the server answers a
 // dial. A talk that fails ends every family still under way with that
-// failure. The talk's connections go when this returns or is dropped.
+// failure. The talk's connections close when this returns or is dropped,
+// but for one it leaves healthy to the naming that keeps it, when the
+// session is a naming's own lookup.
 pub(super) async fn run(session: &mut Session<'_>, reached: &mut bool, judge: &mut impl Judge) {
     let mut talk = session.talk(reached);
     loop {

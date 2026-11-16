@@ -6,7 +6,7 @@
 // found, and what carries a query.
 use crate::{
     TunnelError, TunnelStream,
-    pipe::{DialError, Dialer, Purpose, Target},
+    pipe::{DialError, Dialer, KeeperRef, Purpose, Target},
 };
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
@@ -122,6 +122,13 @@ pub(super) const FAMILIES: [u16; 2] = [1, 28];
 #[async_trait::async_trait]
 pub(super) trait Carrier: Send + Sync {
     async fn open(&self, server: &DnsServer) -> Result<Box<dyn TunnelStream>, TunnelError>;
+
+    // The keepers of the stages a connection opened here rides, the
+    // dialling stage's first, which a connection kept for later is tied to.
+    // None keeps nothing.
+    fn keepers(&self) -> Vec<KeeperRef> {
+        Vec::new()
+    }
 }
 
 // A pipe stage carrying the queries. It keeps why it could not reach a
@@ -149,6 +156,10 @@ impl Carrier for Stage<'_> {
                 Err(said)
             }
         }
+    }
+
+    fn keepers(&self) -> Vec<KeeperRef> {
+        self.dialer.keepers()
     }
 }
 
