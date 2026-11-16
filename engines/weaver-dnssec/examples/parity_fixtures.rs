@@ -28,10 +28,7 @@ fn n(text: &str) -> Name {
 }
 
 fn query(text: &str, rtype: T) -> Query {
-    Query {
-        name: n(text),
-        rtype,
-    }
+    Query::new(n(text), rtype)
 }
 
 fn zone(apex: &str, algorithm: KeyAlgorithm, now: u32) -> Zone {
@@ -407,7 +404,7 @@ fn retain_other_types(records: &mut Vec<Record>, rtype: T) {
     records.retain(|record| {
         record.rtype != rtype
             && (record.rtype != T::RRSIG
-                || record.rdata.get(..2) != Some(rtype.0.to_be_bytes().as_slice()))
+                || record.rdata.get(..2) != Some(rtype.get().to_be_bytes().as_slice()))
     });
 }
 
@@ -439,10 +436,7 @@ fn candidates(case: &Case) -> BTreeSet<Query> {
         .flat_map(|name| {
             [T::A, T::AAAA, T::MX, T::DS, T::DNSKEY, case.rtype]
                 .into_iter()
-                .map(move |rtype| Query {
-                    name: name.clone(),
-                    rtype,
-                })
+                .map(move |rtype| Query::new(name.clone(), rtype))
         })
         .collect()
 }
@@ -470,10 +464,10 @@ fn json_string(value: &str) -> String {
 }
 
 fn answer_fields(answer: &weaver_dnssec::Answer) -> String {
-    let outcome = match &answer.outcome {
+    let outcome = match answer.outcome() {
         weaver_dnssec::Outcome::NoData => "{\"kind\":\"NoData\"}".to_owned(),
         weaver_dnssec::Outcome::NoSuchName => "{\"kind\":\"NoSuchName\"}".to_owned(),
-        weaver_dnssec::Outcome::Records { name, rdata } => {
+        weaver_dnssec::Outcome::Records { name, rdata, .. } => {
             let mut values: Vec<_> = rdata.iter().map(|value| json_string(&hex(value))).collect();
             values.sort();
             format!(
@@ -482,8 +476,9 @@ fn answer_fields(answer: &weaver_dnssec::Answer) -> String {
                 values.join(",")
             )
         }
+        other => panic!("no fixture form for {other:?}"),
     };
-    format!(",\"ttl\":{},\"outcome\":{outcome}", answer.ttl)
+    format!(",\"ttl\":{},\"outcome\":{outcome}", answer.ttl())
 }
 
 fn export(mut case: Case, now: u64) {
@@ -510,22 +505,23 @@ fn export(mut case: Case, now: u64) {
         assert!(replies.contains_key(&query), "fixture omitted {query:?}");
     }
     let (status, extra) = match verdict {
-        Verdict::Secure(answer) => ("Secure", answer_fields(&answer)),
-        Verdict::Insecure(answer) => ("Insecure", answer_fields(&answer)),
-        Verdict::Bogus(failure) => (
+        Verdict::Secure { answer, .. } => ("Secure", answer_fields(&answer)),
+        Verdict::Insecure { answer, .. } => ("Insecure", answer_fields(&answer)),
+        Verdict::Bogus { failure, .. } => (
             "Bogus",
             format!(
                 ",\"reason\":{}",
-                json_string(&format!("{:?}", failure.reason))
+                json_string(&format!("{:?}", failure.reason()))
             ),
         ),
-        Verdict::Unanswered(failure) => (
+        Verdict::Unanswered { failure, .. } => (
             "Unanswered",
             format!(
                 ",\"reason\":{}",
-                json_string(&format!("{:?}", failure.cause))
+                json_string(&format!("{:?}", failure.cause()))
             ),
         ),
+        other => panic!("no fixture form for {other:?}"),
     };
     let anchors = case.resolver.zones()[0]
         .ds_records(2)
@@ -538,7 +534,7 @@ fn export(mut case: Case, now: u64) {
         "{{\"event\":\"case\",\"id\":{},\"name\":{},\"rtype\":{},\"now\":{},\"verdict\":{}{},\"intended\":{},\"anchors\":[{}]}}",
         json_string(case.id),
         json_string(&case.name.to_string()),
-        case.rtype.0,
+        case.rtype.get(),
         now,
         json_string(status),
         extra,
@@ -549,8 +545,8 @@ fn export(mut case: Case, now: u64) {
         println!(
             "{{\"event\":\"reply\",\"case\":{},\"name\":{},\"rtype\":{},\"hex\":{}}}",
             json_string(case.id),
-            json_string(&query.name.to_string()),
-            query.rtype.0,
+            json_string(&query.name().to_string()),
+            query.rtype().get(),
             json_string(&hex(&bytes)),
         );
     }

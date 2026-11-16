@@ -3,7 +3,7 @@
 
 // A server's probes, against fixture servers that each speak one wire.
 use super::*;
-use crate::dns::Failed;
+use crate::dns::Exchanged;
 use crate::dns::probe::{SOCKET_WAIT, Slotted, probe_on, signed, timed};
 use std::time::Duration;
 
@@ -41,12 +41,7 @@ impl ByPort {
 // Sessions of a probe's own that trust `authority` and the fixture's root
 // keys.
 fn probing(authority: &Authority, resolver: &FakeResolver) -> DnsSessions {
-    let sessions = DnsSessions::default();
-    sessions.trust(&authority.wires());
-    sessions
-        .dnssec()
-        .anchored(resolver.zones()[0].anchors().unwrap(), NOW);
-    sessions
+    DnsSessions::with_roots(Some(roots(authority.store(), resolver, NOW)))
 }
 
 // Plain on 53, TLS on `tls_port` with a certificate for `tls_names`, and
@@ -450,12 +445,12 @@ async fn waiting(count: usize) {
 }
 
 // A probe that only opens one stream through `slotted`.
-async fn opens(slotted: &Slotted<'_>, server: &DnsServer) -> Result<(), Failed> {
+async fn opens(slotted: &Slotted<'_>, server: &DnsServer) -> Result<(), Exchanged> {
     slotted
         .open(server)
         .await
         .map(drop)
-        .map_err(Failed::Unreached)
+        .map_err(Exchanged::Unreached)
 }
 
 // Every probe of `probe` supported.
@@ -642,7 +637,7 @@ async fn a_wait_resumes_the_clock_with_only_what_was_left() {
     let held = Mutex::new(None);
     let (probed, ()) = tokio::join!(
         timed(&server, async {
-            drop(slotted.open(&server).await.map_err(Failed::Unreached)?);
+            drop(slotted.open(&server).await.map_err(Exchanged::Unreached)?);
             *held.lock().unwrap() = Some(shared.take());
             opens(&slotted, &server).await
         }),
@@ -673,7 +668,7 @@ async fn the_socket_wait_limit_counts_every_wait_a_probe_makes() {
     let started = tokio::time::Instant::now();
     let (probed, ()) = tokio::join!(
         timed(&server, async {
-            drop(slotted.open(&server).await.map_err(Failed::Unreached)?);
+            drop(slotted.open(&server).await.map_err(Exchanged::Unreached)?);
             *held.lock().unwrap() = Some(shared.take());
             opens(&slotted, &server).await
         }),
@@ -698,7 +693,7 @@ async fn a_probe_with_a_stream_open_runs_its_clock_while_it_waits_for_another() 
     let slotted = Slotted(&*shared);
     let server = first();
     let probed = timed(&server, async {
-        let _open = slotted.open(&server).await.map_err(Failed::Unreached)?;
+        let _open = slotted.open(&server).await.map_err(Exchanged::Unreached)?;
         opens(&slotted, &server).await
     })
     .await;
@@ -760,7 +755,7 @@ async fn a_dial_under_way_counts_against_the_probes_time_limit() {
         let (one, other) = tokio::join!(slotted.open(&server), slotted.open(&server));
         one.and(other)
             .map(drop)
-            .map_err(crate::dns::Failed::Unreached)
+            .map_err(crate::dns::Exchanged::Unreached)
     })
     .await;
     // The second dial was refused, then dialled again armed, and waited.

@@ -38,11 +38,24 @@ fn tree(algorithm: KeyAlgorithm) -> Arc<FakeResolver> {
     Arc::new(FakeResolver::new(vec![root, com, example, plain, home]).unwrap())
 }
 
+// Trust roots that trust `tls_roots` for TLS, and only the fixture's root
+// keys, at the fixed time `now`.
+fn roots(tls_roots: RootCertStore, resolver: &FakeResolver, now: u64) -> Arc<TrustRoots> {
+    Arc::new(
+        TrustRoots::new(
+            tls_roots,
+            resolver.zones()[0].anchors().unwrap(),
+            weaver_dnssec::Policy::default(),
+            crate::dns::roots::Clock::Fixed(now),
+        )
+        .expect("the fixture's trust anchors"),
+    )
+}
+
 // A naming's validator that trusts only the fixture's root keys, at `now`.
+// A validator alone reads no TLS roots, so it is given none.
 fn trusting(resolver: &FakeResolver, now: u64) -> Dnssec {
-    let dnssec = Dnssec::default();
-    dnssec.anchored(resolver.zones()[0].anchors().unwrap(), now);
-    dnssec
+    Dnssec::new(Some(roots(RootCertStore::empty(), resolver, now)))
 }
 
 // The question of a query as it went out, and where it ends.
@@ -52,12 +65,12 @@ fn question(query: &[u8]) -> (Query, usize) {
         at += 1 + query[at] as usize;
     }
     let name = Name::from_wire(&query[12..=at]).unwrap();
-    let rtype = RecordType(u16::from_be_bytes([query[at + 1], query[at + 2]]));
+    let rtype = RecordType::new(u16::from_be_bytes([query[at + 1], query[at + 2]]));
     (name_query(name, rtype), at + 5)
 }
 
 fn name_query(name: Name, rtype: RecordType) -> Query {
-    Query { name, rtype }
+    Query::new(name, rtype)
 }
 
 // How a fixture server answers.
@@ -247,9 +260,14 @@ async fn validated_seven() -> Vec<IpAddr> {
     let listed = first();
     let mut session = Session::new(&servers, &wires, &listed);
     let mut reached = false;
-    let found =
-        crate::dns::dnssec::validated(&mut session, &dnssec, "www.example.com", 1, &mut reached)
-            .await;
+    let found = crate::dns::judge::validating::validated(
+        &mut session,
+        &dnssec,
+        "www.example.com",
+        1,
+        &mut reached,
+    )
+    .await;
     found.map_or_else(|_| Vec::new(), |found| found.addresses)
 }
 
@@ -257,10 +275,10 @@ async fn validated_seven() -> Vec<IpAddr> {
 // place of the worker's other tasks, as in the product.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_signed_answer_validates_on_a_runtime_with_several_workers() {
-    let before = crate::dns::dnssec::steps_in_place();
+    let before = crate::dns::judge::validating::steps_in_place();
     let found = tokio::spawn(validated_seven()).await.unwrap();
     assert_eq!(found, seven());
-    assert!(crate::dns::dnssec::steps_in_place() > before);
+    assert!(crate::dns::judge::validating::steps_in_place() > before);
 }
 
 // Inside a LocalSet on the thread that blocks on a runtime with several
@@ -331,7 +349,7 @@ async fn a_family_that_fails_the_check_is_counted_bogus_when_the_other_answers()
     let answered = resolver.clone();
     let answer = move |_: IpAddr, _: u16, query: &[u8]| {
         let (asked, _) = question(query);
-        if asked.rtype != RecordType::AAAA {
+        if asked.rtype() != RecordType::AAAA {
             return reply(&answered, Serves::Signed, query);
         }
         let mut made = answered.reply(&asked).unwrap();
@@ -712,7 +730,7 @@ async fn a_naming_holds_validated_answers_apart_and_never_asks_the_host() {
     )
     .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"))
     .at("192.0.2.54", authority.server(&["192.0.2.54"], b"dot"));
-    let wires = authority.wires();
+    let rooted = roots(authority.store(), &resolver, NOW);
     let host_asked = || {
         crate::metrics::snapshot()
             .resolutions
@@ -722,11 +740,8 @@ async fn a_naming_holds_validated_answers_apart_and_never_asks_the_host() {
     };
     let asked_before = host_asked();
 
-    let validating = Naming::proxy_servers(vec![dot("192.0.2.53", None)], Trust::Validate);
-    sessions(&validating).trust(&wires);
-    sessions(&validating)
-        .dnssec()
-        .anchored(resolver.zones()[0].anchors().unwrap(), NOW);
+    let validating =
+        proxy_servers_trusting(vec![dot("192.0.2.53", None)], Trust::Validate, &rooted);
     let first = through_naming(&validating, &servers, "www.example.com").await;
     assert_eq!(first.addresses, seven());
     assert_eq!(first.trust, Some(TrustOutcome::Validated));
@@ -739,15 +754,14 @@ async fn a_naming_holds_validated_answers_apart_and_never_asks_the_host() {
     assert_eq!(servers.dials().len(), dials);
 
     // A tampered server: taken as sent by one naming, refused by the other.
-    let as_sent = Naming::proxy_servers(vec![dot("192.0.2.54", None)], Trust::AsSent);
-    sessions(&as_sent).trust(&wires);
+    let as_sent = proxy_servers_trusting(
+        vec![dot("192.0.2.54", None)],
+        Trust::AsSent,
+        &authority.roots(),
+    );
     let taken = through_naming(&as_sent, &servers, "www.example.com").await;
     assert_eq!(taken.addresses, ["192.0.2.66".parse::<IpAddr>().unwrap()]);
-    let strict = Naming::proxy_servers(vec![dot("192.0.2.54", None)], Trust::Validate);
-    sessions(&strict).trust(&wires);
-    sessions(&strict)
-        .dnssec()
-        .anchored(resolver.zones()[0].anchors().unwrap(), NOW);
+    let strict = proxy_servers_trusting(vec![dot("192.0.2.54", None)], Trust::Validate, &rooted);
     let refused = through_naming(&strict, &servers, "www.example.com").await;
     assert!(refused.addresses.is_empty());
     assert!(!refused.cached);
@@ -838,14 +852,14 @@ async fn a_validated_lookup_takes_these_round_trips_on_each_wire() {
 // trusted, .55 with a certificate the client does not trust.
 fn three_over_tls(
     answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static,
-) -> (Servers, Wires) {
+) -> (Servers, Authority) {
     let trusted = Authority::new();
     let stranger = Authority::new();
     let servers = Servers::new(Speaks::Dot { close_after: None }, answer)
         .at("192.0.2.53", trusted.server(&["192.0.2.53"], b"dot"))
         .at("192.0.2.54", trusted.server(&["192.0.2.54"], b"dot"))
         .at("192.0.2.55", stranger.server(&["192.0.2.55"], b"dot"));
-    (servers, trusted.wires())
+    (servers, trusted)
 }
 
 // Under `Validate`, a first server that takes the dial and never answers
@@ -1012,12 +1026,12 @@ async fn a_lookup_ends_once_both_checks_have_their_verdicts_on_every_wire() {
     let signed = resolver.clone();
     let answer = move |_: IpAddr, _: u16, query: &[u8]| {
         let (asked, _) = question(query);
-        if asked.name == name("www.example.com.")
-            && matches!(asked.rtype, RecordType::A | RecordType::AAAA)
+        if *asked.name() == name("www.example.com.")
+            && matches!(asked.rtype(), RecordType::A | RecordType::AAAA)
         {
             return servfail(query);
         }
-        if asked.rtype == RecordType::DNSKEY {
+        if asked.rtype() == RecordType::DNSKEY {
             return Vec::new();
         }
         reply(&signed, Serves::Signed, query)
@@ -1053,10 +1067,10 @@ async fn a_finished_check_leaves_its_unsent_queries_unsent_while_the_other_runs(
     let signed = resolver.clone();
     let answer = move |_: IpAddr, _: u16, query: &[u8]| {
         let (asked, _) = question(query);
-        if asked.rtype == RecordType::AAAA {
+        if asked.rtype() == RecordType::AAAA {
             return Vec::new();
         }
-        if asked.rtype == RecordType::DS {
+        if asked.rtype() == RecordType::DS {
             // REFUSED, with the question alone.
             let mut refused = servfail(query);
             refused[3] = 0x85;
@@ -1084,7 +1098,7 @@ async fn a_finished_check_leaves_its_unsent_queries_unsent_while_the_other_runs(
         .unwrap()
         .requests
         .iter()
-        .map(|seen| question(&seen.body).0.rtype)
+        .map(|seen| question(&seen.body).0.rtype())
         .collect();
     assert_eq!(
         asked,
@@ -1104,13 +1118,14 @@ async fn a_check_that_fails_part_way_or_at_tls_moves_to_the_next_server() {
     let resolver = dual();
     let signed = resolver.clone();
     // 192.0.2.53 answers the addresses but fails every DNSKEY query.
-    let (servers, wires) = three_over_tls(move |asked, _, query| {
-        if asked.to_string() == "192.0.2.53" && question(query).0.rtype == RecordType::DNSKEY {
+    let (servers, trusted) = three_over_tls(move |asked, _, query| {
+        if asked.to_string() == "192.0.2.53" && question(query).0.rtype() == RecordType::DNSKEY {
             servfail(query)
         } else {
             reply(&signed, Serves::Signed, query)
         }
     });
+    let wires = trusted.wires();
     for first in ["192.0.2.53", "192.0.2.55"] {
         let dnssec = trusting(&resolver, NOW);
         let dialled = servers.dials().len();
@@ -1147,7 +1162,9 @@ async fn a_check_that_fails_part_way_or_at_tls_moves_to_the_next_server() {
 #[tokio::test(start_paused = true)]
 async fn a_held_chain_never_makes_a_tampered_answer_pass() {
     let resolver = dual();
-    let (servers, wires) = three_over_tls(serving(&resolver, &[("192.0.2.54", Serves::Tampered)]));
+    let (servers, trusted) =
+        three_over_tls(serving(&resolver, &[("192.0.2.54", Serves::Tampered)]));
+    let wires = trusted.wires();
     let dnssec = trusting(&resolver, NOW);
     let (carrier, wires, dnssec) = (&servers, &wires, &dnssec);
     let lookup = |server: &'static str| async move {
@@ -1186,22 +1203,19 @@ async fn a_held_chain_never_makes_a_tampered_answer_pass() {
 #[tokio::test(start_paused = true)]
 async fn a_dns_setting_change_empties_the_held_chain() {
     let resolver = dual();
-    let (servers, wires) = three_over_tls(serving(&resolver, &[]));
+    let (servers, trusted) = three_over_tls(serving(&resolver, &[]));
     let tunnel = [dot("192.0.2.53", None)];
     let choice = crate::pipe::DnsChoice::Proxy {
         trust: Trust::Validate,
         system_fallback: false,
     };
-    let fresh = |names: &crate::pipe::Names| {
-        let naming = names.at_hop("hop", Some(&tunnel));
-        sessions(&naming).trust(&wires);
-        sessions(&naming)
-            .dnssec()
-            .anchored(resolver.zones()[0].anchors().unwrap(), NOW);
-        naming
-    };
+    // Each setting's names trust the test authority and the fixture's keys.
+    // A setting's names make their own sessions and validator, from the
+    // roots they share.
+    let rooted = roots(trusted.store(), &resolver, NOW);
+    let fresh = |names: &crate::pipe::Names| names.at_hop("hop", Some(&tunnel));
     let asked = |servers: &Servers| servers.answered().iter().sum::<usize>();
-    let names = crate::pipe::Names::new(choice.clone(), None);
+    let names = crate::pipe::Names::with_roots(choice.clone(), None, rooted.clone());
     let naming = fresh(&names);
     let before = asked(&servers);
     let first = through_naming(&naming, &servers, "www.example.com").await;
@@ -1214,7 +1228,7 @@ async fn a_dns_setting_change_empties_the_held_chain() {
     assert_eq!(second.trust, Some(TrustOutcome::Validated));
     assert_eq!(asked(&servers) - before, 2);
     // The setting changes.
-    let changed = crate::pipe::Names::new(choice, None);
+    let changed = crate::pipe::Names::with_roots(choice, None, rooted);
     let naming = fresh(&changed);
     let before = asked(&servers);
     let cold = through_naming(&naming, &servers, "api.example.com").await;
@@ -1266,11 +1280,12 @@ async fn a_validated_negative_answer_holds_by_its_soa_and_for_no_time_without_on
             let Ok(mut reply) = signed.reply(&asked) else {
                 return servfail(query);
             };
-            if asked.name == name(&format!("{host}.")) {
+            if *asked.name() == name(&format!("{host}.")) {
                 let is_soa = |record: &weaver_dnssec::testing::Record| {
                     record.rtype == RecordType::SOA
                         || (record.rtype == RecordType::RRSIG
-                            && record.rdata.get(..2) == Some(&RecordType::SOA.0.to_be_bytes()[..]))
+                            && record.rdata.get(..2)
+                                == Some(&RecordType::SOA.get().to_be_bytes()[..]))
                 };
                 match soa {
                     Soa::Kept => {}
@@ -1330,19 +1345,21 @@ fn a_cold_check_costs_this_much() {
             .collect();
         let validator = weaver_dnssec::Validator::new(anchors, Default::default()).unwrap();
         let mut validation = validator.begin(question, NOW);
+        validation.set_ask_ahead(false);
         let started = std::time::Instant::now();
         let verdict = loop {
             match validation.step() {
-                weaver_dnssec::Step::Done(verdict) => break verdict,
-                weaver_dnssec::Step::Need(query) => {
+                weaver_dnssec::Step::Done { verdict, .. } => break verdict,
+                weaver_dnssec::Step::Need { awaited: query, .. } => {
                     let (_, bytes) = replies.iter().find(|(asked, _)| *asked == query).unwrap();
                     validation.supply(&query, bytes).unwrap();
                 }
+                step => panic!("unexpected step {step:?}"),
             }
         };
         let spent = started.elapsed();
         assert!(
-            matches!(verdict, weaver_dnssec::Verdict::Secure(_)),
+            matches!(verdict, weaver_dnssec::Verdict::Secure { .. }),
             "{algorithm:?}"
         );
         println!(

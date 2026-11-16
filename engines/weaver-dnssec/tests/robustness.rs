@@ -55,10 +55,7 @@ fn n(text: &str) -> Name {
     Name::from_text(text).unwrap()
 }
 fn q(text: &str, rtype: T) -> Query {
-    Query {
-        name: n(text),
-        rtype,
-    }
+    Query::new(n(text), rtype)
 }
 fn zone(text: &str) -> Zone {
     Zone::new(n(text), KeyAlgorithm::P256).unwrap()
@@ -66,15 +63,18 @@ fn zone(text: &str) -> Zone {
 
 fn validate(exchange: &Exchange, replies: &BTreeMap<Query, Vec<u8>>) -> Verdict {
     let validator = (exchange.validator)();
-    let question = Question::new(exchange.question.name.clone(), exchange.question.rtype).unwrap();
+    let question =
+        Question::new(exchange.question.name().clone(), exchange.question.rtype()).unwrap();
     let mut validation = validator.begin(question, exchange.now);
+    validation.set_ask_ahead(false);
     loop {
         match validation.step() {
-            Step::Done(verdict) => return verdict,
-            Step::Need(query) => match replies.get(&query) {
+            Step::Done { verdict, .. } => return verdict,
+            Step::Need { awaited: query, .. } => match replies.get(&query) {
                 Some(bytes) => validation.supply(&query, bytes).unwrap(),
-                None => validation.failed(&query).unwrap(),
+                None => validation.supply_failure(&query).unwrap(),
             },
+            step => panic!("unexpected step {step:?}"),
         }
     }
 }
@@ -82,7 +82,10 @@ fn validate(exchange: &Exchange, replies: &BTreeMap<Query, Vec<u8>>) -> Verdict 
 fn sweep(exchange: &Exchange) -> usize {
     let originals: BTreeMap<_, _> = exchange.replies.iter().cloned().collect();
     let baseline = validate(exchange, &originals);
-    let Verdict::Secure(expected) = &baseline else {
+    let Verdict::Secure {
+        answer: expected, ..
+    } = &baseline
+    else {
         panic!("{}: baseline {baseline:?}", exchange.label);
     };
     let mut rng = Rng(SEED ^ exchange.label.len() as u64);
@@ -113,9 +116,9 @@ fn sweep(exchange: &Exchange) -> usize {
             let verdict = validate(exchange, &replies);
             runs += 1;
             match &verdict {
-                Verdict::Secure(answer) => {
-                    assert_eq!(answer.outcome, expected.outcome, "{}", exchange.label);
-                    assert!(answer.ttl <= expected.ttl, "{}", exchange.label);
+                Verdict::Secure { answer, .. } => {
+                    assert_eq!(answer.outcome(), expected.outcome(), "{}", exchange.label);
+                    assert!(answer.ttl() <= expected.ttl(), "{}", exchange.label);
                     // Every signed RRset left in the mutant is byte-identical
                     // to one in the original. Unsigned strays are not data the
                     // verdict uses, and a dropped set was not needed.
@@ -127,10 +130,11 @@ fn sweep(exchange: &Exchange) -> usize {
                     );
                 }
                 // A signed chain must never be downgraded by changed bytes.
-                Verdict::Insecure(_) => {
+                Verdict::Insecure { .. } => {
                     panic!("{}: {query:?} downgraded to {verdict:?}", exchange.label)
                 }
-                Verdict::Bogus(_) | Verdict::Unanswered(_) => {}
+                Verdict::Bogus { .. } | Verdict::Unanswered { .. } => {}
+                _ => panic!("{}: unexpected verdict {verdict:?}", exchange.label),
             }
         }
     }
@@ -145,7 +149,7 @@ fn generated(label: &str, resolver: &FakeResolver, question: Query) -> Exchange 
     let (_, queries) = drive(
         &anchored(),
         resolver,
-        Question::new(question.name.clone(), question.rtype).unwrap(),
+        Question::new(question.name().clone(), question.rtype()).unwrap(),
         NOW,
     );
     Exchange {
@@ -253,7 +257,7 @@ fn signed_sets(records: &[Record]) -> Vec<Vec<Record>> {
                 _ => continue,
             }
         } else {
-            record.rtype.0
+            record.rtype.get()
         };
         sets.entry((record.owner.as_wire().to_ascii_lowercase(), covered))
             .or_default()
@@ -285,7 +289,10 @@ fn replayed_chains(resolver: &FakeResolver) -> Vec<Vec<Record>> {
 fn splice_sweep(exchange: &Exchange, resolver: &FakeResolver) -> usize {
     let originals: BTreeMap<_, _> = exchange.replies.iter().cloned().collect();
     let baseline = validate(exchange, &originals);
-    let Verdict::Secure(expected) = &baseline else {
+    let Verdict::Secure {
+        answer: expected, ..
+    } = &baseline
+    else {
         panic!("{}: baseline {baseline:?}", exchange.label);
     };
     let replies: Vec<(Query, Reply)> = exchange
@@ -321,19 +328,21 @@ fn splice_sweep(exchange: &Exchange, resolver: &FakeResolver) -> usize {
                 let verdict = validate(exchange, &spliced);
                 runs += 1;
                 match &verdict {
-                    Verdict::Secure(answer) => {
+                    Verdict::Secure { answer, .. } => {
                         assert_eq!(
-                            answer.outcome, expected.outcome,
+                            answer.outcome(),
+                            expected.outcome(),
                             "{}: {query:?} spliced with {set:?}",
                             exchange.label
                         );
-                        assert!(answer.ttl <= expected.ttl, "{}", exchange.label);
+                        assert!(answer.ttl() <= expected.ttl(), "{}", exchange.label);
                     }
-                    Verdict::Insecure(_) => panic!(
+                    Verdict::Insecure { .. } => panic!(
                         "{}: {query:?} spliced with {set:?} downgraded to {verdict:?}",
                         exchange.label
                     ),
-                    Verdict::Bogus(_) | Verdict::Unanswered(_) => {}
+                    Verdict::Bogus { .. } | Verdict::Unanswered { .. } => {}
+                    _ => panic!("{}: unexpected verdict {verdict:?}", exchange.label),
                 }
             }
         }

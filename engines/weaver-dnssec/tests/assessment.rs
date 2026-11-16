@@ -7,10 +7,12 @@
 
 use std::collections::BTreeSet;
 
-use weaver_dnssec::testing::{DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, drive};
+use weaver_dnssec::testing::{
+    self, DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, drive,
+};
 use weaver_dnssec::{
-    BogusReason, InsecureReason, Name, Outcome, Policy, Query, Question, RecordType as T, Step,
-    SupplyError, UnansweredCause, Validator, Verdict,
+    BogusReason, InsecureReason, Name, Outcome, Policy, Query, Question, RecordType as T, Source,
+    Step, SupplyError, UnansweredCause, Validator, Verdict,
 };
 
 const NOW: u64 = 1_100_000;
@@ -20,10 +22,7 @@ fn n(text: &str) -> Name {
     Name::from_text(text).unwrap()
 }
 fn q(text: &str, rtype: T) -> Query {
-    Query {
-        name: n(text),
-        rtype,
-    }
+    Query::new(n(text), rtype)
 }
 fn question(text: &str, rtype: T) -> Question {
     Question::new(n(text), rtype).unwrap()
@@ -54,36 +53,37 @@ fn cold_queries(first: &str) -> Vec<Query> {
     ]
 }
 fn records(name: &str) -> Outcome {
-    Outcome::Records {
-        name: n(name),
-        rdata: vec![IP.to_vec()],
-    }
+    testing::records(n(name), vec![IP.to_vec()])
 }
 fn replace_reply(resolver: &mut FakeResolver, query: Query, reply: Reply) {
     resolver.set_reply(query.clone(), Some(reply.encode(&query).unwrap()));
 }
 fn secure(verdict: &Verdict, expected: Outcome) -> u32 {
-    let Verdict::Secure(answer) = verdict else {
+    let Verdict::Secure { answer, .. } = verdict else {
         panic!("expected secure {expected:?}, got {verdict:?}")
     };
-    assert_eq!(answer.outcome, expected);
-    assert_eq!(answer.insecure, None);
-    answer.ttl
+    assert_eq!(*answer.outcome(), expected);
+    answer.ttl()
 }
 fn insecure(verdict: &Verdict, expected: Outcome, reason: InsecureReason) {
-    let Verdict::Insecure(answer) = verdict else {
+    let Verdict::Insecure {
+        answer,
+        reason: actual,
+        ..
+    } = verdict
+    else {
         panic!("expected insecure {expected:?}, got {verdict:?}")
     };
-    assert_eq!(answer.outcome, expected);
-    assert_eq!(answer.insecure, Some(reason));
+    assert_eq!(*answer.outcome(), expected);
+    assert_eq!(*actual, reason);
 }
 fn bogus(verdict: &Verdict, reason: BogusReason, name: &str, rtype: T) {
-    let Verdict::Bogus(failure) = verdict else {
+    let Verdict::Bogus { failure, .. } = verdict else {
         panic!("expected bogus {reason:?}, got {verdict:?}")
     };
-    assert_eq!(failure.reason, reason);
-    assert_eq!(failure.name, n(name));
-    assert_eq!(failure.rtype, rtype);
+    assert_eq!(failure.reason(), reason);
+    assert_eq!(*failure.name(), n(name));
+    assert_eq!(failure.rtype(), rtype);
 }
 fn nsec3_mode(opt_out: bool, iterations: u16) -> DenialMode {
     DenialMode::Nsec3 {
@@ -128,8 +128,9 @@ fn add_extended_errors(bytes: &mut Vec<u8>, codes: &[u16]) {
     bytes.extend(options);
 }
 
-// Hand out every query a step and also_needed name, and answer them newest
-// first. Returns the verdict, every query asked and the number of rounds.
+// Hand out every query a step names, awaited and ahead, and answer them
+// newest first. Returns the verdict, every query asked and the number of
+// rounds.
 fn drive_parallel(
     validator: &Validator,
     resolver: &FakeResolver,
@@ -141,22 +142,20 @@ fn drive_parallel(
     let mut rounds = 0;
     loop {
         match validation.step() {
-            Step::Done(verdict) => {
-                assert!(validation.also_needed().is_empty());
-                return (verdict, asked, rounds);
-            }
-            Step::Need(query) => {
+            Step::Done { verdict, .. } => return (verdict, asked, rounds),
+            Step::Need { awaited, ahead, .. } => {
                 rounds += 1;
-                let mut batch = vec![query];
-                batch.extend(validation.also_needed());
+                let mut batch = vec![awaited];
+                batch.extend(ahead);
                 for query in batch.iter().rev() {
                     asked.push(query.clone());
                     match resolver.answer(query) {
                         Some(bytes) => validation.supply(query, &bytes).unwrap(),
-                        None => validation.failed(query).unwrap(),
+                        None => validation.supply_failure(query).unwrap(),
                     }
                 }
             }
+            step => panic!("unexpected step {step:?}"),
         }
     }
 }
@@ -171,7 +170,7 @@ fn private_names_are_insecure_without_any_chain_query() {
         &mut resolver,
         printer.clone(),
         Reply {
-            answer: vec![Record::new(printer.name.clone(), T::A, 60, IP.to_vec())],
+            answer: vec![Record::new(printer.name().clone(), T::A, 60, IP.to_vec())],
             ..Reply::default()
         },
     );
@@ -236,7 +235,7 @@ fn a_configured_anchor_inside_a_private_zone_is_still_validated() {
     secure(&verdict, records("host.corp"));
     assert_eq!(queries, [q("host.corp", T::A), q("corp", T::DNSKEY)]);
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer[0].rdata[3] ^= 1;
         }
     });
@@ -327,13 +326,13 @@ fn a_reply_without_signatures_in_a_signed_zone_names_the_server() {
     for remove in [false, true] {
         let mut resolver = tree();
         resolver.tamper(|query, reply| {
-            if query.rtype == T::A {
+            if query.rtype() == T::A {
                 reply.strip_signatures();
             }
         });
         if remove {
             resolver.tamper_bytes(|query, bytes| {
-                if query.rtype == T::A {
+                if query.rtype() == T::A {
                     remove_opt(bytes);
                 }
             });
@@ -361,7 +360,7 @@ fn a_reply_without_opt_that_still_carries_signatures_validates() {
 fn a_stripped_reply_in_an_unsigned_zone_stays_insecure() {
     let mut resolver = unsigned(DenialMode::Nsec);
     resolver.tamper_bytes(|query, bytes| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             remove_opt(bytes);
         }
     });
@@ -499,9 +498,13 @@ fn an_alias_target_missing_from_the_reply_is_asked_for() {
     });
     let (verdict, queries) = run(&resolver, "news.example.com", T::A);
     secure(&verdict, records("news.example.net"));
+    assert_eq!(
+        verdict.answer().unwrap().alias_chain(),
+        [n("news.example.com"), n("news.example.net")]
+    );
     assert!(queries.contains(&q("news.example.net", T::A)));
     assert_eq!(
-        queries.iter().filter(|query| query.rtype == T::A).count(),
+        queries.iter().filter(|query| query.rtype() == T::A).count(),
         2
     );
 }
@@ -548,7 +551,7 @@ fn an_alias_loop_across_follow_up_replies_is_refused() {
         T::CNAME,
     );
     assert_eq!(
-        queries.iter().filter(|query| query.rtype == T::A).count(),
+        queries.iter().filter(|query| query.rtype() == T::A).count(),
         2
     );
 }
@@ -563,12 +566,16 @@ fn an_alias_ending_in_a_proven_denial_is_not_followed() {
     );
     let resolver = FakeResolver::new(vec![zone("."), first]).unwrap();
     let (verdict, queries) = run(&resolver, "news.example.com", T::A);
-    let Verdict::Secure(answer) = verdict else {
+    let Verdict::Secure { answer, .. } = verdict else {
         panic!("{verdict:?}");
     };
-    assert_eq!(answer.outcome, Outcome::NoSuchName);
+    assert_eq!(*answer.outcome(), Outcome::NoSuchName);
     assert_eq!(
-        queries.iter().filter(|query| query.rtype == T::A).count(),
+        answer.alias_chain(),
+        [n("news.example.com"), n("gone.example.com")]
+    );
+    assert_eq!(
+        queries.iter().filter(|query| query.rtype() == T::A).count(),
         1
     );
 }
@@ -609,18 +616,20 @@ fn drive_from(
     question: Question,
     now: u64,
 ) -> (Verdict, Vec<Query>) {
-    let mut validation = validator.begin_from(source, question, now);
+    let mut validation = validator.begin_from(Source::new(source), question, now);
+    validation.set_ask_ahead(false);
     let mut queries = Vec::new();
     loop {
         match validation.step() {
-            Step::Done(verdict) => return (verdict, queries),
-            Step::Need(query) => {
+            Step::Done { verdict, .. } => return (verdict, queries),
+            Step::Need { awaited: query, .. } => {
                 queries.push(query.clone());
                 match resolver.answer(&query) {
                     Some(bytes) => validation.supply(&query, &bytes).unwrap(),
-                    None => validation.failed(&query).unwrap(),
+                    None => validation.supply_failure(&query).unwrap(),
                 }
             }
+            step => panic!("unexpected step {step:?}"),
         }
     }
 }
@@ -722,11 +731,11 @@ fn transport_failures_and_malformed_replies_are_never_held() {
         for _ in 0..2 {
             let (verdict, queries) = drive(&v, &resolver, question("news.example.com", T::A), NOW);
             match (&verdict, cause) {
-                (Verdict::Unanswered(unanswered), Some(cause)) => {
-                    assert_eq!(unanswered.cause, cause)
+                (Verdict::Unanswered { failure, .. }, Some(cause)) => {
+                    assert_eq!(failure.cause(), cause)
                 }
-                (Verdict::Bogus(failure), None) => {
-                    assert_eq!(failure.reason, BogusReason::MalformedReply)
+                (Verdict::Bogus { failure, .. }, None) => {
+                    assert_eq!(failure.reason(), BogusReason::MalformedReply)
                 }
                 _ => panic!("{verdict:?}"),
             }
@@ -735,7 +744,7 @@ fn transport_failures_and_malformed_replies_are_never_held() {
     }
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.strip_signatures();
         }
     });
@@ -768,11 +777,11 @@ fn extended_errors_ride_on_failures_and_never_change_a_verdict() {
         records("news.example.com"),
     );
     tamper_address(&mut resolver);
-    let Verdict::Bogus(failure) = run(&resolver, "news.example.com", T::A).0 else {
+    let Verdict::Bogus { failure, .. } = run(&resolver, "news.example.com", T::A).0 else {
         panic!("a changed address must fail");
     };
-    assert_eq!(failure.reason, BogusReason::SignatureInvalid);
-    assert_eq!(failure.extended_errors, [3, 6]);
+    assert_eq!(failure.reason(), BogusReason::SignatureInvalid);
+    assert_eq!(failure.extended_errors(), [3, 6]);
 
     let mut resolver = tree();
     let target = q("news.example.com", T::A);
@@ -784,11 +793,15 @@ fn extended_errors_ride_on_failures_and_never_change_a_verdict() {
     .unwrap();
     add_extended_errors(&mut servfail, &[22]);
     resolver.set_reply(target.clone(), Some(servfail));
-    let Verdict::Unanswered(unanswered) = run(&resolver, "news.example.com", T::A).0 else {
+    let Verdict::Unanswered {
+        failure: unanswered,
+        ..
+    } = run(&resolver, "news.example.com", T::A).0
+    else {
         panic!("SERVFAIL must be unanswered");
     };
-    assert_eq!(unanswered.cause, UnansweredCause::Rcode(2));
-    assert_eq!(unanswered.extended_errors, [22]);
+    assert_eq!(unanswered.cause(), UnansweredCause::Rcode(2));
+    assert_eq!(unanswered.extended_errors(), [22]);
 }
 
 #[test]
@@ -835,10 +848,18 @@ fn parallel_replies_keep_the_step_contract() {
     let v = validator(&resolver);
     let mut validation = v.begin(question("news.example.com", T::A), NOW);
     let first = q("news.example.com", T::A);
-    assert_eq!(validation.step(), Step::Need(first.clone()));
-    let extra = validation.also_needed();
+    let Step::Need {
+        awaited,
+        ahead: extra,
+        ..
+    } = validation.step()
+    else {
+        panic!("the first step needs a query");
+    };
+    assert_eq!(awaited, first);
     assert_eq!(extra, [q(".", T::DNSKEY)]);
-    assert!(validation.also_needed().is_empty());
+    // A query asked ahead is handed out once.
+    assert_eq!(awaited_alone(validation.step()), first);
     // A query nobody handed out is still refused.
     assert_eq!(
         validation.supply(
@@ -855,11 +876,53 @@ fn parallel_replies_keep_the_step_contract() {
         validation.supply(&extra[0], &resolver.answer(&extra[0]).unwrap()),
         Err(SupplyError::UnexpectedQuery)
     );
-    assert_eq!(validation.step(), Step::Need(first.clone()));
+    assert_eq!(awaited_alone(validation.step()), first);
     validation
         .supply(&first, &resolver.answer(&first).unwrap())
         .unwrap();
-    assert_eq!(validation.step(), Step::Need(q("com", T::DS)));
+    let Step::Need { awaited, .. } = validation.step() else {
+        panic!("the chain still needs a query");
+    };
+    assert_eq!(awaited, q("com", T::DS));
+}
+
+#[test]
+fn a_caller_that_ignores_ahead_still_reaches_a_verdict() {
+    // Ask-ahead stays at its default, on. The caller sends only the
+    // awaited query of each step and never looks at `ahead`.
+    let resolver = tree();
+    let v = validator(&resolver);
+    let mut validation = v.begin(question("news.example.com", T::A), NOW);
+    let mut asked = Vec::new();
+    let mut handed_out = BTreeSet::new();
+    let verdict = loop {
+        match validation.step() {
+            Step::Done { verdict, .. } => break verdict,
+            Step::Need { awaited, ahead, .. } => {
+                handed_out.insert(awaited.clone());
+                handed_out.extend(ahead);
+                asked.push(awaited.clone());
+                match resolver.answer(&awaited) {
+                    Some(bytes) => validation.supply(&awaited, &bytes).unwrap(),
+                    None => validation.supply_failure(&awaited).unwrap(),
+                }
+            }
+            step => panic!("unexpected step {step:?}"),
+        }
+    };
+    secure(&verdict, records("news.example.com"));
+    assert_eq!(asked, cold_queries("news.example.com"));
+    // Every query handed out ahead came back later as the awaited one.
+    assert_eq!(handed_out, asked.into_iter().collect::<BTreeSet<_>>());
+}
+
+/// The awaited query of a step that asks nothing ahead.
+fn awaited_alone(step: Step) -> Query {
+    let Step::Need { awaited, ahead, .. } = step else {
+        panic!("expected a needed query, got {step:?}");
+    };
+    assert!(ahead.is_empty(), "{ahead:?}");
+    awaited
 }
 
 #[test]
@@ -872,11 +935,15 @@ fn a_failed_parallel_query_ends_the_validation_when_it_is_needed() {
         question("news.example.com", T::A),
         NOW,
     );
-    let Verdict::Unanswered(unanswered) = verdict else {
+    let Verdict::Unanswered {
+        failure: unanswered,
+        ..
+    } = verdict
+    else {
         panic!("{verdict:?}");
     };
-    assert_eq!(unanswered.query, q("example.com", T::DNSKEY));
-    assert_eq!(unanswered.cause, UnansweredCause::FetchFailed);
+    assert_eq!(*unanswered.query(), q("example.com", T::DNSKEY));
+    assert_eq!(unanswered.cause(), UnansweredCause::FetchFailed);
 }
 
 #[test]
@@ -891,7 +958,12 @@ fn parallel_queries_share_the_forty_query_total() {
         main.clone(),
         Reply {
             answer: attacker
-                .sign_records(vec![Record::new(main.name.clone(), T::A, 300, IP.to_vec())])
+                .sign_records(vec![Record::new(
+                    main.name().clone(),
+                    T::A,
+                    300,
+                    IP.to_vec(),
+                )])
                 .unwrap(),
             ..Reply::default()
         },
@@ -904,10 +976,7 @@ fn parallel_queries_share_the_forty_query_total() {
         let owner = n(&labels).suffix(count).unwrap();
         replace_reply(
             &mut resolver,
-            Query {
-                name: owner.clone(),
-                rtype: T::DS,
-            },
+            Query::new(owner.clone(), T::DS),
             Reply {
                 answer: root.signed_rrset(&owner, T::CNAME).unwrap(),
                 ..Reply::default()
@@ -917,13 +986,13 @@ fn parallel_queries_share_the_forty_query_total() {
     let (verdict, asked, _) = drive_parallel(
         &validator(&resolver),
         &resolver,
-        Question::new(main.name.clone(), T::A).unwrap(),
+        Question::new(main.name().clone(), T::A).unwrap(),
         NOW,
     );
-    let Verdict::Bogus(failure) = verdict else {
+    let Verdict::Bogus { failure, .. } = verdict else {
         panic!("{verdict:?}");
     };
-    assert_eq!(failure.reason, BogusReason::WorkLimit);
+    assert_eq!(failure.reason(), BogusReason::WorkLimit);
     assert_eq!(asked.len(), 40);
     assert_eq!(asked.iter().collect::<BTreeSet<_>>().len(), 40);
 }
@@ -937,30 +1006,30 @@ fn a_forged_negative_soa_fails_and_its_ttl_never_leaks() {
         resolver.zone_mut(&n("example.com")).unwrap().denial = mode;
         let v = validator(&resolver);
         let (verdict, _) = drive(&v, &resolver, question("missing.example.com", T::A), NOW);
-        let Verdict::Secure(answer) = verdict else {
+        let Verdict::Secure { answer, .. } = verdict else {
             panic!("{verdict:?}");
         };
-        assert_eq!(answer.outcome, Outcome::NoSuchName);
-        assert_eq!(answer.ttl, 300);
+        assert_eq!(*answer.outcome(), Outcome::NoSuchName);
+        assert_eq!(answer.ttl(), 300);
         // The record TTL is not signed: a larger one is bounded by the signature.
         let mut raised = tree();
         raised.zone_mut(&n("example.com")).unwrap().denial = resolver.zones()[2].denial.clone();
         raised.tamper(|query, reply| {
-            if query.rtype == T::A {
+            if query.rtype() == T::A {
                 for record in reply.authority.iter_mut() {
                     record.ttl = 1_000_000;
                 }
             }
         });
-        let Verdict::Secure(answer) = run(&raised, "missing.example.com", T::A).0 else {
+        let Verdict::Secure { answer, .. } = run(&raised, "missing.example.com", T::A).0 else {
             panic!("an unsigned TTL change must not fail the proof");
         };
-        assert_eq!(answer.ttl, 300);
+        assert_eq!(answer.ttl(), 300);
         // The SOA minimum is signed: changing it fails the answer.
         let mut forged = tree();
         forged.zone_mut(&n("example.com")).unwrap().denial = resolver.zones()[2].denial.clone();
         forged.tamper(|query, reply| {
-            if query.rtype == T::A
+            if query.rtype() == T::A
                 && let Some(soa) = reply.authority.iter_mut().find(|r| r.rtype == T::SOA)
             {
                 let at = soa.rdata.len() - 1;
@@ -978,7 +1047,7 @@ fn a_forged_negative_soa_fails_and_its_ttl_never_leaks() {
         unsigned_soa.zone_mut(&n("example.com")).unwrap().denial =
             resolver.zones()[2].denial.clone();
         unsigned_soa.tamper(|query, reply| {
-            if query.rtype == T::A {
+            if query.rtype() == T::A {
                 reply.authority.retain(|record| {
                     !(record.rtype == T::RRSIG && record.rdata.get(..2) == Some(&[0, 6]))
                 });

@@ -40,7 +40,15 @@ pub(crate) struct Message {
 }
 
 impl Query {
-    /// Encode the section 4.3 recursive query, with CD and EDNS DO set.
+    /// Encode this query as a DNS message with the given id.
+    ///
+    /// The message sets RD, CD and the EDNS DO bit, and advertises a
+    /// 1232-byte EDNS buffer. Signed replies often exceed 1232 bytes,
+    /// mostly for RSA and ML-DSA keys. A reply with TC set ends the
+    /// validation as [`Unanswered`](crate::Verdict::Unanswered) with
+    /// [`Truncated`](crate::UnansweredCause::Truncated). So when a UDP
+    /// reply has TC set, retry the query over TCP and supply that reply
+    /// instead.
     pub fn encode(&self, id: u16) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&id.to_be_bytes());

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use weaver_dnssec::testing::{FakeResolver, KeyAlgorithm, Record, Zone, drive, signature_checks};
+use weaver_dnssec::testing::{
+    self, FakeResolver, KeyAlgorithm, Record, Zone, drive, signature_checks,
+};
 use weaver_dnssec::{
-    AnchorError, BogusReason, InsecureReason, Name, Outcome, Policy, Query, Question,
-    RecordType as T, Step, Validator, Verdict,
+    AnchorError, BogusReason, InsecureReason, Name, Policy, Query, Question, RecordType as T, Step,
+    TrustAnchor, Validator, Verdict,
 };
 
 const NOW: u64 = 1_500_000;
@@ -16,15 +18,14 @@ fn name(text: &str) -> Name {
 
 fn address(verdict: Verdict, owner: &Name, secure: bool) {
     let answer = match (secure, verdict) {
-        (true, Verdict::Secure(answer)) | (false, Verdict::Insecure(answer)) => answer,
+        (true, Verdict::Secure { answer, .. }) | (false, Verdict::Insecure { answer, .. }) => {
+            answer
+        }
         (_, verdict) => panic!("unexpected security assessment: {verdict:?}"),
     };
     assert_eq!(
-        answer.outcome,
-        Outcome::Records {
-            name: owner.clone(),
-            rdata: vec![ADDRESS.to_vec()],
-        }
+        *answer.outcome(),
+        testing::records(owner.clone(), vec![ADDRESS.to_vec()])
     );
 }
 
@@ -34,20 +35,36 @@ fn counted(
     owner: &Name,
 ) -> (Verdict, Vec<Query>, usize) {
     let mut validation = validator.begin(Question::new(owner.clone(), T::A).unwrap(), NOW);
+    validation.set_ask_ahead(false);
     let mut queries = Vec::new();
     loop {
         match validation.step() {
-            Step::Need(query) => {
+            Step::Need { awaited: query, .. } => {
                 queries.push(query.clone());
                 validation
                     .supply(&query, &resolver.answer(&query).unwrap())
                     .unwrap();
             }
-            Step::Done(verdict) => {
+            Step::Done { verdict, .. } => {
                 return (verdict, queries, signature_checks(&validation));
             }
+            step => panic!("unexpected step {step:?}"),
         }
     }
+}
+
+fn q(name: Name, rtype: T) -> Query {
+    Query::new(name, rtype)
+}
+
+fn with_algorithm(anchor: &TrustAnchor, algorithm: u8) -> TrustAnchor {
+    TrustAnchor::new(
+        anchor.zone().clone(),
+        anchor.key_tag(),
+        algorithm,
+        anchor.digest_type(),
+        anchor.digest().to_vec(),
+    )
 }
 
 #[test]
@@ -55,8 +72,7 @@ fn default_anchor_policy_excludes_deprecated_algorithms_and_preserves_current_al
     let root = Zone::new(Name::root(), KeyAlgorithm::Ed25519).unwrap();
     let anchor = root.anchors().unwrap().remove(0);
     for algorithm in 0..=u8::MAX {
-        let mut candidate = anchor.clone();
-        candidate.algorithm = algorithm;
+        let candidate = with_algorithm(&anchor, algorithm);
         let result = Validator::new(vec![candidate], Policy::default());
         if matches!(algorithm, 8 | 10 | 13 | 14 | 15 | 18) {
             assert!(result.is_ok(), "algorithm {algorithm}");
@@ -68,16 +84,20 @@ fn default_anchor_policy_excludes_deprecated_algorithms_and_preserves_current_al
         }
     }
     for digest_type in 0..=u8::MAX {
-        let mut candidate = anchor.clone();
-        candidate.digest_type = digest_type;
-        candidate.digest = vec![
-            0;
-            match digest_type {
-                1 => 20,
-                4 => 48,
-                _ => 32,
-            }
-        ];
+        let candidate = TrustAnchor::new(
+            anchor.zone().clone(),
+            anchor.key_tag(),
+            anchor.algorithm(),
+            digest_type,
+            vec![
+                0;
+                match digest_type {
+                    1 => 20,
+                    4 => 48,
+                    _ => 32,
+                }
+            ],
+        );
         let result = Validator::new(vec![candidate], Policy::default());
         if matches!(digest_type, 1 | 2 | 4) {
             assert!(result.is_ok(), "digest {digest_type}");
@@ -119,14 +139,8 @@ fn authenticated_deprecated_only_delegations_are_insecure_without_child_key_fetc
             Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
         let (verdict, queries, _) = counted(&validator, &resolver, &owner);
         address(verdict, &owner, false);
-        assert!(queries.contains(&Query {
-            name: name("example"),
-            rtype: T::DS,
-        }));
-        assert!(!queries.contains(&Query {
-            name: name("example"),
-            rtype: T::DNSKEY,
-        }));
+        assert!(queries.contains(&q(name("example"), T::DS)));
+        assert!(!queries.contains(&q(name("example"), T::DNSKEY)));
     }
 }
 
@@ -162,13 +176,10 @@ fn deprecated_delegations_neither_poison_nor_rescue_accepted_records_in_both_ord
         if accepted_valid {
             address(verdict, &owner, true);
         } else {
-            assert!(matches!(verdict, Verdict::Bogus(failure)
-                if failure.reason == BogusReason::KeysNotProven));
+            assert!(matches!(verdict, Verdict::Bogus { failure, .. }
+                if failure.reason() == BogusReason::KeysNotProven));
         }
-        assert!(queries.contains(&Query {
-            name: name("example"),
-            rtype: T::DNSKEY,
-        }));
+        assert!(queries.contains(&q(name("example"), T::DNSKEY)));
     }
 }
 
@@ -205,7 +216,7 @@ fn malformed_gost_keys_and_signatures_never_add_crypto_work_or_rescue_bad_signat
                 ));
                 let mut resolver = FakeResolver::new(vec![root]).unwrap();
                 resolver.tamper(move |query, reply| {
-                    if query.rtype != T::A || query.name != name("host") {
+                    if query.rtype() != T::A || *query.name() != name("host") {
                         return;
                     }
                     let accepted = reply
@@ -246,16 +257,10 @@ fn malformed_gost_keys_and_signatures_never_add_crypto_work_or_rescue_bad_signat
                 if accepted_valid {
                     address(verdict, &owner, true);
                 } else {
-                    assert!(matches!(verdict, Verdict::Bogus(failure)
-                        if failure.reason == BogusReason::SignatureInvalid));
+                    assert!(matches!(verdict, Verdict::Bogus { failure, .. }
+                        if failure.reason() == BogusReason::SignatureInvalid));
                 }
-                assert_eq!(
-                    queries,
-                    vec![Query {
-                        name: owner,
-                        rtype: T::A
-                    }]
-                );
+                assert_eq!(queries, vec![q(owner, T::A)]);
                 // The cached keys leave exactly the accepted signature attempt.
                 assert_eq!(checks, 1, "GOST length {length}, before {before}");
             }
@@ -288,7 +293,7 @@ fn empty_gost_payloads_fail_structural_parsing_before_crypto() {
         let mut resolver = FakeResolver::new(vec![root, child]).unwrap();
         if target == T::RRSIG {
             resolver.tamper(|query, reply| {
-                if query.rtype == T::A && query.name == name("host") {
+                if query.rtype() == T::A && *query.name() == name("host") {
                     let mut deprecated = reply
                         .answer
                         .iter()
@@ -322,21 +327,12 @@ fn empty_gost_payloads_fail_structural_parsing_before_crypto() {
             "host"
         });
         let (verdict, queries, checks) = counted(&validator, &resolver, &owner);
-        assert!(matches!(verdict, Verdict::Bogus(failure)
-            if failure.reason == BogusReason::MalformedReply));
+        assert!(matches!(verdict, Verdict::Bogus { failure, .. }
+            if failure.reason() == BogusReason::MalformedReply));
         let expected_query = match target {
-            T::DS => Query {
-                name: name("example"),
-                rtype: T::DS,
-            },
-            T::DNSKEY => Query {
-                name: Name::root(),
-                rtype: T::DNSKEY,
-            },
-            _ => Query {
-                name: owner,
-                rtype: T::A,
-            },
+            T::DS => q(name("example"), T::DS),
+            T::DNSKEY => q(Name::root(), T::DNSKEY),
+            _ => q(owner, T::A),
         };
         assert!(queries.contains(&expected_query));
         assert_eq!(checks, 0, "empty payload in {target:?}");
@@ -370,19 +366,13 @@ fn an_ed448_only_zone_is_insecure_without_a_key_fetch() {
         Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
     let owner = name("news.example");
     let (verdict, queries, checks) = counted(&validator, &resolver, &owner);
-    let Verdict::Insecure(answer) = &verdict else {
+    let Verdict::Insecure { reason, .. } = &verdict else {
         panic!("expected insecure, got {verdict:?}");
     };
-    assert_eq!(answer.insecure, Some(InsecureReason::UnsupportedAlgorithm));
+    assert_eq!(*reason, InsecureReason::UnsupportedAlgorithm);
     address(verdict, &owner, false);
-    assert!(queries.contains(&Query {
-        name: name("example"),
-        rtype: T::DS,
-    }));
-    assert!(!queries.contains(&Query {
-        name: name("example"),
-        rtype: T::DNSKEY,
-    }));
+    assert!(queries.contains(&q(name("example"), T::DS)));
+    assert!(!queries.contains(&q(name("example"), T::DNSKEY)));
     // The root's DNSKEY set and the DS set; nothing signed with algorithm 16.
     assert_eq!(checks, 2);
 }
@@ -410,7 +400,7 @@ fn an_ed448_signature_alone_never_authenticates_in_a_p256_zone() {
     ] {
         let mut resolver = ed448_tree(true);
         resolver.tamper(move |query, reply| {
-            if query.rtype == target && query.name != Name::root() {
+            if query.rtype() == target && *query.name() != Name::root() {
                 reply
                     .answer
                     .retain(|record| record.rtype != T::RRSIG || record.rdata[2] == 16);
@@ -420,7 +410,7 @@ fn an_ed448_signature_alone_never_authenticates_in_a_p256_zone() {
             Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
         let (verdict, _, _) = counted(&validator, &resolver, &name("news.example"));
         assert!(
-            matches!(&verdict, Verdict::Bogus(failure) if failure.reason == reason),
+            matches!(&verdict, Verdict::Bogus { failure, .. } if failure.reason() == reason),
             "{target:?}: {verdict:?}"
         );
     }

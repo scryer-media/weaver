@@ -3,6 +3,9 @@
 
 //! In-memory DNSSEC test equipment. Keys are generated; all time is supplied.
 //! The signing encoder deliberately does not use the validator's canonicalizer.
+//!
+//! Only with the `test-support` feature. Not part of the stable API: it may
+//! change in any release.
 
 mod signer;
 mod zone;
@@ -13,6 +16,12 @@ pub use zone::{DenialMode, FakeResolver, Reply, SignatureWindow, Zone};
 /// Number of signature verification attempts made by this validation.
 pub fn signature_checks(validation: &crate::Validation<'_>) -> usize {
     validation.signature_checks()
+}
+
+/// An [`Outcome::Records`](crate::Outcome::Records), to compare an answer
+/// with. The variant cannot be built outside this crate.
+pub fn records(name: crate::Name, rdata: Vec<Vec<u8>>) -> crate::Outcome {
+    crate::Outcome::Records { name, rdata }
 }
 
 /// One signed RRset in canonical form: lower-cased owner, type and record data.
@@ -44,7 +53,8 @@ pub fn signed_records(reply: &[u8], query: &crate::Query) -> Option<Vec<SignedRr
     )
 }
 
-/// Run the public, synchronous validation protocol against an in-memory resolver.
+/// Run the public, synchronous validation protocol against an in-memory
+/// resolver, one query at a time: queries asked ahead are not handed out.
 pub fn drive(
     validator: &crate::Validator,
     resolver: &FakeResolver,
@@ -52,11 +62,12 @@ pub fn drive(
     now: crate::UnixSeconds,
 ) -> (crate::Verdict, Vec<crate::Query>) {
     let mut validation = validator.begin(question, now);
+    validation.set_ask_ahead(false);
     let mut queries = Vec::new();
     loop {
         match validation.step() {
-            crate::Step::Done(verdict) => return (verdict, queries),
-            crate::Step::Need(query) => {
+            crate::Step::Done { verdict } => return (verdict, queries),
+            crate::Step::Need { awaited: query, .. } => {
                 queries.push(query.clone());
                 match resolver.answer(&query) {
                     Some(bytes) => {
@@ -64,7 +75,7 @@ pub fn drive(
                         let _ = validation.supply(&query, &bytes);
                     }
                     None => {
-                        let _ = validation.failed(&query);
+                        let _ = validation.supply_failure(&query);
                     }
                 }
             }

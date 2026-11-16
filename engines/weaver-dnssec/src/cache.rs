@@ -67,6 +67,10 @@ pub(crate) struct TrustCache {
 }
 
 impl TrustCache {
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(crate) fn get(&self, name: &Name, kind: CacheKind, now: UnixSeconds) -> Option<CacheEntry> {
         self.entries
             .get(&(name.clone(), kind))
@@ -122,6 +126,10 @@ pub(crate) struct BogusHolds {
 }
 
 impl BogusHolds {
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(crate) fn get(
         &self,
         source: u64,

@@ -29,7 +29,8 @@ async fn recorded(
     recording
         .scope(async {
             record::asking(host, || record::Asker::servers(servers, trust));
-            if let Ok(lookup) = resolve(zone, &WIRES, servers, trust, host).await {
+            let roots = TrustRoots::built_in();
+            if let Ok(lookup) = resolve(zone, roots.wires(), servers, trust, host).await {
                 record::found(host, &lookup.addresses);
             }
         })
@@ -113,6 +114,17 @@ pub(super) fn answers(naming: &Naming) -> &ResolutionCache<DialError> {
             unreachable!("a naming that asks no servers")
         }
     }
+}
+
+// A naming that asks `servers` through the proxy, as
+// `Naming::proxy_servers` gives, its TLS sessions and validator trusting
+// `roots`.
+pub(super) fn proxy_servers_trusting(
+    servers: Vec<DnsServer>,
+    trust: Trust,
+    roots: &Arc<TrustRoots>,
+) -> Naming {
+    Naming::proxy_servers_trusting(servers, trust, roots.clone())
 }
 
 // The TLS sessions a naming that asks DNS servers resumes.
@@ -246,9 +258,16 @@ async fn a_query_taken_as_sent_asks_for_recursion_and_nothing_else() {
         kept.lock().unwrap().push([query[2], query[3]]);
         v4(query, 60)
     });
-    resolve(&zone, &WIRES, &[server()], Trust::AsSent, "fixture.test")
-        .await
-        .unwrap();
+    let roots = TrustRoots::built_in();
+    resolve(
+        &zone,
+        roots.wires(),
+        &[server()],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await
+    .unwrap();
     assert_eq!(*seen.lock().unwrap(), [[0x01, 0x00], [0x01, 0x00]]);
 }
 

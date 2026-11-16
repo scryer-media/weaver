@@ -7,17 +7,18 @@
 // validator of the probe's own, so nothing a route's naming holds is used
 // or kept. Nothing here is counted in the DNS metrics.
 use super::{
-    Carrier, DnsServer, Failed, NEXT_ID, SERVER_TIMEOUT, Stage, Why, Wire, WireKind, dnssec,
-    refusal, u16_at,
-    wire::{DnsSessions, Session, Wires},
+    Carrier, DnsServer, Exchanged, Failed, SERVER_TIMEOUT, Stage, Wire, WireKind,
+    exchange::{Session, Wires},
+    judge::validating,
+    message::{refusal, u16_at},
+    sessions::DnsSessions,
 };
 use crate::{
     TunnelError, TunnelStream,
     pipe::{DialError, Dialer, Purpose},
-    resolution::record::{LookupError, LookupFailure},
+    resolution::record::LookupError,
 };
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -417,7 +418,7 @@ pub(super) async fn probe_on(
 // server's.
 pub(super) async fn timed(
     server: &DnsServer,
-    probe: impl std::future::Future<Output = Result<(), Failed>>,
+    probe: impl std::future::Future<Output = Result<(), Exchanged>>,
 ) -> Probed {
     let clock = Arc::new(Clock::default());
     let started = Instant::now();
@@ -445,8 +446,7 @@ pub(super) async fn timed(
         }
     };
     let elapsed = clock.read(started).spent;
-    let mut why = Why::default();
-    match answered {
+    let failed = match answered {
         Ok(Ok(())) => {
             return Probed {
                 supported: true,
@@ -454,51 +454,38 @@ pub(super) async fn timed(
                 error: None,
             };
         }
-        Ok(Err(failed)) => why.query(server, &Ok::<_, ()>(Err(failed))),
-        Err(false) => why.query(server, &Err::<Result<super::Found, Failed>, _>(())),
-        Err(true) => {
-            return Probed {
-                supported: false,
-                elapsed,
-                error: Some(LookupError {
-                    failure: LookupFailure::Other,
-                    detail: format!(
-                        "{server}: waited {} s in all for a DNS socket on the route",
-                        SOCKET_WAIT.as_secs()
-                    ),
-                }),
-            };
-        }
-    }
+        Ok(Err(failed)) => Failed::from(failed),
+        Err(false) => Failed::TimedOut,
+        Err(true) => Failed::NoSocket,
+    };
     Probed {
         supported: false,
         elapsed,
-        error: why
-            .0
-            .map(|(failure, detail)| LookupError { failure, detail }),
+        error: Some(failed.error_at(Some(server))),
     }
 }
 
 // Whether `server` answers the root's SOA on its wire: any reply to the
 // query, whatever its records, so long as it is not an error code.
-async fn answers(carrier: &dyn Carrier, wires: &Wires, server: &DnsServer) -> Result<(), Failed> {
-    let id = match server.wire {
-        Wire::Https { .. } => 0,
-        Wire::Plain | Wire::Tls { .. } => NEXT_ID.fetch_add(1, Ordering::Relaxed),
-    };
+async fn answers(
+    carrier: &dyn Carrier,
+    wires: &Wires,
+    server: &DnsServer,
+) -> Result<(), Exchanged> {
+    let session = Session::new(carrier, wires, server);
+    let id = session.id();
     let mut packet = Vec::from(id.to_be_bytes());
     // Recursion desired; one question: the root, SOA, IN.
     packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
     packet.extend_from_slice(&SOA.to_be_bytes());
     packet.extend_from_slice(&[0, 1]);
-    let mut session = Session::new(carrier, wires, server);
     let bytes = session.ask(&packet, &mut false).await?;
     if let Some(rcode) = refusal(&bytes, id) {
-        return Err(Failed::Rcode(rcode));
+        return Err(Exchanged::Rcode(rcode));
     }
-    let flags = u16_at(&bytes, 2).map_err(|_| Failed::Invalid)?;
+    let flags = u16_at(&bytes, 2).map_err(|_| Exchanged::Invalid)?;
     if u16_at(&bytes, 0).ok() != Some(id) || flags & 0x8000 == 0 {
-        return Err(Failed::Invalid);
+        return Err(Exchanged::Invalid);
     }
     Ok(())
 }
@@ -509,15 +496,15 @@ async fn answers(carrier: &dyn Carrier, wires: &Wires, server: &DnsServer) -> Re
 pub(super) async fn signed(
     carrier: &dyn Carrier,
     wires: &Wires,
-    dnssec: &dnssec::Dnssec,
+    dnssec: &validating::Dnssec,
     server: &DnsServer,
-) -> Result<(), Failed> {
+) -> Result<(), Exchanged> {
     let mut session = Session::new(carrier, wires, server);
-    let found = dnssec::validated(&mut session, dnssec, "", SOA, &mut false).await?;
+    let found = validating::validated(&mut session, dnssec, "", SOA, &mut false).await?;
     match found.insecure {
         None => Ok(()),
         // The root anchors prove the root signed, so this only comes of a
         // server whose answer leaves the proof out.
-        Some(_) => Err(Failed::Stripped(Vec::new())),
+        Some(_) => Err(Exchanged::Stripped(Vec::new())),
     }
 }

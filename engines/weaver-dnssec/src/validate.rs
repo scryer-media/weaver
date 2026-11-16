@@ -20,11 +20,75 @@ use crate::{
 };
 
 /// Shared trust configuration and bounded caches. Performs no I/O.
+///
+/// One validator serves any number of validations, from any thread, one
+/// after another or at once.
+///
+/// # What it caches
+///
+/// - Proven keys of each zone, and proven delegation facts: whether a name
+///   is a signed delegation, an unsigned one, or no delegation. Each is held
+///   for the least of its records' TTLs, its signatures' remaining validity
+///   and [`MAX_TRUST_TTL_SECONDS`](crate::limits::MAX_TRUST_TTL_SECONDS),
+///   and at most [`MAX_CACHE_ENTRIES`](crate::limits::MAX_CACHE_ENTRIES)
+///   are held; the one that expires first is dropped to make room.
+/// - Names and types proven bogus, per [`Source`], for
+///   [`BOGUS_HOLD_SECONDS`](crate::limits::BOGUS_HOLD_SECONDS), at most
+///   [`MAX_BOGUS_HOLDS`](crate::limits::MAX_BOGUS_HOLDS) of them. A held
+///   failure is only ever returned as the same failure.
+///
+/// Answer records are never cached. Time is the caller's: an entry whose
+/// insertion time is later than the time a validation gives counts as
+/// expired.
 pub struct Validator {
     anchors: Vec<TrustAnchor>,
     policy: Policy,
     cache: Mutex<TrustCache>,
     holds: Mutex<BogusHolds>,
+}
+
+impl core::fmt::Debug for Validator {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Validator")
+            .field("anchors", &self.anchors)
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Which server, or other source, a validation's replies come from.
+///
+/// A name and type proven bogus is held against its source only, so a
+/// retry with another source is validated afresh. The value is the
+/// caller's: any number that stays the same for the same server.
+/// [`Validator::begin`] uses [`Source::default`].
+///
+/// ```
+/// use weaver_dnssec::Source;
+///
+/// let resolver = Source::new(2);
+/// assert_eq!(resolver.get(), 2);
+/// assert_eq!(Source::from(2), resolver);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Source(u64);
+
+impl Source {
+    /// The source with this number.
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// This source's number.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for Source {
+    fn from(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 impl Validator {
@@ -49,16 +113,60 @@ impl Validator {
         })
     }
 
-    /// Start one assessment at the caller's time, from source 0.
+    /// The trust anchors this validator uses.
+    pub fn trust_anchors(&self) -> &[TrustAnchor] {
+        &self.anchors
+    }
+
+    /// The policy this validator uses.
+    pub fn policy(&self) -> Policy {
+        self.policy
+    }
+
+    /// Drop every cached key, delegation fact and held bogus name. Later
+    /// validations prove everything afresh. Validations already running
+    /// keep what they have proven so far.
+    pub fn clear_cache(&self) {
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = TrustCache::default();
+        }
+        if let Ok(mut holds) = self.holds.lock() {
+            *holds = BogusHolds::default();
+        }
+    }
+
+    /// The number of entries the cache holds now: proven keys and delegation
+    /// facts, plus held bogus names. Expired entries are included until they
+    /// are evicted, which happens when a new entry finds its table full. At
+    /// most [`MAX_CACHE_ENTRIES`](crate::limits::MAX_CACHE_ENTRIES) plus
+    /// [`MAX_BOGUS_HOLDS`](crate::limits::MAX_BOGUS_HOLDS), 1024 in all.
+    pub fn cache_len(&self) -> usize {
+        let cache = self.cache.lock().map_or(0, |cache| cache.len());
+        let holds = self.holds.lock().map_or(0, |holds| holds.len());
+        cache.saturating_add(holds)
+    }
+
+    /// Start one assessment at the caller's time, from [`Source::default`].
+    ///
+    /// The [`Validation`] borrows this validator and lives no longer than
+    /// it. To run one in a spawned task, keep the validator in a `'static`
+    /// (for example a `std::sync::OnceLock`), or begin the validation in the
+    /// task that owns the validator.
     pub fn begin(&self, question: Question, now: UnixSeconds) -> Validation<'_> {
-        self.begin_from(0, question, now)
+        self.begin_from(Source::default(), question, now)
     }
 
     /// Start one assessment of answers from the caller's `source`. A name and
     /// type proven bogus from the same source in the last minute is done at
     /// once with the same failure; another source is asked afresh. Proven
     /// keys and cuts are shared across sources.
-    pub fn begin_from(&self, source: u64, question: Question, now: UnixSeconds) -> Validation<'_> {
+    pub fn begin_from(
+        &self,
+        source: Source,
+        question: Question,
+        now: UnixSeconds,
+    ) -> Validation<'_> {
+        let source = source.get();
         let now = now.min(1_u64 << 62);
         let held = self
             .holds
@@ -74,9 +182,10 @@ impl Validator {
             outstanding: BTreeSet::new(),
             blocked: None,
             hints: Vec::new(),
+            ask_ahead: true,
             extended_errors: Vec::new(),
             server_error: false,
-            final_verdict: held.map(Verdict::Bogus),
+            final_verdict: held.map(|failure| Verdict::Bogus { failure }),
             budget: WorkBudget::default(),
             verifications: BTreeMap::new(),
             rrset_checks: BTreeMap::new(),
@@ -242,7 +351,17 @@ fn unproven_reason(proof: Proof, otherwise: BogusReason) -> BogusReason {
     }
 }
 
-/// One assessment at one fixed caller-supplied time.
+/// One assessment at one fixed caller-supplied time, from
+/// [`Validator::begin`] or [`Validator::begin_from`].
+///
+/// Drive it with [`step`](Self::step), [`supply`](Self::supply) and
+/// [`supply_failure`](Self::supply_failure). It holds the replies it was
+/// given until it is dropped.
+///
+/// A validation borrows its validator, so it lives no longer than the
+/// validator does. To move one into a spawned task, keep the validator in a
+/// `'static` (for example a `std::sync::OnceLock`), or run the validation in
+/// the task that owns the validator.
 pub struct Validation<'v> {
     validator: &'v Validator,
     // Whose answers these are, for the bogus hold.
@@ -254,8 +373,10 @@ pub struct Validation<'v> {
     outstanding: BTreeSet<Query>,
     // The query the last evaluation stopped on.
     blocked: Option<Query>,
-    // Queries the last evaluation will likely need next, for also_needed.
+    // Queries the last evaluation will likely need next, for a step's ahead.
     hints: Vec<Query>,
+    // Whether a step hands out the hints.
+    ask_ahead: bool,
     extended_errors: Vec<u16>,
     // A server error fed the proof, so a retry elsewhere may succeed.
     server_error: bool,
@@ -271,45 +392,99 @@ pub struct Validation<'v> {
     denial: DenialContext,
 }
 
+impl core::fmt::Debug for Validation<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Validation")
+            .field("question", &self.question)
+            .field("now", &self.now)
+            .field("source", &self.source)
+            .field("outstanding", &self.outstanding)
+            .field("verdict", &self.final_verdict)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Validation<'_> {
-    /// The query the assessment waits on, or the verdict once complete.
+    /// The question being validated.
+    pub fn question(&self) -> &Question {
+        &self.question
+    }
+
+    /// Whether a step hands out the queries it expects to need next, in
+    /// [`Step::Need`]'s `ahead`. On by default.
+    ///
+    /// Each query handed out counts once toward
+    /// [`MAX_QUERIES`](crate::limits::MAX_QUERIES), whether it is sent or
+    /// not. A query from `ahead` that the validation later needs comes back
+    /// as `awaited` and is not counted twice. One it never needs is spent.
+    ///
+    /// Turn it off for a caller that sends one query at a time and ignores
+    /// `ahead`, so that no query is spent that way. With it off, each step
+    /// hands out only the query it waits on.
+    pub fn set_ask_ahead(&mut self, enabled: bool) {
+        self.ask_ahead = enabled;
+    }
+
+    /// What the assessment needs next, or the verdict once complete.
+    ///
+    /// [`Step::Need`] names the query the validation waits on and, unless
+    /// [`set_ask_ahead`](Self::set_ask_ahead) turned it off, the queries it
+    /// expects to need after it. A query is handed out once: a later step
+    /// that waits on a query already handed out names it again as
+    /// `awaited`, but never again in `ahead`. [`Step::Done`] carries the
+    /// verdict, and every later step returns the same one.
     pub fn step(&mut self) -> Step {
+        match self.next_step() {
+            Ok(awaited) => {
+                let ahead = if self.ask_ahead {
+                    self.issue_hints()
+                } else {
+                    self.hints.clear();
+                    Vec::new()
+                };
+                Step::Need { awaited, ahead }
+            }
+            Err(verdict) => Step::Done { verdict },
+        }
+    }
+
+    // The query the assessment waits on, or the verdict once complete.
+    fn next_step(&mut self) -> Result<Query, Verdict> {
         if let Some(verdict) = &self.final_verdict {
-            return Step::Done(verdict.clone());
+            return Err(verdict.clone());
         }
         if let Some(query) = self
             .blocked
             .as_ref()
             .filter(|query| self.outstanding.contains(*query))
         {
-            return Step::Need(query.clone());
+            return Ok(query.clone());
         }
         self.blocked = None;
         self.hints.clear();
         let result = self.evaluate();
         match result {
-            Ok(verdict) | Err(Flow::Terminal(verdict)) => Step::Done(self.finish(verdict)),
+            Ok(verdict) | Err(Flow::Terminal(verdict)) => Err(self.finish(verdict)),
             Err(Flow::Need) => {
                 // reply() installs the query before unwinding evaluation.
                 match &self.blocked {
-                    Some(query) => Step::Need(query.clone()),
+                    Some(query) => Ok(query.clone()),
                     None => {
                         let verdict = self.bogus(
                             BogusReason::WorkLimit,
                             self.question.name(),
                             self.question.rtype(),
                         );
-                        Step::Done(self.finish(verdict))
+                        Err(self.finish(verdict))
                     }
                 }
             }
         }
     }
 
-    /// After `step` returns `Need`, further queries this assessment expects
-    /// to need. Each counts toward the query limit; send them with the
-    /// stepped query in parallel and supply the replies in any order.
-    pub fn also_needed(&mut self) -> Vec<Query> {
+    // After the assessment waits on a query, further queries it expects to
+    // need, handed out once each. Each counts toward the query limit.
+    fn issue_hints(&mut self) -> Vec<Query> {
         let mut issued = Vec::new();
         if self.final_verdict.is_some() {
             return issued;
@@ -327,7 +502,16 @@ impl Validation<'_> {
         issued
     }
 
-    /// Supply the reply to any outstanding query.
+    /// Supply the reply to any outstanding query, as the whole DNS message
+    /// received. The message ID is not checked; matching a reply to its
+    /// query is the caller's job. An error leaves the validation unchanged.
+    ///
+    /// A reply with TC set ends the validation as
+    /// [`Unanswered`](crate::Verdict::Unanswered) with
+    /// [`Truncated`](crate::UnansweredCause::Truncated). When a UDP reply has
+    /// TC set, retry the query over TCP and supply that reply instead. Signed
+    /// replies often exceed the 1232-byte buffer that [`Query::encode`]
+    /// advertises, mostly for RSA and ML-DSA keys.
     pub fn supply(&mut self, query: &Query, reply: &[u8]) -> Result<(), SupplyError> {
         if self.final_verdict.is_some() || !self.outstanding.contains(query) {
             return Err(SupplyError::UnexpectedQuery);
@@ -366,8 +550,13 @@ impl Validation<'_> {
         Ok(())
     }
 
-    /// Report that an outstanding query's fetch failed.
-    pub fn failed(&mut self, query: &Query) -> Result<(), SupplyError> {
+    /// Tell the validation that an outstanding query got no usable reply: it
+    /// timed out, the connection failed, or the reply could not be matched
+    /// to it. When the validation needs that reply, it ends
+    /// [`Unanswered`](crate::Verdict::Unanswered) with
+    /// [`UnansweredCause::FetchFailed`]. An error leaves the validation
+    /// unchanged.
+    pub fn supply_failure(&mut self, query: &Query) -> Result<(), SupplyError> {
         if self.final_verdict.is_some() || !self.outstanding.contains(query) {
             return Err(SupplyError::UnexpectedQuery);
         }
@@ -384,7 +573,7 @@ impl Validation<'_> {
 
     fn finish(&mut self, mut verdict: Verdict) -> Verdict {
         match &mut verdict {
-            Verdict::Bogus(bogus) => {
+            Verdict::Bogus { failure: bogus } => {
                 bogus.extended_errors.clone_from(&self.extended_errors);
                 // Transport-shaped failures may clear on a retry elsewhere,
                 // so only proof failures are held.
@@ -404,10 +593,12 @@ impl Validation<'_> {
                     );
                 }
             }
-            Verdict::Unanswered(unanswered) => {
+            Verdict::Unanswered {
+                failure: unanswered,
+            } => {
                 unanswered.extended_errors.clone_from(&self.extended_errors);
             }
-            Verdict::Secure(_) | Verdict::Insecure(_) => {}
+            Verdict::Secure { .. } | Verdict::Insecure { .. } => {}
         }
         self.outstanding.clear();
         self.blocked = None;
@@ -417,20 +608,24 @@ impl Validation<'_> {
     }
 
     fn unanswered(&self, query: &Query, cause: UnansweredCause) -> Verdict {
-        Verdict::Unanswered(Unanswered {
-            query: query.clone(),
-            cause,
-            extended_errors: Vec::new(),
-        })
+        Verdict::Unanswered {
+            failure: Unanswered {
+                query: query.clone(),
+                cause,
+                extended_errors: Vec::new(),
+            },
+        }
     }
 
     fn bogus(&self, reason: BogusReason, name: &Name, rtype: RecordType) -> Verdict {
-        Verdict::Bogus(Bogus {
-            reason,
-            name: name.clone(),
-            rtype,
-            extended_errors: Vec::new(),
-        })
+        Verdict::Bogus {
+            failure: Bogus {
+                reason,
+                name: name.clone(),
+                rtype,
+                extended_errors: Vec::new(),
+            },
+        }
     }
 
     fn error(&self, reason: BogusReason, name: &Name, rtype: RecordType) -> Flow {
@@ -1145,6 +1340,8 @@ impl Validation<'_> {
             .ok_or_else(|| self.error(BogusReason::MalformedReply, &query.name, query.rtype))?;
         let mut current = query.name.clone();
         let mut seen = BTreeSet::from([current.clone()]);
+        // The same names as `seen`, in the order followed, for the answer.
+        let mut chain = vec![current.clone()];
         let mut links = 0;
         let mut insecure = None;
         let mut secure_ttl = u32::MAX;
@@ -1165,14 +1362,10 @@ impl Validation<'_> {
                     } else {
                         raw_ttl
                     },
-                    insecure,
+                    alias_chain: chain,
                     rtype: query.rtype,
                 };
-                return Ok(if insecure.is_none() {
-                    Verdict::Secure(answer)
-                } else {
-                    Verdict::Insecure(answer)
-                });
+                return Ok(judged(answer, insecure));
             }
             let (target, judgment, ttl) =
                 if let Some(set) = reply.answer(&current, RecordType::CNAME) {
@@ -1221,14 +1414,10 @@ impl Validation<'_> {
                         } else {
                             raw_ttl.min(negative_raw)
                         },
-                        insecure,
+                        alias_chain: chain,
                         rtype: query.rtype,
                     };
-                    return Ok(if insecure.is_none() {
-                        Verdict::Secure(answer)
-                    } else {
-                        Verdict::Insecure(answer)
-                    });
+                    return Ok(judged(answer, insecure));
                 };
             insecure = insecure.or(judgment.insecure);
             secure_ttl = secure_ttl.min(judgment.ttl);
@@ -1240,8 +1429,17 @@ impl Validation<'_> {
             if links > MAX_ALIAS_LINKS {
                 return Err(self.error(BogusReason::WorkLimit, &current, RecordType::CNAME));
             }
+            chain.push(target.clone());
             current = target;
         }
+    }
+}
+
+/// A secure verdict, or an insecure one for `insecure`'s reason.
+fn judged(answer: Answer, insecure: Option<InsecureReason>) -> Verdict {
+    match insecure {
+        None => Verdict::Secure { answer },
+        Some(reason) => Verdict::Insecure { answer, reason },
     }
 }
 
@@ -1253,12 +1451,11 @@ mod tests {
         Question::new(Name::from_text("www.example.").unwrap(), RecordType::A).unwrap()
     }
 
-    #[test]
-    fn validator_is_send_sync_and_validation_is_send() {
-        fn send_sync<T: Send + Sync>() {}
-        fn send<T: Send>() {}
-        send_sync::<Validator>();
-        send::<Validation<'_>>();
+    fn need(awaited: &Query, ahead: Vec<Query>) -> Step {
+        Step::Need {
+            awaited: awaited.clone(),
+            ahead,
+        }
     }
 
     #[test]
@@ -1269,8 +1466,13 @@ mod tests {
             name: question().name().clone(),
             rtype: RecordType::A,
         };
-        assert_eq!(validation.step(), Step::Need(query.clone()));
-        assert_eq!(validation.step(), Step::Need(query.clone()));
+        let root_keys = Query {
+            name: Name::root(),
+            rtype: RecordType::DNSKEY,
+        };
+        // The root's keys are handed out ahead once, never again.
+        assert_eq!(validation.step(), need(&query, vec![root_keys]));
+        assert_eq!(validation.step(), need(&query, Vec::new()));
         let wrong = Query {
             name: query.name.clone(),
             rtype: RecordType::AAAA,
@@ -1279,19 +1481,81 @@ mod tests {
             validation.supply(&wrong, &[]),
             Err(SupplyError::UnexpectedQuery)
         );
-        assert_eq!(validation.failed(&wrong), Err(SupplyError::UnexpectedQuery));
-        assert_eq!(validation.step(), Step::Need(query.clone()));
-        validation.failed(&query).unwrap();
-        let done = Step::Done(Verdict::Unanswered(Unanswered {
-            query: query.clone(),
-            cause: UnansweredCause::FetchFailed,
-            extended_errors: Vec::new(),
-        }));
+        assert_eq!(
+            validation.supply_failure(&wrong),
+            Err(SupplyError::UnexpectedQuery)
+        );
+        assert_eq!(validation.step(), need(&query, Vec::new()));
+        validation.supply_failure(&query).unwrap();
+        let done = Step::Done {
+            verdict: Verdict::Unanswered {
+                failure: Unanswered {
+                    query: query.clone(),
+                    cause: UnansweredCause::FetchFailed,
+                    extended_errors: Vec::new(),
+                },
+            },
+        };
         assert_eq!(validation.step(), done);
         assert_eq!(validation.step(), done);
         assert_eq!(
             validation.supply(&query, &[]),
             Err(SupplyError::UnexpectedQuery)
+        );
+    }
+
+    #[test]
+    fn without_ask_ahead_a_step_hands_out_only_the_awaited_query() {
+        let validator = Validator::with_root_anchors();
+        let mut validation = validator.begin(question(), 0);
+        validation.set_ask_ahead(false);
+        let query = Query {
+            name: question().name().clone(),
+            rtype: RecordType::A,
+        };
+        assert_eq!(validation.step(), need(&query, Vec::new()));
+        // The query left out ahead was never handed out.
+        let root_keys = Query {
+            name: Name::root(),
+            rtype: RecordType::DNSKEY,
+        };
+        assert_eq!(
+            validation.supply_failure(&root_keys),
+            Err(SupplyError::UnexpectedQuery)
+        );
+        assert_eq!(validation.step(), need(&query, Vec::new()));
+    }
+
+    #[test]
+    fn clearing_the_cache_empties_keys_facts_and_holds() {
+        let validator = Validator::with_root_anchors();
+        let validation = validator.begin(question(), 0);
+        validation.remember(
+            &Name::root(),
+            CacheValue::InsecureZone(InsecureReason::UnsignedDelegation),
+            3600,
+        );
+        if let Ok(mut holds) = validator.holds.lock() {
+            holds.insert(
+                0,
+                question().name().clone(),
+                RecordType::A,
+                Bogus {
+                    reason: BogusReason::SignatureInvalid,
+                    name: question().name().clone(),
+                    rtype: RecordType::A,
+                    extended_errors: Vec::new(),
+                },
+                0,
+            );
+        }
+        assert_eq!(validator.cache_len(), 2);
+        validator.clear_cache();
+        assert_eq!(validator.cache_len(), 0);
+        assert!(
+            validation
+                .cache(&Name::root(), CacheKind::InsecureZone)
+                .is_none()
         );
     }
 

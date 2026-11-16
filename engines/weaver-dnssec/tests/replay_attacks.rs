@@ -4,9 +4,9 @@
 //! Validly signed records replayed out of place must never make a signed
 //! name Insecure. Each attack here once did; each now ends Bogus.
 
-use weaver_dnssec::testing::{DenialMode, FakeResolver, KeyAlgorithm, Record, Zone, drive};
+use weaver_dnssec::testing::{self, DenialMode, FakeResolver, KeyAlgorithm, Record, Zone, drive};
 use weaver_dnssec::{
-    BogusReason, Name, Outcome, Policy, Query, Question, RecordType as T, Validator, Verdict,
+    BogusReason, Name, Policy, Query, Question, RecordType as T, Validator, Verdict,
 };
 
 const NOW: u64 = 1_100_000;
@@ -17,10 +17,7 @@ fn n(text: &str) -> Name {
     Name::from_text(text).unwrap()
 }
 fn q(text: &str, rtype: T) -> Query {
-    Query {
-        name: n(text),
-        rtype,
-    }
+    Query::new(n(text), rtype)
 }
 fn zone(text: &str) -> Zone {
     Zone::new(n(text), KeyAlgorithm::P256).unwrap()
@@ -42,23 +39,20 @@ fn ask(v: &Validator, r: &FakeResolver, name: &str) -> Verdict {
     ask_at(v, r, name, NOW).0
 }
 fn bogus(verdict: &Verdict, reason: BogusReason, name: &str, rtype: T) {
-    let Verdict::Bogus(failure) = verdict else {
+    let Verdict::Bogus { failure, .. } = verdict else {
         panic!("expected bogus {reason:?}, got {verdict:?}")
     };
-    assert_eq!(failure.reason, reason);
-    assert_eq!(failure.name, n(name));
-    assert_eq!(failure.rtype, rtype);
+    assert_eq!(failure.reason(), reason);
+    assert_eq!(failure.name(), &n(name));
+    assert_eq!(failure.rtype(), rtype);
 }
 fn secure(verdict: &Verdict, name: &str) {
-    let Verdict::Secure(answer) = verdict else {
+    let Verdict::Secure { answer, .. } = verdict else {
         panic!("expected secure {name}, got {verdict:?}")
     };
     assert_eq!(
-        answer.outcome,
-        Outcome::Records {
-            name: n(name),
-            rdata: vec![IP.to_vec()],
-        }
+        *answer.outcome(),
+        testing::records(n(name), vec![IP.to_vec()])
     );
 }
 
@@ -192,7 +186,7 @@ fn control_wildcard_substitution_with_low_iteration_chain_is_bogus() {
         }
     });
     let verdict = ask(&validator(&resolver), &resolver, "bank.example.com");
-    assert!(matches!(verdict, Verdict::Bogus(_)), "{verdict:?}");
+    assert!(matches!(verdict, Verdict::Bogus { .. }), "{verdict:?}");
 }
 
 /// The same substitution with the zone's whole chain rebuilt with opt-out:
@@ -225,7 +219,7 @@ fn an_opt_out_chain_cannot_carry_a_substituted_wildcard() {
         }
     });
     let verdict = ask(&validator(&resolver), &resolver, "bank.example.com");
-    assert!(matches!(verdict, Verdict::Bogus(_)), "{verdict:?}");
+    assert!(matches!(verdict, Verdict::Bogus { .. }), "{verdict:?}");
 }
 
 /// An existing name answered NXDOMAIN, and NODATA, with one unrelated
@@ -306,7 +300,7 @@ fn control_mixed_chain_is_bogus() {
         }
     });
     let verdict = ask(&validator(&resolver), &resolver, "news.example.com");
-    assert!(matches!(verdict, Verdict::Bogus(_)), "{verdict:?}");
+    assert!(matches!(verdict, Verdict::Bogus { .. }), "{verdict:?}");
 }
 
 /// Trust facts proven at one time are not reused when the caller's clock

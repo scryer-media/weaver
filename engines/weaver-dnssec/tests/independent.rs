@@ -54,13 +54,13 @@ impl Key {
     }
 
     fn anchor(&self) -> TrustAnchor {
-        TrustAnchor {
-            zone: Name::root(),
-            key_tag: self.tag,
-            algorithm: 15,
-            digest_type: 2,
-            digest: self.ds(ROOT, 2)[4..].to_vec(),
-        }
+        TrustAnchor::new(
+            Name::root(),
+            self.tag,
+            15,
+            2,
+            self.ds(ROOT, 2)[4..].to_vec(),
+        )
     }
 }
 
@@ -129,18 +129,15 @@ fn signed(
 }
 
 fn query(owner: &[u8], kind: u16) -> Query {
-    Query {
-        name: Name::from_wire(owner).unwrap(),
-        rtype: RecordType(kind),
-    }
+    Query::new(Name::from_wire(owner).unwrap(), RecordType::new(kind))
 }
 
 fn message(query: &Query, answer: &[Record]) -> Vec<u8> {
     let mut bytes = vec![0, 0, 0x81, 0x80, 0, 1];
     bytes.extend(u16::try_from(answer.len()).unwrap().to_be_bytes());
     bytes.extend([0, 0, 0, 0]);
-    bytes.extend(query.name.as_wire());
-    bytes.extend(query.rtype.0.to_be_bytes());
+    bytes.extend(query.name().as_wire());
+    bytes.extend(query.rtype().get().to_be_bytes());
     bytes.extend([0, 1]);
     for record in answer {
         record.append(&mut bytes);
@@ -156,13 +153,13 @@ fn authority_message(query: &Query, records: &[Record]) -> Vec<u8> {
 }
 
 fn host_anchor(key: &Key) -> TrustAnchor {
-    TrustAnchor {
-        zone: Name::from_wire(HOST).unwrap(),
-        key_tag: key.tag,
-        algorithm: 15,
-        digest_type: 2,
-        digest: key.ds(HOST, 2)[4..].to_vec(),
-    }
+    TrustAnchor::new(
+        Name::from_wire(HOST).unwrap(),
+        key.tag,
+        15,
+        2,
+        key.ds(HOST, 2)[4..].to_vec(),
+    )
 }
 
 struct Fixture {
@@ -252,11 +249,12 @@ impl Fixture {
             Question::new(Name::from_wire(owner).unwrap(), RecordType::A).unwrap(),
             now,
         );
+        validation.set_ask_ahead(false);
         let mut asked = Vec::new();
         loop {
             match validation.step() {
-                Step::Done(verdict) => return (verdict, asked),
-                Step::Need(query) => {
+                Step::Done { verdict, .. } => return (verdict, asked),
+                Step::Need { awaited: query, .. } => {
                     let bytes = self
                         .replies
                         .get(&query)
@@ -264,20 +262,27 @@ impl Fixture {
                     asked.push(query.clone());
                     validation.supply(&query, bytes).unwrap();
                 }
+                step => panic!("unexpected step {step:?}"),
             }
         }
     }
 }
 
+fn sha1_ds_policy(sha1_ds_digests: bool) -> Policy {
+    let mut policy = Policy::default();
+    policy.sha1_ds_digests = sha1_ds_digests;
+    policy
+}
+
 fn secure_ttl(verdict: Verdict) -> u32 {
-    let Verdict::Secure(answer) = verdict else {
+    let Verdict::Secure { answer, .. } = verdict else {
         panic!("expected secure answer, got {verdict:?}")
     };
     assert_eq!(
         answer.addresses(),
         vec![std::net::IpAddr::V4([192, 0, 2, 19].into())]
     );
-    answer.ttl
+    answer.ttl()
 }
 
 #[test]
@@ -408,12 +413,8 @@ fn sha1_ds_policy_changes_actual_chain_validation() {
     let (default, asked) = fixture.run(&fixture.validator(Policy::default()), NOW);
     assert_eq!(secure_ttl(default), 300);
     assert!(asked.contains(&query(CHILD, 48)));
-    let policy = Policy {
-        sha1_ds_digests: false,
-        ..Policy::default()
-    };
-    let (disabled, asked) = fixture.run(&fixture.validator(policy), NOW);
-    assert!(matches!(disabled, Verdict::Insecure(_)));
+    let (disabled, asked) = fixture.run(&fixture.validator(sha1_ds_policy(false)), NOW);
+    assert!(matches!(disabled, Verdict::Insecure { .. }));
     assert!(!asked.contains(&query(CHILD, 48)));
 }
 
@@ -428,13 +429,9 @@ fn matching_sha1_ds_cannot_rescue_a_mismatching_supported_sha256_ds() {
         43,
         signed(&fixture.root, CHILD, 1, ROOT, 43, vec![weak, strong], 300),
     );
-    let policy = Policy {
-        sha1_ds_digests: true,
-        ..Policy::default()
-    };
-    let (verdict, asked) = fixture.run(&fixture.validator(policy), NOW);
+    let (verdict, asked) = fixture.run(&fixture.validator(sha1_ds_policy(true)), NOW);
     assert!(
-        matches!(&verdict, Verdict::Bogus(bogus) if bogus.reason == BogusReason::KeysNotProven),
+        matches!(&verdict, Verdict::Bogus { failure: bogus, .. } if bogus.reason() == BogusReason::KeysNotProven),
         "{verdict:?}"
     );
     assert!(asked.contains(&query(CHILD, 48)));
@@ -458,12 +455,8 @@ fn unsupported_ds_does_not_displace_a_supported_sha1_ds() {
             300,
         ),
     );
-    let policy = Policy {
-        sha1_ds_digests: true,
-        ..Policy::default()
-    };
     assert_eq!(
-        secure_ttl(fixture.run(&fixture.validator(policy), NOW).0),
+        secure_ttl(fixture.run(&fixture.validator(sha1_ds_policy(true)), NOW).0),
         300
     );
 }
@@ -495,7 +488,9 @@ fn actual_two_key_rollover_accepts_either_trust_anchor() {
     }
     // The old anchor alone cannot authenticate a set signed only by its successor.
     let (verdict, _) = fixture.run(&fixture.validator(Policy::default()), NOW);
-    assert!(matches!(verdict, Verdict::Bogus(bogus) if bogus.reason == BogusReason::KeysNotProven));
+    assert!(
+        matches!(verdict, Verdict::Bogus { failure: bogus, .. } if bogus.reason() == BogusReason::KeysNotProven)
+    );
     // A set holding no key the anchor names is a distinct anchor mismatch.
     fixture.put(
         ROOT,
@@ -512,7 +507,7 @@ fn actual_two_key_rollover_accepts_either_trust_anchor() {
     );
     let (verdict, _) = fixture.run(&fixture.validator(Policy::default()), NOW);
     assert!(
-        matches!(&verdict, Verdict::Bogus(bogus) if bogus.reason == BogusReason::TrustAnchorMismatch),
+        matches!(&verdict, Verdict::Bogus { failure: bogus, .. } if bogus.reason() == BogusReason::TrustAnchorMismatch),
         "{verdict:?}"
     );
 }
@@ -532,13 +527,13 @@ fn cached_ancestor_keys_cannot_override_the_closest_configured_anchor() {
         43,
         signed(&fixture.root, CHILD, 1, ROOT, 43, vec![stale_ds], 300),
     );
-    let child_anchor = TrustAnchor {
-        zone: Name::from_wire(CHILD).unwrap(),
-        key_tag: fixture.child.tag,
-        algorithm: 15,
-        digest_type: 2,
-        digest: fixture.child.ds(CHILD, 2)[4..].to_vec(),
-    };
+    let child_anchor = TrustAnchor::new(
+        Name::from_wire(CHILD).unwrap(),
+        fixture.child.tag,
+        15,
+        2,
+        fixture.child.ds(CHILD, 2)[4..].to_vec(),
+    );
     let anchors = vec![fixture.root.anchor(), child_anchor];
     let cold = Validator::new(anchors.clone(), Policy::default()).unwrap();
     let (verdict, asked) = fixture.run(&cold, NOW);
@@ -605,7 +600,7 @@ fn cached_ancestor_insecurity_cannot_override_the_closest_configured_anchor() {
         .unwrap();
         assert!(matches!(
             fixture.run_name(&validator, NOW, CHILD).0,
-            Verdict::Insecure(_)
+            Verdict::Insecure { .. }
         ));
         let (verdict, asked) = fixture.run(&validator, NOW);
         assert_eq!(secure_ttl(verdict), 300);
@@ -624,7 +619,7 @@ fn ancestor_signature_cannot_bypass_a_more_specific_anchor() {
     .unwrap();
     let (verdict, asked) = fixture.run(&validator, NOW);
     assert!(
-        matches!(verdict, Verdict::Bogus(bogus) if bogus.reason == BogusReason::SignerMismatch)
+        matches!(verdict, Verdict::Bogus { failure: bogus, .. } if bogus.reason() == BogusReason::SignerMismatch)
     );
     assert_eq!(asked, [query(HOST, 1)]);
 }
@@ -653,7 +648,7 @@ fn ancestor_denial_cannot_bypass_a_more_specific_anchor() {
     .unwrap();
     let (verdict, asked) = fixture.run(&validator, NOW);
     assert!(
-        matches!(&verdict, Verdict::Bogus(bogus) if bogus.reason == BogusReason::DenialMissing),
+        matches!(&verdict, Verdict::Bogus { failure: bogus, .. } if bogus.reason() == BogusReason::DenialMissing),
         "{verdict:?}"
     );
     assert_eq!(asked, [main, query(HOST, 48)]);
@@ -689,7 +684,7 @@ fn malformed_replies_at_every_chain_stage_fail_closed_and_do_not_poison_retry() 
                 if asserted_ad {
                     malformed[3] |= 0x20;
                 }
-                let question_end = 12 + target.name.as_wire().len();
+                let question_end = 12 + target.name().as_wire().len();
                 match shape {
                     "empty" => malformed.clear(),
                     "short_header" => malformed.truncate(11),
@@ -712,10 +707,10 @@ fn malformed_replies_at_every_chain_stage_fail_closed_and_do_not_poison_retry() 
                 let validator = fixture.validator(Policy::default());
                 let (verdict, asked) = fixture.run(&validator, NOW);
                 assert!(
-                    matches!(verdict, Verdict::Bogus(ref failure)
-                        if failure.reason == BogusReason::MalformedReply
-                            && failure.name == target.name
-                            && failure.rtype == target.rtype),
+                    matches!(verdict, Verdict::Bogus { ref failure, .. }
+                        if failure.reason() == BogusReason::MalformedReply
+                            && failure.name() == target.name()
+                            && failure.rtype() == target.rtype()),
                     "{target:?}, {shape}, AD={asserted_ad}: {verdict:?}"
                 );
                 assert_eq!(asked.last(), Some(&target));
