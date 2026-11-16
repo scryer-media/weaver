@@ -2315,6 +2315,13 @@ impl StorageCapacity {
         );
     }
 
+    // Block until the pipeline told `folder` as a configured folder and its
+    // device was read: that read looks at the disk off the samplers.
+    #[cfg(feature = "test-support")]
+    pub fn wait_for_folder_read_for_test(&self, folder: &Path) {
+        self.volumes.wait_folder_read(folder);
+    }
+
     // Rung when a root that someone waits on for room has a new reading.
     pub(crate) fn readings(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.readings)
