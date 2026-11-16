@@ -3,7 +3,7 @@
 
 //! How a tracker is spoken to. Each protocol is one [`TrackerProtocol`], and
 //! one table, [`TrackerProtocols`], maps a URL scheme to the protocol that
-//! speaks it. The tracker task and the scraper ask a tracker's protocol;
+//! speaks it. The tracker task asks a tracker's protocol;
 //! they never ask which protocol it is. A new protocol is one impl and one
 //! row of [`TrackerProtocols::new`].
 
@@ -15,15 +15,14 @@ use url::Url;
 
 use crate::Identity;
 use crate::core::hash_id::Id20;
-use crate::core::net::{HttpClients, Resolver};
+use crate::core::net::HttpClients;
 use crate::session_stats::tracker::{TrackerKind, TrackerResult};
-use crate::tracker::shape::AnnounceShape;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
 use crate::tracker::tracker_comms_udp::UdpTrackerClient;
 
 use super::{
-    Announced, Events, HttpAnnounces, HttpTracker, Leg, ListenPort, Reachable, ScrapeOk,
-    SupportedTracker, TrackerCommsStats, UdpTracker,
+    Announced, Events, HttpAnnounces, HttpTracker, Leg, ListenPort, Reachable, SupportedTracker,
+    TrackerCommsStats, UdpTracker,
 };
 
 /// A turn an announce holds while it is out, handed on once dropped.
@@ -43,9 +42,6 @@ pub(super) trait TrackerProtocol: Send + Sync {
 
     /// One announce, over every leg its events name, as one answer.
     fn announce<'a>(&'a self, ask: AnnounceAsk<'a>) -> BoxFuture<'a, anyhow::Result<Announced>>;
-
-    /// The tracker's counts under one hash.
-    fn scrape<'a>(&'a self, ask: ScrapeAsk<'a>) -> BoxFuture<'a, anyhow::Result<ScrapeOk>>;
 
     /// What a cause of a failed request is counted as, when it is one of
     /// this protocol's own; None leaves it to the causes every protocol
@@ -93,21 +89,13 @@ impl AnnounceAsk<'_> {
     }
 }
 
-/// What a scrape is sent with.
-pub(super) struct ScrapeAsk<'a> {
-    pub tracker: &'a SupportedTracker,
-    pub info_hash: Id20,
-    pub user_agent: &'a str,
-    pub shape: &'static AnnounceShape,
-}
-
 /// What a torrent's trackers are reached through.
 pub struct TrackerNet {
     pub http_clients: Arc<dyn HttpClients>,
-    /// Looks up the names of HTTP trackers.
-    pub resolver: Arc<dyn Resolver>,
     /// Every address a tracker is asked at, on every hop, passes it.
     pub reachable: Reachable,
+    /// Speaks to UDP trackers, and its resolver looks up the name of every
+    /// tracker, HTTP or UDP.
     pub udp_client: UdpTrackerClient,
     /// The turns HTTP announces wait for, shared across the session.
     pub http_announces: HttpAnnounces,

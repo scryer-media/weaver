@@ -1155,3 +1155,485 @@ async fn a_udp_tracker_is_asked_only_at_addresses_the_session_may_reach() {
         "{found:?}"
     );
 }
+
+/// A resolver that finds every name at loopback and tells each name it
+/// was asked for.
+struct Asked(tokio::sync::watch::Sender<Vec<String>>);
+
+impl Resolver for Asked {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
+        self.0.send_modify(|asked| asked.push(host.to_owned()));
+        Box::pin(async move {
+            Ok(crate::core::net::Resolved::Addresses(vec![
+                (Ipv4Addr::LOCALHOST, port).into(),
+            ]))
+        })
+    }
+}
+
+// One torrent's HTTP and UDP trackers have their names looked up by one
+// resolver, the session's: there is one path for tracker names.
+#[tokio::test]
+async fn a_torrents_http_and_udp_tracker_names_go_through_one_resolver() {
+    let (_http, at) = http_listener().await;
+    let udp = crate::test_support::loopback_udp().await;
+    let named = |s: String| Url::parse(&s).unwrap();
+    let http_url = named(format!(
+        "http://http.invalid:{}/announce",
+        at.port().unwrap()
+    ));
+    let udp_url = named(format!(
+        "udp://udp.invalid:{}/announce",
+        udp.bind_addr().port()
+    ));
+    let (asked_tx, mut asked) = tokio::sync::watch::channel(Vec::new());
+    let token = CancellationToken::new();
+    let udp_client = UdpTrackerClient::new_with_socket(
+        token.clone(),
+        crate::test_support::loopback_udp().await,
+        Some(Arc::new(Asked(asked_tx))),
+    );
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![http_url], vec![udp_url]]),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: StoppedAnnounces::default(),
+        counts: Default::default(),
+    });
+    tokio::select! {
+        _ = peers.next() => panic!("no tracker answers"),
+        r = asked.wait_for(|names| {
+            names.iter().any(|n| n == "http.invalid") && names.iter().any(|n| n == "udp.invalid")
+        }) => { r.unwrap(); }
+    }
+    assert!(
+        asked
+            .borrow()
+            .iter()
+            .all(|n| n == "http.invalid" || n == "udp.invalid")
+    );
+    drop((peers, status));
+    token.cancel();
+}
+
+/// What a tracker is sent, byte for byte. Each test compares the request a
+/// tracker reads with fixed text; a change of these bytes is a change a
+/// tracker sees.
+mod golden {
+    use super::super::tests::{ManualStats, live, read_request};
+    use super::super::{TorrentStatsProvider, TrackerCommsStats};
+    use super::*;
+    use crate::Identity;
+    use crate::tracker::{AnnounceShape, qbittorrent};
+
+    /// Starts announcing to `tiers` as `identity`, for the torrent `stats`
+    /// counts, through `clients`, names looked up by `names`.
+    fn start_counted(
+        identity: Identity,
+        tiers: Vec<Vec<Tracker>>,
+        stats: Box<dyn TorrentStatsProvider>,
+        clients: Arc<dyn HttpClients>,
+        names: Option<Arc<dyn Resolver>>,
+        token: &CancellationToken,
+        stopped: &StoppedAnnounces,
+    ) -> TrackerTask {
+        let udp_sock = crate::test_support::loopback_udp_now();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, names);
+        TrackerComms::start_with_tiers(TrackerSetup {
+            info_hashes: v1_hash(),
+            identity,
+            tiers,
+            stats,
+            force_interval: None,
+            listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+            vote: no_vote(),
+            protocols: protocols(clients, reach_all(), udp_client, Default::default(), false),
+            stopped: stopped.clone(),
+            counts: Default::default(),
+        })
+    }
+
+    /// A private torrent's counts: distinct, so a field sent in the
+    /// place of another shows.
+    fn private(downloaded: u64, left: u64, completed_during_run: bool) -> TrackerCommsStats {
+        TrackerCommsStats {
+            uploaded_bytes: 3000,
+            private: true,
+            ..live(downloaded, left, completed_during_run)
+        }
+    }
+
+    fn counted(stats: TrackerCommsStats) -> Arc<ManualStats> {
+        Arc::new(ManualStats {
+            stats: parking_lot::Mutex::new(stats),
+            completed: tokio::sync::watch::channel(false).0,
+        })
+    }
+
+    /// The tests' identity, its announces in `shape`.
+    fn shaped(shape: &'static AnnounceShape) -> Identity {
+        Identity {
+            shape,
+            ..identity()
+        }
+    }
+
+    /// A private tracker at `dual.invalid`, named in both families, each
+    /// routed from a public address of the session's own, so each event
+    /// goes out twice, once a family. The own addresses are never
+    /// dialled: [`Wired`] clients reach every tracker at its loopback
+    /// listener.
+    fn dual_private(at: &Url) -> (Url, Arc<Wired>, Names) {
+        let url = Url::parse(&format!(
+            "http://dual.invalid:{}/announce/0123passkey?pk=s3cret",
+            at.port().unwrap()
+        ))
+        .unwrap();
+        let (names, addrs, _) = dual_stack();
+        let own: [IpAddr; 2] = [Ipv4Addr::new(1, 2, 3, 4).into(), "2a0a::1".parse().unwrap()];
+        let clients = Wired::routing(
+            at,
+            vec![
+                (addrs[0], Egress::From(own[0])),
+                (addrs[1], Egress::From(own[1])),
+            ],
+        );
+        (url, clients, names)
+    }
+
+    /// The next two requests, the two families' announces of one event,
+    /// answered with `bodies`; their heads with the listener's port masked.
+    async fn both_families(
+        listener: &tokio::net::TcpListener,
+        port: u16,
+        bodies: [&str; 2],
+    ) -> [String; 2] {
+        let mut heads = Vec::new();
+        let mut conns = Vec::new();
+        for _ in 0..2 {
+            let (conn, head) = read_request(listener).await;
+            conns.push(conn);
+            heads.push(head.replace(&format!(":{port}"), ":PORT"));
+        }
+        for (conn, body) in conns.into_iter().zip(bodies) {
+            respond(conn, body).await;
+        }
+        <[String; 2]>::try_from(heads).unwrap()
+    }
+
+    /// A Weaver-shaped announce's request head, `query` following the
+    /// hash and peer id. Weaver's shape lists no own address.
+    fn weaver(query: &str) -> String {
+        format!(
+            "GET /announce/0123passkey?\
+             info_hash=%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01\
+             &peer_id=%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02\
+             {query}&pk=s3cret HTTP/1.1\r\n\
+             user-agent: Test/1.0\r\n\
+             accept: */*\r\n\
+             accept-encoding: zstd,gzip,deflate,br\r\n\
+             host: dual.invalid:PORT\r\n\r\n"
+        )
+    }
+
+    /// A qBittorrent-shaped announce's request head, `query` following the
+    /// hash and peer id; reqwest adds the `Accept`, last.
+    fn qbit(query: &str) -> String {
+        format!(
+            "GET /announce/0123passkey?pk=s3cret\
+             &info_hash=%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01\
+             &peer_id=%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02\
+             {query} HTTP/1.1\r\n\
+             Host: dual.invalid:PORT\r\n\
+             User-Agent: Test/1.0\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: close\r\n\
+             Accept: */*\r\n\r\n"
+        )
+    }
+
+    const NAMES_A_PEER: &str = "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe";
+    const NAMES_ANOTHER: &str = "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aBe";
+    const NAMES_A_PEER_AND_AN_ID: &str =
+        "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aA10:tracker id3:t-1e";
+    const NAMES_AN_ID: &str = "d8:intervali1800e5:peers0:10:tracker id3:t-1e";
+    const NO_PEERS: &str = "d8:intervali1800e5:peers0:e";
+
+    /// A private torrent's `started` then `stopped` in `shape`, on a route
+    /// with a public address in each family; the heads they were sent as.
+    async fn started_then_stopped(shape: &'static AnnounceShape) -> [[String; 2]; 2] {
+        let (listener, at) = http_listener().await;
+        let port = at.port().unwrap();
+        let (url, clients, names) = dual_private(&at);
+        let stats = counted(private(5000, 7000, false));
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask {
+            mut peers,
+            status: _status,
+        } = start_counted(
+            shaped(shape),
+            vec![vec![Tracker::operator(url)]],
+            Box::new(stats.clone()),
+            clients,
+            Some(Arc::new(names)),
+            &token,
+            &stopped,
+        );
+        let started = tokio::select! {
+            _ = peers.next() => panic!("a peer came before the tracker was asked"),
+            heads = both_families(&listener, port, [NAMES_A_PEER, NO_PEERS]) => heads,
+        };
+        // The answer is taken in: the tracker is owed `stopped`.
+        assert_eq!(peers.next().await, Some(the_peer()));
+        drop(peers);
+        let stopped_heads = both_families(&listener, port, [NO_PEERS, NO_PEERS]).await;
+        stopped.wait_idle().await;
+        token.cancel();
+        [started, stopped_heads]
+    }
+
+    // A private torrent's `started`, then `stopped` after the answered
+    // `started`. qBittorrent's shape lists the public address each family
+    // leaves from as `ipv4` and `ipv6`; Weaver's lists none.
+    #[tokio::test]
+    async fn a_private_trackers_started_announce_keeps_its_bytes() {
+        let [started, stopped] = started_then_stopped(&AnnounceShape::WEAVER).await;
+        let want = weaver(
+            "&event=started&port=6881&uploaded=3000&downloaded=5000&left=7000&corrupt=0\
+             &redundant=0&compact=1&no_peer_id=0&numwant=200&key=24301",
+        );
+        assert_eq!(started, [want.clone(), want]);
+        let want = weaver(
+            "&event=stopped&port=6881&uploaded=3000&downloaded=5000&left=7000&corrupt=0\
+             &redundant=0&compact=1&no_peer_id=0&numwant=0&key=24301",
+        );
+        assert_eq!(stopped, [want.clone(), want]);
+
+        let [started, stopped] = started_then_stopped(&qbittorrent::SHAPE).await;
+        let want = qbit(
+            "&port=6881&uploaded=3000&downloaded=5000&left=7000&corrupt=0&key=00005EED\
+             &event=started&numwant=200&compact=1&no_peer_id=1&redundant=0\
+             &ipv4=1.2.3.4&ipv6=2a0a%3a%3a1",
+        );
+        assert_eq!(started, [want.clone(), want]);
+        let want = qbit(
+            "&port=6881&uploaded=3000&downloaded=5000&left=7000&corrupt=0&key=00005EED\
+             &event=stopped&numwant=0&compact=1&no_peer_id=1&redundant=0\
+             &ipv4=1.2.3.4&ipv6=2a0a%3a%3a1",
+        );
+        assert_eq!(stopped, [want.clone(), want]);
+    }
+
+    /// A private torrent in `shape` whose tracker answers `started` with a
+    /// tracker id, then completes during the run; the heads of its
+    /// `started`, `completed` and `stopped`.
+    async fn an_id_then_completed(shape: &'static AnnounceShape) -> [[String; 2]; 3] {
+        let (listener, at) = http_listener().await;
+        let port = at.port().unwrap();
+        let (url, clients, names) = dual_private(&at);
+        let stats = counted(private(5000, 7000, false));
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask {
+            mut peers,
+            status: _status,
+        } = start_counted(
+            shaped(shape),
+            vec![vec![Tracker::operator(url)]],
+            Box::new(stats.clone()),
+            clients,
+            Some(Arc::new(names)),
+            &token,
+            &stopped,
+        );
+        let started = tokio::select! {
+            _ = peers.next() => panic!("a peer came before the tracker was asked"),
+            heads = both_families(
+                &listener,
+                port,
+                [NAMES_A_PEER_AND_AN_ID, NAMES_AN_ID],
+            ) => heads,
+        };
+        assert_eq!(peers.next().await, Some(the_peer()));
+
+        *stats.stats.lock() = private(12000, 0, true);
+        stats.completed.send_replace(true);
+        // The task runs while its peers are asked for; the peer the
+        // answer names shows it was taken in before the run ends, so the
+        // tracker is owed `stopped`.
+        let (completed, peer) = tokio::join!(
+            both_families(&listener, port, [NAMES_ANOTHER, NO_PEERS]),
+            peers.next()
+        );
+        let other: SocketAddr = (Ipv4Addr::LOCALHOST, 0x1a42).into();
+        assert_eq!(peer, Some(other));
+
+        drop(peers);
+        let stopped_heads = both_families(&listener, port, [NO_PEERS, NO_PEERS]).await;
+        stopped.wait_idle().await;
+        token.cancel();
+        [started, completed, stopped_heads]
+    }
+
+    // A tracker id a tracker answered with is sent back on every later
+    // announce: `completed`, once earned, and `stopped`.
+    #[tokio::test]
+    async fn a_trackers_id_and_an_earned_completed_keep_their_bytes() {
+        let [started, completed, stopped] = an_id_then_completed(&AnnounceShape::WEAVER).await;
+        let want = weaver(
+            "&event=started&port=6881&uploaded=3000&downloaded=5000&left=7000&corrupt=0\
+             &redundant=0&compact=1&no_peer_id=0&numwant=200&key=24301",
+        );
+        assert_eq!(started, [want.clone(), want]);
+        let want = weaver(
+            "&event=completed&port=6881&uploaded=3000&downloaded=12000&left=0&corrupt=0\
+             &redundant=0&compact=1&no_peer_id=0&numwant=200&key=24301&trackerid=t-1",
+        );
+        assert_eq!(completed, [want.clone(), want]);
+        let want = weaver(
+            "&event=stopped&port=6881&uploaded=3000&downloaded=12000&left=0&corrupt=0\
+             &redundant=0&compact=1&no_peer_id=0&numwant=0&key=24301&trackerid=t-1",
+        );
+        assert_eq!(stopped, [want.clone(), want]);
+
+        let [started, completed, stopped] = an_id_then_completed(&qbittorrent::SHAPE).await;
+        let want = qbit(
+            "&port=6881&uploaded=3000&downloaded=5000&left=7000&corrupt=0&key=00005EED\
+             &event=started&numwant=200&compact=1&no_peer_id=1&redundant=0\
+             &ipv4=1.2.3.4&ipv6=2a0a%3a%3a1",
+        );
+        assert_eq!(started, [want.clone(), want]);
+        let want = qbit(
+            "&port=6881&uploaded=3000&downloaded=12000&left=0&corrupt=0&key=00005EED\
+             &event=completed&numwant=200&compact=1&no_peer_id=1&redundant=0&trackerid=t-1\
+             &ipv4=1.2.3.4&ipv6=2a0a%3a%3a1",
+        );
+        assert_eq!(completed, [want.clone(), want]);
+        let want = qbit(
+            "&port=6881&uploaded=3000&downloaded=12000&left=0&corrupt=0&key=00005EED\
+             &event=stopped&numwant=0&compact=1&no_peer_id=1&redundant=0&trackerid=t-1\
+             &ipv4=1.2.3.4&ipv6=2a0a%3a%3a1",
+        );
+        assert_eq!(stopped, [want.clone(), want]);
+    }
+
+    /// The UDP announce of `event` (BEP 15) the tests' torrent sends, its
+    /// connection and transaction ids zeroed, then the URL data option
+    /// (BEP 41) for `/0123passkey?pk=s3cret`.
+    fn udp_announce(event: u32, downloaded: u64, left: u64, num_want: i32) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0; 8]); // connection id, masked
+        d.extend_from_slice(&1u32.to_be_bytes()); // action: announce
+        d.extend_from_slice(&[0; 4]); // transaction id, masked
+        d.extend_from_slice(&[1; 20]); // info hash
+        d.extend_from_slice(&[2; 20]); // peer id
+        d.extend_from_slice(&downloaded.to_be_bytes());
+        d.extend_from_slice(&left.to_be_bytes());
+        d.extend_from_slice(&3000u64.to_be_bytes()); // uploaded
+        d.extend_from_slice(&event.to_be_bytes());
+        d.extend_from_slice(&0u32.to_be_bytes()); // ip: the sender's
+        d.extend_from_slice(&0x5eedu32.to_be_bytes()); // key
+        d.extend_from_slice(&num_want.to_be_bytes());
+        d.extend_from_slice(&6881u16.to_be_bytes()); // port
+        let data = b"/0123passkey?pk=s3cret";
+        d.extend_from_slice(&[2, u8::try_from(data.len()).unwrap()]);
+        d.extend_from_slice(data);
+        d
+    }
+
+    // The connect and announce datagrams a UDP tracker reads, `started`
+    // then `stopped`, every field compared; only the connection id and
+    // transaction id, which the exchange sets, are masked.
+    #[tokio::test]
+    async fn a_udp_trackers_started_and_stopped_keep_their_bytes() {
+        let tracker = crate::test_support::loopback_udp().await;
+        let url = Url::parse(&format!(
+            "udp://{}/0123passkey?pk=s3cret",
+            tracker.bind_addr()
+        ))
+        .unwrap();
+        let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        // Answers every connect and announce, the stopped one included.
+        let serve = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                let (len, from) = tracker.recv_from(&mut buf).await.unwrap();
+                let tid = buf[12..16].to_vec();
+                let mut reply = Vec::new();
+                if len == 16 {
+                    reply.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+                    reply.extend_from_slice(&tid);
+                    reply.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+                } else {
+                    reply.extend_from_slice(&1u32.to_be_bytes()); // announce
+                    reply.extend_from_slice(&tid);
+                    reply.extend_from_slice(&1800u32.to_be_bytes()); // interval
+                    reply.extend_from_slice(&0u32.to_be_bytes()); // leechers
+                    reply.extend_from_slice(&0u32.to_be_bytes()); // seeders
+                }
+                heard_tx.send(buf[..len].to_vec()).unwrap();
+                tracker.send_to(&reply, from).await.unwrap();
+            }
+        });
+        let stats = counted(private(5000, 7000, false));
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } = start_counted(
+            identity(),
+            vec![vec![Tracker::operator(url)]],
+            Box::new(stats.clone()),
+            crate::test_support::loopback(),
+            None,
+            &token,
+            &stopped,
+        );
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a.iter().all(|a| a.last.is_some())) => { r.unwrap(); }
+        }
+        drop(peers);
+        stopped.wait_idle().await;
+        serve.abort();
+        token.cancel();
+
+        let mut connect = Vec::new();
+        connect.extend_from_slice(&CONNECTION_ID_MAGIC.to_be_bytes());
+        connect.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+        connect.extend_from_slice(&[0; 4]); // transaction id, masked
+        let mut announces = Vec::new();
+        while let Ok(mut datagram) = heard.try_recv() {
+            datagram[12..16].fill(0);
+            if datagram.len() == 16 {
+                assert_eq!(datagram, connect);
+                continue;
+            }
+            assert_eq!(datagram[..8], 0x1122_3344_5566_7788u64.to_be_bytes());
+            datagram[..8].fill(0);
+            announces.push(datagram);
+        }
+        assert_eq!(
+            announces,
+            [
+                udp_announce(2, 5000, 7000, 200),
+                udp_announce(3, 5000, 7000, 0)
+            ]
+        );
+    }
+}

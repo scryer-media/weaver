@@ -22,14 +22,14 @@ use url::Url;
 
 use tokio::time::Instant;
 
-use super::protocol::{AnnounceAsk, ScrapeAsk, TrackerProtocol, Turn};
+use super::protocol::{AnnounceAsk, TrackerProtocol, Turn};
 use super::reach_tests::{FixedResolver, Wired};
 use super::upkeep_tests::table_once;
 use super::{
     AnnounceErrorKind, AnnounceOk, MIN_ANNOUNCE_INTERVAL, Reachable, ReannounceDelay, Refused,
-    ScrapeOk, StoppedAnnounces, SupportedTracker, ToldPorts, Tracker, TrackerAnnounce,
-    TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape,
-    TrackerTask, Unreachable, may_complete, read_answer, retry_delay,
+    StoppedAnnounces, SupportedTracker, ToldPorts, Tracker, TrackerAnnounce, TrackerComms,
+    TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerTask, Unreachable, may_complete,
+    read_answer, retry_delay,
 };
 use super::{AnnounceEvent, TrackerKind, TrackerResult};
 use super::{Announced, HttpAnnounces, TrackerNet, TrackerProtocols, TrackerSetup};
@@ -54,7 +54,6 @@ pub(super) fn protocols(
 ) -> TrackerProtocols {
     TrackerProtocols::new(TrackerNet {
         http_clients: clients,
-        resolver: udp_client.resolver_handle(),
         reachable,
         udp_client,
         http_announces,
@@ -73,10 +72,6 @@ impl TrackerProtocol for Inert {
 
     fn announce<'a>(&'a self, _: AnnounceAsk<'a>) -> BoxFuture<'a, anyhow::Result<Announced>> {
         unreachable!("an inert tracker is never announced to")
-    }
-
-    fn scrape<'a>(&'a self, _: ScrapeAsk<'a>) -> BoxFuture<'a, anyhow::Result<ScrapeOk>> {
-        unreachable!("an inert tracker is never scraped")
     }
 }
 
@@ -1178,9 +1173,9 @@ async fn a_task_another_torrents_run_takes_over_is_dropped_with_stopped() {
 }
 
 /// Stats the test drives by hand.
-struct ManualStats {
-    stats: Mutex<TrackerCommsStats>,
-    completed: tokio::sync::watch::Sender<bool>,
+pub(super) struct ManualStats {
+    pub(super) stats: Mutex<TrackerCommsStats>,
+    pub(super) completed: tokio::sync::watch::Sender<bool>,
 }
 
 impl super::TorrentStatsProvider for Arc<ManualStats> {
@@ -1404,7 +1399,9 @@ pub(super) async fn read_announce(
 }
 
 /// The next HTTP request, unanswered: its request line and headers.
-async fn read_request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
+pub(super) async fn read_request(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, String) {
     let (conn, _) = listener.accept().await.unwrap();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -2399,8 +2396,7 @@ pub(super) async fn http_listener() -> (tokio::net::TcpListener, Url) {
 
 /// `at`, a listener's URL, named by a name [`start_off_loopback`]
 /// resolves to a documentation address instead of loopback, where a
-/// tracker the operator named is asked at any path: a scrape is never
-/// sent to loopback.
+/// tracker the operator named is asked at any path.
 fn off_loopback(at: &Url) -> Url {
     let mut url = at.clone();
     url.set_host(Some("tracker.invalid")).unwrap();
@@ -2834,158 +2830,15 @@ async fn test_announce_abandoned_in_flight_leaves_no_outcome() {
     token.cancel();
 }
 
-/// A scrape reply giving `entry` as the counts of the tests' torrent.
-fn scrape_body(entry: &str) -> String {
-    format!("d5:filesd20:{}{entry}ee", "\u{1}".repeat(20))
-}
-
-#[tokio::test]
-async fn scrape_asks_the_tracker_that_last_answered_and_keeps_its_counts() {
-    let (ok, ok_at) = http_listener().await;
-    let (err, err_at) = http_listener().await;
-    let (ok_url, err_url) = (off_loopback(&ok_at), off_loopback(&err_at));
-    let stopped = StoppedAnnounces::default();
-    let (task, token) =
-        start_off_loopback(vec![vec![err_url.clone()], vec![ok_url.clone()]], &stopped).await;
-    let TrackerTask { mut peers, status } = task;
-    assert_eq!(
-        status.scrapes(),
-        vec![
-            TrackerScrape {
-                url: err_url.to_string(),
-                last: None,
-            },
-            TrackerScrape {
-                url: ok_url.to_string(),
-                last: None,
-            },
-        ]
-    );
-
-    // `err` refuses the announce, then `ok` accepts it with counts.
-    let ok_conn = tokio::select! {
-        _ = peers.next() => panic!("the tracker sent no peers"),
-        conn = async {
-            let (err_conn, _) = read_announce(&err).await;
-            respond(err_conn, "d14:failure reason4:nopee").await;
-            read_announce(&ok).await.0
-        } => conn,
-    };
-    respond(
-        ok_conn,
-        "d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e",
-    )
-    .await;
-    let mut rx = status.subscribe();
-    tokio::select! {
-        _ = peers.next() => panic!("the tracker sent no peers"),
-        r = rx.wait_for(|a| a.iter().all(|a| !a.in_flight && a.last.is_some())) => r.unwrap(),
-    };
-    // The run ends; the table stays scrapable.
-    drop(peers);
-    let q = next_announce(&ok).await;
-    assert_eq!(query_param(&q, "event"), Some("stopped"));
-    stopped.wait_idle().await;
-
-    // The scrape goes to `ok`, at its scrape URL, for the torrent's hash.
-    let tracker = async {
-        let (conn, request) = read_request(&ok).await;
-        let target = request.split(' ').nth(1).unwrap().to_owned();
-        respond(
-            conn,
-            &scrape_body("d8:completei7e10:downloadedi40e10:incompletei1ee"),
-        )
-        .await;
-        target
-    };
-    let (counts, target) = tokio::join!(status.scrape(), tracker);
-    assert_eq!(target, format!("/scrape?info_hash={}", "%01".repeat(20)));
-    let counts = counts.unwrap();
-    assert_eq!(
-        counts,
-        ScrapeOk {
-            complete: Some(7),
-            incomplete: Some(1),
-            downloaded: Some(40),
-        }
-    );
-    let scrapes = status.scrapes();
-    assert_eq!(scrapes[1].last.as_ref().unwrap().result, Ok(counts));
-    assert_eq!(scrapes[0].last, None);
-
-    // The tracker's counts are the scrape's now.
-    let announces = status.announces();
-    let accepted = announce_of(&announces, &ok_url)
-        .last
-        .as_ref()
-        .unwrap()
-        .result
-        .clone()
-        .unwrap();
-    assert_eq!((accepted.seeders, accepted.leechers), (Some(7), Some(1)));
-    // One scrape, of an HTTP tracker, answered.
-    let counted = status.counted();
-    assert_eq!(
-        counted.scrapes[TrackerKind::Http as usize][TrackerResult::Ok as usize],
-        1
-    );
-    assert_eq!(counted.scrapes.as_flattened().iter().sum::<u64>(), 1);
-    token.cancel();
-}
-
-#[tokio::test]
-async fn scrape_without_an_answered_announce_asks_the_first_tracker() {
-    let (listener, at) = http_listener().await;
-    let stopped = StoppedAnnounces::default();
-    let (task, token) = start_off_loopback(vec![vec![off_loopback(&at)]], &stopped).await;
-    // Never polled: nothing was announced.
-    let TrackerTask { peers, status } = task;
-    drop(peers);
-
-    let tracker = async {
-        let (conn, _) = read_request(&listener).await;
-        respond(conn, "d14:failure reason4:nopee").await;
-    };
-    let (result, ()) = tokio::join!(status.scrape(), tracker);
-    let e = result.unwrap_err();
-    assert!(format!("{e:#}").contains("nope"), "{e:#}");
-    let last = status.scrapes()[0].last.clone().unwrap();
-    assert!(last.result.unwrap_err().contains("nope"));
-    // A refused scrape leaves the announce table alone.
-    assert_eq!(status.announces()[0].last, None);
-    stopped.wait_idle().await;
-    token.cancel();
-}
-
-// A scrape is asked at the tracker's scrape URL, which never starts
-// `/announce`, so one at loopback is refused before it is sent
-// (libtorrent `http_tracker_connection::on_filter` judges the URL
-// asked). An e2e build asks a loopback tracker at any path.
-#[cfg(not(feature = "e2e-local-trackers"))]
-#[tokio::test]
-async fn a_loopback_tracker_is_never_scraped() {
-    let (listener, url) = http_listener().await;
-    let stopped = StoppedAnnounces::default();
-    let (task, token) = start(vec![vec![url]], &stopped).await;
-    let TrackerTask { peers, status } = task;
-    drop(peers);
-    let e = status.scrape().await.unwrap_err();
-    assert!(format!("{e:#}").contains("SSRF"), "{e:#}");
-    assert!(listener.accept().now_or_never().is_none());
-    stopped.wait_idle().await;
-    token.cancel();
-}
-
 /// A protocol for a scheme no session speaks, which records what it is
 /// asked, in order, and answers from memory: no socket, no HTTP client.
 #[derive(Default)]
 struct Recording {
     asked: Mutex<Vec<String>>,
-    scrapes: std::sync::atomic::AtomicUsize,
 }
 
-/// The refusal [`Recording`] fails its second scrape with, which only it
-/// can classify.
+/// The refusal [`Recording`] fails an announce to `refused.invalid` with,
+/// which only it can classify.
 #[derive(Debug)]
 struct FakeRefusal;
 
@@ -3026,30 +2879,15 @@ impl TrackerProtocol for Recording {
             body_len: None,
             accepted: Default::default(),
         };
+        if ask.tracker.url.host_str() == Some("refused.invalid") {
+            return futures::future::ready(Err(anyhow::Error::new(FakeRefusal))).boxed();
+        }
         let leg = super::Leg::Unbound;
         let answers = ask
             .events
             .over(leg)
             .map(|event| (leg, event, Ok(announced)));
         futures::future::ready(super::merged(answers)).boxed()
-    }
-
-    fn scrape<'a>(&'a self, ask: ScrapeAsk<'a>) -> BoxFuture<'a, anyhow::Result<ScrapeOk>> {
-        self.asked
-            .lock()
-            .push(format!("scrape {:?} of {:?}", ask.info_hash, ask.tracker));
-        let n = self
-            .scrapes
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let result = match n {
-            0 => Ok(ScrapeOk {
-                complete: Some(5),
-                incomplete: Some(6),
-                downloaded: Some(7),
-            }),
-            _ => Err(anyhow::Error::new(FakeRefusal)),
-        };
-        futures::future::ready(result).boxed()
     }
 
     fn classify(&self, cause: &(dyn std::error::Error + 'static)) -> Option<TrackerResult> {
@@ -3059,20 +2897,23 @@ impl TrackerProtocol for Recording {
 
 // The tracker task speaks to a tracker only through the protocol its
 // scheme's row names: a made-up scheme, registered alone, is announced to
-// after its gate is asked, scraped, and its failures counted as it
+// after its gate is asked, and its answers and failures are counted as it
 // classifies them, under its kind, with no HTTP or UDP code in the table.
 #[tokio::test]
-async fn the_tracker_task_announces_and_scrapes_through_the_scheme_table() {
+async fn the_tracker_task_announces_through_the_scheme_table() {
     let recording = Arc::new(Recording::default());
     let table = TrackerProtocols::from_rows(vec![(
         "fake",
         recording.clone() as Arc<dyn TrackerProtocol>,
     )]);
-    let url = Url::parse("fake://tracker.invalid:1/0123passkey/announce").unwrap();
+    let url = |host: &str| Url::parse(&format!("fake://{host}:1/0123passkey/announce")).unwrap();
     let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
         info_hashes: v1_hash(),
         identity: identity(),
-        tiers: op(vec![vec![url]]),
+        tiers: op(vec![
+            vec![url("tracker.invalid")],
+            vec![url("refused.invalid")],
+        ]),
         stats: Box::new(()),
         force_interval: None,
         listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
@@ -3082,31 +2923,29 @@ async fn the_tracker_task_announces_and_scrapes_through_the_scheme_table() {
         counts: Default::default(),
     });
     assert_eq!(peers.next().await, Some(the_peer()));
-
-    let scraped = status.scrape().await.unwrap();
-    assert_eq!(scraped.complete, Some(5));
-    let refused = status.scrape().await.unwrap_err();
-    assert!(refused.is::<FakeRefusal>(), "{refused:#}");
+    let mut rx = status.subscribe();
+    tokio::select! {
+        _ = peers.next() => panic!("one tracker names one peer"),
+        r = rx.wait_for(|a| a.iter().all(|a| a.last.is_some())) => { r.unwrap(); }
+    }
 
     let hash = Id20::new([1; 20]);
-    let tracker = "fake://tracker.invalid:1/…";
+    let mut asked = recording.asked.lock().clone();
+    asked.sort();
     assert_eq!(
-        *recording.asked.lock(),
+        asked,
         [
+            format!("announce {hash:?} Started to fake://refused.invalid:1/…"),
+            format!("announce {hash:?} Started to fake://tracker.invalid:1/…"),
             "gate event=true".to_owned(),
-            format!("announce {hash:?} Started to {tracker}"),
-            format!("scrape {hash:?} of {tracker}"),
-            format!("scrape {hash:?} of {tracker}"),
+            "gate event=true".to_owned(),
         ]
     );
     let counted = status.counted();
-    let kind = TrackerKind::Udp as usize;
-    assert_eq!(
-        counted.announces[kind][AnnounceEvent::Started as usize][TrackerResult::Ok as usize],
-        1
-    );
-    assert_eq!(counted.scrapes[kind][TrackerResult::Ok as usize], 1);
-    assert_eq!(counted.scrapes[kind][TrackerResult::Refused as usize], 1);
+    let started = &counted.announces[TrackerKind::Udp as usize][AnnounceEvent::Started as usize];
+    assert_eq!(started[TrackerResult::Ok as usize], 1);
+    assert_eq!(started[TrackerResult::Refused as usize], 1);
+    assert_eq!(started.iter().sum::<u64>(), 2);
     // A scheme the table has no row for is no tracker of the torrent.
     assert!(!status.reannounce(
         Duration::ZERO,
@@ -3114,38 +2953,4 @@ async fn the_tracker_task_announces_and_scrapes_through_the_scheme_table() {
         false
     ));
     drop(peers);
-}
-
-// A private tracker's started announce, byte for byte: request line,
-// query order and escapes, and every header. Only the listener's port is
-// masked. A change of these bytes is a change a private tracker sees.
-#[tokio::test]
-async fn a_private_trackers_started_announce_keeps_its_bytes() {
-    let (listener, at) = private_listener().await;
-    let url = off_loopback(&at);
-    let stopped = StoppedAnnounces::default();
-    let (task, token) = start_off_loopback(vec![vec![url.clone()]], &stopped).await;
-    let TrackerTask {
-        mut peers,
-        status: _status,
-    } = task;
-    let (conn, head) = tokio::select! {
-        _ = peers.next() => panic!("the tracker sent no peers"),
-        r = read_request(&listener) => r,
-    };
-    drop(conn);
-    let head = head.replace(&format!(":{}", at.port().unwrap()), ":PORT");
-    assert_eq!(
-        head,
-        "GET /announce/0123passkey?\
-         info_hash=%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01\
-         &peer_id=%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02\
-         &event=started&port=6881&uploaded=0&downloaded=0&left=16384&corrupt=0\
-         &redundant=0&compact=1&no_peer_id=0&numwant=200&key=24301&pk=s3cret HTTP/1.1\r\n\
-         user-agent: Test/1.0\r\n\
-         accept: */*\r\n\
-         accept-encoding: zstd,gzip,deflate,br\r\n\
-         host: tracker.invalid:PORT\r\n\r\n"
-    );
-    token.cancel();
 }

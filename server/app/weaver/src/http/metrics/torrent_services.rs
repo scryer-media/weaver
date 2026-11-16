@@ -64,30 +64,6 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
             );
         }
     }
-    for session in open() {
-        for kind in TrackerKind::ALL {
-            for result in TrackerResult::ALL {
-                out.sample(
-                    &f::TORRENT_TRACKER_SCRAPES,
-                    &[
-                        ("route", session.route.as_str()),
-                        ("kind", kind.as_str()),
-                        ("result", result.as_str()),
-                    ],
-                    session.trackers.scrapes[*kind as usize][*result as usize],
-                );
-            }
-        }
-    }
-    for session in open() {
-        for kind in TrackerKind::ALL {
-            out.sample_f64(
-                &f::TORRENT_TRACKER_SCRAPE_SECONDS,
-                &[("route", session.route.as_str()), ("kind", kind.as_str())],
-                seconds(session.trackers.scrape_nanos[*kind as usize]),
-            );
-        }
-    }
     dht(out, routes);
     incoming(out, routes);
     web_seeds(out, routes);

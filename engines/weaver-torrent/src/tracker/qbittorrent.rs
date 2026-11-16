@@ -169,9 +169,9 @@ mod tests {
     }
 
     // Alphanumerics and `-_!.~*()` go as they are and every other byte in
-    // lowercase hex; a scrape escapes the hash the same way.
+    // lowercase hex.
     #[test]
-    fn a_scrape_escapes_all_but_libtorrents_unreserved_bytes() {
+    fn a_hash_escapes_all_but_libtorrents_unreserved_bytes() {
         let all: Vec<u8> = (0..=255).collect();
         for chunk in all.chunks(20) {
             let mut hash = [0u8; 20];
@@ -186,10 +186,9 @@ mod tests {
                     _ => format!("%{b:02x}"),
                 })
                 .collect();
-            assert_eq!(
-                SHAPE.scrape_query(&Id20::new(hash)),
-                format!("info_hash={escaped}")
-            );
+            let mut got = String::new();
+            SHAPE.escape(&Id20::new(hash).0, &mut got);
+            assert_eq!(got, escaped);
         }
     }
 }

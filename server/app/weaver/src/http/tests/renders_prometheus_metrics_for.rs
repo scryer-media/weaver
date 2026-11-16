@@ -1516,12 +1516,6 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
             r#"weaver_torrent_session_tracker_announce_seconds_total{{{ROUTE},kind="udp"}} 30"#
         ),
         format!(r#"weaver_torrent_session_tracker_peers_total{{{ROUTE},kind="udp"}} 73"#),
-        format!(
-            r#"weaver_torrent_session_tracker_scrapes_total{{{ROUTE},kind="http",result="bad_reply"}} 74"#
-        ),
-        format!(
-            r#"weaver_torrent_session_tracker_scrape_seconds_total{{{ROUTE},kind="http"}} 0.25"#
-        ),
         format!(r#"weaver_torrent_dht_queries_sent_total{{{ROUTE},type="get_peers"}} 80"#),
         format!(
             r#"weaver_torrent_dht_query_results_total{{{ROUTE},type="get_peers",result="timeout"}} 81"#

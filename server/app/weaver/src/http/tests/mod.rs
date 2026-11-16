@@ -1615,8 +1615,6 @@ fn sample_trackers() -> weaver_server_core::torrents::metrics::tracker::TrackerS
     trackers.announces[udp][AnnounceEvent::Periodic as usize][TrackerResult::Timeout as usize] = 71;
     trackers.announce_nanos = [2_500_000_000, 30_000_000_000];
     trackers.peers = [72, 73];
-    trackers.scrapes[http][TrackerResult::BadReply as usize] = 74;
-    trackers.scrape_nanos = [250_000_000, 0];
     trackers
 }
 

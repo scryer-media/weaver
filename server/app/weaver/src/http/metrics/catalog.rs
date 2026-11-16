@@ -798,11 +798,6 @@ metric_families! {
         "Time the announces that ended took in all, since the session opened; divided by the announces it gives their mean. The wait for a turn among HTTP announces is not in it.");
     TORRENT_TRACKER_PEERS = ("weaver_torrent_session_tracker_peers_total", Counter,
         ["route", "kind"], "Peers the accepted announces named, since the session opened, known already or not.");
-    TORRENT_TRACKER_SCRAPES = ("weaver_torrent_session_tracker_scrapes_total", Counter,
-        ["route", "kind", "result"],
-        "Scrapes of a tracker that ended since the session opened, one per hash asked about, by how the tracker is spoken to and how it ended. A tracker that offers no scrape counts as error. Every combination is emitted, so the series pre-exist at zero.");
-    TORRENT_TRACKER_SCRAPE_SECONDS = ("weaver_torrent_session_tracker_scrape_seconds_total", Counter,
-        ["route", "kind"], "Time the scrapes that ended took in all, since the session opened.");
     TORRENT_DHT_QUERIES_SENT = ("weaver_torrent_dht_queries_sent_total", Counter,
         ["route", "type"], "DHT queries the session's node sent since it started, by what they ask. Absent while the session runs no DHT.");
     TORRENT_DHT_QUERY_RESULTS = ("weaver_torrent_dht_query_results_total", Counter,

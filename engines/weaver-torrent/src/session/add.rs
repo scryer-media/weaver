@@ -9,6 +9,7 @@ use super::options::AddTorrent;
 use super::options::AddTorrentOptions;
 use super::options::AddTorrentResponse;
 use super::options::ListOnlyResponse;
+use super::peer_finder::{self, FINDERS, PeerAsk, TrackerAsk};
 use super::peer_sources::Discovery;
 use super::peer_sources::FetchPhase;
 use super::peer_sources::MetadataFetch;
@@ -74,8 +75,7 @@ use tokio::sync::Notify;
 use tracing::{Instrument, debug_span, info, trace};
 
 use super::{
-    PeerRequest, ResolveMagnetResult, Session, is_bare_info_hash, torrent_from_bytes,
-    torrent_from_url,
+    ResolveMagnetResult, Session, is_bare_info_hash, torrent_from_bytes, torrent_from_url,
 };
 
 fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
@@ -379,24 +379,26 @@ impl Session {
         let make_peer_rx = |info_hashes: InfoHashes,
                             identity: &Identity,
                             private: bool,
-                            trackers: Option<TrackerTask>| {
-            self.make_peer_rx(PeerRequest {
-                info_hashes,
-                identity,
-                tracker_tiers: tracker_tiers.clone(),
-                announce: !opts.paused && !opts.list_only,
-                force_tracker_interval: opts.force_tracker_interval,
-                initial_peers: opts.initial_peers.clone().unwrap_or_default(),
-                trackers_only: trackers_only(private, opts.trackers_only),
-                discovery: Discovery::of(
-                    trackers_only(private, opts.trackers_only),
-                    opts.disable_dht,
-                    opts.disable_lsd,
-                ),
-                dht_announce: dht_announce.subscribe(),
-                ssl: None,
-                trackers,
-            })
+                            running: Option<TrackerTask>| {
+            let trackers_only = trackers_only(private, opts.trackers_only);
+            self.make_peer_rx(
+                PeerAsk {
+                    info_hashes,
+                    ssl: None,
+                    port: self.told_port(None),
+                    announce: !opts.paused && !opts.list_only,
+                    dht_announce: dht_announce.subscribe(),
+                    initial_peers: opts.initial_peers.clone().unwrap_or_default(),
+                    trackers: TrackerAsk {
+                        identity,
+                        tiers: tracker_tiers.clone(),
+                        force_interval: opts.force_tracker_interval,
+                        trackers_only,
+                        running,
+                    },
+                },
+                Discovery::of(trackers_only, opts.disable_dht, opts.disable_lsd),
+            )
         };
 
         let mut seen_peers = Vec::new();
@@ -431,15 +433,15 @@ impl Session {
                 // metadata arrives: until then it is taken to be, and asks
                 // its own trackers alone.
                 handover = handover.or_else(|| {
-                    self.start_trackers(
-                        info_hashes,
-                        &identity,
-                        tracker_tiers.clone(),
-                        opts.force_tracker_interval,
-                        true,
-                        None,
-                    )
-                    .map(TrackerHandover::new)
+                    let mut trackers = TrackerAsk {
+                        identity: &identity,
+                        tiers: tracker_tiers.clone(),
+                        force_interval: opts.force_tracker_interval,
+                        trackers_only: true,
+                        running: None,
+                    };
+                    self.start_trackers(info_hashes, &mut trackers, None, &self.announce_port)
+                        .map(TrackerHandover::new)
                 });
                 let fetched = handover.as_ref().map(TrackerHandover::task);
                 let table = fetched.as_ref().map(|task| task.status.clone());
@@ -469,9 +471,14 @@ impl Session {
                     make_peer_rx(info_hashes, &identity, true, fetched).map(|source| source.peers);
                 // The DHT and local discovery, once the trackers named no
                 // peer that may still serve the metadata.
+                // They are the finders the trackers' phase did not ask: those
+                // the torrent's options allow and a torrent taken to be
+                // private is not.
+                let trackers_phase = Discovery::added(true, &opts);
                 let then = {
                     let session = self.clone();
                     let dht_announce = dht_announce.subscribe();
+                    let identity = identity.clone();
                     async move {
                         follow_fetch(
                             table.map(|t| t.subscribe()),
@@ -481,9 +488,13 @@ impl Session {
                             session.trackers_changed.clone(),
                         )
                         .await;
-                        session
-                            .discovery_peers(info_hashes, false, dht_announce, None, sources)
-                            .unwrap_or_else(|| futures::stream::empty().boxed())
+                        let mut ask =
+                            PeerAsk::unannounced(&session, info_hashes, &identity, dht_announce);
+                        peer_finder::find(&FINDERS, &session, &mut ask, |finder| {
+                            peer_finder::after_trackers(finder, sources, trackers_phase)
+                        })
+                        .0
+                        .unwrap_or_else(|| futures::stream::empty().boxed())
                     }
                     .flatten_stream()
                     .boxed()
