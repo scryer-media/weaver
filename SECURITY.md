@@ -38,7 +38,7 @@ Torrent files, magnets, trackers, peers, DHT nodes and web seeds are attacker in
 - **Seed only what is verified.** A piece is advertised and served only when its hash was checked against data now on disk. A file that is missing or short after a restart puts the torrent in the files-missing state; it is not announced as held.
 - **Trackers and web seeds are fetched like hostile URLs.**
   - A host named by the torrent is checked as a resolved address. Where the proxy resolves names, a plainly local name is refused: `localhost`, a single label, `.lan`, `.local`, `.internal`, `.home.arpa`.
-  - A loopback tracker follows libtorrent's rule exactly: the path starts with `/announce` and has no `/`, `\` or `%` after it. A loopback scrape is never sent.
+  - A loopback tracker follows libtorrent's rule exactly: the path starts with `/announce` and has no `/`, `\` or `%` after it.
   - A redirect from a public address to a local one is refused. Trust granted to an operator-added tracker does not carry across a redirect.
   - Internationalised host names are refused where libtorrent refuses them.
   - TLS certificates are always verified.
