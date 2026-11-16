@@ -2585,8 +2585,8 @@ impl SocketDivider for TorrentsOnly {
 }
 
 // Each class holds its own part of a WireGuard tunnel's bytes. A full part
-// is at capacity, a dropped stream's bytes linger, and the reserve still
-// dials.
+// is at capacity, a dropped stream's bytes stay held while it closes, and
+// the reserve still dials.
 #[tokio::test]
 async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     let near = crate::test_support::WireGuardTestPeer::start().await;
@@ -2659,12 +2659,180 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
         Err(DialError::AtCapacity(_))
     ));
 
-    // A dropped stream lingers in the tunnel, and its bytes with it.
+    // A dropped stream's socket stays in the tunnel while it closes, and its
+    // bytes with it, counted closing.
     drop(peer);
-    assert_eq!(session.sockets.lingering(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), stream);
     assert!(!session.has_room(&Purpose::Torrent));
     drop(announce);
-    assert_eq!(session.sockets.lingering(SocketClass::Reserve), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Reserve), stream);
+}
+
+// A WireGuard session on `near` whose tunnel holds a reserve socket, a
+// listener's backlog and two torrent peers, and its tunnel.
+fn budgeted_session(
+    near: &crate::test_support::WireGuardTestPeer,
+) -> (Arc<SessionHop>, Arc<crate::WireGuardTunnelProvider>) {
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let stream = stream_bytes(None);
+    let mtu = near.client_spec("1").mtu;
+    let session = Arc::new(SessionHop {
+        sockets: Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(mtu) + 3 * stream + listener_bytes(),
+                reserve: stream,
+                torrent_kept: listener_bytes(),
+                mtu,
+            },
+            Arc::new(TorrentsOnly),
+        )),
+        ..Arc::into_inner(wireguard_session(
+            1,
+            provider.clone(),
+            provider.clone(),
+            bottom(),
+            vec![],
+            1,
+        ))
+        .unwrap()
+    });
+    (session, provider)
+}
+
+// Until the tunnel holds none of `class`'s bytes: woken as bytes come back,
+// on the slot every give-back rings.
+async fn until_given_back(sockets: &SessionSockets, class: SocketClass) {
+    let past = sockets.budget().expect("a budget").bytes + 1;
+    let freed = sockets
+        .room(SocketClass::Reserve, past)
+        .expect_err("no room past the tunnel's bytes")
+        .notify();
+    loop {
+        let back = freed.notified();
+        tokio::pin!(back);
+        back.as_mut().enable();
+        if sockets.held(class) == 0 {
+            return;
+        }
+        back.await;
+    }
+}
+
+// A dialled stream's bytes stay held after it is dropped, while its socket
+// closes in the tunnel, and come back when the tunnel frees the socket once
+// the far side finished the close.
+#[tokio::test]
+async fn a_dropped_streams_bytes_come_back_when_the_tunnel_frees_its_socket() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let (session, _provider) = budgeted_session(&near);
+    let stream = stream_bytes(None);
+    let peer = session
+        .dial(&Target {
+            purpose: Purpose::Torrent,
+            ..probe_target()
+        })
+        .await
+        .unwrap();
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), 0);
+
+    // Nothing runs the tunnel between the drop and the reads: the socket is
+    // retired, not freed.
+    drop(peer);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.owed(SocketClass::Torrent), 0);
+
+    until_given_back(&session.sockets, SocketClass::Torrent).await;
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), 0);
+}
+
+// A stream dropped while its far side answers nothing stays closing in the
+// tunnel, its bytes held; stopping the tunnel frees the socket and gives them
+// back.
+#[tokio::test]
+async fn a_closing_streams_bytes_come_back_when_its_tunnel_stops() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let (session, provider) = budgeted_session(&near);
+    let stream = stream_bytes(None);
+    let peer = session
+        .dial(&Target {
+            purpose: Purpose::Torrent,
+            ..probe_target()
+        })
+        .await
+        .unwrap();
+    // The far side goes: nothing will finish the close.
+    drop(near);
+    drop(peer);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), stream);
+
+    // Retiring the tunnel waits for its engine to end, which stops its
+    // stack and frees every socket still closing.
+    TunnelProvider::retire(&*provider).await;
+    assert_eq!(session.sockets.held(SocketClass::Torrent), 0);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), 0);
+}
+
+// A dial the far side refuses holds nothing: its socket was freed before the
+// dial returned, and its bytes with it.
+#[tokio::test]
+async fn a_failed_dial_holds_nothing() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let (session, _provider) = budgeted_session(&near);
+    let refused = session
+        .dial(&Target {
+            port: 9,
+            purpose: Purpose::Torrent,
+            ..probe_target()
+        })
+        .await;
+    assert!(refused.is_err(), "a closed port took a connection");
+    assert_eq!(session.sockets.held(SocketClass::Torrent), 0);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), 0);
+}
+
+// An accepted stream's bytes, taken before the accept, are the tunnel's once
+// it accepted: held after the stream is dropped, and back when the tunnel
+// frees the socket. The listener's backlog comes back as it is dropped.
+#[tokio::test]
+async fn an_accepted_streams_bytes_come_back_when_the_tunnel_frees_its_socket() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let (session, _provider) = budgeted_session(&near);
+    let stream = stream_bytes(None);
+    let listener = Arc::clone(&session)
+        .inbound()
+        .expect("a WireGuard session takes connections")
+        .listen(0, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.sockets.held(SocketClass::TorrentSession),
+        listener_bytes()
+    );
+    let port = listener.local_addr().port();
+    let (accepted, far) = tokio::join!(listener.accept(), near.dial_client(port));
+    let accepted = accepted.unwrap();
+    let far = far.unwrap();
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+
+    drop(accepted);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), stream);
+    // The far side closes too, and the close finishes.
+    drop(far);
+    until_given_back(&session.sockets, SocketClass::Torrent).await;
+
+    drop(listener);
+    assert_eq!(session.sockets.held(SocketClass::TorrentSession), 0);
 }
 
 // A stage that records the purpose of every dial and fails it, with room in
@@ -3009,6 +3177,7 @@ impl TunnelProvider for SizedRecorder {
         port: u16,
         _outcome: Arc<ConnectionOutcome>,
         buffers: Option<crate::wireguard::TcpBuffers>,
+        _socket: &mut StreamSocket,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         self.0.lock().unwrap().push(buffers);
         self.dial(host, port).await

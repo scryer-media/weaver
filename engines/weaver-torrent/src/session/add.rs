@@ -18,7 +18,6 @@ use super::peer_sources::follow_fetch;
 use super::peer_sources::merge_tracker_tiers;
 use super::peer_sources::metainfo_tracker_tiers;
 use super::peer_sources::own_tracker_tiers;
-use super::peer_sources::trackers_only;
 use std::{
     collections::HashSet,
     net::SocketAddr,
@@ -117,8 +116,9 @@ fn compute_only_files(
         }
         (None, Some(filename_re)) => {
             let only_files = compute_only_files_regex(info, &filename_re)?;
+            let selected = selected_files(&only_files, info.iter_file_lengths().count());
             for (idx, fd) in info.iter_file_details().enumerate() {
-                if !only_files.contains(&idx) {
+                if !selected[idx] {
                     continue;
                 }
                 if !list_only {
@@ -129,6 +129,19 @@ fn compute_only_files(
         }
         (None, None) => Ok(None),
     }
+}
+
+// Whether each of a torrent's `files` files is one `only_files` names, one
+// flag a file, built in one pass so a pass over the files does not search
+// the list for each. An index past the files names none.
+fn selected_files(only_files: &[usize], files: usize) -> Vec<bool> {
+    let mut selected = vec![false; files];
+    for &index in only_files {
+        if let Some(flag) = selected.get_mut(index) {
+            *flag = true;
+        }
+    }
+    selected
 }
 
 // Each file's level at the start: those given, one a file; or Normal for the
@@ -153,9 +166,10 @@ fn compute_file_priorities(
             }
             given
         }
-        (None, Some(only_files)) => (0..file_infos.len())
-            .map(|index| {
-                if only_files.contains(&index) {
+        (None, Some(only_files)) => selected_files(only_files, file_infos.len())
+            .into_iter()
+            .map(|selected| {
+                if selected {
                     FilePriority::Normal
                 } else {
                     FilePriority::Ignored
@@ -295,7 +309,7 @@ impl Session {
                             .iter()
                             .flatten()
                             .filter_map(|t| url::Url::parse(t).ok()),
-                        trackers_only(torrent.meta.info.data.private, opts.trackers_only),
+                        torrent.meta.info.data.private,
                     );
 
                     InternalAddResult {
@@ -380,7 +394,6 @@ impl Session {
                             identity: &Identity,
                             private: bool,
                             running: Option<TrackerTask>| {
-            let trackers_only = trackers_only(private, opts.trackers_only);
             self.make_peer_rx(
                 PeerAsk {
                     info_hashes,
@@ -388,16 +401,16 @@ impl Session {
                     port: self.told_port(None),
                     announce: !opts.paused && !opts.list_only,
                     dht_announce: dht_announce.subscribe(),
-                    initial_peers: own_peers(&opts.initial_peers, &opts.found_peers, trackers_only),
+                    initial_peers: own_peers(&opts.initial_peers, &opts.found_peers, private),
                     trackers: TrackerAsk {
                         identity,
                         tiers: tracker_tiers.clone(),
                         force_interval: opts.force_tracker_interval,
-                        trackers_only,
+                        private,
                         running,
                     },
                 },
-                Discovery::of(trackers_only, opts.disable_dht, opts.disable_lsd),
+                Discovery::of(private, opts.disable_dht, opts.disable_lsd),
             )
         };
 
@@ -424,8 +437,7 @@ impl Session {
             Some(metadata) => (metadata, peer_list),
             None => {
                 // The DHT and local discovery, when the session runs either
-                // and the torrent was not added to take peers from its
-                // trackers alone.
+                // and the torrent was not added without it.
                 let sources = Discovery::added(false, &opts);
                 let discovery =
                     (sources.dht && self.dht.is_some()) || (sources.lsd && self.lsd.is_some());
@@ -443,7 +455,7 @@ impl Session {
                         identity: &identity,
                         tiers: tracker_tiers.clone(),
                         force_interval: opts.force_tracker_interval,
-                        trackers_only: true,
+                        private: true,
                         running: None,
                     };
                     self.start_trackers(info_hashes, &mut trackers, None, &self.announce_port)
@@ -548,17 +560,6 @@ impl Session {
                 (resolved_magnet.metadata, peers)
             }
         };
-        // A public torrent a tracker rule has it take its peers from its
-        // trackers alone drops at once the peers its save found elsewhere
-        // than its trackers and the operator (the DHT's, local discovery's,
-        // peer exchange's), as a private one does once a tracker answers;
-        // those its trackers named, or that connected in, stay.
-        let peer_list = if opts.trackers_only && !metadata.info.info().private {
-            peer_list.taking_trackers_alone(true)
-        } else {
-            peer_list
-        };
-
         // A running torrent finds its peers from the start; an SSL torrent's
         // are found as it goes live, under its identity. Its trackers hear
         // it as the torrent its metadata fetch announced: that fetch's task
@@ -566,14 +567,13 @@ impl Session {
         let mut peer_rx = None;
         if !opts.paused && !opts.list_only && metadata.info.info().ssl_cert.is_none() {
             let private = metadata.info.info().private;
-            let trackers_only = trackers_only(private, opts.trackers_only);
             let trackers = handover
                 .take()
                 .and_then(TrackerHandover::take)
                 .and_then(|task| {
                     task.take_over(
                         metadata.info_hashes,
-                        self.announce_tiers(tracker_tiers.clone(), trackers_only),
+                        self.announce_tiers(tracker_tiers.clone(), private),
                     )
                 });
             peer_rx = make_peer_rx(metadata.info_hashes, &identity, private, trackers);
@@ -736,13 +736,12 @@ impl Session {
                     initial_peers: own_peers(
                         &opts.initial_peers,
                         &opts.found_peers,
-                        trackers_only(metadata.info.info().private, opts.trackers_only),
+                        metadata.info.info().private,
                     ),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_v1_hashes: opts.disable_v1_hashes,
                     super_seeding: opts.super_seeding,
                     sequential: opts.sequential.into(),
-                    trackers_only: opts.trackers_only,
                     disable_dht: opts.disable_dht,
                     disable_lsd: opts.disable_lsd,
                     disable_pex: opts.disable_pex,
@@ -919,20 +918,52 @@ impl Session {
 }
 
 /// The peers a torrent's own list hands each of its runs: those it was
-/// added with, but for a torrent that takes its peers from its trackers
-/// alone, not those a save found elsewhere. Its peer list holds those
-/// while it owes them, and once they leave, handing them out again would
-/// bring them back as the operator's.
+/// added with, but for a private torrent, not those a save found elsewhere
+/// than its trackers. Its peer list holds those while it owes them, and
+/// once they leave, handing them out again would bring them back as the
+/// operator's. A public torrent's list keeps every peer it was added
+/// with.
 fn own_peers(
     initial: &Option<Vec<SocketAddr>>,
     found: &[SocketAddr],
-    trackers_only: bool,
+    private: bool,
 ) -> Vec<SocketAddr> {
     let peers = initial.iter().flatten().copied();
-    if trackers_only && !found.is_empty() {
+    if private && !found.is_empty() {
         let found: std::collections::HashSet<_> = found.iter().collect();
         peers.filter(|addr| !found.contains(addr)).collect()
     } else {
         peers.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_files;
+
+    // The flags built once say what searching the list for each file said,
+    // over seeded lists with repeats, gaps and indexes past the files.
+    #[test]
+    fn selected_files_say_what_searching_the_list_says() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..500 {
+            let files = usize::try_from(next() % 64).unwrap();
+            let named = usize::try_from(next() % 80).unwrap();
+            let only: Vec<usize> = (0..named)
+                .map(|_| usize::try_from(next() % 80).unwrap())
+                .collect();
+            let searched: Vec<bool> = (0..files).map(|i| only.contains(&i)).collect();
+            assert_eq!(
+                selected_files(&only, files),
+                searched,
+                "{only:?} of {files}"
+            );
+        }
     }
 }

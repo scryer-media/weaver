@@ -69,22 +69,13 @@ pub(super) fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<Trac
     opts.tracker_tiers.clone()
 }
 
-/// Whether a torrent takes peers from its trackers alone: its metainfo
-/// marks it `private` (BEP 27), or it was added
-/// [`trackers_only`](AddTorrentOptions::trackers_only). Such a torrent
-/// neither looks for peers on the DHT, the local network or by peer
-/// exchange, nor announces to any tracker but its own.
-pub(crate) const fn trackers_only(private: bool, added_trackers_only: bool) -> bool {
-    private || added_trackers_only
-}
-
 /// Where a torrent looks for peers beside its trackers, as each of
 /// libtorrent's per-torrent flags leaves it: the DHT unless
 /// `torrent_flags::disable_dht` (`torrent::should_announce_dht`), the local
-/// network unless `disable_lsd` (`torrent::lsd_announce`). A torrent that
-/// takes peers from its trackers alone looks at neither, whatever its
-/// flags say: a private torrent is never announced on either
-/// (`should_announce_dht` and `lsd_announce` both return on `priv()`).
+/// network unless `disable_lsd` (`torrent::lsd_announce`). A private
+/// torrent looks at neither, whatever its flags say: both return on
+/// `priv()`. Each flag turns off its own source and nothing else; all of
+/// them off leaves a public torrent public.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Discovery {
     pub dht: bool,
@@ -92,30 +83,26 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    pub(crate) const fn of(trackers_only: bool, disable_dht: bool, disable_lsd: bool) -> Self {
+    pub(crate) const fn of(private: bool, disable_dht: bool, disable_lsd: bool) -> Self {
         Self {
-            dht: !trackers_only && !disable_dht,
-            lsd: !trackers_only && !disable_lsd,
+            dht: !private && !disable_dht,
+            lsd: !private && !disable_lsd,
         }
     }
 
     /// Under `opts`, for a torrent `private` or not.
     pub(crate) const fn added(private: bool, opts: &AddTorrentOptions) -> Self {
-        Self::of(
-            trackers_only(private, opts.trackers_only),
-            opts.disable_dht,
-            opts.disable_lsd,
-        )
+        Self::of(private, opts.disable_dht, opts.disable_lsd)
     }
 }
 
 /// Whether a torrent speaks peer exchange: the session runs it, the torrent
-/// was not added with `disable_pex`, and it takes peers from more than its
-/// trackers. libtorrent's `create_ut_pex_plugin` adds no plugin to a
-/// private torrent, and `ut_pex_plugin::tick` and
-/// `ut_pex_peer_plugin::on_extended` return while `disable_pex` is set.
-pub(crate) const fn speaks_pex(session_pex: bool, trackers_only: bool, disable_pex: bool) -> bool {
-    session_pex && !trackers_only && !disable_pex
+/// was not added with `disable_pex`, and it is not private. libtorrent's
+/// `create_ut_pex_plugin` adds no plugin to a private torrent, and
+/// `ut_pex_plugin::tick` and `ut_pex_peer_plugin::on_extended` return while
+/// `disable_pex` is set.
+pub(crate) const fn speaks_pex(session_pex: bool, private: bool, disable_pex: bool) -> bool {
+    session_pex && !private && !disable_pex
 }
 
 /// Where a magnet's metadata fetch asks for peers. Until its metadata says
@@ -230,14 +217,15 @@ pub(super) async fn follow_fetch(
 
 /// The tiers a torrent announces to: its own tiers in order, then each of
 /// `extra`, which the operator named, as a tier of its own, unless the
-/// torrent takes peers from its own trackers only. A tracker listed more
-/// than once keeps its first place, and empty tiers are dropped.
+/// torrent is private (or taken to be, as a magnet is until its metadata
+/// arrives). A tracker listed more than once keeps its first place, and
+/// empty tiers are dropped.
 pub(super) fn merge_tracker_tiers(
     own: Vec<Vec<Tracker>>,
     extra: impl IntoIterator<Item = url::Url>,
-    trackers_only: bool,
+    private: bool,
 ) -> Vec<Vec<Tracker>> {
-    let extra = (!trackers_only).then(|| extra.into_iter().map(|t| vec![Tracker::operator(t)]));
+    let extra = (!private).then(|| extra.into_iter().map(|t| vec![Tracker::operator(t)]));
     crate::tracker::tidy_tiers(own.into_iter().chain(extra.into_iter().flatten()))
 }
 
@@ -269,7 +257,7 @@ impl Session {
                     identity: &t.shared().identity(),
                     tiers: t.shared().tracker_tiers(),
                     force_interval: t.shared().options.force_tracker_interval,
-                    trackers_only: t.takes_peers_from_trackers_only(),
+                    private: t.is_private(),
                     running: None,
                 },
             },
@@ -287,16 +275,16 @@ impl Session {
     }
 
     /// The tiers a torrent announces to: its own, then the session's trackers
-    /// unless it takes peers from its own trackers only.
+    /// unless it is private.
     pub(crate) fn announce_tiers(
         &self,
         tracker_tiers: Vec<Vec<Tracker>>,
-        trackers_only: bool,
+        private: bool,
     ) -> Vec<Vec<Tracker>> {
         if self.disable_trackers {
             return Vec::new();
         }
-        merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), trackers_only)
+        merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), private)
     }
 
     /// Whether the session may reach `ip`, whoever is there: a peer, a web
@@ -380,7 +368,7 @@ impl Session {
         let task = TrackerComms::start_with_tiers(TrackerSetup {
             info_hashes,
             identity: trackers.identity.clone(),
-            tiers: self.announce_tiers(std::mem::take(&mut trackers.tiers), trackers.trackers_only),
+            tiers: self.announce_tiers(std::mem::take(&mut trackers.tiers), trackers.private),
             stats: Box::new(stats),
             force_interval: trackers.force_interval,
             listen_port: port.subscribe(),

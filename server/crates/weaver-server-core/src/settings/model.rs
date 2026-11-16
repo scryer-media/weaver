@@ -743,15 +743,6 @@ impl TrackerRule {
         Ok(self)
     }
 
-    // Whether its torrents take peers from their trackers alone: they look
-    // for none on the DHT, the local network or by peer exchange, and so
-    // announce to no tracker but their own.
-    pub fn trackers_only(&self) -> bool {
-        [self.dht, self.pex, self.lsd]
-            .iter()
-            .all(|on| *on == Some(false))
-    }
-
     // The pattern as a rule keeps it: trimmed and lower case, without a
     // trailing dot. An error when it names no host.
     pub fn pattern(pattern: &str) -> Result<String, String> {

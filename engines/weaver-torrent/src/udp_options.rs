@@ -2,11 +2,14 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 //! What a kernel datagram socket is set to before uTP runs over it: its
-//! datagrams are never fragmented, so a path-MTU probe larger than the path
-//! is dropped rather than split, and its receive buffer holds a full receive
-//! window for every connection the session may hold, as far as the host
-//! allows, so a burst across them waits in the kernel instead of being
-//! dropped while the engine is busy.
+//! receive buffer holds a full receive window for every connection the
+//! session may hold, as far as the host allows, so a burst across them waits
+//! in the kernel instead of being dropped while the engine is busy. Its
+//! datagrams keep the host's default for fragmenting; only a path-MTU probe
+//! to an IPv4 peer goes with don't-fragment, set around its one send, so a
+//! probe larger than the path is dropped rather than split (libtorrent
+//! utp_stream.cpp v2.0.15:1810-1812, udp_socket.cpp v2.0.15:159-180,
+//! 346-348).
 
 use std::{io, net::SocketAddr};
 
@@ -39,32 +42,16 @@ pub(crate) fn receive_buffer_for(connections_limit: usize) -> usize {
 }
 
 /// Set `socket`, asked for at `requested`, for uTP, with a receive buffer of
-/// `receive_buffer` bytes. Neither setting is needed for the socket to work:
-/// one the host refuses is logged, and the socket is used as it is.
+/// `receive_buffer` bytes. The setting is not needed for the socket to work:
+/// a buffer the host refuses is logged, and the socket is used as it is. Its
+/// fragmenting is left at the host's default, as libtorrent leaves it.
 pub(crate) fn set_for_utp(socket: &impl AsSocket, requested: SocketAddr, receive_buffer: usize) {
-    if requested.is_ipv4() {
-        if let Err(error) = set_dont_fragment(socket, Family::V4) {
-            warn!(%requested, %error, "the socket's IPv4 datagrams may be fragmented");
-        }
-    } else {
-        if let Err(error) = set_dont_fragment(socket, Family::V6) {
-            debug!(%requested, %error, "the socket's IPv6 datagrams may be fragmented");
-        }
-        // A socket at an IPv6 address that takes IPv4 as well sends its IPv4
-        // datagrams under the IPv4 option. Some hosts refuse it on such a
-        // socket; those datagrams then keep the host's default.
-        if takes_ipv4(socket)
-            && let Err(error) = set_dont_fragment(socket, Family::V4)
-        {
-            debug!(%requested, %error, "the socket's IPv4 datagrams may be fragmented");
-        }
-    }
-
     let socket = socket2::SockRef::from(socket);
     let before = socket.recv_buffer_size().ok();
     match raise_receive_buffer(&socket, receive_buffer) {
         Ok(now) if before != Some(now) => {
             debug!(
+                %requested,
                 ?before,
                 now,
                 asked = receive_buffer,
@@ -72,12 +59,13 @@ pub(crate) fn set_for_utp(socket: &impl AsSocket, requested: SocketAddr, receive
             );
         }
         Ok(now) => debug!(
+            %requested,
             now,
             asked = receive_buffer,
             "the socket's receive buffer was kept"
         ),
         Err(error) => {
-            debug!(?before, asked = receive_buffer, %error, "the socket's receive buffer was not raised");
+            debug!(%requested, ?before, asked = receive_buffer, %error, "the socket's receive buffer was not raised");
         }
     }
 }
@@ -119,43 +107,36 @@ pub(crate) fn takes_ipv4(socket: &impl AsSocket) -> bool {
         .is_ok_and(|only_v6| !only_v6)
 }
 
-/// Forbid fragmenting `socket`'s datagrams of `family`.
-pub(crate) fn set_dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<()> {
-    sys::set(socket, family)
-}
-
 /// Whether `socket`'s datagrams of `family` are never fragmented.
+#[cfg(test)]
 pub(crate) fn dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<bool> {
     sys::get(socket, family)
 }
 
-/// Allow fragmenting `socket`'s datagrams of `family`.
-pub(crate) fn clear_dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<()> {
-    sys::clear(socket, family)
-}
-
-/// Run `send`, one send of a datagram of `family` on `socket`, allowing it
-/// to be fragmented: a socket that forbids fragmenting allows it for this
-/// send and forbids it again after, whatever the send's outcome, as
-/// libtorrent switches the option around one send (udp_socket.cpp
-/// v2.0.15:160-180, 346-350). The caller holds the socket's lock for sends
-/// that test the path's size, so no probe goes out while it is allowed.
-/// Where the option cannot be switched off the datagram goes as any other.
-pub(crate) fn send_fragmenting(
+/// Run `send`, one send of a size probe of `family` on `socket`, with
+/// don't-fragment set for it alone: set before the send and cleared after,
+/// whatever the send's outcome, as libtorrent sets it around one send
+/// (udp_socket.cpp v2.0.15:159-180). Only a probe to an IPv4 peer carries
+/// it (udp_socket.cpp v2.0.15:347-348); one to an IPv6 peer goes as any
+/// other datagram. The caller holds the socket's lock for sends that test
+/// the path's size, so a datagram given up on as too large never goes out
+/// while it is set. Where the host refuses the option, the probe goes as
+/// any other datagram, as libtorrent ignores that error.
+pub(crate) fn send_probe(
     socket: &impl AsSocket,
     family: Family,
     send: impl FnOnce() -> io::Result<usize>,
 ) -> io::Result<usize> {
-    if !dont_fragment(socket, family).unwrap_or(false) {
+    if matches!(family, Family::V6) {
         return send();
     }
-    if let Err(error) = clear_dont_fragment(socket, family) {
-        debug!(?family, %error, "a datagram that may be fragmented goes without it");
+    if let Err(error) = sys::set(socket, family) {
+        debug!(?family, %error, "a size probe goes without don't-fragment");
         return send();
     }
     let sent = send();
-    if let Err(error) = set_dont_fragment(socket, family) {
-        warn!(?family, %error, "the socket's datagrams may be fragmented");
+    if let Err(error) = sys::clear(socket, family) {
+        warn!(?family, %error, "the socket's datagrams may not be fragmented");
     }
     sent
 }
@@ -483,7 +464,9 @@ mod many {
     }
 }
 
-// Linux asks for path-MTU discovery that never fragments.
+// Linux has no flag for it: libtorrent sets path-MTU discovery to probe,
+// which sets don't-fragment and sends past the path size the host holds,
+// and clears it to never set don't-fragment (socket.hpp v2.0.15:246-249).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod sys {
     use std::io;
@@ -492,40 +475,45 @@ mod sys {
 
     use super::Family;
 
-    fn option(family: Family) -> (libc::c_int, libc::c_int, libc::c_int) {
+    // The option's level and name, and its values for set and cleared.
+    fn option(family: Family) -> (libc::c_int, libc::c_int, libc::c_int, libc::c_int) {
         match family {
             Family::V4 => (
                 libc::IPPROTO_IP,
                 libc::IP_MTU_DISCOVER,
-                libc::IP_PMTUDISC_DO,
+                libc::IP_PMTUDISC_PROBE,
+                libc::IP_PMTUDISC_DONT,
             ),
             Family::V6 => (
                 libc::IPPROTO_IPV6,
                 libc::IPV6_MTU_DISCOVER,
-                libc::IPV6_PMTUDISC_DO,
+                libc::IPV6_PMTUDISC_PROBE,
+                libc::IPV6_PMTUDISC_DONT,
             ),
         }
     }
 
     pub(super) fn set(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
-        let (level, name, value) = option(family);
-        super::unix::set_int(socket.as_raw_fd(), level, name, value)
+        let (level, name, set, _) = option(family);
+        super::unix::set_int(socket.as_raw_fd(), level, name, set)
     }
 
-    // Never set don't-fragment, as libtorrent switches it off
-    // (socket.hpp v2.0.15:248-249).
     pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
-        let (level, name, _) = option(family);
-        let value = match family {
-            Family::V4 => libc::IP_PMTUDISC_DONT,
-            Family::V6 => libc::IPV6_PMTUDISC_DONT,
-        };
-        super::unix::set_int(socket.as_raw_fd(), level, name, value)
+        let (level, name, _, cleared) = option(family);
+        super::unix::set_int(socket.as_raw_fd(), level, name, cleared)
     }
 
+    // Set when the host sets don't-fragment on every datagram: probing, or
+    // discovering the path's size and never fragmenting.
+    #[cfg(test)]
     pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
-        let (level, name, value) = option(family);
-        Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? == value)
+        let (level, name, set, _) = option(family);
+        let value = super::unix::get_int(socket.as_raw_fd(), level, name)?;
+        let never = match family {
+            Family::V4 => libc::IP_PMTUDISC_DO,
+            Family::V6 => libc::IPV6_PMTUDISC_DO,
+        };
+        Ok(value == set || value == never)
     }
 }
 
@@ -555,6 +543,7 @@ mod sys {
         super::unix::set_int(socket.as_raw_fd(), level, name, 0)
     }
 
+    #[cfg(test)]
     pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? != 0)
@@ -567,7 +556,7 @@ mod sys {
 
     use windows::Win32::Networking::WinSock::{
         IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPV6_DONTFRAG, SOCKET, WSAGetLastError,
-        getsockopt, setsockopt,
+        setsockopt,
     };
 
     use super::Family;
@@ -608,13 +597,14 @@ mod sys {
         if done == 0 { Ok(()) } else { Err(last_error()) }
     }
 
+    #[cfg(test)]
     pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         let mut value = [0u8; 4];
         let mut len = value.len() as i32;
         // SAFETY: as in `set`; `value` has room for the int the option is.
         let done = unsafe {
-            getsockopt(
+            windows::Win32::Networking::WinSock::getsockopt(
                 SOCKET(socket.as_raw_socket() as usize),
                 level,
                 name,
@@ -630,7 +620,7 @@ mod sys {
     }
 }
 
-// A host with no such option: the socket keeps the host's default.
+// A host with no such option: a probe goes as any other datagram.
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
@@ -654,6 +644,7 @@ mod sys {
         set(socket, family)
     }
 
+    #[cfg(test)]
     pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         set(socket, family).map(|()| false)
     }
@@ -692,6 +683,7 @@ mod unix {
         libc::socklen_t::try_from(mem::size_of::<libc::c_int>()).map_err(io::Error::other)
     }
 
+    #[cfg(any(test, target_os = "linux", target_os = "android"))]
     pub(super) fn get_int(
         fd: RawFd,
         level: libc::c_int,
@@ -729,20 +721,29 @@ mod tests {
         socket2::Socket::new(domain, socket2::Type::DGRAM, None).unwrap()
     }
 
+    // Whether `socket`'s datagrams of `family` go with don't-fragment, where
+    // the host can say: None where it has no option for it, or refuses it
+    // on a socket of both families, as Apple's hosts do for IPv4.
+    fn dont_fragment_where_held(socket: &tokio::net::UdpSocket, family: Family) -> Option<bool> {
+        dont_fragment(socket, family).ok()
+    }
+
+    // A socket of both families leaves each family's datagrams at the host's
+    // default, which lets them fragment (libtorrent sets no option when it
+    // opens one: udp_socket.cpp v2.0.15:159-180 sets it for a probe alone).
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_dualstack_socket_forbids_fragmenting_each_family_the_host_allows() {
+    async fn a_dualstack_socket_lets_each_familys_datagrams_fragment() {
         let socket = crate::test_support::sockets()
             .bind_kernel_utp((Ipv6Addr::UNSPECIFIED, 0).into(), super::STREAM_WINDOW)
             .unwrap();
         assert!(!socket2::SockRef::from(socket.socket()).only_v6().unwrap());
-        assert!(dont_fragment(socket.socket(), Family::V6).unwrap());
-        match dont_fragment(socket.socket(), Family::V4) {
-            Ok(set) => assert!(set, "IPv4 datagrams may be fragmented"),
-            // Apple's hosts refuse the IPv4 option on a socket of both
-            // families; its IPv4 datagrams keep the host's default.
-            Err(_) if cfg!(target_vendor = "apple") => {}
-            Err(error) => panic!("{error}"),
+        for family in [Family::V4, Family::V6] {
+            assert_ne!(
+                dont_fragment_where_held(socket.socket(), family),
+                Some(true),
+                "{family:?}"
+            );
         }
     }
 
@@ -757,11 +758,15 @@ mod tests {
             let socket = crate::test_support::sockets()
                 .bind_kernel_utp(addr, ask)
                 .unwrap();
-            match dont_fragment(socket.socket(), family) {
-                Ok(set) => assert!(set, "{family:?} datagrams may be fragmented"),
-                // A host with no such option keeps its default.
-                Err(error) => eprintln!("{family:?}: no option to forbid fragmenting: {error}"),
-            }
+            // An ordinary datagram may be fragmented: the socket keeps the
+            // host's default, as a fresh one does.
+            let held = dont_fragment_where_held(socket.socket(), family);
+            assert_ne!(held, Some(true), "{family:?}");
+            assert_eq!(
+                held,
+                dont_fragment(&fresh(family), family).ok(),
+                "{family:?}"
+            );
             let granted = socket2::SockRef::from(socket.socket())
                 .recv_buffer_size()
                 .unwrap();
@@ -818,10 +823,10 @@ mod tests {
     }
 
     // A send that tests the path's size, either kind, leaves the socket
-    // forbidding fragmentation as before, for each family a socket of one
-    // family or of both sends, and its datagram arrives.
+    // letting its datagrams fragment as before, for each family a socket of
+    // one family or of both sends, and its datagram arrives.
     #[tokio::test]
-    async fn a_size_send_leaves_the_socket_forbidding_fragmentation() {
+    async fn a_size_send_leaves_the_socket_letting_datagrams_fragment() {
         use crate::network::Fragmenting;
 
         let v4_receiver = crate::test_support::loopback_kernel_udp();
@@ -839,7 +844,8 @@ mod tests {
             let socket = crate::test_support::sockets()
                 .bind_kernel_utp((bound, 0).into(), super::STREAM_WINDOW)
                 .unwrap();
-            let before = dont_fragment(socket.socket(), family).ok();
+            let before = dont_fragment_where_held(socket.socket(), family);
+            assert_ne!(before, Some(true), "{bound} {family:?}");
             let to = receiver.bind_addr();
             for fragmenting in [Fragmenting::Allowed, Fragmenting::Never] {
                 let parts = [IoSlice::new(b"size"), IoSlice::new(b" test")];
@@ -857,15 +863,68 @@ mod tests {
                     "{bound} {family:?} {fragmenting:?}"
                 );
                 assert_eq!(
-                    dont_fragment(socket.socket(), family).ok(),
+                    dont_fragment_where_held(socket.socket(), family),
                     before,
                     "{bound} {family:?} {fragmenting:?}"
                 );
             }
-            // Where the host has the option, the socket forbids it. Apple's
-            // hosts refuse the IPv4 option on a socket of both families.
-            if !(cfg!(target_vendor = "apple") && bound.is_ipv6() && matches!(family, Family::V4)) {
-                assert_eq!(before, Some(true), "{bound} {family:?}");
+        }
+    }
+
+    // libtorrent sends a probe with don't-fragment set around its one send,
+    // to an IPv4 peer alone (utp_stream.cpp v2.0.15:1810-1812, udp_socket.cpp
+    // v2.0.15:159-180, 347-348). A probe to an IPv4 peer is sent forbidding
+    // fragmentation, and the socket lets datagrams fragment again after it,
+    // whatever the send's outcome; one to an IPv6 peer is sent as any other.
+    #[tokio::test]
+    async fn only_a_probe_to_an_ipv4_peer_is_sent_forbidding_fragmentation() {
+        let v4_receiver = crate::test_support::loopback_kernel_udp();
+        let v6_receiver = crate::test_support::sockets()
+            .bind_kernel_udp((Ipv6Addr::LOCALHOST, 0).into())
+            .unwrap();
+        for (bound, receiver, family) in [
+            (Ipv4Addr::UNSPECIFIED.into(), &v4_receiver, Family::V4),
+            (Ipv6Addr::UNSPECIFIED.into(), &v6_receiver, Family::V6),
+            (Ipv6Addr::UNSPECIFIED.into(), &v4_receiver, Family::V4),
+        ] {
+            let bound: std::net::IpAddr = bound;
+            let socket = crate::test_support::sockets()
+                .bind_kernel_utp((bound, 0).into(), super::STREAM_WINDOW)
+                .unwrap();
+            let to = socket2::SockAddr::from(match (bound, receiver.bind_addr()) {
+                (std::net::IpAddr::V6(_), SocketAddr::V4(v4)) => {
+                    SocketAddr::from((v4.ip().to_ipv6_mapped(), v4.port()))
+                }
+                (_, to) => to,
+            });
+            let before = dont_fragment_where_held(socket.socket(), family);
+            for outcome in [Ok(()), Err(())] {
+                let mut during = None;
+                let sent = super::send_probe(socket.socket(), family, || {
+                    during = Some(dont_fragment_where_held(socket.socket(), family));
+                    let sent = socket2::SockRef::from(socket.socket()).send_to(b"probe", &to)?;
+                    outcome
+                        .map(|()| sent)
+                        .map_err(|()| std::io::Error::other("refused"))
+                });
+                assert_eq!(sent.is_ok(), outcome.is_ok());
+                let mut buf = [0u8; 16];
+                let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..len], b"probe");
+                let during = during.expect("the probe was sent");
+                match family {
+                    // Where the host has the option, set for the probe.
+                    Family::V4 if before.is_some() => {
+                        assert_eq!(during, Some(true), "{bound} {outcome:?}");
+                    }
+                    Family::V4 => assert_eq!(during, None, "{bound} {outcome:?}"),
+                    Family::V6 => assert_eq!(during, before, "{bound} {outcome:?}"),
+                }
+                assert_ne!(
+                    dont_fragment_where_held(socket.socket(), family),
+                    Some(true),
+                    "{bound} {family:?} {outcome:?}"
+                );
             }
         }
     }

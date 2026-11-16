@@ -335,7 +335,13 @@ impl InboundListener for SessionListener {
             };
             tokio::select! {
                 accepted = current.accept() => match accepted {
-                    Ok(stream) => break (stream, share),
+                    // The accepted socket's tunnel holds its bytes from
+                    // here, until it frees the socket, whatever comes next.
+                    Ok(stream) => {
+                        let mut socket = super::StreamSocket::new(share);
+                        socket.hold_in(&stream);
+                        break (stream, socket);
+                    }
                     // The tunnel stopped: listen again inside its replacement.
                     Err(_) => *listener = None,
                 },
@@ -359,7 +365,7 @@ impl InboundListener for SessionListener {
                     Some(activity),
                     capacity,
                 )
-                .holding(share.map(super::SocketPermit::lingering)),
+                .holding(share),
             )),
             outcome,
             path,

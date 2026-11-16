@@ -101,6 +101,9 @@ pub(crate) struct WebSeeds {
 #[derive(Default)]
 struct Inner {
     seeds: Vec<Entry>,
+    // The URL and kind of each of `seeds`, so a seed is found in one
+    // lookup, not a pass over them.
+    known: HashSet<(String, WebSeedKind)>,
     next_id: u32,
 }
 
@@ -192,7 +195,7 @@ impl WebSeeds {
     /// it; returns whether it was added.
     pub fn add(&self, seed: WebSeed) -> bool {
         let mut g = self.inner.lock();
-        if g.seeds.iter().any(|e| same_seed(&e.seed, &seed)) {
+        if !g.known.insert(seed_key(&seed)) {
             return false;
         }
         let id = g.next_id;
@@ -216,6 +219,9 @@ impl WebSeeds {
     /// returns whether it was there.
     pub fn remove(&self, seed: &WebSeed) -> bool {
         let mut g = self.inner.lock();
+        if !g.known.contains(&seed_key(seed)) {
+            return false;
+        }
         let Some(at) = g.seeds.iter().position(|e| same_seed(&e.seed, seed)) else {
             return false;
         };
@@ -390,8 +396,14 @@ fn same_seed(a: &WebSeed, b: &WebSeed) -> bool {
     (&a.url, a.kind) == (&b.url, b.kind)
 }
 
+// What `known` holds of a seed.
+fn seed_key(seed: &WebSeed) -> (String, WebSeedKind) {
+    (seed.url.clone(), seed.kind)
+}
+
 fn remove_at(g: &mut Inner, at: usize) {
     let entry = g.seeds.remove(at);
+    g.known.remove(&seed_key(&entry.seed));
     if let Some(c) = entry.connection {
         c.cancel();
     }
@@ -637,13 +649,18 @@ impl Layout {
     }
 
     // The parts of `len` bytes at `offset` of the torrent in each file, in
-    // order (libtorrent `file_storage::map_block`).
+    // order (libtorrent `file_storage::map_block`). The files lie end to end
+    // in torrent order, so the first is found by a binary search and only
+    // the files the bytes reach are looked at.
     fn slices(&self, offset: u64, len: u64) -> Vec<Slice> {
         let end = offset + len;
-        self.files
+        let first = self.files.partition_point(|f| f.offset + f.len <= offset);
+        self.files[first..]
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.len > 0 && f.offset < end && f.offset + f.len > offset)
+            .map(|(i, f)| (first + i, f))
+            .take_while(|(_, f)| f.offset < end)
+            .filter(|(_, f)| f.len > 0 && f.offset + f.len > offset)
             .map(|(file, f)| {
                 let start = offset.max(f.offset);
                 let stop = end.min(f.offset + f.len);
@@ -934,7 +951,7 @@ impl<'a> WebSeedConnection<'a> {
                 Some(file) => self.link.file_missing(file),
                 None => self.link.disable(),
             }
-            return Err(anyhow!("{url}: an internationalized host name"));
+            return Err(anyhow!("{}: an internationalized host name", shown(url)));
         }
         let port = url.port_or_known_default().unwrap_or(0);
         let (host, addrs) = match url.host() {
@@ -944,13 +961,16 @@ impl<'a> WebSeedConnection<'a> {
                 let found =
                     tokio::time::timeout(URLSEED_TIMEOUT, self.resolver.resolve(name, port))
                         .await
-                        .map_err(|_| anyhow!("{url}: the name lookup timed out"))
-                        .and_then(|r| r.with_context(|| format!("{url}: the name lookup failed")))
+                        .map_err(|_| anyhow!("{}: the name lookup timed out", shown(url)))
+                        .and_then(|r| {
+                            r.with_context(|| format!("{}: the name lookup failed", shown(url)))
+                        })
                         .and_then(|resolved| match resolved {
                             Resolved::Addresses(found) => {
                                 anyhow::ensure!(
                                     !found.is_empty(),
-                                    "{url}: the name has no address"
+                                    "{}: the name has no address",
+                                    shown(url)
                                 );
                                 Ok(Some(found.iter().map(SocketAddr::ip).collect()))
                             }
@@ -965,7 +985,7 @@ impl<'a> WebSeedConnection<'a> {
                     }
                 }
             }
-            None => return Err(anyhow!("{url}: no host")),
+            None => return Err(anyhow!("{}: no host", shown(url))),
         };
         let addr = match addrs.map(|addrs| endpoint(&addrs, port, target, self.allowed)) {
             None if !target.named_by.may_ask_by_name(&host) => {
@@ -973,19 +993,22 @@ impl<'a> WebSeedConnection<'a> {
                     Some(file) => self.link.file_missing(file),
                     None => self.link.disable(),
                 }
-                return Err(anyhow!("{url}: a local name it may not be asked by"));
+                return Err(anyhow!(
+                    "{}: a local name it may not be asked by",
+                    shown(url)
+                ));
             }
             None => None,
             Some(Ok(addr)) => Some(addr),
             Some(Err(Unreachable::Blocked(addr))) => {
-                return Err(anyhow!("{url}: the IP filter blocks {addr}"));
+                return Err(anyhow!("{}: the IP filter blocks {addr}", shown(url)));
             }
             Some(Err(Unreachable::Refused)) => {
                 match target.moved {
                     Some(file) => self.link.file_missing(file),
                     None => self.link.disable(),
                 }
-                return Err(anyhow!("{url}: no address it may be asked at"));
+                return Err(anyhow!("{}: no address it may be asked at", shown(url)));
             }
         };
         // A server on the local network is not asked with a query string of
@@ -999,7 +1022,8 @@ impl<'a> WebSeedConnection<'a> {
                 None => self.link.disable(),
             }
             return Err(anyhow!(
-                "SSRF mitigation: {url}: a query to a local address"
+                "SSRF mitigation: {}: a query to a local address",
+                shown(url)
             ));
         }
         let key = (host, port, addr);
@@ -1019,7 +1043,7 @@ impl<'a> WebSeedConnection<'a> {
                 }),
                 &ClientShape::FETCH.for_torrent(self.layout.info_hash),
             )
-            .with_context(|| format!("{url}: building its client"))?;
+            .with_context(|| format!("{}: building its client", shown(url)))?;
         self.pinned.lock().insert(key, client.clone());
         Ok(Reached { addr, client })
     }
@@ -1057,7 +1081,10 @@ impl<'a> WebSeedConnection<'a> {
                 .and_then(|l| target.url.join(l).ok())
             else {
                 self.link.disable();
-                return Err(anyhow!("{}: {status} without a location", target.url));
+                return Err(anyhow!(
+                    "{}: {status} without a location",
+                    shown(&target.url)
+                ));
             };
             target = Target {
                 query: to.query().is_some(),
@@ -1071,7 +1098,7 @@ impl<'a> WebSeedConnection<'a> {
         }
         Err(anyhow!(
             "{}: more than {MAX_REDIRECTS} redirects",
-            target.url
+            shown(&target.url)
         ))
     }
 
@@ -1091,7 +1118,7 @@ impl<'a> WebSeedConnection<'a> {
             self.link.file_missing(slice.file);
             self.counts.waits();
             self.link.retry_after(retry_after(&response));
-            return Err(anyhow!("{url}: {status}"));
+            return Err(anyhow!("{}: {status}", shown(&url)));
         }
         if url != first_url {
             // The file moved: it is asked for where it went from now on.
@@ -1110,11 +1137,12 @@ impl<'a> WebSeedConnection<'a> {
         };
         let Some((start, end)) = range else {
             self.link.disable();
-            return Err(anyhow!("{url}: {status} names no range"));
+            return Err(anyhow!("{}: {status} names no range", shown(&url)));
         };
         if (start, end) != (slice.offset, slice.offset + slice.len) {
             return Err(anyhow!(
-                "{url}: range {start}..{end} answers {}..{}",
+                "{}: range {start}..{end} answers {}..{}",
+                shown(&url),
                 slice.offset,
                 slice.offset + slice.len
             ));
@@ -1163,11 +1191,11 @@ impl<'a> WebSeedConnection<'a> {
                 .unwrap_or(HTTPSEED_DEFAULT_RETRY);
             self.counts.waits();
             self.link.retry_after(Some(wait));
-            return Err(anyhow!("{url}: {status}"));
+            return Err(anyhow!("{}: {status}", shown(&url)));
         }
         if status != StatusCode::OK {
             self.link.remove();
-            return Err(anyhow!("{url}: {status}"));
+            return Err(anyhow!("{}: {status}", shown(&url)));
         }
         self.read_body(response, len, blocks).await
     }
@@ -1180,6 +1208,7 @@ impl<'a> WebSeedConnection<'a> {
         tokio::time::timeout(URLSEED_TIMEOUT, request.send())
             .await
             .context("timed out")?
+            .map_err(reqwest::Error::without_url)
             .context("request failed")
     }
 
@@ -1196,22 +1225,37 @@ impl<'a> WebSeedConnection<'a> {
             let chunk = tokio::time::timeout(URLSEED_TIMEOUT, response.chunk())
                 .await
                 .context("timed out")?
-                .with_context(|| format!("{url}: reading the body"))?;
+                .map_err(reqwest::Error::without_url)
+                .with_context(|| format!("{}: reading the body", shown(&url)))?;
             let Some(chunk) = chunk else {
                 break;
             };
             if chunk.len() as u64 > left {
-                return Err(anyhow!("{url}: the body is longer than the range"));
+                return Err(anyhow!(
+                    "{}: the body is longer than the range",
+                    shown(&url)
+                ));
             }
             left -= chunk.len() as u64;
             self.counts.received(chunk.len());
             blocks.push(&chunk).await?;
         }
         if left > 0 {
-            return Err(anyhow!("{url}: the body ended {left} bytes short"));
+            return Err(anyhow!(
+                "{}: the body ended {left} bytes short",
+                shown(&url)
+            ));
         }
         Ok(())
     }
+}
+
+// `url` as a log or an error shows it: its scheme, host and port. A web
+// seed's user, path and query can carry a credential (SECURITY.md,
+// "Credentials stay with their scope"), and a server's redirect can add
+// one.
+fn shown(url: &Url) -> String {
+    redacted_tracker_url(url.as_str())
 }
 
 // How a request that got a status is counted.
@@ -1256,7 +1300,11 @@ fn wait_seconds(text: &str) -> Option<Duration> {
 /// The body, refused once it passes `cap` bytes.
 async fn read_capped(mut response: reqwest::Response, cap: usize) -> anyhow::Result<Vec<u8>> {
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)?
+    {
         if chunk.len() > cap - body.len() {
             anyhow::bail!("the body is longer than {cap} bytes");
         }

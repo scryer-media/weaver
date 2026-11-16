@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The ledger's mechanics: lingers, timers, wakes and the parts kept off the
+// The ledger's mechanics: closing streams, wakes and the parts kept off the
 // split. How the sides divide and give back is tested on the bandwidth
 // split's own rule, in the server's `socket_ledger_tests`.
 
@@ -64,41 +64,41 @@ fn alive_tasks() -> usize {
         .num_alive_tasks()
 }
 
-fn paused() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap()
-}
-
-// A dropped stream's bytes come back after the tunnel's linger, and not a
-// moment before; a datagram socket's, a listener's and those of a connect
-// that never completed come back at once.
-#[tokio::test(start_paused = true)]
-async fn bytes_come_back_when_the_tunnel_frees_the_socket() {
+// A dropped stream's bytes come back when the tunnel frees its socket, and
+// not a moment before; until then they count closing. A socket the tunnel
+// frees before its stream is dropped, as a stopped tunnel does, gives its
+// bytes back then, and the stream's drop counts nothing more. A datagram
+// socket's, a listener's and those of a connect that never completed come
+// back as they are dropped.
+#[test]
+fn bytes_come_back_when_the_tunnel_frees_the_socket() {
     let sockets = SessionSockets::new(budget(4, listener_bytes(), 40), Arc::new(Halves));
     let stream = take(&sockets, SocketClass::Nntp, peer()).expect("room");
-    drop(stream.lingering());
+    let (freed, open) = stream.for_stream();
+    assert_eq!(sockets.closing(SocketClass::Nntp), 0, "closing while open");
+    drop(open);
     assert_eq!(sockets.held(SocketClass::Nntp), peer());
-    assert_eq!(sockets.lingering(SocketClass::Nntp), peer());
-    tokio::time::advance(TUNNEL_LINGER - Duration::from_millis(1)).await;
-    tokio::task::yield_now().await;
+    assert_eq!(sockets.closing(SocketClass::Nntp), peer());
+    drop(freed);
+    assert_eq!(sockets.held(SocketClass::Nntp), 0);
+    assert_eq!(sockets.closing(SocketClass::Nntp), 0);
+
+    let stream = take(&sockets, SocketClass::Nntp, peer()).expect("room");
+    let (freed, open) = stream.for_stream();
+    drop(freed);
     assert_eq!(
         sockets.held(SocketClass::Nntp),
-        peer(),
-        "back before the linger"
+        0,
+        "freed under an open stream"
     );
-    tokio::time::advance(Duration::from_millis(1)).await;
-    while sockets.held(SocketClass::Nntp) != 0 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(sockets.lingering(SocketClass::Nntp), 0);
+    drop(open);
+    assert_eq!(sockets.held(SocketClass::Nntp), 0);
+    assert_eq!(sockets.closing(SocketClass::Nntp), 0, "closed after freed");
 
     for (class, bytes) in [
         (SocketClass::Torrent, datagram_bytes(MTU)),
         (SocketClass::TorrentSession, listener_bytes()),
-        // A connect that never completed holds no stream to linger.
+        // A connect that never completed holds no socket in the tunnel.
         (SocketClass::Nntp, peer()),
         (SocketClass::Reserve, peer()),
     ] {
@@ -110,10 +110,10 @@ async fn bytes_come_back_when_the_tunnel_frees_the_socket() {
 }
 
 // A hand-out the tunnel refused wakes as bytes come back, without polling.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_refused_dial_wakes_when_bytes_come_back() {
     let sockets = sockets(4, 20);
-    let held = fill(&sockets, SocketClass::Torrent);
+    let mut held = fill(&sockets, SocketClass::Torrent);
     assert_eq!(held.len(), 10);
     let Err(Refused { open, freed, .. }) = sockets.take(SocketClass::Torrent, peer()) else {
         panic!("a full tunnel handed out bytes");
@@ -123,39 +123,54 @@ async fn a_refused_dial_wakes_when_bytes_come_back() {
     let woken = notify.notified();
     tokio::pin!(woken);
     woken.as_mut().enable();
-    drop(held.into_iter().next().map(SocketPermit::lingering));
-    // The wake comes with the bytes, after the linger.
+    let (freed, stream) = held.pop().expect("a stream").for_stream();
+    drop(stream);
+    assert!(
+        !sockets.has_room(SocketClass::Torrent, peer()),
+        "back while closing"
+    );
+    // The wake comes with the bytes, when the tunnel frees the socket.
+    drop(freed);
     woken.await;
     assert!(sockets.has_room(SocketClass::Torrent, peer()));
     assert!(take(&sockets, SocketClass::Torrent, peer()).is_some());
 }
 
-// The linger's one timer runs only while something lingers: none before,
-// and none once the last lingering stream is back, however long after.
-#[tokio::test(start_paused = true)]
-async fn the_linger_timer_is_silent_when_nothing_lingers() {
-    let sockets = sockets(4, 10);
-    let before = alive_tasks();
-    let datagram = take(&sockets, SocketClass::Torrent, datagram_bytes(MTU)).expect("room");
-    drop(datagram);
-    assert_eq!(alive_tasks(), before, "a datagram socket started a timer");
-    let streams = fill(&sockets, SocketClass::Nntp);
-    for stream in streams {
-        drop(stream.lingering());
-    }
-    assert_eq!(alive_tasks(), before + 1, "one timer for the whole tunnel");
-    tokio::time::advance(TUNNEL_LINGER).await;
-    while sockets.held(SocketClass::Nntp) != 0 {
-        tokio::task::yield_now().await;
-    }
-    while alive_tasks() != before {
-        tokio::task::yield_now().await;
-    }
-    let shares = sockets.shares.as_ref().expect("a budget");
-    assert!(!shares.ledger().timer);
-    tokio::time::advance(10 * TUNNEL_LINGER).await;
-    tokio::task::yield_now().await;
-    assert_eq!(alive_tasks(), before);
+// The tunnel frees a socket on whatever thread it is on, holding its stack
+// lock, often with no runtime: giving the bytes back there wakes a waiter on
+// a runtime, and closing or freeing starts no task.
+#[test]
+fn bytes_come_back_off_any_runtime() {
+    let sockets = sockets(4, 2);
+    let held = fill(&sockets, SocketClass::Nntp);
+    assert_eq!(held.len(), 1);
+    let Err(refused) = sockets.take(SocketClass::Nntp, peer()) else {
+        panic!("a full side handed out bytes");
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let before = alive_tasks();
+        let notify = refused.freed.notify();
+        let woken = notify.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        let (freed, stream) = held.into_iter().next().expect("a stream").for_stream();
+        drop(stream);
+        assert_eq!(alive_tasks(), before, "a closing stream started a task");
+        std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            drop(freed);
+        })
+        .join()
+        .unwrap();
+        woken.await;
+        assert_eq!(alive_tasks(), before, "a freed socket started a task");
+    });
+    assert_eq!(sockets.held(SocketClass::Nntp), 0);
+    assert_eq!(sockets.closing(SocketClass::Nntp), 0);
+    drop(refused);
 }
 
 // A refused hand-out of the reserve presses no side, and no side owes.
@@ -227,36 +242,4 @@ async fn nothing_is_handed_out_past_the_tunnels_bytes() {
     assert!(take(&sockets, SocketClass::TorrentSession, peer()).is_none());
     assert_eq!(sockets.owed(SocketClass::Nntp), 7 * peer());
     assert_eq!(sockets.woken(), [true, false]);
-}
-
-// A stream dropped off any runtime still waits out the linger. The timer
-// cancelled with its runtime starts again on the next look, and the bytes
-// come back after the linger.
-#[test]
-fn a_linger_outlives_its_runtime_and_a_dropped_off_a_runtime_stream() {
-    let sockets = sockets(4, 20);
-    let off = take(&sockets, SocketClass::Nntp, peer()).expect("room");
-    drop(off.lingering());
-    assert_eq!(sockets.lingering(SocketClass::Nntp), peer(), "freed early");
-
-    // Lingering under a runtime that ends before the linger does.
-    let first = paused();
-    first.block_on(async {
-        let stream = take(&sockets, SocketClass::Nntp, peer()).expect("room");
-        drop(stream.lingering());
-        assert!(sockets.shares.as_ref().unwrap().ledger().timer);
-    });
-    drop(first);
-    let shares = sockets.shares.as_ref().expect("a budget");
-    assert!(!shares.ledger().timer, "a cancelled timer left its mark");
-    assert_eq!(sockets.lingering(SocketClass::Nntp), 2 * peer());
-
-    paused().block_on(async {
-        assert!(sockets.has_room(SocketClass::Nntp, peer()));
-        assert!(shares.ledger().timer, "the look started the timer");
-        tokio::time::advance(TUNNEL_LINGER).await;
-        while sockets.held(SocketClass::Nntp) != 0 {
-            tokio::task::yield_now().await;
-        }
-    });
 }

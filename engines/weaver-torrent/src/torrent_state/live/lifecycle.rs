@@ -111,10 +111,7 @@ impl TorrentStateLive {
             upload_turns,
             pex: crate::session::speaks_pex(
                 !session.disable_pex,
-                crate::session::trackers_only(
-                    paused.metadata.info.info().private,
-                    paused.shared.options.trackers_only,
-                ),
+                paused.metadata.info.info().private,
                 paused.shared.options.disable_pex,
             ),
             super_seeding,

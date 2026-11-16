@@ -20,7 +20,8 @@ use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, ReadBuf};
 use weaver_torrent::network::{
     AsyncReadVectored, AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
-    DatagramSend, DatagramSocket, Resolved, Resolver, TcpRoom, TcpWant,
+    DatagramSend, DatagramSocket, Departure, DepartureSlot, Fragmenting, Resolved, Resolver,
+    TcpRoom, TcpWant,
 };
 use weaver_torrent::upnp::{PortMapReceiver, PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
@@ -510,6 +511,9 @@ const CARRIED_SEND_BYTES: usize = 256 * 1024;
 struct CarriedPacket {
     bytes: Vec<u8>,
     target: SocketAddr,
+    // A uTP data packet's departure: the worker records when it handed the
+    // packet to the tunnel, so the stream times it from then.
+    departure: Option<Departure>,
 }
 
 struct CarriedWaiter {
@@ -583,17 +587,20 @@ impl CarriedSends {
     }
 
     fn stop(&self, fault: Option<String>) {
-        let waiters = {
+        let (waiters, dropped) = {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
             pending.stopped = true;
             if pending.fault.is_none() {
                 pending.fault = fault;
             }
-            pending.packets.clear();
+            let dropped = std::mem::take(&mut pending.packets);
             pending.bytes = 0;
             pending.count = 0;
-            std::mem::take(&mut pending.waiters)
+            (std::mem::take(&mut pending.waiters), dropped)
         };
+        // Each packet dropped unsent tells its stream it never left, once
+        // the queue's lock is released.
+        drop(dropped);
         self.terminal.send_replace(true);
         self.ready.notify_one();
         for waiter in waiters {
@@ -613,11 +620,22 @@ impl CarriedSends {
                 }
                 pending.packets.pop_front()
             };
-            let Some(packet) = packet else {
+            let Some(mut packet) = packet else {
                 ready.await;
                 continue;
             };
-            if let Err(error) = socket.send_to(&packet.bytes, packet.target).await
+            // Handed to the tunnel now: a data packet is timed from here,
+            // as libtorrent stamps a packet as late as it can, just before
+            // its send (utp_stream.cpp v2.0.15:1789-1793).
+            let handed_off = tokio::time::Instant::now();
+            let departure = packet.departure.take();
+            let sent = socket.send_to(&packet.bytes, packet.target).await;
+            if let Some(departure) = departure
+                && sent.is_ok()
+            {
+                departure.left(handed_off);
+            }
+            if let Err(error) = sent
                 && !fails_only_its_target(&error)
             {
                 // A deferred error belongs to the accepted packet, not to a
@@ -846,12 +864,16 @@ impl CarriedSender {
         Arc::as_ptr(&self.registration) as usize
     }
 
+    // Takes a packet of `len` bytes, copied by `copy`, for the worker to
+    // send, when the queue has room. `departure` gives a data packet's
+    // departure, kept only when the packet is taken.
     fn poll_enqueue(
         &mut self,
         cx: &mut Context<'_>,
         len: usize,
         target: SocketAddr,
         copy: impl FnOnce() -> Vec<u8>,
+        departure: impl FnOnce() -> Option<Departure>,
     ) -> Poll<io::Result<usize>> {
         let mut pending = self
             .sends
@@ -887,6 +909,7 @@ impl CarriedSender {
             pending.packets.push_back(CarriedPacket {
                 bytes: copy(),
                 target,
+                departure: departure(),
             });
             pending.count += 1;
             pending.bytes += len;
@@ -919,6 +942,20 @@ impl Drop for CarriedSender {
     }
 }
 
+// Every packet of a uTP data stream joined into one buffer for the queue.
+fn joined(bufs: &[IoSlice<'_>], len: usize) -> Vec<u8> {
+    let mut joined = Vec::with_capacity(len);
+    for buf in bufs {
+        joined.extend_from_slice(buf);
+    }
+    joined
+}
+
+fn joined_len(bufs: &[IoSlice<'_>]) -> usize {
+    bufs.iter()
+        .fold(0usize, |len, buf| len.saturating_add(buf.len()))
+}
+
 impl DatagramSend for CarriedSender {
     // Success means local acceptance. The worker alone sends the bounded
     // FIFO, so async handshakes and polled data retain their packet order.
@@ -928,16 +965,30 @@ impl DatagramSend for CarriedSender {
         bufs: &[IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        let len = bufs
-            .iter()
-            .fold(0usize, |len, buf| len.saturating_add(buf.len()));
-        self.poll_enqueue(cx, len, target, || {
-            let mut joined = Vec::with_capacity(len);
-            for buf in bufs {
-                joined.extend_from_slice(buf);
-            }
-            joined
-        })
+        let len = joined_len(bufs);
+        self.poll_enqueue(cx, len, target, || joined(bufs, len), || None)
+    }
+
+    // A data packet is taken for the worker, which records when it handed
+    // the packet to the tunnel: the stream times it from then, not from
+    // when it was queued. The tunnel cannot control fragmenting, so a size
+    // probe goes as any other packet.
+    fn poll_send_data(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+        _fragmenting: Option<Fragmenting>,
+        departure: &DepartureSlot<'_>,
+    ) -> Poll<io::Result<usize>> {
+        let len = joined_len(bufs);
+        self.poll_enqueue(
+            cx,
+            len,
+            target,
+            || joined(bufs, len),
+            || Some(departure.keep()),
+        )
     }
 }
 
@@ -2733,9 +2784,9 @@ mod tests {
     }
 
     // A leg whose WireGuard session has its torrent bytes full says it has
-    // no TCP room, so peers connect over uTP; it has room again once a
-    // closed peer's stream is back from the tunnel's linger. A leg on the
-    // kernel's sockets holds no bytes and always has room.
+    // no TCP room, so peers connect over uTP; it has room again once the
+    // tunnel frees a closed peer's socket. A leg on the kernel's sockets
+    // holds no bytes and always has room.
     #[tokio::test]
     async fn a_leg_has_tcp_room_while_its_tcp_peer_share_does() {
         use weaver_tunnel::pipe::{
@@ -2782,7 +2833,6 @@ mod tests {
         tokio::pin!(back);
         back.as_mut().enable();
         drop(connected);
-        tokio::time::pause();
         back.await;
         assert!(sockets.tcp_room().is_free());
 

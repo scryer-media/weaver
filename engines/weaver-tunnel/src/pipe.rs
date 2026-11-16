@@ -23,9 +23,11 @@ pub use buffers::{USENET_SEND_BYTES, set_usenet_receive_bytes, socket_buffers};
 pub use inbound::{
     Inbound, InboundListener, LISTEN_BACKLOG, PortForwarding, PortMapping, gateway_of,
 };
+pub(crate) use sockets::tuned_buffers;
 pub use sockets::{
     Demand, Refused, SIDE_CLASSES, SIDES, SessionSockets, SocketBudget, SocketClass, SocketDivider,
-    SocketPermit, TUNNEL_LINGER, datagram_bytes, listener_bytes, overhead_bytes, stream_bytes,
+    SocketPermit, StreamOpen, StreamSocket, datagram_bytes, listener_bytes, overhead_bytes,
+    stream_bytes,
 };
 
 #[cfg(test)]
@@ -1267,7 +1269,7 @@ struct OutcomeStream {
     runtime: Option<tokio::runtime::Handle>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    _socket: Option<SocketPermit>,
+    _socket: StreamSocket,
 }
 impl OutcomeStream {
     fn new(
@@ -1282,11 +1284,11 @@ impl OutcomeStream {
             runtime: tokio::runtime::Handle::try_current().ok(),
             _session: session,
             _capacity: capacity,
-            _socket: None,
+            _socket: StreamSocket::default(),
         }
     }
     // The stream holds `socket` of its session's share while it lives.
-    fn holding(mut self, socket: Option<SocketPermit>) -> Self {
+    fn holding(mut self, socket: StreamSocket) -> Self {
         self._socket = socket;
         self
     }
@@ -1297,9 +1299,10 @@ impl Drop for OutcomeStream {
         // SAFETY: the stream is dropped exactly once, here, and never used
         // again; the guard above holds the runtime for the drop.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.stream) };
-        // The stream's bytes start their linger after the tunnel retired the
-        // stream, inside the runtime, so the timer that gives them back runs.
-        drop(self._socket.take());
+        // After the tunnel retired the stream: its bytes count closing until
+        // the tunnel frees the socket, or come back now when no tunnel holds
+        // them.
+        drop(std::mem::take(&mut self._socket));
         self.outcome.closed();
     }
 }
@@ -1518,14 +1521,15 @@ impl Dialer for SessionHop {
             ),
         };
         let buffers = socket_buffers(&target.purpose);
-        // A stream lingers in the tunnel after it closes, so its bytes come
-        // back only once the tunnel frees it. One that never connected is
-        // discarded at once.
-        let socket = self.take_socket(
+        // A stream's socket stays in the tunnel after it closes, so the
+        // tunnel holds its bytes once it holds the socket and gives them back
+        // when it frees it. A dial that fails or is cancelled has its socket
+        // discarded before it returns, and these bytes come back after.
+        let mut socket = StreamSocket::new(self.take_socket(
             &sockets,
             SocketClass::of(&target.purpose),
             stream_bytes(buffers),
-        )?;
+        )?);
         let outcome = Arc::new(ConnectionOutcome::default());
         let mut connected = Err(DialError::Skipped("no destination".into()));
         let mut tried = target.host.as_str();
@@ -1539,7 +1543,13 @@ impl Dialer for SessionHop {
                 .saturating_sub(started.elapsed().saturating_sub(resolved));
             connected = tokio::time::timeout(
                 remaining / (destinations.len() - index) as u32,
-                provider.dial_sized(destination, target.port, outcome.clone(), buffers),
+                provider.dial_sized(
+                    destination,
+                    target.port,
+                    outcome.clone(),
+                    buffers,
+                    &mut socket,
+                ),
             )
             .await
             .map_err(|_| DialError::Timeout {
@@ -1600,8 +1610,8 @@ impl Dialer for SessionHop {
         path.proxies.push(self.id);
         // The owner counts the socket connected once its session is set up;
         // the tunnel then reads that side's holdings as moved.
-        if let Some(socket) = &socket {
-            outcome.on_connected(socket.connected_signal());
+        if let Some(connected) = socket.connected_signal() {
+            outcome.on_connected(connected);
         }
         Ok(Dialed {
             stream: DialedStream::Tunnel(Box::new(
@@ -1611,7 +1621,7 @@ impl Dialer for SessionHop {
                     Some(activity),
                     capacity,
                 )
-                .holding(socket.map(SocketPermit::lingering)),
+                .holding(socket),
             )),
             outcome,
             path,

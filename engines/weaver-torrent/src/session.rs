@@ -83,7 +83,7 @@ pub use options::{
     ListOnlyResponse, SessionLimits, SessionOptions, SessionPersistenceConfig, SharedLimits,
 };
 pub use peer_sources::{Discovery, FetchPhase, MetadataFetch};
-pub(crate) use peer_sources::{a_tracker_answered, speaks_pex, trackers_only};
+pub(crate) use peer_sources::{a_tracker_answered, speaks_pex};
 
 use external_ip::ExternalIps;
 

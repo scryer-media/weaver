@@ -1927,9 +1927,11 @@ pub(crate) struct SendGate {
     recv_id: u16,
     // The outbox ticket of the stream's last queued datagram.
     queued_through: u64,
-    // When the I/O task sent the data packets the stream queued.
+    // When the data packets the stream queued left: sent by the I/O task,
+    // or handed on by the stream's own sender that took them to send later.
     departures: std::sync::Arc<crate::outbox::Departures>,
-    // The last data packet was queued for the I/O task, not sent.
+    // The last data packet was queued, for the I/O task or by the stream's
+    // own sender, not sent.
     data_queued: bool,
 }
 
@@ -1941,8 +1943,9 @@ impl SendGate {
         }
     }
 
-    /// Whether the data packet just accepted was queued for the I/O task,
-    /// which records its departure, rather than sent.
+    /// Whether the data packet just accepted was queued, for the I/O task
+    /// or by the stream's own sender, which records its departure, rather
+    /// than sent.
     pub(crate) fn take_data_queued(&mut self) -> bool {
         std::mem::take(&mut self.data_queued)
     }
@@ -2437,21 +2440,31 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
                 return Ok(true);
             }
         }
-        let sent = self.poll_send_gated(gate, cx, shared, |cx| match (sender, fragmenting) {
-            (Some(sender), None) => sender.poll_send_to_vectored(cx, bufs, addr),
-            (None, None) => transport.poll_send_to_vectored(cx, bufs, addr),
-            (Some(sender), Some(fragmenting)) => {
-                sender.poll_send_to_vectored_fragmenting(cx, bufs, addr, fragmenting)
+        // A stream's own sender may take the packet to send later; it then
+        // records the packet's departure, as the I/O task does for one
+        // queued in the outbox.
+        let mut departs_later = false;
+        let sent = match sender {
+            Some(sender) => {
+                let departure = crate::traits::DepartureSlot::new(&gate.departures);
+                let sent = sender.poll_send_data(cx, bufs, addr, fragmenting, &departure);
+                departs_later = departure.kept();
+                debug_assert!(!departs_later || matches!(sent, Poll::Ready(Ok(_))));
+                Some(sent)
             }
-            (None, Some(fragmenting)) => {
-                transport.poll_send_to_vectored_fragmenting(cx, bufs, addr, fragmenting)
-            }
-        });
+            None => self.poll_send_gated(gate, cx, shared, |cx| match fragmenting {
+                None => transport.poll_send_to_vectored(cx, bufs, addr),
+                Some(fragmenting) => {
+                    transport.poll_send_to_vectored_fragmenting(cx, bufs, addr, fragmenting)
+                }
+            }),
+        };
         let Some(sent) = sent else {
             return Ok(true);
         };
         match sent {
             Poll::Ready(Ok(sz)) => {
+                gate.data_queued = departs_later;
                 if sz != total_len {
                     warn!(
                         actual_len = sz,

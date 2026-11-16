@@ -324,9 +324,11 @@ impl<Buf: AsRef<[u8]>> SeedUrls<Buf> {
         match crate::bencode::from_bytes::<BencodeValue<ByteBuf<'_>>>(self.0.as_ref()) {
             Ok(BencodeValue::Bytes(url)) => out.push(url.0),
             Ok(BencodeValue::List(list)) => {
+                // The URLs kept so far, so a long list is read in one pass.
+                let mut seen: HashSet<&[u8]> = HashSet::new();
                 for url in list {
                     if let BencodeValue::Bytes(url) = url
-                        && !out.contains(&url.0)
+                        && seen.insert(url.0)
                     {
                         out.push(url.0);
                     }
@@ -826,8 +828,12 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
     /// The piece layers a torrent carries, one entry per file of
     /// [`Self::iter_file_details`]: each key must be the root of a file
     /// larger than a piece, claimed once, and each layer that file's piece
-    /// count of hashes, whose tree has that root. A file with no layer is allowed, and a value that
-    /// is not a dict counts as no layers (libtorrent `parse_piece_layers`).
+    /// count of hashes, whose tree has that root. Files of the same content
+    /// share a root, and its layer goes to every one of them larger than a
+    /// piece, each of which must have that piece count (libtorrent
+    /// `parse_piece_layers`, src/torrent_info.cpp:1489-1513 at v2.0.15). A
+    /// file with no layer is allowed, and a value that is not a dict counts
+    /// as no layers.
     pub fn piece_layers<B: AsRef<[u8]>>(
         &self,
         layers: &PieceLayers<B>,
@@ -840,12 +846,16 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
             return Ok(out);
         };
         let piece_length = u64::from(self.info.piece_length);
-        let mut unclaimed: HashMap<Id32, usize> = files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.length > piece_length)
-            .filter_map(|(index, f)| Some((f.pieces_root?, index)))
-            .collect();
+        // Each root of a file larger than a piece, with every such file of
+        // it, in file order.
+        let mut unclaimed: HashMap<Id32, Vec<usize>> = HashMap::new();
+        for (index, f) in files.iter().enumerate() {
+            if f.length > piece_length
+                && let Some(root) = f.pieces_root
+            {
+                unclaimed.entry(root).or_default().push(index);
+            }
+        }
         for (root, layer) in entries {
             let root = <[u8; 32]>::try_from(root)
                 .map(Id32::new)
@@ -853,8 +863,11 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
             let layer = layer
                 .filter(|layer| layer.len() % 32 == 0)
                 .ok_or(Error::V2InvalidPieceLayer)?;
-            let index = unclaimed.remove(&root).ok_or(Error::V2InvalidPieceLayer)?;
-            if layer.len() as u64 != files[index].length.div_ceil(piece_length) * 32 {
+            let indexes = unclaimed.remove(&root).ok_or(Error::V2InvalidPieceLayer)?;
+            if indexes
+                .iter()
+                .any(|&i| layer.len() as u64 != files[i].length.div_ceil(piece_length) * 32)
+            {
                 return Err(Error::V2InvalidPieceLayer);
             }
             let hashes: Vec<Id32> = layer
@@ -864,7 +877,9 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
             if merkle::layer_root(&hashes, piece_length / BLOCK_SIZE) != root {
                 return Err(Error::V2InvalidPieceLayer);
             }
-            out[index] = Some(hashes);
+            for &index in &indexes {
+                out[index] = Some(hashes.clone());
+            }
         }
         Ok(out)
     }
@@ -2225,6 +2240,81 @@ mod tests {
         assert!(matches!(
             parsed.check_info_bytes(unordered.as_bytes()),
             Err(Error::InvalidBencoding)
+        ));
+    }
+
+    // libtorrent `parse_piece_layers` (src/torrent_info.cpp:1489-1513 at
+    // v2.0.15) looks each file larger than a piece up by its root: files
+    // of the same content share the one layer the torrent carries for it,
+    // and one whose piece count the layer does not match refuses the
+    // torrent.
+    #[test]
+    fn a_piece_layer_goes_to_every_file_of_its_root() {
+        use crate::core::v2_test_torrent::{TestTorrent, bstr, file_hashes, payload};
+        let piece_length = 16384u64;
+        let data = payload(3 * 16384 + 10, 4);
+        let (root, layer) = file_hashes(&data, piece_length);
+        let (root, layer) = (root.unwrap(), layer.unwrap());
+        let layers_dict = |root: &Id32, layer: &[Id32]| {
+            let mut out = b"12:piece layersd".to_vec();
+            out.extend(bstr(&root.0));
+            out.extend(bstr(&layer.iter().flat_map(|h| h.0).collect::<Vec<u8>>()));
+            out.extend_from_slice(b"e");
+            out
+        };
+        let mut t = TestTorrent::new(
+            vec![
+                ("a", data.clone()),
+                ("small", payload(100, 5)),
+                ("b", data.clone()),
+            ],
+            piece_length,
+        );
+        t.layers = false;
+        let bytes = [
+            b"d4:info".as_slice(),
+            &t.info_bytes(),
+            &layers_dict(&root, &layer),
+            b"e",
+        ]
+        .concat();
+        let (meta, info) = load(&bytes).unwrap();
+        let layers = info
+            .piece_layers(meta.piece_layers.as_ref().unwrap())
+            .unwrap();
+        let files = info.v2_files().unwrap();
+        let of = |name: &str| {
+            let at = files.iter().position(|f| f.path == [name]).unwrap();
+            layers[at].clone()
+        };
+        assert_eq!(of("a"), Some(layer.clone()));
+        assert_eq!(of("b"), Some(layer.clone()));
+        assert_eq!(of("small"), None);
+        assert_eq!(layers.iter().filter(|l| l.is_some()).count(), 2);
+
+        // Two files of the root, one a piece shorter: its piece count is
+        // not the layer's, and the torrent is refused.
+        let mut info = format!(
+            "d9:file treed1:ad0:d6:lengthi{}e11:pieces root32:",
+            data.len()
+        )
+        .into_bytes();
+        info.extend(root.0);
+        info.extend(format!("ee1:bd0:d6:lengthi{}e11:pieces root32:", 2 * 16384).bytes());
+        info.extend(root.0);
+        info.extend(
+            format!("eee12:meta versioni2e4:name1:x12:piece lengthi{piece_length}ee").bytes(),
+        );
+        let bytes = [
+            b"d4:info".as_slice(),
+            &info,
+            &layers_dict(&root, &layer),
+            b"e",
+        ]
+        .concat();
+        assert!(matches!(
+            torrent_from_bytes(&bytes),
+            Err(Error::V2InvalidPieceLayer)
         ));
     }
 
