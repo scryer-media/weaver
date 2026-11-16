@@ -1002,6 +1002,14 @@ func validateNntpChaosResponse(resp string) error {
 	return nil
 }
 
+// serverUnavailableChaos makes a server unavailable until the gate is
+// released: new sessions are refused at the greeting, and a pooled session is
+// dropped at its next BODY, so earlier scenarios cannot leave a connection
+// around the gate. It drops rather than answering 480: a 480 again right
+// after the login it asked for is the server refusing the account, which
+// Weaver holds for its whole login quarantine, long past the gate's release.
+const serverUnavailableChaos = "greet_400=100,drop_conn=100"
+
 // holdNntpChaosOnServer keeps the authenticated control connection alive so
 // greeting failures cannot lock the harness out of clearing its own gate.
 func holdNntpChaosOnServer(host, port, config string) (func() error, error) {
@@ -2642,7 +2650,7 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 	// mid-download. Refuse every BODY until the job has been observed in the
 	// state under test; the job then waits on the provider instead of racing
 	// the harness.
-	const articleGate = "greet_400=100,reauth_body=100"
+	const articleGate = serverUnavailableChaos
 	var releaseArticleGate func() error
 	defer func() {
 		if releaseArticleGate != nil {
