@@ -255,6 +255,10 @@ jobs:
           path: apps/weaver-web/dist
       - name: Run clippy
         run: cargo clippy --workspace --locked --lib --bins --tests --examples --benches -- -D warnings
+      - name: Run clippy on the pure-Rust DNSSEC backend
+        run: |
+          cargo clippy --locked -p weaver-dnssec --all-targets --no-default-features --features rust-crypto,test-support -- -D warnings
+          cargo clippy --locked -p weaver-dnssec --all-targets --features rust-crypto,test-support -- -D warnings
       - name: Cache the dylint tools
         id: dylint-tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -347,6 +351,10 @@ jobs:
         # The default nextest profile excludes every schedule family; it is
         # the single source of truth, so no filter is repeated here.
         run: cargo nextest run --workspace --locked --no-fail-fast
+      - name: Run the DNSSEC tests on the pure-Rust backend
+        run: |
+          cargo nextest run --locked -p weaver-dnssec --features rust-crypto,test-support --no-fail-fast
+          cargo nextest run --locked -p weaver-dnssec --no-default-features --features rust-crypto,test-support --no-fail-fast
       - name: Build the archive e2e binary
         run: cargo build --locked -p weaver
       - name: Prove direct unpack and PAR2 recovery for every sequential format
