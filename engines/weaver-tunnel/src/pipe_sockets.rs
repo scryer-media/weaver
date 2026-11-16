@@ -7,10 +7,11 @@
 // charged against it: first its own overhead (the OS socket's buffer, the
 // packet queues, the engine's receive pool, the resolver's socket), then each
 // socket at the size the tunnel allocates for it, from the moment it is handed
-// out until the tunnel frees it. A TCP stream lingers in the tunnel after it
-// is dropped, so its bytes come back only after the tunnel's linger; a
-// datagram socket, a listener and a connect that never completed come back at
-// once.
+// out until the tunnel frees it. A TCP stream's socket stays in the tunnel
+// after the stream is dropped, until its close finishes or the tunnel's
+// linger runs out, so the tunnel holds its bytes and hands them back the
+// moment it frees the socket (`StreamSocket`); a datagram socket, a listener
+// and a connect that never completed come back at once.
 //
 // The bytes after the overhead are split into a reserve, kept for what
 // serves every kind of traffic (name lookups, probes, feeds, other outbound
@@ -42,30 +43,32 @@
 // as a dialer that tries another transport when there is none, presses for
 // that look once it uses what it was given, as the bandwidth rule counts a
 // side pressing, and for that division only.
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
-use tokio::time::Instant;
 
 use super::{LISTEN_BACKLOG, Purpose};
-use crate::wireguard::TcpBuffers;
+use crate::wireguard::{TcpBuffers, WgTcpStream};
 use proxy_tunnels::SlotFreed;
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 
-// How long the tunnel keeps a dropped TCP stream before it frees it by force
-// (proxy-tunnels `wireguard::stack::LINGER`). A stream's bytes are charged
-// for this long after it is dropped, the worst case.
-pub const TUNNEL_LINGER: Duration = Duration::from_secs(10);
-
 // A TCP socket's buffers, each way, on a tunnel built with download tuning
 // when the socket asks for no sizes of its own (proxy-tunnels
 // `TUNED_TCP_BUFFER_BYTES`).
 const TUNED_TCP_BUFFER_BYTES: u64 = MIB;
+
+// The sizes a tunnel built with download tuning gives a TCP socket that asks
+// for none, asked explicitly.
+pub(crate) const fn tuned_buffers() -> TcpBuffers {
+    TcpBuffers::new(
+        TUNED_TCP_BUFFER_BYTES as usize,
+        TUNED_TCP_BUFFER_BYTES as usize,
+    )
+}
 
 // What the tunnel keeps for one socket beside its buffers: the socket's own
 // record and its place in the socket set. Charged at a fixed worst case.
@@ -246,11 +249,11 @@ impl SocketBudget {
 
 struct Ledger {
     budget: SocketBudget,
-    // Bytes and sockets held by each side, then the reserve, lingering ones
-    // among them.
+    // Bytes and sockets held by each side, then the reserve, and the bytes
+    // among them of streams dropped whose sockets the tunnel still holds.
     held: [u64; KINDS],
     open: [usize; KINDS],
-    lingering: [u64; KINDS],
+    closing: [u64; KINDS],
     // What each side was given at the last division; none before the first.
     given: [Option<u64>; SIDES],
     // Each side's live demands: how many ask each size of socket. A side
@@ -269,9 +272,6 @@ struct Ledger {
     rewake: [bool; SIDES],
     // The sides to wake, read once by whoever answers them.
     wake: [bool; SIDES],
-    // Dropped streams waiting out the linger: when, which kind, how much.
-    linger: VecDeque<(Instant, usize, u64)>,
-    timer: bool,
 }
 
 impl Ledger {
@@ -379,7 +379,7 @@ impl Ledger {
 
     // Bytes a side holds that are not already closing.
     fn active(&self, side: usize) -> u64 {
-        self.held[side] - self.lingering[side]
+        self.held[side] - self.closing[side]
     }
 
     fn given(&self, divider: &dyn SocketDivider, side: usize) -> u64 {
@@ -452,13 +452,13 @@ impl Shares {
         }
     }
 
-    // `bytes` of `kind` come back to the tunnel. True when a side is to be
-    // woken.
-    fn give(&self, ledger: &mut Ledger, kind: usize, bytes: u64, lingered: bool) -> bool {
+    // `bytes` of `kind` come back to the tunnel, of a stream already counted
+    // closing when `closed`. True when a side is to be woken.
+    fn give(&self, ledger: &mut Ledger, kind: usize, bytes: u64, closed: bool) -> bool {
         ledger.held[kind] -= bytes;
         ledger.open[kind] -= 1;
-        if lingered {
-            ledger.lingering[kind] -= bytes;
+        if closed {
+            ledger.closing[kind] -= bytes;
         } else {
             ledger.moved(kind);
         }
@@ -468,90 +468,35 @@ impl Shares {
         ledger.settle(&*self.divider)
     }
 
-    // Give back every lingering stream whose linger has passed. Says whether
-    // any came back, and whether a side is to be woken.
-    fn lingered(&self, ledger: &mut Ledger) -> (bool, bool) {
-        let now = Instant::now();
-        let mut asked = false;
-        let mut returned = false;
-        while let Some(&(due, kind, bytes)) = ledger.linger.front() {
-            if due > now {
-                break;
-            }
-            ledger.linger.pop_front();
-            asked |= self.give(ledger, kind, bytes, true);
-            returned = true;
-        }
-        (returned, asked)
-    }
-
-    // Return `bytes` of `kind` now.
-    fn release(self: &Arc<Self>, kind: usize, bytes: u64) {
+    // Return `bytes` of `kind` now: the socket is gone. `stream` is the
+    // stream's side of a tunnel stream's bytes, when the tunnel held them.
+    // Takes only the ledger's lock and wakes waiters, never a runtime, so it
+    // runs from any thread, the tunnel's own with its stack lock held.
+    fn release(&self, kind: usize, bytes: u64, stream: Option<&StreamEnd>) {
         let mut ledger = self.ledger();
-        let asked = self.give(&mut ledger, kind, bytes, false);
+        let closed = stream.is_some_and(|stream| {
+            stream.freed.store(true, Ordering::Relaxed);
+            stream.closed.load(Ordering::Relaxed)
+        });
+        let asked = self.give(&mut ledger, kind, bytes, closed);
         self.publish(&ledger);
         drop(ledger);
         self.settled(asked);
     }
 
-    // Return `bytes` of `kind` once the tunnel's linger has passed, with one
-    // timer for the whole tunnel, running only while something lingers.
-    // Dropped off a runtime, the bytes still wait out the linger: the next
-    // hand-out, look or timer gives them back.
-    fn linger(self: &Arc<Self>, kind: usize, bytes: u64) {
+    // The stream holding `bytes` of `kind` was dropped while the tunnel still
+    // holds its socket: the bytes are closing, and come back when the tunnel
+    // frees the socket. Nothing, when it already has.
+    fn close(&self, kind: usize, bytes: u64, stream: &StreamEnd) {
         let mut ledger = self.ledger();
-        ledger.lingering[kind] += bytes;
+        if stream.freed.load(Ordering::Relaxed) {
+            return;
+        }
+        stream.closed.store(true, Ordering::Relaxed);
+        ledger.closing[kind] += bytes;
         ledger.moved(kind);
         // Closing, the bytes are owed no more: nothing grows, so none wakes.
         ledger.settle(&*self.divider);
-        ledger
-            .linger
-            .push_back((Instant::now() + TUNNEL_LINGER, kind, bytes));
-        self.time(ledger);
-    }
-
-    // Start the linger's timer, unless one runs or nothing lingers, on the
-    // runtime of the caller, if it has one.
-    fn time(self: &Arc<Self>, mut ledger: std::sync::MutexGuard<'_, Ledger>) {
-        if ledger.timer || ledger.linger.is_empty() {
-            return;
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        ledger.timer = true;
-        drop(ledger);
-        let shares = Arc::downgrade(self);
-        // However the task ends, cancelled before it ever ran among them, the
-        // next linger or look starts the timer again.
-        let timing = Timing(shares.clone());
-        runtime.spawn(async move {
-            let mut timing = timing;
-            loop {
-                let Some(shares) = shares.upgrade() else {
-                    return;
-                };
-                let (next, asked, returned) = {
-                    let mut ledger = shares.ledger();
-                    let (returned, asked) = shares.lingered(&mut ledger);
-                    let next = ledger.linger.front().map(|&(due, _, _)| due);
-                    if next.is_none() {
-                        ledger.timer = false;
-                        timing.disarm();
-                    }
-                    shares.publish(&ledger);
-                    (next, asked, returned)
-                };
-                if returned {
-                    shares.settled(asked);
-                }
-                let Some(next) = next else {
-                    return;
-                };
-                drop(shares);
-                tokio::time::sleep_until(next).await;
-            }
-        });
     }
 
     // A socket of `kind` connected: no bytes move, so only the side woken
@@ -574,40 +519,16 @@ impl Shares {
     }
 }
 
-// The linger's timer, running until it is dropped.
-struct Timing(Weak<Shares>);
-
-impl Timing {
-    // The timer ended itself, and said so.
-    fn disarm(&mut self) {
-        self.0 = Weak::new();
-    }
-}
-
-impl Drop for Timing {
-    fn drop(&mut self) {
-        if let Some(shares) = self.0.upgrade() {
-            shares.ledger().timer = false;
-        }
-    }
-}
-
-// The bytes one socket holds of the tunnel.
+// The bytes one socket holds of the tunnel, given back when it is dropped.
 pub struct SocketPermit {
     shares: Arc<Shares>,
     kind: usize,
     bytes: u64,
-    lingers: bool,
+    // The stream's side, for a permit a tunnel holds for a TCP stream.
+    stream: Option<Arc<StreamEnd>>,
 }
 
 impl SocketPermit {
-    // The socket is a TCP stream: its bytes come back after the tunnel's
-    // linger, not when it is dropped.
-    pub fn lingering(mut self) -> Self {
-        self.lingers = true;
-        self
-    }
-
     pub const fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -625,15 +546,99 @@ impl SocketPermit {
             }
         }
     }
+
+    // Split the bytes of a TCP stream whose socket outlives it: the permit,
+    // for the tunnel to drop when it frees the socket, and the stream's
+    // `StreamOpen`, whose drop counts the bytes closing, owed no more, until
+    // the permit gives them back. Whichever goes first, the bytes come back
+    // exactly once, when the permit goes.
+    pub fn for_stream(self) -> (SocketPermit, StreamOpen) {
+        let stream = Arc::new(StreamEnd::default());
+        let open = StreamOpen {
+            shares: Arc::clone(&self.shares),
+            kind: self.kind,
+            bytes: self.bytes,
+            stream: Arc::clone(&stream),
+        };
+        let mut permit = self;
+        permit.stream = Some(stream);
+        (permit, open)
+    }
 }
 
 impl Drop for SocketPermit {
     fn drop(&mut self) {
-        if self.lingers {
-            self.shares.linger(self.kind, self.bytes);
-        } else {
-            self.shares.release(self.kind, self.bytes);
+        self.shares
+            .release(self.kind, self.bytes, self.stream.as_deref());
+    }
+}
+
+// What a split stream's two sides know of each other, read and written only
+// under the ledger's lock: whether the stream was dropped and counted
+// closing, and whether the tunnel freed the socket.
+#[derive(Default)]
+struct StreamEnd {
+    closed: AtomicBool,
+    freed: AtomicBool,
+}
+
+// The stream's side of a TCP stream's bytes, held by the stream while it is
+// open. Dropped, it counts the bytes closing until the tunnel frees them.
+pub struct StreamOpen {
+    shares: Arc<Shares>,
+    kind: usize,
+    bytes: u64,
+    stream: Arc<StreamEnd>,
+}
+
+impl Drop for StreamOpen {
+    fn drop(&mut self) {
+        self.shares.close(self.kind, self.bytes, &self.stream);
+    }
+}
+
+// A TCP stream's bytes. The dial or accept that opens the stream holds the
+// permit and gives the bytes back if no stream comes of it. Once the
+// stream's socket is on a tunnel's stack, the tunnel holds the permit and
+// gives the bytes back the moment it frees the socket's buffers, however
+// long after the stream is dropped that is; the stream keeps its
+// `StreamOpen`. A stream of any other kind keeps the permit, and its bytes
+// come back as it is dropped.
+#[derive(Default)]
+pub struct StreamSocket {
+    permit: Option<SocketPermit>,
+    open: Option<StreamOpen>,
+}
+
+impl StreamSocket {
+    pub fn new(permit: Option<SocketPermit>) -> Self {
+        Self { permit, open: None }
+    }
+
+    // `stream`'s socket holds these bytes: its tunnel holds the permit
+    // until it frees the socket. Taking the tunnel's stack lock here, this
+    // holds no lock of the ledger's.
+    pub fn hold_in(&mut self, stream: &WgTcpStream) {
+        if let Some(permit) = self.permit.take() {
+            let (permit, open) = permit.for_stream();
+            stream.hold_until_freed(permit);
+            self.open = Some(open);
         }
+    }
+
+    // `SocketPermit::connected_signal`, while this stream holds bytes.
+    pub fn connected_signal(&self) -> Option<impl Fn() + Send + Sync + 'static> {
+        let (shares, kind) = match (&self.permit, &self.open) {
+            (Some(permit), _) => (&permit.shares, permit.kind),
+            (None, Some(open)) => (&open.shares, open.kind),
+            (None, None) => return None,
+        };
+        let shares = Arc::downgrade(shares);
+        Some(move || {
+            if let Some(shares) = shares.upgrade() {
+                shares.connected(kind);
+            }
+        })
     }
 }
 
@@ -721,7 +726,7 @@ impl SessionSockets {
                 budget,
                 held: [0; KINDS],
                 open: [0; KINDS],
-                lingering: [0; KINDS],
+                closing: [0; KINDS],
                 given: [None; SIDES],
                 demand: Default::default(),
                 level: [0; SIDES],
@@ -729,8 +734,6 @@ impl SessionSockets {
                 dry: [false; SIDES],
                 rewake: [false; SIDES],
                 wake: [false; SIDES],
-                linger: VecDeque::new(),
-                timer: false,
             }),
             divider,
             freed: Default::default(),
@@ -798,7 +801,6 @@ impl SessionSockets {
         };
         let divider = &*inner.divider;
         let mut ledger = inner.ledger();
-        let (returned, mut asked) = inner.lingered(&mut ledger);
         let mut fit = fits(&ledger, divider, class, bytes);
         if !fit
             && let Some(side) = class.side()
@@ -819,13 +821,10 @@ impl SessionSockets {
             ledger.divide(divider, [0; SIDES]);
             demand = Some(Demand::pressed(inner, side, bytes));
         }
-        asked |= ledger.settle(divider);
+        let asked = ledger.settle(divider);
         let open = ledger.open[class.index()];
-        if returned {
-            inner.publish(&ledger);
-        }
-        inner.time(ledger);
-        if returned || asked {
+        drop(ledger);
+        if asked {
             inner.settled(asked);
         }
         if fit {
@@ -849,7 +848,6 @@ impl SessionSockets {
             return Ok(None);
         };
         let mut ledger = inner.ledger();
-        let (returned, mut asked) = inner.lingered(&mut ledger);
         let kind = class.index();
         let mut fit = fits(&ledger, &*inner.divider, class, bytes);
         let mut pressed = None;
@@ -861,15 +859,10 @@ impl SessionSockets {
             pressed = Some(side);
         }
         if !fit {
-            asked |= ledger.settle(&*inner.divider);
+            let asked = ledger.settle(&*inner.divider);
             let open = ledger.open[kind];
-            if returned {
-                inner.publish(&ledger);
-            }
-            // A refusal waits on bytes coming back: lingering ones come
-            // back on the timer.
-            inner.time(ledger);
-            if returned || asked {
+            drop(ledger);
+            if asked {
                 inner.settled(asked);
             }
             return Err(Refused {
@@ -892,32 +885,33 @@ impl SessionSockets {
         if ledger.sides() < sides {
             ledger.divide(&*inner.divider, [0; SIDES]);
         }
-        asked |= ledger.settle(&*inner.divider);
+        let asked = ledger.settle(&*inner.divider);
         inner.publish(&ledger);
         drop(ledger);
-        if returned || asked {
+        if asked {
             inner.settled(asked);
         }
         Ok(Some(SocketPermit {
             shares: Arc::clone(inner),
             kind,
             bytes,
-            lingers: false,
+            stream: None,
         }))
     }
 
-    // Bytes of `class` held now, lingering ones among them.
+    // Bytes of `class` held now, closing ones among them.
     pub fn held(&self, class: SocketClass) -> u64 {
         self.shares
             .as_ref()
             .map_or(0, |inner| inner.ledger().held[class.index()])
     }
 
-    // Bytes of `class` that are lingering now.
-    pub fn lingering(&self, class: SocketClass) -> u64 {
+    // Bytes of `class` whose streams were dropped and whose sockets the
+    // tunnel still holds.
+    pub fn closing(&self, class: SocketClass) -> u64 {
         self.shares
             .as_ref()
-            .map_or(0, |inner| inner.ledger().lingering[class.index()])
+            .map_or(0, |inner| inner.ledger().closing[class.index()])
     }
 
     // What `class`'s side was given at the last division: its share before

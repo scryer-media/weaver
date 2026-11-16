@@ -2784,9 +2784,9 @@ mod tests {
     }
 
     // A leg whose WireGuard session has its torrent bytes full says it has
-    // no TCP room, so peers connect over uTP; it has room again once a
-    // closed peer's stream is back from the tunnel's linger. A leg on the
-    // kernel's sockets holds no bytes and always has room.
+    // no TCP room, so peers connect over uTP; it has room again once the
+    // tunnel frees a closed peer's socket. A leg on the kernel's sockets
+    // holds no bytes and always has room.
     #[tokio::test]
     async fn a_leg_has_tcp_room_while_its_tcp_peer_share_does() {
         use weaver_tunnel::pipe::{
@@ -2833,7 +2833,6 @@ mod tests {
         tokio::pin!(back);
         back.as_mut().enable();
         drop(connected);
-        tokio::time::pause();
         back.await;
         assert!(sockets.tcp_room().is_free());
 

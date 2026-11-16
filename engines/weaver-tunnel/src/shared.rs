@@ -87,6 +87,7 @@ impl<T: proxy_tunnels::TunnelProvider + SessionKind> TunnelProvider for SharedPr
         port: u16,
         outcome: Arc<crate::bridge::ConnectionOutcome>,
         buffers: Option<crate::wireguard::TcpBuffers>,
+        _socket: &mut crate::pipe::StreamSocket,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         if let Some(buffers) = buffers
             && let Some(dialed) = self.0.dial_sized(host, port, buffers).await
