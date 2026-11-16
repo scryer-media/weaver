@@ -32,27 +32,30 @@ pub struct OutputFileListing {
     pub total_bytes: u64,
 }
 
-impl OutputFile {
-    /// Where this file stands in listing order: a page that starts after
-    /// it takes up from this key.
-    pub fn listing_key(&self) -> ListingKey {
-        ListingKey {
-            name: self.name.to_ascii_lowercase(),
-            rel_path: self.rel_path.clone(),
-        }
-    }
-}
-
 /// A place in listing order: the lowercased file name, then the relative
-/// path, which is unique.
+/// path as shown, then the relative path's own bytes. Two paths the display
+/// form makes equal still differ in their bytes, so the key is unique.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ListingKey {
     pub name: String,
     pub rel_path: String,
+    pub raw: Vec<u8>,
 }
 
-// Listing order: lowercased name, then relative path, which is unique.
-type Keyed = (String, String, String, u64);
+/// One page of a folder's files after a place in listing order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputFilePage {
+    /// The page's files, with the totals of the whole folder.
+    pub listing: OutputFileListing,
+    /// The place of the page's last file, where the next page starts.
+    pub last: Option<ListingKey>,
+    /// Whether any file comes after the page's last one, as this walk
+    /// found the folder.
+    pub more: bool,
+}
+
+// Listing order, then what the file shows.
+type Keyed = (ListingKey, String, u64);
 
 struct Selection {
     keep: usize,
@@ -60,45 +63,51 @@ struct Selection {
     after: Option<ListingKey>,
     // The largest kept key on top, so a smaller one replaces it.
     kept: BinaryHeap<Keyed>,
+    // The files after `after`, kept or not.
+    following: u64,
     total_count: u64,
     total_bytes: u64,
 }
 
 impl Selection {
-    fn offer(&mut self, rel_path: String, name: String, size_bytes: u64) {
+    fn offer(&mut self, key: ListingKey, name: String, size_bytes: u64) {
         self.total_count += 1;
         self.total_bytes = self.total_bytes.saturating_add(size_bytes);
+        if self.after.as_ref().is_some_and(|after| key <= *after) {
+            return;
+        }
+        self.following += 1;
         if self.keep == 0 {
             return;
         }
-        let key = (name.to_ascii_lowercase(), rel_path, name, size_bytes);
-        if self.after.as_ref().is_some_and(|after| {
-            (key.0.as_str(), key.1.as_str()) <= (after.name.as_str(), after.rel_path.as_str())
-        }) {
-            return;
-        }
+        let keyed = (key, name, size_bytes);
         if self.kept.len() < self.keep {
-            self.kept.push(key);
-        } else if self.kept.peek().is_some_and(|largest| key < *largest) {
+            self.kept.push(keyed);
+        } else if self.kept.peek().is_some_and(|largest| keyed < *largest) {
             self.kept.pop();
-            self.kept.push(key);
+            self.kept.push(keyed);
         }
     }
 
-    fn finish(self) -> OutputFileListing {
-        OutputFileListing {
-            files: self
-                .kept
-                .into_sorted_vec()
-                .into_iter()
-                .map(|(_, rel_path, name, size_bytes)| OutputFile {
-                    rel_path,
-                    name,
-                    size_bytes,
-                })
-                .collect(),
-            total_count: self.total_count,
-            total_bytes: self.total_bytes,
+    fn finish(self) -> OutputFilePage {
+        let kept = self.kept.into_sorted_vec();
+        let more = self.following > kept.len() as u64;
+        let last = kept.last().map(|(key, _, _)| key.clone());
+        OutputFilePage {
+            listing: OutputFileListing {
+                files: kept
+                    .into_iter()
+                    .map(|(key, name, size_bytes)| OutputFile {
+                        rel_path: key.rel_path,
+                        name,
+                        size_bytes,
+                    })
+                    .collect(),
+                total_count: self.total_count,
+                total_bytes: self.total_bytes,
+            },
+            last,
+            more,
         }
     }
 }
@@ -109,7 +118,7 @@ impl Selection {
 /// cannot be read is an error; an entry whose metadata cannot be read is
 /// passed over. Blocks: call it off the async runtime.
 pub fn list_output_files(dir: &Path, keep: usize) -> io::Result<OutputFileListing> {
-    list_output_files_after(dir, None, keep)
+    list_output_files_after(dir, None, keep).map(|page| page.listing)
 }
 
 /// As [`list_output_files`], keeping the first `keep` files that come after
@@ -120,11 +129,12 @@ pub fn list_output_files_after(
     dir: &Path,
     after: Option<&ListingKey>,
     keep: usize,
-) -> io::Result<OutputFileListing> {
+) -> io::Result<OutputFilePage> {
     let mut selection = Selection {
         keep,
         after: after.cloned(),
         kept: BinaryHeap::with_capacity(keep.min(1024)),
+        following: 0,
         total_count: 0,
         total_bytes: 0,
     };
@@ -152,11 +162,6 @@ fn walk(root: &Path, dir: &Path, selection: &mut Selection) -> io::Result<()> {
             walk(root, &path, selection)?;
             continue;
         }
-        let rel_path = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -164,7 +169,13 @@ fn walk(root: &Path, dir: &Path, selection: &mut Selection) -> io::Result<()> {
         if is_ownership_marker(&name) {
             continue;
         }
-        selection.offer(rel_path, name, meta.len());
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let key = ListingKey {
+            name: name.to_ascii_lowercase(),
+            rel_path: rel.to_string_lossy().into_owned(),
+            raw: rel.as_os_str().as_encoded_bytes().to_vec(),
+        };
+        selection.offer(key, name, meta.len());
     }
     Ok(())
 }
@@ -249,10 +260,11 @@ mod tests {
         assert_eq!((skipped.total_count, skipped.total_bytes), (1, 2));
     }
 
-    // A page after a key is the files that follow it in the whole order,
-    // with the whole folder's totals, for a key at every position.
+    // Pages taken one after another, each after the last file of the one
+    // before, are the whole order, with the whole folder's totals, and
+    // each says whether a file follows it.
     #[test]
-    fn a_page_after_a_key_is_the_files_that_follow_it() {
+    fn pages_after_a_key_are_the_files_that_follow_it() {
         let dir = tempfile::tempdir().unwrap();
         for (n, rel) in ["b.mkv", "A.nfo", "Sub/a.nfo", "Other/B.MKV", "c.txt"]
             .iter()
@@ -261,15 +273,80 @@ mod tests {
             write(dir.path(), rel, n + 1);
         }
         let all = list_output_files(dir.path(), 100).unwrap();
-        for (at, file) in all.files.iter().enumerate() {
-            for keep in 0..=5 {
-                let page =
-                    list_output_files_after(dir.path(), Some(&file.listing_key()), keep).unwrap();
-                let end = (at + 1 + keep).min(all.files.len());
-                assert_eq!(page.files, all.files[at + 1..end]);
-                assert_eq!((page.total_count, page.total_bytes), (5, 15));
+        for keep in 1..=6 {
+            let mut after = None;
+            let mut seen = Vec::new();
+            loop {
+                let page = list_output_files_after(dir.path(), after.as_ref(), keep).unwrap();
+                assert_eq!(
+                    (page.listing.total_count, page.listing.total_bytes),
+                    (5, 15)
+                );
+                seen.extend(page.listing.files);
+                assert_eq!(page.more, seen.len() < all.files.len(), "keep {keep}");
+                if !page.more {
+                    break;
+                }
+                after = page.last;
             }
+            assert_eq!(seen, all.files, "keep {keep}");
         }
+    }
+
+    // Whether a file follows the page is read from the walk, not from a
+    // count against the position: files listed on earlier pages that have
+    // since gone leave the rest still to come.
+    #[test]
+    fn a_page_says_more_follows_when_earlier_files_have_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in ["a.mkv", "b.mkv", "c.mkv", "d.mkv", "e.mkv"] {
+            write(dir.path(), rel, 1);
+        }
+        let first = list_output_files_after(dir.path(), None, 2).unwrap();
+        assert!(first.more);
+        std::fs::remove_file(dir.path().join("a.mkv")).unwrap();
+        std::fs::remove_file(dir.path().join("b.mkv")).unwrap();
+        let second = list_output_files_after(dir.path(), first.last.as_ref(), 2).unwrap();
+        assert_eq!(names(&second.listing), ["c.mkv", "d.mkv"]);
+        // Three files are left and two are past the page's position of
+        // four, yet "e.mkv" is still to come.
+        assert_eq!(second.listing.total_count, 3);
+        assert!(second.more);
+        let third = list_output_files_after(dir.path(), second.last.as_ref(), 2).unwrap();
+        assert_eq!(names(&third.listing), ["e.mkv"]);
+        assert!(!third.more);
+    }
+
+    // Two paths whose shown forms are equal, as two names that are not
+    // valid text can be, are told apart by their bytes: a page that ends
+    // on the first still lists the second.
+    #[test]
+    fn paths_equal_once_shown_are_ordered_by_their_bytes() {
+        let key = |raw: &[u8]| ListingKey {
+            name: "\u{fffd}.mkv".into(),
+            rel_path: "\u{fffd}.mkv".into(),
+            raw: raw.to_vec(),
+        };
+        let page = |after: Option<ListingKey>| {
+            let mut selection = Selection {
+                keep: 1,
+                after,
+                kept: BinaryHeap::new(),
+                following: 0,
+                total_count: 0,
+                total_bytes: 0,
+            };
+            selection.offer(key(b"\xfe.mkv"), "\u{fffd}.mkv".into(), 2);
+            selection.offer(key(b"\xff.mkv"), "\u{fffd}.mkv".into(), 3);
+            selection.finish()
+        };
+        let first = page(None);
+        assert_eq!(first.listing.files[0].size_bytes, 2);
+        assert!(first.more);
+        let second = page(first.last);
+        assert_eq!(second.listing.files.len(), 1);
+        assert_eq!(second.listing.files[0].size_bytes, 3);
+        assert!(!second.more);
     }
 
     #[test]

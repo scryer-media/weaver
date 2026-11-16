@@ -1290,11 +1290,18 @@ pub fn decode_output_files_cursor(cursor: Option<&str>) -> Result<OutputFilesCur
     let Some(body) = decoded.strip_prefix("fil:") else {
         return Err("cursor has an invalid prefix".to_string());
     };
-    let (offset, name, rel_path): (usize, String, String) =
+    let (offset, name, rel_path, raw): (usize, String, String, String) =
         serde_json::from_str(body).map_err(|_| "cursor does not name a file".to_string())?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| "cursor does not name a file".to_string())?;
     Ok(OutputFilesCursor {
         offset,
-        after: Some(weaver_server_core::history::output_files::ListingKey { name, rel_path }),
+        after: Some(weaver_server_core::history::output_files::ListingKey {
+            name,
+            rel_path,
+            raw,
+        }),
     })
 }
 
@@ -1302,8 +1309,13 @@ pub fn encode_output_files_cursor(cursor: &OutputFilesCursor) -> String {
     let body = match &cursor.after {
         Some(after) => format!(
             "fil:{}",
-            serde_json::to_string(&(cursor.offset, &after.name, &after.rel_path))
-                .expect("a tuple of a number and two strings serializes")
+            serde_json::to_string(&(
+                cursor.offset,
+                &after.name,
+                &after.rel_path,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&after.raw),
+            ))
+            .expect("a tuple of a number and three strings serializes")
         ),
         None => format!("off:{}", cursor.offset),
     };
