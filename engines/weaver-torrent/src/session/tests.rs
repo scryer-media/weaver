@@ -11,7 +11,7 @@ use bytes::Bytes;
 use tempfile::TempDir;
 
 use super::add::torrent_file_from_info_bytes;
-use super::peer_finder::{FINDERS, PeerAsk, find};
+use super::peer_finder;
 use super::peer_sources::{merge_tracker_tiers, metainfo_tracker_tiers};
 use super::{
     AddTorrent, AddTorrentOptions, Discovery, ManagedTorrentHandle, Session, SessionOptions,
@@ -1615,16 +1615,13 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
     // handed its peers, one that looks nowhere is handed none.
     let peers = |t: &ManagedTorrentHandle| {
         let identity = session.identity().clone();
-        let mut ask = PeerAsk::unannounced(
+        peer_finder::after_trackers(
             &session,
             t.info_hashes(),
             &identity,
             tokio::sync::watch::channel(()).1,
-        );
-        find(&FINDERS, &session, &mut ask, |finder| {
-            finder.allowed(t.discovery()) && !finder.allowed(nowhere)
-        })
-        .0
+            t.discovery(),
+        )
     };
     assert!(peers(&public).is_some());
     assert!(peers(&no_dht).is_some());

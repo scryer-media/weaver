@@ -31,7 +31,7 @@ use crate::{
     peer_protocol::{Message, extended::ExtendedMessage},
     stream_connect::ConnectionKind,
     torrent_state::utils::{TimedExistence, atomic_inc},
-    type_aliases::{BF, PeerHandle, PeerSourceFlag, PeerSources},
+    type_aliases::{BF, PeerHandle, PeerSourceFlag},
 };
 
 use self::{
@@ -235,13 +235,6 @@ pub(crate) struct PeerStates {
     connect_order: ConnectOrder,
 }
 
-// Whether a peer named by `sources` stays on a private torrent's list once
-// its trackers answer: a tracker named it, or the operator did (the peers
-// the torrent was added with, which come back as its resume data).
-fn tracker_or_operator_named(sources: PeerSources) -> bool {
-    sources.contains(PeerSourceFlag::Tracker) || sources.contains(PeerSourceFlag::ResumeData)
-}
-
 /// The peers our PEX messages list, each where it listens, with what the
 /// message says of it; see [`PeerStates::pex_listed`].
 pub(crate) type PexListed = Arc<HashMap<SocketAddr, u8>>;
@@ -266,18 +259,22 @@ impl PeerList {
     /// `peers` not at a banned address, and `banned` banned (libtorrent
     /// `torrent::read_resume_data`, which adds each of `peers` with
     /// `peer_list::add_peer` and bans each of `banned_peers` with
-    /// `peer_list::ban_peer`). The peers are on the list before the torrent
-    /// first runs, so a restart saves them again until it does.
+    /// `peer_list::ban_peer`). Of `peers`, those in `found` a save had
+    /// found by the DHT, local discovery or peer exchange alone, and they
+    /// stay so. The peers are on the list before the torrent first runs, so
+    /// a restart saves them again until it does.
     pub fn resumed(
         peers: impl IntoIterator<Item = SocketAddr>,
+        found: &[SocketAddr],
         banned: impl IntoIterator<Item = IpAddr>,
     ) -> Self {
         let banned: HashSet<IpAddr> = banned.into_iter().collect();
+        let found: HashSet<SocketAddr> = found.iter().copied().collect();
         let mut seen = HashSet::new();
         let peers = peers
             .into_iter()
             .filter(|addr| !banned.contains(&addr.ip()) && seen.insert(*addr))
-            .map(|addr| Peer::new_with_outgoing_address(addr, PeerSourceFlag::ResumeData.into()))
+            .map(|addr| Peer::resumed(addr, found.contains(&addr)))
             .collect();
         Self {
             peers,
@@ -288,7 +285,13 @@ impl PeerList {
 
     /// The peers and bans a restart is to begin with; see [`ResumePeers`].
     pub fn resume_peers(&self) -> ResumePeers {
-        ResumePeers::of(self.peers.iter().filter_map(resume_entry), &self.banned)
+        let owed = self.untracked_owed;
+        ResumePeers::of(
+            self.peers
+                .iter()
+                .filter_map(|peer| resume_entry(peer, owed)),
+            &self.banned,
+        )
     }
 
     /// Bans `ip` on a list no run holds: a peer at it rejoins the next run
@@ -311,13 +314,25 @@ impl PeerList {
         }
         let smart_ban = &mut self.smart_ban;
         self.peers.retain(|peer| {
-            let kept = tracker_or_operator_named(peer.sources());
+            let kept = peer.tracker_or_operator_named();
             if !kept {
                 smart_ban.forget(peer.addr);
             }
             kept
         });
         self
+    }
+
+    /// The list of a private torrent restarted from a save: when the save
+    /// held peers found elsewhere, which a private torrent keeps only while
+    /// no tracker has answered, the list owes them again, as
+    /// [`Self::taking_trackers_alone`] with no answer yet.
+    pub fn owing_found(self) -> Self {
+        if self.peers.iter().any(Peer::found_elsewhere) {
+            self.taking_trackers_alone(false)
+        } else {
+            self
+        }
     }
 
     /// Whether the peers no tracker named are still to leave once a tracker
@@ -352,19 +367,41 @@ pub struct ResumePeers {
     pub peers: Vec<SocketAddr>,
     /// The banned addresses, in order.
     pub banned: Vec<IpAddr>,
+    /// Of `peers`, those only the DHT, local discovery or peer exchange
+    /// named, and, while the list owed its untracked peers
+    /// ([`PeerList::taking_trackers_alone`]), every one no tracker or the
+    /// operator named, in the order of `peers`. A restart adds them marked so
+    /// (`AddTorrentOptions::found_peers`), so a private torrent's leave once
+    /// a tracker answers, as they would have before the restart.
+    pub found: Vec<SocketAddr>,
 }
 
 // What a saved list needs of a peer: its address, where we can connect to
-// it when we can, and whether we were ever connected to it, or None when it
-// is not to be saved: we cannot connect to it (not `connectable`), its last
-// connection failed (`failcount`), or it sent bad data (`trust_points`
-// below zero). None for a peer at no address, which is on no list.
-fn resume_entry(peer: &Peer) -> Option<(IpAddr, Option<(SocketAddr, bool)>)> {
+// it when we can, whether we were ever connected to it, and whether it was
+// found elsewhere (`Peer::found_elsewhere`), or, while the list `owed` its
+// untracked peers, whether it is one of them, as a restart is to owe it
+// again (`PeerList::owing_found`); or None when it is not to be
+// saved: we cannot connect to it (not `connectable`), its last connection
+// failed (`failcount`), or it sent bad data (`trust_points` below zero).
+// None for a peer at no address, which is on no list.
+type ResumeEntry = (IpAddr, Option<(SocketAddr, bool, bool)>);
+
+fn resume_entry(peer: &Peer, owed: bool) -> Option<ResumeEntry> {
     let failcount = peer.failcount();
     let saved = peer
         .outgoing_address
         .filter(|_| failcount == 0 && peer.trust().points() >= 0)
-        .map(|addr| (addr, peer.ever_closed() || peer.connected_out().is_some()));
+        .map(|addr| {
+            (
+                addr,
+                peer.ever_closed() || peer.connected_out().is_some(),
+                if owed {
+                    !peer.tracker_or_operator_named()
+                } else {
+                    peer.found_elsewhere()
+                },
+            )
+        });
     Some((peer.addr.ip()?, saved))
 }
 
@@ -374,6 +411,7 @@ impl ResumePeers {
     /// peer at a banned address as its ban).
     pub fn ban(&mut self, ip: IpAddr) {
         self.peers.retain(|addr| addr.ip() != ip);
+        self.found.retain(|addr| addr.ip() != ip);
         if let Err(at) = self.banned.binary_search(&ip) {
             self.banned.insert(at, ip);
         }
@@ -383,26 +421,35 @@ impl ResumePeers {
     // saved as its ban; every other peer to be saved that we were connected
     // to is; and of those we never were, the first [`RESUME_PEERS`], at
     // random, until that many are saved in all.
-    fn of(
-        entries: impl Iterator<Item = (IpAddr, Option<(SocketAddr, bool)>)>,
-        banned: &HashSet<IpAddr>,
-    ) -> Self {
-        let mut peers = Vec::new();
+    fn of(entries: impl Iterator<Item = ResumeEntry>, banned: &HashSet<IpAddr>) -> Self {
+        let mut saved = Vec::new();
         let mut never = Vec::new();
-        for (ip, saved) in entries {
-            match saved {
+        for (ip, entry) in entries {
+            match entry {
                 _ if banned.contains(&ip) => {}
-                Some((addr, true)) => peers.push(addr),
-                Some((addr, false)) if never.len() < RESUME_PEERS => never.push(addr),
+                Some((addr, true, found)) => saved.push((addr, found)),
+                Some((addr, false, found)) if never.len() < RESUME_PEERS => {
+                    never.push((addr, found));
+                }
                 Some(_) | None => {}
             }
         }
         rand::seq::SliceRandom::shuffle(never.as_mut_slice(), &mut rand::rng());
-        let room = RESUME_PEERS.saturating_sub(peers.len());
-        peers.extend(never.into_iter().take(room));
+        let room = RESUME_PEERS.saturating_sub(saved.len());
+        saved.extend(never.into_iter().take(room));
+        let found = saved
+            .iter()
+            .filter(|(_, found)| *found)
+            .map(|(addr, _)| *addr)
+            .collect();
+        let peers = saved.into_iter().map(|(addr, _)| addr).collect();
         let mut banned: Vec<IpAddr> = banned.iter().copied().collect();
         banned.sort_unstable();
-        Self { peers, banned }
+        Self {
+            peers,
+            banned,
+            found,
+        }
     }
 }
 
@@ -657,7 +704,7 @@ impl PeerStates {
         handle: PeerHandle,
         peer: &Peer,
     ) -> bool {
-        leaving.contains(&handle) && !tracker_or_operator_named(peer.sources())
+        leaving.contains(&handle) && !peer.tracker_or_operator_named()
     }
 
     /// Whether the peers neither a tracker nor the operator named are still
@@ -679,7 +726,7 @@ impl PeerStates {
         let named: Vec<PeerHandle> = self
             .states
             .iter()
-            .filter(|e| e.key().is_listed() && !tracker_or_operator_named(e.value().sources()))
+            .filter(|e| e.key().is_listed() && !e.value().tracker_or_operator_named())
             .map(|e| *e.key())
             .collect();
         for handle in named {
@@ -705,7 +752,7 @@ impl PeerStates {
         }
         let _admission = self.admission.lock();
         if let Some((_, peer)) = self.states.remove_if(&handle, |_, peer| {
-            peer.connected_out().is_none() && !tracker_or_operator_named(peer.sources())
+            peer.connected_out().is_none() && !peer.tracker_or_operator_named()
         }) {
             self.erased(handle, &peer);
         }
@@ -715,13 +762,14 @@ impl PeerStates {
     /// A web seed is on no list, and is not saved.
     pub fn resume_peers(&self) -> ResumePeers {
         let leaving = self.untracked_leaving.lock().clone();
+        let owed = self.owes_untracked();
         let entries: Vec<_> = self
             .states
             .iter()
             .filter(|e| {
                 e.key().is_listed() && !self.leaves_untracked(&leaving, *e.key(), e.value())
             })
-            .filter_map(|e| resume_entry(e.value()))
+            .filter_map(|e| resume_entry(e.value(), owed))
             .collect();
         ResumePeers::of(entries.into_iter(), &self.banned.read())
     }

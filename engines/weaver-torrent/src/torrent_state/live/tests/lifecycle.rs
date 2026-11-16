@@ -290,6 +290,7 @@ async fn saved_peers_and_bans_come_back_as_initial_peers_and_bans() {
         crate::ResumePeers {
             peers: vec![connectable],
             banned: vec![banned.ip()],
+            found: Vec::new(),
         }
     );
 
@@ -352,6 +353,7 @@ async fn a_checked_torrent_keeps_its_peer_list_until_its_state_changes() {
     let saved = crate::ResumePeers {
         peers: vec!["127.0.0.3:6881".parse().unwrap()],
         banned: vec!["127.0.0.4".parse().unwrap()],
+        found: Vec::new(),
     };
     // Every check waits here, so the session's own check of the torrent
     // does not start; the test runs the check itself.

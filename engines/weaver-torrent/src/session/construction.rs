@@ -441,6 +441,8 @@ impl Session {
                 ip_filter: RwLock::new(opts.ip_filter),
                 allowlist,
                 lsd,
+                #[cfg(test)]
+                handed_out: Default::default(),
             });
 
             if let Some(mut listen) = listen_result {

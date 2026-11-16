@@ -406,6 +406,10 @@ pub(crate) struct Peer {
     holepunch: bool,
     // Every source that named the peer.
     sources: PeerSources,
+    // A restart saved the peer as found elsewhere than its trackers and the
+    // operator (`ResumePeers::found`), so its resume data is no tracker's or
+    // operator's word.
+    resumed_found: bool,
     // Where the peer list's index holds the peer (`PeerStates::reindex`).
     indexed: Indexed,
 }
@@ -442,6 +446,7 @@ impl Peer {
             supports_holepunch: false,
             holepunch: false,
             sources: PeerSourceFlag::Incoming.into(),
+            resumed_found: false,
             indexed: Indexed::default(),
         }
     }
@@ -477,6 +482,7 @@ impl Peer {
             supports_holepunch: false,
             holepunch: false,
             sources,
+            resumed_found: false,
             indexed: Indexed::default(),
         }
     }
@@ -640,6 +646,31 @@ impl Peer {
 
     pub(crate) fn sources(&self) -> PeerSources {
         self.sources
+    }
+
+    /// A peer a restart saved, as its own list names it: resume data, and
+    /// `found` when the save had it found elsewhere than its trackers and
+    /// the operator (`ResumePeers::found`).
+    pub fn resumed(addr: SocketAddr, found: bool) -> Self {
+        Self {
+            resumed_found: found,
+            ..Self::new_with_outgoing_address(addr, PeerSourceFlag::ResumeData.into())
+        }
+    }
+
+    /// Whether a tracker named the peer, or the operator did: the peers the
+    /// torrent was added with, and those a restart saved that were not
+    /// [found elsewhere](Self::found_elsewhere). A private torrent keeps
+    /// these once its trackers answer.
+    pub(crate) fn tracker_or_operator_named(&self) -> bool {
+        self.sources.contains(PeerSourceFlag::Tracker)
+            || (self.sources.contains(PeerSourceFlag::ResumeData) && !self.resumed_found)
+    }
+
+    /// Whether only the DHT, local discovery or peer exchange named the
+    /// peer: no tracker, not the operator, and it never connected to us.
+    pub(crate) fn found_elsewhere(&self) -> bool {
+        !self.tracker_or_operator_named() && !self.sources.contains(PeerSourceFlag::Incoming)
     }
 
     /// What a connection to the peer may go over: uTP alone while a
@@ -893,6 +924,7 @@ impl Peer {
             supports_holepunch: self.supports_holepunch,
             holepunch: false,
             sources: self.sources,
+            resumed_found: self.resumed_found,
             indexed: Indexed::default(),
         }
     }

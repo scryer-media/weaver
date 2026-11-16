@@ -1152,6 +1152,7 @@ impl TorrentService {
             tracker_tiers: Some(tracker_tiers(&listed)),
             initial_peers: (!saved.peers.is_empty()).then(|| saved.peers.clone()),
             banned_peers: saved.banned.clone(),
+            found_peers: saved.found.clone(),
             file_priorities: Some(picking.0),
             sequential: picking.1,
             first_last_piece_first: picking.2,

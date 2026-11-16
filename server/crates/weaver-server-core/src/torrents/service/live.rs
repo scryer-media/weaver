@@ -641,7 +641,9 @@ fn same_peers(a: &ResumePeers, b: &ResumePeers) -> bool {
         items.sort_unstable();
         items
     }
-    sorted(&a.peers) == sorted(&b.peers) && sorted(&a.banned) == sorted(&b.banned)
+    sorted(&a.peers) == sorted(&b.peers)
+        && sorted(&a.banned) == sorted(&b.banned)
+        && sorted(&a.found) == sorted(&b.found)
 }
 
 // Every file's bytes in hand. The session's progress counts only the files
