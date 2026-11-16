@@ -530,6 +530,23 @@ impl Weighted {
     pub fn budget_changed(&self) -> Arc<Notify> {
         self.shared.changed.clone()
     }
+    // Where the route runs `stage` now, if it still runs it: a kept leg
+    // moves when a leg before it is removed.
+    pub fn position_of(&self, stage: &Arc<dyn Dialer>) -> Option<usize> {
+        self.legs
+            .read()
+            .expect("route stages")
+            .iter()
+            .position(|current| Arc::ptr_eq(current, stage))
+    }
+    // Whether leg `position` is still dialed by `stage`.
+    pub fn holds(&self, position: usize, stage: &Arc<dyn Dialer>) -> bool {
+        self.legs
+            .read()
+            .expect("route stages")
+            .get(position)
+            .is_some_and(|current| Arc::ptr_eq(current, stage))
+    }
     pub fn track_external(
         &self,
         position: usize,
@@ -538,13 +555,7 @@ impl Weighted {
     ) -> Result<(), DialError> {
         let generation = {
             let mut state = self.shared.state.lock().expect("leg allocation");
-            if !self
-                .legs
-                .read()
-                .expect("route stages")
-                .get(position)
-                .is_some_and(|current| Arc::ptr_eq(current, stage))
-            {
+            if !self.holds(position, stage) {
                 return Err(DialError::Skipped(
                     "leg changed during feed connection".into(),
                 ));
@@ -569,13 +580,7 @@ impl Weighted {
         error: Option<&DialError>,
     ) {
         let mut state = self.shared.state.lock().expect("leg allocation");
-        if self
-            .legs
-            .read()
-            .expect("route stages")
-            .get(position)
-            .is_some_and(|current| Arc::ptr_eq(current, stage))
-        {
+        if self.holds(position, stage) {
             if let Some(error) = error {
                 state.legs[position].failed(error);
             } else {

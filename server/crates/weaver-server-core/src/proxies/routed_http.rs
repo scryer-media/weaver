@@ -12,7 +12,7 @@ use weaver_tunnel::{
     pipe::{DialError, Resolution},
 };
 
-use super::{Consumer, ProxyRuntime};
+use super::{Consumer, FetchAttempt, ProxyRuntime};
 use crate::security::is_blocked_egress_ip;
 
 // One concrete path an HTTP fetch can take: it resolves names the way its
@@ -25,8 +25,9 @@ pub trait FetchPath: TunnelProvider {
     // Pins the checked addresses a dial of `host` uses.
     fn pin(&self, host: &str, addresses: Vec<IpAddr>);
     fn budget(&self) -> Duration;
-    // A response that came over this path failed while its body was read.
-    fn body_failed(&self, _error: &DialError) {}
+    // A response that came over this path failed while its body was read:
+    // the destination's failure, not the path's.
+    fn body_failed(&self) {}
 }
 
 pub struct FetchOptions {
@@ -220,6 +221,10 @@ where
     let status = runtime.route(consumer, Duration::from_secs(30))?;
     let attempts = runtime.network.fetch_attempts(consumer, status)?;
     for attempt in attempts {
+        // A leg the route stopped running carries nothing more.
+        if !attempt.leg_current() {
+            continue;
+        }
         let checked = Arc::new(Checked {
             path: attempt.clone(),
             label,
@@ -313,22 +318,17 @@ pub(crate) fn pinned(
 #[derive(Clone)]
 pub struct RoutedBody {
     path: Arc<dyn FetchPath>,
-    label: &'static str,
     _bridge: Arc<Bridge>,
 }
 
 impl RoutedBody {
     pub fn failed(&self) {
-        self.path
-            .body_failed(&DialError::Destination(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                format!("{} response transport failed", self.label),
-            )));
+        self.path.body_failed();
     }
 }
 
 // Reads a whole body, refusing one larger than `limit`. A body that breaks
-// off counts against the path it came over.
+// off fails the read only: the path carried it.
 pub async fn read_body(mut response: reqwest::Response, limit: u64) -> Result<Vec<u8>, String> {
     if response
         .content_length()
@@ -360,6 +360,10 @@ pub(crate) enum AttemptError {
     // The path failed to carry the request.
     Route,
     Routed(Arc<DialError>),
+    // The request failed once it was handed to the client, before its
+    // response came: the path's failure unless the attempt's dial went
+    // through it. `destination` is the hop's scheme, host and port.
+    Sent { destination: String, cause: String },
     // The destination is refused whichever path it is reached over.
     Destination(String),
     // The path carried a response, but the fetch cannot go on from it.
@@ -383,7 +387,22 @@ where
     let label = options.label;
     let status = runtime.route(consumer, Duration::from_secs(30))?;
     let attempts = runtime.network.fetch_attempts(consumer, status)?;
+    // What the destination failed a request of, kept for when no later
+    // attempt carries the fetch.
+    let mut refused = None;
+    // The last attempt whose path carried a request the destination failed.
+    // The rest of its rung, such as the other members of a pool, would only
+    // ask the same destination again from another exit.
+    let mut spent: Option<Arc<FetchAttempt>> = None;
     for attempt in attempts {
+        // A leg the route stopped running carries nothing more.
+        if !attempt.leg_current()
+            || spent
+                .as_ref()
+                .is_some_and(|spent| spent.same_rung(&attempt))
+        {
+            continue;
+        }
         let path: Arc<dyn FetchPath> = attempt.clone();
         let result = tokio::select! {
             biased;
@@ -393,41 +412,106 @@ where
                 fetch_on(&path, url, options, &request),
             ) => result,
         };
-        if let Some(error) = attempt.take_transport_error() {
-            attempt.report(Some(&error));
-            if matches!(error.as_ref(), DialError::Fatal(_)) {
-                return Err(error.to_string());
+        let verdict = judge(
+            result,
+            attempt.take_transport_error(),
+            attempt.carried(),
+            label,
+        );
+        match verdict.report {
+            Report::Nothing => {}
+            Report::Answered => attempt.report(None),
+            Report::Carried(error) => {
+                attempt.request_failed();
+                refused.get_or_insert(error);
+                spent = Some(attempt.clone());
             }
-            continue;
+            Report::Failed(error) => attempt.report(Some(&error)),
         }
-        match result {
-            Ok(Ok(response)) => {
-                attempt.report(None);
-                return Ok(response);
-            }
-            Ok(Err(AttemptError::Answered(message))) => {
-                attempt.report(None);
-                return Err(message);
-            }
-            Ok(Err(AttemptError::Destination(message))) => return Err(message),
-            Ok(Err(AttemptError::Routed(error))) => {
-                attempt.report(Some(&error));
-                if matches!(error.as_ref(), DialError::Fatal(_)) {
-                    return Err(error.to_string());
-                }
-            }
-            Ok(Err(AttemptError::Route)) => {
-                attempt.report(Some(&DialError::Egress(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    format!("{label} transport or routed DNS failed"),
-                ))))
-            }
-            Err(_) => attempt.report(Some(&DialError::Timeout {
-                stage: format!("{label} route"),
-            })),
+        if let Some(end) = verdict.end {
+            return end;
         }
     }
-    Err(format!("{label} request failed on all permitted routes"))
+    Err(refused.unwrap_or_else(|| format!("{label} request failed on all permitted routes")))
+}
+
+// What one attempt's outcome says about its path.
+#[derive(Debug)]
+pub(crate) enum Report {
+    // Nothing: the fetch is refused whichever path carries it.
+    Nothing,
+    // The path carried the fetch to an answer.
+    Answered,
+    // The path carried a request its destination failed. The error is the
+    // fetch's when no later attempt carries it.
+    Carried(String),
+    // The path failed to carry the fetch.
+    Failed(Arc<DialError>),
+}
+
+pub(crate) struct Verdict {
+    pub(crate) report: Report,
+    // The fetch's result, when the outcome ends the walk.
+    pub(crate) end: Option<Result<reqwest::Response, String>>,
+}
+
+// The one owner of what an attempt's outcome means. `transport` is the
+// failure of the attempt's own dial or lookup, if one failed; `carried`
+// says whether its latest dial went through the path.
+pub(crate) fn judge(
+    result: Result<Result<reqwest::Response, AttemptError>, tokio::time::error::Elapsed>,
+    transport: Option<Arc<DialError>>,
+    carried: bool,
+    label: &'static str,
+) -> Verdict {
+    let failed = |error: Arc<DialError>| Verdict {
+        end: matches!(error.as_ref(), DialError::Fatal(_)).then(|| Err(error.to_string())),
+        report: Report::Failed(error),
+    };
+    if let Some(error) = transport {
+        return failed(error);
+    }
+    match result {
+        Ok(Ok(response)) => Verdict {
+            report: Report::Answered,
+            end: Some(Ok(response)),
+        },
+        Ok(Err(AttemptError::Answered(message))) => Verdict {
+            report: Report::Answered,
+            end: Some(Err(message)),
+        },
+        Ok(Err(AttemptError::Destination(message))) => Verdict {
+            report: Report::Nothing,
+            end: Some(Err(message)),
+        },
+        Ok(Err(AttemptError::Routed(error))) => failed(error),
+        // The path carried the connection, and the destination failed the
+        // request on it, as when a body breaks off: no evidence about the
+        // path, so the next path is tried.
+        Ok(Err(AttemptError::Sent { destination, cause })) if carried => {
+            tracing::warn!(
+                fetch = label,
+                %destination,
+                error = %cause,
+                "request failed after its route connected"
+            );
+            Verdict {
+                report: Report::Carried(format!(
+                    "{label} request failed after its route connected"
+                )),
+                end: None,
+            }
+        }
+        Ok(Err(AttemptError::Route | AttemptError::Sent { .. })) => {
+            failed(Arc::new(DialError::Egress(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                format!("{label} transport or routed DNS failed"),
+            ))))
+        }
+        Err(_) => failed(Arc::new(DialError::Timeout {
+            stage: format!("{label} route"),
+        })),
+    }
 }
 
 const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
@@ -483,16 +567,22 @@ where
             .send()
             .await
             .map_err(|error| {
-                if weaver_nntp::tls::is_tls_error(&error) {
+                if weaver_nntp::tls::is_certificate_error(&error) {
                     AttemptError::Destination(format!("{label} TLS verification failed"))
-                } else {
+                } else if error.is_timeout() {
+                    // The attempt's own time ran out: the path's, as the
+                    // attempt's timeout is.
                     AttemptError::Route
+                } else {
+                    AttemptError::Sent {
+                        destination: scheme_host_port(&current),
+                        cause: causes(&error),
+                    }
                 }
             })?;
         if !REDIRECT_STATUSES.contains(&response.status().as_u16()) {
             response.extensions_mut().insert(RoutedBody {
                 path: path.clone(),
-                label,
                 _bridge: bridge,
             });
             return Ok(response);
@@ -510,6 +600,28 @@ where
             .map_err(|e| AttemptError::Answered(format!("invalid redirect: {e}")))?;
     }
     Err(AttemptError::Answered("too many redirects".into()))
+}
+
+// `url` as scheme, host and port only: no credentials, path or query, which
+// carry tracker passkeys and indexer keys.
+fn scheme_host_port(url: &reqwest::Url) -> String {
+    format!(
+        "{}://{}:{}",
+        url.scheme(),
+        url.host_str().unwrap_or_default(),
+        url.port_or_known_default().unwrap_or_default()
+    )
+}
+
+// What a request failed of, below reqwest's own text, which names the URL.
+fn causes(error: &reqwest::Error) -> String {
+    let mut causes = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        causes.push(error.to_string());
+        source = error.source();
+    }
+    causes.join(": ")
 }
 
 // A runtime with nothing saved: every consumer goes direct.

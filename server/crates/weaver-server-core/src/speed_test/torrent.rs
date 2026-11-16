@@ -336,6 +336,9 @@ async fn get_capped(path: &P2pPath, url: &reqwest::Url) -> Result<Vec<u8>, Strin
     .map_err(|_| format!("GET {url} timed out"))?
     .map_err(|error| match error {
         AttemptError::Route => format!("GET {url} failed: the path did not carry it"),
+        // The request was handed over and failed before its response: by
+        // the path or the destination, which this path cannot tell apart.
+        AttemptError::Sent { cause, .. } => format!("GET {url} failed: {cause}"),
         AttemptError::Routed(error) => format!("GET {url} failed: {error}"),
         AttemptError::Destination(message) | AttemptError::Answered(message) => {
             format!("GET {url} failed: {message}")
