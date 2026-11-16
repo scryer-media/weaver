@@ -15,7 +15,6 @@ type Recall = Arc<dyn Fn(u64) + Send + Sync>;
 pub enum SocketPhase {
     Dialing,
     Active,
-    AsyncIdle,
     OwnedIdle,
     Closing,
 }
@@ -25,10 +24,8 @@ pub struct SocketBudgetSnapshot {
     pub limit: usize,
     pub physical: usize,
     pub dialing: usize,
-    pub async_idle: usize,
     pub owned_idle: usize,
     pub closing: usize,
-    pub replacement: usize,
     pub local_denials: u64,
     pub provider_refusals: u64,
 }
@@ -38,7 +35,6 @@ struct Entry {
     phase: SocketPhase,
     recall: Option<Recall>,
     retiring: Arc<AtomicBool>,
-    replacement: bool,
 }
 
 #[derive(Default)]
@@ -90,7 +86,6 @@ impl SocketBudget {
             state
                 .entries
                 .iter_mut()
-                .filter(|(_, entry)| !entry.replacement)
                 .skip(limit)
                 .filter_map(|(&id, entry)| {
                     entry.retiring.store(true, Ordering::Release);
@@ -108,7 +103,7 @@ impl SocketBudget {
     }
 
     // Withdraw unavailable idle paths immediately. Other weight changes drain
-    // on demand, preserving warm sockets while there is no replacement work.
+    // on demand, preserving warm sockets while no new work waits for them.
     pub(crate) fn configure_legs(&self, targets: &[u16]) {
         let (changed, recalls) = {
             let mut state = self.state.lock().expect("socket budget poisoned");
@@ -183,7 +178,7 @@ impl SocketBudget {
             state
                 .entries
                 .iter_mut()
-                .filter(|(_, entry)| !entry.replacement && entry.phase != SocketPhase::Closing)
+                .filter(|(_, entry)| entry.phase != SocketPhase::Closing)
                 .skip(limit)
                 .filter_map(|(&id, entry)| {
                     entry.retiring.store(true, Ordering::Release);
@@ -200,25 +195,14 @@ impl SocketBudget {
         self.publish();
     }
 
-    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<SocketSlot> {
-        self.acquire(false)
-    }
-
     pub(crate) fn note_provider_refusal(&self) {
         let mut state = self.state.lock().expect("socket budget poisoned");
         state.provider_refusals = state.provider_refusals.saturating_add(1);
     }
 
-    fn acquire(self: &Arc<Self>, replacement: bool) -> Option<SocketSlot> {
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<SocketSlot> {
         let mut state = self.state.lock().expect("socket budget poisoned");
-        let denied = if replacement {
-            state.limit == 0
-                || state.entries.values().any(|entry| entry.replacement)
-                || state.entries.len() > state.limit
-        } else {
-            state.entries.len() >= state.limit
-        };
-        if denied {
+        if state.entries.len() >= state.limit {
             state.local_denials = state.local_denials.saturating_add(1);
             return None;
         }
@@ -235,7 +219,6 @@ impl SocketBudget {
                 phase: SocketPhase::Dialing,
                 recall: None,
                 retiring: Arc::clone(&retiring),
-                replacement,
             },
         );
         Some(SocketSlot {
@@ -305,10 +288,8 @@ impl SocketBudget {
             ..SocketBudgetSnapshot::default()
         };
         for entry in state.entries.values() {
-            snapshot.replacement += usize::from(entry.replacement);
             match entry.phase {
                 SocketPhase::Dialing => snapshot.dialing += 1,
-                SocketPhase::AsyncIdle => snapshot.async_idle += 1,
                 SocketPhase::OwnedIdle => snapshot.owned_idle += 1,
                 SocketPhase::Closing => snapshot.closing += 1,
                 SocketPhase::Active => {}
@@ -406,7 +387,7 @@ impl SocketSlot {
                     return;
                 };
                 entry.retiring.store(true, Ordering::Release);
-                if matches!(entry.phase, SocketPhase::AsyncIdle | SocketPhase::OwnedIdle) {
+                if entry.phase == SocketPhase::OwnedIdle {
                     entry.phase = SocketPhase::Closing;
                     entry.recall.take()
                 } else {
@@ -473,7 +454,7 @@ impl SocketSlot {
         entry.phase = phase;
         entry.recall = recall;
         let recalled = if entry.retiring.load(Ordering::Acquire)
-            && matches!(phase, SocketPhase::AsyncIdle | SocketPhase::OwnedIdle)
+            && phase == SocketPhase::OwnedIdle
         {
             entry.phase = SocketPhase::Closing;
             entry.recall.take()

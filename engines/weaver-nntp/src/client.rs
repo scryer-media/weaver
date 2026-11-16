@@ -5,27 +5,23 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
-use tokio::time::Instant as TokioInstant;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 use weaver_yenc::YencError;
 
 use crate::ServerSet;
 
 use crate::connection::ServerConfig;
-use crate::error::{NntpError, Result};
-use crate::fused_yenc::{FusedArticleBody, FusedYencArticleStats, FusedYencError};
+use crate::error::NntpError;
+use crate::fused_yenc::FusedArticleBody;
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{
-    BodyServerAvailability, FreshConnectAdmission, NntpPool, PoolConfig, PooledConnection,
-    ServerId, ServerPoolConfig,
+    BodyServerAvailability, FreshConnectAdmission, NntpPool, PoolConfig, ServerId,
+    ServerPoolConfig,
 };
 use crate::tls::TransportReadStats;
-use crate::transfer::{
-    ActiveTransferBudget, QuotaRejection,
-};
+use crate::transfer::QuotaRejection;
 
 // Configuration for the high-level NNTP client.
 pub struct NntpClientConfig {
@@ -33,9 +29,8 @@ pub struct NntpClientConfig {
     pub servers: Vec<ServerPoolConfig>,
     // Maximum age for idle connections before eviction.
     pub max_idle_age: Duration,
-    // Maximum number of retries on the same server for transient errors
-    // before failing over to the next server. A value of 1 means try once,
-    // then retry once (2 total attempts per server).
+    // Inert: the download lanes retry by handing an article back to the
+    // scheduler, not on the same server inside the client.
     pub max_retries_per_server: u32,
     // Per-article inactivity budget: how long a BODY may go without bytes
     // arriving. Deliberate local rate-limit waits do not count; exhausting
@@ -59,30 +54,16 @@ impl NntpClientConfig {
     }
 }
 
-// High-level NNTP client with multi-server failover.
+// High-level NNTP client over a server pool.
 //
-// Provides a simple API for fetching articles, automatically managing
-// connection pooling and falling back to backup servers when an article
-// is not found on the primary server.
+// Ranks the servers for an article, hands out blocking BODY lanes on the
+// chosen server, and records what each attempt taught the pool.
 #[derive(Clone)]
 pub struct NntpClient {
     pool: Arc<NntpPool>,
-    work_guard: Option<Arc<WorkGuard>>,
-    max_retries_per_server: u32,
     // Per-article inactivity budget, excluding deliberate local rate waits.
     soft_timeout: Duration,
 }
-
-// Whether work bound to a server is still to be done there, judged by the
-// view of the provider policy it is handed. The guard does not pick the view:
-// before a connection is admitted it is handed the pool's
-// ([`NntpPool::provider_policy`]); once the work has a connection, that
-// connection's ([`NntpPool::provider_policy_on_connection`]), in which the
-// recovery probe a quarantine admitted is past its own server's hold. Read
-// otherwise, the probe would find its own work obsolete and be put down
-// unanswered, holding the server it was admitted to recover.
-pub type WorkGuard =
-    dyn Fn(ServerId, &crate::provider_policy::ProviderPolicy) -> bool + Send + Sync;
 
 // How many yielding `try_lock` attempts an owned-lane server selection makes
 // on the shared health mutex before reporting contention. The critical
@@ -163,9 +144,8 @@ impl BlockingBodyLaneAcquireError {
     }
 
     // Whether the leased work should be handed straight back to the scheduler
-    // and retried on the owned fast path, rather than falling back to an
-    // async lane. Capacity admission and selection contention are both
-    // "ask again shortly", not verdicts about the servers.
+    // to be retried on a lane. Capacity admission and selection contention
+    // are both "ask again shortly", not verdicts about the servers.
     pub fn should_requeue_owned_work(&self) -> bool {
         self.is_capacity_admission() || matches!(self, Self::SelectionContended)
     }
@@ -281,49 +261,6 @@ pub struct DecodedBodyIo {
 pub enum DecodedBodyError {
     Nntp(NntpError),
     Decode { raw_size: u32, error: YencError },
-}
-
-fn saturating_u32(value: u64) -> u32 {
-    value.min(u32::MAX as u64) as u32
-}
-
-fn decoded_cpu_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyCpu {
-    DecodedBodyCpu {
-        raw_decode: stats.fused_decode_cpu,
-        read_poll: stats.read_poll_cpu,
-        response_line: stats.response_line_cpu,
-        yenc_header: stats.yenc_header_cpu,
-        body_decode: stats.body_decode_cpu,
-        yend_line: stats.yend_line_cpu,
-        nntp_terminator: stats.nntp_terminator_cpu,
-        feed: stats.output_callback_cpu,
-        finish: stats.article_finish_cpu,
-    }
-}
-
-fn decoded_io_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyIo {
-    DecodedBodyIo {
-        read_calls: stats.read_calls,
-        read_bytes: stats.read_bytes,
-        input_chunks: stats.input_chunks,
-        decode_calls: stats.decode_calls,
-        crc_update_calls: stats.crc_update_calls,
-        output_batches: stats.output_batches,
-        leftover_bytes_after_terminator: stats.leftover_bytes_after_terminator,
-        buffer_compactions: stats.buffer_compactions,
-        encoded_bytes_consumed: stats.encoded_bytes_consumed,
-        decoded_bytes_written: stats.decoded_bytes_written,
-        transport_read: stats.transport_read,
-        throttle_wait: stats.throttle_wait,
-    }
-}
-
-fn decoded_raw_size_from_fused_stats(stats: &FusedYencArticleStats) -> u32 {
-    saturating_u32(
-        stats
-            .encoded_bytes_consumed
-            .saturating_sub(stats.nntp_terminator_bytes),
-    )
 }
 
 // Existence results used by the health probe pipeline.
@@ -444,14 +381,13 @@ pub struct BodyLaneTraceMeta {
 impl NntpClient {
     // Create a new NNTP client from the given configuration.
     pub fn new(config: NntpClientConfig) -> Self {
-        let max_retries_per_server = config.max_retries_per_server;
         let soft_timeout = config.soft_timeout;
         let pool = NntpPool::new(PoolConfig {
             servers: config.servers,
             max_idle_age: config.max_idle_age,
             ..PoolConfig::default()
         });
-        Self::around(pool, max_retries_per_server, soft_timeout)
+        Self::around(pool, soft_timeout)
     }
 
     // A client for settings: refuses, in words, a server list past
@@ -459,23 +395,20 @@ impl NntpClient {
     pub fn try_new(
         config: NntpClientConfig,
     ) -> std::result::Result<Self, crate::pool::PoolTooLarge> {
-        let max_retries_per_server = config.max_retries_per_server;
         let soft_timeout = config.soft_timeout;
         let pool = NntpPool::try_new(PoolConfig {
             servers: config.servers,
             max_idle_age: config.max_idle_age,
             ..PoolConfig::default()
         })?;
-        Ok(Self::around(pool, max_retries_per_server, soft_timeout))
+        Ok(Self::around(pool, soft_timeout))
     }
 
-    fn around(pool: NntpPool, max_retries_per_server: u32, soft_timeout: Duration) -> Self {
+    fn around(pool: NntpPool, soft_timeout: Duration) -> Self {
         let pool = Arc::new(pool);
         pool.start_route_probes();
         NntpClient {
             pool,
-            work_guard: None,
-            max_retries_per_server,
             soft_timeout,
         }
     }
@@ -485,28 +418,8 @@ impl NntpClient {
         pool.start_route_probes();
         NntpClient {
             pool,
-            work_guard: None,
-            max_retries_per_server: 1,
             soft_timeout: Duration::from_secs(15),
         }
-    }
-
-    pub fn with_work_guard(
-        &self,
-        guard: impl Fn(ServerId, &crate::provider_policy::ProviderPolicy) -> bool
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        let mut client = self.clone();
-        let previous = client.work_guard.take();
-        client.work_guard = Some(Arc::new(move |server, policy| {
-            previous
-                .as_ref()
-                .is_none_or(|previous| previous(server, policy))
-                && guard(server, policy)
-        }));
-        client
     }
 
     pub async fn body_server_order(&self, exclude: ServerSet) -> Vec<ServerId> {
@@ -588,223 +501,6 @@ impl NntpClient {
             }
         }
         saw_fill
-    }
-
-    // Fetch the body of an article by message-id, with multi-server failover.
-    //
-    // Tries each server in priority order. Falls back to the next server
-    // on `ArticleNotFound` (430). Retries on the same server for transient
-    // errors before escalating.
-    pub async fn fetch_body(&self, message_id: &str) -> Result<Bytes> {
-        self.fetch_with_failover(message_id).await
-    }
-
-    // Fetch and decode a yEnc BODY by message-id using streamed NNTP chunks.
-    pub async fn fetch_body_decoded_with_groups(
-        &self,
-        message_id: &str,
-        groups: &[String],
-    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        self.fetch_body_decoded_with_groups_excluding(message_id, groups, ServerSet::EMPTY)
-            .await
-    }
-
-    // Like [`fetch_body_decoded_with_groups`](Self::fetch_body_decoded_with_groups)
-    // but skips the specified servers.
-    pub async fn fetch_body_decoded_with_groups_excluding(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: ServerSet,
-    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        self.fetch_body_decoded_with_groups_excluding_traced(message_id, groups, exclude)
-            .await
-            .result
-    }
-
-    pub async fn fetch_body_decoded_with_groups_excluding_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: ServerSet,
-    ) -> DecodedBodyTrace {
-        self.fetch_body_decoded_with_groups_ordered_traced(
-            message_id,
-            groups,
-            exclude,
-            ServerSet::EMPTY,
-        )
-        .await
-    }
-
-    async fn fetch_body_decoded_with_groups_ordered_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: ServerSet,
-        avoid: ServerSet,
-    ) -> DecodedBodyTrace {
-        let order = self.article_server_order(exclude, avoid).await;
-
-        if order.is_empty() {
-            return DecodedBodyTrace {
-                attempts: Vec::new(),
-                result: Err(DecodedBodyError::Nntp(NntpError::PoolExhausted)),
-            };
-        }
-
-        let mut last_error: Option<DecodedBodyError> = None;
-        let mut last_retryable_error: Option<DecodedBodyError> = None;
-        let mut attempts = Vec::new();
-
-        for idx in order {
-            if !self.article_attempt_eligible(idx, exclude, &attempts).await {
-                if let Some(rejection) = self
-                    .pool
-                    .server_transfer_control(ServerId(idx))
-                    .and_then(|control| control.quota_rejection_for(1))
-                {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: Duration::ZERO,
-                        outcome: FetchAttemptOutcome::QuotaBlocked,
-                        error: Some("server download quota blocked".into()),
-                    });
-                    last_error = Some(DecodedBodyError::Nntp(NntpError::quota_blocked(rejection)));
-                }
-                continue;
-            }
-            let server = ServerId(idx);
-            let start = Instant::now();
-
-            match self
-                .fetch_decoded_from_server_with_groups(server, message_id, groups)
-                .await
-            {
-                Ok((decoded, remote_ip, route_feedback)) => {
-                    let elapsed = start.elapsed().saturating_sub(decoded.io.throttle_wait);
-                    self.record_server_success(idx, elapsed).await;
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip,
-                        elapsed,
-                        outcome: FetchAttemptOutcome::Success,
-                        error: None,
-                    });
-                    return DecodedBodyTrace {
-                        attempts,
-                        result: Ok(decoded),
-                    };
-                }
-                Err(DecodedBodyError::Decode { raw_size, error }) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::Success,
-                        error: None,
-                    });
-                    return DecodedBodyTrace {
-                        attempts,
-                        result: Err(DecodedBodyError::Decode { raw_size, error }),
-                    };
-                }
-                Err(DecodedBodyError::Nntp(
-                    NntpError::ArticleNotFound
-                    | NntpError::NoSuchArticle { .. }
-                    | NntpError::NoArticleWithNumber,
-                )) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::NotFound,
-                        error: Some("article not found".to_string()),
-                    });
-                    last_error = Some(DecodedBodyError::Nntp(NntpError::NoSuchArticle {
-                        message_id: message_id.to_string(),
-                    }));
-                    continue;
-                }
-                Err(DecodedBodyError::Nntp(e @ NntpError::QuotaBlocked(_))) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: Duration::ZERO,
-                        outcome: FetchAttemptOutcome::QuotaBlocked,
-                        error: Some(e.to_string()),
-                    });
-                    last_error = Some(DecodedBodyError::Nntp(e));
-                    continue;
-                }
-                Err(DecodedBodyError::Nntp(error)) if error.is_credentials_refusal() => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::AuthenticationFailure,
-                        error: Some("authentication/access failure".to_string()),
-                    });
-                    last_error = Some(DecodedBodyError::Nntp(NntpError::AuthenticationFailed));
-                    continue;
-                }
-                // Nothing was asked of the server: no attempt to trace.
-                Err(DecodedBodyError::Nntp(NntpError::WorkObsolete)) => {
-                    return DecodedBodyTrace {
-                        attempts,
-                        result: Err(DecodedBodyError::Nntp(NntpError::WorkObsolete)),
-                    };
-                }
-                Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::transient(&e),
-                        error: Some(e.to_string()),
-                    });
-                    last_retryable_error = Some(DecodedBodyError::Nntp(e));
-                    continue;
-                }
-                Err(other) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::PermanentFailure,
-                        error: Some(format!("{other:?}")),
-                    });
-                    return DecodedBodyTrace {
-                        attempts,
-                        result: Err(other),
-                    };
-                }
-            }
-        }
-
-        DecodedBodyTrace {
-            attempts,
-            result: Err(last_retryable_error
-                .or(last_error)
-                .unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted))),
-        }
     }
 
     // Gracefully shut down the client and all pooled connections.
@@ -1028,7 +724,7 @@ impl NntpClient {
                     // Debug for every failure, and one WARN per server per
                     // window carrying how many it stands for. A lane that
                     // cannot connect is invisible otherwise: the work is
-                    // requeued or handed to an async lane, so the download
+                    // requeued for another lane, so the download
                     // keeps running — slowly, on a fraction of its lanes, with
                     // nothing above debug to say why.
                     debug!(
@@ -1348,189 +1044,10 @@ impl NntpClient {
         self.pool.retire_quarantined_idle(server_idx);
     }
 
-    async fn record_server_success(&self, server_idx: usize, elapsed: Duration) {
-        let mut health = self.pool.health().lock().await;
-        health.record_latency(server_idx, elapsed);
-    }
-
-    async fn record_connection_reply(
-        &self,
-        idx: usize,
-        ticket: &crate::recovery::ConnectionHealth,
-        error: Option<&NntpError>,
-    ) {
-        let success = error.is_none_or(|error| {
-            matches!(
-                error,
-                NntpError::ArticleNotFound
-                    | NntpError::NoSuchArticle { .. }
-                    | NntpError::NoArticleWithNumber
-            )
-        });
-        let auth = error.is_some_and(|error| {
-            matches!(
-                error,
-                NntpError::AuthenticationFailed
-                    | NntpError::AuthenticationRejected
-                    | NntpError::AuthenticationRequired
-                    | NntpError::AccessDenied
-            )
-        });
-        let failure = error.is_some_and(|error| {
-            stat_cooldown_reason(error).is_some()
-                && !matches!(
-                    error,
-                    NntpError::PoolExhausted
-                        | NntpError::PoolShutdown
-                        | NntpError::TooManyConnections
-                        | NntpError::ServerOverLimit { .. }
-                        | NntpError::AcquireTimeout(_)
-                )
-        });
-        if success || auth || failure {
-            self.pool
-                .health()
-                .lock()
-                .await
-                .record_connection_outcome(idx, ticket, success, auth);
-            self.pool.retire_quarantined_idle(idx);
-        }
-    }
-
-    async fn record_premature_death_if_needed(&self, server_idx: usize, age: Duration) {
-        if age < crate::health::ServerHealth::MIN_CONNECTION_LIFETIME {
-            let mut health = self.pool.health().lock().await;
-            health.record_premature_death(server_idx);
-        }
-    }
-
-    // Drop the connection that just failed, and only that one.
-    //
-    // One socket's fault says nothing about the server's other sockets: they
-    // were opened at different times, may run over different addresses, and
-    // are the warm capacity the next request is about to reuse. Throwing them
-    // away turned a single refused command into a fleet-wide cold dial.
-    async fn discard_connection_error(&self, server_idx: usize, conn: PooledConnection) {
-        let age = conn.created_at().elapsed();
-        if let Some(lease) = &conn.health_lease {
-            self.record_connection_reply(server_idx, &lease.0, Some(&NntpError::ConnectionClosed))
-                .await;
-        }
-        conn.discard();
-        self.record_premature_death_if_needed(server_idx, age).await;
-    }
-
     // Whether `server` could hand out a normal lease right now without
     // waiting on its connection semaphore.
     pub fn has_available_permit(&self, server: ServerId) -> bool {
         self.pool.has_available_permit(server)
-    }
-
-    async fn acquire_before_deadline(
-        &self,
-        server: ServerId,
-        deadline: &mut TokioInstant,
-    ) -> Result<PooledConnection> {
-        self.pool
-            .acquire_guarded_before_deadline(
-                server,
-                None,
-                true,
-                deadline,
-                self.work_guard.as_deref(),
-            )
-            .await
-            .and_then(|conn| self.validate_acquired_work(server, conn))
-            .map_err(|error| self.map_acquire_timeout(error))
-    }
-
-    fn validate_acquired_work(
-        &self,
-        server: ServerId,
-        conn: PooledConnection,
-    ) -> Result<PooledConnection> {
-        if let Some(guard) = &self.work_guard {
-            let policy = self
-                .pool
-                .provider_policy_on_connection(server.0, conn.holds_recovery_probe());
-            if !guard(server, &policy) {
-                return Err(NntpError::WorkObsolete);
-            }
-        }
-        Ok(conn)
-    }
-
-    fn map_acquire_timeout(&self, error: NntpError) -> NntpError {
-        match error {
-            // Zero is the pool reporting that it never waited: the deadline was
-            // already spent, or every connection belongs to a busy download
-            // lane. Restamping it with the soft timeout would claim a wait that
-            // never happened and hide the difference from whoever reads the log.
-            NntpError::AcquireTimeout(0) => NntpError::AcquireTimeout(0),
-            NntpError::AcquireTimeout(_) => self.acquire_timeout_error(),
-            other => other,
-        }
-    }
-
-    async fn sleep_before_deadline(&self, delay: Duration, deadline: TokioInstant) -> Result<()> {
-        match tokio::time::timeout_at(deadline, tokio::time::sleep(delay)).await {
-            Ok(()) => Ok(()),
-            Err(_) => Err(self.soft_timeout_error()),
-        }
-    }
-
-    fn soft_timeout_error(&self) -> NntpError {
-        NntpError::SoftTimeout(self.soft_timeout.as_secs())
-    }
-
-    // The acquire-side twin of [`Self::soft_timeout_error`], for deadlines
-    // that expire while we are still queued behind our own connection
-    // semaphore.
-    fn acquire_timeout_error(&self) -> NntpError {
-        NntpError::AcquireTimeout(self.soft_timeout.as_secs())
-    }
-
-    // Rank candidates without granting permission to use them. Eligibility
-    // is evaluated for each article immediately before its next attempt.
-    async fn article_server_order(&self, exclude: ServerSet, avoid: ServerSet) -> Vec<usize> {
-        let mut groups = std::collections::BTreeMap::new();
-        for idx in 0..self.pool.server_count() {
-            if !exclude.contains(idx) {
-                groups
-                    .entry((
-                        self.pool.server_backfill_flags()[idx],
-                        self.pool.server_groups()[idx],
-                    ))
-                    .or_insert_with(Vec::new)
-                    .push(idx);
-            }
-        }
-        let mut order = Vec::new();
-        for group in groups.into_values() {
-            let mut ranked = self.rank_servers_in_group(&group).await;
-            ranked.sort_by_key(|idx| avoid.contains(*idx));
-            order.extend(ranked);
-        }
-        order
-    }
-
-    async fn article_attempt_eligible(
-        &self,
-        server: usize,
-        exclude: ServerSet,
-        attempts: &[FetchAttemptTrace],
-    ) -> bool {
-        let missing: ServerSet = attempts
-            .iter()
-            .filter(|attempt| matches!(attempt.outcome, FetchAttemptOutcome::NotFound))
-            .map(|attempt| attempt.server_idx)
-            .collect();
-        matches!(
-            self.pool
-                .provider_policy()
-                .eligibility(server, missing, exclude, 1),
-            crate::provider_policy::ArticleEligibility::Eligible(_)
-        )
     }
 
     // Build the server try-order, exhausting lower-priority fill groups
@@ -1697,320 +1214,6 @@ impl NntpClient {
 
         result
     }
-
-    // Internal: fetch with multi-server failover logic.
-    async fn fetch_with_failover(&self, message_id: &str) -> Result<Bytes> {
-        let exclude = ServerSet::EMPTY;
-        let order = self.article_server_order(exclude, ServerSet::EMPTY).await;
-        let mut last_error: Option<NntpError> = None;
-        let mut last_retryable_error: Option<NntpError> = None;
-
-        let mut missing = ServerSet::EMPTY;
-        for idx in order {
-            if !matches!(
-                self.pool
-                    .provider_policy()
-                    .eligibility(idx, missing, exclude, 1),
-                crate::provider_policy::ArticleEligibility::Eligible(_)
-            ) {
-                continue;
-            }
-            let server = ServerId(idx);
-            let start = Instant::now();
-
-            match self.fetch_from_server(server, message_id).await {
-                Ok(data) => {
-                    let elapsed = start.elapsed();
-                    self.record_server_success(idx, elapsed).await;
-                    return Ok(data);
-                }
-                Err(NntpError::ArticleNotFound)
-                | Err(NntpError::NoSuchArticle { .. })
-                | Err(NntpError::NoArticleWithNumber) => {
-                    missing.insert(idx);
-                    debug!(
-                        server = idx,
-                        message_id, "article not found, trying next server"
-                    );
-                    last_error = Some(NntpError::NoSuchArticle {
-                        message_id: message_id.to_string(),
-                    });
-                    continue;
-                }
-                Err(e @ NntpError::QuotaBlocked(_)) => {
-                    last_error = Some(e);
-                    continue;
-                }
-                Err(NntpError::AuthenticationFailed)
-                | Err(NntpError::AuthenticationRejected)
-                | Err(NntpError::AccessDenied) => {
-                    warn!(
-                        server = idx,
-                        message_id, "authentication/access failure, trying next server"
-                    );
-                    last_error = Some(NntpError::AuthenticationFailed);
-                    continue;
-                }
-                Err(e) if is_transient(&e) => {
-                    if matches!(
-                        e,
-                        NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
-                    ) {
-                        // The holdoff already reported itself once for this
-                        // window; every later article that lands on the same
-                        // server must stay quiet.
-                        trace!(
-                            server = idx,
-                            message_id, "provider capacity rejected connection"
-                        );
-                    } else {
-                        warn!(
-                            server = idx,
-                            error = %e,
-                            message_id,
-                            "transient error, trying next server"
-                        );
-                    }
-                    last_retryable_error = Some(e);
-                    continue;
-                }
-                Err(e) => {
-                    // Non-recoverable error (pool shutdown, etc.)
-                    return Err(e);
-                }
-            }
-        }
-
-        // All servers exhausted.
-        Err(last_retryable_error
-            .or(last_error)
-            .unwrap_or(NntpError::PoolExhausted))
-    }
-
-    // Try to select one of the given groups on the connection.
-    //
-    // Returns `Ok(true)` if a group was selected or the server needs none,
-    // `Ok(false)` if none were accepted, or `Err` on a connection-level
-    // error.
-    //
-    // A server that has not proven it refuses message-id fetches without a
-    // selected group is sent no GROUP, as on the download lanes: the round
-    // trip is spent only where a 412 has asked for it.
-    async fn try_select_group(conn: &mut PooledConnection, groups: &[String]) -> Result<bool> {
-        if !conn.needs_group_prologue() {
-            if !groups.is_empty() {
-                conn.decline_group();
-            }
-            return Ok(true);
-        }
-        for group in groups {
-            match conn.select_group(group).await {
-                Ok(()) => return Ok(true),
-                Err(e) if is_connection_error(&e) => return Err(e),
-                Err(_) => continue,
-            }
-        }
-        Ok(false)
-    }
-
-    async fn fetch_decoded_from_server_with_groups(
-        &self,
-        server: ServerId,
-        message_id: &str,
-        groups: &[String],
-    ) -> std::result::Result<(DecodedBody, Option<IpAddr>, RouteFeedback), DecodedBodyError> {
-        let mut attempts = 0u32;
-
-        loop {
-            let mut deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = self
-                .acquire_before_deadline(server, &mut deadline)
-                .await
-                .map_err(DecodedBodyError::Nntp)?;
-
-            let group_result =
-                match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        self.discard_connection_error(server.0, conn).await;
-                        return Err(DecodedBodyError::Nntp(self.soft_timeout_error()));
-                    }
-                };
-
-            match group_result {
-                Err(e) if is_transient(&e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await
-                        .map_err(DecodedBodyError::Nntp)?;
-                        continue;
-                    }
-                    return Err(DecodedBodyError::Nntp(e));
-                }
-                Err(e) => return Err(DecodedBodyError::Nntp(e)),
-                Ok(false) => {}
-                Ok(true) => {}
-            }
-
-            let mut budget = ActiveTransferBudget::new(self.soft_timeout);
-            let stream_result = conn
-                .stream_yenc_article_with_active_budget(message_id, 0, &mut budget, |_| Ok(()))
-                .await;
-
-            if let Some(lease) = &conn.health_lease {
-                let error = match &stream_result {
-                    Err(FusedYencError::Nntp(error)) => Some(error),
-                    _ => None,
-                };
-                self.record_connection_reply(server.0, &lease.0, error)
-                    .await;
-            }
-            match stream_result {
-                Ok(article) => {
-                    return Ok((
-                        DecodedBody {
-                            raw_size: decoded_raw_size_from_fused_stats(&article.stats),
-                            cpu: decoded_cpu_from_fused_stats(&article.stats),
-                            io: decoded_io_from_fused_stats(&article.stats),
-                            decoded: article.chunks,
-                            body: article.body,
-                        },
-                        conn.remote_ip(),
-                        conn.route_outcome.clone(),
-                    ));
-                }
-                Err(FusedYencError::Yenc(error)) => {
-                    return Err(DecodedBodyError::Decode { raw_size: 0, error });
-                }
-                Err(FusedYencError::Nntp(
-                    e @ (NntpError::ArticleNotFound
-                    | NntpError::NoSuchArticle { .. }
-                    | NntpError::NoArticleWithNumber),
-                )) => {
-                    return Err(DecodedBodyError::Nntp(e));
-                }
-                Err(FusedYencError::Nntp(e)) if is_transient(&e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await
-                        .map_err(DecodedBodyError::Nntp)?;
-                        continue;
-                    }
-                    return Err(DecodedBodyError::Nntp(e));
-                }
-                Err(FusedYencError::Nntp(e)) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    } else if is_egress_quota_rejection(&e) {
-                        conn.discard();
-                    }
-                    return Err(DecodedBodyError::Nntp(e));
-                }
-            }
-        }
-    }
-
-    // Fetch from a specific server, retrying on transient errors.
-    //
-    // Connection acquisition and retry delay are bounded by a per-attempt
-    // soft timeout. BODY payload reads use an inactivity budget that restarts
-    // whenever bytes arrive or a transfer-policy wait ends.
-    async fn fetch_from_server(
-        &self,
-        server: ServerId,
-        message_id: &str,
-    ) -> Result<Bytes> {
-        let mut attempts = 0u32;
-
-        loop {
-            let mut deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = self.acquire_before_deadline(server, &mut deadline).await?;
-
-            let mut budget = ActiveTransferBudget::new(self.soft_timeout);
-            let result = conn
-                .body_by_id_raw_with_active_budget(message_id, &mut budget)
-                .await;
-
-            if let Some(lease) = &conn.health_lease {
-                self.record_connection_reply(server.0, &lease.0, result.as_ref().err())
-                    .await;
-            }
-            match result {
-                Ok(response) => return Ok(response.data),
-                Err(NntpError::ArticleNotFound) | Err(NntpError::NoSuchArticle { .. }) => {
-                    // Article not found — do not retry, return immediately.
-                    return Err(result.unwrap_err());
-                }
-                Err(e) if is_transient(&e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await?;
-                        debug!(
-                            server = server.0,
-                            attempt = attempts,
-                            error = %e,
-                            message_id,
-                            "transient error, retrying on same server"
-                        );
-                        continue;
-                    }
-                    return Err(e);
-                }
-                Err(e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    } else if is_egress_quota_rejection(&e) {
-                        conn.discard();
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-}
-
-// Returns true if the error is transient and the request might succeed on retry.
-fn is_transient(err: &NntpError) -> bool {
-    matches!(
-        err,
-        NntpError::Io(_)
-            | NntpError::Timeout
-            | NntpError::ConnectionClosed
-            | NntpError::TruncatedMultilineBody
-            | NntpError::ServerDisconnectedMidBody
-            | NntpError::MalformedMultilineTerminator
-            // The next connection can select the group learned from this 412.
-            | NntpError::NoGroupSelected
-            | NntpError::ServiceUnavailable
-            | NntpError::TooManyConnections
-            | NntpError::ServerOverLimit { .. }
-            | NntpError::PoolExhausted
-            | NntpError::SoftTimeout(_)
-            | NntpError::AcquireTimeout(_)
-    )
 }
 
 fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
@@ -2034,45 +1237,6 @@ fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
         NntpError::AcquireTimeout(_) => None,
         _ => None,
     }
-}
-
-fn stat_cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
-    cooldown_reason(err).or_else(|| {
-        matches!(err, NntpError::MalformedResponse(_)).then_some(CooldownReason::Transport)
-    })
-}
-
-// Whether the egress the connection runs over refused the body for quota.
-//
-// The socket is sound, but it is bound to a route leg with no quota left;
-// pooling it would hand the next request the same refusal. It is dropped
-// without a health penalty so the next dial takes whatever leg the route
-// now offers.
-fn is_egress_quota_rejection(err: &NntpError) -> bool {
-    matches!(
-        err,
-        NntpError::QuotaBlocked(rejection) if rejection.scope == crate::transfer::TransferScope::Egress
-    )
-}
-
-// Returns true if the error indicates the connection itself is bad
-// and should be discarded rather than returned to the pool.
-fn is_connection_error(err: &NntpError) -> bool {
-    matches!(
-        err,
-        NntpError::Io(_)
-            | NntpError::Timeout
-            | NntpError::ConnectionClosed
-            | NntpError::TruncatedMultilineBody
-            | NntpError::ServerDisconnectedMidBody
-            | NntpError::MalformedMultilineTerminator
-            | NntpError::TooManyConnections
-            | NntpError::AccessDenied
-            // The batch's remaining replies are still queued on that socket,
-            // so nothing else may be sent down it.
-            | NntpError::SessionExpired
-            | NntpError::SoftTimeout(_)
-    )
 }
 
 #[cfg(test)]

@@ -74,49 +74,10 @@ impl Providers {
     }
 
     async fn close(mut self) {
-        self.client.pool.drain_all_idle().await;
+        self.client.pool.drain_all_idle();
         self.servers.abort_all();
         while self.servers.join_next().await.is_some() {}
     }
-}
-
-#[tokio::test]
-async fn selective_fallback_and_mixed_probes_reuse_only_eligible_sockets() {
-    let fixture = Providers::new().await;
-    // A preexisting paid socket must not turn into permission to use it.
-    drop(fixture.client.pool.acquire(ServerId(2)).await.unwrap());
-    for id in 0..124 {
-        fixture
-            .client
-            .fetch_body(&format!("<primary-{id}@example.invalid>"))
-            .await
-            .unwrap();
-    }
-    fixture
-        .client
-        .fetch_body("<fallback@example.invalid>")
-        .await
-        .unwrap();
-    fixture
-        .client
-        .fetch_body("<primary-again@example.invalid>")
-        .await
-        .unwrap();
-    let commands = fixture.commands.lock().unwrap().clone();
-    assert!(commands.iter().all(|(server, _)| *server != 2));
-    assert!(
-        commands
-            .iter()
-            .filter(|(server, _)| *server == 1)
-            .all(|(_, command)| command.contains("fallback"))
-    );
-    assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fixture.dials[1].load(Ordering::SeqCst),
-        1,
-        "one fallback does not dial sixteen connections"
-    );
-    fixture.close().await;
 }
 
 // Commands a server read, leaving out the goodbye a closing lane sends.
@@ -188,90 +149,6 @@ async fn blocking_fallback_uses_the_lower_group_only_for_the_missing_article() {
     assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 1);
     assert_eq!(fixture.dials[1].load(Ordering::SeqCst), 1);
     assert_eq!(fixture.dials[2].load(Ordering::SeqCst), 0);
-    fixture.close().await;
-}
-
-#[tokio::test]
-async fn obsolete_work_cannot_dial_or_take_a_socket_after_waiting_for_capacity() {
-    use std::future::Future;
-    use std::sync::atomic::AtomicBool;
-    use std::task::Poll;
-
-    let fixture = Providers::new().await;
-    let allowed = Arc::new(AtomicBool::new(false));
-    let guard = Arc::clone(&allowed);
-    let client = fixture
-        .client
-        .with_work_guard(move |_, _| guard.load(Ordering::SeqCst));
-    let mut deadline = TokioInstant::now() + UNREACHED_TIMEOUT;
-    assert!(matches!(
-        client
-            .acquire_before_deadline(ServerId(0), &mut deadline)
-            .await,
-        Err(NntpError::WorkObsolete)
-    ));
-    assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 0);
-
-    allowed.store(true, Ordering::SeqCst);
-    let mut held = Vec::new();
-    for _ in 0..16 {
-        held.push(fixture.client.pool.acquire(ServerId(0)).await.unwrap());
-    }
-    // Model an owned idle lane whose recall is queued until we release it.
-    held.last().unwrap().socket_slot.as_ref().unwrap().idle(
-        crate::socket_budget::SocketPhase::OwnedIdle,
-        Arc::new(|_| {}),
-    );
-    let mut waiting = Box::pin(client.acquire_before_deadline(ServerId(0), &mut deadline));
-    std::future::poll_fn(|cx| {
-        assert!(waiting.as_mut().poll(cx).is_pending());
-        Poll::Ready(())
-    })
-    .await;
-    allowed.store(false, Ordering::SeqCst);
-    drop(held.pop());
-    assert!(matches!(waiting.await, Err(NntpError::WorkObsolete)));
-    assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 16);
-    assert!(fixture.commands.lock().unwrap().is_empty());
-    drop(held);
-    fixture.close().await;
-}
-
-// A guard that turns the work away is neither a wait nor a server fault:
-// the article leaves no attempt behind and no server's health moves.
-#[tokio::test]
-async fn obsolete_work_leaves_no_attempt_and_no_health_mark() {
-    let fixture = Providers::new().await;
-    let client = fixture.client.with_work_guard(|_, _| false);
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced(
-            "<obsolete@example.invalid>",
-            &["alt.binaries.test".to_string()],
-            crate::ServerSet::EMPTY,
-        )
-        .await;
-    assert!(
-        matches!(
-            trace.result,
-            Err(crate::client::DecodedBodyError::Nntp(NntpError::WorkObsolete))
-        ),
-        "{:?}",
-        trace.result
-    );
-    assert!(trace.attempts.is_empty(), "{:?}", trace.attempts);
-    {
-        let health = fixture.client.pool.health().lock().await;
-        for idx in 0..3 {
-            assert_eq!(health.server(idx).failure_count, 0);
-            assert!(health.server(idx).is_available());
-        }
-    }
-    assert!(
-        fixture
-            .dials
-            .iter()
-            .all(|count| count.load(Ordering::SeqCst) == 0)
-    );
     fixture.close().await;
 }
 
@@ -386,56 +263,6 @@ async fn refused_dials_reach_health_past_an_idle_cached_socket() {
     })
     .await
     .unwrap();
-}
-
-#[tokio::test]
-async fn ordinary_outages_do_not_unlock_a_cached_backfill_socket() {
-    let fixture = Providers::new().await;
-    fixture
-        .client
-        .pool
-        .health()
-        .lock()
-        .await
-        .set_reenable_clock(Instant::now());
-    drop(fixture.client.pool.acquire(ServerId(2)).await.unwrap());
-    fixture
-        .client
-        .pool
-        .health()
-        .lock()
-        .await
-        .record_cooldown(0, crate::health::CooldownReason::Transport);
-    fixture
-        .client
-        .fetch_body("<ordinary-outage@example.invalid>")
-        .await
-        .unwrap();
-    assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.dials[1].load(Ordering::SeqCst), 1);
-    fixture
-        .client
-        .pool
-        .health()
-        .lock()
-        .await
-        .record_cooldown(1, crate::health::CooldownReason::Transport);
-    assert!(
-        fixture
-            .client
-            .fetch_body("<protected@example.invalid>")
-            .await
-            .is_err()
-    );
-    assert!(
-        fixture
-            .commands
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(server, _)| *server != 2)
-    );
-    fixture.close().await;
 }
 
 // Fill servers that are down are an outage, not a miss: the connection

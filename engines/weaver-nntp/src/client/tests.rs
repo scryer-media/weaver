@@ -94,35 +94,6 @@ async fn spawn_delayed_reauth_server() -> u16 {
     port
 }
 
-async fn spawn_unterminated_body_server() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        socket.write_all(b"200 ready\r\n").await.unwrap();
-
-        let capabilities = read_command_line(&mut socket).await;
-        assert!(capabilities.starts_with("CAPABILITIES"));
-        socket
-            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-            .await
-            .unwrap();
-
-        let body = read_command_line(&mut socket).await;
-        assert!(body.starts_with("BODY "));
-        socket
-            .write_all(b"222 1 <unterminated@example.com>\r\n")
-            .await
-            .unwrap();
-        socket.write_all(&vec![b'x'; 64 * 1024]).await.unwrap();
-        socket.flush().await.unwrap();
-        let _ = socket.read_to_end(&mut Vec::new()).await;
-    });
-
-    port
-}
-
 // Longer than any test runs. A script answers, closes or deliberately goes
 // silent, so a connection's own timeouts only decide a test that sets them
 // itself, never a slow runner.
@@ -263,109 +234,6 @@ fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
 }
 
 #[test]
-fn transient_errors() {
-    assert!(is_transient(&NntpError::NoGroupSelected));
-    assert!(is_transient(&NntpError::Timeout));
-    assert!(is_transient(&NntpError::ConnectionClosed));
-    assert!(is_transient(&NntpError::TruncatedMultilineBody));
-    assert!(is_transient(&NntpError::ServerDisconnectedMidBody));
-    assert!(is_transient(&NntpError::MalformedMultilineTerminator));
-    assert!(is_transient(&NntpError::ServiceUnavailable));
-    assert!(is_transient(&NntpError::TooManyConnections));
-    assert!(is_transient(&NntpError::PoolExhausted));
-    assert!(is_transient(&NntpError::Io(std::io::Error::new(
-        std::io::ErrorKind::ConnectionReset,
-        "reset"
-    ))));
-
-    // Non-transient errors
-    assert!(!is_transient(&NntpError::AuthenticationFailed));
-    assert!(!is_transient(&NntpError::AccessDenied));
-    assert!(!is_transient(&NntpError::PoolShutdown));
-    assert!(!is_transient(&NntpError::ArticleNotFound));
-    assert!(!is_transient(&NntpError::MalformedResponse("bad".into())));
-}
-
-#[test]
-fn connection_errors() {
-    assert!(is_connection_error(&NntpError::Timeout));
-    assert!(is_connection_error(&NntpError::ConnectionClosed));
-    assert!(is_connection_error(&NntpError::TruncatedMultilineBody));
-    assert!(is_connection_error(&NntpError::ServerDisconnectedMidBody));
-    assert!(is_connection_error(
-        &NntpError::MalformedMultilineTerminator
-    ));
-    assert!(is_connection_error(&NntpError::TooManyConnections));
-    assert!(is_connection_error(&NntpError::AccessDenied));
-    assert!(!is_connection_error(&NntpError::ArticleNotFound));
-    assert!(!is_connection_error(&NntpError::AuthenticationFailed));
-}
-
-#[test]
-fn client_config_default_retries() {
-    let config = NntpClientConfig::single(
-        ServerConfig {
-            host: "news.example.com".into(),
-            ..Default::default()
-        },
-        5,
-    );
-    assert_eq!(config.max_retries_per_server, 1);
-}
-
-#[test]
-fn client_config_custom_retries() {
-    let mut config = NntpClientConfig::single(
-        ServerConfig {
-            host: "news.example.com".into(),
-            ..Default::default()
-        },
-        5,
-    );
-    config.max_retries_per_server = 3;
-    assert_eq!(config.max_retries_per_server, 3);
-
-    let client = NntpClient::new(config);
-    assert_eq!(client.max_retries_per_server, 3);
-}
-
-#[test]
-fn from_pool_default_retries() {
-    let config = NntpClientConfig::single(
-        ServerConfig {
-            host: "news.example.com".into(),
-            ..Default::default()
-        },
-        5,
-    );
-    let pool = Arc::new(NntpPool::new(PoolConfig {
-        servers: config.servers,
-        max_idle_age: config.max_idle_age,
-        ..PoolConfig::default()
-    }));
-    let client = NntpClient::from_pool(pool);
-    assert_eq!(client.max_retries_per_server, 1);
-}
-
-#[test]
-fn transient_errors_are_retriable() {
-    // Verify that the errors we consider transient would trigger retries
-    assert!(is_transient(&NntpError::Timeout));
-    assert!(is_transient(&NntpError::ConnectionClosed));
-    assert!(is_transient(&NntpError::ServiceUnavailable));
-    assert!(is_transient(&NntpError::TooManyConnections));
-    assert!(is_transient(&NntpError::PoolExhausted));
-
-    // These should NOT trigger retries
-    assert!(!is_transient(&NntpError::ArticleNotFound));
-    assert!(!is_transient(&NntpError::AuthenticationFailed));
-    assert!(!is_transient(&NntpError::AccessDenied));
-    assert!(!is_transient(&NntpError::NoSuchArticle {
-        message_id: "<test@example.com>".into(),
-    }));
-}
-
-#[test]
 fn client_config_single() {
     let config = NntpClientConfig::single(
         ServerConfig {
@@ -394,8 +262,8 @@ fn client_creation() {
     assert_eq!(client.pool().server_count(), 1);
 }
 
-#[tokio::test]
-async fn infrastructure_admission_failures_do_not_poison_server_health() {
+#[test]
+fn infrastructure_admission_failures_do_not_poison_server_health() {
     let client = NntpClient::new(NntpClientConfig::single(
         ServerConfig {
             host: "news.example.com".into(),
@@ -410,32 +278,30 @@ async fn infrastructure_admission_failures_do_not_poison_server_health() {
         .unwrap();
     let ticket = &permit.health_lease.0;
     for error in [
-        NntpError::TooManyConnections,
         NntpError::PoolExhausted,
         NntpError::PoolShutdown,
+        NntpError::AcquireTimeout(15),
     ] {
-        client
-            .record_connection_reply(0, ticket, Some(&error))
-            .await;
+        client.record_blocking_connect_failure(
+            0,
+            crate::pool::FreshConnectAdmission::Open,
+            &error,
+            ticket,
+        );
     }
     assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
+        client.pool().health().blocking_lock().server(0).failure_count,
         0
     );
 
-    client
-        .record_connection_reply(0, ticket, Some(&NntpError::AcquireTimeout(15)))
-        .await;
-    assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
-        0
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::SoftTimeout(15),
+        ticket,
     );
-
-    client
-        .record_connection_reply(0, ticket, Some(&NntpError::SoftTimeout(15)))
-        .await;
     assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
+        client.pool().health().blocking_lock().server(0).failure_count,
         1
     );
 }
@@ -470,16 +336,19 @@ async fn declined_dial_holds_blocking_lanes_on_the_holdoff() {
         4,
     ));
 
-    assert!(matches!(
-        client.pool().acquire(ServerId(0)).await,
-        Err(NntpError::TooManyConnections)
-    ));
-    assert!(client.pool().is_over_limit(ServerId(0)));
-    assert!(matches!(
-        client.pool().acquire(ServerId(0)).await,
-        Err(NntpError::ServerOverLimit { .. })
-    ));
     let client = tokio::task::spawn_blocking(move || {
+        let Err(declined) = client.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+        else {
+            panic!("the provider declines the dial");
+        };
+        assert!(
+            matches!(
+                declined,
+                BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::TooManyConnections)
+            ),
+            "{declined:?}"
+        );
+        assert!(client.pool().is_over_limit(ServerId(0)));
         for _ in 0..4 {
             let Err(error) = client.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
             else {
@@ -708,33 +577,6 @@ fn blocking_lane_preserves_provider_capacity_rejection() {
     );
 }
 
-#[tokio::test]
-async fn client_shutdown() {
-    let config = NntpClientConfig::single(
-        ServerConfig {
-            host: "news.example.com".into(),
-            ..Default::default()
-        },
-        5,
-    );
-    let client = NntpClient::new(config);
-    client.shutdown().await;
-
-    // After shutdown, fetches should fail
-    let result = client.fetch_body("<test@example.com>").await;
-    assert!(result.is_err());
-}
-
-#[test]
-fn soft_timeout_is_transient() {
-    assert!(is_transient(&NntpError::SoftTimeout(15)));
-}
-
-#[test]
-fn soft_timeout_is_connection_error() {
-    assert!(is_connection_error(&NntpError::SoftTimeout(15)));
-}
-
 #[test]
 fn transient_failure_recording_counts_soft_timeouts() {
     assert_eq!(
@@ -750,14 +592,10 @@ fn transient_failure_recording_counts_soft_timeouts() {
 }
 
 // Failing to obtain a connection is local capacity, not a server fault:
-// it is still retryable, but it must never cool the server down, and it
-// carries no connection to discard.
+// it must never cool the server down.
 #[test]
 fn acquire_timeout_is_capacity_not_transport() {
-    assert!(is_transient(&NntpError::AcquireTimeout(15)));
-    assert!(!is_connection_error(&NntpError::AcquireTimeout(15)));
     assert_eq!(cooldown_reason(&NntpError::AcquireTimeout(15)), None);
-    assert_eq!(stat_cooldown_reason(&NntpError::AcquireTimeout(15)), None);
     assert_eq!(
         NntpError::AcquireTimeout(15).to_string(),
         "no connection available within 15s"
@@ -841,8 +679,6 @@ fn multi_server_client(server_count: usize) -> NntpClient {
 
     NntpClient {
         pool: Arc::new(pool),
-        work_guard: None,
-        max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     }
 }
@@ -1207,6 +1043,22 @@ fn never_dialled(listener: &std::net::TcpListener) -> bool {
         listener.accept(),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
     )
+}
+
+// The setup a scripted server greets a reader session with.
+fn greeted_reader(mut rest: Vec<ScriptStep>) -> Vec<ScriptStep> {
+    let mut steps = vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: READER_CAPABILITIES,
+        },
+    ];
+    steps.append(&mut rest);
+    steps
 }
 
 // The connection downloads use skips a fill server whose quota is spent and
@@ -1689,11 +1541,9 @@ fn selection_contention_is_requeued_but_is_not_capacity_admission() {
     );
 }
 
-// The dispatcher asks this question before it decides between an owned lane
-// and the async path, and a momentary lock collision is not an answer about
-// servers. Collapsing it into "no candidate" sent the batch to the async
-// path — which then dialled its own connection while the owned lane sat on a
-// warm one.
+// The dispatcher asks this question before it opens a lane, and a
+// momentary lock collision is not an answer about servers: contention is
+// asked again, while having no candidate is a verdict.
 #[tokio::test]
 async fn candidacy_separates_contention_from_having_no_candidate() {
     let client = NntpClient::new(NntpClientConfig {
@@ -1779,523 +1629,6 @@ async fn backfill_server_that_misses_joins_exclusion_ladder() {
         .build_server_order(crate::ServerSet::from([0, 1]))
         .await;
     assert!(order.is_empty());
-}
-
-#[tokio::test]
-async fn decoded_traced_fetch_reports_successful_server_idx() {
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <exists@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced(
-            "<exists@example.com>",
-            &[String::from("alt.binaries.test")],
-            crate::ServerSet::EMPTY,
-        )
-        .await;
-
-    assert!(trace.result.is_ok(), "traced fetch should succeed");
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(trace.attempts[0].server_idx, 0);
-    assert_eq!(
-        trace.attempts[0].remote_ip,
-        Some("127.0.0.1".parse().unwrap())
-    );
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
-}
-
-// A fetch with a group to select sends no GROUP to a server that has not
-// asked for one. The server answers the BODY with 412: the process learns
-// it needs a group, that connection is not used again, and the retry
-// selects the group on a new one before it asks for the BODY.
-#[tokio::test]
-async fn a_fetch_selects_a_group_only_after_a_412_asks_for_one() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let (mut first, _) = listener.accept().await.unwrap();
-        first.write_all(b"200 ready\r\n").await.unwrap();
-        assert!(
-            read_command_line(&mut first)
-                .await
-                .starts_with("CAPABILITIES")
-        );
-        first
-            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-            .await
-            .unwrap();
-        let asked = read_command_line(&mut first).await;
-        assert!(
-            asked.starts_with("BODY "),
-            "no GROUP is sent first: {asked}"
-        );
-        first.write_all(b"412 no group selected\r\n").await.unwrap();
-
-        let (mut second, _) = listener.accept().await.unwrap();
-        second.write_all(b"200 ready\r\n").await.unwrap();
-        assert!(
-            read_command_line(&mut second)
-                .await
-                .starts_with("CAPABILITIES")
-        );
-        second
-            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-            .await
-            .unwrap();
-        let asked = read_command_line(&mut second).await;
-        assert!(asked.starts_with("GROUP alt.binaries.test"), "{asked}");
-        second
-            .write_all(b"211 1 1 1 alt.binaries.test\r\n")
-            .await
-            .unwrap();
-        let asked = read_command_line(&mut second).await;
-        assert!(asked.starts_with("BODY "), "{asked}");
-        second
-            .write_all(b"222 1 <exists@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n")
-            .await
-            .unwrap();
-    });
-
-    assert!(!crate::server_caps::requires_group_selection(
-        "127.0.0.1",
-        port
-    ));
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 1,
-        soft_timeout: Duration::from_secs(3600),
-    });
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced(
-            "<exists@example.com>",
-            &[String::from("alt.binaries.test")],
-            crate::ServerSet::EMPTY,
-        )
-        .await;
-
-    trace.result.expect("the retry brings the article");
-    assert!(crate::server_caps::requires_group_selection(
-        "127.0.0.1",
-        port
-    ));
-    server.await.expect("the server saw the commands in order");
-}
-
-#[tokio::test]
-async fn decoded_quota_rejection_fails_over_to_another_fill_server() {
-    let capped_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-    ])
-    .await;
-    let healthy_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <quota-failover@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let capped_control = transfers.configure(
-        crate::transfer::StableServerId(101),
-        crate::transfer::ServerTransferConfig {
-            rate_bytes_per_sec: 0,
-            quota: Some(crate::transfer::QuotaRuntimeConfig {
-                limit_bytes: 0,
-                generation: 1,
-                retry_at: None,
-            }),
-        },
-    );
-    let mut capped = scripted_server(capped_port, 0);
-    capped.stable_id = crate::transfer::StableServerId(101);
-    capped.transfer_control = Some(capped_control);
-    let healthy = scripted_server(healthy_port, 1);
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![capped, healthy],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: UNREACHED_TIMEOUT,
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<quota-failover@example.com>", &[], crate::ServerSet::EMPTY)
-        .await;
-    let decoded = trace.result.expect("second fill server should succeed");
-    let decoded_bytes: Vec<u8> = decoded
-        .decoded
-        .iter()
-        .flat_map(|chunk| chunk.iter().copied())
-        .collect();
-    assert_eq!(decoded_bytes, b"A");
-    assert_eq!(trace.attempts.len(), 2);
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::QuotaBlocked);
-    assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
-}
-
-#[tokio::test]
-async fn decoded_quota_rejection_does_not_unlock_backfill() {
-    let capped_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-    ])
-    .await;
-    let backfill_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <backfill-locked@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let capped_control = transfers.configure(
-        crate::transfer::StableServerId(102),
-        crate::transfer::ServerTransferConfig {
-            rate_bytes_per_sec: 0,
-            quota: Some(crate::transfer::QuotaRuntimeConfig {
-                limit_bytes: 0,
-                generation: 1,
-                retry_at: None,
-            }),
-        },
-    );
-    let mut capped = scripted_server(capped_port, 0);
-    capped.stable_id = crate::transfer::StableServerId(102);
-    capped.transfer_control = Some(capped_control);
-    let mut backfill = scripted_server(backfill_port, 0);
-    backfill.backfill = true;
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![capped, backfill],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: UNREACHED_TIMEOUT,
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<backfill-locked@example.com>", &[], crate::ServerSet::EMPTY)
-        .await;
-    assert!(matches!(
-        trace.result,
-        Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(_)))
-    ));
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(trace.attempts[0].server_idx, 0);
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::QuotaBlocked);
-}
-
-#[tokio::test]
-async fn deliberate_rate_wait_does_not_trip_decoded_soft_timeout_or_health() {
-    const DECODED_SIZE: usize = 1_200;
-    let mut response =
-        b"222 1 <rate-wait@example.com>\r\n=ybegin line=128 size=1200 name=x\r\n".to_vec();
-    for offset in (0..DECODED_SIZE).step_by(128) {
-        let line_len = (DECODED_SIZE - offset).min(128);
-        response.extend(std::iter::repeat_n(b'k', line_len));
-        response.extend_from_slice(b"\r\n");
-    }
-    response.extend_from_slice(b"=yend size=1200\r\n.\r\n");
-    let response: &'static [u8] = Box::leak(response.into_boxed_slice());
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response,
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let control = transfers.configure(
-        crate::transfer::StableServerId(103),
-        crate::transfer::ServerTransferConfig {
-            rate_bytes_per_sec: 1_000,
-            quota: None,
-        },
-    );
-    let mut server = scripted_server(port, 0);
-    server.stable_id = crate::transfer::StableServerId(103);
-    server.transfer_control = Some(control.clone());
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![server],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(50),
-    });
-
-    let started = Instant::now();
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<rate-wait@example.com>", &[], crate::ServerSet::EMPTY)
-        .await;
-    assert!(started.elapsed() >= Duration::from_millis(100));
-    let decoded = trace.result.expect("deliberate wait must not time out");
-    let expected = vec![b'A'; DECODED_SIZE];
-    let decoded_bytes: Vec<u8> = decoded
-        .decoded
-        .iter()
-        .flat_map(|chunk| chunk.iter().copied())
-        .collect();
-    assert_eq!(decoded_bytes, expected);
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
-    assert_eq!(
-        *client.pool.health().lock().await.server(0).state(),
-        crate::health::ServerState::Healthy
-    );
-    assert!(control.snapshot().lifetime_body_bytes > 1_000);
-}
-
-#[tokio::test]
-async fn delayed_body_initial_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
-    let primary_port = spawn_delayed_body_initial_server().await;
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <delayed@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(75),
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<delayed@example.com>", &[], crate::ServerSet::EMPTY)
-        .await;
-
-    assert!(matches!(
-        trace.result,
-        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
-    ));
-    assert_eq!(trace.attempts.len(), 1);
-    assert!(
-        trace.attempts[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("soft timeout"))
-    );
-}
-
-#[tokio::test]
-async fn delayed_reauth_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
-    let primary_port = spawn_delayed_reauth_server().await;
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <reauth@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-    let mut primary = scripted_server(primary_port, 0);
-    primary.server.username = Some("user".to_string());
-    primary.server.password = Some("pass".to_string());
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![primary, scripted_server(backup_port, 1)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(75),
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<reauth@example.com>", &[], crate::ServerSet::EMPTY)
-        .await;
-
-    assert!(matches!(
-        trace.result,
-        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
-    ));
-    assert_eq!(trace.attempts.len(), 1);
-    assert!(
-        trace.attempts[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("soft timeout"))
-    );
-}
-
-#[tokio::test]
-async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
-    let primary_port = spawn_unterminated_body_server().await;
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <unterminated@example.com>\r\nbackup\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let control = transfers.configure(
-        crate::transfer::StableServerId(105),
-        crate::transfer::ServerTransferConfig {
-            rate_bytes_per_sec: 1,
-            quota: None,
-        },
-    );
-    let mut primary = scripted_server(primary_port, 0);
-    primary.stable_id = crate::transfer::StableServerId(105);
-    primary.transfer_control = Some(control.clone());
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![primary, scripted_server(backup_port, 1)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(75),
-    });
-
-    let result = client.fetch_body("<unterminated@example.com>").await;
-
-    assert!(matches!(result, Err(NntpError::SoftTimeout(_))), "{result:?}");
-    let snapshot = control.snapshot();
-    assert!(snapshot.lifetime_body_bytes >= 64 * 1024);
-    assert_eq!(snapshot.throttle_wait, Duration::ZERO);
-}
-
-#[tokio::test]
-async fn grouped_body_missing_plus_transport_uncertainty_is_not_authoritative_not_found() {
-    let primary_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"430 No such article\r\n",
-        },
-    ])
-    .await;
-
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced(
-            "<maybe@example.com>",
-            &[String::from("alt.binaries.test")],
-            crate::ServerSet::EMPTY,
-        )
-        .await;
-
-    assert_eq!(trace.attempts.len(), 2);
-    assert!(matches!(
-        trace.result,
-        Err(DecodedBodyError::Nntp(
-            NntpError::ConnectionClosed | NntpError::SoftTimeout(_)
-        ))
-    ));
 }
 
 #[tokio::test]
@@ -2385,8 +1718,6 @@ async fn build_server_order_keeps_backfill_after_primary_group() {
 
     let client = NntpClient {
         pool: Arc::new(pool),
-        work_guard: None,
-        max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     };
 
@@ -2423,8 +1754,6 @@ async fn build_server_order_prefers_ready_servers_within_same_group() {
 
     let client = NntpClient {
         pool: Arc::new(pool),
-        work_guard: None,
-        max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     };
 
@@ -2541,91 +1870,5 @@ fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
     );
     assert!(client.server_quota_rejection(ServerId(0), 41).is_some());
     assert!(limited.snapshot().quota_blocked);
-}
-
-// A client over one scripted server whose own timeouts never decide a test.
-fn patient_client(port: u16) -> NntpClient {
-    NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: UNREACHED_TIMEOUT,
-    })
-}
-
-// The setup a scripted server greets a reader session with.
-fn greeted_reader(mut rest: Vec<ScriptStep>) -> Vec<ScriptStep> {
-    let mut steps = vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: READER_CAPABILITIES,
-        },
-    ];
-    steps.append(&mut rest);
-    steps
-}
-
-// A guarded fetch on a server whose quarantine has lapsed dials the server's
-// recovery probe. The guard, asked again once the probe's connection is had,
-// reads that connection's view of the policy, where the probe is past its
-// own server's hold: read as a new connection, the server would stand held
-// by the very probe, the work would be found obsolete, and the probe would
-// be put down unanswered.
-#[tokio::test]
-async fn a_guarded_fetch_carries_the_due_probe_and_its_server_recovers() {
-    let port = spawn_scripted_server(greeted_reader(vec![ScriptStep {
-        expect_prefix: Some("BODY "),
-        response: b"222 1 <probe@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-    }]))
-    .await;
-    let client = patient_client(port);
-    let pool = Arc::clone(client.pool());
-    pool.quarantine_for_transport_for_test(0);
-    pool.expire_quarantine_for_test(0);
-    let guarded = client.with_work_guard(|server, policy| {
-        matches!(
-            policy.eligibility(server.0, ServerSet::EMPTY, ServerSet::EMPTY, 1),
-            crate::provider_policy::ArticleEligibility::Eligible(_)
-        )
-    });
-
-    let trace = guarded
-        .fetch_body_decoded_with_groups_excluding_traced("<probe@example.com>", &[], ServerSet::EMPTY)
-        .await;
-
-    assert!(trace.result.is_ok(), "{:?}", trace.result.err());
-    assert!(!pool.requires_recovery(0), "the probe answered");
-}
-
-// An async connection that is its server's unanswered recovery probe is
-// never put back on the idle list: kept there, it would hold the server's
-// every other connection with nothing on the wire. Dropped, it gives the
-// probe back, and the probe is due again.
-#[tokio::test]
-async fn an_async_probe_put_down_unanswered_gives_the_probe_back() {
-    let port = spawn_scripted_server(greeted_reader(Vec::new())).await;
-    let client = patient_client(port);
-    let pool = Arc::clone(client.pool());
-    pool.quarantine_for_transport_for_test(0);
-    pool.expire_quarantine_for_test(0);
-    let mut deadline = TokioInstant::now() + UNREACHED_TIMEOUT;
-
-    let probe = pool
-        .acquire_guarded_before_deadline(ServerId(0), None, true, &mut deadline, None)
-        .await
-        .unwrap();
-    assert!(probe.holds_recovery_probe());
-    assert!(pool.recovery_holds_new_work(0), "the probe is out");
-    drop(probe);
-
-    assert!(
-        !pool.recovery_holds_new_work(0),
-        "the probe was given back, not kept idle"
-    );
-    assert!(pool.requires_recovery(0), "nothing answered it");
 }
 

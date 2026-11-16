@@ -692,10 +692,6 @@ impl DownloadFailure {
             // Never got a socket before the deadline: local lane capacity, not
             // a transport fault of the server.
             | NntpError::AcquireTimeout(_) => Some(DownloadFailureKind::CapacityUnavailable),
-            // The lease's own guard turned the work away before a command
-            // went out: nothing was requested, and nothing is known about the
-            // article or the server.
-            NntpError::WorkObsolete => Some(DownloadFailureKind::Unrequested),
             // A session that expired part-way through a batch costs the
             // connection, not the server and not the article: the 480 stood
             // where the article's status line would have, so the article is
