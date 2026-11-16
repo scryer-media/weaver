@@ -665,7 +665,6 @@ fn every_weaver_state_maps_to_one_client_state() {
         (
             TorrentView {
                 completed_at_ms: done,
-                detail: Some(status::Stated::GoalMet.as_str().into()),
                 stated: Some(status::Stated::GoalMet),
                 ..view(TorrentState::Stopped)
             },

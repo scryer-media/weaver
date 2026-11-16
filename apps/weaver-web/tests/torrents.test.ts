@@ -9,6 +9,7 @@ import {
   routeExposureText,
   routeReasonText,
   TORRENT_ROUTE_REASONS,
+  TORRENT_STATED_REASONS,
   showsSeeding,
   torrentStateLabelKey,
   trackerSourceKey,
@@ -64,6 +65,7 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
   name: "set",
   infohash: "ab".repeat(20),
   infohashV2: null,
+  stated: null,
   detail: null,
   routeReason: null,
   category: null,
@@ -245,12 +247,24 @@ test("the transfer section notes its route's reason in each locale, else the ser
       const key = reason.startsWith("TORRENT_ROUTE_") ? `next.refusal.${reason}` : `next.torrents.routeReason.${reason}`;
       assert.equal(transferNote(translate, torrent({ state: "STALLED", routeReason: reason })), dictionary[key], `${locale}: ${reason}`);
     }
-    assert.equal(transferNote(translate, torrent({ state: "STALLED", detail: "disk_space" })), dictionary["next.status.wait.disk_space"], locale);
+    for (const reason of TORRENT_STATED_REASONS) {
+      const key = `next.torrents.stated.${reason}`;
+      assert.equal(transferNote(translate, torrent({ state: "STALLED", stated: reason })), dictionary[key], `${locale}: ${reason}`);
+    }
+    // A torrent waiting for room on its disk reads as a usenet job waiting for the same does.
+    assert.equal(dictionary["next.torrents.stated.DISK_SPACE"], dictionary["next.status.wait.disk_space"], locale);
+    // Each code a torrent's job row waits with has words.
+    for (const code of ["disk_space", "disk_full", "goal_met", "fetch_trackers", "fetch_discovery", "fetch_waiting"]) {
+      translate(`next.status.wait.${code}`);
+    }
   }
   assert.equal(transferNote(t, torrent({ state: "STALLED", routeReason: "SESSION_LIMIT" })), "Session limit reached");
   assert.equal(transferNote(t, torrent({ state: "STOPPED", detail: "disk gone" })), "disk gone");
-  // A torrent waiting for room on its disk reads as a usenet job does.
-  assert.equal(transferNote(t, torrent({ state: "STALLED", detail: "disk_space" })), "Low disk space");
+  assert.equal(transferNote(t, torrent({ state: "STALLED", stated: "DISK_SPACE" })), "Low disk space");
+  assert.equal(transferNote(t, torrent({ state: "STALLED", stated: "DISK_FULL" })), "Disk full: seeding only");
+  assert.equal(transferNote(t, torrent({ state: "STOPPED", stated: "GOAL_MET" })), "Seeding goal met");
+  // Free words that look like a code are shown as they came.
+  assert.equal(transferNote(t, torrent({ state: "STALLED", detail: "disk_space" })), "disk_space");
   assert.equal(transferNote(t, torrent()), undefined);
 });
 

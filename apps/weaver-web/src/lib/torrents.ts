@@ -171,6 +171,9 @@ export interface TorrentData extends TorrentSummaryData {
   name: string;
   infohash: string;
   infohashV2: string | null;
+  /** Why it is in its state, when the server states the reason itself. */
+  stated: TorrentStatedReason | null;
+  /** Why it is in its state in the server's free words: an error, a refusal, a route's cause. */
   detail: string | null;
   /** Why its route holds it, while its state comes from that hold. */
   routeReason: TorrentRouteReason | null;
@@ -349,6 +352,25 @@ export type TorrentRouteReason = (typeof TORRENT_ROUTE_REASONS)[number];
 
 export function routeReasonText(t: Translate, reason: TorrentRouteReason): string {
   return t(reason.startsWith("TORRENT_ROUTE_") ? `next.refusal.${reason}` : `next.torrents.routeReason.${reason}`);
+}
+
+/** The reasons the server states a torrent's state with, by name. */
+export const TORRENT_STATED_REASONS = [
+  "DISK_SPACE",
+  "DISK_FULL",
+  "GOAL_MET",
+  "HELD_MANUAL",
+  "HELD_SCHEDULED",
+  "HELD_SPEED_TEST",
+  "FETCH_TRACKERS",
+  "FETCH_DISCOVERY",
+  "FETCH_WAITING",
+] as const;
+
+export type TorrentStatedReason = (typeof TORRENT_STATED_REASONS)[number];
+
+export function statedReasonText(t: Translate, reason: TorrentStatedReason): string {
+  return t(`next.torrents.stated.${reason}`);
 }
 
 /**
