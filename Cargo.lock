@@ -6454,7 +6454,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-torrent"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6545,7 +6545,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-utp"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "anyhow",
  "bitvec",
