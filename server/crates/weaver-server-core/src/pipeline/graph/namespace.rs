@@ -2372,22 +2372,35 @@ impl NamespaceWriter {
     // that object still has the member as the volume they went to. An
     // object that gave the member up gave those bytes up with it, and
     // whoever takes the member next reads them from the file like the rest,
-    // the same object taking it again as another volume included.
+    // the same object taking it again as another volume included. An
+    // object refused while it has them gives them to no file: the refusal
+    // hands them on to what takes the member (`Self::materialise`).
     fn not_in_file(&self, tree: &Tree, node: NodeId, member: MemberId) -> Vec<ByteRange> {
-        let owner = tree.child_of(node, member);
         let mut ranges = self
             .files
             .get(&node)
             .map(|files| files.holds.held_ranges(held_volume(member)))
             .unwrap_or_default();
-        ranges.extend(
-            self.reached_now
-                .iter()
-                .filter(|(at, of, child, _)| *at == node && *of == member && owner == Some(*child))
-                .map(|(_, _, _, range)| *range),
-        );
+        if let Some(owner) = tree.child_of(node, member) {
+            ranges.extend(self.reached_by(node, member, owner));
+        }
         ranges.sort_by_key(|range| range.start);
         ranges
+    }
+
+    // What the delivery that bound the member gave `child`, the object and
+    // its volume the bytes went to, while the member is handed over.
+    fn reached_by(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        child: (NodeId, VolumeIndex),
+    ) -> Vec<ByteRange> {
+        self.reached_now
+            .iter()
+            .filter(|(at, of, to, _)| *at == node && *of == member && *to == child)
+            .map(|(_, _, _, range)| *range)
+            .collect()
     }
 
     // Held bytes go down again once the object their member is a volume of

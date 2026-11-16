@@ -1050,3 +1050,62 @@ async fn rar_xz_read_back_of_binding_bytes_tail_first() {
 async fn rar_xz_read_back_when_the_binding_article_is_lost() {
     rar_xz_read_back(|scenario| scenario, 1, "binding article lost").await;
 }
+
+// An LZMA2 7z of one file.
+fn sevenz_lzma2(name: &str, bytes: &[u8]) -> Vec<u8> {
+    use sevenz_turbo::encoder_options::Lzma2Options;
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter};
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![Lzma2Options::from_level(1).into()]);
+    let mut entry = ArchiveEntry::new_file(name);
+    entry.size = bytes.len() as u64;
+    writer
+        .push_archive_entry(entry, Some(Cursor::new(bytes.to_vec())))
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+// An LZMA2 7z in a stored zip, posted as `posted` in `wrap`, large enough
+// (from about 66 KB of file) that the zip places the 7z's tail in the
+// member's own file before its front binds the 7z store. The store refuses
+// the compressed 7z for the engine while the member is handed to it, when
+// the bytes of the delivery that bound it are with the store and in no
+// file: the engine is given them from the store and the holds, and
+// decodes the file whole.
+async fn an_lzma2_7z_in_a_stored_zip(posted: &str, wrap: fn(Vec<u8>) -> Vec<u8>) {
+    let held = noise(80_000, 301);
+    let store = wrap(zip(&[("level1.7z", sevenz_lzma2(FILE, &held))]));
+    for (scenario, case) in
+        both_orders(|| Scenario::new(vec![Post::plain(posted, store.clone())]).framed(FRAME))
+    {
+        let (lines, guard) = Lines::capture();
+        let graph = run(&scenario).await;
+        drop(guard);
+        let refused = lines.of("object refused");
+        assert!(
+            refused
+                .iter()
+                .all(|line| field(line, "kind") == "sevenz_store"
+                    && field(line, "why") == "compressed"),
+            "{case}: {refused:?}"
+        );
+        assert_eq!(
+            summary(&graph),
+            format!("Some(Complete) [{FILE}]"),
+            "{case}: {refused:?}"
+        );
+        assert!(graph.files[&delivered(FILE)] == held, "{case}: the bytes");
+    }
+}
+
+#[tokio::test]
+async fn an_lzma2_7z_in_a_stored_zip_handed_to_the_engine_while_bound_delivers() {
+    an_lzma2_7z_in_a_stored_zip("lantern.zip", |zip| zip).await;
+}
+
+// The bench's nested-3deep shape: the same zip as the one member of a
+// stored RAR.
+#[tokio::test]
+async fn an_lzma2_7z_in_a_stored_zip_in_a_stored_rar_handed_to_the_engine_while_bound_delivers() {
+    an_lzma2_7z_in_a_stored_zip("lantern.rar", |zip| rar(&[("level2.zip", zip)])).await;
+}

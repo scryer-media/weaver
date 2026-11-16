@@ -14,7 +14,9 @@
 //
 // A member still in its own file was never handed to the object whole: the
 // file holds every byte it arrived with, so those go on from the file and
-// the object is asked for nothing.
+// the object is asked for nothing, but for the bytes of the delivery that
+// bound it, which went to the object alone while it was handed over: they
+// go on from the holds and from the object, as a member's with no file do.
 //
 // A range the map cannot reproduce is delivered as damage. A recovery object
 // that covers the member repairs it from there; with none, the member
@@ -132,12 +134,58 @@ impl NamespaceWriter {
             .get(&node)
             .is_some_and(|files| files.leaves.contains_key(&member))
         {
-            // What the object held came from the file, which still has it.
-            self.drop_held(node, member, super::ALL)?;
-            if tree.child_of(node, member).is_some() {
+            // What the object held came from the file, which still has it,
+            // but for what the delivery that bound the member gave the
+            // object while the member is handed to it: that went to the
+            // object alone, and what it held of that is the only copy. Those
+            // holds go on from the holds, and the rest of those bytes is
+            // read back through the object, as for a member with no file.
+            let reached = self.reached_by(node, member, (retired, volume));
+            for range in outside(super::ALL, &reached) {
+                self.drop_held(node, member, range)?;
+            }
+            let held = self
+                .files
+                .get(&node)
+                .map(|files| files.holds.held_ranges(super::held_volume(member)))
+                .unwrap_or_default();
+            let record = tree
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .ok_or(WriteError::UnknownMember { node, member })?;
+            let runs: Vec<_> = record
+                .coverage
+                .runs()
+                .flat_map(|run| {
+                    reached
+                        .iter()
+                        .filter_map(move |range| run.range.intersect(*range))
+                        .map(move |range| (range, run.provenance))
+                })
+                .flat_map(|(range, provenance)| {
+                    outside(range, &held).map(move |range| (range, provenance))
+                })
+                .collect();
+            if let Some(owner) = tree.child_of(node, member) {
+                // What takes the member reads none of those bytes from the
+                // file either: the file is shared and read around them.
+                self.reached_now
+                    .extend(reached.iter().map(|range| (node, member, owner, *range)));
+                self.share_file(tree, node, member, None);
+                self.replay(tree, builder, segments, node, member, super::ALL, None, out)?;
                 self.replay_file(tree, builder, segments, node, member, None, out)?;
+            } else {
+                self.release_to_leaf(tree, node, member)?;
             }
             self.release_subtree(tree, retired)?;
+            self.read_back_runs(
+                tree,
+                builder,
+                segments,
+                (node, member, retired, volume),
+                runs,
+                out,
+            )?;
             return self.close_if_leaf(tree, node, member);
         }
         // What the member's holds carry never reached the object, whatever
@@ -178,6 +226,34 @@ impl NamespaceWriter {
             self.release_to_leaf(tree, node, member)?;
         }
         self.release_subtree(tree, retired)?;
+        self.read_back_runs(
+            tree,
+            builder,
+            segments,
+            (node, member, retired, volume),
+            runs,
+            out,
+        )?;
+        if let Some(envelope) = shared {
+            // The file is the member's now, or its engine's envelope: the
+            // retired object no longer keeps it, so it is not removed with
+            // the object's other envelopes.
+            self.envelopes.take(retired, envelope);
+        }
+        self.close_if_leaf(tree, node, member)
+    }
+
+    // Runs of the member's record, read back through the retired object and
+    // delivered again, a bounded chunk at a time.
+    fn read_back_runs(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, member, retired, volume): (NodeId, MemberId, NodeId, VolumeIndex),
+        runs: Vec<(ByteRange, Provenance)>,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
         for (run, provenance) in runs {
             // A loss brought no bytes: only what reached the object's
             // sources over it since, a repair's, goes down again, and the
@@ -204,13 +280,7 @@ impl NamespaceWriter {
                 }
             }
         }
-        if let Some(envelope) = shared {
-            // The file is the member's now, or its engine's envelope: the
-            // retired object no longer keeps it, so it is not removed with
-            // the object's other envelopes.
-            self.envelopes.take(retired, envelope);
-        }
-        self.close_if_leaf(tree, node, member)
+        Ok(())
     }
 
     // One chunk of a run the member's record holds, read back through the
