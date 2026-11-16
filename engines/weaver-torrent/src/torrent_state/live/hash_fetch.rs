@@ -13,7 +13,6 @@
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     ops::Range,
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -44,7 +43,7 @@ const REQUESTS_PER_PEER: usize = 2;
 
 /// A request out to a peer, and when the run it asks for may go to another.
 struct Out {
-    peer: SocketAddr,
+    peer: PeerHandle,
     deadline: Instant,
 }
 
@@ -80,7 +79,7 @@ struct Wanted {
     /// The peers asked for it whose answer is still due.
     out: Vec<Out>,
     /// The peers that rejected it, which are not asked for it again.
-    rejected_by: Vec<SocketAddr>,
+    rejected_by: Vec<PeerHandle>,
 }
 
 impl Wanted {
@@ -96,7 +95,7 @@ enum Wake {
     /// None: no want came free, and no connection's held requests fell.
     Nobody,
     /// These, whose held requests fell, and none other.
-    Peers(Vec<SocketAddr>),
+    Peers(Vec<PeerHandle>),
     /// Every connection: a want came free or may go to another sooner, or a
     /// new one is wanted.
     All,
@@ -118,7 +117,7 @@ impl Wake {
     // at `now`: its own held requests fell, and the want came free or may
     // go to another sooner when it is due earlier than it was, or not at
     // all.
-    fn taken_off(peer: SocketAddr, was: Option<Instant>, now: Option<Instant>) -> Wake {
+    fn taken_off(peer: PeerHandle, was: Option<Instant>, now: Option<Instant>) -> Wake {
         match (was, now) {
             (Some(was), Some(now)) if now >= was => Wake::Peers(vec![peer]),
             _ => Wake::All,
@@ -214,7 +213,7 @@ pub(crate) struct LayerFetch {
     /// every connection; a request of its own answered, rejected or
     /// dropped, for it alone. A connection no change can give work is left
     /// asleep. Taken after `wanted` is let go.
-    waiters: Mutex<HashMap<SocketAddr, Arc<Notify>>>,
+    waiters: Mutex<HashMap<PeerHandle, Arc<Notify>>>,
 }
 
 impl LayerFetch {
@@ -239,7 +238,7 @@ impl LayerFetch {
 
     /// The bell of `peer`'s connection; see [`Self::waiters`]. A ring that
     /// comes before the connection waits is kept for it.
-    pub(super) fn waiter(&self, peer: SocketAddr) -> Arc<Notify> {
+    pub(super) fn waiter(&self, peer: PeerHandle) -> Arc<Notify> {
         self.waiters.lock().entry(peer).or_default().clone()
     }
 
@@ -269,7 +268,7 @@ impl LayerFetch {
     /// `hash_picker::pick_hashes`).
     pub fn pick(
         &self,
-        peer: SocketAddr,
+        peer: PeerHandle,
         has_any: impl Fn(Range<u32>) -> bool,
         timeout: Duration,
         now: Instant,
@@ -313,7 +312,7 @@ impl LayerFetch {
 
     /// `peer` answered `request`: what it asked for, when it was out to it
     /// (libtorrent `bt_peer_connection::on_hashes` ignores the others).
-    fn answered(&self, peer: SocketAddr, request: &HashRequest) -> Option<Asked> {
+    fn answered(&self, peer: PeerHandle, request: &HashRequest) -> Option<Asked> {
         let (asked, wake) = match self.take_out(peer, request) {
             Some((w, wake)) => (
                 Some(match w.kind {
@@ -396,7 +395,7 @@ impl LayerFetch {
     /// `peer` rejected `request`: the run may go to another peer at once
     /// (libtorrent `hash_picker::hashes_rejected`), and is not asked of it
     /// again.
-    fn rejected(&self, peer: SocketAddr, request: &HashRequest) {
+    fn rejected(&self, peer: PeerHandle, request: &HashRequest) {
         let wake = match self.take_out(peer, request) {
             Some((mut w, wake)) => {
                 w.rejected_by.push(peer);
@@ -408,7 +407,7 @@ impl LayerFetch {
     }
 
     /// `peer` left: what it held may go to another, and its bell goes.
-    pub fn forget(&self, peer: SocketAddr) {
+    pub fn forget(&self, peer: PeerHandle) {
         let mut wake = Wake::Nobody;
         for w in self.wanted.lock().iter_mut() {
             let was = w.due();
@@ -427,7 +426,7 @@ impl LayerFetch {
     /// out to it, and whom that may give work.
     fn take_out(
         &self,
-        peer: SocketAddr,
+        peer: PeerHandle,
         request: &HashRequest,
     ) -> Option<(parking_lot::MappedMutexGuard<'_, Wanted>, Wake)> {
         let wanted = self.wanted.lock();
@@ -589,7 +588,7 @@ impl PeerHandler {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, net::SocketAddr};
 
     use futures::FutureExt;
 
@@ -629,7 +628,7 @@ mod tests {
         fn run(&mut self, peer: SocketAddr, has: &[bool], timeout: Duration, now: Instant) {
             loop {
                 let pick = self.fetch.pick(
-                    peer,
+                    peer.into(),
                     |pieces| pieces.into_iter().any(|p| has[p as usize]),
                     timeout,
                     now,
@@ -715,7 +714,7 @@ mod tests {
             let mut joined = vec![true; peers.len()];
             let mut now = Instant::now();
             for (peer, ..) in &peers {
-                new.fetch.waiter(*peer);
+                new.fetch.waiter((*peer).into());
             }
             for (peer, has, timeout) in &peers {
                 old.run(*peer, has, *timeout, now);
@@ -731,7 +730,7 @@ mod tests {
                     .wanted
                     .lock()
                     .iter()
-                    .filter(|w| w.out.iter().any(|o| o.peer == peer))
+                    .filter(|w| w.out.iter().any(|o| o.peer == peer.into()))
                     .map(|w| w.request)
                     .collect();
                 let event = match r % 6 {
@@ -739,7 +738,7 @@ mod tests {
                         let asked = held[(r >> 16) as usize % held.len()];
                         let landed = r & 0x100 != 0;
                         for side in [&mut old, &mut new] {
-                            side.fetch.answered(peer, &asked);
+                            side.fetch.answered(peer.into(), &asked);
                             if landed {
                                 side.fetch.landed(&asked);
                             }
@@ -749,7 +748,7 @@ mod tests {
                     2 if !held.is_empty() => {
                         let asked = held[(r >> 16) as usize % held.len()];
                         for side in [&mut old, &mut new] {
-                            side.fetch.rejected(peer, &asked);
+                            side.fetch.rejected(peer.into(), &asked);
                         }
                         true
                     }
@@ -772,12 +771,12 @@ mod tests {
                         if joined[at] {
                             joined[at] = false;
                             for side in [&mut old, &mut new] {
-                                side.fetch.forget(peer);
+                                side.fetch.forget(peer.into());
                                 side.wake_at.remove(&peer);
                             }
                         } else {
                             joined[at] = true;
-                            new.fetch.waiter(peer);
+                            new.fetch.waiter(peer.into());
                             let (_, has, timeout) = &peers[at];
                             old.run(peer, has, *timeout, now);
                             new.run(peer, has, *timeout, now);
@@ -796,7 +795,12 @@ mod tests {
                     if event || old.timer_due(*peer, now) {
                         old.run(*peer, has, *timeout, now);
                     }
-                    let rung = new.fetch.waiter(*peer).notified().now_or_never().is_some();
+                    let rung = new
+                        .fetch
+                        .waiter((*peer).into())
+                        .notified()
+                        .now_or_never()
+                        .is_some();
                     if rung || new.timer_due(*peer, now) {
                         new.run(*peer, has, *timeout, now);
                     }

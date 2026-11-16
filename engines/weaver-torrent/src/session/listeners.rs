@@ -306,7 +306,7 @@ impl Session {
                     match added {
                         Ok(AddIncomingPeerResult::Added) => {
                             if let Some(session) = session {
-                                session.settle_over_limit(&live, addr);
+                                session.settle_over_limit(&live, addr.into());
                             }
                         }
                         Ok(_) => {}

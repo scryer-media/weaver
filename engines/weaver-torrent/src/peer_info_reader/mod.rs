@@ -633,7 +633,7 @@ impl PeerConnectionHandler for Handler {
     }
 
     fn encrypt_outgoing(&self) -> bool {
-        self.peers.encrypt_outgoing(self.addr)
+        self.peers.encrypt_outgoing(self.addr.into())
     }
 
     fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
@@ -644,7 +644,8 @@ impl PeerConnectionHandler for Handler {
                 swarm::Encryption::of(encryption),
             );
         }
-        self.peers.handshake_encryption(self.addr, encryption);
+        self.peers
+            .handshake_encryption(self.addr.into(), encryption);
     }
 
     fn on_handshake(

@@ -29,7 +29,7 @@ async fn what_a_connection_does_is_counted_under_what_it_was() {
 
     handler
         .on_handshake(
-            Handshake::new(Id20::new([7; 20]), client_id(peer.addr)),
+            Handshake::new(Id20::new([7; 20]), client_id(peer.addr.addr().unwrap())),
             ConnectionKind::Utp,
             false,
         )

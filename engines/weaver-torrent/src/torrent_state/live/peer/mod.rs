@@ -32,7 +32,7 @@ use crate::peer_protocol::extended::ut_pex::{
     PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PexPeerInfo,
 };
 use crate::stream_connect::{ConnectionKind, Transports};
-use crate::type_aliases::{BF, PeerSourceFlag, PeerSources};
+use crate::type_aliases::{BF, PeerHandle, PeerSourceFlag, PeerSources};
 
 use super::PeerStates;
 use super::choker::Transfer;
@@ -360,7 +360,7 @@ pub(crate) fn opening_rank(trust: Trust) -> DisconnectRank {
 
 #[derive(Debug)]
 pub(crate) struct Peer {
-    pub addr: SocketAddr,
+    pub addr: PeerHandle,
     state: PeerState,
     pub stats: stats::atomic::PeerStats,
     // Where the peer listens, when we know. We can connect to the peer when it
@@ -420,7 +420,7 @@ impl Peer {
     ) -> Self {
         let stats = stats::atomic::PeerStats::default();
         Self {
-            addr,
+            addr: addr.into(),
             state: PeerState::Live(Box::new(LivePeerState::new(
                 peer_id,
                 tx,
@@ -449,9 +449,20 @@ impl Peer {
     /// A peer `sources` named, listening where it was named. The peer list
     /// counts it on admission.
     pub fn new_with_outgoing_address(addr: SocketAddr, sources: PeerSources) -> Self {
+        Self::not_connected(addr.into(), Some(addr), sources)
+    }
+
+    /// A peer under `addr` we are not connected to, dialled at
+    /// `outgoing_address` when it has one: the one place a peer's fields
+    /// begin, but for an incoming connection's.
+    fn not_connected(
+        addr: PeerHandle,
+        outgoing_address: Option<SocketAddr>,
+        sources: PeerSources,
+    ) -> Self {
         Self {
             addr,
-            outgoing_address: Some(addr),
+            outgoing_address,
             stats: Default::default(),
             state: Default::default(),
             failcount: 0,
@@ -480,15 +491,29 @@ impl Peer {
         }
     }
 
+    /// Web seed `handle`, which no source named and which listens nowhere
+    /// we can dial, so it is never a connect candidate. The peer list
+    /// counts it on admission.
+    pub fn new_web_seed(handle: PeerHandle) -> Self {
+        Self::not_connected(handle, None, PeerSources::default())
+    }
+
+    /// Whether the peer listens at the address it is listed under, so we
+    /// can connect to it there.
+    pub(crate) fn listens_where_listed(&self) -> bool {
+        self.outgoing_address
+            .is_some_and(|at| self.addr == PeerHandle::from(at))
+    }
+
     // The state of a peer we are not connected to. A banned peer is no
     // connect candidate (libtorrent `peer_list::is_connect_candidate`); a
     // holepunched one is, whatever its failures. Nor is one known to only
     // upload while the list says we are finished, however it came to be
     // idle: named again, let go, or brought into a new run.
     fn idle_state(&self, peers: &PeerStates) -> PeerState {
-        if self.outgoing_address == Some(self.addr)
+        if self.listens_where_listed()
             && (self.failcount < MAX_FAILCOUNT || self.holepunch)
-            && !peers.is_banned(self.addr.ip())
+            && !self.addr.ip().is_some_and(|ip| peers.is_banned(ip))
         {
             if self.holepunch || self.needed(peers.is_finished()) {
                 PeerState::Queued
@@ -584,14 +609,16 @@ impl Peer {
     /// (`bt_peer_connection::on_holepunch` calls `torrent::connect_to_peer`),
     /// not through the candidates, so here it goes before them.
     pub(crate) fn connect_rank(&self, order: &ConnectRanking, finished: bool) -> ConnectRank {
+        // Only a peer at an address is a connect candidate.
+        let addr = self.addr.addr();
         (
             !self.holepunch,
             self.failcount,
-            !is_local(self.addr.ip()),
+            !addr.is_some_and(|addr| is_local(addr.ip())),
             order.session_seconds(self.last_connected),
             finished && self.maybe_upload_only,
             Reverse(source_rank(self.sources)),
-            Reverse(order.peer_rank(self.addr)),
+            Reverse(addr.map_or(0, |addr| order.peer_rank(addr))),
         )
     }
 
@@ -636,7 +663,7 @@ impl Peer {
             return false;
         }
         self.holepunch = true;
-        self.outgoing_address = Some(self.addr);
+        self.outgoing_address = self.addr.addr();
         self.set_state(self.idle_state(peers), peers);
         self.is_connect_candidate()
     }

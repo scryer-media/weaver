@@ -167,7 +167,7 @@ mod tests {
     }
 
     fn peer(i: u8) -> PeerHandle {
-        SocketAddr::from(([10, 0, 0, i], 6881))
+        SocketAddr::from(([10, 0, 0, i], 6881)).into()
     }
 
     // The bytes of each block of piece 0, in storage.

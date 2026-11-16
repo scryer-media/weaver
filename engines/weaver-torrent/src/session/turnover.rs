@@ -5,10 +5,11 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::torrent_state::TorrentStateLive;
 use crate::torrent_state::live::choker::{OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL};
+use crate::type_aliases::PeerHandle;
 use anyhow::Context;
 use tracing::debug_span;
 
@@ -101,7 +102,7 @@ impl Session {
 
     // The peer at `addr` of `torrent` said it is interested: it takes one of
     // the session's upload slots when one is free.
-    pub(crate) fn peer_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
+    pub(crate) fn peer_interested(&self, torrent: &TorrentStateLive, addr: PeerHandle) {
         self.choker.peer_interested(torrent, addr);
     }
 
@@ -146,7 +147,7 @@ impl Session {
     // `peer_connection::attach_to_torrent`, `find_disconnect_candidate_torrent`,
     // `torrent::find_lowest_ranking_peer`). One that displaced a connection
     // of its own torrent took that one's place, and is under the cap.
-    pub(crate) fn settle_over_limit(&self, live: &TorrentStateLive, addr: SocketAddr) {
+    pub(crate) fn settle_over_limit(&self, live: &TorrentStateLive, addr: PeerHandle) {
         if !live.exceeds_limit(addr, &self.connection_slots) {
             return;
         }

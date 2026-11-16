@@ -20,7 +20,6 @@
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -36,7 +35,7 @@ use super::{
     TorrentStateLive,
     peer::{LivePeerState, stats::atomic::PeerCountersAtomic},
 };
-use crate::session::TorrentId;
+use crate::{session::TorrentId, type_aliases::PeerHandle};
 
 // libtorrent `unchoke_slots_limit`: the peers the session uploads to at once.
 pub(crate) const DEFAULT_UNCHOKE_SLOTS_LIMIT: usize = 8;
@@ -107,7 +106,7 @@ struct OptimisticRank {
 }
 
 // A connection the choker deals with: its torrent, and the peer's address.
-type Key = (TorrentId, SocketAddr);
+type Key = (TorrentId, PeerHandle);
 
 // Who holds the slots.
 #[derive(Default)]
@@ -199,7 +198,7 @@ impl Choker {
     /// `peer_connection::maybe_unchoke_this_peer`,
     /// `session_impl::preemptive_unchoke`). A peer we already unchoked is
     /// told so again. Only this peer is touched.
-    pub fn peer_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
+    pub fn peer_interested(&self, torrent: &TorrentStateLive, addr: PeerHandle) {
         let mut held = self.held.lock();
         let free = self.slots() > held.count();
         let now = Instant::now();
@@ -224,7 +223,7 @@ impl Choker {
 
     /// The peer at `addr` of `torrent` said it is not interested. It is
     /// choked at once, and a slot it held is handed out again now.
-    pub fn peer_not_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
+    pub fn peer_not_interested(&self, torrent: &TorrentStateLive, addr: PeerHandle) {
         let mut held = self.held.lock();
         let now = Instant::now();
         let held_slot = torrent
@@ -240,7 +239,7 @@ impl Choker {
     /// The connection to the peer at `addr` of the torrent `torrent` is
     /// gone; `held_slot` when we did not choke it. Its slot is handed out
     /// again now.
-    pub fn peer_gone(&self, torrent: TorrentId, addr: SocketAddr, held_slot: bool) {
+    pub fn peer_gone(&self, torrent: TorrentId, addr: PeerHandle, held_slot: bool) {
         let mut held = self.held.lock();
         self.give_up_slot(&mut held, (torrent, addr), held_slot);
     }
@@ -261,7 +260,7 @@ impl Choker {
     }
 
     /// The peers of `torrent` holding the optimistic slots.
-    pub fn optimistic(&self, torrent: TorrentId) -> Vec<SocketAddr> {
+    pub fn optimistic(&self, torrent: TorrentId) -> Vec<PeerHandle> {
         let held = self.held.lock();
         held.optimistic
             .iter()

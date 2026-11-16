@@ -25,12 +25,7 @@ fn the_connected_addresses_kept_are_those_a_walk_of_the_list_finds() {
                 6881 + (i / 16 % 4) as u16,
             ))
         };
-        let web_seed = |i: u64| {
-            SocketAddr::from((
-                std::net::Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, u16::try_from(i % 3).unwrap()),
-                0,
-            ))
-        };
+        let web_seed = |i: u64| PeerHandle::WebSeed(u32::try_from(i % 3).unwrap());
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
             rng ^= rng << 13;
@@ -48,33 +43,33 @@ fn the_connected_addresses_kept_are_those_a_walk_of_the_list_finds() {
                 0 | 1 => peers.add_peer(a, PeerSourceFlag::Tracker),
                 2 => {
                     if let Some((handle, rx, tx)) = peers.connect_next(at) {
-                        keep.push((handle, rx, tx));
+                        keep.push((handle.into(), rx, tx));
                     }
                 }
                 3 => {
                     if let Ok(rx) = connected_to_us(&peers, a) {
-                        keep.push((a, rx, unbounded_channel().0));
+                        keep.push((a.into(), rx, unbounded_channel().0));
                         // Half tell us the port they listen on.
                         if r & 2 == 0 {
-                            peers.with_peer_mut(a, "test", |peer| {
+                            peers.with_peer_mut(a.into(), "test", |peer| {
                                 peer.listens_at(a, &peers);
                             });
                         }
                     }
                 }
                 4 | 5 => {
-                    peers.with_peer_mut(a, "test", |peer| {
+                    peers.with_peer_mut(a.into(), "test", |peer| {
                         if peer.connected_out().is_some() {
                             peers.connection_closed(peer, at, r & 1 == 0, false);
                         }
                     });
                 }
                 6 => {
-                    peers.with_peer_mut(a, "test", |peer| peer.set_not_needed(&peers));
+                    peers.with_peer_mut(a.into(), "test", |peer| peer.set_not_needed(&peers));
                 }
                 7 => {
                     if r & 3 == 0 {
-                        peers.drop_peer(a);
+                        peers.drop_peer(a.into());
                     } else if let Some((rx, tx)) = peers.admit_web_seed(web_seed(r >> 8)) {
                         keep.push((web_seed(r >> 8), rx, tx));
                     }
@@ -174,12 +169,7 @@ fn index_matches_walk(seed: u64) {
             6882 + u16::try_from(i / 12 % 4).unwrap(),
         )
     };
-    let web_seed = |i: u64| {
-        SocketAddr::from((
-            std::net::Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, u16::try_from(i % 3).unwrap()),
-            0,
-        ))
-    };
+    let web_seed = |i: u64| PeerHandle::WebSeed(u32::try_from(i % 3).unwrap());
     let endpoints = [
         OurEndpoints::default(),
         OurEndpoints {
@@ -252,7 +242,7 @@ fn index_matches_walk(seed: u64) {
                 peers.pex_flags(a, flags);
             }
             4 => {
-                peers.with_peer_mut(a, "test", |peer| peer.holepunch(&peers));
+                peers.with_peer_mut(a.into(), "test", |peer| peer.holepunch(&peers));
             }
             5 | 6 => {
                 let q = query_times(at)[usize::try_from((r >> 8) % 4).unwrap()];
@@ -263,9 +253,9 @@ fn index_matches_walk(seed: u64) {
                     expected,
                     "seed {seed:#x} step {step}: connect_next"
                 );
-                if let Some(conn) = got {
+                if let Some((addr, rx, tx)) = got {
                     picked += 1;
-                    conns.push(conn);
+                    conns.push((addr.into(), rx, tx));
                 }
             }
             7 => {
@@ -314,9 +304,9 @@ fn index_matches_walk(seed: u64) {
             }
             10 => {
                 if let Ok(rx) = connected_to_us(&peers, a) {
-                    conns.push((a, rx, unbounded_channel().0));
+                    conns.push((a.into(), rx, unbounded_channel().0));
                     if r & 0x100 == 0 {
-                        peers.with_peer_mut(a, "test", |peer| {
+                        peers.with_peer_mut(a.into(), "test", |peer| {
                             peer.listens_at(SocketAddr::new(a.ip(), 7000), &peers);
                         });
                     }
@@ -325,11 +315,11 @@ fn index_matches_walk(seed: u64) {
             11 => match (r >> 8) % 64 {
                 0 => peers.ban(a.ip()),
                 1..=12 => {
-                    peers.drop_peer(a);
+                    peers.drop_peer(a.into());
                 }
                 13..=20 => peers.refuse(|handle| handle == a),
                 _ => {
-                    peers.with_peer_mut(a, "test", |peer| peer.set_not_needed(&peers));
+                    peers.with_peer_mut(a.into(), "test", |peer| peer.set_not_needed(&peers));
                 }
             },
             12 => peers.set_finished(r & 0x100 == 0),
@@ -346,10 +336,10 @@ fn index_matches_walk(seed: u64) {
                     }
                 }
                 1 => {
-                    peers.with_peer_mut(a, "test", |peer| peer.piece_passed(&peers));
+                    peers.with_peer_mut(a.into(), "test", |peer| peer.piece_passed(&peers));
                 }
                 2 => {
-                    peers.with_peer_mut(a, "test", |peer| {
+                    peers.with_peer_mut(a.into(), "test", |peer| {
                         peer.piece_failed(r & 0x1000 == 0, &peers)
                     });
                 }
@@ -391,7 +381,11 @@ fn index_matches_walk(seed: u64) {
                     .saturating_sub(usize::try_from((r >> 9) % 3).unwrap())
                     .max(1);
                 let excess = (listed + 1).saturating_sub(fewer_than);
-                let expected = peers.erase_victims_walked(displace, excess);
+                let expected: BTreeSet<PeerHandle> = peers
+                    .erase_victims_walked(displace, excess)
+                    .into_iter()
+                    .map(PeerHandle::from)
+                    .collect();
                 let before: BTreeSet<PeerHandle> = peers.states.iter().map(|e| *e.key()).collect();
                 peers.erase_to(displace, fewer_than);
                 let after: BTreeSet<PeerHandle> = peers.states.iter().map(|e| *e.key()).collect();
@@ -598,23 +592,22 @@ fn erase_walked(peers: &PeerStates, displace: Displace, fewer_than: usize) {
         return;
     }
     for addr in peers.erase_victims_walked(displace, excess) {
-        if let Some((_, peer)) = peers
-            .states
-            .remove_if(&addr, |_, peer| peer.connected_out().is_none())
-        {
-            peers.erased(addr, &peer);
+        if let Some((_, peer)) = peers.states.remove_if(&PeerHandle::from(addr), |_, peer| {
+            peer.connected_out().is_none()
+        }) {
+            peers.erased(addr.into(), &peer);
         }
     }
 }
 
 // `PeerStates::connect_next` as it walked the whole list for its pick
 // and its victims.
-fn connect_next_walked(peers: &PeerStates, now: Instant) -> Option<PeerHandle> {
+fn connect_next_walked(peers: &PeerStates, now: Instant) -> Option<SocketAddr> {
     let _admission = peers.admission.lock();
     erase_walked(peers, Displace::EraseCandidates, PEERLIST_LOW_WATERMARK);
     let addr = peers.connect_pick_walked(now)?;
     peers
-        .with_peer_mut(addr, "test", |peer| peer.connect_if_due(now, peers))
+        .with_peer_mut(addr.into(), "test", |peer| peer.connect_if_due(now, peers))
         .flatten()
         .map(|_| addr)
 }
@@ -772,15 +765,15 @@ fn failures_are_forgotten_once_a_connection_delivers() {
     // The next attempt completes its handshake and carries a message.
     let t2 = t1 + reconnect_wait(2);
     peers
-        .with_peer_mut(a, "test", |peer| peer.connect_if_due(t2, &peers))
+        .with_peer_mut(a.into(), "test", |peer| peer.connect_if_due(t2, &peers))
         .unwrap()
         .unwrap();
-    peers.connection_delivered(a);
+    peers.connection_delivered(a.into());
 
     // Its later failure is the first in a row, not the third.
     let t3 = t2 + Duration::from_secs(600);
     peers
-        .with_peer_mut(a, "test", |peer| {
+        .with_peer_mut(a.into(), "test", |peer| {
             peers.connection_closed(peer, t3, true, false)
         })
         .unwrap();
@@ -803,7 +796,7 @@ fn a_seed_we_let_go_is_due_at_once_when_wanted_again() {
     for (addr, fails) in [(let_go, false), (failed, true)] {
         peers.add_peer(addr, PeerSourceFlag::Tracker);
         peers
-            .with_peer_mut(addr, "test", |peer| {
+            .with_peer_mut(addr.into(), "test", |peer| {
                 peer.connect_if_due(t0, &peers).unwrap();
                 assert!(
                     peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp)
@@ -811,9 +804,9 @@ fn a_seed_we_let_go_is_due_at_once_when_wanted_again() {
                 );
             })
             .unwrap();
-        peers.update_bitfield(addr, full_bitfield()).unwrap();
+        peers.update_bitfield(addr.into(), full_bitfield()).unwrap();
         peers
-            .with_peer_mut(addr, "test", |peer| {
+            .with_peer_mut(addr.into(), "test", |peer| {
                 peers.connection_closed(peer, t0, fails, true);
             })
             .unwrap();
@@ -839,7 +832,7 @@ fn a_connection_we_close_is_not_a_failure() {
     peers.add_peer(a, PeerSourceFlag::Tracker);
     let t0 = Instant::now();
     peers
-        .with_peer_mut(a, "test", |peer| {
+        .with_peer_mut(a.into(), "test", |peer| {
             peer.connect_if_due(t0, &peers).unwrap();
             peers.connection_closed(peer, t0, false, false);
         })
@@ -872,7 +865,7 @@ async fn an_insert_at_full_displaces_by_the_erase_rank() {
     // It connected over TCP, from no port it listens on, and failed.
     let _closed_rx = connected_to_us(&peers, unconnectable).unwrap();
     peers
-        .with_peer_mut(unconnectable, "test", |peer| {
+        .with_peer_mut(unconnectable.into(), "test", |peer| {
             peer.take_state(&peers);
             peers.connection_closed(peer, t0, true, false);
         })
@@ -882,7 +875,8 @@ async fn an_insert_at_full_displaces_by_the_erase_rank() {
     }
     assert!(
         !peers
-            .with_peer_mut(distrusted, "test", |peer| peer.piece_failed(false, &peers))
+            .with_peer_mut(distrusted.into(), "test", |peer| peer
+                .piece_failed(false, &peers))
             .unwrap()
     );
     never_failed(&peers, kept);
@@ -932,12 +926,16 @@ async fn a_peer_resume_data_alone_named_goes_first_at_equal_failures() {
     peers.add_peer(resume_failed, PeerSourceFlag::ResumeData);
     fail_at(&peers, resume_failed, t0);
     peers
-        .with_peer_mut(resume_failed, "test", |peer| peer.set_not_needed(&peers))
+        .with_peer_mut(resume_failed.into(), "test", |peer| {
+            peer.set_not_needed(&peers)
+        })
         .unwrap();
     failed_once(&peers, tracker_failed, t0);
     peers.add_peer(resume_idle, PeerSourceFlag::ResumeData);
     peers
-        .with_peer_mut(resume_idle, "test", |peer| peer.set_not_needed(&peers))
+        .with_peer_mut(resume_idle.into(), "test", |peer| {
+            peer.set_not_needed(&peers)
+        })
         .unwrap();
     never_failed(&peers, kept);
     for i in 4..MAX_PEERLIST_SIZE {
@@ -1022,12 +1020,12 @@ fn erased_by_full_sort(
     peers: &PeerStates,
     displace: Displace,
     fewer_than: usize,
-) -> HashSet<SocketAddr> {
+) -> HashSet<PeerHandle> {
     let excess = (peers.listed() + 1).saturating_sub(fewer_than);
     let mut ranked = peers
         .states
         .iter()
-        .filter(|e| !is_web_seed(*e.key()) && e.value().connected_out().is_none())
+        .filter(|e| e.key().is_listed() && e.value().connected_out().is_none())
         .map(|e| (erase_rank(e.value()), *e.key()))
         .filter(|(rank, _)| displace.allows(rank))
         .collect::<Vec<_>>();
@@ -1065,20 +1063,20 @@ fn seeded_list(
                     fail_at(peers, addr, t0 + spaced * (k + 1));
                 }
                 if r & 16 != 0 {
-                    peers.with_peer_mut(addr, "test", |peer| peer.set_not_needed(peers));
+                    peers.with_peer_mut(addr.into(), "test", |peer| peer.set_not_needed(peers));
                 }
             }
             2 => never_failed(peers, addr),
             3 => keep.push(connected_to_us(peers, addr).unwrap()),
             4 => {
                 let _rx = connected_to_us(peers, addr).unwrap();
-                peers.with_peer_mut(addr, "test", |peer| {
+                peers.with_peer_mut(addr.into(), "test", |peer| {
                     peers.connection_closed(peer, t0, r & 16 != 0, false);
                 });
             }
             _ => peers.add_refused_incoming(addr, ConnectionKind::Tcp),
         }
-        peers.with_peer_mut(addr, "test", |peer| {
+        peers.with_peer_mut(addr.into(), "test", |peer| {
             if r & 32 != 0 {
                 peer.piece_passed(peers);
             }
@@ -1140,10 +1138,10 @@ async fn weeding_forgets_the_peers_a_full_sort_would() {
                 1 + usize::try_from(next() % u64::try_from(listed + 1).unwrap()).unwrap()
             };
             let expected = erased_by_full_sort(&peers, displace, fewer_than);
-            let before: HashSet<SocketAddr> = peers.states.iter().map(|e| *e.key()).collect();
+            let before: HashSet<PeerHandle> = peers.states.iter().map(|e| *e.key()).collect();
             let under = peers.erase_to(displace, fewer_than);
-            let after: HashSet<SocketAddr> = peers.states.iter().map(|e| *e.key()).collect();
-            let erased: HashSet<SocketAddr> = before.difference(&after).copied().collect();
+            let after: HashSet<PeerHandle> = peers.states.iter().map(|e| *e.key()).collect();
+            let erased: HashSet<PeerHandle> = before.difference(&after).copied().collect();
             assert_eq!(erased, expected, "seed {seed} round {round}");
             assert_eq!(under, listed - expected.len() < fewer_than);
             checked += expected.len();

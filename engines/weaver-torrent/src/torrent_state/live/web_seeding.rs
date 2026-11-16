@@ -83,7 +83,6 @@ impl TorrentStateLive {
         let registry = &self.shared.web_seeds;
         let due = registry.due(
             tokio::time::Instant::now(),
-            |handle| self.peers.is_banned(handle.ip()),
             |lacks| self.web_layout.bitfield(lacks).any(),
             session.allow_idna,
         );
@@ -109,11 +108,7 @@ impl TorrentStateLive {
             let resolver = session.resolver.clone();
             self.spawn(
                 debug_span!(parent: self.shared.span.clone(), "web_seed", seed = ?link.handle()),
-                format!(
-                    "[{}][web_seed={}]manage_web_seed",
-                    self.shared.id,
-                    link.handle()
-                ),
+                format!("[{}][{}]manage_web_seed", self.shared.id, link.handle()),
                 aframe!(
                     self.clone()
                         .task_manage_web_seed(link, clients, resolver, rx, tx, held)

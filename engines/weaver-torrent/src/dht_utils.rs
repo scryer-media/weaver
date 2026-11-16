@@ -154,7 +154,7 @@ where
     let mut name = |addr, source| {
         seen.insert(addr);
         peers.add_peer(addr, source);
-        if peers.with_peer(addr, |_| ()).is_none() {
+        if peers.with_peer(addr.into(), |_| ()).is_none() {
             found_unable(addr);
         }
     };
@@ -183,7 +183,7 @@ where
                     let failed = e
                         .downcast_ref::<crate::Error>()
                         .is_none_or(crate::Error::is_failure);
-                    peers.with_peer_mut(addr, "metadata_failed", |peer| {
+                    peers.with_peer_mut(addr.into(), "metadata_failed", |peer| {
                         peers.connection_closed(peer, Instant::now(), failed, false)
                     });
                     found_unable(addr);

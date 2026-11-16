@@ -752,7 +752,12 @@ async fn an_address_banned_for_bad_data_on_one_torrent_is_banned_on_every_torren
     );
     assert_eq!(state(&b, "127.0.0.7:6881"), Some("queued"));
 
-    a.ban_for_bad_data("127.0.0.7".parse().unwrap());
+    a.ban_for_bad_data(
+        "127.0.0.7:6881"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into(),
+    );
 
     // Nothing below awaits, so no connection is attempted meanwhile.
     // On B the peer it knew is no connect candidate, and the address at
@@ -773,6 +778,94 @@ async fn an_address_banned_for_bad_data_on_one_torrent_is_banned_on_every_torren
     );
     assert_eq!(state(&b, "127.0.0.8:6881"), Some("queued"));
     assert_eq!(check_once(&session, "127.0.0.8:6881"), None);
+    session.stop().await;
+}
+
+/// A web seed at a URL nothing serves.
+fn idle_web_seed() -> crate::WebSeed {
+    crate::WebSeed {
+        url: "http://192.0.2.1/s/".into(),
+        kind: crate::WebSeedKind::Url,
+        named_by: crate::core::net::NamedBy::Operator,
+    }
+}
+
+// A web seed is banned on the torrent it sent bad data to, by its entry
+// there: another torrent of the session with a seed of the same id and URL
+// still uses its own.
+#[tokio::test]
+async fn a_web_seed_banned_on_one_torrent_is_usable_on_another() {
+    let (dir, session, a) = seeding_with(10, 0, crate::limits::LimitKind::Unlimited).await;
+    let b = crate::create_torrent(
+        dir.path(),
+        crate::CreateTorrentOptions {
+            piece_length: Some(32768),
+            ..Default::default()
+        },
+        &crate::spawn_utils::BlockingSpawner::new(1),
+    )
+    .await
+    .unwrap()
+    .as_bytes()
+    .unwrap();
+    let b = session
+        .add_torrent(
+            AddTorrent::from_bytes(b),
+            Some(AddTorrentOptions {
+                output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                overwrite: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    b.wait_until_completed().await.unwrap();
+    assert!(a.add_web_seed(idle_web_seed()));
+    assert!(b.add_web_seed(idle_web_seed()));
+
+    let seed = crate::peer_handle::PeerHandle::WebSeed(0);
+    a.live().unwrap().ban_for_bad_data(seed);
+
+    let due = |torrent: &super::ManagedTorrentHandle| {
+        torrent
+            .shared
+            .web_seeds
+            .due(tokio::time::Instant::now(), |_| true, false)
+            .len()
+    };
+    assert!(a.web_seeds().is_empty());
+    assert_eq!(due(&a), 0);
+    assert_eq!(b.web_seeds(), [idle_web_seed()]);
+    assert_eq!(due(&b), 1);
+    assert!(b.shared.web_seeds.link(0).is_some());
+    session.stop().await;
+}
+
+// A web seed's ban outlasts a pause: once resumed, the torrent does not
+// connect to it again.
+#[tokio::test]
+async fn a_banned_web_seed_stays_banned_across_a_pause() {
+    let (_dir, session, torrent) = seeding_with(10, 0, crate::limits::LimitKind::Unlimited).await;
+    assert!(torrent.add_web_seed(idle_web_seed()));
+    torrent
+        .live()
+        .unwrap()
+        .ban_for_bad_data(crate::peer_handle::PeerHandle::WebSeed(0));
+
+    session.pause(&torrent).await.unwrap();
+    session.unpause(&torrent).await.unwrap();
+    torrent.wait_until_completed().await.unwrap();
+
+    let seeds = &torrent.shared.web_seeds;
+    assert!(torrent.web_seeds().is_empty());
+    assert!(
+        seeds
+            .due(tokio::time::Instant::now(), |_| true, false)
+            .is_empty()
+    );
+    assert!(seeds.link(0).is_none());
     session.stop().await;
 }
 

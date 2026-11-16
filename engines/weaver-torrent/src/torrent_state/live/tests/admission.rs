@@ -169,7 +169,10 @@ async fn a_connection_we_asked_to_close_counts_no_failure() {
         let (peer, _rx) = h.peer(addr);
         let counters = peer.counters.clone();
         peer.on_peer_died(Some(error)).unwrap();
-        let failcount = h.peers.with_peer(sock(addr), |p| p.failcount()).unwrap();
+        let failcount = h
+            .peers
+            .with_peer(sock(addr).into(), |p| p.failcount())
+            .unwrap();
         failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
     }
     assert_eq!(failcounts, [(0, 0), (1, 1)]);
@@ -199,7 +202,10 @@ async fn a_connect_refused_on_our_side_counts_no_failure() {
         let (peer, _rx) = h.peer(addr);
         let counters = peer.counters.clone();
         peer.on_peer_died(Some(error)).unwrap();
-        let failcount = h.peers.with_peer(sock(addr), |p| p.failcount()).unwrap();
+        let failcount = h
+            .peers
+            .with_peer(sock(addr).into(), |p| p.failcount())
+            .unwrap();
         failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
     }
     assert_eq!(failcounts, [(0, 0), (0, 0), (0, 0), (1, 1)]);
@@ -214,7 +220,7 @@ async fn a_finished_torrent_still_dials_a_leecher_and_not_a_seed() {
     let h = Harness::seeding("finished_dials").await;
     let listens = |peer: &PeerHandler| {
         let mut hs = ExtendedHandshake::new();
-        hs.p = Some(u32::from(peer.addr.port()));
+        hs.p = Some(u32::from(peer.addr.addr().unwrap().port()));
         peer.on_extended_handshake(&hs).unwrap();
     };
     let (leecher, _leecher_rx) = h.new_peer("127.0.0.1:6881");
@@ -246,7 +252,7 @@ async fn a_changed_ip_filter_takes_the_peers_it_refuses_off_the_list() {
     for addr in ["203.0.113.1:6881", "203.0.113.2:80", "203.0.113.3:6881"] {
         h.add_peer(sock(addr), PeerSourceFlag::Tracker);
     }
-    let listed = |addr: &str| h.peers.with_peer(sock(addr), |_| ()).is_some();
+    let listed = |addr: &str| h.peers.with_peer(sock(addr).into(), |_| ()).is_some();
 
     h._session.set_ip_filter(crate::IpFilter {
         blocked: Arc::new(crate::IpRanges::new(
@@ -446,7 +452,7 @@ async fn an_incoming_connection_at_the_cap_replaces_the_oldest_connect_while_man
     for addr in ["203.0.113.1:6881", "203.0.113.2:6881"] {
         h.peers.add_peer(sock(addr), PeerSourceFlag::Tracker);
         let (addr, rx, tx) = h.peers.connect_next(tokio::time::Instant::now()).unwrap();
-        held.push(h.hold(addr, &tx));
+        held.push(h.hold(addr.into(), &tx));
         connects.push((addr, rx));
         tokio::time::advance(Duration::from_secs(1)).await;
     }
@@ -468,7 +474,7 @@ async fn an_incoming_connection_at_the_cap_replaces_the_oldest_connect_while_man
     assert!(!asked_to_close(newer_rx));
     assert!(live.iter_mut().all(|rx| !asked_to_close(rx)));
     assert!(!h.holds_place("203.0.113.1:6881"));
-    assert!(h.places.lock().contains_key(newer));
+    assert!(h.places.lock().contains_key(&PeerHandle::from(*newer)));
     assert!(h.holds_place("192.0.2.1:6881"));
     assert_eq!(h.connections(), (10, 10));
 }
@@ -553,7 +559,7 @@ async fn an_incoming_encrypted_connection_is_advertised_encrypted_in_our_pex() {
 
     let flags = |addr| {
         h.peers
-            .with_live(sock(addr), |live| live.advertised_pex_flags())
+            .with_live(sock(addr).into(), |live| live.advertised_pex_flags())
             .unwrap()
     };
     assert_eq!(flags("192.0.2.1:6881") & PEX_ENCRYPTION, PEX_ENCRYPTION);

@@ -1669,7 +1669,10 @@ mod tests {
     }
 
     fn peer() -> PeerHandle {
-        "127.0.0.1:6881".parse().unwrap()
+        "127.0.0.1:6881"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into()
     }
 
     // Every block of the torrent, in order.

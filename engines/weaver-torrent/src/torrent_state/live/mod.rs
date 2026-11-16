@@ -463,11 +463,24 @@ impl TorrentStateLive {
         self.peers.ban(ip);
     }
 
-    /// Bans `ip` for the bad data it sent: here, and on every torrent of
-    /// the session while it runs, each closing its connections to it (see
+    /// Bans `peer` for the bad data it sent. A peer of the swarm is banned
+    /// by its host: here, and on every torrent of the session while it
+    /// runs, each closing its connections to it (see
     /// [`PeerStates::ban_for_bad_data`]). libtorrent bans a peer on the one
-    /// torrent it sent the data to (`torrent::ban_peer`).
-    pub(crate) fn ban_for_bad_data(&self, ip: std::net::IpAddr) {
+    /// torrent it sent the data to (`torrent::ban_peer`). A web seed, at no
+    /// address, is banned on this torrent alone and not connected to again
+    /// ([`web_seed::WebSeeds::ban`]).
+    pub(crate) fn ban_for_bad_data(&self, peer: PeerHandle) {
+        let Some(ip) = peer.ip() else {
+            if self.shared.web_seeds.ban(peer) {
+                // A seed's URL can carry a credential: the line names the
+                // seed by its entry alone.
+                warn!(id = ?self.shared.id, %peer, "banning the web seed");
+                self.peers
+                    .with_peer_mut(peer, "ban_web_seed", |p| p.ban(&self.peers));
+            }
+            return;
+        };
         if !self.peers.ban_for_bad_data(ip) {
             return;
         }
@@ -530,7 +543,7 @@ impl TorrentStateLive {
             }
             let outgoing = p.connected_out() == Some(true);
             match p.get_live() {
-                Some(live) if !web_seed::is_web_seed(handle) => Some(self.peers.claim_peer_id(
+                Some(live) if handle.sends_peer_id() => Some(self.peers.claim_peer_id(
                     handle,
                     live.peer_id(),
                     outgoing,
@@ -693,7 +706,7 @@ struct PeerHandler {
     // extended handshake that names ut_pex.
     pex_started: AtomicBool,
 
-    addr: SocketAddr,
+    addr: PeerHandle,
     incoming: bool,
     tx: PeerTx,
     // The answers to the peer's requests that wait for the writer.

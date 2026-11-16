@@ -825,7 +825,7 @@ async fn a_connection_that_failed_its_handshake_asks_for_no_introduction() {
     assert!(h.knows(&target.to_string()));
 
     // The connect loop dials the target; its connection fails once open.
-    while h.peers.with_peer(target, |p| p.failcount()).unwrap() == 0 {
+    while h.peers.with_peer(target.into(), |p| p.failcount()).unwrap() == 0 {
         tokio::task::yield_now().await;
     }
     assert_eq!(holepunch_sent(&mut rx), []);
@@ -961,4 +961,38 @@ async fn a_private_torrent_offers_no_dht_and_no_metadata() {
     (&peer).update_my_extended_handshake(&mut hs).unwrap();
     assert_eq!(hs.m.ut_metadata, None);
     assert_eq!(hs.metadata_size, None);
+}
+
+// A web seed is its table entry, at no address. A rendezvous, or a PEX
+// entry, naming the address web seeds were once given, `[100::]:0`, names
+// a swarm peer nobody is connected to: the sender is told so, and the seed
+// hears nothing and its entry is as it was.
+#[tokio::test]
+async fn an_address_in_the_discard_prefix_reaches_no_web_seed() {
+    let h = Harness::new("discard_prefix_no_web_seed").await;
+    let (seed, mut seed_rx, _link) = h.web_seed();
+    std::iter::from_fn(|| seed_rx.try_recv().ok()).for_each(drop);
+    let entry = |h: &Harness| {
+        h.peers
+            .with_peer(seed.addr, |p| (p.get_state().name(), p.sources()))
+            .unwrap()
+    };
+    let before = entry(&h);
+    let (a, mut a_rx) = h.holepunch_peer("203.0.113.1:6881", true);
+    let discard = sock("[100::]:0");
+
+    send_holepunch(&a, UtHolepunch::Rendezvous(discard)).await;
+    assert_eq!(
+        holepunch_sent(&mut a_rx),
+        [UtHolepunch::Error(
+            discard,
+            ut_holepunch::error::NOT_CONNECTED
+        )]
+    );
+    a.send_pex(&pex(&["[100::]:0"], &[])).await.unwrap();
+
+    assert!(seed_rx.try_recv().is_err(), "the seed was sent something");
+    assert_eq!(entry(&h), before);
+    assert_eq!(h.shared.web_seeds.list().len(), 1);
+    assert!(!h.banned(&seed));
 }

@@ -410,7 +410,15 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         }))
     }
 
+    // Only a swarm peer, at an address, speaks the extension protocol: a
+    // web seed sends no extended handshake, so the address-bound steps
+    // below never meet one.
     fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+        // Only a swarm peer, at an address, speaks the extension protocol.
+        debug_assert!(
+            self.addr.addr().is_some(),
+            "a web seed sent an extended handshake"
+        );
         if let Some(client_name) = hs.v.as_ref().and_then(format_peer_client_name) {
             self.state
                 .peers
@@ -471,6 +479,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // (libtorrent `ut_pex_peer_plugin`, one per connection).
         if self.state.pex
             && hs.m.ut_pex.is_some()
+            && let Some(at) = self.addr.addr()
             && !self.pex_started.swap(true, Ordering::Relaxed)
         {
             spawn_with_cancel(
@@ -486,7 +495,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 self.cancel_token.clone(),
                 self.state
                     .clone()
-                    .task_send_pex_to_peer(self.addr, self.tx.clone()),
+                    .task_send_pex_to_peer(at, self.tx.clone()),
             );
         }
         // `yourip`, our address as the peer sees it, is the peer's vote on
@@ -494,11 +503,12 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // `bt_peer_connection::on_extended_handshake`, into
         // `session_impl::set_external_address`).
         if let Some(yourip) = hs.yourip
+            && let Some(ip) = self.addr.ip()
             && let Some(session) = self.state.shared.session.upgrade()
         {
             session.external_ips.cast_vote(
                 yourip.0,
-                crate::session::external_ip::Voter::Peer(self.addr.ip()),
+                crate::session::external_ip::Voter::Peer(ip),
                 tokio::time::Instant::now(),
             );
         }
@@ -509,8 +519,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // into `peer_list::update_peer_port`).
         if self.incoming
             && let Some(port) = hs.port().filter(|&port| port != 0)
+            && let Some(ip) = self.addr.ip()
         {
-            let listen = SocketAddr::new(self.addr.ip(), port);
+            let listen = SocketAddr::new(ip, port);
             self.state
                 .peers
                 .with_peer_mut(self.addr, "update outgoing addr", |peer| {
@@ -570,7 +581,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // listen on, whatever announce port is set).
         if !self.incoming {
             let shared = &self.state.shared;
-            let ipv6 = self.addr.ip().to_canonical().is_ipv6();
+            let ipv6 = self.addr.ip().is_some_and(|ip| ip.to_canonical().is_ipv6());
             handshake.p = shared
                 .session
                 .upgrade()

@@ -772,7 +772,7 @@ async fn a_seed_let_go_in_upload_mode_is_dialled_at_once_when_it_ends() {
     tokio::time::pause();
     let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
     let mut hs = ExtendedHandshake::new();
-    hs.p = Some(u32::from(seed.addr.port()));
+    hs.p = Some(u32::from(seed.addr.addr().unwrap().port()));
     (&seed).on_extended_handshake(&hs).unwrap();
     h.enter_upload_mode(false, h.upload_epoch());
     assert!(h.upload_mode());
@@ -791,7 +791,7 @@ async fn a_seed_let_go_in_upload_mode_is_dialled_at_once_when_it_ends() {
     let now = tokio::time::Instant::now();
     assert_eq!(
         h.peers
-            .with_peer(sock("127.0.0.1:6881"), |p| p.reconnect_at())
+            .with_peer(sock("127.0.0.1:6881").into(), |p| p.reconnect_at())
             .unwrap(),
         Some(now + peer::MIN_RECONNECT_TIME)
     );
@@ -817,7 +817,7 @@ async fn a_seed_let_go_in_upload_mode_and_closed_after_it_ends_is_dialled_at_onc
     tokio::time::pause();
     let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
     let mut hs = ExtendedHandshake::new();
-    hs.p = Some(u32::from(seed.addr.port()));
+    hs.p = Some(u32::from(seed.addr.addr().unwrap().port()));
     (&seed).on_extended_handshake(&hs).unwrap();
     h.enter_upload_mode(false, h.upload_epoch());
 
@@ -836,7 +836,7 @@ async fn a_seed_let_go_in_upload_mode_and_closed_after_it_ends_is_dialled_at_onc
     let now = tokio::time::Instant::now();
     assert_eq!(
         h.peers
-            .with_peer(sock("127.0.0.1:6881"), |p| p.reconnect_at())
+            .with_peer(sock("127.0.0.1:6881").into(), |p| p.reconnect_at())
             .unwrap(),
         None
     );

@@ -159,7 +159,7 @@ impl TorrentStateLive {
                 })
                 .unwrap_or(bannable);
             if to_ban {
-                self.ban_for_bad_data(peer.ip());
+                self.ban_for_bad_data(peer);
             }
         }
     }

@@ -335,7 +335,7 @@ async fn a_seed_let_go_while_nothing_was_wanted_is_dialled_once_a_piece_is_wante
     tokio::time::pause();
     let listens = |peer: &PeerHandler| {
         let mut hs = ExtendedHandshake::new();
-        hs.p = Some(u32::from(peer.addr.port()));
+        hs.p = Some(u32::from(peer.addr.addr().unwrap().port()));
         peer.on_extended_handshake(&hs).unwrap();
     };
 
@@ -361,7 +361,8 @@ async fn a_seed_let_go_while_nothing_was_wanted_is_dialled_once_a_piece_is_wante
     // Both had every piece, so both are let go while we only upload.
     for addr in ["127.0.0.1:6881", "127.0.0.2:6881"] {
         assert_eq!(
-            h.peers.with_peer(sock(addr), |p| p.get_state().name()),
+            h.peers
+                .with_peer(sock(addr).into(), |p| p.get_state().name()),
             Some("not needed")
         );
     }
@@ -376,7 +377,7 @@ async fn a_seed_let_go_while_nothing_was_wanted_is_dialled_once_a_piece_is_wante
     assert!(h.peers.connect_next(now).is_none());
     assert_eq!(
         h.peers
-            .with_peer(sock("127.0.0.2:6881"), |p| p.reconnect_at())
+            .with_peer(sock("127.0.0.2:6881").into(), |p| p.reconnect_at())
             .unwrap(),
         Some(now + peer::MIN_RECONNECT_TIME * 2)
     );

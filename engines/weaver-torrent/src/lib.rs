@@ -63,6 +63,7 @@ pub mod natpmp;
 pub mod network;
 mod off_shard;
 mod peer_connection;
+mod peer_handle;
 mod peer_info_reader;
 pub mod peer_protocol;
 mod piece_priority;

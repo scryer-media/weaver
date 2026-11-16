@@ -851,7 +851,7 @@ mod tests {
     const PIECE_LENGTH: u32 = CHUNK_SIZE * 4;
 
     fn peer(id: u8) -> PeerHandle {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, id)), 6881)
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, id)), 6881)).into()
     }
 
     /// A ChunkTracker for one file of `num_pieces` four-chunk pieces, all
