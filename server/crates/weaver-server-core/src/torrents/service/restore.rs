@@ -796,7 +796,7 @@ impl TorrentService {
             {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not keep a crashed torrent's pause");
             }
-            torrent.settle(self.inner.clock.now_ms());
+            torrent.settle(self.inner.clock.unix_ms());
             torrent.record.kept = KeptIntent::Intent(TorrentIntent::Paused);
         }
         torrent.restore_held = Some(why);
@@ -985,7 +985,7 @@ impl TorrentService {
     async fn joining(&self, job_id: JobId) -> Option<Joining> {
         let settings = self.settings();
         let rules = self.rules();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let (
             scope,
             bytes,
@@ -1233,7 +1233,7 @@ impl TorrentService {
                 if torrent.trackers != listed {
                     handle.replace_trackers(tracker_tiers(&torrent.trackers));
                 }
-                torrent.settle(self.inner.clock.now_ms());
+                torrent.settle(self.inner.clock.unix_ms());
                 let leg = self
                     .queue()
                     .and_then(|queue| queue.proxy_runtime())
@@ -1292,7 +1292,7 @@ impl TorrentService {
                     &self.settings(),
                     &self.rules(),
                     torrent,
-                    self.inner.clock.now_ms(),
+                    self.inner.clock.unix_ms(),
                 );
                 if let Some(attached) = &torrent.attached
                     && attached.handle.is_paused() != paused_now
@@ -1368,7 +1368,7 @@ impl TorrentService {
 
     pub(super) async fn held(&self, job_id: JobId, key: Option<RouteKey>, held: Held) {
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
-            torrent.settle(self.inner.clock.now_ms());
+            torrent.settle(self.inner.clock.unix_ms());
             torrent.route = key.or(torrent.route.take());
             torrent.held = Some(held);
         }
@@ -1391,7 +1391,7 @@ impl TorrentService {
 
     async fn leave(&self, torrent: &mut Live, moving: bool) {
         let job_id = torrent.record.job_id;
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         if self.inner.signal.take_unsaved_one(job_id)
             && let Some(save) = self.queue_checkpoint(torrent, now)
         {
@@ -1546,7 +1546,7 @@ impl TorrentService {
                 tracing::warn!(error = %error, "could not read the torrents' history");
                 BTreeMap::new()
             });
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         if let Some(last) = records.iter().map(|row| row.record.queue_position).max() {
             self.inner
                 .next_queue_position

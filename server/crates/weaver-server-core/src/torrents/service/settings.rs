@@ -386,7 +386,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let holds = self.holds();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
         for torrent in self.inner.live.lock().await.values() {
             if torrent.resumed()
@@ -578,7 +578,7 @@ impl TorrentService {
     // Every torrent is read before its session changes, as `stop` reads
     // before the sessions close.
     async fn turn(&self, on: bool) {
-        self.read(self.inner.clock.now_ms(), true).await;
+        self.read(self.inner.clock.unix_ms(), true).await;
         self.inner.sessions.turn(on).await;
         self.read_sessions().await;
         self.run(on).await;

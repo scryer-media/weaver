@@ -90,7 +90,7 @@ impl TorrentService {
     // `pause` for each torrent: one write of their intents, then one pass
     // of the queue and one publish.
     pub(super) async fn pause_many(&self, job_ids: &[JobId]) -> Outcome {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         let mut stopped = Vec::new();
         let mut landings = Vec::new();
@@ -137,7 +137,7 @@ impl TorrentService {
     // `resume` for each torrent: one write of their intents, then one pass
     // of the queue and one publish.
     pub(super) async fn resume_many(&self, job_ids: &[JobId]) -> Outcome {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         // A resume is the go-ahead to restore a torrent that crashed the
         // daemon. Its marker goes first, so a panic in the restore leaves a
@@ -408,7 +408,7 @@ impl TorrentService {
         gated: Vec<(JobId, bool, tokio::sync::OwnedMutexGuard<()>)>,
     ) -> Outcome {
         let settings = self.settings();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         let mut begun = Vec::new();
         {

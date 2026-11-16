@@ -391,7 +391,7 @@ impl TorrentService {
         shown: Shown,
     ) -> Result<Vec<TorrentView>, crate::StateError> {
         let picked = self.picked_ids(pick, window)?;
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         Ok(self
             .listed_by(shown, false, false, now, move |_, live| picked.under(live))
             .await
@@ -409,7 +409,7 @@ impl TorrentService {
         shown: Shown,
     ) -> Result<Vec<(TorrentView, FileTotals)>, crate::StateError> {
         let picked = self.picked_ids(pick, window)?;
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         Ok(self
             .listed_by(shown, false, true, now, move |_, live| picked.under(live))
             .await
@@ -421,7 +421,7 @@ impl TorrentService {
     /// The torrents of `ids` there are, as [`TorrentService::torrents`]
     /// lists them and in its order. Only their views are built.
     pub async fn torrents_of(&self, ids: &BTreeSet<JobId>) -> Vec<TorrentView> {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         self.listed_by(Shown::LISTED, false, false, now, |_, live| {
             let mut kept: Vec<(i64, JobId)> = ids
                 .iter()

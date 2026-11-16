@@ -149,7 +149,7 @@ impl TorrentService {
         if !self.inner.db.queue_scripts_possible() {
             return None;
         }
-        let mut view = self.view(&self.settings(), torrent, self.inner.clock.now_ms());
+        let mut view = self.view(&self.settings(), torrent, self.inner.clock.unix_ms());
         // Its trackers as its run announces to them, for the one it goes by.
         self.track(
             &mut view,

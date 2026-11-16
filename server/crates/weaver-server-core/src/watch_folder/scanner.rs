@@ -1304,8 +1304,9 @@ mod tests {
 
     mod torrents {
         use super::*;
+        use crate::clock::SystemClock;
         use crate::settings::Config;
-        use crate::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
+        use crate::torrents::service::{JobEnv, TorrentService, TorrentSettings};
         use crate::torrents::sessions::tests::{FakeRoutes, env};
         use crate::torrents::sessions::{Routes, Sessions};
         use crate::{PipelineMetrics, SharedPipelineState};

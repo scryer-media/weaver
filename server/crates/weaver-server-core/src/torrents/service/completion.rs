@@ -28,7 +28,7 @@ impl TorrentService {
     // or their goals did, stay stopped, and so does one whose goal is met
     // by now: its mark is cleared in the same write, as its goal's stop.
     pub(super) async fn resume_wound_down(&self) {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let settings = self.settings();
         let rules = self.rules();
         let mut landings = Vec::new();
@@ -296,7 +296,7 @@ impl TorrentService {
     // The job is done: its completion is written on its own, so an intent
     // written beside it keeps it, and the ledger and peers as they stand.
     pub(super) async fn completed(&self, job_id: JobId) {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let (landing, downloaded) = {
             let mut live = self.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {
@@ -372,7 +372,7 @@ impl TorrentService {
         self.completed(job_id).await;
         let status = short_status(&store.whole_names(), placed, &why);
         let settings = self.settings();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let (report, hash) = {
             let mut live = self.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {

@@ -496,7 +496,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let holds = self.holds();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let queued = queued(&settings, &rules, &torrent, now);
         let place = (torrent.record.queue_position, torrent.record.job_id);
         {
@@ -702,7 +702,7 @@ impl TorrentService {
             source,
             metainfo,
             category_id: category.map(|category| category.id),
-            added_at_ms: self.inner.clock.now_ms(),
+            added_at_ms: self.inner.clock.unix_ms(),
             kept: KeptIntent::Intent(if request.paused {
                 TorrentIntent::Paused
             } else {
@@ -754,7 +754,7 @@ impl TorrentService {
             .insert_placed_torrent(&record, trackers, adopted, held.as_deref())
         {
             Ok(TorrentInsert::Inserted) => {
-                let now = self.inner.clock.now_ms();
+                let now = self.inner.clock.unix_ms();
                 let mut torrent = Live::new(
                     record,
                     TorrentCounters::default(),

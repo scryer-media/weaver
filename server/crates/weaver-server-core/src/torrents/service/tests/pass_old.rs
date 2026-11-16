@@ -242,8 +242,8 @@ impl Scene {
         match (run, old) {
             (Run::Tick, true) => service.old_tick().await,
             (Run::Tick, false) => service.tick().await,
-            (Run::ReadAtOnce, true) => service.old_read(service.inner.clock.now_ms(), true).await,
-            (Run::ReadAtOnce, false) => service.read(service.inner.clock.now_ms(), true).await,
+            (Run::ReadAtOnce, true) => service.old_read(service.inner.clock.unix_ms(), true).await,
+            (Run::ReadAtOnce, false) => service.read(service.inner.clock.unix_ms(), true).await,
         }
         self.rig.db.flush_write_queue().await.unwrap();
         announced(self, jobs, &before, from).await;

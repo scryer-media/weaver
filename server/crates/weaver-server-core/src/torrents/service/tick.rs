@@ -370,7 +370,7 @@ impl TorrentService {
         self.follow_routes().await;
         // Taken after the routes are followed, whose readings take their
         // own: no reading in the tick runs from before one already kept.
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         // Each torrent read, its checkpoint written when it is behind, its
         // goals applied, then its queue turn, picking and limits.
         self.policy_pass(now).await;
@@ -398,7 +398,7 @@ impl TorrentService {
     // fetching on a session its route no longer runs, or on a route gone
     // down, ends that fetch and fetches again on its route as it stands.
     pub(super) async fn follow_routes(&self) {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let settings = self.settings();
         let rules = self.rules();
         let outdated = self.inner.sessions.outdated().await;
@@ -498,7 +498,7 @@ impl TorrentService {
                 if let Some(torrent) = live.get_mut(&job_id)
                     && let Some(held) = torrent.route.as_ref().and_then(|key| failed.get(key))
                 {
-                    torrent.settle(self.inner.clock.now_ms());
+                    torrent.settle(self.inner.clock.unix_ms());
                     torrent.held = Some(held.clone());
                     continue;
                 }
@@ -651,7 +651,7 @@ impl TorrentService {
             let copied = tokio::task::spawn_blocking(move || copying.relevel(&ignored))
                 .await
                 .unwrap_or_else(|error| Err(std::io::Error::other(error)));
-            let now = self.inner.clock.now_ms();
+            let now = self.inner.clock.unix_ms();
             let next = self
                 .with_torrent(job_id, |torrent| {
                     if !torrent

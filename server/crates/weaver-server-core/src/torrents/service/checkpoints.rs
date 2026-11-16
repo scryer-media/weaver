@@ -82,7 +82,7 @@ impl TorrentService {
     // ledger. A tee checkpoints its job on its own, as a job of the
     // pipeline's does, once the bytes it took or their age make a write due.
     pub(super) async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let saves: Vec<CheckpointSave> = {
             let mut live = self.inner.live.lock().await;
             jobs.into_iter()

@@ -58,8 +58,11 @@ use tracing::{Instrument, debug, debug_span, info, trace, warn};
 
 use crate::session_stats::dht::{DhtCounts, DhtIgnored, DhtQuery, DhtQueryEnd, DhtSnapshot};
 
+// The routing table goes by tokio's clock, the one every other DHT timer
+// runs on, so a paused runtime stands it still with them. Outside a test
+// it is the machine's own monotonic clock.
 fn now() -> Instant {
-    Instant::now()
+    tokio::time::Instant::now().into_std()
 }
 
 #[derive(Debug, Serialize)]
