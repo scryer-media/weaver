@@ -16,7 +16,7 @@
 // seed-mode piece's check passes, is read from the torrent's files and
 // handed to it the same way; no byte goes to it that no check passed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -25,6 +25,7 @@ use weaver_graph::slots::AskerId;
 use weaver_graph::{Listed, VolumeIndex};
 
 use super::layout::{PieceLayout, Span};
+use super::relocate::MoveError;
 use super::service::Signal;
 use crate::jobs::graph_checkpoint::GraphCheckpoint;
 use crate::jobs::ids::JobId;
@@ -40,6 +41,8 @@ use crate::pipeline::graph::status::RepairSlots;
 use crate::runtime::panic_trap::JobScope;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[cfg(test)]
+mod outputs_tests;
 #[cfg(test)]
 mod tests;
 
@@ -1017,20 +1020,25 @@ async fn hear(tee: std::sync::Weak<Tee>, mut words: tokio::sync::mpsc::Unbounded
 // never replaces the file there. Do not ask again.
 //
 // So each output takes the first form of its name
-// (`weaver_graph::names::numbered`: "movie.mkv", "movie (1).mkv", ...) that
-// no other output keeps as its own and that it can create new here: a file
-// that holds a name is passed over for the next form, and nothing is ever
-// written over. Every name is claimed that way, by an empty file, before
-// any goes on the torrent's row, and the outputs move over their claims
-// only after: the row, and what the torrent holds, name no file this
-// torrent did not create. A name on the row (`kept`) that holds an empty
-// file is the claim a placing cut short by a restart left: the output takes
-// it again rather than a second numbered name. A claim a crash came after,
-// before the row kept it, stays an empty file on no row.
+// (`weaver_graph::names::numbered_part`: "movie.mkv", "movie (1).mkv", ...)
+// that no other output keeps as its own, that the torrent lists for no file
+// of its own, and that it can create new here: a file that holds a name is
+// passed over for the next form, and nothing is ever written over. Only the
+// file's own name is numbered, as the filesystem holds it, text or not. A
+// folder of its path whose name something that is not a folder holds is
+// numbered the same way ("Extras (1)/a.mkv"), once for every output under
+// it. Every name is claimed that way, by an empty file, before any goes on
+// the torrent's row, and the outputs move over their claims only after: the
+// row, and what the torrent holds, name no file this torrent did not
+// create. A name on the row (`kept`) that holds an empty file is the claim
+// a placing cut short by a restart left: the output takes it again rather
+// than a second numbered name. A claim a crash came after, before the row
+// kept it, stays an empty file on no row.
 pub(crate) struct Outputs {
     // Each output's path under `work`, and the place claimed for it.
     moves: Vec<(PathBuf, PathBuf)>,
-    // Each claimed place, relative to `dir`, as the row keeps it.
+    // Each claimed place, relative to `dir`, as the row keeps it: text, so
+    // a name that is not text is kept as it reads.
     pub(crate) names: Vec<String>,
 }
 
@@ -1038,7 +1046,7 @@ pub(crate) struct Outputs {
 // `dropped` are their names, for the row to let go of those it kept.
 #[derive(Debug)]
 pub(crate) struct Unclaimed {
-    pub(crate) error: super::relocate::MoveError,
+    pub(crate) error: MoveError,
     pub(crate) dropped: Vec<String>,
 }
 
@@ -1060,18 +1068,13 @@ pub(crate) fn claim_outputs(
             !own && !listed.contains(relative) && !spent.contains(&work.join(relative))
         })
         .collect();
-    // Every output's own name first, as each takes it when it is free, so
-    // a numbered form is never claimed over a name another output keeps.
-    let mut planned: HashSet<String> = found
-        .iter()
-        .map(|relative| weaver_graph::names::key(&relative.to_string_lossy()))
-        .collect();
+    let mut claims = Claims::of(dir, kept, listed, &found);
     let mut outputs = Outputs {
         moves: Vec::with_capacity(found.len()),
         names: Vec::with_capacity(found.len()),
     };
     for relative in found {
-        match claim(dir, kept, &mut planned, &relative) {
+        match claims.file(&relative) {
             Ok((to, name)) => {
                 outputs.moves.push((work.join(relative), to));
                 outputs.names.push(name);
@@ -1088,51 +1091,184 @@ pub(crate) fn claim_outputs(
     Ok(outputs)
 }
 
-// The first form of `relative` this torrent may place at, claimed: its own
-// claim a restart left, or a name made new for it here.
-fn claim(
-    dir: &Path,
-    kept: &HashSet<String>,
-    planned: &mut HashSet<String>,
-    relative: &Path,
-) -> Result<(PathBuf, String), super::relocate::MoveError> {
-    let wanted = relative.to_string_lossy();
-    if let Some(parent) = dir.join(relative).parent()
-        && let Err(source) = std::fs::create_dir_all(parent)
-    {
-        return Err(super::relocate::MoveError {
-            path: parent.to_path_buf(),
-            source,
-        });
-    }
-    let mut n = 0;
-    loop {
-        let name = weaver_graph::names::numbered(&wanted, n);
-        // Its own name, or a form no other output keeps or took.
-        if n == 0 || planned.insert(weaver_graph::names::key(&name)) {
-            let to = dir.join(&name);
-            if ours(&to, kept, &name) {
-                return Ok((to, name));
-            }
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&to)
-            {
-                Ok(_) => return Ok((to, name)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(super::relocate::MoveError { path: to, source }),
+// The names one torrent's outputs take under `dir`, as they are claimed.
+struct Claims<'a> {
+    dir: &'a Path,
+    kept: &'a HashSet<String>,
+    // The files the torrent lists as its own, there yet or not, by the key
+    // of each one's path under `dir`.
+    listed: HashSet<String>,
+    // By the key of its path under the job's folder: every output's own
+    // name and folders, as each takes its own when it is free, and each
+    // numbered form given out, so none is given over a name another output
+    // keeps.
+    planned: HashSet<String>,
+    // Each folder of an output, by its path under the job's folder: the
+    // folder under `dir` its files go in, made by then.
+    folders: HashMap<PathBuf, PathBuf>,
+}
+
+fn key_of(path: &Path) -> String {
+    weaver_graph::names::key(&path.to_string_lossy())
+}
+
+impl<'a> Claims<'a> {
+    fn of(
+        dir: &'a Path,
+        kept: &'a HashSet<String>,
+        listed: &HashSet<PathBuf>,
+        found: &[PathBuf],
+    ) -> Self {
+        let mut planned = HashSet::with_capacity(found.len());
+        for relative in found {
+            // A folder that is in has every folder above it in.
+            for path in relative.ancestors() {
+                if path.as_os_str().is_empty() || !planned.insert(key_of(path)) {
+                    break;
+                }
             }
         }
-        n += 1;
+        Self {
+            dir,
+            kept,
+            listed: listed.iter().map(|path| key_of(path)).collect(),
+            planned,
+            folders: HashMap::new(),
+        }
+    }
+
+    // Whether the `n`th form of a name may be tried: `placed`, its path
+    // under `dir`, is no file the torrent lists, and `wanted`, its path
+    // under the job's folder, is the output's own or a form no other output
+    // keeps or took.
+    fn free(&mut self, wanted: &Path, placed: &Path, n: usize) -> bool {
+        let key = key_of(wanted);
+        let listed = if wanted == placed {
+            self.listed.contains(&key)
+        } else {
+            self.listed.contains(&key_of(placed))
+        };
+        !listed && (n == 0 || self.planned.insert(key))
+    }
+
+    // The first form of `relative` this torrent may place at, claimed: its
+    // own claim a restart left, or a name made new for it here. Its path,
+    // and its name as the row keeps it.
+    fn file(&mut self, relative: &Path) -> Result<(PathBuf, String), MoveError> {
+        let above = relative.parent().unwrap_or(Path::new(""));
+        let folder = self.folder(above)?;
+        let leaf = relative.file_name().unwrap_or(relative.as_os_str());
+        let mut n = 0;
+        loop {
+            let part = weaver_graph::names::numbered_part(leaf, n, false);
+            let placed = folder.join(&part);
+            if self.free(&above.join(&part), &placed, n) {
+                let name = placed.to_string_lossy().into_owned();
+                let to = self.dir.join(&placed);
+                if ours(&to, self.kept, &name) {
+                    return Ok((to, name));
+                }
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&to)
+                {
+                    Ok(_) => return Ok((to, name)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(source) => return Err(MoveError { path: to, source }),
+                }
+            }
+            n += 1;
+        }
+    }
+
+    // The folder under `dir`, relative to it, that the outputs in the
+    // folder `wanted` under the job's go in, there by now. Each part of its
+    // path is settled once, for every output under it.
+    fn folder(&mut self, wanted: &Path) -> Result<PathBuf, MoveError> {
+        // The parts of `wanted` not settled yet, the deepest first.
+        let mut parts = Vec::new();
+        let mut known = wanted;
+        let mut placed = loop {
+            if let Some(placed) = self.folders.get(known) {
+                break placed.clone();
+            }
+            let (Some(above), Some(part)) = (known.parent(), known.file_name()) else {
+                // The torrent's own folder.
+                std::fs::create_dir_all(self.dir).map_err(|source| MoveError {
+                    path: self.dir.to_path_buf(),
+                    source,
+                })?;
+                self.folders.insert(known.to_path_buf(), PathBuf::new());
+                break PathBuf::new();
+            };
+            parts.push(part);
+            known = above;
+        };
+        let mut wanted = known.to_path_buf();
+        for part in parts.into_iter().rev() {
+            placed = self.folder_part(&wanted, &placed, part)?;
+            wanted.push(part);
+            self.folders.insert(wanted.clone(), placed.clone());
+        }
+        Ok(placed)
+    }
+
+    // The first form of the folder `part`, wanted under `wanted` and going
+    // under `placed`, that is a folder or can be made one: a name that
+    // something not a folder holds is passed over, as a file's is.
+    fn folder_part(
+        &mut self,
+        wanted: &Path,
+        placed: &Path,
+        part: &std::ffi::OsStr,
+    ) -> Result<PathBuf, MoveError> {
+        let mut n = 0;
+        loop {
+            let name = weaver_graph::names::numbered_part(part, n, true);
+            let placed = placed.join(&name);
+            if self.free(&wanted.join(&name), &placed, n) {
+                let path = self.dir.join(&placed);
+                let is_folder = || std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir());
+                if is_folder() {
+                    return Ok(placed);
+                }
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Ok(placed),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if is_folder() {
+                            return Ok(placed);
+                        }
+                    }
+                    Err(source) => return Err(MoveError { path, source }),
+                }
+            }
+            n += 1;
+        }
     }
 }
 
 // Whether `to` holds the empty file a claim of this torrent's left: one
-// on its row as `name`, so this torrent's, that no placing filled.
+// on its row as `name`, so this torrent's, that no placing filled, and
+// spelled there as the row spells it. Where the filesystem takes two
+// spellings for one name, an empty file under another spelling answers to
+// `to` and is not the claim.
 fn ours(to: &Path, kept: &HashSet<String>, name: &str) -> bool {
     kept.contains(name)
         && std::fs::symlink_metadata(to).is_ok_and(|meta| meta.is_file() && meta.len() == 0)
+        && spelled(to)
+}
+
+// Whether the file at `to` has the name `to` gives it, letter for letter.
+// A filesystem that keeps names in a form of its own (composed or not)
+// still spells it so.
+fn spelled(to: &Path) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let composed = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().nfc().collect::<String>())
+    };
+    std::fs::canonicalize(to).is_ok_and(|found| composed(&found) == composed(to))
 }
 
 // What placing came to.
@@ -1141,7 +1277,7 @@ pub(crate) struct Placed {
     // went whole; after a failed move, the ones it could not put back.
     pub(crate) names: Vec<String>,
     // Why it failed, when it did.
-    pub(crate) failed: Option<super::relocate::MoveError>,
+    pub(crate) failed: Option<MoveError>,
 }
 
 impl Outputs {

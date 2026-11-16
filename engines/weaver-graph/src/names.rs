@@ -1203,14 +1203,39 @@ fn fold_case(c: char) -> char {
 // The `n`th form of `name`: the name itself, then "subs (1).srt",
 // "subs (2).srt" and on, the number before the extension ("noext (1)",
 // ".hidden (1)"). The one numbered form of a name Weaver places beside
-// another of the same name: the ledger's, and a torrent's unpacked file's
-// beside a file already there.
+// another of the same name. `name` is a path as the graph writes one, its
+// parts joined by "/" whatever the operating system joins them by; a part
+// of a path on disk is numbered by [`numbered_part`].
 pub fn numbered(name: &str, n: usize) -> String {
     if n == 0 {
         return name.to_owned();
     }
     let (stem, extension) = split_extension(name);
     format!("{stem} ({n}){extension}")
+}
+
+// [`numbered`] for one part of a path on disk, as the operating system
+// holds it, which need not be text: a file's number goes before its
+// extension and a folder's after its whole name, as `numbered` puts them.
+// The part alone is numbered, so a separator or a dot in the folders above
+// it never moves the number. A torrent's unpacked file takes this form
+// beside a file already there.
+pub fn numbered_part(part: &std::ffi::OsStr, n: usize, folder: bool) -> std::ffi::OsString {
+    if n == 0 {
+        return part.to_owned();
+    }
+    let whole = std::path::Path::new(part);
+    let (stem, extension) = match (whole.file_stem(), whole.extension()) {
+        (Some(stem), Some(extension)) if !folder => (stem, Some(extension)),
+        _ => (part, None),
+    };
+    let mut numbered = stem.to_owned();
+    numbered.push(format!(" ({n})"));
+    if let Some(extension) = extension {
+        numbered.push(".");
+        numbered.push(extension);
+    }
+    numbered
 }
 
 // "subs.srt" -> ("subs", ".srt"); "archive.tar.gz" -> ("archive.tar", ".gz");
@@ -1231,6 +1256,47 @@ fn split_extension(name: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // One part of a path is numbered as the ledger numbers a name: the same
+    // form for every file name, and a folder's number after its whole name.
+    #[test]
+    fn a_part_of_a_path_is_numbered_as_a_name_is() {
+        use std::ffi::OsStr;
+        for name in [
+            "subs.srt",
+            "archive.tar.gz",
+            ".hidden",
+            "noext",
+            "a.",
+            "..a",
+            ".a.b",
+            "movie (1).mkv",
+        ] {
+            for n in 0..3 {
+                assert_eq!(
+                    numbered_part(OsStr::new(name), n, false),
+                    OsStr::new(&numbered(name, n)),
+                    "{name} {n}"
+                );
+            }
+        }
+        assert_eq!(numbered_part(OsStr::new("v1.0"), 2, true), "v1.0 (2)");
+        assert_eq!(numbered("v1.0/", 2), "v1.0 (2)/");
+        assert_eq!(numbered_part(OsStr::new("v1.0"), 0, true), "v1.0");
+    }
+
+    // A name that is not text keeps every byte of it: the number goes
+    // before its extension as it stands.
+    #[cfg(unix)]
+    #[test]
+    fn a_part_that_is_not_text_is_numbered_as_it_stands() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            numbered_part(OsStr::from_bytes(b"mov\xffie.mkv"), 1, false),
+            OsStr::from_bytes(b"mov\xffie (1).mkv")
+        );
+    }
 
     const ROOT: NodeId = NodeId::ROOT;
     const STORE: NodeId = NodeId(1);

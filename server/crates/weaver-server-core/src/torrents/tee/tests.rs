@@ -618,14 +618,25 @@ mod numbered_outputs {
     use super::super::{Outputs, claim_outputs};
 
     fn claim(work: &Path, dir: &Path, kept: &[&str]) -> Outputs {
+        claim_listing(work, dir, kept, &[])
+    }
+
+    // `claim`, for a torrent that lists `listed` as files of its own.
+    fn claim_listing(work: &Path, dir: &Path, kept: &[&str], listed: &[&str]) -> Outputs {
         claim_outputs(
             work,
             dir,
-            &HashSet::new(),
+            &listed.iter().map(PathBuf::from).collect(),
             &HashSet::new(),
             &kept.iter().map(|name| (*name).to_owned()).collect(),
         )
         .unwrap()
+    }
+
+    fn names(outputs: &Outputs) -> Vec<&str> {
+        let mut names: Vec<&str> = outputs.names.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     fn folders() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -793,5 +804,128 @@ mod numbered_outputs {
         let names: HashSet<String> = outputs.names.iter().cloned().collect();
         let wanted: HashSet<String> = (0..count).map(|i| format!("e{i} (1).mkv")).collect();
         assert_eq!(names, wanted);
+    }
+
+    // A folder of an output's path whose name a file holds is numbered, once
+    // for every output under it, and nothing is dropped: the file stays as
+    // it was, and the outputs go under the numbered folder, on the row.
+    #[test]
+    fn a_folder_whose_name_a_file_holds_is_numbered_for_every_output_under_it() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("Extras"), b"there").unwrap();
+        std::fs::create_dir_all(work.join("Extras/deep")).unwrap();
+        for name in ["Extras/a.mkv", "Extras/b.mkv", "Extras/deep/c.mkv"] {
+            std::fs::write(work.join(name), name.as_bytes()).unwrap();
+        }
+        let outputs = claim(&work, &dir, &[]);
+        assert_eq!(
+            names(&outputs),
+            [
+                "Extras (1)/a.mkv",
+                "Extras (1)/b.mkv",
+                "Extras (1)/deep/c.mkv"
+            ]
+        );
+        let placed = outputs.place(&work);
+        assert!(placed.failed.is_none());
+        assert_eq!(std::fs::read(dir.join("Extras")).unwrap(), b"there");
+        for name in ["a.mkv", "b.mkv", "deep/c.mkv"] {
+            assert_eq!(
+                std::fs::read(dir.join("Extras (1)").join(name)).unwrap(),
+                format!("Extras/{name}").as_bytes()
+            );
+        }
+    }
+
+    // A folder numbered past a file never takes the folder another output
+    // keeps as its own, and one a restart finds made is taken again.
+    #[test]
+    fn a_numbered_folder_is_not_another_outputs_and_is_taken_again_after_a_restart() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("Extras"), b"there").unwrap();
+        std::fs::create_dir_all(work.join("Extras")).unwrap();
+        std::fs::create_dir_all(work.join("Extras (1)")).unwrap();
+        std::fs::write(work.join("Extras/a.mkv"), b"one").unwrap();
+        std::fs::write(work.join("Extras (1)/a.mkv"), b"two").unwrap();
+        let first = claim(&work, &dir, &[]);
+        assert_eq!(names(&first), ["Extras (1)/a.mkv", "Extras (2)/a.mkv"]);
+        let again = claim(&work, &dir, &names(&first));
+        assert_eq!(names(&again), names(&first));
+        assert!(again.place(&work).failed.is_none());
+        assert_eq!(std::fs::read(dir.join("Extras (1)/a.mkv")).unwrap(), b"two");
+        assert_eq!(std::fs::read(dir.join("Extras (2)/a.mkv")).unwrap(), b"one");
+        assert!(!dir.join("Extras (3)").exists());
+    }
+
+    // Only the file's own name is numbered: a dot in a folder above it does
+    // not draw the number there.
+    #[test]
+    fn the_number_goes_in_the_files_own_name() {
+        let (_root, work, dir) = folders();
+        for folder in [&work, &dir] {
+            std::fs::create_dir_all(folder.join("v1.0")).unwrap();
+            std::fs::write(folder.join("v1.0/noext"), b"x").unwrap();
+            std::fs::write(folder.join("v1.0/a.tar.gz"), b"x").unwrap();
+        }
+        let outputs = claim(&work, &dir, &[]);
+        assert_eq!(names(&outputs), ["v1.0/a.tar (1).gz", "v1.0/noext (1)"]);
+    }
+
+    // A name the torrent lists for a file of its own, not there yet, is no
+    // output's: a numbered form passes over it, and so does a folder.
+    #[test]
+    fn a_name_the_torrent_lists_is_passed_over_though_nothing_holds_it() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("movie.mkv"), b"there").unwrap();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::create_dir_all(work.join("Extras")).unwrap();
+        std::fs::write(work.join("Extras/a.mkv"), b"unpacked").unwrap();
+        let outputs = claim_listing(&work, &dir, &[], &["movie (1).mkv", "Extras"]);
+        assert_eq!(names(&outputs), ["Extras (1)/a.mkv", "movie (2).mkv"]);
+        assert!(!dir.join("movie (1).mkv").exists());
+        assert!(!dir.join("Extras").exists());
+    }
+
+    // An empty file whose name differs from a name on the row only by case
+    // is not this torrent's claim, where the filesystem takes the two for
+    // one name or not: it stays as it is, and the output goes elsewhere.
+    #[test]
+    fn an_empty_file_under_another_spelling_is_not_the_torrents_claim() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("Movie.mkv"), b"").unwrap();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        let outputs = claim(&work, &dir, &["movie.mkv"]);
+        assert!(outputs.place(&work).failed.is_none());
+        let spelled: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(spelled.contains(&"Movie.mkv".to_owned()), "{spelled:?}");
+        assert_eq!(std::fs::read(dir.join("Movie.mkv")).unwrap(), b"");
+        assert_ne!(outputs.names, ["Movie.mkv"]);
+        assert_eq!(
+            std::fs::read(dir.join(&outputs.names[0])).unwrap(),
+            b"unpacked"
+        );
+    }
+
+    // A name that is not text is numbered as the filesystem holds it, every
+    // byte kept, and the row keeps it as it reads.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn a_name_that_is_not_text_is_placed_under_its_own_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let (_root, work, dir) = folders();
+        let name = OsStr::from_bytes(b"mov\xffie.mkv");
+        std::fs::write(dir.join(name), b"there").unwrap();
+        std::fs::write(work.join(name), b"unpacked").unwrap();
+        let outputs = claim(&work, &dir, &[]);
+        assert_eq!(outputs.names, ["mov\u{fffd}ie (1).mkv"]);
+        assert!(outputs.place(&work).failed.is_none());
+        let numbered = OsStr::from_bytes(b"mov\xffie (1).mkv");
+        assert_eq!(std::fs::read(dir.join(numbered)).unwrap(), b"unpacked");
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"there");
+        assert!(!dir.join("mov\u{fffd}ie (1).mkv").exists());
     }
 }
