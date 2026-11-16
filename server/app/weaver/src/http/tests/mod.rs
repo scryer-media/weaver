@@ -1855,6 +1855,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             seeders: 3,
         },
         piece_steals: 8,
+        untracked_dropped: 9,
         outgoing_encryption: [50, 30, 6, 4, 3],
         disk: {
             use weaver_server_core::torrents::metrics::{

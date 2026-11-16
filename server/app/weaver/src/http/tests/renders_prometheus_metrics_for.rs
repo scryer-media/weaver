@@ -1488,6 +1488,7 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(r#"weaver_torrent_session_connected_peers{{{ROUTE},transport="utp"}} 2"#),
         format!("weaver_torrent_session_connected_seeders{{{ROUTE}}} 3"),
         format!("weaver_torrent_session_piece_steals_total{{{ROUTE}}} 8"),
+        format!("weaver_torrent_session_peers_dropped_untracked_total{{{ROUTE}}} 9"),
         format!(
             r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="plaintext"}} 50"#
         ),

@@ -178,6 +178,13 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
     }
     for session in open() {
         out.sample(
+            &f::TORRENT_SESSION_PEERS_DROPPED_UNTRACKED,
+            &[("route", session.route.as_str())],
+            session.untracked_dropped,
+        );
+    }
+    for session in open() {
+        out.sample(
             &f::TORRENT_UTP_SYN_FLOOD_DROPPED,
             &[("route", session.route.as_str())],
             session.utp.syn_flood_dropped,
