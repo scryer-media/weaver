@@ -5,7 +5,10 @@
 //! starts a piece of its own, so every piece lies in one file, and its v2
 //! hash covers only that file's share of it.
 
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU32, AtomicUsize, Ordering},
+};
 
 use crate::core::{
     Id32,
@@ -29,6 +32,8 @@ pub struct V2File {
     /// once a peer's hashes for it prove `root`. Empty for a file of one
     /// piece, which its root proves.
     chunks: Vec<OnceLock<Box<[Id32]>>>,
+    /// How many of `chunks` are not set yet.
+    chunks_left: AtomicU32,
     /// The tree over the file's piece layer, once all of it is held.
     tree: OnceLock<PieceTree>,
 }
@@ -58,6 +63,9 @@ pub struct V2Hashes {
     /// Each file's index in `files`, by root (libtorrent
     /// `file_storage::file_index_for_root`).
     by_root: Vec<(Id32, usize)>,
+    /// How many files' layers are not held yet, so whether all are is
+    /// known without a pass over the files.
+    layers_left: AtomicUsize,
 }
 
 impl V2Hashes {
@@ -96,16 +104,19 @@ impl V2Hashes {
                         .expect("piece indexes fit in u32"),
                     pieces,
                     chunks: (0..chunks).map(|_| OnceLock::new()).collect(),
+                    chunks_left: AtomicU32::new(chunks),
                     tree,
                 })
             })
             .collect::<Vec<V2File>>();
         let mut by_root: Vec<_> = files.iter().enumerate().map(|(i, f)| (f.root, i)).collect();
         by_root.sort();
+        let layers_left = files.iter().filter(|f| !f.layer_held()).count();
         Some(Self {
             piece_length,
             files,
             by_root,
+            layers_left: AtomicUsize::new(layers_left),
         })
     }
 
@@ -209,6 +220,14 @@ impl V2Hashes {
     /// for (libtorrent `hash_picker::add_hashes`), and the run is then held
     /// by every file of that root; a file's tree is built once all its runs
     /// are. Returns whether every file's layer is then held.
+    ///
+    /// The request is shaped for the first file of the root. A file of the
+    /// same root with more pieces, which only a malformed torrent has (the
+    /// same content is the same length), would need more nodes than were
+    /// proven: the run is left unheld for it rather than read past the
+    /// nodes. libtorrent loads such a torrent, so it is not refused here
+    /// either; a layer the torrent carries for it is refused by
+    /// [`ValidatedTorrentMetaV1Info::piece_layers`].
     pub fn add_chunk(&self, request: &HashRequest, hashes: &[Id32]) -> Result<bool, InvalidHashes> {
         let (nodes, uncles) = hashes
             .split_at_checked(request.count as usize)
@@ -222,19 +241,29 @@ impl V2Hashes {
             let Some(chunk) = f.chunks.get((request.index / LAYER_CHUNK) as usize) else {
                 continue;
             };
-            let _ = chunk.set(nodes[..held].into());
-            if f.tree.get().is_none() && f.chunks.iter().all(|c| c.get().is_some()) {
-                let layer = f
-                    .chunks
-                    .iter()
-                    .flat_map(|c| c.get().into_iter().flatten().copied())
-                    .collect();
-                let _ = f
-                    .tree
-                    .set(PieceTree::from_piece_layer(layer, self.blocks_per_piece()));
+            let Some(nodes) = nodes.get(..held) else {
+                continue;
+            };
+            // The run that sets the file's last chunk builds its tree.
+            if chunk.set(nodes.into()).is_err()
+                || f.chunks_left.fetch_sub(1, Ordering::AcqRel) != 1
+                || f.tree.get().is_some()
+            {
+                continue;
+            }
+            let layer = f
+                .chunks
+                .iter()
+                .flat_map(|c| c.get().into_iter().flatten().copied())
+                .collect();
+            if f.tree
+                .set(PieceTree::from_piece_layer(layer, self.blocks_per_piece()))
+                .is_ok()
+            {
+                self.layers_left.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        Ok(self.files.iter().all(V2File::layer_held))
+        Ok(self.layers_left.load(Ordering::Acquire) == 0)
     }
 
     /// The hashes that answer a peer's request, or `None` to reject it
@@ -474,6 +503,120 @@ mod tests {
         assert_eq!(v2.missing_chunks().count(), 0);
         let held = v2.layers().unwrap();
         assert_eq!(held, vec![(tree.root(), layer.as_slice())]);
+    }
+
+    /// The v2 hashes of a torrent of files `(length, root)`, named f0, f1
+    /// and on, with no layer held.
+    fn files_of(files: &[(u64, Id32)], piece_length: u64) -> V2Hashes {
+        let mut info = b"d9:file treed".to_vec();
+        for (i, (length, root)) in files.iter().enumerate() {
+            let name = format!("f{i}");
+            info.extend(
+                format!(
+                    "{}:{name}d0:d6:lengthi{length}e11:pieces root32:",
+                    name.len()
+                )
+                .bytes(),
+            );
+            info.extend(root.0);
+            info.extend(b"ee");
+        }
+        info.extend(
+            format!("e12:meta versioni2e4:name1:x12:piece lengthi{piece_length}ee").bytes(),
+        );
+        let torrent = [b"d4:info".as_slice(), &info, b"e"].concat();
+        let meta = torrent_from_bytes(&torrent).unwrap();
+        let info = meta.info.data.clone().validate().unwrap();
+        V2Hashes::new(&info, Vec::new()).unwrap()
+    }
+
+    // A malformed torrent names one root for files of different lengths.
+    // The request for a run is shaped for the first of them; the answer
+    // is held for every file it covers and passed over for one it is too
+    // short for, with no read past the nodes it carries.
+    #[test]
+    fn a_root_shared_by_files_of_different_lengths_panics_nothing() {
+        let layer = made_up_layer(3);
+        let root = merkle::layer_root(&layer, 1);
+        let v2 = files_of(&[(3 * 16384, root), (5 * 16384, root)], 16384);
+        let tree = PieceTree::from_piece_layer(layer.clone(), 1);
+        let runs: Vec<_> = v2.missing_chunks().collect();
+        assert_eq!(runs, vec![(0, 0)]);
+        let r = v2.chunk_request(0, 0);
+        assert_eq!(r.count, 4);
+        let hashes = tree
+            .hashes(0, r.index.into(), r.count.into(), r.proof_layers)
+            .unwrap();
+        assert!(!v2.add_chunk(&r, &hashes).unwrap());
+        assert!((0..3).all(|p| v2.expected(p) == Some(layer[p as usize])));
+        // The longer file's pieces stay unknown.
+        assert!((3..8).all(|p| v2.expected(p).is_none()));
+        assert!(v2.layers().is_none());
+    }
+
+    // Whether every layer is held, from the count of those left, is what
+    // a pass over the files says, after every run taken, over seeded
+    // torrents of files of one piece and of many, some sharing a root,
+    // their runs answered in any order and some answered twice.
+    #[test]
+    fn layers_left_say_what_a_pass_over_the_files_says() {
+        let mut rng = 0x510e_527f_ade6_82d1u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..40 {
+            let mut layers: Vec<Vec<Id32>> = Vec::new();
+            let mut files = Vec::new();
+            for _ in 0..1 + next() % 5 {
+                let r = next();
+                let layer = match layers.last() {
+                    // The same content again: the same root and length.
+                    Some(last) if r % 4 == 0 => last.clone(),
+                    _ => {
+                        let pieces = u32::try_from(1 + (r >> 8) % 1100).unwrap();
+                        (0..pieces)
+                            .map(|i| merkle::hash_block(&(r ^ u64::from(i)).to_le_bytes()))
+                            .collect()
+                    }
+                };
+                let root = match layer.len() {
+                    1 => layer[0],
+                    _ => merkle::layer_root(&layer, 1),
+                };
+                files.push((layer.len() as u64 * 16384, root));
+                layers.push(layer);
+            }
+            let v2 = files_of(&files, 16384);
+            let mut runs: Vec<_> = v2.missing_chunks().collect();
+            let again: Vec<_> = runs.iter().filter(|_| next() % 3 == 0).copied().collect();
+            runs.extend(again);
+            for i in (1..runs.len()).rev() {
+                runs.swap(i, usize::try_from(next()).unwrap() % (i + 1));
+            }
+            assert_eq!(
+                v2.layers_left.load(Ordering::Relaxed) == 0,
+                v2.files.iter().all(V2File::layer_held)
+            );
+            for (file, chunk) in runs {
+                let r = v2.chunk_request(file, chunk);
+                let layer = &layers[file];
+                let tree = PieceTree::from_piece_layer(layer.clone(), 1);
+                let hashes = tree
+                    .hashes(0, r.index.into(), r.count.into(), r.proof_layers)
+                    .unwrap();
+                let all = v2.add_chunk(&r, &hashes).unwrap();
+                assert_eq!(all, v2.files.iter().all(V2File::layer_held));
+            }
+            assert!(v2.files.iter().all(V2File::layer_held));
+            for (file, layer) in layers.iter().enumerate() {
+                if layer.len() > 1 {
+                    assert_eq!(v2.files[file].tree().unwrap().pieces(), layer.as_slice());
+                }
+            }
+        }
     }
 
     /// [`one_file`] with every run of its layer held, as a seed holds it.
