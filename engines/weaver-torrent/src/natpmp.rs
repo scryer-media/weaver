@@ -20,6 +20,7 @@ use tracing::{debug, trace};
 
 use crate::{
     core::net::{DatagramSocket, Egress, HttpClients},
+    port_mapper::PortMapper,
     route_interface::{self, RouteInterface},
     upnp::{PortMapEvents, PortMapReports, PortMapRequest, PortmapProtocol, PortmapTransport},
 };
@@ -665,13 +666,7 @@ impl NatPmpMapper {
     /// mapper with no gateway to ask fails every mapping, as one the gateway
     /// never answers does.
     pub async fn run(self, cancel: CancellationToken, events: PortMapEvents) -> anyhow::Result<()> {
-        let ipv6 = self.ipv6 || self.route.as_ref().is_ok_and(|r| r.local_ip.is_ipv6());
-        let transport = if ipv6 {
-            PortmapTransport::PcpIpv6
-        } else {
-            PortmapTransport::NatPmp
-        };
-        let reports = PortMapReports::new(transport, events);
+        let reports = PortMapReports::new(PortMapper::transport(&self), events);
         let (socket, local_ip) = match Self::open_gateway(self.route, self.clients.as_ref()).await {
             Ok(connected) => connected,
             Err(e) => {
@@ -714,6 +709,34 @@ impl NatPmpMapper {
         }
         state.close(&socket, &reports).await;
         Ok(())
+    }
+}
+
+impl PortMapper for NatPmpMapper {
+    /// PCP over IPv6 for a mapper for an IPv6 address or one asking from
+    /// one, else NAT-PMP.
+    fn transport(&self) -> PortmapTransport {
+        if self.ipv6 || self.route.as_ref().is_ok_and(|r| r.local_ip.is_ipv6()) {
+            PortmapTransport::PcpIpv6
+        } else {
+            PortmapTransport::NatPmp
+        }
+    }
+
+    fn task_name(&self) -> &'static str {
+        if self.ipv6 {
+            "pcp_ipv6_forward"
+        } else {
+            "natpmp_forward"
+        }
+    }
+
+    fn run(
+        self: Box<Self>,
+        cancel: CancellationToken,
+        events: PortMapEvents,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        NatPmpMapper::run(*self, cancel, events).boxed()
     }
 }
 

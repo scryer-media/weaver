@@ -472,7 +472,11 @@ impl Session {
                 // A forwarded port reaches the plain listener only: the SSL
                 // one gets no mapping through it.
                 if let Some(forwarded) = forwarded {
-                    session.follow_port_mappings(forwarded, None, port_map_events);
+                    session.follow_port_mappings(
+                        forwarded,
+                        super::ports::Reports::Announce { ssl: None },
+                        port_map_events,
+                    );
                 }
             }
 

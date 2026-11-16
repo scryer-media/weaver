@@ -68,6 +68,7 @@ mod peer_info_reader;
 pub mod peer_protocol;
 mod piece_priority;
 mod piece_tracker;
+mod port_mapper;
 mod read_buf;
 pub mod route_interface;
 mod session;

@@ -334,6 +334,24 @@ async fn a_pcp_port_is_announced_over_ipv6_only() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A NAT-PMP / PCP mapper for `requests` asking over `route` through
+/// `session`'s clients.
+fn natpmp_over(
+    session: &Session,
+    route: Result<crate::natpmp::GatewayRoute, String>,
+    requests: Vec<crate::upnp::PortMapRequest>,
+) -> crate::natpmp::NatPmpMapper {
+    crate::natpmp::NatPmpMapper::new(route, requests, None, session.http_clients.clone())
+}
+
+/// `mapper`, its reports announced.
+fn announced(mapper: crate::natpmp::NatPmpMapper) -> super::ports::Planned {
+    super::ports::Planned {
+        mapper: Box::new(mapper),
+        announced: true,
+    }
+}
+
 // A session on `[::]` maps its port over PCP from each global IPv6
 // address, each from its own gateway (libtorrent starts a mapper on each
 // expanded IPv6 listen socket, session_impl.cpp:5912-5919). It tells
@@ -377,19 +395,23 @@ async fn each_ipv6_address_is_mapped_and_the_first_one_announced() -> anyhow::Re
             })
         })
         .collect();
-    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
-    session.map_ipv6_over(
-        routes,
-        vec![PortMapRequest {
-            protocol: PortmapProtocol::Tcp,
-            local_port,
-            external_port: local_port,
-        }],
-        events_tx,
-        Some(forward.clone()),
+    let requests = vec![PortMapRequest {
+        protocol: PortmapProtocol::Tcp,
+        local_port,
+        external_port: local_port,
+    }];
+    let routes: Vec<Result<GatewayRoute, String>> = routes;
+    session.run_port_mappers(
+        routes
+            .into_iter()
+            .enumerate()
+            .map(|(at, route)| super::ports::Planned {
+                mapper: Box::new(natpmp_over(&session, route, requests.clone()).ipv6()),
+                announced: at == 0,
+            }),
+        Some(forward),
     );
-    session.follow_port_mappings(events, None, Some(forward));
     for (gateway, granted) in gateways.iter().zip([2004u16, 2006]) {
         let mut buf = [0u8; 1100];
         let (n, mapper) = gateway.recv_from(&mut buf).await?;
@@ -502,18 +524,16 @@ async fn an_ssl_torrent_announces_the_port_mapped_for_the_ssl_listener() {
         })
         .collect();
     let mut ssl_announced = session.ssl_port.subscribe();
-    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
-    session.map_over(
-        Ok(GatewayRoute {
-            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
-            gateway: gateway.address(),
-            interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
-        }),
-        requests,
-        events_tx,
+    let route = Ok(GatewayRoute {
+        local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+        gateway: gateway.address(),
+        interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+    });
+    session.run_port_mappers(
+        [announced(natpmp_over(&session, route, requests))],
+        Some(forward),
     );
-    session.follow_port_mappings(events, session.ssl_mapped_port(), Some(forward));
 
     let mut granted = Vec::new();
     while granted.len() < 2 {
@@ -578,22 +598,21 @@ async fn legs_behind_one_gateway_map_their_own_ports_and_announce_the_set_one() 
 
     let mut forwarded = Vec::new();
     for (session, &port) in sessions.iter().zip(&ports) {
-        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let (forward, reports) = tokio::sync::mpsc::unbounded_channel();
-        session.map_over(
-            Ok(GatewayRoute {
-                local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
-                gateway: gateway.address(),
-                interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
-            }),
-            vec![PortMapRequest {
-                protocol: PortmapProtocol::Tcp,
-                local_port: port,
-                external_port: port,
-            }],
-            events_tx,
+        let route = Ok(GatewayRoute {
+            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            gateway: gateway.address(),
+            interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+        });
+        let requests = vec![PortMapRequest {
+            protocol: PortmapProtocol::Tcp,
+            local_port: port,
+            external_port: port,
+        }];
+        session.run_port_mappers(
+            [announced(natpmp_over(session, route, requests))],
+            Some(forward),
         );
-        session.follow_port_mappings(events, None, Some(forward));
         forwarded.push(reports);
     }
 
@@ -664,21 +683,23 @@ async fn an_ipv6_mapping_over_pcp_moves_the_announced_port() {
     });
 
     let mut announced = session.announce_port_changes();
-    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
-    session.map_over(
-        Ok(GatewayRoute {
-            local_ip: Ipv6Addr::LOCALHOST.into(),
-            gateway: gateway_addr,
-            interface_addresses: vec![Ipv6Addr::LOCALHOST.into()],
-        }),
-        vec![PortMapRequest {
-            protocol: PortmapProtocol::Tcp,
-            local_port: port,
-            external_port: port,
+    let route = Ok(GatewayRoute {
+        local_ip: Ipv6Addr::LOCALHOST.into(),
+        gateway: gateway_addr,
+        interface_addresses: vec![Ipv6Addr::LOCALHOST.into()],
+    });
+    let requests = vec![PortMapRequest {
+        protocol: PortmapProtocol::Tcp,
+        local_port: port,
+        external_port: port,
+    }];
+    session.run_port_mappers(
+        [super::ports::Planned {
+            mapper: Box::new(natpmp_over(&session, route, requests)),
+            announced: true,
         }],
-        events_tx,
+        None,
     );
-    session.follow_port_mappings(events, None, None);
 
     let request = heard.await.unwrap();
     assert_eq!(request[0], 2, "PCP");

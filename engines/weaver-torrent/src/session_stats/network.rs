@@ -8,7 +8,8 @@
 use serde::Serialize;
 
 use super::swarm::{Tally, add, counted, read};
-use crate::upnp::{PortMapped, PortmapTransport};
+use crate::port_mapper::Transport;
+use crate::upnp::PortMapped;
 
 counted! {
     /// Which mapper reported on a port mapping.
@@ -64,11 +65,7 @@ pub struct NetworkStats {
 impl NetworkStats {
     /// A mapper's report.
     pub(crate) fn port_mapped(&self, report: &PortMapped) {
-        let mapper = match report.transport {
-            PortmapTransport::NatPmp => PortMapper::NatPmp,
-            PortmapTransport::Upnp => PortMapper::Upnp,
-            PortmapTransport::PcpIpv6 => PortMapper::PcpIpv6,
-        };
+        let mapper = Transport::of(report.transport).stat;
         let result = match (&report.error, report.external_port) {
             (Some(_), _) => PortMapResult::Failed,
             (None, Some(_)) => PortMapResult::Mapped,
