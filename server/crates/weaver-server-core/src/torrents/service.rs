@@ -60,6 +60,7 @@ mod disk_room;
 mod intake;
 mod live;
 mod moves;
+mod policy;
 mod queue;
 mod restore;
 mod retire;
@@ -759,6 +760,12 @@ struct Inner {
     // What the last pass over the queue left at its end, written under
     // `live`'s lock: a torrent added goes there.
     queue_end: Mutex<QueueEnd>,
+    // The queue's order as the last pass worked it out, taken again while
+    // no torrent's place moved. Kept under `live`'s lock.
+    queue_order: Mutex<policy::QueueOrder>,
+    // What the passes did: each take of `live`, walk and write.
+    #[cfg(test)]
+    pass_counts: watch::Sender<policy::PassCounts>,
     // The readings of every torrent's views their followers share.
     readings: updates::Readings,
     // The torrents waiting for room on their disks, each by the wait every
@@ -840,6 +847,9 @@ impl TorrentService {
                     slots: status::Slots::new(max_active),
                     last: None,
                 }),
+                queue_order: Mutex::default(),
+                #[cfg(test)]
+                pass_counts: watch::channel(policy::PassCounts::default()).0,
                 readings: updates::Readings::default(),
                 disk_waits: Mutex::default(),
                 disk_waits_moved: watch::channel(0).0,

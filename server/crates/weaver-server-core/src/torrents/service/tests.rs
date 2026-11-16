@@ -47,6 +47,8 @@ mod disk_room;
 mod intake;
 mod listing;
 mod moves;
+mod pass;
+mod pass_rules;
 mod policies;
 mod queue;
 mod readings;

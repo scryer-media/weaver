@@ -173,15 +173,28 @@ async fn run(count: usize, archive: bool) {
 
     // Each tick on its own: a first tick that writes what the adds left
     // reads apart from the steady ones after it.
+    // And the ordered writer's writes each tick took.
+    let mut writes = Vec::new();
     let ticks: Vec<f64> = {
         let mut ticks = Vec::new();
         for _ in 0..3 {
+            let taken = db.writes_taken();
+            let passes = *service.inner.pass_counts.borrow();
             let at = Instant::now();
             service.tick().await;
             ticks.push(ms(at));
+            let after = *service.inner.pass_counts.borrow();
+            writes.push(format!(
+                "{} (pass: {} locks, {} walks, {} writes)",
+                db.writes_taken() - taken,
+                after.locks - passes.locks,
+                after.walks - passes.walks,
+                after.writes - passes.writes,
+            ));
         }
         ticks
     };
+    let writes = writes.join(" / ");
     let tick = ticks
         .iter()
         .map(|tick| format!("{tick:.1}"))
@@ -214,7 +227,7 @@ async fn run(count: usize, archive: bool) {
 
     println!(
         "BENCH service scale {count} {} torrents ({unpacked} unpacked): add {added:.0} ms, all seeding {seeding:.0} ms, all complete {complete:.0} ms; \
-         ticks {tick} ms, list {list:.1} ms; stop {stopped:.0} ms; restart: start {opened:.0} ms, \
+         ticks {tick} ms, tick writes {writes}, list {list:.1} ms; stop {stopped:.0} ms; restart: start {opened:.0} ms, \
          all seeding {back:.0} ms; resident MiB before {}, seeding {}, after restart {}",
         if archive { "archive" } else { "plain" },
         mib(before),

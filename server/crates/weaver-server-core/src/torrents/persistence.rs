@@ -29,6 +29,28 @@ const TRACKER_INSERT: &str =
 const TRACKER_HOST_INSERT: &str =
     "INSERT INTO tracker_hosts (host) VALUES ({}) ON CONFLICT (host) DO NOTHING";
 
+/// The rows a pass over the torrents changes, written together by
+/// [`Database::write_torrent_pass`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct TorrentPassWrites {
+    /// Left seed mode: no check passed in it is kept.
+    pub(crate) left_seed_mode: Vec<JobId>,
+    /// The pieces each checked in seed mode, and how many.
+    pub(crate) verified: Vec<(JobId, Vec<u8>, usize)>,
+    /// Stopped by a wind-down to the downloads alone, and by their goals.
+    pub(crate) wound_down: Vec<JobId>,
+    pub(crate) met: Vec<JobId>,
+}
+
+impl TorrentPassWrites {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.left_seed_mode.is_empty()
+            && self.verified.is_empty()
+            && self.wound_down.is_empty()
+            && self.met.is_empty()
+    }
+}
+
 // The statement that writes a torrent's ledger and the peers and bans it
 // begins with, each only when given; none when neither is.
 fn resume_update(
@@ -1160,6 +1182,86 @@ impl Database {
             SqlArg::I64(stored(job_id.0)?),
         ];
         self.set_torrent_column("state", args)
+    }
+
+    // What a pass over the torrents changed, in one transaction: the
+    // torrents that left seed mode, the pieces each still in it checked, and
+    // the kept intents of those stopped by a wind-down and by their goals.
+    // The statements and columns are those of `clear_torrent_seed_mode`,
+    // `set_torrent_seed_verified` and `update_torrent_intents`, each list in
+    // bind-limit chunks.
+    pub(crate) fn write_torrent_pass(&self, writes: &TorrentPassWrites) -> Result<(), StateError> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let ids = |job_ids: &[JobId]| {
+            job_ids
+                .iter()
+                .map(|job_id| stored(job_id.0))
+                .collect::<Result<Vec<_>, StateError>>()
+        };
+        let left = ids(&writes.left_seed_mode)?;
+        let verified = writes
+            .verified
+            .iter()
+            .map(|(job_id, pieces, _)| Ok((stored(job_id.0)?, pieces.clone())))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let intents = [
+            (KeptIntent::WoundDown.as_str(), ids(&writes.wound_down)?),
+            (
+                KeptIntent::Intent(TorrentIntent::Stopped).as_str(),
+                ids(&writes.met)?,
+            ),
+        ];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "write_torrent_pass", |tx| {
+                let left = left.clone();
+                let verified = verified.clone();
+                let intents = intents.clone();
+                Box::pin(async move {
+                    // Each statement binds one value besides its ids.
+                    let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 1)
+                        .saturating_sub(1)
+                        .max(1);
+                    for chunk in left.chunks(rows) {
+                        let placeholders = vec!["{}"; chunk.len()].join(", ");
+                        let mut args = vec![SqlArg::Bool(false)];
+                        args.extend(chunk.iter().copied().map(SqlArg::I64));
+                        tx.execute(
+                            &format!(
+                                "UPDATE torrents SET seed_mode = {{}}, seed_verified = NULL WHERE job_id IN ({placeholders})"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    for (id, pieces) in verified {
+                        tx.execute(
+                            "UPDATE torrents SET seed_verified = {} WHERE job_id = {}",
+                            &[SqlArg::OptBytes(Some(pieces)), SqlArg::I64(id)],
+                        )
+                        .await?;
+                    }
+                    for (state, ids) in &intents {
+                        for chunk in ids.chunks(rows) {
+                            let placeholders = vec!["{}"; chunk.len()].join(", ");
+                            let mut args = vec![SqlArg::Text((*state).to_owned())];
+                            args.extend(chunk.iter().copied().map(SqlArg::I64));
+                            tx.execute(
+                                &format!(
+                                    "UPDATE torrents SET state = {{}} WHERE job_id IN ({placeholders})"
+                                ),
+                                &args,
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 
     // Each group's kept intent for every torrent of its ids, and no other
