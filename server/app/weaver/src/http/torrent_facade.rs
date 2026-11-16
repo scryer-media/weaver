@@ -2611,6 +2611,19 @@ async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> 
             }
         }
     }
+    // A place the caller may not save at is refused before any URL is
+    // fetched (`TorrentService::may_place`): a refused add reaches no host.
+    // `add_as` checks again, once a path that is not absolute has its
+    // folder.
+    let placement = placement(&params);
+    if [&placement.save_path, &placement.download_path]
+        .into_iter()
+        .flatten()
+        .map(|path| Path::new(path.trim()))
+        .any(|path| path.is_absolute() && !torrents.may_place(scope, path))
+    {
+        return forbidden();
+    }
     for line in urls {
         let body = match classify(line.as_bytes()) {
             Kind::Url(url) => match ctx.inner.handle.proxy_runtime() {
@@ -2634,7 +2647,6 @@ async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> 
     let first_last = params.flag("firstLastPiecePrio").unwrap_or(false);
     // Off unless asked, as qBittorrent's `isAddTorrentToQueueTop` is.
     let to_top = params.flag_value("addToTopOfQueue").unwrap_or(false);
-    let placement = placement(&params);
     // A comma list; empty parts are skipped (qBittorrent `torrents/add`).
     let tags = params.get("tags").map(split_tags).unwrap_or_default();
     let mut ids = Vec::new();

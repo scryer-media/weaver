@@ -2058,6 +2058,106 @@ async fn rig_with_a_control_key() -> (Rig, PathBuf, PathBuf) {
     (rig, complete, tv)
 }
 
+// An add a control key may not save where it names is refused before any
+// of its URLs is fetched: the host is never reached. An add that may be
+// saved fetches as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_refused_for_its_save_folder_fetches_no_url() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let handle = scheduler();
+    handle.set_proxy_runtime(
+        weaver_server_core::proxies::ProxyRuntime::new(
+            Database::open_in_memory().unwrap(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+    let rig = rig_on(
+        true,
+        RuntimeSecurityConfig::default(),
+        handle,
+        Offline {
+            up: true,
+            ..Default::default()
+        },
+        Api::LATEST,
+    )
+    .await;
+    rig.keys.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key(CONTROLLER),
+        id: 3,
+        scope: "control".to_owned(),
+    });
+    let complete = PathBuf::from(rig.config.read().await.complete_dir());
+    let elsewhere = rig._dir.path().join("elsewhere");
+    let path = |path: &Path| url_encode(&path.to_string_lossy());
+
+    // A server that counts each connection made to it, and answers every
+    // request with a torrent.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http%3A%2F%2F{}%2Fa.torrent",
+        listener.local_addr().unwrap()
+    );
+    let reached = Arc::new(AtomicUsize::new(0));
+    let server = tokio::spawn({
+        let reached = reached.clone();
+        async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                reached.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+                let body = metainfo("fetched.mkv", 4096, false);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        }
+    });
+
+    for form in [
+        format!("urls={url}&savepath={}", path(&elsewhere)),
+        format!(
+            "urls={url}&savepath={}&downloadPath={}",
+            path(&complete.join("shows")),
+            path(&elsewhere)
+        ),
+    ] {
+        let refused = rig.post_as("/api/v2/torrents/add", &form, CONTROLLER).await;
+        assert_eq!(
+            (refused.status, refused.body.as_str()),
+            (StatusCode::FORBIDDEN, "Forbidden"),
+            "{form}"
+        );
+        assert_eq!(reached.load(Ordering::SeqCst), 0, "{form}");
+    }
+    assert!(rig.torrents().await.is_empty());
+
+    let added = rig
+        .post_as(
+            "/api/v2/torrents/add",
+            &format!("urls={url}&savepath={}", path(&complete.join("shows"))),
+            CONTROLLER,
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    assert_eq!(reached.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.torrents().await[0]["name"], "fetched.mkv");
+    server.abort();
+}
+
 // Operator ruling, 2026-11-16 (PR 129 question 2): a control key saves a
 // torrent it adds only at or under the default save folder or a category's
 // folder; elsewhere, or by `..` out of one, it is forbidden and nothing is
