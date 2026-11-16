@@ -146,6 +146,7 @@ pub(super) async fn resolve_routed(
         };
         return (Ok(lookup), Account::default());
     }
+    sessions.ready().await;
     let stage = Stage {
         dialer,
         failure: Mutex::new(None),

@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Plain DNS over TCP: a stream of its own for each query.
-use super::{Exchange, NEXT_ID, Next, Queue, Reply, Session, framed, io_reason, sent};
+use super::{Exchange, NEXT_ID, Next, Queue, Reply, framed, io_reason, sent};
 use crate::dns::Exchanged;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -29,17 +29,6 @@ pub(super) struct PlainTcp<'a> {
 impl<'a> Exchange<'a> for PlainTcp<'a> {
     fn id() -> u16 {
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    }
-
-    async fn ask(session: &Session<'a>, packet: &[u8], reached: &mut bool) -> Reply {
-        let mut stream = session
-            .provider
-            .open(session.server)
-            .await
-            .map_err(Exchanged::Unreached)?;
-        *reached = true;
-        session.sent(1);
-        framed(&mut stream, packet, plain_failed).await
     }
 
     // A stream dialled for each query, at most `PLAIN_DIALS` at once. Until

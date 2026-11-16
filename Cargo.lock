@@ -6806,6 +6806,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "reqwest",
+ "rustls-native-certs",
  "socket2",
  "thiserror 2.0.21",
  "tokio",

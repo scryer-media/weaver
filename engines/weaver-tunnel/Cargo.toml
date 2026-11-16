@@ -24,6 +24,10 @@ if-addrs = "0.15.0"
 # DNS over TLS and over HTTPS, on the stream the routing layer dials.
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
+# The host's trust store, read once and trusted beside webpki-roots, so an
+# operator can add a root for DNS over TLS and HTTPS. Reads files or the OS
+# keychain only; it dials nothing.
+rustls-native-certs = { workspace = true }
 # HTTP/2 or HTTP/1.1 on that stream only: no pooled client, no connector, no resolver.
 hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
 # The HTTP/2 errors hyper passes on, read to tell a connection gone from a

@@ -3,14 +3,14 @@
 
 // What one DNS server can do: whether it answers in plain, over TLS and
 // over HTTPS, and whether it hands back the records a DNSSEC check needs.
-// Each is asked once, through the stage given, with TLS sessions and a
-// validator of the probe's own, so nothing a route's naming holds is used
-// or kept. Nothing here is counted in the DNS metrics.
+// Each is asked through the stage given by the code a lookup asks with, on
+// connections, TLS sessions and a validator of the probe's own, so nothing
+// a route's naming holds is used or kept. Nothing here is counted in the
+// DNS metrics.
 use super::{
     Carrier, DnsServer, Exchanged, Failed, SERVER_TIMEOUT, Stage, Wire, WireKind,
-    exchange::{Session, Wires},
-    judge::validating,
-    message::{refusal, u16_at},
+    exchange::{Reply, Session, Wires},
+    judge::{self, Asking, Judge, as_sent, validating},
     sessions::DnsSessions,
 };
 use crate::{
@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Notify, futures::Notified};
 use tokio::time::Instant;
+use weaver_dnssec::{Name, Query, RecordType};
 
 // The root's SOA: a question every recursive server answers, and one whose
 // check needs the root's DNSKEY set, proven by the built-in root anchors.
@@ -389,6 +390,7 @@ pub(super) async fn probe_on(
     sessions: &DnsSessions,
     server: &DnsServer,
 ) -> ServerProbe {
+    sessions.ready().await;
     let wires = sessions.wires();
     let (plain, tls, https) = (
         on(server, WireKind::Plain),
@@ -416,10 +418,13 @@ pub(super) async fn probe_on(
 // limit of their own, SOCKET_WAIT, summed over every wait the probe makes,
 // and a probe that reaches it fails on the route's account, not the
 // server's.
-pub(super) async fn timed(
+pub(super) async fn timed<E>(
     server: &DnsServer,
-    probe: impl std::future::Future<Output = Result<(), Exchanged>>,
-) -> Probed {
+    probe: impl std::future::Future<Output = Result<(), E>>,
+) -> Probed
+where
+    Failed: From<E>,
+{
     let clock = Arc::new(Clock::default());
     let started = Instant::now();
     let probe = CLOCK.scope(Arc::clone(&clock), probe);
@@ -465,29 +470,62 @@ pub(super) async fn timed(
     }
 }
 
-// Whether `server` answers the root's SOA on its wire: any reply to the
-// query, whatever its records, so long as it is not an error code.
-async fn answers(
-    carrier: &dyn Carrier,
-    wires: &Wires,
-    server: &DnsServer,
-) -> Result<(), Exchanged> {
-    let session = Session::new(carrier, wires, server);
-    let id = session.id();
-    let mut packet = Vec::from(id.to_be_bytes());
-    // Recursion desired; one question: the root, SOA, IN.
-    packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-    packet.extend_from_slice(&SOA.to_be_bytes());
-    packet.extend_from_slice(&[0, 1]);
-    let bytes = session.ask(&packet, &mut false).await?;
-    if let Some(rcode) = refusal(&bytes, id) {
-        return Err(Exchanged::Rcode(rcode));
+// Whether `server` answers the root's SOA on its wire, asked and read as a
+// lookup taking answers as sent asks and reads its queries: through the
+// lookup's own loop, exchanges and reader, so a server that would fail a
+// lookup fails this probe the same way. Any reply that reads, whatever its
+// records, is an answer. The talk's connections are the probe's own, and
+// go when it ends.
+async fn answers(carrier: &dyn Carrier, wires: &Wires, server: &DnsServer) -> Result<(), Failed> {
+    let mut session = Session::new(carrier, wires, server);
+    let mut asked = RootSoa::default();
+    judge::run(&mut session, &mut false, &mut asked).await;
+    match asked.answered {
+        Some(answered) => answered.map_err(Failed::from),
+        // A talk that ended with the query neither answered nor failed: a
+        // lookup counts a family left so as timed out (`ServerSaid::take`).
+        None => Err(Failed::TimedOut),
     }
-    let flags = u16_at(&bytes, 2).map_err(|_| Exchanged::Invalid)?;
-    if u16_at(&bytes, 0).ok() != Some(id) || flags & 0x8000 == 0 {
-        return Err(Exchanged::Invalid);
+}
+
+// The probe's one question, the root's SOA, as a judge: the query goes out
+// once, and its reply is read by the reader a lookup taking answers as sent
+// uses.
+#[derive(Default)]
+struct RootSoa {
+    // The id the query went out with, once it has.
+    id: Option<u16>,
+    answered: Option<Result<(), Exchanged>>,
+}
+
+impl RootSoa {
+    fn query() -> Query {
+        Query::new(Name::root(), RecordType::new(SOA))
     }
-    Ok(())
+}
+
+impl Judge for RootSoa {
+    async fn want(&mut self, asking: &mut Asking<'_, '_, '_>) {
+        if self.id.is_none() {
+            let id = asking.id();
+            self.id = Some(id);
+            asking.send(0, 0, as_sent::packet(id, &Name::root(), SOA));
+        }
+    }
+
+    fn supply(&mut self, _: usize, reply: Reply) {
+        let id = self.id.expect("a reply comes only to a query sent");
+        self.answered =
+            Some(reply.and_then(|bytes| as_sent::read(&Self::query(), id, &bytes).map(drop)));
+    }
+
+    fn done(&self) -> bool {
+        self.answered.is_some()
+    }
+
+    fn fail(&mut self, failed: Exchanged) {
+        self.answered.get_or_insert(Err(failed));
+    }
 }
 
 // Whether `server` gives the root's SOA with the signatures and keys that

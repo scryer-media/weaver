@@ -2,10 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // DNS over TLS (RFC 7858): one connection kept for a lookup's queries.
-use super::{
-    Asked, Exchange, NEXT_ID, Next, Queue, Reply, SENDS, Session, Tls, Wires, closed, framed,
-    handshake, reply,
-};
+use super::{Asked, Exchange, NEXT_ID, Next, Queue, SENDS, Tls, Wires, handshake, reply};
 use crate::dns::{Carrier, DnsServer, Exchanged};
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -36,13 +33,6 @@ pub(super) struct Dot {
 impl<'a> Exchange<'a> for Dot {
     fn id() -> u16 {
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    }
-
-    async fn ask(session: &Session<'a>, packet: &[u8], reached: &mut bool) -> Reply {
-        let (provider, wires, server) = (session.provider, session.wires, session.server);
-        let mut stream = dot(provider, wires, server, || *reached = true).await?;
-        session.sent(1);
-        framed(stream.as_mut(), packet, closed).await
     }
 
     // Each query written on the connection as it is given, and the replies

@@ -192,6 +192,9 @@ enum H2Misstep {
     Interims(usize),
     // Tries to push a response first, and logs what came of it.
     Push,
+    // Refuses the first stream on each connection unhandled, and answers
+    // the rest.
+    RefuseFirst,
     // Refuses the second stream on each connection unhandled, as a server
     // over its limit of streams at once does (RFC 9113 §8.7), and answers
     // the rest.
@@ -251,6 +254,9 @@ struct Servers {
     // DNS over TLS: a query given no reply closes the connection, instead
     // of staying unanswered on it.
     closing: bool,
+    // DNS over TLS: each reply goes out after a copy of it under an id no
+    // query out has.
+    straying: bool,
     // A permit for each dial.
     dialled: Arc<tokio::sync::Semaphore>,
     // Every read on a client's stream fails with this kind, when set, as a
@@ -413,6 +419,7 @@ impl Servers {
             stalled: None,
             switched: None,
             closing: false,
+            straying: false,
             dialled: Arc::new(tokio::sync::Semaphore::new(0)),
             broken: None,
             open: Arc::default(),
@@ -437,6 +444,10 @@ impl Servers {
     }
     fn closing_unanswered(mut self) -> Self {
         self.closing = true;
+        self
+    }
+    fn straying(mut self) -> Self {
+        self.straying = true;
         self
     }
     fn broken(mut self, kind: std::io::ErrorKind) -> Self {
@@ -541,7 +552,7 @@ impl Carrier for Servers {
         let asked = server.address.ip();
         let answer = self.answer.clone();
         let replies = self.replies.clone();
-        let closing = self.closing;
+        let (closing, straying) = (self.closing, self.straying);
         if self.silent.contains(&asked) {
             self.held.lock().unwrap().push(inner);
             return Ok(client);
@@ -553,7 +564,7 @@ impl Carrier for Servers {
                     &mut stream,
                     asked,
                     &*answer,
-                    (None, closing),
+                    (None, closing, false),
                     None,
                     &queries,
                 )
@@ -585,7 +596,7 @@ impl Carrier for Servers {
                         &mut tls,
                         asked,
                         &*answer,
-                        (close_after, closing),
+                        (close_after, closing, straying),
                         replies.as_deref(),
                         &queries,
                     )
@@ -720,6 +731,7 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
             continue;
         }
         let refuse = match misstep {
+            H2Misstep::RefuseFirst => accepted == 1,
             H2Misstep::RefuseSecond => accepted == 2,
             H2Misstep::RefuseEvery => true,
             _ => false,
@@ -765,6 +777,7 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
             });
             match misstep {
                 H2Misstep::None
+                | H2Misstep::RefuseFirst
                 | H2Misstep::RefuseSecond
                 | H2Misstep::RefuseEvery
                 | H2Misstep::Graceful
@@ -809,14 +822,23 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+// `reply` under an id no query out with it has: its own with the top bit
+// flipped. A lookup's queries out at once have neighbouring ids, so none
+// of them has this one.
+fn stray(mut reply: Vec<u8>) -> Vec<u8> {
+    reply[0] ^= 0x80;
+    reply
+}
+
 // DNS over TCP replies to each query read, until the client goes, the
 // connection has answered `close_after`, or no `replies` are left. With
-// `closing`, a query given no reply closes the connection.
+// `closing`, a query given no reply closes the connection. With `straying`,
+// each reply goes out after a copy of it under a stray id.
 async fn framed_replies<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     asked: IpAddr,
     answer: &Answer,
-    (close_after, closing): (Option<usize>, bool),
+    (close_after, closing, straying): (Option<usize>, bool, bool),
     replies: Option<&AtomicUsize>,
     queries: &AtomicUsize,
 ) {
@@ -849,7 +871,12 @@ async fn framed_replies<S: AsyncRead + AsyncWrite + Unpin>(
         if reply.is_empty() {
             continue;
         }
-        let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
+        let mut framed = Vec::new();
+        if straying {
+            framed.extend_from_slice(&(reply.len() as u16).to_be_bytes());
+            framed.extend_from_slice(&stray(reply.clone()));
+        }
+        framed.extend_from_slice(&(reply.len() as u16).to_be_bytes());
         framed.extend(reply);
         if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
             return;
@@ -1116,6 +1143,111 @@ async fn dot_fails_a_certificate_from_an_untrusted_issuer() {
     assert_eq!(resolution.error, tls_failed("192.0.2.53", "unknown issuer"));
     // No answer came to judge.
     assert_eq!(resolution.trust, None);
+}
+
+// The built-in TLS roots from a host store holding `host`, unreadable for
+// `errors`. The compiled-in roots always lead them.
+fn built_from(host: Vec<CertificateDer<'static>>, errors: &[String]) -> RootCertStore {
+    let roots = crate::dns::roots::tls_roots(host, errors);
+    assert_eq!(
+        &roots.roots[..webpki_roots::TLS_SERVER_ROOTS.len()],
+        webpki_roots::TLS_SERVER_ROOTS
+    );
+    roots
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_certificate_chained_only_to_a_root_from_the_host_store_is_trusted() {
+    let operators = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", operators.server(&["192.0.2.53"], b"dot"));
+    let roots = built_from(vec![operators.certificate.clone()], &[]);
+    assert_eq!(roots.len(), webpki_roots::TLS_SERVER_ROOTS.len() + 1);
+    let lookup = resolve(
+        &servers,
+        &Wires::trusting(roots),
+        &[dot("192.0.2.53", None)],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookup.addresses, seven());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_certificate_chained_to_neither_the_built_in_nor_the_host_roots_is_not_trusted() {
+    let operators = Authority::new();
+    let stranger = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", stranger.server(&["192.0.2.53"], b"dot"));
+    let resolution = recorded(
+        &servers,
+        &Wires::trusting(built_from(vec![operators.certificate.clone()], &[])),
+        &[dot("192.0.2.53", None)],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(resolution.error, tls_failed("192.0.2.53", "unknown issuer"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unparsable_host_certificate_is_skipped_and_the_rest_still_load() {
+    let operators = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", operators.server(&["192.0.2.53"], b"dot"));
+    let roots = built_from(
+        vec![
+            CertificateDer::from(vec![1, 2, 3]),
+            operators.certificate.clone(),
+        ],
+        &[],
+    );
+    assert_eq!(roots.len(), webpki_roots::TLS_SERVER_ROOTS.len() + 1);
+    let lookup = resolve(
+        &servers,
+        &Wires::trusting(roots),
+        &[dot("192.0.2.53", None)],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookup.addresses, seven());
+}
+
+#[test]
+fn a_host_store_read_that_panics_reads_nothing_and_leaves_the_compiled_in_roots() {
+    let (certificates, errors) =
+        crate::dns::roots::read_host_store(|| panic!("a store entry would not open"));
+    assert!(certificates.is_empty());
+    assert_eq!(
+        errors,
+        ["reading the store panicked: a store entry would not open"]
+    );
+    let roots = built_from(certificates, &errors);
+    assert_eq!(roots.roots, webpki_roots::TLS_SERVER_ROOTS);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_host_store_leaves_the_compiled_in_roots_working() {
+    // Every compiled-in root, and nothing besides.
+    let roots = built_from(Vec::new(), &["could not load PEM file".to_string()]);
+    assert_eq!(roots.roots, webpki_roots::TLS_SERVER_ROOTS);
+    // Lookups still go out over TLS and judge the server's certificate.
+    let operators = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", operators.server(&["192.0.2.53"], b"dot"));
+    let resolution = recorded(
+        &servers,
+        &Wires::trusting(roots),
+        &[dot("192.0.2.53", None)],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(resolution.error, tls_failed("192.0.2.53", "unknown issuer"));
 }
 
 #[tokio::test(start_paused = true)]
