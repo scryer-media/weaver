@@ -433,6 +433,12 @@ impl UdpTrackerClient {
         &*self.state.resolver
     }
 
+    /// The resolver for tracker hostnames, shared.
+    #[cfg(test)]
+    pub(crate) fn resolver_handle(&self) -> Arc<dyn Resolver> {
+        self.state.resolver.clone()
+    }
+
     async fn run(self) -> anyhow::Result<()> {
         let mut buf = [0u8; 16384];
         loop {

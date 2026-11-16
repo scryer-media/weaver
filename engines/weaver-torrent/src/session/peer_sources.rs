@@ -18,8 +18,8 @@ use crate::Identity;
 use crate::core::{hash_id::InfoHashes, torrent_metainfo::TorrentMetaV1Owned};
 use crate::ssl::{SslHttpClients, SslTorrent};
 use crate::tracker::{
-    Reachable, ToldPorts, Tracker, TrackerAnnounce, TrackerComms, TrackerStatus, TrackerTask,
-    Unreachable,
+    Reachable, ToldPorts, Tracker, TrackerAnnounce, TrackerComms, TrackerNet, TrackerProtocols,
+    TrackerSetup, TrackerStatus, TrackerTask, Unreachable,
 };
 use crate::{
     ManagedTorrent,
@@ -352,31 +352,35 @@ impl Session {
             session: Arc::downgrade(self),
             torrent: Default::default(),
         };
-        let task = TrackerComms::start_with_tiers(
-            info_hashes,
-            identity.clone(),
-            self.announce_tiers(tracker_tiers, trackers_only),
-            Box::new(stats),
-            force_tracker_interval,
-            match ssl {
-                Some(_) => self.ssl_port.subscribe(),
-                None => self.announce_port.subscribe(),
-            },
-            self.external_ips.tracker_vote(),
-            match ssl {
+        let protocols = TrackerProtocols::new(TrackerNet {
+            http_clients: match ssl {
                 Some(ssl) => Arc::new(SslHttpClients {
                     inner: self.http_clients.clone(),
                     ssl: ssl.clone(),
                 }),
                 None => self.http_clients.clone(),
             },
-            self.reachable(),
-            self.udp_tracker_client.clone(),
-            self.stopped_announces.clone(),
-            self.http_announces.clone(),
-            self.allow_idna,
-            self.stats.trackers.clone(),
-        );
+            resolver: self.resolver.clone(),
+            reachable: self.reachable(),
+            udp_client: self.udp_tracker_client.clone(),
+            http_announces: self.http_announces.clone(),
+            allow_idna: self.allow_idna,
+        });
+        let task = TrackerComms::start_with_tiers(TrackerSetup {
+            info_hashes,
+            identity: identity.clone(),
+            tiers: self.announce_tiers(tracker_tiers, trackers_only),
+            stats: Box::new(stats),
+            force_interval: force_tracker_interval,
+            listen_port: match ssl {
+                Some(_) => self.ssl_port.subscribe(),
+                None => self.announce_port.subscribe(),
+            },
+            vote: self.external_ips.tracker_vote(),
+            protocols,
+            stopped: self.stopped_announces.clone(),
+            counts: self.stats.trackers.clone(),
+        });
         // The table rings the session's watcher at each change, until the
         // table is gone.
         if let Some(changed) = &self.trackers_changed {

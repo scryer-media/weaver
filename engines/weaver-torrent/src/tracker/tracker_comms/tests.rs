@@ -22,6 +22,7 @@ use url::Url;
 
 use tokio::time::Instant;
 
+use super::protocol::{AnnounceAsk, ScrapeAsk, TrackerProtocol, Turn};
 use super::reach_tests::{FixedResolver, Wired};
 use super::upkeep_tests::table_once;
 use super::{
@@ -31,13 +32,62 @@ use super::{
     TrackerTask, Unreachable, may_complete, read_answer, retry_delay,
 };
 use super::{AnnounceEvent, TrackerKind, TrackerResult};
+use super::{Announced, HttpAnnounces, TrackerNet, TrackerProtocols, TrackerSetup};
 use crate::Identity;
 use crate::tracker::tracker_comms_http::{MAX_INTERVAL, TrackerRequestEvent};
 use crate::tracker::tracker_comms_udp::UdpTrackerClient;
 
 pub(super) fn http(name: &str) -> SupportedTracker {
     let url = Url::parse(&format!("http://{name}/announce")).unwrap();
-    SupportedTracker::new(Tracker::operator(url)).unwrap()
+    SupportedTracker::new(Tracker::operator(url), &inert()).unwrap()
+}
+
+/// The protocols of a test's tracker task, the real ones: HTTP over
+/// `clients`, its names looked up by `udp_client`'s resolver as the
+/// session's are, and UDP over `udp_client`.
+pub(super) fn protocols(
+    clients: Arc<dyn HttpClients>,
+    reachable: Reachable,
+    udp_client: UdpTrackerClient,
+    http_announces: HttpAnnounces,
+    allow_idna: bool,
+) -> TrackerProtocols {
+    TrackerProtocols::new(TrackerNet {
+        http_clients: clients,
+        resolver: udp_client.resolver_handle(),
+        reachable,
+        udp_client,
+        http_announces,
+        allow_idna,
+    })
+}
+
+/// A protocol a tracker list's own tests never speak: they only order,
+/// count and compare trackers.
+struct Inert(TrackerKind);
+
+impl TrackerProtocol for Inert {
+    fn kind(&self) -> TrackerKind {
+        self.0
+    }
+
+    fn announce<'a>(&'a self, _: AnnounceAsk<'a>) -> BoxFuture<'a, anyhow::Result<Announced>> {
+        unreachable!("an inert tracker is never announced to")
+    }
+
+    fn scrape<'a>(&'a self, _: ScrapeAsk<'a>) -> BoxFuture<'a, anyhow::Result<ScrapeOk>> {
+        unreachable!("an inert tracker is never scraped")
+    }
+}
+
+/// The schemes of the real table, each of an inert protocol of its kind.
+pub(super) fn inert() -> TrackerProtocols {
+    let http: Arc<dyn TrackerProtocol> = Arc::new(Inert(TrackerKind::Http));
+    TrackerProtocols::from_rows(vec![
+        ("http", http.clone()),
+        ("https", http),
+        ("udp", Arc::new(Inert(TrackerKind::Udp))),
+    ])
 }
 
 // Tiers of trackers the operator named: the test trackers listen on
@@ -73,7 +123,7 @@ fn a_tracker_shows_only_its_scheme_host_and_port() {
     let url = Url::parse(PRIVATE).unwrap();
     let shown = format!(
         "{:?}",
-        SupportedTracker::new(Tracker::operator(url.clone())).unwrap()
+        SupportedTracker::new(Tracker::operator(url.clone()), &inert()).unwrap()
     );
     assert_eq!(shown, "https://tracker.example:8443/…");
     assert!(!leaks(&shown, &url), "{shown}");
@@ -81,7 +131,7 @@ fn a_tracker_shows_only_its_scheme_host_and_port() {
     assert_eq!(
         format!(
             "{:?}",
-            SupportedTracker::new(Tracker::operator(udp)).unwrap()
+            SupportedTracker::new(Tracker::operator(udp), &inert()).unwrap()
         ),
         "udp://tracker.example:6969/…"
     );
@@ -92,14 +142,23 @@ fn a_tracker_shows_only_its_scheme_host_and_port() {
     assert_eq!(super::redacted_tracker_url("not a url"), "…");
 }
 
-// A tracker's scheme names how it is spoken to, and the kind's text is the
-// metric label its counts carry.
-#[test]
-fn a_trackers_scheme_names_its_kind() {
-    use crate::session_stats::tracker::TrackerKind;
+// A tracker's scheme names the protocol it is spoken to over, and the
+// protocol's kind's text is the metric label its counts carry.
+#[tokio::test]
+async fn a_trackers_scheme_names_its_kind() {
+    let token = CancellationToken::new();
+    let udp_sock = crate::test_support::loopback_udp().await;
+    let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
+    let table = protocols(
+        crate::test_support::loopback(),
+        reach_all(),
+        udp_client,
+        Default::default(),
+        false,
+    );
     let kind = |url: &str| {
-        SupportedTracker::new(Tracker::operator(Url::parse(url).unwrap()))
-            .map(|tracker| tracker.kind)
+        SupportedTracker::new(Tracker::operator(Url::parse(url).unwrap()), &table)
+            .map(|tracker| tracker.protocol.kind())
     };
     assert_eq!(kind("http://t.invalid/announce"), Some(TrackerKind::Http));
     assert_eq!(kind("https://t.invalid/announce"), Some(TrackerKind::Http));
@@ -233,7 +292,7 @@ async fn a_client_error_is_mapped_without_its_url() {
 }
 
 fn http_of(url: &Url) -> SupportedTracker {
-    SupportedTracker::new(Tracker::operator(url.clone())).unwrap()
+    SupportedTracker::new(Tracker::operator(url.clone()), &inert()).unwrap()
 }
 
 pub(super) fn live(downloaded: u64, left: u64, completed_during_run: bool) -> TrackerCommsStats {
@@ -937,22 +996,24 @@ async fn a_hybrid_announces_under_v1_and_the_truncated_v2() {
     let token = CancellationToken::new();
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
-    let mut peers = TrackerComms::start_with_tiers(
-        hashes,
-        identity(),
-        op(vec![vec![url]]),
-        Box::new(()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: hashes,
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
     let mut announced = Vec::new();
     while announced.len() < 2 {
@@ -994,22 +1055,24 @@ async fn a_task_taken_over_stops_the_trackers_left_out_and_announces_under_every
     let token = CancellationToken::new();
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
-    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
-        v1,
-        identity(),
-        op(vec![vec![a_url.clone()]]),
-        Box::new(()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    );
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1,
+        identity: identity(),
+        tiers: op(vec![vec![a_url.clone()]]),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
     let (conn, started) = tokio::select! {
         _ = peers.next() => panic!("the tracker sent peers"),
         r = read_announce(&a) => r,
@@ -1076,22 +1139,24 @@ async fn a_task_another_torrents_run_takes_over_is_dropped_with_stopped() {
     let token = CancellationToken::new();
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
-    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
-        mine,
-        identity(),
-        op(vec![vec![a_url.clone()]]),
-        Box::new(()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    );
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: mine,
+        identity: identity(),
+        tiers: op(vec![vec![a_url.clone()]]),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
     let (conn, started) = tokio::select! {
         _ = peers.next() => panic!("the tracker sent peers"),
         r = read_announce(&a) => r,
@@ -1179,26 +1244,28 @@ async fn a_stopped_announce_reports_what_the_runs_closing_connections_counted() 
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     // Bounds far past the exchange, so nothing here races them.
     let stopped = StoppedAnnounces::new(DAY).run_end_within(DAY);
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![url]]),
-        Box::new(EndingStats {
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(EndingStats {
             stats: stats.clone(),
             ended: ended.clone(),
             waiting,
         }),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
     let q = answer_with_a_peer(
         &listener,
@@ -1244,26 +1311,28 @@ async fn a_run_slow_to_end_still_leaves_the_stopped_announce_its_bound() {
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     let stopped = StoppedAnnounces::new(DAY).run_end_within(Duration::ZERO);
     assert_eq!(stopped.whole(), DAY);
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![url]]),
-        Box::new(EndingStats {
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(EndingStats {
             stats: stats.clone(),
             ended,
             waiting,
         }),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
     let q = answer_with_a_peer(
         &listener,
@@ -1387,22 +1456,24 @@ async fn a_port_that_changes_is_announced_without_waiting_out_the_interval() {
     let token = CancellationToken::new();
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![url]]),
-        Box::new(()),
-        None,
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(()),
+        force_interval: None,
         listen_port,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        StoppedAnnounces::default(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: StoppedAnnounces::default(),
+        counts: Default::default(),
+    })
     .peers;
     let first = tokio::select! {
         _ = peers.next() => panic!("the tracker sent no peers"),
@@ -1439,22 +1510,24 @@ async fn an_http_announce_reports_the_bytes_that_failed_their_hash_and_the_bytes
     let token = CancellationToken::new();
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![url]]),
-        Box::new(stats.clone()),
-        None,
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(stats.clone()),
+        force_interval: None,
         listen_port,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        StoppedAnnounces::default(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: StoppedAnnounces::default(),
+        counts: Default::default(),
+    })
     .peers;
     let first = tokio::select! {
         _ = peers.next() => panic!("the tracker sent no peers"),
@@ -1498,22 +1571,24 @@ async fn test_http_tracker_hears_started_completed_and_stopped() {
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     let stopped = StoppedAnnounces::default();
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![tracker]]),
-        Box::new(stats.clone()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![tracker]]),
+        stats: Box::new(stats.clone()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
 
     // The torrent completes only once `started` is answered: an answer
@@ -1582,22 +1657,24 @@ async fn a_completed_in_flight_when_the_run_stops_still_reaches_its_tracker() {
     let stopped = StoppedAnnounces::new(DAY);
     let identity = identity();
     let completion = identity.completion.clone();
-    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
-        v1_hash(),
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
         identity,
-        op(vec![vec![url.clone()]]),
-        Box::new(stats.clone()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    );
+        tiers: op(vec![vec![url.clone()]]),
+        stats: Box::new(stats.clone()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
     let q = answer_with_a_peer(
         &listener,
         &mut peers,
@@ -1660,25 +1737,27 @@ async fn one_answered_one_in_flight(
     let (b, b_url) = http_listener().await;
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
-    let mut task = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![a_url.clone()], vec![b_url.clone()]]),
-        Box::new(Arc::new(ManualStats {
+    let mut task = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![a_url.clone()], vec![b_url.clone()]]),
+        stats: Box::new(Arc::new(ManualStats {
             stats: Mutex::new(live(0, 90, false)),
             completed: tokio::sync::watch::channel(false).0,
         })),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    );
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
     let q = answer_with_a_peer(
         &b,
         &mut task.peers,
@@ -1778,22 +1857,24 @@ async fn at_session_shutdown_a_tracker_whose_completed_is_cut_hears_stopped() {
     let stopped = StoppedAnnounces::new(DAY);
     let identity = identity();
     let completion = identity.completion.clone();
-    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
-        v1_hash(),
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
         identity,
-        op(vec![vec![url.clone()]]),
-        Box::new(stats.clone()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    );
+        tiers: op(vec![vec![url.clone()]]),
+        stats: Box::new(stats.clone()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
     let q = answer_with_a_peer(
         &listener,
         &mut peers,
@@ -1850,22 +1931,24 @@ async fn a_completed_left_to_finish_and_cut_at_shutdown_leaves_its_tracker_stopp
     let stopped = StoppedAnnounces::new(DAY);
     let identity = identity();
     let completion = identity.completion.clone();
-    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
-        v1_hash(),
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
         identity,
-        op(vec![vec![url.clone()]]),
-        Box::new(stats.clone()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    );
+        tiers: op(vec![vec![url.clone()]]),
+        stats: Box::new(stats.clone()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
     let q = answer_with_a_peer(
         &listener,
         &mut peers,
@@ -1923,22 +2006,24 @@ async fn a_completed_left_to_finish_and_cut_once_withheld_leaves_its_tracker_uns
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     let stopped = StoppedAnnounces::new(DAY);
-    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![url.clone()]]),
-        Box::new(stats.clone()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    );
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url.clone()]]),
+        stats: Box::new(stats.clone()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
     let q = answer_with_a_peer(
         &listener,
         &mut peers,
@@ -2019,22 +2104,24 @@ async fn a_zero_stopped_timeout_sends_no_stopped_announce() {
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     let stopped = StoppedAnnounces::new(Duration::ZERO);
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![url]]),
-        Box::new(()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
 
     let q = answer_with_a_peer(
@@ -2062,26 +2149,28 @@ async fn test_http_announce_carries_the_torrents_peer_id_and_user_agent() {
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     let stopped = StoppedAnnounces::default();
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![url]]),
-        Box::new(()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        Arc::new(crate::test_support::Loopback::with(|| {
-            reqwest::Client::builder()
-                .no_proxy()
-                .user_agent("Session/1.0")
-        })),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            Arc::new(crate::test_support::Loopback::with(|| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .user_agent("Session/1.0")
+            })),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
 
     let request = tokio::select! {
@@ -2127,22 +2216,24 @@ async fn test_tracker_id_is_sent_back_and_stopped_wants_no_peers() {
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     let stopped = StoppedAnnounces::default();
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![url]]),
-        Box::new(stats.clone()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(stats.clone()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
 
     let q = answer_with_a_peer(
@@ -2265,26 +2356,28 @@ async fn test_stream_dropped_before_any_announce_sends_nothing() {
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     let stopped = StoppedAnnounces::default();
-    let peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![
+    let peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![
             Url::parse("http://tracker.invalid/announce").unwrap(),
         ]]),
-        Box::new(()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        Arc::new(crate::test_support::Loopback::with(
-            reqwest::Client::builder,
-        )),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            Arc::new(crate::test_support::Loopback::with(
+                reqwest::Client::builder,
+            )),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
     drop(peers);
     // Never polled, so no tracker heard `started` and none is owed `stopped`.
@@ -2343,22 +2436,18 @@ async fn start_over(
     let token = CancellationToken::new();
     let udp_sock = crate::test_support::loopback_udp().await;
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, resolver);
-    let task = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(tiers),
-        Box::new(()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        no_vote(),
-        clients,
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    );
+    let task = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(tiers),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(clients, reach_all(), udp_client, Default::default(), false),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
     (task, token)
 }
 
@@ -2658,22 +2747,24 @@ async fn an_accepted_answers_external_ip_is_the_trackers_vote() {
     let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
     let (votes, mut voted) = tokio::sync::mpsc::unbounded_channel();
     let stopped = StoppedAnnounces::default();
-    let mut peers = TrackerComms::start_with_tiers(
-        v1_hash(),
-        identity(),
-        op(vec![vec![refusing_url], vec![url]]),
-        Box::new(()),
-        None,
-        tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
-        Arc::new(move |ours, by| votes.send((ours, by)).unwrap()),
-        crate::test_support::loopback(),
-        reach_all(),
-        udp_client,
-        stopped.clone(),
-        Default::default(),
-        false,
-        Default::default(),
-    )
+    let mut peers = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![refusing_url], vec![url]]),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: Arc::new(move |ours, by| votes.send((ours, by)).unwrap()),
+        protocols: protocols(
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    })
     .peers;
 
     // The first tier's tracker refuses, naming an address (65.65.65.65):
@@ -2882,5 +2973,179 @@ async fn a_loopback_tracker_is_never_scraped() {
     assert!(format!("{e:#}").contains("SSRF"), "{e:#}");
     assert!(listener.accept().now_or_never().is_none());
     stopped.wait_idle().await;
+    token.cancel();
+}
+
+/// A protocol for a scheme no session speaks, which records what it is
+/// asked, in order, and answers from memory: no socket, no HTTP client.
+#[derive(Default)]
+struct Recording {
+    asked: Mutex<Vec<String>>,
+    scrapes: std::sync::atomic::AtomicUsize,
+}
+
+/// The refusal [`Recording`] fails its second scrape with, which only it
+/// can classify.
+#[derive(Debug)]
+struct FakeRefusal;
+
+impl std::fmt::Display for FakeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the fake tracker refused")
+    }
+}
+
+impl std::error::Error for FakeRefusal {}
+
+impl TrackerProtocol for Recording {
+    fn kind(&self) -> TrackerKind {
+        TrackerKind::Udp
+    }
+
+    fn gate(&self, event: bool) -> Option<BoxFuture<'_, Turn>> {
+        self.asked.lock().push(format!("gate event={event}"));
+        Some(async { Box::new(()) as Turn }.boxed())
+    }
+
+    fn announce<'a>(&'a self, ask: AnnounceAsk<'a>) -> BoxFuture<'a, anyhow::Result<Announced>> {
+        self.asked.lock().push(format!(
+            "announce {:?} {:?} to {:?}",
+            ask.info_hash,
+            ask.events.counted_as(),
+            ask.tracker
+        ));
+        let announced = Announced {
+            peers: vec![the_peer()],
+            interval: Duration::from_secs(1800),
+            min_interval: Duration::from_secs(60),
+            seeders: Some(3),
+            leechers: Some(4),
+            downloaded: None,
+            warning: None,
+            seen_as: None,
+            body_len: None,
+            accepted: Default::default(),
+        };
+        let leg = super::Leg::Unbound;
+        let answers = ask
+            .events
+            .over(leg)
+            .map(|event| (leg, event, Ok(announced)));
+        futures::future::ready(super::merged(answers)).boxed()
+    }
+
+    fn scrape<'a>(&'a self, ask: ScrapeAsk<'a>) -> BoxFuture<'a, anyhow::Result<ScrapeOk>> {
+        self.asked
+            .lock()
+            .push(format!("scrape {:?} of {:?}", ask.info_hash, ask.tracker));
+        let n = self
+            .scrapes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result = match n {
+            0 => Ok(ScrapeOk {
+                complete: Some(5),
+                incomplete: Some(6),
+                downloaded: Some(7),
+            }),
+            _ => Err(anyhow::Error::new(FakeRefusal)),
+        };
+        futures::future::ready(result).boxed()
+    }
+
+    fn classify(&self, cause: &(dyn std::error::Error + 'static)) -> Option<TrackerResult> {
+        cause.is::<FakeRefusal>().then_some(TrackerResult::Refused)
+    }
+}
+
+// The tracker task speaks to a tracker only through the protocol its
+// scheme's row names: a made-up scheme, registered alone, is announced to
+// after its gate is asked, scraped, and its failures counted as it
+// classifies them, under its kind, with no HTTP or UDP code in the table.
+#[tokio::test]
+async fn the_tracker_task_announces_and_scrapes_through_the_scheme_table() {
+    let recording = Arc::new(Recording::default());
+    let table = TrackerProtocols::from_rows(vec![(
+        "fake",
+        recording.clone() as Arc<dyn TrackerProtocol>,
+    )]);
+    let url = Url::parse("fake://tracker.invalid:1/0123passkey/announce").unwrap();
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: op(vec![vec![url]]),
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: table,
+        stopped: StoppedAnnounces::default(),
+        counts: Default::default(),
+    });
+    assert_eq!(peers.next().await, Some(the_peer()));
+
+    let scraped = status.scrape().await.unwrap();
+    assert_eq!(scraped.complete, Some(5));
+    let refused = status.scrape().await.unwrap_err();
+    assert!(refused.is::<FakeRefusal>(), "{refused:#}");
+
+    let hash = Id20::new([1; 20]);
+    let tracker = "fake://tracker.invalid:1/…";
+    assert_eq!(
+        *recording.asked.lock(),
+        [
+            "gate event=true".to_owned(),
+            format!("announce {hash:?} Started to {tracker}"),
+            format!("scrape {hash:?} of {tracker}"),
+            format!("scrape {hash:?} of {tracker}"),
+        ]
+    );
+    let counted = status.counted();
+    let kind = TrackerKind::Udp as usize;
+    assert_eq!(
+        counted.announces[kind][AnnounceEvent::Started as usize][TrackerResult::Ok as usize],
+        1
+    );
+    assert_eq!(counted.scrapes[kind][TrackerResult::Ok as usize], 1);
+    assert_eq!(counted.scrapes[kind][TrackerResult::Refused as usize], 1);
+    // A scheme the table has no row for is no tracker of the torrent.
+    assert!(!status.reannounce(
+        Duration::ZERO,
+        Some(&Url::parse("udp://tracker.invalid:6969").unwrap()),
+        false
+    ));
+    drop(peers);
+}
+
+// A private tracker's started announce, byte for byte: request line,
+// query order and escapes, and every header. Only the listener's port is
+// masked. A change of these bytes is a change a private tracker sees.
+#[tokio::test]
+async fn a_private_trackers_started_announce_keeps_its_bytes() {
+    let (listener, at) = private_listener().await;
+    let url = off_loopback(&at);
+    let stopped = StoppedAnnounces::default();
+    let (task, token) = start_off_loopback(vec![vec![url.clone()]], &stopped).await;
+    let TrackerTask {
+        mut peers,
+        status: _status,
+    } = task;
+    let (conn, head) = tokio::select! {
+        _ = peers.next() => panic!("the tracker sent no peers"),
+        r = read_request(&listener) => r,
+    };
+    drop(conn);
+    let head = head.replace(&format!(":{}", at.port().unwrap()), ":PORT");
+    assert_eq!(
+        head,
+        "GET /announce/0123passkey?\
+         info_hash=%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01\
+         &peer_id=%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02%02\
+         &event=started&port=6881&uploaded=0&downloaded=0&left=16384&corrupt=0\
+         &redundant=0&compact=1&no_peer_id=0&numwant=200&key=24301&pk=s3cret HTTP/1.1\r\n\
+         user-agent: Test/1.0\r\n\
+         accept: */*\r\n\
+         accept-encoding: zstd,gzip,deflate,br\r\n\
+         host: tracker.invalid:PORT\r\n\r\n"
+    );
     token.cancel();
 }
