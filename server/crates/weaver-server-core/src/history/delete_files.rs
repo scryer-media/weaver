@@ -620,7 +620,8 @@ pub(crate) async fn delete_history_rows(
 // job's, or a delivery folder, it is not housekeeping's to remove and stays,
 // said once. Returns whether housekeeping has done all it ever will for the
 // job; false when its recorded folder carries its marker and is still there,
-// which the next sweep's scan finds.
+// which the next sweep's scan finds, and false when a category folder could
+// not be searched for its staging, which the next sweep tries again.
 pub(crate) async fn sweep_failed_job_files(
     intermediate_dir: &std::path::Path,
     staging_roots: &[PathBuf],
@@ -641,12 +642,12 @@ pub(crate) async fn sweep_failed_job_files(
         );
     }
     let staged = present_staging_dirs(staging_roots, job_id).await;
-    crate::pipeline::queue::remove_job_staging(staging_roots, job_id).await?;
+    let checked = crate::pipeline::queue::remove_job_staging_checked(staging_roots, job_id).await?;
     for staging in staged {
         info!(dir = %staging.display(), "removed a failed job's staging directory");
     }
     let Some(recorded) = recorded else {
-        return Ok(true);
+        return Ok(checked);
     };
     let (root, destinations) = (intermediate_dir.to_path_buf(), staging_roots.to_vec());
     tokio::task::spawn_blocking(move || {
@@ -679,6 +680,7 @@ pub(crate) async fn sweep_failed_job_files(
     .await
     .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?
     .map_err(crate::SchedulerError::Io)
+    .map(|swept| swept && checked)
 }
 
 // Archiving history entries: their files are removed while the entries, and
@@ -694,7 +696,8 @@ pub(crate) async fn sweep_failed_job_files(
 // 3. per job, the script-stopped barrier, then the proof of its output
 //    directory and the listing of what it holds, before anything goes;
 // 4. one transaction keeping the record of every listed folder, unstamped;
-// 5. per job, the removal;
+// 5. per job, the script-stopped barrier again for a script the job gained
+//    since step 3, then the removal;
 // 6. one transaction stamping every entry whose files are gone as archived.
 //
 // Every id gets its own outcome whatever fails: a record that cannot be
@@ -895,8 +898,28 @@ pub(crate) async fn archive_history(
         }
     }
 
+    // A script that started after a job's barrier in step 3, such as one a
+    // mark queued while later jobs were listed, stops before the job's files
+    // go. Nothing is read again unless a script has started since.
+    let removal_order: Vec<u64> = proven.iter().map(|(id, ..)| id.0).collect();
     let mut stamp = Vec::new();
-    for (job_id, recorded, dirs, output) in proven {
+    for (turn, (job_id, recorded, dirs, output)) in proven.into_iter().enumerate() {
+        #[cfg(test)]
+        archive_removals::run(archive_removals::Step::Turn(job_id));
+        if scripted.waits(db, &removal_order[turn..]).await
+            && let Err(error) = retry_script_stop_wait(job_id, || {
+                #[cfg(test)]
+                archive_removals::run(archive_removals::Step::Wait(job_id));
+                crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
+            })
+            .await
+        {
+            outcomes.insert(
+                job_id,
+                Archive::new(Outcome::Failed, None, Some(error.to_string())),
+            );
+            continue;
+        }
         let removal = remove_job_files(
             intermediate_dir,
             staging_roots,
@@ -959,6 +982,44 @@ pub(crate) async fn archive_history(
         }
     }
     Ok(outcomes)
+}
+
+// What a test runs at each job's turn of an archive's removals, and when
+// that turn waits for the job's scripts, on the thread that archives.
+#[cfg(test)]
+pub(crate) mod archive_removals {
+    use std::cell::RefCell;
+
+    use crate::jobs::ids::JobId;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Step {
+        Turn(JobId),
+        Wait(JobId),
+    }
+
+    type Hook = Box<dyn FnMut(Step)>;
+
+    thread_local! {
+        static RUN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(run: impl FnMut(Step) + 'static) {
+        RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
+    }
+
+    pub(super) fn run(step: Step) {
+        let taken = RUN.with(|slot| slot.borrow_mut().take());
+        if let Some(mut run) = taken {
+            run(step);
+            RUN.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(run);
+                }
+            });
+        }
+    }
 }
 
 struct JobFilesRemoval {
