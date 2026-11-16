@@ -129,13 +129,25 @@ impl TorrentService {
         tee.stop_checkpoints();
         tee.forget();
         let work = tee.work().to_path_buf();
-        let (planned, tee) = (Arc::clone(store), Arc::clone(tee));
+        let (planned, tee, db) = (Arc::clone(store), Arc::clone(tee), self.inner.db.clone());
         let planned = tokio::task::spawn_blocking(move || {
             let _job = JobScope::enter(job_id);
             let files = planned.files();
-            let listed: Vec<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
+            let listed: HashSet<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
+            let spent: HashSet<PathBuf> = spent.into_iter().collect();
             let dir = files.dir();
-            let outputs = plan_outputs(tee.work(), &dir, &listed, &spent);
+            // The names an earlier placing of this torrent's kept on its row:
+            // a claim of one a restart cut short is taken again, not passed
+            // over for a second numbered name.
+            let kept = db
+                .torrent_outputs(job_id)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read the files a torrent placed before");
+                    Vec::new()
+                })
+                .into_iter()
+                .collect();
+            let outputs = plan_outputs(tee.work(), &dir, &listed, &spent, kept);
             // Held before they move, as the row keeps them.
             let held = held_tops(outputs.names.iter().map(String::as_str)).map_or_else(
                 || vec![resolved(&dir).to_string_lossy().into_owned()],
@@ -174,37 +186,43 @@ impl TorrentService {
         let (from, moving) = (work.clone(), Arc::clone(&outputs));
         let placed = tokio::task::spawn_blocking(move || {
             let _job = JobScope::enter(job_id);
-            moving
-                .place(&from)
-                .map_err(|error| (error.to_string(), Some(moving.there())))
+            moving.place(&from)
         })
-        .await
-        .unwrap_or_else(|error| Err((error.to_string(), None)));
-        // A move that failed takes off the row the files it put back; one
-        // whose end is not known leaves every one on it, for its delete.
-        let (names, unplaced_names) = match &placed {
-            Ok(()) | Err((_, None)) => (outputs.names.clone(), Vec::new()),
-            Err((_, Some(there))) => {
-                let there: HashSet<&String> = there.iter().collect();
+        .await;
+        // The row keeps the names the files are at: a name a claim passed
+        // over goes from it, and so does every file a failed move put back.
+        // A placing whose end is not known leaves every planned one on it,
+        // for its delete.
+        let (names, unplaced_names, failed) = match placed {
+            Ok(placed) => {
+                let there: HashSet<&String> = placed.names.iter().collect();
                 let left = outputs
                     .names
                     .iter()
                     .filter(|name| !there.contains(name))
                     .cloned()
                     .collect();
-                (Vec::new(), left)
+                let failed = placed
+                    .failed
+                    .map(|error| (error.to_string(), placed.names.clone()));
+                (placed.names, left, failed)
             }
+            Err(error) => (
+                outputs.names.clone(),
+                Vec::new(),
+                Some((error.to_string(), Vec::new())),
+            ),
         };
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
             db.finish_torrent_unpack(job_id, &names, &unplaced_names)
         });
         self.recorded(job_id, recorded.await);
         self.unclaim_outputs(job_id).await;
-        if let Err((error, there)) = placed {
+        if let Some((error, there)) = failed {
             tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not move beside it");
             return Placing::Short {
                 why: unplaced(&work, &error),
-                placed: there.unwrap_or_default(),
+                placed: there,
             };
         }
         let root = self.inner.env.work.clone();

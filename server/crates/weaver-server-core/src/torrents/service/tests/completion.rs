@@ -2325,3 +2325,91 @@ async fn a_removal_with_what_was_there_unknown_keeps_every_file() {
     assert_eq!(files_under(&dir), files, "not known: every file stays");
     rig.service.stop().await;
 }
+
+const SMALL_TXT: &[u8] = include_bytes!(concat!(
+    std::env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/originals/small.txt"
+));
+
+// Adds a torrent of `set.rar`, which holds `small.txt`, and `sample.mkv`,
+// downloads it whole with a file at each of `taken` already in its folder,
+// each holding its own name, and waits for it to complete: its unpacked
+// file is placed by then.
+async fn unpacked_beside(taken: &[&str]) -> (Rig, JobId, PathBuf) {
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let sample = vec![0x5a_u8; 300];
+    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("sample.mkv", &sample)];
+    let bytes = metainfo("set", &files, 128, false);
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let mut published = rig.service.inner.published.subscribe();
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    let mut dir = PathBuf::new();
+    fetch_pieces(&rig.service, job_id, &whole, None, |torrent| {
+        dir = torrent.store.as_ref().unwrap().files().dir();
+        for name in taken {
+            std::fs::write(dir.join(name), name.as_bytes()).unwrap();
+        }
+    })
+    .await;
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    (rig, job_id, dir)
+}
+
+// Operator ruling, 2026-11-16 (PR 129 question 10): an unpacked file whose
+// name is taken is placed under a numbered name, kept on the torrent's row,
+// and the file that held the name stays as it was. A removal with the
+// torrent's files takes the numbered file and leaves the one it never wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacked_file_whose_name_is_taken_lands_under_a_numbered_name() {
+    let (rig, job_id, dir) = unpacked_beside(&["small.txt"]).await;
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
+    assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        ["small (1).txt".to_owned()]
+    );
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert!(!dir.join("small (1).txt").exists());
+    assert!(!dir.join("set.rar").exists());
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
+    rig.service.stop().await;
+}
+
+// A second collision takes the next number: "small.txt" and
+// "small (1).txt" both held, the unpacked file lands as "small (2).txt".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_collision_takes_the_next_number() {
+    let (rig, job_id, dir) = unpacked_beside(&["small.txt", "small (1).txt"]).await;
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
+    assert_eq!(
+        std::fs::read(dir.join("small (1).txt")).unwrap(),
+        b"small (1).txt"
+    );
+    assert_eq!(std::fs::read(dir.join("small (2).txt")).unwrap(), SMALL_TXT);
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        ["small (2).txt".to_owned()]
+    );
+    rig.service.stop().await;
+}

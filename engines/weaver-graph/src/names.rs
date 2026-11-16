@@ -632,7 +632,6 @@ impl NameLedger {
         }
         #[cfg(test)]
         let scanned = (!self.unchecked).then(|| self.seat_by_scan(holder, rank, wanted));
-        let (stem, extension) = split_extension(wanted);
         let path = key(wanted);
         let first = self.first_unknown(&path, holder, rank);
         #[cfg(test)]
@@ -644,10 +643,7 @@ impl NameLedger {
             {
                 self.read += 1;
             }
-            let candidate = match n {
-                0 => wanted.to_owned(),
-                n => format!("{stem} ({n}){extension}"),
-            };
+            let candidate = numbered(wanted, n);
             let key = key(&candidate);
             let at = self.paths.find(&key);
             if let Some(at) = at {
@@ -1202,6 +1198,19 @@ fn fold_case(c: char) -> char {
         (Some(single), None) => single,
         _ => c,
     }
+}
+
+// The `n`th form of `name`: the name itself, then "subs (1).srt",
+// "subs (2).srt" and on, the number before the extension ("noext (1)",
+// ".hidden (1)"). The one numbered form of a name Weaver places beside
+// another of the same name: the ledger's, and a torrent's unpacked file's
+// beside a file already there.
+pub fn numbered(name: &str, n: usize) -> String {
+    if n == 0 {
+        return name.to_owned();
+    }
+    let (stem, extension) = split_extension(name);
+    format!("{stem} ({n}){extension}")
 }
 
 // "subs.srt" -> ("subs", ".srt"); "archive.tar.gz" -> ("archive.tar", ".gz");
