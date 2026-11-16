@@ -185,12 +185,6 @@ pub struct AddTorrentOptions {
     /// `torrent_flags::super_seeding`). Off by default.
     #[serde(default)]
     pub super_seeding: bool,
-    /// Take peers from the torrent's trackers alone, as a private torrent
-    /// does (BEP 27) whatever its metainfo says: no DHT, local discovery or
-    /// peer exchange, and none of the session's trackers beside its own.
-    /// Off by default; a private torrent is held to it either way.
-    #[serde(default)]
-    pub trackers_only: bool,
     /// Neither announce the torrent on the DHT nor take peers from it,
     /// while the session runs it for others (libtorrent
     /// `torrent_flags::disable_dht`). Off by default.
@@ -284,7 +278,6 @@ impl Default for AddTorrentOptions {
             totals: TorrentTotals::default(),
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,
-            trackers_only: false,
             disable_dht: false,
             disable_lsd: false,
             disable_pex: false,
