@@ -381,7 +381,7 @@ impl TorrentStateLive {
                 // Nothing to fetch and nothing to give: connect to no one until
                 // the peers are wanted again.
                 debug!("connect loop idle: no peers are wanted");
-                state.peers.candidates_changed().await;
+                state.tcp_wants.idle(state.peers.candidates_changed()).await;
                 continue;
             }
             // Why the loop waits, so a torrent that connects to no one shows
@@ -402,7 +402,27 @@ impl TorrentStateLive {
                     );
                 }
             }
-            state.peers.wait_for_candidate().await;
+            // Wait for a candidate due. Waiting out a candidate's reconnect
+            // time, or a dial under way, the torrent still wants TCP room,
+            // so a want stands through it; with no candidate at all and no
+            // dial under way it can dial no one, and wants none.
+            loop {
+                match state.peers.next_candidate(tokio::time::Instant::now()) {
+                    peers::NextCandidate::Due => break,
+                    peers::NextCandidate::At(at) => {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(at) => {}
+                            () = state.peers.candidates_changed() => {}
+                        }
+                    }
+                    peers::NextCandidate::None if state.peers.dialling() > 0 => {
+                        state.peers.candidates_changed().await;
+                    }
+                    peers::NextCandidate::None => {
+                        state.tcp_wants.idle(state.peers.candidates_changed()).await;
+                    }
+                }
+            }
             // A session closed under the torrent ends its adder: that is
             // how a torrent leaves a session, not a fault.
             let Some(session) = state.shared.session.upgrade() else {
@@ -422,7 +442,10 @@ impl TorrentStateLive {
                         limit = state.peer_limit,
                         "connect loop waiting: the torrent is at its peer limit"
                     );
-                    state.peer_semaphore.clone().acquire_owned().await?
+                    state
+                        .tcp_wants
+                        .idle(state.peer_semaphore.clone().acquire_owned())
+                        .await?
                 }
             };
             let slot = match slots.try_open() {
@@ -433,7 +456,7 @@ impl TorrentStateLive {
                         limit = slots.limit(),
                         "connect loop waiting: the session is at its connection limit"
                     );
-                    slots.open().await?
+                    state.tcp_wants.idle(slots.open()).await?
                 }
             };
             // The slots may have taken a while: we may have finished since,
@@ -558,6 +581,18 @@ impl TorrentStateLive {
             .max(1)
             .min(self.peers.connect_candidates());
         self.peers.disconnect_lowest(n, tokio::time::Instant::now());
+    }
+
+    /// Closes up to `n` of the torrent's live TCP connections at addresses
+    /// `among` takes, those it would keep least first, and says how many;
+    /// see [`super::peers::PeerStates::disconnect_lowest_tcp`].
+    pub(crate) fn give_back_tcp_peers(
+        &self,
+        n: usize,
+        now: tokio::time::Instant,
+        among: &(dyn Fn(std::net::SocketAddr) -> bool + Send + Sync),
+    ) -> usize {
+        self.peers.disconnect_lowest_tcp(n, now, among)
     }
 
     // The connection at `addr`, whose writer queue is `tx`, begins: it holds

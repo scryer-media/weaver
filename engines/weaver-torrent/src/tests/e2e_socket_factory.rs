@@ -395,3 +395,157 @@ async fn test_stream_connector_dials_through_factory() -> anyhow::Result<()> {
     assert_eq!(CountingFactory::count(&factory.connect_tcp), 1);
     Ok(())
 }
+
+// A route whose TCP room is always crowded out by others: every look leaves
+// a want, counted while it is held. Everything else goes to the kernel
+// sockets of a `CountingFactory`.
+struct CrowdedTcp {
+    inner: CountingFactory,
+    wants: Arc<HeldWants>,
+}
+
+#[derive(Default)]
+struct HeldWants {
+    made: AtomicUsize,
+    held: AtomicUsize,
+    gone: tokio::sync::Notify,
+}
+
+struct HeldWant(Arc<HeldWants>);
+
+impl Drop for HeldWant {
+    fn drop(&mut self) {
+        self.0.held.fetch_sub(1, Ordering::SeqCst);
+        self.0.gone.notify_one();
+    }
+}
+
+impl SocketFactory for CrowdedTcp {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        self.inner.connect_tcp(addr)
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        self.inner.listen_tcp(addr)
+    }
+
+    fn tcp_room(&self) -> crate::network::TcpRoom {
+        self.wants.made.fetch_add(1, Ordering::SeqCst);
+        self.wants.held.fetch_add(1, Ordering::SeqCst);
+        crate::network::TcpRoom::Crowded(crate::network::TcpWant::new(HeldWant(Arc::clone(
+            &self.wants,
+        ))))
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        self.inner.bind_udp(addr)
+    }
+}
+
+// A torrent in a thin swarm dials its last candidate. Its look finds TCP
+// crowded out, so it wants TCP room and the dial goes over uTP, where the
+// peer comes live. With that dial ended and no one left to dial, no TCP dial
+// is possible: the connect loop looks again and lets the want go. Neither
+// side has the payload, so the run never completes, and nothing but the dial
+// ending can wake the loop. Real loopback uTP runs on real time; the test
+// waits on the want's release alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_want_goes_once_the_last_dial_comes_live_over_utp() -> anyhow::Result<()> {
+    setup_test_logging();
+    let files = create_default_random_dir_with_torrents(1, 8192, Some("last_dial_utp"));
+    let torrent = create_torrent(
+        files.path(),
+        CreateTorrentOptions {
+            name: None,
+            piece_length: Some(1024),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await?;
+    let utp_only = || ListenerOptions {
+        mode: ListenerMode::UtpOnly,
+        listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+        ..Default::default()
+    };
+    let add = |dir: &TempDir, initial_peers| {
+        Some(AddTorrentOptions {
+            paused: false,
+            output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+            initial_peers,
+            ..Default::default()
+        })
+    };
+
+    let server_dir = TempDir::with_prefix("last_dial_utp_server")?;
+    let server = Arc::new(CountingFactory::default());
+    let server_session = Session::new_with_opts(
+        server_dir.path().into(),
+        session_opts(&server, Some(utp_only()), None),
+    )
+    .await?;
+    let _served = server_session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.as_bytes()?),
+            add(&server_dir, None),
+        )
+        .await?;
+    let peer = server_session.listen_addr().context("a uTP listener")?;
+
+    let wants = Arc::new(HeldWants::default());
+    let client = Arc::new(CrowdedTcp {
+        inner: CountingFactory::default(),
+        wants: Arc::clone(&wants),
+    });
+    let client_dir = TempDir::with_prefix("last_dial_utp_client")?;
+    let client_session = Session::new_with_opts(
+        client_dir.path().into(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            identity: Some(crate::Identity {
+                peer_id: TestPeerMetadata::good().as_peer_id(),
+                ..Default::default()
+            }),
+            disable_local_service_discovery: true,
+            listen: Some(utp_only()),
+            connect: None,
+            socket_factory: client.clone(),
+            ..crate::test_support::session_options()
+        },
+    )
+    .await?;
+    let handle = client_session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.as_bytes()?),
+            add(&client_dir, Some(vec![peer])),
+        )
+        .await?
+        .into_handle()
+        .unwrap();
+
+    // The look before the dial left a want; it goes once the loop finds
+    // that no TCP dial is possible.
+    loop {
+        let gone = wants.gone.notified();
+        if wants.made.load(Ordering::SeqCst) > 0 && wants.held.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        gone.await;
+    }
+    let live = handle.live().context("the torrent runs")?;
+    let peers = live.peer_states();
+    assert_eq!(peers.stats().live_utp, 1, "the dial came live over uTP");
+    assert_eq!(peers.dialling(), 0);
+    assert_eq!(CountingFactory::count(&client.inner.connect_tcp), 0);
+    Ok(())
+}

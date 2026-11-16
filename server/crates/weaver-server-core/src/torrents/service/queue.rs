@@ -448,6 +448,96 @@ impl JobClass for TorrentClass {
     fn intake(&self) -> Option<&dyn ClassIntake> {
         Some(self)
     }
+
+    // Close enough TCP peers on the tunnel's torrent sessions to cover the
+    // bytes, each at a peer socket's size, those the sessions would keep
+    // least first: the choice a connection past the cap already makes. A
+    // peer closed this way is no failure and stays a connect candidate.
+    // Listeners and datagram sockets are never closed for it.
+    fn give_back(&self, ask: crate::jobs::TunnelGiveBack) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let running = inner.sessions.running_on_tunnels().await;
+            let dropped = answer_give_back(&running, &ask);
+            weaver_tunnel::metrics::record_socket_peers_dropped(dropped as u64);
+        });
+    }
+}
+
+// Read what torrents owe the tunnel now, close that many TCP peers' worth,
+// and say how many closed. An answer that owed some and closed none tells
+// the tunnel, so it does not wake torrents again until their holdings there
+// change.
+fn answer_give_back(
+    running: &std::collections::BTreeMap<
+        crate::torrents::sessions::RouteKey,
+        (
+            Arc<weaver_torrent::Session>,
+            Arc<crate::torrents::net::PeerTunnels>,
+        ),
+    >,
+    ask: &crate::jobs::TunnelGiveBack,
+) -> usize {
+    let owed = ask.owed.bytes();
+    if owed == 0 {
+        return 0;
+    }
+    let peer = weaver_tunnel::pipe::stream_bytes(None);
+    let peers = usize::try_from(owed.div_ceil(peer)).unwrap_or(usize::MAX);
+    let dropped = give_back_peers(running, ask, peers);
+    if dropped == 0 {
+        ask.owed.dry();
+    }
+    dropped
+}
+
+// Close up to `peers` TCP peers of the asking tunnel's torrent sessions,
+// those each session would keep least first, and say how many. Only a peer
+// whose every live connection rides the asking tunnel is closed: one on
+// another rung, another tunnel or the kernel's sockets never is.
+fn give_back_peers(
+    running: &std::collections::BTreeMap<
+        crate::torrents::sessions::RouteKey,
+        (
+            Arc<weaver_torrent::Session>,
+            Arc<crate::torrents::net::PeerTunnels>,
+        ),
+    >,
+    ask: &crate::jobs::TunnelGiveBack,
+    peers: usize,
+) -> usize {
+    give_back_through(running, ask, peers, |(session, tunnels), peers| {
+        let on = |addr| tunnels.only_on(addr, |egress, proxies| ask.rides(egress, proxies));
+        session.give_back_tcp_peers(peers, &on)
+    })
+}
+
+// Hand up to `peers` to `close` of each running session the ask names, in
+// its order, and say how many it closed. Once nothing is owed, before
+// torrents act or while they do, nothing more closes: it is read just before
+// each session's peers close.
+pub(super) fn give_back_through<S>(
+    running: &std::collections::BTreeMap<crate::torrents::sessions::RouteKey, S>,
+    ask: &crate::jobs::TunnelGiveBack,
+    peers: usize,
+    mut close: impl FnMut(&S, usize) -> usize,
+) -> usize {
+    let mut dropped = 0;
+    for key in &ask.torrent_routes {
+        if dropped == peers || !ask.owed.stands() {
+            break;
+        }
+        let Some(session) = running.get(key) else {
+            continue;
+        };
+        dropped += close(session, peers - dropped);
+    }
+    dropped
 }
 
 #[async_trait::async_trait]

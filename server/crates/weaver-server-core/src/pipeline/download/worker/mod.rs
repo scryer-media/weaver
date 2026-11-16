@@ -643,6 +643,33 @@ impl Pipeline {
         }
     }
 
+    // Say of each job holding a slot whether this pass left it download work
+    // to hand out, for the lanes whose press waits on that work (see
+    // `JobCounters::drained_through`). One read of the queue per pass, over
+    // the jobs holding a slot, and an atomic per job, stored only when it
+    // changes: no revision, no event, no write to the database.
+    pub(in crate::pipeline) fn publish_download_drained(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.shared_state.queue.read(|inner| {
+            for job_id in &self.nzb_admitted {
+                let (Some(state), Some(row)) = (self.jobs.get(job_id), inner.job(*job_id)) else {
+                    continue;
+                };
+                let drained = !state.articles.has_queued_download_work()
+                    && !self.pending_retries_by_job.contains_key(job_id);
+                let counters = &row.counters;
+                let through = if drained {
+                    counters.lane_refusals_heard.load(Relaxed)
+                } else {
+                    0
+                };
+                if counters.drained_through.load(Relaxed) != through {
+                    counters.drained_through.store(through, Relaxed);
+                }
+            }
+        });
+    }
+
     pub(crate) fn maybe_finish_download_pass(&mut self, job_id: JobId) {
         let in_flight = self
             .articles_in_flight_by_job
@@ -689,6 +716,7 @@ impl Pipeline {
         self.dispatch_download_pass(now);
         self.download_pass_provider_policy = None;
         self.report_changed_dispatch_holds();
+        self.publish_download_drained();
         #[cfg(test)]
         self.audit_lane_holdings();
     }

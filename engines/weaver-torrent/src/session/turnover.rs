@@ -138,6 +138,31 @@ impl Session {
         }
     }
 
+    /// Closes up to `peers` TCP peer connections so the tunnel they ride
+    /// gets their bytes back, and says how many. The torrents give them up in
+    /// the order a connection past the session's cap takes one
+    /// (`disconnect_candidate_rank`), and each its connections worth least
+    /// first (`disconnect_lowest`). Only peers at an address `among` takes
+    /// are closed: those whose socket rides the tunnel that asks. The close
+    /// is no failure: the peers stay connect candidates, unmarked.
+    pub fn give_back_tcp_peers(
+        &self,
+        peers: usize,
+        among: &(dyn Fn(std::net::SocketAddr) -> bool + Send + Sync),
+    ) -> usize {
+        let mut torrents = self.live_torrents();
+        torrents.sort_by_key(|torrent| disconnect_candidate_rank(torrent));
+        let now = tokio::time::Instant::now();
+        let mut closed = 0;
+        for torrent in torrents {
+            if closed == peers {
+                break;
+            }
+            closed += torrent.give_back_tcp_peers(peers - closed, now, among);
+        }
+        closed
+    }
+
     // An incoming connection at `addr` of `live` that the slack let in past
     // the session's cap takes a place under it: a free one, or that of the
     // lowest-ranked connection of the torrent that holds the most, when it

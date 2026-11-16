@@ -1267,3 +1267,61 @@ async fn a_batch_of_torrent_actions_ends_as_the_same_actions_one_at_a_time() {
     assert_eq!(left[2].map(|row| row.0), Some(TorrentIntent::Paused));
     assert_eq!(left[3].map(|row| (row.1, row.2)), Some((None, true)));
 }
+
+// An ask the tunnel withdraws before torrents act on it closes no peer, and
+// one withdrawn while they act closes none past the session it was read
+// before: it is read just before each session's peers close.
+#[test]
+fn a_give_back_withdrawn_before_torrents_act_closes_nothing() {
+    use crate::jobs::{Owed, TunnelGiveBack};
+    use crate::torrents::sessions::RouteKey;
+    use std::sync::atomic::AtomicBool;
+    let route = |egress| {
+        RouteKey::of(
+            egress,
+            &crate::proxies::EgressBinding::System,
+            &crate::proxies::LegPath::Direct,
+        )
+    };
+    let running = std::collections::BTreeMap::from([(route(1), 3usize), (route(2), 3)]);
+    let held = Arc::new(AtomicBool::new(false));
+    let ask = TunnelGiveBack {
+        egress: 1,
+        hops: vec![11],
+        torrent_routes: vec![route(1), route(2)],
+        owed: Owed::new(
+            {
+                let held = Arc::clone(&held);
+                move || u64::from(held.load(Ordering::Acquire))
+            },
+            || {},
+        ),
+    };
+    let closed = std::sync::Mutex::new(Vec::new());
+    let close = |open: &usize, peers: usize| {
+        closed.lock().unwrap().push(peers);
+        // The waiter is served as the first session closes its peers.
+        held.store(false, Ordering::Release);
+        peers.min(*open)
+    };
+
+    assert_eq!(
+        super::super::queue::give_back_through(&running, &ask, 4, close),
+        0
+    );
+    assert!(
+        closed.lock().unwrap().is_empty(),
+        "withdrawn before it acted"
+    );
+
+    held.store(true, Ordering::Release);
+    assert_eq!(
+        super::super::queue::give_back_through(&running, &ask, 4, close),
+        3
+    );
+    assert_eq!(
+        *closed.lock().unwrap(),
+        [4],
+        "withdrawn after the first session"
+    );
+}

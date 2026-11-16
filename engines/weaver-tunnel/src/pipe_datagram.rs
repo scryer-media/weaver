@@ -14,17 +14,23 @@ use std::{
 
 use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit};
 
-use super::{DialError, Dialer, Resolution, SessionHop, SocketClass, SocketPermit};
+use super::{
+    DialError, Dialer, Resolution, SessionHop, SessionSockets, SocketClass, SocketPermit,
+    datagram_bytes,
+};
 use crate::{
     TunnelError,
     endpoint::{DatagramSocket, DatagramTransport},
 };
 
-pub(super) struct SessionDatagrams(Arc<SessionHop>);
+// The class names whose bytes each socket holds: a torrent session's
+// datagram sockets are the torrents', the socket a tunnel stacked on this one
+// rides is the reserve's.
+pub(super) struct SessionDatagrams(Arc<SessionHop>, SocketClass);
 
 impl SessionDatagrams {
-    pub(super) fn new(session: Arc<SessionHop>) -> Self {
-        Self(session)
+    pub(super) fn new(session: Arc<SessionHop>, class: SocketClass) -> Self {
+        Self(session, class)
     }
 }
 
@@ -33,6 +39,21 @@ pub(super) fn tunnel_error(error: DialError) -> TunnelError {
         DialError::Fatal(error) => error,
         error => TunnelError::Engine(error.to_string()),
     }
+}
+
+// `bytes` of `class` in `sockets`, or the tunnel at capacity with the slot
+// that rings when bytes come back.
+pub(super) fn take_bytes(
+    sockets: &SessionSockets,
+    class: SocketClass,
+    bytes: u64,
+) -> Result<Option<SocketPermit>, TunnelError> {
+    sockets
+        .take(class, bytes)
+        .map_err(|refused| TunnelError::AtCapacity {
+            open: refused.open,
+            freed: refused.freed,
+        })
 }
 
 #[async_trait::async_trait]
@@ -55,24 +76,19 @@ impl DatagramTransport for SessionDatagrams {
                 session.id
             )));
         };
-        let (provider, activity, capacity) = match super::identity::claim(session).await {
-            Some(lent) => (lent.resolver, lent.activity, None),
+        let (provider, activity, capacity, sockets) = match super::identity::claim(session).await {
+            Some(lent) => (lent.resolver, lent.activity, None, lent.sockets),
             None => (
                 provider.clone(),
                 session.activity.clone().read_owned().await,
                 session.capacity.acquire().map_err(tunnel_error)?,
+                session.sockets.clone(),
             ),
         };
-        let share = session
-            .sockets
-            .take(SocketClass::ReserveCore)
-            .map_err(|_| {
-                TunnelError::Engine(format!(
-                    "proxy {}: the tunnel's {} share of sockets is full",
-                    session.id,
-                    SocketClass::ReserveCore.as_str()
-                ))
-            })?;
+        // Every datagram socket the tunnel hands out is sized as a carrier,
+        // and is freed the moment it is dropped.
+        let mtu = sockets.budget().map_or(0, |budget| budget.mtu);
+        let share = take_bytes(&sockets, self.1, datagram_bytes(mtu))?;
         match provider.0.bind(peer).await {
             Ok(socket) => {
                 crate::resolution::record::bound(peer, true);

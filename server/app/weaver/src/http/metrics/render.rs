@@ -28,7 +28,7 @@ use weaver_server_core::post_processing::run_metrics::{
 use weaver_server_core::proxies::network_metrics::tunnel::TunnelMetricsSnapshot;
 use weaver_server_core::proxies::network_metrics::{
     EgressHealthLabel, EgressMetrics, LegMetrics, LegStateLabel, NetworkMetricsSnapshot,
-    PoolMetrics, RungStateLabel, proxy_kind_label,
+    PoolMetrics, RungStateLabel, TunnelBytesMetrics, proxy_kind_label,
 };
 use weaver_server_core::settings::PerJobSeries;
 use weaver_server_core::torrents::metrics::{
@@ -2262,6 +2262,36 @@ pub(crate) fn render_network(
             count,
         );
     }
+    // Each tunnel by its egress, its WireGuard proxy, and the proxies beneath
+    // it in hop order, empty for one straight on the egress.
+    let tunnels: Vec<(String, String, String, &TunnelBytesMetrics)> = metrics
+        .tunnels
+        .iter()
+        .map(|tunnel| {
+            let via: Vec<String> = tunnel.via.iter().map(u32::to_string).collect();
+            (
+                tunnel.egress_id.to_string(),
+                tunnel.proxy_id.to_string(),
+                via.join(","),
+                tunnel,
+            )
+        })
+        .collect();
+    for (family, value) in [
+        (
+            &f::NETWORK_TUNNEL_SOCKET_BYTES,
+            (|t: &TunnelBytesMetrics| t.reserved_bytes) as fn(&TunnelBytesMetrics) -> u64,
+        ),
+        (&f::NETWORK_TUNNEL_SOCKET_LIMIT_BYTES, |t| t.limit_bytes),
+    ] {
+        for (egress, proxy, via, tunnel) in &tunnels {
+            out.sample(
+                family,
+                &[("egress_id", egress), ("proxy_id", proxy), ("via", via)],
+                value(tunnel),
+            );
+        }
+    }
 }
 
 // The egress rate limiter's counters, from the same registry the egress
@@ -2349,6 +2379,26 @@ pub(crate) fn render_tunnel(out: &mut Encoder, metrics: &TunnelMetricsSnapshot) 
         out.sample(&f::NETWORK_RUNG_FALLBACKS, &[("rung", &rung)], *count);
     }
     out.sample(&f::NETWORK_LEG_REVOCATIONS, &[], metrics.revocations);
+    out.sample(
+        &f::NETWORK_SOCKET_GIVE_BACKS,
+        &[],
+        metrics.socket_give_backs,
+    );
+    out.sample(
+        &f::NETWORK_SOCKET_GIVE_BACK_BYTES,
+        &[],
+        metrics.socket_give_back_bytes,
+    );
+    out.sample(
+        &f::NETWORK_SOCKET_PEERS_DROPPED,
+        &[],
+        metrics.socket_peers_dropped,
+    );
+    out.sample(
+        &f::NETWORK_SOCKET_IDLE_RETIRED,
+        &[],
+        metrics.socket_idle_retired,
+    );
 }
 
 // Speed tests. The run counter's label set comes from the kind and status

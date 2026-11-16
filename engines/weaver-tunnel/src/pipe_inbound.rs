@@ -29,7 +29,7 @@ use super::natpmp::{self, NATPMP_PORT};
 pub use super::natpmp::{PortMapping, gateway_of};
 use super::{
     ConnectionOutcome, DialError, Dialed, DialedStream, Dialer, OutcomeStream, SessionHop,
-    SocketClass,
+    SocketClass, datagram::take_bytes, listener_bytes, stream_bytes,
 };
 use crate::{TunnelError, wireguard::WgTcpListener};
 
@@ -102,10 +102,11 @@ fn tunnel_error(error: DialError) -> TunnelError {
 // Listen inside the session's tunnel, retiring it when it cannot come up.
 // A probe lent another session's tunnel listens in that one, and gets back
 // the guard that holds the lender busy.
-async fn listen_in(
-    session: &SessionHop,
-    port: u16,
-) -> Result<(WgTcpListener, Option<OwnedRwLockReadGuard<()>>), TunnelError> {
+// The listener holds its backlog's bytes, the torrents', for as long as it
+// listens, charged to the lender's tunnel when it listens in one lent. They
+// come back the moment it is dropped. A listener that does not fit is the
+// tunnel at capacity.
+async fn listen_in(session: &SessionHop, port: u16) -> Result<Listened, TunnelError> {
     let Some(provider) = session.resolver.as_ref() else {
         return Err(TunnelError::Engine(format!(
             "proxy {} cannot accept connections",
@@ -113,12 +114,18 @@ async fn listen_in(
         )));
     };
     session.prepare_carrier().await.map_err(tunnel_error)?;
-    let (provider, lent) = match super::identity::claim(session).await {
-        Some(lent) => (lent.resolver, Some(lent.activity)),
-        None => (provider.clone(), None),
+    let (provider, lent, sockets) = match super::identity::claim(session).await {
+        Some(lent) => (lent.resolver, Some(lent.activity), lent.sockets),
+        None => (provider.clone(), None, session.sockets.clone()),
     };
+    let backlog = take_bytes(&sockets, SocketClass::TorrentSession, listener_bytes())?;
     match provider.listen(port, LISTEN_BACKLOG).await {
-        Ok(listener) => Ok((listener, lent)),
+        Ok(listener) => Ok(Listened {
+            listener,
+            lent,
+            sockets,
+            _backlog: backlog,
+        }),
         // A full tunnel is working, as it is for a dial: it has room again
         // once a socket closes, so the hop is not blamed and stays up.
         Err(error @ TunnelError::AtCapacity { .. }) => Err(error),
@@ -130,6 +137,15 @@ async fn listen_in(
             Err(error)
         }
     }
+}
+
+// A listener up inside a tunnel, the tunnel whose bytes it holds, and the
+// guard of the session that lent the tunnel, when one did.
+struct Listened {
+    listener: WgTcpListener,
+    lent: Option<OwnedRwLockReadGuard<()>>,
+    sockets: Arc<super::SessionSockets>,
+    _backlog: Option<super::SocketPermit>,
 }
 
 // A task that ends when its handle is dropped.
@@ -158,7 +174,12 @@ impl Inbound for SessionInbound {
             PortForwarding::Fixed(forwarded) => forwarded,
             PortForwarding::None | PortForwarding::NatPmp { .. } => port,
         };
-        let (listener, lent) = listen_in(&session, port).await?;
+        let Listened {
+            listener,
+            lent,
+            sockets,
+            _backlog: backlog,
+        } = listen_in(&session, port).await?;
         let (activity, capacity) = match lent {
             Some(activity) => (activity, None),
             None => {
@@ -175,7 +196,10 @@ impl Inbound for SessionInbound {
         let (mapping, keeper) = match forwarding {
             PortForwarding::NatPmp { gateway } => {
                 let (published, mapping) = watch::channel(PortMapping::default());
-                let transport = Arc::new(super::datagram::SessionDatagrams::new(session.clone()));
+                let transport = Arc::new(super::datagram::SessionDatagrams::new(
+                    session.clone(),
+                    SocketClass::TorrentSession,
+                ));
                 let keeper = tokio::spawn(natpmp::keep(
                     transport,
                     SocketAddr::new(gateway.into(), NATPMP_PORT),
@@ -189,6 +213,8 @@ impl Inbound for SessionInbound {
             local: SyncMutex::new(listener.local_addr()),
             state: Mutex::new(Listening {
                 listener: Some(listener),
+                backlog,
+                sockets,
                 mapping: mapping.clone(),
             }),
             mapping,
@@ -218,6 +244,9 @@ struct SessionListener {
 struct Listening {
     // None once the tunnel it listened in has stopped.
     listener: Option<WgTcpListener>,
+    // The listener's backlog bytes, and the tunnel they are charged to.
+    backlog: Option<super::SocketPermit>,
+    sockets: Arc<super::SessionSockets>,
     // The gateway's word on the port it forwards, watched for a move.
     mapping: Option<watch::Receiver<PortMapping>>,
 }
@@ -250,7 +279,12 @@ impl InboundListener for SessionListener {
 
     async fn accept(&self) -> Result<Dialed, TunnelError> {
         let mut state = self.state.lock().await;
-        let Listening { listener, mapping } = &mut *state;
+        let Listening {
+            listener,
+            backlog,
+            sockets,
+            mapping,
+        } = &mut *state;
         let (stream, share) = loop {
             // The port the gateway forwards now, else the one listened on.
             let port = mapping
@@ -267,20 +301,41 @@ impl InboundListener for SessionListener {
                 Some(current) => current,
                 None => {
                     // The listener already holds the session it listens in
-                    // busy.
-                    let (fresh, _) = listen_in(&self.session, port).await?;
-                    *self.local.lock().unwrap_or_else(PoisonError::into_inner) = fresh.local_addr();
-                    listener.insert(fresh)
+                    // busy. The old backlog's bytes go back before the new
+                    // one takes its own.
+                    *backlog = None;
+                    let fresh = listen_in(&self.session, port).await?;
+                    *self.local.lock().unwrap_or_else(PoisonError::into_inner) =
+                        fresh.listener.local_addr();
+                    *backlog = fresh._backlog;
+                    *sockets = fresh.sockets;
+                    listener.insert(fresh.listener)
                 }
+            };
+            // Accepting hands a backlog socket to the peer and opens a fresh
+            // one in its place, so the stream's bytes are taken before the
+            // accept. Without them the listener waits for bytes to come back.
+            let share = match take_bytes(sockets, SocketClass::Torrent, stream_bytes(None)) {
+                Ok(share) => share,
+                Err(TunnelError::AtCapacity { freed, .. }) => {
+                    let freed = freed.notify();
+                    let wake = freed.notified();
+                    tokio::pin!(wake);
+                    wake.as_mut().enable();
+                    if sockets.has_room(SocketClass::Torrent, stream_bytes(None)) {
+                        continue;
+                    }
+                    tokio::select! {
+                        () = wake => {}
+                        () = moved(mapping) => {}
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             tokio::select! {
                 accepted = current.accept() => match accepted {
-                    // A peer past the torrent share is turned away and the
-                    // listener keeps listening.
-                    Ok(stream) => match self.session.sockets.take(SocketClass::Torrent) {
-                        Ok(share) => break (stream, share),
-                        Err(_) => drop(stream),
-                    },
+                    Ok(stream) => break (stream, share),
                     // The tunnel stopped: listen again inside its replacement.
                     Err(_) => *listener = None,
                 },
@@ -304,7 +359,7 @@ impl InboundListener for SessionListener {
                     Some(activity),
                     capacity,
                 )
-                .holding(share),
+                .holding(share.map(super::SocketPermit::lingering)),
             )),
             outcome,
             path,

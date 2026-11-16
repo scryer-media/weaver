@@ -1,38 +1,165 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The share of a WireGuard tunnel's sockets each kind of traffic may hold.
+// How a WireGuard tunnel's memory is shared out, in bytes.
 //
-// A tunnel holds a fixed number of sockets. Usenet connections, torrent
-// peers over TCP, the tunnel's own sockets (name lookups, datagram sockets,
-// probes) and HTTP (trackers, web seeds, feeds) each get a share of them, so
-// one kind can never take the sockets another needs. Every stream or socket the session hands out holds
-// one permit of its share until it is dropped.
-use std::sync::{Arc, Mutex};
+// A tunnel holds a fixed number of bytes, and every byte it allocates is
+// charged against it: first its own overhead (the OS socket's buffer, the
+// packet queues, the engine's receive pool, the resolver's socket), then each
+// socket at the size the tunnel allocates for it, from the moment it is handed
+// out until the tunnel frees it. A TCP stream lingers in the tunnel after it
+// is dropped, so its bytes come back only after the tunnel's linger; a
+// datagram socket, a listener and a connect that never completed come back at
+// once.
+//
+// The bytes after the overhead are split into a reserve, kept for what
+// serves every kind of traffic (name lookups, probes, feeds, other outbound
+// HTTP and the carriers proxies above share), the bytes kept for the torrent
+// sessions' listeners and datagram sockets, which they hold for their whole
+// life and nothing can ask back, and the sides, one per class of job, that
+// the bandwidth split divides: one side alone may take every byte, and sides
+// that all press get their share of the split in force. The rule itself is
+// the bandwidth split's, behind `SocketDivider`.
+//
+// Together they never hold more than the tunnel's bytes: a hand-out that
+// would pass them is refused, whatever part it is of.
+//
+// A side that holds more than it is given while another side presses owes
+// the rest: a level the ledger reads from what each holds and is given, not
+// an ask that is handed out and can be lost. The ledger wakes the side when
+// its debt grows or another side begins to press, and the server answers the
+// wake by asking the class to close what it owes less what it has already
+// marked to close. Bytes already closing are owed no more. A side whose
+// answer found nothing to give is not woken again until its own holdings
+// change.
+//
+// A side presses exactly while something holds one of its `Demand`s: the
+// want a refused hand-out leaves, held by what truly wants the socket (a
+// download lane parked for the route, a torrent with peers it could not dial
+// over TCP) until it gets one or stops wanting it. With the last one dropped
+// the side stops pressing, and the other side owes nothing for it.
+// A look alone never leaves one: a side refused only on a look at its room,
+// as a dialer that tries another transport when there is none, presses for
+// that look once it uses what it was given, as the bandwidth rule counts a
+// side pressing, and for that division only.
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
-use super::Purpose;
+use super::{LISTEN_BACKLOG, Purpose};
+use crate::wireguard::TcpBuffers;
+use proxy_tunnels::SlotFreed;
 
-// Which share a socket counts against.
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+
+// How long the tunnel keeps a dropped TCP stream before it frees it by force
+// (proxy-tunnels `wireguard::stack::LINGER`). A stream's bytes are charged
+// for this long after it is dropped, the worst case.
+pub const TUNNEL_LINGER: Duration = Duration::from_secs(10);
+
+// A TCP socket's buffers, each way, on a tunnel built with download tuning
+// when the socket asks for no sizes of its own (proxy-tunnels
+// `TUNED_TCP_BUFFER_BYTES`).
+const TUNED_TCP_BUFFER_BYTES: u64 = MIB;
+
+// What the tunnel keeps for one socket beside its buffers: the socket's own
+// record and its place in the socket set. Charged at a fixed worst case.
+const SOCKET_RECORD_BYTES: u64 = 4 * KIB;
+
+// What the tunnel keeps for each datagram or packet slot beside its payload.
+// Charged at a fixed worst case.
+const PACKET_RECORD_BYTES: u64 = 64;
+
+// The packets the tunnel's link queues each way (proxy-tunnels
+// `PACKET_QUEUE_DEPTH`), and the engine passes a carrying socket receives
+// (`TRANSPORT_RECEIVE_PASSES`).
+const PACKET_QUEUE_DEPTH: u64 = 512;
+const TRANSPORT_RECEIVE_PASSES: u64 = 8;
+
+// The OS socket's receive buffer the tunnel asks for (proxy-tunnels
+// `TUNED_RECEIVE_BUFFER_BYTES`), charged twice since Linux doubles what is
+// asked, and the send buffer the OS keeps beside it.
+const OS_RECEIVE_BYTES: u64 = 2 * 4 * MIB;
+const OS_SEND_BYTES: u64 = MIB;
+
+// The engine's pool of receive buffers (proxy-tunnels `RECEIVE_BUFFERS`, of
+// gotatun's 4096-byte packet buffers).
+const ENGINE_RECEIVE_BYTES: u64 = (PACKET_QUEUE_DEPTH + 64) * 4096;
+
+// The tunnel's one resolver socket and its query list, at a worst case.
+const RESOLVER_BYTES: u64 = 64 * KIB;
+
+// What a tunnel of `mtu` holds before any socket is handed out.
+pub const fn overhead_bytes(mtu: u16) -> u64 {
+    let packet = mtu as u64 + PACKET_RECORD_BYTES;
+    OS_RECEIVE_BYTES
+        + OS_SEND_BYTES
+        + 2 * PACKET_QUEUE_DEPTH * packet
+        + ENGINE_RECEIVE_BYTES
+        + RESOLVER_BYTES
+}
+
+// What one TCP socket holds, asked `buffers` or the tunnel's own sizes.
+pub fn stream_bytes(buffers: Option<TcpBuffers>) -> u64 {
+    let (receive, send) = buffers.map_or((TUNED_TCP_BUFFER_BYTES, TUNED_TCP_BUFFER_BYTES), |b| {
+        (b.receive() as u64, b.send() as u64)
+    });
+    receive + send + SOCKET_RECORD_BYTES
+}
+
+// What one datagram socket holds on a tunnel of `mtu`: the tunnel sizes
+// every datagram socket it hands out as a carrier of another tunnel, one
+// pass of packets to send and `TRANSPORT_RECEIVE_PASSES` passes to receive.
+pub const fn datagram_bytes(mtu: u16) -> u64 {
+    let packets = PACKET_QUEUE_DEPTH * (1 + TRANSPORT_RECEIVE_PASSES);
+    packets * (mtu as u64 + PACKET_RECORD_BYTES) + SOCKET_RECORD_BYTES
+}
+
+// What one listener holds for as long as it listens: its backlog of TCP
+// sockets at the tunnel's own sizes.
+pub fn listener_bytes() -> u64 {
+    LISTEN_BACKLOG as u64 * stream_bytes(None)
+}
+
+// The classes of job the bandwidth split divides, one side each. A new class
+// is one more side here and one more `SocketClass`.
+pub const SIDES: usize = 2;
+const USENET: usize = 0;
+const TORRENT: usize = 1;
+const RESERVE: usize = SIDES;
+const KEPT: usize = SIDES + 1;
+const KINDS: usize = SIDES + 2;
+
+// Which part of the tunnel's bytes a socket counts against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SocketClass {
+    // Usenet connections and tests of usenet servers.
     Nntp,
-    // Torrent peers over TCP. uTP peers ride the session's datagram socket
-    // and take nothing of this.
+    // Torrent peers over TCP, and web seed transfers over HTTP.
     Torrent,
-    // Name lookups, datagram sockets (DHT and uTP), probes and the carrier
-    // a proxy session shares.
-    ReserveCore,
-    // Trackers, web seeds, feeds and other outbound HTTP.
-    ReserveHttp,
+    // A torrent session's listeners and datagram sockets (DHT, uTP, UDP
+    // trackers), held for its whole life: off the split, in the bytes kept
+    // for them, and past those in what they hold, as a speed test's session
+    // beside the routes' does while it lives.
+    TorrentSession,
+    // Name lookups, probes, feeds, other outbound HTTP, the torrent
+    // sessions' trackers and metainfo, and the carriers a proxy's session
+    // shares: off the split, so a torrent's own peers never starve its
+    // announces.
+    Reserve,
 }
 
 impl SocketClass {
     pub fn of(purpose: &Purpose) -> Self {
         match purpose {
             Purpose::Nntp { .. } => Self::Nntp,
-            Purpose::Torrent => Self::Torrent,
+            Purpose::Torrent | Purpose::TorrentWebSeed => Self::Torrent,
+            Purpose::Datagram => Self::TorrentSession,
             Purpose::ProxyEndpoint {
                 carrying: Some(class),
                 ..
@@ -43,455 +170,877 @@ impl SocketClass {
             | Purpose::ProxyEndpoint { .. }
             | Purpose::Probe
             | Purpose::Dns
-            | Purpose::Datagram => Self::ReserveCore,
-            Purpose::TorrentHttp | Purpose::Feed { .. } | Purpose::Outbound => Self::ReserveHttp,
+            | Purpose::TorrentHttp
+            | Purpose::Feed { .. }
+            | Purpose::Outbound => Self::Reserve,
+        }
+    }
+
+    // The side of the split the class takes, or none for bytes kept off it.
+    pub const fn side(self) -> Option<usize> {
+        match self {
+            Self::Nntp => Some(USENET),
+            Self::Torrent => Some(TORRENT),
+            Self::Reserve | Self::TorrentSession => None,
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Nntp => "usenet",
-            Self::Torrent => "torrent TCP",
-            Self::ReserveCore => "reserve",
-            Self::ReserveHttp => "tracker and HTTP",
+            Self::Torrent => "torrent",
+            Self::Reserve => "reserve",
+            Self::TorrentSession => "torrent session",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Nntp => USENET,
+            Self::Torrent => TORRENT,
+            Self::Reserve => RESERVE,
+            Self::TorrentSession => KEPT,
         }
     }
 }
 
-// How many sockets each class may hold at once.
+// The class of each side, by side.
+pub const SIDE_CLASSES: [SocketClass; SIDES] = [SocketClass::Nntp, SocketClass::Torrent];
+
+// The rule that divides the sides' bytes: the bandwidth split's.
+pub trait SocketDivider: Send + Sync {
+    // Each side's share of `cap` by the split in force, adding up to it.
+    fn shares(&self, cap: u64) -> [u64; SIDES];
+    // Each side's bytes out of `cap`, from its share, what it was `given` at
+    // the last division and what it `used`: held, and asked for by a refused
+    // hand-out. Adding up to `cap`.
+    fn share_out(&self, cap: u64, shares: &[u64], given: &[Option<u64>], used: &[u64]) -> Vec<u64>;
+    // Whether a side that `used` this much of what it was `given` presses.
+    fn presses(&self, used: u64, given: u64) -> bool;
+}
+
+// A tunnel's bytes: everything it may hold, of which the reserve and those
+// kept for the torrent sessions' listeners and datagram sockets, on a link of
+// `mtu`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SocketShares {
-    pub nntp: usize,
-    pub torrent: usize,
-    pub core: usize,
-    pub http: usize,
+pub struct SocketBudget {
+    pub bytes: u64,
+    pub reserve: u64,
+    pub torrent_kept: u64,
+    pub mtu: u16,
 }
 
-impl SocketShares {
-    pub fn of(&self, class: SocketClass) -> usize {
-        match class {
-            SocketClass::Nntp => self.nntp,
-            SocketClass::Torrent => self.torrent,
-            SocketClass::ReserveCore => self.core,
-            SocketClass::ReserveHttp => self.http,
-        }
+impl SocketBudget {
+    // The bytes the sockets may hold, after the overhead.
+    pub const fn sockets(&self) -> u64 {
+        self.bytes.saturating_sub(overhead_bytes(self.mtu))
+    }
+
+    // The bytes the sides divide.
+    pub const fn sides(&self) -> u64 {
+        self.sockets()
+            .saturating_sub(self.reserve)
+            .saturating_sub(self.torrent_kept)
     }
 }
 
-const CLASSES: [SocketClass; 4] = [
-    SocketClass::Nntp,
-    SocketClass::Torrent,
-    SocketClass::ReserveCore,
-    SocketClass::ReserveHttp,
-];
-
-const fn index(class: SocketClass) -> usize {
-    match class {
-        SocketClass::Nntp => 0,
-        SocketClass::Torrent => 1,
-        SocketClass::ReserveCore => 2,
-        SocketClass::ReserveHttp => 3,
-    }
-}
-
-// Every share of a session, under one lock so a re-budget and the sockets
-// ending during it are settled together.
-#[derive(Default)]
 struct Ledger {
-    size: [usize; 4],
-    held: [usize; 4],
-    // How much of each share grew while another share still held sockets
-    // above its new size. That growth waits for those sockets to end.
-    growing: [usize; 4],
+    budget: SocketBudget,
+    // Bytes and sockets held by each side, then the reserve, lingering ones
+    // among them.
+    held: [u64; KINDS],
+    open: [usize; KINDS],
+    lingering: [u64; KINDS],
+    // What each side was given at the last division; none before the first.
+    given: [Option<u64>; SIDES],
+    // Each side's live demands: how many ask each size of socket. A side
+    // presses while it has one.
+    demand: [BTreeMap<u64, usize>; SIDES],
+    // What each side owed when the ledger last settled, and who pressed
+    // then: a settle wakes a side whose debt grew, or that owes when
+    // another side begins to press.
+    level: [u64; SIDES],
+    pressed: [bool; SIDES],
+    // A side whose answer found nothing it could give: not woken again
+    // until its own holdings change.
+    dry: [bool; SIDES],
+    // A dry side one of whose dials connected since: its answer may find
+    // that socket now, so the next settle wakes it while it owes.
+    rewake: [bool; SIDES],
+    // The sides to wake, read once by whoever answers them.
+    wake: [bool; SIDES],
+    // Dropped streams waiting out the linger: when, which kind, how much.
+    linger: VecDeque<(Instant, usize, u64)>,
+    timer: bool,
 }
 
 impl Ledger {
-    // Sockets held above their share's size, by shares that shrank.
-    fn overflow(&self) -> usize {
-        self.held
-            .iter()
-            .zip(&self.size)
-            .map(|(held, size)| held.saturating_sub(*size))
-            .sum()
+    // The most a live demand of `side` asks; none without one.
+    fn asked(&self, side: usize) -> u64 {
+        self.demand[side].keys().next_back().copied().unwrap_or(0)
     }
 
-    // How many sockets each share may hold now: its size, less the growth
-    // still waiting on the sockets the shrunk shares hold above their size.
-    // A share takes no more of that wait than it could still open, since a
-    // wait on sockets it would not open anyway holds nothing back.
-    fn limits(&self) -> [usize; 4] {
-        let mut overflow = self.overflow();
-        let mut limits = self.size;
-        let shares = limits.iter_mut().zip(&self.held).zip(&self.growing);
-        for ((limit, &held), &growing) in shares {
-            let waiting = overflow.min(growing).min(limit.saturating_sub(held));
-            overflow -= waiting;
-            *limit -= waiting;
+    fn pressing(&self) -> [bool; SIDES] {
+        std::array::from_fn(|side| !self.demand[side].is_empty())
+    }
+
+    // One more demand of `side` for `bytes`.
+    fn press(&mut self, side: usize, bytes: u64) {
+        *self.demand[side].entry(bytes).or_default() += 1;
+    }
+
+    // One demand of `side` for `bytes` let go.
+    fn unpress(&mut self, side: usize, bytes: u64) {
+        if let Some(count) = self.demand[side].get_mut(&bytes) {
+            *count -= 1;
+            if *count == 0 {
+                self.demand[side].remove(&bytes);
+            }
         }
-        limits
     }
 
-    fn settle(&mut self) {
-        if self.overflow() == 0 {
-            self.growing = [0; 4];
+    // What `side` owes, a level and not an ask: the bytes it holds past
+    // what it is given, not counting those already closing, while another
+    // side presses or the sides hold past their bytes, as a lowered budget
+    // leaves them. Nothing otherwise.
+    fn owed(&self, divider: &dyn SocketDivider, side: usize) -> u64 {
+        let pressing = self.pressing();
+        let pressed = (0..SIDES).any(|other| other != side && pressing[other]) || self.over();
+        if pressed {
+            self.active(side).saturating_sub(self.given(divider, side))
+        } else {
+            0
+        }
+    }
+
+    // `side`'s own holdings changed: an answer that found nothing to give
+    // may find something now.
+    fn moved(&mut self, kind: usize) {
+        if kind < SIDES {
+            self.dry[kind] = false;
+        }
+    }
+
+    // One of `kind`'s sockets went from dialling to connected. The bytes
+    // were held from the dial, so nothing grows, but an answer that found
+    // nothing to give counted the dial as nothing: a dry side is woken again.
+    fn connected(&mut self, kind: usize) {
+        if kind < SIDES && self.dry[kind] {
+            self.dry[kind] = false;
+            self.rewake[kind] = true;
+        }
+    }
+
+    // Read what each side owes now and mark for waking each that owes and
+    // is not dry, when its debt grew, another side began to press, or a dial
+    // of a side found dry connected. True when a side is to be woken.
+    fn settle(&mut self, divider: &dyn SocketDivider) -> bool {
+        let pressing = self.pressing();
+        let mut woke = false;
+        let rewake = std::mem::take(&mut self.rewake);
+        for (side, rewake) in rewake.into_iter().enumerate() {
+            let owed = self.owed(divider, side);
+            let began =
+                (0..SIDES).any(|other| other != side && pressing[other] && !self.pressed[other]);
+            if owed > 0 && !self.dry[side] && (owed > self.level[side] || began || rewake) {
+                crate::metrics::record_socket_give_back(owed - owed.min(self.level[side]));
+                self.wake[side] = true;
+                woke = true;
+            }
+            self.level[side] = owed;
+        }
+        self.pressed = pressing;
+        woke
+    }
+
+    fn sides_held(&self) -> u64 {
+        self.held[..SIDES].iter().sum()
+    }
+
+    // The bytes kept off the split for the torrent sessions' sockets: what
+    // the budget keeps for them, or what they hold when they hold more.
+    fn kept(&self) -> u64 {
+        self.budget.torrent_kept.max(self.held[KEPT])
+    }
+
+    // The bytes the sides divide: the budget's, less any torrent session
+    // sockets held past what it keeps for them.
+    fn sides(&self) -> u64 {
+        self.budget
+            .sockets()
+            .saturating_sub(self.budget.reserve)
+            .saturating_sub(self.kept())
+    }
+
+    // Whether the sides hold past their bytes.
+    fn over(&self) -> bool {
+        self.sides_held() > self.sides()
+    }
+
+    // Bytes a side holds that are not already closing.
+    fn active(&self, side: usize) -> u64 {
+        self.held[side] - self.lingering[side]
+    }
+
+    fn given(&self, divider: &dyn SocketDivider, side: usize) -> u64 {
+        self.given[side].unwrap_or_else(|| divider.shares(self.sides())[side])
+    }
+
+    // Whether a hand-out of `bytes` to `side` is refused only because
+    // another side holds past its own share: the side has room in its own
+    // share, and gets it once the other gives back. Read against the shares,
+    // not what each side was given, since a look shares those out to what
+    // each side holds.
+    fn crowded_out(&self, divider: &dyn SocketDivider, side: usize, bytes: u64) -> bool {
+        let shares = divider.shares(self.sides());
+        self.held[side] + bytes <= shares[side]
+            && (0..SIDES).any(|other| other != side && self.active(other) > shares[other])
+    }
+
+    // Divide the sides' bytes again. `looked` is what a look at a side's
+    // room asked: it shares out what each side is given, for this division
+    // only, and is no press. What a side then owes is read by `settle`.
+    fn divide(&mut self, divider: &dyn SocketDivider, looked: [u64; SIDES]) {
+        let cap = self.sides();
+        let shares = divider.shares(cap);
+        // A side with a demand presses however little it asked: it uses all
+        // it was given, and the bytes it was refused.
+        let demand: [u64; SIDES] = std::array::from_fn(|side| self.asked(side));
+        let wants: [u64; SIDES] = std::array::from_fn(|side| demand[side].max(looked[side]));
+        let used: Vec<u64> = (0..SIDES)
+            .map(|side| match wants[side] {
+                0 => self.held[side],
+                asked => (self.held[side] + asked).max(self.given(divider, side)),
+            })
+            .collect();
+        let given = divider.share_out(cap, &shares, &self.given, &used);
+        for (side, given) in given.into_iter().enumerate() {
+            self.given[side] = Some(given);
         }
     }
 }
 
 struct Shares {
     ledger: Mutex<Ledger>,
-    freed: [Arc<Notify>; 4],
+    divider: Arc<dyn SocketDivider>,
+    freed: [SlotFreed; KINDS],
+    // Rings when a side is to be woken to give bytes back.
+    give_back: Arc<Notify>,
+    // The bytes held now, overhead included, and the limit, for metrics.
+    reserved: AtomicU64,
+    limit: AtomicU64,
 }
 
 impl Shares {
     fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
-        self.ledger.lock().expect("socket shares")
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn publish(&self, ledger: &Ledger) {
+        let held: u64 = ledger.held.iter().sum();
+        self.reserved
+            .store(held + overhead_bytes(ledger.budget.mtu), Ordering::Relaxed);
+        self.limit.store(ledger.budget.bytes, Ordering::Relaxed);
+    }
+
+    // Wake every waiter: each class's slot rings as bytes come back.
     fn wake(&self) {
         for freed in &self.freed {
-            freed.notify_waiters();
+            freed.notify().notify_waiters();
+        }
+    }
+
+    // `bytes` of `kind` come back to the tunnel. True when a side is to be
+    // woken.
+    fn give(&self, ledger: &mut Ledger, kind: usize, bytes: u64, lingered: bool) -> bool {
+        ledger.held[kind] -= bytes;
+        ledger.open[kind] -= 1;
+        if lingered {
+            ledger.lingering[kind] -= bytes;
+        } else {
+            ledger.moved(kind);
+        }
+        if ledger.pressing().contains(&true) || ledger.over() {
+            ledger.divide(&*self.divider, [0; SIDES]);
+        }
+        ledger.settle(&*self.divider)
+    }
+
+    // Give back every lingering stream whose linger has passed. Says whether
+    // any came back, and whether a side is to be woken.
+    fn lingered(&self, ledger: &mut Ledger) -> (bool, bool) {
+        let now = Instant::now();
+        let mut asked = false;
+        let mut returned = false;
+        while let Some(&(due, kind, bytes)) = ledger.linger.front() {
+            if due > now {
+                break;
+            }
+            ledger.linger.pop_front();
+            asked |= self.give(ledger, kind, bytes, true);
+            returned = true;
+        }
+        (returned, asked)
+    }
+
+    // Return `bytes` of `kind` now.
+    fn release(self: &Arc<Self>, kind: usize, bytes: u64) {
+        let mut ledger = self.ledger();
+        let asked = self.give(&mut ledger, kind, bytes, false);
+        self.publish(&ledger);
+        drop(ledger);
+        self.settled(asked);
+    }
+
+    // Return `bytes` of `kind` once the tunnel's linger has passed, with one
+    // timer for the whole tunnel, running only while something lingers.
+    // Dropped off a runtime, the bytes still wait out the linger: the next
+    // hand-out, look or timer gives them back.
+    fn linger(self: &Arc<Self>, kind: usize, bytes: u64) {
+        let mut ledger = self.ledger();
+        ledger.lingering[kind] += bytes;
+        ledger.moved(kind);
+        // Closing, the bytes are owed no more: nothing grows, so none wakes.
+        ledger.settle(&*self.divider);
+        ledger
+            .linger
+            .push_back((Instant::now() + TUNNEL_LINGER, kind, bytes));
+        self.time(ledger);
+    }
+
+    // Start the linger's timer, unless one runs or nothing lingers, on the
+    // runtime of the caller, if it has one.
+    fn time(self: &Arc<Self>, mut ledger: std::sync::MutexGuard<'_, Ledger>) {
+        if ledger.timer || ledger.linger.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        ledger.timer = true;
+        drop(ledger);
+        let shares = Arc::downgrade(self);
+        // However the task ends, cancelled before it ever ran among them, the
+        // next linger or look starts the timer again.
+        let timing = Timing(shares.clone());
+        runtime.spawn(async move {
+            let mut timing = timing;
+            loop {
+                let Some(shares) = shares.upgrade() else {
+                    return;
+                };
+                let (next, asked, returned) = {
+                    let mut ledger = shares.ledger();
+                    let (returned, asked) = shares.lingered(&mut ledger);
+                    let next = ledger.linger.front().map(|&(due, _, _)| due);
+                    if next.is_none() {
+                        ledger.timer = false;
+                        timing.disarm();
+                    }
+                    shares.publish(&ledger);
+                    (next, asked, returned)
+                };
+                if returned {
+                    shares.settled(asked);
+                }
+                let Some(next) = next else {
+                    return;
+                };
+                drop(shares);
+                tokio::time::sleep_until(next).await;
+            }
+        });
+    }
+
+    // A socket of `kind` connected: no bytes move, so only the side woken
+    // to give back is told.
+    fn connected(&self, kind: usize) {
+        let mut ledger = self.ledger();
+        ledger.connected(kind);
+        let woke = ledger.settle(&*self.divider);
+        drop(ledger);
+        if woke {
+            self.give_back.notify_waiters();
+        }
+    }
+
+    fn settled(&self, asked: bool) {
+        self.wake();
+        if asked {
+            self.give_back.notify_waiters();
         }
     }
 }
 
-// The permit one socket holds of its share.
+// The linger's timer, running until it is dropped.
+struct Timing(Weak<Shares>);
+
+impl Timing {
+    // The timer ended itself, and said so.
+    fn disarm(&mut self) {
+        self.0 = Weak::new();
+    }
+}
+
+impl Drop for Timing {
+    fn drop(&mut self) {
+        if let Some(shares) = self.0.upgrade() {
+            shares.ledger().timer = false;
+        }
+    }
+}
+
+// The bytes one socket holds of the tunnel.
 pub struct SocketPermit {
     shares: Arc<Shares>,
-    class: usize,
+    kind: usize,
+    bytes: u64,
+    lingers: bool,
+}
+
+impl SocketPermit {
+    // The socket is a TCP stream: its bytes come back after the tunnel's
+    // linger, not when it is dropped.
+    pub fn lingering(mut self) -> Self {
+        self.lingers = true;
+        self
+    }
+
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    // What the socket's owner calls once it counts the socket connected,
+    // not still dialling: the side's holdings moved, so a side found dry is
+    // woken again. Holds the tunnel weakly; a call after it is gone does
+    // nothing.
+    pub fn connected_signal(&self) -> impl Fn() + Send + Sync + 'static {
+        let shares = Arc::downgrade(&self.shares);
+        let kind = self.kind;
+        move || {
+            if let Some(shares) = shares.upgrade() {
+                shares.connected(kind);
+            }
+        }
+    }
 }
 
 impl Drop for SocketPermit {
     fn drop(&mut self) {
-        let mut ledger = self.shares.ledger();
-        ledger.held[self.class] -= 1;
-        let overflowed = ledger.growing.iter().any(|&growing| growing > 0);
-        ledger.settle();
-        drop(ledger);
-        if overflowed {
-            self.shares.wake();
+        if self.lingers {
+            self.shares.linger(self.kind, self.bytes);
         } else {
-            self.shares.freed[self.class].notify_waiters();
+            self.shares.release(self.kind, self.bytes);
         }
     }
 }
 
-// A session's shares. A session without them, any but a WireGuard one,
-// holds its sockets to no share at all.
+// A hand-out or look refused: the sockets of its class open now, the slot
+// that rings as bytes come back, and the demand a side's refusal leaves.
+#[derive(Debug)]
+pub struct Refused {
+    pub open: usize,
+    pub freed: SlotFreed,
+    pub demand: Option<Demand>,
+}
+
+// A side's want for a socket it was refused. The side presses exactly while
+// one is held, and the other side owes as long: whoever truly wants the
+// socket holds it, and drops it once it is served or wants the socket no
+// more. Clones share the one want.
+#[derive(Clone)]
+pub struct Demand(Arc<Want>);
+
+struct Want {
+    shares: Arc<Shares>,
+    side: usize,
+    bytes: u64,
+}
+
+impl Demand {
+    // The want for a press already counted in the ledger.
+    fn pressed(shares: &Arc<Shares>, side: usize, bytes: u64) -> Self {
+        Self(Arc::new(Want {
+            shares: Arc::clone(shares),
+            side,
+            bytes,
+        }))
+    }
+
+    // The bytes the refused socket asked.
+    pub fn bytes(&self) -> u64 {
+        self.0.bytes
+    }
+
+    // The class whose side presses.
+    pub fn class(&self) -> SocketClass {
+        SIDE_CLASSES[self.0.side]
+    }
+
+    // Whether both press on one tunnel's bytes.
+    pub fn same_tunnel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0.shares, &other.0.shares)
+    }
+}
+
+impl std::fmt::Debug for Demand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Demand")
+            .field("class", &self.class().as_str())
+            .field("bytes", &self.0.bytes)
+            .finish()
+    }
+}
+
+impl Drop for Want {
+    fn drop(&mut self) {
+        let mut ledger = self.shares.ledger();
+        ledger.unpress(self.side, self.bytes);
+        // The press ends: what the other side owes falls.
+        let woke = ledger.settle(&*self.shares.divider);
+        drop(ledger);
+        if woke {
+            self.shares.give_back.notify_waiters();
+        }
+    }
+}
+
+// A session's bytes. A session without them, any but a WireGuard one, holds
+// its sockets to no budget at all.
 #[derive(Default)]
 pub struct SessionSockets {
     shares: Option<Arc<Shares>>,
 }
 
 impl SessionSockets {
-    pub fn new(shares: SocketShares) -> Self {
+    pub fn new(budget: SocketBudget, divider: Arc<dyn SocketDivider>) -> Self {
+        let shares = Arc::new(Shares {
+            ledger: Mutex::new(Ledger {
+                budget,
+                held: [0; KINDS],
+                open: [0; KINDS],
+                lingering: [0; KINDS],
+                given: [None; SIDES],
+                demand: Default::default(),
+                level: [0; SIDES],
+                pressed: [false; SIDES],
+                dry: [false; SIDES],
+                rewake: [false; SIDES],
+                wake: [false; SIDES],
+                linger: VecDeque::new(),
+                timer: false,
+            }),
+            divider,
+            freed: Default::default(),
+            give_back: Arc::new(Notify::new()),
+            reserved: AtomicU64::new(0),
+            limit: AtomicU64::new(0),
+        });
+        shares.publish(&shares.ledger());
         Self {
-            shares: Some(Arc::new(Shares {
-                ledger: Mutex::new(Ledger {
-                    size: CLASSES.map(|class| shares.of(class)),
-                    ..Ledger::default()
-                }),
-                freed: CLASSES.map(|_| Arc::new(Notify::new())),
-            })),
+            shares: Some(shares),
         }
     }
 
-    // Resize every share at once. Sockets already open stay open. A share
-    // that shrank below them takes no new one until enough have ended, and
-    // a share that grew meanwhile grows only into the sockets left free
-    // under the new total, the rest as the shrunk shares' sockets end.
-    pub fn set_shares(&self, shares: SocketShares) {
+    // Put a new budget in force. Sockets already open stay open; the sides
+    // are divided afresh from their shares, and a side left holding past
+    // what it is given, while another presses or past the sides' bytes,
+    // owes the rest.
+    pub fn set_budget(&self, budget: SocketBudget) {
         let Some(inner) = &self.shares else {
             return;
         };
         let mut ledger = inner.ledger();
-        for class in CLASSES {
-            let i = index(class);
-            let size = shares.of(class);
-            ledger.growing[i] = if size >= ledger.size[i] {
-                ledger.growing[i] + (size - ledger.size[i])
-            } else {
-                ledger.growing[i].saturating_sub(ledger.size[i] - size)
-            };
-            ledger.size[i] = size;
+        if ledger.budget == budget {
+            return;
         }
-        ledger.settle();
+        ledger.budget = budget;
+        ledger.given = [None; SIDES];
+        ledger.divide(&*inner.divider, [0; SIDES]);
+        let asked = ledger.settle(&*inner.divider);
+        inner.publish(&ledger);
         drop(ledger);
-        inner.wake();
+        inner.settled(asked);
     }
 
-    // The shares in force, when the session has them.
-    pub fn shares(&self) -> Option<SocketShares> {
-        let ledger = self.shares.as_ref()?.ledger();
-        Some(SocketShares {
-            nntp: ledger.size[0],
-            torrent: ledger.size[1],
-            core: ledger.size[2],
-            http: ledger.size[3],
-        })
+    // The budget in force, when the session has one.
+    pub fn budget(&self) -> Option<SocketBudget> {
+        Some(self.shares.as_ref()?.ledger().budget)
     }
 
-    // Whether `class` has a socket free now.
-    pub fn has_room(&self, class: SocketClass) -> bool {
-        self.room(class).is_ok()
+    // Whether `bytes` of `class` fit now.
+    pub fn has_room(&self, class: SocketClass, bytes: u64) -> bool {
+        self.room(class, bytes).is_ok()
     }
 
-    // A socket free in `class`'s share now, or the signal that one is freed.
-    pub fn room(&self, class: SocketClass) -> Result<(), Arc<Notify>> {
+    // Room for `bytes` of `class` now, or the signal that bytes come back.
+    // A side refused that uses what it was given looks with its want: what
+    // each side is given is shared out again with it. A look alone asks no
+    // side to give anything back, and leaves no demand.
+    pub fn room(&self, class: SocketClass, bytes: u64) -> Result<(), SlotFreed> {
+        self.look(class, bytes, false)
+            .map_err(|refused| refused.freed)
+    }
+
+    // As `room`, but a side refused only because another holds past its
+    // share is handed a `Demand`, as a refused hand-out is: while the caller
+    // holds it the side presses and the other owes what it holds past its
+    // share. A side at or past its own share is handed none.
+    pub fn wait_room(&self, class: SocketClass, bytes: u64) -> Result<(), Refused> {
+        self.look(class, bytes, true)
+    }
+
+    fn look(&self, class: SocketClass, bytes: u64, wait: bool) -> Result<(), Refused> {
         let Some(inner) = &self.shares else {
             return Ok(());
         };
-        let i = index(class);
-        let ledger = inner.ledger();
-        if ledger.held[i] < ledger.limits()[i] {
+        let divider = &*inner.divider;
+        let mut ledger = inner.ledger();
+        let (returned, mut asked) = inner.lingered(&mut ledger);
+        let mut fit = fits(&ledger, divider, class, bytes);
+        if !fit
+            && let Some(side) = class.side()
+            && divider.presses(ledger.held[side], ledger.given(divider, side))
+        {
+            let mut looked = [0; SIDES];
+            looked[side] = bytes;
+            ledger.divide(divider, looked);
+            fit = fits(&ledger, divider, class, bytes);
+        }
+        let mut demand = None;
+        if !fit
+            && wait
+            && let Some(side) = class.side()
+            && ledger.crowded_out(divider, side, bytes)
+        {
+            ledger.press(side, bytes);
+            ledger.divide(divider, [0; SIDES]);
+            demand = Some(Demand::pressed(inner, side, bytes));
+        }
+        asked |= ledger.settle(divider);
+        let open = ledger.open[class.index()];
+        if returned {
+            inner.publish(&ledger);
+        }
+        inner.time(ledger);
+        if returned || asked {
+            inner.settled(asked);
+        }
+        if fit {
             Ok(())
         } else {
-            Err(Arc::clone(&inner.freed[i]))
+            Err(Refused {
+                open,
+                freed: inner.freed[class.index()].clone(),
+                demand,
+            })
         }
     }
 
-    // A permit of `class`'s share, or the signal that one is freed when the
-    // share is full. A session without shares hands out no permits.
-    pub fn take(&self, class: SocketClass) -> Result<Option<SocketPermit>, Arc<Notify>> {
+    // `bytes` of `class`, held until the permit is dropped, or the refusal:
+    // the sockets of `class` open now, the signal that bytes come back and,
+    // for a side, the `Demand` the refusal leaves. A refusal divides the
+    // sides again with the side refused pressing. A session without a
+    // budget hands out no permits.
+    pub fn take(&self, class: SocketClass, bytes: u64) -> Result<Option<SocketPermit>, Refused> {
         let Some(inner) = &self.shares else {
             return Ok(None);
         };
-        let i = index(class);
         let mut ledger = inner.ledger();
-        if ledger.held[i] >= ledger.limits()[i] {
-            return Err(Arc::clone(&inner.freed[i]));
+        let (returned, mut asked) = inner.lingered(&mut ledger);
+        let kind = class.index();
+        let mut fit = fits(&ledger, &*inner.divider, class, bytes);
+        let mut pressed = None;
+        if !fit && let Some(side) = class.side() {
+            // The refusal presses for the division that may yet fit it.
+            ledger.press(side, bytes);
+            ledger.divide(&*inner.divider, [0; SIDES]);
+            fit = fits(&ledger, &*inner.divider, class, bytes);
+            pressed = Some(side);
         }
-        ledger.held[i] += 1;
+        if !fit {
+            asked |= ledger.settle(&*inner.divider);
+            let open = ledger.open[kind];
+            if returned {
+                inner.publish(&ledger);
+            }
+            // A refusal waits on bytes coming back: lingering ones come
+            // back on the timer.
+            inner.time(ledger);
+            if returned || asked {
+                inner.settled(asked);
+            }
+            return Err(Refused {
+                open,
+                freed: inner.freed[kind].clone(),
+                demand: pressed.map(|side| Demand::pressed(inner, side, bytes)),
+            });
+        }
+        // Divided again, it fits: the refusal it nearly was wants nothing.
+        if let Some(side) = pressed {
+            ledger.unpress(side, bytes);
+        }
+        let sides = ledger.sides();
+        ledger.held[kind] += bytes;
+        ledger.open[kind] += 1;
+        ledger.moved(kind);
+        // Torrent session sockets past what is kept for them leave the sides
+        // fewer bytes: each side is given its part of those, and one left
+        // holding past it owes the rest.
+        if ledger.sides() < sides {
+            ledger.divide(&*inner.divider, [0; SIDES]);
+        }
+        asked |= ledger.settle(&*inner.divider);
+        inner.publish(&ledger);
+        drop(ledger);
+        if returned || asked {
+            inner.settled(asked);
+        }
         Ok(Some(SocketPermit {
             shares: Arc::clone(inner),
-            class: i,
+            kind,
+            bytes,
+            lingers: false,
         }))
     }
 
-    // Sockets of `class` open now.
-    pub fn held(&self, class: SocketClass) -> usize {
+    // Bytes of `class` held now, lingering ones among them.
+    pub fn held(&self, class: SocketClass) -> u64 {
         self.shares
             .as_ref()
-            .map_or(0, |inner| inner.ledger().held[index(class)])
+            .map_or(0, |inner| inner.ledger().held[class.index()])
     }
+
+    // Bytes of `class` that are lingering now.
+    pub fn lingering(&self, class: SocketClass) -> u64 {
+        self.shares
+            .as_ref()
+            .map_or(0, |inner| inner.ledger().lingering[class.index()])
+    }
+
+    // What `class`'s side was given at the last division: its share before
+    // the first. The reserve's is the reserve, and the torrent sessions'
+    // what is kept for them.
+    pub fn given(&self, class: SocketClass) -> u64 {
+        let Some(inner) = &self.shares else {
+            return 0;
+        };
+        let ledger = inner.ledger();
+        match class {
+            SocketClass::Reserve => ledger.budget.reserve,
+            SocketClass::TorrentSession => ledger.budget.torrent_kept,
+            SocketClass::Nntp | SocketClass::Torrent => {
+                ledger.given(&*inner.divider, class.index())
+            }
+        }
+    }
+
+    // Whether `class`'s side presses: something holds one of its demands.
+    pub fn pressing(&self, class: SocketClass) -> bool {
+        let (Some(inner), Some(side)) = (&self.shares, class.side()) else {
+            return false;
+        };
+        inner.ledger().asked(side) > 0
+    }
+
+    // What `class`'s side owes now: the bytes it holds past what it is
+    // given, not counting those already closing, while another side
+    // presses. A level read at the moment it is acted on, never an ask that
+    // can be lost: an answer covers it less what it already has marked to
+    // close, and a mark closes only while it is above nothing.
+    pub fn owed(&self, class: SocketClass) -> u64 {
+        let (Some(inner), Some(side)) = (&self.shares, class.side()) else {
+            return 0;
+        };
+        inner.ledger().owed(&*inner.divider, side)
+    }
+
+    // Whether `class`'s side owes anything now.
+    pub fn owes(&self, class: SocketClass) -> bool {
+        self.owed(class) > 0
+    }
+
+    // `class`'s side was woken and found nothing it could give: it is not
+    // woken again until its own holdings change.
+    pub fn dry(&self, class: SocketClass) {
+        let (Some(inner), Some(side)) = (&self.shares, class.side()) else {
+            return;
+        };
+        let mut ledger = inner.ledger();
+        if ledger.owed(&*inner.divider, side) > 0 {
+            ledger.dry[side] = true;
+        }
+    }
+
+    // How far `class`'s side holds past what it is given, not counting the
+    // bytes already closing. A cheap read; nothing acts on it.
+    pub fn over_share(&self, class: SocketClass) -> u64 {
+        let (Some(inner), Some(side)) = (&self.shares, class.side()) else {
+            return 0;
+        };
+        let ledger = inner.ledger();
+        ledger
+            .active(side)
+            .saturating_sub(ledger.given(&*inner.divider, side))
+    }
+
+    // Rings when a side is to be woken to give bytes back; `woken` says
+    // which.
+    pub fn give_back_asked(&self) -> Option<Arc<Notify>> {
+        Some(Arc::clone(&self.shares.as_ref()?.give_back))
+    }
+
+    // The sides to wake since the last read, by side. A wake carries no
+    // amount: the side woken reads what it owes when it answers.
+    pub fn woken(&self) -> [bool; SIDES] {
+        let Some(inner) = &self.shares else {
+            return [false; SIDES];
+        };
+        std::mem::take(&mut inner.ledger().wake)
+    }
+
+    // The bytes held now, the tunnel's overhead included, and its limit.
+    pub fn reserved(&self) -> u64 {
+        self.shares
+            .as_ref()
+            .map_or(0, |inner| inner.reserved.load(Ordering::Relaxed))
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.shares
+            .as_ref()
+            .map_or(0, |inner| inner.limit.load(Ordering::Relaxed))
+    }
+}
+
+// Whether `bytes` of `class` fit: within the tunnel's bytes, and the reserve
+// within the reserve, a side within what it is given and the sides together
+// within their bytes. A torrent session's socket fits in what is kept for
+// them, or past it in bytes neither the sides nor the reserve hold: it is
+// never given back, so it takes none a give-back would have to close.
+fn fits(ledger: &Ledger, divider: &dyn SocketDivider, class: SocketClass, bytes: u64) -> bool {
+    let held: u64 = ledger.held.iter().sum();
+    held + bytes <= ledger.budget.sockets()
+        && match class {
+            SocketClass::Reserve => ledger.held[RESERVE] + bytes <= ledger.budget.reserve,
+            SocketClass::TorrentSession => {
+                ledger.held[KEPT] + bytes <= ledger.budget.torrent_kept
+                    || ledger.sides_held()
+                        + ledger.held[KEPT]
+                        + bytes
+                        + ledger.budget.reserve.max(ledger.held[RESERVE])
+                        <= ledger.budget.sockets()
+            }
+            SocketClass::Nntp | SocketClass::Torrent => {
+                let side = class.index();
+                ledger.held[side] + bytes <= ledger.given(divider, side)
+                    && ledger.sides_held() + bytes <= ledger.sides()
+            }
+        }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SHARES: SocketShares = SocketShares {
-        nntp: 2,
-        torrent: 1,
-        core: 1,
-        http: 1,
-    };
-
-    #[test]
-    fn each_class_holds_its_own_share() {
-        let sockets = SessionSockets::new(SHARES);
-        let nntp: Vec<_> = (0..2)
-            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
-            .collect();
-        assert!(sockets.take(SocketClass::Nntp).is_err());
-        let torrent = sockets.take(SocketClass::Torrent).unwrap().unwrap();
-        assert!(!sockets.has_room(SocketClass::Torrent));
-        assert!(sockets.has_room(SocketClass::ReserveCore));
-        let tracker = sockets.take(SocketClass::ReserveHttp).unwrap().unwrap();
-        assert!(sockets.take(SocketClass::ReserveHttp).is_err());
-        assert!(sockets.has_room(SocketClass::ReserveCore));
-        drop(tracker);
-        drop(torrent);
-        assert!(sockets.has_room(SocketClass::Torrent));
-        drop(nntp);
-        assert_eq!(sockets.held(SocketClass::Nntp), 0);
-    }
-
-    #[test]
-    fn a_shrunk_share_takes_busy_permits_back_as_they_end() {
-        let sockets = SessionSockets::new(SHARES);
-        let busy: Vec<_> = (0..2)
-            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
-            .collect();
-        sockets.set_shares(SocketShares { nntp: 1, ..SHARES });
-        assert_eq!(sockets.held(SocketClass::Nntp), 2);
-        let mut busy = busy.into_iter();
-        drop(busy.next());
-        assert!(!sockets.has_room(SocketClass::Nntp));
-        drop(busy.next());
-        assert_eq!(sockets.held(SocketClass::Nntp), 0);
-        let one = sockets.take(SocketClass::Nntp).unwrap().unwrap();
-        assert!(sockets.take(SocketClass::Nntp).is_err());
-        drop(one);
-
-        sockets.set_shares(SocketShares { nntp: 3, ..SHARES });
-        let grown: Vec<_> = (0..3)
-            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
-            .collect();
-        assert!(sockets.take(SocketClass::Nntp).is_err());
-        drop(grown);
-    }
-
-    #[test]
-    fn a_share_grown_while_permits_are_owed_cancels_them_first() {
-        let sockets = SessionSockets::new(SHARES);
-        let busy: Vec<_> = (0..2)
-            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
-            .collect();
-        sockets.set_shares(SocketShares { nntp: 0, ..SHARES });
-        sockets.set_shares(SocketShares { nntp: 2, ..SHARES });
-        assert!(sockets.take(SocketClass::Nntp).is_err());
-        drop(busy);
-        assert_eq!(sockets.held(SocketClass::Nntp), 0);
-        let _again: Vec<_> = (0..2)
-            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
-            .collect();
-        assert!(sockets.take(SocketClass::Nntp).is_err());
-    }
-
-    #[test]
-    fn a_session_without_shares_takes_no_permit() {
-        let sockets = SessionSockets::default();
-        assert!(sockets.take(SocketClass::Torrent).unwrap().is_none());
-        assert!(sockets.has_room(SocketClass::Torrent));
-        assert_eq!(sockets.shares(), None);
-    }
-
-    // Usenet shrinks from 101 to 51 with all 101 open while torrent grows
-    // from 123 to 173: torrent takes only what the open usenet sockets leave
-    // under the total, and the rest as they close.
-    #[test]
-    fn a_rebudget_never_lets_the_shares_hold_more_than_the_total() {
-        let before = SocketShares {
-            nntp: 101,
-            torrent: 123,
-            core: 8,
-            http: 8,
-        };
-        let sockets = SessionSockets::new(before);
-        let mut usenet: Vec<_> = (0..101)
-            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
-            .collect();
-        let mut torrent: Vec<_> = (0..100)
-            .map(|_| sockets.take(SocketClass::Torrent).unwrap().unwrap())
-            .collect();
-        sockets.set_shares(SocketShares {
-            nntp: 51,
-            torrent: 173,
-            core: 8,
-            http: 8,
-        });
-        let total = 256 - 16;
-        let take_all = |torrent: &mut Vec<SocketPermit>| {
-            while let Ok(permit) = sockets.take(SocketClass::Torrent) {
-                torrent.push(permit.unwrap());
-            }
-        };
-        take_all(&mut torrent);
-        assert_eq!(torrent.len(), total - 101 - 16);
-        let reserve: Vec<_> = [SocketClass::ReserveCore, SocketClass::ReserveHttp]
-            .into_iter()
-            .flat_map(|class| std::iter::repeat_n(class, 8))
-            .map(|class| sockets.take(class).unwrap().unwrap())
-            .collect();
-        while usenet.len() > 51 {
-            usenet.pop();
-            assert!(!sockets.has_room(SocketClass::Nntp));
-            take_all(&mut torrent);
-            assert_eq!(usenet.len() + torrent.len() + reserve.len(), total);
-        }
-        assert_eq!(torrent.len(), 173);
-        usenet.pop();
-        assert!(!sockets.has_room(SocketClass::Torrent));
-        assert!(sockets.take(SocketClass::Nntp).unwrap().is_some());
-    }
-
-    // A share that moves twice before the shrunk share's sockets end still
-    // never lets the shares hold more than they add up to.
-    #[test]
-    fn two_rebudgets_in_a_row_never_let_the_shares_hold_more_than_the_total() {
-        let shares = |nntp, torrent| SocketShares {
-            nntp,
-            torrent,
-            core: 8,
-            http: 8,
-        };
-        let sockets = SessionSockets::new(shares(100, 100));
-        let take_all = |class, held: &mut Vec<SocketPermit>| {
-            while let Ok(permit) = sockets.take(class) {
-                held.push(permit.unwrap());
-            }
-        };
-        let mut usenet = Vec::new();
-        let mut torrent = Vec::new();
-        take_all(SocketClass::Nntp, &mut usenet);
-        take_all(SocketClass::Torrent, &mut torrent);
-        assert_eq!((usenet.len(), torrent.len()), (100, 100));
-
-        sockets.set_shares(shares(50, 150));
-        take_all(SocketClass::Torrent, &mut torrent);
-        assert_eq!(torrent.len(), 100);
-
-        sockets.set_shares(shares(70, 130));
-        take_all(SocketClass::Torrent, &mut torrent);
-        assert_eq!(torrent.len(), 100);
-        while usenet.len() > 70 {
-            usenet.pop();
-            take_all(SocketClass::Nntp, &mut usenet);
-            take_all(SocketClass::Torrent, &mut torrent);
-            assert_eq!(usenet.len() + torrent.len(), 200);
-        }
-        assert_eq!((usenet.len(), torrent.len()), (70, 130));
-        assert!(!sockets.has_room(SocketClass::Nntp));
-        assert!(!sockets.has_room(SocketClass::Torrent));
-    }
-
-    // A share at exactly its size takes none of the wait another share's
-    // growth needs, so the reserve shrinking beside it still holds the
-    // shares to what they add up to.
-    #[test]
-    fn a_share_at_its_size_takes_none_of_the_wait_on_a_shrunk_reserve() {
-        let shares = |nntp, torrent, core| SocketShares {
-            nntp,
-            torrent,
-            core,
-            http: 4,
-        };
-        let sockets = SessionSockets::new(shares(101, 117, 18));
-        let take_all = |class, held: &mut Vec<SocketPermit>| {
-            while let Ok(permit) = sockets.take(class) {
-                held.push(permit.unwrap());
-            }
-        };
-        let mut usenet = Vec::new();
-        let mut torrent = Vec::new();
-        let mut core = Vec::new();
-        let mut http = Vec::new();
-        take_all(SocketClass::Nntp, &mut usenet);
-        take_all(SocketClass::Torrent, &mut torrent);
-        take_all(SocketClass::ReserveCore, &mut core);
-        take_all(SocketClass::ReserveHttp, &mut http);
-        let total = |usenet: &Vec<_>, torrent: &Vec<_>, core: &Vec<_>| {
-            usenet.len() + torrent.len() + core.len() + http.len()
-        };
-        assert_eq!(total(&usenet, &torrent, &core), 240);
-
-        for step in [
-            shares(51, 167, 18),
-            shares(71, 147, 18),
-            shares(71, 152, 13),
-        ] {
-            sockets.set_shares(step);
-            take_all(SocketClass::Torrent, &mut torrent);
-            assert_eq!(total(&usenet, &torrent, &core), 240);
-        }
-        usenet.truncate(71);
-        take_all(SocketClass::Torrent, &mut torrent);
-        assert_eq!(torrent.len(), 147);
-        assert_eq!(total(&usenet, &torrent, &core), 240);
-        core.truncate(13);
-        take_all(SocketClass::Torrent, &mut torrent);
-        assert_eq!(torrent.len(), 152);
-        assert_eq!(total(&usenet, &torrent, &core), 240);
-    }
-}
+#[path = "pipe_sockets_tests.rs"]
+mod tests;

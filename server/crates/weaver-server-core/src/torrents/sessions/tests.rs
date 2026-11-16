@@ -4,6 +4,7 @@
 mod outgoing_utp;
 mod pool_members;
 mod system_utp;
+mod tcp_want;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -349,8 +350,10 @@ impl Routes for FakeRoutes {
                 &LegKind::System,
                 crate::torrents::net::system_dialer(),
                 None,
+                None,
             )?,
             leg,
+            tunnels: None,
         })
     }
 
@@ -2386,9 +2389,11 @@ fn leg(kind: LegKind) -> OpenLeg {
             &LegKind::System,
             crate::torrents::net::system_dialer(),
             None,
+            None,
         )
         .unwrap(),
         leg: None,
+        tunnels: None,
     }
 }
 

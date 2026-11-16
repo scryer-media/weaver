@@ -1057,6 +1057,7 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
     use weaver_server_core::proxies::network_metrics::{
         EgressHealthLabel, EgressMetrics, LegDialResult, LegMetrics, LegStateLabel,
         NetworkMetricsSnapshot, PROXY_KINDS, PoolMemberMetrics, PoolMetrics, RungStateLabel,
+        TunnelBytesMetrics,
     };
     NetworkMetricsSnapshot {
         legs: vec![
@@ -1126,6 +1127,22 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
             .into_iter()
             .flat_map(|kind| [(kind, true, 1), (kind, false, 0)])
             .collect(),
+        tunnels: vec![
+            TunnelBytesMetrics {
+                egress_id: 2,
+                proxy_id: 11,
+                via: Vec::new(),
+                reserved_bytes: 120 * 1024 * 1024,
+                limit_bytes: 516 * 1024 * 1024,
+            },
+            TunnelBytesMetrics {
+                egress_id: 2,
+                proxy_id: 13,
+                via: vec![11, 12],
+                reserved_bytes: 40 * 1024 * 1024,
+                limit_bytes: 516 * 1024 * 1024,
+            },
+        ],
     }
 }
 
@@ -1155,6 +1172,10 @@ fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::Tunn
         rung_cooldowns: vec![1; RUNGS],
         rung_fallbacks: vec![2; RUNGS],
         revocations: 3,
+        socket_give_backs: 2,
+        socket_give_back_bytes: 4096,
+        socket_peers_dropped: 5,
+        socket_idle_retired: 6,
     }
 }
 

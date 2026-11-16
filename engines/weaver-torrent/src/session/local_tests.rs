@@ -869,6 +869,71 @@ async fn a_banned_web_seed_stays_banned_across_a_pause() {
     session.stop().await;
 }
 
+// What a test's TCP want holds: says when the want is let go.
+struct WantGone(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for WantGone {
+    fn drop(&mut self) {
+        if let Some(gone) = self.0.take() {
+            let _ = gone.send(());
+        }
+    }
+}
+
+// A look finds the torrent's route crowded out; the receiver resolves once
+// the want it left is let go. The look lands before the connect loop's wait,
+// and the wait lets the want go on entry, or in it, and leaves none.
+fn hold_tcp_want(torrent: &super::ManagedTorrentHandle) -> tokio::sync::oneshot::Receiver<()> {
+    let (gone, released) = tokio::sync::oneshot::channel();
+    torrent
+        .live()
+        .unwrap()
+        .tcp_wants
+        .looked(crate::network::TcpRoom::Crowded(
+            crate::network::TcpWant::new(WantGone(Some(gone))),
+        ));
+    released
+}
+
+// A paused torrent dials no one, so it holds no TCP want: the route stops
+// counting it as pressing for TCP room.
+#[tokio::test]
+async fn a_paused_torrent_holds_no_tcp_want() {
+    let (_dir, session, torrent) = seeding_with(10, 0, crate::limits::LimitKind::Unlimited).await;
+    let mut released = hold_tcp_want(&torrent);
+    session.pause(&torrent).await.unwrap();
+    assert_eq!(
+        released.try_recv(),
+        Ok(()),
+        "the paused torrent kept its want"
+    );
+    session.stop().await;
+}
+
+// A completed torrent that wants no peers, its upload closed, holds no TCP
+// want once its connect loop looks again.
+#[tokio::test]
+async fn a_completed_torrent_wanting_no_peers_holds_no_tcp_want() {
+    let (_dir, session, torrent) = seeding_with(10, 0, crate::limits::LimitKind::Closed).await;
+    let released = hold_tcp_want(&torrent);
+    torrent.live().unwrap().connections_per_ip_changed();
+    released.await.unwrap();
+    assert!(!torrent.live().unwrap().tcp_wants.holds());
+    session.stop().await;
+}
+
+// A completed torrent that still seeds but knows no peer left to dial holds
+// no TCP want once its connect loop looks again.
+#[tokio::test]
+async fn a_completed_torrent_with_no_one_to_dial_holds_no_tcp_want() {
+    let (_dir, session, torrent) = seeding_with(10, 0, crate::limits::LimitKind::Unlimited).await;
+    let released = hold_tcp_want(&torrent);
+    torrent.live().unwrap().connections_per_ip_changed();
+    released.await.unwrap();
+    assert!(!torrent.live().unwrap().tcp_wants.holds());
+    session.stop().await;
+}
+
 // At its bound the session forgets its oldest ban for bad data.
 #[test]
 fn the_session_forgets_its_oldest_ban_for_bad_data_at_its_bound() {

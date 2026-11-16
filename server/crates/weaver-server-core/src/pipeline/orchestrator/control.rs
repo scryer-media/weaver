@@ -860,13 +860,45 @@ impl Pipeline {
         );
     }
 
+    // A WireGuard tunnel woke usenet to give back what it owes there: read
+    // what it owes now and retire enough connections on it to cover that,
+    // less those already marked for it, through the pool's own idle recall,
+    // which charges the servers nothing. Idle ones close now; for the rest,
+    // busy ones are marked to close once their article is done, as a
+    // lowered limit marks them, and are never interrupted. None is dialled
+    // again while usenet holds past its share, since the tunnel refuses it.
+    // An answer that needed some and could close none tells the tunnel, so
+    // it does not wake usenet again until usenet's holdings there change.
+    fn give_back_idle_connections(&self, ask: &crate::jobs::TunnelGiveBack) {
+        let owed = ask.owed.bytes();
+        if owed == 0 {
+            return;
+        }
+        let connections = owed.div_ceil(crate::proxies::usenet_socket_bytes().max(1));
+        let connections = usize::try_from(connections).unwrap_or(usize::MAX);
+        let (needed, retired) = self.nntp.pool().retire_idle_on(
+            connections,
+            |path| ask.holds(path),
+            ask.owed.standing(),
+        );
+        if needed > 0 && retired == 0 {
+            ask.owed.dry();
+        }
+        weaver_tunnel::metrics::record_socket_idle_retired(retired as u64);
+    }
+
     async fn apply_queue_globals(&mut self) {
-        let pending = self
-            .shared_state
-            .queue
-            .write(|inner| Change::unchanged(inner.nntp.take()));
+        let (pending, give_backs) = self.shared_state.queue.write(|inner| {
+            Change::unchanged((
+                inner.nntp.take(),
+                std::mem::take(&mut inner.socket_give_backs),
+            ))
+        });
         if let Some((generation, client, connections)) = pending {
             self.activate_nntp(client, connections, generation);
+        }
+        for ask in give_backs {
+            self.give_back_idle_connections(&ask);
         }
         let iops = self
             .shared_state

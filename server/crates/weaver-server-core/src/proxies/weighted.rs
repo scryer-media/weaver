@@ -402,7 +402,7 @@ impl Weighted {
             .iter()
             .find(|a| a.target > 0)
             .map(|a| a.position)
-            .ok_or_else(|| DialError::AtCapacity(vec![self.shared.changed.clone()]))
+            .ok_or_else(|| DialError::AtCapacity(vec![self.shared.changed.clone()].into()))
     }
     pub fn new(
         route: Route,
@@ -677,7 +677,7 @@ impl Weighted {
                 )
             })
             .map(|a| a.position)
-            .ok_or(DialError::AtCapacity(waits))?;
+            .ok_or(DialError::AtCapacity(waits.into()))?;
         let dialer = legs[position].clone();
         drop(legs);
         state.legs[position].opening += 1;

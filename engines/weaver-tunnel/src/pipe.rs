@@ -23,7 +23,10 @@ pub use buffers::{USENET_SEND_BYTES, set_usenet_receive_bytes, socket_buffers};
 pub use inbound::{
     Inbound, InboundListener, LISTEN_BACKLOG, PortForwarding, PortMapping, gateway_of,
 };
-pub use sockets::{SessionSockets, SocketClass, SocketPermit, SocketShares};
+pub use sockets::{
+    Demand, Refused, SIDE_CLASSES, SIDES, SessionSockets, SocketBudget, SocketClass, SocketDivider,
+    SocketPermit, TUNNEL_LINGER, datagram_bytes, listener_bytes, overhead_bytes, stream_bytes,
+};
 
 #[cfg(test)]
 #[path = "pipe_tests.rs"]
@@ -90,9 +93,11 @@ pub enum Purpose {
     Outbound,
     // A torrent session's peers over TCP.
     Torrent,
-    // A torrent session's trackers, metainfo downloads and web seeds over
-    // HTTP.
+    // A torrent session's trackers and metainfo downloads over HTTP.
     TorrentHttp,
+    // A torrent session's web seed transfers over HTTP: long-lived, as a
+    // peer's are.
+    TorrentWebSeed,
     Probe,
     // A DNS query a hop asks to resolve a name dialled through it.
     Dns,
@@ -414,12 +419,46 @@ impl Dialed {
 #[error("{}", NO_ADDRESS_RESOLVED)]
 pub struct ResolutionFailed;
 
+// A route with no room for a dial: the signals that fire when room may have
+// freed, and the demands its refusals left. A side presses for as long as
+// whoever wants the socket holds the error, or the demands taken from it.
+#[derive(Clone, Debug, Default)]
+pub struct Capacity {
+    pub waits: Vec<Arc<Notify>>,
+    pub demand: Vec<Demand>,
+}
+
+impl Capacity {
+    pub fn extend(&mut self, other: Self) {
+        self.waits.extend(other.waits);
+        self.demand.extend(other.demand);
+    }
+}
+
+impl From<Vec<Arc<Notify>>> for Capacity {
+    fn from(waits: Vec<Arc<Notify>>) -> Self {
+        Self {
+            waits,
+            demand: Vec::new(),
+        }
+    }
+}
+
+impl From<Refused> for Capacity {
+    fn from(refused: Refused) -> Self {
+        Self {
+            waits: vec![refused.freed.notify()],
+            demand: refused.demand.into_iter().collect(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DialError {
     #[error("{0}")]
     Skipped(String),
     #[error("all route legs are at capacity")]
-    AtCapacity(Vec<Arc<Notify>>),
+    AtCapacity(Capacity),
     // The WireGuard session budget has no session left for the dial. Read as
     // `Skipped` is everywhere but `is_capacity`: no evidence, the same text.
     #[error("{}", SESSION_BUDGET_EXHAUSTED)]
@@ -493,7 +532,7 @@ impl DialError {
             Self::Fatal(source)
         } else if let TunnelError::AtCapacity { freed, .. } = &source {
             // A full tunnel is working; it has room again once a socket closes.
-            Self::AtCapacity(vec![freed.notify()])
+            Self::AtCapacity(vec![freed.notify()].into())
         } else if matches!(&source, TunnelError::Dial { detail, .. } if is_forwarding_refusal(detail))
         {
             // The proxy answered and refused to forward at all. That is the
@@ -512,7 +551,7 @@ impl Replicate for DialError {
     fn replicate(&self) -> Self {
         match self {
             Self::Skipped(reason) => Self::Skipped(reason.clone()),
-            Self::AtCapacity(waits) => Self::AtCapacity(waits.clone()),
+            Self::AtCapacity(capacity) => Self::AtCapacity(capacity.clone()),
             Self::SessionBudget => Self::SessionBudget,
             Self::Bind(error) => Self::Bind(error.replicate()),
             Self::Egress(error) => Self::Egress(error.replicate()),
@@ -724,6 +763,13 @@ pub trait Dialer: Send + Sync {
     fn has_room(&self, purpose: &Purpose) -> bool {
         self.room(purpose).is_ok()
     }
+    // As `room`, but where a share is refused only because another holds
+    // past what it is given, the refusal carries the share's demand: while
+    // the caller holds it, its share presses for the room. A path that
+    // cannot press answers as `room` does.
+    fn wait_room(&self, purpose: &Purpose) -> Result<(), Capacity> {
+        self.room(purpose).map_err(Capacity::from)
+    }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError>;
     async fn resolve(&self, _host: &str) -> Result<Resolution, DialError> {
         Ok(Resolution::Unresolved)
@@ -741,6 +787,11 @@ pub trait Dialer: Send + Sync {
     // egress sends them from its own sockets; any other stage only through
     // what it carries.
     fn relay_datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        self.datagrams()
+    }
+    // Datagrams a WireGuard tunnel stacked directly on this stage sends its
+    // packets through. They carry every kind of traffic.
+    fn carrier_datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         self.datagrams()
     }
     // Stream connections arriving through this stage, for a session that
@@ -1131,6 +1182,9 @@ impl Dialer for TransportHop {
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
         self.inner.room(purpose)
     }
+    fn wait_room(&self, purpose: &Purpose) -> Result<(), Capacity> {
+        self.inner.wait_room(purpose)
+    }
     fn failing_hop(&self) -> Option<FailingHop> {
         self.inner
             .failing_hop()
@@ -1243,6 +1297,9 @@ impl Drop for OutcomeStream {
         // SAFETY: the stream is dropped exactly once, here, and never used
         // again; the guard above holds the runtime for the drop.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.stream) };
+        // The stream's bytes start their linger after the tunnel retired the
+        // stream, inside the runtime, so the timer that gives them back runs.
+        drop(self._socket.take());
         self.outcome.closed();
     }
 }
@@ -1341,16 +1398,30 @@ pub struct SessionHop {
 }
 
 impl SessionHop {
-    // A permit of `class`'s share of the tunnel's sockets. A full share
-    // says the session is at capacity until one of its sockets closes.
-    fn take_socket(&self, class: SocketClass) -> Result<Option<SocketPermit>, DialError> {
-        self.sockets.take(class).map_err(|freed| {
+    // The bytes a socket for `purpose` holds in this session's tunnel.
+    fn purpose_bytes(sockets: &SessionSockets, purpose: &Purpose) -> u64 {
+        match purpose {
+            Purpose::Datagram => datagram_bytes(sockets.budget().map_or(0, |budget| budget.mtu)),
+            purpose => stream_bytes(socket_buffers(purpose)),
+        }
+    }
+
+    // `bytes` of `class` in `sockets`, this session's or a lender's. No
+    // room says the session is at capacity until bytes come back.
+    fn take_socket(
+        &self,
+        sockets: &SessionSockets,
+        class: SocketClass,
+        bytes: u64,
+    ) -> Result<Option<SocketPermit>, DialError> {
+        sockets.take(class, bytes).map_err(|refused| {
             tracing::debug!(
                 proxy = self.id,
                 share = class.as_str(),
-                "the tunnel's socket share is full"
+                bytes,
+                "the tunnel's bytes for the class are taken"
             );
-            DialError::AtCapacity(vec![freed])
+            DialError::AtCapacity(refused.into())
         })
     }
 
@@ -1437,16 +1508,24 @@ impl Dialer for SessionHop {
         // A probe lent another session's tunnel dials through it, and holds
         // that session busy, not its own; the lender's budget already counts
         // the tunnel.
-        let (provider, activity, capacity) = match identity::claim(self).await {
-            Some(lent) => (lent.provider, lent.activity, None),
+        let (provider, activity, capacity, sockets) = match identity::claim(self).await {
+            Some(lent) => (lent.provider, lent.activity, None, lent.sockets),
             None => (
                 self.provider.clone(),
                 self.activity.clone().read_owned().await,
                 self.capacity.acquire()?,
+                self.sockets.clone(),
             ),
         };
-        let socket = self.take_socket(SocketClass::of(&target.purpose))?;
         let buffers = socket_buffers(&target.purpose);
+        // A stream lingers in the tunnel after it closes, so its bytes come
+        // back only once the tunnel frees it. One that never connected is
+        // discarded at once.
+        let socket = self.take_socket(
+            &sockets,
+            SocketClass::of(&target.purpose),
+            stream_bytes(buffers),
+        )?;
         let outcome = Arc::new(ConnectionOutcome::default());
         let mut connected = Err(DialError::Skipped("no destination".into()));
         let mut tried = target.host.as_str();
@@ -1519,6 +1598,11 @@ impl Dialer for SessionHop {
             )
         });
         path.proxies.push(self.id);
+        // The owner counts the socket connected once its session is set up;
+        // the tunnel then reads that side's holdings as moved.
+        if let Some(socket) = &socket {
+            outcome.on_connected(socket.connected_signal());
+        }
         Ok(Dialed {
             stream: DialedStream::Tunnel(Box::new(
                 OutcomeStream::new(
@@ -1527,7 +1611,7 @@ impl Dialer for SessionHop {
                     Some(activity),
                     capacity,
                 )
-                .holding(socket),
+                .holding(socket.map(SocketPermit::lingering)),
             )),
             outcome,
             path,
@@ -1594,13 +1678,35 @@ impl Dialer for SessionHop {
     }
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
         self.sockets
-            .room(SocketClass::of(purpose))
-            .map_err(|freed| vec![freed])
+            .room(
+                SocketClass::of(purpose),
+                Self::purpose_bytes(&self.sockets, purpose),
+            )
+            .map_err(|freed| vec![freed.notify()])
+    }
+    fn wait_room(&self, purpose: &Purpose) -> Result<(), Capacity> {
+        self.sockets
+            .wait_room(
+                SocketClass::of(purpose),
+                Self::purpose_bytes(&self.sockets, purpose),
+            )
+            .map_err(Capacity::from)
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
-        self.resolver
-            .is_some()
-            .then(|| Arc::new(datagram::SessionDatagrams::new(self)) as Arc<dyn DatagramTransport>)
+        self.resolver.is_some().then(|| {
+            Arc::new(datagram::SessionDatagrams::new(
+                self,
+                SocketClass::TorrentSession,
+            )) as Arc<dyn DatagramTransport>
+        })
+    }
+    // The tunnel stacked on this one rides one datagram socket of the
+    // reserve: it carries every kind of traffic.
+    fn carrier_datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        self.resolver.is_some().then(|| {
+            Arc::new(datagram::SessionDatagrams::new(self, SocketClass::Reserve))
+                as Arc<dyn DatagramTransport>
+        })
     }
     fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
         self.resolver
@@ -1762,6 +1868,37 @@ impl Fallback {
     fn answering(&self) -> Option<usize> {
         (0..self.rungs.len()).find(|index| self.allows_rung(*index, false))
     }
+
+    // Room on the first rung a dial for `purpose` would try, asked of it by
+    // `ask`: a probe tries the rungs still cooling too. With none on it, the
+    // dial waits for that rung's share and for each rung it skipped as
+    // cooling to finish its cooldown or free a socket of its own.
+    fn rung_room(
+        &self,
+        purpose: &Purpose,
+        ask: impl Fn(&Arc<dyn Dialer>) -> Result<(), Capacity>,
+    ) -> Result<(), Capacity> {
+        let probe = probes(purpose);
+        let mut skipped = Vec::new();
+        for (index, rung) in self.rungs.iter().enumerate() {
+            if !self.allows_rung(index, probe) {
+                skipped.push(
+                    self.states.lock().expect("rung state")[index]
+                        .cooled
+                        .clone(),
+                );
+                if let Err(freed) = rung.room(purpose) {
+                    skipped.extend(freed);
+                }
+                continue;
+            }
+            return ask(rung).map_err(|mut capacity| {
+                capacity.waits.extend(skipped);
+                capacity
+            });
+        }
+        Ok(())
+    }
 }
 
 // `target` as `rung`, a ladder rung or a route leg, dials it. Addresses
@@ -1825,7 +1962,7 @@ impl Dialer for Fallback {
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let mut last = DialError::Skipped("all rungs are unavailable".into());
-        let mut capacity_changes = Vec::new();
+        let mut capacity_changes = Capacity::default();
         let answering = self.answering();
         for (index, rung) in self.rungs.iter().enumerate() {
             if !self.allows_rung(index, probes(&target.purpose)) {
@@ -1854,7 +1991,7 @@ impl Dialer for Fallback {
                 }
             }
         }
-        if !last.is_evidence() && !capacity_changes.is_empty() {
+        if !last.is_evidence() && !capacity_changes.waits.is_empty() {
             return Err(DialError::AtCapacity(capacity_changes));
         }
         Err(last)
@@ -1866,31 +2003,15 @@ impl Dialer for Fallback {
             None => Ok(Resolution::Unresolved),
         }
     }
-    // Room on the first rung a dial for `purpose` would try: a probe tries
-    // the rungs still cooling too. With none on it, the dial waits for that
-    // rung's share and for each rung it skipped as cooling to finish its
-    // cooldown or free a socket of its own.
+    // Room on the first rung a dial for `purpose` would try.
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
-        let probe = probes(purpose);
-        let mut skipped = Vec::new();
-        for (index, rung) in self.rungs.iter().enumerate() {
-            if !self.allows_rung(index, probe) {
-                skipped.push(
-                    self.states.lock().expect("rung state")[index]
-                        .cooled
-                        .clone(),
-                );
-                if let Err(freed) = rung.room(purpose) {
-                    skipped.extend(freed);
-                }
-                continue;
-            }
-            return rung.room(purpose).map_err(|mut freed| {
-                freed.extend(skipped);
-                freed
-            });
-        }
-        Ok(())
+        self.rung_room(purpose, |rung| rung.room(purpose).map_err(Capacity::from))
+            .map_err(|capacity| capacity.waits)
+    }
+    // The dial presses on the rung it would try; a rung skipped as cooling
+    // is only looked at.
+    fn wait_room(&self, purpose: &Purpose) -> Result<(), Capacity> {
+        self.rung_room(purpose, |rung| rung.wait_room(purpose))
     }
     // The datagrams of the first rung a dial would try.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {

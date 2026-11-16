@@ -220,7 +220,104 @@ pub trait JobClass: Send + Sync {
     fn intake(&self) -> Option<&dyn ClassIntake> {
         None
     }
+
+    /// A WireGuard tunnel wakes the class to give back what it owes there,
+    /// as another class presses for bytes this one holds past its share.
+    /// Answered without waiting: on its own turn the class reads what it
+    /// owes then, `ask.owed`, and closes what it can of that less what it
+    /// has already marked to close, never a busy connection; the rest comes
+    /// back as its sockets close by themselves. An answer that finds nothing
+    /// it can give says so, through `ask.owed`.
+    fn give_back(&self, ask: TunnelGiveBack) {
+        let _ = ask;
+    }
 }
+
+/// A WireGuard tunnel's wake for a class to give back its sockets there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TunnelGiveBack {
+    /// The tunnel: its egress and the hops up to and including it, as a
+    /// socket's `DialPath` names them.
+    pub egress: u32,
+    pub hops: Vec<u32>,
+    /// The torrent sessions whose legs run over the tunnel.
+    pub torrent_routes: Vec<crate::torrents::sessions::RouteKey>,
+    /// What the class owes the tunnel, read when it acts.
+    pub owed: Owed,
+}
+
+impl TunnelGiveBack {
+    /// Whether a socket dialled over `path` sits in the tunnel itself: on
+    /// its egress, with the tunnel its last hop.
+    pub fn holds(&self, path: &weaver_tunnel::pipe::DialPath) -> bool {
+        self.rides(path.egress, &path.proxies)
+    }
+
+    /// Whether a socket on `egress` through `proxies` sits in the tunnel.
+    pub fn rides(&self, egress: u32, proxies: &[u32]) -> bool {
+        egress == self.egress && proxies == self.hops
+    }
+}
+
+/// What a class owes a tunnel: the bytes it holds there past what it is
+/// given while another class presses, read at the moment it is acted on.
+/// A level, never an amount handed over once: an answer, or a connection
+/// marked to close for one, reads it again when it acts.
+#[derive(Clone)]
+pub struct Owed {
+    owed: Arc<dyn Fn() -> u64 + Send + Sync>,
+    dry: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Owed {
+    /// `owed` reads the level; `dry` tells the tunnel an answer found
+    /// nothing it could give.
+    pub fn new(
+        owed: impl Fn() -> u64 + Send + Sync + 'static,
+        dry: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            owed: Arc::new(owed),
+            dry: Arc::new(dry),
+        }
+    }
+
+    /// The bytes owed now.
+    pub fn bytes(&self) -> u64 {
+        (self.owed)()
+    }
+
+    /// Whether anything is owed now.
+    pub fn stands(&self) -> bool {
+        self.bytes() > 0
+    }
+
+    /// The answer found nothing it could give: the class is not woken again
+    /// until its own holdings on the tunnel change.
+    pub fn dry(&self) {
+        (self.dry)()
+    }
+
+    /// Whether anything is owed, as a connection marked to close reads it.
+    pub fn standing(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let owed = Arc::clone(&self.owed);
+        Arc::new(move || owed() > 0)
+    }
+}
+
+impl std::fmt::Debug for Owed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Owed")
+    }
+}
+
+impl PartialEq for Owed {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owed, &other.owed)
+    }
+}
+
+impl Eq for Owed {}
 
 /// Where an intake hands a payload.
 pub enum Route<'a> {
@@ -348,6 +445,15 @@ impl JobClass for PipelineClass {
             }
         }
         outcome
+    }
+
+    // The pipeline answers on its own turn: the ask waits in the queue for
+    // it, and the turn retires idle connections on the tunnel.
+    fn give_back(&self, ask: TunnelGiveBack) {
+        self.0.write_intent(|inner| {
+            inner.socket_give_backs.push(ask);
+            crate::pipeline::queue::Change::unchanged(())
+        });
     }
 }
 

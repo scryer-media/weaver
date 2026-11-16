@@ -649,7 +649,7 @@ fn a_full_route_refuses_the_lane_for_capacity_and_spares_the_server() {
         .build()
         .unwrap();
     let refusals: [fn() -> weaver_tunnel::pipe::DialError; 2] = [
-        || weaver_tunnel::pipe::DialError::AtCapacity(Vec::new()),
+        || weaver_tunnel::pipe::DialError::AtCapacity(Default::default()),
         || weaver_tunnel::pipe::DialError::SessionBudget,
     ];
     for refusal in refusals {
@@ -741,7 +741,7 @@ fn a_real_fault_outranks_a_full_route_and_two_full_routes_wait() {
         .build()
         .unwrap();
     let full: fn() -> weaver_tunnel::pipe::DialError =
-        || weaver_tunnel::pipe::DialError::AtCapacity(Vec::new());
+        || weaver_tunnel::pipe::DialError::AtCapacity(Default::default());
     let refused: fn() -> weaver_tunnel::pipe::DialError = || {
         weaver_tunnel::pipe::DialError::Refused(std::io::Error::from(
             std::io::ErrorKind::ConnectionRefused,
@@ -772,6 +772,150 @@ fn a_real_fault_outranks_a_full_route_and_two_full_routes_wait() {
     };
     assert!(error.is_route_capacity(), "{error:?}");
     assert!(error.should_requeue_owned_work());
+}
+
+// Gives the sides nothing: every usenet socket is refused, and presses.
+struct NoRoom;
+
+impl weaver_tunnel::pipe::SocketDivider for NoRoom {
+    fn shares(&self, _: u64) -> [u64; weaver_tunnel::pipe::SIDES] {
+        [0; weaver_tunnel::pipe::SIDES]
+    }
+
+    fn share_out(&self, _: u64, shares: &[u64], _: &[Option<u64>], _: &[u64]) -> Vec<u64> {
+        shares.to_vec()
+    }
+
+    fn presses(&self, used: u64, given: u64) -> bool {
+        used >= given
+    }
+}
+
+fn full_tunnel() -> Arc<weaver_tunnel::pipe::SessionSockets> {
+    const MTU: u16 = 1420;
+    Arc::new(weaver_tunnel::pipe::SessionSockets::new(
+        weaver_tunnel::pipe::SocketBudget {
+            bytes: weaver_tunnel::pipe::overhead_bytes(MTU),
+            reserve: 0,
+            torrent_kept: 0,
+            mtu: MTU,
+        },
+        Arc::new(NoRoom),
+    ))
+}
+
+// A route whose tunnel has no room: each dial is refused by the tunnel's
+// ledger, and the refusal carries the press it leaves.
+struct LedgerRoute(Arc<weaver_tunnel::pipe::SessionSockets>);
+
+#[async_trait::async_trait]
+impl weaver_tunnel::pipe::Dialer for LedgerRoute {
+    async fn dial(
+        &self,
+        _: &weaver_tunnel::pipe::Target,
+    ) -> std::result::Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+        let refused = match self.0.take(
+            weaver_tunnel::pipe::SocketClass::Nntp,
+            weaver_tunnel::pipe::stream_bytes(None),
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("a tunnel with no room hands out no socket"),
+        };
+        Err(weaver_tunnel::pipe::DialError::AtCapacity(refused.into()))
+    }
+    fn budget(&self) -> Duration {
+        UNREACHED_TIMEOUT
+    }
+    fn describe(&self) -> String {
+        "ledger route fixture".into()
+    }
+}
+
+// A client of two servers, each behind its own full tunnel.
+fn client_behind_two_tunnels(
+    runtime: &tokio::runtime::Runtime,
+    tunnels: &[Arc<weaver_tunnel::pipe::SessionSockets>; 2],
+) -> NntpClient {
+    let servers = tunnels
+        .iter()
+        .enumerate()
+        .map(|(index, tunnel)| {
+            let mut server = scripted_server(119 + index as u16, 0);
+            server.server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+                inner: Arc::new(LedgerRoute(Arc::clone(tunnel))),
+                plan: None,
+                egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+                runtime: runtime.handle().clone(),
+                server: index as u32 + 1,
+            });
+            server
+        })
+        .collect();
+    NntpClient::new(NntpClientConfig {
+        servers,
+        max_idle_age: Duration::from_secs(30),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    })
+}
+
+// Every tunnel that refused a lane keeps its press while the work waits, not
+// only the last one asked, and whichever error answers. The press ends when
+// the work drops its demand.
+#[test]
+fn every_tunnel_that_refused_a_lane_keeps_its_press() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let usenet = weaver_tunnel::pipe::SocketClass::Nntp;
+
+    // Both tunnels full: the route's error answers, and both press.
+    let tunnels = [full_tunnel(), full_tunnel()];
+    let client = client_behind_two_tunnels(&runtime, &tunnels);
+    let mut route_demand = Vec::new();
+    let Err(error) = client.try_acquire_blocking_body_lane_pressing(
+        &[],
+        crate::ServerSet::EMPTY,
+        0,
+        &mut route_demand,
+    ) else {
+        panic!("no tunnel opens a lane");
+    };
+    assert!(error.is_route_capacity(), "{error:?}");
+    assert!(tunnels.iter().all(|tunnel| tunnel.pressing(usenet)));
+    drop(error);
+    assert!(
+        tunnels.iter().all(|tunnel| tunnel.pressing(usenet)),
+        "the work's demand holds both presses"
+    );
+    drop(route_demand);
+    assert!(tunnels.iter().all(|tunnel| !tunnel.pressing(usenet)));
+
+    // A's tunnel full and B at its provider's limit: the provider's error
+    // answers, as before, and A's tunnel still presses.
+    let tunnels = [full_tunnel(), full_tunnel()];
+    let client = client_behind_two_tunnels(&runtime, &tunnels);
+    client.pool().note_provider_over_limit(ServerId(1));
+    let mut route_demand = Vec::new();
+    let Err(error) = client.try_acquire_blocking_body_lane_pressing(
+        &[],
+        crate::ServerSet::EMPTY,
+        0,
+        &mut route_demand,
+    ) else {
+        panic!("no server opens a lane");
+    };
+    assert!(
+        matches!(error, BlockingBodyLaneAcquireError::ProviderCapacity(_)),
+        "{error:?}"
+    );
+    drop(error);
+    assert!(tunnels[0].pressing(usenet), "A's refusal still presses");
+    assert!(!tunnels[1].pressing(usenet), "B was never dialled");
+    drop(route_demand);
+    assert!(!tunnels[0].pressing(usenet));
 }
 
 #[test]

@@ -849,7 +849,7 @@ async fn saturated_fallback_reports_every_capacity_release_source() {
             self.available.load(Ordering::Acquire)
         }
         async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
-            Err(DialError::AtCapacity(vec![self.changed.clone()]))
+            Err(DialError::AtCapacity(vec![self.changed.clone()].into()))
         }
         fn budget(&self) -> Duration {
             Duration::ZERO
@@ -873,9 +873,9 @@ async fn saturated_fallback_reports_every_capacity_release_source() {
     else {
         panic!("all saturated rungs must report capacity");
     };
-    assert_eq!(changes.len(), 2);
-    assert!(Arc::ptr_eq(&changes[0], &first.changed));
-    assert!(Arc::ptr_eq(&changes[1], &second.changed));
+    assert_eq!(changes.waits.len(), 2);
+    assert!(Arc::ptr_eq(&changes.waits[0], &first.changed));
+    assert!(Arc::ptr_eq(&changes.waits[1], &second.changed));
     for rung in [&first, &second] {
         rung.available.store(true, Ordering::Release);
         assert!(ladder.has_capacity());
@@ -1119,7 +1119,7 @@ fn only_a_full_tunnel_or_session_budget_is_a_capacity_refusal() {
         "{exhausted:?}"
     );
     assert!(exhausted.is_capacity(), "{exhausted}");
-    assert!(DialError::AtCapacity(Vec::new()).is_capacity());
+    assert!(DialError::AtCapacity(Default::default()).is_capacity());
     for other in [
         // Only the variant is capacity: the same words in a skip are not.
         DialError::Skipped(SESSION_BUDGET_EXHAUSTED.into()),
@@ -2142,7 +2142,7 @@ async fn a_full_tunnel_waits_for_room_without_cooling_its_rung() {
     let Err(DialError::AtCapacity(waits)) = ladder.dial(&target).await else {
         panic!("a full tunnel is at capacity");
     };
-    assert!(Arc::ptr_eq(&waits[0], &freed.notify()));
+    assert!(Arc::ptr_eq(&waits.waits[0], &freed.notify()));
     assert_eq!(ladder.rung_states(), ["STANDBY"]);
 }
 
@@ -2569,9 +2569,24 @@ fn a_revoked_leg_reports_no_route() {
     ));
 }
 
-// Each kind of traffic holds its own share of a WireGuard tunnel's sockets.
-// A full share is at capacity until one of its streams closes, and traffic
-// of another kind still dials or binds.
+// Gives torrents every byte of the sides and usenet none.
+struct TorrentsOnly;
+
+impl SocketDivider for TorrentsOnly {
+    fn shares(&self, cap: u64) -> [u64; SIDES] {
+        [0, cap]
+    }
+    fn share_out(&self, cap: u64, _: &[u64], _: &[Option<u64>], _: &[u64]) -> Vec<u64> {
+        vec![0, cap]
+    }
+    fn presses(&self, used: u64, given: u64) -> bool {
+        used >= given
+    }
+}
+
+// Each class holds its own part of a WireGuard tunnel's bytes. A full part
+// is at capacity, a dropped stream's bytes linger, and the reserve still
+// dials.
 #[tokio::test]
 async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     let near = crate::test_support::WireGuardTestPeer::start().await;
@@ -2582,13 +2597,18 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
         )
         .with_udp_factory(bottom()),
     );
+    let stream = stream_bytes(None);
+    let mtu = near.client_spec("1").mtu;
     let session = Arc::new(SessionHop {
-        sockets: Arc::new(SessionSockets::new(SocketShares {
-            nntp: 0,
-            torrent: 1,
-            core: 1,
-            http: 1,
-        })),
+        sockets: Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(mtu) + 2 * stream,
+                reserve: stream,
+                torrent_kept: 0,
+                mtu,
+            },
+            Arc::new(TorrentsOnly),
+        )),
         ..Arc::into_inner(wireguard_session(
             1,
             provider.clone(),
@@ -2607,25 +2627,27 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     assert!(session.has_room(&Purpose::Torrent));
     let peer = session.dial(&target(Purpose::Torrent)).await.unwrap();
     assert!(!session.has_room(&Purpose::Torrent));
-    assert_eq!(session.sockets.held(SocketClass::Torrent), 1);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
     assert!(matches!(
         session.dial(&target(Purpose::Torrent)).await,
         Err(DialError::AtCapacity(_))
     ));
-    let tracker = session.dial(&target(Purpose::TorrentHttp)).await.unwrap();
-    assert_eq!(session.sockets.held(SocketClass::ReserveHttp), 1);
-    // A tracker storm fills the HTTP reserve and leaves the DHT and uTP
-    // their datagram sockets.
+    // A web seed transfer and the DHT are torrents' too.
     assert!(matches!(
-        session.dial(&target(Purpose::Feed { feed: 1 })).await,
+        session.dial(&target(Purpose::TorrentWebSeed)).await,
         Err(DialError::AtCapacity(_))
     ));
     let datagrams = Arc::clone(&session).datagrams().unwrap();
     let far: SocketAddr = "192.0.2.50:6881".parse().unwrap();
-    let utp = datagrams.bind(far).await.unwrap();
-    assert_eq!(session.sockets.held(SocketClass::ReserveCore), 1);
     assert!(datagrams.bind(far).await.is_err());
-    drop(utp);
+    // The reserve is off the split: with the torrent side full, an announce
+    // dials at once.
+    let announce = session.dial(&target(Purpose::TorrentHttp)).await.unwrap();
+    assert_eq!(session.sockets.held(SocketClass::Reserve), stream);
+    assert!(matches!(
+        session.dial(&target(Purpose::Feed { feed: 2 })).await,
+        Err(DialError::AtCapacity(_))
+    ));
     assert!(matches!(
         session
             .dial(&target(Purpose::Nntp {
@@ -2637,22 +2659,23 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
         Err(DialError::AtCapacity(_))
     ));
 
+    // A dropped stream lingers in the tunnel, and its bytes with it.
     drop(peer);
-    assert!(session.has_room(&Purpose::Torrent));
-    let _again = session.dial(&target(Purpose::Torrent)).await.unwrap();
-    drop(tracker);
-    assert_eq!(session.sockets.held(SocketClass::ReserveHttp), 0);
+    assert_eq!(session.sockets.lingering(SocketClass::Torrent), stream);
+    assert!(!session.has_room(&Purpose::Torrent));
+    drop(announce);
+    assert_eq!(session.sockets.lingering(SocketClass::Reserve), stream);
 }
 
 // A stage that records the purpose of every dial and fails it, with room in
-// every share but the HTTP reserve.
+// every class but the reserve.
 #[derive(Default)]
 struct RecordsPurpose(Mutex<Vec<Purpose>>);
 
 #[async_trait::async_trait]
 impl Dialer for RecordsPurpose {
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
-        if SocketClass::of(purpose) == SocketClass::ReserveHttp {
+        if SocketClass::of(purpose) == SocketClass::Reserve {
             Err(Vec::new())
         } else {
             Ok(())
@@ -2700,7 +2723,7 @@ async fn a_chained_dial_takes_its_own_share_of_the_tunnel_beneath() {
         .collect();
     assert_eq!(classes, [SocketClass::Nntp, SocketClass::Torrent]);
     assert!(chain.has_room(&Purpose::Torrent));
-    assert!(!chain.has_room(&Purpose::TorrentHttp));
+    assert!(!chain.has_room(&Purpose::Feed { feed: 1 }));
 }
 
 // A rung whose share has room, or is full and says what frees it.

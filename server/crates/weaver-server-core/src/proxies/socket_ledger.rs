@@ -1,38 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// How each WireGuard tunnel's sockets are shared out.
+// How each WireGuard tunnel's bytes are shared out.
 //
-// A tunnel holds `cap` sockets. Usenet servers routed through it get every
-// connection they may put on it, so a leg that takes over a failed leg's
-// share still has the sockets. At least an eighth of the tunnel is reserved
-// for the rest. A sixteenth is never handed out, so sockets closed but still
-// lingering in the tunnel never leave a new one without room. The tunnel's
-// own sockets (name lookups, probes, and each torrent session's datagram
-// sockets and listeners) are counted from the routes that reach it, and HTTP
-// (trackers, web seeds, feeds) has what else the reserve holds, so a tracker
-// storm never takes the sockets DHT and uTP bind. A listener's sockets are
-// held for as long as it listens and never through a share, so the reserve
-// keeps them and no share hands them out. A tunnel whose own sockets need
-// more than the eighth reserves more. Torrent peers over TCP take what is
-// left; once that is full they connect over uTP, which needs no socket of
-// its own.
+// A tunnel holds WIREGUARD_INSTANCE_BYTES, and every byte it allocates is
+// charged against that: its own overhead, then each socket at the size the
+// tunnel allocates for it (see `weaver_tunnel::pipe::SessionSockets`). A
+// reserve is kept off the split for what serves every kind of traffic: name
+// lookups, probes, feeds and other outbound HTTP, and the carriers of
+// proxies above. The rest is divided between usenet and torrents by the
+// bandwidth split in force: one class alone may take all of it, and classes
+// that both press get their shares.
 //
 // Usenet connections are set per server, so a save that asks more than the
-// tunnel can hold is refused. The torrent peer limit is one setting for
-// every route, so it is never refused: its TCP peers are held to the share.
+// tunnel can hold beside what it keeps for itself and its torrent sessions'
+// listeners and datagram sockets is refused. The torrent peer limit is one
+// setting for every route, so it is never refused: its TCP peers take what
+// the split gives torrents, and connect over uTP past it.
 
 use std::collections::{HashMap, HashSet};
 
-use weaver_tunnel::pipe::{LISTEN_BACKLOG, SocketShares};
+use weaver_tunnel::pipe::{
+    Purpose, SIDES, SocketBudget, SocketDivider, datagram_bytes, listener_bytes, overhead_bytes,
+    socket_buffers, stream_bytes,
+};
 
 use super::{
     Consumer, Failover, LegPath, NetworkRefusal, ProxyKind, ProxyPool, ProxyProfile, Route, Rung,
+    WIREGUARD_INSTANCE_BYTES,
 };
-
-// TCP peers a tunnel keeps for a torrent route that uses it, however much
-// usenet asks.
-pub const SOCKET_PEER_FLOOR: usize = 16;
 
 // The tunnel's own sockets kept for name lookups, probes and the carriers
 // of proxies above it.
@@ -45,58 +41,62 @@ pub const SOCKET_CORE_BASE: usize = 8;
 pub const DATAGRAMS_PER_TORRENT_SESSION: usize = 5;
 
 // The TCP listeners one torrent session opens on a tunnel: its peer
-// listener, and its SSL listener when SSL torrents are on. Each holds the
-// tunnel's listen backlog in sockets for as long as it listens.
+// listener, and its SSL listener when SSL torrents are on.
 pub const LISTENERS_PER_TORRENT_SESSION: usize = 2;
 
-// The sockets one torrent session's listeners hold on a tunnel.
-pub const LISTENING_PER_TORRENT_SESSION: usize = LISTENERS_PER_TORRENT_SESSION * LISTEN_BACKLOG;
-
-// Every socket one torrent session holds on a tunnel for its whole life: its
-// datagram sockets and its listeners' sockets.
-pub const SOCKETS_PER_TORRENT_SESSION: usize =
-    DATAGRAMS_PER_TORRENT_SESSION + LISTENING_PER_TORRENT_SESSION;
-
-// The fewest HTTP sockets a tunnel keeps however many torrent sessions it
-// carries.
+// The fewest HTTP sockets (feeds, other outbound) a tunnel keeps.
 pub const SOCKET_HTTP_FLOOR: usize = 4;
 
-// The HTTP sockets a tunnel of `cap` keeps however many torrent sessions it
-// carries: one in 32 of the cap, and never under the floor.
-pub fn socket_http_floor(cap: usize) -> usize {
-    SOCKET_HTTP_FLOOR.max(cap / 32)
+// The MTU a tunnel is budgeted at when nothing names one.
+const DEFAULT_MTU: u16 = 1420;
+
+// What one torrent session holds on a tunnel of `mtu` for its whole life:
+// its datagram sockets and its listeners.
+pub fn torrent_session_bytes(mtu: u16) -> u64 {
+    DATAGRAMS_PER_TORRENT_SESSION as u64 * datagram_bytes(mtu)
+        + LISTENERS_PER_TORRENT_SESSION as u64 * listener_bytes()
 }
 
-// The tunnel's own sockets when `torrent_sessions` torrent sessions use it,
-// their listeners' sockets among them.
-pub fn socket_core(torrent_sessions: usize) -> usize {
-    SOCKET_CORE_BASE + SOCKETS_PER_TORRENT_SESSION * torrent_sessions
+// What one usenet connection holds of a tunnel, at the buffers the hardware
+// profile in force gives it.
+pub fn usenet_socket_bytes() -> u64 {
+    stream_bytes(socket_buffers(&Purpose::Nntp {
+        server: 0,
+        leg: 0,
+        probing: false,
+    }))
 }
 
-// The sockets the listeners of `torrent_sessions` torrent sessions hold on a
-// tunnel, which no share hands out.
-pub fn socket_listening(torrent_sessions: usize) -> usize {
-    LISTENING_PER_TORRENT_SESSION * torrent_sessions
+// Put the hardware profile's usenet receive buffer in force. When that
+// changes what a usenet connection holds, the routes are reloaded, so every
+// tunnel's ledger, its over-budget warning and its sessions' budgets are
+// computed again at the new size. Returns whether the size changed.
+pub fn set_usenet_receive_bytes(
+    bytes: usize,
+    proxies: Option<std::sync::Arc<super::ProxyRuntime>>,
+) -> bool {
+    if !weaver_tunnel::pipe::set_usenet_receive_bytes(bytes) {
+        return false;
+    }
+    if let (Some(proxies), Ok(runtime)) = (proxies, tokio::runtime::Handle::try_current()) {
+        runtime.spawn(async move {
+            if let Err(error) = proxies.reload().await {
+                tracing::warn!(
+                    error,
+                    "budgeting the WireGuard tunnels for a new usenet buffer size failed"
+                );
+            }
+        });
+    }
+    true
 }
 
-// The sockets a tunnel of `cap` reserves for everything but usenet and
-// torrent peers over TCP, when its own sockets come to `core`.
-pub fn socket_reserve(cap: usize, core: usize) -> usize {
-    (cap / 8).max(socket_linger(cap) + core + socket_http_floor(cap))
-}
-
-// The part of the reserve kept for sockets closed but still lingering in the
-// tunnel, which no share hands out.
-pub fn socket_linger(cap: usize) -> usize {
-    cap / 16
-}
-
-// One WireGuard session's sockets.
+// One WireGuard session's bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelSockets {
     pub egress: u32,
     pub proxy: u32,
-    pub cap: usize,
+    pub mtu: u16,
     // Every connection the usenet servers routed through it may hold there,
     // each with one more for replacing a connection.
     pub nntp: usize,
@@ -108,58 +108,62 @@ pub struct TunnelSockets {
 }
 
 impl TunnelSockets {
-    pub fn new(egress: u32, proxy: u32, cap: usize) -> Self {
+    pub fn new(egress: u32, proxy: u32, mtu: u16) -> Self {
         Self {
             egress,
             proxy,
-            cap,
+            mtu,
             nntp: 0,
             torrent_sessions: 0,
             carriers: 0,
         }
     }
 
-    // The TCP peers kept for torrents.
-    pub fn peer_floor(&self) -> usize {
-        if self.torrent_sessions > 0 {
-            SOCKET_PEER_FLOOR
-        } else {
-            0
-        }
+    // The bytes kept off the split for every kind of traffic: the tunnel's
+    // own sockets and HTTP, each at a stream's size, and the one datagram
+    // socket each proxy above holds as its carrier.
+    pub fn reserve(&self) -> u64 {
+        (SOCKET_CORE_BASE + SOCKET_HTTP_FLOOR) as u64 * stream_bytes(None)
+            + self.carriers as u64 * datagram_bytes(self.mtu)
     }
 
-    fn core(&self) -> usize {
-        socket_core(self.torrent_sessions) + self.carriers
+    // The bytes kept off the split for the torrent sessions' listeners and
+    // datagram sockets, which they hold for their whole life and no
+    // give-back can close.
+    pub fn torrent_kept(&self) -> u64 {
+        self.torrent_sessions as u64 * torrent_session_bytes(self.mtu)
     }
 
-    // The sockets kept from usenet and torrent peers over TCP.
-    pub fn reserve(&self) -> usize {
-        socket_reserve(self.cap, self.core())
+    // What the tunnel keeps apart from usenet: its overhead, the reserve,
+    // and its torrent sessions' listeners and datagram sockets.
+    pub fn kept(&self) -> u64 {
+        overhead_bytes(self.mtu) + self.reserve() + self.torrent_kept()
+    }
+
+    // What usenet asks of the tunnel.
+    pub fn nntp_bytes(&self) -> u64 {
+        self.nntp as u64 * usenet_socket_bytes()
     }
 
     pub fn over_budget(&self) -> bool {
-        self.nntp + self.reserve() + self.peer_floor() > self.cap
+        self.nntp_bytes() + self.kept() > WIREGUARD_INSTANCE_BYTES
     }
 
-    // The shares the session holds its sockets to. The torrent sessions'
-    // listeners hold their sockets outside every share, so the reserve
-    // hands out what is left of it once they and the lingering sockets are
-    // kept. A tunnel over budget, as one becomes when the hardware profile
-    // lowers the cap under a saved configuration, holds usenet to what the
-    // reserve and the peer floor leave.
-    pub fn shares(&self) -> SocketShares {
-        let reserve = self.reserve().min(self.cap);
-        let nntp = self
-            .nntp
-            .min(self.cap.saturating_sub(reserve + self.peer_floor()));
-        let listening = socket_listening(self.torrent_sessions);
-        let handed = reserve.saturating_sub(socket_linger(self.cap) + listening);
-        let core = (self.core() - listening).min(handed);
-        SocketShares {
-            nntp,
-            torrent: self.cap - reserve - nntp,
-            core,
-            http: handed - core,
+    // The usenet connections the tunnel holds beside what it keeps, at most
+    // what usenet asks.
+    pub fn nntp_held(&self) -> usize {
+        let room = WIREGUARD_INSTANCE_BYTES.saturating_sub(self.kept());
+        self.nntp
+            .min(usize::try_from(room / usenet_socket_bytes()).unwrap_or(usize::MAX))
+    }
+
+    // The bytes the session holds its sockets to.
+    pub fn budget(&self) -> SocketBudget {
+        SocketBudget {
+            bytes: WIREGUARD_INSTANCE_BYTES,
+            reserve: self.reserve(),
+            torrent_kept: self.torrent_kept(),
+            mtu: self.mtu,
         }
     }
 
@@ -168,10 +172,42 @@ impl TunnelSockets {
             proxy: self.proxy,
             egress: self.egress,
             nntp: self.nntp,
-            reserve: self.reserve(),
-            peers: self.peer_floor(),
-            cap: self.cap,
+            nntp_bytes: self.nntp_bytes(),
+            kept_bytes: self.kept(),
+            limit_bytes: WIREGUARD_INSTANCE_BYTES,
         }
+    }
+}
+
+// The bandwidth split's rule, dividing a tunnel's bytes between usenet and
+// torrents by the split in force, as it divides the download limit. The
+// tunnel's sides are the job classes, by protocol.
+pub enum SplitDivider {
+    // The split the bandwidth service put in force.
+    InForce,
+    // A split given, for tests of the rule.
+    #[cfg(test)]
+    Fixed(Option<crate::bandwidth::BandwidthSplit>),
+}
+
+const _: () = assert!(SIDES == crate::jobs::Protocol::COUNT);
+
+impl SocketDivider for SplitDivider {
+    fn shares(&self, cap: u64) -> [u64; SIDES] {
+        let split = match self {
+            Self::InForce => crate::bandwidth::split_in_force(),
+            #[cfg(test)]
+            Self::Fixed(split) => *split,
+        };
+        split.unwrap_or_default().shares(cap)
+    }
+
+    fn share_out(&self, cap: u64, shares: &[u64], given: &[Option<u64>], used: &[u64]) -> Vec<u64> {
+        crate::bandwidth::share_out(cap, shares, given, used)
+    }
+
+    fn presses(&self, used: u64, given: u64) -> bool {
+        crate::bandwidth::presses(used, given)
     }
 }
 
@@ -187,7 +223,6 @@ pub fn socket_ledger(
     profiles: &HashMap<u32, ProxyProfile>,
     pools: &HashMap<u32, ProxyPool>,
     connections: &HashMap<u32, u16>,
-    cap: usize,
 ) -> HashMap<SessionPath, TunnelSockets> {
     let mut ledger: HashMap<SessionPath, TunnelSockets> = HashMap::new();
     // What each server may put on each session, before the replacement.
@@ -220,7 +255,7 @@ pub fn socket_ledger(
                 if let Rung::Chain { ids } = rung {
                     for (index, id) in ids.iter().enumerate() {
                         if wireguard(profiles, id) {
-                            session(&mut ledger, leg.egress_id, &ids[..=index], cap);
+                            session(&mut ledger, profiles, leg.egress_id, &ids[..=index]);
                         }
                     }
                     if let Some(last) = carried_above(ids, profiles) {
@@ -230,7 +265,7 @@ pub fn socket_ledger(
                 let pooled = matches!(rung, Rung::Pool { .. });
                 let carriers = rung_carriers(rung, profiles, pools);
                 for path in carriers {
-                    let key = session(&mut ledger, leg.egress_id, &path, cap);
+                    let key = session(&mut ledger, profiles, leg.egress_id, &path);
                     match consumer {
                         Consumer::Torrent(_) => {
                             torrents.insert((key, TorrentSession::of(&leg.path, pooled)));
@@ -343,15 +378,23 @@ pub fn rung_carriers(
 
 fn session(
     ledger: &mut HashMap<SessionPath, TunnelSockets>,
+    profiles: &HashMap<u32, ProxyProfile>,
     egress: u32,
     path: &[u32],
-    cap: usize,
 ) -> SessionPath {
     let key = (egress, path.to_vec());
     ledger.entry(key.clone()).or_insert_with(|| {
-        TunnelSockets::new(egress, *path.last().expect("a session has a proxy"), cap)
+        let proxy = *path.last().expect("a session has a proxy");
+        TunnelSockets::new(egress, proxy, tunnel_mtu(profiles, proxy))
     });
     key
+}
+
+// The MTU a tunnel of `proxy` is built with.
+pub fn tunnel_mtu(profiles: &HashMap<u32, ProxyProfile>, proxy: u32) -> u16 {
+    profiles
+        .get(&proxy)
+        .map_or(DEFAULT_MTU, |profile| profile.mtu)
 }
 
 // What the usenet servers ask of each tunnel in `ledger`.
@@ -365,8 +408,8 @@ pub fn socket_asks(ledger: &HashMap<SessionPath, TunnelSockets>) -> HashMap<Sess
 // Refuse a change that raises what usenet asks of a tunnel it leaves over
 // budget, measured against `before`, what the servers asked before it. A
 // change that leaves a tunnel over budget without asking it for more, as
-// any does once the hardware profile lowers the cap, is no reason to refuse
-// it: that tunnel's legs warn instead. The first refused tunnel, by egress
+// any does once the hardware profile raises usenet's buffers, is no reason
+// to refuse it: that tunnel's legs warn instead. The first refused tunnel, by egress
 // and path, is named.
 pub fn validate_socket_raise(
     before: &HashMap<SessionPath, usize>,

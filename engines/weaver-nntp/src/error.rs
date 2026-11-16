@@ -246,6 +246,18 @@ impl NntpError {
         matches!(self, NntpError::Route(route) if route.is_capacity())
     }
 
+    // The demands a full route's refusal left: usenet presses for the room
+    // while whoever wants the connection holds them.
+    pub fn route_demand(&self) -> Vec<weaver_tunnel::pipe::Demand> {
+        match self {
+            NntpError::Route(route) => match route.as_ref() {
+                weaver_tunnel::pipe::DialError::AtCapacity(capacity) => capacity.demand.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
     // Create an `UnexpectedResponse` from a status code and message.
     pub fn unexpected(code: StatusCode, message: impl Into<String>) -> Self {
         NntpError::UnexpectedResponse {

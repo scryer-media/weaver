@@ -65,6 +65,8 @@ struct Claim {
     activity: Weak<RwLock<()>>,
     provider: Weak<dyn TunnelProvider>,
     resolver: Weak<WireGuardTunnelProvider>,
+    // The session's bytes, which a probe lent its tunnel is charged to.
+    sockets: Weak<super::SessionSockets>,
     held: Weak<Held>,
     // The activity of the session this one rides on, when it is carried.
     carrier: Option<Weak<RwLock<()>>>,
@@ -78,6 +80,8 @@ pub(super) struct Lent {
     pub(super) provider: Arc<dyn TunnelProvider>,
     pub(super) resolver: Arc<WireGuardTunnelProvider>,
     pub(super) activity: OwnedRwLockReadGuard<()>,
+    // The lender's bytes: a lent tunnel's sockets are the lender's.
+    pub(super) sockets: Arc<super::SessionSockets>,
 }
 
 // Every WireGuard session that has claimed its identity and not given the
@@ -110,6 +114,7 @@ pub(super) async fn claim(hop: &SessionHop) -> Option<Lent> {
         Arc<RwLock<()>>,
         Arc<dyn TunnelProvider>,
         Arc<WireGuardTunnelProvider>,
+        Arc<super::SessionSockets>,
     );
     let next: Result<Vec<Claim>, Option<Lender>> = {
         let mut claims = CLAIMS.lock().expect("wireguard claims");
@@ -136,6 +141,7 @@ pub(super) async fn claim(hop: &SessionHop) -> Option<Lent> {
                         claim.activity.upgrade()?,
                         claim.provider.upgrade()?,
                         claim.resolver.upgrade()?,
+                        claim.sockets.upgrade()?,
                     ))
                 })
             })
@@ -155,6 +161,7 @@ pub(super) async fn claim(hop: &SessionHop) -> Option<Lent> {
                 activity: mine,
                 provider: Arc::downgrade(&hop.provider),
                 resolver: Arc::downgrade(resolver),
+                sockets: Arc::downgrade(&hop.sockets),
                 held: Arc::downgrade(&hop.capacity.held),
                 carrier,
                 probe,
@@ -170,10 +177,11 @@ pub(super) async fn claim(hop: &SessionHop) -> Option<Lent> {
             None
         }
         Err(None) => None,
-        Err(Some((activity, provider, resolver))) => Some(Lent {
+        Err(Some((activity, provider, resolver, sockets))) => Some(Lent {
             provider,
             resolver,
             activity: activity.read_owned().await,
+            sockets,
         }),
     }
 }

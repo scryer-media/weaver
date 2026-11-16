@@ -20,7 +20,7 @@ use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, ReadBuf};
 use weaver_torrent::network::{
     AsyncReadVectored, AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
-    DatagramSend, DatagramSocket, Resolved, Resolver,
+    DatagramSend, DatagramSocket, Resolved, Resolver, TcpRoom, TcpWant,
 };
 use weaver_torrent::upnp::{PortMapReceiver, PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
@@ -175,6 +175,7 @@ fn carrier(dialer: &Arc<dyn Dialer>) -> Option<Arc<dyn DatagramTransport>> {
 pub struct LegSockets {
     dialer: Arc<dyn Dialer>,
     source: Option<IpAddr>,
+    tunnels: Arc<PeerTunnels>,
 }
 
 impl LegSockets {
@@ -182,7 +183,13 @@ impl LegSockets {
         Self {
             dialer,
             source: kind.listen_ip(),
+            tunnels: Arc::default(),
         }
+    }
+
+    /// Which path each of the leg's live TCP peer connections rides.
+    pub fn tunnels(&self) -> Arc<PeerTunnels> {
+        Arc::clone(&self.tunnels)
     }
 
     // A listener on `addr`'s port: on the pinned source address, else inside
@@ -208,12 +215,13 @@ impl LegSockets {
                 ))
             });
         };
+        let tunnels = self.tunnels();
         shared(async move {
             let listener = inbound
                 .listen(addr.port(), forwarded)
                 .await
                 .map_err(io::Error::other)?;
-            Ok(Box::new(Arriving(listener)) as Box<dyn StreamListener>)
+            Ok(Box::new(Arriving(listener, tunnels)) as Box<dyn StreamListener>)
         })
     }
 
@@ -240,11 +248,74 @@ fn shared<'a, T>(future: impl Future<Output = T> + Send + 'a) -> BoxFuture<'a, T
     }))
 }
 
+/// The path, egress and proxies, each live TCP peer connection of a leg
+/// rides, by the peer's address: the one way to tell which tunnel's bytes a
+/// peer holds. Every connection is counted, those over the kernel's sockets
+/// too, so a peer whose address has a connection on another path as well is
+/// never taken for the asking tunnel's.
+#[derive(Default)]
+pub struct PeerTunnels(Mutex<PeerRides>);
+
+// Each peer's live connections, by the egress and proxies each rides.
+type PeerRides = HashMap<SocketAddr, Vec<(u32, Vec<u32>)>>;
+
+impl PeerTunnels {
+    // Count a connection to `peer` over `path` until the guard drops.
+    fn hold(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        path: &weaver_tunnel::pipe::DialPath,
+    ) -> PeerTunnel {
+        let rides = (path.egress, path.proxies.clone());
+        self.lock().entry(peer).or_default().push(rides.clone());
+        PeerTunnel {
+            tunnels: Arc::clone(self),
+            peer,
+            rides,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PeerRides> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether every live connection to `peer` rides a path `on` takes, and
+    /// it has one.
+    pub fn only_on(&self, peer: SocketAddr, on: impl Fn(u32, &[u32]) -> bool) -> bool {
+        self.lock().get(&peer).is_some_and(|rides| {
+            !rides.is_empty() && rides.iter().all(|(egress, proxies)| on(*egress, proxies))
+        })
+    }
+}
+
+// One live connection counted in [`PeerTunnels`].
+struct PeerTunnel {
+    tunnels: Arc<PeerTunnels>,
+    peer: SocketAddr,
+    rides: (u32, Vec<u32>),
+}
+
+impl Drop for PeerTunnel {
+    fn drop(&mut self) {
+        let mut tunnels = self.tunnels.lock();
+        if let Some(rides) = tunnels.get_mut(&self.peer) {
+            if let Some(at) = rides.iter().position(|ride| *ride == self.rides) {
+                rides.swap_remove(at);
+            }
+            if rides.is_empty() {
+                tunnels.remove(&self.peer);
+            }
+        }
+    }
+}
+
 // A peer connection's read half through a leg's dialer. The leg counts the
-// bytes it reads, as it counts those of every connection it carries.
+// bytes it reads, as it counts those of every connection it carries, and
+// the path it rides while it is open.
 struct Counted {
     read: BoxAsyncReadVectored,
     outcome: Arc<ConnectionOutcome>,
+    _rides: PeerTunnel,
 }
 
 impl AsyncRead for Counted {
@@ -329,8 +400,17 @@ impl LegSockets {
 }
 
 impl SocketFactory for LegSockets {
-    fn tcp_room(&self) -> bool {
-        self.dialer.has_room(&Purpose::Torrent)
+    // A look before a TCP dial. Refused only because the tunnel's other side
+    // holds past its share, the refusal's demand goes to the torrent as its
+    // TCP want: while the torrent holds it, torrents press for the room and
+    // that side is asked to give back. The dial meanwhile goes over uTP,
+    // which waits on nothing. The leg itself holds nothing.
+    fn tcp_room(&self) -> TcpRoom {
+        match self.dialer.wait_room(&Purpose::Torrent) {
+            Ok(()) => TcpRoom::Free,
+            Err(capacity) if capacity.demand.is_empty() => TcpRoom::Full,
+            Err(capacity) => TcpRoom::Crowded(TcpWant::new(capacity.demand)),
+        }
     }
 
     fn datagram_room(&self) -> bool {
@@ -356,10 +436,12 @@ impl SocketFactory for LegSockets {
                 .await
                 .map_err(io::Error::other)?
                 .map_err(|error| io::Error::other(error.to_string()))?;
+            let rides = self.tunnels.hold(addr, &dialed.path);
             let (read, write) = halves(dialed.stream);
             let read = Counted {
                 read,
                 outcome: dialed.outcome,
+                _rides: rides,
             };
             Ok((Box::new(read) as BoxAsyncReadVectored, write))
         })
@@ -921,7 +1003,7 @@ impl StreamListener for Listener {
 
 // A listener inside the leg's tunnel. The leg counts the bytes each
 // connection it accepts reads, as it counts those of the ones it dials.
-struct Arriving(Box<dyn Listening>);
+struct Arriving(Box<dyn Listening>, Arc<PeerTunnels>);
 
 impl StreamListener for Arriving {
     fn local_addr(&self) -> SocketAddr {
@@ -960,10 +1042,12 @@ impl StreamListener for Arriving {
             let peer = accepted
                 .peer
                 .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+            let rides = self.1.hold(peer, &accepted.path);
             let (read, write) = halves(accepted.stream);
             let read = Counted {
                 read,
                 outcome: accepted.outcome,
+                _rides: rides,
             };
             Ok((peer, Box::new(read) as BoxAsyncReadVectored, write))
         })
@@ -1019,17 +1103,20 @@ impl DatagramSocket for NoDatagrams {
 /// addresses its host was checked at. A ladder leg's clients ride `bridge`,
 /// the leg's own; a direct leg's route is `dialer`'s, which says where a
 /// request leaves and binds the port mapper's socket. They name no client:
-/// each request names the client of the torrent it is for.
+/// each request names the client of the torrent it is for. A ladder leg's
+/// web seed transfers ride the bridge `seeds` starts, when it has one.
 pub fn tracker_client(
     kind: &LegKind,
     dialer: Arc<dyn Dialer>,
     bridge: Option<PathBridge>,
+    seeds: Option<SeedBridge>,
 ) -> Result<Arc<dyn HttpClients>, String> {
     let bridge = match (kind, bridge) {
         (LegKind::Ladder, None) => return Err("a ladder leg needs its bridge".into()),
         (LegKind::Ladder, bridge) => bridge,
         _ => None,
     };
+    let seeds = seeds.filter(|_| bridge.is_some());
     let base = {
         let kind = kind.clone();
         move || match &kind {
@@ -1037,13 +1124,18 @@ pub fn tracker_client(
             kind => Ok(plain_builder(kind)),
         }
     };
-    let clients = LegClients::new(base, bridge, kind.clone(), dialer);
+    let clients = LegClients::new(base, bridge, kind.clone(), dialer).with_seeds(seeds);
     // A leg whose clients cannot be built does not open.
     let _ = clients
         .client(None, &ClientShape::FETCH)
         .map_err(|error| format!("{error:#}"))?;
     Ok(Arc::new(clients))
 }
+
+/// Starts, the first time, the bridge a ladder leg's web seed transfers
+/// ride, apart from its trackers' bridge: what they hold of the tunnel is
+/// the torrent side's, not the reserve its announces are kept.
+pub type SeedBridge = Arc<dyn Fn() -> Result<PathBridge, String> + Send + Sync>;
 
 // A builder leaving from the leg's source address when it pins one, and
 // held to no device.
@@ -1085,6 +1177,7 @@ pub(crate) fn system_dialer() -> Arc<dyn Dialer> {
 pub(crate) struct LegClients<F> {
     base: F,
     bridge: Option<PathBridge>,
+    seeds: Option<SeedBridge>,
     kind: LegKind,
     dialer: Arc<dyn Dialer>,
     kept: Mutex<Kept>,
@@ -1160,11 +1253,18 @@ where
         Self {
             base,
             bridge,
+            seeds: None,
             kind,
             dialer,
             kept: Mutex::default(),
             built: AtomicUsize::new(0),
         }
+    }
+
+    /// The leg's web seed clients ride the bridge `seeds` starts.
+    pub(crate) fn with_seeds(mut self, seeds: Option<SeedBridge>) -> Self {
+        self.seeds = seeds;
+        self
     }
 
     /// How many clients the leg has built.
@@ -1206,7 +1306,17 @@ where
         let (host, port, addrs) = target.map_or(("", 0, &[][..]), |target| {
             (target.host, target.port, target.addrs)
         });
-        let builder = match &self.bridge {
+        // A web seed's client rides the leg's seed bridge, any other the
+        // bridge its trackers and metainfo ride.
+        let seed;
+        let bridge = match &self.seeds {
+            Some(seeds) if shape.torrent.is_some() => {
+                seed = seeds().map_err(anyhow::Error::msg)?;
+                Some(&seed)
+            }
+            _ => self.bridge.as_ref(),
+        };
+        let builder = match bridge {
             Some(bridge) => {
                 if !addrs.is_empty() && host.parse::<IpAddr>().is_err() {
                     bridge.path.pin(host, addrs.to_vec());
@@ -1379,6 +1489,46 @@ mod tests {
         }
     }
 
+    // With two tunnels on one egress, a give-back asked by one takes only
+    // peers whose every live connection rides that tunnel: never one on the
+    // other tunnel, one with a connection on both, or one on the kernel's
+    // sockets, and a peer counts as the tunnel's once its other connection
+    // is gone.
+    #[test]
+    fn a_give_back_takes_only_the_peers_of_the_asking_tunnel() {
+        let path = |proxies: Vec<u32>| weaver_tunnel::pipe::DialPath {
+            egress: 2,
+            proxies,
+            ..Default::default()
+        };
+        let ask = crate::jobs::TunnelGiveBack {
+            egress: 2,
+            hops: vec![11],
+            torrent_routes: Vec::new(),
+            owed: crate::jobs::Owed::new(|| 1, || {}),
+        };
+        let tunnels = Arc::new(PeerTunnels::default());
+        let peer = |port| SocketAddr::from(([10, 0, 0, 1], port));
+        let on = |addr| tunnels.only_on(addr, |egress, proxies| ask.rides(egress, proxies));
+
+        let _asking = tunnels.hold(peer(1), &path(vec![11]));
+        let _other = tunnels.hold(peer(2), &path(vec![13]));
+        let _chained = tunnels.hold(peer(3), &path(vec![11, 12]));
+        let _kernel = tunnels.hold(peer(4), &path(Vec::new()));
+        let _both_asking = tunnels.hold(peer(5), &path(vec![11]));
+        let both_other = tunnels.hold(peer(5), &path(vec![13]));
+
+        assert!(on(peer(1)));
+        assert!(!on(peer(2)), "a peer on the other tunnel");
+        assert!(!on(peer(3)), "a peer on a tunnel stacked above it");
+        assert!(!on(peer(4)), "a peer on the kernel's sockets");
+        assert!(!on(peer(5)), "a peer with a connection on both tunnels");
+        assert!(!on(peer(6)), "a peer with no live connection");
+
+        drop(both_other);
+        assert!(on(peer(5)), "its other connection is gone");
+    }
+
     #[test]
     fn a_direct_leg_follows_its_egress_binding() {
         assert_eq!(
@@ -1480,7 +1630,7 @@ mod tests {
 
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
         for (kind, dialer) in own_network_legs() {
-            let clients = tracker_client(&kind, dialer, None).unwrap();
+            let clients = tracker_client(&kind, dialer, None, None).unwrap();
             let gateway = NatPmpGateway::granting(|_| 40_001).await;
             let route = GatewayRoute {
                 local_ip: loopback,
@@ -2288,8 +2438,8 @@ mod tests {
 
     #[test]
     fn a_ladder_client_needs_its_bridge() {
-        assert!(tracker_client(&LegKind::Ladder, system_dialer(), None).is_err());
-        assert!(tracker_client(&LegKind::System, system_dialer(), None).is_ok());
+        assert!(tracker_client(&LegKind::Ladder, system_dialer(), None, None).is_err());
+        assert!(tracker_client(&LegKind::System, system_dialer(), None, None).is_ok());
     }
 
     // A leg builds one client for each target and shape and hands it to
@@ -2582,25 +2732,35 @@ mod tests {
         }
     }
 
-    // A leg whose WireGuard session has its TCP peer share full says it has
-    // no TCP room, so peers connect over uTP; it has room again once a peer
-    // closes. A leg on the kernel's sockets holds no share and always has
-    // room.
+    // A leg whose WireGuard session has its torrent bytes full says it has
+    // no TCP room, so peers connect over uTP; it has room again once a
+    // closed peer's stream is back from the tunnel's linger. A leg on the
+    // kernel's sockets holds no bytes and always has room.
     #[tokio::test]
     async fn a_leg_has_tcp_room_while_its_tcp_peer_share_does() {
-        use weaver_tunnel::pipe::{PortForwarding, SessionSockets, SocketShares};
+        use weaver_tunnel::pipe::{
+            PortForwarding, SessionSockets, SocketBudget, SocketClass, overhead_bytes, stream_bytes,
+        };
         use weaver_tunnel::test_support::{
             TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT, WireGuardTestPeer,
         };
         let peer = WireGuardTestPeer::start().await;
+        // Room for two peers on the sides: one alone, beside the idle
+        // side's probe.
+        let stream = stream_bytes(None);
+        let tunnel = Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(1420) + 3 * stream,
+                reserve: stream,
+                torrent_kept: 0,
+                mtu: 1420,
+            },
+            Arc::new(crate::proxies::SplitDivider::InForce),
+        ));
+        let sockets = tunnel.clone();
         let hop = wireguard_hop(1, peer.client_spec("1"), None, PortForwarding::None);
         let hop = Arc::new(weaver_tunnel::pipe::SessionHop {
-            sockets: Arc::new(SessionSockets::new(SocketShares {
-                nntp: 0,
-                torrent: 1,
-                core: 1,
-                http: 1,
-            })),
+            sockets: sockets.clone(),
             ..Arc::into_inner(hop).unwrap()
         });
         let rung: Arc<dyn Dialer> = hop;
@@ -2608,12 +2768,23 @@ mod tests {
             weaver_tunnel::pipe::Fallback::new(vec![rung]),
         )));
         let sockets = LegSockets::new(leg, &LegKind::Ladder);
-        assert!(sockets.tcp_room());
+        assert!(sockets.tcp_room().is_free());
         let address = SocketAddr::new(TEST_PEER_ADDRESS.into(), TEST_PEER_HTTP_PORT);
         let connected = sockets.connect_tcp(address).await.unwrap();
-        assert!(!sockets.tcp_room());
+        assert!(!sockets.tcp_room().is_free());
+        let Err(weaver_tunnel::pipe::Refused { freed, .. }) =
+            tunnel.take(SocketClass::Torrent, stream)
+        else {
+            panic!("a full share handed out bytes");
+        };
+        let freed = freed.notify();
+        let back = freed.notified();
+        tokio::pin!(back);
+        back.as_mut().enable();
         drop(connected);
-        assert!(sockets.tcp_room());
+        tokio::time::pause();
+        back.await;
+        assert!(sockets.tcp_room().is_free());
 
         let kernel = LegSockets::new(loopback_egress(), &LegKind::Ladder);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2625,8 +2796,99 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            assert!(kernel.tcp_room());
+            assert!(kernel.tcp_room().is_free());
         }
+    }
+
+    // A leg refused TCP room only because usenet holds past what it is
+    // given is handed the torrents' want for that room: the peer still dials
+    // over uTP now, and while the want is held torrents press and usenet's
+    // ask stands. A look that finds room leaves the want with its holder;
+    // once torrents reach their own share a look hands out none, and the
+    // press ends exactly when the holder drops its want.
+    #[tokio::test]
+    async fn a_leg_crowded_out_of_tcp_waits_for_the_room_and_still_dials_utp() {
+        use weaver_torrent::network::TcpRoom;
+        use weaver_tunnel::pipe::{
+            PortForwarding, SessionSockets, SocketBudget, SocketClass, SocketPermit,
+            overhead_bytes, stream_bytes,
+        };
+        use weaver_tunnel::test_support::WireGuardTestPeer;
+        let peer = WireGuardTestPeer::start().await;
+        let stream = stream_bytes(None);
+        let tunnel = Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(1420) + 21 * stream,
+                reserve: stream,
+                torrent_kept: 0,
+                mtu: 1420,
+            },
+            Arc::new(crate::proxies::SplitDivider::Fixed(None)),
+        ));
+        let hop = wireguard_hop(1, peer.client_spec("1"), None, PortForwarding::None);
+        let hop = Arc::new(weaver_tunnel::pipe::SessionHop {
+            sockets: tunnel.clone(),
+            ..Arc::into_inner(hop).unwrap()
+        });
+        let rung: Arc<dyn Dialer> = hop;
+        let leg: Arc<dyn Dialer> = Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+            weaver_tunnel::pipe::Fallback::new(vec![rung]),
+        )));
+        let take = |class| tunnel.take(class, stream).ok().flatten();
+        // Torrents hold 2 of the sides' 20; usenet and torrents then take
+        // what their looks give them until the sides are full.
+        let mut held: Vec<SocketPermit> = (0..2)
+            .map(|_| take(SocketClass::Torrent).unwrap())
+            .collect();
+        let mut usenet = Vec::new();
+        loop {
+            let before = held.len() + usenet.len();
+            while tunnel.has_room(SocketClass::Nntp, stream) {
+                usenet.push(take(SocketClass::Nntp).unwrap());
+            }
+            while tunnel.has_room(SocketClass::Torrent, stream) {
+                held.push(take(SocketClass::Torrent).unwrap());
+            }
+            if held.len() + usenet.len() == before {
+                break;
+            }
+        }
+        assert!(usenet.len() > 10, "usenet holds past its half");
+        assert_eq!(tunnel.woken(), [false, false], "the looks woke nobody");
+
+        let sockets = LegSockets::new(leg, &LegKind::Ladder);
+        let want = sockets.tcp_room();
+        assert!(
+            matches!(want, TcpRoom::Crowded(_)),
+            "the peer dials over uTP now"
+        );
+        assert!(tunnel.pressing(SocketClass::Torrent));
+        assert_eq!(tunnel.woken(), [true, false], "usenet is woken");
+        assert_eq!(tunnel.owed(SocketClass::Nntp), 7 * stream);
+        assert!(tunnel.owes(SocketClass::Nntp));
+        // Torrents grow into the room the division gave them, and the ask
+        // stands while the want is held, asked once.
+        while sockets.tcp_room().is_free() {
+            held.push(take(SocketClass::Torrent).unwrap());
+            assert!(tunnel.owes(SocketClass::Nntp), "the ask lapsed");
+        }
+        assert!(tunnel.pressing(SocketClass::Torrent));
+        // Usenet gives back what it was asked.
+        usenet.truncate(10);
+        assert!(!tunnel.owes(SocketClass::Nntp));
+        while sockets.tcp_room().is_free() {
+            held.push(take(SocketClass::Torrent).unwrap());
+        }
+        assert_eq!(held.len(), 10, "torrents at their share");
+        // At their own share a look hands out no want; the one held still
+        // presses until its holder drops it.
+        assert!(matches!(sockets.tcp_room(), TcpRoom::Full));
+        assert!(tunnel.pressing(SocketClass::Torrent));
+        drop(want);
+        assert!(!tunnel.pressing(SocketClass::Torrent));
+        assert_eq!(tunnel.woken(), [false, false], "woken once");
+        assert_eq!(tunnel.owed(SocketClass::Nntp), 0);
+        assert_eq!(usenet.len(), 10, "usenet at its share");
     }
 }
 

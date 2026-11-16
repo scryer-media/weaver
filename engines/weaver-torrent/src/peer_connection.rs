@@ -75,6 +75,11 @@ pub trait PeerConnectionHandler {
     fn encrypt_outgoing(&self) -> bool {
         true
     }
+    /// Where the torrent holds its want for a TCP socket its route held for
+    /// others; a handler with none has its dials hold nothing.
+    fn tcp_wants(&self) -> Option<&crate::stream_connect::TcpWants> {
+        None
+    }
     /// The connection, whichever side opened it, completed its handshake,
     /// as `encryption` says; told right after
     /// [`Self::on_handshake`].
@@ -906,6 +911,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 || self.handler.encrypt_outgoing(),
                 connect_timeout,
                 handshake_timeout,
+                self.handler.tcp_wants(),
             )
             .await?;
         self.handler.on_connected(now.elapsed());

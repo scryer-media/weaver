@@ -32,8 +32,8 @@ mod support_facts_persistence;
 pub mod working_dir;
 
 pub use class::{
-    AddRefusal, ByProtocol, ClassIntake, ClassRate, ClassRates, JobClass, JobClasses, OwnedRows,
-    PipelineClass, RefusalReason, Route, Submission,
+    AddRefusal, ByProtocol, ClassIntake, ClassRate, ClassRates, JobClass, JobClasses, Owed,
+    OwnedRows, PipelineClass, RefusalReason, Route, Submission, TunnelGiveBack,
 };
 pub use duplicate::{
     CallerScopedIdempotency, DuplicateAction, DuplicateDecision, DuplicateJobLifecycle,

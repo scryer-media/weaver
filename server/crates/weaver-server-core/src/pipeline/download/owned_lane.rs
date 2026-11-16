@@ -143,6 +143,10 @@ struct OwnedLaneWorkerSlot {
     // the same worker, and a worker that is already spoken for is not offered
     // a second lease.
     idle: Option<IdleOwnedLaneWorker>,
+    // The worker holds the press of a dial a full route refused. A dial
+    // routed to it settles that press, so the next run without a connection
+    // to reuse goes here first.
+    pressing: bool,
 }
 
 #[derive(Clone, Default)]
@@ -243,6 +247,97 @@ struct CachedOwnedLane {
     group_selected: bool,
 }
 
+// The press a dial refused for a full route leaves: the demand of every
+// tunnel that refused it, whichever error won. The lane holds it, not the
+// work it dialled for, so it lasts across the work's paced requeue and across
+// a refusal some other server's answer won: until this lane's next dial
+// resolves (a connection drops it, a new refusal replaces it), the lane is
+// retired or reset, or the job it dialled for stops.
+struct RoutePress {
+    state: crate::jobs::handle::SharedPipelineState,
+    job_id: JobId,
+    generation: u64,
+    // The job's counters and this refusal's report among the job's lane
+    // refusals (see `JobCounters::drained_through`), when the lease carried
+    // the counters.
+    report: Option<(Arc<crate::pipeline::queue::JobCounters>, u64)>,
+    _demand: Vec<weaver_tunnel::pipe::Demand>,
+}
+
+impl RoutePress {
+    // Whether the job the refused dial was for still wants downloads, and
+    // still has download work to hand out: once a pass after this refusal
+    // was heard left it none (its work went to other lanes, or it has moved
+    // on past its download), nothing waits for this lane's dial.
+    fn stands(&self) -> bool {
+        job_work_is_current(&self.state, self.job_id, self.generation)
+            && self.report.as_ref().is_none_or(|(counters, report)| {
+                counters
+                    .drained_through
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    < *report
+            })
+    }
+}
+
+// Take the next of the job's lane refusal reports, for the refusal about to
+// be sent for `lease`.
+fn next_refusal_report(
+    lease: &DownloadBatchLease,
+) -> Option<(Arc<crate::pipeline::queue::JobCounters>, u64)> {
+    let counters = lease.works.iter().find_map(|work| work.counters.as_ref())?;
+    let report = counters
+        .lane_refusals_sent
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    Some((Arc::clone(counters), report))
+}
+
+// The press a lane's refused dial for `lease` leaves, for the pipeline's
+// tests: it reports the refusal the way the lane does, and holds no demand.
+#[cfg(test)]
+pub(in crate::pipeline) struct TestRoutePress(RoutePress);
+
+#[cfg(test)]
+impl TestRoutePress {
+    pub(in crate::pipeline) fn refused(
+        state: &crate::jobs::handle::SharedPipelineState,
+        lease: &DownloadBatchLease,
+    ) -> Self {
+        Self(RoutePress {
+            state: state.clone(),
+            job_id: lease.job_id,
+            generation: lease.runtime_generation,
+            report: next_refusal_report(lease),
+            _demand: Vec::new(),
+        })
+    }
+
+    pub(in crate::pipeline) fn stands(&self) -> bool {
+        self.0.stands()
+    }
+}
+
+// Settle this worker's press after it did something, and publish the change
+// so the next dial without a connection to reuse is routed here. A connection
+// the worker now holds settles the press, as does its job stopping.
+fn settle_route_press(
+    seat: OwnedLaneSeat,
+    shared: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
+    cached_lane: &Option<CachedOwnedLane>,
+    press: &mut Option<RoutePress>,
+    published: &mut bool,
+) {
+    if cached_lane.is_some() || press.as_ref().is_some_and(|press| !press.stands()) {
+        *press = None;
+    }
+    let pressing = press.is_some();
+    if pressing != *published {
+        lock_pool(shared).note_press(seat, pressing);
+        *published = pressing;
+    }
+}
+
 // What a warm dial needs: the article exclusions and size a lease for this
 // job would carry, so the dial makes the server choice that lease would, and
 // the one server whose unclaimed seat it may fill.
@@ -290,6 +385,12 @@ impl OwnedLanePoolShared {
                 .is_some_and(&serves)
         });
         let index = matching
+            .or_else(|| {
+                self.workers.iter().position(|worker| {
+                    worker.as_ref().is_some_and(|slot| slot.pressing)
+                        && idle_marker(worker).is_some_and(|idle| idle.lane.is_none())
+                })
+            })
             .or_else(|| {
                 self.workers
                     .iter()
@@ -355,6 +456,13 @@ impl OwnedLanePoolShared {
             && let Some(idle) = worker.idle.as_mut()
         {
             idle.lane = lane;
+        }
+    }
+
+    // Publish whether the worker in `seat` holds a refused dial's press.
+    fn note_press(&mut self, seat: OwnedLaneSeat, pressing: bool) {
+        if let Some(worker) = self.seat_mut(seat) {
+            worker.pressing = pressing;
         }
     }
 
@@ -782,6 +890,7 @@ fn spawn_owned_lane_worker(
         id,
         sender: tx,
         idle: None,
+        pressing: false,
     });
     if index == shared.workers.len() {
         shared.workers.push(slot);
@@ -805,6 +914,8 @@ fn run_owned_lane_worker(
     // has published what it holds, so whoever hears the answer finds the
     // connection that gave it already offered to the next batch.
     let mut owed: Option<OwedProbeAnswer> = None;
+    let mut press: Option<RoutePress> = None;
+    let mut published_press = false;
     if start == OwnedLaneWorkerStart::Claimed {
         // Started for one piece of work, which its submit sends right behind
         // the spawn. Publishing idle first would offer this worker to a
@@ -815,12 +926,13 @@ fn run_owned_lane_worker(
                 return;
             };
             if let Some(work) = answer_idle_command(seat, shared, &mut cached_lane, command) {
-                owed = run_owned_lane_work(&mut cached_lane, work);
+                owed = run_owned_lane_work(&mut cached_lane, &mut press, work);
                 break;
             }
         }
     }
     'work: loop {
+        settle_route_press(seat, shared, &cached_lane, &mut press, &mut published_press);
         // Drain the pool's queue before going to sleep, and publish this
         // worker as idle only when there is nothing left to take.
         let queued = lock_pool(shared).take_queued_run_or_publish_idle(
@@ -831,7 +943,7 @@ fn run_owned_lane_worker(
             answer.send();
         }
         if let Some(work) = queued {
-            owed = run_owned_lane_work(&mut cached_lane, work);
+            owed = run_owned_lane_work(&mut cached_lane, &mut press, work);
             continue;
         }
 
@@ -860,11 +972,20 @@ fn run_owned_lane_worker(
                     if discard_closed_cached_lane(&mut cached_lane) {
                         lock_pool(shared).note_idle_lane(seat, None);
                     }
+                    // A press whose job stopped while nothing was routed here
+                    // is let go on this same check.
+                    settle_route_press(
+                        seat,
+                        shared,
+                        &cached_lane,
+                        &mut press,
+                        &mut published_press,
+                    );
                     if idle_since.elapsed() >= intervals.idle_release {
                         match release_idle_worker(seat, shared, &mut cached_lane) {
                             OwnedLaneRelease::Stay => {}
                             OwnedLaneRelease::Work(work) => {
-                                owed = run_owned_lane_work(&mut cached_lane, work);
+                                owed = run_owned_lane_work(&mut cached_lane, &mut press, work);
                                 continue 'work;
                             }
                             OwnedLaneRelease::Withdrawn | OwnedLaneRelease::Left => return,
@@ -877,10 +998,15 @@ fn run_owned_lane_worker(
             // A warmed connection is about to be wanted: its idle spell
             // starts now, not when the worker last finished a run.
             let warmed = matches!(command, OwnedLanePoolCommand::Warm(_));
+            // A reset retires what the lane holds, its press with it.
+            if matches!(command, OwnedLanePoolCommand::Reset) {
+                press = None;
+            }
             if let Some(work) = answer_idle_command(seat, shared, &mut cached_lane, command) {
-                owed = run_owned_lane_work(&mut cached_lane, work);
+                owed = run_owned_lane_work(&mut cached_lane, &mut press, work);
                 continue 'work;
             }
+            settle_route_press(seat, shared, &cached_lane, &mut press, &mut published_press);
             if warmed {
                 idle_since = Instant::now();
             }
@@ -918,11 +1044,12 @@ fn release_idle_worker(
 // be sent once the worker has published itself again.
 fn run_owned_lane_work(
     cached_lane: &mut Option<CachedOwnedLane>,
+    press: &mut Option<RoutePress>,
     work: QueuedOwnedLaneWork,
 ) -> Option<OwedProbeAnswer> {
     let owed = match work {
         QueuedOwnedLaneWork::Run(run) => {
-            run_owned_blocking_download_lane(cached_lane, *run);
+            run_owned_lane(cached_lane, press, *run);
             None
         }
         QueuedOwnedLaneWork::Probe(probe) => Some(ask_owned_lane_probe(cached_lane, *probe)),
@@ -1577,9 +1704,20 @@ fn issue_is_current(
         )
 }
 
-// Run one lease to its park on this worker's connection.
-#[allow(clippy::too_many_lines)]
+// Run one lease to its park on a worker that holds no press.
+#[cfg(test)]
 fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, run: OwnedLaneRun) {
+    run_owned_lane(cached_lane, &mut None, run);
+}
+
+// Run one lease to its park on this worker's connection. A dial it makes
+// settles the worker's press: a connection drops it, a refusal replaces it.
+#[allow(clippy::too_many_lines)]
+fn run_owned_lane(
+    cached_lane: &mut Option<CachedOwnedLane>,
+    press: &mut Option<RoutePress>,
+    run: OwnedLaneRun,
+) {
     let fetch_started = Instant::now();
     let OwnedLaneRun {
         nntp,
@@ -1633,18 +1771,23 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         // The dial picks its own server, so the requirement is read for
         // every server before it.
         let group_required = servers_requiring_group(&nntp);
+        // Every full route the dial was refused on: this lane presses on
+        // each until its next dial resolves.
+        let mut route_demand = Vec::new();
         let dialled = acquire_owned_lane_through_contention(
             || lease_is_current(&state, &nntp, &lease, None),
             || {
-                nntp.try_acquire_blocking_body_lane_with_estimate(
+                nntp.try_acquire_blocking_body_lane_pressing(
                     lease_groups(&lease),
                     lease.dial_exclude_servers,
                     initial_estimate,
+                    &mut route_demand,
                 )
             },
         );
         match dialled {
             Ok(lane) => {
+                *press = None;
                 let server = lane.server_id().0;
                 let required = group_required.contains(server);
                 *cached_lane = Some(CachedOwnedLane::dialled(
@@ -1655,6 +1798,14 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 ));
             }
             Err(error) => {
+                let report = next_refusal_report(&lease);
+                *press = (!route_demand.is_empty()).then(|| RoutePress {
+                    state: state.clone(),
+                    job_id: lease.job_id,
+                    generation: lease.runtime_generation,
+                    report,
+                    _demand: route_demand,
+                });
                 let _ =
                     event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed { lease, error });
                 crate::runtime::perf_probe::record(
@@ -3577,6 +3728,7 @@ mod routing_tests {
                     id: index as u64,
                     sender: std_mpsc::channel().0,
                     idle,
+                    pressing: false,
                 })
             })
             .collect();
@@ -4080,7 +4232,9 @@ mod routing_tests {
         ) -> std::result::Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError>
         {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(weaver_tunnel::pipe::DialError::AtCapacity(Vec::new()))
+            Err(weaver_tunnel::pipe::DialError::AtCapacity(
+                Default::default(),
+            ))
         }
         fn budget(&self) -> std::time::Duration {
             std::time::Duration::from_secs(3600)
@@ -4250,7 +4404,11 @@ mod routing_tests {
         let (nntp, probe, server) = probe_due_on_stat_fixture(&["<lantern-0@example.com>"]);
         let mut cached = None;
 
-        let owed = run_owned_lane_work(&mut cached, QueuedOwnedLaneWork::Probe(Box::new(probe)));
+        let owed = run_owned_lane_work(
+            &mut cached,
+            &mut None,
+            QueuedOwnedLaneWork::Probe(Box::new(probe)),
+        );
 
         assert!(owed.is_some());
         assert!(
@@ -4270,7 +4428,11 @@ mod routing_tests {
         let (nntp, probe, server) = probe_due_on_stat_fixture(&["<lantern-1@example.com>"]);
         let mut cached = None;
 
-        let owed = run_owned_lane_work(&mut cached, QueuedOwnedLaneWork::Probe(Box::new(probe)));
+        let owed = run_owned_lane_work(
+            &mut cached,
+            &mut None,
+            QueuedOwnedLaneWork::Probe(Box::new(probe)),
+        );
 
         assert!(owed.is_some());
         assert!(nntp.pool().requires_recovery(0), "a 430 is no answer");
@@ -4537,3 +4699,6 @@ mod routing_tests {
 
 #[cfg(test)]
 mod fault_tests;
+
+#[cfg(test)]
+mod route_press_tests;
