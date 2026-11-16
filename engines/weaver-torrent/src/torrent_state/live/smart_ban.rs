@@ -406,7 +406,7 @@ mod tests {
                             .map(|_| {
                                 let b = next();
                                 SentBlock {
-                                    chunk: chunks[(b % u64::from(BLOCKS)) as usize],
+                                    chunk: chunks[usize::try_from(b % u64::from(BLOCKS)).unwrap()],
                                     sender: peer(u8::try_from(1 + (b >> 8) % 5).unwrap()),
                                     digest: [u8::try_from((b >> 16) % 3).unwrap(); 20],
                                 }

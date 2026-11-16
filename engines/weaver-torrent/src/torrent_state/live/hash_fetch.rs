@@ -466,7 +466,7 @@ impl LayerFetch {
             wants.insert(
                 Wanted {
                     request,
-                    pieces: vec![piece.get()..piece.get() + 1],
+                    pieces: std::iter::once(piece.get()..piece.get() + 1).collect(),
                     kind: Kind::Blocks { piece, failed },
                     out: Vec::new(),
                     rejected_by: Vec::new(),
@@ -929,7 +929,7 @@ mod tests {
                     0,
                     Wanted {
                         request,
-                        pieces: vec![piece.get()..piece.get() + 1],
+                        pieces: std::iter::once(piece.get()..piece.get() + 1).collect(),
                         kind: Kind::Blocks { piece, failed },
                         out: Vec::new(),
                         rejected_by: Vec::new(),

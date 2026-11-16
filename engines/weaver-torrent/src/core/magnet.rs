@@ -178,7 +178,7 @@ impl Magnet {
                             // Handling single file index
                             None => (file_desc.parse(), file_desc.parse()),
                         };
-                        let (Ok(start), Ok(end)) = (start, end) else {
+                        let (Ok::<usize, _>(start), Ok::<usize, _>(end)) = (start, end) else {
                             continue;
                         };
                         // An index past the bound is passed over, as is a
@@ -188,8 +188,10 @@ impl Magnet {
                         }
                         let selected =
                             selected.get_or_insert_with(|| vec![false; MAX_SELECT_ONLY_INDEX + 1]);
-                        for index in start..=end {
-                            if !std::mem::replace(&mut selected[index], true) {
+                        for (index, seen) in
+                            selected.iter_mut().enumerate().take(end + 1).skip(start)
+                        {
+                            if !std::mem::replace(seen, true) {
                                 files.push(index);
                             }
                         }
