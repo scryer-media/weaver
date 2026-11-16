@@ -348,6 +348,51 @@ async fn a_cancel_while_measuring_stops_every_connection_after_its_article() {
     assert!(!rig.handle.is_globally_paused());
 }
 
+// A slow server keeps an article arriving long after the operator cancels.
+// The cancel cuts it at its next read: the run ends Cancelled while the
+// server is still sending, rather than when the article would end.
+#[tokio::test]
+async fn a_cancel_cuts_an_article_that_is_still_arriving() {
+    let rig = rig().await;
+    let nntp = NntpFixture::start_with(
+        vec![FixtureArticle::patterned("endless@fixture", 9_000)],
+        None,
+        None,
+        NntpBehaviour {
+            endless_body: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let http = HttpFixture::start(nzb(&[("endless@fixture", 9_000)]), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let mut trickled = nntp.trickled();
+    nntp.trickle();
+    trickled.wait_for(|lines| *lines >= 1).await.unwrap();
+    assert!(rig.service.cancel(started.id));
+    // The article keeps arriving, one line for each the run ends without.
+    let run = loop {
+        nntp.trickle();
+        tokio::select! {
+            run = finished(&rig, started.id) => break run,
+            changed = trickled.changed() => changed.unwrap(),
+        }
+    };
+
+    assert_eq!(run.status, SpeedTestStatus::Cancelled);
+    assert_eq!(nntp.log(), vec!["BODY endless".to_string()]);
+    assert!(!rig.handle.is_globally_paused());
+}
+
 #[tokio::test]
 async fn a_queue_paused_before_the_run_stays_paused_after_it() {
     let rig = rig().await;

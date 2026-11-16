@@ -2039,3 +2039,63 @@ async fn a_probe_holding_its_scratch_file_leaves_the_jobs_folder_and_delivery_al
     drop(hold);
     retire_pipeline_database(pipeline).await;
 }
+
+// Hear the next report or mail the loop is sent.
+async fn hear_next(pipeline: &mut Pipeline) {
+    tokio::select! {
+        Some(report) = pipeline.volume_reports.recv() => pipeline.volume_batch_returned(report),
+        Some(said) = pipeline.graph_runs.recv() => pipeline.graph_run_said(said),
+    }
+}
+
+// A file the volume's writer cannot make for its name is skipped once. Each
+// later write of it returns at hand-over, before its own refusal comes back:
+// the member stays marked through it, and the refusal that follows skips
+// nothing more, so it is logged and damaged once.
+#[tokio::test]
+async fn a_name_a_volumes_thread_refuses_is_skipped_once_over_later_writes() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_431);
+    // One part of 300 bytes, past the 255 a part may hold.
+    let name = format!("{}.bin", "a".repeat(296));
+    let posts = [Post::plain(&name, payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let unnamable = |pipeline: &Pipeline| {
+        pipeline.graph_jobs[&job_id]
+            .writer()
+            .unnamable(weaver_graph::NodeId::ROOT, MemberId(0))
+    };
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    while !unnamable(&pipeline) {
+        hear_next(&mut pipeline).await;
+    }
+    for ordinal in 1..3 {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+        assert!(unnamable(&pipeline), "article {ordinal}");
+        let barrier = pipeline.graph_jobs[&job_id].disk().unwrap().barrier();
+        while !barrier.passed() {
+            hear_next(&mut pipeline).await;
+        }
+        assert!(unnamable(&pipeline), "article {ordinal}");
+    }
+    let job = &pipeline.graph_jobs[&job_id];
+    assert_eq!(job.writer().names_skipped, 1);
+    let whole = ByteRange::new(0, posts[0].bytes.len() as u64);
+    assert!(
+        job.namespace()
+            .get(MemberId(0))
+            .unwrap()
+            .coverage
+            .damaged(whole)
+    );
+    let listed: Vec<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !listed.iter().any(|listed| listed.ends_with(".bin")),
+        "{listed:?}"
+    );
+    retire_pipeline_database(pipeline).await;
+}
