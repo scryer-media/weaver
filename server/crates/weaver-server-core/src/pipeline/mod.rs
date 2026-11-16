@@ -739,13 +739,19 @@ impl DownloadFailure {
             return Self::new(DownloadFailureKind::RouteCapacity, error.to_string());
         }
 
+        // Nothing read before a lane is open is an answer about an article.
+        // A server that answered GROUP 411 for every newsgroup the work lists
+        // does not carry the post: the articles move to the next server as on
+        // a 430 (the refusal names its server). An answer with no class (an
+        // odd greeting, a 483, an unknown AUTHINFO reply, a line that does not
+        // parse) is the server refusing the connection: the dial has cooled
+        // it, and the articles wait like any refused connect.
         let kind = Self::infrastructure_kind(error, DownloadFailureKind::ConnectionEstablishment)
             .unwrap_or(match error {
-                NntpError::NoSuchGroup
-                | NntpError::CommandNotRecognized
-                | NntpError::TlsRequired
-                | NntpError::UnexpectedResponse { .. }
-                | NntpError::MalformedResponse(_) => DownloadFailureKind::ContentOrProtocol,
+                NntpError::NoSuchGroup => DownloadFailureKind::ArticleNotFound,
+                error if error.is_unclassed_setup_answer() => {
+                    DownloadFailureKind::ConnectionEstablishment
+                }
                 _ => DownloadFailureKind::LaneUnavailable,
             });
 

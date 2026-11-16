@@ -433,6 +433,7 @@ fn dial_error(error: BlockingBodyLaneAcquireError) -> NntpError {
         BlockingBodyLaneAcquireError::CredentialsRefused { .. } => NntpError::AuthenticationFailed,
         BlockingBodyLaneAcquireError::ProviderCapacity(error)
         | BlockingBodyLaneAcquireError::RouteCapacity(error)
+        | BlockingBodyLaneAcquireError::GroupsNotCarried { error, .. }
         | BlockingBodyLaneAcquireError::Other(error) => error,
         BlockingBodyLaneAcquireError::ServerRecovering => NntpError::ServerRecovering,
         BlockingBodyLaneAcquireError::LocalCapacity

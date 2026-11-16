@@ -484,8 +484,9 @@ fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, n
 //
 // It answers each dial with a greeting the lane refuses, so a worker that
 // was handed a lease fails its dial at once and gives the permit back, and
-// the refusal is a protocol answer rather than a transport fault: it records
-// no cooldown, so the server stays eligible for the next pass. A name that
+// the refusal is a protocol answer rather than a transport fault: it counts
+// against the server's health but takes no reconnect delay, so the server
+// stays eligible for the next pass. A name that
 // does not resolve did the first half of that and not the second, and left
 // each test racing the worker's health bookkeeping.
 fn refusing_harness_server_port() -> u16 {
