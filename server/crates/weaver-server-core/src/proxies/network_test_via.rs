@@ -165,6 +165,50 @@ pub(super) fn paths(route: &Route, pools: &HashMap<u32, ProxyPool>) -> Vec<(usiz
     paths
 }
 
+// A leg on egress `egress_id` that rides proxies `ids`, from the egress up,
+// as one rung; none for a path with no proxy.
+fn path_leg(egress_id: u32, ids: Vec<u32>) -> Option<RouteLeg> {
+    let rung = match ids.as_slice() {
+        [] => return None,
+        [id] => Rung::Proxy { id: *id },
+        _ => Rung::Chain { ids },
+    };
+    Some(RouteLeg {
+        egress_id,
+        weight: 1,
+        path: LegPath::Ladder {
+            rungs: vec![rung],
+            direct_fallback: false,
+        },
+    })
+}
+
+// Whether a test may dial at all, refused as a save would refuse it, before
+// anything is dialled. `ridden` holds the proxied paths the test dials, and
+// `names` the route whose names it answers on DNS `profile`.
+//
+// A WireGuard server keeps one endpoint per key: a test must not reach a
+// WireGuard proxy by a path other than the one a saved route holds it on, or
+// the two sessions take the endpoint from each other. Then the route must be
+// one its profile can answer on.
+fn may_dial(
+    config: &Configuration,
+    ridden: &Route,
+    names: &Route,
+    profile: &crate::proxies::DnsProfile,
+) -> Result<(), NetworkRefusal> {
+    let mut routes: Vec<Route> = config.policies.values().map(RoutingPolicy::route).collect();
+    routes.push(ridden.clone());
+    validate_wireguard_paths(&routes, &config.profiles, &config.pools)?;
+    crate::proxies::dns_persistence::validate_draft_route_dns(
+        names,
+        profile,
+        &config.profiles,
+        &config.pools,
+        &config.dns,
+    )
+}
+
 // Whether `kind` may ride on `beneath` the way a chain would carry it: only
 // WireGuard carries the UDP that WireGuard and HTTP/3 travel over, and only
 // WireGuard can use it.
@@ -320,51 +364,29 @@ impl NetworkRuntime {
                 limit: MAX_TEST_PATHS,
             });
         }
-        // A WireGuard server keeps one endpoint per key: a test must not
-        // reach a WireGuard proxy by a path other than the one a saved route
-        // holds it on, or the two sessions take the endpoint from each other.
-        let mut routes: Vec<Route> = config.policies.values().map(RoutingPolicy::route).collect();
         // Each path with the proxy under test on top of it, as a chain holds it.
         let tested = Route {
             legs: paths
                 .iter()
                 .flat_map(|(_, egress_id, carriers)| {
                     subjects.iter().filter_map(move |subject| {
-                        let ids: Vec<u32> = carriers.iter().copied().chain(*subject).collect();
-                        let rung = match ids.as_slice() {
-                            [] => return None,
-                            [id] => Rung::Proxy { id: *id },
-                            _ => Rung::Chain { ids },
-                        };
-                        Some(RouteLeg {
-                            egress_id: *egress_id,
-                            weight: 1,
-                            path: LegPath::Ladder {
-                                rungs: vec![rung],
-                                direct_fallback: false,
-                            },
-                        })
+                        path_leg(
+                            *egress_id,
+                            carriers.iter().copied().chain(*subject).collect(),
+                        )
                     })
                 })
                 .collect(),
             failover: Failover::default(),
         };
-        routes.push(tested.clone());
-        validate_wireguard_paths(&routes, &config.profiles, &config.pools)?;
-        // Names are answered on the route the test rides, the draft alone
-        // or with the proxy under test on top of each path: refused as a
-        // save of that route would refuse it, before anything is dialled.
-        crate::proxies::dns_persistence::validate_draft_route_dns(
-            if subject == TestSubject::Route {
-                route
-            } else {
-                &tested
-            },
-            &resolved_by,
-            &config.profiles,
-            &config.pools,
-            &config.dns,
-        )?;
+        // Names are answered on the route the test rides, the draft alone or
+        // with the proxy under test on top of each path.
+        let answered = if subject == TestSubject::Route {
+            route
+        } else {
+            &tested
+        };
+        may_dial(&config, &tested, answered, &resolved_by)?;
         // A pool carries the target through the member it picks.
         let pool = match subject {
             TestSubject::Pool(id) if targeted => Some(id),
@@ -640,12 +662,10 @@ impl NetworkRuntime {
         let config = self.configuration.read().expect("network configuration");
         route.validate_references(&config.egresses, &config.profiles, &config.pools)?;
         // Only a route profile, as a route's save requires.
-        config.route_profile(dns_profile)?;
+        let profile = config.route_profile(dns_profile)?;
         let Some((_, egress_id, carriers)) = paths(route, &config.pools).into_iter().next() else {
             return Err(NetworkRefusal::RouteLegCount);
         };
-        let bottom = Self::bottom(&config, egress_id, ROUTE_TEST_WAIT)
-            .map_err(|_| NetworkRefusal::RouteEgressMissing)?;
         let through_proxy = matches!(
             config.dns_choice(dns_profile),
             DnsChoice::Weaver {
@@ -653,6 +673,20 @@ impl NetworkRuntime {
                 ..
             }
         );
+        // The servers are asked through the first path's proxies only when
+        // the profile asks through the proxy; the draft is the route whose
+        // names they would answer.
+        let ridden = Route {
+            legs: through_proxy
+                .then(|| path_leg(egress_id, carriers.clone()))
+                .flatten()
+                .into_iter()
+                .collect(),
+            failover: Failover::default(),
+        };
+        may_dial(&config, &ridden, route, &profile)?;
+        let bottom = Self::bottom(&config, egress_id, ROUTE_TEST_WAIT)
+            .map_err(|_| NetworkRefusal::RouteEgressMissing)?;
         let stage: Arc<dyn Dialer> = if !through_proxy || carriers.is_empty() {
             bottom
         } else {
