@@ -3,11 +3,7 @@
 
 use super::completion::Placing;
 use super::intake::Resolving;
-use super::live::Live;
-use super::{
-    ActionError, PeerTerms, TICK, TorrentService, fetch_levels, ignored_of, load_of, ratelimits_of,
-    state_error,
-};
+use super::{ActionError, PeerTerms, TICK, TorrentService, ignored_of, load_of, state_error};
 use crate::categories::model::resolve_category_config;
 use crate::jobs::JobId;
 use crate::proxies::{ResolvedBy, TorrentScope};
@@ -245,8 +241,7 @@ impl TorrentService {
         // they are (libtorrent posts a state update for the torrents that
         // changed, not every one). The tick picks and publishes every one.
         if self.inner.signal.take_pass() {
-            self.apply_queue().await;
-            self.apply_picking().await;
+            self.apply_queue_and_picking().await;
             self.publish().await;
         } else {
             self.pick(Some(&dirty)).await;
@@ -376,13 +371,9 @@ impl TorrentService {
         // Taken after the routes are followed, whose readings take their
         // own: no reading in the tick runs from before one already kept.
         let now = self.inner.clock.now_ms();
-        self.read(now, false).await;
-        self.save_checkpoints(self.inner.signal.take_unsaved())
-            .await;
-        self.apply_goals(now).await;
-        self.apply_queue().await;
-        self.apply_picking().await;
-        self.apply_limits().await;
+        // Each torrent read, its checkpoint written when it is behind, its
+        // goals applied, then its queue turn, picking and limits.
+        self.policy_pass(now).await;
         self.drop_idle_sessions().await;
         self.read_sessions().await;
         self.publish().await;
@@ -518,135 +509,6 @@ impl TorrentService {
         }
         for job_id in unresolved {
             self.resolve(job_id).await;
-        }
-    }
-
-    // The session's figures for each torrent, and the ledger kept from
-    // them: written whenever it changed, with its peers once a minute while
-    // they change, or now when `at_once`.
-    pub(super) async fn read(&self, now: i64, at_once: bool) {
-        let mut landings = Vec::new();
-        {
-            let mut live = self.inner.live.lock().await;
-            for torrent in live.values_mut() {
-                // Seed mode ended in the session: from here what the job has
-                // is what the torrent has, after a restart too.
-                if torrent.record.seed_mode
-                    && let Some(attached) = &torrent.attached
-                    && !attached.handle.seed_mode()
-                {
-                    torrent.record.seed_mode = false;
-                    torrent.seed_verified = 0;
-                    // Seeding no more, it may be queued again.
-                    self.inner.signal.want_pass();
-                    if let Err(error) = self.inner.db.clear_torrent_seed_mode(torrent.record.job_id)
-                    {
-                        tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not record that a torrent left seed mode");
-                    }
-                }
-                // Still in it: the pieces that passed since they were last
-                // kept are kept, so a restart serves them without a second
-                // check (libtorrent saves `verified_pieces` in resume data).
-                if torrent.record.seed_mode
-                    && let Some(attached) = &torrent.attached
-                    && let Some(verified) = attached.handle.seed_verified()
-                    && verified.count_ones() > torrent.seed_verified
-                {
-                    let count = verified.count_ones();
-                    match self
-                        .inner
-                        .db
-                        .set_torrent_seed_verified(torrent.record.job_id, verified.as_raw_slice())
-                    {
-                        Ok(_) => torrent.seed_verified = count,
-                        Err(error) => {
-                            tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not keep the pieces a torrent checked in seed mode");
-                        }
-                    }
-                }
-                let reading = torrent.reading(now);
-                torrent.engine = reading.engine.clone();
-                torrent.speeds = reading.speeds;
-                torrent.peers = reading.peers;
-                torrent.keep(reading);
-                // Queued in the step that took it, so ledgers land in the
-                // order they were read.
-                landings.extend(self.queue_resume(torrent, now, at_once));
-            }
-        }
-        for landing in landings {
-            let _ = self.landed(Some(landing)).await;
-        }
-    }
-
-    // What each session runs is what is stored: the levels the operator
-    // set for the files, sequential and first-and-last, each read from the torrent's handle and
-    // pushed only where it differs. A change the session refuses (while it
-    // checks its files) is pushed again on the next pass. A full disk
-    // leaves the levels as they are: the session stops fetching in upload
-    // mode, not by lower levels.
-    pub(super) async fn apply_picking(&self) {
-        self.pick(None).await;
-    }
-
-    // Picking for the torrents in `only`, or for every one.
-    async fn pick(&self, only: Option<&BTreeSet<JobId>>) {
-        let live = self.inner.live.lock().await;
-        let torrents: Box<dyn Iterator<Item = &Live> + Send> = match only {
-            Some(only) => Box::new(only.iter().filter_map(|job_id| live.get(job_id))),
-            None => Box::new(live.values()),
-        };
-        for torrent in torrents {
-            let (Some(attached), Some(_)) = (&torrent.attached, &torrent.store) else {
-                continue;
-            };
-            let handle = &attached.handle;
-            let record = &torrent.record;
-            if handle.sequential() != record.sequential {
-                handle.set_sequential(record.sequential);
-            }
-            if handle.first_last_piece_first() != record.first_last_piece_first
-                && let Err(error) = handle.set_first_last_piece_first(record.first_last_piece_first)
-            {
-                tracing::debug!(job_id = record.job_id.0, error = %error, "a torrent's first and last pieces did not move");
-            }
-            let wanted = fetch_levels(torrent);
-            let running = attached.handle.file_priorities();
-            let changes: Vec<(usize, FilePriority)> = wanted
-                .iter()
-                .enumerate()
-                .filter(|(index, level)| running.get(*index) != Some(*level))
-                .map(|(index, level)| (index, *level))
-                .collect();
-            if changes.is_empty() {
-                continue;
-            }
-            if let Err(error) = attached
-                .session
-                .set_file_priorities(&attached.handle, &changes)
-                .await
-            {
-                tracing::debug!(job_id = torrent.record.job_id.0, error = %error, "a torrent's file levels did not change");
-            }
-        }
-    }
-
-    // The limits each torrent's session holds it to, from its own and its
-    // seeding policy's as they are now: a change of either at any level
-    // reaches the torrent's peers without reconnecting them.
-    async fn apply_limits(&self) {
-        let settings = self.settings();
-        let rules = self.rules();
-        let live = self.inner.live.lock().await;
-        for torrent in live.values() {
-            let Some(attached) = &torrent.attached else {
-                continue;
-            };
-            let rule = torrent.rule(&rules);
-            let limits = ratelimits_of(&torrent.record, settings.upload_cap(&torrent.record, rule));
-            if attached.handle.ratelimits() != limits {
-                attached.handle.set_ratelimits(limits);
-            }
         }
     }
 

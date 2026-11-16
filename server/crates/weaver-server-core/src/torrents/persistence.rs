@@ -29,6 +29,22 @@ const TRACKER_INSERT: &str =
 const TRACKER_HOST_INSERT: &str =
     "INSERT INTO tracker_hosts (host) VALUES ({}) ON CONFLICT (host) DO NOTHING";
 
+/// Seed mode as a pass over the torrents found it, written together by
+/// [`Database::write_torrent_seed_modes`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TorrentSeedWrites {
+    /// Left seed mode: no check passed in it is kept.
+    pub(crate) left: Vec<JobId>,
+    /// The pieces each still in it has checked, a bitfield as the wire's.
+    pub(crate) verified: Vec<(JobId, Vec<u8>)>,
+}
+
+impl TorrentSeedWrites {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.left.is_empty() && self.verified.is_empty()
+    }
+}
+
 // The statement that writes a torrent's ledger and the peers and bans it
 // begins with, each only when given; none when neither is.
 fn resume_update(
@@ -1160,6 +1176,81 @@ impl Database {
             SqlArg::I64(stored(job_id.0)?),
         ];
         self.set_torrent_column("state", args)
+    }
+
+    // Seed mode as a pass found it, in one transaction: the torrents that
+    // left it, as `clear_torrent_seed_mode` writes one, and the pieces each
+    // still in it checked, as `set_torrent_seed_verified` writes one. Each
+    // list goes in bind-limit chunks, one statement a chunk. The statements
+    // are built once, the bitfields moved into them: a retry of the
+    // transaction copies none.
+    pub(crate) fn write_torrent_seed_modes(
+        &self,
+        writes: TorrentSeedWrites,
+    ) -> Result<(), StateError> {
+        use crate::persistence::sql_runtime::max_rows_for_engine;
+
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        let engine = datastore.engine();
+        let mut statements: Vec<(String, Vec<SqlArg>)> = Vec::new();
+        // One bind for the seed mode, then the ids.
+        let rows = max_rows_for_engine(engine, 1).saturating_sub(1).max(1);
+        for chunk in writes.left.chunks(rows) {
+            let placeholders = vec!["{}"; chunk.len()].join(", ");
+            let mut args = Vec::with_capacity(chunk.len() + 1);
+            args.push(SqlArg::Bool(false));
+            for job_id in chunk {
+                args.push(SqlArg::I64(stored(job_id.0)?));
+            }
+            statements.push((
+                format!(
+                    "UPDATE torrents SET seed_mode = {{}}, seed_verified = NULL WHERE job_id IN ({placeholders})"
+                ),
+                args,
+            ));
+        }
+        // Each row binds its id and bitfield in the CASE and its id in the
+        // list.
+        let rows = max_rows_for_engine(engine, 3);
+        let mut verified = writes.verified.into_iter().peekable();
+        while verified.peek().is_some() {
+            let chunk: Vec<(i64, Vec<u8>)> = verified
+                .by_ref()
+                .take(rows)
+                .map(|(job_id, pieces)| Ok((stored(job_id.0)?, pieces)))
+                .collect::<Result<_, StateError>>()?;
+            let ids: Vec<i64> = chunk.iter().map(|(id, _)| *id).collect();
+            let mut args = Vec::with_capacity(chunk.len() * 3);
+            for (id, pieces) in chunk {
+                args.push(SqlArg::I64(id));
+                args.push(SqlArg::OptBytes(Some(pieces)));
+            }
+            args.extend(ids.iter().copied().map(SqlArg::I64));
+            let cases = vec!["WHEN {} THEN {}"; ids.len()].join(" ");
+            let placeholders = vec!["{}"; ids.len()].join(", ");
+            statements.push((
+                format!(
+                    "UPDATE torrents SET seed_verified = CASE job_id {cases} END WHERE job_id IN ({placeholders})"
+                ),
+                args,
+            ));
+        }
+        let statements = std::sync::Arc::new(statements);
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "write_torrent_seed_modes", |tx| {
+                let statements = std::sync::Arc::clone(&statements);
+                Box::pin(async move {
+                    for (sql, args) in statements.iter() {
+                        tx.execute(sql, args).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 
     // Each group's kept intent for every torrent of its ids, and no other
