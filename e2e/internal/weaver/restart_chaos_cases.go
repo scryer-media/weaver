@@ -340,6 +340,11 @@ func runEarlyGapDoesNotThrottle(ctx *restartCaseContext) (restartCaseResult, err
 	endedFirst := ""
 	servedRest := 0
 	for time.Now().Before(deadline) {
+		// The status is read before the counts. A job that ends between the
+		// two reads is then judged on counts taken after its end, never on
+		// counts from before its last articles were served.
+		status, ended := restartJobStatusFromDB(caseDBPath(ctx), jobID)
+		ended = ended && dbStatusTerminal(normalizeDBStatus(status))
 		metrics, err := fetchNntpBodyMetrics("")
 		if err != nil {
 			return restartCaseResult{}, err
@@ -354,7 +359,7 @@ func runEarlyGapDoesNotThrottle(ctx *restartCaseContext) (restartCaseResult, err
 			everyOther = true
 			break
 		}
-		if status, ok := restartJobStatusFromDB(caseDBPath(ctx), jobID); ok && dbStatusTerminal(normalizeDBStatus(status)) {
+		if ended {
 			endedFirst = normalizeDBStatus(status)
 			break
 		}
