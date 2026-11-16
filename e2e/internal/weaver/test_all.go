@@ -377,12 +377,10 @@ func runExclusiveFunctionalJob(
 			job.errMsg = "backup-unavailable gate requires the backup NNTP server"
 			return
 		}
-		// Refuse new sessions and make any pooled session re-authenticate on
-		// BODY, so earlier scenarios cannot leave a connection around the gate.
 		release, err := holdNntpChaosOnServer(
 			nntpHost(),
 			backupNntpPort(),
-			"greet_400=100,reauth_body=100",
+			serverUnavailableChaos,
 		)
 		if err != nil {
 			job.status = "setup_error"
