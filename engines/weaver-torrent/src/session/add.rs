@@ -388,7 +388,7 @@ impl Session {
                     port: self.told_port(None),
                     announce: !opts.paused && !opts.list_only,
                     dht_announce: dht_announce.subscribe(),
-                    initial_peers: opts.initial_peers.clone().unwrap_or_default(),
+                    initial_peers: own_peers(&opts.initial_peers, &opts.found_peers, trackers_only),
                     trackers: TrackerAsk {
                         identity,
                         tiers: tracker_tiers.clone(),
@@ -547,6 +547,16 @@ impl Session {
                 };
                 (resolved_magnet.metadata, peers)
             }
+        };
+        // A public torrent a tracker rule has it take its peers from its
+        // trackers alone drops at once the peers its save found elsewhere
+        // than its trackers and the operator (the DHT's, local discovery's,
+        // peer exchange's), as a private one does once a tracker answers;
+        // those its trackers named, or that connected in, stay.
+        let peer_list = if opts.trackers_only && !metadata.info.info().private {
+            peer_list.taking_trackers_alone(true)
+        } else {
+            peer_list
         };
 
         // A running torrent finds its peers from the start; an SSL torrent's
@@ -723,7 +733,11 @@ impl Session {
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: Limits::new(opts.ratelimits),
-                    initial_peers: opts.initial_peers.clone().unwrap_or_default(),
+                    initial_peers: own_peers(
+                        &opts.initial_peers,
+                        &opts.found_peers,
+                        trackers_only(metadata.info.info().private, opts.trackers_only),
+                    ),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_v1_hashes: opts.disable_v1_hashes,
                     super_seeding: opts.super_seeding,
@@ -901,5 +915,24 @@ impl Session {
             .context("error adding to session")?;
 
         Ok((torrent, handle))
+    }
+}
+
+/// The peers a torrent's own list hands each of its runs: those it was
+/// added with, but for a torrent that takes its peers from its trackers
+/// alone, not those a save found elsewhere. Its peer list holds those
+/// while it owes them, and once they leave, handing them out again would
+/// bring them back as the operator's.
+fn own_peers(
+    initial: &Option<Vec<SocketAddr>>,
+    found: &[SocketAddr],
+    trackers_only: bool,
+) -> Vec<SocketAddr> {
+    let peers = initial.iter().flatten().copied();
+    if trackers_only && !found.is_empty() {
+        let found: std::collections::HashSet<_> = found.iter().collect();
+        peers.filter(|addr| !found.contains(addr)).collect()
+    } else {
+        peers.collect()
     }
 }

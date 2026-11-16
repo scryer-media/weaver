@@ -26,7 +26,11 @@ gen_stats!(AggregatePeerStatsAtomic AggregatePeerStats, [
     seen u32,
     dead u32,
     not_needed u32,
-    steals u32
+    steals u32,
+    // Peers that left a list because no tracker or the operator named them
+    // and its torrent takes its peers from its trackers alone; counted as
+    // each leaves.
+    untracked_dropped u32
 ], []);
 
 impl AggregatePeerStatsAtomic {

@@ -486,6 +486,10 @@ pub struct SessionSeries {
     pub connected: ConnectedPeers,
     /// Pieces its connections took from slower peers.
     pub piece_steals: u64,
+    /// Peers its torrents' lists dropped because no tracker or the
+    /// operator named them, while those torrents take their peers from
+    /// their trackers alone.
+    pub untracked_dropped: u64,
     /// Its outgoing handshakes by how each ended: sent plain, or sent
     /// encrypted and settled on RC4, on header only, failed, or dropped
     /// before it ended.
@@ -560,6 +564,7 @@ impl SessionSeries {
                 seeders: peers.live_seeders,
             },
             piece_steals: peers.steals.into(),
+            untracked_dropped: peers.untracked_dropped.into(),
             outgoing_encryption: {
                 let encryption = &connections.encryption;
                 [

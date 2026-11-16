@@ -252,6 +252,9 @@ pub(crate) struct PeerList {
     smart_ban: SmartBan,
     // See [`Self::taking_trackers_alone`].
     untracked_owed: bool,
+    // How many peers [`Self::taking_trackers_alone`] dropped; the run
+    // founded on the list counts them.
+    untracked_dropped: u32,
 }
 
 impl PeerList {
@@ -313,10 +316,12 @@ impl PeerList {
             return self;
         }
         let smart_ban = &mut self.smart_ban;
+        let dropped = &mut self.untracked_dropped;
         self.peers.retain(|peer| {
             let kept = peer.tracker_or_operator_named();
             if !kept {
                 smart_ban.forget(peer.addr);
+                *dropped = dropped.saturating_add(1);
             }
             kept
         });
@@ -595,6 +600,7 @@ impl PeerStates {
             peer.rejoin(&peers);
             peers.states.insert(peer.addr, peer);
         }
+        peers.untracked_dropped(list.untracked_dropped);
         peers
     }
 
@@ -692,6 +698,7 @@ impl PeerStates {
             banned: self.banned.read().clone(),
             smart_ban,
             untracked_owed: self.untracked_owed.load(Ordering::Relaxed),
+            untracked_dropped: 0,
         }
     }
 
@@ -734,7 +741,10 @@ impl PeerStates {
                 .states
                 .remove_if(&handle, |_, peer| peer.connected_out().is_none())
             {
-                Some((_, peer)) => self.erased(handle, &peer),
+                Some((_, peer)) => {
+                    self.erased(handle, &peer);
+                    self.untracked_dropped(1);
+                }
                 None => {
                     self.untracked_leaving.lock().insert(handle);
                     self.with_peer(handle, Peer::disconnect);
@@ -755,6 +765,16 @@ impl PeerStates {
             peer.connected_out().is_none() && !peer.tracker_or_operator_named()
         }) {
             self.erased(handle, &peer);
+            self.untracked_dropped(1);
+        }
+    }
+
+    // `count` peers left the list as no tracker or the operator named them:
+    // the run's and the session's counters count them.
+    fn untracked_dropped(&self, count: u32) {
+        if count > 0 {
+            self.stats.untracked_dropped(count);
+            self.session_stats.untracked_dropped(count);
         }
     }
 
