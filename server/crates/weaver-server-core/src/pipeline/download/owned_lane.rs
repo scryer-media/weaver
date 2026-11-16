@@ -1202,7 +1202,10 @@ fn ask_owned_lane_probe(
             }
             // A busy health state or a seat not free yet is the wait a lease
             // the scheduler takes back makes, not an answer from the server.
-            Err(error) if error.should_requeue_owned_work() => {
+            // A full route is not: nothing holds the server off until the
+            // route frees, so putting the batch back would seat and refuse
+            // it again at once. It leaves that server inconclusive instead.
+            Err(error) if error.should_requeue_owned_work() && !error.is_route_capacity() => {
                 return OwedProbeAnswer::unseated(probe);
             }
             Err(error) => {
@@ -4064,6 +4067,98 @@ mod routing_tests {
 
         park_cached_lane(&mut cached);
         server.join().unwrap();
+    }
+
+    // A route that refuses every dial for room, and the dials it refused.
+    struct FullRoute(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl weaver_tunnel::pipe::Dialer for FullRoute {
+        async fn dial(
+            &self,
+            _: &weaver_tunnel::pipe::Target,
+        ) -> std::result::Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(weaver_tunnel::pipe::DialError::AtCapacity(Vec::new()))
+        }
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(3600)
+        }
+        fn describe(&self) -> String {
+            "full route fixture".into()
+        }
+    }
+
+    // A probe batch whose seat sits behind a full route is answered
+    // inconclusive on that server, so the health round moves on. Handing it
+    // back unasked would seat it on the same server at once and be refused
+    // again: nothing holds a server off while its route is full.
+    #[test]
+    fn a_probe_behind_a_full_route_is_inconclusive_there_and_seated_once() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dialer = Arc::new(weaver_nntp::route_dialer::RouteDialer {
+            inner: Arc::new(FullRoute(Arc::clone(&dials))),
+            plan: None,
+            egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::new()),
+            runtime: runtime.handle().clone(),
+            server: 0,
+        });
+        let nntp = Arc::new(weaver_nntp::client::NntpClient::new(
+            weaver_nntp::client::NntpClientConfig::single(
+                weaver_nntp::ServerConfig {
+                    host: "nntp-full-route.invalid".to_string(),
+                    port: 119,
+                    tls: false,
+                    dialer,
+                    ..Default::default()
+                },
+                1,
+            ),
+        ));
+        let (mail, _heard) = mpsc::channel(4);
+        let batch = crate::pipeline::post_health::ProbeBatch::new(
+            JobId(1),
+            1,
+            vec!["<lantern-0@example.com>".into()],
+        );
+        let probe = OwnedLaneProbe {
+            nntp: Arc::clone(&nntp),
+            seat: weaver_nntp::pool::ServerId(0),
+            ids: batch.unfound(),
+            batch,
+            mail,
+        };
+        let mut cached = None;
+
+        let owed = ask_owned_lane_probe(&mut cached, probe);
+
+        let crate::pipeline::post_health::ProbeMail::Answered(answer) = owed.word else {
+            panic!(
+                "a full route must not hand the batch back to be seated again: {:?}",
+                owed.word
+            );
+        };
+        assert_eq!(answer.server, 0);
+        assert!(answer.result.inconclusive, "the server could not be asked");
+        assert_eq!(answer.result.exists, vec![false]);
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the seat is dialled once"
+        );
+        assert!(cached.is_none());
+        let health = nntp.pool().health().blocking_lock();
+        assert_eq!(
+            health.server(0).failure_count,
+            0,
+            "a full route is no fault"
+        );
     }
 
     // The check just before a BODY is written reads the policy as the lane's

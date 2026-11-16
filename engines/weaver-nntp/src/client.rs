@@ -78,6 +78,11 @@ const BLOCKING_HEALTH_LOCK_SPINS: usize = 4;
 #[derive(Debug)]
 pub enum BlockingBodyLaneAcquireError {
     ProviderCapacity(NntpError),
+    // The server's network route had no room for the dial: a tunnel on it is
+    // full, or its WireGuard session budget is spent
+    // (`NntpError::is_route_capacity`). Self-clearing as a socket or session
+    // closes, and no verdict about the server.
+    RouteCapacity(NntpError),
     LocalCapacity,
     // Every candidate server is recovering and its one probe connection is
     // already out. Self-clearing like local capacity, but not the same
@@ -105,6 +110,8 @@ impl BlockingBodyLaneAcquireError {
             NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
         ) {
             Self::ProviderCapacity(error)
+        } else if error.is_route_capacity() {
+            Self::RouteCapacity(error)
         } else if error.is_credentials_refusal() {
             Self::CredentialsRefused { server, error }
         } else {
@@ -123,8 +130,19 @@ impl BlockingBodyLaneAcquireError {
     pub fn is_capacity_admission(&self) -> bool {
         matches!(
             self,
-            Self::ProviderCapacity(_) | Self::LocalCapacity | Self::ServerRecovering
+            Self::ProviderCapacity(_)
+                | Self::RouteCapacity(_)
+                | Self::LocalCapacity
+                | Self::ServerRecovering
         )
+    }
+
+    // Whether the server's network route was full. Its work is asked again
+    // after the lane-unavailable delay rather than at once: nothing tells the
+    // scheduler when the tunnel frees, and handing the work straight back
+    // would redial the full tunnel on every dispatch pass.
+    pub fn is_route_capacity(&self) -> bool {
+        matches!(self, Self::RouteCapacity(_))
     }
 
     // The transport error behind this refusal, where there is one. Local
@@ -133,6 +151,7 @@ impl BlockingBodyLaneAcquireError {
     pub fn nntp_error(&self) -> Option<&NntpError> {
         match self {
             Self::ProviderCapacity(error)
+            | Self::RouteCapacity(error)
             | Self::Other(error)
             | Self::CredentialsRefused { error, .. } => Some(error),
             Self::LocalCapacity
@@ -156,6 +175,7 @@ impl BlockingBodyLaneAcquireError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::ProviderCapacity(_) => "provider_capacity",
+            Self::RouteCapacity(_) => "route_capacity",
             Self::LocalCapacity => "local_capacity",
             Self::ServerRecovering => "server_recovering",
             Self::CredentialsRefused { .. } => "credentials_refused",
@@ -170,6 +190,9 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ProviderCapacity(error) | Self::Other(error) => error.fmt(formatter),
+            Self::RouteCapacity(error) => {
+                write!(formatter, "the server's network route is full ({error})")
+            }
             Self::LocalCapacity => formatter.write_str("blocking BODY lane capacity is saturated"),
             Self::ServerRecovering => formatter
                 .write_str("server is recovering; the recovery probe connection is already out"),
@@ -360,6 +383,12 @@ pub enum BodyLaneMode {
 // would have to answer here.
 fn supports_blocking_body_lane(_config: &ServerConfig) -> bool {
     true
+}
+
+// Whether a failed dial says something about its server: everything but a
+// route refusal that is no evidence (a full tunnel, a skipped leg).
+fn is_server_evidence(error: &NntpError) -> bool {
+    !matches!(error, NntpError::Route(route) if !route.is_evidence())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -625,6 +654,7 @@ impl NntpClient {
         let mut saw_recovery_gate = false;
         let mut credentials_refused = None;
         let mut provider_capacity_error = None;
+        let mut route_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
             if warm_seat.is_some_and(|seat| seat != server) {
@@ -721,29 +751,57 @@ impl NntpClient {
                     // cannot connect is invisible otherwise: the work is
                     // requeued for another lane, so the download
                     // keeps running — slowly, on a fraction of its lanes, with
-                    // nothing above debug to say why.
-                    debug!(
-                        server = server.0,
-                        error = %error,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "blocking BODY lane connect failed"
-                    );
-                    if let Some(suppressed) = self.pool.note_blocking_connect_warning(server) {
-                        warn!(
+                    // nothing above debug to say why. A full route is told as
+                    // one: the dial never left this machine.
+                    if error.is_route_capacity() {
+                        debug!(
                             server = server.0,
-                            address = %self.pool.server_address(server),
+                            error = %error,
+                            "blocking BODY lane not opened: the server's network route is full"
+                        );
+                    } else {
+                        debug!(
+                            server = server.0,
                             error = %error,
                             elapsed_ms = started.elapsed().as_millis(),
-                            failures_since_last_warning = suppressed,
                             "blocking BODY lane connect failed"
                         );
+                    }
+                    if let Some(suppressed) = self.pool.note_blocking_connect_warning(server) {
+                        if error.is_route_capacity() {
+                            warn!(
+                                server = server.0,
+                                address = %self.pool.server_address(server),
+                                error = %error,
+                                refusals_since_last_warning = suppressed,
+                                "blocking BODY lane not opened: the server's network route is full; the work waits for room"
+                            );
+                        } else {
+                            warn!(
+                                server = server.0,
+                                address = %self.pool.server_address(server),
+                                error = %error,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                failures_since_last_warning = suppressed,
+                                "blocking BODY lane connect failed"
+                            );
+                        }
                     }
                     match BlockingBodyLaneAcquireError::from_connect_error(server, error) {
                         BlockingBodyLaneAcquireError::ProviderCapacity(error) => {
                             provider_capacity_error = Some(error);
                         }
+                        BlockingBodyLaneAcquireError::RouteCapacity(error) => {
+                            route_capacity_error = Some(error);
+                        }
+                        // A server's real fault is kept over a later
+                        // refusal that says nothing about its server.
                         BlockingBodyLaneAcquireError::Other(error) => {
-                            other_error = Some(error);
+                            if is_server_evidence(&error)
+                                || !other_error.as_ref().is_some_and(is_server_evidence)
+                            {
+                                other_error = Some(error);
+                            }
                         }
                         refused @ BlockingBodyLaneAcquireError::CredentialsRefused { .. } => {
                             credentials_refused.get_or_insert(refused);
@@ -758,6 +816,14 @@ impl NntpClient {
         }
         if let Some(error) = provider_capacity_error {
             Err(BlockingBodyLaneAcquireError::ProviderCapacity(error))
+        } else if let Some(error) = other_error.take_if(|error| is_server_evidence(error)) {
+            // A server that failed for real is the answer, as a rung that
+            // failed for real outranks a full one in the route's ladder.
+            Err(BlockingBodyLaneAcquireError::Other(error))
+        } else if let Some(error) = route_capacity_error {
+            // A wait on a server that will take the work once its route has
+            // room, ahead of a refusal that says nothing about any server.
+            Err(BlockingBodyLaneAcquireError::RouteCapacity(error))
         } else if let Some(error) = other_error {
             Err(BlockingBodyLaneAcquireError::Other(error))
         } else if saw_contention {

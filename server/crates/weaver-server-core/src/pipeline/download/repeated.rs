@@ -453,6 +453,7 @@ fn is_the_servers_answer(error: &DownloadError) -> bool {
             DownloadFailureKind::CapacityUnavailable
             | DownloadFailureKind::ServerQuota
             | DownloadFailureKind::LaneUnavailable
+            | DownloadFailureKind::RouteCapacity
             | DownloadFailureKind::Unrequested
             | DownloadFailureKind::EstablishedTransport
             | DownloadFailureKind::Unanswered => false,

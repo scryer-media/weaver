@@ -155,6 +155,125 @@ async fn repeated_acquire_failures_report_at_most_once_a_window() {
     );
 }
 
+// A lane refused because the server's network route is full (a tunnel at
+// capacity, or its session budget spent) is a wait, not a fault: the lane
+// parks as capacity, and every leased article waits the lane-unavailable
+// delay with its retry budget untouched and nothing failed. It does not come
+// straight back, since nothing tells the scheduler when the route frees.
+#[tokio::test]
+async fn a_full_route_parks_as_capacity_and_paces_its_work_without_failing_it() {
+    for refusal in [
+        weaver_tunnel::pipe::DialError::AtCapacity(Vec::new()),
+        weaver_tunnel::pipe::DialError::SessionBudget,
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(41504);
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            standalone_job_spec("Full Route", &many_standalone_files("full-route", 4)),
+        )
+        .await;
+
+        let lease = lease_for(&mut pipeline, job_id);
+        let leased: Vec<_> = lease.works.iter().map(|work| work.segment_id).collect();
+        let retry_counts: Vec<_> = lease.works.iter().map(|work| work.retry_count).collect();
+        pipeline.active_download_connections = 1;
+        pipeline
+            .active_download_connections_by_job
+            .insert(job_id, 1);
+        let parks_error_before = pipeline
+            .metrics
+            .download_lane_parks_error_total
+            .load(Ordering::Relaxed);
+        // No counter counts a capacity park, so the park is heard as its
+        // line, which names the reason.
+        let (parks, parks_guard) = StateLines::hear("download lane parked");
+
+        let mut pending = std::collections::VecDeque::new();
+        pipeline.handle_owned_download_lane_event(
+            OwnedDownloadLaneEvent::AcquireFailed {
+                lease,
+                error: weaver_nntp::client::BlockingBodyLaneAcquireError::RouteCapacity(
+                    weaver_nntp::NntpError::Route(Arc::new(refusal)),
+                ),
+            },
+            &mut pending,
+        );
+
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_id)
+                .unwrap()
+                .articles
+                .active()
+                .unwrap()
+                .download_queue
+                .len(),
+            0,
+            "a full route must not hand its work straight back to redial it"
+        );
+        assert_eq!(pending.len(), leased.len());
+        assert_eq!(
+            pipeline
+                .metrics
+                .download_lane_parks_error_total
+                .load(Ordering::Relaxed),
+            parks_error_before,
+            "the lane parks as capacity, not as an error"
+        );
+        let parked = parks.take();
+        drop(parks_guard);
+        assert_eq!(parked.len(), 1, "{parked:?}");
+        assert!(parked[0].contains(" reason=Capacity"), "{parked:?}");
+        assert!(
+            parked[0].contains(" released_connection=true"),
+            "{parked:?}"
+        );
+        assert_eq!(pipeline.active_download_connections, 0);
+
+        let watermark = tokio::time::Instant::now();
+        while let Some(result) = pending.pop_front() {
+            pipeline.handle_download_done(result).await;
+        }
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(state.failed_bytes, 0);
+        assert_eq!(
+            pipeline
+                .metrics
+                .segments_failed_permanent
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            pipeline
+                .download_wait_by_job
+                .get(&job_id)
+                .map(|wait| wait.reason),
+            Some("NNTP server's network route is full")
+        );
+        assert_eq!(pipeline.infrastructure_retries.len(), leased.len());
+        for (deadline, retry) in pipeline.infrastructure_retries.iter_with_deadlines() {
+            let index = leased
+                .iter()
+                .position(|segment| *segment == retry.work.segment_id)
+                .expect("only the leased articles wait");
+            assert_eq!(
+                retry.work.retry_count, retry_counts[index],
+                "waiting for the route spends no retry"
+            );
+            let deadline = deadline.expect("the wait is paced, not open-ended");
+            assert!(
+                deadline >= watermark + std::time::Duration::from_millis(250),
+                "the work waits the lane-unavailable delay before redialling"
+            );
+        }
+    }
+}
+
 // The download lines that follow a state, as a test hears them: every event
 // on this thread whose message names `prefix`, message first, then each field
 // as `key=value`.

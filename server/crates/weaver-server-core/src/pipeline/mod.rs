@@ -561,6 +561,10 @@ pub(super) enum DownloadFailureKind {
     CapacityUnavailable,
     ServerQuota,
     LaneUnavailable,
+    // The server's network route had no room for the lane: a tunnel on it
+    // is full, or its WireGuard session budget is spent. Requeued as an
+    // unavailable lane is, and no verdict about the server or the article.
+    RouteCapacity,
     Unrequested,
     ConnectionEstablishment,
     EstablishedTransport,
@@ -581,6 +585,7 @@ impl DownloadFailureKind {
             Self::CapacityUnavailable
                 | Self::ServerQuota
                 | Self::LaneUnavailable
+                | Self::RouteCapacity
                 | Self::Unrequested
                 | Self::ConnectionEstablishment
                 | Self::EstablishedTransport
@@ -594,6 +599,7 @@ impl DownloadFailureKind {
             Self::CapacityUnavailable => Some("provider connection capacity unavailable"),
             Self::ServerQuota => Some("NNTP server quota blocked"),
             Self::LaneUnavailable => Some("no eligible NNTP server"),
+            Self::RouteCapacity => Some("NNTP server's network route is full"),
             Self::Unrequested => Some("NNTP lane replaced"),
             Self::ConnectionEstablishment => Some("NNTP connection unavailable"),
             Self::EstablishedTransport | Self::Unanswered => {
@@ -728,6 +734,9 @@ impl DownloadFailure {
         };
         if let NntpError::QuotaBlocked(rejection) = error {
             return Self::server_quota(error.to_string(), rejection.as_ref().clone());
+        }
+        if error.is_route_capacity() {
+            return Self::new(DownloadFailureKind::RouteCapacity, error.to_string());
         }
 
         let kind = Self::infrastructure_kind(error, DownloadFailureKind::ConnectionEstablishment)

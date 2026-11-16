@@ -1442,7 +1442,6 @@ pub fn encode_output_files_cursor(cursor: &OutputFilesCursor) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
 }
 
-
 pub use weaver_server_core::jobs::model::PRIORITY_ATTRIBUTE_KEY;
 
 pub fn normalize_priority_value(value: &str) -> std::result::Result<String, String> {

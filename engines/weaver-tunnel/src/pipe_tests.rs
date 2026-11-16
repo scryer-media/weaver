@@ -1097,15 +1097,42 @@ fn session_budget_counts_probes_and_keeps_live_stream_reservations() {
     let live = SessionCapacity::new(budget.clone());
     let probe = SessionCapacity::new(budget.clone());
     let stream = live.acquire().unwrap();
-    assert!(matches!(probe.acquire(), Err(DialError::Skipped(_))));
+    assert!(matches!(probe.acquire(), Err(DialError::SessionBudget)));
     live.release();
-    assert!(matches!(probe.acquire(), Err(DialError::Skipped(_))));
+    assert!(matches!(probe.acquire(), Err(DialError::SessionBudget)));
     drop(stream);
     let probe_stream = probe.acquire().unwrap();
     assert_eq!(budget.available_permits(), 0);
     drop(probe_stream);
     probe.release();
     assert_eq!(budget.available_permits(), 1);
+}
+
+// A full tunnel and an exhausted session budget are refusals for room; every
+// other refusal, skipped or not, is not.
+#[test]
+fn only_a_full_tunnel_or_session_budget_is_a_capacity_refusal() {
+    let budget = Arc::new(tokio::sync::Semaphore::new(0));
+    let exhausted = SessionCapacity::new(budget).acquire().unwrap_err();
+    assert!(
+        matches!(exhausted, DialError::SessionBudget),
+        "{exhausted:?}"
+    );
+    assert!(exhausted.is_capacity(), "{exhausted}");
+    assert!(DialError::AtCapacity(Vec::new()).is_capacity());
+    for other in [
+        // Only the variant is capacity: the same words in a skip are not.
+        DialError::Skipped(SESSION_BUDGET_EXHAUSTED.into()),
+        DialError::Skipped("leg revoked".into()),
+        DialError::Skipped("all rungs are unavailable".into()),
+        DialError::Timeout {
+            stage: "network route".into(),
+        },
+        DialError::Egress(io::Error::other("down")),
+        DialError::Refused(io::Error::from(io::ErrorKind::ConnectionRefused)),
+    ] {
+        assert!(!other.is_capacity(), "{other}");
+    }
 }
 
 #[test]
@@ -1384,7 +1411,7 @@ async fn an_exhausted_budget_beneath_a_carried_hop_is_a_skip_not_its_failure() {
         Ok(_) => panic!("no budget beneath, no tunnel above"),
         Err(error) => error,
     };
-    assert!(matches!(error, DialError::Skipped(_)), "{error:?}");
+    assert!(matches!(error, DialError::SessionBudget), "{error:?}");
     assert!(!error.is_path_evidence());
     // The hop above never took a permit of its own for a tunnel it could
     // not bring up.
@@ -3075,10 +3102,10 @@ async fn a_direct_usenet_dial_is_not_sized_by_the_profile() {
     let usenet = egress
         .dial(&Target {
             purpose: Purpose::Nntp {
-        server: 1,
-        leg: 0,
-        probing: false,
-    },
+                server: 1,
+                leg: 0,
+                probing: false,
+            },
             ..target(address)
         })
         .await

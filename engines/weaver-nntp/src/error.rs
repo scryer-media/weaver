@@ -239,6 +239,13 @@ impl NntpError {
         )
     }
 
+    // Whether the server's network route turned the dial away for room: a
+    // tunnel on it is full, or its WireGuard session budget is spent. Nothing
+    // reached the server, so it says nothing about the server.
+    pub fn is_route_capacity(&self) -> bool {
+        matches!(self, NntpError::Route(route) if route.is_capacity())
+    }
+
     // Create an `UnexpectedResponse` from a status code and message.
     pub fn unexpected(code: StatusCode, message: impl Into<String>) -> Self {
         NntpError::UnexpectedResponse {
