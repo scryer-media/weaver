@@ -310,8 +310,11 @@ pub(crate) struct NamespaceWriter {
     // The budgets each member has spilled past, said once each.
     spills_said: BTreeSet<(NodeId, MemberId, Budget)>,
     // The members whose file the file system refused to create for its
-    // name (`skip_unnamable`).
+    // name (`skip_unnamable`), until the ledger renames them.
     unnamable: BTreeSet<(NodeId, MemberId)>,
+    // How many times a member was skipped for its name.
+    #[cfg(test)]
+    pub(crate) names_skipped: usize,
     // Their damage, to apply once the refused write has returned.
     unnamed_damage: Vec<Effect>,
     #[cfg(test)]
@@ -428,6 +431,8 @@ impl NamespaceWriter {
             left_to_write: None,
             spills_said: BTreeSet::new(),
             unnamable: BTreeSet::new(),
+            #[cfg(test)]
+            names_skipped: 0,
             unnamed_damage: Vec::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
@@ -1227,6 +1232,9 @@ impl NamespaceWriter {
             };
             self.caps.admit_name(new)?;
             self.intend(*node, *member, new);
+            // A member renamed since its name was refused is tried again
+            // under the new one; a refusal of that marks it again.
+            self.unnamable.remove(&(*node, *member));
             // A name no file of the member sits at is free in the ledger
             // once it moved the member off it. The database may still give
             // it the member, as its name or the one its file waits for, so
@@ -2764,19 +2772,9 @@ impl NamespaceWriter {
         result: Result<(), WriteError>,
     ) -> Result<(), WriteError> {
         let Err(WriteError::Leaf(error)) = &result else {
-            // A member renamed since its name was refused, and now written
-            // under the new one, has a file: it is no longer marked. A close
-            // with nothing written leaves the mark.
-            if result.is_ok()
-                && !self.unnamable.is_empty()
-                && self
-                    .files
-                    .get(&node)
-                    .and_then(|files| files.leaves.get(&member))
-                    .is_some_and(Leaf::on_disk)
-            {
-                self.unnamable.remove(&(node, member));
-            }
+            // A write that returns has not proved the name: on a volume's
+            // writer it returns at hand-over and the refusal comes back
+            // later. Only a rename (`moved`) lifts the mark.
             return result;
         };
         let creating = self
@@ -2799,6 +2797,10 @@ impl NamespaceWriter {
         self.caps.forget(tree, node, member);
         if !self.unnamable.insert((node, member)) {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.names_skipped += 1;
         }
         let name_bytes = tree
             .namespace(node)
