@@ -7,11 +7,37 @@ license-file.workspace = true
 repository.workspace = true
 
 [features]
-test-support = []
+default = ["aws-lc-rs"]
+# Verify and hash with aws-lc-rs. Wins when both backends are enabled.
+aws-lc-rs = ["dep:aws-lc-rs"]
+# Verify and hash with pure-Rust RustCrypto and dalek crates.
+rust-crypto = [
+    "dep:ed25519-dalek",
+    "dep:ml-dsa",
+    # Keeps ML-DSA's expanded key and signature on the heap, not the stack.
+    "ml-dsa/alloc",
+    "dep:p256",
+    "dep:p384",
+    "dep:rsa",
+    "dep:sha1",
+    "dep:sha2",
+]
+# The signing test equipment signs with aws-lc-rs under either backend.
+test-support = ["dep:aws-lc-rs"]
 
 [dependencies]
-aws-lc-rs = { workspace = true }
+aws-lc-rs = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+ml-dsa = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
+p384 = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+aws-lc-rs = { workspace = true }
 
 [[test]]
 name = "validator"
