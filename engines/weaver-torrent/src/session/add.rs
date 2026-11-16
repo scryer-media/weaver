@@ -9,7 +9,7 @@ use super::options::AddTorrent;
 use super::options::AddTorrentOptions;
 use super::options::AddTorrentResponse;
 use super::options::ListOnlyResponse;
-use super::peer_finder::{self, FINDERS, PeerAsk, TrackerAsk};
+use super::peer_finder::{self, PeerAsk, TrackerAsk};
 use super::peer_sources::Discovery;
 use super::peer_sources::FetchPhase;
 use super::peer_sources::MetadataFetch;
@@ -388,7 +388,7 @@ impl Session {
                     port: self.told_port(None),
                     announce: !opts.paused && !opts.list_only,
                     dht_announce: dht_announce.subscribe(),
-                    initial_peers: opts.initial_peers.clone().unwrap_or_default(),
+                    initial_peers: own_peers(&opts.initial_peers, &opts.found_peers, trackers_only),
                     trackers: TrackerAsk {
                         identity,
                         tiers: tracker_tiers.clone(),
@@ -406,8 +406,10 @@ impl Session {
         // The torrent's one peer list, from its first metadata connection to
         // its last connection (libtorrent `torrent::m_peer_list`, which
         // `torrent::set_metadata` keeps).
+        // The peers a save found elsewhere come back marked so.
         let peer_list = PeerList::resumed(
             opts.initial_peers.iter().flatten().copied(),
+            &opts.found_peers,
             opts.banned_peers.iter().copied(),
         );
 
@@ -415,6 +417,10 @@ impl Session {
         // that follows: the caller's, or this magnet's own.
         let mut handover = opts.tracker_handover.take();
         let (metadata, peer_list) = match metadata {
+            // A private torrent saved while its list still owed its
+            // untracked peers (a magnet's whose trackers had not answered)
+            // owes them again: they stay until a tracker answers.
+            Some(metadata) if metadata.info.info().private => (metadata, peer_list.owing_found()),
             Some(metadata) => (metadata, peer_list),
             None => {
                 // The DHT and local discovery, when the session runs either
@@ -470,11 +476,8 @@ impl Session {
                 let asked_first =
                     make_peer_rx(info_hashes, &identity, true, fetched).map(|source| source.peers);
                 // The DHT and local discovery, once the trackers named no
-                // peer that may still serve the metadata.
-                // They are the finders the trackers' phase did not ask: those
-                // the torrent's options allow and a torrent taken to be
-                // private is not.
-                let trackers_phase = Discovery::added(true, &opts);
+                // peer that may still serve the metadata, each where the
+                // torrent's options let it look.
                 let then = {
                     let session = self.clone();
                     let dht_announce = dht_announce.subscribe();
@@ -488,12 +491,13 @@ impl Session {
                             session.trackers_changed.clone(),
                         )
                         .await;
-                        let mut ask =
-                            PeerAsk::unannounced(&session, info_hashes, &identity, dht_announce);
-                        peer_finder::find(&FINDERS, &session, &mut ask, |finder| {
-                            peer_finder::after_trackers(finder, sources, trackers_phase)
-                        })
-                        .0
+                        peer_finder::after_trackers(
+                            &session,
+                            info_hashes,
+                            &identity,
+                            dht_announce,
+                            sources,
+                        )
                         .unwrap_or_else(|| futures::stream::empty().boxed())
                     }
                     .flatten_stream()
@@ -543,6 +547,16 @@ impl Session {
                 };
                 (resolved_magnet.metadata, peers)
             }
+        };
+        // A public torrent a tracker rule has it take its peers from its
+        // trackers alone drops at once the peers its save found elsewhere
+        // than its trackers and the operator (the DHT's, local discovery's,
+        // peer exchange's), as a private one does once a tracker answers;
+        // those its trackers named, or that connected in, stay.
+        let peer_list = if opts.trackers_only && !metadata.info.info().private {
+            peer_list.taking_trackers_alone(true)
+        } else {
+            peer_list
         };
 
         // A running torrent finds its peers from the start; an SSL torrent's
@@ -719,7 +733,11 @@ impl Session {
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: Limits::new(opts.ratelimits),
-                    initial_peers: opts.initial_peers.clone().unwrap_or_default(),
+                    initial_peers: own_peers(
+                        &opts.initial_peers,
+                        &opts.found_peers,
+                        trackers_only(metadata.info.info().private, opts.trackers_only),
+                    ),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_v1_hashes: opts.disable_v1_hashes,
                     super_seeding: opts.super_seeding,
@@ -897,5 +915,24 @@ impl Session {
             .context("error adding to session")?;
 
         Ok((torrent, handle))
+    }
+}
+
+/// The peers a torrent's own list hands each of its runs: those it was
+/// added with, but for a torrent that takes its peers from its trackers
+/// alone, not those a save found elsewhere. Its peer list holds those
+/// while it owes them, and once they leave, handing them out again would
+/// bring them back as the operator's.
+fn own_peers(
+    initial: &Option<Vec<SocketAddr>>,
+    found: &[SocketAddr],
+    trackers_only: bool,
+) -> Vec<SocketAddr> {
+    let peers = initial.iter().flatten().copied();
+    if trackers_only && !found.is_empty() {
+        let found: std::collections::HashSet<_> = found.iter().collect();
+        peers.filter(|addr| !found.contains(addr)).collect()
+    } else {
+        peers.collect()
     }
 }

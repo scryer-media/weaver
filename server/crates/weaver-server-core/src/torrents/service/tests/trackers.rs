@@ -273,6 +273,7 @@ async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
     let saved = ResumePeers {
         peers: vec!["127.0.0.2:6881".parse().unwrap()],
         banned: vec!["127.0.0.3".parse().unwrap()],
+        found: Vec::new(),
     };
     assert!(rig.db.save_torrent_peers(job_id, &saved).unwrap());
 
@@ -376,6 +377,7 @@ async fn a_banned_peer_stays_banned_across_a_restart() {
     let saved = ResumePeers {
         peers: vec!["127.0.0.5:6881".parse().unwrap()],
         banned: vec![in_session, off],
+        found: Vec::new(),
     };
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
     again.stop().await;

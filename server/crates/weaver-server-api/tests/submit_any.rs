@@ -16,13 +16,14 @@ use common::{TestHarness, assert_no_errors, response_data};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use weaver_server_api::auth::{CallerIdentity, CallerScope};
+use weaver_server_core::clock::SystemClock;
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::TorrentConfig;
 use weaver_server_core::torrents::net::LegKind;
-use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
+use weaver_server_core::torrents::service::{JobEnv, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
     IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };

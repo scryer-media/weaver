@@ -970,7 +970,7 @@ async fn a_graceful_stop_drains_the_volumes_and_then_checkpoints() {
 // bytes it never saw put down, and the restarted job fetches them again.
 #[tokio::test]
 async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
-    use crate::operations::disk::writer::{Leaping, SettleBound};
+    use crate::operations::disk::writer::SettleBound;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_413);
@@ -984,7 +984,9 @@ async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
         // A clock a minute later at each look: the volume's span is over
         // the first time the stop finds it standing still.
         pipeline.shutdown_settle = SettleBound {
-            clock: Arc::new(Leaping(std::sync::atomic::AtomicU64::new(0))),
+            clock: Arc::new(crate::clock::ManualClock::stepping(
+                std::time::Duration::from_secs(60),
+            )),
             span: std::time::Duration::from_secs(30),
         };
         let handle =
@@ -1053,9 +1055,11 @@ async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
 // Stop the pipeline with a clock a minute later at each look, so a volume
 // that stands still is given up the first time the stop finds it so.
 async fn stop_past_a_still_volume(pipeline: &mut Pipeline) {
-    use crate::operations::disk::writer::{Leaping, SettleBound};
+    use crate::operations::disk::writer::SettleBound;
     pipeline.shutdown_settle = SettleBound {
-        clock: Arc::new(Leaping(std::sync::atomic::AtomicU64::new(0))),
+        clock: Arc::new(crate::clock::ManualClock::stepping(
+            std::time::Duration::from_secs(60),
+        )),
         span: std::time::Duration::from_secs(30),
     };
     let handle =
@@ -1157,7 +1161,8 @@ async fn a_stop_does_not_wait_for_a_repair_held_by_a_still_volume() {
 // checkpointed as any other, not left at an older checkpoint.
 #[tokio::test]
 async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
-    use crate::operations::disk::writer::{HandClock, SettleBound};
+    use crate::clock::ManualClock;
+    use crate::operations::disk::writer::SettleBound;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_418);
@@ -1179,7 +1184,7 @@ async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
     // writes come down. The volume is let go once the settle stands still
     // for it, which is after the repair came back stopped and was kept.
     pipeline.shutdown_settle = SettleBound {
-        clock: Arc::new(HandClock::default()),
+        clock: Arc::new(ManualClock::default()),
         span: std::time::Duration::from_secs(30),
     };
     let release = std::thread::spawn(move || {
@@ -1222,7 +1227,7 @@ async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
 // not fail, and it is left at its last written checkpoint.
 #[tokio::test]
 async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_end() {
-    use crate::operations::disk::writer::HandClock;
+    use crate::clock::ManualClock;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_419);
@@ -1254,7 +1259,7 @@ async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_
     assert!(pipeline.graph_jobs[&job_id].repair_out());
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
     let volume = Arc::clone(disk.working().volume());
-    let clock = Arc::new(HandClock::default());
+    let clock = Arc::new(ManualClock::default());
     let span = std::time::Duration::from_secs(30);
     // The repair's return is in hand and everything before it is down when
     // the stop is rung and the volume stands still.
@@ -1266,7 +1271,7 @@ async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_
             disk.barrier().wait_aside();
             let hold = pipeline.volume_writers.hold(&volume);
             let writers = Arc::clone(&pipeline.volume_writers);
-            writers.end_loop_waits_at(Arc::clone(&clock) as _, span);
+            writers.end_loop_waits_at(Arc::clone(&clock) as _, clock.instant(span));
             writers.stop_waits();
             let (watched, clock) = (Arc::clone(&volume), Arc::clone(&clock));
             watcher = Some(std::thread::spawn(move || {

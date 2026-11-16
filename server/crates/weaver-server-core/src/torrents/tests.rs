@@ -214,6 +214,7 @@ fn intent_and_counters_update_in_place() {
     let peers = weaver_torrent::ResumePeers {
         peers: vec!["10.0.0.1:6881".parse().unwrap()],
         banned: Vec::new(),
+        found: Vec::new(),
     };
     assert!(
         db.save_torrent_resume(JobId(3), None, Some(&peers))
@@ -452,6 +453,7 @@ fn a_torrents_peers_and_bans_round_trip() {
             "[2001:db8::1]:51413".parse().unwrap(),
         ],
         banned: vec!["10.0.0.9".parse().unwrap(), "2001:db8::9".parse().unwrap()],
+        found: vec!["[2001:db8::1]:51413".parse().unwrap()],
     };
     assert!(db.save_torrent_peers(JobId(1), &saved).unwrap());
     assert_eq!(db.torrent_peers(JobId(1)).unwrap(), saved);
@@ -465,6 +467,43 @@ fn a_torrents_peers_and_bans_round_trip() {
 
     assert!(!db.save_torrent_peers(JobId(2), &saved).unwrap());
     assert_eq!(db.torrent_peers(JobId(2)).unwrap(), ResumePeers::default());
+}
+
+// A saved peer mark that does not read costs the marks alone: the
+// torrent's peers and bans still restore, on its own read and the boot's.
+#[test]
+fn a_mark_that_does_not_read_keeps_the_peers_and_bans() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    use weaver_torrent::ResumePeers;
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(1, Some([1; 20]), None), &[])
+        .unwrap();
+    let saved = ResumePeers {
+        peers: vec!["10.0.0.1:6881".parse().unwrap()],
+        banned: vec!["10.0.0.9".parse().unwrap()],
+        found: vec!["10.0.0.1:6881".parse().unwrap()],
+    };
+    assert!(db.save_torrent_peers(JobId(1), &saved).unwrap());
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(
+            datastore.write_exec(),
+            "UPDATE torrent_counters SET found_peers = {} WHERE job_id = {}",
+            &[SqlArg::Text("not a list".to_owned()), SqlArg::I64(1)],
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+
+    let unmarked = ResumePeers {
+        found: Vec::new(),
+        ..saved
+    };
+    assert_eq!(db.torrent_peers(JobId(1)).unwrap(), unmarked);
+    let boot = db.torrent_counters_by_job().unwrap();
+    assert_eq!(boot[&JobId(1)].peers.as_ref().unwrap(), &unmarked);
 }
 
 #[test]

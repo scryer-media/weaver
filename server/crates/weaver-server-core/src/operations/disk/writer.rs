@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
+use crate::clock::{Clock, SystemClock};
+
 use super::volume::{LoopWait, Volume, WriterCounts};
 use super::volume_rate::RateSignal;
 
@@ -99,51 +101,36 @@ pub(crate) struct Unsettled {
     pub(crate) bytes: u64,
 }
 
-// The time a bounded settle goes by.
-pub(crate) trait Clock: Sync {
-    // How long since a moment that does not move.
-    fn now(&self) -> Duration;
-    // Whether time passes by itself. A clock a test moves by hand does not:
-    // the test wakes the settle after moving it.
-    fn runs(&self) -> bool {
-        true
-    }
-}
-
-// The machine's own clock, from when it was made.
-pub(crate) struct WallClock(Instant);
-
-impl WallClock {
-    pub(crate) fn start() -> Self {
-        Self(Instant::now())
-    }
-}
-
-impl Clock for WallClock {
-    fn now(&self) -> Duration {
-        self.0.elapsed()
-    }
-}
-
 // The clock a bounded settle goes by and the span it has, chosen by
 // whoever will ask for the settle: the machine's clock outside tests, and
 // in a test one it moves by hand.
 #[derive(Clone)]
 pub(crate) struct SettleBound {
-    pub(crate) clock: Arc<dyn Clock + Send>,
+    pub(crate) clock: Arc<dyn Clock>,
     pub(crate) span: Duration,
 }
 
 impl SettleBound {
-    // What the clock reads when the span, begun now, is over.
-    pub(crate) fn end(&self) -> Duration {
-        self.clock.now().saturating_add(self.span)
+    // What the clock reads when the span, begun now, is over. A span too
+    // long to add to the reading saturates, as a `Duration` would: it ends
+    // at the latest moment the clock holds within it, centuries away, so
+    // the settle never gives a volume up.
+    pub(crate) fn end(&self) -> Instant {
+        let now = self.clock.now();
+        let mut span = self.span;
+        loop {
+            if let Some(end) = now.checked_add(span) {
+                return end;
+            }
+            // Halved until it fits; a zero span always does.
+            span /= 2;
+        }
     }
 
     // `span` by the machine's own clock.
     pub(crate) fn wall(span: Duration) -> Self {
         Self {
-            clock: Arc::new(WallClock::start()),
+            clock: Arc::new(SystemClock),
             span,
         }
     }
@@ -156,7 +143,7 @@ impl SettleBound {
 #[derive(Default)]
 struct LoopEnd {
     set: AtomicBool,
-    at: Mutex<Option<(Arc<dyn Clock + Send>, Duration)>>,
+    at: Mutex<Option<(Arc<dyn Clock>, Instant)>>,
 }
 
 impl LoopEnd {
@@ -168,7 +155,7 @@ impl LoopEnd {
         }
         let at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
         let (clock, end) = at.as_ref()?;
-        Some((end.saturating_sub(clock.now()), clock.runs()))
+        Some((end.saturating_duration_since(clock.now()), clock.runs()))
     }
 
     // Wait on `woke` while `over` says so and the end has not passed.
@@ -371,11 +358,11 @@ impl VolumeWriters {
     // Settles that share one `end` share one span between them: a later
     // one has what the earlier ones left of it. What each volume given up
     // on still held comes back; nothing does when everything returned.
-    pub(crate) fn settle_until(&self, clock: &dyn Clock, end: Duration) -> Vec<Unsettled> {
+    pub(crate) fn settle_until(&self, clock: &dyn Clock, end: Instant) -> Vec<Unsettled> {
         self.settle_each(Some((end, clock)))
     }
 
-    fn settle_each(&self, bound: Option<(Duration, &dyn Clock)>) -> Vec<Unsettled> {
+    fn settle_each(&self, bound: Option<(Instant, &dyn Clock)>) -> Vec<Unsettled> {
         let lanes: Vec<(Arc<Lane>, u64)> = self
             .registry
             .lock()
@@ -402,7 +389,7 @@ impl VolumeWriters {
                     continue;
                 };
                 // How long the volume is still waited for.
-                let more = end.saturating_sub(clock.now());
+                let more = end.saturating_duration_since(clock.now());
                 if more.is_zero() {
                     let done = state.done.load(Ordering::SeqCst);
                     left.push(Unsettled {
@@ -437,7 +424,7 @@ impl VolumeWriters {
     // `Submitter::loop_wait_room`) end there too, with what they waited
     // for still out; the key they waited on says so (`Submitter::left`).
     // Called by the loop, which stands in none of those waits then.
-    pub(crate) fn end_loop_waits_at(&self, clock: Arc<dyn Clock + Send>, end: Duration) {
+    pub(crate) fn end_loop_waits_at(&self, clock: Arc<dyn Clock>, end: Instant) {
         let loop_end = &self.registry.loop_end;
         *loop_end.at.lock().unwrap_or_else(PoisonError::into_inner) = Some((clock, end));
         loop_end.set.store(true, Ordering::SeqCst);
@@ -2901,60 +2888,6 @@ impl Drop for Hold {
     fn drop(&mut self) {
         self.hold_drops(false);
         self.0.leave();
-    }
-}
-
-// A clock that is a minute later each time it is looked at.
-#[cfg(test)]
-pub(crate) struct Leaping(pub(crate) AtomicU64);
-
-#[cfg(test)]
-impl Clock for Leaping {
-    fn now(&self) -> Duration {
-        Duration::from_secs(self.0.fetch_add(60, Ordering::Relaxed))
-    }
-
-    fn runs(&self) -> bool {
-        false
-    }
-}
-
-// A clock a test moves by hand, which counts the looks taken at it. A
-// settle that goes by it looks again only when `VolumeWriters::look_again`
-// wakes it, after the test moved the clock.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct HandClock {
-    at: Mutex<(Duration, u32)>,
-    looked: Condvar,
-}
-
-#[cfg(test)]
-impl HandClock {
-    pub(crate) fn move_to(&self, at: Duration) {
-        self.at.lock().unwrap().0 = at;
-    }
-
-    // Wait until the clock has been looked at `looks` times in all.
-    pub(crate) fn wait_looks(&self, looks: u32) {
-        let mut at = self.at.lock().unwrap();
-        while at.1 < looks {
-            at = self.looked.wait(at).unwrap();
-        }
-    }
-}
-
-#[cfg(test)]
-impl Clock for HandClock {
-    fn now(&self) -> Duration {
-        let mut at = self.at.lock().unwrap();
-        at.1 += 1;
-        self.looked.notify_all();
-        at.0
-    }
-
-    fn runs(&self) -> bool {
-        false
     }
 }
 

@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc};
+
+use crate::clock::{Clock, SystemClock};
 use weaver_tunnel::pipe::HopWatcher;
 
 use super::{
@@ -89,17 +91,6 @@ pub struct RouteEvent {
     pub kind: RouteKind,
     pub name: String,
     pub reason: String,
-}
-
-// Where route health takes the time from.
-pub trait RouteClock: Send + Sync {
-    fn now(&self) -> Instant;
-}
-struct SystemClock;
-impl RouteClock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -344,7 +335,7 @@ fn same_pool(before: Option<&ProxyPool>, after: Option<&ProxyPool>) -> bool {
 
 pub struct RouteHealth {
     state: Mutex<State>,
-    clock: Arc<dyn RouteClock>,
+    clock: Arc<dyn Clock>,
     // Woken when a down starts to wait, so the follower can sleep to it.
     rearm: Arc<Notify>,
 }
@@ -352,7 +343,7 @@ impl RouteHealth {
     pub fn new() -> Arc<Self> {
         Self::with_clock(Arc::new(SystemClock))
     }
-    pub fn with_clock(clock: Arc<dyn RouteClock>) -> Arc<Self> {
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
             clock,

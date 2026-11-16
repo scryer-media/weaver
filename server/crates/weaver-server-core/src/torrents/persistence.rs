@@ -29,6 +29,22 @@ const TRACKER_INSERT: &str =
 const TRACKER_HOST_INSERT: &str =
     "INSERT INTO tracker_hosts (host) VALUES ({}) ON CONFLICT (host) DO NOTHING";
 
+/// Seed mode as a pass over the torrents found it, written together by
+/// [`Database::write_torrent_seed_modes`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TorrentSeedWrites {
+    /// Left seed mode: no check passed in it is kept.
+    pub(crate) left: Vec<JobId>,
+    /// The pieces each still in it has checked, a bitfield as the wire's.
+    pub(crate) verified: Vec<(JobId, Vec<u8>)>,
+}
+
+impl TorrentSeedWrites {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.left.is_empty() && self.verified.is_empty()
+    }
+}
+
 // The statement that writes a torrent's ledger and the peers and bans it
 // begins with, each only when given; none when neither is.
 fn resume_update(
@@ -57,10 +73,11 @@ fn resume_update(
         ]);
     }
     if let Some(peers) = peers {
-        sets.push("peers = {}, banned_peers = {}");
+        sets.push("peers = {}, banned_peers = {}, found_peers = {}");
         args.extend([
             SqlArg::OptText(stored_list(&peers.peers)?),
             SqlArg::OptText(stored_list(&peers.banned)?),
+            SqlArg::OptText(stored_list(&peers.found)?),
         ]);
     }
     if sets.is_empty() {
@@ -1012,6 +1029,20 @@ fn listed<T: serde::de::DeserializeOwned>(
     .map(Option::unwrap_or_default)
 }
 
+// Which saved peers were found elsewhere than the torrent's trackers and
+// the operator. The marks never cost the peers or bans they sit beside: a
+// value that does not read is no marks.
+fn found_marks(
+    job_id: JobId,
+    json: Result<Option<String>, StateError>,
+) -> Vec<std::net::SocketAddr> {
+    json.and_then(|json| listed("found_peers", json))
+        .unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's saved peer marks did not read; its peers restore unmarked");
+            Vec::new()
+        })
+}
+
 fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
     let policy_override = SeedingPolicy::kept(torrent.policy_override)
         .map(|policy| serde_json::to_string(&policy))
@@ -1160,6 +1191,81 @@ impl Database {
             SqlArg::I64(stored(job_id.0)?),
         ];
         self.set_torrent_column("state", args)
+    }
+
+    // Seed mode as a pass found it, in one transaction: the torrents that
+    // left it, as `clear_torrent_seed_mode` writes one, and the pieces each
+    // still in it checked, as `set_torrent_seed_verified` writes one. Each
+    // list goes in bind-limit chunks, one statement a chunk. The statements
+    // are built once, the bitfields moved into them: a retry of the
+    // transaction copies none.
+    pub(crate) fn write_torrent_seed_modes(
+        &self,
+        writes: TorrentSeedWrites,
+    ) -> Result<(), StateError> {
+        use crate::persistence::sql_runtime::max_rows_for_engine;
+
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        let engine = datastore.engine();
+        let mut statements: Vec<(String, Vec<SqlArg>)> = Vec::new();
+        // One bind for the seed mode, then the ids.
+        let rows = max_rows_for_engine(engine, 1).saturating_sub(1).max(1);
+        for chunk in writes.left.chunks(rows) {
+            let placeholders = vec!["{}"; chunk.len()].join(", ");
+            let mut args = Vec::with_capacity(chunk.len() + 1);
+            args.push(SqlArg::Bool(false));
+            for job_id in chunk {
+                args.push(SqlArg::I64(stored(job_id.0)?));
+            }
+            statements.push((
+                format!(
+                    "UPDATE torrents SET seed_mode = {{}}, seed_verified = NULL WHERE job_id IN ({placeholders})"
+                ),
+                args,
+            ));
+        }
+        // Each row binds its id and bitfield in the CASE and its id in the
+        // list.
+        let rows = max_rows_for_engine(engine, 3);
+        let mut verified = writes.verified.into_iter().peekable();
+        while verified.peek().is_some() {
+            let chunk: Vec<(i64, Vec<u8>)> = verified
+                .by_ref()
+                .take(rows)
+                .map(|(job_id, pieces)| Ok((stored(job_id.0)?, pieces)))
+                .collect::<Result<_, StateError>>()?;
+            let ids: Vec<i64> = chunk.iter().map(|(id, _)| *id).collect();
+            let mut args = Vec::with_capacity(chunk.len() * 3);
+            for (id, pieces) in chunk {
+                args.push(SqlArg::I64(id));
+                args.push(SqlArg::OptBytes(Some(pieces)));
+            }
+            args.extend(ids.iter().copied().map(SqlArg::I64));
+            let cases = vec!["WHEN {} THEN {}"; ids.len()].join(" ");
+            let placeholders = vec!["{}"; ids.len()].join(", ");
+            statements.push((
+                format!(
+                    "UPDATE torrents SET seed_verified = CASE job_id {cases} END WHERE job_id IN ({placeholders})"
+                ),
+                args,
+            ));
+        }
+        let statements = std::sync::Arc::new(statements);
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "write_torrent_seed_modes", |tx| {
+                let statements = std::sync::Arc::clone(&statements);
+                Box::pin(async move {
+                    for (sql, args) in statements.iter() {
+                        tx.execute(sql, args).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 
     // Each group's kept intent for every torrent of its ids, and no other
@@ -1961,7 +2067,7 @@ impl Database {
         let row = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT peers, banned_peers FROM torrent_counters WHERE job_id = {}",
+                "SELECT peers, banned_peers, found_peers FROM torrent_counters WHERE job_id = {}",
                 &[SqlArg::I64(id)],
             )
             .await
@@ -1972,6 +2078,7 @@ impl Database {
         Ok(ResumePeers {
             peers: listed("peers", row.opt_text("peers")?)?,
             banned: listed("banned_peers", row.opt_text("banned_peers")?)?,
+            found: found_marks(job_id, row.opt_text("found_peers")),
         })
     }
 
@@ -1991,7 +2098,7 @@ impl Database {
                 "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
                         last_seen_complete_ms, finished_duration_s, last_activity_ms,
                         consecutive_seeding_s, failed_bytes, redundant_bytes, pieces,
-                        pieces_checking, peers, banned_peers
+                        pieces_checking, peers, banned_peers, found_peers
                    FROM torrent_counters",
                 &[],
             )
@@ -2015,7 +2122,12 @@ impl Database {
                             let banned = row
                                 .opt_text("banned_peers")
                                 .and_then(|banned| listed("banned_peers", banned))?;
-                            Ok(ResumePeers { peers, banned })
+                            let found = found_marks(job_id, row.opt_text("found_peers"));
+                            Ok(ResumePeers {
+                                peers,
+                                banned,
+                                found,
+                            })
                         });
                     Ok((
                         job_id,

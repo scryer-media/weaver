@@ -113,6 +113,14 @@ pub struct AddTorrentOptions {
     #[serde(default)]
     pub banned_peers: Vec<IpAddr>,
 
+    /// Of `initial_peers`, those a save found elsewhere than the torrent's
+    /// trackers and the operator (see
+    /// [`ResumePeers::found`](crate::ResumePeers::found)). They come back
+    /// marked so: a private torrent keeps them only until a tracker
+    /// answers, as before the restart.
+    #[serde(default)]
+    pub found_peers: Vec<SocketAddr>,
+
     /// Web seeds beside those the torrent names; a magnet link's `ws` join
     /// them (libtorrent `add_torrent_params::url_seeds`).
     #[serde(default)]
@@ -263,6 +271,7 @@ impl Default for AddTorrentOptions {
             ratelimits: LimitsConfig::default(),
             initial_peers: None,
             banned_peers: Vec::new(),
+            found_peers: Vec::new(),
             web_seeds: Vec::new(),
             peer_limit: None,
             preferred_id: None,

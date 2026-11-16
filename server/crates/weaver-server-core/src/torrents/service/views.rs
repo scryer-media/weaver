@@ -354,7 +354,7 @@ impl TorrentService {
     // their sessions as the tick last read them, as the exporter reads
     // them: one reading of each torrent.
     pub(super) async fn publish(&self) {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         // Presence is counted in the walk that picks the torrents.
         let mut presence = Presence::default();
         let listed = self
@@ -393,7 +393,7 @@ impl TorrentService {
         let Some(queue) = self.queue() else {
             return;
         };
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         if let Some(view) = self.torrent(job_id).await {
             let status = job_status(&view);
             queue.publish_owned_job(
@@ -565,7 +565,7 @@ impl TorrentService {
     /// One torrent, with its files and trackers.
     pub async fn torrent(&self, job_id: JobId) -> Option<TorrentView> {
         let settings = self.settings();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let (mut view, announces, pinned, listed) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
@@ -589,7 +589,7 @@ impl TorrentService {
     /// from its session.
     pub async fn support(&self, job_id: JobId) -> Option<TorrentSupport> {
         let settings = self.settings();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let (mut support, announces, handle, pinned, listed) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
@@ -647,7 +647,7 @@ impl TorrentService {
     /// Every torrent, or a category's, in the order they were added, each
     /// with its trackers.
     pub async fn torrents(&self, category: Option<&str>) -> Vec<TorrentView> {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         self.listed(category, false, now)
             .await
             .into_iter()
@@ -658,7 +658,7 @@ impl TorrentService {
     /// Every torrent with its files, from one pass over them: what
     /// `torrent` gives one at a time.
     pub async fn torrents_with_files(&self) -> Vec<TorrentView> {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         self.listed(None, true, now)
             .await
             .into_iter()
@@ -848,7 +848,7 @@ impl TorrentService {
 
     /// The torrents as queue items.
     pub async fn job_infos(&self) -> Vec<JobInfo> {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         job_infos(self.torrents(None).await, now)
     }
 

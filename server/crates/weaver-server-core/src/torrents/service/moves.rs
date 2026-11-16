@@ -128,7 +128,7 @@ impl TorrentService {
                         "the torrent is being removed".to_owned(),
                     ));
                 }
-                torrent.settle(self.inner.clock.now_ms());
+                torrent.settle(self.inner.clock.unix_ms());
                 torrent.moving = Some(Moving::Dir(to.clone()));
                 Ok(())
             })
@@ -268,7 +268,7 @@ impl TorrentService {
                         "the torrent is being removed".to_owned(),
                     ));
                 }
-                torrent.settle(self.inner.clock.now_ms());
+                torrent.settle(self.inner.clock.unix_ms());
                 torrent.moving = Some(Moving::Files);
                 Ok(torrent.record.storage_dir.clone())
             })
@@ -356,7 +356,7 @@ impl TorrentService {
     async fn move_refused(&self, job_id: JobId) {
         let _ = self
             .with_torrent(job_id, |torrent| {
-                torrent.settle(self.inner.clock.now_ms());
+                torrent.settle(self.inner.clock.unix_ms());
                 torrent.moving = None;
                 Ok(())
             })
@@ -378,7 +378,7 @@ impl TorrentService {
     ) -> Result<(), ActionError> {
         let (moving, store) = self
             .with_torrent(job_id, |torrent| {
-                torrent.settle(self.inner.clock.now_ms());
+                torrent.settle(self.inner.clock.unix_ms());
                 Ok((torrent.moving.take(), torrent.store.clone()))
             })
             .await

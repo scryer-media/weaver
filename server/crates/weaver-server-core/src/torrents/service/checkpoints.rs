@@ -7,7 +7,7 @@ use crate::StateError;
 use crate::jobs::JobId;
 use crate::persistence::Database;
 use crate::torrents::TorrentCounters;
-use crate::torrents::store::TorrentStore;
+use crate::torrents::store::{Kept, TorrentStore};
 use crate::torrents::tee::Tee;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -46,6 +46,30 @@ pub(super) struct CheckpointSave {
     pieces: Option<Arc<TorrentStore>>,
 }
 
+// A torrent's checkpoint as taken, to be queued before `live` is let go:
+// the pieces it has unsaved, and its ledger and peers when they changed.
+pub(super) struct CheckpointTaken {
+    job_id: JobId,
+    store: Arc<TorrentStore>,
+    pieces: Option<Kept>,
+    resume: Option<Resume>,
+}
+
+// The torrent's checkpoint, taken: none when it has no store.
+pub(super) fn take_checkpoint(torrent: &mut Live, now: i64) -> Option<CheckpointTaken> {
+    let job_id = torrent.record.job_id;
+    let store = Arc::clone(torrent.store.as_ref()?);
+    let pieces = store.unsaved();
+    torrent.settle(now);
+    let resume = torrent.take_resume(now, false);
+    Some(CheckpointTaken {
+        job_id,
+        store,
+        pieces,
+        resume,
+    })
+}
+
 // A write of a torrent's ledger and peers, queued.
 pub(super) struct Landing {
     job_id: JobId,
@@ -58,7 +82,7 @@ impl TorrentService {
     // ledger. A tee checkpoints its job on its own, as a job of the
     // pipeline's does, once the bytes it took or their age make a write due.
     pub(super) async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let saves: Vec<CheckpointSave> = {
             let mut live = self.inner.live.lock().await;
             jobs.into_iter()
@@ -80,20 +104,27 @@ impl TorrentService {
         now: i64,
         at_once: bool,
     ) -> Option<Landing> {
+        let resume = torrent.take_resume(now, at_once)?;
+        Some(self.queue_taken_resume(torrent.record.job_id, resume))
+    }
+
+    // Queue the write of a ledger and peers taken from the torrent of
+    // `job_id`. The caller took it under `live` and queues it before it lets
+    // `live` go, so no later taking of the torrent's is queued first.
+    pub(super) fn queue_taken_resume(&self, job_id: JobId, resume: Resume) -> Landing {
         let Resume {
             counters,
             peers,
             lost,
-        } = torrent.take_resume(now, at_once)?;
-        let job_id = torrent.record.job_id;
+        } = resume;
         let landed = self.queue_save(job_id, "torrent_resume", move |db| {
             db.save_torrent_resume(job_id, counters.as_ref(), peers.as_ref())
         });
-        Some(Landing {
+        Landing {
             job_id,
             landed,
             lost,
-        })
+        }
     }
 
     // Wait for a write of a torrent's ledger and peers to land. One that
@@ -158,19 +189,26 @@ impl TorrentService {
     // it again from the files at the next start. None when the torrent has
     // no store.
     pub(super) fn queue_checkpoint(&self, torrent: &mut Live, now: i64) -> Option<CheckpointSave> {
-        let job_id = torrent.record.job_id;
-        let store = Arc::clone(torrent.store.as_ref()?);
-        let pieces = store.unsaved();
-        torrent.settle(now);
-        let resume = torrent.take_resume(now, false);
+        Some(self.queue_taken_checkpoint(take_checkpoint(torrent, now)?))
+    }
+
+    // Queue a checkpoint taken by [`take_checkpoint`], as
+    // [`Self::queue_taken_resume`] queues a ledger.
+    pub(super) fn queue_taken_checkpoint(&self, taken: CheckpointTaken) -> CheckpointSave {
+        let CheckpointTaken {
+            job_id,
+            store,
+            pieces,
+            resume,
+        } = taken;
         // Nothing changed since the last write: none is queued.
         if pieces.is_none() && resume.is_none() {
-            return Some(CheckpointSave {
+            return CheckpointSave {
                 job_id,
                 landed: None,
                 lost: None,
                 pieces: None,
-            });
+            };
         }
         let (counters, peers, lost) = resume.map_or((None, None, None), |resume| {
             (resume.counters, resume.peers, Some(resume.lost))
@@ -179,12 +217,12 @@ impl TorrentService {
         let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
             db.save_torrent_checkpoint(job_id, pieces.as_ref(), counters.as_ref(), peers.as_ref())
         });
-        Some(CheckpointSave {
+        CheckpointSave {
             job_id,
             landed: Some(landed),
             lost,
             pieces: wrote,
-        })
+        }
     }
 
     // Queue a checkpoint of the torrent's unpacking on a blocking thread:

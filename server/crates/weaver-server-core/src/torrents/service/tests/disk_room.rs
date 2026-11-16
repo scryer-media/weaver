@@ -417,24 +417,19 @@ async fn a_refusal_heard_after_the_wake_installs_no_wait() {
     let service = &disk.rig.service;
     let ledger = disk.capacity.ledger(StorageRoot::Complete);
     let run = held(&disk).await.live().unwrap();
-    // The seeder goes first, so no piece written after the wake can be
-    // refused and enter upload mode on its own.
     disk.seeding.stop().await;
     ledger.release(60 << 10);
     run.wait_for_upload_mode(false).await;
     waits_for_room(service, disk.job_id, false).await;
-    let intake = service.inner.live.lock().await[&disk.job_id]
-        .intake
-        .clone()
-        .unwrap();
-    // What the wake handed the torrent goes back, and the room is promised
-    // elsewhere: the piece below books on the ledger and is refused.
-    intake.room().give_back();
-    ledger.promise(1 << 40);
-    let piece = bytes::Bytes::from(vec![0u8; 16_384]);
-    assert!(weaver_torrent::storage::write_refused(
-        &intake.verified(0, &piece).unwrap_err()
-    ));
+    // The refusal of a write made before the wake, heard now. It is said as
+    // the intake says one, and the ledger is left with room: a piece the
+    // run fetched before the wake may still be written after it, and with
+    // room for all four pieces no such write is refused and enters upload
+    // mode on its own.
+    service.inner.signal.heard(
+        disk.job_id,
+        crate::torrents::intake::Heard::NotBooked(16_384),
+    );
     service
         .inner
         .settled
@@ -446,7 +441,6 @@ async fn a_refusal_heard_after_the_wake_installs_no_wait() {
     assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
     let view = service.torrent(disk.job_id).await.unwrap();
     assert_ne!(view.stated, Some(Stated::DiskSpace));
-    ledger.release(1 << 40);
     assert!(!ledger.waited_on());
     service.stop().await;
 }

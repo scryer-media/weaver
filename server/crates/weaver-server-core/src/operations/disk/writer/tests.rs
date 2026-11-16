@@ -4,6 +4,7 @@
 use std::sync::Mutex;
 
 use super::*;
+use crate::clock::ManualClock;
 
 // Opens the file with nothing said of its length: every close sets it.
 fn open(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
@@ -663,6 +664,27 @@ fn a_wake_asked_for_comes_once_when_the_line_is_crossed() {
     assert!(reports.try_recv().is_err(), "one wake for one ask");
 }
 
+// A span longer than the clock holds saturates, as the `Duration` it once
+// was did: its end is centuries on, and a wait set to it has all that left.
+#[test]
+fn a_settle_span_too_long_for_the_clock_ends_centuries_on() {
+    const CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+    let clock = Arc::new(ManualClock::default());
+    let bound = SettleBound {
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
+        span: Duration::MAX,
+    };
+    let end = bound.end();
+    assert!(end >= clock.instant(CENTURY), "{end:?}");
+    let (writers, _reports) = writers();
+    writers.end_loop_waits_at(Arc::clone(&bound.clock), end);
+    let (more, runs) = writers.registry.loop_end.more().unwrap();
+    assert!(more >= CENTURY, "{more:?}");
+    assert!(!runs);
+    // Nothing is out, so a settle to that end returns at once.
+    assert!(writers.settle_until(&*clock, end).is_empty());
+}
+
 #[test]
 fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -682,7 +704,7 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
     // gives up at once finds it and the close behind it.
     // The clock and span are chosen beforehand, as a pipeline chooses its own.
     let bound = SettleBound {
-        clock: Arc::new(Leaping(AtomicU64::new(0))),
+        clock: Arc::new(ManualClock::stepping(Duration::from_secs(60))),
         span: Duration::from_secs(30),
     };
     let left = writers.settle_until(&*bound.clock, bound.end());
@@ -778,12 +800,12 @@ fn a_bounded_settle_gives_up_on_a_volume_that_holds_writes_at_its_end() {
     let job = writers.submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"stuck"), create(&path));
     hold.wait_held();
-    let clock = HandClock::default();
+    let clock = ManualClock::default();
     let span = Duration::from_secs(30);
     let over = AtomicBool::new(false);
     let left = std::thread::scope(|scope| {
         let settling = scope.spawn(|| {
-            let left = writers.settle_until(&clock, span);
+            let left = writers.settle_until(&clock, clock.instant(span));
             over.store(true, Ordering::SeqCst);
             left
         });
@@ -824,10 +846,10 @@ fn settles_that_share_an_end_give_up_at_it_whatever_returned_meanwhile() {
     job.write(1, 0, Bytes::from_static(b"first"), create(&a));
     job.write(2, 0, Bytes::from_static(b"stuck"), create(&b));
     hold.wait_held();
-    let clock = HandClock::default();
+    let clock = ManualClock::default();
     let end = Duration::from_secs(30);
     let left = std::thread::scope(|scope| {
-        let settling = scope.spawn(|| writers.settle_until(&clock, end));
+        let settling = scope.spawn(|| writers.settle_until(&clock, clock.instant(end)));
         // One look before the settle waits.
         clock.wait_looks(1);
         // A second before the end one write goes through.
@@ -842,7 +864,7 @@ fn settles_that_share_an_end_give_up_at_it_whatever_returned_meanwhile() {
     assert_eq!(left[0].label, "one");
     assert!(left[0].operations > 0, "{left:?}");
     // Nothing of the span is left for the settle that follows.
-    assert_eq!(writers.settle_until(&clock, end), left);
+    assert_eq!(writers.settle_until(&clock, clock.instant(end)), left);
     // What was left is still written once the volume moves.
     hold.open();
     writers.settle();
@@ -955,9 +977,10 @@ fn a_volume_with_no_thread_is_asked_for_one_again_only_once_it_was_let_go() {
     assert!(!first_path.exists() && !second_path.exists());
     // Nothing is waited for, with or without a span.
     writers.settle();
+    let clock = ManualClock::default();
     assert!(
         writers
-            .settle_until(&HandClock::default(), Duration::from_secs(30))
+            .settle_until(&clock, clock.instant(Duration::from_secs(30)))
             .is_empty()
     );
     assert_eq!(starts(), 1);
@@ -1211,9 +1234,9 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     hold.wait_held();
     // The four bytes held fill the volume: one more does not fit.
     volume.set_buffer_limits(4, 4);
-    let clock = Arc::new(HandClock::default());
+    let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock + Send>, end);
+    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     std::thread::scope(|scope| {
         let producer = scope.spawn(|| job.wait_below(0));
         let looped = scope.spawn(|| job.loop_wait_room(1));
@@ -1258,9 +1281,9 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
     let wrote = job.write(1, 0, Bytes::from_static(b"held"), create(&path));
     hold.wait_held();
     let barrier = job.barrier_at(wrote);
-    let clock = Arc::new(HandClock::default());
+    let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock + Send>, end);
+    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     std::thread::scope(|scope| {
         let read = scope.spawn(|| job.read_after(wrote, path.clone(), 0, 4));
         // The read looked at the clock once, short of the end, and stands
@@ -1737,9 +1760,9 @@ fn a_loop_write_given_up_at_the_stops_end_leaves_nothing_counted() {
     job.write(1, 0, Bytes::from(vec![1u8; 60]), create(&path));
     assert_eq!(volume.unwritten_bytes(), 60);
     hold.wait_held();
-    let clock = Arc::new(HandClock::default());
+    let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock + Send>, end);
+    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     writers.stop_waits();
     clock.move_to(end);
     // An arrived article of two, then eight past it: the first piece is

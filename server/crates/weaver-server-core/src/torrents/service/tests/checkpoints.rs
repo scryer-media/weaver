@@ -29,7 +29,7 @@ async fn the_ledger_is_written_at_each_tick_it_changed() {
         .unwrap()
         .counters
         .uploaded_bytes = 5;
-    clock.0.fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
+    clock.shift_unix_ms(TICK.as_millis() as i64);
     rig.service.tick().await;
     assert_eq!(written.borrow().ledgers, base + 1);
     assert_eq!(
@@ -40,7 +40,7 @@ async fn the_ledger_is_written_at_each_tick_it_changed() {
             .uploaded_bytes,
         5
     );
-    clock.0.fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
+    clock.shift_unix_ms(TICK.as_millis() as i64);
     rig.service.tick().await;
     assert_eq!(written.borrow().ledgers, base + 1);
 }
@@ -227,6 +227,7 @@ async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
     let older = ResumePeers {
         peers: vec!["127.0.0.2:6881".parse().unwrap()],
         banned: vec!["127.0.0.3".parse().unwrap()],
+        found: Vec::new(),
     };
     assert_ne!(older, current);
     let (running, run) = tokio::sync::oneshot::channel();
@@ -414,7 +415,7 @@ async fn an_unchanged_ledger_is_not_written_and_wasted_bytes_are() {
     let seeded = seeded().await;
     seeded.advance(super::TIMES_EVERY_MS);
     seeded.rig.service.tick().await;
-    let now = seeded.clock.0.load(Ordering::SeqCst);
+    let now = seeded.clock.unix_ms();
     let mut live = seeded.rig.service.inner.live.lock().await;
     let torrent = live.get_mut(&seeded.job_id).unwrap();
     assert!(torrent.take_resume(now, false).is_none());

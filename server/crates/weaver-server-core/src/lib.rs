@@ -19,6 +19,7 @@ pub mod application_upgrade;
 pub mod auth;
 pub mod bandwidth;
 pub mod categories;
+pub mod clock;
 pub mod e2e_clock;
 pub mod e2e_failpoint;
 pub mod error;

@@ -2295,7 +2295,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.3#9be192845088efc136fb507b7be2d789b3b2a20c"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2308,7 +2308,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.3#9be192845088efc136fb507b7be2d789b3b2a20c"
 dependencies = [
  "bytes",
  "futures",
@@ -3865,8 +3865,8 @@ dependencies = [
 
 [[package]]
 name = "proxy-tunnels"
-version = "0.5.2"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
+version = "0.5.3"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.3#9be192845088efc136fb507b7be2d789b3b2a20c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6190,7 +6190,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "aho-corasick",
  "application-updater",
@@ -6252,7 +6252,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-graph"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "bytes",
  "crc-turbo",
@@ -6265,14 +6265,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6301,7 +6301,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "blake3",
  "html-escape 0.3.0",
@@ -6315,7 +6315,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -6340,7 +6340,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6372,7 +6372,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -6454,7 +6454,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-torrent"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6521,7 +6521,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6545,7 +6545,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-utp"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -6562,7 +6562,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "cc",
  "crc-turbo",

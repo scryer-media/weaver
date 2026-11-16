@@ -517,7 +517,7 @@ async fn a_move_onto_a_file_already_there_keeps_it_and_checks_again() {
     let save = rig.dir.path().join("flat");
     std::fs::create_dir_all(&save).unwrap();
     std::fs::write(save.join("a.bin"), &data).unwrap();
-    let (job_id, _, mut changes) = completed_placed(
+    let (job_id, _, _) = completed_placed(
         &rig,
         metainfo,
         Placement {
@@ -542,11 +542,20 @@ async fn a_move_onto_a_file_already_there_keeps_it_and_checks_again() {
     assert_eq!(stored.files_dir.as_deref(), Some(taken_text.as_str()));
     assert_eq!(stored.save_path.as_deref(), Some(taken_text.as_str()));
 
-    // It had every piece; the check from the new place finds none.
-    let view = view_once(&rig.service, &mut changes, job_id, |view| {
-        view.have_bytes == 0 && view.state != TorrentState::CheckingFiles
-    })
-    .await;
+    // It had every piece; the check from the new place finds none. The
+    // move began the check before it answered, and its end is the
+    // engine's to tell: nothing publishes the queue when a check ends
+    // until the next tick, and no tick runs here.
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_initialized()
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.have_bytes, view.state != TorrentState::CheckingFiles),
+        (0, true)
+    );
     assert_eq!(view.files_dir.as_deref(), Some(taken_text.as_str()));
     rig.service.stop().await;
 }

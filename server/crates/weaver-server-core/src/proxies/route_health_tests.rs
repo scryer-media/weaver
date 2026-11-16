@@ -2,8 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::clock::{ManualClock, RuntimeClock};
 use crate::proxies::{ProxySecrets, Resolver, RouteLeg};
 
 fn interface(id: u32) -> EgressInterface {
@@ -43,19 +44,6 @@ fn wireguard(id: u32, revision: u64) -> ProxyProfile {
     }
 }
 
-// A clock the test moves by hand.
-struct Clock(Mutex<Instant>);
-impl RouteClock for Clock {
-    fn now(&self) -> Instant {
-        *self.0.lock().unwrap()
-    }
-}
-impl Clock {
-    fn advance(&self, by: Duration) {
-        *self.0.lock().unwrap() += by;
-    }
-}
-
 fn configured(
     egresses: &[EgressInterface],
     profiles: &[ProxyProfile],
@@ -72,9 +60,9 @@ fn clocked(
 ) -> (
     Arc<RouteHealth>,
     mpsc::UnboundedReceiver<RouteEvent>,
-    Arc<Clock>,
+    Arc<ManualClock>,
 ) {
-    let clock = Arc::new(Clock(Mutex::new(Instant::now())));
+    let clock = Arc::new(ManualClock::default());
     let health = RouteHealth::with_clock(clock.clone());
     configure_with(&health, egresses, profiles, pools, routes);
     let events = health.subscribe();
@@ -672,20 +660,12 @@ async fn a_proxy_with_two_hops_is_down_only_once_both_fail() {
     );
 }
 
-// A clock that reads tokio's, so a paused runtime moves it.
-struct TokioClock;
-impl RouteClock for TokioClock {
-    fn now(&self) -> Instant {
-        tokio::time::Instant::now().into_std()
-    }
-}
-
 // The follower raises each turn as it is told. A second down inside the
 // quiet period wakes it to sleep to the period's end, and is raised then,
 // the route still down. It ends once route health is dropped.
 #[tokio::test(start_paused = true)]
 async fn the_follower_raises_a_held_down_when_the_quiet_period_ends() {
-    let health = RouteHealth::with_clock(Arc::new(TokioClock));
+    let health = RouteHealth::with_clock(Arc::new(RuntimeClock::at_unix_ms(0)));
     configure(&health, &[interface(3)], &[]);
     let (sender, mut raised) = mpsc::unbounded_channel();
     let follower = crate::post_processing::route_events::follow_routes(&health, move |event| {

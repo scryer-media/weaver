@@ -1738,3 +1738,20 @@ kind = "sql"
 file = "migrations/0123_rss_waiting_items/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 124
+description = "a torrent's saved peers say which were found elsewhere than its trackers and the operator"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0124_torrent_found_peers/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0124_torrent_found_peers/postgres.sql"
+engine = "postgres"
+scope = "all"

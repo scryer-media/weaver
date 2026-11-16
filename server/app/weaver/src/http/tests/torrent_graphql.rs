@@ -10,6 +10,7 @@ use std::sync::RwLock as StdRwLock;
 
 use base64::Engine;
 use weaver_server_api::{SchemaContext, SystemRuntimeContext, build_schema};
+use weaver_server_core::clock::SystemClock;
 use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
@@ -22,7 +23,7 @@ use weaver_server_core::settings::{
     Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig,
 };
 use weaver_server_core::torrents::net::LegKind;
-use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
+use weaver_server_core::torrents::service::{JobEnv, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
     IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };

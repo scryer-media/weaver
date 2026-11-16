@@ -27,7 +27,7 @@ use futures::{FutureExt, future::BoxFuture};
 use tokio::sync::Notify;
 use tracing::{trace, warn};
 
-use super::peer_finder::{self, FINDERS, PeerAsk, PeerFinder, TrackerAsk};
+use super::peer_finder::{self, PeerAsk, TrackerAsk};
 use super::ports::AnnouncePort;
 use super::{PeerRxTorrentInfo, Session};
 
@@ -410,22 +410,12 @@ impl Session {
         ask: PeerAsk<'_>,
         discovery: Discovery,
     ) -> Option<PeerSource> {
-        self.peer_source(&FINDERS, ask, discovery)
-    }
-
-    // `make_peer_rx` over `finders`.
-    pub(super) fn peer_source(
-        self: &Arc<Self>,
-        finders: &[&dyn PeerFinder],
-        mut ask: PeerAsk<'_>,
-        discovery: Discovery,
-    ) -> Option<PeerSource> {
+        let mut ask = ask;
         // An SSL torrent with no identity asks no one for peers.
         if ask.ssl.is_some_and(|ssl| !ssl.has_identity()) {
             return None;
         }
-        let (peers, trackers) =
-            peer_finder::find(finders, self, &mut ask, |finder| finder.allowed(discovery));
+        let (peers, trackers) = peer_finder::run(self, &mut ask, discovery);
         peers.map(|peers| PeerSource { peers, trackers })
     }
 }

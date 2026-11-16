@@ -645,6 +645,106 @@ fn a_refused_peer_leaves_the_list_once_it_has_no_connection() {
     assert_eq!(peers.stats().live, 0);
 }
 
+// A save marks the peers only the DHT, local discovery or PEX named, not
+// one that connected in, and a peer it marked so comes back marked: it is
+// no operator's word, so a private torrent's list restarted with it owes
+// it. Owed, the list saves it marked again, and with it the peers that
+// connected in, which it owes too; a tracker's answer drops them all,
+// while a peer the operator named stays, and so does a found one a
+// tracker names after the restart. A list restarted with no such
+// peer owes nothing.
+#[test]
+fn a_save_marks_the_peers_found_elsewhere_and_a_restart_keeps_the_mark() {
+    let (operator, resumed_found) = (peer_addr(1), peer_addr(2));
+    let peers = PeerStates::founded_on(
+        PeerList::resumed([operator, resumed_found], &[resumed_found], []),
+        Default::default(),
+        u32::try_from(TOTAL_PIECES).unwrap(),
+    );
+    let (tracker, dht, lsd, pex, both) = (
+        peer_addr(3),
+        peer_addr(4),
+        peer_addr(5),
+        peer_addr(6),
+        peer_addr(7),
+    );
+    peers.add_peer(tracker, PeerSourceFlag::Tracker);
+    peers.add_peer(dht, PeerSourceFlag::Dht);
+    peers.add_peer(lsd, PeerSourceFlag::Lsd);
+    peers.add_peer(pex, PeerSourceFlag::Pex);
+    peers.add_peer(both, PeerSourceFlag::Dht);
+    peers.add_peer(both, PeerSourceFlag::Tracker);
+    let incoming = peer_addr(8);
+    peers.add_refused_incoming(incoming, ConnectionKind::Utp);
+
+    let saved = peers.resume_peers();
+    let sorted = |mut v: Vec<SocketAddr>| {
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        sorted(saved.peers.clone()),
+        vec![
+            operator,
+            resumed_found,
+            tracker,
+            dht,
+            lsd,
+            pex,
+            both,
+            incoming
+        ]
+    );
+    assert_eq!(
+        sorted(saved.found.clone()),
+        vec![resumed_found, dht, lsd, pex]
+    );
+
+    // Restored, the found peers are still no operator's: owed, they are
+    // saved again until a tracker answers, then leave, and the operator's
+    // stays. One a tracker names after the restart is the tracker's, and
+    // stays too.
+    let tracker_named = dht;
+    let list = PeerList::resumed(
+        [operator, resumed_found, tracker_named],
+        &[resumed_found, tracker_named],
+        [],
+    )
+    .owing_found();
+    assert!(list.owes_untracked());
+    let peers = PeerStates::founded_on(
+        list,
+        Default::default(),
+        u32::try_from(TOTAL_PIECES).unwrap(),
+    );
+    peers.add_refused_incoming(incoming, ConnectionKind::Utp);
+    let saved = peers.resume_peers();
+    assert_eq!(
+        sorted(saved.found),
+        vec![resumed_found, tracker_named, incoming]
+    );
+    peers.add_peer(tracker_named, PeerSourceFlag::Tracker);
+    let saved = peers.resume_peers();
+    assert_eq!(
+        sorted(saved.peers),
+        vec![operator, resumed_found, tracker_named, incoming]
+    );
+    assert_eq!(sorted(saved.found), vec![resumed_found, incoming]);
+    peers.drop_untracked();
+    assert_eq!(state_of(&peers, resumed_found), None);
+    assert_eq!(state_of(&peers, incoming), None);
+    assert_eq!(state_of(&peers, operator), Some("queued"));
+    assert_eq!(state_of(&peers, tracker_named), Some("queued"));
+    assert!(peers.resume_peers().found.is_empty());
+
+    // A list restarted with no peer found elsewhere owes nothing.
+    assert!(
+        !PeerList::resumed([operator], &[], [])
+            .owing_found()
+            .owes_untracked()
+    );
+}
+
 // A private torrent's list, once a tracker answers, keeps the peers a
 // tracker or the operator named, whoever else named them too; the
 // DHT's, local discovery's, PEX's and incoming ones leave, an idle one
@@ -654,7 +754,7 @@ fn a_refused_peer_leaves_the_list_once_it_has_no_connection() {
 fn a_trackers_answer_drops_the_peers_no_tracker_or_operator_named() {
     let operator = peer_addr(1);
     let peers = PeerStates::founded_on(
-        PeerList::resumed([operator], []).taking_trackers_alone(false),
+        PeerList::resumed([operator], &[], []).taking_trackers_alone(false),
         Default::default(),
         u32::try_from(TOTAL_PIECES).unwrap(),
     );
@@ -738,8 +838,11 @@ fn a_peer_a_tracker_names_while_it_closes_stays() {
 #[test]
 fn a_fetched_list_takes_trackers_alone_now_or_at_the_first_answer() {
     let fetched = || {
-        let peers =
-            PeerStates::founded_on(PeerList::resumed([peer_addr(1)], []), Default::default(), 0);
+        let peers = PeerStates::founded_on(
+            PeerList::resumed([peer_addr(1)], &[], []),
+            Default::default(),
+            0,
+        );
         peers.add_peer(peer_addr(2), PeerSourceFlag::Tracker);
         peers.add_peer(peer_addr(3), PeerSourceFlag::Dht);
         peers.add_peer(peer_addr(4), PeerSourceFlag::Lsd);
@@ -1753,6 +1856,7 @@ fn the_saved_peers_are_the_connectable_trusted_ones_those_connected_to_first() {
         ResumePeers {
             peers: vec![connecting, never],
             banned: vec![banned.ip()],
+            found: Vec::new(),
         }
     );
     // The list a pause leaves saves the same.
@@ -1784,7 +1888,7 @@ fn peers_never_connected_to_fill_the_saved_list_to_a_hundred() {
 fn a_saved_ban_refuses_the_peer() {
     let banned = peer_addr(1);
     let peers = PeerStates::founded_on(
-        PeerList::resumed([], [banned.ip()]),
+        PeerList::resumed([], &[], [banned.ip()]),
         Default::default(),
         u32::try_from(TOTAL_PIECES).unwrap(),
     );

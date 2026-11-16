@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::disk_room::{DiskHeld, StartHold};
+use super::disk_room::DiskHeld;
 use super::intake::Resolving;
 use super::intake::{AddError, AddRequest};
 use super::live::Live;
 use super::scripts::StoppedSeeding;
-use super::{ActionError, Inner, TorrentService, queued, state_error, take_turn};
+use super::{ActionError, Inner, TorrentService, state_error};
 use crate::SchedulerError;
 use crate::jobs::JobId;
 use crate::jobs::class::{
@@ -17,7 +17,6 @@ use crate::jobs::model::Protocol;
 use crate::jobs::model::{FieldUpdate, JobUpdate, PRIORITY_ATTRIBUTE_KEY};
 use crate::torrents::admission::Refusal;
 use crate::torrents::metrics::FetchOutcome;
-use crate::torrents::status::Queued;
 use crate::torrents::{TorrentIntent, status};
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, Weak};
@@ -317,75 +316,6 @@ impl TorrentService {
         match forced {
             Some(forced) => self.set_forced(job_id, forced).await,
             None => Ok(()),
-        }
-    }
-
-    // Which torrents the queue lets download, applied to their sessions.
-    pub(super) async fn apply_queue(&self) {
-        let settings = self.settings();
-        let rules = self.rules();
-        let now = self.inner.clock.now_ms();
-        let holds = self.holds();
-        let mut live = self.inner.live.lock().await;
-        let mut order: Vec<&Live> = live.values().collect();
-        order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
-        let queue: Vec<Queued> = order
-            .iter()
-            .map(|torrent| queued(&settings, &rules, torrent, now))
-            .collect();
-        let last = order
-            .last()
-            .map(|torrent| (torrent.record.queue_position, torrent.record.job_id));
-        let (turns, slots) = status::turns(&queue, settings.torrent.max_active_downloads, &holds);
-        let turns: BTreeMap<JobId, (&Queued, status::Turn)> = queue
-            .iter()
-            .zip(turns)
-            .map(|(queued, turn)| (queued.job_id, (queued, turn)))
-            .collect();
-        *self
-            .inner
-            .queue_end
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = QueueEnd { slots, last };
-        for torrent in live.values_mut() {
-            let (queued, turn) = turns[&torrent.record.job_id];
-            take_turn(torrent, queued, turn, &holds, now);
-            let mut run = turn.active && torrent.resumed();
-            // One not running yet whose turn lets it run is kept from
-            // starting while the disk is short; one let go starts.
-            let starting = torrent
-                .attached
-                .as_ref()
-                .is_none_or(|attached| attached.handle.is_paused());
-            if run && (starting || torrent.disk_held == Some(DiskHeld::Starting)) {
-                match self.start_hold(torrent) {
-                    StartHold::Short => {
-                        torrent.disk_held = Some(DiskHeld::Starting);
-                        run = false;
-                    }
-                    StartHold::Unplaced => run = false,
-                    StartHold::Free if torrent.disk_held == Some(DiskHeld::Starting) => {
-                        torrent.disk_held = None;
-                    }
-                    StartHold::Free => {}
-                }
-            } else if !run && torrent.disk_held == Some(DiskHeld::Starting) {
-                torrent.disk_held = None;
-            }
-            let Some(attached) = &torrent.attached else {
-                continue;
-            };
-            let result = if run && attached.handle.is_paused() {
-                attached.session.unpause(&attached.handle).await
-            } else if !run && !attached.handle.is_paused() {
-                attached.session.pause(&attached.handle).await
-            } else {
-                continue;
-            };
-            // A run that ends or begins is not in upload mode: a wait for
-            // room on it, and what a wake handed it, end.
-            self.end_disk_room(torrent);
-            torrent.ran(result);
         }
     }
 }

@@ -126,6 +126,12 @@ pub(super) struct Live {
     // How many pieces had passed their check in seed mode when they were
     // last kept.
     pub(super) seed_verified: usize,
+    // Whether the database refused the row that says it left seed mode,
+    // and has not kept one since: warned of once, not at every pass that
+    // writes it again.
+    pub(super) seed_left_refused: bool,
+    // The same for the row that keeps the pieces it checked in seed mode.
+    pub(super) seed_verified_refused: bool,
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
@@ -218,6 +224,8 @@ impl Live {
             leveling: None,
             copy_error: None,
             seed_verified: 0,
+            seed_left_refused: false,
+            seed_verified_refused: false,
             file_have: Vec::new(),
             have_bytes: 0,
             kept_pieces: 0,
@@ -633,7 +641,9 @@ fn same_peers(a: &ResumePeers, b: &ResumePeers) -> bool {
         items.sort_unstable();
         items
     }
-    sorted(&a.peers) == sorted(&b.peers) && sorted(&a.banned) == sorted(&b.banned)
+    sorted(&a.peers) == sorted(&b.peers)
+        && sorted(&a.banned) == sorted(&b.banned)
+        && sorted(&a.found) == sorted(&b.found)
 }
 
 // Every file's bytes in hand. The session's progress counts only the files

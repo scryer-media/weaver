@@ -1591,6 +1591,21 @@ fn listed(live: &crate::torrent_state::TorrentStateLive, addr: SocketAddr) -> bo
     .contains_key(&addr.to_string())
 }
 
+/// The peers the run has dropped because no tracker or the operator named
+/// them.
+fn untracked_dropped(live: &crate::torrent_state::TorrentStateLive) -> u32 {
+    live.stats_snapshot().peer_stats.untracked_dropped
+}
+
+/// Waits until the drop counter `count` reads more than `watermark`, read
+/// before the action that drops. The count is a plain counter with nothing
+/// to wake on, so this yields between reads.
+async fn untracked_dropped_past(count: impl Fn() -> u32, watermark: u32) {
+    while count() <= watermark {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// The torrent's run, once it has one.
 async fn live_run(
     handle: &crate::torrent_state::ManagedTorrentHandle,
@@ -1923,6 +1938,195 @@ async fn test_a_private_torrent_found_on_the_dht_takes_peers_from_its_trackers_a
 
     // From its metadata on, it takes peers from its trackers alone.
     assert!(handle.takes_peers_from_trackers_only());
+    server.abort();
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+/// A session running the DHT, bootstrapped from `node`, and local discovery
+/// over a socket that records what it sends.
+async fn dht_and_lsd_session(
+    out: &TempDir,
+    node: &std::sync::Arc<crate::network::KernelUdp>,
+) -> anyhow::Result<std::sync::Arc<Session>> {
+    let (session, _sent) = dht_and_lsd_session_on(out, node, None).await?;
+    Ok(session)
+}
+
+/// [`dht_and_lsd_session`] on `listen`, with what local discovery sends.
+async fn dht_and_lsd_session_on(
+    out: &TempDir,
+    node: &std::sync::Arc<crate::network::KernelUdp>,
+    listen: Option<ListenerOptions>,
+) -> anyhow::Result<(
+    std::sync::Arc<Session>,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+)> {
+    let (sent_tx, sent) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::new_with_opts(
+        out.path().into(),
+        SessionOptions {
+            disable_local_service_discovery: false,
+            lsd_socket: Some(Box::new(crate::lsd::RecordingSocket(sent_tx))),
+            listen,
+            ..discovery_session_opts(node)?
+        },
+    )
+    .await?;
+    anyhow::ensure!(session.get_dht().is_some() && session.lsd.is_some());
+    Ok((session, sent))
+}
+
+/// Local discovery's next announce of `info_hash`, passing over others.
+async fn next_lsd_announce(
+    sent: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    info_hash: crate::core::hash_id::Id20,
+) -> anyhow::Result<()> {
+    let line = format!("Infohash: {}\r", info_hash.as_string());
+    loop {
+        let announce = sent.recv().await.context("local discovery stopped")?;
+        if announce.contains(&line) {
+            return Ok(());
+        }
+    }
+}
+
+/// Where the session's peer finders were asked to look for `info_hash`, in
+/// the order they handed out their streams.
+fn looked(
+    session: &Session,
+    info_hash: crate::core::hash_id::Id20,
+) -> Vec<crate::type_aliases::PeerSourceFlag> {
+    session
+        .handed_out
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(asked, _)| *asked == info_hash)
+        .map(|(_, source)| *source)
+        .collect()
+}
+
+/// Adds `torrent` running, announcing to `url`.
+async fn add_running(
+    session: &std::sync::Arc<Session>,
+    torrent: bytes::Bytes,
+    url: &str,
+) -> anyhow::Result<crate::torrent_state::ManagedTorrentHandle> {
+    session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                tracker_tiers: Some(named(vec![vec![url]])),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")
+}
+
+// libtorrent `torrent::should_announce_dht` and `torrent::lsd_announce`: a
+// private torrent added on a session running the DHT and local discovery
+// is handed neither, sends the DHT no get_peers and registers nothing with
+// local discovery; it asks its trackers alone. A public one, on the same
+// session, is handed both.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_private_torrent_asks_neither_the_dht_nor_local_discovery() -> anyhow::Result<()> {
+    use crate::type_aliases::PeerSourceFlag::{Dht, Lsd, Tracker};
+    setup_test_logging();
+    let node = crate::test_support::loopback_kernel_udp();
+    let out = TempDir::with_prefix("test_private_no_dht_lsd_out")?;
+    // Local discovery announces only a port peers can reach. A loopback
+    // listener tells none unless an announce port is set (listen.rs), so
+    // the session sets one.
+    let (session, mut sent) = dht_and_lsd_session_on(
+        &out,
+        &node,
+        Some(ListenerOptions {
+            mode: ListenerMode::TcpOnly,
+            listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+            announce_port: Some(6881),
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let lsd = session.lsd.clone().context("no LSD")?;
+
+    let mut private = TestTorrent::new("test_private_no_dht_lsd", 4096, 1024).await?;
+    private.torrent = made_private(&private.torrent)?;
+    let private_hash = info_hash_of(&private.torrent)?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let handle = add_running(&session, private.torrent.clone(), &url).await?;
+    assert!(handle.takes_peers_from_trackers_only());
+    // Its peers are looked for as it is added: on its trackers alone.
+    assert_eq!(looked(&session, private_hash), [Tracker]);
+    // Its first announce: its peer search runs, and has asked the DHT and
+    // local discovery nothing.
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond(conn, REFUSED).await?;
+    assert!(!asked_for_peers(&node, private_hash));
+    assert!(!lsd.registered(private_hash));
+
+    // A public torrent on the same session is handed the DHT and local
+    // discovery, and asks the DHT.
+    let public = TestTorrent::new("test_public_dht_lsd", 4096, 1024).await?;
+    let public_hash = info_hash_of(&public.torrent)?;
+    let public_tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let public_url = format!("http://{}/announce", public_tracker.local_addr()?);
+    let _public = add_running(&session, public.torrent.clone(), &public_url).await?;
+    assert_eq!(looked(&session, public_hash), [Tracker, Dht, Lsd]);
+    next_get_peers(&node, public_hash).await?;
+    next_lsd_announce(&mut sent, public_hash).await?;
+    assert!(lsd.registered(public_hash));
+
+    assert_eq!(looked(&session, private_hash), [Tracker]);
+    assert!(!lsd.registered(private_hash));
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+// A private magnet whose tracker names the peer that serves its metadata:
+// neither its metadata fetch nor its run, once the metadata says it is
+// private, is handed the DHT or local discovery, the DHT is sent no
+// get_peers for it and local discovery registers nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_private_magnets_tracker_fetch_and_its_run_ask_neither_the_dht_nor_local_discovery()
+-> anyhow::Result<()> {
+    use crate::type_aliases::PeerSourceFlag::Tracker;
+    setup_test_logging();
+    let node = crate::test_support::loopback_kernel_udp();
+    let out = TempDir::with_prefix("test_private_magnet_no_dht_lsd_out")?;
+    let session = dht_and_lsd_session(&out, &node).await?;
+    let lsd = session.lsd.clone().context("no LSD")?;
+    let mut t = TestTorrent::new("test_private_magnet_no_dht_lsd", 4096, 1024).await?;
+    t.torrent = made_private(&t.torrent)?;
+    let info_hash = info_hash_of(&t.torrent)?;
+    let (server, seeder) = serve_metadata(&t.torrent).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+
+    let (add, view) = add_running_magnet(&session, magnet_of(&t.torrent)?, &url).await?;
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond_bytes(conn, &answer_with_peer(seeder)?).await?;
+    let handle = add.await??.into_handle().context("expected a handle")?;
+
+    // The fetch asked its trackers, whose answer named the peer that served
+    // the metadata, so it never went on to the DHT and local discovery.
+    // The metadata says private; the run is handed its trackers alone.
+    assert!(handle.takes_peers_from_trackers_only());
+    assert_eq!(*view.phase.borrow(), crate::FetchPhase::Trackers);
+    assert_eq!(looked(&session, info_hash), [Tracker, Tracker]);
+    // Its next announce, once it runs: the run's search runs, and has asked
+    // the DHT and local discovery nothing.
+    live_run(&handle).await;
+    handle.force_reannounce(Duration::ZERO, None, true);
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond(conn, REFUSED).await?;
+    assert!(!asked_for_peers(&node, info_hash));
+    assert!(!lsd.registered(info_hash));
     server.abort();
     session.cancellation_token().cancel();
     Ok(())
@@ -2667,5 +2871,348 @@ async fn test_a_family_whose_started_was_refused_is_sent_started_again_and_no_st
     assert!(heard_nothing_more(&mut heard6));
     serve4.abort();
     serve6.abort();
+    Ok(())
+}
+
+/// A peer that serves `torrent`'s metadata over its first connection, as
+/// [`serve_metadata`] does, then holds every connection after it as
+/// [`hold_over`] does, until aborted. Returns its task, its address and
+/// the receiver its delivered connections are told on.
+async fn serve_metadata_then_hold(
+    torrent: &[u8],
+    pieces: usize,
+) -> anyhow::Result<(
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+)> {
+    let parsed = crate::core::torrent_metainfo::torrent_from_bytes(torrent)?;
+    let info_hash = parsed.info_hashes.v1.context("a v1 torrent")?;
+    let info = parsed.info.raw_bytes.as_ref().to_vec();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let (delivered_tx, delivered) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let (conn, _) = listener.accept().await?;
+        serve_metadata_over(conn, info_hash, &info).await?;
+        hold_over(listener, info_hash, pieces, delivered_tx).await
+    });
+    Ok((task, addr, delivered))
+}
+
+/// A peer of `info_hash` that holds every connection to it as
+/// [`hold_over`] does, until aborted, telling `delivered`. Returns its task
+/// and its address.
+async fn holding_peer(
+    info_hash: crate::core::hash_id::Id20,
+    pieces: usize,
+    delivered: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+) -> anyhow::Result<(tokio::task::JoinHandle<anyhow::Result<()>>, SocketAddr)> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    Ok((
+        tokio::spawn(hold_over(listener, info_hash, pieces, delivered)),
+        addr,
+    ))
+}
+
+/// Answers the handshake of every connection to `listener`, says it has
+/// every one of its `pieces`, and holds each open. Each connection whose
+/// torrent said it is interested, which it does only once it took that
+/// bitfield as the connection's first message, is told on `delivered` by
+/// the listener's address.
+async fn hold_over(
+    listener: TcpListener,
+    info_hash: crate::core::hash_id::Id20,
+    pieces: usize,
+    delivered: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+) -> anyhow::Result<()> {
+    use crate::buffers::ByteBuf;
+    use crate::peer_protocol::{Message, extended::PeerExtendedMessageIds};
+    let addr = listener.local_addr()?;
+    let mut have = vec![0u8; pieces.div_ceil(8)];
+    for piece in 0..pieces {
+        have[piece / 8] |= 0x80 >> (piece % 8);
+    }
+    let mut out = vec![0u8; 1024];
+    let len = Message::Bitfield(ByteBuf(&have)).serialize(&mut out, &PeerExtendedMessageIds::my)?;
+    let bitfield = out[..len].to_vec();
+    // A peer id of its own, so peers held side by side are not taken for
+    // one.
+    let mut peer_id = [0x55; 20];
+    peer_id[18..].copy_from_slice(&addr.port().to_be_bytes());
+    let mut handshake =
+        crate::peer_protocol::Handshake::new(info_hash, crate::core::hash_id::Id20::new(peer_id));
+    handshake.reserved = 0;
+    let len = handshake.serialize_unchecked_len(&mut out);
+    let handshake = out[..len].to_vec();
+    let mut held = Vec::new();
+    loop {
+        let mut conn = accept_handshake(&listener).await?;
+        conn.write_all(&handshake).await?;
+        conn.write_all(&bitfield).await?;
+        if interested(&mut conn).await {
+            let _ = delivered.send(addr);
+            held.push(conn);
+        }
+    }
+}
+
+/// Reads `conn` until the other side says it is interested; false if the
+/// connection ends first.
+async fn interested(conn: &mut TcpStream) -> bool {
+    use crate::peer_protocol::Message;
+    loop {
+        let Ok(frame) = conn.read_u32().await else {
+            return false;
+        };
+        let mut message = frame.to_be_bytes().to_vec();
+        message.resize(4 + frame as usize, 0);
+        if conn.read_exact(&mut message[4..]).await.is_err() {
+            return false;
+        }
+        if let Ok((Message::Interested, _)) = Message::deserialize(&message, &[], None) {
+            return true;
+        }
+    }
+}
+
+/// The next announce to `tracker` that is no `stopped` one, unanswered;
+/// each `stopped` one before it is refused.
+async fn next_running_announce(tracker: &TcpListener) -> anyhow::Result<TcpStream> {
+    loop {
+        let (conn, event) = read_announce(tracker).await?;
+        if event.as_deref() != Some("stopped") {
+            return Ok(conn);
+        }
+        respond(conn, REFUSED).await?;
+    }
+}
+
+// A private magnet whose tracker failed found its metadata on a peer the
+// DHT named, and keeps that peer while no tracker has answered: a save
+// marks it as found on the DHT. Restarted from that save, the torrent
+// keeps it while its tracker still does not answer, and saves it again
+// marked; once the tracker answers, it leaves, as it would have without
+// the restart, and the peer the tracker named stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_restarted_private_magnet_keeps_its_dht_peer_until_its_tracker_answers()
+-> anyhow::Result<()> {
+    use crate::type_aliases::PeerSourceFlag::{Dht, Tracker};
+    setup_test_logging();
+    let scene = MagnetScene::new("test_private_restart_dht_peer", true).await?;
+    let (serving, dht_peer, mut delivered) = serve_metadata_then_hold(&scene.t.torrent, 4).await?;
+    let tracker_peer_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let tracker_peer = tracker_peer_listener.local_addr()?;
+
+    let handle = scene.add_found_on_the_dht(&[dht_peer]).await?;
+    assert!(handle.takes_peers_from_trackers_only());
+    // The fetch asked the DHT after its tracker failed; the run, private,
+    // is handed its trackers alone.
+    assert_eq!(
+        looked(&scene.session, scene.info_hash),
+        [Tracker, Dht, Tracker]
+    );
+    let live = live_run(&handle).await;
+    // The run's connection to the DHT's peer delivered a message.
+    delivered.recv().await.context("the DHT's peer stopped")?;
+    assert!(!tracker_answered(&handle));
+    assert!(listed(&live, dht_peer));
+    let saved = handle.resume_peers().context("no saved peers")?;
+    assert!(saved.peers.contains(&dht_peer));
+    assert_eq!(saved.found, [dht_peer]);
+
+    // Restarted from the save.
+    scene
+        .session
+        .delete(crate::api::TorrentIdOrHash::Id(handle.id()), false)
+        .await?;
+    let restarted = scene
+        .session
+        .add_torrent(
+            AddTorrent::from_bytes(scene.t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                tracker_tiers: Some(named(vec![vec![scene.url.clone()]])),
+                initial_peers: Some(saved.peers.clone()),
+                found_peers: saved.found.clone(),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let live = live_run(&restarted).await;
+
+    // Its tracker refuses, and its new connection to the DHT's peer
+    // delivers a message: the peer stays, and a save holds it marked.
+    respond(next_running_announce(&scene.tracker).await?, REFUSED).await?;
+    table_until(&restarted, |rows| rows.iter().any(|row| row.fails > 0)).await?;
+    delivered.recv().await.context("the DHT's peer stopped")?;
+    assert!(!tracker_answered(&restarted));
+    assert!(listed(&live, dht_peer));
+    let saved = restarted.resume_peers().context("no saved peers")?;
+    assert!(saved.peers.contains(&dht_peer));
+    assert_eq!(saved.found, [dht_peer]);
+
+    // Its tracker answers, naming another peer: the DHT's leaves, counted
+    // as it goes, and the tracker's joins and stays.
+    let dropped = untracked_dropped(&live);
+    restarted.force_reannounce(Duration::ZERO, None, true);
+    respond_bytes(
+        next_running_announce(&scene.tracker).await?,
+        &answer_with_peer(tracker_peer)?,
+    )
+    .await?;
+    untracked_dropped_past(|| untracked_dropped(&live), dropped).await;
+    assert_eq!(untracked_dropped(&live), dropped + 1);
+    let _dialed = tracker_peer_listener.accept().await?;
+    assert!(!listed(&live, dht_peer));
+    assert!(listed(&live, tracker_peer));
+    assert!(
+        !restarted
+            .resume_peers()
+            .context("no saved peers")?
+            .peers
+            .contains(&dht_peer)
+    );
+    serving.abort();
+    scene.session.cancellation_token().cancel();
+    Ok(())
+}
+
+// A public torrent ran with the DHT on: its tracker named one peer, the DHT
+// two, and a save marks the DHT's as found off-tracker. A tracker rule then
+// has it take its peers from its trackers alone, which re-adds it from that
+// save: the DHT's two leave at once, counted as they go, the tracker's
+// stays, a save holds the tracker's alone, and a restart from that save
+// does not bring the DHT's back.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_public_torrent_a_rule_turns_trackers_only_drops_its_peers_found_off_tracker()
+-> anyhow::Result<()> {
+    use crate::type_aliases::PeerSourceFlag::{Dht, ResumeData, Tracker};
+    setup_test_logging();
+    let node = crate::test_support::loopback_kernel_udp();
+    let out = TempDir::with_prefix("test_rule_trackers_only_out")?;
+    // Every peer here is on 127.0.0.1: the run holds a connection to each.
+    let session = Session::new_with_opts(
+        out.path().into(),
+        SessionOptions {
+            allow_multiple_connections_per_ip: true,
+            ..discovery_session_opts(&node)?
+        },
+    )
+    .await?;
+    let t = TestTorrent::new("test_rule_trackers_only", 4096, 1024).await?;
+    let info_hash = info_hash_of(&t.torrent)?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel();
+    let (tracker_serving, tracker_peer) = holding_peer(info_hash, 4, delivered_tx.clone()).await?;
+    let (dht_serving_a, dht_a) = holding_peer(info_hash, 4, delivered_tx.clone()).await?;
+    let (dht_serving_b, dht_b) = holding_peer(info_hash, 4, delivered_tx).await?;
+    let mut dht_peers = vec![dht_a, dht_b];
+    dht_peers.sort();
+
+    // It runs public: its tracker names one peer, the DHT two, and its
+    // connection to each delivers a message.
+    let handle = add_running(&session, t.torrent.clone(), &url).await?;
+    assert!(!handle.takes_peers_from_trackers_only());
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond_bytes(conn, &answer_with_peer(tracker_peer)?).await?;
+    dht_names(&node, info_hash, &dht_peers).await?;
+    let mut reached = Vec::new();
+    for _ in 0..3 {
+        reached.push(delivered.recv().await.context("a peer stopped")?);
+    }
+    reached.sort();
+    let mut all = vec![tracker_peer, dht_a, dht_b];
+    all.sort();
+    assert_eq!(reached, all);
+    let saved = handle.resume_peers().context("no saved peers")?;
+    let mut found = saved.found.clone();
+    found.sort();
+    assert_eq!(found, dht_peers);
+    for peer in &all {
+        assert!(saved.peers.contains(peer));
+    }
+
+    // The rule takes effect as the server applies it: the torrent leaves
+    // the session and is re-added from its save, taking its peers from its
+    // trackers alone.
+    session
+        .delete(crate::api::TorrentIdOrHash::Id(handle.id()), false)
+        .await?;
+    let readd = |saved: crate::torrent_state::live::peers::ResumePeers| {
+        let session = session.clone();
+        let torrent = t.torrent.clone();
+        let url = url.clone();
+        async move {
+            session
+                .add_torrent(
+                    AddTorrent::from_bytes(torrent),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                        tracker_tiers: Some(named(vec![vec![url]])),
+                        trackers_only: true,
+                        initial_peers: Some(saved.peers),
+                        found_peers: saved.found,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")
+        }
+    };
+    let dropped = session.stats_snapshot().peers.untracked_dropped;
+    let ruled = readd(saved).await?;
+    assert!(ruled.takes_peers_from_trackers_only());
+    let live = live_run(&ruled).await;
+    // The DHT's two leave, counted by the run and the session; the
+    // tracker's stays, its own list hands out the tracker's alone, and the
+    // DHT is not asked again.
+    untracked_dropped_past(|| session.stats_snapshot().peers.untracked_dropped, dropped).await;
+    assert_eq!(untracked_dropped(&live), 2);
+    assert_eq!(
+        session.stats_snapshot().peers.untracked_dropped,
+        dropped + 2
+    );
+    assert!(!listed(&live, dht_a));
+    assert!(!listed(&live, dht_b));
+    assert!(listed(&live, tracker_peer));
+    assert_eq!(
+        looked(&session, info_hash),
+        [Tracker, Dht, Tracker, ResumeData]
+    );
+    assert_eq!(
+        delivered.recv().await.context("a peer stopped")?,
+        tracker_peer
+    );
+    let saved = ruled.resume_peers().context("no saved peers")?;
+    assert_eq!(saved.peers, [tracker_peer]);
+    assert!(saved.found.is_empty());
+
+    // Restarted from that save, the DHT's peers stay gone.
+    session
+        .delete(crate::api::TorrentIdOrHash::Id(ruled.id()), false)
+        .await?;
+    let restarted = readd(saved).await?;
+    let live = live_run(&restarted).await;
+    assert_eq!(untracked_dropped(&live), 0);
+    assert!(!listed(&live, dht_a));
+    assert!(!listed(&live, dht_b));
+    assert!(listed(&live, tracker_peer));
+    assert_eq!(
+        delivered.recv().await.context("a peer stopped")?,
+        tracker_peer
+    );
+    let saved = restarted.resume_peers().context("no saved peers")?;
+    assert_eq!(saved.peers, [tracker_peer]);
+    assert!(saved.found.is_empty());
+    tracker_serving.abort();
+    dht_serving_a.abort();
+    dht_serving_b.abort();
+    session.cancellation_token().cancel();
     Ok(())
 }

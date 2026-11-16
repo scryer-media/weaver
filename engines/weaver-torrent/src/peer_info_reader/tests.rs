@@ -671,7 +671,7 @@ async fn two_peers_send_the_metadata_between_them() {
         Id20::new([1; 20]),
         MetadataFetch::new(hashes, None),
         MetadataPeers {
-            list: PeerList::resumed([addr(1), addr(2)], []),
+            list: PeerList::resumed([addr(1), addr(2)], &[], []),
             stream: futures::stream::pending(),
             order: Default::default(),
         },
@@ -733,7 +733,7 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
         Id20::new([1; 20]),
         MetadataFetch::new(hashes, None),
         MetadataPeers {
-            list: PeerList::resumed([addr(1)], []),
+            list: PeerList::resumed([addr(1)], &[], []),
             stream: futures::stream::pending(),
             order: Default::default(),
         },
