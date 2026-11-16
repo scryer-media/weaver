@@ -1357,12 +1357,9 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
         TorrentState::Moving => "moving",
         // qBittorrent serialize_torrent.cpp:50.
         TorrentState::FilesMissing => "missingFiles",
-        // A stop with any reason but its met goal is a failure.
-        TorrentState::Stopped
-            if view.detail.is_none() || view.stated == Some(status::Stated::GoalMet) =>
-        {
-            side("stoppedDL", "stoppedUP")
-        }
+        // A stop with words of its own, an error, is a failure; a met goal is
+        // stated, with none.
+        TorrentState::Stopped if view.detail.is_none() => side("stoppedDL", "stoppedUP"),
         TorrentState::Stopped => "error",
     }
 }
