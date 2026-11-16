@@ -673,6 +673,7 @@ impl Session {
                 first_last_piece_first: opts.first_last_piece_first,
                 output_folder,
                 seen_peers,
+                web_seeds: opts.web_seeds,
                 trackers: handover,
             }));
         }
