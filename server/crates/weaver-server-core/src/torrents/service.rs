@@ -359,6 +359,9 @@ pub enum ActionError {
     Invalid(String),
     #[error("{0}")]
     State(String),
+    // The caller may not use that location (`may_place`).
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 fn state_error(error: StateError) -> String {

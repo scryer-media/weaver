@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use super::intake::OUTSIDE_SAVE_FOLDERS;
 use super::{ActionError, TorrentService, files_dir, give_back, locked, state_error};
+use crate::auth::CallerScope;
+use crate::categories::model;
 use crate::jobs::JobId;
 use crate::pipeline::claim_complete_destination_path;
 use crate::torrents::files::Files;
@@ -26,8 +29,32 @@ impl TorrentService {
     /// stays, and the torrent is checked again from there. A move that
     /// fails leaves the torrent where it was, and says why when it failed
     /// at once.
+    /// This is the server's own move: `parent` is not checked against a
+    /// caller's. An entry point that takes a location from a caller moves
+    /// through `set_location_as`.
     pub async fn set_location(&self, job_id: JobId, parent: String) -> Result<(), ActionError> {
         self.move_storage(job_id, parent, Existing::Keep).await
+    }
+
+    /// `set_location` for `caller`, who must be allowed `parent`
+    /// (`may_place`); refused, nothing moves.
+    pub async fn set_location_as(
+        &self,
+        caller: CallerScope,
+        job_id: JobId,
+        parent: String,
+    ) -> Result<(), ActionError> {
+        if !self.may_place(caller, Path::new(parent.trim())) {
+            return Err(ActionError::Forbidden(OUTSIDE_SAVE_FOLDERS.to_owned()));
+        }
+        self.set_location(job_id, parent).await
+    }
+
+    /// Whether `caller` may have a torrent saved or moved under `path`, by
+    /// the settings in force (`categories::model::may_place`).
+    pub fn may_place(&self, caller: CallerScope, path: &Path) -> bool {
+        let settings = self.settings();
+        model::may_place(caller, path, &settings.complete_dir, &settings.categories)
     }
 
     // The move of `set_location`. A placed file already at the new place

@@ -8,8 +8,9 @@ use super::{
     NEEDS_DHT, PeerTerms, TorrentService, give_back, hashes_of, held_by, identity_of,
     in_table_order, queued, state_error, take_turn, tidy_trackers, tracker, tracker_tiers,
 };
+use crate::auth::CallerScope;
 use crate::categories::CategoryConfig;
-use crate::categories::model::{completion_parent, resolve_category_config};
+use crate::categories::model::{completion_parent, may_place, resolve_category_config};
 use crate::jobs::JobId;
 use crate::persistence::Database;
 use crate::pipeline::claim_complete_destination_path;
@@ -176,7 +177,14 @@ pub enum AddError {
     Off,
     #[error("{0}")]
     State(String),
+    // The caller may not save there (`may_place`).
+    #[error("{0}")]
+    Forbidden(String),
 }
+
+// Why a caller that only controls is refused a save location.
+pub(super) const OUTSIDE_SAVE_FOLDERS: &str =
+    "this key may save only under the default save folder or a category's folder";
 
 // A torrent's metainfo, read.
 pub(super) struct Parsed {
@@ -314,7 +322,20 @@ impl TorrentService {
         self.inner.sessions.ip_filter(torrent).await
     }
 
+    /// Add the torrent `request` names, as the server itself adds it: its
+    /// save location is not checked against a caller's. An entry point
+    /// that takes a save location from a caller adds through `add_as`.
     pub async fn add(&self, request: AddRequest) -> Result<JobId, AddError> {
+        self.add_as(CallerScope::Local, request).await
+    }
+
+    /// Add the torrent `request` names for `caller`, who must be allowed
+    /// its save and download paths once they are absolute (`may_place`).
+    pub async fn add_as(
+        &self,
+        caller: CallerScope,
+        request: AddRequest,
+    ) -> Result<JobId, AddError> {
         // Off, a wind-down's sessions open included: no torrent is new.
         let settings = self.settings();
         if !self.takes_new() {
@@ -349,6 +370,21 @@ impl TorrentService {
             )
             .map_err(AddError::Invalid)?;
             request.placement = absolute_placement(&request.placement, &parent);
+        }
+        let placement = &request.placement;
+        if [&placement.save_path, &placement.download_path]
+            .into_iter()
+            .flatten()
+            .any(|path| {
+                !may_place(
+                    caller,
+                    Path::new(path.trim()),
+                    &settings.complete_dir,
+                    &settings.categories,
+                )
+            })
+        {
+            return Err(AddError::Forbidden(OUTSIDE_SAVE_FOLDERS.to_owned()));
         }
         match request.source.clone() {
             AddSource::Metainfo(bytes) => {

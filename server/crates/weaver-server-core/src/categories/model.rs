@@ -141,6 +141,67 @@ pub fn completion_parent(
     Ok(parent)
 }
 
+/// Whether `caller` may have a torrent's files saved or moved under `path`:
+/// an admin anywhere, a key that only controls at or under the default save
+/// folder, `complete_dir`, or a category's own folder. The one answer every
+/// entry point that takes a save location asks.
+///
+/// This departs from qBittorrent, whose Web API takes any path from any
+/// caller that may change torrents (`TorrentsController::addAction`,
+/// src/webui/api/torrentscontroller.cpp:1150 and :1205; `setLocationAction`
+/// :1762; `setSavePathAction` :1787), by the operator's ruling of
+/// 2026-11-16 (PR 129 question 2).
+///
+/// The comparison is of names, never of the disk: `path` must be absolute
+/// and have no `..`, `.` parts are dropped, and the result must start with
+/// a configured folder as configured. A configured folder that is a
+/// symbolic link is taken by its own name, so a path through the link
+/// passes and the same place named through its target does not.
+pub fn may_place(
+    caller: crate::auth::CallerScope,
+    path: &std::path::Path,
+    complete_dir: &std::path::Path,
+    categories: &[CategoryConfig],
+) -> bool {
+    if caller.is_admin() {
+        return true;
+    }
+    if !caller.can_control() {
+        return false;
+    }
+    let Some(path) = plain(path) else {
+        return false;
+    };
+    std::iter::once(complete_dir.to_path_buf())
+        .chain(
+            categories
+                .iter()
+                .filter_map(|category| category.dest_dir.as_deref())
+                .filter(|folder| !folder.is_empty())
+                .map(std::path::PathBuf::from),
+        )
+        .filter_map(|folder| plain(&folder))
+        .any(|folder| path.starts_with(folder))
+}
+
+// `path` absolute with its `.` parts dropped; None for a relative path or
+// one with a `..`.
+fn plain(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut plain = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => return None,
+            Component::CurDir => {}
+            part => plain.push(part),
+        }
+    }
+    Some(plain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +340,71 @@ mod tests {
         assert!(
             resolve_submission_category(&unsafe_without_override, Some("unsafe-alias")).is_err()
         );
+    }
+
+    // A key that only controls places under the default save folder or a
+    // category's own folder, compared by name with no `..` escape; an
+    // admin places anywhere.
+    #[test]
+    fn a_control_key_places_only_under_a_configured_folder() {
+        use crate::auth::CallerScope;
+        use std::path::Path;
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        let at = |path: &str| Path::new(root).join(path);
+        let complete = at("data/complete");
+        let categories = [
+            CategoryConfig {
+                id: 1,
+                name: "tv".into(),
+                dest_dir: Some(at("media/tv").to_string_lossy().into_owned()),
+                aliases: String::new(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
+                upload_cap: Default::default(),
+            },
+            CategoryConfig {
+                id: 2,
+                name: "movies".into(),
+                dest_dir: None,
+                aliases: String::new(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
+                upload_cap: Default::default(),
+            },
+        ];
+        let control = |path: &Path| may_place(CallerScope::Control, path, &complete, &categories);
+        for passes in [
+            at("data/complete"),
+            at("data/complete/shows"),
+            at("data/complete/./movies/x"),
+            at("media/tv"),
+            at("media/tv/Show/Season 1"),
+        ] {
+            assert!(control(&passes), "{}", passes.display());
+        }
+        for refused in [
+            at("data"),
+            at("data/completed"),
+            at("data/complete/../escape"),
+            at("media/tv/../../etc"),
+            at("media/movies"),
+            at("elsewhere"),
+            Path::new("complete/shows").to_path_buf(),
+        ] {
+            assert!(!control(&refused), "{}", refused.display());
+        }
+        for scope in [CallerScope::Read, CallerScope::ScriptRun] {
+            assert!(!may_place(
+                scope,
+                &at("data/complete/x"),
+                &complete,
+                &categories
+            ));
+        }
+        for scope in [CallerScope::Admin, CallerScope::Local] {
+            assert!(may_place(scope, &at("elsewhere"), &complete, &categories));
+        }
     }
 }

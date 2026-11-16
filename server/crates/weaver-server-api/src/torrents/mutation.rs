@@ -11,7 +11,7 @@ use weaver_server_core::torrents::service::{ActionError, AddRequest, AddSource};
 
 use super::service;
 use super::types::{SubmitTorrentInput, Torrent, TorrentFilePriorityInput, TorrentTrackerInput};
-use crate::auth::{ControlGuard, graphql_error};
+use crate::auth::{CallerScope, ControlGuard, graphql_error};
 use crate::settings::types::SeedingPolicyInput;
 
 pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
@@ -20,6 +20,7 @@ pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
         ActionError::UnmetGoal(_) => "SEEDING_GOAL_UNMET",
         ActionError::Invalid(_) => "INVALID_INPUT",
         ActionError::State(_) => "INTERNAL",
+        ActionError::Forbidden(_) => "FORBIDDEN",
     };
     graphql_error(code, error.to_string())
 }
@@ -130,10 +131,13 @@ impl TorrentsMutation {
     }
 
     /// Move the torrent's directory under `path`; it goes on from there.
+    /// A key that only controls may name only a path under the default
+    /// save folder or a category's folder.
     #[graphql(guard = "ControlGuard")]
     async fn set_torrent_location(&self, ctx: &Context<'_>, id: u64, path: String) -> Result<bool> {
+        let caller = *ctx.data::<CallerScope>()?;
         service(ctx)?
-            .set_location(JobId(id), path)
+            .set_location_as(caller, JobId(id), path)
             .await
             .map_err(action_error)?;
         Ok(true)
