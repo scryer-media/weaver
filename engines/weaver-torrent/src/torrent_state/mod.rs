@@ -1186,16 +1186,6 @@ impl ManagedTorrent {
         }
     }
 
-    /// Asks a tracker of the latest live run for the swarm's counts now; see
-    /// [`crate::tracker::TrackerStatus::scrape`]. Fails when the torrent has
-    /// not run with trackers yet.
-    pub async fn scrape(&self) -> anyhow::Result<crate::tracker::ScrapeOk> {
-        let trackers = self
-            .tracker_status()
-            .context("the torrent has not run with trackers")?;
-        trackers.scrape().await
-    }
-
     // A run that checks every piece and trusts nothing saved, on files
     // opened again, founded on `peers`: the restart after an error, and a
     // forced recheck.

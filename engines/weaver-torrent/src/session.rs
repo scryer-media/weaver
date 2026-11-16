@@ -32,11 +32,9 @@ use crate::dht::{Dht, Id20};
 use crate::lsd::LocalServiceDiscovery;
 use crate::meter::Meter;
 use crate::peer_protocol::Handshake;
-use crate::ssl::{SslIdentity, SslTorrent};
+use crate::ssl::SslIdentity;
 use crate::torrent_state::live::{RateTick, choker::Choker};
-use crate::tracker::{
-    HttpAnnounces, ListenPort, StoppedAnnounces, Tracker, TrackerTask, UdpTrackerClient,
-};
+use crate::tracker::{HttpAnnounces, ListenPort, StoppedAnnounces, UdpTrackerClient};
 use crate::{
     api::TorrentIdOrHash,
     bitv_factory::BitVFactory,
@@ -76,6 +74,7 @@ mod construction;
 pub(crate) mod external_ip;
 mod listeners;
 mod options;
+mod peer_finder;
 mod peer_sources;
 mod ports;
 mod turnover;
@@ -453,24 +452,6 @@ pub(crate) struct CheckedIncomingConnection {
     pub encryption: crate::mse::Encryption,
     /// What has crossed the socket so far, the handshakes included.
     pub meter: Meter,
-}
-
-/// What a torrent asks for peers with: the hashes and identity it goes by,
-/// the trackers and sources it asks, and whether it announces itself.
-struct PeerRequest<'a> {
-    info_hashes: InfoHashes,
-    identity: &'a Identity,
-    tracker_tiers: Vec<Vec<Tracker>>,
-    announce: bool,
-    force_tracker_interval: Option<Duration>,
-    initial_peers: Vec<SocketAddr>,
-    trackers_only: bool,
-    discovery: Discovery,
-    dht_announce: tokio::sync::watch::Receiver<()>,
-    ssl: Option<&'a Arc<SslTorrent>>,
-    // A tracker task already running for the torrent, taken over in place
-    // of starting its own.
-    trackers: Option<TrackerTask>,
 }
 
 impl Session {

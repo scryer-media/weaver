@@ -11,12 +11,14 @@ use bytes::Bytes;
 use tempfile::TempDir;
 
 use super::add::torrent_file_from_info_bytes;
+use super::peer_finder::{FINDERS, PeerAsk, find};
 use super::peer_sources::{merge_tracker_tiers, metainfo_tracker_tiers};
 use super::{
     AddTorrent, AddTorrentOptions, Discovery, ManagedTorrentHandle, Session, SessionOptions,
-    Tracker, is_bare_info_hash, torrent_from_bytes,
+    is_bare_info_hash, torrent_from_bytes,
 };
 use crate::tracker::ToldPorts;
+use crate::tracker::Tracker;
 
 fn url(s: &str) -> url::Url {
     url::Url::parse(s).unwrap()
@@ -1612,13 +1614,17 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
     // The session runs local discovery: a torrent that looks there is
     // handed its peers, one that looks nowhere is handed none.
     let peers = |t: &ManagedTorrentHandle| {
-        session.discovery_peers(
+        let identity = session.identity().clone();
+        let mut ask = PeerAsk::unannounced(
+            &session,
             t.info_hashes(),
-            false,
+            &identity,
             tokio::sync::watch::channel(()).1,
-            None,
-            t.discovery(),
-        )
+        );
+        find(&FINDERS, &session, &mut ask, |finder| {
+            finder.allowed(t.discovery()) && !finder.allowed(nowhere)
+        })
+        .0
     };
     assert!(peers(&public).is_some());
     assert!(peers(&no_dht).is_some());

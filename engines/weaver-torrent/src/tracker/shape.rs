@@ -14,7 +14,7 @@ use reqwest::header::{self, HeaderMap, HeaderValue};
 use crate::EncryptionPolicy;
 use crate::tracker::tracker_comms_http::{Family, TrackerRequest};
 
-/// How a torrent's announces and scrapes are written.
+/// How a torrent's announces are written.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AnnounceShape {
     /// The arguments of an announce's query, in order.
@@ -229,13 +229,6 @@ impl AnnounceShape {
                 }
             }
         }
-    }
-
-    /// The query of a scrape for `info_hash`.
-    pub(crate) fn scrape_query(&self, info_hash: &crate::core::hash_id::Id20) -> String {
-        let mut s = String::from("info_hash=");
-        self.escape(&info_hash.0, &mut s);
-        s
     }
 
     /// `query` set on `url` beside the URL's own query `own`.
