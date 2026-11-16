@@ -938,13 +938,18 @@ struct Seeded {
 }
 
 async fn seeded() -> Seeded {
+    seeded_with(0).await
+}
+
+// The torrent `seeded` makes, of other bytes for each `seed`.
+async fn seeded_with(seed: u8) -> Seeded {
     let dir = tempfile::tempdir().unwrap();
     let set = dir.path().join("set");
     std::fs::create_dir(&set).unwrap();
     let originals = [
-        ("a.bin", noise(1000, 1)),
-        ("b.bin", noise(2500, 2)),
-        ("c.bin", noise(700, 3)),
+        ("a.bin", noise(1000, 1 + 3 * seed)),
+        ("b.bin", noise(2500, 2 + 3 * seed)),
+        ("c.bin", noise(700, 3 + 3 * seed)),
     ];
     for (name, bytes) in &originals {
         std::fs::write(set.join(name), bytes).unwrap();
@@ -1197,7 +1202,20 @@ async fn fetch(
     factory: BoxStorageFactory,
 ) -> Arc<Session> {
     let leecher = session(&dir.join("session"), blocking).await;
-    let _fetching = leecher
+    fetch_into(&leecher, seeded, dir, factory, false).await;
+    leecher
+}
+
+// The seeded torrent fetched from its seeder alone by `leecher`, into
+// `factory`; added paused when `paused` says so.
+async fn fetch_into(
+    leecher: &Arc<Session>,
+    seeded: &Seeded,
+    dir: &Path,
+    factory: BoxStorageFactory,
+    paused: bool,
+) -> Arc<weaver_torrent::ManagedTorrent> {
+    leecher
         .add_torrent(
             AddTorrent::from_bytes(seeded.bytes.clone()),
             Some(AddTorrentOptions {
@@ -1205,14 +1223,122 @@ async fn fetch(
                 overwrite: true,
                 initial_peers: Some(vec![seeded.peer]),
                 storage_factory: Some(factory),
+                paused,
                 ..Default::default()
             }),
         )
         .await
         .unwrap()
         .into_handle()
+        .unwrap()
+}
+
+// One session fetches two torrents while the first one's files are being
+// moved: its one hash thread never waits on the move. The second torrent's
+// pieces are verified and stored while the move is held; the first's are
+// verified and kept in memory, and once the move ends they are written
+// where the files went, and nothing is written where they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_moving_holds_up_no_other_torrent_of_its_session() {
+    // A seeder each: a session takes one connection from an address.
+    let seeders = [seeded_with(0).await, seeded_with(1).await];
+    let disk = disk_off_runtime();
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let stores: Vec<_> = seeders
+        .iter()
+        .zip(&dirs)
+        .zip([1, 2])
+        .map(|((seeded, dir), key)| store_on(&disk, key, &seeded.layout, &dir.path().join("job")))
+        .collect();
+    let moved_dir = tempfile::tempdir().unwrap();
+    let moved = moved_dir.path().join("moved");
+    let leecher_dir = tempfile::tempdir().unwrap();
+    let leecher = session(&leecher_dir.path().join("session"), None).await;
+    let watching: Vec<_> = stores
+        .iter()
+        .map(|store| watched(Arc::clone(store)))
+        .collect();
+    let factory = |at: usize| {
+        PieceStorageFactory::new(
+            Arc::clone(&seeders[at].layout),
+            Arc::clone(&watching[at].0) as Arc<dyn Pieces>,
+            unbounded(),
+        )
+        .boxed_factory()
+    };
+
+    // The first torrent checked and paused before its move: the check
+    // reads its files, and reads are not what this is about.
+    let first = fetch_into(&leecher, &seeders[0], dirs[0].path(), factory(0), true).await;
+    first.wait_until_initialized().await.unwrap();
+
+    // Its move begins, and is held until let go.
+    let (entered, in_move) = std::sync::mpsc::channel();
+    let (end, ended) = std::sync::mpsc::channel::<()>();
+    let moving = {
+        let store = Arc::clone(&stores[0]);
+        let moved = moved.clone();
+        std::thread::spawn(move || {
+            let names: Vec<std::path::PathBuf> = store
+                .files()
+                .names()
+                .flatten()
+                .map(Path::to_path_buf)
+                .collect();
+            store.relocate(|dir| {
+                entered.send(()).unwrap();
+                ended.recv().unwrap();
+                let moves: Vec<_> = names
+                    .iter()
+                    .map(|name| (dir.join(name), moved.join(name)))
+                    .collect();
+                crate::torrents::relocate::move_files(dir, &moves, Existing::Keep)?;
+                Ok::<_, anyhow::Error>((moved, ()))
+            })
+        })
+    };
+    in_move.recv().unwrap();
+
+    // Both fetch on the one session while the move is held.
+    leecher.unpause(&first).await.unwrap();
+    let _second = fetch_into(&leecher, &seeders[1], dirs[1].path(), factory(1), false).await;
+    let mut watching: Vec<_> = watching.into_iter().collect();
+
+    // While the move is held: every piece of the first torrent verified
+    // and handed over, none of them written; the second torrent whole on
+    // disk.
+    let pieces = seeders[0].layout.piece_count();
+    watching[0]
+        .0
+        .handed
+        .subscribe()
+        .wait_for(|handed| *handed == pieces)
+        .await
         .unwrap();
-    leecher
+    watching[1].1.wait_for(|whole| *whole).await.unwrap();
+    assert_eq!(stores[0].count(), 0);
+    for (name, original) in &seeders[1].originals {
+        assert_eq!(
+            &std::fs::read(dirs[1].path().join("job").join(name)).unwrap(),
+            original
+        );
+    }
+
+    end.send(()).unwrap();
+    moving.join().unwrap().unwrap();
+    watching[0].1.wait_for(|whole| *whole).await.unwrap();
+    for (name, original) in &seeders[0].originals {
+        assert_eq!(&std::fs::read(moved.join(name)).unwrap(), original);
+    }
+    let old = dirs[0].path().join("job");
+    assert!(
+        !old.exists() || std::fs::read_dir(&old).unwrap().count() == 0,
+        "written where the files were"
+    );
+    leecher.stop().await;
+    for seeded in &seeders {
+        seeded.seeder.stop().await;
+    }
 }
 
 // One session seeds a torrent from its files; the other fetches it from

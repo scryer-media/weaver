@@ -9,6 +9,7 @@
 // again for it. The files are what the torrent seeds from; nothing else
 // writes them.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -18,12 +19,12 @@ use bitvec::order::Msb0;
 use bitvec::vec::BitVec;
 use bytes::Bytes;
 
-use super::files::Files;
+use super::files::{Files, Placed};
 use super::layout::PieceLayout;
 use super::side::Side;
 use super::storage::Pieces;
 use super::tee::Tee;
-use super::writes::{Done, Paid, VolumeRoom, Writes};
+use super::writes::{Done, Paid, Paying, VolumeRoom, Writes};
 use tokio::sync::Notify;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -145,6 +146,24 @@ pub(crate) struct TorrentStore {
     side: Arc<Mutex<Side>>,
     // Its writes, through the writer of the volume its files are on.
     writes: Writes,
+    // Whether its files are moving, and the pieces handed over meanwhile:
+    // the thread that hands a piece over never waits for a move.
+    moves: Mutex<Moves>,
+}
+
+// A piece handed over while its files moved, queued for the files where
+// they are once the move ends.
+struct Parked {
+    piece: u32,
+    held: Bytes,
+    paid: Option<Paid>,
+    done: Done,
+}
+
+#[derive(Default)]
+struct Moves {
+    moving: bool,
+    parked: VecDeque<Parked>,
 }
 
 impl TorrentStore {
@@ -168,6 +187,7 @@ impl TorrentStore {
             aside: RwLock::new(Vec::new()),
             side: Arc::new(Mutex::new(Side::none())),
             writes,
+            moves: Mutex::default(),
         };
         *store.saved() = Some(store.kept());
         store
@@ -222,7 +242,7 @@ impl TorrentStore {
         let mut copied = Vec::new();
         {
             let placed = self.files.placed();
-            let barrier = self.writes.queue(None, |batch| {
+            let barrier = self.writes.queue(|batch| {
                 for piece in opened.pieces() {
                     if !(checking || self.has(piece)) {
                         opened.drop_piece(piece)?;
@@ -350,7 +370,7 @@ impl TorrentStore {
             })
             .collect();
         if !touched.is_empty() {
-            let barrier = self.writes.queue(None, |batch| {
+            let barrier = self.writes.queue(|batch| {
                 for piece in &touched {
                     for span in self.layout.spans(*piece) {
                         if !turned_on(span.file) {
@@ -689,6 +709,7 @@ impl TorrentStore {
     // are let go, and its tee hears nothing more and gives back what it
     // holds of the repair slots.
     pub(crate) async fn forget(&self) {
+        drop(self.unpark());
         self.writes.forget().await;
         self.files.release();
         if let Some(tee) = &self.tee {
@@ -699,6 +720,7 @@ impl TorrentStore {
     // `forget` for a test off the async runtime.
     #[cfg(test)]
     pub(crate) fn forget_now(&self) {
+        drop(self.unpark());
         if let Some(barrier) = self.writes.abandon() {
             barrier.wait_aside();
         }
@@ -716,30 +738,81 @@ impl TorrentStore {
     // Move the files, as `Files::relocate` does, once every write queued
     // for them where they are has been written: those after go where they
     // went. For a thread that may wait on a disk.
+    // Pieces handed over while it lasts are kept, and queued as it ends.
     pub(crate) fn relocate<T, E>(
         &self,
         relocate: impl FnOnce(&Path) -> Result<(PathBuf, T), E>,
     ) -> Result<T, E> {
-        self.files.relocate(|dir| {
+        self.begin_move();
+        let moved = self.files.relocate(|dir| {
             if !self.writes.drain() {
                 tracing::warn!(dir = %dir.display(), "a torrent's files moved with pieces queued for them unwritten");
             }
             let (to, outcome) = relocate(dir)?;
             self.writes.moved(&to);
             Ok((to, outcome))
-        })
+        });
+        self.end_move();
+        moved
     }
 
     // The files are under `to` from now on, moved by no one: a torrent held
     // for its files, which writes nothing. Its writes go there when it
     // does.
     pub(crate) fn place(&self, to: PathBuf) {
+        self.begin_move();
         self.files
             .relocate(|_| {
                 self.writes.placed(&to);
                 Ok::<_, std::convert::Infallible>((to.clone(), ()))
             })
             .unwrap_or_else(|never| match never {});
+        self.end_move();
+    }
+
+    // A move begins: from here no piece handed over waits for the files,
+    // it is kept until the move ends. Said before the files are taken, so a
+    // piece handed over before it is queued under them first. One torrent's
+    // moves never overlap: the service refuses a move while one is under
+    // way.
+    fn begin_move(&self) {
+        lock(&self.moves).moving = true;
+    }
+
+    // The move ended, the files where they now are: the pieces kept while
+    // it lasted are queued for them, in the order they were handed over,
+    // and those handed over meanwhile behind them. On the thread that
+    // moved, which may wait on a disk.
+    fn end_move(&self) {
+        loop {
+            let parked = {
+                let mut moves = lock(&self.moves);
+                if moves.parked.is_empty() {
+                    moves.moving = false;
+                    return;
+                }
+                std::mem::take(&mut moves.parked)
+            };
+            let placed = self.files.placed();
+            for mut parked in parked {
+                // Counted on the volume the files left: given back there,
+                // and counted where they are as its writes fit.
+                let paying = match self.writes.pay(parked.paid.take()) {
+                    Ok(paying) => paying,
+                    Err(elsewhere) => {
+                        drop(elsewhere);
+                        self.paying_unpaid()
+                    }
+                };
+                self.queue_piece(&placed, paying, parked);
+            }
+        }
+    }
+
+    // The pieces kept for a move that will not be written: given up with
+    // the torrent's writes.
+    fn unpark(&self) -> VecDeque<Parked> {
+        std::mem::take(&mut lock(&self.moves).parked)
     }
 
     // The piece handed to the writer of its files' volume, paid out of
@@ -748,10 +821,48 @@ impl TorrentStore {
     // Then it is had, and then it goes on to the tee, off the writer. `done`
     // hears after all of it, or hears the error of a write that failed, or
     // is dropped when the writes were given up.
-    fn hand_over(&self, piece: u32, held: Bytes, paid: Option<Paid>, done: Done) {
-        let aside = self.aside();
+    //
+    // While the files move, the piece is kept instead, and queued when the
+    // move ends. A piece whose room was counted on a volume its files are no
+    // longer on is handed back: queued here, it would stand still until the
+    // volume they are on has room for it.
+    fn hand_over(&self, parked: Parked) -> Option<Parked> {
+        let mut moves = lock(&self.moves);
+        if moves.moving {
+            moves.parked.push_back(parked);
+            return None;
+        }
+        // Not waited for: a move says it begins before it takes the files.
         let placed = self.files.placed();
-        self.writes.queue(paid, move |batch| {
+        drop(moves);
+        let mut parked = parked;
+        let paying = match self.writes.pay(parked.paid.take()) {
+            Ok(paying) => paying,
+            Err(elsewhere) => {
+                parked.paid = Some(elsewhere);
+                return Some(parked);
+            }
+        };
+        self.queue_piece(&placed, paying, parked);
+        None
+    }
+
+    // Nothing paid: each write is counted as it fits.
+    fn paying_unpaid(&self) -> Paying {
+        match self.writes.pay(None) {
+            Ok(paying) => paying,
+            Err(_) => unreachable!("nothing paid is counted nowhere"),
+        }
+    }
+
+    // The piece's writes queued for the files where `placed` has them,
+    // paid out of `paying`.
+    fn queue_piece(&self, placed: &Placed<'_>, paying: Paying, parked: Parked) {
+        let Parked {
+            piece, held, done, ..
+        } = parked;
+        let aside = self.aside();
+        self.writes.queue_paying(paying, move |batch| {
             let mut kept: Option<Vec<bool>> = None;
             for span in self.layout.spans(piece) {
                 if self.layout.file(span.file).is_none_or(|file| file.padding) {
@@ -822,14 +933,16 @@ impl Pieces for TorrentStore {
     // on a thread that may wait on a disk.
     fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
         let (told, stored) = std::sync::mpsc::sync_channel(1);
-        self.hand_over(
+        let parked = Parked {
             piece,
-            held.clone(),
-            None,
-            Box::new(move |written| {
+            held: held.clone(),
+            paid: None,
+            done: Box::new(move |written| {
                 let _ = told.send(written);
             }),
-        );
+        };
+        // Nothing paid: it never waits for room it holds elsewhere.
+        drop(self.hand_over(parked));
         stored.recv().unwrap_or_else(|_| {
             Err(anyhow::anyhow!(
                 "the writes of piece {piece} were given up before it was written"
@@ -837,9 +950,22 @@ impl Pieces for TorrentStore {
         })
     }
 
-    // The same, the piece handed over without waiting.
+    // The same, the piece handed over without waiting: one that would
+    // wait for its volume's room is handed over off this thread.
     fn store(self: Arc<Self>, piece: u32, held: Bytes, paid: Option<Paid>, done: Done) {
-        self.hand_over(piece, held, paid, done);
+        let parked = Parked {
+            piece,
+            held,
+            paid,
+            done,
+        };
+        if let Some(mut parked) = self.hand_over(parked) {
+            // Counted where its files were: given back there, and counted
+            // where they are as its writes fit, off this thread.
+            parked.paid = None;
+            let store = Arc::clone(&self);
+            self.writes.aside(move || drop(store.hand_over(parked)));
+        }
     }
 
     fn reserve(&self, bytes: u64, room: &Arc<Notify>) -> VolumeRoom {
@@ -847,6 +973,7 @@ impl Pieces for TorrentStore {
     }
 
     fn stop_writes(&self) {
+        drop(self.unpark());
         drop(self.writes.abandon());
     }
 

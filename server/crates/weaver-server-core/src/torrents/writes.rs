@@ -429,37 +429,61 @@ impl Writes {
         }
     }
 
-    // Queue writes through `queue`, paid first out of `paid`: what the
-    // writes do not take is given back as `queue` returns.
-    pub(crate) fn queue<T>(
-        &self,
-        paid: Option<Paid>,
-        queue: impl FnOnce(&mut Batch<'_>) -> T,
-    ) -> T {
+    // What writes queued now are paid out of: `paid`, when it is counted
+    // on the volume the torrent writes to; handed back when it is counted
+    // on another, where its files were before they moved.
+    pub(crate) fn pay(&self, paid: Option<Paid>) -> Result<Paying, Paid> {
         let generation = self.generation();
         let volume = generation.submitter.volume();
-        let disk = &self.current.disk;
         let reservation = match paid {
-            Some(mut paid) => {
-                let held =
-                    std::mem::replace(&mut paid.reservation, Reservation::none(Arc::clone(volume)));
-                let mut reservation = Reservation::none(Arc::clone(volume));
-                // Moved meanwhile: counted on the volume written to.
-                reservation.join(held);
-                reservation
+            Some(mut paid) if Arc::ptr_eq(paid.reservation.volume(), volume) => {
+                std::mem::replace(&mut paid.reservation, Reservation::none(Arc::clone(volume)))
             }
+            Some(paid) => return Err(paid),
             None => Reservation::none(Arc::clone(volume)),
         };
+        Ok(Paying {
+            generation,
+            reservation,
+        })
+    }
+
+    // Queue writes through `queue`, paid first out of `paying`: what the
+    // writes do not take is given back as `queue` returns. Past it, each
+    // write is counted on its volume as it fits, the caller standing still
+    // for the writer until it does.
+    pub(crate) fn queue_paying<T>(
+        &self,
+        paying: Paying,
+        queue: impl FnOnce(&mut Batch<'_>) -> T,
+    ) -> T {
+        let Paying {
+            generation,
+            reservation,
+        } = paying;
         let mut open = lock(&generation.open);
         let mut batch = Batch {
             generation: &generation,
             open: &mut open,
             paid: Paid {
                 reservation,
-                disk: Arc::clone(disk),
+                disk: Arc::clone(&self.current.disk),
             },
         };
         queue(&mut batch)
+    }
+
+    // Queue writes no reservation pays for: each is counted as it fits.
+    pub(crate) fn queue<T>(&self, queue: impl FnOnce(&mut Batch<'_>) -> T) -> T {
+        let generation = self.generation();
+        let reservation = Reservation::none(Arc::clone(generation.submitter.volume()));
+        self.queue_paying(
+            Paying {
+                generation,
+                reservation,
+            },
+            queue,
+        )
     }
 
     // Wait until everything queued so far has been written, for a thread
@@ -585,6 +609,13 @@ impl Writes {
     pub(crate) fn disk(&self) -> &Arc<TorrentDisk> {
         &self.current.disk
     }
+}
+
+// The room writes about to be queued are paid out of, on the volume they
+// go to.
+pub(crate) struct Paying {
+    generation: Arc<Generation>,
+    reservation: Reservation,
 }
 
 // Writes being queued for one torrent, paid out of one reservation.

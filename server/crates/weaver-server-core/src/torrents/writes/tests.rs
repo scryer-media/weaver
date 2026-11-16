@@ -45,7 +45,10 @@ fn queue_piece(writes: &Writes, paid: Paid, path: &Path, done: Done) -> mpsc::Re
     let volume = writes.volume();
     let (seen, at_landing) = mpsc::channel();
     let path = path.to_path_buf();
-    writes.queue(Some(paid), move |batch| {
+    let Ok(paying) = writes.pay(Some(paid)) else {
+        panic!("paid on another volume");
+    };
+    writes.queue_paying(paying, move |batch| {
         batch.write(0, 0, Bytes::from_static(b"abcdefgh"), || path);
         batch.then(done, move |done| {
             let _ = seen.send(volume.unwritten_bytes());
