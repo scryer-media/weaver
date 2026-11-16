@@ -981,9 +981,20 @@ fn lane_acquire_failure_preserves_retry_semantics() {
     ));
     assert_eq!(auth_failure.kind, DownloadFailureKind::Auth);
 
-    let setup_failure =
+    // Every group refused: the named server does not carry the post.
+    let not_carried =
         DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::NoSuchGroup));
-    assert_eq!(setup_failure.kind, DownloadFailureKind::ContentOrProtocol);
+    assert_eq!(not_carried.kind, DownloadFailureKind::ArticleNotFound);
+
+    // An odd answer before the lane opened is the server's, not the article's.
+    let odd_greeting = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::unexpected(weaver_nntp::StatusCode::new(500), "maintenance"),
+    ));
+    assert_eq!(
+        odd_greeting.kind,
+        DownloadFailureKind::ConnectionEstablishment
+    );
+    assert!(odd_greeting.preserves_article_retry_budget());
 }
 
 #[tokio::test]

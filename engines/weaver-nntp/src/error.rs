@@ -239,6 +239,22 @@ impl NntpError {
         )
     }
 
+    // Whether this is an answer the client has no class for: a code it does
+    // not know, a line that does not parse, a command the server does not
+    // know, or a demand for TLS. Read while a connection is being opened (the
+    // greeting, STARTTLS, AUTHINFO, the GROUP prologue), it is the server's
+    // trouble at admission and says nothing about any article: the dial cools
+    // the server as a refused connect does, and the work keeps its tries.
+    pub fn is_unclassed_setup_answer(&self) -> bool {
+        matches!(
+            self,
+            NntpError::UnexpectedResponse { .. }
+                | NntpError::MalformedResponse(_)
+                | NntpError::CommandNotRecognized
+                | NntpError::TlsRequired
+        )
+    }
+
     // Whether the server's network route turned the dial away for room: a
     // tunnel on it is full, or its WireGuard session budget is spent. Nothing
     // reached the server, so it says nothing about the server.
@@ -332,6 +348,11 @@ impl NntpError {
                 ReplyPhase::Login => NntpError::AccessDenied,
                 ReplyPhase::Session => NntpError::ServiceUnavailable,
             },
+            // The server's own trouble once the session is up: 503 is a
+            // fault or a feature it cannot offer now, 499 is the code some
+            // providers send for an internal error. Like 400 and the bare
+            // 502, it costs the connection, not the article.
+            499 | 503 if phase == ReplyPhase::Session => NntpError::ServiceUnavailable,
             _ => NntpError::unexpected(code, message),
         }
     }
@@ -635,7 +656,50 @@ mod tests {
 
     #[test]
     fn from_status_unknown_falls_through() {
-        let err = NntpError::from_status(StatusCode::new(503), "test msg");
+        let err = NntpError::from_status(StatusCode::new(501), "test msg");
         assert!(matches!(err, NntpError::UnexpectedResponse { .. }));
+    }
+
+    // 499 and 503 after login are the server's trouble, read as 400 and the
+    // bare 502 are: the connection goes, the article is not charged.
+    #[test]
+    fn server_error_codes_in_a_session_are_service_unavailable() {
+        let sc = |raw| StatusCode::new(raw);
+        for code in [400, 499, 502, 503] {
+            let error = NntpError::from_status(sc(code), "internal server error");
+            assert!(
+                matches!(error, NntpError::ServiceUnavailable),
+                "{code} gave {error:?}"
+            );
+        }
+        // While logging in they keep their own reading: nothing the session
+        // phase learned changes how the admission is told.
+        assert!(matches!(
+            NntpError::from_login_status(sc(503), "maintenance"),
+            NntpError::UnexpectedResponse { .. }
+        ));
+    }
+
+    // What a dial reads before its lane opens and has no class for is the
+    // server's trouble at admission, not an answer about an article.
+    #[test]
+    fn odd_setup_answers_are_told_apart() {
+        let sc = |raw| StatusCode::new(raw);
+        for error in [
+            NntpError::unexpected(sc(500), "maintenance"),
+            NntpError::MalformedResponse("garbage".into()),
+            NntpError::CommandNotRecognized,
+            NntpError::TlsRequired,
+        ] {
+            assert!(error.is_unclassed_setup_answer(), "{error:?}");
+        }
+        for error in [
+            NntpError::ServiceUnavailable,
+            NntpError::NoSuchGroup,
+            NntpError::AuthenticationFailed,
+            NntpError::TooManyConnections,
+        ] {
+            assert!(!error.is_unclassed_setup_answer(), "{error:?}");
+        }
     }
 }

@@ -94,6 +94,11 @@ pub enum BlockingBodyLaneAcquireError {
     // A verdict, not a wait: the leased articles take the failure, so the
     // server leaves their candidates instead of holding them in the queue.
     CredentialsRefused { server: ServerId, error: NntpError },
+    // The server answered GROUP with 411 for every newsgroup the work lists,
+    // on a server that needs a group selected before it serves an article.
+    // That server does not carry the post: a verdict for the leased
+    // articles on that server, as a 430 is, not a fault of the server.
+    GroupsNotCarried { server: ServerId, error: NntpError },
     NoEligibleServer,
     // The health mutex was held elsewhere, so candidates could not be ranked.
     // This says nothing about server availability — the caller should hand
@@ -114,6 +119,8 @@ impl BlockingBodyLaneAcquireError {
             Self::RouteCapacity(error)
         } else if error.is_credentials_refusal() {
             Self::CredentialsRefused { server, error }
+        } else if matches!(error, NntpError::NoSuchGroup) {
+            Self::GroupsNotCarried { server, error }
         } else {
             Self::Other(error)
         }
@@ -122,7 +129,9 @@ impl BlockingBodyLaneAcquireError {
     // The server whose answer this is, where the refusal is one server's.
     pub fn server(&self) -> Option<ServerId> {
         match self {
-            Self::CredentialsRefused { server, .. } => Some(*server),
+            Self::CredentialsRefused { server, .. } | Self::GroupsNotCarried { server, .. } => {
+                Some(*server)
+            }
             _ => None,
         }
     }
@@ -153,7 +162,8 @@ impl BlockingBodyLaneAcquireError {
             Self::ProviderCapacity(error)
             | Self::RouteCapacity(error)
             | Self::Other(error)
-            | Self::CredentialsRefused { error, .. } => Some(error),
+            | Self::CredentialsRefused { error, .. }
+            | Self::GroupsNotCarried { error, .. } => Some(error),
             Self::LocalCapacity
             | Self::ServerRecovering
             | Self::NoEligibleServer
@@ -179,6 +189,7 @@ impl BlockingBodyLaneAcquireError {
             Self::LocalCapacity => "local_capacity",
             Self::ServerRecovering => "server_recovering",
             Self::CredentialsRefused { .. } => "credentials_refused",
+            Self::GroupsNotCarried { .. } => "groups_not_carried",
             Self::NoEligibleServer => "no_eligible_server",
             Self::SelectionContended => "selection_contended",
             Self::Other(_) => "other",
@@ -200,6 +211,13 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
                 write!(
                     formatter,
                     "server {} refuses credentials: {error}",
+                    server.0
+                )
+            }
+            Self::GroupsNotCarried { server, error } => {
+                write!(
+                    formatter,
+                    "server {} carries none of the work's newsgroups: {error}",
                     server.0
                 )
             }
@@ -676,6 +694,7 @@ impl NntpClient {
         let mut saw_contention = false;
         let mut saw_recovery_gate = false;
         let mut credentials_refused = None;
+        let mut groups_not_carried = None;
         let mut provider_capacity_error = None;
         let mut route_capacity_error = None;
         let mut other_error = None;
@@ -834,6 +853,9 @@ impl NntpClient {
                         refused @ BlockingBodyLaneAcquireError::CredentialsRefused { .. } => {
                             credentials_refused.get_or_insert(refused);
                         }
+                        not_carried @ BlockingBodyLaneAcquireError::GroupsNotCarried { .. } => {
+                            groups_not_carried.get_or_insert(not_carried);
+                        }
                         BlockingBodyLaneAcquireError::LocalCapacity
                         | BlockingBodyLaneAcquireError::ServerRecovering
                         | BlockingBodyLaneAcquireError::NoEligibleServer
@@ -844,6 +866,12 @@ impl NntpClient {
         }
         if let Some(error) = provider_capacity_error {
             Err(BlockingBodyLaneAcquireError::ProviderCapacity(error))
+        } else if let Some(not_carried) = groups_not_carried {
+            // A server that does not carry the post is a verdict the leased
+            // articles act on at once, by moving to the next server: it
+            // outranks a fault or a wait elsewhere, which the articles would
+            // meet again on that next try anyway.
+            Err(not_carried)
         } else if let Some(error) = other_error.take_if(|error| is_server_evidence(error)) {
             // A server that failed for real is the answer, as a rung that
             // failed for real outranks a full one in the route's ladder.
@@ -1123,6 +1151,17 @@ impl NntpClient {
                 .record_connection_outcome(server_idx, ticket, false, true);
         } else if cooldown_reason(error).is_some() {
             self.pool.note_blocking_connect_failure(server_idx);
+            self.pool
+                .health()
+                .blocking_lock()
+                .record_connection_outcome(server_idx, ticket, false, false);
+        } else if error.is_unclassed_setup_answer() {
+            // An answer with no class, read before the lane opened (an odd
+            // greeting, a 483, an unknown AUTHINFO reply, a greeting line
+            // that does not parse), is the server refusing the connection
+            // in its own words. It counts against the server's health, which
+            // cools it once such answers repeat. The server did answer, so it
+            // takes no reconnect delay as a dropped dial does.
             self.pool
                 .health()
                 .blocking_lock()
