@@ -419,8 +419,8 @@ enum Taken {
 
 /// What a walk undoes in memory of seed mode when its rows are not kept:
 /// the torrent left it, or kept `count` pieces; it had `prior` kept.
-/// `refused`: its last row that said it left was refused, and a row kept
-/// now ends that streak.
+/// `refused`: its last row of the same kind was refused, and a row kept now
+/// ends that streak.
 struct SeedUndo {
     job_id: JobId,
     left: bool,
@@ -711,7 +711,7 @@ impl TorrentService {
                     left: false,
                     count,
                     prior: torrent.seed_verified,
-                    refused: false,
+                    refused: torrent.seed_verified_refused,
                 });
                 // Kept now, and undone should the row not be.
                 torrent.seed_verified = count;
@@ -943,7 +943,11 @@ impl TorrentService {
                 relocked = true;
                 for undo in undo.iter().filter(|undo| undo.refused) {
                     if let Some(torrent) = live.get_mut(&undo.job_id) {
-                        torrent.seed_left_refused = false;
+                        if undo.left {
+                            torrent.seed_left_refused = false;
+                        } else {
+                            torrent.seed_verified_refused = false;
+                        }
                     }
                 }
             }
@@ -1075,7 +1079,8 @@ impl TorrentService {
 // database and the next pass writes them again: a torrent that left seed
 // mode is in it again, with the pieces it had kept; one that kept more
 // pieces has what it had kept. A torrent changed since, or gone, is left.
-// A refused "left" row is warned of once per torrent until one is kept.
+// A refused row is warned of once per torrent until one of its kind is
+// kept.
 fn undo_seed(live: &mut LiveMap, undo: &[SeedUndo], error: &str) {
     for undo in undo {
         let Some(torrent) = live.get_mut(&undo.job_id) else {
@@ -1091,7 +1096,10 @@ fn undo_seed(live: &mut LiveMap, undo: &[SeedUndo], error: &str) {
                 torrent.seed_verified = undo.prior;
             }
         } else {
-            tracing::warn!(job_id = undo.job_id.0, error = %error, "could not keep the pieces a torrent checked in seed mode");
+            if !torrent.seed_verified_refused {
+                torrent.seed_verified_refused = true;
+                tracing::warn!(job_id = undo.job_id.0, error = %error, "could not keep the pieces a torrent checked in seed mode");
+            }
             if torrent.record.seed_mode && torrent.seed_verified == undo.count {
                 torrent.seed_verified = undo.prior;
             }

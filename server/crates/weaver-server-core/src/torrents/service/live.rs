@@ -130,6 +130,8 @@ pub(super) struct Live {
     // and has not kept one since: warned of once, not at every pass that
     // writes it again.
     pub(super) seed_left_refused: bool,
+    // The same for the row that keeps the pieces it checked in seed mode.
+    pub(super) seed_verified_refused: bool,
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
@@ -223,6 +225,7 @@ impl Live {
             copy_error: None,
             seed_verified: 0,
             seed_left_refused: false,
+            seed_verified_refused: false,
             file_have: Vec::new(),
             have_bytes: 0,
             kept_pieces: 0,

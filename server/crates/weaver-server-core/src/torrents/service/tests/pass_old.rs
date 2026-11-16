@@ -9,7 +9,8 @@
 // alone, a seed-mode write the database refuses is undone in memory to what
 // the disk still holds (the old tick left a refused "left seed mode" false
 // in memory), a stop decided in the same pass is kept, the next pass writes
-// it again, and a refused "left" row is warned of once per streak.
+// it again, and each kind of refused seed-mode row is warned of once per
+// streak.
 
 use super::pass::{add, done_then, events, written};
 use super::*;
@@ -774,14 +775,30 @@ impl tracing::Subscriber for Warned {
 // How many times it was warned that `job_id`'s leaving seed mode was not
 // recorded.
 fn left_refusals(warned: &std::sync::Mutex<Vec<String>>, job_id: JobId) -> usize {
+    refusals(
+        warned,
+        job_id,
+        "could not record that a torrent left seed mode",
+    )
+}
+
+// How many times it was warned that the pieces `job_id` checked in seed
+// mode were not kept.
+fn verified_refusals(warned: &std::sync::Mutex<Vec<String>>, job_id: JobId) -> usize {
+    refusals(
+        warned,
+        job_id,
+        "could not keep the pieces a torrent checked in seed mode",
+    )
+}
+
+fn refusals(warned: &std::sync::Mutex<Vec<String>>, job_id: JobId, message: &str) -> usize {
     let id = format!(" job_id={} ", job_id.0);
     warned
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
-        .filter(|line| {
-            line.contains(&id) && line.contains("could not record that a torrent left seed mode")
-        })
+        .filter(|line| line.contains(&id) && line.contains(message))
         .count()
 }
 
@@ -887,5 +904,51 @@ async fn a_refused_seed_verified_write_keeps_the_last_count() {
         stored_seed_mode(&rig.db, job_id),
         (true, Some(vec![0b1010_0000]))
     );
+    rig.service.stop().await;
+}
+
+// A torrent in seed mode whose checked pieces the database refuses to keep
+// tick after tick: written again every tick and warned of once. A write
+// kept ends the streak, so a later refusal warns again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_seed_verified_write_warns_once_per_streak() {
+    let mut scene = Scene {
+        rig: rig(set_clock()),
+        heard: heard(),
+    };
+    let job_id = restarted_in_seed_mode(&mut scene).await;
+    let rig = &scene.rig;
+    // The passes run on this thread when ticked: only their warnings are
+    // heard.
+    let warned = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _capture = tracing::subscriber::set_default(Warned(Arc::clone(&warned)));
+    refuse_seed_writes(&rig.db, "refuse_seed_writes");
+
+    for _ in 0..5 {
+        rig.service.tick().await;
+        rig.db.flush_write_queue().await.unwrap();
+        assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 1));
+    }
+    assert_eq!(verified_refusals(&warned, job_id), 1);
+
+    allow_seed_writes(&rig.db, "refuse_seed_writes");
+    rig.service.tick().await;
+    rig.db.flush_write_queue().await.unwrap();
+    assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 2));
+    assert_eq!(
+        stored_seed_mode(&rig.db, job_id),
+        (true, Some(vec![0b1010_0000]))
+    );
+    assert!(!rig.service.inner.live.lock().await[&job_id].seed_verified_refused);
+
+    rig_set_verified(rig, job_id, &[0b1000_0000], 1).await;
+    refuse_seed_writes(&rig.db, "refuse_seed_writes_again");
+    for _ in 0..3 {
+        rig.service.tick().await;
+        rig.db.flush_write_queue().await.unwrap();
+    }
+    assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 1));
+    assert_eq!(verified_refusals(&warned, job_id), 2);
+    assert_eq!(left_refusals(&warned, job_id), 0);
     rig.service.stop().await;
 }
