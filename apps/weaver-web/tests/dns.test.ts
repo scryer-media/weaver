@@ -18,7 +18,6 @@ import {
   listInput,
   listProblem,
   probeRequest,
-  profileChoices,
   profileForm,
   profileInput,
   profileProblem,
@@ -37,6 +36,39 @@ import {
   type DnsTestRun,
 } from "../src/lib/dns.ts";
 import type { NetworkRoute } from "../src/lib/networking.ts";
+import { Kind, type DocumentNode, type FieldNode } from "graphql";
+import { DNS_PROFILE_CHOICES_QUERY, DNS_PROFILE_NAMES_QUERY, DNS_QUERY } from "../src/graphql/dns.ts";
+
+/** Each `dnsProfiles` read of a document, by the name it answers under: the kind it asks for, and the fields it selects. */
+function profileReads(document: DocumentNode): Record<string, { kind: string | null; fields: string[] }> {
+  const definition = document.definitions[0];
+  assert.ok(definition?.kind === Kind.OPERATION_DEFINITION);
+  const reads: Record<string, { kind: string | null; fields: string[] }> = {};
+  for (const selection of definition.selectionSet.selections) {
+    const field = selection as FieldNode;
+    if (field.name.value !== "dnsProfiles") continue;
+    const kind = field.arguments?.find((argument) => argument.name.value === "kind")?.value;
+    reads[field.alias?.value ?? field.name.value] = {
+      kind: kind?.kind === Kind.ENUM ? kind.value : null,
+      fields: (field.selectionSet?.selections ?? []).map((inner) => (inner as FieldNode).name.value),
+    };
+  }
+  return reads;
+}
+
+test("each DNS read asks for one kind of profile, and only the fields its caller shows", () => {
+  assert.deepEqual(profileReads(DNS_QUERY), {
+    nameProfiles: { kind: "PROXY_NAME", fields: ["id", "name", "builtIn", "who", "trust", "serverListId", "usedByProxies"] },
+    routeProfiles: {
+      kind: "ROUTE",
+      fields: ["id", "name", "builtIn", "who", "transit", "trust", "serverListId", "systemFallback", "usedByRoutes"],
+    },
+  });
+  assert.deepEqual(profileReads(DNS_PROFILE_CHOICES_QUERY), {
+    dnsProfiles: { kind: "ROUTE", fields: ["id", "name", "who", "trust", "systemFallback"] },
+  });
+  assert.deepEqual(profileReads(DNS_PROFILE_NAMES_QUERY), { dnsProfiles: { kind: "PROXY_NAME", fields: ["id", "name"] } });
+});
 
 const rows = (...list: Partial<DnsServerRow>[]): DnsServerRow[] => list.map((row) => ({ wire: "PLAIN", address: "", tlsName: "", ...row }));
 const t = (key: string) => key;
@@ -196,15 +228,10 @@ test("a proxy name profile has the system or Weaver answer, asks from the egress
   assert.equal(profileForm(stored, []).kind, "PROXY_NAME");
 });
 
-test("a select offers System, then only the saved profiles of its kind", () => {
-  const profiles = [
-    { id: 2, kind: "ROUTE" as const },
-    { id: 0, kind: "ROUTE" as const },
-    { id: 6, kind: "PROXY_NAME" as const },
-    { id: 3, kind: "ROUTE" as const },
-  ];
-  assert.deepEqual(profileChoices(profiles, "ROUTE").map((profile) => profile.id), [0, 2, 3]);
-  assert.deepEqual(profileChoices(profiles, "PROXY_NAME").map((profile) => profile.id), [0, 6]);
+test("a proxy name profile read without transit or fallback opens in its editor as one that has neither", () => {
+  const form = profileForm({ id: 6, name: "Names", kind: "PROXY_NAME", who: "WEAVER", trust: "AS_SENT", serverListId: 7 }, [{ id: 7 }]);
+  assert.equal(form.systemFallback, false);
+  assert.deepEqual(profileInput(form), { id: 6, kind: "PROXY_NAME", name: "Names", who: "WEAVER", transit: "EGRESS", trust: "AS_SENT", serverListId: 7, systemFallback: false });
 });
 
 test("finding a proxy, the system is the host, and the built-in profile is named for it", () => {

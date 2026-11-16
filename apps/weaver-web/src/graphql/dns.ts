@@ -6,17 +6,23 @@ import { gql } from "urql";
 const SERVER_FIELDS = "wire address tlsName url";
 const PROBE_FIELDS = "supported millis error { code detail }";
 
-/** The DNS page: every saved server list and profile, and what uses each. */
+/**
+ * The DNS page: every saved server list, and each kind's profiles with what
+ * its table and editor show. A proxy name profile has no transit and no
+ * system fallback, and is counted by the proxies that use it, a route
+ * profile by its routes.
+ */
 export const DNS_QUERY = gql`
   query Dns {
     dnsServerLists { id name servers { ${SERVER_FIELDS} } usedByProfiles }
-    dnsProfiles { id name builtIn who transit trust serverListId systemFallback usedByRoutes usedByProxies kind }
+    nameProfiles: dnsProfiles(kind: PROXY_NAME) { id name builtIn who trust serverListId usedByProxies }
+    routeProfiles: dnsProfiles(kind: ROUTE) { id name builtIn who transit trust serverListId systemFallback usedByRoutes }
   }
 `;
 /** What a route's DNS select offers, and what its in-form check needs. */
-export const DNS_PROFILE_CHOICES_QUERY = gql`query DnsProfileChoices { dnsProfiles { id name kind who trust systemFallback } }`;
+export const DNS_PROFILE_CHOICES_QUERY = gql`query DnsProfileChoices { dnsProfiles(kind: ROUTE) { id name who trust systemFallback } }`;
 /** What a proxy's "Find this proxy with" select and its "Found with" line show. */
-export const DNS_PROFILE_NAMES_QUERY = gql`query DnsProfileNames { dnsProfiles { id name kind } }`;
+export const DNS_PROFILE_NAMES_QUERY = gql`query DnsProfileNames { dnsProfiles(kind: PROXY_NAME) { id name } }`;
 export const SAVE_DNS_SERVER_LIST = gql`mutation SaveDnsServerList($input:DnsServerListInput!) { saveDnsServerList(input:$input) { id } }`;
 export const DELETE_DNS_SERVER_LIST = gql`mutation DeleteDnsServerList($id:Int!) { deleteDnsServerList(id:$id) }`;
 export const SAVE_DNS_PROFILE = gql`mutation SaveDnsProfile($input:DnsProfileInput!) { saveDnsProfile(input:$input) { id } }`;

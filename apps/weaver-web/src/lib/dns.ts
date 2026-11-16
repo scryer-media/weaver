@@ -34,10 +34,20 @@ export type DnsProfile = {
   usedByRoutes: number;
   usedByProxies: number;
 };
-/** A profile as a route's or a proxy's DNS select reads it. */
-export type DnsProfileChoice = Pick<DnsProfile, "id" | "name" | "kind" | "who" | "trust" | "systemFallback">;
-/** A profile as a proxy's editor offers it: its name alone. */
-export type DnsProfileName = Pick<DnsProfile, "id" | "name" | "kind">;
+/** A profile as a route's DNS select reads it: System and the route profiles, read by kind. */
+export type DnsProfileChoice = Pick<DnsProfile, "id" | "name" | "who" | "trust" | "systemFallback">;
+/** A profile as a proxy's editor offers it: its name alone, System and the proxy name profiles, read by kind. */
+export type DnsProfileName = Pick<DnsProfile, "id" | "name">;
+/** What a profile's editor starts from. A proxy name profile has no transit and no system fallback. */
+export type DnsProfileEdited = Pick<DnsProfile, "id" | "name" | "kind" | "who" | "trust" | "serverListId"> &
+  Partial<Pick<DnsProfile, "transit" | "systemFallback">>;
+/** A proxy name profile as the DNS page reads it, counted by the proxies that use it. */
+export type DnsNameProfileRow = Pick<DnsProfile, "id" | "name" | "builtIn" | "who" | "trust" | "serverListId" | "usedByProxies">;
+/** A route profile as the DNS page reads it, counted by the routes that use it. */
+export type DnsRouteProfileRow = Pick<
+  DnsProfile,
+  "id" | "name" | "builtIn" | "who" | "transit" | "trust" | "serverListId" | "systemFallback" | "usedByRoutes"
+>;
 
 /** The built-in System profile: every route starts on it, and it cannot be changed. */
 export const SYSTEM_DNS_PROFILE_ID = 0;
@@ -53,11 +63,6 @@ export function whoChoices(kind: DnsProfileKind): readonly DnsWho[] {
   return kind === "PROXY_NAME" ? ["SYSTEM", "WEAVER"] : DNS_WHOS;
 }
 
-/** The profiles a select of this kind offers: System, then the saved profiles of that kind. */
-export function profileChoices<T extends Pick<DnsProfile, "id" | "kind">>(profiles: readonly T[], kind: DnsProfileKind): T[] {
-  const system = profiles.filter((profile) => profile.id === SYSTEM_DNS_PROFILE_ID);
-  return [...system, ...profiles.filter((profile) => profile.id !== SYSTEM_DNS_PROFILE_ID && profile.kind === kind)];
-}
 export const dnsWireKey = (wire: DnsWire) => `next.dnsWire.${wire}`;
 export const lookupTrustKey = (trust: LookupTrust) => `next.lookupTrust.${trust}`;
 /** Who answers, in words. Finding a proxy, the system is the host: the one above it in a chain, else the system. */
@@ -304,7 +309,7 @@ export type DnsProfileForm = {
  * for a route, from the egress for a proxy's name.
  */
 export function profileForm(
-  profile: DnsProfile | null,
+  profile: DnsProfileEdited | null,
   lists: readonly Pick<DnsServerList, "id">[],
   kind: DnsProfileKind = profile?.kind ?? "ROUTE",
 ): DnsProfileForm {
@@ -320,7 +325,7 @@ export function profileForm(
     transit: profile.transit ?? "PROXY",
     trust: profile.trust,
     serverListId: profile.serverListId,
-    systemFallback: profile.systemFallback,
+    systemFallback: profile.systemFallback ?? false,
   };
 }
 
@@ -360,7 +365,7 @@ function listPhrase(t: Translate, list: Pick<DnsServerList, "name" | "servers">)
 /** A profile in one line, such as "Weaver · Quad9 TLS · Via the proxy · Validate here". A proxy's name has no transit. */
 export function profileSummary(
   t: Translate,
-  profile: Pick<DnsProfile, "kind" | "who" | "transit" | "trust" | "serverListId" | "systemFallback">,
+  profile: Pick<DnsProfile, "kind" | "who" | "trust" | "serverListId"> & Partial<Pick<DnsProfile, "transit" | "systemFallback">>,
   lists: readonly Pick<DnsServerList, "id" | "name" | "servers">[],
 ): string {
   const who = t(dnsWhoKey(profile.who, profile.kind));

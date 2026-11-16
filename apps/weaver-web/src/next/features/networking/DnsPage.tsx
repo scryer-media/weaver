@@ -25,7 +25,6 @@ import {
   listProblem,
   probeRequest,
   problemCode,
-  profileChoices,
   profileForm,
   profileInput,
   profileProblem,
@@ -38,9 +37,11 @@ import {
   whoChoices,
   withWho,
   type DnsListForm,
-  type DnsProfile,
+  type DnsProfileEdited,
   type DnsProfileForm,
   type DnsProfileKind,
+  type DnsNameProfileRow,
+  type DnsRouteProfileRow,
   type DnsServerCapability,
   type DnsServerList,
   type DnsServerRow,
@@ -81,7 +82,8 @@ const KIND_WORDS: Record<DnsProfileKind, { title: string; add: string; used: str
   },
 };
 
-type DnsData = { dnsServerLists: DnsServerList[]; dnsProfiles: DnsProfile[] };
+/** The lists, and the profiles of each kind: System first, then that kind by id. */
+type DnsData = { dnsServerLists: DnsServerList[]; nameProfiles: DnsNameProfileRow[]; routeProfiles: DnsRouteProfileRow[] };
 
 /** Runs one change; resolves to its refusal's sentence, or null once it landed and the page was read again. */
 type DnsAction = (document: DocumentNode, variables: Record<string, unknown>, onData?: (data: unknown) => void) => Promise<string | null>;
@@ -100,7 +102,7 @@ export function DnsPage() {
   const [failed, setFailed] = useState(false);
   const [editingList, setEditingList] = useState<DnsServerList | "new" | null>(null);
   // A saved profile, or the kind of a new one.
-  const [editingProfile, setEditingProfile] = useState<DnsProfile | { kind: DnsProfileKind } | null>(null);
+  const [editingProfile, setEditingProfile] = useState<DnsProfileEdited | { kind: DnsProfileKind } | null>(null);
   usePanelStatus(message, failed);
   useSearchReport(0, !data && fetching);
 
@@ -150,10 +152,13 @@ export function DnsPage() {
   }
 
   const lists = data.dnsServerLists;
-  const profiles = data.dnsProfiles;
   // One table per kind, System first in each; the same editor serves both.
   const profileBlock = (kind: DnsProfileKind): SettingsBlock => {
-    const shown = profileChoices(profiles, kind);
+    // Each with its kind, and counted by what uses that kind.
+    const shown: (DnsProfileEdited & { builtIn: boolean; used: number })[] =
+      kind === "PROXY_NAME"
+        ? data.nameProfiles.map((profile) => ({ ...profile, kind, used: profile.usedByProxies }))
+        : data.routeProfiles.map((profile) => ({ ...profile, kind, used: profile.usedByRoutes }));
     const words = KIND_WORDS[kind];
     return {
       kind: "table",
@@ -175,12 +180,12 @@ export function DnsPage() {
         if (profile && !profile.builtIn) setEditingProfile(profile);
       },
       rows: shown.map((profile) => {
-        const summary = profileSummary(t, { ...profile, kind }, lists);
+        const summary = profileSummary(t, profile, lists);
         const name = dnsProfileName(t, profile, kind);
         const used =
           kind === "PROXY_NAME"
-            ? countLabel(t, "next.dns.profiles.proxyCount", profile.usedByProxies)
-            : countLabel(t, "next.dns.profiles.routeCount", profile.usedByRoutes);
+            ? countLabel(t, "next.dns.profiles.proxyCount", profile.used)
+            : countLabel(t, "next.dns.profiles.routeCount", profile.used);
         return {
           id: String(profile.id),
           searchText: `${name} ${summary}`,
@@ -492,7 +497,7 @@ function DnsProfileEditor({
   busy,
   onClose,
 }: {
-  profile: DnsProfile | null;
+  profile: DnsProfileEdited | null;
   kind: DnsProfileKind;
   lists: DnsServerList[];
   action: DnsAction;

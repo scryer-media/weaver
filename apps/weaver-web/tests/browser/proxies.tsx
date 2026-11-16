@@ -84,13 +84,15 @@ function graphql(name: string, variables: Record<string, unknown>) {
   }
   if (name === "Networking" || name === "DraftRoute") return { data: { ...pools, egressInterfaces: egresses, proxyProfiles: profiles.map(view) } };
   if (name === "TestVia") return testVia(variables);
-  if (name === "DnsProfileChoices" || name === "DnsProfileNames") {
-    // System, a route profile a proxy never offers, and a proxy name profile.
+  // As `dnsProfiles(kind:)` answers: System, then a route profile a proxy never offers, or a proxy name profile.
+  if (name === "DnsProfileChoices") {
     return { data: { dnsProfiles: [
-      { id: 0, name: "System", kind: "ROUTE", who: "SYSTEM", trust: "AS_SENT", systemFallback: false },
-      { id: 3, name: "Checked", kind: "ROUTE", who: "WEAVER", trust: "VALIDATE", systemFallback: false },
-      { id: 6, name: "Proxy names", kind: "PROXY_NAME", who: "WEAVER", trust: "AS_SENT", systemFallback: false },
+      { id: 0, name: "System", who: "SYSTEM", trust: "AS_SENT", systemFallback: false },
+      { id: 3, name: "Checked", who: "WEAVER", trust: "VALIDATE", systemFallback: false },
     ] } };
+  }
+  if (name === "DnsProfileNames") {
+    return { data: { dnsProfiles: [{ id: 0, name: "System" }, { id: 6, name: "Proxy names" }] } };
   }
   if (name === "DeleteProxyProfile") {
     const id = variables.id as number;

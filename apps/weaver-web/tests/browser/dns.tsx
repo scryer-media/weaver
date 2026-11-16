@@ -7,7 +7,7 @@ import { MemoryRouter } from "react-router";
 import { Client, Provider, fetchExchange } from "urql";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
-import type { DnsProfile, DnsServer, DnsServerCapability, DnsServerList } from "@/lib/dns";
+import type { DnsProfile, DnsProfileKind, DnsServer, DnsServerCapability, DnsServerList } from "@/lib/dns";
 import { NextDataContext, useDnsProfileReads, type NextData } from "@/next/data/next-data";
 import type { NetworkingData } from "@/next/features/networking/data";
 import { DnsPage } from "@/next/features/networking/DnsPage";
@@ -34,6 +34,8 @@ const profiles: DnsProfile[] = [
   /* A proxy name profile one proxy finds its address with. */
   { id: 6, name: "Proxy names", builtIn: false, kind: "PROXY_NAME", who: "WEAVER", transit: "EGRESS", trust: "AS_SENT", serverListId: 1, systemFallback: false, usedByRoutes: 0, usedByProxies: 1 },
 ];
+/* As `dnsProfiles(kind:)` answers: System, then the saved profiles of that kind. */
+const ofKind = (kind: DnsProfileKind) => profiles.filter((profile) => profile.builtIn || profile.kind === kind);
 const requests: { name: string; variables: Record<string, unknown> }[] = [];
 const refusal = (code: string, params: Record<string, unknown> = {}) => ({ errors: [{ message: code, extensions: { code, params } }] });
 
@@ -68,11 +70,17 @@ async function graphql(name: string, variables: Record<string, unknown>) {
   const input = variables.input as Record<string, unknown> | undefined;
   switch (name) {
     case "Dns":
-      return { data: { dnsServerLists: lists, dnsProfiles: profiles } };
+      return {
+        data: {
+          dnsServerLists: lists,
+          nameProfiles: ofKind("PROXY_NAME").map(({ id, name: label, builtIn, who, trust, serverListId, usedByProxies }) => ({ id, name: label, builtIn, who, trust, serverListId, usedByProxies })),
+          routeProfiles: ofKind("ROUTE").map(({ id, name: label, builtIn, who, transit, trust, serverListId, systemFallback, usedByRoutes }) => ({ id, name: label, builtIn, who, transit, trust, serverListId, systemFallback, usedByRoutes })),
+        },
+      };
     case "DnsProfileChoices":
-      return { data: { dnsProfiles: profiles.map(({ id, name: label, kind, who, trust, systemFallback }) => ({ id, name: label, kind, who, trust, systemFallback })) } };
+      return { data: { dnsProfiles: ofKind("ROUTE").map(({ id, name: label, who, trust, systemFallback }) => ({ id, name: label, who, trust, systemFallback })) } };
     case "DnsProfileNames":
-      return { data: { dnsProfiles: profiles.map(({ id, name: label, kind }) => ({ id, name: label, kind })) } };
+      return { data: { dnsProfiles: ofKind("PROXY_NAME").map(({ id, name: label }) => ({ id, name: label })) } };
     case "Networking":
     case "DraftRoute":
       return { data: networking };
