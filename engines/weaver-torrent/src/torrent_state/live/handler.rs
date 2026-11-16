@@ -414,6 +414,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     // web seed sends no extended handshake, so the address-bound steps
     // below never meet one.
     fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+        // Only a swarm peer, at an address, speaks the extension protocol.
+        debug_assert!(
+            self.addr.addr().is_some(),
+            "a web seed sent an extended handshake"
+        );
         if let Some(client_name) = hs.v.as_ref().and_then(format_peer_client_name) {
             self.state
                 .peers

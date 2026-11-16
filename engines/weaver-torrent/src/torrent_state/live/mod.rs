@@ -473,6 +473,9 @@ impl TorrentStateLive {
     pub(crate) fn ban_for_bad_data(&self, peer: PeerHandle) {
         let Some(ip) = peer.ip() else {
             if self.shared.web_seeds.ban(peer) {
+                // A seed's URL can carry a credential: the line names the
+                // seed by its entry alone.
+                warn!(id = ?self.shared.id, %peer, "banning the web seed");
                 self.peers
                     .with_peer_mut(peer, "ban_web_seed", |p| p.ban(&self.peers));
             }

@@ -144,6 +144,7 @@ impl PeerHandler {
     /// `bt_peer_connection::on_holepunch`).
     pub(super) fn on_holepunch(&self, msg: UtHolepunch) {
         // Only a swarm peer, at an address, speaks the extension.
+        debug_assert!(self.addr.addr().is_some(), "a web seed sent a holepunch");
         let Some(me) = self.addr.addr() else {
             return;
         };

@@ -1420,6 +1420,38 @@ fn a_bad_piece_loses_the_seed_its_file_or_itself() {
     assert!(!have.any());
 }
 
+// The web seed tick finds a seed due, then opens its connection. A seed
+// banned between the two is not connected to; one banned once its
+// connection is opening has that connection ended, and is due no more.
+#[test]
+fn a_seed_banned_after_it_was_found_due_is_not_connected_to() {
+    let now = Instant::now();
+    let any = |_: &Lacks| true;
+    let seeds = || {
+        Arc::new(WebSeeds::new([WebSeed {
+            url: "http://192.0.2.1/f".into(),
+            kind: WebSeedKind::Url,
+            named_by: NamedBy::Torrent,
+        }]))
+    };
+
+    let banned_before_link = seeds();
+    let due = banned_before_link.due(now, any, false);
+    assert_eq!(due.len(), 1);
+    assert!(banned_before_link.ban(PeerHandle::WebSeed(due[0].id)));
+    assert!(banned_before_link.link(due[0].id).is_none());
+
+    let banned_after_link = seeds();
+    let due = banned_after_link.due(now, any, false);
+    let link = banned_after_link.link(due[0].id).unwrap();
+    assert!(!link.cancel.is_cancelled());
+    assert!(banned_after_link.ban(link.handle()));
+    assert!(link.cancel.is_cancelled());
+    drop(link);
+    assert!(banned_after_link.due(now, any, false).is_empty());
+    assert!(banned_after_link.link(due[0].id).is_none());
+}
+
 #[test]
 fn which_seeds_are_due() {
     let now = Instant::now();

@@ -108,11 +108,7 @@ impl TorrentStateLive {
             let resolver = session.resolver.clone();
             self.spawn(
                 debug_span!(parent: self.shared.span.clone(), "web_seed", seed = ?link.handle()),
-                format!(
-                    "[{}][web_seed={}]manage_web_seed",
-                    self.shared.id,
-                    link.handle()
-                ),
+                format!("[{}][{}]manage_web_seed", self.shared.id, link.handle()),
                 aframe!(
                     self.clone()
                         .task_manage_web_seed(link, clients, resolver, rx, tx, held)

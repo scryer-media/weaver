@@ -449,9 +449,20 @@ impl Peer {
     /// A peer `sources` named, listening where it was named. The peer list
     /// counts it on admission.
     pub fn new_with_outgoing_address(addr: SocketAddr, sources: PeerSources) -> Self {
+        Self::not_connected(addr.into(), Some(addr), sources)
+    }
+
+    /// A peer under `addr` we are not connected to, dialled at
+    /// `outgoing_address` when it has one: the one place a peer's fields
+    /// begin, but for an incoming connection's.
+    fn not_connected(
+        addr: PeerHandle,
+        outgoing_address: Option<SocketAddr>,
+        sources: PeerSources,
+    ) -> Self {
         Self {
-            addr: addr.into(),
-            outgoing_address: Some(addr),
+            addr,
+            outgoing_address,
             stats: Default::default(),
             state: Default::default(),
             failcount: 0,
@@ -484,25 +495,7 @@ impl Peer {
     /// we can dial, so it is never a connect candidate. The peer list
     /// counts it on admission.
     pub fn new_web_seed(handle: PeerHandle) -> Self {
-        Self {
-            addr: handle,
-            outgoing_address: None,
-            stats: Default::default(),
-            state: Default::default(),
-            failcount: 0,
-            upload_only: false,
-            maybe_upload_only: false,
-            last_connected: None,
-            encrypt: true,
-            fast_reconnects: 0,
-            fast_reconnect: false,
-            last_optimistic_unchoke: None,
-            trust: Trust::default(),
-            supports_holepunch: false,
-            holepunch: false,
-            sources: PeerSources::default(),
-            indexed: Indexed::default(),
-        }
+        Self::not_connected(handle, None, PeerSources::default())
     }
 
     /// Whether the peer listens at the address it is listed under, so we

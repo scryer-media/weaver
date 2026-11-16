@@ -303,11 +303,12 @@ impl WebSeeds {
         due
     }
 
-    /// Opens the connection to seed `id`; None when it is gone or connected.
+    /// Opens the connection to seed `id`; None when it is gone, connected,
+    /// or banned since it was found due.
     pub fn link(self: &Arc<Self>, id: u32) -> Option<SeedLink> {
         let mut g = self.inner.lock();
         let entry = g.seeds.iter_mut().find(|e| e.id == id)?;
-        if entry.connection.is_some() {
+        if entry.connection.is_some() || entry.banned {
             return None;
         }
         let cancel = CancellationToken::new();
@@ -346,8 +347,9 @@ impl WebSeeds {
 
     /// Seed `handle` is banned for sending bad data: it is not listed and
     /// not connected to again (libtorrent `peer_info.banned`, which
-    /// `torrent::maybe_connect_web_seeds` reads). Returns whether `handle` is
-    /// a seed's that was not banned before.
+    /// `torrent::maybe_connect_web_seeds` reads), and a connection to it
+    /// that is open, or opening, ends. Returns whether `handle` is a seed's
+    /// that was not banned before.
     pub fn ban(&self, handle: PeerHandle) -> bool {
         let mut g = self.inner.lock();
         let Some(entry) = g
@@ -357,6 +359,9 @@ impl WebSeeds {
         else {
             return false;
         };
+        if let Some(c) = &entry.connection {
+            c.cancel();
+        }
         !std::mem::replace(&mut entry.banned, true)
     }
 

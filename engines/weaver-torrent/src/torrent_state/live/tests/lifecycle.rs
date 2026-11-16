@@ -60,7 +60,7 @@ impl Harness {
     /// A web seed of the torrent, connected and live with every piece of
     /// the files it serves, the queue of what we send it, and its link,
     /// whose hold keeps the torrent from connecting to the seed itself.
-    fn web_seed(&self) -> (PeerHandler, PeerRx, web_seed::SeedLink) {
+    pub(super) fn web_seed(&self) -> (PeerHandler, PeerRx, web_seed::SeedLink) {
         use crate::core::torrent_metainfo::{WebSeed, WebSeedKind};
 
         let seeds = &self.shared.web_seeds;
