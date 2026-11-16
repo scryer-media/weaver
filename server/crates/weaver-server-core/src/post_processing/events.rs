@@ -1136,13 +1136,12 @@ impl Database {
         &self,
         job_ids: &[u64],
     ) -> Result<std::collections::HashSet<u64>, StateError> {
+        // Each registry is walked once, not once per asked job.
+        let held = self.jobs_with_scripts_held();
         let mut live = job_ids
             .iter()
             .copied()
-            .filter(|id| {
-                self.has_pending_script_admission(*id)
-                    || self.active_script_run_for_job(*id).is_some()
-            })
+            .filter(|id| held.contains(id))
             .collect::<std::collections::HashSet<_>>();
         if job_ids.is_empty() {
             return Ok(live);
@@ -1174,6 +1173,45 @@ impl Database {
         })?;
         live.extend(queued);
         Ok(live)
+    }
+
+    // The jobs with a script waiting to be admitted, admitted, claimed or
+    // being cancelled: what `has_pending_script_admission` and
+    // `active_script_run_for_job` answer job by job, read in one walk of
+    // each registry.
+    fn jobs_with_scripts_held(&self) -> std::collections::HashSet<u64> {
+        let mut held = std::collections::HashSet::new();
+        {
+            let admissions = self
+                .script_runtime
+                .admissions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            held.extend(admissions.active_job);
+            held.extend(
+                admissions
+                    .pending
+                    .iter()
+                    .filter_map(|entry| entry.context.job_id),
+            );
+        }
+        held.extend(
+            self.script_runtime
+                .claimed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .filter_map(|(job, _)| *job),
+        );
+        held.extend(
+            self.script_runtime
+                .cancellations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .filter_map(|(job, _)| *job),
+        );
+        held
     }
 
     fn has_pending_script_admission(&self, job_id: u64) -> bool {

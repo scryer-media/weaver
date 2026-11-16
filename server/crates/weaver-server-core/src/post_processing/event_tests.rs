@@ -783,3 +783,59 @@ async fn every_script_shares_one_pool_whose_size_applies_to_the_next_waiter() {
     drop(held);
     assert_eq!(db.script_runtime.slots.running(), 0);
 }
+
+// The batched live-script read answers what the job-by-job checks answer:
+// a pending or admitted admission, a claimed or cancelling run, and a
+// queued row each make a job live; a job with none of them is not.
+#[tokio::test]
+async fn jobs_with_live_script_events_match_the_job_by_job_checks() {
+    let (db, _data) = configured();
+    for job in [50, 51] {
+        history(&db, job);
+    }
+    db.script_runtime.admissions.lock().unwrap().running = true;
+    let pending = db.admit_queue_script_event(event(50, QueueEvent::NzbAdded), false);
+    db.script_runtime.admissions.lock().unwrap().active_job = Some(52);
+    let (claim, _claim_rx) = watch::channel(false);
+    db.script_runtime
+        .claimed
+        .lock()
+        .unwrap()
+        .insert("claimed-run".into(), (Some(53), claim));
+    let _held = hold_test_event_run(&db, 54, "cancelling-run");
+    db.enqueue_script_event(&event(55, QueueEvent::NzbAdded), 1)
+        .unwrap()
+        .unwrap();
+
+    let asked: Vec<u64> = (48..=57).collect();
+    let live = db.jobs_with_live_script_events(&asked).unwrap();
+    let datastore = db.datastore();
+    let queued: std::collections::HashSet<u64> = db
+        .run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT DISTINCT job_id FROM script_event_queue WHERE state IN ('queued', 'started')",
+                &[],
+            )
+            .await?;
+            rows.iter()
+                .map(|row| row.i64("job_id").map(|id| id as u64))
+                .collect()
+        })
+        .unwrap();
+    let one_by_one: std::collections::HashSet<u64> = asked
+        .iter()
+        .copied()
+        .filter(|id| {
+            db.has_pending_script_admission(*id)
+                || db.active_script_run_for_job(*id).is_some()
+                || queued.contains(id)
+        })
+        .collect();
+    assert_eq!(live, one_by_one);
+    assert_eq!(live, [50, 52, 53, 54, 55].into_iter().collect());
+
+    db.script_runtime.admissions.lock().unwrap().active_job = None;
+    drain_admissions(db.clone()).await;
+    let _ = pending.await;
+}
