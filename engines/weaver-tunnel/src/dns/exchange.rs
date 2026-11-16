@@ -156,27 +156,6 @@ impl<'a> Session<'a> {
         sent(self.counts, queries);
     }
 
-    // The id the next query to the server goes out with, as its wire sends
-    // it.
-    pub(super) fn id(&self) -> u16 {
-        match self.server.wire {
-            Wire::Plain => PlainTcp::id(),
-            Wire::Tls { .. } => Dot::id(),
-            Wire::Https { .. } => Doh::id(),
-        }
-    }
-
-    // Sends `packet` on a connection of its own and returns the reply,
-    // whatever it says. `reached` is set once the server answers the dial.
-    // The session asks once, and is used up.
-    pub(super) async fn ask(self, packet: &[u8], reached: &mut bool) -> Reply {
-        match self.server.wire {
-            Wire::Plain => PlainTcp::ask(&self, packet, reached).await,
-            Wire::Tls { .. } => Dot::ask(&self, packet, reached).await,
-            Wire::Https { .. } => Doh::ask(&self, packet, reached).await,
-        }
-    }
-
     // A talk with the server: queries given one at a time, each sent as it
     // is given while others are still out, and each reply handed back as it
     // comes. `reached` is set once the server answers a dial, or a kept
@@ -390,14 +369,6 @@ fn turns(
 trait Exchange<'a> {
     // The id a query to the server goes out with.
     fn id() -> u16;
-
-    // Sends `packet` on a connection of its own and returns the reply,
-    // whatever it says. `reached` is set once the server answers the dial.
-    fn ask(
-        session: &Session<'a>,
-        packet: &[u8],
-        reached: &mut bool,
-    ) -> impl Future<Output = Reply> + Send;
 
     // Sends what the queue holds as the wire lets it go, and returns the
     // next reply to come, with its query's key: None once nothing is given

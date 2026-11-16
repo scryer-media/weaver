@@ -42,13 +42,7 @@ impl Walk {
         }
         self.sent += 1;
         self.id = id();
-        let mut packet = Vec::from(self.id.to_be_bytes());
-        // Recursion desired.
-        packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-        packet.extend_from_slice(self.name.as_wire());
-        packet.extend_from_slice(&self.qtype.to_be_bytes());
-        packet.extend_from_slice(&[0, 1]);
-        Some(packet)
+        Some(packet(self.id, &self.name, self.qtype))
     }
 
     // Takes the reply to the walk's last query: an answer, or an alias to
@@ -62,21 +56,10 @@ impl Walk {
                 return;
             }
         };
-        if bytes.get(..2) != Some(&self.id.to_be_bytes()[..]) {
-            self.done = Some(Err(Exchanged::Invalid));
-            return;
-        }
         let query = Query::new(self.name.clone(), RecordType::new(self.qtype));
-        let reply = match Reply::read(&query, &bytes) {
-            Ok(reply) if reply.answer().alias_chain().len() <= MOST + 1 => reply,
-            Ok(_) => {
-                self.done = Some(Err(Exchanged::Invalid));
-                return;
-            }
-            // A refusal is read from the header alone, so one without a
-            // question to answer still says what it refused.
-            Err(_) => {
-                let failed = refusal(&bytes, self.id).map_or(Exchanged::Invalid, Exchanged::Rcode);
+        let reply = match read(&query, self.id, &bytes) {
+            Ok(reply) => reply,
+            Err(failed) => {
                 self.done = Some(Err(failed));
                 return;
             }
@@ -107,6 +90,36 @@ impl Walk {
             }
         }
     }
+}
+
+// A query for `name`'s records of `qtype` under `id`, as a lookup that takes
+// answers as sent asks it: recursion desired, one question, no EDNS.
+pub(in crate::dns) fn packet(id: u16, name: &Name, qtype: u16) -> Vec<u8> {
+    let mut packet = Vec::from(id.to_be_bytes());
+    // Recursion desired.
+    packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    packet.extend_from_slice(name.as_wire());
+    packet.extend_from_slice(&qtype.to_be_bytes());
+    packet.extend_from_slice(&[0, 1]);
+    packet
+}
+
+// `bytes` read as the reply to `query`, which went out under `id`, as a
+// lookup that takes answers as sent reads it. A reply is taken only under
+// the id its query went out with, only when it answers the question asked,
+// and only when its answer follows at most MOST aliases.
+pub(in crate::dns) fn read(query: &Query, id: u16, bytes: &[u8]) -> Result<Reply, Exchanged> {
+    if bytes.get(..2) != Some(&id.to_be_bytes()[..]) {
+        return Err(Exchanged::Invalid);
+    }
+    // A refusal is read from the header alone, so one without a question
+    // to answer still says what it refused.
+    let reply = Reply::read(query, bytes)
+        .map_err(|_| refusal(bytes, id).map_or(Exchanged::Invalid, Exchanged::Rcode))?;
+    if reply.answer().alias_chain().len() > MOST + 1 {
+        return Err(Exchanged::Invalid);
+    }
+    Ok(reply)
 }
 
 // The wire name of `host`, a name `host_name` passes: its dot-separated

@@ -52,6 +52,11 @@ impl DnsSessions {
             dnssec,
         }
     }
+    // Builds the built-in roots off the async runtime, if this naming uses
+    // them and they are not built yet. Awaited before `wires` or `dnssec`.
+    pub(super) async fn ready(&self) {
+        roots::ready(&self.roots).await;
+    }
     pub(super) fn wires(&self) -> &Wires {
         self.wires
             .get_or_init(|| roots::or_built_in(&self.roots).wires().apart())

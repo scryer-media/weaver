@@ -4,8 +4,7 @@
 // DNS over HTTPS (RFC 8484): HTTP/2 streams on one connection, or HTTP/1.1
 // queries one at a time per connection, as the server's handshake says.
 use super::{
-    Asked, Exchange, Link, Next, Queue, REUSED_WAIT, Reply, SENDS, Session, Wires, handshake, sent,
-    turns,
+    Asked, Exchange, Link, Next, Queue, REUSED_WAIT, Reply, SENDS, Wires, handshake, sent, turns,
 };
 use crate::dns::{Carrier, DnsServer, Exchanged, Wire};
 pub(super) use https::Connection;
@@ -104,17 +103,6 @@ impl<'a> Exchange<'a> for Doh<'a> {
     // §4.1).
     fn id() -> u16 {
         0
-    }
-
-    async fn ask(session: &Session<'a>, packet: &[u8], reached: &mut bool) -> Reply {
-        let (provider, wires, server) = (session.provider, session.wires, session.server);
-        let mut connection = doh(provider, wires, server, || *reached = true).await?;
-        session.sent(1);
-        let Wire::Https { path } = &server.wire else {
-            unreachable!("an HTTPS query goes only to an HTTPS server")
-        };
-        let (reply, _) = connection.exchange(server, path, packet).await?;
-        Ok(reply)
     }
 
     // Over the HTTP the first connection's handshake picks.

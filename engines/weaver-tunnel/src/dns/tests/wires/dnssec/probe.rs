@@ -850,3 +850,433 @@ async fn a_share_that_never_frees_fails_each_probe_on_the_routes_account() {
         )
     );
 }
+
+// How a fixture server changes each reply before it goes out, given the
+// query it answers.
+type Shape = fn(&[u8], Vec<u8>) -> Vec<u8>;
+
+fn as_made(_: &[u8], reply: Vec<u8>) -> Vec<u8> {
+    reply
+}
+
+// The reply with its question's type changed: it answers another question
+// than the one asked.
+fn other_question(query: &[u8], mut reply: Vec<u8>) -> Vec<u8> {
+    let (_, end) = question(query);
+    reply[end - 4..end - 2].copy_from_slice(&16u16.to_be_bytes());
+    reply
+}
+
+// The reply with its records taken out: the question asked, answered with
+// nothing, NODATA.
+fn no_data(query: &[u8], reply: Vec<u8>) -> Vec<u8> {
+    let (_, end) = question(query);
+    let mut empty = reply[..end].to_vec();
+    empty[6..12].fill(0);
+    empty
+}
+
+// The reply as an answer that follows one alias more than a lookup takes:
+// the name asked is an alias of a0., a0. of a1., and so on to a9., ten
+// links, and nothing besides.
+fn long_chain(query: &[u8], reply: Vec<u8>) -> Vec<u8> {
+    const LINKS: u8 = 10;
+    let (_, end) = question(query);
+    let mut chain = reply[..end].to_vec();
+    chain[6..8].copy_from_slice(&u16::from(LINKS).to_be_bytes());
+    chain[8..12].fill(0);
+    for link in 0..LINKS {
+        match link {
+            // The question's name, by a pointer to it.
+            0 => chain.extend_from_slice(&[0xc0, 12]),
+            _ => chain.extend_from_slice(&[2, b'a', b'0' + link - 1, 0]),
+        }
+        // CNAME, IN, a TTL of 60, and the four bytes of the alias.
+        chain.extend_from_slice(&[0, 5, 0, 1, 0, 0, 0, 60, 0, 4]);
+        chain.extend_from_slice(&[2, b'a', b'0' + link, 0]);
+    }
+    chain
+}
+
+// The long chain reads as a reply, so only the cap on aliases followed
+// turns it away, for the root's SOA as for a host name's address.
+#[test]
+fn a_long_chain_reads_and_only_the_alias_cap_refuses_it() {
+    use crate::dns::judge::as_sent;
+    use weaver_dnssec::{Name, Query, RecordType, Reply};
+    let host = Name::from_wire(b"\x03www\x07example\x03com\x00").unwrap();
+    for (name, qtype) in [(Name::root(), 6), (host, 1)] {
+        let query = as_sent::packet(7, &name, qtype);
+        let mut reply = query.clone();
+        reply[2] |= 0x80;
+        let chained = long_chain(&query, reply);
+        let asked = Query::new(name, RecordType::new(qtype));
+        let read = Reply::read(&asked, &chained).unwrap();
+        assert_eq!(read.answer().alias_chain().len(), 11);
+        assert!(matches!(
+            as_sent::read(&asked, 7, &chained),
+            Err(crate::dns::Exchanged::Invalid)
+        ));
+    }
+}
+
+// The reply under an id no query has, and nothing under the query's own.
+fn stray_only(_: &[u8], reply: Vec<u8>) -> Vec<u8> {
+    stray(reply)
+}
+
+fn h2_doing(misstep: H2Misstep) -> Speaks {
+    Speaks::H2 {
+        respond: Arc::new(h2_message),
+        goaway_after: None,
+        misstep,
+    }
+}
+
+fn dot_speaking() -> Speaks {
+    Speaks::Dot { close_after: None }
+}
+
+// One server at 192.0.2.53 on `kind` alone, at the wire's usual port,
+// speaking `speaks` once TLS is up, with a certificate `authority` signed
+// for its address, and answering the fixture's signed zones with each reply
+// shaped by `shape`; then `adjusted`. With it, the server as a lookup lists
+// it on that wire, which is the server the probe of that wire asks. The
+// server test of `first()` reaches it on that wire's probe only: every
+// other port, the DNSSEC check's among them, has nothing listening.
+fn only_on(
+    kind: WireKind,
+    speaks: Speaks,
+    authority: &Authority,
+    resolver: &Arc<FakeResolver>,
+    shape: Shape,
+    adjusted: fn(Servers) -> Servers,
+) -> (ByPort, DnsServer) {
+    let base = serving(resolver, &[]);
+    let alpn: &[u8] = match &speaks {
+        Speaks::Dot { .. } => b"dot",
+        Speaks::Doh { .. } => b"http/1.1",
+        Speaks::H2 { .. } => b"h2",
+    };
+    let servers = Servers::new(speaks, move |asked, qtype, query: &[u8]| {
+        shape(query, base(asked, qtype, query))
+    });
+    let (servers, listed) = match kind {
+        WireKind::Plain => (servers.plain_at("192.0.2.53"), first()),
+        WireKind::Tls => (
+            servers.at("192.0.2.53", authority.server(&["192.0.2.53"], alpn)),
+            dot("192.0.2.53", None),
+        ),
+        WireKind::Https => (
+            servers.at("192.0.2.53", authority.server(&["192.0.2.53"], alpn)),
+            doh("192.0.2.53:443"),
+        ),
+    };
+    (
+        ByPort(vec![(listed.address.port(), adjusted(servers))]),
+        listed,
+    )
+}
+
+// The probe of `kind`'s wire.
+fn of_wire(probe: &crate::dns::ServerProbe, kind: WireKind) -> &crate::dns::Probed {
+    match kind {
+        WireKind::Plain => &probe.plain,
+        WireKind::Tls => &probe.tls,
+        WireKind::Https => &probe.https,
+    }
+}
+
+// What the server test of `first()` says of the wire `kind` through
+// `carrier`.
+async fn probed_on(
+    carrier: &ByPort,
+    authority: &Authority,
+    resolver: &FakeResolver,
+    kind: WireKind,
+) -> crate::dns::Probed {
+    let probe = probe_on(carrier, &probing(authority, resolver), &first()).await;
+    of_wire(&probe, kind).clone()
+}
+
+// A reply that answers another question than the one asked fails the
+// probe of every wire as an invalid response, as it fails a lookup.
+#[tokio::test(start_paused = true)]
+async fn a_server_answering_another_question_is_not_supported_on_any_wire() {
+    let resolver = tree(KeyAlgorithm::P256);
+    for (kind, speaks) in [
+        (WireKind::Plain, dot_speaking()),
+        (WireKind::Tls, dot_speaking()),
+        (WireKind::Https, doh_fixture(plain_reply, false)),
+        (WireKind::Https, h2_doing(H2Misstep::None)),
+    ] {
+        let authority = Authority::new();
+        let (carrier, listed) = only_on(
+            kind,
+            speaks,
+            &authority,
+            &resolver,
+            other_question,
+            std::convert::identity,
+        );
+        let probed = probed_on(&carrier, &authority, &resolver, kind).await;
+        assert!(!probed.supported, "{listed}: {probed:?}");
+        assert_eq!(
+            probed.error,
+            Some(failure(
+                LookupFailure::Other,
+                &format!("{listed}: {}", crate::dns::INVALID)
+            )),
+            "{listed}"
+        );
+    }
+}
+
+// An HTTP/2 server that refuses the probe's stream once and answers it
+// sent again: the probe sends it again on the same connection, as a lookup
+// does, and the wire is supported.
+#[tokio::test(start_paused = true)]
+async fn an_http_2_stream_refused_once_is_sent_again_and_the_wire_is_supported() {
+    let resolver = tree(KeyAlgorithm::P256);
+    let authority = Authority::new();
+    let (carrier, _) = only_on(
+        WireKind::Https,
+        h2_doing(H2Misstep::RefuseFirst),
+        &authority,
+        &resolver,
+        as_made,
+        std::convert::identity,
+    );
+    let probed = probed_on(&carrier, &authority, &resolver, WireKind::Https).await;
+    assert!(probed.supported, "{probed:?}");
+    let servers = &carrier.0[0].1;
+    // Two sends on the one connection: the one refused, and the one
+    // answered.
+    assert_eq!(servers.dials().len(), 1);
+    assert_eq!(servers.log.lock().unwrap().refused, 1);
+    assert_eq!(servers.answered(), [1]);
+}
+
+// An HTTP/2 server that refuses every stream: the probe's query goes out
+// three times on the one connection, and the wire fails as the server
+// resetting the query.
+#[tokio::test(start_paused = true)]
+async fn an_http_2_stream_refused_every_time_fails_as_reset_after_three_sends() {
+    let resolver = tree(KeyAlgorithm::P256);
+    let authority = Authority::new();
+    let (carrier, listed) = only_on(
+        WireKind::Https,
+        h2_doing(H2Misstep::RefuseEvery),
+        &authority,
+        &resolver,
+        as_made,
+        std::convert::identity,
+    );
+    let probed = probed_on(&carrier, &authority, &resolver, WireKind::Https).await;
+    assert!(!probed.supported);
+    assert_eq!(
+        probed.error,
+        Some(failure(
+            LookupFailure::NoReply,
+            &format!("{listed}: the server reset the query")
+        ))
+    );
+    let servers = &carrier.0[0].1;
+    assert_eq!(servers.dials().len(), 1);
+    assert_eq!(servers.log.lock().unwrap().refused, 3);
+}
+
+// A DNS over TLS reply under an id no query has is passed over, as a lookup
+// passes over it. Followed by nothing, the probe waits out the server's
+// time limit; followed by the right reply, the wire is supported.
+#[tokio::test(start_paused = true)]
+async fn a_dot_reply_under_an_unknown_id_is_passed_over() {
+    let resolver = tree(KeyAlgorithm::P256);
+    let authority = Authority::new();
+    let (carrier, listed) = only_on(
+        WireKind::Tls,
+        dot_speaking(),
+        &authority,
+        &resolver,
+        stray_only,
+        std::convert::identity,
+    );
+    let probed = probed_on(&carrier, &authority, &resolver, WireKind::Tls).await;
+    assert!(!probed.supported);
+    assert_eq!(
+        probed.error,
+        Some(failure(
+            LookupFailure::TimedOut,
+            &format!("{listed}: no answer within {}s", SERVER_TIMEOUT.as_secs())
+        ))
+    );
+    assert_eq!(probed.elapsed, SERVER_TIMEOUT);
+
+    let (carrier, _) = only_on(
+        WireKind::Tls,
+        dot_speaking(),
+        &authority,
+        &resolver,
+        as_made,
+        Servers::straying,
+    );
+    let probed = probed_on(&carrier, &authority, &resolver, WireKind::Tls).await;
+    assert!(probed.supported, "{probed:?}");
+    assert_eq!(carrier.0[0].1.dials().len(), 1);
+}
+
+// For each way a server misbehaves, the same fake server is asked by a
+// lookup and by the server test of its wire, and both come to the same
+// outcome: an answer and no error, or the same error in the same words.
+#[tokio::test(start_paused = true)]
+async fn the_server_test_and_a_lookup_come_to_the_same_outcome_through_one_server() {
+    let resolver = tree(KeyAlgorithm::P256);
+    let identity: fn(Servers) -> Servers = std::convert::identity;
+    // The wire tested, how the server speaks, how it shapes its reply, and
+    // what else it does.
+    type Case = (WireKind, fn() -> Speaks, Shape, fn(Servers) -> Servers);
+    let cases: [Case; 11] = [
+        (WireKind::Plain, dot_speaking, as_made, identity),
+        (WireKind::Plain, dot_speaking, no_data, identity),
+        (WireKind::Plain, dot_speaking, long_chain, identity),
+        (WireKind::Plain, dot_speaking, other_question, identity),
+        (WireKind::Tls, dot_speaking, other_question, identity),
+        (WireKind::Tls, dot_speaking, stray_only, identity),
+        (WireKind::Tls, dot_speaking, as_made, Servers::straying),
+        (
+            WireKind::Https,
+            || doh_fixture(plain_reply, false),
+            other_question,
+            identity,
+        ),
+        (
+            WireKind::Https,
+            || h2_doing(H2Misstep::None),
+            other_question,
+            identity,
+        ),
+        (
+            WireKind::Https,
+            || h2_doing(H2Misstep::RefuseFirst),
+            as_made,
+            identity,
+        ),
+        (
+            WireKind::Https,
+            || h2_doing(H2Misstep::RefuseEvery),
+            as_made,
+            identity,
+        ),
+    ];
+    for (at, (kind, speaks, shape, adjusted)) in cases.into_iter().enumerate() {
+        let authority = Authority::new();
+        let (carrier, listed) = only_on(kind, speaks(), &authority, &resolver, shape, adjusted);
+        let looked_up = recorded(
+            &carrier.0[0].1,
+            &authority.wires(),
+            std::slice::from_ref(&listed),
+            Trust::AsSent,
+            "www.example.com",
+        )
+        .await;
+        let probed = probed_on(&carrier, &authority, &resolver, kind).await;
+        // The server answered the lookup when it gave addresses, or said
+        // the name has none: the probe takes any reply that reads as an
+        // answer, whatever its records.
+        let answered = match &looked_up.error {
+            None => true,
+            Some(error) => matches!(
+                error.failure,
+                LookupFailure::NoAddress | LookupFailure::NoSuchName
+            ),
+        };
+        assert_eq!(
+            (probed.supported, probed.error),
+            (answered, looked_up.error.filter(|_| !answered)),
+            "case {at}: {listed}"
+        );
+    }
+}
+
+// `servers` reached only at `port`, through the stage whose keepers they
+// name: a probe's dial to any other port reaches nothing.
+struct AtPort<'a>(&'a Servers, u16);
+
+#[async_trait::async_trait]
+impl Carrier for AtPort<'_> {
+    fn keepers(&self) -> Vec<crate::pipe::KeeperRef> {
+        self.0.keepers()
+    }
+    async fn open(&self, server: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+        if server.address.port() != self.1 {
+            return Err(TunnelError::Engine(format!(
+                "nothing listens at {}",
+                server.address
+            )));
+        }
+        self.0.open(server).await
+    }
+}
+
+// A server test keeps and reuses nothing, on every encrypted wire: once it
+// returns, every connection it opened has ended on the server's side and
+// nothing is open, and a lookup by a naming on the same sessions, through a
+// stage that could take a kept connection, dials afresh.
+#[tokio::test(start_paused = true)]
+async fn a_server_test_keeps_no_connection_and_a_lookup_after_it_dials_afresh() {
+    let resolver = tree(KeyAlgorithm::P256);
+    let wires = [
+        (
+            "dot",
+            Speaks::Dot { close_after: None },
+            &b"dot"[..],
+            dot("192.0.2.53", None),
+        ),
+        (
+            "http/1.1",
+            doh_fixture(plain_reply, false),
+            b"http/1.1",
+            doh("192.0.2.53:443"),
+        ),
+        (
+            "h2",
+            Speaks::H2 {
+                respond: Arc::new(h2_message),
+                goaway_after: None,
+                misstep: H2Misstep::None,
+            },
+            b"h2",
+            doh("192.0.2.53:443"),
+        ),
+    ];
+    for (wire, speaks, alpn, listed) in wires {
+        let authority = Authority::new();
+        let servers = Servers::new(speaks, serving(&resolver, &[]))
+            .at("192.0.2.53", authority.server(&["192.0.2.53"], alpn));
+        let carrier = AtPort(&servers, listed.address.port());
+        let sessions = probing(&authority, &resolver);
+        let probe = probe_on(&carrier, &sessions, &listed).await;
+        assert!(probe.dnssec.supported, "{wire}: {:?}", probe.dnssec);
+        let probed = servers.dials().len();
+        assert!(probed > 0, "{wire}");
+        servers
+            .ended
+            .acquire_many(probed as u32)
+            .await
+            .unwrap()
+            .forget();
+        assert_eq!(servers.open_now(), 0, "{wire}");
+        assert_eq!(sessions.kept().len(), 0, "{wire}");
+
+        let (resolved, _) = resolve_judged(
+            &carrier,
+            &sessions,
+            std::slice::from_ref(&listed),
+            Trust::AsSent,
+            "www.example.com",
+        )
+        .await;
+        assert!(!resolved.unwrap().addresses.is_empty(), "{wire}");
+        assert!(servers.dials().len() > probed, "{wire}");
+    }
+}
