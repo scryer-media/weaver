@@ -83,6 +83,17 @@ fn assert_limits_of(pipeline: &Pipeline, profile: HardwareProfile) {
     );
     let grant = pipeline.graph_hardware.grant();
     assert_eq!(pool_size(&grant), tuning.extract_threads);
+    // The next usenet socket dialled through a WireGuard tunnel.
+    assert_eq!(
+        weaver_tunnel::pipe::socket_buffers(&weaver_tunnel::pipe::Purpose::Nntp {
+            server: 1,
+            leg: 0,
+        }),
+        Some(weaver_tunnel::wireguard::TcpBuffers::new(
+            tuning.wireguard_usenet_receive_bytes,
+            weaver_tunnel::pipe::USENET_SEND_BYTES,
+        ))
+    );
     // The decode pool fits one run at the profile's ceiling, and its
     // overhead.
     assert_eq!(

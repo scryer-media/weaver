@@ -10,6 +10,21 @@ pub type WireGuardTunnelProvider = SharedProvider<proxy_tunnels::WireGuardTunnel
 
 impl crate::shared::SessionKind for proxy_tunnels::WireGuardTunnelProvider {
     const KIND: crate::metrics::TunnelKind = crate::metrics::TunnelKind::WireGuard;
+
+    // Each stream is a TCP socket on the tunnel's own stack, so it takes the
+    // sizes it asks for.
+    async fn dial_sized(
+        &self,
+        host: &str,
+        port: u16,
+        buffers: TcpBuffers,
+    ) -> Option<Result<Box<dyn crate::TunnelStream>, TunnelError>> {
+        Some(
+            self.dial_with(host, port, buffers)
+                .await
+                .map(|stream| Box::new(stream) as Box<dyn crate::TunnelStream>),
+        )
+    }
 }
 
 impl WireGuardTunnelProvider {

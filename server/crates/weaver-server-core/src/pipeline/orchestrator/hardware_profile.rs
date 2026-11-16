@@ -97,6 +97,7 @@ impl Pipeline {
         self.shared_state.set_hardware_profile_in_force(in_force);
         self.size_volume_buffers();
         let tuning = in_force.active.tuning(self.tuner.system_profile());
+        weaver_tunnel::pipe::set_usenet_receive_bytes(tuning.wireguard_usenet_receive_bytes);
         if tuning == self.tuner.profile_tuning() {
             return;
         }
