@@ -181,6 +181,9 @@ pub struct ProxyRuntime {
     routes: Mutex<HashMap<Consumer, Arc<ConsumerRoute>>>,
     pub mutations: tokio::sync::Mutex<()>,
     updating: AtomicBool,
+    // A feed was turned away while the routes were changing; the reload's
+    // end wakes the feed poller for it. Set and taken under `routes`.
+    feeds_passed_over: AtomicBool,
     stopped: AtomicBool,
     // Whether feeds and Default outbound may reach private addresses: the
     // one switch, `WEAVER_RSS_ALLOW_PRIVATE_NETWORK`.
@@ -223,6 +226,7 @@ impl ProxyRuntime {
             routes: Mutex::new(HashMap::new()),
             mutations: tokio::sync::Mutex::new(()),
             updating: AtomicBool::new(false),
+            feeds_passed_over: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             allow_private_network: AtomicBool::new(true),
         }))
@@ -251,6 +255,25 @@ impl ProxyRuntime {
             .expect("proxy consumers")
             .contains(&consumer)
     }
+    // Whether a feed can be polled now: it is a consumer and the routes are
+    // not mid-reload. A feed turned away by a reload is polled when the
+    // reload ends, through the wake it sends.
+    pub fn feed_routable(&self, consumer: Consumer) -> bool {
+        let _routes = self.routes.lock().expect("proxy routes");
+        if self.changing(consumer) {
+            return false;
+        }
+        self.routes_consumer(consumer)
+    }
+    // Whether the routes are mid-reload, noting a feed turned away for it.
+    // Called with `routes` held, so the reload's end cannot slip between.
+    fn changing(&self, consumer: Consumer) -> bool {
+        let changing = self.updating.load(Ordering::Acquire);
+        if changing && matches!(consumer, Consumer::Rss(_)) {
+            self.feeds_passed_over.store(true, Ordering::Release);
+        }
+        changing
+    }
     pub fn set_allow_private_network(&self, allow: bool) {
         self.allow_private_network.store(allow, Ordering::Release);
     }
@@ -271,8 +294,11 @@ impl ProxyRuntime {
         timeout: Duration,
     ) -> Result<Arc<ConsumerRoute>, String> {
         let mut routes = self.routes.lock().expect("proxy routes");
-        if self.updating.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
-            return Err("proxy runtime is changing or stopped".into());
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("proxy runtime is stopped".into());
+        }
+        if self.changing(consumer) {
+            return Err(ROUTES_CHANGING.into());
         }
         if !self
             .consumers
@@ -308,17 +334,18 @@ impl ProxyRuntime {
             timeout,
         }))
     }
-    pub async fn reload(&self) -> Result<(), String> {
+    // Marks the routes as changing until the returned guard drops.
+    pub(crate) fn begin_reload(&self) -> Result<Reloading<'_>, String> {
         if self.updating.swap(true, Ordering::AcqRel) {
             return Err("proxy runtime reload already in progress".into());
         }
-        struct Reset<'a>(&'a AtomicBool);
-        impl Drop for Reset<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _reset = Reset(&self.updating);
+        Ok(Reloading {
+            runtime: self,
+            new_feeds: false,
+        })
+    }
+    pub async fn reload(&self) -> Result<(), String> {
+        let mut reloading = self.begin_reload()?;
         let db = self.db.clone();
         let (policies, consumers) = tokio::task::spawn_blocking(move || {
             Ok::<_, crate::StateError>((db.list_proxy_routes()?, Self::load_consumers(&db)?))
@@ -366,12 +393,10 @@ impl ProxyRuntime {
         for route in obsolete {
             route.revoke().await;
         }
+        // The poller skipped these feeds while they had no route; once the
+        // reload ends, poll them through it without waiting a tick.
+        reloading.new_feeds = new_feeds;
         self.network.reload().await?;
-        if new_feeds {
-            // The poller skipped these feeds while they had no route; now
-            // that one exists, poll them through it without waiting a tick.
-            self.db.wake_rss_scheduler();
-        }
         Ok(())
     }
     pub async fn stop_all(&self) {
@@ -380,6 +405,35 @@ impl ProxyRuntime {
         let routes = std::mem::take(&mut *self.routes.lock().expect("proxy routes"));
         for (_, route) in routes {
             route.revoke().await;
+        }
+    }
+}
+
+// The refusal a consumer meets while the routes are mid-reload. It is a short
+// internal state, not a failure of the consumer: a feed meeting it is left
+// due and polled when the reload ends.
+pub const ROUTES_CHANGING: &str = "proxy routes are changing";
+
+// A reload in progress. Dropping it, on success or error, ends the reload and
+// then wakes the feed poller if a feed was turned away meanwhile or new feeds
+// appeared, so the wake never lands while the routes still refuse.
+pub(crate) struct Reloading<'a> {
+    runtime: &'a ProxyRuntime,
+    new_feeds: bool,
+}
+impl Drop for Reloading<'_> {
+    fn drop(&mut self) {
+        let runtime = self.runtime;
+        let passed_over = {
+            let _routes = runtime
+                .routes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            runtime.updating.store(false, Ordering::Release);
+            runtime.feeds_passed_over.swap(false, Ordering::AcqRel)
+        };
+        if passed_over || self.new_feeds {
+            runtime.db.wake_rss_scheduler();
         }
     }
 }
