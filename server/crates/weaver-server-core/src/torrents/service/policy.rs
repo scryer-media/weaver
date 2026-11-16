@@ -580,7 +580,7 @@ impl TorrentService {
     pub(super) async fn apply_turns(&self, then: &[&dyn Policy]) -> u64 {
         let settings = self.settings();
         let rules = self.rules();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let holds = self.holds();
         let cx = Self::context(&settings, &rules, &holds, now);
         let mut gathered = Gathered::default();
@@ -1046,7 +1046,7 @@ impl TorrentService {
     // no settings.
     pub(super) async fn pick(&self, only: Option<&BTreeSet<JobId>>) {
         let holds = HoldSet::default();
-        let cx = Self::context(&NO_SETTINGS, &[], &holds, self.inner.clock.now_ms());
+        let cx = Self::context(&NO_SETTINGS, &[], &holds, self.inner.clock.unix_ms());
         self.walk_alone(only, &[&Picking], &cx).await;
     }
 
@@ -1055,7 +1055,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let holds = HoldSet::default();
-        let cx = Self::context(&settings, &rules, &holds, self.inner.clock.now_ms());
+        let cx = Self::context(&settings, &rules, &holds, self.inner.clock.unix_ms());
         self.walk_alone(None, &[&Limits], &cx).await;
     }
 

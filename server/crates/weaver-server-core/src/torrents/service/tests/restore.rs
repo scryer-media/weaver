@@ -654,7 +654,7 @@ const SPLIT_PIECE: usize = 16_384;
 
 struct PartlyFetched {
     rig: Rig,
-    clock: Arc<SetClock>,
+    clock: Arc<ManualClock>,
     job_id: JobId,
     seeding: Arc<Session>,
     _seeds: tempfile::TempDir,
@@ -966,10 +966,7 @@ fn lifetime(view: &TorrentView) -> (u64, u64, u64) {
 async fn ticked(fetched: &PartlyFetched) -> (u64, u64, u64) {
     let service = &fetched.rig.service;
     service.tick().await;
-    fetched
-        .clock
-        .0
-        .fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
+    fetched.clock.shift_unix_ms(TICK.as_millis() as i64);
     service.tick().await;
     let shown = lifetime(&service.torrent(fetched.job_id).await.unwrap());
     assert!(shown.0 >= 3 * SPLIT_PIECE as u64, "{shown:?}");

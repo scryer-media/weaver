@@ -293,7 +293,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     // tick writes the ledger it changed, and a clean stop writes the ledger
     // as it stands.
     rig.service.tick().await;
-    clock.0.fetch_add(30_000, Ordering::SeqCst);
+    clock.shift_unix_ms(30_000);
     rig.service.tick().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!(kept.active_duration_s, 30);
@@ -685,7 +685,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     );
 
     rig.service.tick().await;
-    clock.0.fetch_add(5_000, Ordering::SeqCst);
+    clock.shift_unix_ms(5_000);
     rig.service.tick().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (5, 5));
@@ -699,7 +699,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
         (view.state, view.progress, view.completed_at_ms),
         (TorrentState::Stalled, 0.0, None)
     );
-    clock.0.fetch_add(5_000, Ordering::SeqCst);
+    clock.shift_unix_ms(5_000);
     rig.service.tick().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (10, 5));

@@ -1991,7 +1991,7 @@ impl Pipeline {
     // Wait, off the runtime, for every volume's writer to put down what it
     // holds, until the stop's settle clock reads `end`. Each volume that
     // still holds writes then is warned of and left.
-    async fn settle_volumes_until(&self, end: std::time::Duration, lost: &'static str) {
+    async fn settle_volumes_until(&self, end: std::time::Instant, lost: &'static str) {
         let writers = Arc::clone(&self.volume_writers);
         let clock = Arc::clone(&self.shutdown_settle.clock);
         match tokio::task::spawn_blocking(move || writers.settle_until(&*clock, end)).await {

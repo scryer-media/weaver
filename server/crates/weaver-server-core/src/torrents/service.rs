@@ -20,6 +20,7 @@ use weaver_torrent::{
 };
 
 use crate::StateError;
+use crate::clock::{Clock, SystemClock};
 use crate::jobs::JobId;
 use crate::jobs::handle::{HoldSet, JobInfo, SchedulerHandle};
 use crate::jobs::model::{JobStatus, Protocol};
@@ -131,19 +132,6 @@ const RESTORES_AT_ONCE: usize = 8;
 /// a faster one only waits on the write in flight, and its next write
 /// takes everything verified meanwhile.
 pub const CHECKPOINT_PIECES: u32 = 16;
-
-/// The time torrents are stamped with.
-pub trait Clock: Send + Sync {
-    fn now_ms(&self) -> i64;
-}
-
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_ms(&self) -> i64 {
-        chrono::Utc::now().timestamp_millis()
-    }
-}
 
 // What a torrent's session holds its peers to under its tracker rule:
 // whether it takes them from its trackers alone, whether it looks for them
@@ -962,7 +950,7 @@ impl TorrentService {
         // peers changed since the last write, before the sessions close
         // (qBittorrent saves only what changed as it exits, libtorrent
         // `torrent::write_resume_data` reads the peers off the torrent).
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         self.read(now, true).await;
         self.inner.sessions.stop_all().await;
         // Every tee's checkpoint goes at once, whether or not it was due,
@@ -1070,7 +1058,7 @@ impl TorrentService {
     // What the operator asks of the torrent, written under its lock with
     // no other column, and the ledger and peers as they stand beside it.
     async fn set_intent(&self, job_id: JobId, intent: TorrentIntent) -> Result<(), ActionError> {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let landing = self
             .with_torrent(job_id, |torrent| {
                 self.inner

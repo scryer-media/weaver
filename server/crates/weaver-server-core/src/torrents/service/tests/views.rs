@@ -303,7 +303,7 @@ async fn the_metrics_carry_what_the_tick_read() {
         torrent.counters.uploaded_bytes = 6000;
         torrent.counters.finished_duration_s = 120;
     }
-    clock.0.fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
+    clock.shift_unix_ms(TICK.as_millis() as i64);
     rig.service.tick().await;
 
     let metrics = rig.service.metrics();

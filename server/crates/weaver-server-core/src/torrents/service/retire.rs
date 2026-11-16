@@ -94,7 +94,7 @@ impl TorrentService {
             }
         }
         let settings = self.settings();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let (report, hash, landing) = {
             let mut live = self.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {
@@ -159,7 +159,7 @@ impl TorrentService {
         error: Option<String>,
     ) -> (JobReport, crate::history::JobHistoryRow) {
         let settings = self.settings();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let mut report = report(
             self.view(&settings, torrent, now),
             job_status_from_persisted_str(status.as_str(), error.as_deref()),
@@ -414,7 +414,7 @@ impl TorrentService {
         ending: Ending,
     ) -> Result<(), ActionError> {
         let settings = self.settings();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;

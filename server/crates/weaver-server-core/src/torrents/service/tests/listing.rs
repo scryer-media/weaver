@@ -12,14 +12,11 @@ const TORRENTS: usize = 120;
 
 // TORRENTS paused torrents: every other in "tv", every third private, two
 // added at each instant so that the order falls back to the job id.
-async fn seeded(rig: &Rig, clock: &SetClock) -> Vec<JobId> {
+async fn seeded(rig: &Rig, clock: &ManualClock) -> Vec<JobId> {
     rig.service.open().await.unwrap();
     let mut jobs = Vec::with_capacity(TORRENTS);
     for at in 0..TORRENTS {
-        clock.0.store(
-            EPOCH_MS + (TORRENTS - at / 2) as i64 * 1000,
-            Ordering::SeqCst,
-        );
+        clock.set_unix_ms(EPOCH_MS + (TORRENTS - at / 2) as i64 * 1000);
         let name = format!("t{at}");
         let bytes = metainfo(
             &name,
@@ -43,7 +40,7 @@ async fn seeded(rig: &Rig, clock: &SetClock) -> Vec<JobId> {
             .unwrap();
         jobs.push(job_id);
     }
-    clock.0.store(EPOCH_MS + 10_000_000, Ordering::SeqCst);
+    clock.set_unix_ms(EPOCH_MS + 10_000_000);
     settled(&rig.service, TORRENTS).await;
     jobs
 }
@@ -348,7 +345,7 @@ async fn a_row_reads_the_totals_its_files_give() {
     rig.service.open().await.unwrap();
     let mut jobs = Vec::new();
     for at in 0..24usize {
-        clock.0.store(EPOCH_MS + at as i64 * 1000, Ordering::SeqCst);
+        clock.set_unix_ms(EPOCH_MS + at as i64 * 1000);
         let name = format!("r{at}");
         let paths: Vec<String> = match at % 3 {
             0 => vec![name.clone()],
@@ -635,9 +632,7 @@ async fn a_retiring_torrent_is_in_no_page_and_no_count() {
     });
     let mut jobs = Vec::new();
     for at in 0..3_u8 {
-        clock
-            .0
-            .store(EPOCH_MS + i64::from(at) * 1000, Ordering::SeqCst);
+        clock.set_unix_ms(EPOCH_MS + i64::from(at) * 1000);
         let name = format!("r{at}");
         let bytes = metainfo(
             &name,

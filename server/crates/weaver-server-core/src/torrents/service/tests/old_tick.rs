@@ -42,7 +42,7 @@ impl TorrentService {
     pub(super) async fn old_tick(&self) {
         self.restore_jobs().await;
         self.follow_routes().await;
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         self.old_read(now, false).await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
@@ -202,7 +202,7 @@ impl TorrentService {
     pub(super) async fn old_apply_queue(&self) {
         let settings = self.settings();
         let rules = self.rules();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let holds = self.holds();
         let mut live = self.inner.live.lock().await;
         let mut order: Vec<&Live> = live.values().collect();

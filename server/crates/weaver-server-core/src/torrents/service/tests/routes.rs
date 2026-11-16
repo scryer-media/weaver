@@ -842,7 +842,7 @@ async fn a_new_listen_port_reopens_the_torrents_route_on_it() {
 // tick's next turn.
 #[tokio::test(start_paused = true)]
 async fn a_new_listen_port_reaches_the_route_without_waiting_for_the_tick() {
-    let clock = Arc::new(RuntimeClock(tokio::time::Instant::now()));
+    let clock = Arc::new(RuntimeClock::at_unix_ms(EPOCH_MS));
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
     unbound_leg(&rig.routes);
     let mut ticks = rig.service.ticks();
@@ -881,7 +881,7 @@ async fn a_new_listen_port_reaches_the_route_without_waiting_for_the_tick() {
 // the leg the network gives its route now, and the revoked one stops.
 #[tokio::test(start_paused = true)]
 async fn a_torrent_whose_leg_is_revoked_moves_to_a_session_on_the_new_leg() {
-    let clock = Arc::new(RuntimeClock(tokio::time::Instant::now()));
+    let clock = Arc::new(RuntimeClock::at_unix_ms(EPOCH_MS));
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
     let (db, network) = on_network(&rig.routes);
     let mut ticks = rig.service.ticks();

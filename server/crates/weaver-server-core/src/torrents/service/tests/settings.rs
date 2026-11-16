@@ -7,7 +7,7 @@ use super::*;
 // refuses new ones; turning them on starts the tick, which takes them up.
 #[tokio::test(start_paused = true)]
 async fn torrents_turn_off_and_on_while_running() {
-    let clock = Arc::new(RuntimeClock(tokio::time::Instant::now()));
+    let clock = Arc::new(RuntimeClock::at_unix_ms(EPOCH_MS));
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
     rig.service.open().await.unwrap();
     let job_id = rig
@@ -449,7 +449,7 @@ async fn finishing_downloads_stops_many_seeds_in_one_pass_as_one_by_one_did() {
 
     // One by one, as each stop wrote its own row.
     let (old, old_ids) = seeded().await;
-    let now = old.service.inner.clock.now_ms();
+    let now = old.service.inner.clock.unix_ms();
     let landings: Vec<_> = {
         let mut live = old.service.inner.live.lock().await;
         old_ids
@@ -464,7 +464,7 @@ async fn finishing_downloads_stops_many_seeds_in_one_pass_as_one_by_one_did() {
     // One pass.
     let (new, new_ids) = seeded().await;
     new.service
-        .apply_goals(new.service.inner.clock.now_ms())
+        .apply_goals(new.service.inner.clock.unix_ms())
         .await;
 
     // Each rig keeps its files in a folder of its own.
@@ -518,7 +518,7 @@ async fn seeds_meeting_their_goals_stop_in_one_pass_as_one_by_one_did() {
 
     // One by one, as each stop wrote its own row.
     let (old, old_ids) = seeded().await;
-    let now = old.service.inner.clock.now_ms();
+    let now = old.service.inner.clock.unix_ms();
     let landings: Vec<_> = {
         let mut live = old.service.inner.live.lock().await;
         old_ids
@@ -533,7 +533,7 @@ async fn seeds_meeting_their_goals_stop_in_one_pass_as_one_by_one_did() {
     // One pass.
     let (new, new_ids) = seeded().await;
     new.service
-        .apply_goals(new.service.inner.clock.now_ms())
+        .apply_goals(new.service.inner.clock.unix_ms())
         .await;
 
     // Each rig keeps its files in a folder of its own.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sha1::{Digest, Sha1};
 use weaver_torrent::core::lengths::Lengths;
@@ -17,6 +17,7 @@ use super::settings::WIND_DOWN_KEY;
 use super::views::job_status;
 use super::*;
 use crate::categories::CategoryConfig;
+use crate::clock::{ManualClock, RuntimeClock};
 use crate::jobs::handle::HoldOrigin;
 use crate::jobs::model::{FieldUpdate, JobUpdate};
 use crate::jobs::{Hold, HoldOwner, HoldScope};
@@ -65,24 +66,6 @@ mod unpacking;
 mod views;
 
 const EPOCH_MS: i64 = 1_700_000_000_000;
-
-// A clock the test sets.
-struct SetClock(AtomicI64);
-
-impl Clock for SetClock {
-    fn now_ms(&self) -> i64 {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-// The runtime's clock, which a paused runtime moves only as timers fire.
-struct RuntimeClock(tokio::time::Instant);
-
-impl Clock for RuntimeClock {
-    fn now_ms(&self) -> i64 {
-        EPOCH_MS + self.0.elapsed().as_millis() as i64
-    }
-}
 
 fn job_env() -> JobEnv {
     JobEnv::unbounded()
@@ -237,8 +220,8 @@ async fn reopen(service: &TorrentService) {
     service.tick().await;
 }
 
-fn set_clock() -> Arc<SetClock> {
-    Arc::new(SetClock(AtomicI64::new(EPOCH_MS)))
+fn set_clock() -> Arc<ManualClock> {
+    Arc::new(ManualClock::at_unix_ms(EPOCH_MS))
 }
 
 fn request(source: AddSource) -> AddRequest {
@@ -767,7 +750,7 @@ fn uploaded(seeder: &Session) -> u64 {
 // the test sets.
 struct Seeded {
     rig: Rig,
-    clock: Arc<SetClock>,
+    clock: Arc<ManualClock>,
     job_id: JobId,
     seeder: Arc<Session>,
     // What its tracker has answered.
@@ -818,7 +801,7 @@ async fn seeded() -> Seeded {
 
 impl Seeded {
     fn advance(&self, ms: i64) {
-        self.clock.0.fetch_add(ms, Ordering::SeqCst);
+        self.clock.shift_unix_ms(ms);
     }
 
     async fn view(&self) -> TorrentView {

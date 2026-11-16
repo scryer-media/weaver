@@ -38,7 +38,7 @@ impl TorrentService {
     /// The bans are written with the peers and bans the torrent's next
     /// start begins with, so they outlive a restart.
     pub async fn ban_peers(&self, job_id: JobId, ips: &[IpAddr]) -> Result<(), ActionError> {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let landing = self
             .with_torrent(job_id, |torrent| {
                 match torrent

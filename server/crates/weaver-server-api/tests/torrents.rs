@@ -14,13 +14,14 @@ use serde_json::Value;
 use weaver_server_api::auth::{CallerIdentity, CallerScope};
 use weaver_server_api::networking::ResolvedBy as ResolvedByGql;
 use weaver_server_core::categories::CategoryConfig;
+use weaver_server_core::clock::SystemClock;
 use weaver_server_core::post_processing::model::PostProcessingSettings;
 use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::{Leaf, SeedingPolicy, TorrentConfig};
 use weaver_server_core::torrents::net::LegKind;
-use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
+use weaver_server_core::torrents::service::{JobEnv, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
     IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };

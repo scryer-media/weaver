@@ -93,7 +93,7 @@ async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
         sessions,
         crate::torrents::service::TorrentSettings::of(&*config.read().await),
         crate::torrents::service::JobEnv::unbounded(),
-        Arc::new(crate::torrents::service::SystemClock),
+        Arc::new(crate::clock::SystemClock),
     ));
     Rig {
         service,

@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::categories::CategoryConfig;
+use crate::clock::SystemClock;
 use crate::settings::TorrentConfig;
-use crate::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
+use crate::torrents::service::{JobEnv, TorrentService, TorrentSettings};
 use crate::torrents::sessions::tests::{FakeRoutes, env};
 use crate::torrents::sessions::{Routes, Sessions};
 use sha1::{Digest, Sha1};
