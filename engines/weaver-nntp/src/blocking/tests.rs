@@ -487,6 +487,26 @@ fn spawn_blocking_probe_server(
     stat_reply: &'static [u8],
     head_reply: &'static [u8],
 ) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    spawn_probe_server_asking_login(held, stat_reply, head_reply, ProbeLogin::NotAsked)
+}
+
+// When the probe server answers STAT and HEAD with 480.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeLogin {
+    // Never.
+    NotAsked,
+    // Until a login is taken.
+    UntilLoggedIn,
+    // Always, the login taken or not.
+    Always,
+}
+
+fn spawn_probe_server_asking_login(
+    held: &'static [&'static str],
+    stat_reply: &'static [u8],
+    head_reply: &'static [u8],
+    login: ProbeLogin,
+) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -498,6 +518,7 @@ fn spawn_blocking_probe_server(
             .unwrap();
         socket.write_all(b"200 ready\r\n").unwrap();
         let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut logged_in = false;
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
@@ -507,10 +528,18 @@ fn spawn_blocking_probe_server(
             let command = line.trim_end_matches(['\r', '\n']).to_string();
             recorder.lock().unwrap().push(command.clone());
             let upper = command.to_ascii_uppercase();
+            let asks_login = match login {
+                ProbeLogin::NotAsked => false,
+                ProbeLogin::UntilLoggedIn => !logged_in,
+                ProbeLogin::Always => true,
+            };
             let response: Vec<u8> = if upper.starts_with("AUTHINFO USER") {
                 b"381 password\r\n".to_vec()
             } else if upper.starts_with("AUTHINFO PASS") {
+                logged_in = true;
                 b"281 authenticated\r\n".to_vec()
+            } else if asks_login && (upper.starts_with("STAT ") || upper.starts_with("HEAD ")) {
+                b"480 authentication required\r\n".to_vec()
             } else if let Some(id) = upper.strip_prefix("STAT ") {
                 if held.contains(&id.trim()) {
                     format!("223 0 {} article exists\r\n", id.trim()).into_bytes()
@@ -749,6 +778,105 @@ fn a_server_without_head_settles_on_the_stat_verdict() {
         &config.host,
         config.port
     ));
+    crate::server_caps::forget(&config.host, config.port);
+}
+
+// 451 to STAT and HEAD is the article missing, as 430 is: the batch settles
+// with a verdict for every id instead of reporting itself unanswerable.
+#[test]
+fn a_451_to_the_probe_is_a_missing_article() {
+    const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
+    let (port, _seen, handle) = spawn_blocking_probe_server(
+        HELD,
+        b"451 article not found\r\n",
+        b"451 article not found\r\n",
+    );
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut lane = probe_server_lane(&config, &[]);
+    let result = lane.probe_exists(&[
+        "<held@silver.horizon>".to_string(),
+        "<gone@silver.horizon>".to_string(),
+    ]);
+    assert!(!result.inconclusive, "a 451 is an answer");
+    assert_eq!(result.exists, vec![true, false]);
+    assert!(lane.is_healthy());
+    lane.park();
+    handle.join().unwrap();
+    crate::server_caps::forget(&config.host, config.port);
+}
+
+// A 480 to STAT asks for a login, as at a BODY: every reply of the batch is
+// read, the connection logs in once on the same socket, and only the ids the
+// 480s answered are asked again.
+#[test]
+fn a_480_to_the_probe_logs_in_and_asks_again() {
+    const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
+    let (port, seen, handle) = spawn_probe_server_asking_login(
+        HELD,
+        b"430 no such article\r\n",
+        b"430 no such article\r\n",
+        ProbeLogin::UntilLoggedIn,
+    );
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut lane = probe_server_lane(&config, &[]);
+    let result = lane.probe_exists(&[
+        "<held@silver.horizon>".to_string(),
+        "<gone@silver.horizon>".to_string(),
+    ]);
+    assert!(!result.inconclusive, "the login settled the batch");
+    assert_eq!(result.exists, vec![true, false]);
+    assert!(lane.is_healthy());
+    lane.park();
+    handle.join().unwrap();
+
+    let seen = seen.lock().unwrap().clone();
+    let stats = positions(&seen, "STAT");
+    let users = positions(&seen, "AUTHINFO USER");
+    let passes = positions(&seen, "AUTHINFO PASS");
+    assert_eq!(users.len(), 1, "one login; saw {seen:?}");
+    assert_eq!(seen[users[0]], "AUTHINFO USER ", "the empty login");
+    assert_eq!(stats.len(), 4, "each id asked twice; saw {seen:?}");
+    assert!(
+        stats[1] < users[0] && passes[0] < stats[2],
+        "the login goes out after the batch and before it is asked again; saw {seen:?}"
+    );
+    crate::server_caps::forget(&config.host, config.port);
+}
+
+// A 480 to the probe asked again after the login it asked for is the server
+// refusing the account: the batch is inconclusive and nothing is booked
+// missing.
+#[test]
+fn a_480_to_the_probe_after_its_login_is_a_refusal() {
+    let (port, seen, handle) = spawn_probe_server_asking_login(
+        &[],
+        b"430 no such article\r\n",
+        b"430 no such article\r\n",
+        ProbeLogin::Always,
+    );
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut conn = BlockingNntpConnection::connect(&config).unwrap();
+    let error = conn
+        .probe_exists(&["<gone@silver.horizon>".to_string()])
+        .unwrap_err();
+    assert!(
+        matches!(error, NntpError::AuthenticationRequired),
+        "{error:?}"
+    );
+    drop(conn);
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        positions(&seen, "AUTHINFO PASS").len(),
+        1,
+        "one login, none after; saw {seen:?}"
+    );
     crate::server_caps::forget(&config.host, config.port);
 }
 

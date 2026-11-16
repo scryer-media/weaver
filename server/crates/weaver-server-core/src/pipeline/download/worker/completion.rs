@@ -18,6 +18,35 @@ impl Pipeline {
             .or_default() += 1;
     }
 
+    // The exclusions an article carries to the next server once its tries
+    // on `source` are spent on answers to BODY the client has no class for,
+    // or `None` when it stays where it is: the failure is of another kind,
+    // no server is named, the server is already excluded, or no other server
+    // may serve the article (then the spent tries end it).
+    //
+    // The server joins the exclusions as one without the article does, so a
+    // fill server spent this way counts toward opening the backfill tier: it
+    // could not produce the article in its tries, which is what backfill is
+    // for. Constant work per article: one pass over the configured servers.
+    fn next_server_after_spent_tries(
+        &mut self,
+        job_id: JobId,
+        kind: DownloadFailureKind,
+        source: Option<usize>,
+        excludes: weaver_nntp::ServerSet,
+    ) -> Option<weaver_nntp::ServerSet> {
+        if kind != DownloadFailureKind::ContentOrProtocol {
+            return None;
+        }
+        let source = source?;
+        if source >= self.nntp.pool().server_count() || excludes.contains(source) {
+            return None;
+        }
+        let mut next = excludes;
+        next.insert(source);
+        (!self.no_server_can_serve(job_id, next)).then_some(next)
+    }
+
     fn note_infrastructure_retry_scheduled(
         &mut self,
         job_id: JobId,
@@ -1605,11 +1634,39 @@ impl Pipeline {
                     let preserves_retry_budget =
                         failure.preserves_article_retry_budget() && !article_local_transport;
                     let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
-                    let next_retry = if preserves_retry_budget || source_not_found {
+                    let mut next_retry = if preserves_retry_budget || source_not_found {
                         result.retry_count
                     } else {
                         result.retry_count + 1
                     };
+                    // A server that answered BODY with something unreadable
+                    // for every try could not produce the article: with its
+                    // tries spent it joins the article's exclusions, as a
+                    // server without the article does, and the next server is
+                    // asked with a fresh count. Only with none left is the
+                    // article booked below.
+                    let mut retry_exclude_servers = retry_exclude_servers;
+                    let next_server_excludes = (next_retry > MAX_SEGMENT_RETRIES)
+                        .then(|| {
+                            self.next_server_after_spent_tries(
+                                job_id,
+                                failure.kind,
+                                source_server_idx,
+                                retry_exclude_servers,
+                            )
+                        })
+                        .flatten();
+                    let moved_to_next_server = next_server_excludes.is_some();
+                    if let Some(excludes) = next_server_excludes {
+                        debug!(
+                            segment = %seg_id,
+                            error = %failure.message,
+                            server = ?source_server_idx,
+                            "article's tries spent on one server; asking the next server"
+                        );
+                        retry_exclude_servers = excludes;
+                        next_retry = 0;
+                    }
 
                     if next_retry > MAX_SEGMENT_RETRIES {
                         warn!(
@@ -1680,7 +1737,7 @@ impl Pipeline {
                                 SEGMENT_TRANSPORT_HOLD_DELAY
                             } else if infrastructure_retry {
                                 std::time::Duration::from_secs(1)
-                            } else if source_not_found {
+                            } else if source_not_found || moved_to_next_server {
                                 std::time::Duration::ZERO
                             } else {
                                 std::time::Duration::from_secs(1 << (next_retry - 1))
