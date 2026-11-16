@@ -595,12 +595,13 @@ fn a_70_30_split_gives_back_to_its_proportions() {
 }
 
 // Torrents alone fill the tunnel; usenet presses, and torrents are asked
-// once for exactly their bytes past their share. What they close lingers and
-// counts toward the ask, so usenet asking again asks nothing more, and once
-// the closed streams are back usenet has its share.
-#[tokio::test(start_paused = true)]
+// once for exactly their bytes past their share. What they close stays in
+// the tunnel until it frees the sockets, and counts toward the ask, so
+// usenet asking again asks nothing more, and once the tunnel frees the
+// closed streams usenet has its share.
+#[tokio::test]
 async fn a_class_over_its_share_gives_back_once_another_presses() {
-    use weaver_tunnel::pipe::{SocketClass, TUNNEL_LINGER};
+    use weaver_tunnel::pipe::SocketClass;
     let peer = stream_bytes(None);
     let sockets = rule_sockets(None, 100);
     let mut peers = fill_peers(&sockets, SocketClass::Torrent);
@@ -619,24 +620,18 @@ async fn a_class_over_its_share_gives_back_once_another_presses() {
     assert_eq!(sockets.woken(), [false, true]);
     assert_eq!(sockets.over_share(SocketClass::Torrent), 49 * peer);
 
-    // Torrents close their 49 lowest peers: streams, so they linger.
-    for peer in peers.drain(..49) {
-        drop(peer.lingering());
-    }
+    // Torrents close their 49 lowest peers: streams, so the tunnel holds
+    // their sockets while they close.
+    let closing: Vec<_> = peers.drain(..49).map(close_stream).collect();
     assert_eq!(sockets.over_share(SocketClass::Torrent), 0);
     assert!(
         sockets.take(SocketClass::Nntp, 2 * peer).is_err(),
-        "the closed peers still linger"
+        "the closed peers are still in the tunnel"
     );
-    assert_eq!(owed(&sockets), [0, 0], "owed while lingering");
-    assert_eq!(sockets.woken(), [false, false], "woken while lingering");
+    assert_eq!(owed(&sockets), [0, 0], "owed while closing");
+    assert_eq!(sockets.woken(), [false, false], "woken while closing");
 
-    let woken = freed.notify();
-    let woken = woken.notified();
-    tokio::pin!(woken);
-    woken.as_mut().enable();
-    tokio::time::advance(TUNNEL_LINGER).await;
-    woken.await;
+    freed_back(freed.notify(), closing).await;
     let usenet = fill_peers(&sockets, SocketClass::Nntp);
     assert_eq!(usenet.len(), 50, "usenet has its share");
     assert_eq!(owed(&sockets), [0, 0], "owed at its share");
@@ -789,9 +784,9 @@ fn a_look_alone_never_raises_an_ask() {
 // the room: while its signal is held the ask on usenet stands, usenet closes
 // what is asked, and once those bytes come back torrents grow to their share
 // and usenet keeps its own.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_waiting_torrent_dial_holds_the_ask_until_both_sides_hold_their_share() {
-    use weaver_tunnel::pipe::{SocketClass, TUNNEL_LINGER};
+    use weaver_tunnel::pipe::SocketClass;
     let peer = stream_bytes(None);
     let sockets = rule_sockets(None, 190);
     let (mut peers, mut connections) = usenet_past_half(&sockets);
@@ -819,20 +814,13 @@ async fn a_waiting_torrent_dial_holds_the_ask_until_both_sides_hold_their_share(
     );
 
     // Usenet closes what is asked, and the ask stands until it has.
-    let closing = usize::try_from(asked.div_ceil(peer)).unwrap();
-    for connection in connections.drain(..closing - 1) {
-        drop(connection.lingering());
-    }
+    let closes = usize::try_from(asked.div_ceil(peer)).unwrap();
+    let mut closing: Vec<_> = connections.drain(..closes - 1).map(close_stream).collect();
     assert!(sockets.owes(SocketClass::Nntp), "one more is owed");
-    drop(connections.pop().unwrap().lingering());
+    closing.push(close_stream(connections.pop().unwrap()));
     assert!(!sockets.owes(SocketClass::Nntp));
 
-    let woken = waiting.freed.notify();
-    let woken = woken.notified();
-    tokio::pin!(woken);
-    woken.as_mut().enable();
-    tokio::time::advance(TUNNEL_LINGER).await;
-    woken.await;
+    freed_back(waiting.freed.notify(), closing).await;
     while sockets.has_room(SocketClass::Torrent, peer) {
         peers.push(take_peer(&sockets, SocketClass::Torrent).expect("the room it had"));
     }
@@ -851,20 +839,30 @@ async fn a_waiting_torrent_dial_holds_the_ask_until_both_sides_hold_their_share(
     assert_eq!(sockets.woken(), [false, false]);
 }
 
+// A TCP stream dropped: its socket stays in the tunnel while it closes. The
+// permit returned is the tunnel's, given back when it frees the socket.
+fn close_stream(permit: weaver_tunnel::pipe::SocketPermit) -> weaver_tunnel::pipe::SocketPermit {
+    let (freed, stream) = permit.for_stream();
+    drop(stream);
+    freed
+}
+
 // Closes what the give-back hook of `class` would close: one socket at a
 // time from the newest, each only while the ask on `class` still stands, as
-// a give-back reads `owes` before it closes. Returns how many it closed.
+// a give-back reads `owes` before it closes. Each stays in the tunnel, its
+// permit in `closing`. Returns how many it closed.
 fn give_back(
     sockets: &weaver_tunnel::pipe::SessionSockets,
     class: weaver_tunnel::pipe::SocketClass,
     held: &mut Vec<weaver_tunnel::pipe::SocketPermit>,
+    closing: &mut Vec<weaver_tunnel::pipe::SocketPermit>,
 ) -> usize {
     let mut closed = 0;
     while sockets.owes(class) {
         let Some(permit) = held.pop() else {
             break;
         };
-        drop(permit.lingering());
+        closing.push(close_stream(permit));
         closed += 1;
     }
     closed
@@ -881,13 +879,16 @@ fn refused(
     }
 }
 
-// Bytes of `class` coming back after they linger: waits on the slot that
-// rings as they do, with the paused clock moved past the linger.
-async fn lingered_back(freed: std::sync::Arc<tokio::sync::Notify>) {
+// The tunnel frees the `closing` streams' sockets: waits on the slot that
+// rings as their bytes come back.
+async fn freed_back(
+    freed: std::sync::Arc<tokio::sync::Notify>,
+    closing: Vec<weaver_tunnel::pipe::SocketPermit>,
+) {
     let back = freed.notified();
     tokio::pin!(back);
     back.as_mut().enable();
-    tokio::time::advance(weaver_tunnel::pipe::TUNNEL_LINGER).await;
+    drop(closing);
     back.await;
 }
 
@@ -912,7 +913,7 @@ fn take_until_refused(
 // refusal's demand through its paced requeue, so the ask on torrents stands
 // that long, torrents give back what they hold past their half, and usenet
 // grows into it. Both end at their share, and nothing more is asked.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_parked_usenet_lane_holds_its_press_until_both_sides_hold_their_share() {
     use weaver_tunnel::pipe::SocketClass;
     let peer = stream_bytes(None);
@@ -943,11 +944,12 @@ async fn a_parked_usenet_lane_holds_its_press_until_both_sides_hold_their_share(
     // the ask standing until torrents have given it.
     assert!(sockets.pressing(SocketClass::Nntp));
     assert!(sockets.owes(SocketClass::Torrent), "the ask lapsed");
+    let mut closing = Vec::new();
     assert_eq!(
-        give_back(&sockets, SocketClass::Torrent, &mut peers),
+        give_back(&sockets, SocketClass::Torrent, &mut peers, &mut closing),
         142 - 95
     );
-    lingered_back(parked.freed.notify()).await;
+    freed_back(parked.freed.notify(), closing).await;
 
     // The lane is fed: it dials again and takes what it was owed.
     while let Some(connection) = take_peer(&sockets, SocketClass::Nntp) {
@@ -967,7 +969,7 @@ async fn a_parked_usenet_lane_holds_its_press_until_both_sides_hold_their_share(
 // wanting no more TCP dials, so their demand is dropped: torrents press no
 // more, nothing stands on usenet, and usenet grows to every byte torrents do
 // not keep, as a side alone may.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn usenet_grows_back_once_torrents_stop_wanting_tcp() {
     use weaver_tunnel::pipe::SocketClass;
     let peer = stream_bytes(None);
@@ -993,11 +995,12 @@ async fn usenet_grows_back_once_torrents_stop_wanting_tcp() {
     assert_eq!(sockets.given(SocketClass::Nntp), 133 * peer);
     assert_eq!(owed(&sockets), [(alone as u64 - 133) * peer, 0]);
     assert_eq!(sockets.woken(), [true, false]);
+    let mut closing = Vec::new();
     assert_eq!(
-        give_back(&sockets, SocketClass::Nntp, &mut connections),
+        give_back(&sockets, SocketClass::Nntp, &mut connections, &mut closing),
         alone - 133
     );
-    lingered_back(crowded.freed.notify()).await;
+    freed_back(crowded.freed.notify(), closing).await;
     while sockets.has_room(SocketClass::Torrent, peer) {
         peers.push(take_peer(&sockets, SocketClass::Torrent).expect("the room it had"));
     }
@@ -1021,7 +1024,11 @@ async fn usenet_grows_back_once_torrents_stop_wanting_tcp() {
     );
     assert_eq!(owed(&sockets), [0, 0], "nothing owed by usenet");
     assert_eq!(sockets.woken(), [false, false], "usenet woken");
-    assert_eq!(give_back(&sockets, SocketClass::Nntp, &mut connections), 0);
+    let mut closing = Vec::new();
+    assert_eq!(
+        give_back(&sockets, SocketClass::Nntp, &mut connections, &mut closing),
+        0
+    );
 }
 
 // A side woken to give back that finds nothing to give is marked dry, and is
@@ -1056,12 +1063,12 @@ fn a_dry_side_is_woken_once_until_its_holdings_change() {
 
     // Torrents' holdings change: the next press wakes them for the whole
     // level again.
-    drop(peers.pop().unwrap().lingering());
+    let mut closing = vec![close_stream(peers.pop().unwrap())];
     let again = refused(&sockets, SocketClass::Nntp);
     assert_eq!(sockets.woken(), [false, true], "woken after a change");
     assert_eq!(owed(&sockets), [0, (alone - 57 - 1) * peer]);
     assert_eq!(
-        give_back(&sockets, SocketClass::Torrent, &mut peers) as u64,
+        give_back(&sockets, SocketClass::Torrent, &mut peers, &mut closing) as u64,
         alone - 57 - 1
     );
     drop(again);
@@ -1071,7 +1078,7 @@ fn a_dry_side_is_woken_once_until_its_holdings_change() {
 // converge on their proportions, and from then on nothing more closes: each
 // side keeps its demands and keeps being refused, and no ask is raised or
 // stands on either.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_70_30_split_converges_and_then_closes_nothing() {
     use weaver_tunnel::pipe::SocketClass;
     let peer = stream_bytes(None);
@@ -1091,11 +1098,12 @@ async fn a_70_30_split_converges_and_then_closes_nothing() {
     let torrents = peers.len();
     assert_eq!(owed(&sockets), [0, (torrents as u64 - 57) * peer]);
     assert_eq!(sockets.woken(), [false, true]);
+    let mut closing = Vec::new();
     assert_eq!(
-        give_back(&sockets, SocketClass::Torrent, &mut peers),
+        give_back(&sockets, SocketClass::Torrent, &mut peers, &mut closing),
         torrents - 57
     );
-    lingered_back(parked.freed.notify()).await;
+    freed_back(parked.freed.notify(), closing).await;
     while let Some(connection) = take_peer(&sockets, SocketClass::Nntp) {
         connections.push(connection);
     }
@@ -1120,8 +1128,9 @@ async fn a_70_30_split_converges_and_then_closes_nothing() {
         assert!(!sockets.has_room(SocketClass::Torrent, peer));
         assert_eq!(owed(&sockets), [0, 0], "owed after convergence");
         assert_eq!(sockets.woken(), [false, false], "woken after convergence");
-        closes += give_back(&sockets, SocketClass::Nntp, &mut connections);
-        closes += give_back(&sockets, SocketClass::Torrent, &mut peers);
+        let mut closing = Vec::new();
+        closes += give_back(&sockets, SocketClass::Nntp, &mut connections, &mut closing);
+        closes += give_back(&sockets, SocketClass::Torrent, &mut peers, &mut closing);
     }
     assert_eq!(closes, 0, "closes after convergence");
     drop((refusals, usenet_demand));
@@ -1212,12 +1221,12 @@ fn torrent_sessions_sockets_are_off_the_split() {
 }
 
 // What the tunnel holds never passes its bytes over a long run of random
-// opens, closes, lingers and presses, and of budget changes, lowered and
-// raised, MTU among them, on the bandwidth split's rule: while it holds past
-// a lowered limit, no new hand-out is granted.
-#[tokio::test(start_paused = true)]
-async fn what_is_held_never_passes_the_limit() {
-    use std::time::Duration;
+// opens, closes, streams the tunnel frees after they close, and presses, and
+// of budget changes, lowered and raised, MTU among them, on the bandwidth
+// split's rule: while it holds past a lowered limit, no new hand-out is
+// granted, and the bytes closing are always among those held.
+#[test]
+fn what_is_held_never_passes_the_limit() {
     use weaver_tunnel::pipe::{
         SocketBudget, SocketClass, SocketPermit, datagram_bytes, listener_bytes,
     };
@@ -1244,7 +1253,10 @@ async fn what_is_held_never_passes_the_limit() {
         SocketClass::TorrentSession,
     ];
     let sizes = [peer, datagram_bytes(1420), listener_bytes(), 3 * peer / 2];
-    let mut open: Vec<SocketPermit> = Vec::new();
+    // Each open socket, and whether it is a stream whose socket outlives
+    // it; the closed streams' permits the tunnel holds.
+    let mut open: Vec<(SocketPermit, bool)> = Vec::new();
+    let mut closing: Vec<SocketPermit> = Vec::new();
     let mut pressing = Vec::new();
     let mut lowered = 0;
     for _ in 0..20_000 {
@@ -1260,11 +1272,7 @@ async fn what_is_held_never_passes_the_limit() {
                             sockets.reserved() <= sockets.limit(),
                             "handed out past the limit"
                         );
-                        open.push(if next() % 2 == 0 {
-                            permit.lingering()
-                        } else {
-                            permit
-                        });
+                        open.push((permit, next() % 2 == 0));
                     }
                     Ok(None) => unreachable!("a budgeted tunnel hands out permits"),
                     Err(refused) if next() % 4 == 0 => pressing.push(refused),
@@ -1273,7 +1281,10 @@ async fn what_is_held_never_passes_the_limit() {
             }
             9..=11 if !open.is_empty() => {
                 let at = (next() % open.len() as u64) as usize;
-                drop(open.swap_remove(at));
+                match open.swap_remove(at) {
+                    (permit, true) => closing.push(close_stream(permit)),
+                    (permit, false) => drop(permit),
+                }
             }
             12 => pressing.clear(),
             13 => {
@@ -1285,9 +1296,16 @@ async fn what_is_held_never_passes_the_limit() {
                     lowered += 1;
                 }
             }
-            _ => tokio::time::advance(Duration::from_millis(next() % 3_000)).await,
+            // The tunnel frees a closed stream's socket.
+            14 | 15 if !closing.is_empty() => {
+                let at = (next() % closing.len() as u64) as usize;
+                drop(closing.swap_remove(at));
+            }
+            _ => {}
         }
-        tokio::task::yield_now().await;
+        for class in classes {
+            assert!(sockets.closing(class) <= sockets.held(class), "{class:?}");
+        }
         let limit = sockets.budget().expect("a budget");
         assert_eq!(
             sockets.reserved(),
