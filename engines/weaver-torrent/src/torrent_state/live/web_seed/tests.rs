@@ -165,6 +165,7 @@ fn serve(mut conn: TcpStream, respond: &Respond, seen: &Mutex<Vec<Head>>) {
 #[derive(Default)]
 struct Fake {
     bitfield: Mutex<Option<Vec<u8>>>,
+    handshaken: AtomicBool,
     unchoked: AtomicBool,
     pieces: Mutex<Vec<(u32, u32, Vec<u8>)>>,
     arrived: Notify,
@@ -209,6 +210,7 @@ impl PeerConnectionHandler for &Fake {
         Ok(0)
     }
     fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+        self.handshaken.store(true, Ordering::SeqCst);
         Ok(())
     }
     fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
@@ -1418,6 +1420,23 @@ fn a_bad_piece_loses_the_seed_its_file_or_itself() {
         .piece_failed(PeerHandle::WebSeed(0), piece, &single)
         .unwrap();
     assert!(!have.any());
+}
+
+// A seed banned once its connection was opening, before the connection
+// runs, tells the torrent nothing: no handshake, no bitfield, no unchoke.
+#[tokio::test]
+async fn a_connection_to_a_seed_banned_before_it_runs_tells_the_torrent_nothing() {
+    let layout = layout(&[("f", 70000, false)]);
+    let (seeds, link) = one_seed("http://192.0.2.1/f".into(), WebSeedKind::Url);
+    assert!(seeds.ban(link.handle()));
+    let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
+    let fake = Fake::default();
+    let (_tx, rx) = unbounded_channel();
+    conn.run(&fake, rx).await.unwrap();
+    assert!(!fake.handshaken.load(Ordering::SeqCst));
+    assert!(fake.bitfield.lock().is_none());
+    assert!(!fake.unchoked.load(Ordering::SeqCst));
+    assert!(fake.pieces.lock().is_empty());
 }
 
 // The web seed tick finds a seed due, then opens its connection. A seed

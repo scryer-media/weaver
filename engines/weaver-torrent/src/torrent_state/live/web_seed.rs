@@ -764,6 +764,10 @@ impl<'a> WebSeedConnection<'a> {
         mut rx: PeerRx,
     ) -> crate::Result<()> {
         let anyhow = crate::Error::Anyhow;
+        // A seed banned once its connection was opening is told nothing.
+        if self.link.cancel.is_cancelled() {
+            return Ok(());
+        }
         handler.on_connected(Duration::ZERO);
         handler
             .on_handshake(
