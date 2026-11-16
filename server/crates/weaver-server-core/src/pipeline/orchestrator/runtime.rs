@@ -15,7 +15,7 @@ const UU_SPOOL_MAX_SEGMENTS: usize = 16_384;
 const UU_SPOOL_SEGMENT_MULTIPLIER: usize = 64;
 const UU_SPOOL_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
-fn compute_uu_spool_max_bytes(write_backlog_budget_bytes: usize) -> usize {
+pub(super) fn compute_uu_spool_max_bytes(write_backlog_budget_bytes: usize) -> usize {
     write_backlog_budget_bytes
         .saturating_mul(UU_SPOOL_WRITE_BACKLOG_MULTIPLIER)
         .clamp(UU_SPOOL_MIN_BYTES, UU_SPOOL_MAX_BYTES)
@@ -489,6 +489,8 @@ impl Pipeline {
             applied_speed_test_pause: false,
             applied_random_read_iops: None,
             applied_sequential_write_mbps: None,
+            applied_storage_classification: None,
+            backlog_base_bytes,
             scheduled_pause: false,
             rate_limit_reservations: HashMap::new(),
             configured_rate_limit: 0,

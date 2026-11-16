@@ -1097,6 +1097,47 @@ fn hdd_profile_allocates_more_write_backlog_than_ssd() {
     assert!(hdd_budget > ssd_budget);
 }
 
+// A storage class learned after start-up reaches the tuner's machine and
+// sizes the backlog limits again, on the pipeline's own turn, once.
+#[tokio::test]
+async fn a_storage_class_learned_after_start_up_sizes_the_backlog_again() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let backlog_base_bytes = 48 * 1024 * 1024;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes, 4).await;
+    let ssd_write = pipeline.write_backlog_budget_bytes;
+    let ssd_spool = pipeline.uu_spool_max_bytes;
+    let mut hdd = pipeline.tuner.system_profile().clone();
+    hdd.disk.storage_class = StorageClass::Hdd;
+    hdd.disk.filesystem = FilesystemType::Ext4;
+    let hdd_write = compute_write_backlog_budget_bytes(&hdd, backlog_base_bytes);
+    assert!(hdd_write > ssd_write);
+
+    pipeline.shared_state.queue.write_intent(|inner| {
+        inner.globals.storage_classification = Some((StorageClass::Hdd, FilesystemType::Ext4));
+        crate::pipeline::queue::Change::changed(())
+    });
+    pipeline.run_queue_intents().await;
+
+    let disk = &pipeline.tuner.system_profile().disk;
+    assert_eq!(disk.storage_class, StorageClass::Hdd);
+    assert_eq!(disk.filesystem, FilesystemType::Ext4);
+    assert_eq!(pipeline.write_backlog_budget_bytes, hdd_write);
+    assert_eq!(
+        pipeline.decode_backlog_budget_bytes,
+        compute_decode_backlog_budget_bytes(&hdd, backlog_base_bytes, hdd_write)
+    );
+    assert!(
+        pipeline.uu_spool_max_bytes > ssd_spool,
+        "the spool follows the write limit"
+    );
+
+    // Applied once: a later turn leaves limits set since alone.
+    pipeline.write_backlog_budget_bytes = 1;
+    pipeline.run_queue_intents().await;
+    assert_eq!(pipeline.write_backlog_budget_bytes, 1);
+}
+
 #[test]
 fn decode_backlog_budget_is_separate_bounded_raw_article_cache() {
     let profile = SystemProfile {

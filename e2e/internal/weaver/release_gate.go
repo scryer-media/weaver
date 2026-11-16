@@ -876,6 +876,7 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase, qu
 			_ = logFile.Close()
 		}
 	}
+	flowEnded := time.Now()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		err = fmt.Errorf("flow exceeded %s", timeout)
 	}
@@ -908,6 +909,7 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase, qu
 	if stagesErr != nil {
 		log.Printf("warning: read stage timings for %s: %v", weaverReleaseFlowKey(phase), stagesErr)
 	}
+	stages = closeWeaverReleaseStages(stages, flowEnded, err)
 	playwright, lifecycle := splitWeaverReleaseFlowTime(duration, stages)
 	status.FinishedAt = time.Now().UTC()
 	status.DurationMS = duration.Milliseconds()
@@ -2581,7 +2583,8 @@ func runWeaverReleasePlaywright(ctx context.Context, script string) (err error) 
 	if stage == "" {
 		stage = script
 	}
-	defer endWeaverReleaseStage("playwright "+stage, weaverReleaseStagePlaywright, time.Now(), &err)
+	defer endWeaverReleaseStage("playwright "+stage, weaverReleaseStagePlaywright,
+		beginWeaverReleaseStage("playwright "+stage, weaverReleaseStagePlaywright), &err)
 	err = runWeaverReleasePlaywrightOnce(ctx, script)
 	if err == nil || !isWeaverBrowserCrash(err) {
 		return err

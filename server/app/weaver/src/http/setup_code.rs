@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use weaver_server_core::auth::service::verify_browser_csrf_token;
 use weaver_server_core::auth::{generate_setup_code, hash_api_key, normalize_setup_code};
-use weaver_server_core::security::canonical_ip;
+use weaver_server_core::security::{canonical_ip, ip_is_loopback};
 
 // Failures one client may make inside the window.
 const MAX_FAILURES: usize = 5;
@@ -17,7 +17,8 @@ const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 // refused while the table is full, before its code is looked at, so guessing
 // is capped at this many clients times `MAX_FAILURES` a window however many
 // addresses a guesser rotates through. The cost: 1,024 clients failing inside
-// one window keep setup closed to any new client until their failures expire.
+// one window keep setup closed to any new client until their failures expire,
+// except loopback, which has its own slot outside the table.
 const MAX_TRACKED_CLIENTS: usize = 1024;
 // An IPv6 client is its /64: one host commonly holds a whole /64, so each of
 // its addresses is not a separate client.
@@ -48,6 +49,11 @@ struct State {
     // Recent failures per client, so one client cannot hold setup closed for
     // everyone else.
     failures: HashMap<IpAddr, VecDeque<Instant>>,
+    // Loopback's failures, outside the table: a full table never refuses
+    // this machine, so the owner is not locked out by a flood. Its own limit
+    // still applies, since a reverse proxy on this host that is not trusted
+    // makes every browser it relays look like loopback.
+    loopback: VecDeque<Instant>,
     // While the table is full, no entry can expire before this, so a new
     // client is refused without walking the table. It is the earliest expiry
     // seen by the last walk; failures only move an entry's expiry later, so
@@ -63,6 +69,7 @@ impl State {
         Self {
             verifier,
             failures: HashMap::new(),
+            loopback: VecDeque::new(),
             full_until: None,
             #[cfg(test)]
             walks: 0,
@@ -76,7 +83,10 @@ impl State {
     // only for a new client at a full table, and only once `full_until` has
     // passed, so it runs at most once per expiry of a tracked failure, not
     // once per refused request.
-    fn admits(&mut self, client: IpAddr, now: Instant) -> bool {
+    fn admits(&mut self, client: Client, now: Instant) -> bool {
+        let Client::Remote(client) = client else {
+            return true;
+        };
         if self.failures.contains_key(&client) || self.failures.len() < MAX_TRACKED_CLIENTS {
             return true;
         }
@@ -101,9 +111,13 @@ impl State {
         self.failures.len() < MAX_TRACKED_CLIENTS
     }
     // The failures `client` made inside the window ending at `now`.
-    fn recent_failures(&mut self, client: IpAddr, now: Instant) -> usize {
-        let Some(times) = self.failures.get_mut(&client) else {
-            return 0;
+    fn recent_failures(&mut self, client: Client, now: Instant) -> usize {
+        let times = match client {
+            Client::Loopback => &mut self.loopback,
+            Client::Remote(client) => match self.failures.get_mut(&client) {
+                Some(times) => times,
+                None => return 0,
+            },
         };
         while times
             .front()
@@ -112,7 +126,7 @@ impl State {
             times.pop_front();
         }
         let count = times.len();
-        if count == 0 {
+        if let (0, Client::Remote(client)) = (count, client) {
             self.failures.remove(&client);
         }
         count
@@ -120,7 +134,11 @@ impl State {
 
     // Only a client `admits` let in reaches here, so the table never grows
     // past its bound.
-    fn record_failure(&mut self, client: IpAddr, now: Instant) {
+    fn record_failure(&mut self, client: Client, now: Instant) {
+        let Client::Remote(client) = client else {
+            self.loopback.push_back(now);
+            return;
+        };
         debug_assert!(
             self.failures.contains_key(&client) || self.failures.len() < MAX_TRACKED_CLIENTS
         );
@@ -128,9 +146,24 @@ impl State {
     }
 }
 
-// The client a request counts against: its address in the canonical form,
-// with an IPv6 address cut to its /64. IPv4, and IPv4 in the mapped form,
-// stay whole addresses.
+// Who a request counts against: loopback, in any of its forms, is one
+// client with its own slot; any other address is a client of the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Client {
+    Loopback,
+    Remote(IpAddr),
+}
+
+fn client_of(address: IpAddr) -> Client {
+    if ip_is_loopback(address) {
+        Client::Loopback
+    } else {
+        Client::Remote(client_key(address))
+    }
+}
+
+// The table key of an address: its canonical form, with an IPv6 address cut
+// to its /64. IPv4, and IPv4 in the mapped form, stay whole addresses.
 fn client_key(address: IpAddr) -> IpAddr {
     match canonical_ip(address) {
         IpAddr::V6(address) => {
@@ -191,7 +224,7 @@ impl SetupChallenge {
         client: IpAddr,
         now: Instant,
     ) -> Result<(), SetupCodeError> {
-        let client = client_key(client);
+        let client = client_of(client);
         let mut state = self.0.lock().expect("setup challenge lock poisoned");
         if state.consumed {
             return Err(SetupCodeError::Consumed);
@@ -472,6 +505,63 @@ mod tests {
         // Once the window has passed, the full entries expire and it gets in.
         assert_eq!(
             challenge.verify_at(Some(&code), newcomer, now + FAILURE_WINDOW),
+            Ok(())
+        );
+    }
+
+    const LOOPBACKS: [&str; 4] = ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"];
+
+    // A full table never refuses this machine: loopback in each of its forms
+    // gets in with the right code.
+    #[test]
+    fn a_full_table_admits_loopback() {
+        for address in LOOPBACKS {
+            let (challenge, code) = SetupChallenge::generate();
+            let now = Instant::now();
+            fill(&challenge, now);
+            let loopback: IpAddr = address.parse().unwrap();
+            assert_eq!(
+                challenge.verify_at(Some(&code), loopback, now),
+                Ok(()),
+                "{address}"
+            );
+            // A new client from elsewhere is still refused.
+            assert_eq!(
+                challenge.verify_at(Some(&code), CLIENT, now),
+                Err(SetupCodeError::RateLimited)
+            );
+        }
+    }
+
+    // Loopback keeps its own limit while the table is full, shared by all of
+    // its forms, and its failures take no place in the table.
+    #[test]
+    fn loopback_stops_at_its_own_limit_while_the_table_is_full() {
+        let (challenge, code) = SetupChallenge::generate();
+        let now = Instant::now();
+        fill(&challenge, now);
+        for (attempt, address) in LOOPBACKS.iter().cycle().take(MAX_FAILURES).enumerate() {
+            assert_eq!(
+                challenge.verify_at(Some("wrong"), address.parse().unwrap(), now),
+                Err(SetupCodeError::Invalid),
+                "attempt {attempt}"
+            );
+        }
+        for address in LOOPBACKS {
+            assert_eq!(
+                challenge.verify_at(Some(&code), address.parse().unwrap(), now),
+                Err(SetupCodeError::RateLimited),
+                "{address}"
+            );
+        }
+        assert_eq!(tracked(&challenge), MAX_TRACKED_CLIENTS);
+        // Its window passes as any client's does.
+        assert_eq!(
+            challenge.verify_at(
+                Some(&code),
+                "127.0.0.1".parse().unwrap(),
+                now + FAILURE_WINDOW
+            ),
             Ok(())
         );
     }
