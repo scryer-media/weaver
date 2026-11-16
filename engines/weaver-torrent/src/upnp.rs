@@ -25,6 +25,7 @@ use tracing::{Instrument, debug, debug_span, trace, warn};
 use url::Url;
 
 use crate::core::net::{ClientShape, DatagramSocket, HttpClients};
+use crate::port_mapper::PortMapper;
 use crate::route_interface::RouteInterface;
 
 /// What a mapping forwards (libtorrent `portmap_protocol`).
@@ -967,7 +968,7 @@ impl UpnpPortForwarder {
         cancel: CancellationToken,
         events: PortMapEvents,
     ) -> anyhow::Result<()> {
-        let reports = PortMapReports::new(PortmapTransport::Upnp, events);
+        let reports = PortMapReports::new(PortMapper::transport(self), events);
         let mut known = HashSet::<Url>::new();
         let mut opening = FuturesUnordered::new();
         let mut gateways = FuturesUnordered::new();
@@ -1030,6 +1031,24 @@ impl UpnpPortForwarder {
             r = self.run_gateways(found_rx, cancel.clone(), events) => r,
             _ = self.discovery(found_tx) => Ok(()),
         }
+    }
+}
+
+impl PortMapper for UpnpPortForwarder {
+    fn transport(&self) -> PortmapTransport {
+        PortmapTransport::Upnp
+    }
+
+    fn task_name(&self) -> &'static str {
+        "upnp_forward"
+    }
+
+    fn run(
+        self: Box<Self>,
+        cancel: CancellationToken,
+        events: PortMapEvents,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        UpnpPortForwarder::run(*self, cancel, events).boxed()
     }
 }
 
