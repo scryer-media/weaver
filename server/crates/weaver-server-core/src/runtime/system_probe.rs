@@ -23,8 +23,8 @@ use tracing::{debug, info, warn};
 //
 // Detection is best-effort: any individual probe that fails silently
 // falls back to a safe default rather than aborting startup.
-pub fn detect(output_dir: &Path) -> SystemProfile {
-    let mut profile = detect_startup_profile(output_dir);
+pub async fn detect(output_dir: &Path) -> SystemProfile {
+    let mut profile = detect_startup_profile(output_dir).await;
     let measured = startup_disk_measurement(output_dir);
     profile.disk.random_read_iops = measured.random_read_iops;
     profile
@@ -56,9 +56,19 @@ pub fn detect_cpu_and_memory() -> (CpuProfile, MemoryProfile) {
 // admits only one extraction until the measured value is applied. Write
 // throughput is zero, "not measured", until the pipeline applies the live
 // write rate of the working directory's volume.
-pub fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
+//
+// The directory's storage is asked of the disk owner without an owner, off
+// the async runtime and within its time limit: the OS's answer comes from
+// a helper process that can take minutes on a busy host, and start-up does
+// not wait on it. Storage that does not answer in time is unknown.
+pub async fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
     let (cpu, memory) = detect_cpu_and_memory();
-    let (storage_class, filesystem) = detect_disk_info(output_dir);
+    let (storage_class, filesystem) =
+        crate::operations::StorageCapacity::classifications(None, &[output_dir.to_path_buf()])
+            .await
+            .pop()
+            .flatten()
+            .unwrap_or((StorageClass::Unknown, FilesystemType::Unknown(String::new())));
     let disk = DiskProfile {
         storage_class,
         filesystem,

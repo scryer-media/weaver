@@ -133,7 +133,7 @@ pub(crate) async fn run(
     };
 
     let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(
-        weaver_server_core::runtime::detect_startup_profile(&data_dir),
+        weaver_server_core::runtime::detect_startup_profile(&data_dir).await,
     );
     let system_profile = Arc::new(std::sync::RwLock::new(profile.clone()));
 
