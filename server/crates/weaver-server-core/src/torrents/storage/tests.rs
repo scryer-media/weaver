@@ -74,7 +74,13 @@ fn noise(length: usize, seed: u8) -> Vec<u8> {
 // The store of a torrent of plain files under `dir`, with what it kept.
 fn store_in(layout: &Arc<PieceLayout>, dir: &Path, kept: Option<&Kept>) -> Arc<TorrentStore> {
     let files = Files::new(layout, dir.to_path_buf()).unwrap();
-    Arc::new(TorrentStore::new(Arc::clone(layout), files, kept, None))
+    Arc::new(TorrentStore::new(
+        Arc::clone(layout),
+        files,
+        kept,
+        None,
+        crate::torrents::writes::Writes::for_test(),
+    ))
 }
 
 struct Shim {
@@ -171,6 +177,7 @@ fn shim_aside(
             Files::new(&layout, dir.path().to_path_buf()).unwrap(),
             kept,
             None,
+            crate::torrents::writes::Writes::for_test(),
         )
         .with_side(work.join("torrent-1.side"), ignored)
         .unwrap(),
@@ -319,14 +326,14 @@ fn a_kept_store_has_no_piece_its_files_lost() {
     }
     let kept = shim.store.kept();
     let dir = shim.dir.path();
-    shim.store.forget();
+    shim.store.forget_now();
 
     // Nothing changed: every piece stays, and there is nothing to save.
     let again = store_in(&shim.layout, dir, Some(&kept));
     assert_eq!(again.drop_unbacked(), Some(0));
     assert_eq!(again.count(), 5);
     assert!(again.unsaved().is_none());
-    again.forget();
+    again.forget_now();
 
     // b.bin is torrent bytes 1000..3500, pieces 0 to 3. Cut to 2499 bytes,
     // one short of its length, it loses its last piece only; c.bin, in
@@ -345,7 +352,7 @@ fn a_kept_store_has_no_piece_its_files_lost() {
     assert_eq!(again.file_have(), [1000, 2048 - 1000 + 1024, 0]);
     // The pieces it lost are saved as lost.
     assert!(again.unsaved().is_some());
-    again.forget();
+    again.forget_now();
 
     // Cut to 1048 bytes, b.bin still holds pieces 0 and 1 whole, and loses
     // piece 2, whose share of it goes past that.
@@ -359,7 +366,7 @@ fn a_kept_store_has_no_piece_its_files_lost() {
     assert_eq!(again.drop_unbacked(), Some(3));
     let have = again.initial_have(false).unwrap();
     assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 1]);
-    again.forget();
+    again.forget_now();
 
     // A folder where a.bin was holds none of its bytes.
     std::fs::remove_file(dir.join("a.bin")).unwrap();
@@ -386,7 +393,7 @@ fn a_kept_store_loses_nothing_to_its_padding() {
         shim.complete(piece, &torrent);
     }
     let kept = shim.store.kept();
-    shim.store.forget();
+    shim.store.forget_now();
     let again = store_in(&shim.layout, shim.dir.path(), Some(&kept));
     assert_eq!(again.drop_unbacked(), Some(0));
     assert_eq!(again.count(), 2);
@@ -413,7 +420,7 @@ fn a_kept_store_keeps_its_pieces_while_none_of_its_files_is_there() {
     }
     let kept = shim.store.kept();
     let dir = shim.dir.path();
-    shim.store.forget();
+    shim.store.forget_now();
     let aside = tempfile::tempdir().unwrap();
     for name in ["a.bin", "b.bin", "c.bin"] {
         std::fs::rename(dir.join(name), aside.path().join(name)).unwrap();
@@ -423,7 +430,7 @@ fn a_kept_store_keeps_its_pieces_while_none_of_its_files_is_there() {
     assert_eq!(again.drop_unbacked(), None);
     assert_eq!(again.count(), 5);
     assert!(again.unsaved().is_none());
-    again.forget();
+    again.forget_now();
 
     let gone = dir.join("not-mounted");
     let again = store_in(&shim.layout, &gone, Some(&kept));
@@ -431,7 +438,7 @@ fn a_kept_store_keeps_its_pieces_while_none_of_its_files_is_there() {
     assert_eq!(again.count(), 5);
     assert!(again.unsaved().is_none());
     assert!(!gone.exists());
-    again.forget();
+    again.forget_now();
 
     // Back again, with a.bin, all of piece 0 and none of the others, still
     // away: only piece 0 is lost.
@@ -471,7 +478,7 @@ fn a_kept_store_looks_at_each_file_once() {
         LOOKS.with(|looks| looks.set(0));
         assert_eq!(store.drop_unbacked(), Some(0));
         assert_eq!(LOOKS.with(std::cell::Cell::get), count as u64);
-        store.forget();
+        store.forget_now();
 
         let store = store_in(&layout, dir.path(), None);
         LOOKS.with(|looks| looks.set(0));
@@ -566,7 +573,7 @@ fn deleting_a_torrents_files_removes_them_and_its_output_and_nothing_else() {
     std::fs::create_dir_all(dir.join("out")).unwrap();
     std::fs::write(dir.join("out/member.txt"), b"unpacked").unwrap();
     std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
-    shim.store.forget();
+    shim.store.forget_now();
 
     let written = deletion(
         shim.store.files(),
@@ -615,7 +622,7 @@ fn deleting_a_torrents_files_leaves_what_was_there_before_it() {
         shim.complete(piece, &torrent);
     }
     let dir = shim.dir.path().to_path_buf();
-    shim.store.forget();
+    shim.store.forget_now();
     delete_written(&deletion(shim.store.files(), &adopted, &[], None));
 
     let mut left: Vec<_> = walkdir(&dir);
@@ -635,7 +642,7 @@ fn deleting_a_torrents_files_leaves_a_folder_where_a_file_was() {
         shim.complete(piece, &torrent);
     }
     let dir = shim.dir.path().to_path_buf();
-    shim.store.forget();
+    shim.store.forget_now();
     std::fs::remove_file(dir.join("a.bin")).unwrap();
     std::fs::create_dir_all(dir.join("a.bin/deep")).unwrap();
     std::fs::write(dir.join("a.bin/deep/photo.jpg"), b"the operator's").unwrap();
@@ -728,7 +735,7 @@ fn files_move_part_written_and_the_torrent_goes_on_from_there() {
     assert!(!placed.join("c.bin").exists());
     std::fs::create_dir_all(&moved).unwrap();
 
-    let (to, kept) = move_listed(shim.store.files(), &[], moved.clone(), Existing::Keep).unwrap();
+    let (to, kept) = move_listed(&shim.store, &[], moved.clone(), Existing::Keep).unwrap();
     assert_eq!((to, kept), (moved.clone(), false));
     assert!(!placed.join("a.bin").exists());
     assert!(!placed.join("sub").exists());
@@ -763,7 +770,7 @@ fn a_file_already_where_the_files_go_is_kept() {
     let moved = moved_dir.path().to_path_buf();
     std::fs::write(moved.join("b.bin"), b"theirs").unwrap();
 
-    let (to, kept) = move_listed(shim.store.files(), &[], moved.clone(), Existing::Keep).unwrap();
+    let (to, kept) = move_listed(&shim.store, &[], moved.clone(), Existing::Keep).unwrap();
     assert_eq!((to, kept), (moved.clone(), true));
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
     assert!(!placed.join("a.bin").exists());
@@ -796,7 +803,7 @@ fn a_file_is_read_through_one_handle_that_does_not_follow_a_move() {
 
     let moved_dir = tempfile::tempdir().unwrap();
     let moved = moved_dir.path().to_path_buf();
-    move_listed(shim.store.files(), &[], moved.clone(), Existing::Keep).unwrap();
+    move_listed(&shim.store, &[], moved.clone(), Existing::Keep).unwrap();
     // Another file now stands where a.bin went: a handle kept from before
     // the move would still read the old one.
     std::fs::remove_file(moved.join("a.bin")).unwrap();
@@ -805,10 +812,13 @@ fn a_file_is_read_through_one_handle_that_does_not_follow_a_move() {
     assert_eq!(buf, vec![0x5a; 1000]);
 }
 
-// The torrent's store, telling the test when every piece is had.
+// The torrent's store, telling the test when every piece is had, how many
+// pieces the session handed it, and the thread each was stored on.
 struct Watched {
     store: Arc<TorrentStore>,
     whole: watch::Sender<bool>,
+    handed: watch::Sender<u32>,
+    stored_on: std::sync::Mutex<Vec<(std::thread::ThreadId, Option<String>)>>,
 }
 
 impl Watched {
@@ -823,6 +833,39 @@ impl Pieces for Watched {
         self.store.verified(piece, held)?;
         self.tell();
         Ok(())
+    }
+
+    fn store(
+        self: Arc<Self>,
+        piece: u32,
+        held: Bytes,
+        paid: Option<crate::torrents::writes::Paid>,
+        done: crate::torrents::writes::Done,
+    ) {
+        self.handed.send_modify(|handed| *handed += 1);
+        let store = Arc::clone(&self.store);
+        store.store(
+            piece,
+            held,
+            paid,
+            Box::new(move |written| {
+                let thread = std::thread::current();
+                self.stored_on
+                    .lock()
+                    .unwrap()
+                    .push((thread.id(), thread.name().map(str::to_owned)));
+                self.tell();
+                done(written);
+            }),
+        );
+    }
+
+    fn reserve(&self, bytes: u64, room: &Arc<Notify>) -> crate::torrents::writes::VolumeRoom {
+        self.store.reserve(bytes, room)
+    }
+
+    fn stop_writes(&self) {
+        self.store.stop_writes();
     }
 
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {
@@ -953,14 +996,197 @@ async fn seeded() -> Seeded {
 // The torrent's store over the layout under `dir`, with the side the
 // storage hands pieces to.
 fn watched_store(layout: &Arc<PieceLayout>, dir: &Path) -> (Arc<Watched>, watch::Receiver<bool>) {
+    watched(store_in(layout, dir, None))
+}
+
+fn watched(store: Arc<TorrentStore>) -> (Arc<Watched>, watch::Receiver<bool>) {
     let (whole, in_hand) = watch::channel(false);
     (
         Arc::new(Watched {
-            store: store_in(layout, dir, None),
+            store,
             whole,
+            handed: watch::channel(0).0,
+            stored_on: std::sync::Mutex::default(),
         }),
         in_hand,
     )
+}
+
+// Writers of their own, made off the async runtime, so what follows a
+// piece's writes runs on the writer's thread alone.
+fn disk_off_runtime() -> Arc<crate::torrents::writes::TorrentDisk> {
+    std::thread::spawn(crate::torrents::writes::TorrentDisk::alone)
+        .join()
+        .unwrap()
+}
+
+// The store of a torrent of plain files under `dir`, written by `disk`
+// under `key`.
+fn store_on(
+    disk: &Arc<crate::torrents::writes::TorrentDisk>,
+    key: u64,
+    layout: &Arc<PieceLayout>,
+    dir: &Path,
+) -> Arc<TorrentStore> {
+    let files = Files::new(layout, dir.to_path_buf()).unwrap();
+    Arc::new(TorrentStore::new(
+        Arc::clone(layout),
+        files,
+        None,
+        None,
+        disk.writes(key, dir),
+    ))
+}
+
+// Two torrents fetched by two sessions into files on one volume are written
+// by that volume's one writer: every piece of both is stored on one thread,
+// the volume's writer, and held there, neither session writes a piece of
+// either. Once let go, both have every piece in their files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_torrents_in_two_sessions_on_one_volume_share_its_one_writer() {
+    // A seeder each: a session takes one connection from an address.
+    let seeders = [seeded().await, seeded().await];
+    let seeded = &seeders[0];
+    let layout = &seeded.layout;
+    let disk = disk_off_runtime();
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let stores = [1, 2].map(|key| {
+        store_on(
+            &disk,
+            key,
+            layout,
+            &dirs[key as usize - 1].path().join("job"),
+        )
+    });
+    let volume = stores[0].writes().volume();
+    assert!(Arc::ptr_eq(&volume, &stores[1].writes().volume()));
+    let held = disk.writers().hold(&volume);
+    let mut watching = Vec::new();
+    let mut leechers = Vec::new();
+    for ((store, dir), seeded) in stores.iter().zip(&dirs).zip(&seeders) {
+        let (watched, in_hand) = watched(Arc::clone(store));
+        let factory = PieceStorageFactory::new(
+            Arc::clone(layout),
+            Arc::clone(&watched) as Arc<dyn Pieces>,
+            unbounded(),
+        );
+        leechers.push(fetch(seeded, dir.path(), None, factory.boxed_factory()).await);
+        watching.push((watched, in_hand));
+    }
+    // Every piece of both handed over, and none written while the writer
+    // is held.
+    for (watched, _) in &watching {
+        watched
+            .handed
+            .subscribe()
+            .wait_for(|handed| *handed == layout.piece_count())
+            .await
+            .unwrap();
+    }
+    for (store, dir) in stores.iter().zip(&dirs) {
+        assert_eq!(store.count(), 0);
+        assert!(!dir.path().join("job").join("a.bin").exists());
+    }
+    held.open();
+    drop(held);
+    for (_, in_hand) in &mut watching {
+        in_hand.wait_for(|whole| *whole).await.unwrap();
+    }
+    let threads: std::collections::HashSet<_> = watching
+        .iter()
+        .flat_map(|(watched, _)| watched.stored_on.lock().unwrap().clone())
+        .collect();
+    assert_eq!(threads.len(), 1, "{threads:?}");
+    let (_, name) = threads.into_iter().next().unwrap();
+    assert!(name.unwrap().starts_with("volume-writer"));
+    for dir in &dirs {
+        for (name, original) in &seeded.originals {
+            assert_eq!(
+                &std::fs::read(dir.path().join("job").join(name)).unwrap(),
+                original
+            );
+        }
+    }
+    let total: u64 = layout.files().map(|file| file.length).sum();
+    assert_eq!(
+        volume
+            .written_bytes
+            .load(std::sync::atomic::Ordering::Acquire),
+        2 * total
+    );
+    assert_eq!(volume.unwritten_bytes(), 0);
+    for leecher in leechers {
+        leecher.stop().await;
+    }
+    for seeded in &seeders {
+        seeded.seeder.stop().await;
+    }
+}
+
+// With the server's storage, the session writes no piece itself: its
+// threads hand each piece over and go on, and the volume's writer is the
+// one thread that writes it. Held there, the session has handed every
+// piece over and nothing is on disk; every byte on disk was written by
+// the writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_piece_is_written_on_a_session_thread() {
+    let seeded = seeded().await;
+    let layout = &seeded.layout;
+    let disk = disk_off_runtime();
+    let fetch_dir = tempfile::tempdir().unwrap();
+    let store = store_on(&disk, 1, layout, &fetch_dir.path().join("job"));
+    let volume = store.writes().volume();
+    let held = disk.writers().hold(&volume);
+    let (watched, mut in_hand) = watched(Arc::clone(&store));
+    let factory = PieceStorageFactory::new(
+        Arc::clone(layout),
+        Arc::clone(&watched) as Arc<dyn Pieces>,
+        unbounded(),
+    );
+    // One thread for the session's disk work: were a piece written there,
+    // the held writer would hold it, and the session would hand over no
+    // more.
+    let leecher = fetch(&seeded, fetch_dir.path(), Some(1), factory.boxed_factory()).await;
+    watched
+        .handed
+        .subscribe()
+        .wait_for(|handed| *handed == layout.piece_count())
+        .await
+        .unwrap();
+    assert_eq!(store.count(), 0);
+    assert!(!fetch_dir.path().join("job").join("a.bin").exists());
+    assert_eq!(
+        volume
+            .written_bytes
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    held.open();
+    drop(held);
+    in_hand.wait_for(|whole| *whole).await.unwrap();
+    let stored_on = watched.stored_on.lock().unwrap().clone();
+    assert_eq!(stored_on.len(), layout.piece_count() as usize);
+    assert!(
+        stored_on.iter().all(|(_, name)| name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("volume-writer"))),
+        "{stored_on:?}"
+    );
+    let total: u64 = layout.files().map(|file| file.length).sum();
+    assert_eq!(
+        volume
+            .written_bytes
+            .load(std::sync::atomic::Ordering::Acquire),
+        total
+    );
+    for (name, original) in &seeded.originals {
+        assert_eq!(
+            &std::fs::read(fetch_dir.path().join("job").join(name)).unwrap(),
+            original
+        );
+    }
+    leecher.stop().await;
+    seeded.seeder.stop().await;
 }
 
 // The seeded torrent fetched from its seeder alone, into `factory`.
@@ -1219,6 +1445,62 @@ async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 8);
     drop(storage);
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+}
+
+// A piece its volume has no room for is not started: the session's room
+// for it is not taken, and it starts once the volume has written enough.
+// A storage taken gives back what its volume counted for pieces not
+// written.
+#[tokio::test]
+async fn a_piece_its_volume_refuses_is_not_started_until_the_volume_has_room() {
+    let layout = Arc::new(PieceLayout::new(8, vec![file("a", 32)]).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&layout, &dir.path().join("job"), None);
+    let volume = store.writes().volume();
+    // Room for one piece of eight, less the share its writes keep.
+    volume.set_buffer_limits(16, 16);
+    let budget = accountant(u64::MAX);
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        Arc::clone(&store) as Arc<dyn Pieces>,
+        holds(&budget),
+    );
+    let lengths = Lengths::new(32, 8).unwrap();
+    let [first, second, third] =
+        [0, 1, 2].map(|piece| lengths.try_validate_piece_index(piece).unwrap());
+    let room = Arc::new(Notify::new());
+    assert!(storage.reserve_piece(first, &room));
+    assert_eq!(volume.unwritten_bytes(), 8);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 8);
+    assert!(!storage.reserve_piece(second, &room));
+    // Not started: nothing more held, and no block of it is taken.
+    assert_eq!(volume.unwritten_bytes(), 8);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 8);
+    assert!(storage.pwrite_all(0, 8, b"x").is_err());
+
+    let rung = room.notified();
+    storage.pwrite_all(0, 0, b"abcdefgh").unwrap();
+    storage.on_piece_completed(first).unwrap();
+    rung.await;
+    assert_eq!(
+        std::fs::read(dir.path().join("job").join("a")).unwrap()[..8],
+        *b"abcdefgh"
+    );
+    assert_eq!(volume.unwritten_bytes(), 0);
+    assert!(storage.reserve_piece(second, &room));
+    assert_eq!(volume.unwritten_bytes(), 8);
+    storage.pwrite_all(0, 8, b"ijk").unwrap();
+
+    // Taken at a pause, the storage gives back what the volume counted
+    // for the piece it held in memory, which starts again on its next
+    // reserve.
+    let taken = storage.take().unwrap();
+    assert_eq!(volume.unwritten_bytes(), 0);
+    drop(taken);
+    assert!(storage.reserve_piece(third, &room));
+    assert_eq!(volume.unwritten_bytes(), 8);
+    drop(storage);
+    assert_eq!(volume.unwritten_bytes(), 0);
 }
 
 // The store's side that keeps what it is handed, reads the piece back
@@ -1613,7 +1895,7 @@ fn a_move_keeps_the_side_store() {
     let moved_dir = tempfile::tempdir().unwrap();
     let moved = moved_dir.path().join("moved");
     std::fs::create_dir_all(&moved).unwrap();
-    move_listed(shim.store.files(), &[], moved.clone(), Existing::Keep).unwrap();
+    move_listed(&shim.store, &[], moved.clone(), Existing::Keep).unwrap();
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1536]);
     assert!(!moved.join("sub").exists());
     assert_eq!(shim.read(1), torrent[1024..2048]);

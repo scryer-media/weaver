@@ -187,8 +187,8 @@ async fn a_block_owed_for_a_piece_that_failed_its_hash_is_written_into_room_gran
 
 // A block the storage copies into memory lands with every blocking permit
 // taken, on the task that read it, and so does its piece's last: the piece
-// is checked on the hashing thread and written on the torrent's turn of the
-// write threads, neither of which is a blocking permit's.
+// is checked on the hashing thread and handed from there to its storage to
+// write, neither of which takes a blocking permit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_piece_copied_into_memory_is_landed_checked_and_written_with_no_blocking_permit() {
     let storage = HeldStorageFactory::default();
@@ -1016,8 +1016,8 @@ async fn a_pause_waits_for_the_check_under_way_and_drops_the_one_queued() {
 
 // The same pause where the storage holds its pieces in memory and keeps
 // their room from one run to the next. The check of piece 0 is under way
-// and ends as the run does: its piece is not written, for the run has ended
-// by its turn of the write threads. The check of piece 1 never runs. Both
+// and ends as the run does: its piece is not handed to the storage to be
+// written, for the run was told to end. The check of piece 1 never runs. Both
 // pieces go back to the queue, and nothing of the run that ended touches the
 // storage once it is handed on: the next run, granted the room again, lands
 // its blocks in it.

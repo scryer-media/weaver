@@ -2,11 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A torrent's files on disk, as its metainfo lists them under the directory
-// they are placed in. Verified pieces are written here, and peers are served
-// and pieces checked from here: these files are the torrent's own, whatever
-// unpacking makes of them beside.
+// they are placed in. Verified pieces are written to them by the writer of
+// the volume they are on (`super::writes`), and peers are served and pieces
+// checked from here: these files are the torrent's own, whatever unpacking
+// makes of them beside.
 //
-// Handles are shared by every torrent through one pool, so a file read again
+// Handles to read are shared by every torrent through one pool, so a file read again
 // and again, as a seed's are by its peers, is opened once rather than at
 // every read (libtorrent `file_pool`). A handle is known by a key, never by
 // path: a file takes fresh keys whenever it may have moved, so no handle
@@ -15,7 +16,7 @@
 // sweep that runs only while any is open.
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -300,12 +301,10 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Res
     }
 }
 
-// Where the files are, and the keys their handles are open under: one to
-// read each file, one to write it.
+// Where the files are, and the keys their handles to read are open under.
 struct At {
     dir: PathBuf,
     reads: Vec<u64>,
-    writes: Vec<u64>,
 }
 
 impl At {
@@ -313,12 +312,7 @@ impl At {
         Self {
             dir,
             reads: (0..count).map(|_| key()).collect(),
-            writes: (0..count).map(|_| key()).collect(),
         }
-    }
-
-    fn keys(&self) -> Vec<u64> {
-        self.reads.iter().chain(&self.writes).copied().collect()
     }
 }
 
@@ -413,23 +407,14 @@ impl Files {
             })
     }
 
-    // `bytes` written at `offset` of the file, which is made, with the
-    // directories it is in, when it is not there yet.
-    pub(crate) fn write(&self, file: usize, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        let name = self.name(file)?;
-        let at = self.at();
-        let path = at.dir.join(name);
-        let handle = self.pool.open(at.writes[file], || open_for_write(&path))?;
-        // The write and its counters, in one place: a write handed to
-        // another writer takes its counters with it.
-        counted(
-            &self.ends[file].write,
-            offset,
-            bytes.len(),
-            &STATS.writes,
-            &STATS.write_seeks,
-        );
-        write_all_at(&handle, offset, bytes)
+    // Where the files are, held there while the guard is: a move waits for
+    // it, so writes queued under it are queued for the files where they
+    // are.
+    pub(crate) fn placed(&self) -> Placed<'_> {
+        Placed {
+            files: self,
+            at: self.at(),
+        }
     }
 
     // The file's bytes from `offset` into `out`, which is filled whole or
@@ -493,25 +478,11 @@ impl Files {
         Some(if found.is_file() { found.len() } else { 0 })
     }
 
-    // The file made `length` long when it is shorter, so a file whose
-    // pieces are all had is there whole, an empty one among them. A longer
-    // one stays as it is.
-    pub(crate) fn grow(&self, file: usize, length: u64) -> io::Result<()> {
-        let name = self.name(file)?;
-        let at = self.at();
-        let path = at.dir.join(name);
-        let handle = self.pool.open(at.writes[file], || open_for_write(&path))?;
-        if handle.metadata()?.len() < length {
-            handle.set_len(length)?;
-        }
-        Ok(())
-    }
-
-    // Every handle let go, so the files can be moved, removed or replaced;
-    // the next use opens them again under fresh keys.
+    // Every handle to read let go, so the files can be moved, removed or
+    // replaced; the next read opens them again under fresh keys.
     pub(crate) fn release(&self) {
         let mut at = self.at.write().unwrap_or_else(PoisonError::into_inner);
-        self.pool.forget(&at.keys());
+        self.pool.forget(&at.reads);
         let dir = std::mem::take(&mut at.dir);
         *at = At::new(dir, self.names.len());
     }
@@ -525,10 +496,35 @@ impl Files {
         relocate: impl FnOnce(&Path) -> Result<(PathBuf, T), E>,
     ) -> Result<T, E> {
         let mut at = self.at.write().unwrap_or_else(PoisonError::into_inner);
-        self.pool.forget(&at.keys());
+        self.pool.forget(&at.reads);
         let (to, outcome) = relocate(&at.dir)?;
         *at = At::new(to, self.names.len());
         Ok(outcome)
+    }
+}
+
+// The files where they are, while no move can take them elsewhere.
+pub(crate) struct Placed<'a> {
+    files: &'a Files,
+    at: RwLockReadGuard<'a, At>,
+}
+
+impl Placed<'_> {
+    // Where the file is; an error for padding, which is never on disk.
+    pub(crate) fn path(&self, file: usize) -> io::Result<PathBuf> {
+        Ok(self.at.dir.join(self.files.name(file)?))
+    }
+
+    // A write of `len` bytes at `offset` of the file, counted as it is
+    // handed to its writer.
+    pub(crate) fn count_write(&self, file: usize, offset: u64, len: usize) {
+        counted(
+            &self.files.ends[file].write,
+            offset,
+            len,
+            &STATS.writes,
+            &STATS.write_seeks,
+        );
     }
 }
 
@@ -611,26 +607,6 @@ fn advise_will_need(file: &File, offset: u64, len: u64) {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn advise_will_need(_file: &File, _offset: u64, _len: u64) {}
 
-fn open_for_write(path: &Path) -> io::Result<File> {
-    let open = || {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-    };
-    match open() {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            open()
-        }
-        opened => opened,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::layout::PieceFile;
@@ -655,10 +631,25 @@ mod tests {
         Box::leak(Box::new(HandlePool::new()))
     }
 
-    // A file is made, directories and all, at its first write, and reads
-    // back what was written; a file not there is not read as zeros.
+    // `bytes` put at `offset` of the file at `path`, as its writer puts a
+    // piece's share.
+    fn put(path: &Path, offset: u64, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        write_all_at(&file, offset, bytes).unwrap();
+    }
+
+    // A file reads back what was written to it where its name places it; a
+    // file not there is not read as zeros.
     #[test]
-    fn a_file_is_made_at_its_first_write_and_read_back() {
+    fn a_file_reads_back_what_was_written_where_it_is_placed() {
         let dir = tempfile::tempdir().unwrap();
         let files = Files::in_pool(
             &layout(&[("a/b.bin", 8), ("c.bin", 4)]),
@@ -666,18 +657,15 @@ mod tests {
             pool(),
         )
         .unwrap();
-        files.write(0, 4, b"wxyz").unwrap();
+        let path = files.placed().path(0).unwrap();
+        assert_eq!(path, dir.path().join("a").join("b.bin"));
+        put(&path, 4, b"wxyz");
         let mut out = [0; 4];
         files.read(0, 4, &mut out).unwrap();
         assert_eq!(&out, b"wxyz");
         assert_eq!(
             files.read(1, 0, &mut out).unwrap_err().kind(),
             io::ErrorKind::NotFound
-        );
-        files.grow(1, 4).unwrap();
-        assert_eq!(
-            std::fs::metadata(dir.path().join("c.bin")).unwrap().len(),
-            4
         );
     }
 
@@ -693,7 +681,8 @@ mod tests {
             pool(),
         )
         .unwrap();
-        files.write(0, 0, b"abcdwxyz").unwrap();
+        put(&files.placed().path(0).unwrap(), 0, b"abcdwxyz");
+        assert!(files.placed().path(1).is_err());
         files.will_read(0, 0, 8);
         files.will_read(0, 4, 1 << 30);
         files.will_read(1, 0, 4);
@@ -733,13 +722,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = pool();
         let files = Files::in_pool(&layout(&[("a.bin", 4)]), dir.path().into(), pool).unwrap();
-        files.write(0, 0, b"abcd").unwrap();
-        let before = files.at().writes[0];
+        put(&dir.path().join("a.bin"), 0, b"abcd");
+        let mut out = [0; 4];
+        files.read(0, 0, &mut out).unwrap();
+        let before = files.at().reads[0];
         assert!(pool.is_open(before));
         files.release();
         assert!(!pool.is_open(before));
-        files.write(0, 0, b"dcba").unwrap();
-        assert!(pool.is_open(files.at().writes[0]));
-        assert_ne!(files.at().writes[0], before);
+        files.read(0, 0, &mut out).unwrap();
+        assert!(pool.is_open(files.at().reads[0]));
+        assert_ne!(files.at().reads[0], before);
     }
 }

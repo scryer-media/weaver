@@ -27,6 +27,7 @@ pub(crate) mod post_health;
 mod progress;
 pub mod queue;
 mod queue_window;
+pub(crate) use download::VolumeBuffers;
 pub(crate) use queue_window::waits_its_turn;
 mod scan_inputs;
 mod server_attribution;

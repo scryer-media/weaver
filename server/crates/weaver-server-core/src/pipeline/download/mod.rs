@@ -12,6 +12,7 @@ pub(in crate::pipeline) mod scheduler;
 pub(crate) mod transport;
 mod worker;
 pub(in crate::pipeline) use worker::volume_pace;
+pub(crate) use worker::volume_pace::VolumeBuffers;
 
 #[cfg(test)]
 pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;

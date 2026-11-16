@@ -45,6 +45,11 @@ impl PipelineWriters {
         Self { writers, owner }
     }
 
+    // The writers the process shares, for another owner to write through.
+    pub(crate) fn writers(&self) -> &Arc<VolumeWriters> {
+        &self.writers
+    }
+
     // The way to write to `volume` for the job `key`.
     pub(crate) fn submitter(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
         self.writers.submitter(volume, key, &self.owner)

@@ -221,6 +221,9 @@ pub struct JobEnv {
     // job does. None with no pipeline, where a torrent in upload mode
     // tries again by itself.
     pub(crate) capacity: Option<Arc<StorageCapacity>>,
+    // Where every torrent's pieces are written: the volumes' writers the
+    // pipeline writes through too.
+    pub(crate) disk: Arc<crate::torrents::writes::TorrentDisk>,
     pub(crate) slots: usize,
     pub(crate) limits: Arc<ExtractionLimits>,
     // The decode pool the pipeline's jobs share, and where a decode window
@@ -251,10 +254,17 @@ impl JobEnv {
     /// the complete root's free space.
     pub fn of_pipeline(pipeline: &crate::pipeline::Pipeline) -> Self {
         let budget = pipeline.graph_budget();
+        let (writers, buffers) = pipeline.volume_writing();
+        let capacity = pipeline.storage_capacity();
         Self {
             accountant: budget.accountant,
             free_disk: budget.free_disk,
-            capacity: Some(pipeline.storage_capacity()),
+            disk: crate::torrents::writes::TorrentDisk::new(
+                writers,
+                Some(Arc::clone(&capacity)),
+                Some(buffers),
+            ),
+            capacity: Some(capacity),
             slots: budget.slots.max(1),
             limits: budget.limits,
             decode: budget.decode,
@@ -293,6 +303,7 @@ impl JobEnv {
             })),
             free_disk: CapacityReader::unknown(),
             capacity: None,
+            disk: crate::torrents::writes::TorrentDisk::alone(),
             slots: 1,
             limits: Arc::new(ExtractionLimits::unbounded()),
             decode: Arc::new(DecodePool::new(u64::MAX)),

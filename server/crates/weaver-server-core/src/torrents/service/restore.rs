@@ -286,6 +286,7 @@ impl TorrentService {
                 None
             }
         };
+        let writes = self.inner.env.disk.writes(job_id.0, &files);
         let files = Files::new(&layout, files).map_err(|error| Unmade::Fails(error.to_string()))?;
         let mut notes = Vec::new();
         let tee = match tee.then(|| Plan::of(&layout)).flatten() {
@@ -296,7 +297,7 @@ impl TorrentService {
             }
             None => None,
         };
-        let store = TorrentStore::new(layout, files, kept.as_ref(), tee)
+        let store = TorrentStore::new(layout, files, kept.as_ref(), tee, writes)
             .with_side(side, &ignored)
             .map_err(|error| {
                 Unmade::Fails(format!("could not open the torrent's side store: {error}"))
@@ -728,7 +729,9 @@ impl TorrentService {
                 (torrent.held.is_none() && !missing, copy)
             }
             None => {
-                store.forget();
+                // Never handed to a session: it has nothing queued, and the
+                // wait is none.
+                store.forget().await;
                 (false, None)
             }
         };

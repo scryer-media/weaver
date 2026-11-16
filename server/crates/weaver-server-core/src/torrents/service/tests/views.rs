@@ -35,7 +35,13 @@ fn a_checking_torrent_has_the_bytes_of_the_pieces_it_counts() {
         bits: vec![0b1110_0000],
         checking: false,
     };
-    let store = crate::torrents::store::TorrentStore::new(layout, files, Some(&every), None);
+    let store = crate::torrents::store::TorrentStore::new(
+        layout,
+        files,
+        Some(&every),
+        None,
+        crate::torrents::writes::Writes::for_test(),
+    );
     let mut have = Vec::new();
     take_file_have(&mut have, &[], Some(&store));
     assert_eq!((store.count(), have.clone()), (3, vec![100, 92]));

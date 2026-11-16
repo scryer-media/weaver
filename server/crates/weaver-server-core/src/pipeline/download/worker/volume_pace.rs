@@ -434,7 +434,13 @@ pub(in crate::pipeline) fn intake_of(volume: &Volume) -> VolumeIntake {
 // a volume is held above its share. Nothing here runs per article.
 pub(crate) struct VolumeBuffers {
     sizing: Mutex<Sizing>,
+    // Told, outside the lock, whenever a limit changed: a writer that waits
+    // on a volume's room without the pipeline's tick (the torrents) looks
+    // again.
+    resized: Mutex<Option<Resized>>,
 }
+
+type Resized = Arc<dyn Fn() + Send + Sync>;
 
 struct Sizing {
     figure_bytes: u64,
@@ -467,7 +473,27 @@ impl VolumeBuffers {
                 untold: false,
                 holding: false,
             }),
+            resized: Mutex::new(None),
         }
+    }
+
+    // Have `resized` told whenever a limit changes.
+    pub(crate) fn on_resize(&self, resized: Resized) {
+        *self.resized.lock().unwrap_or_else(PoisonError::into_inner) = Some(resized);
+    }
+
+    fn told(&self, changed: bool) -> bool {
+        if changed {
+            let resized = self
+                .resized
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(resized) = resized {
+                resized();
+            }
+        }
+        changed
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Sizing> {
@@ -488,9 +514,12 @@ impl VolumeBuffers {
             rate: SplitRate::new(volume.write_rate.load(Ordering::Relaxed)),
             jobs: 1,
         });
-        if sizing.size() {
+        let changed = sizing.size();
+        if changed {
             sizing.untold = true;
         }
+        drop(sizing);
+        self.told(changed);
     }
 
     // A job that was given `volume`'s writer let it go. When it was the
@@ -510,9 +539,12 @@ impl VolumeBuffers {
             return;
         }
         sizing.volumes.swap_remove(at);
-        if sizing.size() {
+        let changed = sizing.size();
+        if changed {
             sizing.untold = true;
         }
+        drop(sizing);
+        self.told(changed);
     }
 
     // Size every limit on another figure. Whether a limit changed.
@@ -529,7 +561,9 @@ impl VolumeBuffers {
         }
         sizing.figure_bytes = figure_bytes;
         sizing.memory_ceiling_bytes = memory_ceiling_bytes;
-        sizing.size()
+        let changed = sizing.size();
+        drop(sizing);
+        self.told(changed)
     }
 
     // Size every limit again when the rate the split reads for a volume
@@ -553,6 +587,9 @@ impl VolumeBuffers {
         if untold {
             sizing.untold = false;
         }
+        drop(sizing);
+        // A change heard as a volume joined or left was told then.
+        self.told(sized);
         sized || untold
     }
 }

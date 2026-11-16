@@ -683,6 +683,20 @@ impl Pipeline {
         Arc::clone(&self.storage_capacity)
     }
 
+    // The volumes' writers the process shares and the one sizing of their
+    // limits, for the torrents to write through beside the pipeline.
+    pub(crate) fn volume_writing(
+        &self,
+    ) -> (
+        Arc<crate::operations::VolumeWriters>,
+        Arc<crate::pipeline::VolumeBuffers>,
+    ) {
+        (
+            Arc::clone(self.volume_writers.writers()),
+            Arc::clone(&self.volume_buffers),
+        )
+    }
+
     // Point the per-server metric counters at the servers of `nntp`.
     //
     // Called only when an NNTP runtime generation is activated (startup and
