@@ -137,17 +137,31 @@ func withholdArticles(host, port string, messageIDs []string) (func() error, err
 	return func() error { return restoreWithheldArticles(host, port, held) }, nil
 }
 
+// storedArticleHangGuard bounds each read of a stored article only so a dead
+// news server cannot hang a case. The news server answers ARTICLE with no
+// chaos, so any wait is load: a case reads hundreds of articles in a row on a
+// runner busy with other suites, and a short deadline failed a case before
+// Weaver had started. It is set far above any real answer.
+const storedArticleHangGuard = 10 * time.Minute
+
 func readStoredArticle(session *nntpCommandSession, messageID string) ([]byte, error) {
-	status, err := session.send("ARTICLE <" + messageID + ">")
-	if err != nil {
-		return nil, err
+	cmd := "ARTICLE <" + messageID + ">"
+	session.conn.SetWriteDeadline(time.Now().Add(storedArticleHangGuard))
+	if _, err := session.conn.Write([]byte(cmd + "\r\n")); err != nil {
+		return nil, fmt.Errorf("write command %q to %s: %w", cmd, session.addr, err)
 	}
+	session.conn.SetReadDeadline(time.Now().Add(storedArticleHangGuard))
+	status, err := session.reader.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read response for %q from %s: %w", cmd, session.addr, err)
+	}
+	status = strings.TrimSpace(status)
 	if !strings.HasPrefix(status, "220") {
 		return nil, fmt.Errorf("ARTICLE <%s>: %s", messageID, status)
 	}
 	var lines [][]byte
 	for {
-		session.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		session.conn.SetReadDeadline(time.Now().Add(storedArticleHangGuard))
 		line, err := session.reader.ReadBytes('\n')
 		if err != nil {
 			return nil, fmt.Errorf("read ARTICLE <%s>: %w", messageID, err)

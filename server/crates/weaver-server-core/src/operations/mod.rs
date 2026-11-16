@@ -27,7 +27,8 @@ pub use backup::{
 };
 pub use disk::{
     Capacity, CapacityDebits, CapacityReader, CapacityReading, DiskProbeError, DiskSpace,
-    OnDemandSpace, Reach, StorageCapacity, StorageRoot, is_out_of_space, is_quota_exceeded,
+    LateClassification, OnDemandSpace, Reach, StorageCapacity, StorageRoot, is_out_of_space,
+    is_quota_exceeded,
 };
 pub use health::{
     BrowseDirectoryError, CreateDirectoryError, DirectoryBrowseEntry, DirectoryBrowseListing,

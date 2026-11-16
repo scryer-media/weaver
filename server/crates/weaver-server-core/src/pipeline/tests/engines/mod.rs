@@ -104,6 +104,7 @@ mod plain_par2;
 mod post_health_seats;
 mod prefix_sets;
 mod rar;
+mod rar4_end_records;
 mod rar_engine;
 mod rar_rev;
 mod recovery_audit;

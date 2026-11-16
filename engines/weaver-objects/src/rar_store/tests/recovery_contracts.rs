@@ -103,9 +103,11 @@ fn a_canonical_name_places_a_volume_when_held_labels_cannot_number_the_set() {
             );
             if first_name == "opaque.001" {
                 object.renamed(VolumeIndex(0), "archive.part01.rar", &mut out);
+                // The store may say the place between them is its own;
+                // it gives none of its volumes back.
                 assert!(
-                    out.is_empty(),
-                    "the other rename order keeps the same slots"
+                    out.iter().all(|emit| matches!(emit, Emit::Wants(_))),
+                    "the other rename order keeps the same slots: {out:?}"
                 );
             }
         }

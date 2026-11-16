@@ -117,17 +117,24 @@ impl Pipeline {
         self.pipeline_failure_stages
             .entry(job_id)
             .or_insert(failure_stage);
-        self.cancel_graph_checkpoint_retries(job_id);
-        let live = self
+        self.give_up_failed_graph_checkpoints(job_id);
+        // A graph with something out is stopped and kept until it is over.
+        // Whether it still holds anything is known only as it stops: a
+        // volume's thread may return its last operation first, and the
+        // graph then stays for the release below, as one that held nothing
+        // does.
+        if self
             .graph_jobs
             .get(&job_id)
-            .is_some_and(|graph| graph.holds_retirement());
-        if live {
-            self.retire_graph_job(job_id);
+            .is_some_and(|graph| graph.holds_retirement())
+            && let Some(graph) = self.stop_graph_job(job_id)
+        {
+            self.graph_jobs.insert(job_id, graph);
         }
-        // A job stopped earlier whose graph is still kept, for its mail or
-        // for a volume's writer, fails when that retirement ends too.
-        if live || self.retiring_graph_jobs.contains_key(&job_id) {
+        // A job whose graph is kept, for its mail or for a volume's writer,
+        // whether stopped now or earlier, fails when that retirement ends:
+        // the end of the retirement is the only thing that carries it out.
+        if self.retiring_graph_jobs.contains_key(&job_id) {
             self.transition_postprocessing_status(
                 job_id,
                 JobStatus::Failed {
@@ -317,10 +324,13 @@ impl Pipeline {
         // refused, so the graph is the last holder of its files: it lets go
         // of every one before any is removed. A file unlinked while open
         // stays behind on an NFS or FUSE share, and the directory never
-        // empties.
-        if let Some(graph) = self.graph_jobs.get_mut(&job_id) {
+        // empties. A handle the graph lets go of is dropped by its volume's
+        // writer, so nothing is removed before the writer has returned the
+        // job's last operation.
+        let returned = self.graph_jobs.get_mut(&job_id).and_then(|graph| {
             graph.release_handles();
-        }
+            graph.disk().map(|disk| disk.barrier().returned_later())
+        });
         #[cfg(test)]
         {
             let hook = BEFORE_FAILED_RELEASE.lock().unwrap().take();
@@ -332,6 +342,9 @@ impl Pipeline {
         let done = self.failed_release_tx.clone();
         self.releasing_failed_jobs.insert(job_id);
         tokio::spawn(async move {
+            if let Some(returned) = returned {
+                returned.await;
+            }
             let dir = working_dir.clone();
             let released = tokio::task::spawn_blocking(move || {
                 crate::pipeline::completion::finalize::release_failed_delivery(

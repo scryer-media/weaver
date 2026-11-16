@@ -233,6 +233,51 @@ impl Database {
             Ok(ids)
         })
     }
+
+    // Which of `job_ids` a queue or history row records: one statement per
+    // chunk that fits the bind limit, so the read is the size of the ids
+    // asked about, never of the whole queue and history.
+    pub(crate) fn recorded_job_ids_among(
+        &self,
+        job_ids: &[u64],
+    ) -> Result<HashSet<u64>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+        self.run_sql_blocking(async move {
+            let mut recorded = HashSet::new();
+            // Each id is bound twice: once for each table.
+            for chunk in ids.chunks(crate::persistence::sql_runtime::max_rows_for_engine(
+                datastore.engine(),
+                2,
+            )) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk
+                    .iter()
+                    .chain(chunk)
+                    .copied()
+                    .map(SqlArg::I64)
+                    .collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id FROM active_jobs WHERE job_id IN ({placeholders}) \
+                         UNION SELECT job_id FROM job_history WHERE job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    if let Ok(id) = u64::try_from(row.i64("job_id")?) {
+                        recorded.insert(id);
+                    }
+                }
+            }
+            Ok(recorded)
+        })
+    }
 }
 
 async fn run_sqlite_maintenance_pass(

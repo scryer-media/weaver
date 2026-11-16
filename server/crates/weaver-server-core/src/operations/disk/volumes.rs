@@ -48,7 +48,7 @@ pub(super) struct Volumes {
     // `Known::generation` (`StorageCapacity::slowest_write_mbps`).
     pub(super) rate_volumes: Mutex<Option<super::volume_view::RateVolumes>>,
     // Rung when the reader thread ends.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     read: std::sync::Condvar,
 }
 
@@ -188,6 +188,13 @@ impl StorageCapacity {
         };
         for folder in unread {
             Volumes::read_later(&self.volumes, &folder);
+        }
+        // A test waiting for the folders to be told hears of them, with
+        // the reader's queue locked so the wake is not missed.
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let _unread = self.volumes.unread();
+            self.volumes.read.notify_all();
         }
     }
 
@@ -404,7 +411,7 @@ impl Volumes {
                 let mut unread = self.0.unread();
                 unread.reading = None;
                 unread.running = false;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.0.read.notify_all();
             }
         }
@@ -418,7 +425,7 @@ impl Volumes {
                     // a path: none is left behind as the thread goes.
                     unread.running = false;
                     ended.1 = true;
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     self.read.notify_all();
                     return;
                 };
@@ -448,6 +455,22 @@ impl Volumes {
             .as_mut()
         {
             rates.age();
+        }
+    }
+
+    // Wait until `folder` is among the folders told, nothing waits to be
+    // read and the reader thread has ended.
+    #[cfg(feature = "test-support")]
+    pub(super) fn wait_folder_read(&self, folder: &Path) {
+        let mut unread = self.unread();
+        while unread.running
+            || !unread.paths.is_empty()
+            || !self.lock().told.iter().any(|told| told == folder)
+        {
+            unread = self
+                .read
+                .wait(unread)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 

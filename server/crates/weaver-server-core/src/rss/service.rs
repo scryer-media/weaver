@@ -65,6 +65,9 @@ pub enum RssServiceError {
     Parse(String),
     #[error("HTTP error: {0}")]
     Http(String),
+    // The proxy routes were mid-reload: not a feed failure.
+    #[error("{}", crate::proxies::ROUTES_CHANGING)]
+    RoutesChanging,
 }
 
 // Why an accepted item made no job: one already holds it, its class takes
@@ -376,7 +379,13 @@ impl RssService {
             },
         )
         .await
-        .map_err(RssServiceError::Http)
+        .map_err(|error| {
+            if error == crate::proxies::ROUTES_CHANGING {
+                RssServiceError::RoutesChanging
+            } else {
+                RssServiceError::Http(error)
+            }
+        })
     }
 
     // The seen row of `item`, written with the rest of its poll's.

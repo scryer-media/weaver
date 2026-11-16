@@ -545,8 +545,6 @@ impl NamespaceWriter {
                     return Err(error);
                 }
                 moved = true;
-                // Select the actual moved payload, before recording its new location.
-                crate::e2e_failpoint::fire_rename(&wants);
             }
         }
         self.moves = kept.into();

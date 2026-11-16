@@ -15,7 +15,7 @@ const UU_SPOOL_MAX_SEGMENTS: usize = 16_384;
 const UU_SPOOL_SEGMENT_MULTIPLIER: usize = 64;
 const UU_SPOOL_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
-fn compute_uu_spool_max_bytes(write_backlog_budget_bytes: usize) -> usize {
+pub(super) fn compute_uu_spool_max_bytes(write_backlog_budget_bytes: usize) -> usize {
     write_backlog_budget_bytes
         .saturating_mul(UU_SPOOL_WRITE_BACKLOG_MULTIPLIER)
         .clamp(UU_SPOOL_MIN_BYTES, UU_SPOOL_MAX_BYTES)
@@ -155,6 +155,9 @@ impl Pipeline {
             volume_buffer_figure(hardware_profile, &profile, total_connections);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         crate::proxies::set_wireguard_socket_cap(profile_tuning.wireguard_socket_cap);
+        weaver_tunnel::pipe::set_usenet_receive_bytes(
+            profile_tuning.wireguard_usenet_receive_bytes,
+        );
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
         shared_state.set_hardware_profile_in_force(crate::HardwareProfileInForce {
             active: hardware_profile,
@@ -486,6 +489,8 @@ impl Pipeline {
             applied_holds: initial_holds,
             applied_random_read_iops: None,
             applied_sequential_write_mbps: None,
+            applied_storage_classification: None,
+            backlog_base_bytes,
             rate_limit_reservations: HashMap::new(),
             configured_bandwidth: crate::proxies::Bandwidth::default(),
             scheduled_bandwidth: None,

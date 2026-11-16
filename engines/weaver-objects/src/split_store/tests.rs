@@ -536,6 +536,28 @@ fn a_piece_is_placed_by_its_number_in_its_own_set() {
     assert!(object.claim("vessel.bin", &[], None).is_empty());
 }
 
+// A set numbered from zero counts from its `.000`: `.000 .001 .002` is one
+// set of three pieces, and the joined member closes whole. A set `.001`
+// founds still counts from `.001`, and takes no `.000`.
+#[test]
+fn a_set_numbered_from_zero_counts_from_its_zeroth_piece() {
+    let mut object = set(&["ember.7z.000", "ember.7z.001", "ember.7z.002"]);
+    let mut out = Vec::new();
+    for volume in 0..3 {
+        out.extend(deliver(&mut *object, volume, 0, &[volume as u8; 8]));
+        out.extend(closed(&mut *object, volume, 8));
+    }
+    assert_eq!(placed(&out), vec![(0, 8), (8, 8), (16, 8)]);
+    assert!(lengths(&out).contains(&Some(24)));
+
+    let mut object = set(&["ember.7z.001"]);
+    assert!(object.claim("ember.7z.000", &[], None).is_empty());
+    assert_eq!(
+        object.claim("ember.7z.002", &[], None),
+        vec![VolumeIndex(1)]
+    );
+}
+
 // A set missing a number is no file: what was placed of it is forgotten,
 // and its pieces go back.
 #[test]

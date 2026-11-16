@@ -1153,10 +1153,8 @@ fn render_servers(out: &mut Encoder, server_health: &[ServerHealthInfo], runtime
         for (phase, count) in [
             ("physical", srv.sockets.physical),
             ("dialing", srv.sockets.dialing),
-            ("async_idle", srv.sockets.async_idle),
             ("owned_idle", srv.sockets.owned_idle),
             ("closing", srv.sockets.closing),
-            ("replacement", srv.sockets.replacement),
         ] {
             out.sample(
                 &f::SERVER_SOCKETS,

@@ -98,6 +98,7 @@ impl Pipeline {
         self.size_volume_buffers();
         let tuning = in_force.active.tuning(self.tuner.system_profile());
         crate::proxies::set_wireguard_socket_cap(tuning.wireguard_socket_cap);
+        weaver_tunnel::pipe::set_usenet_receive_bytes(tuning.wireguard_usenet_receive_bytes);
         if tuning == self.tuner.profile_tuning() {
             return;
         }

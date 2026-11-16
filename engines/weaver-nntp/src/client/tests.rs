@@ -5,8 +5,9 @@ use super::*;
 use crate::test_support::{
     ScriptedStep, read_command_line, spawn_scripted_server as spawn_shared_scripted_server,
 };
+use crate::transfer::StableServerId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 mod strict_priority;
 
@@ -93,177 +94,6 @@ async fn spawn_delayed_reauth_server() -> u16 {
     port
 }
 
-async fn spawn_unterminated_body_server() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        socket.write_all(b"200 ready\r\n").await.unwrap();
-
-        let capabilities = read_command_line(&mut socket).await;
-        assert!(capabilities.starts_with("CAPABILITIES"));
-        socket
-            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-            .await
-            .unwrap();
-
-        let group = read_command_line(&mut socket).await;
-        assert!(group.starts_with("GROUP "));
-        socket
-            .write_all(b"211 1 1 1 alt.binaries.test\r\n")
-            .await
-            .unwrap();
-
-        let body = read_command_line(&mut socket).await;
-        assert!(body.starts_with("BODY "));
-        socket
-            .write_all(b"222 1 <unterminated@example.com>\r\n")
-            .await
-            .unwrap();
-        socket.write_all(&vec![b'x'; 64 * 1024]).await.unwrap();
-        socket.flush().await.unwrap();
-        let _ = socket.read_to_end(&mut Vec::new()).await;
-    });
-
-    port
-}
-
-async fn try_read_command_line(socket: &mut TcpStream) -> Option<String> {
-    let mut buf = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        let n = socket.read(&mut byte).await.unwrap();
-        if n == 0 {
-            if buf.is_empty() {
-                return None;
-            }
-            panic!("client closed connection before command completed");
-        }
-        buf.push(byte[0]);
-        if byte[0] == b'\n' {
-            return Some(String::from_utf8(buf).unwrap());
-        }
-    }
-}
-
-async fn spawn_probe_confirmation_server(head_response: &'static [u8]) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-
-            tokio::spawn(async move {
-                socket.write_all(b"200 ready\r\n").await.unwrap();
-                socket.flush().await.unwrap();
-
-                while let Some(line) = try_read_command_line(&mut socket).await {
-                    if line.starts_with("MODE READER") {
-                        socket
-                            .write_all(b"500 MODE READER unsupported\r\n")
-                            .await
-                            .unwrap();
-                        socket.flush().await.unwrap();
-                        continue;
-                    }
-
-                    if line.starts_with("CAPABILITIES") {
-                        socket
-                            .write_all(
-                                b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-                            )
-                            .await
-                            .unwrap();
-                        socket.flush().await.unwrap();
-                        continue;
-                    }
-
-                    if line.starts_with("STAT ") {
-                        socket.write_all(b"430 No such article\r\n").await.unwrap();
-                        socket.flush().await.unwrap();
-                        continue;
-                    }
-
-                    if line.starts_with("HEAD ") {
-                        if !head_response.is_empty() {
-                            socket.write_all(head_response).await.unwrap();
-                            socket.flush().await.unwrap();
-                        }
-                        break;
-                    }
-
-                    panic!("unexpected command line: {line:?}");
-                }
-            });
-        }
-    });
-
-    port
-}
-
-// A server on which STAT finds nothing, and which insists that the HEAD
-// re-check arrive as one pipelined batch: the second HEAD has to be on the
-// wire before the first is answered. Answers the first id as present and the
-// second as missing.
-async fn spawn_pipelined_head_recheck_server() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        socket.write_all(b"200 ready\r\n").await.unwrap();
-        socket.flush().await.unwrap();
-
-        while let Some(line) = try_read_command_line(&mut socket).await {
-            if line.starts_with("MODE READER") {
-                socket
-                    .write_all(b"500 MODE READER unsupported\r\n")
-                    .await
-                    .unwrap();
-                socket.flush().await.unwrap();
-                continue;
-            }
-            if line.starts_with("CAPABILITIES") {
-                socket
-                    .write_all(
-                        b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-                    )
-                    .await
-                    .unwrap();
-                socket.flush().await.unwrap();
-                continue;
-            }
-            if line.starts_with("STAT ") {
-                socket.write_all(b"430 No such article\r\n").await.unwrap();
-                socket.flush().await.unwrap();
-                continue;
-            }
-            if line.starts_with("HEAD <first@example.com>") {
-                let second = read_command_line(&mut socket).await;
-                assert!(
-                    second.starts_with("HEAD <second@example.com>"),
-                    "unexpected second command: {second:?}"
-                );
-                socket
-                    .write_all(
-                        b"221 0 <first@example.com> Headers follow\r\nSubject: still here\r\n.\r\n430 No such article\r\n",
-                    )
-                    .await
-                    .unwrap();
-                socket.flush().await.unwrap();
-                continue;
-            }
-            panic!("unexpected command line: {line:?}");
-        }
-    });
-
-    port
-}
-
 // Longer than any test runs. A script answers, closes or deliberately goes
 // silent, so a connection's own timeouts only decide a test that sets them
 // itself, never a slow runner.
@@ -285,120 +115,6 @@ fn scripted_server(port: u16, group: usize) -> ServerPoolConfig {
     }
 }
 
-fn yenc_body_response(message_id: &str, data: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::new();
-    weaver_yenc::encode(data, &mut encoded, 128, "checkpoint-plan.bin").unwrap();
-
-    let mut response = format!("222 0 {message_id} body follows\r\n").into_bytes();
-    response.extend_from_slice(&encoded);
-    response.extend_from_slice(b".\r\n");
-    response
-}
-
-async fn spawn_checkpoint_plan_pipelining_server() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        socket.write_all(b"200 ready\r\n").await.unwrap();
-        socket.flush().await.unwrap();
-
-        let capabilities = read_command_line(&mut socket).await;
-        assert!(capabilities.starts_with("CAPABILITIES"));
-        socket
-            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n")
-            .await
-            .unwrap();
-        socket.flush().await.unwrap();
-
-        let first = read_command_line(&mut socket).await;
-        assert_eq!(first, "BODY <first@checkpoint.test>\r\n");
-        let second = read_command_line(&mut socket).await;
-        assert_eq!(second, "BODY <second@checkpoint.test>\r\n");
-        socket
-            .write_all(&yenc_body_response(
-                "<first@checkpoint.test>",
-                &(0..512u16).map(|byte| byte as u8).collect::<Vec<_>>(),
-            ))
-            .await
-            .unwrap();
-        socket
-            .write_all(&yenc_body_response(
-                "<second@checkpoint.test>",
-                &(0..512u16)
-                    .map(|byte| (byte.wrapping_mul(17)) as u8)
-                    .collect::<Vec<_>>(),
-            ))
-            .await
-            .unwrap();
-        socket.flush().await.unwrap();
-
-        let refill = read_command_line(&mut socket).await;
-        assert_eq!(refill, "BODY <refill@checkpoint.test>\r\n");
-        socket
-            .write_all(&yenc_body_response(
-                "<refill@checkpoint.test>",
-                &vec![0x5a; 512],
-            ))
-            .await
-            .unwrap();
-        socket.flush().await.unwrap();
-
-        let pooled = read_command_line(&mut socket).await;
-        assert_eq!(pooled, "BODY <pooled@checkpoint.test>\r\n");
-        socket
-            .write_all(&yenc_body_response(
-                "<pooled@checkpoint.test>",
-                &vec![0xa5; 512],
-            ))
-            .await
-            .unwrap();
-        socket.flush().await.unwrap();
-    });
-
-    port
-}
-
-async fn spawn_stat_server(expect_pipelined: bool) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        socket.write_all(b"200 ready\r\n").await.unwrap();
-        socket.flush().await.unwrap();
-
-        let first = read_command_line(&mut socket).await;
-        assert!(first.starts_with("STAT <first@example.com>"));
-        if expect_pipelined {
-            let second = read_command_line(&mut socket).await;
-            assert!(second.starts_with("STAT <second@example.com>"));
-            socket
-                .write_all(
-                    b"223 1 <first@example.com> article exists\r\n223 2 <second@example.com> article exists\r\n",
-                )
-                .await
-                .unwrap();
-        } else {
-            socket
-                .write_all(b"223 1 <first@example.com> article exists\r\n")
-                .await
-                .unwrap();
-            socket.flush().await.unwrap();
-            let second = read_command_line(&mut socket).await;
-            assert!(second.starts_with("STAT <second@example.com>"));
-            socket
-                .write_all(b"223 2 <second@example.com> article exists\r\n")
-                .await
-                .unwrap();
-        }
-        socket.flush().await.unwrap();
-    });
-
-    port
-}
-
 fn scripted_blocking_s2n_server(port: u16, max_connections: usize) -> ServerPoolConfig {
     ServerPoolConfig {
         server: ServerConfig {
@@ -414,84 +130,6 @@ fn scripted_blocking_s2n_server(port: u16, max_connections: usize) -> ServerPool
         group: 0,
         ..ServerPoolConfig::default()
     }
-}
-
-#[test]
-fn fetch_kind_is_copy() {
-    let kind = FetchKind::Body;
-    let _copy = kind;
-    let _another = kind;
-}
-
-#[tokio::test]
-async fn body_lane_multi_checkpoint_plan_resets_for_refill_and_pool_reuse() {
-    let port = spawn_checkpoint_plan_pipelining_server().await;
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-    let checkpoint_plan = CheckpointPlan::from_sizes([
-        std::num::NonZeroU64::new(64).unwrap(),
-        std::num::NonZeroU64::new(96).unwrap(),
-    ])
-    .plan;
-
-    let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-    assert!(lane.supports_pipelining());
-    lane.set_checkpoint_plan(checkpoint_plan.clone());
-    let message_ids = [
-        "<first@checkpoint.test>".to_string(),
-        "<second@checkpoint.test>".to_string(),
-    ];
-    let mut callbacks = Vec::new();
-    let stats = lane
-        .fetch_decoded_pipeline(
-            &message_ids.iter().map(String::as_str).collect::<Vec<_>>(),
-            2,
-            |index, trace, meta| {
-                callbacks.push((index, trace, meta));
-                std::future::ready(())
-            },
-        )
-        .await;
-
-    assert_eq!(stats.offered, 2);
-    assert_eq!(stats.requested, 2);
-    assert_eq!(stats.completed, 2);
-    assert_eq!(callbacks.len(), 2);
-    for (expected_index, (index, trace, _)) in callbacks.iter().enumerate() {
-        assert_eq!(*index, expected_index);
-        let body = trace.result.as_ref().unwrap().body.yenc().unwrap();
-        assert_eq!(body.checkpoint_plan, checkpoint_plan);
-        assert!(
-            body.segments.len() > 1,
-            "multi-grid plan must refine segments"
-        );
-    }
-
-    lane.set_checkpoint_plan(CheckpointPlan::None);
-    let refill = lane
-        .fetch_decoded_sequential("<refill@checkpoint.test>")
-        .await;
-    let refill = refill.result.unwrap();
-    let refill_body = refill.body.yenc().unwrap();
-    assert_eq!(refill_body.checkpoint_plan, CheckpointPlan::None);
-    assert_eq!(refill_body.segments.len(), 1);
-    lane.park();
-    // Returning a pooled connection is spawned on drop; let that task park
-    // the sole fixture connection before proving the next lane reuses it.
-    tokio::task::yield_now().await;
-
-    let mut reused_lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-    let pooled = reused_lane
-        .fetch_decoded_sequential("<pooled@checkpoint.test>")
-        .await;
-    let pooled = pooled.result.unwrap();
-    let pooled_body = pooled.body.yenc().unwrap();
-    assert_eq!(pooled_body.checkpoint_plan, CheckpointPlan::None);
-    assert_eq!(pooled_body.segments.len(), 1);
 }
 
 #[test]
@@ -595,153 +233,6 @@ fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
     assert!(!client.has_blocking_body_lane_candidate(crate::ServerSet::from([0, 1])));
 }
 
-#[tokio::test]
-async fn group_requirement_discovery_retries_the_decoded_batch_item() {
-    let client = multi_server_client(1);
-    let mut attempts = Vec::new();
-    let mut last_error = None;
-    let disposition = client
-        .classify_decoded_batch_item(
-            0,
-            None,
-            None,
-            None,
-            "<group-required@example.com>",
-            DecodedBatchItem {
-                elapsed: Duration::ZERO,
-                result: Err(DecodedBodyError::Nntp(NntpError::NoGroupSelected)),
-            },
-            &mut attempts,
-            &mut last_error,
-        )
-        .await;
-
-    assert!(matches!(disposition, DecodedBatchDisposition::Retry));
-    assert_eq!(
-        attempts[0].outcome,
-        FetchAttemptOutcome::GroupSelectionRequired
-    );
-    assert!(matches!(
-        last_error,
-        Some(DecodedBodyError::Nntp(NntpError::NoGroupSelected))
-    ));
-    assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
-        0
-    );
-}
-
-#[test]
-fn transient_errors() {
-    assert!(is_transient(&NntpError::NoGroupSelected));
-    assert!(is_transient(&NntpError::Timeout));
-    assert!(is_transient(&NntpError::ConnectionClosed));
-    assert!(is_transient(&NntpError::TruncatedMultilineBody));
-    assert!(is_transient(&NntpError::ServerDisconnectedMidBody));
-    assert!(is_transient(&NntpError::MalformedMultilineTerminator));
-    assert!(is_transient(&NntpError::ServiceUnavailable));
-    assert!(is_transient(&NntpError::TooManyConnections));
-    assert!(is_transient(&NntpError::PoolExhausted));
-    assert!(is_transient(&NntpError::Io(std::io::Error::new(
-        std::io::ErrorKind::ConnectionReset,
-        "reset"
-    ))));
-
-    // Non-transient errors
-    assert!(!is_transient(&NntpError::AuthenticationFailed));
-    assert!(!is_transient(&NntpError::AccessDenied));
-    assert!(!is_transient(&NntpError::PoolShutdown));
-    assert!(!is_transient(&NntpError::ArticleNotFound));
-    assert!(!is_transient(&NntpError::MalformedResponse("bad".into())));
-}
-
-#[test]
-fn connection_errors() {
-    assert!(is_connection_error(&NntpError::Timeout));
-    assert!(is_connection_error(&NntpError::ConnectionClosed));
-    assert!(is_connection_error(&NntpError::TruncatedMultilineBody));
-    assert!(is_connection_error(&NntpError::ServerDisconnectedMidBody));
-    assert!(is_connection_error(
-        &NntpError::MalformedMultilineTerminator
-    ));
-    assert!(is_connection_error(&NntpError::TooManyConnections));
-    assert!(is_connection_error(&NntpError::AccessDenied));
-    assert!(!is_connection_error(&NntpError::ArticleNotFound));
-    assert!(!is_connection_error(&NntpError::AuthenticationFailed));
-}
-
-#[test]
-fn malformed_stat_response_is_retryable_transport_fault() {
-    let err = NntpError::MalformedResponse("2\u{fffd}3".into());
-    assert!(is_retryable_stat_error(&err));
-    assert!(should_discard_stat_connection(&err));
-    assert_eq!(stat_cooldown_reason(&err), Some(CooldownReason::Transport));
-}
-
-#[test]
-fn client_config_default_retries() {
-    let config = NntpClientConfig::single(
-        ServerConfig {
-            host: "news.example.com".into(),
-            ..Default::default()
-        },
-        5,
-    );
-    assert_eq!(config.max_retries_per_server, 1);
-}
-
-#[test]
-fn client_config_custom_retries() {
-    let mut config = NntpClientConfig::single(
-        ServerConfig {
-            host: "news.example.com".into(),
-            ..Default::default()
-        },
-        5,
-    );
-    config.max_retries_per_server = 3;
-    assert_eq!(config.max_retries_per_server, 3);
-
-    let client = NntpClient::new(config);
-    assert_eq!(client.max_retries_per_server, 3);
-}
-
-#[test]
-fn from_pool_default_retries() {
-    let config = NntpClientConfig::single(
-        ServerConfig {
-            host: "news.example.com".into(),
-            ..Default::default()
-        },
-        5,
-    );
-    let pool = Arc::new(NntpPool::new(PoolConfig {
-        servers: config.servers,
-        max_idle_age: config.max_idle_age,
-        ..PoolConfig::default()
-    }));
-    let client = NntpClient::from_pool(pool);
-    assert_eq!(client.max_retries_per_server, 1);
-}
-
-#[test]
-fn transient_errors_are_retriable() {
-    // Verify that the errors we consider transient would trigger retries
-    assert!(is_transient(&NntpError::Timeout));
-    assert!(is_transient(&NntpError::ConnectionClosed));
-    assert!(is_transient(&NntpError::ServiceUnavailable));
-    assert!(is_transient(&NntpError::TooManyConnections));
-    assert!(is_transient(&NntpError::PoolExhausted));
-
-    // These should NOT trigger retries
-    assert!(!is_transient(&NntpError::ArticleNotFound));
-    assert!(!is_transient(&NntpError::AuthenticationFailed));
-    assert!(!is_transient(&NntpError::AccessDenied));
-    assert!(!is_transient(&NntpError::NoSuchArticle {
-        message_id: "<test@example.com>".into(),
-    }));
-}
-
 #[test]
 fn client_config_single() {
     let config = NntpClientConfig::single(
@@ -771,8 +262,8 @@ fn client_creation() {
     assert_eq!(client.pool().server_count(), 1);
 }
 
-#[tokio::test]
-async fn infrastructure_admission_failures_do_not_poison_server_health() {
+#[test]
+fn infrastructure_admission_failures_do_not_poison_server_health() {
     let client = NntpClient::new(NntpClientConfig::single(
         ServerConfig {
             host: "news.example.com".into(),
@@ -787,191 +278,45 @@ async fn infrastructure_admission_failures_do_not_poison_server_health() {
         .unwrap();
     let ticket = &permit.health_lease.0;
     for error in [
-        NntpError::TooManyConnections,
         NntpError::PoolExhausted,
         NntpError::PoolShutdown,
+        NntpError::AcquireTimeout(15),
     ] {
-        client
-            .record_connection_reply(0, ticket, Some(&error))
-            .await;
+        client.record_blocking_connect_failure(
+            0,
+            crate::pool::FreshConnectAdmission::Open,
+            &error,
+            ticket,
+        );
     }
     assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
+        client
+            .pool()
+            .health()
+            .blocking_lock()
+            .server(0)
+            .failure_count,
         0
     );
 
-    client
-        .record_connection_reply(0, ticket, Some(&NntpError::AcquireTimeout(15)))
-        .await;
-    assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
-        0
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::SoftTimeout(15),
+        ticket,
     );
-
-    client
-        .record_connection_reply(0, ticket, Some(&NntpError::SoftTimeout(15)))
-        .await;
     assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
+        client
+            .pool()
+            .health()
+            .blocking_lock()
+            .server(0)
+            .failure_count,
         1
     );
 }
 
-fn single_permit_server(port: u16) -> ServerPoolConfig {
-    let mut server = scripted_server(port, 0);
-    server.max_connections = 1;
-    server
-}
-
-fn probing_client(server: ServerPoolConfig) -> NntpClient {
-    NntpClient::new(NntpClientConfig {
-        servers: vec![server],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(200),
-    })
-}
-
 const READER_CAPABILITIES: &[u8] = b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
-
-// A STAT batch that never got a connection must leave the server alone.
-//
-// The deadline expired while the request was still queued behind our own
-// connection semaphore, so nothing ever reached the server. Cooling it
-// down here stalls every download behind a transient cooldown when only
-// one server is configured.
-#[tokio::test]
-async fn stat_batch_that_never_got_a_connection_leaves_the_server_healthy() {
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: READER_CAPABILITIES,
-        },
-    ])
-    .await;
-
-    let client = probing_client(single_permit_server(port));
-
-    // Occupy the server's only permit, the way an idle owned download lane
-    // holds its cached connection after a job's queue drains.
-    let held = client.pool().acquire(ServerId(0)).await.unwrap();
-
-    let error = client
-        .stat_many(&["<probe@silver.horizon>"])
-        .await
-        .expect_err("no permit was free, so the batch cannot conclude");
-    assert!(matches!(error, NntpError::AcquireTimeout(_)), "{error:?}");
-
-    {
-        let health = client.pool().health().lock().await;
-        assert_eq!(health.server(0).state(), &ServerState::Healthy);
-        assert_eq!(health.server(0).failure_count, 0);
-    }
-    drop(held);
-}
-
-// A soft timeout on a live connection is still a transport failure: the
-// command went out and the reply never came, so the server is implicated
-// and keeps its cooldown.
-#[tokio::test]
-async fn stat_batch_that_stalls_mid_command_still_cools_the_server_down() {
-    let port = spawn_shared_scripted_server(
-        vec![
-            ScriptStep {
-                expect_prefix: None,
-                response: b"200 ready\r\n",
-            },
-            ScriptStep {
-                expect_prefix: Some("CAPABILITIES"),
-                response: READER_CAPABILITIES,
-            },
-        ],
-        // Keep the socket open but silent so the STAT reply never arrives.
-        UNREACHED_TIMEOUT,
-    )
-    .await;
-
-    let client = probing_client(single_permit_server(port));
-
-    let error = client
-        .stat_many(&["<probe@silver.horizon>"])
-        .await
-        .expect_err("the server never answered the STAT");
-    assert!(matches!(error, NntpError::SoftTimeout(_)), "{error:?}");
-
-    let health = client.pool().health().lock().await;
-    assert!(
-        matches!(health.server(0).state(), ServerState::CoolingDown { .. }),
-        "{:?}",
-        health.server(0).state()
-    );
-}
-
-#[tokio::test]
-async fn all_async_fetch_families_keep_capacity_rejections_out_of_health() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let _ = socket.write_all(b"502 Too Many Connections\r\n").await;
-            });
-        }
-    });
-    let client = NntpClient::new(NntpClientConfig::single(
-        ServerConfig {
-            host: "127.0.0.1".into(),
-            port,
-            tls: false,
-            ..Default::default()
-        },
-        64,
-    ));
-
-    let body_error = client.fetch_body("<test>").await.unwrap_err();
-    assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
-        0,
-        "BODY: {body_error:?}"
-    );
-    assert!(
-        client
-            .fetch_body_decoded_with_groups("<test>", &[])
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
-        0,
-        "decoded BODY"
-    );
-    assert!(client.stat_many(&["<test>"]).await.is_err());
-    assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
-        0,
-        "STAT"
-    );
-    assert!(client.fetch_head("<test>").await.is_err());
-    assert_eq!(
-        client.pool().health().lock().await.server(0).failure_count,
-        0,
-        "HEAD"
-    );
-    assert!(client.fetch_article("<test>").await.is_err());
-
-    let health = client.pool().health().lock().await;
-    assert_eq!(health.server(0).failure_count, 0);
-    assert_eq!(health.server(0).consecutive_failures, 0);
-    drop(health);
-    assert_eq!(client.pool().configured_connections(ServerId(0)), Some(64));
-    assert!(client.pool().is_over_limit(ServerId(0)));
-    server.abort();
-}
 
 // A dial the provider declined is paced by the holdoff alone. A lane asked
 // for on that server inside the window learns it is over its limit, not
@@ -1001,16 +346,19 @@ async fn declined_dial_holds_blocking_lanes_on_the_holdoff() {
         4,
     ));
 
-    assert!(matches!(
-        client.pool().acquire(ServerId(0)).await,
-        Err(NntpError::TooManyConnections)
-    ));
-    assert!(client.pool().is_over_limit(ServerId(0)));
-    assert!(matches!(
-        client.pool().acquire(ServerId(0)).await,
-        Err(NntpError::ServerOverLimit { .. })
-    ));
     let client = tokio::task::spawn_blocking(move || {
+        let Err(declined) = client.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+        else {
+            panic!("the provider declines the dial");
+        };
+        assert!(
+            matches!(
+                declined,
+                BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::TooManyConnections)
+            ),
+            "{declined:?}"
+        );
+        assert!(client.pool().is_over_limit(ServerId(0)));
         for _ in 0..4 {
             let Err(error) = client.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
             else {
@@ -1096,6 +444,143 @@ async fn blocking_capacity_holdoff_never_cools_healthy_server() {
     assert!(health.is_available(0));
 }
 
+// A provider that turns a dial away with 502 parks fresh lanes on that
+// server only: the next lane meets the holdoff without a socket, the lanes
+// already open keep fetching, the configured limit stands, and a peer server
+// is untouched.
+#[test]
+fn blocking_provider_rejection_parks_fresh_lanes_for_that_server_only() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_by_server = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { return };
+            let slot = accepted_by_server.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                if slot >= 2 {
+                    let _ = socket.write_all(b"502 Too Many Connections\r\n");
+                    return;
+                }
+                socket.write_all(b"200 test server ready\r\n").unwrap();
+                let reader = BufReader::new(socket.try_clone().unwrap());
+                for line in reader.lines() {
+                    let Ok(line) = line else { return };
+                    let reply: &[u8] = if line == "CAPABILITIES" {
+                        READER_CAPABILITIES
+                    } else if line.starts_with("BODY ") {
+                        b"222 1 <test> body follows\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n"
+                    } else if line == "QUIT" {
+                        let _ = socket.write_all(b"205 closing\r\n");
+                        return;
+                    } else {
+                        b"500 unsupported\r\n"
+                    };
+                    if socket.write_all(reply).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut capped = scripted_server(port, 0);
+    capped.max_connections = 8;
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![
+            capped,
+            ServerPoolConfig {
+                server: ServerConfig {
+                    host: "backup.example.com".into(),
+                    ..Default::default()
+                },
+                max_connections: 4,
+                group: 0,
+                ..ServerPoolConfig::default()
+            },
+        ],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: UNREACHED_TIMEOUT,
+    });
+    // The peer is excluded throughout, so nothing ever dials it.
+    let only_capped = ServerSet::from([1]);
+
+    let mut open: Vec<_> = (0..2)
+        .map(|_| {
+            client
+                .try_acquire_blocking_body_lane(&[], only_capped)
+                .expect("the provider admits its first two connections")
+        })
+        .collect();
+    let refused = client
+        .try_acquire_blocking_body_lane(&[], only_capped)
+        .err()
+        .expect("the third connection is refused");
+    assert!(
+        matches!(
+            refused,
+            BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::TooManyConnections)
+        ),
+        "{refused:?}"
+    );
+    assert!(client.pool().is_over_limit(ServerId(0)));
+    let accepted_after_rejection = accepted.load(Ordering::SeqCst);
+    assert_eq!(accepted_after_rejection, 3);
+
+    let held = client
+        .try_acquire_blocking_body_lane(&[], only_capped)
+        .err()
+        .expect("a held-off server opens no lane");
+    assert!(
+        matches!(
+            held,
+            BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::ServerOverLimit { .. })
+        ),
+        "{held:?}"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        accepted_after_rejection,
+        "a held-off server must not open another socket"
+    );
+    // The provider refused connections, not the configuration.
+    assert_eq!(client.pool().configured_connections(ServerId(0)), Some(8));
+    assert_eq!(client.pool().server_load(0), (6, 8));
+
+    // Lanes already open are untouched by the holdoff.
+    for lane in &mut open {
+        let trace = lane.fetch_decoded_sequential("<test>");
+        client.record_blocking_attempts(&trace.attempts);
+        let decoded = trace.result.expect("an open lane keeps fetching");
+        let bytes: Vec<u8> = decoded
+            .decoded
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert_eq!(bytes, b"A");
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), accepted_after_rejection);
+    assert_eq!(
+        client
+            .pool()
+            .health()
+            .blocking_lock()
+            .server(0)
+            .failure_count,
+        0
+    );
+
+    // A peer server that never rejected anything is unaffected.
+    assert!(!client.pool().is_over_limit(ServerId(1)));
+    assert_eq!(client.pool().server_load(1), (4, 4));
+    drop(open);
+}
+
 #[test]
 fn blocking_lane_preserves_provider_capacity_rejection() {
     let error = NntpError::from_status(crate::types::StatusCode::new(502), "Too many connections");
@@ -1108,33 +593,6 @@ fn blocking_lane_preserves_provider_capacity_rejection() {
         ),
         "unexpected blocking lane error: {error:?}"
     );
-}
-
-#[tokio::test]
-async fn client_shutdown() {
-    let config = NntpClientConfig::single(
-        ServerConfig {
-            host: "news.example.com".into(),
-            ..Default::default()
-        },
-        5,
-    );
-    let client = NntpClient::new(config);
-    client.shutdown().await;
-
-    // After shutdown, fetches should fail
-    let result = client.fetch_body("<test@example.com>").await;
-    assert!(result.is_err());
-}
-
-#[test]
-fn soft_timeout_is_transient() {
-    assert!(is_transient(&NntpError::SoftTimeout(15)));
-}
-
-#[test]
-fn soft_timeout_is_connection_error() {
-    assert!(is_connection_error(&NntpError::SoftTimeout(15)));
 }
 
 #[test]
@@ -1152,15 +610,10 @@ fn transient_failure_recording_counts_soft_timeouts() {
 }
 
 // Failing to obtain a connection is local capacity, not a server fault:
-// it is still retryable, but it must never cool the server down, and it
-// carries no connection to discard.
+// it must never cool the server down.
 #[test]
 fn acquire_timeout_is_capacity_not_transport() {
-    assert!(is_transient(&NntpError::AcquireTimeout(15)));
-    assert!(is_retryable_stat_error(&NntpError::AcquireTimeout(15)));
-    assert!(!is_connection_error(&NntpError::AcquireTimeout(15)));
     assert_eq!(cooldown_reason(&NntpError::AcquireTimeout(15)), None);
-    assert_eq!(stat_cooldown_reason(&NntpError::AcquireTimeout(15)), None);
     assert_eq!(
         NntpError::AcquireTimeout(15).to_string(),
         "no connection available within 15s"
@@ -1244,8 +697,6 @@ fn multi_server_client(server_count: usize) -> NntpClient {
 
     NntpClient {
         pool: Arc::new(pool),
-        work_guard: None,
-        max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     }
 }
@@ -1461,184 +912,6 @@ fn global_quota_predicate_requires_every_normal_fill_and_ignores_backfill() {
     assert!(!empty_pool.all_normal_fill_servers_quota_blocked());
 }
 
-// A 430 in the middle of a pipelined batch must not dirty the batch.
-//
-// The article-not-found answer is a complete, bodyless response: the
-// reader stays in sync and the socket is reusable. Marking the batch dirty
-// made the caller discard the connection and permanently block the
-// server's pipelining proof, so a provider that legitimately does not
-// carry some articles could never be pipelined.
-#[tokio::test]
-async fn pipelined_article_not_found_keeps_the_batch_and_connection_clean() {
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <one@miss-batch>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"430 No such article\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 3 <three@miss-batch>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: UNREACHED_TIMEOUT,
-    });
-    let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-    let message_ids = ["<one@miss-batch>", "<two@miss-batch>", "<three@miss-batch>"];
-    let mut seen = Vec::new();
-
-    let stats = lane
-        .fetch_decoded_pipeline_with_estimates(&message_ids, &[0, 0, 0], 8, |idx, trace, meta| {
-            seen.push((idx, trace, meta));
-            std::future::ready(())
-        })
-        .await;
-
-    assert_eq!(stats.requested, 3);
-    assert_eq!(stats.completed, 3);
-    assert_eq!(stats.unresolved, 0);
-    assert!(!stats.connection_discarded);
-    assert!(!stats.response_order_mismatch);
-
-    assert_eq!(seen[0].1.attempts[0].outcome, FetchAttemptOutcome::Success);
-    assert_eq!(seen[1].1.attempts[0].outcome, FetchAttemptOutcome::NotFound);
-    assert_eq!(seen[2].1.attempts[0].outcome, FetchAttemptOutcome::Success);
-    assert!(matches!(
-        &seen[1].1.result,
-        Err(DecodedBodyError::Nntp(NntpError::NoSuchArticle { .. }))
-    ));
-    // The two surrounding articles still decoded: the miss did not
-    // desynchronise the response stream.
-    assert!(seen[0].1.result.is_ok());
-    assert!(seen[2].1.result.is_ok());
-
-    for (idx, _, meta) in &seen {
-        assert!(meta.batch_clean, "item {idx} dirtied the batch on a 430");
-        assert!(!meta.connection_discarded, "item {idx} discarded the lane");
-    }
-    assert!(seen[2].2.batch_complete);
-    assert_eq!(seen[2].2.batch_response_count, 3);
-
-    lane.park();
-}
-
-#[tokio::test]
-async fn quota_stopped_pipeline_reports_every_unissued_item_without_poisoning_lane() {
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <first@quota-tail>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let stable_id = crate::transfer::StableServerId(303);
-    let control = transfers.configure(
-        stable_id,
-        crate::transfer::ServerTransferConfig {
-            closed: false,
-            rate_bytes_per_sec: 0,
-            quota: Some(crate::transfer::QuotaRuntimeConfig {
-                limit_bytes: 500,
-                generation: 1,
-                retry_at: None,
-            }),
-        },
-    );
-    let mut server = scripted_server(port, 0);
-    server.stable_id = stable_id;
-    server.transfer_control = Some(control);
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![server],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: UNREACHED_TIMEOUT,
-    });
-    let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-    let message_ids = [
-        String::from("<first@quota-tail>"),
-        String::from("<blocked@quota-tail>"),
-        String::from("<fits-after-refund@quota-tail>"),
-    ];
-    let estimates = [400, 200, 50];
-    let mut seen = Vec::new();
-
-    let stats = lane
-        .fetch_decoded_pipeline_with_estimates(
-            &message_ids.iter().map(String::as_str).collect::<Vec<_>>(),
-            &estimates,
-            4,
-            |idx, trace, meta| {
-                seen.push((idx, trace, meta));
-                std::future::ready(())
-            },
-        )
-        .await;
-
-    assert_eq!(stats.offered, 3);
-    assert_eq!(stats.requested, 1);
-    assert_eq!(stats.unrequested, 2);
-    assert_eq!(stats.completed, 3);
-    assert_eq!(stats.unresolved, 0);
-    assert_eq!(
-        seen.iter().map(|(idx, _, _)| *idx).collect::<Vec<_>>(),
-        vec![0, 1, 2]
-    );
-    assert_eq!(seen[0].1.attempts[0].outcome, FetchAttemptOutcome::Success);
-    assert_eq!(
-        seen[1].1.attempts[0].outcome,
-        FetchAttemptOutcome::QuotaBlocked
-    );
-    assert_eq!(
-        seen[2].1.attempts[0].outcome,
-        FetchAttemptOutcome::QuotaUnrequested
-    );
-    assert!(matches!(
-        &seen[2].1.result,
-        Err(DecodedBodyError::Nntp(
-            NntpError::BodyNotRequestedDueToQuota {
-                preceding_rejection,
-                requested_body_bytes: 50,
-            }
-        )) if preceding_rejection.requested_body_bytes == 200
-    ));
-    assert!(seen[1].2.batch_clean);
-    assert!(!seen[1].2.connection_discarded);
-    assert!(!seen[1].2.batch_complete);
-    assert!(seen[2].2.batch_clean);
-    assert!(!seen[2].2.connection_discarded);
-    assert!(seen[2].2.batch_complete);
-    assert_eq!(seen[2].2.unresolved_count, 0);
-
-    lane.park();
-}
-
 #[test]
 fn earliest_quota_selection_preserves_first_blocked_registry_revision() {
     let transfers = crate::transfer::ServerTransferRegistry::new();
@@ -1776,6 +1049,206 @@ async fn quota_blocked_fill_does_not_unlock_or_report_locked_backfill() {
         .await;
     assert_eq!(selection.eligible, vec![ServerId(1)]);
     assert!(selection.quota_blocked.is_none());
+}
+
+// A local listener a test must never dial. Nothing ever accepts on it, so
+// `never_dialled` reads the kernel's backlog without waiting.
+fn undialled_listener() -> (std::net::TcpListener, u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+fn never_dialled(listener: &std::net::TcpListener) -> bool {
+    matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
+// The setup a scripted server greets a reader session with.
+fn greeted_reader(mut rest: Vec<ScriptStep>) -> Vec<ScriptStep> {
+    let mut steps = vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: READER_CAPABILITIES,
+        },
+    ];
+    steps.append(&mut rest);
+    steps
+}
+
+// The connection downloads use skips a fill server whose quota is spent and
+// opens on the next fill server, which serves the article. The capped server
+// is never dialled.
+#[tokio::test]
+async fn blocking_quota_rejection_fails_over_to_another_fill_server() {
+    let (capped_listener, capped_port) = undialled_listener();
+    let healthy_port = spawn_scripted_server(greeted_reader(vec![ScriptStep {
+        expect_prefix: Some("BODY "),
+        response: b"222 1 <quota-failover@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+    }]))
+    .await;
+    let transfers = crate::transfer::ServerTransferRegistry::new();
+    let capped_control = transfers.configure(
+        StableServerId(111),
+        crate::transfer::ServerTransferConfig {
+            closed: false,
+            rate_bytes_per_sec: 0,
+            quota: Some(crate::transfer::QuotaRuntimeConfig {
+                limit_bytes: 0,
+                generation: 1,
+                retry_at: None,
+            }),
+        },
+    );
+    let mut capped = scripted_server(capped_port, 0);
+    capped.stable_id = StableServerId(111);
+    capped.transfer_control = Some(capped_control);
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![capped, scripted_server(healthy_port, 1)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: UNREACHED_TIMEOUT,
+    });
+
+    let trace = tokio::task::spawn_blocking(move || {
+        let mut lane = client
+            .try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+            .expect("the second fill server opens a lane");
+        assert_eq!(lane.server_id(), ServerId(1));
+        let trace = lane.fetch_decoded_sequential("<quota-failover@example.com>");
+        client.record_blocking_attempts(&trace.attempts);
+        trace
+    })
+    .await
+    .unwrap();
+
+    let decoded = trace.result.expect("second fill server should succeed");
+    let decoded_bytes: Vec<u8> = decoded
+        .decoded
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect();
+    assert_eq!(decoded_bytes, b"A");
+    assert_eq!(trace.attempts.len(), 1);
+    assert_eq!(trace.attempts[0].server_idx, 1);
+    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+    assert!(never_dialled(&capped_listener));
+}
+
+// A fill server out of quota is no reason to open the backfill: the
+// connection downloads use reports that quota and opens no lane, and the
+// backfill is offered only once the fill server is excluded for the article.
+#[test]
+fn blocking_quota_blocked_fill_does_not_unlock_or_report_locked_backfill() {
+    let retry_at = Instant::now() + Duration::from_secs(60);
+    let client = quota_selection_client(&[false, true], &[(0, Some(retry_at))]);
+
+    let refused = client
+        .try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+        .err()
+        .expect("a quota-blocked fill server must not open the backfill");
+    assert!(
+        matches!(
+            &refused,
+            BlockingBodyLaneAcquireError::Other(NntpError::QuotaBlocked(rejection))
+                if rejection.stable_server_id == StableServerId(1_000)
+        ),
+        "{refused:?}"
+    );
+    let selection = client
+        .try_blocking_body_server_selection_with_estimate(ServerSet::EMPTY, 0)
+        .expect("the health state is uncontended in this test");
+    assert!(selection.eligible.is_empty());
+
+    let selection = client
+        .try_blocking_body_server_selection_with_estimate(ServerSet::from([0]), 0)
+        .expect("the health state is uncontended in this test");
+    assert_eq!(selection.eligible, vec![ServerId(1)]);
+    assert!(selection.quota_blocked.is_none());
+}
+
+// A primary that goes silent spends the lane's active budget and fails the
+// article on that server alone. One soft timeout leaves the primary first in
+// line, and the healthy lower group stays behind it: nothing dials it. The
+// silence comes either before the body's status line or in the login a
+// mid-session 480 asks for.
+#[tokio::test]
+async fn blocking_soft_timeout_on_the_primary_does_not_unlock_a_healthy_lower_group() {
+    for reauth in [false, true] {
+        let primary_port = if reauth {
+            spawn_delayed_reauth_server().await
+        } else {
+            spawn_delayed_body_initial_server().await
+        };
+        let (backup_listener, backup_port) = undialled_listener();
+        let mut primary = scripted_server(primary_port, 0);
+        if reauth {
+            primary.server.username = Some("user".to_string());
+            primary.server.password = Some("pass".to_string());
+        }
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![primary, scripted_server(backup_port, 1)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_millis(75),
+        });
+
+        let (client, trace) = tokio::task::spawn_blocking(move || {
+            let mut lane = client
+                .try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+                .expect("the primary opens a lane");
+            assert_eq!(lane.server_id(), ServerId(0));
+            let trace = lane.fetch_decoded_sequential("<delayed@example.com>");
+            drop(lane);
+            client.record_blocking_attempts(&trace.attempts);
+            (client, trace)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                trace.result,
+                Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
+            ),
+            "reauth={reauth}: {:?}",
+            trace.result.as_ref().err()
+        );
+        assert_eq!(trace.attempts.len(), 1, "reauth={reauth}");
+        assert_eq!(trace.attempts[0].server_idx, 0, "reauth={reauth}");
+        assert!(
+            trace.attempts[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("soft timeout")),
+            "reauth={reauth}: {:?}",
+            trace.attempts[0].error
+        );
+        let order = client
+            .blocking_body_server_order(ServerSet::EMPTY)
+            .expect("the health state is uncontended in this test");
+        assert_eq!(order.first(), Some(&ServerId(0)), "reauth={reauth}");
+        assert!(
+            matches!(
+                client.pool().provider_policy().eligibility(
+                    1,
+                    ServerSet::EMPTY,
+                    ServerSet::EMPTY,
+                    1
+                ),
+                crate::provider_policy::ArticleEligibility::HigherPriority(_)
+            ),
+            "reauth={reauth}"
+        );
+        assert!(never_dialled(&backup_listener), "reauth={reauth}");
+    }
 }
 
 // The pipeline asks this on every article it takes, so it reads what each
@@ -2094,11 +1567,9 @@ fn selection_contention_is_requeued_but_is_not_capacity_admission() {
     );
 }
 
-// The dispatcher asks this question before it decides between an owned lane
-// and the async path, and a momentary lock collision is not an answer about
-// servers. Collapsing it into "no candidate" sent the batch to the async
-// path — which then dialled its own connection while the owned lane sat on a
-// warm one.
+// The dispatcher asks this question before it opens a lane, and a
+// momentary lock collision is not an answer about servers: contention is
+// asked again, while having no candidate is a verdict.
 #[tokio::test]
 async fn candidacy_separates_contention_from_having_no_candidate() {
     let client = NntpClient::new(NntpClientConfig {
@@ -2184,692 +1655,6 @@ async fn backfill_server_that_misses_joins_exclusion_ladder() {
         .build_server_order(crate::ServerSet::from([0, 1]))
         .await;
     assert!(order.is_empty());
-}
-
-#[tokio::test]
-async fn fetch_body_with_groups_traced_reports_successful_server_idx() {
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <exists@example.com>\r\npayload\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let trace = client
-        .fetch_body_with_groups_traced("<exists@example.com>", &[String::from("alt.binaries.test")])
-        .await;
-
-    assert!(trace.result.is_ok(), "traced fetch should succeed");
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(trace.attempts[0].server_idx, 0);
-    assert_eq!(
-        trace.attempts[0].remote_ip,
-        Some("127.0.0.1".parse().unwrap())
-    );
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
-}
-
-#[tokio::test]
-async fn decoded_quota_rejection_fails_over_to_another_fill_server() {
-    let capped_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-    ])
-    .await;
-    let healthy_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <quota-failover@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let capped_control = transfers.configure(
-        crate::transfer::StableServerId(101),
-        crate::transfer::ServerTransferConfig {
-            closed: false,
-            rate_bytes_per_sec: 0,
-            quota: Some(crate::transfer::QuotaRuntimeConfig {
-                limit_bytes: 0,
-                generation: 1,
-                retry_at: None,
-            }),
-        },
-    );
-    let mut capped = scripted_server(capped_port, 0);
-    capped.stable_id = crate::transfer::StableServerId(101);
-    capped.transfer_control = Some(capped_control);
-    let healthy = scripted_server(healthy_port, 1);
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![capped, healthy],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: UNREACHED_TIMEOUT,
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_traced("<quota-failover@example.com>", &[])
-        .await;
-    let decoded = trace.result.expect("second fill server should succeed");
-    let decoded_bytes: Vec<u8> = decoded
-        .decoded
-        .iter()
-        .flat_map(|chunk| chunk.iter().copied())
-        .collect();
-    assert_eq!(decoded_bytes, b"A");
-    assert_eq!(trace.attempts.len(), 2);
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::QuotaBlocked);
-    assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
-}
-
-#[tokio::test]
-async fn decoded_quota_rejection_does_not_unlock_backfill() {
-    let capped_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-    ])
-    .await;
-    let backfill_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <backfill-locked@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let capped_control = transfers.configure(
-        crate::transfer::StableServerId(102),
-        crate::transfer::ServerTransferConfig {
-            closed: false,
-            rate_bytes_per_sec: 0,
-            quota: Some(crate::transfer::QuotaRuntimeConfig {
-                limit_bytes: 0,
-                generation: 1,
-                retry_at: None,
-            }),
-        },
-    );
-    let mut capped = scripted_server(capped_port, 0);
-    capped.stable_id = crate::transfer::StableServerId(102);
-    capped.transfer_control = Some(capped_control);
-    let mut backfill = scripted_server(backfill_port, 0);
-    backfill.backfill = true;
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![capped, backfill],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: UNREACHED_TIMEOUT,
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_traced("<backfill-locked@example.com>", &[])
-        .await;
-    assert!(matches!(
-        trace.result,
-        Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(_)))
-    ));
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(trace.attempts[0].server_idx, 0);
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::QuotaBlocked);
-}
-
-#[tokio::test]
-async fn deliberate_rate_wait_does_not_trip_decoded_soft_timeout_or_health() {
-    const DECODED_SIZE: usize = 1_200;
-    let mut response =
-        b"222 1 <rate-wait@example.com>\r\n=ybegin line=128 size=1200 name=x\r\n".to_vec();
-    for offset in (0..DECODED_SIZE).step_by(128) {
-        let line_len = (DECODED_SIZE - offset).min(128);
-        response.extend(std::iter::repeat_n(b'k', line_len));
-        response.extend_from_slice(b"\r\n");
-    }
-    response.extend_from_slice(b"=yend size=1200\r\n.\r\n");
-    let response: &'static [u8] = Box::leak(response.into_boxed_slice());
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response,
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let control = transfers.configure(
-        crate::transfer::StableServerId(103),
-        crate::transfer::ServerTransferConfig {
-            closed: false,
-            rate_bytes_per_sec: 1_000,
-            quota: None,
-        },
-    );
-    let mut server = scripted_server(port, 0);
-    server.stable_id = crate::transfer::StableServerId(103);
-    server.transfer_control = Some(control.clone());
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![server],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(50),
-    });
-
-    let started = Instant::now();
-    let trace = client
-        .fetch_body_decoded_with_groups_traced("<rate-wait@example.com>", &[])
-        .await;
-    assert!(started.elapsed() >= Duration::from_millis(100));
-    let decoded = trace.result.expect("deliberate wait must not time out");
-    let expected = vec![b'A'; DECODED_SIZE];
-    let decoded_bytes: Vec<u8> = decoded
-        .decoded
-        .iter()
-        .flat_map(|chunk| chunk.iter().copied())
-        .collect();
-    assert_eq!(decoded_bytes, expected);
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
-    assert_eq!(
-        *client.pool.health().lock().await.server(0).state(),
-        crate::health::ServerState::Healthy
-    );
-    assert!(control.snapshot().lifetime_body_bytes > 1_000);
-}
-
-#[tokio::test]
-async fn delayed_body_initial_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
-    let primary_port = spawn_delayed_body_initial_server().await;
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <delayed@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(75),
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_traced("<delayed@example.com>", &[])
-        .await;
-
-    assert!(matches!(
-        trace.result,
-        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
-    ));
-    assert_eq!(trace.attempts.len(), 1);
-    assert!(
-        trace.attempts[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("soft timeout"))
-    );
-}
-
-#[tokio::test]
-async fn delayed_reauth_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
-    let primary_port = spawn_delayed_reauth_server().await;
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <reauth@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-        },
-    ])
-    .await;
-    let mut primary = scripted_server(primary_port, 0);
-    primary.server.username = Some("user".to_string());
-    primary.server.password = Some("pass".to_string());
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![primary, scripted_server(backup_port, 1)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(75),
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_traced("<reauth@example.com>", &[])
-        .await;
-
-    assert!(matches!(
-        trace.result,
-        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
-    ));
-    assert_eq!(trace.attempts.len(), 1);
-    assert!(
-        trace.attempts[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("soft timeout"))
-    );
-}
-
-#[tokio::test]
-async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
-    let primary_port = spawn_unterminated_body_server().await;
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <unterminated@example.com>\r\nbackup\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let transfers = crate::transfer::ServerTransferRegistry::new();
-    let control = transfers.configure(
-        crate::transfer::StableServerId(105),
-        crate::transfer::ServerTransferConfig {
-            closed: false,
-            rate_bytes_per_sec: 1,
-            quota: None,
-        },
-    );
-    let mut primary = scripted_server(primary_port, 0);
-    primary.stable_id = crate::transfer::StableServerId(105);
-    primary.transfer_control = Some(control.clone());
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![primary, scripted_server(backup_port, 1)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(75),
-    });
-
-    let trace = client
-        .fetch_body_with_groups_traced(
-            "<unterminated@example.com>",
-            &[String::from("alt.binaries.test")],
-        )
-        .await;
-
-    assert!(matches!(trace.result, Err(NntpError::SoftTimeout(_))));
-    assert_eq!(trace.attempts.len(), 1);
-    assert!(
-        trace.attempts[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("soft timeout"))
-    );
-    let snapshot = control.snapshot();
-    assert!(snapshot.lifetime_body_bytes >= 64 * 1024);
-    assert_eq!(snapshot.throttle_wait, Duration::ZERO);
-}
-
-#[tokio::test]
-async fn grouped_body_missing_plus_transport_uncertainty_is_not_authoritative_not_found() {
-    let primary_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"430 No such article\r\n",
-        },
-    ])
-    .await;
-
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let trace = client
-        .fetch_body_with_groups_traced("<maybe@example.com>", &[String::from("alt.binaries.test")])
-        .await;
-
-    assert_eq!(trace.attempts.len(), 2);
-    assert!(matches!(
-        trace.result,
-        Err(NntpError::ConnectionClosed) | Err(NntpError::SoftTimeout(_))
-    ));
-}
-
-#[tokio::test]
-async fn extra_body_lane_reports_remote_ip() {
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let lane = client
-        .acquire_extra_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
-        .await
-        .expect("extra BODY lane should acquire");
-
-    assert_eq!(
-        lane.remote_ip(),
-        Some("127.0.0.1".parse::<IpAddr>().unwrap())
-    );
-    lane.park();
-}
-
-#[tokio::test]
-async fn extra_body_lane_uses_fresh_connection_instead_of_idle_pool() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let accepted_task = accepted.clone();
-
-    tokio::spawn(async move {
-        for _ in 0..2 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            socket.write_all(b"200 ready\r\n").await.unwrap();
-            socket.flush().await.unwrap();
-            let line = read_command_line(&mut socket).await;
-            assert!(line.starts_with("CAPABILITIES"));
-            socket
-                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-                .await
-                .unwrap();
-            socket.flush().await.unwrap();
-            // A body lane fetches by message-id, so no GROUP follows: the
-            // connection is ready for the caller's own command here.
-        }
-    });
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let first = client
-        .acquire_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
-        .await
-        .expect("normal BODY lane should acquire");
-    first.park();
-
-    let second = client
-        .acquire_extra_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
-        .await
-        .expect("extra BODY lane should acquire fresh connection");
-    second.discard().await;
-
-    assert_eq!(
-        accepted.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "extra BODY lane must create a fresh connection instead of reusing idle"
-    );
-}
-
-#[tokio::test]
-async fn parked_extra_body_lane_is_not_returned_to_normal_idle_pool() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let accepted_task = accepted.clone();
-
-    tokio::spawn(async move {
-        for _ in 0..2 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            socket.write_all(b"200 ready\r\n").await.unwrap();
-            socket.flush().await.unwrap();
-            let line = read_command_line(&mut socket).await;
-            assert!(line.starts_with("CAPABILITIES"));
-            socket
-                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-                .await
-                .unwrap();
-            socket.flush().await.unwrap();
-            // A body lane fetches by message-id, so no GROUP follows: the
-            // connection is ready for the caller's own command here.
-        }
-    });
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let extra = client
-        .acquire_extra_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
-        .await
-        .expect("extra BODY lane should acquire");
-    extra.park();
-
-    let normal = client
-        .acquire_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
-        .await
-        .expect("normal BODY lane should not reuse parked extra connection");
-    normal.discard().await;
-
-    assert_eq!(
-        accepted.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "parked over-max BODY lane must close instead of entering normal idle pool"
-    );
-}
-
-#[tokio::test]
-async fn fetch_body_prefer_excluding_falls_back_when_only_server_excluded() {
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <exists@example.com>\r\npayload\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let trace = client
-        .fetch_body_with_groups_prefer_excluding_traced(
-            "<exists@example.com>",
-            &[String::from("alt.binaries.test")],
-            crate::ServerSet::from([0]),
-        )
-        .await;
-
-    assert!(trace.result.is_ok(), "fallback fetch should succeed");
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(trace.attempts[0].server_idx, 0);
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
-}
-
-#[tokio::test]
-async fn fetch_body_prefer_excluding_uses_alternate_server_first() {
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: b"222 1 <exists@example.com>\r\nbackup\r\n.\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(1, 0), scripted_server(backup_port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let trace = client
-        .fetch_body_with_groups_prefer_excluding_traced(
-            "<exists@example.com>",
-            &[String::from("alt.binaries.test")],
-            crate::ServerSet::from([0]),
-        )
-        .await;
-
-    assert!(trace.result.is_ok(), "alternate fetch should succeed");
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(trace.attempts[0].server_idx, 1);
-    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
 }
 
 #[tokio::test]
@@ -2959,8 +1744,6 @@ async fn build_server_order_keeps_backfill_after_primary_group() {
 
     let client = NntpClient {
         pool: Arc::new(pool),
-        work_guard: None,
-        max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     };
 
@@ -2997,262 +1780,11 @@ async fn build_server_order_prefers_ready_servers_within_same_group() {
 
     let client = NntpClient {
         pool: Arc::new(pool),
-        work_guard: None,
-        max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     };
 
     let order = client.build_server_order(crate::ServerSet::EMPTY).await;
     assert_eq!(order, vec![1, 0]);
-}
-
-#[tokio::test]
-async fn known_pipelining_pipelines_stats_without_capabilities() {
-    let port = spawn_stat_server(true).await;
-    let mut server = scripted_server(port, 0);
-    server.server.pipelining = crate::connection::PipeliningCapability::Known(true);
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![server],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    assert_eq!(
-        client
-            .stat_many(&["<first@example.com>", "<second@example.com>"])
-            .await
-            .unwrap(),
-        vec![true, true]
-    );
-}
-
-#[tokio::test]
-async fn known_non_pipelining_serializes_stats_without_capabilities() {
-    let port = spawn_stat_server(false).await;
-    let mut server = scripted_server(port, 0);
-    server.server.pipelining = crate::connection::PipeliningCapability::Known(false);
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![server],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    assert_eq!(
-        client
-            .stat_many(&["<first@example.com>", "<second@example.com>"])
-            .await
-            .unwrap(),
-        vec![true, true]
-    );
-}
-
-#[tokio::test]
-async fn stat_many_fails_over_after_malformed_pipelined_response_when_article_is_confirmed() {
-    let primary_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("STAT "),
-            response: b"2\xff3 malformed\r\n",
-        },
-    ])
-    .await;
-
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("STAT "),
-            response: b"223 0 <exists@example.com>\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let results = client
-        .stat_many(&["<exists@example.com>"])
-        .await
-        .expect("stat_many should fail over");
-    assert_eq!(results, vec![true]);
-}
-
-#[tokio::test]
-async fn stat_many_is_inconclusive_when_malformed_response_precedes_clean_missing() {
-    let primary_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("STAT "),
-            response: b"2\xff3 malformed\r\n",
-        },
-    ])
-    .await;
-
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("STAT "),
-            response: b"430 No such article\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let err = client
-        .stat_many(&["<missing@example.com>"])
-        .await
-        .expect_err("malformed STAT plus clean missing must be inconclusive");
-    assert!(matches!(err, NntpError::MalformedResponse(_)));
-}
-
-#[tokio::test]
-async fn confirm_exists_for_probe_recovers_false_stat_with_head_success() {
-    let port = spawn_probe_confirmation_server(
-        b"221 0 <exists@example.com> Headers follow\r\nSubject: still here\r\n.\r\n",
-    )
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let result = client
-        .confirm_exists_for_probe(&["<exists@example.com>"])
-        .await;
-    assert_eq!(
-        result,
-        ProbeBatchResult {
-            exists: vec![true],
-            inconclusive: false,
-        }
-    );
-}
-
-#[tokio::test]
-async fn confirm_exists_for_probe_marks_head_transport_failure_inconclusive() {
-    let port = spawn_probe_confirmation_server(b"").await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let result = client
-        .confirm_exists_for_probe(&["<exists@example.com>"])
-        .await;
-    assert_eq!(
-        result,
-        ProbeBatchResult {
-            exists: vec![false],
-            inconclusive: true,
-        }
-    );
-}
-
-#[tokio::test]
-async fn confirm_exists_for_probe_marks_malformed_stat_with_clean_missing_inconclusive() {
-    let primary_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("STAT "),
-            response: b"2\xff3 malformed\r\n",
-        },
-    ])
-    .await;
-
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("STAT "),
-            response: b"430 No such article\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let result = client
-        .confirm_exists_for_probe(&["<missing@example.com>"])
-        .await;
-    assert_eq!(
-        result,
-        ProbeBatchResult {
-            exists: vec![false],
-            inconclusive: true,
-        }
-    );
 }
 
 fn lane_config(tls: bool, starttls: bool, pinned_ca: bool) -> ServerConfig {
@@ -3288,112 +1820,6 @@ fn adopted_name_mismatch_certificate_still_gets_an_owned_lane() {
     config.tls_name_mismatch_certificate_der = Some(vec![0x30, 0x82, 0x01, 0x0a]);
 
     assert!(supports_blocking_body_lane(&config));
-}
-
-// A 501 is a syntax error in the one request, not a server without STAT.
-//
-// One message-id the server cannot parse must not retire STAT for the
-// process: every later probe would then run HEAD per article, one round trip
-// each, against a server that pipelines STAT perfectly well.
-#[tokio::test]
-async fn a_501_to_one_stat_does_not_retire_stat_for_the_server() {
-    let port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("STAT "),
-            response: b"501 Syntax error\r\n",
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let err = client
-        .stat_many(&["<odd id@example.com>"])
-        .await
-        .expect_err("a 501 is a refusal of the request");
-    assert!(
-        !matches!(err, NntpError::CommandNotRecognized),
-        "a 501 must not be read as the command being missing: {err:?}"
-    );
-    assert!(
-        crate::server_caps::supports_stat("127.0.0.1", port),
-        "one unparseable id must not retire STAT for the server"
-    );
-}
-
-// With every usable server excluded there is nobody left to ask, and that is
-// an answer for the caller — not an inconclusive batch, and not a dial.
-#[tokio::test]
-async fn a_probe_with_every_server_excluded_has_nobody_to_ask() {
-    // The script would fail on any command; the point is that no connection
-    // is ever opened to it.
-    let port = spawn_scripted_server(vec![ScriptStep {
-        expect_prefix: None,
-        response: b"200 ready\r\n",
-    }])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let outcome = client
-        .confirm_exists_for_probe_excluding(
-            &["<probe@silver.horizon>"],
-            crate::ServerSet::from([0]),
-        )
-        .await;
-    assert!(
-        outcome.is_none(),
-        "excluding the only server leaves nothing to ask: {outcome:?}"
-    );
-    assert!(
-        client.has_available_permit(ServerId(0)),
-        "no connection may be opened on an excluded server"
-    );
-}
-
-// The HEAD re-check of STAT's misses is one pipelined batch, not one
-// failover fetch per article: N misses cost one round trip per server, and a
-// missing article is exactly the case where every server has to be asked.
-#[tokio::test]
-async fn the_head_recheck_of_stat_misses_is_one_pipelined_batch() {
-    let port = spawn_pipelined_head_recheck_server().await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let result = client
-        .confirm_exists_for_probe(&["<first@example.com>", "<second@example.com>"])
-        .await;
-    assert_eq!(
-        result,
-        ProbeBatchResult {
-            exists: vec![true, false],
-            inconclusive: false,
-        },
-        "the batch's answers land on the ids they were asked about"
-    );
 }
 
 // The owned-lane candidacy probe asks whether any server could take work at

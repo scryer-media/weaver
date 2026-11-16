@@ -27,8 +27,11 @@ pub(crate) use counters::COUNTER_SAMPLES;
 pub(crate) use history::FAILED_SWEEP_PAGE;
 #[cfg(test)]
 pub(crate) use history::SweepPlaces;
+#[cfg(test)]
+pub(crate) use history::between_sweeps;
 pub(crate) use history::{
     MoveOut, clear_left_working_dirs, clear_restart_artifacts, remove_job_staging,
+    remove_job_staging_checked,
 };
 
 /// The control plane's shared facts. A guard never leaves a synchronous
@@ -221,6 +224,10 @@ pub struct Globals {
     pub hardware_profile_in_force: Option<crate::jobs::handle::HardwareProfileInForce>,
     pub scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub random_read_iops: Option<f64>,
+    pub storage_classification: Option<(
+        crate::runtime::system_profile::StorageClass,
+        crate::runtime::system_profile::FilesystemType,
+    )>,
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
     pub nntp_active: Option<crate::jobs::handle::NntpRuntimeActivation>,

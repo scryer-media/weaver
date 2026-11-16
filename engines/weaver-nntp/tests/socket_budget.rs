@@ -32,13 +32,34 @@ fn direct_route() -> Arc<RouteDialer> {
     })
 }
 
+// The two pools share one durable control, as an old and a replacement client
+// generation do, so they share one socket budget of one.
+fn connect_lane(
+    pool: &NntpPool,
+    config: ServerConfig,
+) -> tokio::task::JoinHandle<weaver_nntp::blocking::BlockingBodyLane> {
+    let permit = pool.try_acquire_blocking_permit(ServerId(0)).unwrap();
+    tokio::task::spawn_blocking(move || {
+        weaver_nntp::blocking::BlockingBodyLane::connect(
+            ServerId(0),
+            StableServerId(7),
+            None,
+            &config,
+            &[],
+            Duration::from_secs(2),
+            permit,
+        )
+        .unwrap()
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_idle_socket_is_closed_before_blocking_slot_is_reassigned() {
+async fn an_idle_lane_socket_is_closed_before_its_slot_is_reassigned() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let (closed_tx, mut closed_rx) = tokio::sync::mpsc::channel(3);
+    let (closed_tx, mut closed_rx) = tokio::sync::mpsc::channel(2);
     let server = tokio::spawn(async move {
-        for _ in 0..3 {
+        for _ in 0..2 {
             let (socket, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = socket.into_split();
             writer.write_all(b"200 ready\r\n").await.unwrap();
@@ -70,52 +91,32 @@ async fn async_idle_socket_is_closed_before_blocking_slot_is_reassigned() {
         }],
         ..Default::default()
     };
+    let server_config = || config().servers.remove(0).server;
     let old = NntpPool::new(config());
-    drop(old.acquire(ServerId(0)).await.unwrap());
-    assert_eq!(old.server_load(0), (1, 1));
-    assert_eq!(old.socket_budget_snapshot(0).async_idle, 1);
-    // The same durable control covers a concurrently alive replacement client.
-    let replacement = NntpPool::new(config());
-    let permit = replacement
-        .try_acquire_blocking_permit(ServerId(0))
-        .unwrap();
-    closed_rx.recv().await.unwrap();
+    let lane = connect_lane(&old, server_config()).await.unwrap();
     assert_eq!(old.socket_budget_snapshot(0).physical, 1);
-    assert_eq!(old.socket_budget_snapshot(0).async_idle, 0);
-    assert!(old.try_acquire_blocking_permit(ServerId(0)).is_err());
-    let server_config = config().servers.remove(0).server;
-    let lane = tokio::task::spawn_blocking(move || {
-        weaver_nntp::blocking::BlockingBodyLane::connect(
-            ServerId(0),
-            StableServerId(7),
-            None,
-            &server_config,
-            &[],
-            Duration::from_secs(2),
-            permit,
-        )
-        .unwrap()
-    })
-    .await
-    .unwrap();
-    assert_eq!(old.socket_budget_snapshot(0).physical, 1);
-    let (recall_tx, recall_rx) = std::sync::mpsc::channel();
+    // The idle lane's owner closes its exact socket when recalled.
+    let held = Arc::new(std::sync::Mutex::new(None));
     let socket_id = lane.socket_id();
+    let owner = Arc::clone(&held);
     lane.mark_idle(Arc::new(move |id| {
-        recall_tx.send(id).unwrap();
+        assert_eq!(id, socket_id);
+        drop(owner.lock().unwrap().take());
     }));
-    let owner = std::thread::spawn(move || {
-        assert_eq!(recall_rx.recv().unwrap(), socket_id);
-        drop(lane);
-    });
-    // Reverse backend handoff must wake on both the owned dispatch permit
-    // and the physical-slot acknowledgement, without a lost wakeup.
-    let async_again = replacement.acquire(ServerId(0)).await.unwrap();
-    owner.join().unwrap();
-    assert_eq!(old.socket_budget_snapshot(0).physical, 1);
+    *held.lock().unwrap() = Some(lane);
+    assert_eq!(old.socket_budget_snapshot(0).owned_idle, 1);
+
+    // The replacement generation recalls the idle socket for its own dial,
+    // and gets the slot only once that socket has closed.
+    let replacement = NntpPool::new(config());
+    let lane = connect_lane(&replacement, server_config()).await.unwrap();
+    assert!(held.lock().unwrap().is_none());
     closed_rx.recv().await.unwrap();
-    drop(async_again);
-    replacement.drain_all_idle().await;
+    assert_eq!(old.socket_budget_snapshot(0).physical, 1);
+    assert_eq!(old.socket_budget_snapshot(0).owned_idle, 0);
+    assert!(old.try_acquire_blocking_permit(ServerId(0)).is_err());
+    drop(lane);
     assert_eq!(old.socket_budget_snapshot(0).physical, 0);
+    closed_rx.recv().await.unwrap();
     server.await.unwrap();
 }

@@ -265,9 +265,22 @@ impl RarStore {
     // A transferable volume is judged by its parsed headers, or by the
     // retained front and name while those headers say nothing. Both are
     // the same evidence an unowned member offers, without reading it again,
-    // and are answered as it is, not yet included.
+    // and are answered as it is, not yet included. A volume whose end
+    // record says its set ends with it is taken nowhere a volume held here
+    // lies past: held there, that volume would go back at once, as one past
+    // the last does, only to be taken again.
     pub(super) fn reclaim_volume(&self, name: &str, front: &[u8], given: &Volume) -> Claim {
-        self.reclaim_front(name, front, given.stated())
+        let ends = given.walk.is_last();
+        let mut placing = self.reclaim_placing(name, front, given.stated());
+        placing.placed = placing.placed.filter(|at| {
+            !ends
+                || self
+                    .volumes
+                    .range((std::ops::Bound::Excluded(*at), std::ops::Bound::Unbounded))
+                    .next()
+                    .is_none()
+        });
+        placing.claim(self)
     }
 
     pub(super) fn reclaim_front(
@@ -276,7 +289,19 @@ impl RarStore {
         front: &[u8],
         facts: Option<&RarVolumeFacts>,
     ) -> Claim {
-        self.placing_front(name, front, facts).claim(self)
+        self.reclaim_placing(name, front, facts).claim(self)
+    }
+
+    fn reclaim_placing(&self, name: &str, front: &[u8], facts: Option<&RarVolumeFacts>) -> Placing {
+        let mut placing = self.placing_front(name, front, facts);
+        // A volume another store holds is taken nowhere it cannot sit
+        // beside a volume held here: what its holder links it to outranks
+        // a name or number every set states alike.
+        let held = Bound(&self.volumes);
+        placing.placed = placing
+            .placed
+            .filter(|at| !facts.is_some_and(|facts| breaks(facts, at.0, &held)));
+        placing
     }
 
     fn placing_front(&self, name: &str, front: &[u8], facts: Option<&RarVolumeFacts>) -> Placing {
@@ -292,7 +317,10 @@ impl RarStore {
     // Whether the volume at `index` yields to the member whose name and
     // front, or what was parsed of it, give that place: links alone hold it
     // there, and the member states it, by its headers or by its name in the
-    // set's numbering. A claimant that only links never moves it.
+    // set's numbering. A claimant that only links never moves it. Nor does
+    // a name or number keep a holder there that cannot sit beside a held
+    // neighbour, when the claimant that states the place can: that holder
+    // is another set's, however it came first.
     pub(super) fn yields(
         &self,
         index: VolumeIndex,
@@ -301,11 +329,23 @@ impl RarStore {
         front: &[u8],
         given: Option<&Volume>,
     ) -> bool {
-        let placing = match given {
-            Some(given) => self.placing_front(name, front, given.stated()),
-            None => self.placing_volume(name, front),
+        let read;
+        let facts = match given {
+            Some(given) => given.stated(),
+            None => {
+                read = self.front_facts(front);
+                read.as_ref()
+            }
         };
-        !settled(index, holder) && placing.stated == Some(index)
+        let placing = self.placing_front(name, front, facts);
+        let held = Bound(&self.volumes);
+        placing.stated == Some(index)
+            && (!settled(index, holder)
+                || facts
+                    .zip(holder.stated())
+                    .is_some_and(|(claimant, holder)| {
+                        breaks(holder, index.0, &held) && !breaks(claimant, index.0, &held)
+                    }))
     }
 
     // The place a volume's headers and name give it in this set. Headers
@@ -345,24 +385,42 @@ impl RarStore {
         // volume, and then it links each to all the others. Nothing places
         // a volume where its own headers say it is not, a name least of all.
         let stated = facts.is_some_and(states_position);
-        let named = wanted
+        let numbered = wanted
             .filter(|_| named)
-            .map(|wanted| VolumeIndex(wanted.index()))
-            .filter(|index| !facts.is_some_and(|facts| misplaced(*index, facts)));
+            .map(|wanted| VolumeIndex(wanted.index()));
+        // A name in the set's numbering that the headers contradict: the
+        // two disagree, so beside a held volume whose headers could link it
+        // the stated position is the volume's only where that neighbour
+        // does. A stray posted under a volume's name then takes no place
+        // the set's own volume should, whichever came first.
+        let misnamed =
+            numbered.is_some_and(|index| facts.is_some_and(|facts| misplaced(index, facts)));
+        let contradicted = bound && misnamed && facts.is_some_and(|facts| self.beside(facts));
+        let named = numbered.filter(|_| !misnamed);
         // A number is one every set states alike, so a position the headers
         // state is the volume's only where a held volume beside it judged
         // it, or where nothing gives the volume to another set.
         let (headers, judged) = facts.map_or((None, false), |facts| self.claim_by_headers(facts));
         let unread = facts.is_some_and(|facts| Nameless { facts }.unread());
         let not_yet = headers.is_some() && !judged && elsewhere && unread;
-        let headers = headers.filter(|_| judged || !elsewhere);
+        let headers = headers.filter(|_| judged || !(elsewhere || contradicted));
         // A new numbering can refine an established header link, but an
         // unrelated name cannot invent membership beside opaque labels.
         let named = named.filter(|_| bound || self.volumes.is_empty() || headers.is_some());
         // A position held already is answered all the same: the volume
-        // posted again is that volume.
+        // posted again is that volume. Headers that state a position a held
+        // volume beside it cannot sit beside place it nowhere here, its name
+        // least of all: a first volume that does not run into the second
+        // held is another set's, whichever came first. A neighbour whose
+        // front stops short says nothing against it, and the name places it.
+        let ruled_out = facts.is_some_and(|facts| {
+            Nameless { facts }
+                .position()
+                .is_some_and(|stated| breaks(facts, stated, &Bound(&self.volumes)))
+        });
         let (placed, stated) = match (headers, named) {
             (Some(placed), _) if stated => (Some(placed), Some(placed)),
+            (None, Some(_)) if stated && ruled_out => (None, None),
             (_, Some(named)) => (Some(named), Some(named)),
             (linked, None) => (linked, None),
         };
@@ -381,6 +439,18 @@ impl RarStore {
             password.as_deref().map(String::as_str),
             Arc::clone(self.keys.kdf()),
         )
+    }
+
+    // Whether a held volume whose headers were read sits beside the
+    // position this volume's headers state.
+    fn beside(&self, facts: &RarVolumeFacts) -> bool {
+        let held = Bound(&self.volumes);
+        Nameless { facts }.position().is_some_and(|stated| {
+            [stated.checked_sub(1), stated.checked_add(1)]
+                .into_iter()
+                .flatten()
+                .any(|at| held.at(at).is_some_and(|held| held.facts.is_some()))
+        })
     }
 
     // The position this volume's headers give it beside the volumes held,
@@ -439,6 +509,174 @@ pub(crate) fn judged(facts: &RarVolumeFacts, held: &impl Holds) -> bool {
             });
         same || before || after
     })
+}
+
+// How a volume at `index` meets the held volumes beside it, the one before
+// and the one after: whether one member runs across that boundary, the
+// same kind of set on both sides, or nothing where no neighbour is held
+// whose headers were read.
+fn meets(facts: &RarVolumeFacts, index: u32, held: &impl Holds) -> [Option<bool>; 2] {
+    let this = Nameless { facts };
+    let across = |tail: &Nameless<'_>, head: &Nameless<'_>| {
+        tail.kin(head)
+            && tail
+                .continuing_member()
+                .zip(head.continued_member())
+                .is_some_and(|(tail, head)| continues(tail, head))
+    };
+    let neighbour = |at: Option<u32>| {
+        at.and_then(|at| held.at(at))
+            .and_then(|held| held.facts)
+            .map(|facts| Nameless { facts })
+    };
+    [
+        neighbour(index.checked_sub(1)).map(|previous| across(&previous, &this)),
+        neighbour(index.checked_add(1)).map(|next| across(&this, &next)),
+    ]
+}
+
+// Whether a volume at `index` cannot sit beside the held volume before it
+// or after it, by what the headers at that boundary state: the sets differ
+// in kind, a member carried on is not the one the next volume opens on, or
+// a volume opens on a continued member that the one before, read to its
+// end, does not carry on. A front not read that far says nothing.
+fn breaks(facts: &RarVolumeFacts, index: u32, held: &impl Holds) -> bool {
+    let this = Nameless { facts };
+    let before = index
+        .checked_sub(1)
+        .and_then(|at| held.at(at))
+        .is_some_and(|previous| {
+            previous.facts.is_some_and(|facts| {
+                apart(&Nameless { facts }, previous.successor.is_some(), &this)
+            })
+        });
+    let after = index
+        .checked_add(1)
+        .and_then(|at| held.at(at))
+        .is_some_and(|next| {
+            next.facts
+                .is_some_and(|facts| apart(&this, false, &Nameless { facts }))
+        });
+    before || after
+}
+
+// Whether `head` cannot follow `tail`, by what both state at the boundary
+// between them; `ended` when `tail` was read to its end.
+fn apart(tail: &Nameless<'_>, ended: bool, head: &Nameless<'_>) -> bool {
+    !tail.kin(head)
+        || match (tail.continuing_member(), head.first_member()) {
+            (Some(tail), Some(head)) => !(head.split_before && continues(tail, head)),
+            (None, Some(head)) => head.split_before && ended && tail.last_member().is_some(),
+            (_, None) => false,
+        }
+}
+
+// The places beside the volume at `index` its headers run into: the place
+// after it when a member carries on past its end and a volume follows it
+// before any last one, and the place before it when its first member
+// carries on from a volume before it.
+pub(super) fn beside(
+    index: VolumeIndex,
+    volume: &Volume,
+    last: Option<VolumeIndex>,
+) -> [Option<VolumeIndex>; 2] {
+    let Some(facts) = volume.stated() else {
+        return [None, None];
+    };
+    let this = Nameless { facts };
+    let after = (volume.walk.successor() == Some(true)
+        && this.continuing_member().is_some()
+        && last.is_none_or(|last| index < last))
+    .then(|| index.0.checked_add(1).map(VolumeIndex))
+    .flatten();
+    let before = this
+        .first_member()
+        .is_some_and(|member| member.split_before)
+        .then(|| index.0.checked_sub(1).map(VolumeIndex))
+        .flatten();
+    [after, before]
+}
+
+// The held volumes beside the one at `index` that cannot sit beside it,
+// where one of the two is anchored and the other is not: a member runs
+// across between it and its other neighbour, or it states it is its set's
+// first, at the first place. The one not anchored is no volume of this set
+// there, whichever came first; where both or neither are anchored, what the
+// store holds does not say which, and it keeps both.
+pub(super) fn misfits(
+    index: VolumeIndex,
+    volumes: &BTreeMap<VolumeIndex, Volume>,
+) -> Vec<VolumeIndex> {
+    let held = Bound(volumes);
+    let anchored = |at: u32| {
+        held.at(at)
+            .and_then(|held| held.facts)
+            .is_some_and(|facts| {
+                (at == 0 && Nameless { facts }.position() == Some(0))
+                    || meets(facts, at, &held).contains(&Some(true))
+            })
+    };
+    let Some(this) = held.at(index.0) else {
+        return Vec::new();
+    };
+    let Some(facts) = this.facts else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for at in [index.0.checked_sub(1), index.0.checked_add(1)]
+        .into_iter()
+        .flatten()
+    {
+        let Some(other) = held.at(at) else {
+            continue;
+        };
+        let Some(theirs) = other.facts else {
+            continue;
+        };
+        let broken = if at < index.0 {
+            apart(
+                &Nameless { facts: theirs },
+                other.successor.is_some(),
+                &Nameless { facts },
+            )
+        } else {
+            apart(
+                &Nameless { facts },
+                this.successor.is_some(),
+                &Nameless { facts: theirs },
+            )
+        };
+        if !broken {
+            continue;
+        }
+        match (anchored(index.0), anchored(at)) {
+            (true, false) => out.push(VolumeIndex(at)),
+            (false, true) => out.push(index),
+            _ => {}
+        }
+    }
+    out
+}
+
+// Whether the volume held at `index` is tied there: its headers state that
+// position, or its name gives it in the set's numbering, and a member runs
+// across from the held volume before it, or on into the one after. Such a
+// volume is its set's at that place, so no other store takes it, whichever
+// of them, or of a stray, came first. One held by links alone ties nothing:
+// one member spanning every volume links each place to all the others.
+pub(super) fn tied(index: VolumeIndex, volumes: &BTreeMap<VolumeIndex, Volume>) -> bool {
+    let held = Bound(volumes);
+    let Some(facts) = held.at(index.0).and_then(|this| this.facts) else {
+        return false;
+    };
+    let numbered = volumes
+        .get(&index)
+        .and_then(|volume| volume.numbered.as_ref())
+        .is_some_and(|name| name.index() == index.0);
+    if !numbered && (Nameless { facts }).position() != Some(index.0) {
+        return false;
+    }
+    meets(facts, index.0, &held).contains(&Some(true))
 }
 
 // Whether a volume's headers state its position: a number, or the first

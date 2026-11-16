@@ -1707,7 +1707,9 @@ fn a_loop_write_takes_its_credit_first_and_goes_in_pieces_past_its_share() {
     assert_eq!(volume.unwritten_bytes(), 30);
     assert_eq!(count(&volume.writer.operations), 0);
     hold.open();
-    writers.settle();
+    // A settle passes once the last piece returned, which can be before
+    // the batch adds its operations to the count; parked, it has.
+    hold.wait_parked();
     assert_eq!(
         count(&volume.writer.operations),
         6,

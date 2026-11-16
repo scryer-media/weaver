@@ -317,6 +317,15 @@ func dockerComposeUp(services ...string) error {
 			return err
 		}
 	}
+	return upWithStackSubnetRepick(
+		func() error { return dockerComposeUpServices(services...) },
+		os.Getenv(stackNetworkOverrideEnv),
+		os.Getenv("E2E_PROJECT"),
+		liveEngineSubnets,
+	)
+}
+
+func dockerComposeUpServices(services ...string) error {
 	// Two retries cover the transient causes below: a host port another
 	// process took between allocation and bind, or one API call the engine
 	// dropped under load. A third failure in a row is not transient.

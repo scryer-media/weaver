@@ -135,6 +135,7 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(efficient.extract_threads, 4);
     assert_eq!(efficient.max_concurrent_downloads_cap, Some(10));
     assert_eq!(efficient.wireguard_socket_cap, 256);
+    assert_eq!(efficient.wireguard_usenet_receive_bytes, 256 * 1024);
 
     let balanced = HardwareProfile::Balanced.tuning(&large);
     assert_eq!(balanced.sevenz_decode_memory_bytes, GIB);
@@ -144,6 +145,7 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(balanced.extract_threads, 8);
     assert_eq!(balanced.max_concurrent_downloads_cap, None);
     assert_eq!(balanced.wireguard_socket_cap, 512);
+    assert_eq!(balanced.wireguard_usenet_receive_bytes, 1024 * 1024);
 
     let performance = HardwareProfile::Performance.tuning(&large);
     assert_eq!(performance.sevenz_decode_memory_bytes, 4 * GIB);
@@ -153,6 +155,32 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.extract_threads, 8);
     assert_eq!(performance.max_concurrent_downloads_cap, None);
     assert_eq!(performance.wireguard_socket_cap, 1024);
+    assert_eq!(performance.wireguard_usenet_receive_bytes, 1984 * 1024);
+}
+
+// A WireGuard tunnel full of its largest sockets holds no more than the
+// profile states, and no more than a tunnel is charged: 256 sockets, each at the tunnel's own 2 MiB or at a usenet
+// socket's receive buffer and 64 KiB send buffer, whichever is larger.
+#[test]
+fn a_full_tunnel_holds_what_each_profile_states() {
+    let large = machine(16, 32);
+    let tunnel_own = 2 * 1024 * 1024;
+    let full = |profile: HardwareProfile| {
+        let usenet = profile.tuning(&large).wireguard_usenet_receive_bytes
+            + weaver_tunnel::pipe::USENET_SEND_BYTES;
+        weaver_tunnel::wireguard::DEFAULT_MAX_SOCKETS * usenet.max(tunnel_own)
+    };
+    assert_eq!(weaver_tunnel::wireguard::DEFAULT_MAX_SOCKETS, 256);
+    assert_eq!(full(HardwareProfile::Efficient), 512 * 1024 * 1024);
+    assert_eq!(full(HardwareProfile::Balanced), 512 * 1024 * 1024);
+    assert_eq!(full(HardwareProfile::Performance), 512 * 1024 * 1024);
+    for profile in [
+        HardwareProfile::Efficient,
+        HardwareProfile::Balanced,
+        HardwareProfile::Performance,
+    ] {
+        assert!(full(profile) as u64 <= crate::proxies::WIREGUARD_INSTANCE_BYTES);
+    }
 }
 
 // Every profile lends a window over the ceiling from scratch; where the

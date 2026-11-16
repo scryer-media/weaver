@@ -309,11 +309,13 @@ impl Envelopes {
         let started = shelf.update(|state| match state.kept.entry(envelope) {
             Entry::Occupied(_) => false,
             Entry::Vacant(free) => {
-                free.insert(Kept::in_file(
-                    Leaf::over(&shelf.dir, name, on_disk)
-                        .through(shelf.to.as_ref())
-                        .after(made),
-                ));
+                free.insert(Kept::in_file(Leaf::handed(
+                    &shelf.dir,
+                    name,
+                    on_disk,
+                    shelf.to.as_ref(),
+                    made,
+                )));
                 true
             }
         });

@@ -67,7 +67,7 @@ fn range_named_volumes_count_their_blocks_and_the_fewest_cover_the_damage() {
     for (volume, count) in &claimed {
         let held = &job.object.volumes[volume.0 as usize];
         assert_eq!(held.named_blocks, Some(*count));
-        assert_eq!(held.left(), *count);
+        assert_eq!(held.left(packet), *count);
         assert_eq!(held.coming(packet), *count);
     }
     let total: u64 = claimed.iter().map(|(_, count)| count).sum();
