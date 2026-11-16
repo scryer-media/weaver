@@ -45,12 +45,17 @@ const emptyPage = {
   etaTotalBytes: 0, etaDownloadedBytes: 0, etaThrough: [], latestCursor: "0",
 };
 
-// Reads are answered at once; subscriptions stay open and push nothing.
+// Reads are answered at once. Subscriptions stay open; the queue page's pushes the
+// empty page once, as the server's first push is the page as it stands, and the
+// others push nothing.
 const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [() => (operations) => pipe(operations, mergeMap((operation) => {
   const definition = operation.query.definitions.find((entry) => entry.kind === "OperationDefinition");
   const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
   if (operation.kind === "teardown") return make<OperationResult>((observer) => { observer.complete(); return () => {}; });
-  if (operation.kind === "subscription") return make<OperationResult>(() => () => {});
+  if (operation.kind === "subscription") return make<OperationResult>((observer) => {
+    if (name === "QueuePageUpdates") observer.next({ operation, data: { queuePageUpdates: emptyPage }, stale: false, hasNext: true });
+    return () => {};
+  });
   const variables: Record<string, unknown> = operation.variables ?? {};
   if (operation.kind === "mutation") {
     sent.push({ name, variables });
