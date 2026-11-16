@@ -264,7 +264,7 @@ mod tests {
 
     /// A list with `addrs` on it, as a torrent is added with.
     fn listing(addrs: impl IntoIterator<Item = SocketAddr>) -> PeerList {
-        PeerList::resumed(addrs, [])
+        PeerList::resumed(addrs, &[], [])
     }
 
     #[tokio::test(start_paused = true)]
@@ -295,7 +295,7 @@ mod tests {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         tx.unbounded_send((banned, PeerSourceFlag::Tracker))
             .unwrap();
-        let list = PeerList::resumed([addr(1)], [banned.ip()]);
+        let list = PeerList::resumed([addr(1)], &[], [banned.ip()]);
         let (found, _, _, _) = first_answer(list, Default::default(), rx, &unable, ask).await;
 
         assert_eq!(found, Some(addr(1)));

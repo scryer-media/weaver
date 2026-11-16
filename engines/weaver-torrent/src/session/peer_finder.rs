@@ -39,10 +39,10 @@ pub(super) struct PeerAsk<'a> {
 }
 
 impl<'a> PeerAsk<'a> {
-    /// The ask of a torrent that names no tracker or peer of its own, and
-    /// does not announce itself: a magnet's fetch, once its trackers'
-    /// phase is over.
-    pub fn unannounced(
+    // The ask of a torrent that names no tracker or peer of its own, and
+    // does not announce itself: a magnet's fetch, once its trackers' phase
+    // is over.
+    fn unannounced(
         session: &Session,
         info_hashes: InfoHashes,
         identity: &'a Identity,
@@ -114,9 +114,49 @@ pub(super) trait PeerFinder: Sync {
 /// Every finder, in the order their streams are merged.
 pub(super) static FINDERS: [&dyn PeerFinder; 4] = [&Trackers, &OwnList, &DhtFinder, &LsdFinder];
 
-/// The peers the finders `which` picks name, each with who named it, and the
-/// announce table of the trackers asked; none when no finder named any.
-pub(super) fn find(
+// The finders a magnet's fetch goes on to once its trackers' phase is over:
+// those a torrent taken to be private never asks. Neither its trackers nor
+// its own list is on it, so that phase cannot reach them.
+static AFTER_TRACKERS: [&dyn PeerFinder; 2] = [&DhtFinder, &LsdFinder];
+
+/// The peers every finder `discovery` allows names, each with who named it,
+/// and the announce table of the trackers asked; none when no finder named
+/// any.
+pub(super) fn run(
+    session: &Arc<Session>,
+    ask: &mut PeerAsk<'_>,
+    discovery: Discovery,
+) -> (Option<PeerStream>, Option<TrackerStatus>) {
+    run_over(&FINDERS, session, ask, discovery)
+}
+
+fn run_over(
+    finders: &[&dyn PeerFinder],
+    session: &Arc<Session>,
+    ask: &mut PeerAsk<'_>,
+    discovery: Discovery,
+) -> (Option<PeerStream>, Option<TrackerStatus>) {
+    find(finders, session, ask, |finder| finder.allowed(discovery))
+}
+
+/// The peers a magnet's fetch hears once its trackers' phase is over: the
+/// DHT's and local discovery's, each where `sources` (the torrent's
+/// options) lets it look, announcing on neither. It asks no tracker and no
+/// own list, whatever `sources` says.
+pub(super) fn after_trackers(
+    session: &Arc<Session>,
+    info_hashes: InfoHashes,
+    identity: &Identity,
+    dht_announce: tokio::sync::watch::Receiver<()>,
+    sources: Discovery,
+) -> Option<PeerStream> {
+    let mut ask = PeerAsk::unannounced(session, info_hashes, identity, dht_announce);
+    run_over(&AFTER_TRACKERS, session, &mut ask, sources).0
+}
+
+// The peers the finders `which` picks name, each with who named it, and the
+// announce table of the trackers asked; none when no finder named any.
+fn find(
     finders: &[&dyn PeerFinder],
     session: &Arc<Session>,
     ask: &mut PeerAsk<'_>,
@@ -131,21 +171,16 @@ pub(super) fn find(
                 .flatten()?;
             trackers = trackers.take().or(found.trackers);
             let source = finder.source();
+            #[cfg(test)]
+            session
+                .handed_out
+                .lock()
+                .unwrap()
+                .extend(ask.info_hashes.ids20().map(|info_hash| (info_hash, source)));
             Some(found.peers.map(move |addr| (addr, source)).boxed())
         })
         .collect::<Vec<_>>();
     (merged(streams), trackers)
-}
-
-/// Whether a magnet's fetch asks `finder` once its trackers' phase is over:
-/// `sources`, where the torrent's options let it look, allows it, and
-/// `trackers_phase`, where a torrent taken to be private looks, does not.
-pub(super) fn after_trackers(
-    finder: &dyn PeerFinder,
-    sources: Discovery,
-    trackers_phase: Discovery,
-) -> bool {
-    finder.allowed(sources) && !finder.allowed(trackers_phase)
 }
 
 // The streams merged pairwise, halves first, the order kept: four finders
@@ -289,7 +324,7 @@ mod tests {
 
     use futures::StreamExt;
 
-    use super::{FINDERS, Found, PeerAsk, PeerFinder, after_trackers, find};
+    use super::{AFTER_TRACKERS, FINDERS, Found, PeerAsk, PeerFinder, run_over};
     use crate::session::{AddTorrentOptions, Discovery, Session};
     use crate::type_aliases::PeerSourceFlag;
 
@@ -348,13 +383,17 @@ mod tests {
         }
     }
 
-    // Stand-ins for every finder the session runs, in its order.
-    fn stand_ins() -> Vec<Fake> {
-        FINDERS
-            .iter()
+    // Stand-ins for every finder on `list`, in its order.
+    fn stand_ins_of(list: &'static [&'static dyn PeerFinder]) -> Vec<Fake> {
+        list.iter()
             .zip(1..)
             .map(|(real, n)| Fake::of(*real, n))
             .collect()
+    }
+
+    // Stand-ins for every finder the session runs, in its order.
+    fn stand_ins() -> Vec<Fake> {
+        stand_ins_of(&FINDERS)
     }
 
     // Where a test's finders are asked from.
@@ -362,9 +401,8 @@ mod tests {
         // A torrent's run, `make_peer_rx`'s path, under its discovery.
         Run(Discovery),
         // A magnet's fetch once its trackers' phase is over, `add`'s
-        // path: where its options let it look, and where a torrent taken
-        // to be private does.
-        AfterTrackers(Discovery, Discovery),
+        // path: where its options let it look.
+        AfterTrackers(Discovery),
     }
 
     // The sources a finder list was started for, each with whether its
@@ -391,16 +429,9 @@ mod tests {
         let peers = match asked {
             Asked::Run(discovery) => {
                 ask.announce = true;
-                session
-                    .peer_source(&as_dyn, ask, discovery)
-                    .map(|source| source.peers)
+                run_over(&as_dyn, session, &mut ask, discovery).0
             }
-            Asked::AfterTrackers(sources, trackers_phase) => {
-                find(&as_dyn, session, &mut ask, |f| {
-                    after_trackers(f, sources, trackers_phase)
-                })
-                .0
-            }
+            Asked::AfterTrackers(sources) => run_over(&as_dyn, session, &mut ask, sources).0,
         };
         let mut named = match peers {
             Some(peers) => peers.collect::<Vec<_>>().await,
@@ -487,19 +518,30 @@ mod tests {
             // A magnet's fetch past its trackers' phase: the DHT and the
             // LSD as its options leave them, unannounced, and neither the
             // trackers nor the own list again.
-            let finders = stand_ins();
-            let (started, _) = run(
-                &session,
-                &finders,
-                Asked::AfterTrackers(discovery, Discovery::added(true, &opts(false))),
-            )
-            .await;
+            let finders = stand_ins_of(&AFTER_TRACKERS);
+            let (started, _) = run(&session, &finders, Asked::AfterTrackers(discovery)).await;
             let mut want = Vec::new();
             want.extend((!disable_dht).then_some((Dht, false)));
             want.extend((!disable_lsd).then_some((Lsd, false)));
             assert_eq!(started, want);
         }
         session.stop().await;
+    }
+
+    // The phase after a magnet's trackers' can reach the DHT and local
+    // discovery alone: no tracker and no own list is on its list, so no
+    // `Discovery` makes it ask one.
+    #[test]
+    fn the_phase_after_the_trackers_reaches_only_the_dht_and_lsd() {
+        use PeerSourceFlag::{Dht, Lsd};
+        let sources = AFTER_TRACKERS
+            .iter()
+            .map(|f| f.source())
+            .collect::<Vec<_>>();
+        assert_eq!(sources, vec![Dht, Lsd]);
+        // And each of them is one a torrent taken to be private never asks.
+        let private = Discovery::of(true, false, false);
+        assert!(AFTER_TRACKERS.iter().all(|f| !f.allowed(private)));
     }
 
     // Each real finder's own rule, read from the table: trackers and the

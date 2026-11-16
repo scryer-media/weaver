@@ -227,6 +227,7 @@ async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
     let older = ResumePeers {
         peers: vec!["127.0.0.2:6881".parse().unwrap()],
         banned: vec!["127.0.0.3".parse().unwrap()],
+        found: Vec::new(),
     };
     assert_ne!(older, current);
     let (running, run) = tokio::sync::oneshot::channel();

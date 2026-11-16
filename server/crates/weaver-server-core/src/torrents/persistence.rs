@@ -57,10 +57,11 @@ fn resume_update(
         ]);
     }
     if let Some(peers) = peers {
-        sets.push("peers = {}, banned_peers = {}");
+        sets.push("peers = {}, banned_peers = {}, found_peers = {}");
         args.extend([
             SqlArg::OptText(stored_list(&peers.peers)?),
             SqlArg::OptText(stored_list(&peers.banned)?),
+            SqlArg::OptText(stored_list(&peers.found)?),
         ]);
     }
     if sets.is_empty() {
@@ -975,6 +976,20 @@ fn listed<T: serde::de::DeserializeOwned>(
     .map(Option::unwrap_or_default)
 }
 
+// Which saved peers were found elsewhere than the torrent's trackers and
+// the operator. The marks never cost the peers or bans they sit beside: a
+// value that does not read is no marks.
+fn found_marks(
+    job_id: JobId,
+    json: Result<Option<String>, StateError>,
+) -> Vec<std::net::SocketAddr> {
+    json.and_then(|json| listed("found_peers", json))
+        .unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's saved peer marks did not read; its peers restore unmarked");
+            Vec::new()
+        })
+}
+
 fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
     let policy_override = SeedingPolicy::kept(torrent.policy_override)
         .map(|policy| serde_json::to_string(&policy))
@@ -1878,7 +1893,7 @@ impl Database {
         let row = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT peers, banned_peers FROM torrent_counters WHERE job_id = {}",
+                "SELECT peers, banned_peers, found_peers FROM torrent_counters WHERE job_id = {}",
                 &[SqlArg::I64(id)],
             )
             .await
@@ -1889,6 +1904,7 @@ impl Database {
         Ok(ResumePeers {
             peers: listed("peers", row.opt_text("peers")?)?,
             banned: listed("banned_peers", row.opt_text("banned_peers")?)?,
+            found: found_marks(job_id, row.opt_text("found_peers")),
         })
     }
 
@@ -1908,7 +1924,7 @@ impl Database {
                 "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
                         last_seen_complete_ms, finished_duration_s, last_activity_ms,
                         consecutive_seeding_s, failed_bytes, redundant_bytes, pieces,
-                        pieces_checking, peers, banned_peers
+                        pieces_checking, peers, banned_peers, found_peers
                    FROM torrent_counters",
                 &[],
             )
@@ -1932,7 +1948,12 @@ impl Database {
                             let banned = row
                                 .opt_text("banned_peers")
                                 .and_then(|banned| listed("banned_peers", banned))?;
-                            Ok(ResumePeers { peers, banned })
+                            let found = found_marks(job_id, row.opt_text("found_peers"));
+                            Ok(ResumePeers {
+                                peers,
+                                banned,
+                                found,
+                            })
                         });
                     Ok((
                         job_id,

@@ -341,6 +341,12 @@ pub struct Session {
     /// yet (see [`Session::rejoin_local_discovery`]).
     pub(crate) lsd: Option<LocalServiceDiscovery>,
 
+    /// Each info hash a peer finder was asked for, with the finder's source,
+    /// at the moment it handed the torrent a stream: a test's record of
+    /// where each torrent looks.
+    #[cfg(test)]
+    pub(crate) handed_out: std::sync::Mutex<Vec<(Id20, crate::type_aliases::PeerSourceFlag)>>,
+
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub(crate) connection_slots: Arc<ConnectionSlots>,
