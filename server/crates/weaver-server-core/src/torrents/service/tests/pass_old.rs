@@ -5,9 +5,11 @@
 // torrents: two rigs set up alike, one ticked by `old_tick` (the bodies of
 // e53173421, in `old_tick.rs`) and one by `tick`, must leave the same
 // sessions, rows, views, script events, checkpoints and stored peers, and
-// their trackers must hear the same announces. Then a seed-mode write the
-// database refuses leaves memory and disk agreeing, as the old tick left
-// them, and the next pass writes it again.
+// their trackers must hear the same announces. Then, against the new tick
+// alone, a seed-mode write the database refuses is undone in memory to what
+// the disk still holds (the old tick left a refused "left seed mode" false
+// in memory), a stop decided in the same pass is kept, the next pass writes
+// it again, and a refused "left" row is warned of once per streak.
 
 use super::pass::{add, done_then, events, written};
 use super::*;
@@ -627,31 +629,27 @@ async fn a_reading_at_once_writes_every_ledger_as_before() {
 }
 
 // Refuses every write of `torrents.seed_mode` or `torrents.seed_verified`
-// until `allow_seed_writes`.
-fn refuse_seed_writes(db: &Database) {
+// until `allow_seed_writes` drops the trigger `name`. A refusal after one
+// is dropped takes a new name: the same CREATE text again is refused as the
+// trigger existing still.
+fn refuse_seed_writes(db: &Database, name: &str) {
     let datastore = db.datastore();
+    let sql = format!(
+        "CREATE TRIGGER {name} BEFORE UPDATE OF seed_mode, seed_verified \
+         ON torrents BEGIN SELECT RAISE(ABORT, 'refused'); END"
+    );
     db.run_sql_blocking(async move {
-        SqlRuntime::execute(
-            datastore.write_exec(),
-            "CREATE TRIGGER refuse_seed_writes BEFORE UPDATE OF seed_mode, seed_verified \
-             ON torrents BEGIN SELECT RAISE(ABORT, 'refused'); END",
-            &[],
-        )
-        .await?;
+        SqlRuntime::execute(datastore.write_exec(), &sql, &[]).await?;
         Ok(())
     })
     .unwrap();
 }
 
-fn allow_seed_writes(db: &Database) {
+fn allow_seed_writes(db: &Database, name: &str) {
     let datastore = db.datastore();
+    let sql = format!("DROP TRIGGER {name}");
     db.run_sql_blocking(async move {
-        SqlRuntime::execute(
-            datastore.write_exec(),
-            "DROP TRIGGER refuse_seed_writes",
-            &[],
-        )
-        .await?;
+        SqlRuntime::execute(datastore.write_exec(), &sql, &[]).await?;
         Ok(())
     })
     .unwrap();
@@ -715,7 +713,7 @@ async fn a_refused_seed_mode_clear_leaves_memory_as_the_disk_says() {
         torrent.record.seed_mode = true;
         torrent.seed_verified = 1;
     }
-    refuse_seed_writes(&rig.db);
+    refuse_seed_writes(&rig.db, "refuse_seed_writes");
 
     rig.service.tick().await;
     rig.db.flush_write_queue().await.unwrap();
@@ -730,7 +728,7 @@ async fn a_refused_seed_mode_clear_leaves_memory_as_the_disk_says() {
         KeptIntent::Intent(TorrentIntent::Stopped)
     );
 
-    allow_seed_writes(&rig.db);
+    allow_seed_writes(&rig.db, "refuse_seed_writes");
     rig.service.tick().await;
     rig.db.flush_write_queue().await.unwrap();
     assert_eq!(live_seed_mode(&rig.service, left).await, (false, 0));
@@ -739,6 +737,124 @@ async fn a_refused_seed_mode_clear_leaves_memory_as_the_disk_says() {
         rig.db.get_torrent(met).unwrap().unwrap().intent(),
         TorrentIntent::Stopped
     );
+    rig.service.stop().await;
+}
+
+// Every warning logged on this thread, as its fields, one line each.
+struct Warned(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Warned {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {field}={value:?}");
+            }
+        }
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(fields.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// How many times it was warned that `job_id`'s leaving seed mode was not
+// recorded.
+fn left_refusals(warned: &std::sync::Mutex<Vec<String>>, job_id: JobId) -> usize {
+    let id = format!(" job_id={} ", job_id.0);
+    warned
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|line| {
+            line.contains(&id) && line.contains("could not record that a torrent left seed mode")
+        })
+        .count()
+}
+
+// `job_id` back in seed mode, on disk and in the pass, its session out of
+// it: the next pass decides it left.
+async fn in_seed_mode_again(rig: &Rig, job_id: JobId) {
+    let datastore = rig.db.datastore();
+    let id = job_id.0;
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                &format!(
+                    "UPDATE torrents SET seed_mode = 1, seed_verified = X'80' WHERE job_id = {id}"
+                ),
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+    let mut live = rig.service.inner.live.lock().await;
+    let torrent = live.get_mut(&job_id).unwrap();
+    torrent.record.seed_mode = true;
+    torrent.seed_verified = 1;
+}
+
+// Torrents whose leaving seed mode the database refuses tick after tick:
+// each is written again every tick and warned of once, not every tick. A
+// write kept ends the streak, so a later refusal warns again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_seed_mode_clear_warns_once_per_streak() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let base = || request(AddSource::Metainfo(Vec::new()));
+    let first = add(&rig, "first", 1, base()).await;
+    complete(&rig, first).await;
+    let second = add(&rig, "second", 2, base()).await;
+    complete(&rig, second).await;
+    for job_id in [first, second] {
+        in_seed_mode_again(&rig, job_id).await;
+    }
+    // The passes run on this thread when ticked: only their warnings are
+    // heard.
+    let warned = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _capture = tracing::subscriber::set_default(Warned(Arc::clone(&warned)));
+    refuse_seed_writes(&rig.db, "refuse_seed_writes");
+
+    for _ in 0..5 {
+        rig.service.tick().await;
+        rig.db.flush_write_queue().await.unwrap();
+        assert_eq!(live_seed_mode(&rig.service, first).await, (true, 1));
+        assert_eq!(live_seed_mode(&rig.service, second).await, (true, 1));
+    }
+    assert_eq!(left_refusals(&warned, first), 1);
+    assert_eq!(left_refusals(&warned, second), 1);
+
+    allow_seed_writes(&rig.db, "refuse_seed_writes");
+    rig.service.tick().await;
+    rig.db.flush_write_queue().await.unwrap();
+    assert_eq!(stored_seed_mode(&rig.db, first), (false, None));
+    assert_eq!(stored_seed_mode(&rig.db, second), (false, None));
+    assert!(!rig.service.inner.live.lock().await[&first].seed_left_refused);
+
+    in_seed_mode_again(&rig, first).await;
+    refuse_seed_writes(&rig.db, "refuse_seed_writes_again");
+    for _ in 0..3 {
+        rig.service.tick().await;
+        rig.db.flush_write_queue().await.unwrap();
+    }
+    assert_eq!(live_seed_mode(&rig.service, first).await, (true, 1));
+    assert_eq!(left_refusals(&warned, first), 2);
+    assert_eq!(left_refusals(&warned, second), 1);
     rig.service.stop().await;
 }
 
@@ -753,7 +869,7 @@ async fn a_refused_seed_verified_write_keeps_the_last_count() {
     };
     let job_id = restarted_in_seed_mode(&mut scene).await;
     let rig = &scene.rig;
-    refuse_seed_writes(&rig.db);
+    refuse_seed_writes(&rig.db, "refuse_seed_writes");
 
     rig.service.tick().await;
     rig.db.flush_write_queue().await.unwrap();
@@ -763,7 +879,7 @@ async fn a_refused_seed_verified_write_keeps_the_last_count() {
         (true, Some(vec![0b1000_0000]))
     );
 
-    allow_seed_writes(&rig.db);
+    allow_seed_writes(&rig.db, "refuse_seed_writes");
     rig.service.tick().await;
     rig.db.flush_write_queue().await.unwrap();
     assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 2));

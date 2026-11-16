@@ -419,11 +419,14 @@ enum Taken {
 
 /// What a walk undoes in memory of seed mode when its rows are not kept:
 /// the torrent left it, or kept `count` pieces; it had `prior` kept.
+/// `refused`: its last row that said it left was refused, and a row kept
+/// now ends that streak.
 struct SeedUndo {
     job_id: JobId,
     left: bool,
     count: usize,
     prior: usize,
+    refused: bool,
 }
 
 /// A pass's seed-mode rows, queued, and what to undo should they fail.
@@ -694,6 +697,7 @@ impl TorrentService {
                     left: true,
                     count: 0,
                     prior: torrent.seed_verified,
+                    refused: torrent.seed_left_refused,
                 });
                 torrent.record.seed_mode = false;
                 torrent.seed_verified = 0;
@@ -707,6 +711,7 @@ impl TorrentService {
                     left: false,
                     count,
                     prior: torrent.seed_verified,
+                    refused: false,
                 });
                 // Kept now, and undone should the row not be.
                 torrent.seed_verified = count;
@@ -931,6 +936,16 @@ impl TorrentService {
                 let mut live = self.inner.live.lock().await;
                 relocked = true;
                 undo_seed(&mut live, &undo, &error);
+            } else if undo.iter().any(|undo| undo.refused) {
+                // Kept at last: a later refusal is warned of again. Only
+                // when a streak ends is `live` taken for it.
+                let mut live = self.inner.live.lock().await;
+                relocked = true;
+                for undo in undo.iter().filter(|undo| undo.refused) {
+                    if let Some(torrent) = live.get_mut(&undo.job_id) {
+                        torrent.seed_left_refused = false;
+                    }
+                }
             }
         }
         for landing in gathered.landings {
@@ -1060,13 +1075,17 @@ impl TorrentService {
 // database and the next pass writes them again: a torrent that left seed
 // mode is in it again, with the pieces it had kept; one that kept more
 // pieces has what it had kept. A torrent changed since, or gone, is left.
+// A refused "left" row is warned of once per torrent until one is kept.
 fn undo_seed(live: &mut LiveMap, undo: &[SeedUndo], error: &str) {
     for undo in undo {
         let Some(torrent) = live.get_mut(&undo.job_id) else {
             continue;
         };
         if undo.left {
-            tracing::warn!(job_id = undo.job_id.0, error = %error, "could not record that a torrent left seed mode");
+            if !torrent.seed_left_refused {
+                torrent.seed_left_refused = true;
+                tracing::warn!(job_id = undo.job_id.0, error = %error, "could not record that a torrent left seed mode");
+            }
             if !torrent.record.seed_mode {
                 torrent.record.seed_mode = true;
                 torrent.seed_verified = undo.prior;
