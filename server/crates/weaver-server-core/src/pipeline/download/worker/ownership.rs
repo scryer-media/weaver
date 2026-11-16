@@ -258,7 +258,7 @@ impl Pipeline {
             self.hold_volume_arrived(job_id, &volume, arrived);
         }
         volume.settle(bytes, arrived);
-        if volume.take_wake() {
+        if self.volume_writers.take_wake(&volume) {
             self.volume_room_changed();
         }
     }

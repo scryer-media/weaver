@@ -924,9 +924,9 @@ async fn a_job_held_by_a_full_write_buffer_is_dispatched_again_once_woken() {
     // have come back.
     no_loop_waits(&volume);
     hold.open();
-    let report = pipeline.volume_reports.recv().await.unwrap();
-    assert!(report.below);
-    pipeline.volume_batch_returned(report);
+    // The writer's word of room: the line was crossed.
+    pipeline.volume_rooms.recv().await.unwrap();
+    pipeline.volume_room_heard();
     assert!(pipeline.download_dispatch_wake);
     assert!(!pipeline.volume_holds_budget(job_id));
     assert!(pipeline.lease_for_server_for_test(0).is_some());
@@ -2060,7 +2060,7 @@ async fn a_probe_holding_its_scratch_file_leaves_the_jobs_folder_and_delivery_al
 // Hear the next report or mail the loop is sent.
 async fn hear_next(pipeline: &mut Pipeline) {
     tokio::select! {
-        Some(report) = pipeline.volume_reports.recv() => pipeline.volume_batch_returned(report),
+        Some(()) = pipeline.volume_rooms.recv() => pipeline.volume_room_heard(),
         Some(said) = pipeline.graph_runs.recv() => pipeline.graph_run_said(said),
     }
 }

@@ -1045,13 +1045,13 @@ fn destination_writer() -> (
     Renames,
     Arc<crate::operations::disk::writer::Submitter>,
 ) {
-    let writers = crate::operations::disk::writer::VolumeWriters::new(|_| {});
+    let writers = crate::operations::disk::writer::VolumeWriters::reporting(|_| {});
     let volume = Arc::new(crate::operations::disk::volume::Volume::new(
         None,
         "complete".into(),
     ));
-    let renames = Renames::through(writers.submitter(&volume, 1));
-    let other = writers.submitter(&volume, 2);
+    let renames = Renames::through(writers.test_submitter(&volume, 1));
+    let other = writers.test_submitter(&volume, 2);
     (writers, volume, renames, other)
 }
 

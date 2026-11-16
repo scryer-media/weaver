@@ -84,6 +84,7 @@ impl Pipeline {
         db: crate::Database,
         config: crate::settings::SharedConfig,
         startup_disk_work: crate::runtime::StartupDiskGate,
+        volume_writers: Arc<crate::operations::VolumeWriters>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::clone(shared_state.metrics());
         initial_history.truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
@@ -200,45 +201,14 @@ impl Pipeline {
             startup_disk_work,
         ));
         shared_state.set_storage_capacity(&storage_capacity);
-        let (volume_report_tx, volume_reports) = mpsc::unbounded_channel();
+        let (volume_room_tx, volume_rooms) = mpsc::unbounded_channel();
         let graph_runs = crate::pipeline::graph::engine::RunMail::default();
-        let disk_mail = graph_runs.written();
-        // A pipeline under test reads its files right after it writes
-        // them, so its writers run each operation as it is submitted,
-        // unless the test asked for a thread per volume.
-        #[cfg(test)]
-        let volume_writers_of = |report| {
-            if crate::pipeline::graph::disk::threads::asked() {
-                crate::operations::disk::writer::VolumeWriters::new(report)
-            } else {
-                crate::operations::disk::writer::VolumeWriters::inline(report)
-            }
-        };
-        #[cfg(not(test))]
-        let volume_writers_of = crate::operations::disk::writer::VolumeWriters::new;
-        let volume_rates = storage_capacity.volume_rate_signal();
-        let volume_writers = Arc::new(
-            volume_writers_of(move |mut report: crate::operations::disk::writer::Report| {
-                // A failure is the job's to hear, with its other mail. What
-                // is left tells the loop a volume it stopped dispatch for
-                // fell below its line, or that a failure may have freed
-                // one; a writer with neither to say sends nothing. A
-                // pipeline that has gone hears nothing, and needs to.
-                let wakes = report.below || !report.failures.is_empty();
-                for failure in report.failures.drain(..) {
-                    let _ = disk_mail.send(crate::pipeline::graph::engine::Said {
-                        scope: failure.key,
-                        node: weaver_graph::NodeId::ROOT,
-                        generation: 0,
-                        heard: crate::pipeline::graph::engine::Heard::DiskFailed(Box::new(failure)),
-                    });
-                }
-                if wakes {
-                    let _ = volume_report_tx.send(report);
-                }
-            })
-            .ringing(volume_rates),
-        );
+        volume_writers.ring(storage_capacity.volume_rate_signal());
+        let volume_writers = Arc::new(crate::pipeline::graph::disk::PipelineWriters::new(
+            volume_writers,
+            graph_runs.written(),
+            volume_room_tx,
+        ));
         // Each volume's first write rate comes from a probe queued on its
         // writer; the figures an earlier run kept are read here, off the
         // runtime. A pipeline under test probes nothing.
@@ -558,7 +528,7 @@ impl Pipeline {
             pending_unanchored_release: Vec::new(),
             storage_capacity,
             volume_writers,
-            volume_reports,
+            volume_rooms,
             volume_budget_held: std::sync::atomic::AtomicBool::new(false),
             shutdown_settle: crate::operations::disk::writer::SettleBound::wall(
                 Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT,
@@ -1237,7 +1207,7 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
-            turn_active |= self.hear_volume_reports();
+            turn_active |= self.hear_volume_rooms();
             #[cfg(test)]
             self.pump_decode_queue();
 
@@ -1411,9 +1381,9 @@ impl Pipeline {
                                     );
                                 }
                             }
-                            Some(report) = self.volume_reports.recv() => {
+                            Some(()) = self.volume_rooms.recv() => {
                                 turn_timer.resume(PipelinePhase::GraphRun);
-                                self.volume_batch_returned(report);
+                                self.volume_room_heard();
                             }
                             Some(mail) = self.post_probes.recv() => {
                                 turn_timer.resume(PipelinePhase::PostProbe);
@@ -2061,7 +2031,7 @@ impl Pipeline {
             "the volume writers could not be drained at shutdown",
         )
         .await;
-        self.hear_volume_reports();
+        self.hear_volume_rooms();
         self.hear_graph_runs();
         // A repair the stop ended while its job's volume still held writes
         // is taken back now that the volume had its time. What taking it
@@ -2074,7 +2044,7 @@ impl Pipeline {
                 "the volume writers could not be drained after a stopped repair was taken back",
             )
             .await;
-            self.hear_volume_reports();
+            self.hear_volume_rooms();
             self.hear_graph_runs();
         }
         self.checkpoint_graph_holds();
@@ -2087,7 +2057,7 @@ impl Pipeline {
             "the volume writers could not be drained after the last checkpoint",
         )
         .await;
-        self.hear_volume_reports();
+        self.hear_volume_rooms();
         self.hear_graph_runs();
 
         if self.articles_in_flight > 0 || self.has_queued_or_active_decode() {

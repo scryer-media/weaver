@@ -1555,9 +1555,9 @@ async fn a_change_held_behind_a_queued_write_is_written_once_its_writes_return()
     const PIECE: u32 = 4 * 1024;
     let _clock = ClockHeld::new();
     let (db, id) = checkpoint_database();
-    let writers = VolumeWriters::new(|_| {});
+    let writers = VolumeWriters::reporting(|_| {});
     let volume = Arc::new(Volume::new(None, "test".to_owned()));
-    let disk = JobDisk::new(writers.submitter(&volume, 1), None);
+    let disk = JobDisk::new(writers.test_submitter(&volume, 1), None);
     let files: Vec<RootFile> = (0..2)
         .map(|index| file(&format!("part{index}.mkv"), &[PIECE; 2]))
         .collect();

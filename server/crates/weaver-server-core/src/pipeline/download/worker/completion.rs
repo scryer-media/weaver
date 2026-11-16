@@ -697,7 +697,7 @@ impl Pipeline {
             before.release(held);
             volume.arrived_bytes.fetch_add(held, Ordering::SeqCst);
             volume.charge(held);
-            if before.take_wake() {
+            if self.volume_writers.take_wake(&before) {
                 self.volume_room_changed();
             }
         }
@@ -730,7 +730,7 @@ impl Pipeline {
         };
         let left = volume.loop_credit.swap(0, Ordering::Relaxed);
         volume.release(left);
-        if left != 0 && volume.take_wake() {
+        if left != 0 && self.volume_writers.take_wake(&volume) {
             self.volume_room_changed();
         }
     }
@@ -746,7 +746,7 @@ impl Pipeline {
             volume.arrived_bytes.fetch_sub(held, Ordering::SeqCst);
             volume.release(held);
         }
-        if volume.take_wake() {
+        if self.volume_writers.take_wake(&volume) {
             self.volume_room_changed();
         }
     }

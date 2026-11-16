@@ -14,13 +14,81 @@ use crate::JobId;
 use crate::jobs::model::JobStatus;
 use crate::operations::StorageCapacity;
 use crate::operations::disk::volume::Volume;
-use crate::operations::disk::writer::{Barrier, Failure, Report, Submitter, VolumeWriters};
+use crate::operations::disk::writer::{
+    Barrier, DiskOwner, Failure, Owner, Submitter, VolumeWriters,
+};
 use crate::pipeline::Pipeline;
 use crate::pipeline::download::volume_pace::{VolumeBuffers, VolumeIntake, intake_of};
 use crate::pipeline::graph::job::GraphError;
 use crate::pipeline::graph::job::GraphJob;
 use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::namespace::WriteError;
+
+// The volumes' writers as the pipeline writes through them: the writers
+// the process shares, and the pipeline's place among their owners. Every
+// submitter the pipeline takes is its own, so its jobs' failures and the
+// wakes it asks for come back to it.
+pub(crate) struct PipelineWriters {
+    writers: Arc<VolumeWriters>,
+    owner: Owner,
+}
+
+impl PipelineWriters {
+    // Write through `writers` as the pipeline: a job's failure comes as
+    // mail on `mail`, and room on a volume as a message on `rooms`.
+    pub(crate) fn new(
+        writers: Arc<VolumeWriters>,
+        mail: tokio::sync::mpsc::UnboundedSender<crate::pipeline::graph::engine::Said>,
+        rooms: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
+        let owner = writers.owner(Arc::new(PipelineOwner { mail, rooms }));
+        Self { writers, owner }
+    }
+
+    // The way to write to `volume` for the job `key`.
+    pub(crate) fn submitter(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
+        self.writers.submitter(volume, key, &self.owner)
+    }
+
+    // Take the wake asked for on `volume`, as the loop lowers its count:
+    // whether the pipeline asked for it. Any other owner that asked is
+    // told.
+    pub(crate) fn take_wake(&self, volume: &Volume) -> bool {
+        self.writers.take_wake(volume, &self.owner)
+    }
+}
+
+impl std::ops::Deref for PipelineWriters {
+    type Target = VolumeWriters;
+
+    fn deref(&self) -> &VolumeWriters {
+        &self.writers
+    }
+}
+
+// What the pipeline hears from the writers. A failure is the job's to
+// hear, with its other mail. Room tells the loop a volume it stopped
+// dispatch for fell below its line, or that a failure may have freed one.
+// A pipeline that has gone hears nothing, and needs to.
+struct PipelineOwner {
+    mail: tokio::sync::mpsc::UnboundedSender<crate::pipeline::graph::engine::Said>,
+    rooms: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl DiskOwner for PipelineOwner {
+    fn failed(&self, failure: Failure) {
+        let _ = self.mail.send(crate::pipeline::graph::engine::Said {
+            scope: failure.key,
+            node: weaver_graph::NodeId::ROOT,
+            generation: 0,
+            heard: crate::pipeline::graph::engine::Heard::DiskFailed(Box::new(failure)),
+        });
+    }
+
+    fn room(&self) {
+        let _ = self.rooms.send(());
+    }
+}
 
 // The volumes of a job's directories as a thread off the loop read them.
 pub(crate) type ReadVolumes = Vec<(PathBuf, Arc<Volume>)>;
@@ -35,7 +103,7 @@ pub(crate) type ReadVolumes = Vec<(PathBuf, Arc<Volume>)>;
 // against the limit of the volume they land on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn job_disk(
-    writers: &VolumeWriters,
+    writers: &PipelineWriters,
     capacity: &StorageCapacity,
     probes: &VolumeProbes,
     key: u64,
@@ -58,13 +126,13 @@ pub(crate) fn job_disk(
     // The job holds the volume before the probe is queued: a volume held
     // and not written to yet keeps its probe for later.
     let working = writers.submitter(&volume, key);
-    probes.first_seen(writers, &volume, working_dir);
+    probes.first_seen(writers, &writers.owner, &volume, working_dir);
     let output = output_dir.and_then(|dir| {
         let other = volume_of(dir);
         (!Arc::ptr_eq(&other, &volume)).then(|| {
             writing.join(&other);
             let output = writers.submitter(&other, key);
-            probes.first_seen(writers, &other, dir);
+            probes.first_seen(writers, &writers.owner, &other, dir);
             (dir.to_path_buf(), output)
         })
     });
@@ -152,7 +220,7 @@ impl VolumeProbes {
         }
     }
 
-    fn first_seen(&self, writers: &VolumeWriters, volume: &Arc<Volume>, dir: &Path) {
+    fn first_seen(&self, writers: &VolumeWriters, owner: &Owner, volume: &Arc<Volume>, dir: &Path) {
         let Some(probe) = &self.probe else {
             return;
         };
@@ -167,7 +235,7 @@ impl VolumeProbes {
             seen.push(Arc::clone(volume));
         }
         let (probe, probed, under) = (Arc::clone(probe), Arc::clone(volume), dir.to_path_buf());
-        writers.volume_submitter(volume).when_idle(move || {
+        writers.volume_submitter(volume, owner).when_idle(move || {
             if let Some(dir) = probed_dir(&under) {
                 let _ = probe(probed, dir.to_path_buf())();
             }
@@ -203,6 +271,17 @@ pub(crate) mod threads {
 
     pub(crate) fn asked() -> bool {
         ASKED.load(Ordering::SeqCst)
+    }
+
+    // The writers a pipeline under test writes through: each operation
+    // run as it is submitted, so the test reads its files right after it
+    // writes them, unless the test asked for a thread per volume.
+    pub(crate) fn writers() -> std::sync::Arc<crate::operations::VolumeWriters> {
+        std::sync::Arc::new(if asked() {
+            crate::operations::VolumeWriters::new()
+        } else {
+            crate::operations::VolumeWriters::unthreaded()
+        })
     }
 
     impl Drop for Threads {
@@ -363,12 +442,13 @@ impl Pipeline {
         }
     }
 
-    // Hear every batch report that is waiting. Whether any was.
-    pub(in crate::pipeline) fn hear_volume_reports(&mut self) -> bool {
+    // Hear every word of room from the writers that is waiting. Whether
+    // any was.
+    pub(in crate::pipeline) fn hear_volume_rooms(&mut self) -> bool {
         let mut heard = false;
-        while let Ok(report) = self.volume_reports.try_recv() {
+        while let Ok(()) = self.volume_rooms.try_recv() {
             heard = true;
-            self.volume_batch_returned(report);
+            self.volume_room_heard();
         }
         heard
     }
@@ -464,13 +544,11 @@ impl Pipeline {
         }
     }
 
-    // A volume's writer has something for the loop: a volume dispatch was
-    // stopped for fell below its line, or an operation failed and may
-    // have freed one. Dispatch that stopped for a volume looks again.
-    pub(in crate::pipeline) fn volume_batch_returned(&mut self, report: Report) {
-        for failure in report.failures {
-            self.graph_disk_failed(failure);
-        }
+    // A volume's writer says there may be room: a volume dispatch was
+    // stopped for fell below its line, or an operation failed and may have
+    // freed one. Its failures came first, as mail. Dispatch that stopped
+    // for a volume looks again.
+    pub(in crate::pipeline) fn volume_room_heard(&mut self) {
         self.volume_room_changed();
     }
 }

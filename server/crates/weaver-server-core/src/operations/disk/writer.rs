@@ -23,7 +23,7 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -74,12 +74,117 @@ pub(crate) struct Create {
     pub(crate) open: OpenFn,
 }
 
-// What a volume's writer has to say. Never sent with nothing in it.
+// Whoever writes through the volumes' writers: a caller obtains its
+// `Submitter` with its owner, and hears through it what its writes have to
+// say. Called on a writer thread, or on the submitting thread for a volume
+// that has none; neither call may wait.
+pub(crate) trait DiskOwner: Send + Sync {
+    // One of this owner's operations failed. A batch's failures are told one
+    // after another, and `room` follows them once.
+    fn failed(&self, failure: Failure);
+    // The volume may have room this owner waits for: its unwritten bytes
+    // fell to the line the owner asked about (`Submitter::wake_below`), or
+    // operations of the owner failed, which frees what they held.
+    fn room(&self);
+}
+
+// An owner as the writers know it: the owner itself and the one bit its
+// asks for a wake are marked with on a volume. Made once for each owner
+// (`VolumeWriters::owner`); cloning it is cheap.
+#[derive(Clone)]
+pub(crate) struct Owner {
+    owner: Arc<dyn DiskOwner>,
+    bit: u64,
+}
+
+// The most owners one set of writers tells apart: one bit each in a
+// volume's mark of who asked for a wake.
+const OWNERS: usize = 64;
+
+// The owners known to a set of writers, each in the slot of its bit. Set
+// once each; read without a lock.
+struct Owners {
+    known: [OnceLock<Arc<dyn DiskOwner>>; OWNERS],
+    next: AtomicUsize,
+}
+
+impl Default for Owners {
+    fn default() -> Self {
+        Self {
+            known: std::array::from_fn(|_| OnceLock::new()),
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Owners {
+    fn add(&self, owner: Arc<dyn DiskOwner>) -> Owner {
+        let at = self.next.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            at < OWNERS,
+            "at most {OWNERS} owners write through one set of writers"
+        );
+        let _ = self.known[at].set(Arc::clone(&owner));
+        Owner {
+            owner,
+            bit: 1 << at,
+        }
+    }
+
+    // Tell every owner whose bit is in `asked` that the volume has room.
+    // Nothing when no wake was taken.
+    #[inline]
+    fn room(&self, asked: u64) {
+        if asked != 0 {
+            self.wake(asked);
+        }
+    }
+
+    #[cold]
+    fn wake(&self, asked: u64) {
+        break_span();
+        let mut left = asked;
+        while left != 0 {
+            let at = left.trailing_zeros() as usize;
+            left &= left - 1;
+            if let Some(owner) = self.known[at].get() {
+                owner.room();
+            }
+        }
+    }
+}
+
+// What a volume's writer had to say in a test, as one report: the failures
+// of a batch, or that the bytes waiting fell to a line asked about.
+#[cfg(test)]
 pub(crate) struct Report {
     pub(crate) failures: Vec<Failure>,
-    // The bytes waiting for the volume fell to the line `wake_below` was
-    // given.
     pub(crate) below: bool,
+}
+
+// An owner for a test that hears its writers as reports: the failures told
+// are gathered and sent with the `room` that follows them.
+#[cfg(test)]
+struct Reporting {
+    failures: Mutex<Vec<Failure>>,
+    report: Box<dyn Fn(Report) + Send + Sync>,
+}
+
+#[cfg(test)]
+impl DiskOwner for Reporting {
+    fn failed(&self, failure: Failure) {
+        self.failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(failure);
+    }
+
+    fn room(&self) {
+        let failures =
+            std::mem::take(&mut *self.failures.lock().unwrap_or_else(PoisonError::into_inner));
+        let below = failures.is_empty();
+        (self.report)(Report { failures, below });
+    }
 }
 
 // An operation that failed, under the key and for the file it was given.
@@ -185,18 +290,27 @@ impl LoopEnd {
     }
 }
 
-type ReportFn = dyn Fn(Report) + Send + Sync;
 type Then = Box<dyn FnOnce() + Send>;
 type Lanes = Vec<(usize, Arc<Lane>)>;
+// Rung after a batch that wrote, so an idle rate sampler looks again; set
+// once, by whoever samples the rates.
+type Rates = OnceLock<Arc<RateSignal>>;
 
-// The writer threads, one per volume in use.
-pub(crate) struct VolumeWriters {
+/// The writer threads, one per volume in use. Built once for the process
+/// and shared by everything that writes downloads to disk.
+pub struct VolumeWriters {
     registry: Arc<Registry>,
-    report: Arc<ReportFn>,
-    // Rung after a batch that wrote, so an idle rate sampler looks again.
-    rates: Option<Arc<RateSignal>>,
     #[cfg(test)]
     mode: Mode,
+    // The owner a test's writers report to (`VolumeWriters::reporting`).
+    #[cfg(test)]
+    test_owner: Option<Owner>,
+}
+
+impl Default for VolumeWriters {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // Every volume with a writer, by the address of its record. A volume stays
@@ -212,6 +326,9 @@ struct Registry {
     // Where the loop's own waits end once the owner is stopping. Every
     // lane holds it.
     loop_end: Arc<LoopEnd>,
+    // The owners writing through these writers. Every lane holds it.
+    owners: Arc<Owners>,
+    rates: Rates,
     #[cfg(test)]
     ended: Condvar,
     // Times a thread was asked for.
@@ -238,22 +355,41 @@ enum Mode {
 }
 
 impl VolumeWriters {
-    // `report` is called on a writer thread, or on the submitting thread
-    // for a volume that has none. It must not wait.
-    pub(crate) fn new(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
+    /// Writers with no volume in use yet: each volume's thread starts with
+    /// its first caller.
+    pub fn new() -> Self {
         Self {
             registry: Arc::default(),
-            report: Arc::new(report),
-            rates: None,
             #[cfg(test)]
             mode: Mode::Threads,
+            #[cfg(test)]
+            test_owner: None,
         }
     }
 
-    // The same writers, ringing `rates` after every batch that wrote.
-    pub(crate) fn ringing(mut self, rates: Arc<RateSignal>) -> Self {
-        self.rates = Some(rates);
-        self
+    // Ring `rates` after every batch that wrote, from now on. Set once;
+    // a second call changes nothing.
+    pub(crate) fn ring(&self, rates: Arc<RateSignal>) {
+        let _ = self.registry.rates.set(rates);
+    }
+
+    // Make `owner` known to the writers. Each owner is made known once and
+    // keeps what this returns; at most `OWNERS` are.
+    pub(crate) fn owner(&self, owner: Arc<dyn DiskOwner>) -> Owner {
+        self.registry.owners.add(owner)
+    }
+
+    // Writers that report to `report`, for a test, with a thread per
+    // volume. A test's submitters write as that owner
+    // (`VolumeWriters::test_submitter`).
+    #[cfg(test)]
+    pub(crate) fn reporting(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
+        let mut writers = Self::new();
+        writers.test_owner = Some(writers.owner(Arc::new(Reporting {
+            failures: Mutex::default(),
+            report: Box::new(report),
+        })));
+        writers
     }
 
     // Writers on a machine that will not start another thread.
@@ -261,7 +397,7 @@ impl VolumeWriters {
     pub(crate) fn threadless(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
         Self {
             mode: Mode::NoThread,
-            ..Self::new(report)
+            ..Self::reporting(report)
         }
     }
 
@@ -272,29 +408,65 @@ impl VolumeWriters {
     pub(crate) fn inline(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
         Self {
             mode: Mode::Inline,
-            ..Self::new(report)
+            ..Self::reporting(report)
         }
     }
 
-    // A caller's way to write to `volume` under `key`. The volume's thread
-    // starts here when it has none; one that has not ended is used again.
-    pub(crate) fn submitter(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
+    // The same writers, with no threads, for a pipeline a test builds that
+    // makes its own owner.
+    #[cfg(test)]
+    pub(crate) fn unthreaded() -> Self {
+        Self {
+            mode: Mode::Inline,
+            ..Self::new()
+        }
+    }
+
+    // The owner a test's writers report to.
+    #[cfg(test)]
+    pub(crate) fn test_owner(&self) -> &Owner {
+        self.test_owner
+            .as_ref()
+            .expect("writers made to report to a test")
+    }
+
+    // A test's way to write to `volume` under `key`, as its owner.
+    #[cfg(test)]
+    pub(crate) fn test_submitter(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
+        self.submitter(volume, key, self.test_owner())
+    }
+
+    // A test's way to queue a volume's own work, as its owner.
+    #[cfg(test)]
+    pub(crate) fn test_volume_submitter(&self, volume: &Arc<Volume>) -> Arc<Submitter> {
+        self.volume_submitter(volume, self.test_owner())
+    }
+
+    // A caller's way to write to `volume` under `key`, as `owner`, which
+    // hears what its operations have to say. The volume's thread starts
+    // here when it has none; one that has not ended is used again.
+    pub(crate) fn submitter(
+        &self,
+        volume: &Arc<Volume>,
+        key: u64,
+        owner: &Owner,
+    ) -> Arc<Submitter> {
         debug_assert_ne!(key, VOLUME_KEY, "the volume's own key is no caller's");
-        self.submitter_under(volume, key)
+        self.submitter_under(volume, key, owner)
     }
 
     // The way to queue a volume's own work on its writer, such as the probe
-    // of its write rate, under the one key no caller has.
-    pub(crate) fn volume_submitter(&self, volume: &Arc<Volume>) -> Arc<Submitter> {
-        self.submitter_under(volume, VOLUME_KEY)
+    // of its write rate, under the one key no caller has, for `owner`.
+    pub(crate) fn volume_submitter(&self, volume: &Arc<Volume>, owner: &Owner) -> Arc<Submitter> {
+        self.submitter_under(volume, VOLUME_KEY, owner)
     }
 
-    fn submitter_under(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
+    fn submitter_under(&self, volume: &Arc<Volume>, key: u64, owner: &Owner) -> Arc<Submitter> {
         let lane = self.lane(volume);
         let send = Mutex::new(lane.send.clone());
         Arc::new(Submitter {
             lane,
-            key: Arc::new(Key::new(key)),
+            key: Arc::new(Key::new(key, owner.clone())),
             send,
         })
     }
@@ -315,14 +487,7 @@ impl VolumeWriters {
         let (inline, threadless) = (false, false);
         #[cfg(test)]
         self.registry.starts.fetch_add(1, Ordering::Relaxed);
-        let lane = Lane::start(
-            Arc::clone(volume),
-            Arc::clone(&self.report),
-            self.rates.clone(),
-            &self.registry,
-            inline,
-            threadless,
-        );
+        let lane = Lane::start(Arc::clone(volume), &self.registry, inline, threadless);
         lane.state.users.fetch_add(1, Ordering::SeqCst);
         // A lane whose thread could not be started is kept as well, so the
         // callers that come while it is held share it and fail at once: no
@@ -333,15 +498,15 @@ impl VolumeWriters {
         lane
     }
 
-    // Wake whoever hears the reports, once, when the bytes that arrived for
-    // `volume` and are not written (`Volume::unwritten_bytes`) are `bytes`
-    // or fewer. False when they already are: nothing was asked and no wake
-    // comes. One line is kept per volume, the highest asked
-    // (`Volume::ask_wake`). The writer takes the wake as it writes; the
-    // loop takes it itself, with `Volume::take_wake`, as it hands on what
-    // was being decoded.
-    pub(crate) fn wake_below(&self, volume: &Arc<Volume>, bytes: u64) -> bool {
-        volume.ask_wake(bytes)
+    // Take the wake asked of `volume`, when its unwritten bytes have
+    // fallen to the line asked (`Volume::take_wake`), for a caller that
+    // lowered them itself: every other owner that asked hears `room`, and
+    // whether `owner` asked comes back for the caller to act on itself.
+    // One atomic step when no wake is due.
+    pub(crate) fn take_wake(&self, volume: &Volume, owner: &Owner) -> bool {
+        let asked = volume.take_wake();
+        self.registry.owners.room(asked & !owner.bit);
+        asked & owner.bit != 0
     }
 
     // Wait until everything submitted to every volume so far has returned,
@@ -535,6 +700,8 @@ const BATCH_BYTES: u64 = 32 * 1024 * 1024;
 
 struct Key {
     id: u64,
+    // Who hears of the key's failures, and whose asks for a wake it makes.
+    owner: Owner,
     // An operation under the key failed: the ones after it are not run.
     failed: AtomicBool,
     // The caller gave the key up: the ones still queued are not run.
@@ -628,9 +795,10 @@ struct Held {
 const KEPT_CLOSED: usize = 64;
 
 impl Key {
-    fn new(id: u64) -> Self {
+    fn new(id: u64, owner: Owner) -> Self {
         Self {
             id,
+            owner,
             failed: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             left: AtomicBool::new(false),
@@ -787,6 +955,17 @@ pub(crate) struct Submitter {
 impl Submitter {
     pub(crate) fn volume(&self) -> &Arc<Volume> {
         &self.lane.state.volume
+    }
+
+    // Have the key's owner hear `room`, once, when the bytes counted on the
+    // volume and not written (`Volume::unwritten_bytes`) are `bytes` or
+    // fewer. False when they already are: nothing was asked and no wake
+    // comes. One line is kept per volume, the highest asked
+    // (`Volume::ask_wake`). The writer takes the wake as it writes; a
+    // caller that lowers the count itself takes it with
+    // `VolumeWriters::take_wake`.
+    pub(crate) fn wake_below(&self, bytes: u64) -> bool {
+        self.lane.state.volume.ask_wake(bytes, self.key.owner.bit)
     }
 
     // Write `bytes` at `offset` of `file`, opening it through `create` when
@@ -1139,7 +1318,7 @@ impl Submitter {
             // The volume has no thread, so nothing will be written: the
             // bytes stop waiting and the barrier does not hold anyone.
             if let Op::Write { bytes, .. } = &unsent.op {
-                unbuffer(state, &*self.lane.report, bytes.len() as u64);
+                unbuffer(state, bytes.len() as u64);
             }
             state.done.fetch_add(1, Ordering::Relaxed);
             // The caller makes this one itself: nothing failed.
@@ -1157,16 +1336,15 @@ impl Submitter {
                 && !self.key.abandoned.load(Ordering::Acquire)
                 && !matches!(unsent.op, Op::Forget | Op::Release { .. })
             {
-                (self.lane.report)(Report {
-                    failures: vec![Failure {
-                        key: self.key.id,
-                        file: unsent.op.file(),
-                        path: unsent.op.path(),
-                        error: io::Error::other("the volume's writer thread is gone"),
-                        creating: false,
-                    }],
-                    below: false,
+                let owner = &self.key.owner.owner;
+                owner.failed(Failure {
+                    key: self.key.id,
+                    file: unsent.op.file(),
+                    path: unsent.op.path(),
+                    error: io::Error::other("the volume's writer thread is gone"),
+                    creating: false,
                 });
+                owner.room();
             }
             // Nothing sent to the volume will run, so all of it has
             // returned: a settle does not wait for it. Said after the
@@ -1332,7 +1510,6 @@ impl std::fmt::Debug for Submitter {
 
 struct Lane {
     state: Arc<LaneState>,
-    report: Arc<ReportFn>,
     // The way to the thread; each caller takes a copy of its own.
     send: mpsc::Sender<Mail>,
     // A lane with no thread: what a thread would hold, run by whoever
@@ -1367,6 +1544,8 @@ struct LaneState {
     // The keys threads stand in `Barrier::wait_aside` for, so a stop can
     // wake them.
     aside: Mutex<Vec<Arc<Key>>>,
+    // Who hears a volume's wakes, by the bit each asked under.
+    owners: Arc<Owners>,
     #[cfg(test)]
     gate: Mutex<Gate>,
     #[cfg(test)]
@@ -1413,7 +1592,7 @@ impl LaneState {
 
 // `bytes` no longer wait for the volume's writer. Whoever asked to be woken
 // at a line the count has now reached is woken, once.
-fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
+fn unbuffer(state: &LaneState, bytes: u64) {
     if bytes == 0 {
         return;
     }
@@ -1421,13 +1600,7 @@ fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
     volume.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
     volume.release(bytes);
     state.look_below();
-    if volume.take_wake() {
-        break_span();
-        report(Report {
-            failures: Vec::new(),
-            below: true,
-        });
-    }
+    state.owners.room(volume.take_wake());
 }
 
 impl Lane {
@@ -1436,12 +1609,14 @@ impl Lane {
     // key at once.
     fn start(
         volume: Arc<Volume>,
-        report: Arc<ReportFn>,
-        rates: Option<Arc<RateSignal>>,
         registry: &Arc<Registry>,
         inline: bool,
         threadless: bool,
     ) -> Arc<Self> {
+        // Taken once, at the lane's start: the owner rings the rates before
+        // any caller asks for a lane (`VolumeWriters::ring`).
+        let rates = registry.rates.get().cloned();
+        let owners = Arc::clone(&registry.owners);
         let stopped = Arc::clone(&registry.stopped);
         let loop_end = Arc::clone(&registry.loop_end);
         let registry = Arc::downgrade(registry);
@@ -1461,21 +1636,16 @@ impl Lane {
             stopped,
             loop_end,
             aside: Mutex::default(),
+            owners,
             #[cfg(test)]
             gate: Mutex::default(),
             #[cfg(test)]
             gate_moved: Condvar::new(),
         });
-        let thread = Thread::new(
-            Arc::clone(&state),
-            Arc::clone(&report),
-            rates,
-            registry.clone(),
-        );
+        let thread = Thread::new(Arc::clone(&state), rates, registry.clone());
         if inline {
             return Arc::new(Self {
                 state,
-                report,
                 send,
                 inline: Some(Mutex::new((thread, queued))),
                 threadless: None,
@@ -1500,7 +1670,6 @@ impl Lane {
         }
         Arc::new(Self {
             state,
-            report,
             send,
             inline: None,
             threadless: spawned.is_err().then_some(registry),
@@ -1799,7 +1968,8 @@ fn nanos_since(began: Instant) -> u64 {
 // What a batch has come to so far.
 #[derive(Default)]
 struct Ran {
-    failures: Vec<Failure>,
+    // Each with the owner of the key that failed.
+    failures: Vec<(Owner, Failure)>,
     tally: Tally,
     // The bytes of the write being made, still counted as waiting.
     in_hand: u64,
@@ -1897,7 +2067,6 @@ struct Entry {
 
 struct Thread {
     state: Arc<LaneState>,
-    report: Arc<ReportFn>,
     rates: Option<Arc<RateSignal>>,
     registry: Weak<Registry>,
     batch: Vec<Entry>,
@@ -1923,13 +2092,11 @@ struct Thread {
 impl Thread {
     fn new(
         state: Arc<LaneState>,
-        report: Arc<ReportFn>,
         rates: Option<Arc<RateSignal>>,
         registry: Weak<Registry>,
     ) -> Self {
         Self {
             state,
-            report,
             rates,
             registry,
             batch: Vec::new(),
@@ -2115,12 +2282,9 @@ impl Thread {
             }
         }
         if !failures.is_empty() {
-            (self.report)(Report {
-                failures,
-                below: false,
-            });
+            tell(failures);
         }
-        // After the report: a settle that waited for this batch finds its
+        // After the failures are told: a settle that waited for this batch finds its
         // failures already with the caller.
         self.state.returned(self.arrived);
         work
@@ -2149,14 +2313,7 @@ impl Thread {
             #[cfg(not(test))]
             let forced = None;
             let op = self.batch[at].op.take().expect("each operation runs once");
-            perform(
-                &self.state,
-                &*self.report,
-                &self.batch[at].key,
-                op,
-                forced,
-                &mut self.ran,
-            );
+            perform(&self.state, &self.batch[at].key, op, forced, &mut self.ran);
             self.batch[at].done = true;
             self.state.done.fetch_add(1, Ordering::Relaxed);
             let key = &self.batch[at].key;
@@ -2240,12 +2397,11 @@ impl Thread {
     // What was not run is not run, all of it counts as returned, and its
     // bytes stop waiting.
     fn fail_batch(&mut self) {
-        let report = &*self.report;
-        unbuffer(&self.state, report, std::mem::take(&mut self.ran.in_hand));
+        unbuffer(&self.state, std::mem::take(&mut self.ran.in_hand));
         self.held.clear();
         for entry in &mut self.batch {
             if let Some(Op::Write { bytes, .. }) = entry.op.take() {
-                unbuffer(&self.state, report, bytes.len() as u64);
+                unbuffer(&self.state, bytes.len() as u64);
             }
             if entry.key.letting.swap(0, Ordering::Relaxed) != 0 {
                 entry.key.held().letting_go.clear();
@@ -2255,13 +2411,16 @@ impl Thread {
             }
             let key = &entry.key;
             if !key.failed.swap(true, Ordering::SeqCst) && !key.abandoned.load(Ordering::Acquire) {
-                self.ran.failures.push(Failure {
-                    key: key.id,
-                    file: None,
-                    path: PathBuf::new(),
-                    error: io::Error::other("a file operation panicked on the volume's writer"),
-                    creating: false,
-                });
+                self.ran.failures.push((
+                    key.owner.clone(),
+                    Failure {
+                        key: key.id,
+                        file: None,
+                        path: PathBuf::new(),
+                        error: io::Error::other("a file operation panicked on the volume's writer"),
+                        creating: false,
+                    },
+                ));
             }
             key.returned(entry.seq);
         }
@@ -2468,14 +2627,7 @@ impl Entry {
 }
 
 // Run one operation of `key` to its end.
-fn perform(
-    state: &LaneState,
-    report: &ReportFn,
-    key: &Key,
-    op: Op,
-    forced: Option<io::Error>,
-    ran: &mut Ran,
-) {
+fn perform(state: &LaneState, key: &Key, op: Op, forced: Option<io::Error>, ran: &mut Ran) {
     let Ran {
         failures,
         tally,
@@ -2669,7 +2821,7 @@ fn perform(
     if let Some(run) = after {
         result = run();
     }
-    unbuffer(state, report, std::mem::take(in_hand));
+    unbuffer(state, std::mem::take(in_hand));
     if let Err(error) = result {
         // A name the file system will not take is a refusal of that one
         // file: the caller decides what follows. Anything else fails
@@ -2685,13 +2837,32 @@ fn perform(
             key.failed.store(true, Ordering::SeqCst);
             state.look_below();
         }
-        failures.push(Failure {
-            key: key.id,
-            file,
-            path: failed_at,
-            error,
-            creating,
-        });
+        failures.push((
+            key.owner.clone(),
+            Failure {
+                key: key.id,
+                file,
+                path: failed_at,
+                error,
+                creating,
+            },
+        ));
+    }
+}
+
+// Tell each owner its keys' failures from a batch, in the order they came,
+// then `room` once to each owner told, in the order first told.
+#[cold]
+fn tell(failures: Vec<(Owner, Failure)>) {
+    let mut told: Vec<Owner> = Vec::new();
+    for (owner, failure) in failures {
+        owner.owner.failed(failure);
+        if !told.iter().any(|seen| seen.bit == owner.bit) {
+            told.push(owner);
+        }
+    }
+    for owner in told {
+        owner.owner.room();
     }
 }
 

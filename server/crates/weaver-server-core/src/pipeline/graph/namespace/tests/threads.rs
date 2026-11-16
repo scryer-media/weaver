@@ -27,7 +27,7 @@ impl Disk {
         let (send, reports) = mpsc::channel();
         let send = Mutex::new(send);
         Self {
-            writers: VolumeWriters::new(move |report| {
+            writers: VolumeWriters::reporting(move |report| {
                 let _ = send.lock().unwrap().send(report);
             }),
             volume: Arc::new(Volume::new(None, "test".to_owned())),
@@ -37,8 +37,10 @@ impl Disk {
 
     // The job's files are written through the volume's thread from here.
     fn attach(&self, job: &mut Job) {
-        job.writer
-            .move_disk_for_test(JobDisk::new(self.writers.submitter(&self.volume, 1), None));
+        job.writer.move_disk_for_test(JobDisk::new(
+            self.writers.test_submitter(&self.volume, 1),
+            None,
+        ));
     }
 
     fn hold(&self) -> Hold {

@@ -2177,9 +2177,8 @@ pub struct Pipeline {
     // when dispatch should look again (a volume fell below the line it
     // was stopped at, or an operation failed), and whether a job was
     // refused dispatch because a volume held its budget of bytes.
-    pub(super) volume_writers: Arc<crate::operations::disk::writer::VolumeWriters>,
-    pub(super) volume_reports:
-        tokio::sync::mpsc::UnboundedReceiver<crate::operations::disk::writer::Report>,
+    pub(super) volume_writers: Arc<crate::pipeline::graph::disk::PipelineWriters>,
+    pub(super) volume_rooms: tokio::sync::mpsc::UnboundedReceiver<()>,
     pub(super) volume_budget_held: std::sync::atomic::AtomicBool,
     // The clock the shutdown settle of the volume writers goes by, and how
     // long a volume may stand still before it is left behind. The machine's

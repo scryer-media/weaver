@@ -53,6 +53,9 @@ pub(crate) struct Volume {
     // One more than the count of unwritten bytes someone asked to be woken
     // at; zero when no one asked. Whoever wakes them clears it.
     pub(crate) wake_line: AtomicU64,
+    // Who asked for the wake: one bit for each owner of the volume's
+    // writers that asked (`VolumeWriters::owner`). Taken with the line.
+    wake_askers: AtomicU64,
     // Times its writer ran out of work. A sample across which this did not
     // move is one in which the writer never did.
     pub(crate) idle_turns: AtomicU64,
@@ -210,6 +213,7 @@ impl Volume {
             buffer_soft_bytes: AtomicU64::new(u64::MAX),
             buffer_hard_bytes: AtomicU64::new(u64::MAX),
             wake_line: AtomicU64::new(0),
+            wake_askers: AtomicU64::new(0),
             idle_turns: AtomicU64::new(0),
             write_rate: AtomicU64::new(0),
             throughput: AtomicU64::new(0),
@@ -349,16 +353,23 @@ impl Volume {
     }
 
     // Take the wake someone asked for, when the unwritten bytes have fallen
-    // to their line: true once for each ask, to whoever lowered the bytes
-    // there, the volume's writer or the pipeline loop. The caller lowers
-    // its count first and asks after. A line raised while it takes is
-    // looked at again, so a wake the count has reached is never missed.
-    pub(crate) fn take_wake(&self) -> bool {
-        self.wake_line
+    // to their line: the bits of whoever asked, once for each ask, to
+    // whoever lowered the bytes there; zero when there is no wake to take.
+    // The caller lowers its count first and asks after. A line raised while
+    // it takes is looked at again, so a wake the count has reached is never
+    // missed. One load when no one asked.
+    pub(crate) fn take_wake(&self) -> u64 {
+        let taken = self
+            .wake_line
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |ask| {
                 (ask != 0 && self.unwritten_bytes() < ask).then_some(0)
             })
-            .is_ok()
+            .is_ok();
+        if taken {
+            self.wake_askers.swap(0, Ordering::SeqCst)
+        } else {
+            0
+        }
     }
 
     // Ask to be woken, once, when the unwritten bytes are `bytes` or
@@ -366,8 +377,12 @@ impl Volume {
     // comes. One line is kept, the highest asked, which wakes soonest:
     // every wake rings dispatch, and whoever it finds still short of room
     // asks again for its own line, so a lower ask never holds back a
-    // higher one. Only the pipeline loop asks.
-    pub(crate) fn ask_wake(&self, bytes: u64) -> bool {
+    // higher one. `asker` is the asking owner's bit; an owner whose ask
+    // finds the count already there may still be woken by a line another
+    // owner asked for, which only says the volume may have room.
+    pub(crate) fn ask_wake(&self, bytes: u64, asker: u64) -> bool {
+        // Marked before the line, so whoever takes the line finds the bit.
+        self.wake_askers.fetch_or(asker, Ordering::SeqCst);
         let ask = bytes.saturating_add(1);
         let before = self.wake_line.fetch_max(ask, Ordering::SeqCst);
         if before >= ask || self.unwritten_bytes() > bytes {
@@ -445,24 +460,41 @@ mod tests {
     fn a_lower_ask_never_holds_back_a_higher_one() {
         let volume = sized(1600);
         volume.charge(1000);
-        assert!(volume.ask_wake(800));
-        assert!(volume.ask_wake(400), "a lower line asked after");
+        assert!(volume.ask_wake(800, 1));
+        assert!(volume.ask_wake(400, 1), "a lower line asked after");
         volume.release(150);
-        assert!(!volume.take_wake(), "850 is above the line at 800");
+        assert_eq!(volume.take_wake(), 0, "850 is above the line at 800");
         volume.release(100);
-        assert!(volume.take_wake(), "750 has reached the higher line");
-        assert!(!volume.take_wake(), "one wake for the line");
+        assert_eq!(volume.take_wake(), 1, "750 has reached the higher line");
+        assert_eq!(volume.take_wake(), 0, "one wake for the line");
         // Asked the other way about, the same.
-        assert!(volume.ask_wake(400));
-        assert!(volume.ask_wake(700));
+        assert!(volume.ask_wake(400, 1));
+        assert!(volume.ask_wake(700, 1));
         volume.release(100);
-        assert!(volume.take_wake(), "650 has reached the higher line");
+        assert_eq!(volume.take_wake(), 1, "650 has reached the higher line");
         // An ask the count is already under asks nothing and leaves the
         // line asked before it as it was.
-        assert!(volume.ask_wake(300));
-        assert!(!volume.ask_wake(900), "already under 900");
+        assert!(volume.ask_wake(300, 1));
+        assert!(!volume.ask_wake(900, 1), "already under 900");
         volume.release(400);
-        assert!(volume.take_wake(), "250 has reached the line at 300");
+        assert_eq!(volume.take_wake(), 1, "250 has reached the line at 300");
+    }
+
+    // A wake goes to every owner that asked for it, once, and to no other.
+    #[test]
+    fn a_wake_goes_to_whoever_asked() {
+        let volume = sized(1600);
+        volume.charge(1000);
+        assert!(volume.ask_wake(800, 0b01));
+        assert!(volume.ask_wake(600, 0b10));
+        volume.release(100);
+        assert_eq!(volume.take_wake(), 0, "900 is above both lines");
+        volume.release(150);
+        assert_eq!(volume.take_wake(), 0b11, "the line taken wakes both");
+        assert_eq!(volume.take_wake(), 0, "one wake for the asks");
+        assert!(volume.ask_wake(700, 0b10));
+        volume.release(100);
+        assert_eq!(volume.take_wake(), 0b10, "only the owner that asked");
     }
 
     // A release past the count is a fault: in a test it is caught, and
