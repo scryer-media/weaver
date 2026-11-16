@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 use super::*;
 use crate::operations::disk::volume::Volume;
 use crate::operations::disk::writer::Hold;
+use crate::pipeline::graph::disk::VolumeLeases;
 use crate::pipeline::graph::disk::threads;
 use crate::pipeline::tests::{job_status_for_assert, settle_failed_releases};
 
@@ -1271,7 +1272,7 @@ async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_
             disk.barrier().wait_aside();
             let hold = pipeline.volume_writers.hold(&volume);
             let writers = Arc::clone(&pipeline.volume_writers);
-            writers.end_loop_waits_at(Arc::clone(&clock) as _, clock.instant(span));
+            writers.end_waits_at(Arc::clone(&clock) as _, clock.instant(span));
             writers.stop_waits();
             let (watched, clock) = (Arc::clone(&volume), Arc::clone(&clock));
             watcher = Some(std::thread::spawn(move || {

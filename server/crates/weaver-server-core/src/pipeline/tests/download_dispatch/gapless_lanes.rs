@@ -10,6 +10,7 @@
 // be booked under.
 
 use super::*;
+use crate::pipeline::graph::disk::VolumeLeases;
 use crate::pipeline::tests::new_scheduler_pipeline as new_direct_pipeline;
 
 // Retag the queue so every remaining item sits at `head_priority`, and drop

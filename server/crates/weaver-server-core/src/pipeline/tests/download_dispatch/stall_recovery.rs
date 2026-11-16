@@ -10,6 +10,7 @@ use crate::pipeline::download::{
     DOWNLOAD_DISPATCH_STALL_KICK_AFTER, DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL,
     DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
 };
+use crate::pipeline::graph::disk::VolumeLeases;
 
 // A pipeline with no connections: every pass with queued work ends with
 // none open, which is the stall's shape. Its pool still has one server to

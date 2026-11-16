@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::pipeline::download::scheduler::{Handout, LaneShare, SaturationWake, YieldReason};
+use crate::pipeline::graph::disk::VolumeLeases;
 
 const SERVER_A: usize = 0;
 const SERVER_B: usize = 1;

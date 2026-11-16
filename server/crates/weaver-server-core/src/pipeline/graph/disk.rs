@@ -13,9 +13,9 @@ use std::sync::Arc;
 use crate::JobId;
 use crate::jobs::model::JobStatus;
 use crate::operations::StorageCapacity;
-use crate::operations::disk::volume::Volume;
+use crate::operations::disk::volume::{Reservation, Volume};
 use crate::operations::disk::writer::{
-    Barrier, DiskOwner, Failure, Owner, Submitter, VolumeWriters,
+    Barrier, DiskOwner, Failure, Owner, Prepaid, Submitter, VolumeWriters,
 };
 use crate::pipeline::Pipeline;
 use crate::pipeline::download::volume_pace::{VolumeBuffers, VolumeIntake, intake_of};
@@ -55,6 +55,44 @@ impl PipelineWriters {
     // told.
     pub(crate) fn take_wake(&self, volume: &Volume) -> bool {
         self.writers.take_wake(volume, &self.owner)
+    }
+
+    // Move `bytes` of `from` ahead of the writes the loop is about to queue
+    // in this step: they take them first (`Owner::prepay`).
+    pub(crate) fn prepay(&self, from: &mut Reservation, bytes: u64) -> Prepaid {
+        self.owner.prepay(from, bytes)
+    }
+}
+
+// A volume's limits as the loop leases articles against them. The loop
+// both leases and writes, so its leases keep one write piece of the hard
+// limit for its writes (`Volume::write_piece`): those always find room
+// once the writer has written what it holds.
+pub(crate) trait VolumeLeases {
+    // The loop's share of the hard limit: what leases leave free for it.
+    fn loop_share(&self) -> u64;
+    // The bytes below which leases are granted: the hard limit less the
+    // loop's share. `u64::MAX` when the volume is not sized.
+    fn lease_limit(&self) -> u64;
+    // The bytes a lease may still take.
+    fn lease_room(&self) -> u64;
+}
+
+impl VolumeLeases for Volume {
+    fn loop_share(&self) -> u64 {
+        self.write_piece()
+    }
+
+    fn lease_limit(&self) -> u64 {
+        let (_, hard) = self.buffer_limits();
+        if hard == u64::MAX {
+            return u64::MAX;
+        }
+        hard.saturating_sub(self.loop_share())
+    }
+
+    fn lease_room(&self) -> u64 {
+        self.lease_limit().saturating_sub(self.unwritten_bytes())
     }
 }
 
@@ -303,7 +341,7 @@ impl Pipeline {
     }
 
     // The bytes the job's volumes may still lease below their lease limits
-    // (`Volume::lease_room`), the least of them. `None` when the job writes
+    // (`VolumeLeases::lease_room`), the least of them. `None` when the job writes
     // through no writer or none of its volumes is sized.
     pub(in crate::pipeline) fn volume_room(&self, job_id: JobId) -> Option<u64> {
         let disk = self.graph_jobs.get(&job_id)?.disk()?;
@@ -317,7 +355,7 @@ impl Pipeline {
     }
 
     // Whether every volume the job writes to counts nothing: each grants
-    // one article then, whatever its size (`Volume::reserve`).
+    // one article then, whatever its size (`Reservation::reserve`).
     pub(in crate::pipeline) fn volume_counts_nothing(&self, job_id: JobId) -> bool {
         self.graph_jobs
             .get(&job_id)
@@ -625,7 +663,7 @@ impl JobDisk {
     // The loop's own wait on a volume's hard limit, before the next slice
     // of a repair's or a replay's output is read back and said again: the
     // loop stands still until every volume the job writes to has its share
-    // of room (`Volume::loop_share`), so the slice is read only once it can
+    // of room (`VolumeLeases::loop_share`), so the slice is read only once it can
     // be queued within the limit. Counted as a loop wait on the volume.
     //
     // A stop does not end the wait: what the loop says again while the
@@ -636,15 +674,15 @@ impl JobDisk {
     pub(crate) fn loop_wait_below(&self) -> bool {
         self.each().all(|submitter| {
             let share = submitter.volume().loop_share();
-            submitter.loop_wait_room(share)
+            submitter.wait_room(share)
         })
     }
 
     // Whether a wait of the loop on one of the job's volumes was given up
-    // at the end of a stop (`Submitter::left`): the step that made it, and
-    // every later one, stands on bytes that are not written.
+    // at the end of a stop (`Submitter::gave_up`): the step that made it,
+    // and every later one, stands on bytes that are not written.
     pub(crate) fn left_at_stop(&self) -> bool {
-        self.each().any(|submitter| submitter.left())
+        self.each().any(|submitter| submitter.gave_up())
     }
 
     // What the volumes the job writes to ask of its lanes: the most held

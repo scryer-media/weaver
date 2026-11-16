@@ -1989,7 +1989,7 @@ impl Pipeline {
         // when the stop's span is over, and the job it was made for is
         // left at its last checkpoint. The work still out has one span to
         // come in.
-        self.volume_writers.end_loop_waits_at(
+        self.volume_writers.end_waits_at(
             Arc::clone(&self.shutdown_settle.clock),
             self.shutdown_settle.end(),
         );
@@ -2006,7 +2006,7 @@ impl Pipeline {
         // so it is fetched again.
         let settle_end = self.shutdown_settle.end();
         self.volume_writers
-            .end_loop_waits_at(Arc::clone(&self.shutdown_settle.clock), settle_end);
+            .end_waits_at(Arc::clone(&self.shutdown_settle.clock), settle_end);
         // A graph job's run or repair still out on a thread speaks through
         // the run mail; heard here, so nothing of a job is out when the
         // pipeline is down and the checkpoint holds what it came to.

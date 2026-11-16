@@ -7,9 +7,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 
 use super::JobDisk;
-use crate::operations::disk::volume::Volume;
+use crate::operations::disk::volume::{Reservation, Volume};
 use crate::operations::disk::writer::{Hold, Report, VolumeWriters};
 use crate::pipeline::graph::checkpoint::Pending;
+use crate::pipeline::graph::disk::VolumeLeases;
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::leaf::Leaf;
 use crate::pipeline::graph::root::tests::{decoded, file, job_through, job_with};
@@ -482,18 +483,20 @@ fn a_volume_counts_what_is_being_decoded_with_what_waits_for_its_writer() {
     let disk = through.disk();
     through.volume.set_buffer_limits(700, 1000);
     assert_eq!(through.volume.lease_limit(), 938);
-    through.volume.charge(400);
+    let mut held = Reservation::none(Arc::clone(&through.volume));
+    held.count(400);
     assert_eq!(disk.intake(), VolumeIntake::Open);
-    through.volume.charge(300);
+    held.count(300);
     assert_eq!(through.volume.unwritten_bytes(), 700);
     assert_eq!(disk.intake(), VolumeIntake::Open);
-    through.volume.charge(300);
+    held.count(300);
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
-    through.volume.release(600);
+    held.give_back(600);
     assert_eq!(disk.intake(), VolumeIntake::Open);
     through.volume.set_buffer_limits(280, 400);
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
-    through.volume.release(400);
+    held.give_back(400);
+    assert_eq!(through.volume.unwritten_bytes(), 0);
 }
 
 // A job whose delivered files lie on another volume than its working

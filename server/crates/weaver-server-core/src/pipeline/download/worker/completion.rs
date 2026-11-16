@@ -631,21 +631,13 @@ impl Pipeline {
     // the volume and become the step's loop credit. The fixture writes it
     // and ends the step with `Self::end_hand_on_for_test`.
     #[cfg(test)]
-    pub(crate) fn begin_hand_on_for_test(
-        &mut self,
-        job_id: JobId,
-        bytes: u64,
-    ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
+    pub(crate) fn begin_hand_on_for_test(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
         self.note_volume_arrived(job_id, bytes);
         self.arm_volume_credit(job_id, bytes)
     }
 
     #[cfg(test)]
-    pub(crate) fn end_hand_on_for_test(
-        &mut self,
-        job_id: JobId,
-        credit: Option<Arc<crate::operations::disk::volume::Volume>>,
-    ) {
+    pub(crate) fn end_hand_on_for_test(&mut self, job_id: JobId, credit: Option<Prepaid>) {
         self.settle_volume_credit(credit);
         if !self
             .pending_released_download_results_by_job
@@ -666,71 +658,78 @@ impl Pipeline {
         else {
             return;
         };
-        self.hold_volume_arrived(job_id, &volume, bytes);
-        volume.charge(bytes);
-    }
-
-    // Hold `bytes` that arrived for the job as counted on `volume`, the
-    // volume its articles are written to, until the loop has handed them
-    // on. The caller counts them on the volume. One map entry per job with
-    // results waiting; nothing is walked. A job whose bytes now count on
-    // another volume than those it holds, its volume having changed while
-    // they waited, moves those it holds there as well: the entry names the
-    // one volume all of them count on, so each volume gives back only what
-    // it counted.
-    pub(in crate::pipeline) fn hold_volume_arrived(
-        &mut self,
-        job_id: JobId,
-        volume: &Arc<crate::operations::disk::volume::Volume>,
-        bytes: u64,
-    ) {
-        let (counted_on, held) = self
-            .volume_arrived_by_job
-            .entry(job_id)
-            .or_insert_with(|| (Arc::clone(volume), 0));
-        let moved = (!Arc::ptr_eq(counted_on, volume))
-            .then(|| (std::mem::replace(counted_on, Arc::clone(volume)), *held));
-        *held = held.saturating_add(bytes);
-        volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
-        if let Some((before, held)) = moved {
-            before.arrived_bytes.fetch_sub(held, Ordering::SeqCst);
-            before.release(held);
-            volume.arrived_bytes.fetch_add(held, Ordering::SeqCst);
-            volume.charge(held);
-            if self.volume_writers.take_wake(&before) {
-                self.volume_room_changed();
-            }
+        if self.hold_volume_arrived(job_id, Reservation::none(volume), bytes, false) {
+            self.volume_room_changed();
         }
     }
 
-    // The loop is about to hand on `bytes` of the job that arrived: they
-    // become the volume's loop credit, which the writes of this step take
-    // first (`Submitter::write`). The volume, for `settle_volume_credit`.
-    fn arm_volume_credit(
+    // Hold `bytes` that arrived for the job as counted on the volume of
+    // `from`, the volume its articles are written to, until the loop has
+    // handed them on. `from` is what of the article's lease is reserved
+    // there, settled here to what arrived; nothing for bytes no lease
+    // reserved, which are counted here. One map entry per job with results
+    // waiting; nothing is walked. A job whose bytes now count on another
+    // volume than those it holds, its volume having changed while they
+    // waited, moves those it holds there as well: the entry names the one
+    // volume all of them count on, so each volume gives back only what it
+    // counted. Whether a wake was taken: on the volume left, and, when
+    // `take` says so, on the volume settled.
+    pub(in crate::pipeline) fn hold_volume_arrived(
         &mut self,
         job_id: JobId,
+        mut from: Reservation,
         bytes: u64,
-    ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
-        let (volume, held) = self.volume_arrived_by_job.get_mut(&job_id)?;
-        let moved = bytes.min(*held);
-        *held -= moved;
-        volume.arrived_bytes.fetch_sub(moved, Ordering::SeqCst);
-        volume.loop_credit.store(moved, Ordering::Relaxed);
-        Some(Arc::clone(volume))
+        take: bool,
+    ) -> bool {
+        let volume = from.volume();
+        let held = self
+            .volume_arrived_by_job
+            .entry(job_id)
+            .or_insert_with(|| Reservation::none(Arc::clone(volume)));
+        let moved = (!Arc::ptr_eq(held.volume(), volume))
+            .then(|| std::mem::replace(held, Reservation::none(Arc::clone(volume))));
+        volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let mut woke = false;
+        if let Some(mut before) = moved {
+            let bytes = before.bytes();
+            before
+                .volume()
+                .arrived_bytes
+                .fetch_sub(bytes, Ordering::SeqCst);
+            before.give_back(bytes);
+            volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
+            held.count(bytes);
+            woke = self.volume_writers.take_wake(before.volume());
+        }
+        let of = from.bytes();
+        from.settle(of, bytes);
+        if take {
+            woke |= self.volume_writers.take_wake(from.volume());
+        }
+        held.join(from);
+        woke
     }
 
-    // The step is done: what of the credit its writes did not take no
+    // The loop is about to hand on `bytes` of the job that arrived: they
+    // are prepaid for the writes of this step, which take them first
+    // (`Owner::prepay`). What was prepaid, for `settle_volume_credit`.
+    fn arm_volume_credit(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
+        let held = self.volume_arrived_by_job.get_mut(&job_id)?;
+        let moved = bytes.min(held.bytes());
+        held.volume()
+            .arrived_bytes
+            .fetch_sub(moved, Ordering::SeqCst);
+        Some(self.volume_writers.prepay(held, moved))
+    }
+
+    // The step is done: what was prepaid and its writes did not take no
     // longer counts.
-    fn settle_volume_credit(
-        &mut self,
-        volume: Option<Arc<crate::operations::disk::volume::Volume>>,
-    ) {
-        let Some(volume) = volume else {
+    fn settle_volume_credit(&mut self, credit: Option<Prepaid>) {
+        let Some(credit) = credit else {
             return;
         };
-        let left = volume.loop_credit.swap(0, Ordering::Relaxed);
-        volume.release(left);
-        if left != 0 && self.volume_writers.take_wake(&volume) {
+        let left = credit.settle();
+        if left != 0 && self.volume_writers.take_wake(credit.volume()) {
             self.volume_room_changed();
         }
     }
@@ -739,14 +738,17 @@ impl Pipeline {
     // as arrived no longer counts, and dispatch that asked to be woken at
     // the line the volume has now reached looks again.
     fn note_volume_handed_on(&mut self, job_id: JobId) {
-        let Some((volume, held)) = self.volume_arrived_by_job.remove(&job_id) else {
+        let Some(mut held) = self.volume_arrived_by_job.remove(&job_id) else {
             return;
         };
-        if held != 0 {
-            volume.arrived_bytes.fetch_sub(held, Ordering::SeqCst);
-            volume.release(held);
+        let bytes = held.bytes();
+        if bytes != 0 {
+            held.volume()
+                .arrived_bytes
+                .fetch_sub(bytes, Ordering::SeqCst);
+            held.give_back(bytes);
         }
-        if self.volume_writers.take_wake(&volume) {
+        if self.volume_writers.take_wake(held.volume()) {
             self.volume_room_changed();
         }
     }

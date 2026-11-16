@@ -2188,16 +2188,14 @@ pub struct Pipeline {
     pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
     // The keeper of every volume's buffer limits.
     pub(super) volume_buffers: Arc<download::volume_pace::VolumeBuffers>,
-    // For each job with released results waiting for the loop: the volume
-    // their bytes are counted on as arrived, and how many of them.
-    pub(super) volume_arrived_by_job:
-        HashMap<JobId, (Arc<crate::operations::disk::volume::Volume>, u64)>,
-    // For each job with articles leased to lanes: the volume they are
-    // reserved on (`Volume::reserve`), and how many bytes of them. Each
-    // article is reserved once, as it is leased, and given back once, as
-    // it leaves its lane's record however it ends (`note_lane_work_left`).
-    pub(super) volume_reserved_by_job:
-        HashMap<JobId, (Arc<crate::operations::disk::volume::Volume>, u64)>,
+    // For each job with released results waiting for the loop: their bytes,
+    // counted as arrived on the one volume they are held on.
+    pub(super) volume_arrived_by_job: HashMap<JobId, crate::operations::disk::volume::Reservation>,
+    // For each job with articles leased to lanes: their bytes, reserved on
+    // the volume the job writes to (`Reservation::reserve`). Each article
+    // is reserved once, as it is leased, and given back once, as it leaves
+    // its lane's record however it ends (`note_lane_work_left`).
+    pub(super) volume_reserved_by_job: HashMap<JobId, crate::operations::disk::volume::Reservation>,
     // What decode windows took from each disk they go on, for every graph
     // job together.
     pub(super) window_ledgers: graph::window::WindowLedgers,

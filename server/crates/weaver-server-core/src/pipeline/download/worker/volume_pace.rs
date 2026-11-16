@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::operations::disk::volume::Volume;
 use crate::operations::disk::volume_rate::WINDOW;
+use crate::pipeline::graph::disk::VolumeLeases;
 use crate::runtime::HardwareProfile;
 
 const MIB: u64 = 1024 * 1024;
@@ -404,7 +405,7 @@ pub(in crate::pipeline) fn volume_intake(counted_bytes: u64, limits: VolumeLimit
 }
 
 // The state of a volume as it stands: what it counts, against the limit
-// leases stop at (`Volume::lease_limit`). A volume that counts nothing is
+// leases stop at (`VolumeLeases::lease_limit`). A volume that counts nothing is
 // open whatever its limit, for the one article it grants then.
 pub(in crate::pipeline) fn intake_of(volume: &Volume) -> VolumeIntake {
     let (soft_bytes, _) = volume.buffer_limits();

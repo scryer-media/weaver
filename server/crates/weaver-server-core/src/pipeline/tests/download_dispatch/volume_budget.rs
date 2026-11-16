@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::operations::disk::volume::Volume;
+use crate::pipeline::graph::disk::VolumeLeases;
 
 const ARTICLE: u32 = 512;
 
@@ -52,7 +53,7 @@ fn assert_reservations_match_lanes(pipeline: &Pipeline) {
     let reserved: u64 = pipeline
         .volume_reserved_by_job
         .values()
-        .map(|(_, bytes)| *bytes)
+        .map(|reserved| reserved.bytes())
         .sum();
     assert_eq!(reserved, held, "reservations disagree with the lanes");
 }

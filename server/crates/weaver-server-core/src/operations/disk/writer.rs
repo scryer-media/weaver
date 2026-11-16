@@ -15,6 +15,12 @@
 // nothing is queued; until it has ended, every caller of the volume gets
 // that same thread.
 //
+// Each caller is an owner (`DiskOwner`): it hears of its keys' failures
+// and of the wakes it asked for. An owner's queuing thread is the one
+// thread that queues its writes and must not stand still for a disk
+// longer than the volume's limit makes it; its waits are counted apart
+// from those of any other thread.
+//
 // Nothing here syncs: an operation has returned when its system call has.
 
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
@@ -30,7 +36,7 @@ use bytes::Bytes;
 
 use crate::clock::{Clock, SystemClock};
 
-use super::volume::{LoopWait, Volume, WriterCounts};
+use super::volume::{LoopWait, OWNERS, Reservation, Volume, WriterCounts};
 use super::volume_rate::RateSignal;
 
 // How a file that is not open is opened, made when it is not there, at the
@@ -88,18 +94,55 @@ pub(crate) trait DiskOwner: Send + Sync {
     fn room(&self);
 }
 
-// An owner as the writers know it: the owner itself and the one bit its
-// asks for a wake are marked with on a volume. Made once for each owner
+// An owner as the writers know it: the owner itself, its slot among the
+// owners of one set of writers, and the one bit its asks for a wake are
+// marked with on a volume. Made once for each owner
 // (`VolumeWriters::owner`); cloning it is cheap.
 #[derive(Clone)]
 pub(crate) struct Owner {
     owner: Arc<dyn DiskOwner>,
+    slot: usize,
     bit: u64,
 }
 
-// The most owners one set of writers tells apart: one bit each in a
-// volume's mark of who asked for a wake.
-const OWNERS: usize = 64;
+impl Owner {
+    // Move `bytes` of `from` ahead of the writes the owner is about to
+    // queue to its volume: those writes take them first, and are counted
+    // only past them (`Submitter::write`). The bytes stay counted. The
+    // owner prepays and writes from one thread, and settles what it
+    // prepaid (`Prepaid::settle`) before it prepays on the volume again.
+    pub(crate) fn prepay(&self, from: &mut Reservation, bytes: u64) -> Prepaid {
+        from.hand_over(bytes);
+        let volume = Arc::clone(from.volume());
+        volume.prepaid[self.slot].store(bytes, Ordering::Relaxed);
+        Prepaid {
+            volume,
+            slot: self.slot,
+        }
+    }
+}
+
+// What an owner prepaid on a volume (`Owner::prepay`), until it settles.
+#[must_use = "what was prepaid stays counted until it is settled"]
+pub(crate) struct Prepaid {
+    volume: Arc<Volume>,
+    slot: usize,
+}
+
+impl Prepaid {
+    pub(crate) fn volume(&self) -> &Arc<Volume> {
+        &self.volume
+    }
+
+    // The writes are queued: what of the prepaid bytes they did not take
+    // no longer counts. The bytes given back; the caller takes the wake
+    // they may have reached (`VolumeWriters::take_wake`).
+    pub(crate) fn settle(&self) -> u64 {
+        let left = self.volume.prepaid[self.slot].swap(0, Ordering::Relaxed);
+        self.volume.release(left);
+        left
+    }
+}
 
 // The owners known to a set of writers, each in the slot of its bit. Set
 // once each; read without a lock.
@@ -127,6 +170,7 @@ impl Owners {
         let _ = self.known[at].set(Arc::clone(&owner));
         Owner {
             owner,
+            slot: at,
             bit: 1 << at,
         }
     }
@@ -241,18 +285,18 @@ impl SettleBound {
     }
 }
 
-// Where the pipeline loop's own waits for a volume end once the owner is
+// Where the queuing thread's own waits for a volume end once the owner is
 // stopping: the clock and the reading at which the stop gives a volume up,
-// the same one its settles go by. Until it is set the loop waits as long
+// the same one its settles go by. Until it is set the queuing thread waits as long
 // as the volume takes.
 #[derive(Default)]
-struct LoopEnd {
+struct WaitEnd {
     set: AtomicBool,
     at: Mutex<Option<(Arc<dyn Clock>, Instant)>>,
 }
 
-impl LoopEnd {
-    // How long the loop may still wait and whether the clock runs by
+impl WaitEnd {
+    // How long the queuing thread may still wait and whether the clock runs by
     // itself, once the end is set. One load before then.
     fn more(&self) -> Option<(Duration, bool)> {
         if !self.set.load(Ordering::SeqCst) {
@@ -265,7 +309,7 @@ impl LoopEnd {
 
     // Wait on `woke` while `over` says so and the end has not passed.
     // Whether `over` came to say no: false when the wait was given up at
-    // the end. Only the loop waits here and only the loop sets the end, so
+    // the end. Only the queuing thread waits here and only the queuing thread sets the end, so
     // setting it wakes nobody.
     fn wait<'a>(
         &self,
@@ -320,12 +364,12 @@ impl Default for VolumeWriters {
 #[derive(Default)]
 struct Registry {
     lanes: Mutex<Lanes>,
-    // Set once the owner is stopping: no thread but the pipeline loop
+    // Set once the owner is stopping: no thread but the queuing thread
     // stands still for a volume from then on. Every lane holds it.
     stopped: Arc<AtomicBool>,
-    // Where the loop's own waits end once the owner is stopping. Every
+    // Where the queuing thread's own waits end once the owner is stopping. Every
     // lane holds it.
-    loop_end: Arc<LoopEnd>,
+    wait_end: Arc<WaitEnd>,
     // The owners writing through these writers. Every lane holds it.
     owners: Arc<Owners>,
     rates: Rates,
@@ -412,8 +456,8 @@ impl VolumeWriters {
         }
     }
 
-    // The same writers, with no threads, for a pipeline a test builds that
-    // makes its own owner.
+    // The same writers, with no threads, for a test whose caller makes its
+    // own owner.
     #[cfg(test)]
     pub(crate) fn unthreaded() -> Self {
         Self {
@@ -511,8 +555,8 @@ impl VolumeWriters {
 
     // Wait until everything submitted to every volume so far has returned,
     // whether or not its caller still holds the volume. A settle is the
-    // wait of a stop, made off the pipeline loop: it is not counted as a
-    // loop wait.
+    // wait of a stop, made off the queuing thread: it is not counted as
+    // one of its waits.
     #[cfg(test)]
     pub(crate) fn settle(&self) {
         self.settle_each(None);
@@ -584,27 +628,27 @@ impl VolumeWriters {
     }
 
     // The owner has begun to stop, and gives a volume up once `clock` reads
-    // `end`: the end its settles share. From now on the pipeline loop's own
+    // `end`: the end its settles share. From now on the queuing thread's own
     // waits for a volume (`Barrier::wait`, `Submitter::wait_for`,
-    // `Submitter::loop_wait_room`) end there too, with what they waited
-    // for still out; the key they waited on says so (`Submitter::left`).
-    // Called by the loop, which stands in none of those waits then.
-    pub(crate) fn end_loop_waits_at(&self, clock: Arc<dyn Clock>, end: Instant) {
-        let loop_end = &self.registry.loop_end;
-        *loop_end.at.lock().unwrap_or_else(PoisonError::into_inner) = Some((clock, end));
-        loop_end.set.store(true, Ordering::SeqCst);
+    // `Submitter::wait_room`) end there too, with what they waited
+    // for still out; the key they waited on says so (`Submitter::gave_up`).
+    // Called by the queuing thread, which stands in none of those waits then.
+    pub(crate) fn end_waits_at(&self, clock: Arc<dyn Clock>, end: Instant) {
+        let wait_end = &self.registry.wait_end;
+        *wait_end.at.lock().unwrap_or_else(PoisonError::into_inner) = Some((clock, end));
+        wait_end.set.store(true, Ordering::SeqCst);
     }
 
     // The owner is stopping. Every thread that stands still for a volume
-    // without being the pipeline loop goes on, and none stands still again:
+    // without being the queuing thread goes on, and none stands still again:
     // a producer in `Submitter::wait_below`, and a reader in
     // `Barrier::wait_aside`, which finds its operations still out. What a
     // volume holds is still written when its thread gets to it.
     //
-    // The pipeline loop's own waits do not end here. The loop still keeps
+    // The queuing thread's own waits do not end here. The queuing thread still keeps
     // a volume's limit when it says a repair's output again
-    // (`Submitter::loop_wait_room`), and still waits for what it reads
-    // back; those waits end at `end_loop_waits_at`'s end.
+    // (`Submitter::wait_room`), and still waits for what it reads
+    // back; those waits end at `end_waits_at`'s end.
     pub(crate) fn stop_waits(&self) {
         self.registry.stopped.store(true, Ordering::SeqCst);
         let lanes: Vec<Arc<Lane>> = self
@@ -634,7 +678,7 @@ impl VolumeWriters {
         }
     }
 
-    // Have a bounded settle, and a wait of the loop on a volume's limit,
+    // Have a bounded settle, and a wait of the queuing thread on a volume's limit,
     // look at its clock again, after a test moved it.
     #[cfg(test)]
     pub(crate) fn look_again(&self) {
@@ -685,9 +729,9 @@ impl VolumeWriters {
 }
 
 // The key a volume's own work is queued under: reserved here, and handed
-// out only by `volume_submitter`. A caller's key is its own number, for a
-// job its id. Ids are counted up one at a time from ten thousand and kept
-// in signed 64-bit columns, so none reaches this.
+// out only by `volume_submitter`. A caller's key is its own number. The
+// callers today number their keys from ten thousand up, one at a time, and
+// keep them in signed 64-bit columns, so none reaches this.
 const VOLUME_KEY: u64 = u64::MAX;
 
 // No entry of a batch: the end of a key's chain through it.
@@ -706,9 +750,9 @@ struct Key {
     failed: AtomicBool,
     // The caller gave the key up: the ones still queued are not run.
     abandoned: AtomicBool,
-    // A wait of the pipeline loop on the key was given up at the end of a
+    // A wait of the queuing thread on the key was given up at the end of a
     // stop, with what it waited for still out.
-    left: AtomicBool,
+    gave_up: AtomicBool,
     // Refusals the caller has yet to hear and answer; no barrier of the key
     // passes while there are any.
     unheard: AtomicU32,
@@ -801,7 +845,7 @@ impl Key {
             owner,
             failed: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
-            left: AtomicBool::new(false),
+            gave_up: AtomicBool::new(false),
             unheard: AtomicU32::new(0),
             submitted: AtomicU64::new(0),
             returned: AtomicU64::new(0),
@@ -905,10 +949,10 @@ impl Key {
     // Wait until the key's operations through `seq` have returned, or
     // until `stopped` is set when one is given. Whoever sets it wakes the
     // wait under the key's lock.
-    // The pipeline loop's wait for the key's operations through `seq`:
+    // The queuing thread's wait for the key's operations through `seq`:
     // until they returned, or until the end of a stop passes with them
     // still out, which the key then says of itself. Whether they returned.
-    fn wait_loop(&self, seq: u64, end: &LoopEnd) -> bool {
+    fn wait_to_end(&self, seq: u64, end: &WaitEnd) -> bool {
         if self.has_returned(seq) {
             return true;
         }
@@ -918,7 +962,7 @@ impl Key {
         self.waiters.fetch_sub(1, Ordering::SeqCst);
         drop(held);
         if !returned {
-            self.left.store(true, Ordering::SeqCst);
+            self.gave_up.store(true, Ordering::SeqCst);
         }
         returned
     }
@@ -974,14 +1018,14 @@ impl Submitter {
     // write to any other file that is neither open nor given a way to open
     // fails the key.
     //
-    // Only the pipeline loop writes. What it queues counts against the
-    // volume's hard limit before it is queued: first out of the loop's
-    // credit (`Volume::loop_credit`), the arrived article it is handing on;
-    // past that, charged once it fits (`Volume::fits`), the loop standing
-    // still for the writer until then. A write longer than the loop's
-    // share is queued in pieces of that share, each charged as it fits.
-    // When that wait is given up at the end of a stop, the rest of the
-    // write is not queued (`Submitter::left`).
+    // Only the queuing thread writes. What it queues counts against the
+    // volume's hard limit before it is queued: first out of what its owner
+    // prepaid (`Owner::prepay`); past that, counted once it fits
+    // (`Volume::fits`), the queuing thread standing still for the writer
+    // until then. A write longer than `Volume::write_piece` is queued in
+    // pieces of that size, each counted as it fits. When that wait is
+    // given up at the end of a stop, the rest of the write is not queued
+    // (`Submitter::gave_up`).
     pub(crate) fn write(
         &self,
         file: u64,
@@ -991,9 +1035,10 @@ impl Submitter {
     ) -> u64 {
         let volume = &self.lane.state.volume;
         let len = bytes.len() as u64;
-        let credit = volume.loop_credit.load(Ordering::Relaxed);
+        let prepaid = &volume.prepaid[self.key.owner.slot];
+        let credit = prepaid.load(Ordering::Relaxed);
         if credit >= len {
-            volume.loop_credit.store(credit - len, Ordering::Relaxed);
+            prepaid.store(credit - len, Ordering::Relaxed);
             volume.buffered_bytes.fetch_add(len, Ordering::Relaxed);
             return self.submit(Op::Write {
                 file,
@@ -1002,11 +1047,11 @@ impl Submitter {
                 create: create.map(Box::new),
             });
         }
-        volume.loop_credit.store(0, Ordering::Relaxed);
+        prepaid.store(0, Ordering::Relaxed);
         self.write_charged(file, offset, bytes, create, credit)
     }
 
-    // `write` past the loop's credit: `credit` of the bytes are paid.
+    // `write` past what was prepaid: `credit` of the bytes are paid.
     #[cold]
     fn write_charged(
         &self,
@@ -1017,18 +1062,18 @@ impl Submitter {
         mut credit: u64,
     ) -> u64 {
         let volume = &self.lane.state.volume;
-        let share = volume.loop_share();
+        let share = volume.write_piece();
         loop {
             let len = bytes.len() as u64;
             let piece = len.min(credit.saturating_add(share));
             let charged = piece - credit.min(piece);
             credit -= credit.min(piece);
             if charged > 0 {
-                if !self.loop_wait_room(charged) {
+                if !self.wait_room(charged) {
                     // The end of a stop passed with the volume still full:
-                    // nothing more is queued, and the key says it was left.
-                    // What of the piece the credit paid for is not queued
-                    // either, and no longer counts.
+                    // nothing more is queued, and the key says it gave up.
+                    // What of the piece was prepaid is not queued either,
+                    // and no longer counts.
                     volume.release(piece - charged);
                     return self.key.submitted.load(Ordering::Acquire);
                 }
@@ -1126,10 +1171,10 @@ impl Submitter {
     // is being ended and produces nothing more. The writer wakes it as the
     // bytes fall; nothing is polled.
     //
-    // Never for the pipeline loop, which must not stand still for a disk:
-    // the loop asks `VolumeWriters::wake_below` and goes on, or, where it
-    // queues what is written itself, waits in `loop_wait_room`. The
-    // wait is not counted against the loop.
+    // Never for the queuing thread, which must not stand still for a disk:
+    // the queuing thread asks `VolumeWriters::wake_below` and goes on, or, where it
+    // queues what is written itself, waits in `wait_room`. The
+    // wait is not counted against the queuing thread.
     pub(crate) fn wait_below(&self, bytes: u64) {
         let state = &self.lane.state;
         let over = || {
@@ -1163,14 +1208,14 @@ impl Submitter {
         drop(held);
     }
 
-    // The pipeline loop's wait to queue `bytes` of its own: it stands
+    // The queuing thread's wait to queue `bytes` of its own: it stands
     // still until they fit below the volume's hard limit (`Volume::fits`),
-    // counted as a budget wait. A stop does not end it: the loop keeps the
+    // counted as a budget wait. A stop does not end it: the queuing thread keeps the
     // volume's limit for as long as it queues. It ends when the bytes fit,
     // the key stopped, or the end of a stop passed with them still over,
-    // which the key then says of itself. Whether the loop may queue more:
+    // which the key then says of itself. Whether the queuing thread may queue more:
     // false only at that end.
-    pub(crate) fn loop_wait_room(&self, bytes: u64) -> bool {
+    pub(crate) fn wait_room(&self, bytes: u64) -> bool {
         let state = &self.lane.state;
         let over = || {
             !state.volume.fits(bytes)
@@ -1191,28 +1236,28 @@ impl Submitter {
             .unwrap_or_else(PoisonError::into_inner);
         #[cfg(test)]
         state.below.notify_all();
-        let (held, below) = state.loop_end.wait(&state.below, held, over);
+        let (held, below) = state.wait_end.wait(&state.below, held, over);
         state.below_waiters.fetch_sub(1, Ordering::SeqCst);
         drop(held);
         state.waited(LoopWait::Budget, began);
         if !below {
-            self.key.left.store(true, Ordering::SeqCst);
+            self.key.gave_up.store(true, Ordering::SeqCst);
         }
         below
     }
 
-    // Whether a wait of the pipeline loop on the key was given up at the
-    // end of a stop: something of the key is still out, and what the loop
+    // Whether a wait of the queuing thread on the key was given up at the
+    // end of a stop: something of the key is still out, and what the queuing thread
     // did after it is borne out by nothing on disk.
-    pub(crate) fn left(&self) -> bool {
-        self.key.left.load(Ordering::SeqCst)
+    pub(crate) fn gave_up(&self) -> bool {
+        self.key.gave_up.load(Ordering::SeqCst)
     }
 
     // Read `len` bytes at `offset` of the file at `path`, after everything
     // the key submitted before. The caller waits for the answer. Only the
-    // tests read this way: the pipeline loop waits for the file's own
+    // tests read this way: the queuing thread waits for the file's own
     // writes (`wait_for`) and reads it itself, never behind every file of
-    // its key. A thread that is not the loop waits with
+    // its key. A thread that is not the queuing thread waits with
     // `Barrier::wait_aside` and reads the file itself.
     #[cfg(test)]
     pub(crate) fn read(&self, path: PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -1246,7 +1291,7 @@ impl Submitter {
     pub(crate) fn wait_for(&self, seq: u64) -> io::Result<()> {
         if !self.key.has_returned(seq) {
             let began = Instant::now();
-            let returned = self.key.wait_loop(seq, &self.lane.state.loop_end);
+            let returned = self.key.wait_to_end(seq, &self.lane.state.wait_end);
             self.lane.state.waited(LoopWait::Read, began);
             if !returned {
                 return Err(io::Error::other(
@@ -1260,7 +1305,7 @@ impl Submitter {
         Ok(())
     }
 
-    // A read of the loop's own, made after `wait_for`, counted on the
+    // A read of the queuing thread's own, made after `wait_for`, counted on the
     // volume: how many and how long, the open of the file included.
     pub(crate) fn loop_read(&self, began: Instant) {
         self.lane.state.loop_read(began);
@@ -1396,17 +1441,17 @@ impl Barrier {
     }
 
     // Wait until everything behind the barrier has returned, failed or not.
-    // For the pipeline loop only: a wait that stops here is counted as a
-    // loop wait on the volume. Every other thread uses `wait_aside`. Once
+    // For the queuing thread only: a wait that stops here is counted as one
+    // of its waits on the volume. Every other thread uses `wait_aside`. Once
     // the owner is stopping the wait also ends at the end of the stop
-    // (`VolumeWriters::end_loop_waits_at`) with the operations still out:
+    // (`VolumeWriters::end_waits_at`) with the operations still out:
     // the caller asks `unwritten`.
     pub(crate) fn wait(&self) {
         if self.returned() {
             return;
         }
         let began = Instant::now();
-        self.key.wait_loop(self.seq, &self.lane.loop_end);
+        self.key.wait_to_end(self.seq, &self.lane.wait_end);
         self.lane.waited(LoopWait::Settle, began);
     }
 
@@ -1419,10 +1464,10 @@ impl Barrier {
         self.failed() || !self.key.has_placed(self.seq)
     }
 
-    // The same wait for any thread that is not the pipeline loop: a check,
+    // The same wait for any thread that is not the queuing thread: a check,
     // a repair, a replay or an extraction on a thread of its own. It is
-    // counted apart (`aside_waits`), so the loop-wait counters say only
-    // what the loop stood for.
+    // counted apart (`aside_waits`), so the queuing thread's wait counters
+    // say only what it stood for.
     // It also ends once the owner is stopping
     // (`VolumeWriters::stop_waits`), with the operations still out: the
     // caller asks `unwritten` and reads nothing back when they are.
@@ -1448,7 +1493,7 @@ impl Barrier {
             aside.swap_remove(at);
         }
         drop(aside);
-        // Counted apart from the loop's waits: what a check, a repair or a
+        // Counted apart from the queuing thread's waits: what a check, a repair or a
         // replay stood for the writer.
         self.lane
             .volume
@@ -1456,7 +1501,7 @@ impl Barrier {
             .aside_waited(began.elapsed().as_nanos() as u64);
     }
 
-    // Have a wait of the loop on the barrier's key look at its clock
+    // Have a wait of the queuing thread on the barrier's key look at its clock
     // again, after a test moved it.
     #[cfg(test)]
     pub(crate) fn look_again(&self) {
@@ -1539,8 +1584,8 @@ struct LaneState {
     below: Condvar,
     // The owner is stopping: see `VolumeWriters::stop_waits`.
     stopped: Arc<AtomicBool>,
-    // Where the loop's own waits end once the owner is stopping.
-    loop_end: Arc<LoopEnd>,
+    // Where the queuing thread's own waits end once the owner is stopping.
+    wait_end: Arc<WaitEnd>,
     // The keys threads stand in `Barrier::wait_aside` for, so a stop can
     // wake them.
     aside: Mutex<Vec<Arc<Key>>>,
@@ -1553,8 +1598,8 @@ struct LaneState {
 }
 
 impl LaneState {
-    // The pipeline loop stood still for the writer since `began`. Called
-    // only from the waits the loop itself makes.
+    // The queuing thread stood still for the writer since `began`. Called
+    // only from the waits the queuing thread itself makes.
     fn waited(&self, kind: LoopWait, began: Instant) {
         self.volume
             .writer
@@ -1618,7 +1663,7 @@ impl Lane {
         let rates = registry.rates.get().cloned();
         let owners = Arc::clone(&registry.owners);
         let stopped = Arc::clone(&registry.stopped);
-        let loop_end = Arc::clone(&registry.loop_end);
+        let wait_end = Arc::clone(&registry.wait_end);
         let registry = Arc::downgrade(registry);
         let (send, queued) = mpsc::channel();
         let state = Arc::new(LaneState {
@@ -1634,7 +1679,7 @@ impl Lane {
             below_waiting: Mutex::new(()),
             below: Condvar::new(),
             stopped,
-            loop_end,
+            wait_end,
             aside: Mutex::default(),
             owners,
             #[cfg(test)]
@@ -2169,8 +2214,8 @@ impl Thread {
     // Nothing is queued. Count the turn when the thread worked since the
     // last one, and run one piece of the volume's own work when the writer
     // has just run out of work or no caller holds the volume: a volume a
-    // job holds and has not written to yet keeps it, so the job's first
-    // writes find the thread free. Leaving the work here is itself followed
+    // caller holds and has not written to yet keeps it, so the caller's
+    // first writes find the thread free. Leaving the work here is itself followed
     // by a key forgotten, which is no work and so does not start it.
     // Whether a piece ran.
     fn run_idle(&mut self) -> bool {
@@ -2752,7 +2797,7 @@ fn perform(state: &LaneState, key: &Key, op: Op, forced: Option<io::Error>, ran:
                     // Its count fell as the call returned (`in_hand`). The
                     // last share of the buffer is freed here, as soon as it
                     // is written: the memory goes back while it is still
-                    // warm, and the next article decodes into it.
+                    // warm, and the next buffer is filled from it.
                     if bytes.is_unique() {
                         break_span();
                     }

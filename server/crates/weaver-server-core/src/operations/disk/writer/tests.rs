@@ -677,8 +677,8 @@ fn a_settle_span_too_long_for_the_clock_ends_centuries_on() {
     let end = bound.end();
     assert!(end >= clock.instant(CENTURY), "{end:?}");
     let (writers, _reports) = writers();
-    writers.end_loop_waits_at(Arc::clone(&bound.clock), end);
-    let (more, runs) = writers.registry.loop_end.more().unwrap();
+    writers.end_waits_at(Arc::clone(&bound.clock), end);
+    let (more, runs) = writers.registry.wait_end.more().unwrap();
     assert!(more >= CENTURY, "{more:?}");
     assert!(!runs);
     // Nothing is out, so a settle to that end returns at once.
@@ -1239,10 +1239,10 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     volume.set_buffer_limits(4, 4);
     let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
+    writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     std::thread::scope(|scope| {
         let producer = scope.spawn(|| job.wait_below(0));
-        let looped = scope.spawn(|| job.loop_wait_room(1));
+        let looped = scope.spawn(|| job.wait_room(1));
         hold.wait_below_waiters(2);
         // The loop's wait read the clock once before it stood still.
         clock.wait_looks(1);
@@ -1251,20 +1251,20 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
         // Woken by the stop, the loop's wait read the clock again and
         // stands: it did not go on as the producer did.
         clock.wait_looks(2);
-        assert!(!job.left());
+        assert!(!job.gave_up());
         clock.move_to(end);
         writers.look_again();
         assert!(!looped.join().unwrap(), "the wait was given up at the end");
     });
-    assert!(job.left());
+    assert!(job.gave_up());
     assert_eq!(count(&volume.buffered_bytes), 4);
     // Past the end the loop does not stand still again, and queues nothing.
-    assert!(!job.loop_wait_room(1));
+    assert!(!job.wait_room(1));
     hold.open();
     writers.settle();
     assert_eq!(std::fs::read(&path).unwrap(), b"held");
     // With room the loop's wait says so, whatever the clock reads.
-    assert!(job.loop_wait_room(1));
+    assert!(job.wait_room(1));
 }
 
 // The loop's read of a file whose writes sit on a stuck volume does not
@@ -1286,7 +1286,7 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
     let barrier = job.barrier_at(wrote);
     let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
+    writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     std::thread::scope(|scope| {
         let read = scope.spawn(|| job.read_after(wrote, path.clone(), 0, 4));
         // The read looked at the clock once, short of the end, and stands
@@ -1309,7 +1309,7 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
         ),
         (1, 0, 0)
     );
-    assert!(job.left());
+    assert!(job.gave_up());
     assert!(!barrier.failed(), "nothing of the key failed");
     // Past the end the loop does not stand again.
     barrier.wait();
@@ -1666,19 +1666,19 @@ fn a_batch_stops_taking_writes_at_its_byte_cap() {
     writers.wait_ended(&volume);
 }
 
-// The loop's writes count against the volume's hard limit before they are
-// queued, in pieces of at most its share (100 of 1600 here). With the volume
+// Writes count against the volume's hard limit before they are queued, in
+// pieces of at most its write piece (100 of 1600 here). With the volume
 // full the next write stands still for the writer, queues nothing
 // meanwhile, and goes once the writer has written one piece of what it
 // holds; the count never passes the limit.
 #[test]
-fn a_loop_write_on_a_full_volume_waits_for_room_and_never_counts_past_the_limit() {
+fn a_write_on_a_full_volume_waits_for_room_and_never_counts_past_the_limit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
     volume.set_buffer_limits(1600, 1600);
-    assert_eq!(volume.loop_share(), 100);
+    assert_eq!(volume.write_piece(), 100);
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from(vec![1u8; 1000]), create(&path));
@@ -1706,30 +1706,33 @@ fn a_loop_write_on_a_full_volume_waits_for_room_and_never_counts_past_the_limit(
     assert!(written[1600..].iter().all(|byte| *byte == 3));
 }
 
-// What the loop holds as credit, the arrived article it hands on, is
-// already counted: a write within it adds nothing to the count. Past it a
-// write longer than the loop's share goes in pieces of that share, each
-// counted as it fits.
+// What an owner prepaid out of its reservation is already counted: a write
+// within it adds nothing to the count. Past it a write longer than the
+// volume's write piece goes in pieces of that size, each counted as it
+// fits.
 #[test]
-fn a_loop_write_takes_its_credit_first_and_goes_in_pieces_past_its_share() {
+fn a_write_takes_what_was_prepaid_first_and_goes_in_pieces_past_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
     volume.set_buffer_limits(64, 64);
-    assert_eq!(volume.loop_share(), 4);
+    assert_eq!(volume.write_piece(), 4);
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    volume.charge(10);
-    volume.loop_credit.store(10, Ordering::Relaxed);
+    let mut held = Reservation::none(Arc::clone(&volume));
+    held.count(10);
+    let prepaid = writers.test_owner().prepay(&mut held, 10);
+    assert_eq!(held.bytes(), 0, "the reservation handed its bytes on");
     job.write(1, 0, Bytes::from(vec![1u8; 10]), create(&path));
-    assert_eq!(volume.unwritten_bytes(), 10, "the credit paid for it");
-    assert_eq!(count(&volume.loop_credit), 0);
+    assert_eq!(volume.unwritten_bytes(), 10, "what was prepaid paid for it");
+    assert_eq!(prepaid.settle(), 0, "the write took all of it");
     hold.wait_held();
-    // Two of credit, then eighteen past it: pieces of 6, 4, 4, 4 and 2.
-    volume.charge(2);
-    volume.loop_credit.store(2, Ordering::Relaxed);
+    // Two prepaid, then eighteen past it: pieces of 6, 4, 4, 4 and 2.
+    held.count(2);
+    let prepaid = writers.test_owner().prepay(&mut held, 2);
     job.write(1, 10, Bytes::from(vec![2u8; 20]), None);
+    assert_eq!(prepaid.settle(), 0);
     assert_eq!(volume.unwritten_bytes(), 30);
     assert_eq!(count(&volume.writer.operations), 0);
     hold.open();
@@ -1747,17 +1750,17 @@ fn a_loop_write_takes_its_credit_first_and_goes_in_pieces_past_its_share() {
     assert!(written[10..].iter().all(|byte| *byte == 2));
 }
 
-// A loop write whose wait for room is given up at the end of a stop queues
-// nothing more, and what of it the loop's credit paid for no longer counts:
-// once the writer has written what it holds, the volume counts nothing.
+// A write whose wait for room is given up at the end of a stop queues
+// nothing more, and what of it was prepaid no longer counts: once the
+// writer has written what it holds, the volume counts nothing.
 #[test]
-fn a_loop_write_given_up_at_the_stops_end_leaves_nothing_counted() {
+fn a_write_given_up_at_the_stops_end_leaves_nothing_counted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
     volume.set_buffer_limits(64, 64);
-    assert_eq!(volume.loop_share(), 4);
+    assert_eq!(volume.write_piece(), 4);
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from(vec![1u8; 60]), create(&path));
@@ -1765,19 +1768,21 @@ fn a_loop_write_given_up_at_the_stops_end_leaves_nothing_counted() {
     hold.wait_held();
     let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
+    writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     writers.stop_waits();
     clock.move_to(end);
-    // An arrived article of two, then eight past it: the first piece is
-    // two of credit and four charged, and four more do not fit.
-    volume.charge(2);
-    volume.loop_credit.store(2, Ordering::Relaxed);
+    // Two prepaid, then eight past it: the first piece is two prepaid and
+    // four counted, and four more do not fit.
+    let mut held = Reservation::none(Arc::clone(&volume));
+    held.count(2);
+    let prepaid = writers.test_owner().prepay(&mut held, 2);
     job.write(1, 60, Bytes::from(vec![2u8; 10]), None);
-    assert!(job.left());
+    assert!(job.gave_up());
+    assert_eq!(prepaid.settle(), 0, "the write took what was prepaid");
     assert_eq!(
         volume.unwritten_bytes(),
         60,
-        "the credit's two are given back"
+        "the two prepaid are given back"
     );
     hold.open();
     writers.settle();
