@@ -247,6 +247,47 @@ fn a_tunnel_keeps_its_overhead_reserve_and_torrent_sessions() {
     }
 }
 
+// At the performance profile's 4 MiB usenet receive buffer, a usenet
+// connection is charged what the tunnel allocates for it, 4 MiB and the
+// 64 KiB send buffer and its record, and the tunnel's bytes stay a hard
+// limit: 117 connections fit beside the reserve, and asking 118 is over.
+#[test]
+fn a_four_mib_usenet_buffer_is_charged_whole_within_the_tunnels_bytes() {
+    let receive = 4 * MIB as usize;
+    set_usenet_receive_bytes(receive, None);
+    let buffers = socket_buffers(&Purpose::Nntp {
+        server: 1,
+        leg: 0,
+        probing: false,
+    })
+    .expect("a usenet socket asks its own buffers");
+    assert_eq!(buffers.receive(), receive);
+    assert_eq!(buffers.send(), weaver_tunnel::pipe::USENET_SEND_BYTES);
+    assert_eq!(usenet_socket_bytes(), 4 * MIB + 68 * 1024);
+    assert_eq!(usenet_socket_bytes(), stream_bytes(Some(buffers)));
+
+    for (asked, over) in [(117usize, false), (118, true)] {
+        let routes = vec![(
+            Consumer::Server(1),
+            route(vec![Rung::Proxy { id: 1 }], Failover::Redistribute),
+        )];
+        let ledger = socket_ledger(
+            &routes,
+            &profiles(&[1], &[5, 6]),
+            &HashMap::new(),
+            &HashMap::from([(1, u16::try_from(asked - 1).unwrap())]),
+        );
+        let tunnel = &ledger[&tunnel(1)];
+        assert_eq!(tunnel.nntp, asked);
+        assert_eq!(tunnel.over_budget(), over, "{asked}");
+        assert_eq!(tunnel.nntp_held(), 117, "{asked}");
+        assert!(
+            tunnel.nntp_held() as u64 * usenet_socket_bytes() + tunnel.kept()
+                <= WIREGUARD_INSTANCE_BYTES
+        );
+    }
+}
+
 // Usenet over a WireGuard tunnel then SSH rides the one socket the SSH
 // session holds in the tunnel, however many connections and servers use it;
 // over SOCKS each connection opens a socket of its own.

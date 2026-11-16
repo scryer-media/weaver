@@ -578,7 +578,7 @@ async fn a_new_usenet_buffer_size_budgets_the_tunnels_again() {
             .encode(weaver_tunnel::test_support::test_key(seed))
     };
     let small = 256 * 1024;
-    let large = 1984 * 1024;
+    let large = 4 * 1024 * 1024;
     // Before the runtime loads, as the profile is applied at start-up.
     crate::proxies::set_usenet_receive_bytes(small, None);
     let db = Database::open_in_memory().unwrap();

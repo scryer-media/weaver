@@ -64,11 +64,11 @@ pub struct ProfileTuning {
     // dialled after a change gets the new size; one already open keeps its
     // own.
     //
-    // Each socket is charged against its tunnel's bytes at the buffers its
-    // dial asked for: this profile's usenet receive buffer plus 64 KiB for a
-    // usenet connection. No usenet socket holds more than a socket at the
-    // tunnel's own 2 MiB: the largest receive buffer is 2 MiB less the send
-    // buffer.
+    // Each socket is charged against its tunnel's bytes at exactly the
+    // buffers the tunnel allocates for it: this receive buffer, the 64 KiB
+    // usenet send buffer and the socket's record. The tunnel's byte budget
+    // stays hard: a larger buffer means fewer usenet sockets fit, never a
+    // tunnel over its budget.
     pub wireguard_usenet_receive_bytes: usize,
     // What a run whose decode window is wider than the profile's ceiling
     // gets.
@@ -177,7 +177,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: GIB,
         },
         direct_store_resident_default_cap_bytes: None,
-        wireguard_usenet_receive_bytes: 2 * MIB as usize - 64 * KIB,
+        wireguard_usenet_receive_bytes: 4 * MIB as usize,
         over_limit: OverLimit::ScratchThenRam,
     },
 ];
