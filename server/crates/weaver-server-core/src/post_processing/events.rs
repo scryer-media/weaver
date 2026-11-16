@@ -1288,6 +1288,20 @@ impl Database {
         )
     }
     pub fn cancel_event_scripts(&self, job_id: u64) {
+        self.cancel_event_scripts_where(|job| job == job_id);
+    }
+
+    // `cancel_event_scripts` for every job of `job_ids`, walking each
+    // registry once for the whole list.
+    pub(crate) fn cancel_event_scripts_of(&self, job_ids: &std::collections::HashSet<u64>) {
+        if !job_ids.is_empty() {
+            self.cancel_event_scripts_where(|job| job_ids.contains(&job));
+        }
+    }
+
+    // Signal every run, queued, running or fire-and-forget, of a job `of`
+    // picks to stop.
+    fn cancel_event_scripts_where(&self, of: impl Fn(u64) -> bool) {
         for registry in [
             &self.script_runtime.claimed,
             &self.script_runtime.cancellations,
@@ -1297,12 +1311,23 @@ impl Database {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .values()
             {
-                if *job == Some(job_id) {
+                if job.is_some_and(&of) {
                     sender.send_replace(true);
                 }
             }
         }
-        self.cancel_background_scripts(job_id);
+        for (job, sender) in self
+            .script_runtime
+            .background
+            .runs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            if job.is_some_and(&of) {
+                sender.send_replace(true);
+            }
+        }
     }
 
     // Signal every fire-and-forget run of `job_id` to stop. Returns whether

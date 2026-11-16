@@ -787,6 +787,58 @@ async fn every_script_shares_one_pool_whose_size_applies_to_the_next_waiter() {
 // The batched live-script read answers what the job-by-job checks answer:
 // a pending or admitted admission, a claimed or cancelling run, and a
 // queued row each make a job live; a job with none of them is not.
+// Cancelling a list of jobs at once signals exactly the runs that
+// cancelling each job alone does, in every registry, and no other job's.
+#[test]
+fn cancelling_a_list_of_jobs_signals_what_each_job_alone_does() {
+    // One run of each job in each registry, plus a run of no job; what each
+    // run was told.
+    fn seeded(db: &Database) -> Vec<watch::Receiver<bool>> {
+        let mut told = Vec::new();
+        for (n, job) in [Some(70), Some(71), Some(72), None].into_iter().enumerate() {
+            let runtime = &db.script_runtime;
+            for registry in [&runtime.claimed, &runtime.cancellations] {
+                let (sender, receiver) = watch::channel(false);
+                registry
+                    .lock()
+                    .unwrap()
+                    .insert(format!("run-{n}-{}", told.len()), (job, sender));
+                told.push(receiver);
+            }
+            let (sender, receiver) = watch::channel(false);
+            runtime
+                .background
+                .runs
+                .lock()
+                .unwrap()
+                .insert(n as u64, (job, sender));
+            told.push(receiver);
+        }
+        told
+    }
+    let read =
+        |told: &[watch::Receiver<bool>]| told.iter().map(|rx| *rx.borrow()).collect::<Vec<_>>();
+    let asked = [70u64, 72];
+
+    let (alone, _alone_data) = configured();
+    let alone_told = seeded(&alone);
+    for job in asked {
+        alone.cancel_event_scripts(job);
+    }
+    let (batched, _batched_data) = configured();
+    let batched_told = seeded(&batched);
+    batched.cancel_event_scripts_of(&asked.into_iter().collect());
+
+    assert_eq!(read(&batched_told), read(&alone_told));
+    // Jobs 70 and 72 in all three registries; job 71 and the jobless run
+    // are left alone.
+    let expected: Vec<bool> = [true, false, true, false]
+        .into_iter()
+        .flat_map(|told| [told; 3])
+        .collect();
+    assert_eq!(read(&batched_told), expected);
+}
+
 #[tokio::test]
 async fn jobs_with_live_script_events_match_the_job_by_job_checks() {
     let (db, _data) = configured();

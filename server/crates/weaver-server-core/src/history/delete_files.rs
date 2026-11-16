@@ -458,9 +458,7 @@ pub(crate) async fn delete_history_rows(
     BTreeSet<JobId>,
     Result<crate::HistoryDeleteBatchOutcome, crate::SchedulerError>,
 ) {
-    for id in &job_ids {
-        db.cancel_event_scripts(id.0);
-    }
+    db.cancel_event_scripts_of(&job_ids.iter().map(|id| id.0).collect());
     let mut output_dirs = BTreeMap::new();
     let mut refused = BTreeMap::new();
     let ids = job_ids.iter().copied().collect::<Vec<_>>();
@@ -777,9 +775,7 @@ pub(crate) async fn archive_history(
             }
         }
     }
-    for (job_id, _, _) in &planned {
-        db.cancel_event_scripts(job_id.0);
-    }
+    db.cancel_event_scripts_of(&planned.iter().map(|(id, _, _)| id.0).collect());
     let shared = shared_output_dirs(
         db,
         planned
