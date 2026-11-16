@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::trust::{counted, sessions, since, through_naming};
+use super::trust::{counted, proxy_servers_trusting, sessions, since, through_naming};
 use super::ttl::{ASKED, Answer, failure, respond, rr, soa, v4, wire};
 use super::*;
+use crate::dns::roots::Clock;
 use crate::pipe::Naming;
 use crate::resolution::record::{LookupError, Recording};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
@@ -48,11 +49,31 @@ impl Authority {
         }
     }
 
-    // Wires that trust only this authority.
-    fn wires(&self) -> Wires {
+    // A root store that holds only this authority.
+    fn store(&self) -> RootCertStore {
         let mut roots = RootCertStore::empty();
         roots.add(self.certificate.clone()).unwrap();
-        Wires::trusting(roots)
+        roots
+    }
+
+    // Wires that trust only this authority.
+    fn wires(&self) -> Wires {
+        Wires::trusting(self.store())
+    }
+
+    // Trust roots that trust only this authority for TLS, and otherwise
+    // what a product build trusts: the IANA root keys, the default policy
+    // and the host clock.
+    fn roots(&self) -> Arc<TrustRoots> {
+        Arc::new(
+            TrustRoots::new(
+                self.store(),
+                weaver_dnssec::TrustAnchor::iana_root(),
+                weaver_dnssec::Policy::default(),
+                Clock::Host,
+            )
+            .unwrap(),
+        )
     }
 
     // A server's TLS settings, with a certificate for `names` (addresses or
@@ -1817,13 +1838,12 @@ async fn a_naming_records_a_failed_lookup_as_judged_by_nobody() {
     let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
         .at("192.0.2.53", stranger.server(&["192.0.2.53"], b"dot"))
         .silent_at("192.0.2.54");
-    let wires = trusted.wires();
+    let roots = trusted.roots();
     for (address, failure) in [
         ("192.0.2.53", LookupFailure::TlsFailed),
         ("192.0.2.54", LookupFailure::TimedOut),
     ] {
-        let naming = Naming::proxy_servers(vec![dot(address, None)], Trust::AsSent);
-        sessions(&naming).trust(&wires);
+        let naming = proxy_servers_trusting(vec![dot(address, None)], Trust::AsSent, &roots);
         let before = counted();
         let resolution = through_naming(&naming, &servers, "fixture.test").await;
         assert!(!resolution.cached);
@@ -2368,15 +2388,19 @@ async fn tls_sessions_resume_through_a_naming_and_its_clones_and_never_across_tw
         let authority = Authority::new();
         let servers =
             Servers::new(speaks, answers).at("192.0.2.53", authority.server(&["192.0.2.53"], alpn));
-        let wires = authority.wires();
+        let roots = authority.roots();
         let first = Naming::proxy_servers(vec![listed.clone()], Trust::AsSent);
         let clone = first.clone();
         let second = Naming::proxy_servers(vec![listed.clone()], Trust::AsSent);
         assert!(Arc::ptr_eq(sessions(&first), sessions(&clone)));
         assert!(!Arc::ptr_eq(sessions(&first), sessions(&second)));
-        // A store trusts the test authority once: the clone's is the first's.
-        sessions(&first).trust(&wires);
-        sessions(&second).trust(&wires);
+        // The same, trusting the test authority: the clone's store is the
+        // first's, and the second naming's is its own.
+        let first = proxy_servers_trusting(vec![listed.clone()], Trust::AsSent, &roots);
+        let clone = first.clone();
+        let second = proxy_servers_trusting(vec![listed.clone()], Trust::AsSent, &roots);
+        assert!(Arc::ptr_eq(sessions(&first), sessions(&clone)));
+        assert!(!Arc::ptr_eq(sessions(&first), sessions(&second)));
         // A name apiece, so none is answered from what the naming holds.
         // Each lookup's first connection is the one held to account: a
         // second one in the same lookup, as HTTP/1.1 opens for the other
@@ -2608,7 +2632,7 @@ async fn dot_sends_a_query_its_connection_goes_with_three_times_then_fails_it() 
     talk.send(4, 4, query_packet(4, "fixture.test", 1));
     assert!(matches!(
         talk.next().await,
-        Ok(Some((1, Err(Failed::Closed))))
+        Ok(Some((1, Err(Exchanged::Closed))))
     ));
     assert!(matches!(talk.next().await, Ok(Some((4, Ok(_))))));
     assert!(matches!(talk.next().await, Ok(None)));

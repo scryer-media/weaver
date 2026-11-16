@@ -46,11 +46,11 @@ use tokio::{
 use crate::{
     TunnelError, TunnelProvider, TunnelStream,
     bridge::ConnectionOutcome,
-    dns::{DnsServer, Trust, WireKind},
+    dns::{self, DnsServer, ExitResolver, ListResolver, Refusing, Resolver, Trust, WireKind},
     egress::SocketEgress,
     endpoint::{DatagramTransport, EndpointStream, EndpointTransport, UdpSocketFactory},
     fault::{self, ProxyFault},
-    metrics::Resolver,
+    metrics,
     resolution::{
         Account, Lookup, Replicate, ResolutionCache, Ttl,
         record::{self, Asker, LookupFailure},
@@ -176,11 +176,31 @@ impl Naming {
         }
     }
     pub fn proxy_servers(servers: Vec<DnsServer>, trust: Trust) -> Self {
+        Self::proxy_servers_with(servers, trust, Default::default())
+    }
+    // The same, its TLS sessions and validator trusting a test's own roots.
+    #[cfg(test)]
+    pub(crate) fn proxy_servers_trusting(
+        servers: Vec<DnsServer>,
+        trust: Trust,
+        roots: Arc<crate::dns::TrustRoots>,
+    ) -> Self {
+        Self::proxy_servers_with(
+            servers,
+            trust,
+            crate::dns::DnsSessions::with_roots(Some(roots)),
+        )
+    }
+    fn proxy_servers_with(
+        servers: Vec<DnsServer>,
+        trust: Trust,
+        sessions: crate::dns::DnsSessions,
+    ) -> Self {
         Self::ProxyServers {
             servers,
             trust,
             answers: Default::default(),
-            sessions: Default::default(),
+            sessions: Arc::new(sessions),
         }
     }
     // What `host` resolves to for a dial through `hop`, the hop of proxy
@@ -195,56 +215,14 @@ impl Naming {
         if let Ok(ip) = host.parse() {
             return Ok(Resolution::Addresses(vec![ip]));
         }
-        if let Self::Refused(reason) = self {
-            let said = format!("{host}: {reason}");
-            record::failed(host, LookupFailure::Other, || said.clone());
-            return Err(DialError::Destination(io::Error::other(said)));
-        }
-        record::asking(host, || match self {
-            Self::Host => Asker::host(),
-            Self::Servers { servers, trust, .. } => Asker::servers(servers, *trust),
-            Self::Proxy => Asker::proxy(proxy),
-            Self::ProxyServers { servers, trust, .. } => {
-                Asker::proxy_servers(proxy, servers, *trust)
-            }
-            Self::Refused(_) => unreachable!("a refused naming asks no one"),
-        });
+        let resolver = self.resolver(hop);
+        resolver.refuse(host)?;
+        record::asking(host, || resolver.asker(proxy));
         // Each naming value holds its own answers. A lookup says how it was
         // judged, and a caller that joins it or finds its answer held notes
         // the same. A lookup that was refused is an error, which the cache
         // never holds.
-        let resolving = async {
-            match self {
-                Self::Proxy => Ok(None),
-                Self::Refused(_) => unreachable!("a refused naming asks no one"),
-                Self::Host => lookup(host).await.map(Some),
-                Self::Servers {
-                    servers,
-                    trust,
-                    egress,
-                    answers,
-                    sessions,
-                } => answers
-                    .resolve_accounted(Resolver::Routed, host, || {
-                        crate::dns::resolve_routed(egress.as_ref(), sessions, servers, *trust, host)
-                    })
-                    .await
-                    .and_then(routed)
-                    .map(Some),
-                Self::ProxyServers {
-                    servers,
-                    trust,
-                    answers,
-                    sessions,
-                } => answers
-                    .resolve_accounted(Resolver::Routed, host, || {
-                        crate::dns::resolve_routed(hop, sessions, servers, *trust, host)
-                    })
-                    .await
-                    .and_then(routed)
-                    .map(Some),
-            }
-        };
+        let resolving = resolver.lookup(host);
         let resolved = match tokio::time::timeout(timeout, resolving).await {
             Ok(resolved) => resolved.inspect_err(|error| record::failed_saying(host, error))?,
             Err(_) => {
@@ -271,25 +249,105 @@ impl Naming {
         })
     }
     // Drops what this naming holds for `host`, after none of the addresses
-    // it gave could be reached.
-    fn forget(&self, host: &str) {
+    // it gave through `hop` could be reached.
+    fn forget(&self, hop: &dyn Dialer, host: &str) {
+        self.resolver(hop).forget(host);
+    }
+    // The resolver this naming stands for, for one lookup through `hop`:
+    // the hop's own dial, or the leg's egress for servers asked from it.
+    // The one place a `HostResolver` is built, and today the one caller of
+    // the `ListResolver` constructors. `SessionHop::resolve` asks a
+    // WireGuard tunnel's own resolver itself, outside this trait.
+    fn resolver<'a>(&'a self, hop: &'a dyn Dialer) -> Resolving<'a> {
         match self {
-            Self::Host => crate::resolution::forget_host(host),
-            Self::Servers { answers, .. } | Self::ProxyServers { answers, .. } => {
-                answers.forget(host)
-            }
-            Self::Proxy | Self::Refused(_) => {}
+            Self::Host => Resolving::Host(HostResolver(())),
+            Self::Proxy => Resolving::Exit(ExitResolver),
+            Self::Servers {
+                servers,
+                trust,
+                egress,
+                answers,
+                sessions,
+            } => Resolving::Listed(ListResolver::at_egress(
+                servers,
+                *trust,
+                egress.as_ref(),
+                answers,
+                sessions,
+            )),
+            Self::ProxyServers {
+                servers,
+                trust,
+                answers,
+                sessions,
+            } => Resolving::Listed(ListResolver::through_hop(
+                servers, *trust, hop, answers, sessions,
+            )),
+            Self::Refused(reason) => Resolving::Refusing(Refusing(reason)),
         }
     }
 }
 
-// DNS servers that all say the name has no address fail as one that
-// answered nothing would.
-fn routed(addresses: Vec<IpAddr>) -> Result<Vec<IpAddr>, DialError> {
-    if addresses.is_empty() {
-        return Err(crate::dns::unresolved());
+// The resolver a naming stands for, borrowed from it for one lookup. One
+// lookup builds one, so the choice among them is made once per lookup.
+enum Resolving<'a> {
+    Host(HostResolver),
+    Exit(ExitResolver),
+    Listed(ListResolver<'a>),
+    Refusing(Refusing<'a>),
+}
+
+impl Resolver for Resolving<'_> {
+    fn refuse(&self, host: &str) -> Result<(), DialError> {
+        match self {
+            Self::Host(host_dns) => host_dns.refuse(host),
+            Self::Exit(exit) => exit.refuse(host),
+            Self::Listed(listed) => listed.refuse(host),
+            Self::Refusing(refusing) => refusing.refuse(host),
+        }
     }
-    Ok(addresses)
+    fn asker(&self, proxy: u32) -> Asker {
+        match self {
+            Self::Host(host_dns) => host_dns.asker(proxy),
+            Self::Exit(exit) => exit.asker(proxy),
+            Self::Listed(listed) => listed.asker(proxy),
+            Self::Refusing(refusing) => refusing.asker(proxy),
+        }
+    }
+    async fn lookup(&self, host: &str) -> dns::Answer {
+        match self {
+            Self::Host(host_dns) => host_dns.lookup(host).await,
+            Self::Exit(exit) => exit.lookup(host).await,
+            Self::Listed(listed) => listed.lookup(host).await,
+            Self::Refusing(refusing) => refusing.lookup(host).await,
+        }
+    }
+    fn forget(&self, host: &str) {
+        match self {
+            Self::Host(host_dns) => host_dns.forget(host),
+            Self::Exit(exit) => exit.forget(host),
+            Self::Listed(listed) => listed.forget(host),
+            Self::Refusing(refusing) => refusing.forget(host),
+        }
+    }
+}
+
+// The host's own DNS, for a naming that says Host. It asks through
+// `host_dns` alone. Its field is private to this module, so only `pipe` and
+// its submodules can build one; `Naming::resolver` is the only place that
+// does.
+struct HostResolver(());
+
+impl Resolver for HostResolver {
+    fn asker(&self, _proxy: u32) -> Asker {
+        Asker::host()
+    }
+    async fn lookup(&self, host: &str) -> dns::Answer {
+        lookup(host).await.map(Some)
+    }
+    fn forget(&self, host: &str) {
+        crate::resolution::forget_host(host);
+    }
 }
 
 // Whether a WireGuard tunnel's own resolver can serve servers asked by
@@ -867,7 +925,7 @@ impl Egress {
     fn forget_named(&self, host: &str, endpoint: bool) {
         match self.naming_for(Names::current().as_ref(), endpoint) {
             None => crate::resolution::forget_host(host),
-            Some(naming) => naming.forget(host),
+            Some(naming) => naming.forget(self, host),
         }
     }
     // What the naming in use resolves `host` to, as addresses this egress
@@ -1258,7 +1316,7 @@ impl Dialer for TransportHop {
         }
         let error = last.expect("a hop dials at least one destination");
         if unreached(target, &error) {
-            self.naming_now().forget(&target.host);
+            self.naming_now().forget(self, &target.host);
         }
         Err(error)
     }
@@ -1652,7 +1710,7 @@ impl Dialer for SessionHop {
                     error
                 };
                 if unreached(target, &error) {
-                    self.naming_now().forget(&target.host);
+                    self.naming_now().forget(self, &target.host);
                 }
                 drop(capacity);
                 drop(activity);
@@ -1723,7 +1781,7 @@ impl Dialer for SessionHop {
         // The tunnel's resolver is given one server, asked in plain.
         let from = servers.first().map(record::Answerer::of);
         answers
-            .resolve_accounted(Resolver::WireGuard, host, || async {
+            .resolve_accounted(metrics::Resolver::WireGuard, host, || async {
                 let found = async {
                     self.prepare_carrier().await?;
                     let (resolver, _activity, _capacity) = match identity::claim(self).await {
@@ -1737,9 +1795,9 @@ impl Dialer for SessionHop {
                     resolver
                         .resolve_host(host)
                         .await
-                        .inspect(|_| crate::metrics::record_resolution(Resolver::WireGuard, true))
+                        .inspect(|_| metrics::record_resolution(metrics::Resolver::WireGuard, true))
                         .inspect_err(|_| {
-                            crate::metrics::record_resolution(Resolver::WireGuard, false)
+                            metrics::record_resolution(metrics::Resolver::WireGuard, false)
                         })
                         .inspect_err(|error| match error {
                             // The tunnel's resolver asked, and says it found nothing.

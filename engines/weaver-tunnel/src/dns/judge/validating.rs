@@ -6,69 +6,64 @@
 // being asked, on that server's session, as an address query does, and
 // nowhere else. Nothing falls back: a check that cannot finish fails the
 // query.
-use super::{DnsServer, Failed, Found, NEXT_ID, Wire, wire::Session};
+use crate::dns::{
+    DnsServer, Exchanged, Found,
+    exchange::{Reply, Session},
+    judge::{self, Asking, Judge},
+    roots::{self, TrustRoots},
+};
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use weaver_dnssec::{
     Answer, BogusReason, InsecureReason, Name, Outcome, Query, Question, RecordType, Source, Step,
-    UnansweredCause, Validator, Verdict,
+    UnansweredCause, Validation, Validator, Verdict,
 };
 
 // One naming's validator: the root's keys, the keys and delegations it has
-// proven, and the names each server has lately been seen to fail. Built on
-// the naming's first lookup that validates and kept for the naming's life.
-#[derive(Default)]
-pub(super) struct Dnssec {
+// proven, and the names each server has lately been seen to fail. Built
+// from the naming's trust roots on its first lookup that validates, and
+// kept for the naming's life.
+pub(in crate::dns) struct Dnssec {
+    // None for the built-in roots, built at their first use.
+    roots: Option<Arc<TrustRoots>>,
     validator: OnceLock<Validator>,
-    #[cfg(test)]
-    now: OnceLock<u64>,
 }
 
 impl Dnssec {
-    fn validator(&self) -> &Validator {
-        self.validator.get_or_init(Validator::with_root_anchors)
-    }
-
-    // Seconds since 1970 by the host clock, which signatures are checked
-    // against within the validator's allowance for skew.
-    fn now(&self) -> u64 {
-        #[cfg(test)]
-        if let Some(now) = self.now.get() {
-            return *now;
+    pub(in crate::dns) fn new(roots: Option<Arc<TrustRoots>>) -> Self {
+        Self {
+            roots,
+            validator: OnceLock::new(),
         }
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs())
     }
 
-    // Trusts only `anchors`, at the fixed time `now`, for a test's own
-    // signed zones. Only once, before any lookup.
-    #[cfg(test)]
-    pub(super) fn anchored(&self, anchors: Vec<weaver_dnssec::TrustAnchor>, now: u64) {
-        let validator = Validator::new(anchors, weaver_dnssec::Policy::default())
-            .expect("the fixture's trust anchors");
-        assert!(
-            self.validator.set(validator).is_ok() && self.now.set(now).is_ok(),
-            "validator set twice"
-        );
+    fn validator(&self) -> &Validator {
+        self.validator
+            .get_or_init(|| roots::or_built_in(&self.roots).validator())
+    }
+
+    // The time signatures are checked against, by the roots' clock.
+    fn now(&self) -> u64 {
+        roots::or_built_in(&self.roots).now()
     }
 }
 
 // Asks the session's server for `name`'s records of `qtype`, and for every
 // key, delegation and denial that proves them, and checks the signatures.
 // The caller says whether the session counts the queries it sends.
-pub(super) async fn validated(
+pub(in crate::dns) async fn validated(
     session: &mut Session<'_>,
     dnssec: &Dnssec,
     name: &str,
     qtype: u16,
     reached: &mut bool,
-) -> Result<Found, Failed> {
+) -> Result<Found, Exchanged> {
     let mut found = [None];
     validated_all(session, dnssec, name, &[qtype], &mut found, reached).await;
     let [found] = found;
-    found.unwrap_or(Err(Failed::Invalid))
+    found.unwrap_or(Err(Exchanged::Invalid))
 }
 
 // Checks `name`'s records of each of `qtypes` at the session's server, all
@@ -81,52 +76,95 @@ pub(super) async fn validated(
 // asks ahead, where queries take turns. A family's chain shares the keys
 // and delegations the other proved, through the validator's cache. A reply
 // is taken only under the id its query went out with. A server that
-// cannot be reached, or fails TLS, fails every check still running: the other queries would only fail
-// the same way. Once every check has its verdict the talk ends, and a query
-// no running check still waits on is not sent.
+// cannot be reached, or fails TLS, fails every check still running: the
+// other queries would only fail the same way. Once every check has its
+// verdict the talk ends, and a query no running check still waits on is not
+// sent.
 pub(super) async fn validated_all(
     session: &mut Session<'_>,
     dnssec: &Dnssec,
     name: &str,
     qtypes: &[u16],
-    found: &mut [Option<Result<Found, Failed>>],
+    found: &mut [Option<Result<Found, Exchanged>>],
     reached: &mut bool,
 ) {
-    let source = Source::new(source(session.server()));
-    let https = matches!(session.server().wire, Wire::Https { .. });
-    let now = dnssec.now();
-    let mut checks: Vec<_> = qtypes
-        .iter()
-        .zip(found.iter_mut())
-        .map(|(qtype, found)| {
-            let question = Name::from_text(&format!("{name}."))
-                .ok()
-                .and_then(|name| Question::new(name, RecordType::new(*qtype)).ok());
-            match question {
-                Some(question) => Some(dnssec.validator().begin_from(source, question, now)),
-                None => {
-                    *found = Some(Err(Failed::Invalid));
-                    None
-                }
-            }
-        })
-        .collect();
+    let mut checks = Validating::new(session.server(), dnssec, name, qtypes, found);
+    judge::run(session, reached, &mut checks).await;
+}
+
+// The DNSSEC checks of one name at one server, one per type asked, each
+// verdict put in its slot of `found` as it is reached. A query's key is its
+// place in `sent`; its lane is the check that first gave it.
+struct Validating<'f, 'v> {
+    checks: Vec<Option<Validation<'v>>>,
+    found: &'f mut [Option<Result<Found, Exchanged>>],
     // Why each query that got no reply failed, for each check, for an
     // unanswered verdict to say.
-    let mut failures: Vec<BTreeMap<Query, Failed>> =
-        qtypes.iter().map(|_| BTreeMap::new()).collect();
+    failures: Vec<BTreeMap<Query, Exchanged>>,
     // Each query sent, by its key: the query, its id, and the checks that
     // wait on its reply, until the reply comes.
-    let mut sent: Vec<(Query, u16, Option<Vec<usize>>)> = Vec::new();
+    sent: Vec<(Query, u16, Option<Vec<usize>>)>,
     // The key of each query still out, by the query.
-    let mut out: BTreeMap<Query, usize> = BTreeMap::new();
+    out: BTreeMap<Query, usize>,
     // The key of the query each check's last step waits on.
-    let mut blocked: Vec<Option<usize>> = qtypes.iter().map(|_| None).collect();
+    blocked: Vec<Option<usize>>,
     // The checks to step: every one at the start, then each whose awaited
     // reply came.
-    let mut due: Vec<usize> = (0..checks.len()).rev().collect();
-    let mut talk = session.talk(reached);
-    loop {
+    due: Vec<usize>,
+}
+
+impl<'f, 'v> Validating<'f, 'v> {
+    fn new(
+        server: &DnsServer,
+        dnssec: &'v Dnssec,
+        name: &str,
+        qtypes: &[u16],
+        found: &'f mut [Option<Result<Found, Exchanged>>],
+    ) -> Self {
+        let source = Source::new(source(server));
+        let now = dnssec.now();
+        let checks: Vec<_> = qtypes
+            .iter()
+            .zip(found.iter_mut())
+            .map(|(qtype, found)| {
+                let question = Name::from_text(&format!("{name}."))
+                    .ok()
+                    .and_then(|name| Question::new(name, RecordType::new(*qtype)).ok());
+                match question {
+                    Some(question) => Some(dnssec.validator().begin_from(source, question, now)),
+                    None => {
+                        *found = Some(Err(Exchanged::Invalid));
+                        None
+                    }
+                }
+            })
+            .collect();
+        let due = (0..checks.len()).rev().collect();
+        Self {
+            checks,
+            found,
+            failures: qtypes.iter().map(|_| BTreeMap::new()).collect(),
+            sent: Vec::new(),
+            out: BTreeMap::new(),
+            blocked: qtypes.iter().map(|_| None).collect(),
+            due,
+        }
+    }
+}
+
+impl Judge for Validating<'_, '_> {
+    // Steps each check due, in order, and gives the queries its step needs:
+    // the one it waits on, then those it asks ahead.
+    async fn want(&mut self, asking: &mut Asking<'_, '_, '_>) {
+        let Self {
+            checks,
+            found,
+            failures,
+            sent,
+            out,
+            blocked,
+            due,
+        } = self;
         while let Some(at) = due.pop() {
             let Some(validation) = &mut checks[at] else {
                 continue;
@@ -138,7 +176,7 @@ pub(super) async fn validated_all(
                 step => {
                     found[at] = Some(match step {
                         Step::Done { verdict, .. } => judged(verdict, &mut failures[at]),
-                        _ => Err(Failed::Invalid),
+                        _ => Err(Exchanged::Invalid),
                     });
                     checks[at] = None;
                     // A query only this check waited on, and not yet sent,
@@ -148,7 +186,7 @@ pub(super) async fn validated_all(
                             return false;
                         };
                         wanting.retain(|wants| *wants != at);
-                        !(wanting.is_empty() && talk.withdraw(*key))
+                        !(wanting.is_empty() && asking.withdraw(*key))
                     });
                     continue;
                 }
@@ -156,21 +194,17 @@ pub(super) async fn validated_all(
             for (hint, query) in std::iter::once(query).chain(hints).enumerate() {
                 let key = match out.get(&query) {
                     Some(&key) => {
-                        talk.wanted_by(key, at, hint == 0);
+                        asking.wanted_by(key, at, hint == 0);
                         key
                     }
                     None => {
-                        // DNS over HTTPS sends id 0, as the address queries
-                        // do.
-                        let id = if https {
-                            0
-                        } else {
-                            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-                        };
+                        // The id the server's wire sends, as the address
+                        // queries do.
+                        let id = asking.id();
                         if hint == 0 {
-                            talk.send(sent.len(), at, query.encode(id));
+                            asking.send(sent.len(), at, query.encode(id));
                         } else {
-                            talk.ahead(sent.len(), at, query.encode(id));
+                            asking.ahead(sent.len(), at, query.encode(id));
                         }
                         out.insert(query.clone(), sent.len());
                         sent.push((query, id, Some(Vec::new())));
@@ -186,73 +220,75 @@ pub(super) async fn validated_all(
                 }
             }
         }
-        if checks.iter().all(Option::is_none) {
-            return;
-        }
-        let (key, reply) = match talk.next().await {
-            Ok(Some(ended)) => ended,
-            Ok(None) => return,
-            Err(failed) => {
-                for (at, check) in checks.iter_mut().enumerate() {
-                    if check.take().is_some() {
-                        found[at] = Some(Err(failed.copy()));
-                    }
-                }
-                return;
-            }
-        };
-        let (query, id, wanting) = &mut sent[key];
+    }
+
+    // A reply is taken only under the id its query went out with. Each check
+    // that waited on it is stepped next.
+    fn supply(&mut self, key: usize, reply: Reply) {
+        let (query, id, wanting) = &mut self.sent[key];
         let wanting = wanting.take().unwrap_or_default();
-        out.remove(query);
+        self.out.remove(query);
         let failed = match reply {
             Ok(bytes) if bytes.get(..2) == Some(&id.to_be_bytes()[..]) => {
                 for at in &wanting {
-                    if let Some(validation) = &mut checks[*at] {
+                    if let Some(validation) = &mut self.checks[*at] {
                         // The query is this check's own and outstanding.
                         let _ = validation.supply(query, &bytes);
                     }
                 }
                 None
             }
-            Ok(_) => Some(Failed::Invalid),
+            Ok(_) => Some(Exchanged::Invalid),
             Err(failed) => Some(failed),
         };
         for at in wanting {
-            if let Some(validation) = &mut checks[at] {
+            if let Some(validation) = &mut self.checks[at] {
                 if let Some(failed) = &failed {
-                    failures[at].insert(query.clone(), failed.copy());
+                    self.failures[at].insert(query.clone(), failed.copy());
                     let _ = validation.supply_failure(query);
                 }
-                if blocked[at] == Some(key) {
-                    due.push(at);
+                if self.blocked[at] == Some(key) {
+                    self.due.push(at);
                 }
+            }
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.checks.iter().all(Option::is_none)
+    }
+
+    fn fail(&mut self, failed: Exchanged) {
+        for (at, check) in self.checks.iter_mut().enumerate() {
+            if check.take().is_some() {
+                self.found[at] = Some(Err(failed.copy()));
             }
         }
     }
 }
 
 // What a check's verdict comes to for the lookup.
-fn judged(verdict: Verdict, failures: &mut BTreeMap<Query, Failed>) -> Result<Found, Failed> {
+fn judged(verdict: Verdict, failures: &mut BTreeMap<Query, Exchanged>) -> Result<Found, Exchanged> {
     match verdict {
         Verdict::Secure { answer, .. } => Ok(found(&answer, None)),
         Verdict::Insecure { answer, reason, .. } => Ok(found(&answer, Some(reason))),
         Verdict::Bogus { failure, .. } if failure.reason() == BogusReason::NoDnssecRecords => {
-            Err(Failed::Stripped(failure.extended_errors().to_vec()))
+            Err(Exchanged::Stripped(failure.extended_errors().to_vec()))
         }
-        Verdict::Bogus { failure, .. } => Err(Failed::Bogus(
+        Verdict::Bogus { failure, .. } => Err(Exchanged::Bogus(
             failure.reason(),
             failure.extended_errors().to_vec(),
         )),
         Verdict::Unanswered { failure, .. } => Err(match failure.cause() {
-            UnansweredCause::FetchFailed => {
-                failures.remove(failure.query()).unwrap_or(Failed::Closed)
-            }
-            UnansweredCause::Truncated => Failed::Invalid,
-            UnansweredCause::Rcode(rcode) => Failed::Rcode(rcode),
-            _ => Failed::Invalid,
+            UnansweredCause::FetchFailed => failures
+                .remove(failure.query())
+                .unwrap_or(Exchanged::Closed),
+            UnansweredCause::Truncated => Exchanged::Invalid,
+            UnansweredCause::Rcode(rcode) => Exchanged::Rcode(rcode),
+            _ => Exchanged::Invalid,
         }),
         // A verdict this build does not know is never taken as an answer.
-        _ => Err(Failed::Invalid),
+        _ => Err(Exchanged::Invalid),
     }
 }
 
@@ -311,7 +347,7 @@ static IN_PLACE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 
 // Steps run in place so far, in this process.
 #[cfg(test)]
-pub(super) fn steps_in_place() -> usize {
+pub(in crate::dns) fn steps_in_place() -> usize {
     IN_PLACE.load(Ordering::Relaxed)
 }
 
@@ -336,7 +372,7 @@ fn steps() -> &'static tokio::sync::Semaphore {
 }
 
 // Why the signatures failed, in a few fixed words.
-pub(super) fn bogus_words(reason: BogusReason) -> &'static str {
+pub(in crate::dns) fn bogus_words(reason: BogusReason) -> &'static str {
     match reason {
         BogusReason::MalformedReply => "a reply could not be read",
         BogusReason::SignaturesMissing => "the records carry no usable signature",
@@ -363,7 +399,7 @@ pub(super) fn bogus_words(reason: BogusReason) -> &'static str {
 }
 
 // A failure the host's clock may explain.
-pub(super) fn clock_words(reason: BogusReason) -> &'static str {
+pub(in crate::dns) fn clock_words(reason: BogusReason) -> &'static str {
     match reason {
         BogusReason::SignatureExpired | BogusReason::SignatureNotYetValid => {
             "; the host clock may be wrong"
@@ -373,7 +409,7 @@ pub(super) fn clock_words(reason: BogusReason) -> &'static str {
 }
 
 // Why a name was not signed, in a few fixed words.
-pub(super) fn insecure_words(reason: InsecureReason) -> &'static str {
+pub(in crate::dns) fn insecure_words(reason: InsecureReason) -> &'static str {
     match reason {
         InsecureReason::NoTrustAnchor => "no trust anchor covers the name",
         InsecureReason::UnsignedDelegation => "the zone is not signed",
@@ -386,7 +422,7 @@ pub(super) fn insecure_words(reason: InsecureReason) -> &'static str {
 }
 
 // The Extended DNS Error codes (RFC 8914) the replies carried, as numbers.
-pub(super) fn extended_words(codes: &[u16]) -> String {
+pub(in crate::dns) fn extended_words(codes: &[u16]) -> String {
     if codes.is_empty() {
         return String::new();
     }
@@ -397,6 +433,7 @@ pub(super) fn extended_words(codes: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::Wire;
 
     // Servers of two namings at one address, on different wire settings,
     // are different sources, so a name held bogus against one is not held

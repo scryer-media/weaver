@@ -15,7 +15,7 @@ use std::{
 
 use super::{DialError, Dialer, Naming};
 use crate::{
-    dns::{DnsServer, DnsSessions, Trust},
+    dns::{DnsServer, DnsSessions, Trust, TrustRoots},
     resolution::ResolutionCache,
 };
 
@@ -57,16 +57,28 @@ pub enum DnsTransit {
     Proxy,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Held {
     answers: Arc<ResolutionCache<DialError>>,
     sessions: Arc<DnsSessions>,
+}
+
+impl Held {
+    fn new(roots: &Option<Arc<TrustRoots>>) -> Self {
+        Self {
+            answers: Arc::default(),
+            sessions: Arc::new(DnsSessions::with_roots(roots.clone())),
+        }
+    }
 }
 
 struct Inner {
     choice: DnsChoice,
     // The leg's egress, which listed servers are asked from.
     egress: Option<Arc<dyn Dialer>>,
+    // What each path's TLS sessions and validator trust: None for the
+    // built-in roots, built only when a lookup first needs them.
+    roots: Option<Arc<TrustRoots>>,
     // The answers and TLS sessions of each path names are asked on, kept
     // apart so no answer is shared between legs on different paths.
     held: Mutex<HashMap<String, Held>>,
@@ -82,10 +94,27 @@ pub struct Names {
 
 impl Names {
     pub fn new(choice: DnsChoice, egress: Option<Arc<dyn Dialer>>) -> Self {
+        Self::rooted(choice, egress, None)
+    }
+    // The same, trusting a test's own roots.
+    #[cfg(test)]
+    pub(crate) fn with_roots(
+        choice: DnsChoice,
+        egress: Option<Arc<dyn Dialer>>,
+        roots: Arc<TrustRoots>,
+    ) -> Self {
+        Self::rooted(choice, egress, Some(roots))
+    }
+    fn rooted(
+        choice: DnsChoice,
+        egress: Option<Arc<dyn Dialer>>,
+        roots: Option<Arc<TrustRoots>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 choice,
                 egress,
+                roots,
                 held: Mutex::new(HashMap::new()),
             }),
             endpoint: false,
@@ -126,7 +155,7 @@ impl Names {
             .lock()
             .expect("held names")
             .entry(path.to_owned())
-            .or_default()
+            .or_insert_with(|| Held::new(&self.inner.roots))
             .clone()
     }
     fn servers_at_egress(&self, servers: &[DnsServer], trust: Trust) -> Naming {
@@ -148,92 +177,179 @@ impl Names {
     // own endpoint is named below the proxy: by the listed servers when
     // Weaver answers, else by the host.
     pub(crate) fn at_egress(&self, endpoint: bool) -> Naming {
-        let endpoint = endpoint || self.endpoint;
-        match &self.inner.choice {
-            DnsChoice::Refused(reason) => Naming::Refused(reason.clone()),
-            DnsChoice::System => Naming::Host,
-            DnsChoice::Proxy { .. } if endpoint => Naming::Host,
-            DnsChoice::Proxy {
-                system_fallback: true,
-                ..
-            } => Naming::Host,
-            DnsChoice::Proxy { .. } => Naming::Refused(
-                "the route's DNS is answered by its proxy, and this stage has no proxy".into(),
-            ),
-            DnsChoice::Weaver { servers, trust, .. } => self.servers_at_egress(servers, *trust),
-        }
+        let pick = NamingPolicy(&self.inner.choice).pick(Stage::Egress, endpoint || self.endpoint);
+        self.named(pick)
     }
     // How a name dialled through the hop on `path` is resolved. `tunnel` is
     // the DNS servers of a WireGuard hop's tunnel, None for any other kind.
     pub(crate) fn at_hop(&self, path: &str, tunnel: Option<&[DnsServer]>) -> Naming {
-        match &self.inner.choice {
-            DnsChoice::Refused(reason) => Naming::Refused(reason.clone()),
-            // A proxy's own address on the host's profile, carried by this
-            // hop, is resolved by the hop: a proxy is handed the name, a
-            // WireGuard tunnel's servers are asked through it, and the host
-            // is never asked.
-            DnsChoice::System if self.endpoint => match tunnel {
-                Some([]) => Naming::Refused(
-                    "the WireGuard proxy carrying this proxy lists no DNS servers".into(),
-                ),
-                Some(servers) => {
-                    let held = self.held(path);
-                    Naming::ProxyServers {
-                        servers: servers.to_vec(),
-                        trust: Trust::AsSent,
-                        answers: held.answers,
-                        sessions: held.sessions,
-                    }
-                }
-                None => Naming::Proxy,
-            },
-            DnsChoice::System => Naming::Host,
-            DnsChoice::Proxy { trust, .. } => match tunnel {
-                Some([]) => Naming::Refused("the WireGuard proxy lists no DNS servers".into()),
-                Some(servers) => {
-                    let held = self.held(path);
-                    Naming::ProxyServers {
-                        servers: servers.to_vec(),
-                        trust: *trust,
-                        answers: held.answers,
-                        sessions: held.sessions,
-                    }
-                }
-                None if *trust == Trust::AsSent => Naming::Proxy,
-                None => {
-                    Naming::Refused("only a WireGuard proxy's answers can be validated here".into())
-                }
-            },
-            // A proxy's own address named by listed servers, dialled through
-            // the hop beneath it, asks them on the path below that hop.
-            DnsChoice::Weaver { servers, trust, .. } if self.endpoint => {
-                let held = self.held(path);
-                Naming::ProxyServers {
-                    servers: servers.clone(),
-                    trust: *trust,
-                    answers: held.answers,
-                    sessions: held.sessions,
-                }
-            }
-            DnsChoice::Weaver {
+        let pick =
+            NamingPolicy(&self.inner.choice).pick(Stage::Hop { path, tunnel }, self.endpoint);
+        self.named(pick)
+    }
+    // The naming `pick` says, holding the answers and TLS sessions of the
+    // path it asks on: the hop's path for servers asked through the hop,
+    // the egress's own for servers asked from it.
+    fn named(&self, pick: Pick<'_>) -> Naming {
+        match pick {
+            Pick::Host => Naming::Host,
+            Pick::Proxy => Naming::Proxy,
+            Pick::Refused(reason) => Naming::Refused(reason),
+            Pick::Listed {
                 servers,
                 trust,
-                transit: DnsTransit::Egress,
-            } => self.servers_at_egress(servers, *trust),
-            DnsChoice::Weaver {
+                via: Via::Egress,
+            } => self.servers_at_egress(servers, trust),
+            Pick::Listed {
                 servers,
                 trust,
-                transit: DnsTransit::Proxy,
+                via: Via::Hop { path },
             } => {
                 let held = self.held(path);
                 Naming::ProxyServers {
-                    servers: servers.clone(),
-                    trust: *trust,
+                    servers: servers.to_vec(),
+                    trust,
                     answers: held.answers,
                     sessions: held.sessions,
                 }
             }
         }
+    }
+}
+
+// The stage a name is dialled from.
+#[derive(Clone, Copy)]
+enum Stage<'a> {
+    // Straight out of the leg's egress.
+    Egress,
+    // Through the proxy hop on `path`. `tunnel` is the DNS servers of a
+    // WireGuard hop's tunnel, None for any other kind.
+    Hop {
+        path: &'a str,
+        tunnel: Option<&'a [DnsServer]>,
+    },
+}
+
+// Where listed servers are asked from. Only a hop stage has a path to
+// give, so servers asked through a hop are never held in the egress's slot.
+#[derive(Clone, Copy)]
+enum Via<'a> {
+    // Straight out of the leg's egress, held in the egress's own slot.
+    Egress,
+    // Through the hop on `path`, held in that path's slot.
+    Hop { path: &'a str },
+}
+
+// Which resolver answers a name, with what it needs.
+enum Pick<'a> {
+    // The host's own resolver.
+    Host,
+    // The proxy the dial goes through, handed the name.
+    Proxy,
+    // These servers, asked in order and judged by `trust`.
+    Listed {
+        servers: &'a [DnsServer],
+        trust: Trust,
+        via: Via<'a>,
+    },
+    // No one: every lookup fails, saying why.
+    Refused(String),
+}
+
+// A route's DNS choice, read as one table: for each stage a name is dialled
+// from, and whether the name is a proxy's or tunnel's own endpoint, which
+// resolver answers it.
+struct NamingPolicy<'a>(&'a DnsChoice);
+
+impl<'a> NamingPolicy<'a> {
+    fn pick(&self, stage: Stage<'a>, endpoint: bool) -> Pick<'a> {
+        match (self.0, stage, endpoint) {
+            (DnsChoice::Refused(reason), _, _) => Pick::Refused(reason.clone()),
+            (DnsChoice::System, Stage::Egress, _) => Pick::Host,
+            (DnsChoice::System, Stage::Hop { .. }, false) => Pick::Host,
+            // A proxy's own address on the host's profile, carried by this
+            // hop, is resolved by the hop: a proxy is handed the name, a
+            // WireGuard tunnel's servers are asked through it, and the host
+            // is never asked.
+            (DnsChoice::System, Stage::Hop { path, tunnel }, true) => through_tunnel(
+                path,
+                tunnel,
+                Trust::AsSent,
+                "the WireGuard proxy carrying this proxy lists no DNS servers",
+            ),
+            // Below the proxy, its own endpoint is named by the host.
+            (DnsChoice::Proxy { .. }, Stage::Egress, true) => Pick::Host,
+            (
+                DnsChoice::Proxy {
+                    system_fallback: true,
+                    ..
+                },
+                Stage::Egress,
+                false,
+            ) => Pick::Host,
+            (DnsChoice::Proxy { .. }, Stage::Egress, false) => Pick::Refused(
+                "the route's DNS is answered by its proxy, and this stage has no proxy".into(),
+            ),
+            (DnsChoice::Proxy { trust, .. }, Stage::Hop { path, tunnel }, _) => through_tunnel(
+                path,
+                tunnel,
+                *trust,
+                "the WireGuard proxy lists no DNS servers",
+            ),
+            (DnsChoice::Weaver { servers, trust, .. }, Stage::Egress, _) => Pick::Listed {
+                servers,
+                trust: *trust,
+                via: Via::Egress,
+            },
+            // A proxy's own address named by listed servers, dialled through
+            // the hop beneath it, asks them on the path below that hop.
+            (DnsChoice::Weaver { servers, trust, .. }, Stage::Hop { path, .. }, true) => {
+                Pick::Listed {
+                    servers,
+                    trust: *trust,
+                    via: Via::Hop { path },
+                }
+            }
+            (
+                DnsChoice::Weaver {
+                    servers,
+                    trust,
+                    transit,
+                },
+                Stage::Hop { path, .. },
+                false,
+            ) => Pick::Listed {
+                servers,
+                trust: *trust,
+                via: match transit {
+                    DnsTransit::Egress => Via::Egress,
+                    DnsTransit::Proxy => Via::Hop { path },
+                },
+            },
+        }
+    }
+}
+
+// The hop resolves the name itself: a WireGuard tunnel's own servers are
+// asked through it, judged by `trust`, and any other proxy is handed the
+// name, which only answers taken as sent allow. A tunnel that lists no
+// servers refuses, saying `none_listed`. The tunnel's servers are held in
+// the slot of the hop's `path`.
+fn through_tunnel<'a>(
+    path: &'a str,
+    tunnel: Option<&'a [DnsServer]>,
+    trust: Trust,
+    none_listed: &str,
+) -> Pick<'a> {
+    match tunnel {
+        Some([]) => Pick::Refused(none_listed.into()),
+        Some(servers) => Pick::Listed {
+            servers,
+            trust,
+            via: Via::Hop { path },
+        },
+        None if trust == Trust::AsSent => Pick::Proxy,
+        None => Pick::Refused("only a WireGuard proxy's answers can be validated here".into()),
     }
 }
 

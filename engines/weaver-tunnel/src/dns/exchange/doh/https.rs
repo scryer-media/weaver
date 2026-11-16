@@ -8,9 +8,9 @@
 // executor, are polled here inside each exchange and never spawned, so they
 // do no work outside a lookup and go when the lookup drops them. Every part
 // of a reply is read under a fixed cap.
-use super::{
-    DnsServer, Failed,
-    wire::{REPLY_CAP, Tls},
+use crate::dns::{
+    DnsServer, Exchanged,
+    exchange::{REPLY_CAP, Tls},
 };
 use hyper::{
     Method, Request, Response, StatusCode, Uri, Version,
@@ -76,7 +76,7 @@ enum Http {
 }
 
 impl Connection {
-    pub(super) async fn new(stream: Tls) -> Result<Self, Failed> {
+    pub(super) async fn new(stream: Tls) -> Result<Self, Exchanged> {
         let two = stream.get_ref().1.alpn_protocol() == Some(b"h2");
         let read = Arc::new(AtomicUsize::new(0));
         let io = Io {
@@ -93,7 +93,7 @@ impl Connection {
                 .max_send_buf_size(REPLY_CAP)
                 .handshake(io)
                 .await
-                .map_err(|_| Failed::Closed)?;
+                .map_err(|_| Exchanged::Closed)?;
             Http::Two {
                 send,
                 driver: Some(Box::pin(driver)),
@@ -108,7 +108,7 @@ impl Connection {
                 .max_headers(HEADERS)
                 .handshake(io)
                 .await
-                .map_err(|_| Failed::Closed)?;
+                .map_err(|_| Exchanged::Closed)?;
             Http::One {
                 send,
                 driver: Some(Box::pin(driver)),
@@ -125,7 +125,7 @@ impl Connection {
         server: &DnsServer,
         path: &str,
         packet: &[u8],
-    ) -> Result<(Vec<u8>, bool), Failed> {
+    ) -> Result<(Vec<u8>, bool), Exchanged> {
         let two = matches!(self.http, Http::Two { .. });
         let mut request = request(server.address, path, packet, two)?;
         let interim = Arc::new(AtomicUsize::new(0));
@@ -155,7 +155,7 @@ impl Connection {
                             *driver = None;
                         }
                         if interims() {
-                            return Poll::Ready(Err(Failed::Invalid));
+                            return Poll::Ready(Err(Exchanged::Invalid));
                         }
                         call.as_mut().poll(cx)
                     })
@@ -164,8 +164,8 @@ impl Connection {
                 match outcome {
                     // Nothing came back: the connection was dead before the
                     // query.
-                    Err(Failed::Cut) if self.read.load(Ordering::Relaxed) == before => {
-                        Err(Failed::Closed)
+                    Err(Exchanged::Cut) if self.read.load(Ordering::Relaxed) == before => {
+                        Err(Exchanged::Closed)
                     }
                     Ok((reply, open)) => Ok((reply, open && driver.is_some())),
                     outcome => outcome,
@@ -199,7 +199,7 @@ impl Connection {
                         }
                         tasks.run(running, cx);
                         if self.read.load(Ordering::Relaxed) - before > EXCHANGE_READ {
-                            return Poll::Ready(Err(Failed::Invalid));
+                            return Poll::Ready(Err(Exchanged::Invalid));
                         }
                         call.as_mut().poll(cx)
                     })
@@ -225,7 +225,7 @@ impl Connection {
         path: &str,
         key: usize,
         packet: &[u8],
-    ) -> Result<(), Failed> {
+    ) -> Result<(), Exchanged> {
         let Http::Two { send, streams, .. } = &mut self.http else {
             unreachable!("only an HTTP/2 connection carries queries together")
         };
@@ -266,7 +266,7 @@ impl Connection {
 
     // The next stream out to end, with its key and reply. None when none is
     // out. Once the streams out have read more than they may, each fails.
-    pub(super) async fn next(&mut self) -> Option<(usize, Result<Vec<u8>, Failed>)> {
+    pub(super) async fn next(&mut self) -> Option<(usize, Result<Vec<u8>, Exchanged>)> {
         let Http::Two {
             driver,
             tasks,
@@ -290,7 +290,7 @@ impl Connection {
             tasks.run(running, cx);
             if read.load(Ordering::Relaxed) - streams.since > streams.bound {
                 let (key, _) = streams.calls.swap_remove(0);
-                return Poll::Ready(Some((key, Err(Failed::Invalid))));
+                return Poll::Ready(Some((key, Err(Exchanged::Invalid))));
             }
             for at in 0..streams.calls.len() {
                 if let Poll::Ready(outcome) = streams.calls[at].1.as_mut().poll(cx) {
@@ -305,7 +305,7 @@ impl Connection {
 }
 
 // One query out on an HTTP/2 stream.
-type Call = Pin<Box<dyn Future<Output = Result<(Vec<u8>, bool), Failed>> + Send>>;
+type Call = Pin<Box<dyn Future<Output = Result<(Vec<u8>, bool), Exchanged>> + Send>>;
 
 // The streams out on an HTTP/2 connection, each with its caller's key, and
 // the bytes they may read between them, counted from `since`.
@@ -318,12 +318,12 @@ struct Streams {
 
 // Reads the response `sent` resolves to.
 async fn call(
-    sent: impl Future<Output = Result<Response<Incoming>, Failed>>,
+    sent: impl Future<Output = Result<Response<Incoming>, Exchanged>>,
     two: bool,
-) -> Result<(Vec<u8>, bool), Failed> {
+) -> Result<(Vec<u8>, bool), Exchanged> {
     let response = sent.await?;
     if response.status() != StatusCode::OK {
-        return Err(Failed::Http(response.status().as_u16()));
+        return Err(Exchanged::Http(response.status().as_u16()));
     }
     let length = judge(response.headers(), two)?;
     let close = !two && (response.version() != Version::HTTP_11 || closes(response.headers()));
@@ -341,7 +341,7 @@ async fn call(
             continue;
         };
         if data.len() > REPLY_CAP - reply.len() {
-            return Err(Failed::Invalid);
+            return Err(Exchanged::Invalid);
         }
         reply.extend_from_slice(&data);
     }
@@ -350,11 +350,11 @@ async fn call(
 
 // What a hyper error says of the exchange: a response that does not parse is
 // invalid, anything else a reply cut short.
-fn failed(error: hyper::Error) -> Failed {
+fn failed(error: hyper::Error) -> Exchanged {
     if error.is_parse() {
-        Failed::Invalid
+        Exchanged::Invalid
     } else {
-        Failed::Cut
+        Exchanged::Cut
     }
 }
 
@@ -368,10 +368,14 @@ fn failed(error: hyper::Error) -> Failed {
 // connection.
 // A response this side refused, such as a header list over the cap or a
 // protocol error on the stream, is invalid.
-fn failed_two(error: &hyper::Error, begun: bool) -> Failed {
-    let gone = if begun { Failed::Cut } else { Failed::Closed };
+fn failed_two(error: &hyper::Error, begun: bool) -> Exchanged {
+    let gone = if begun {
+        Exchanged::Cut
+    } else {
+        Exchanged::Closed
+    };
     if error.is_parse() {
-        return Failed::Invalid;
+        return Exchanged::Invalid;
     }
     // hyper passes an h2 IO error on as the IO error itself.
     let cause = std::error::Error::source(error);
@@ -389,10 +393,10 @@ fn failed_two(error: &hyper::Error, begun: bool) -> Failed {
                 && h2.is_remote()
                 && h2.reason() == Some(h2::Reason::REFUSED_STREAM) =>
         {
-            Failed::Refused
+            Exchanged::Refused
         }
-        Some(h2) if h2.is_reset() && h2.is_remote() => Failed::Reset,
-        _ => Failed::Invalid,
+        Some(h2) if h2.is_reset() && h2.is_remote() => Exchanged::Reset,
+        _ => Exchanged::Invalid,
     }
 }
 
@@ -400,7 +404,7 @@ fn failed_two(error: &hyper::Error, begun: bool) -> Failed {
 // one. Their values must be visible ASCII, the content type a DNS message,
 // and the body delimited by a single length within the cap, by chunked alone
 // over HTTP/1.1, or by the end of the stream over HTTP/2.
-fn judge(headers: &HeaderMap, two: bool) -> Result<Option<usize>, Failed> {
+fn judge(headers: &HeaderMap, two: bool) -> Result<Option<usize>, Exchanged> {
     for name in [CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION, CONTENT_TYPE] {
         if headers.get_all(&name).iter().any(|value| {
             !value
@@ -408,7 +412,7 @@ fn judge(headers: &HeaderMap, two: bool) -> Result<Option<usize>, Failed> {
                 .iter()
                 .all(|byte| byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t'))
         }) {
-            return Err(Failed::Invalid);
+            return Err(Exchanged::Invalid);
         }
     }
     let text = |name| -> Vec<&str> {
@@ -425,16 +429,16 @@ fn judge(headers: &HeaderMap, two: bool) -> Result<Option<usize>, Failed> {
         .next()
         .is_some_and(|media| media.trim().eq_ignore_ascii_case(DNS_MESSAGE)));
     if !typed {
-        return Err(Failed::Invalid);
+        return Err(Exchanged::Invalid);
     }
     match (
         text(CONTENT_LENGTH).as_slice(),
         text(TRANSFER_ENCODING).as_slice(),
     ) {
-        ([length], []) => length_of(length).map(Some).ok_or(Failed::Invalid),
+        ([length], []) => length_of(length).map(Some).ok_or(Exchanged::Invalid),
         ([], []) if two => Ok(None),
         ([], [coding]) if !two && coding.trim().eq_ignore_ascii_case("chunked") => Ok(None),
-        _ => Err(Failed::Invalid),
+        _ => Err(Exchanged::Invalid),
     }
 }
 
@@ -474,11 +478,11 @@ fn authority(address: SocketAddr) -> String {
 // The path a request may be sent to: it starts with '/' and holds only
 // visible ASCII, so no space, control byte or line break reaches the
 // request line.
-fn target(path: &str) -> Result<Uri, Failed> {
+fn target(path: &str) -> Result<Uri, Exchanged> {
     if !path.starts_with('/') || !path.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err(Failed::Invalid);
+        return Err(Exchanged::Invalid);
     }
-    Uri::try_from(path).map_err(|_| Failed::Invalid)
+    Uri::try_from(path).map_err(|_| Exchanged::Invalid)
 }
 
 // The request for one query: these four headers and the query, nothing
@@ -488,7 +492,7 @@ fn request(
     path: &str,
     packet: &[u8],
     two: bool,
-) -> Result<Request<Query>, Failed> {
+) -> Result<Request<Query>, Exchanged> {
     let path = target(path)?;
     let host = authority(address);
     let builder = if two {
@@ -497,7 +501,7 @@ fn request(
             .authority(host)
             .path_and_query(path.path_and_query().map_or("/", |path| path.as_str()))
             .build()
-            .map_err(|_| Failed::Invalid)?;
+            .map_err(|_| Exchanged::Invalid)?;
         Request::builder().uri(uri)
     } else {
         Request::builder().uri(path).header(HOST, host)
@@ -508,7 +512,7 @@ fn request(
         .header(ACCEPT, DNS_MESSAGE)
         .header(CONTENT_LENGTH, packet.len())
         .body(Query(Some(Bytes::copy_from_slice(packet))))
-        .map_err(|_| Failed::Invalid)
+        .map_err(|_| Exchanged::Invalid)
 }
 
 // A query as a request body: one frame.
@@ -624,7 +628,7 @@ mod tests {
             "dns-query",
             "",
         ] {
-            assert!(matches!(target(path), Err(Failed::Invalid)), "{path:?}");
+            assert!(matches!(target(path), Err(Exchanged::Invalid)), "{path:?}");
             for two in [false, true] {
                 assert!(
                     request("192.0.2.53:443".parse().unwrap(), path, &[0; 12], two).is_err(),
