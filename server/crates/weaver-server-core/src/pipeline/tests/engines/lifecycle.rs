@@ -243,6 +243,7 @@ async fn the_last_server_refusing_credentials_fails_the_job(servers: &[u32], nam
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
     pipeline.active_download_connections = 1;
@@ -390,6 +391,7 @@ async fn refused_probe_for_first_article(
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
     pipeline.active_download_connections = 1;

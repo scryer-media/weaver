@@ -244,18 +244,12 @@ impl Pipeline {
     // config can describe is lane-served — plaintext, implicit TLS, STARTTLS,
     // and a TLS server whose preferred backend cannot build trust for it,
     // which the rustls backend picks up — so no server needs a second
-    // download path and none exists. The only lease that leaves here by
-    // another route is one whose articles are already in the repeated-article
-    // cache, which is answered from memory rather than fetched at all.
+    // download path and none exists. An article several files share goes
+    // the same way: the lane fetches it once and answers its other
+    // references from the job's repeated-article cache, which the lease
+    // carries.
     pub(crate) fn spawn_download_batch(&mut self, initial_lease: DownloadBatchLease) {
         if initial_lease.works.is_empty() {
-            return;
-        }
-
-        if !self.repeated_articles.is_empty()
-            && let Some(cache) = self.repeated_articles.get(&initial_lease.job_id)
-        {
-            self.spawn_repeated_download_batch(initial_lease, Arc::clone(cache));
             return;
         }
 

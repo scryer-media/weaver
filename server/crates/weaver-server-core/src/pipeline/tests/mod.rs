@@ -74,6 +74,7 @@ mod queue_window;
 mod restore_history;
 mod script_events;
 mod server_attribution;
+mod shared_articles;
 mod terminal_settlement;
 mod uu_assembly;
 mod yenc_compatibility;

@@ -81,6 +81,7 @@ async fn a_recovery_lease_takes_an_owned_lane() {
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
 
@@ -132,6 +133,7 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
 
