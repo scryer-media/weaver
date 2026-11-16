@@ -158,6 +158,9 @@ Everything below is new since 0.16.15.
   the next connection dialled.
 - **A failed feed poll is logged as a warning,** with the feed and the
   error.
+- **A feed poll that meets a change of routes waits for it.** It was
+  recorded as a failure, and the feed was not read again until its next
+  interval. It is now read as soon as the change ends.
 - **A held server recovers.** Its recovery probe carries real work and is
   never left unanswered, so jobs no longer stall after body timeouts or a
   refused login.
