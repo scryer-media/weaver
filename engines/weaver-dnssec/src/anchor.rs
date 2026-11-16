@@ -5,18 +5,95 @@ use std::sync::LazyLock;
 
 use crate::{Name, algorithm};
 
-/// A configured DS trust anchor for one zone.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A configured DS trust anchor for one zone: the data of one DS record
+/// (RFC 4034 section 5) that the zone's DNSKEY set must match.
+///
+/// [`Validator::with_root_anchors`](crate::Validator::with_root_anchors)
+/// uses [`TrustAnchor::iana_root`]. To trust other keys, build anchors with
+/// [`TrustAnchor::new`] and pass them to
+/// [`Validator::new`](crate::Validator::new), which checks them.
+///
+/// ```
+/// use weaver_dnssec::{Name, Policy, TrustAnchor, Validator};
+///
+/// let mut anchors = TrustAnchor::iana_root();
+/// anchors.push(TrustAnchor::new(
+///     Name::from_text("corp.example.").unwrap(),
+///     12_345, // key tag
+///     13,     // ECDSA P-256 with SHA-256
+///     2,      // SHA-256 digest
+///     vec![0; 32],
+/// ));
+/// let validator = Validator::new(anchors, Policy::default()).unwrap();
+/// # drop(validator);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TrustAnchor {
-    pub zone: Name,
-    pub key_tag: u16,
-    pub algorithm: u8,
-    pub digest_type: u8,
-    pub digest: Vec<u8>,
+    pub(crate) zone: Name,
+    pub(crate) key_tag: u16,
+    pub(crate) algorithm: u8,
+    pub(crate) digest_type: u8,
+    pub(crate) digest: Vec<u8>,
 }
 
-/// Cryptographic choices. Limits are fixed independently of policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl TrustAnchor {
+    /// An anchor for `zone` with one DS record's key tag, DNSSEC algorithm
+    /// number, digest type and digest. It is checked when a validator is
+    /// built from it.
+    pub fn new(zone: Name, key_tag: u16, algorithm: u8, digest_type: u8, digest: Vec<u8>) -> Self {
+        Self {
+            zone,
+            key_tag,
+            algorithm,
+            digest_type,
+            digest,
+        }
+    }
+
+    /// The built-in IANA root trust anchors: the root key-signing keys with
+    /// key tags 20326 and 38696, as published in IANA's root-anchors.xml.
+    /// The retired key 19036 is not included.
+    pub fn iana_root() -> Vec<TrustAnchor> {
+        root_anchors()
+    }
+
+    /// The zone whose keys this anchor proves.
+    pub fn zone(&self) -> &Name {
+        &self.zone
+    }
+
+    /// The key tag of the key the digest is of.
+    pub fn key_tag(&self) -> u16 {
+        self.key_tag
+    }
+
+    /// The DNSSEC algorithm number of that key.
+    pub fn algorithm(&self) -> u8 {
+        self.algorithm
+    }
+
+    /// The DS digest type number.
+    pub fn digest_type(&self) -> u8 {
+        self.digest_type
+    }
+
+    /// The digest of the key.
+    pub fn digest(&self) -> &[u8] {
+        &self.digest
+    }
+}
+
+/// Cryptographic choices. Limits are fixed independently of policy; they are
+/// in [`limits`](crate::limits).
+///
+/// Start from [`Policy::default`] and set the fields to change:
+///
+/// ```
+/// let mut policy = weaver_dnssec::Policy::default();
+/// policy.sha1_ds_digests = false;
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Policy {
     /// Accept RSA/SHA-1 signatures and delegations (algorithms 5 and 7).
     /// Disabled by default per RFC 9905; retained for explicit compatibility.
@@ -35,16 +112,25 @@ impl Default for Policy {
 }
 
 /// A trust-anchor configuration that cannot initialize a validator.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
 pub enum AnchorError {
+    /// No trust anchor was given.
     #[error("at least one trust anchor is required")]
     EmptyAnchors,
+    /// An anchor's digest has the wrong length for its known digest type.
     #[error("digest type {digest_type} needs {expected} octets, received {actual}")]
+    #[non_exhaustive]
     InvalidDigestLength {
+        /// The anchor's digest type.
         digest_type: u8,
+        /// The length that digest type has.
         expected: usize,
+        /// The length the anchor's digest has.
         actual: usize,
     },
+    /// Every anchor uses an algorithm or digest type this validator does not
+    /// check under the policy.
     #[error("no trust anchor is usable under this policy")]
     NoUsableAnchors,
 }
@@ -86,11 +172,18 @@ const ROOT_DS_38696: [u8; 32] = [
     0x29, 0x8d, 0x0a, 0x45, 0x0d, 0x61, 0x2c, 0x48, 0x3a, 0xf4, 0x44, 0xa4, 0xc0, 0xfb, 0x2b, 0x16,
 ];
 
-// Built-in negative trust anchors. The list is systemd-resolved's
-// (src/resolve/resolved-dns-trust-anchor.c, private_domains), joined with the
-// locally served zones of RFC 6303 section 4, home.arpa (RFC 8375), local
-// (RFC 6762) and internal. The root cannot prove anything under these names.
-const PRIVATE_ZONES: &[&str] = &[
+// The list is systemd-resolved's (src/resolve/resolved-dns-trust-anchor.c,
+// private_domains), joined with the locally served zones of RFC 6303
+// section 4, home.arpa (RFC 8375), local (RFC 6762) and internal.
+/// The built-in negative trust anchors: private and special-use zones, in
+/// presentation form.
+///
+/// The root cannot prove anything under these names, so a name at or below
+/// one of them is [`Insecure`](crate::Verdict::Insecure) with
+/// [`InsecureReason::PrivateName`](crate::InsecureReason::PrivateName), and
+/// no key or delegation query is sent for it. A configured trust anchor at or below one
+/// of these zones lifts this for the names it covers.
+pub const PRIVATE_ZONES: &[&str] = &[
     "test.",
     "local.",
     "home.",

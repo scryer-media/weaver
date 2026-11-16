@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_dnssec::testing::{
-    DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, drive, signature_checks,
+    self, DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, drive, signature_checks,
 };
 use weaver_dnssec::{
     BogusReason, Name, Outcome, Policy, Query, Question, RecordType as T, Step, SupplyError,
@@ -16,10 +16,7 @@ fn n(text: &str) -> Name {
     Name::from_text(text).unwrap()
 }
 fn q(text: &str, rtype: T) -> Query {
-    Query {
-        name: n(text),
-        rtype,
-    }
+    Query::new(n(text), rtype)
 }
 fn question(text: &str, rtype: T) -> Question {
     Question::new(n(text), rtype).unwrap()
@@ -40,29 +37,26 @@ fn run(resolver: &FakeResolver, name: &str, rtype: T) -> (Verdict, Vec<Query>) {
     drive(&validator(resolver), resolver, question(name, rtype), NOW)
 }
 fn secure(verdict: &Verdict, expected: Outcome) {
-    let Verdict::Secure(answer) = verdict else {
+    let Verdict::Secure { answer, .. } = verdict else {
         panic!("expected secure {expected:?}, got {verdict:?}")
     };
-    assert_eq!(answer.outcome, expected);
-    assert_eq!(answer.ttl, 300);
+    assert_eq!(*answer.outcome(), expected);
+    assert_eq!(answer.ttl(), 300);
 }
 fn records(name: &str) -> Outcome {
-    Outcome::Records {
-        name: n(name),
-        rdata: vec![IP.to_vec()],
-    }
+    testing::records(n(name), vec![IP.to_vec()])
 }
 fn insecure(verdict: &Verdict, expected: Outcome) {
-    let Verdict::Insecure(answer) = verdict else {
+    let Verdict::Insecure { answer, .. } = verdict else {
         panic!("expected insecure {expected:?}, got {verdict:?}")
     };
-    assert_eq!(answer.outcome, expected);
+    assert_eq!(*answer.outcome(), expected);
 }
 fn bogus(verdict: &Verdict, reason: BogusReason) {
-    let Verdict::Bogus(failure) = verdict else {
+    let Verdict::Bogus { failure, .. } = verdict else {
         panic!("expected bogus {reason:?}, got {verdict:?}")
     };
-    assert_eq!(failure.reason, reason);
+    assert_eq!(failure.reason(), reason);
 }
 fn cold_queries() -> Vec<Query> {
     vec![
@@ -76,12 +70,12 @@ fn cold_queries() -> Vec<Query> {
 }
 fn nsec(owner: &str, next: &str, types: &[T]) -> Record {
     let mut rdata = n(next).as_wire().to_vec();
-    let max = types.iter().map(|t| t.0).max().unwrap_or(0);
+    let max = types.iter().map(|t| t.get()).max().unwrap_or(0);
     assert!(max < 256);
     if !types.is_empty() {
         let mut bits = vec![0; usize::from(max / 8) + 1];
         for t in types {
-            bits[usize::from(t.0 / 8)] |= 0x80 >> (t.0 % 8);
+            bits[usize::from(t.get() / 8)] |= 0x80 >> (t.get() % 8);
         }
         rdata.extend([0, bits.len() as u8]);
         rdata.extend(bits);
@@ -110,7 +104,7 @@ fn secure_a_record_three_zones() {
     let (verdict, queries) = run(&resolver, "news.example.com", T::A);
     secure(&verdict, records("news.example.com"));
     assert_eq!(queries, cold_queries());
-    let Verdict::Secure(answer) = verdict else {
+    let Verdict::Secure { answer, .. } = verdict else {
         unreachable!()
     };
     assert_eq!(answer.addresses(), vec![std::net::IpAddr::V4(IP.into())]);
@@ -223,7 +217,7 @@ fn secure_dname_with_unsigned_cname() {
 fn secure_dname_without_cname() {
     let mut resolver = aliases(true);
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer.retain(|r| r.rtype != T::CNAME);
         }
     });
@@ -231,6 +225,38 @@ fn secure_dname_without_cname() {
         &run(&resolver, "news.old.example.com", T::A).0,
         records("news.example.net"),
     );
+}
+fn alias_chain(verdict: &Verdict) -> Vec<Name> {
+    let Some(answer) = verdict.answer() else {
+        panic!("expected an answer, got {verdict:?}")
+    };
+    answer.alias_chain().to_vec()
+}
+#[test]
+fn a_cname_answer_lists_the_question_then_the_target() {
+    let resolver = aliases(false);
+    let (verdict, _) = run(&resolver, "news.example.com", T::A);
+    secure(&verdict, records("news.example.net"));
+    assert_eq!(
+        alias_chain(&verdict),
+        vec![n("news.example.com"), n("news.example.net")]
+    );
+}
+#[test]
+fn a_dname_answer_lists_the_question_then_the_synthesised_target() {
+    let resolver = aliases(true);
+    let (verdict, _) = run(&resolver, "news.old.example.com", T::A);
+    secure(&verdict, records("news.example.net"));
+    assert_eq!(
+        alias_chain(&verdict),
+        vec![n("news.old.example.com"), n("news.example.net")]
+    );
+}
+#[test]
+fn an_unaliased_answer_lists_only_the_question() {
+    let resolver = tree();
+    let (verdict, _) = run(&resolver, "news.example.com", T::A);
+    assert_eq!(alias_chain(&verdict), vec![n("news.example.com")]);
 }
 
 fn wildcard(mode: DenialMode) -> FakeResolver {
@@ -313,7 +339,7 @@ fn secure_nodata_ent() {
 fn nxdomain_rcode_with_nodata_proof_is_nodata() {
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::AAAA {
+        if query.rtype() == T::AAAA {
             reply.rcode = 3;
         }
     });
@@ -331,7 +357,7 @@ fn secure_cname_to_missing_name_with_noerror_rcode() {
         .records
         .retain(|r| r.rtype != T::A);
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.rcode = 0;
         }
     });
@@ -345,7 +371,7 @@ fn secure_nodata_after_cname_into_other_zone_with_first_zones_nsec_present() {
     let mut resolver = aliases(false);
     let extra = resolver.zones()[1].denial_records().unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::AAAA {
+        if query.rtype() == T::AAAA {
             reply.authority.splice(0..0, extra.clone());
         }
     });
@@ -386,7 +412,7 @@ fn compressed_rrsig_signer_name_still_verifies() {
         }
         // The answer encoder emits uncompressed records. Point the RRSIG signer
         // back at the example.com suffix in the question (offset 17).
-        let mut position = 12 + query.name.as_wire().len() + 4;
+        let mut position = 12 + query.name().as_wire().len() + 4;
         for _ in 0..2 {
             while bytes[position] != 0 {
                 position += usize::from(bytes[position]) + 1;
@@ -443,6 +469,7 @@ fn mldsa_chain_authenticates_keys_once_and_reuses_the_cache() {
     let resolver = mldsa_tree();
     let v = validator(&resolver);
     let mut validation = v.begin(question("news.example", T::A), NOW);
+    validation.set_ask_ahead(false);
     let mut queries = Vec::new();
     loop {
         let step = validation.step();
@@ -450,16 +477,17 @@ fn mldsa_chain_authenticates_keys_once_and_reuses_the_cache() {
         assert_eq!(validation.step(), step);
         assert_eq!(signature_checks(&validation), checks);
         match step {
-            Step::Need(query) => {
+            Step::Need { awaited: query, .. } => {
                 queries.push(query.clone());
                 validation
                     .supply(&query, &resolver.answer(&query).unwrap())
                     .unwrap();
             }
-            Step::Done(verdict) => {
+            Step::Done { verdict, .. } => {
                 secure(&verdict, records("news.example"));
                 break;
             }
+            step => panic!("unexpected step {step:?}"),
         }
     }
     assert_eq!(
@@ -590,7 +618,7 @@ fn mldsa_signed_nsec_and_nsec3_prove_negative_answers_and_reject_tampering() {
             resolver.zone_mut(&n("example")).unwrap().denial = mode.clone();
             secure(&run(&resolver, owner, rtype).0, outcome);
             resolver.tamper(|query, reply| {
-                if query.rtype == T::DNSKEY || query.rtype == T::DS {
+                if query.rtype() == T::DNSKEY || query.rtype() == T::DS {
                     return;
                 }
                 for record in &mut reply.authority {
@@ -655,12 +683,14 @@ fn mldsa_invalid_signatures_obey_the_rrset_work_budget() {
         });
         let v = validator(&resolver);
         let mut validation = v.begin(question("news.example", T::A), NOW);
+        validation.set_ask_ahead(false);
         let verdict = loop {
             match validation.step() {
-                Step::Need(query) => validation
+                Step::Need { awaited: query, .. } => validation
                     .supply(&query, &resolver.answer(&query).unwrap())
                     .unwrap(),
-                Step::Done(verdict) => break verdict,
+                Step::Done { verdict, .. } => break verdict,
+                step => panic!("unexpected step {step:?}"),
             }
         };
         // Twenty failures end the RRset before its valid signature is tried.
@@ -797,7 +827,7 @@ fn insecure_negative_answer_proving_unsigned_delegation_above_name() {
     let mut resolver = unsigned(DenialMode::Nsec);
     let proofs = resolver.zones()[0].denial_records().unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.authority = proofs.clone();
         }
     });
@@ -832,7 +862,7 @@ fn insecure_zone_whose_only_ds_matched_key_is_rsa_512() {
 fn bogus_rrsigs_stripped_from_answer() {
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.strip_signatures();
         }
     });
@@ -848,7 +878,7 @@ fn unsigned_answer_beside_other_signatures_is_signatures_missing() {
         .signed_rrset(&n("other.example.com"), T::A)
         .unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.strip_signatures();
             reply.answer.extend(other.clone());
         }
@@ -862,7 +892,7 @@ fn unsigned_answer_beside_other_signatures_is_signatures_missing() {
 fn bogus_rrsigs_stripped_and_ds_reply_stripped() {
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.strip_signatures();
         }
         if query == &q("example.com", T::DS) {
@@ -879,7 +909,7 @@ fn bogus_rrsigs_stripped_and_ds_reply_stripped() {
 fn bogus_answer_record_changed() {
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer[0].rdata[3] ^= 1;
         }
     });
@@ -892,9 +922,9 @@ fn bogus_answer_record_changed() {
 fn bogus_extra_record_added_to_rrset() {
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer.push(Record::new(
-                query.name.clone(),
+                query.name().clone(),
                 T::A,
                 300,
                 vec![203, 0, 113, 99],
@@ -915,7 +945,7 @@ fn bogus_record_removed_from_rrset() {
         vec![203, 0, 113, 8],
     );
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             let index = reply.answer.iter().position(|r| r.rtype == T::A).unwrap();
             reply.answer.remove(index);
         }
@@ -989,7 +1019,7 @@ fn bogus_signed_by_sibling_zone() {
         )])
         .unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer = evil.clone();
         }
     });
@@ -1011,7 +1041,7 @@ fn bogus_signed_by_child_claimed_as_zone() {
         )])
         .unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer = evil.clone();
         }
     });
@@ -1107,7 +1137,7 @@ fn bogus_nxdomain_without_wildcard_denial() {
         .sign_records(vec![nsec("a.example.com", "z.example.com", &[T::A])])
         .unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.authority = proof.clone();
         }
     });
@@ -1120,7 +1150,7 @@ fn bogus_nxdomain_without_wildcard_denial() {
 fn bogus_nxdomain_proof_with_noerror_rcode() {
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.rcode = 0;
         }
     });
@@ -1136,7 +1166,7 @@ fn bogus_nodata_with_type_bit_set() {
         .sign_records(vec![nsec("news.example.com", "example.com", &[T::A])])
         .unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer.clear();
             reply.authority = proof.clone();
         }
@@ -1175,7 +1205,7 @@ fn denial_nsec_keeps_its_signed_wildcard_owner() {
 fn bogus_negative_answer_no_nsec_in_signed_zone() {
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.authority.clear();
         }
     });
@@ -1188,7 +1218,7 @@ fn bogus_negative_answer_no_nsec_in_signed_zone() {
 fn bogus_wildcard_answer_without_closer_name_proof() {
     let mut resolver = wildcard(DenialMode::Nsec);
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.authority.clear();
         }
     });
@@ -1211,7 +1241,7 @@ fn bogus_wildcard_answer_with_closer_wildcard_nsec() {
         .sign_records(vec![nsec("*.b.example.com", "c.example.com", &[T::A])])
         .unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer = expanded.clone();
             reply.authority = proofs.clone();
         }
@@ -1262,7 +1292,7 @@ fn bogus_wildcard_dname() {
         record.owner = n("old.example.com");
     }
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.answer.retain(|r| {
                 r.rtype != T::DNAME
                     && !(r.rtype == T::RRSIG && r.rdata[..2] == 39_u16.to_be_bytes())
@@ -1279,7 +1309,7 @@ fn bogus_wildcard_dname() {
 fn bogus_cname_after_dname_wrong_target() {
     let mut resolver = aliases(true);
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             for record in &mut reply.answer {
                 if record.rtype == T::CNAME {
                     record.rdata = n("wrong.example.net").as_wire().to_vec();
@@ -1359,7 +1389,7 @@ fn secure_with_an_unrelated_extra_signer_on_one_rrset() {
         )])
         .unwrap();
     resolver.tamper(move |query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply
                 .answer
                 .extend(extra.iter().filter(|r| r.rtype == T::RRSIG).cloned());
@@ -1374,7 +1404,7 @@ fn secure_with_an_unrelated_extra_signer_on_one_rrset() {
 fn additional_section_records_are_never_used() {
     let mut resolver = tree();
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.additional.append(&mut reply.answer);
         }
     });
@@ -1403,17 +1433,16 @@ fn unanswered_case(target: Query, cause: UnansweredCause) {
                 ..Reply::default()
             },
         ),
+        other => panic!("no fixture for {other:?}"),
     }
     let v = validator(&resolver);
     let (verdict, queries) = drive(&v, &resolver, question("news.example.com", T::A), NOW);
-    assert_eq!(
-        verdict,
-        Verdict::Unanswered(weaver_dnssec::Unanswered {
-            query: target.clone(),
-            cause,
-            extended_errors: Vec::new(),
-        })
-    );
+    let Verdict::Unanswered { failure, .. } = &verdict else {
+        panic!("expected unanswered, got {verdict:?}");
+    };
+    assert_eq!(*failure.query(), target);
+    assert_eq!(failure.cause(), cause);
+    assert!(failure.extended_errors().is_empty());
     let sequence = cold_queries();
     let failed_at = sequence.iter().position(|query| query == &target).unwrap();
     assert_eq!(queries, sequence[..=failed_at]);
@@ -1493,7 +1522,7 @@ fn bogus_when_ds_servfail_and_answer_unsigned() {
         },
     );
     resolver.tamper(|query, reply| {
-        if query.rtype == T::A {
+        if query.rtype() == T::A {
             reply.strip_signatures();
         }
     });
@@ -1559,7 +1588,12 @@ fn work_limit_queries() {
         main.clone(),
         Reply {
             answer: attacker
-                .sign_records(vec![Record::new(main.name.clone(), T::A, 300, IP.to_vec())])
+                .sign_records(vec![Record::new(
+                    main.name().clone(),
+                    T::A,
+                    300,
+                    IP.to_vec(),
+                )])
                 .unwrap(),
             ..Reply::default()
         },
@@ -1572,10 +1606,7 @@ fn work_limit_queries() {
         let owner = n(&labels).suffix(count).unwrap();
         replace_reply(
             &mut resolver,
-            Query {
-                name: owner.clone(),
-                rtype: T::DS,
-            },
+            Query::new(owner.clone(), T::DS),
             Reply {
                 answer: root.signed_rrset(&owner, T::CNAME).unwrap(),
                 ..Reply::default()
@@ -1627,12 +1658,14 @@ fn work_limit_signatures() {
     );
     let v = validator(&resolver);
     let mut validation = v.begin(question("missing", T::A), NOW);
+    validation.set_ask_ahead(false);
     let verdict = loop {
         match validation.step() {
-            Step::Done(verdict) => break verdict,
-            Step::Need(query) => validation
+            Step::Done { verdict, .. } => break verdict,
+            Step::Need { awaited: query, .. } => validation
                 .supply(&query, &resolver.answer(&query).unwrap())
                 .unwrap(),
+            step => panic!("unexpected step {step:?}"),
         }
     };
     bogus(&verdict, BogusReason::WorkLimit);
@@ -1643,8 +1676,13 @@ fn step_repeats_need_until_supplied() {
     let resolver = tree();
     let v = validator(&resolver);
     let mut validation = v.begin(question("news.example.com", T::A), NOW);
+    validation.set_ask_ahead(false);
     let first = validation.step();
-    assert_eq!(first, Step::Need(q("news.example.com", T::A)));
+    let Step::Need { awaited, ahead, .. } = &first else {
+        panic!("expected a needed query, got {first:?}");
+    };
+    assert_eq!(*awaited, q("news.example.com", T::A));
+    assert!(ahead.is_empty());
     for _ in 0..4 {
         assert_eq!(validation.step(), first);
         assert_eq!(signature_checks(&validation), 0);
@@ -1655,12 +1693,14 @@ fn step_repeats_done() {
     let resolver = tree();
     let v = validator(&resolver);
     let mut validation = v.begin(question("news.example.com", T::A), NOW);
+    validation.set_ask_ahead(false);
     let final_step = loop {
         match validation.step() {
-            Step::Need(query) => validation
+            Step::Need { awaited: query, .. } => validation
                 .supply(&query, &resolver.answer(&query).unwrap())
                 .unwrap(),
-            done @ Step::Done(_) => break done,
+            done @ Step::Done { .. } => break done,
+            step => panic!("unexpected step {step:?}"),
         }
     };
     let count = signature_checks(&validation);
@@ -1669,7 +1709,7 @@ fn step_repeats_done() {
         assert_eq!(signature_checks(&validation), count);
     }
     assert_eq!(
-        validation.failed(&q("news.example.com", T::A)),
+        validation.supply_failure(&q("news.example.com", T::A)),
         Err(SupplyError::UnexpectedQuery)
     );
     assert_eq!(validation.step(), final_step);
@@ -1679,6 +1719,7 @@ fn supply_for_wrong_query_is_an_error_and_changes_nothing() {
     let resolver = tree();
     let v = validator(&resolver);
     let mut validation = v.begin(question("news.example.com", T::A), NOW);
+    validation.set_ask_ahead(false);
     let wrong = q("other.example.com", T::A);
     let bytes = resolver.answer(&wrong).unwrap();
     assert_eq!(
@@ -1690,15 +1731,19 @@ fn supply_for_wrong_query_is_an_error_and_changes_nothing() {
         validation.supply(&wrong, &bytes),
         Err(SupplyError::UnexpectedQuery)
     );
-    assert_eq!(validation.failed(&wrong), Err(SupplyError::UnexpectedQuery));
+    assert_eq!(
+        validation.supply_failure(&wrong),
+        Err(SupplyError::UnexpectedQuery)
+    );
     assert_eq!(validation.step(), expected);
     assert_eq!(signature_checks(&validation), 0);
     let verdict = loop {
         match validation.step() {
-            Step::Need(query) => validation
+            Step::Need { awaited: query, .. } => validation
                 .supply(&query, &resolver.answer(&query).unwrap())
                 .unwrap(),
-            Step::Done(verdict) => break verdict,
+            Step::Done { verdict, .. } => break verdict,
+            step => panic!("unexpected step {step:?}"),
         }
     };
     secure(&verdict, records("news.example.com"));
@@ -1708,6 +1753,7 @@ fn no_crypto_repeated_across_steps() {
     let resolver = tree();
     let v = validator(&resolver);
     let mut validation = v.begin(question("news.example.com", T::A), NOW);
+    validation.set_ask_ahead(false);
     let mut queries = Vec::new();
     loop {
         let step = validation.step();
@@ -1715,16 +1761,17 @@ fn no_crypto_repeated_across_steps() {
         assert_eq!(validation.step(), step);
         assert_eq!(signature_checks(&validation), before);
         match step {
-            Step::Need(query) => {
+            Step::Need { awaited: query, .. } => {
                 queries.push(query.clone());
                 validation
                     .supply(&query, &resolver.answer(&query).unwrap())
                     .unwrap();
             }
-            Step::Done(verdict) => {
+            Step::Done { verdict, .. } => {
                 secure(&verdict, records("news.example.com"));
                 break;
             }
+            step => panic!("unexpected step {step:?}"),
         }
     }
     assert_eq!(queries, cold_queries());
@@ -1755,9 +1802,9 @@ fn byte_flip_sweep() {
             bytes[index] ^= 1;
             resolver.set_reply(query.clone(), Some(bytes));
             let (verdict, _) = run(&resolver, "news.example.com", T::A);
-            if let Verdict::Secure(answer) | Verdict::Insecure(answer) = verdict {
+            if let Verdict::Secure { answer, .. } | Verdict::Insecure { answer, .. } = verdict {
                 assert_eq!(
-                    answer.outcome,
+                    *answer.outcome(),
                     records("news.example.com"),
                     "query {query:?}, byte {index}"
                 );
@@ -1784,7 +1831,7 @@ fn ancestor_dname_cannot_bypass_a_more_specific_anchor() {
         let mut resolver = FakeResolver::new(vec![zone("."), parent, target]).unwrap();
         if !synthesized_cname {
             resolver.tamper(|query, reply| {
-                if query.rtype == T::A {
+                if query.rtype() == T::A {
                     reply.answer.retain(|record| record.rtype != T::CNAME);
                 }
             });

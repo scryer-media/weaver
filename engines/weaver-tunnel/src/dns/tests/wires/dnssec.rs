@@ -52,12 +52,12 @@ fn question(query: &[u8]) -> (Query, usize) {
         at += 1 + query[at] as usize;
     }
     let name = Name::from_wire(&query[12..=at]).unwrap();
-    let rtype = RecordType(u16::from_be_bytes([query[at + 1], query[at + 2]]));
+    let rtype = RecordType::new(u16::from_be_bytes([query[at + 1], query[at + 2]]));
     (name_query(name, rtype), at + 5)
 }
 
 fn name_query(name: Name, rtype: RecordType) -> Query {
-    Query { name, rtype }
+    Query::new(name, rtype)
 }
 
 // How a fixture server answers.
@@ -331,7 +331,7 @@ async fn a_family_that_fails_the_check_is_counted_bogus_when_the_other_answers()
     let answered = resolver.clone();
     let answer = move |_: IpAddr, _: u16, query: &[u8]| {
         let (asked, _) = question(query);
-        if asked.rtype != RecordType::AAAA {
+        if asked.rtype() != RecordType::AAAA {
             return reply(&answered, Serves::Signed, query);
         }
         let mut made = answered.reply(&asked).unwrap();
@@ -1012,12 +1012,12 @@ async fn a_lookup_ends_once_both_checks_have_their_verdicts_on_every_wire() {
     let signed = resolver.clone();
     let answer = move |_: IpAddr, _: u16, query: &[u8]| {
         let (asked, _) = question(query);
-        if asked.name == name("www.example.com.")
-            && matches!(asked.rtype, RecordType::A | RecordType::AAAA)
+        if *asked.name() == name("www.example.com.")
+            && matches!(asked.rtype(), RecordType::A | RecordType::AAAA)
         {
             return servfail(query);
         }
-        if asked.rtype == RecordType::DNSKEY {
+        if asked.rtype() == RecordType::DNSKEY {
             return Vec::new();
         }
         reply(&signed, Serves::Signed, query)
@@ -1053,10 +1053,10 @@ async fn a_finished_check_leaves_its_unsent_queries_unsent_while_the_other_runs(
     let signed = resolver.clone();
     let answer = move |_: IpAddr, _: u16, query: &[u8]| {
         let (asked, _) = question(query);
-        if asked.rtype == RecordType::AAAA {
+        if asked.rtype() == RecordType::AAAA {
             return Vec::new();
         }
-        if asked.rtype == RecordType::DS {
+        if asked.rtype() == RecordType::DS {
             // REFUSED, with the question alone.
             let mut refused = servfail(query);
             refused[3] = 0x85;
@@ -1084,7 +1084,7 @@ async fn a_finished_check_leaves_its_unsent_queries_unsent_while_the_other_runs(
         .unwrap()
         .requests
         .iter()
-        .map(|seen| question(&seen.body).0.rtype)
+        .map(|seen| question(&seen.body).0.rtype())
         .collect();
     assert_eq!(
         asked,
@@ -1105,7 +1105,7 @@ async fn a_check_that_fails_part_way_or_at_tls_moves_to_the_next_server() {
     let signed = resolver.clone();
     // 192.0.2.53 answers the addresses but fails every DNSKEY query.
     let (servers, wires) = three_over_tls(move |asked, _, query| {
-        if asked.to_string() == "192.0.2.53" && question(query).0.rtype == RecordType::DNSKEY {
+        if asked.to_string() == "192.0.2.53" && question(query).0.rtype() == RecordType::DNSKEY {
             servfail(query)
         } else {
             reply(&signed, Serves::Signed, query)
@@ -1266,11 +1266,12 @@ async fn a_validated_negative_answer_holds_by_its_soa_and_for_no_time_without_on
             let Ok(mut reply) = signed.reply(&asked) else {
                 return servfail(query);
             };
-            if asked.name == name(&format!("{host}.")) {
+            if *asked.name() == name(&format!("{host}.")) {
                 let is_soa = |record: &weaver_dnssec::testing::Record| {
                     record.rtype == RecordType::SOA
                         || (record.rtype == RecordType::RRSIG
-                            && record.rdata.get(..2) == Some(&RecordType::SOA.0.to_be_bytes()[..]))
+                            && record.rdata.get(..2)
+                                == Some(&RecordType::SOA.get().to_be_bytes()[..]))
                 };
                 match soa {
                     Soa::Kept => {}
@@ -1330,19 +1331,21 @@ fn a_cold_check_costs_this_much() {
             .collect();
         let validator = weaver_dnssec::Validator::new(anchors, Default::default()).unwrap();
         let mut validation = validator.begin(question, NOW);
+        validation.set_ask_ahead(false);
         let started = std::time::Instant::now();
         let verdict = loop {
             match validation.step() {
-                weaver_dnssec::Step::Done(verdict) => break verdict,
-                weaver_dnssec::Step::Need(query) => {
+                weaver_dnssec::Step::Done { verdict, .. } => break verdict,
+                weaver_dnssec::Step::Need { awaited: query, .. } => {
                     let (_, bytes) = replies.iter().find(|(asked, _)| *asked == query).unwrap();
                     validation.supply(&query, bytes).unwrap();
                 }
+                step => panic!("unexpected step {step:?}"),
             }
         };
         let spent = started.elapsed();
         assert!(
-            matches!(verdict, weaver_dnssec::Verdict::Secure(_)),
+            matches!(verdict, weaver_dnssec::Verdict::Secure { .. }),
             "{algorithm:?}"
         );
         println!(

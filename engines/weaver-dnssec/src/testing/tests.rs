@@ -366,7 +366,10 @@ fn collision_regeneration_updates_explicit_ds_and_retains_wrong_entries() {
         crate::Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
     let question = crate::Question::new(name("www.example."), RecordType::A).unwrap();
     let (verdict, _) = drive(&validator, &resolver, question, 1_100_000);
-    assert!(matches!(verdict, crate::Verdict::Secure(_)), "{verdict:?}");
+    assert!(
+        matches!(verdict, crate::Verdict::Secure { .. }),
+        "{verdict:?}"
+    );
 }
 
 #[test]
@@ -399,7 +402,10 @@ fn duplicate_zone_keys_preserve_retained_and_regenerated_ds_signers() {
                 .unwrap();
         let question = crate::Question::new(name("www.example."), RecordType::A).unwrap();
         let (verdict, _) = drive(&validator, &resolver, question, 1_100_000);
-        assert!(matches!(verdict, crate::Verdict::Secure(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, crate::Verdict::Secure { .. }),
+            "{verdict:?}"
+        );
     }
 }
 
@@ -428,7 +434,10 @@ fn duplicate_ds_entries_are_expanded_once_per_original_digest() {
         crate::Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
     let question = crate::Question::new(name("www.example."), RecordType::A).unwrap();
     let (verdict, _) = drive(&validator, &resolver, question, 1_100_000);
-    assert!(matches!(verdict, crate::Verdict::Secure(_)), "{verdict:?}");
+    assert!(
+        matches!(verdict, crate::Verdict::Secure { .. }),
+        "{verdict:?}"
+    );
 }
 
 #[test]
@@ -481,7 +490,7 @@ fn large_zones_return_small_sufficient_denial_proofs() {
                     .unwrap();
             let question = crate::Question::new(name(owner), rtype).unwrap();
             let (verdict, queries) = drive(&validator, &resolver, question, 1_100_000);
-            let crate::Verdict::Secure(answer) = verdict else {
+            let crate::Verdict::Secure { answer } = verdict else {
                 panic!("{owner}: {verdict:?}");
             };
             assert_eq!(answer.outcome, outcome);

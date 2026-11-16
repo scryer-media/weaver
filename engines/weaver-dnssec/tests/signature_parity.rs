@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_dnssec::testing::{
-    FakeResolver, KeyAlgorithm, Record, SignatureWindow, Zone, drive, signature_checks,
+    self, FakeResolver, KeyAlgorithm, Record, SignatureWindow, Zone, drive, signature_checks,
 };
 use weaver_dnssec::{
     BogusReason, Name, Outcome, Policy, Query, Question, RecordType as T, Step, Validator, Verdict,
@@ -40,34 +40,33 @@ fn run_with_signature_checks(resolver: &FakeResolver, name: &str) -> (Verdict, u
     let validator =
         Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
     let mut validation = validator.begin(Question::new(n(name), T::A).unwrap(), NOW);
+    validation.set_ask_ahead(false);
     loop {
         match validation.step() {
-            Step::Need(query) => validation
+            Step::Need { awaited: query, .. } => validation
                 .supply(&query, &resolver.answer(&query).unwrap())
                 .unwrap(),
-            Step::Done(verdict) => return (verdict, signature_checks(&validation)),
+            Step::Done { verdict, .. } => return (verdict, signature_checks(&validation)),
+            step => panic!("unexpected step {step:?}"),
         }
     }
 }
 
 fn assert_secure(verdict: Verdict, name: &str) {
-    let Verdict::Secure(answer) = verdict else {
+    let Verdict::Secure { answer, .. } = verdict else {
         panic!("expected secure, got {verdict:?}")
     };
     assert_eq!(
-        answer.outcome,
-        Outcome::Records {
-            name: n(name),
-            rdata: vec![IP.to_vec()]
-        }
+        *answer.outcome(),
+        testing::records(n(name), vec![IP.to_vec()])
     );
 }
 
 fn assert_bogus(verdict: Verdict, reason: BogusReason) {
-    let Verdict::Bogus(failure) = verdict else {
+    let Verdict::Bogus { failure, .. } = verdict else {
         panic!("expected bogus {reason:?}, got {verdict:?}")
     };
-    assert_eq!(failure.reason, reason);
+    assert_eq!(failure.reason(), reason);
 }
 
 #[test]
@@ -78,7 +77,7 @@ fn unrelated_signatures_are_ignored_in_both_orders_for_answers_and_chain_records
                 let mut resolver = resolver();
                 let unrelated = zone("unrelated.test");
                 resolver.tamper(move |query, reply| {
-                    if query.rtype != target {
+                    if query.rtype() != target {
                         return;
                     }
                     let mut extras = Vec::new();
@@ -108,7 +107,7 @@ fn unrelated_signatures_are_ignored_in_both_orders_for_answers_and_chain_records
                 assert!(
                     queries
                         .iter()
-                        .all(|query| !query.name.is_at_or_below(&n("unrelated.test")))
+                        .all(|query| !query.name().is_at_or_below(&n("unrelated.test")))
                 );
             }
         }
@@ -121,7 +120,7 @@ fn unrelated_signatures_are_ignored_in_negative_answers_in_both_orders() {
         let mut resolver = resolver();
         let unrelated = zone("unrelated.test");
         resolver.tamper(move |query, reply| {
-            if query.rtype != T::A {
+            if query.rtype() != T::A {
                 return;
             }
             let mut extras = Vec::new();
@@ -145,10 +144,10 @@ fn unrelated_signatures_are_ignored_in_negative_answers_in_both_orders() {
             }
         });
         let (verdict, _) = run(&resolver, "missing.example.com", NOW);
-        let Verdict::Secure(answer) = verdict else {
+        let Verdict::Secure { answer, .. } = verdict else {
             panic!("expected secure denial, got {verdict:?}")
         };
-        assert_eq!(answer.outcome, Outcome::NoSuchName);
+        assert_eq!(*answer.outcome(), Outcome::NoSuchName);
     }
 }
 
@@ -159,7 +158,7 @@ fn multiple_plausible_ancestor_signers_reject_in_both_orders_even_with_a_valid_s
             let mut resolver = resolver();
             let parent = resolver.zones()[1].clone();
             resolver.tamper(move |query, reply| {
-                if query.rtype != T::A {
+                if query.rtype() != T::A {
                     return;
                 }
                 let records: Vec<_> = reply
@@ -196,7 +195,7 @@ fn missing_unrelated_wrong_owner_and_bad_signatures_fail_closed() {
         let mut resolver = resolver();
         let unrelated = zone("unrelated.test");
         resolver.tamper(move |query, reply| {
-            if query.rtype != T::A {
+            if query.rtype() != T::A {
                 return;
             }
             match shape {
@@ -247,7 +246,7 @@ fn bad_signature_before_or_after_valid_signature_does_not_mask_success() {
     for before in [false, true] {
         let mut resolver = resolver();
         resolver.tamper(move |query, reply| {
-            if query.rtype != T::A {
+            if query.rtype() != T::A {
                 return;
             }
             let mut bad = reply
@@ -330,7 +329,7 @@ fn signature_dates_allow_a_day_of_skew_and_include_exact_endpoints() {
             };
         }
         resolver.tamper(move |query, reply| {
-            if query.rtype == T::A {
+            if query.rtype() == T::A {
                 reply.answer = signed.clone();
             }
         });
@@ -380,7 +379,7 @@ fn ds_authenticated_dnskey_accepts_valid_signature_after_twenty_one_failures() {
     for valid in [false, true] {
         let mut resolver = resolver();
         resolver.tamper(move |query, reply| {
-            if query.rtype != T::DNSKEY || query.name != n("example.com") {
+            if query.rtype() != T::DNSKEY || *query.name() != n("example.com") {
                 return;
             }
             prepend_twenty_one_invalid_signatures(&mut reply.answer, valid);
@@ -412,7 +411,7 @@ fn repeated_explicit_dnskey_work_still_exhausts_the_shared_crypto_budget() {
             .add_record(n(&owner), T::A, IP.to_vec());
         let mut resolver = FakeResolver::new(zones).unwrap();
         resolver.tamper(|query, reply| {
-            if query.rtype == T::DNSKEY {
+            if query.rtype() == T::DNSKEY {
                 prepend_twenty_one_invalid_signatures(&mut reply.answer, true);
             }
         });

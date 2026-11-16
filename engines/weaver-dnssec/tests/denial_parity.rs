@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_dnssec::testing::{
-    DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, base32hex, drive, nsec3_hash,
+    self, DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, base32hex, drive, nsec3_hash,
 };
 use weaver_dnssec::{
     BogusReason, Name, Outcome, Policy, Query, Question, RecordType as T, Validator, Verdict,
@@ -15,10 +15,7 @@ fn n(text: &str) -> Name {
 }
 
 fn query(text: &str, rtype: T) -> Query {
-    Query {
-        name: n(text),
-        rtype,
-    }
+    Query::new(n(text), rtype)
 }
 
 fn tree() -> FakeResolver {
@@ -38,7 +35,7 @@ fn run(validator: &Validator, resolver: &FakeResolver, q: &Query) -> (Verdict, V
     drive(
         validator,
         resolver,
-        Question::new(q.name.clone(), q.rtype).unwrap(),
+        Question::new(q.name().clone(), q.rtype()).unwrap(),
         NOW,
     )
 }
@@ -85,18 +82,18 @@ fn hash_owner(owner: &str, salt: &[u8], iterations: u16) -> Name {
 }
 
 fn secure(verdict: Verdict, expected: Outcome, ttl: u32) {
-    let Verdict::Secure(answer) = verdict else {
+    let Verdict::Secure { answer, .. } = verdict else {
         panic!("expected secure {expected:?}, got {verdict:?}");
     };
-    assert_eq!(answer.outcome, expected);
-    assert_eq!(answer.ttl, ttl);
+    assert_eq!(answer.outcome(), &expected);
+    assert_eq!(answer.ttl(), ttl);
 }
 
 fn bogus(verdict: Verdict, expected: BogusReason) {
-    let Verdict::Bogus(failure) = verdict else {
+    let Verdict::Bogus { failure, .. } = verdict else {
         panic!("expected bogus {expected:?}, got {verdict:?}");
     };
-    assert_eq!(failure.reason, expected);
+    assert_eq!(failure.reason(), expected);
 }
 
 #[test]
@@ -121,10 +118,7 @@ fn rollover_salts_and_iterations_work_in_either_authority_order() {
                 (query("missing.example.", T::A), Outcome::NoSuchName),
                 (
                     query("a.wild.example.", T::A),
-                    Outcome::Records {
-                        name: n("a.wild.example."),
-                        rdata: vec![vec![203, 0, 113, 7]],
-                    },
+                    testing::records(n("a.wild.example."), vec![vec![203, 0, 113, 7]]),
                 ),
             ] {
                 install(&mut resolver, &q, first.clone());
@@ -223,7 +217,7 @@ fn nsec3_qname_cover_without_closest_encloser_and_wildcard_proofs_is_bogus() {
     let salt = [0xaa, 0xbb];
     let complete = chain(&mut resolver, &salt, 0);
     let q = query("missing.example.", T::A);
-    let hash = nsec3_hash(&q.name, &salt, 0);
+    let hash = nsec3_hash(q.name(), &salt, 0);
     let mut lower = hash.clone();
     let mut upper = hash.clone();
     assert!((1..u8::MAX).contains(hash.last().unwrap()));
@@ -280,10 +274,7 @@ fn iteration_150_is_usable_but_151_is_bogus() {
             (query("missing.example.", T::A), Outcome::NoSuchName),
             (
                 query("a.wild.example.", T::A),
-                Outcome::Records {
-                    name: n("a.wild.example."),
-                    rdata: vec![vec![203, 0, 113, 7]],
-                },
+                testing::records(n("a.wild.example."), vec![vec![203, 0, 113, 7]]),
             ),
         ] {
             install(&mut resolver, &q, records.clone());
@@ -375,10 +366,7 @@ fn high_iteration_ds_denial_is_bogus_and_leaves_no_insecure_cut() {
     };
     resolver.set_reply(ds_query.clone(), Some(bad.encode(&ds_query).unwrap()));
     let v = validator(&resolver);
-    let answer = |name: &str| Outcome::Records {
-        name: n(name),
-        rdata: vec![vec![203, 0, 113, 7]],
-    };
+    let answer = |name: &str| testing::records(n(name), vec![vec![203, 0, 113, 7]]);
     bogus(
         run(&v, &resolver, &query("news.example.", T::A)).0,
         BogusReason::Nsec3Iterations,

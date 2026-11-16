@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use weaver_dnssec::{
-    BogusReason, InsecureReason, Name, Outcome, Query, Question, RecordType, Step, UnansweredCause,
-    Validator, Verdict,
+    Answer, BogusReason, InsecureReason, Name, Outcome, Query, Question, RecordType, Source, Step,
+    UnansweredCause, Validator, Verdict,
 };
 
 // One naming's validator: the root's keys, the keys and delegations it has
@@ -92,7 +92,7 @@ pub(super) async fn validated_all(
     found: &mut [Option<Result<Found, Failed>>],
     reached: &mut bool,
 ) {
-    let source = source(session.server());
+    let source = Source::new(source(session.server()));
     let https = matches!(session.server().wire, Wire::Https { .. });
     let now = dnssec.now();
     let mut checks: Vec<_> = qtypes
@@ -101,7 +101,7 @@ pub(super) async fn validated_all(
         .map(|(qtype, found)| {
             let question = Name::from_text(&format!("{name}."))
                 .ok()
-                .and_then(|name| Question::new(name, RecordType(*qtype)).ok());
+                .and_then(|name| Question::new(name, RecordType::new(*qtype)).ok());
             match question {
                 Some(question) => Some(dnssec.validator().begin_from(source, question, now)),
                 None => {
@@ -131,9 +131,15 @@ pub(super) async fn validated_all(
             let Some(validation) = &mut checks[at] else {
                 continue;
             };
-            let query = match off_the_workers(|| validation.step()).await {
-                Step::Done(verdict) => {
-                    found[at] = Some(judged(verdict, &mut failures[at]));
+            let (query, hints) = match off_the_workers(|| validation.step()).await {
+                Step::Need { awaited, ahead, .. } => (awaited, ahead),
+                // The check is over. A step this build does not know ends it
+                // too, as a failure.
+                step => {
+                    found[at] = Some(match step {
+                        Step::Done { verdict, .. } => judged(verdict, &mut failures[at]),
+                        _ => Err(Failed::Invalid),
+                    });
                     checks[at] = None;
                     // A query only this check waited on, and not yet sent,
                     // is not sent at all.
@@ -146,9 +152,7 @@ pub(super) async fn validated_all(
                     });
                     continue;
                 }
-                Step::Need(query) => query,
             };
-            let hints = validation.also_needed();
             for (hint, query) in std::iter::once(query).chain(hints).enumerate() {
                 let key = match out.get(&query) {
                     Some(&key) => {
@@ -217,7 +221,7 @@ pub(super) async fn validated_all(
             if let Some(validation) = &mut checks[at] {
                 if let Some(failed) = &failed {
                     failures[at].insert(query.clone(), failed.copy());
-                    let _ = validation.failed(query);
+                    let _ = validation.supply_failure(query);
                 }
                 if blocked[at] == Some(key) {
                     due.push(at);
@@ -230,23 +234,36 @@ pub(super) async fn validated_all(
 // What a check's verdict comes to for the lookup.
 fn judged(verdict: Verdict, failures: &mut BTreeMap<Query, Failed>) -> Result<Found, Failed> {
     match verdict {
-        Verdict::Secure(answer) | Verdict::Insecure(answer) => Ok(Found {
-            addresses: answer.addresses(),
-            ttl: Some(answer.ttl),
-            nonexistent: answer.outcome == Outcome::NoSuchName,
-            insecure: answer.insecure,
-        }),
-        Verdict::Bogus(bogus) if bogus.reason == BogusReason::NoDnssecRecords => {
-            Err(Failed::Stripped(bogus.extended_errors))
+        Verdict::Secure { answer, .. } => Ok(found(&answer, None)),
+        Verdict::Insecure { answer, reason, .. } => Ok(found(&answer, Some(reason))),
+        Verdict::Bogus { failure, .. } if failure.reason() == BogusReason::NoDnssecRecords => {
+            Err(Failed::Stripped(failure.extended_errors().to_vec()))
         }
-        Verdict::Bogus(bogus) => Err(Failed::Bogus(bogus.reason, bogus.extended_errors)),
-        Verdict::Unanswered(unanswered) => Err(match unanswered.cause {
+        Verdict::Bogus { failure, .. } => Err(Failed::Bogus(
+            failure.reason(),
+            failure.extended_errors().to_vec(),
+        )),
+        Verdict::Unanswered { failure, .. } => Err(match failure.cause() {
             UnansweredCause::FetchFailed => {
-                failures.remove(&unanswered.query).unwrap_or(Failed::Closed)
+                failures.remove(failure.query()).unwrap_or(Failed::Closed)
             }
             UnansweredCause::Truncated => Failed::Invalid,
             UnansweredCause::Rcode(rcode) => Failed::Rcode(rcode),
+            _ => Failed::Invalid,
         }),
+        // A verdict this build does not know is never taken as an answer.
+        _ => Err(Failed::Invalid),
+    }
+}
+
+// The lookup's answer from a verdict's records, and why the name was not
+// signed when it was not.
+fn found(answer: &Answer, insecure: Option<InsecureReason>) -> Found {
+    Found {
+        addresses: answer.addresses(),
+        ttl: Some(answer.ttl()),
+        nonexistent: *answer.outcome() == Outcome::NoSuchName,
+        insecure,
     }
 }
 
@@ -341,6 +358,7 @@ pub(super) fn bogus_words(reason: BogusReason) -> &'static str {
         BogusReason::Nsec3Iterations => {
             "the zone's NSEC3 records use more iterations than Weaver will compute"
         }
+        _ => "the proof failed for a reason this build does not name",
     }
 }
 
@@ -363,6 +381,7 @@ pub(super) fn insecure_words(reason: InsecureReason) -> &'static str {
             "the zone is signed only with algorithms Weaver does not check"
         }
         InsecureReason::PrivateName => "the name is in a private zone",
+        _ => "the name is not signed for another reason",
     }
 }
 

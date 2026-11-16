@@ -5,30 +5,51 @@ use core::{cmp::Ordering, fmt, ops::Range};
 use std::hash::{Hash, Hasher};
 
 /// An uncompressed DNS name, retaining the received bytes and their case.
-#[derive(Clone, Debug)]
+///
+/// Names compare, hash and order without regard to ASCII case, in DNSSEC
+/// canonical order (RFC 4034 section 6.1).
+///
+/// `Display` writes presentation form with a final dot; the root is `.`.
+/// Inside a label it escapes:
+///
+/// - `.` and `\` as `\.` and `\\`;
+/// - space, the characters `"` `(` `)` `;` `@`, and every byte outside
+///   printable ASCII, as `\DDD` in decimal (a space is `\032`).
+///
+/// Every other byte is written as it is.
+#[derive(Clone)]
 pub struct Name {
     wire: Vec<u8>,
     labels: Vec<Range<usize>>,
 }
 
 /// An invalid presentation name or uncompressed wire name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
 pub enum NameError {
+    /// The text was empty; the root is written `.`.
     #[error("an empty name is not the root; use a dot")]
     EmptyName,
+    /// A label other than the root's is empty.
     #[error("a non-root label is empty")]
     EmptyLabel,
+    /// A label is longer than 63 bytes.
     #[error("a label exceeds 63 octets")]
     LabelTooLong,
+    /// The name is longer than 255 bytes in wire form.
     #[error("a name exceeds 255 wire octets")]
     NameTooLong,
+    /// A backslash escape is neither one character nor three decimal digits
+    /// up to 255.
     #[error("an escape must contain one character or three decimal digits in 0..=255")]
     InvalidEscape,
+    /// The wire bytes are not exactly one uncompressed name.
     #[error("an uncompressed wire name is malformed")]
     InvalidWire,
 }
 
 impl Name {
+    /// The root name, `.`.
     pub fn root() -> Name {
         Self {
             wire: vec![0],
@@ -158,18 +179,26 @@ impl Name {
         }
     }
 
+    /// The name in uncompressed wire form, with its final root byte, in the
+    /// case it was given.
     pub fn as_wire(&self) -> &[u8] {
         &self.wire
     }
 
+    /// The number of labels, not counting the root: 0 for `.`, 2 for
+    /// `example.com.`.
     pub fn label_count(&self) -> usize {
         self.labels.len()
     }
 
+    /// The name with its first label removed, or `None` for the root.
     pub fn parent(&self) -> Option<Name> {
         self.suffix(self.label_count().checked_sub(1)?)
     }
 
+    /// The name made of its last `count` labels: `suffix(0)` is the root, and
+    /// `suffix(label_count())` is the name itself. `None` when `count` is
+    /// more than the name has.
     pub fn suffix(&self, count: usize) -> Option<Name> {
         if count == 0 {
             return Some(Self::root());
@@ -179,6 +208,7 @@ impl Name {
         Self::from_wire(self.wire.get(start..)?).ok()
     }
 
+    /// Whether this name is `other` or a name under it, ignoring ASCII case.
     pub fn is_at_or_below(&self, other: &Name) -> bool {
         if self.label_count() < other.label_count() {
             return false;
@@ -203,6 +233,7 @@ impl Name {
         self.label_count().cmp(&other.label_count())
     }
 
+    /// The same name with ASCII letters in lower case.
     pub fn to_lowercase(&self) -> Name {
         Self {
             wire: self.wire.iter().map(u8::to_ascii_lowercase).collect(),
@@ -243,6 +274,13 @@ impl Ord for Name {
 impl PartialOrd for Name {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// The name in presentation form, as `Display` writes it.
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Name(\"{self}\")")
     }
 }
 
