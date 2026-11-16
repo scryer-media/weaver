@@ -148,8 +148,15 @@ Everything below is new since 0.16.15.
   file then asks for itself.
 - **A speed test dial that is refused waits for the server.** It asks
   again when the server's health changes or its hold ends, not on a
-  timer, and gives up after 15 seconds. A cancel waits for the article
-  in flight.
+  timer, and gives up after 15 seconds.
+- **A speed test cancel cuts the article in flight.** It waited for a
+  slow article to end.
+- **A usenet connection inside a WireGuard tunnel sizes its buffers for
+  a download.** It sends through 64 KiB, and receives through 256 KiB on
+  Efficient, 1 MiB on Balanced and 4 MiB on Performance. A change of
+  profile applies to the next connection dialled.
+- **A failed feed poll is logged as a warning,** with the feed and the
+  error.
 - **A held server recovers.** Its recovery probe carries real work and is
   never left unanswered, so jobs no longer stall after body timeouts or a
   refused login.
@@ -166,6 +173,17 @@ Everything below is new since 0.16.15.
   holding more than 50 servers restores.
 - **A server's card shows what it found and did not find.** A server that
   was never timed shows a dash for its round trip.
+
+## Start-up
+
+- **Start-up waits at most 3 seconds to learn what kind of disk the
+  working folder is on.** A slow answer held the whole start, and the web
+  page with it. A late answer is kept and applied to the pipeline's
+  limits and the system page. A look that read nothing is made again
+  until one does.
+- **A disk is never asked for its kind twice at once.** A second asker
+  waits for the first answer. On macOS the filesystem name comes from the
+  mount's own record, with no helper process.
 
 ## Queue and jobs
 
@@ -240,6 +258,8 @@ This release changes the GraphQL API in ways that can break a client.
 
 - unrar-rs 0.16.3.
 - par2-rs 0.12.0 and par3-rs 0.8.2, from the registry.
+- proxy-tunnels 0.5.2. A WireGuard tunnel stacked on another passes a
+  batch of datagrams down whole.
 
 ## Regression coverage
 
