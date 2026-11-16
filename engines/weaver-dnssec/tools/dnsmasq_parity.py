@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 """Compare exported signed fixtures with an isolated, loopback-only dnsmasq.

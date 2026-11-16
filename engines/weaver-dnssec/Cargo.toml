@@ -3,7 +3,7 @@ name = "weaver-dnssec"
 publish = false
 version.workspace = true
 edition.workspace = true
-license-file.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 
 [features]
