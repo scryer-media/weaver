@@ -289,7 +289,7 @@ impl RssService {
     // held while they were off, before the feeds are read: those feeds are
     // then read whole. With none held this is one indexed read, no write.
     async fn take_up_waiting_items(&self) {
-        if !self.torrents_take_new() {
+        if !self.classes_take_new() {
             return;
         }
         let db = self.inner.db.clone();
@@ -519,13 +519,8 @@ impl RssService {
                         // A torrent while torrents are off: held, once, so
                         // later polls fetch nothing for it, and judged anew
                         // once torrents are on.
-                        Err(NotAdded::Waiting) => {
-                            record!(
-                                &item,
-                                RssSeenDecision::Waiting,
-                                None,
-                                Some(crate::torrents::status::TORRENTS_OFF)
-                            );
+                        Err(NotAdded::Waiting(reason)) => {
+                            record!(&item, RssSeenDecision::Waiting, None, Some(&reason));
                         }
                         Err(NotAdded::Failed(error)) => {
                             if cancellation.is_cancelled() {

@@ -600,20 +600,48 @@ fn job_download_rates_report_only_transferring_download_phases() {
     );
 }
 
-// An owner that records what the queue asked of it.
-#[derive(Default)]
-struct RecordingOwner {
+// A class that records what the queue asked of it: each call, and every
+// job's action in it.
+struct RecordingClass {
+    protocol: crate::jobs::Protocol,
     asked: std::sync::Mutex<Vec<(JobId, String)>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingClass {
+    fn new(protocol: crate::jobs::Protocol) -> Self {
+        Self {
+            protocol,
+            asked: std::sync::Mutex::default(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[async_trait::async_trait]
-impl QueueOwner for RecordingOwner {
-    async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError> {
-        self.asked
-            .lock()
-            .unwrap()
-            .push((job_id, format!("{action:?}")));
-        Ok(())
+impl crate::jobs::JobClass for RecordingClass {
+    fn protocol(&self) -> crate::jobs::Protocol {
+        self.protocol
+    }
+
+    async fn act(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> std::collections::BTreeMap<JobId, Result<(), SchedulerError>> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut asked = self.asked.lock().unwrap();
+        actions
+            .into_iter()
+            .map(|(job_id, action)| {
+                asked.push((job_id, format!("{action:?}")));
+                (job_id, Ok(()))
+            })
+            .collect()
     }
 }
 
@@ -671,9 +699,12 @@ async fn a_queue_action_goes_to_the_jobs_owner() {
         )
         .await
         .unwrap();
-    let owner = Arc::new(RecordingOwner::default());
-    handle.state().seat_owner(owner.clone());
-    handle.publish_owned_jobs(vec![owned_job(JobId(2), 0.0)]);
+    let owner = Arc::new(RecordingClass::new(crate::jobs::Protocol::Torrent));
+    handle.state().classes().seat(owner.clone());
+    handle.publish_owned_jobs(
+        crate::jobs::Protocol::Torrent,
+        vec![owned_job(JobId(2), 0.0)],
+    );
 
     handle.pause_job(JobId(2)).await.unwrap();
     handle.resume_job(JobId(2)).await.unwrap();
@@ -712,6 +743,205 @@ async fn a_queue_action_goes_to_the_jobs_owner() {
     task.await.unwrap();
 }
 
+// A batch over two classes is one call to each, and what it answers is what
+// the jobs one at a time answer: each job its own class's word.
+#[tokio::test]
+async fn a_batch_over_two_classes_is_one_call_each_and_routes_as_one_at_a_time() {
+    let (handle, task) = test_scheduler().await;
+    handle
+        .add_job(
+            JobId(1),
+            make_spec("Pipeline Job"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
+        .await
+        .unwrap();
+    let torrents = Arc::new(RecordingClass::new(crate::jobs::Protocol::Torrent));
+    handle.state().classes().seat(torrents.clone());
+    handle.publish_owned_jobs(
+        crate::jobs::Protocol::Torrent,
+        vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)],
+    );
+    // Job 4 is no one's: the pipeline answers for it.
+    let ids = [JobId(1), JobId(2), JobId(3), JobId(4)];
+
+    let merged = handle.set_jobs_paused(ids, true).await;
+    assert_eq!(torrents.calls(), 1, "one call for the torrent class");
+    let asked: Vec<JobId> = torrents
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(asked, vec![JobId(2), JobId(3)]);
+    assert_eq!(merged.keys().copied().collect::<Vec<_>>(), ids.to_vec());
+
+    handle.set_jobs_paused(ids, false).await;
+    let calls = torrents.calls();
+    let mut one_at_a_time = std::collections::BTreeMap::new();
+    for id in ids {
+        one_at_a_time.insert(id, format!("{:?}", handle.pause_job(id).await));
+    }
+    assert_eq!(
+        torrents.calls(),
+        calls + 2,
+        "one call per torrent job alone"
+    );
+    let merged: std::collections::BTreeMap<_, _> = merged
+        .into_iter()
+        .map(|(id, outcome)| (id, format!("{outcome:?}")))
+        .collect();
+    assert_eq!(merged, one_at_a_time);
+    assert!(one_at_a_time[&JobId(4)].contains("JobNotFound"));
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+// Each action over jobs of two classes and of no one is one call to the
+// torrent class with only its jobs, in the order named, and one revision of
+// the queue for the pipeline's part; each job is answered as written out
+// here, apart from either path.
+#[tokio::test]
+async fn every_batch_action_over_two_classes_is_one_call_each_and_one_queue_revision() {
+    use crate::jobs::Protocol;
+    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let handle = SchedulerHandle::new(events, state);
+    let mut pipeline_job = owned_job(JobId(1), 0.0);
+    pipeline_job.protocol = Protocol::Nzb;
+    handle.state().publish_jobs(vec![pipeline_job]);
+    let torrents = Arc::new(RecordingClass::new(Protocol::Torrent));
+    handle.state().classes().seat(torrents.clone());
+    handle.publish_owned_jobs(
+        Protocol::Torrent,
+        vec![owned_job(JobId(2), 1.0), owned_job(JobId(3), 2.0)],
+    );
+    // Job 4 is no one's: the pipeline answers for it.
+    let ids = [JobId(1), JobId(2), JobId(3), JobId(4)];
+    let expected = |pipeline: &str| {
+        std::collections::BTreeMap::from([
+            (JobId(1), pipeline.to_owned()),
+            (JobId(2), "Ok(())".to_owned()),
+            (JobId(3), "Ok(())".to_owned()),
+            (JobId(4), "Err(JobNotFound(JobId(4)))".to_owned()),
+        ])
+    };
+    let shown = |outcome: std::collections::BTreeMap<JobId, Result<(), SchedulerError>>| {
+        outcome
+            .into_iter()
+            .map(|(job_id, result)| (job_id, format!("{result:?}")))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    // What the torrent class was asked by the last call, and the queue's
+    // revisions since `before`.
+    let last_call = |calls: usize| {
+        assert_eq!(
+            torrents.calls(),
+            calls + 1,
+            "one call for the torrent class"
+        );
+        let asked = torrents.asked.lock().unwrap();
+        asked[asked.len() - 2..].to_vec()
+    };
+    let pair = |action: &str| vec![(JobId(2), action.to_owned()), (JobId(3), action.to_owned())];
+
+    let (calls, before) = (torrents.calls(), handle.job_revision());
+    assert_eq!(
+        shown(handle.set_jobs_paused(ids, true).await),
+        expected("Ok(())")
+    );
+    assert_eq!(last_call(calls), pair("Pause"));
+    assert_eq!(handle.job_revision(), before + 1);
+
+    let (calls, before) = (torrents.calls(), handle.job_revision());
+    assert_eq!(
+        shown(handle.set_jobs_paused(ids, false).await),
+        expected("Ok(())")
+    );
+    assert_eq!(last_call(calls), pair("Resume"));
+    assert_eq!(handle.job_revision(), before + 1);
+
+    let (calls, before) = (torrents.calls(), handle.job_revision());
+    let update = JobUpdate {
+        category: FieldUpdate::Set("tv".into()),
+        ..JobUpdate::default()
+    };
+    let asked_update = format!("Update({update:?})");
+    assert_eq!(
+        shown(
+            handle
+                .update_jobs(ids.map(|job_id| (job_id, update.clone())))
+                .await
+        ),
+        expected("Ok(())")
+    );
+    assert_eq!(last_call(calls), pair(&asked_update));
+    assert_eq!(handle.job_revision(), before + 1);
+
+    // The moves name no job of no one's: one unknown to the pipeline ends
+    // them before any class is asked.
+    let (calls, before) = (torrents.calls(), handle.job_revision());
+    handle
+        .reorder_jobs(
+            [JobId(1), JobId(2), JobId(3)]
+                .map(|job_id| (job_id, QueueMoveTarget::Top))
+                .to_vec(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(last_call(calls), pair("Move(Top)"));
+    assert_eq!(handle.job_revision(), before + 1);
+
+    let (calls, before) = (torrents.calls(), handle.job_revision());
+    let cancelled = handle
+        .cancel_jobs(BTreeSet::from(ids), CancellationOrigin::User)
+        .await
+        .unwrap();
+    assert_eq!(shown(cancelled), expected("Ok(())"));
+    assert_eq!(last_call(calls), pair("Cancel(User)"));
+    assert_eq!(handle.job_revision(), before + 1);
+}
+
+// A hold over one class stops that class alone; a hold over all stops every
+// class. The targets are those product code asks about: the pipeline's jobs
+// are the queue's own items, a held class's are its own, and a class with no
+// hold of its own has no hold to name.
+#[test]
+fn a_hold_over_one_class_spares_the_others_and_one_over_all_stops_them_all() {
+    use crate::jobs::{HeldClass, Protocol};
+    let pipeline = HoldOwner::All;
+    let torrents = HoldOwner::Class(crate::torrents::CLASS);
+    assert_eq!(HeldClass::of(Protocol::Nzb), None);
+
+    let set = hold_set(&[Hold::manual(torrents)]);
+    for complete in [false, true] {
+        assert!(set.stops(torrents, complete), "{complete}");
+        assert!(!set.stops(pipeline, complete), "{complete}");
+    }
+
+    let set = hold_set(&[Hold::manual(HoldOwner::All)]);
+    for owner in [pipeline, torrents] {
+        assert!(set.stops(owner, false), "{owner:?}");
+    }
+}
+
+// The kept holds are the queue's and each class's that holds apart, under
+// the setting each is saved as.
+#[test]
+fn the_kept_holds_are_saved_under_each_class_s_setting() {
+    let kept: Vec<_> = HoldOwner::kept().collect();
+    assert_eq!(
+        kept,
+        vec![
+            (HoldOwner::All, "global_paused"),
+            (HoldOwner::Class(crate::torrents::CLASS), "torrent_paused"),
+        ]
+    );
+}
+
 // The queue lists every owner's jobs by when they were added, each owner's
 // own order kept, then the finished jobs.
 #[test]
@@ -726,7 +956,10 @@ fn the_queue_interleaves_owners_by_when_their_jobs_were_added() {
     let finished = vec![owned_job(JobId(9), 10.0)];
     state.publish_jobs(live);
     state.load_history(finished);
-    state.publish_torrent_jobs(vec![owned_job(JobId(4), 200.0), owned_job(JobId(5), 400.0)]);
+    state.publish_class_jobs(
+        crate::jobs::Protocol::Torrent,
+        vec![owned_job(JobId(4), 200.0), owned_job(JobId(5), 400.0)],
+    );
     let order: Vec<u64> = state.list_jobs().iter().map(|job| job.job_id.0).collect();
     assert_eq!(order, vec![1, 4, 2, 3, 5, 9]);
 }
@@ -750,10 +983,11 @@ const fn hold(origin: HoldOrigin, scope: HoldScope, owner: HoldOwner) -> Hold {
 #[test]
 fn a_hold_stops_what_it_covers_and_names_who_stops_it() {
     use HoldOrigin::{Manual, Scheduled, SpeedTest};
-    use HoldOwner::{All, Torrents};
+    use HoldOwner::All;
+    const TORRENTS: HoldOwner = HoldOwner::Class(crate::torrents::CLASS);
     use HoldScope::{Downloads, Everything};
     // Usenet downloads, torrent downloads, seeding torrents.
-    let items = [(All, false), (Torrents, false), (Torrents, true)];
+    let items = [(All, false), (TORRENTS, false), (TORRENTS, true)];
     for (holds, expected) in [
         (vec![], [None, None, None]),
         (vec![Hold::manual(All)], [Some(Manual), Some(Manual), None]),
@@ -762,11 +996,11 @@ fn a_hold_stops_what_it_covers_and_names_who_stops_it() {
             [Some(Scheduled), Some(Scheduled), Some(Scheduled)],
         ),
         (
-            vec![Hold::manual(Torrents)],
+            vec![Hold::manual(TORRENTS)],
             [None, Some(Manual), Some(Manual)],
         ),
         (
-            vec![hold(Scheduled, Everything, Torrents)],
+            vec![hold(Scheduled, Everything, TORRENTS)],
             [None, Some(Scheduled), Some(Scheduled)],
         ),
         (
@@ -785,7 +1019,7 @@ fn a_hold_stops_what_it_covers_and_names_who_stops_it() {
             [Some(Scheduled), Some(Scheduled), Some(SpeedTest)],
         ),
         (
-            vec![Hold::manual(Torrents), hold(Scheduled, Downloads, All)],
+            vec![Hold::manual(TORRENTS), hold(Scheduled, Downloads, All)],
             [Some(Scheduled), Some(Manual), Some(Manual)],
         ),
     ] {
@@ -801,7 +1035,8 @@ fn a_hold_stops_what_it_covers_and_names_who_stops_it() {
 #[test]
 fn a_hold_origin_releases_what_it_shares_and_nothing_else() {
     use HoldOrigin::{Manual, Scheduled, SpeedTest};
-    use HoldOwner::{All, Torrents};
+    use HoldOwner::All;
+    const TORRENTS: HoldOwner = HoldOwner::Class(crate::torrents::CLASS);
     use HoldScope::{Downloads, Everything};
     let speed_test = hold(SpeedTest, Everything, All);
 
@@ -822,12 +1057,12 @@ fn a_hold_origin_releases_what_it_shares_and_nothing_else() {
     assert_eq!(set, hold_set(&[hold(Scheduled, Downloads, All)]));
 
     // A hold over the torrents stands apart from the queue's.
-    let mut set = hold_set(&[Hold::manual(Torrents), Hold::manual(All)]);
+    let mut set = hold_set(&[Hold::manual(TORRENTS), Hold::manual(All)]);
     set.release(Manual, All);
-    assert_eq!(set, hold_set(&[Hold::manual(Torrents)]));
-    assert!(set.held_by(Manual, Torrents));
+    assert_eq!(set, hold_set(&[Hold::manual(TORRENTS)]));
+    assert!(set.held_by(Manual, TORRENTS));
     assert!(!set.held_by(Manual, All));
-    set.release(Scheduled, Torrents);
+    set.release(Scheduled, TORRENTS);
     assert_eq!(set, HoldSet::default());
 }
 
@@ -836,11 +1071,11 @@ fn the_queue_is_paused_only_by_a_hold_over_it() {
     let metrics = PipelineMetrics::new();
     let state = SharedPipelineState::new(metrics, vec![]);
     let mut holds = state.subscribe_holds();
-    state.hold(Hold::manual(HoldOwner::Torrents));
+    state.hold(Hold::manual(HoldOwner::Class(crate::torrents::CLASS)));
     assert!(holds.has_changed().unwrap());
     holds.borrow_and_update();
     assert!(!state.is_paused());
-    state.hold(Hold::manual(HoldOwner::Torrents));
+    state.hold(Hold::manual(HoldOwner::Class(crate::torrents::CLASS)));
     assert!(
         !holds.has_changed().unwrap(),
         "an unchanged set is not sent"
@@ -912,47 +1147,44 @@ fn a_job_s_debug_text_never_shows_its_password() {
 // positions after it: every position is the one a fresh walk gives.
 #[test]
 fn the_owned_jobs_keep_their_positions_through_each_add_and_removal() {
-    let mut inner = crate::pipeline::queue::QueueInner::default();
-    let held = |inner: &crate::pipeline::queue::QueueInner, gone: &[JobId]| {
-        let jobs = inner.torrents();
+    let mut rows = crate::jobs::OwnedRows::default();
+    let held = |rows: &crate::jobs::OwnedRows, gone: &[JobId]| {
+        let jobs = rows.rows();
         assert!(jobs.windows(2).all(|pair| {
             (pair[0].created_at_epoch_ms, pair[0].job_id)
                 <= (pair[1].created_at_epoch_ms, pair[1].job_id)
         }));
         for (at, job) in jobs.iter().enumerate() {
-            assert_eq!(inner.torrent_position(job.job_id), Some(at));
-            assert_eq!(inner.torrent(job.job_id), Some(job));
+            assert_eq!(rows.position(job.job_id), Some(at));
+            assert_eq!(rows.get(job.job_id), Some(job));
         }
         for job_id in gone {
-            assert_eq!(inner.torrent_position(*job_id), None);
+            assert_eq!(rows.position(*job_id), None);
         }
     };
     for id in 0..200_u64 {
         // Three at each instant, added out of the order they sit in.
         let at = ((id * 37) % 67 / 3) as f64;
-        inner.insert_torrent(owned_job(JobId(id), at));
-        held(&inner, &[]);
+        rows.insert(owned_job(JobId(id), at));
+        held(&rows, &[]);
     }
-    assert_eq!(inner.torrents().len(), 200);
-    let mut job = owned_job(
-        JobId(5),
-        inner.torrent(JobId(5)).unwrap().created_at_epoch_ms,
-    );
+    assert_eq!(rows.rows().len(), 200);
+    let mut job = owned_job(JobId(5), rows.get(JobId(5)).unwrap().created_at_epoch_ms);
     job.name = "renamed".to_owned();
-    let at = inner.torrent_position(JobId(5)).unwrap();
-    inner.set_torrent(at, job);
-    assert_eq!(inner.torrent(JobId(5)).unwrap().name, "renamed");
+    let at = rows.position(JobId(5)).unwrap();
+    rows.set(at, job);
+    assert_eq!(rows.get(JobId(5)).unwrap().name, "renamed");
     let mut gone = Vec::new();
     for id in (0..200_u64).step_by(7).chain([199, 0]) {
-        let removed = inner.remove_torrent(JobId(id));
+        let removed = rows.remove(JobId(id));
         assert_eq!(removed.is_some(), !gone.contains(&JobId(id)));
         gone.push(JobId(id));
-        held(&inner, &gone);
+        held(&rows, &gone);
     }
-    assert_eq!(inner.torrents().len(), 200 - 200_usize.div_ceil(7) - 1);
+    assert_eq!(rows.rows().len(), 200 - 200_usize.div_ceil(7) - 1);
     let replaced: Vec<JobInfo> = (300..303).map(|id| owned_job(JobId(id), 1.0)).collect();
-    inner.replace_torrents(replaced);
-    held(&inner, &(0..200).map(JobId).collect::<Vec<_>>());
+    rows.replace(replaced);
+    held(&rows, &(0..200).map(JobId).collect::<Vec<_>>());
 }
 
 // Publishing the other owner's jobs as they already stand changes nothing:
@@ -962,13 +1194,19 @@ async fn publishing_the_owned_jobs_as_they_stand_wakes_no_reader() {
     let (handle, _task) = test_scheduler().await;
     let mut events = handle.subscribe_events();
     let mut changes = handle.subscribe_job_changes();
-    handle.publish_owned_jobs(vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)]);
+    handle.publish_owned_jobs(
+        crate::jobs::Protocol::Torrent,
+        vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)],
+    );
     assert!(changes.has_changed().unwrap());
     changes.borrow_and_update();
     while events.try_recv().is_ok() {}
 
-    handle.publish_owned_jobs(vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)]);
-    handle.publish_owned_job(owned_job(JobId(3), 1.0));
+    handle.publish_owned_jobs(
+        crate::jobs::Protocol::Torrent,
+        vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)],
+    );
+    handle.publish_owned_job(crate::jobs::Protocol::Torrent, owned_job(JobId(3), 1.0));
     assert!(
         !changes.has_changed().unwrap(),
         "an idle publish woke a reader"
@@ -977,7 +1215,7 @@ async fn publishing_the_owned_jobs_as_they_stand_wakes_no_reader() {
 
     let mut paused = owned_job(JobId(3), 1.0);
     paused.status = JobStatus::Paused;
-    handle.publish_owned_job(paused);
+    handle.publish_owned_job(crate::jobs::Protocol::Torrent, paused);
     assert!(changes.has_changed().unwrap());
     assert!(matches!(
         events.try_recv(),
@@ -986,7 +1224,30 @@ async fn publishing_the_owned_jobs_as_they_stand_wakes_no_reader() {
     assert_eq!(
         handle
             .state()
-            .read_queue(|inner| inner.torrent(JobId(3)).map(|job| job.status.clone())),
+            .read_queue(|inner| inner.owned_job(JobId(3)).map(|job| job.status.clone())),
         Some(JobStatus::Paused)
     );
+}
+
+// The queue holds no way back to itself: once its state and handles are
+// gone, with the pipeline seated and its admission resources set, the
+// queue is dropped.
+#[test]
+fn the_queue_is_dropped_with_the_last_handle_on_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    let _ = state
+        .queue
+        .resources
+        .set(crate::pipeline::test_support::admission_resources(
+            crate::Database::open_in_memory().unwrap(),
+            temp.path(),
+        ));
+    assert!(state.classes().get(crate::jobs::Protocol::Nzb).is_some());
+    let (events, _) = tokio::sync::broadcast::channel(4);
+    let handle = SchedulerHandle::new(events, state.clone());
+    let queue = Arc::downgrade(&state.queue);
+    drop(handle);
+    drop(state);
+    assert!(queue.upgrade().is_none());
 }

@@ -533,7 +533,7 @@ fn session_limits(session: &Session) -> (Option<u32>, Option<u32>) {
 // the rate comes back. A torrent on another egress is untouched throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
-    use crate::bandwidth::TorrentRates;
+    use crate::bandwidth::ClassRates;
 
     let mut seeded = seeded().await;
     let service = seeded.rig.service.clone();
@@ -564,7 +564,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
     assert_eq!(session_limits(&seeding), (None, None));
 
     // Past the soft cap: the egress's uploads trickle.
-    let trickle = TorrentRates {
+    let trickle = ClassRates {
         download: None,
         upload: Some(crate::proxies::DEFAULT_UPLOAD_TRICKLE_BPS),
     };
@@ -582,7 +582,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
 
     // At the hard cap: a budget of no bytes. The torrent still seeds, and
     // its next announce still goes out as a seed's.
-    let stopped = TorrentRates {
+    let stopped = ClassRates {
         download: None,
         upload: Some(0),
     };
@@ -595,7 +595,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
     assert_eq!(seeded.view().await.state, TorrentState::Seeding);
 
     // Lifted: the session moves as it did.
-    let at = ring(SYSTEM_EGRESS_ID, TorrentRates::default());
+    let at = ring(SYSTEM_EGRESS_ID, ClassRates::default());
     applied.wait_for(|applied| *applied >= at).await.unwrap();
     assert_eq!(session_limits(&seeding), (None, None));
     assert_eq!(session_limits(&elsewhere), (None, None));

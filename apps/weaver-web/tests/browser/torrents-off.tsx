@@ -73,7 +73,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
 
 // The shell's data, as it reads with this presence and an empty queue.
 const nextData: NextData = {
-  version: "0.0.0", update: undefined, speed: 0, peakSpeed: 0, isPaused: false, torrentsPaused: false,
+  version: "0.0.0", update: undefined, speed: 0, peakSpeed: 0, isPaused: false, pausedClasses: [],
   torrents: torrentsStateFrom(presence), torrentPresence: presence, resumeAt: null, speedLimit: null,
   downloadBlock: {
     kind: "NONE", egressId: null, egressName: null, usedBytes: 0, limitBytes: 0, remainingBytes: 0,

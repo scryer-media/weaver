@@ -3,15 +3,19 @@
 
 use super::disk_room::{DiskHeld, StartHold};
 use super::intake::Resolving;
+use super::intake::{AddError, AddRequest};
 use super::live::Live;
 use super::scripts::StoppedSeeding;
 use super::{ActionError, Inner, TorrentService, queued, state_error, take_turn};
 use crate::SchedulerError;
 use crate::jobs::JobId;
-use crate::jobs::handle::{
-    CancellationOrigin, QueueAction, QueueMoveTarget, QueueOwner, SchedulerHandle, TorrentRate,
+use crate::jobs::class::{
+    AddRefusal, ClassIntake, ClassRate, ClassRates, JobClass, RefusalReason, Submission,
 };
+use crate::jobs::handle::{CancellationOrigin, QueueAction, QueueMoveTarget, SchedulerHandle};
+use crate::jobs::model::Protocol;
 use crate::jobs::model::{FieldUpdate, JobUpdate, PRIORITY_ATTRIBUTE_KEY};
+use crate::torrents::admission::Refusal;
 use crate::torrents::metrics::FetchOutcome;
 use crate::torrents::status::Queued;
 use crate::torrents::{TorrentIntent, status};
@@ -36,10 +40,30 @@ impl TorrentService {
     ///
     /// The torrents also take their share of the global download limit from
     /// it, and follow its global pause.
+    ///
+    /// It also seats the torrents as the queue's torrent class, so tests and
+    /// callers that start the client themselves get the whole wiring; the
+    /// server wires first and seats only once [`Self::start_seated`] has
+    /// started the client.
     pub fn publish_to(&self, queue: SchedulerHandle) {
-        let seat = Arc::new(Seat(Arc::downgrade(&self.inner)));
-        queue.state().seat_owner(seat.clone());
-        queue.state().seat_torrent_rate(seat);
+        self.wire_to(queue.clone());
+        queue.state().classes().seat(self.class());
+    }
+
+    /// Start the client, and only once it runs seat it as the torrent class
+    /// of the queue it was wired to: a client that failed to start is never
+    /// the class the job layer hands torrents to.
+    pub(super) async fn start_seated(&self) -> Result<(), String> {
+        self.start().await?;
+        if let Some(queue) = self.queue() {
+            queue.state().classes().seat(self.class());
+        }
+        Ok(())
+    }
+
+    // The queue wiring without the seat: holds, starts and the queue the
+    // torrents are published to.
+    pub(super) fn wire_to(&self, queue: SchedulerHandle) {
         let mut hold = queue.state().subscribe_holds();
         let mut starts = queue.state().subscribe_starts();
         *self
@@ -63,6 +87,14 @@ impl TorrentService {
                 service.look_again_held().await;
             }
         }));
+    }
+
+    // The torrents as a job class: the job layer's way to them, which does
+    // not keep the service alive.
+    pub(crate) fn class(&self) -> Arc<dyn JobClass> {
+        Arc::new(TorrentClass {
+            inner: Arc::downgrade(&self.inner),
+        })
     }
 
     pub(super) fn queue(&self) -> Option<SchedulerHandle> {
@@ -358,44 +390,119 @@ impl TorrentService {
     }
 }
 
-// The torrents' seat in the queue.
-struct Seat(Weak<Inner>);
+// The torrents as a class of job in the queue: the actions on them, their
+// side of the global limits and their intake.
+struct TorrentClass {
+    inner: Weak<Inner>,
+}
 
-impl TorrentRate for Seat {
+impl TorrentClass {
+    fn service(&self) -> Option<TorrentService> {
+        self.inner.upgrade().map(|inner| TorrentService { inner })
+    }
+}
+
+impl ClassRate for TorrentClass {
     fn sample(&self) -> u64 {
-        self.0
+        self.inner
             .upgrade()
             .map_or(0, |inner| inner.sessions.rates().sample())
     }
 
-    fn set_rates(&self, rates: crate::bandwidth::TorrentRates) {
-        if let Some(inner) = self.0.upgrade() {
+    fn set_rates(&self, rates: ClassRates) {
+        if let Some(inner) = self.inner.upgrade() {
             inner.sessions.rates().set(rates);
         }
     }
 }
 
 #[async_trait::async_trait]
-impl QueueOwner for Seat {
-    async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError> {
-        let inner = self
-            .0
-            .upgrade()
-            .ok_or(SchedulerError::JobNotFound(job_id))?;
-        TorrentService { inner }
-            .act(job_id, action)
+impl JobClass for TorrentClass {
+    fn protocol(&self) -> Protocol {
+        Protocol::Torrent
+    }
+
+    // The actions of one request as one unit (`act_many`).
+    async fn act(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        let Some(service) = self.service() else {
+            return actions
+                .into_iter()
+                .map(|(job_id, _)| (job_id, Err(SchedulerError::JobNotFound(job_id))))
+                .collect();
+        };
+        service
+            .act_many(actions)
             .await
-            .map_err(|error| match error {
-                ActionError::NotFound(job_id) => SchedulerError::JobNotFound(job_id),
-                ActionError::UnmetGoal(_) => SchedulerError::Conflict(error.to_string()),
-                ActionError::Invalid(reason) => SchedulerError::InvalidInput(reason),
-                ActionError::State(reason) => SchedulerError::Internal(reason),
-            })
+            .into_iter()
+            .map(|(job_id, result)| (job_id, result.map_err(scheduler_error)))
+            .collect()
+    }
+
+    fn rate(&self) -> Option<&dyn ClassRate> {
+        Some(self)
+    }
+
+    fn intake(&self) -> Option<&dyn ClassIntake> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl ClassIntake for TorrentClass {
+    fn takes_new(&self) -> Result<(), AddRefusal> {
+        match self.service() {
+            Some(service) if service.takes_new() => Ok(()),
+            Some(_) => Err(refusal(AddError::Off)),
+            None => Err(AddRefusal::not_running(Protocol::Torrent)),
+        }
+    }
+
+    async fn add(&self, submission: Submission) -> Result<JobId, AddRefusal> {
+        let service = self
+            .service()
+            .ok_or_else(|| AddRefusal::not_running(Protocol::Torrent))?;
+        let request = AddRequest::of(submission).map_err(refusal)?;
+        service.add(request).await.map_err(refusal)
+    }
+}
+
+// A refused add, as the intakes tell refusals apart, in the client's words.
+impl From<AddError> for AddRefusal {
+    fn from(error: AddError) -> Self {
+        refusal(error)
+    }
+}
+
+fn refusal(error: AddError) -> AddRefusal {
+    let reason = match &error {
+        AddError::Invalid(_) => RefusalReason::Invalid,
+        AddError::Refused(Refusal::Removing(_)) => RefusalReason::Removing,
+        AddError::Refused(_) => RefusalReason::Refused,
+        AddError::Duplicate(job_id) => RefusalReason::Duplicate(*job_id),
+        AddError::NoNetwork(_) => RefusalReason::NoNetwork,
+        AddError::Off => RefusalReason::Off,
+        AddError::State(_) => RefusalReason::State,
+    };
+    AddRefusal {
+        reason,
+        text: error.to_string(),
+    }
+}
+
+pub(super) fn scheduler_error(error: ActionError) -> SchedulerError {
+    match error {
+        ActionError::NotFound(job_id) => SchedulerError::JobNotFound(job_id),
+        ActionError::UnmetGoal(_) => SchedulerError::Conflict(error.to_string()),
+        ActionError::Invalid(reason) => SchedulerError::InvalidInput(reason),
+        ActionError::State(reason) => SchedulerError::Internal(reason),
     }
 }
 
 // The top priority a job can be given.
-fn top_priority(value: &str) -> bool {
+pub(super) fn top_priority(value: &str) -> bool {
     use crate::post_processing::scan::numeric_priority;
     numeric_priority(value) >= numeric_priority("HIGH")
 }

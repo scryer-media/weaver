@@ -11,11 +11,12 @@ use tokio::sync::broadcast;
 
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
+use crate::jobs::class::{ByProtocol, JobClasses, PipelineClass};
 use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
 
 use crate::jobs::error::SchedulerError;
-use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
+use crate::jobs::model::{HeldClass, JobSpec, JobStatus, JobUpdate, Protocol};
 use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 use crate::pipeline::queue::{Change, Queue};
 
@@ -31,8 +32,9 @@ pub const LOGIN_REFUSED_WAIT_REASON: &str = "login_refused";
 #[derive(Clone)]
 pub struct SharedPipelineState {
     pub(crate) queue: Arc<Queue>,
-    // The owner of the jobs published beside the pipeline's.
-    owner: Arc<RwLock<Option<Arc<dyn QueueOwner>>>>,
+    // The class of each protocol, each seated once: the pipeline at start,
+    // every other class when it starts.
+    classes: JobClasses,
     // The holds in force, as the queue records them, for every owner of
     // queue items to follow.
     holds: tokio::sync::watch::Sender<HoldSet>,
@@ -40,8 +42,6 @@ pub struct SharedPipelineState {
     // for, held or not, for every owner of queue items to look again at what
     // it keeps from running.
     starts: tokio::sync::watch::Sender<u64>,
-    // The torrent side of the global download limit, once torrents run.
-    torrent_rate: Arc<RwLock<Option<Arc<dyn TorrentRate>>>>,
     // How the global download limit is shared out, as last put in force.
     bandwidth_split: Arc<RwLock<crate::bandwidth::SplitState>>,
     metrics: Arc<PipelineMetrics>,
@@ -102,12 +102,13 @@ impl SharedPipelineState {
             Change::unchanged(())
         });
         let (segment_events, _) = broadcast::channel(SEGMENT_EVENT_CAPACITY);
+        let classes = JobClasses::default();
+        classes.seat(Arc::new(PipelineClass(queue.clone())));
         Self {
             queue,
-            owner: Arc::new(RwLock::new(None)),
+            classes,
             holds: tokio::sync::watch::channel(HoldSet::default()).0,
             starts: tokio::sync::watch::channel(0).0,
-            torrent_rate: Arc::new(RwLock::new(None)),
             bandwidth_split: Arc::new(RwLock::new(crate::bandwidth::SplitState::default())),
             metrics,
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
@@ -149,7 +150,7 @@ impl SharedPipelineState {
     pub fn list_jobs(&self) -> Vec<JobInfo> {
         self.queue.read(|inner| {
             let mut live = inner.visible_jobs().peekable();
-            let mut owned = inner.torrents().iter().cloned().peekable();
+            let mut owned = inner.owned_rows().map(|(_, _, job)| job.clone()).peekable();
             std::iter::from_fn(|| match (live.peek(), owned.peek()) {
                 (Some(job), Some(other)) if other.created_at_epoch_ms < job.created_at_epoch_ms => {
                     owned.next()
@@ -174,11 +175,12 @@ impl SharedPipelineState {
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         self.queue.read(|inner| {
             inner.history_summary.with_statuses(
-                inner
-                    .jobs
-                    .iter()
-                    .map(|row| &row.report.job.status)
-                    .chain(inner.torrents().iter().map(|job| &job.status)),
+                inner.jobs.iter().map(|row| &row.report.job.status).chain(
+                    Protocol::ALL
+                        .iter()
+                        .flat_map(|protocol| inner.owned(*protocol))
+                        .map(|job| &job.status),
+                ),
             )
         })
     }
@@ -275,7 +277,9 @@ impl SharedPipelineState {
                         .map(|rate| (row.id, rate))
                 })
                 .collect();
-            rates.extend(job_download_rates(inner.torrents()));
+            for protocol in Protocol::ALL {
+                rates.extend(job_download_rates(inner.owned(*protocol)));
+            }
             rates
         })
     }
@@ -285,7 +289,7 @@ impl SharedPipelineState {
             inner
                 .job(job_id)
                 .map(|row| row.info(&inner.globals))
-                .or_else(|| inner.torrent(job_id).cloned())
+                .or_else(|| inner.owned_job(job_id).cloned())
                 .or_else(|| {
                     self.queue
                         .history()
@@ -390,53 +394,47 @@ impl SharedPipelineState {
         });
     }
 
-    // Publish the torrents, kept beside whatever the pipeline publishes, and
-    // say what the publish changed as the pipeline says it of its own jobs.
-    // The owner publishes through its handle, which carries the events.
-    fn publish_torrent_jobs(&self, torrents: Vec<JobInfo>) -> Vec<PipelineEvent> {
+    // Publish the jobs of `protocol`'s class, kept beside whatever the
+    // pipeline publishes, and say what the publish changed as the pipeline
+    // says it of its own jobs. The class publishes through its handle, which
+    // carries the events.
+    fn publish_class_jobs(&self, protocol: Protocol, jobs: Vec<JobInfo>) -> Vec<PipelineEvent> {
         self.queue.write(|inner| {
             // The same jobs as they stand: nothing changed, and nothing is
             // said, so an idle publish wakes no reader.
-            if inner.torrents() == torrents.as_slice() {
+            if inner.owned(protocol) == jobs.as_slice() {
                 return Change::unchanged(Vec::new());
             }
-            let events = owned_job_events(inner.torrents(), &torrents);
-            inner.replace_torrents(torrents);
+            let events = owned_job_events(inner.owned(protocol), &jobs);
+            inner.owned_mut(protocol).replace(jobs);
             Change::changed(events)
         })
     }
 
-    // One job of the other owner's, the rest left as published: a job new to
-    // the queue takes its place in the owner's order, by when it was added.
-    fn publish_torrent_job(&self, job: JobInfo) -> Vec<PipelineEvent> {
+    // One job of a class's, the rest left as published: a job new to the
+    // queue takes its place in the class's order, by when it was added.
+    fn publish_class_job(&self, protocol: Protocol, job: JobInfo) -> Vec<PipelineEvent> {
         self.queue.write(|inner| {
             let job_id = job.job_id;
+            let owned = inner.owned_mut(protocol);
             // Only a job already published is looked for among the others.
-            let at = inner.torrent_position(job_id);
-            if at.is_some_and(|at| inner.torrents()[at] == job) {
+            let at = owned.position(job_id);
+            if at.is_some_and(|at| owned.rows()[at] == job) {
                 return Change::unchanged(Vec::new());
             }
-            let before = at.map_or(&[][..], |at| std::slice::from_ref(&inner.torrents()[at]));
+            let before = at.map_or(&[][..], |at| std::slice::from_ref(&owned.rows()[at]));
             let events = owned_job_events(before, std::slice::from_ref(&job));
             match at {
-                Some(at) => inner.set_torrent(at, job),
-                None => inner.insert_torrent(job),
+                Some(at) => owned.set(at, job),
+                None => owned.insert(job),
             }
             Change::changed(events)
         })
     }
 
-    // Seat the owner of the jobs published beside the pipeline's.
-    pub fn seat_owner(&self, owner: Arc<dyn QueueOwner>) {
-        *self.owner.write().unwrap() = Some(owner);
-    }
-
-    // The owner that answers for `job_id`; `None` is the pipeline.
-    fn owner_of(&self, job_id: JobId) -> Option<Arc<dyn QueueOwner>> {
-        let owned = self
-            .queue
-            .read(|inner| inner.torrent_position(job_id).is_some());
-        owned.then(|| self.owner.read().unwrap().clone()).flatten()
+    // The class of each protocol in force.
+    pub fn classes(&self) -> &JobClasses {
+        &self.classes
     }
 
     pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -501,15 +499,6 @@ impl SharedPipelineState {
             self.holds.send_replace(inner.globals.holds.clone());
             Change::changed(())
         });
-    }
-
-    // Seat the torrent side of the global download limit.
-    pub fn seat_torrent_rate(&self, rate: Arc<dyn TorrentRate>) {
-        *self.torrent_rate.write().unwrap() = Some(rate);
-    }
-
-    pub fn torrent_rate(&self) -> Option<Arc<dyn TorrentRate>> {
-        self.torrent_rate.read().unwrap().clone()
     }
 
     pub fn set_bandwidth_split(&self, state: crate::bandwidth::SplitState) {
@@ -810,13 +799,6 @@ pub enum QueueAction {
     Move(QueueMoveTarget),
 }
 
-// The owner of the jobs published beside the pipeline's. Each job id has one
-// owner: the one that published it, or else the pipeline.
-#[async_trait::async_trait]
-pub trait QueueOwner: Send + Sync {
-    async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError>;
-}
-
 // Who put a hold in force, in the order their reasons take precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HoldOrigin {
@@ -864,17 +846,17 @@ pub enum HoldScope {
 pub enum HoldOwner {
     // Every item in the queue.
     All,
-    // The torrents alone.
-    Torrents,
+    // One class's jobs alone: only a class whose row has a hold of its own.
+    Class(HeldClass),
 }
 
 impl HoldOwner {
-    // The setting an operator's hold over these items is kept in.
-    pub const fn setting(self) -> &'static str {
-        match self {
-            Self::All => "global_paused",
-            Self::Torrents => "torrents_paused",
-        }
+    // Every owner an operator's hold is kept for across a restart, with the
+    // setting it is kept in: the whole queue, then each class the protocol
+    // table gives a hold of its own.
+    pub fn kept() -> impl Iterator<Item = (Self, &'static str)> {
+        std::iter::once((Self::All, "global_paused"))
+            .chain(HeldClass::all().map(|class| (Self::Class(class), class.hold().setting)))
     }
 }
 
@@ -888,13 +870,14 @@ pub struct Hold {
 
 impl Hold {
     // The operator's hold over `owner`: the queue's pause leaves what is
-    // complete seeding, the torrents' pause stops them whole.
+    // complete seeding; a class's pause stops what its row in the protocol
+    // table says.
     pub const fn manual(owner: HoldOwner) -> Self {
         Self {
             origin: HoldOrigin::Manual,
             scope: match owner {
                 HoldOwner::All => HoldScope::Downloads,
-                HoldOwner::Torrents => HoldScope::Everything,
+                HoldOwner::Class(class) => class.hold().scope,
             },
             owner,
         }
@@ -903,10 +886,13 @@ impl Hold {
     // Whether the hold covers `target` and what it stops of it, before
     // what the target says of the schedule.
     const fn reaches(self, target: HoldTarget) -> bool {
-        let covers = matches!(
-            (self.owner, target.owner),
-            (HoldOwner::All, _) | (HoldOwner::Torrents, HoldOwner::Torrents)
-        );
+        let covers = match (self.owner, target.owner) {
+            (HoldOwner::All, _) => true,
+            (HoldOwner::Class(held), HoldOwner::Class(of)) => {
+                held.protocol().index() == of.protocol().index()
+            }
+            (HoldOwner::Class(_), HoldOwner::All) => false,
+        };
         covers
             && match self.scope {
                 HoldScope::Downloads => !target.complete,
@@ -993,15 +979,6 @@ impl HoldSet {
             .iter()
             .any(|hold| hold.origin == origin && hold.owner == owner)
     }
-}
-
-// The torrent side of the global limits.
-pub trait TorrentRate: Send + Sync {
-    // Measure the torrents: what they received at since they were last
-    // measured, in bytes per second. Their sessions' shares follow it.
-    fn sample(&self) -> u64;
-    // Put the torrents' download and upload rates in force.
-    fn set_rates(&self, rates: crate::bandwidth::TorrentRates);
 }
 
 // Splice `job_id` to its new position in the manual queue order. Pure so the
@@ -1646,24 +1623,59 @@ impl SchedulerHandle {
         self.state.queue.restore(request)
     }
 
-    // Every queue action on one job comes through here, and the job's owner
+    // Every queue action on one job comes through here, and the job's class
     // answers it.
     async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError> {
-        if let Some(owner) = self.state.owner_of(job_id) {
-            return owner.act(job_id, action).await;
+        self.act_all(vec![(job_id, action)])
+            .await
+            .remove(&job_id)
+            .unwrap_or(Err(SchedulerError::JobNotFound(job_id)))
+    }
+
+    // The actions of one request, each job's under its class, in the
+    // protocol table's order: one read of the queue finds every job's class.
+    fn by_class(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> ByProtocol<Vec<(JobId, QueueAction)>> {
+        let mut grouped: ByProtocol<Vec<_>> = ByProtocol::default();
+        self.state.queue.read(|inner| {
+            for (job_id, action) in actions {
+                grouped[inner.class_of(job_id)].push((job_id, action));
+            }
+        });
+        grouped
+    }
+
+    // One class's actions, as one call to it. A job whose class is not
+    // seated is not found.
+    async fn act_class(
+        &self,
+        protocol: Protocol,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        match self.state.classes.get(protocol) {
+            Some(class) => class.act(actions).await,
+            None => actions
+                .into_iter()
+                .map(|(job_id, _)| (job_id, Err(SchedulerError::JobNotFound(job_id))))
+                .collect(),
         }
-        match action {
-            QueueAction::Pause => self.state.queue.set_job_paused(job_id, true),
-            QueueAction::Resume => self.state.queue.set_job_paused(job_id, false),
-            QueueAction::Cancel(origin) => self
-                .state
-                .queue
-                .cancel_jobs(BTreeSet::from([job_id]), origin)
-                .remove(&job_id)
-                .unwrap_or(Err(SchedulerError::JobNotFound(job_id))),
-            QueueAction::Update(update) => self.state.queue.update_job(job_id, update),
-            QueueAction::Move(target) => self.state.queue.reorder_jobs(vec![(job_id, target)]),
+    }
+
+    // Every action of one request, each class called once with its own
+    // jobs, each job answered on its own.
+    async fn act_all(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        let mut outcome = BTreeMap::new();
+        for (protocol, actions) in self.by_class(actions).into_iter() {
+            if !actions.is_empty() {
+                outcome.extend(self.act_class(protocol, actions).await);
+            }
         }
+        outcome
     }
 
     // Pause a job.
@@ -1676,41 +1688,41 @@ impl SchedulerHandle {
         self.act(job_id, QueueAction::Resume).await
     }
 
-    // Pause or resume every job named as one queue change: one revision for
-    // the batch, each job answered on its own. Another owner's jobs go to it.
+    // Pause or resume every job named: each class's as one call, the
+    // pipeline's as one queue change with one revision, each job answered on
+    // its own.
     pub async fn set_jobs_paused(
         &self,
         job_ids: impl IntoIterator<Item = JobId>,
         paused: bool,
     ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
-        let (owned, job_ids): (Vec<_>, Vec<_>) = job_ids
-            .into_iter()
-            .partition(|job_id| self.state.owner_of(*job_id).is_some());
-        let mut outcome = self.state.queue.set_jobs_paused(job_ids, paused);
         let action = || match paused {
             true => QueueAction::Pause,
             false => QueueAction::Resume,
         };
-        for job_id in owned {
-            outcome.insert(job_id, self.act(job_id, action()).await);
-        }
-        outcome
+        self.act_all(
+            job_ids
+                .into_iter()
+                .map(|job_id| (job_id, action()))
+                .collect(),
+        )
+        .await
     }
 
-    // Apply every job update named as one queue change: one revision for the
-    // batch, each job answered on its own. Another owner's jobs go to it.
+    // Apply every job update named: each class's as one call, the
+    // pipeline's as one queue change with one revision, each job answered on
+    // its own.
     pub async fn update_jobs(
         &self,
         updates: impl IntoIterator<Item = (JobId, JobUpdate)>,
     ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
-        let (owned, updates): (Vec<_>, Vec<_>) = updates
-            .into_iter()
-            .partition(|(job_id, _)| self.state.owner_of(*job_id).is_some());
-        let mut outcome = self.state.queue.update_jobs(updates);
-        for (job_id, update) in owned {
-            outcome.insert(job_id, self.act(job_id, QueueAction::Update(update)).await);
-        }
-        outcome
+        self.act_all(
+            updates
+                .into_iter()
+                .map(|(job_id, update)| (job_id, QueueAction::Update(update)))
+                .collect(),
+        )
+        .await
     }
 
     // Cancel a job.
@@ -1764,22 +1776,21 @@ impl SchedulerHandle {
     }
 
     // Record cancellation and hide accepted rows immediately. Teardown and
-    // durable history follow at the pipeline's next boundary. Another
-    // owner's jobs go to it.
+    // durable history follow at the pipeline's next boundary. Each class's
+    // jobs go to it as one call.
     pub async fn cancel_jobs(
         &self,
         job_ids: BTreeSet<JobId>,
         origin: CancellationOrigin,
     ) -> Result<CancelJobsOutcome, SchedulerError> {
-        let (owned, job_ids): (BTreeSet<_>, BTreeSet<_>) = job_ids
-            .into_iter()
-            .partition(|job_id| self.state.owner_of(*job_id).is_some());
-        let mut outcome = self.state.queue.cancel_jobs(job_ids, origin);
-        for job_id in owned {
-            let result = self.act(job_id, QueueAction::Cancel(origin)).await;
-            outcome.insert(job_id, result);
-        }
-        Ok(outcome)
+        Ok(self
+            .act_all(
+                job_ids
+                    .into_iter()
+                    .map(|job_id| (job_id, QueueAction::Cancel(origin)))
+                    .collect(),
+            )
+            .await)
     }
 
     // Update a job's category and/or metadata.
@@ -1820,33 +1831,42 @@ impl SchedulerHandle {
         &self,
         moves: Vec<(JobId, QueueMoveTarget)>,
     ) -> Result<(), SchedulerError> {
-        // The pipeline's moves go as one batch; another owner's go to it.
-        let (owned, moves): (Vec<_>, Vec<_>) = moves
-            .into_iter()
-            .partition(|(job_id, _)| self.state.owner_of(*job_id).is_some());
-        if !moves.is_empty() || owned.is_empty() {
-            self.state.queue.reorder_jobs(moves)?;
+        // No move at all is still the pipeline's one, empty, change.
+        if moves.is_empty() {
+            return self.state.queue.reorder_jobs(moves);
         }
-        for (job_id, target) in owned {
-            self.act(job_id, QueueAction::Move(target)).await?;
+        // Each class's moves go as one call, in the protocol table's order;
+        // the first class to fail ends the request, so the pipeline's moves,
+        // applied whole or not at all, go before any other class's.
+        let actions = moves
+            .into_iter()
+            .map(|(job_id, target)| (job_id, QueueAction::Move(target)))
+            .collect();
+        for (protocol, actions) in self.by_class(actions).into_iter() {
+            if actions.is_empty() {
+                continue;
+            }
+            for (_, outcome) in self.act_class(protocol, actions).await {
+                outcome?;
+            }
         }
         Ok(())
     }
 
-    // Publish the jobs another owner keeps beside the pipeline's. What the
-    // publish changed goes out on the job events, as the pipeline's own
+    // Publish the jobs `protocol`'s class keeps beside the pipeline's. What
+    // the publish changed goes out on the job events, as the pipeline's own
     // changes do: a job that appears is created, one that changes says so.
     // A job that leaves is retired, which says how it ended.
-    pub fn publish_owned_jobs(&self, jobs: Vec<JobInfo>) {
-        for event in self.state.publish_torrent_jobs(jobs) {
+    pub fn publish_owned_jobs(&self, protocol: Protocol, jobs: Vec<JobInfo>) {
+        for event in self.state.publish_class_jobs(protocol, jobs) {
             let _ = self.event_tx.send(event);
         }
     }
 
-    // Publish one job another owner keeps, the others as they stand, with
-    // what that changed on the job events.
-    pub fn publish_owned_job(&self, job: JobInfo) {
-        for event in self.state.publish_torrent_job(job) {
+    // Publish one job `protocol`'s class keeps, the others as they stand,
+    // with what that changed on the job events.
+    pub fn publish_owned_job(&self, protocol: Protocol, job: JobInfo) {
+        for event in self.state.publish_class_job(protocol, job) {
             let _ = self.event_tx.send(event);
         }
     }
@@ -1858,7 +1878,8 @@ impl SchedulerHandle {
         queue.write(|inner| {
             let ended = info.ended_event();
             let job_id = info.job_id;
-            inner.remove_torrent(job_id);
+            let protocol = inner.class_of(job_id);
+            inner.owned_mut(protocol).remove(job_id);
             let mut history: Vec<_> = queue
                 .history()
                 .iter()
@@ -2240,14 +2261,16 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    // The operator's pause of every torrent, as one hold.
-    pub async fn pause_torrents(&self) -> Result<(), SchedulerError> {
-        self.pause(Hold::manual(HoldOwner::Torrents)).await
+    // The operator's pause of every job of one class, as one hold.
+    pub async fn pause_class(&self, class: HeldClass) -> Result<(), SchedulerError> {
+        self.pause(Hold::manual(HoldOwner::Class(class))).await
     }
 
-    // The operator's start of every torrent, as `resume_all` starts them.
-    pub async fn resume_torrents(&self) -> Result<(), SchedulerError> {
-        self.resume(HoldOrigin::Manual, HoldOwner::Torrents).await?;
+    // The operator's start of every job of one class, as `resume_all` starts
+    // them.
+    pub async fn resume_class(&self, class: HeldClass) -> Result<(), SchedulerError> {
+        self.resume(HoldOrigin::Manual, HoldOwner::Class(class))
+            .await?;
         self.state.started();
         Ok(())
     }
@@ -2401,11 +2424,17 @@ impl SchedulerHandle {
         match &action {
             // Pause stops downloading and leaves what is complete seeding;
             // pause all stops seeding too.
-            ScheduleAction::Pause | ScheduleAction::PauseAll | ScheduleAction::PauseTorrents => {
+            // A class's pause stops what the operator's pause of it does.
+            ScheduleAction::Pause
+            | ScheduleAction::PauseAll
+            | ScheduleAction::PauseClass { .. } => {
                 let (scope, owner) = match action {
                     ScheduleAction::Pause => (HoldScope::Downloads, HoldOwner::All),
-                    ScheduleAction::PauseAll => (HoldScope::Everything, HoldOwner::All),
-                    _ => (HoldScope::Everything, HoldOwner::Torrents),
+                    ScheduleAction::PauseClass { class } => {
+                        let owner = HoldOwner::Class(class);
+                        (Hold::manual(owner).scope, owner)
+                    }
+                    _ => (HoldScope::Everything, HoldOwner::All),
                 };
                 let hold = Hold {
                     origin: HoldOrigin::Scheduled,
@@ -2416,10 +2445,10 @@ impl SchedulerHandle {
                 tracing::info!(?hold, "schedule: paused");
                 return Ok(());
             }
-            ScheduleAction::Resume | ScheduleAction::ResumeTorrents => {
+            ScheduleAction::Resume | ScheduleAction::ResumeClass { .. } => {
                 let owner = match action {
-                    ScheduleAction::Resume => HoldOwner::All,
-                    _ => HoldOwner::Torrents,
+                    ScheduleAction::ResumeClass { class } => HoldOwner::Class(class),
+                    _ => HoldOwner::All,
                 };
                 self.state.release(HoldOrigin::Scheduled, owner);
                 self.state.started();

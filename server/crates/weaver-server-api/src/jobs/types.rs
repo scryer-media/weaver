@@ -256,6 +256,15 @@ impl From<weaver_server_core::Protocol> for ProtocolGql {
     }
 }
 
+impl From<ProtocolGql> for weaver_server_core::Protocol {
+    fn from(value: ProtocolGql) -> Self {
+        match value {
+            ProtocolGql::Nzb => Self::Nzb,
+            ProtocolGql::Torrent => Self::Torrent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 #[graphql(complex)]
 pub struct QueueItem {
@@ -352,10 +361,10 @@ pub struct QueueSummary {
 #[graphql(complex)]
 pub struct GlobalQueueState {
     pub is_paused: bool,
-    /// Whether the operator's or the schedule's pause of every torrent is in
-    /// force.
+    /// The classes of job the operator's or the schedule's pause of the
+    /// whole class holds.
     #[serde(default)]
-    pub torrents_paused: bool,
+    pub paused_classes: Vec<ProtocolGql>,
     pub speed_limit_bytes_per_sec: Option<u64>,
     pub download_block: DownloadBlock,
 }
@@ -1744,9 +1753,14 @@ pub fn global_queue_state(
 ) -> GlobalQueueState {
     GlobalQueueState {
         is_paused: holds.stops(HoldOwner::All, false),
-        torrents_paused: [HoldOrigin::Manual, HoldOrigin::Scheduled]
-            .into_iter()
-            .any(|origin| holds.held_by(origin, HoldOwner::Torrents)),
+        paused_classes: weaver_server_core::jobs::HeldClass::all()
+            .filter(|class| {
+                [HoldOrigin::Manual, HoldOrigin::Scheduled]
+                    .into_iter()
+                    .any(|origin| holds.held_by(origin, HoldOwner::Class(*class)))
+            })
+            .map(|class| class.protocol().into())
+            .collect(),
         speed_limit_bytes_per_sec,
         download_block: DownloadBlock::from(download_block),
     }

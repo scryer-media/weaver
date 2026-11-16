@@ -1011,7 +1011,7 @@ async fn a_used_up_egress_quota_takes_its_leg_down_and_its_share_moves_to_the_ot
 // caps back. Each crossing rings. Another egress adds no limit.
 #[tokio::test]
 async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
-    use crate::bandwidth::TorrentRates;
+    use crate::bandwidth::ClassRates;
 
     let db = Database::open_in_memory().unwrap();
     let mut capped = metered_egress(1_000_000);
@@ -1032,7 +1032,7 @@ async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
     )
     .unwrap();
     let mut changes = runtime.egress_limit_changes().unwrap();
-    let rates = |download, upload| TorrentRates { download, upload };
+    let rates = |download, upload| ClassRates { download, upload };
     assert_eq!(
         runtime.torrent_egress_rates(capped.id),
         rates(Some(80_000), Some(50_000))
@@ -1053,7 +1053,7 @@ async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
     );
     assert_eq!(
         runtime.torrent_egress_rates(capped.id + 1),
-        TorrentRates::default()
+        ClassRates::default()
     );
 
     policy.reset_egress_usage(capped.id).unwrap();

@@ -516,27 +516,24 @@ async fn the_queue_events_carry_a_torrent() {
 async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
     use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
     let harness = TestHarness::new().await;
-    let state = "{ globalQueueState { isPaused torrentsPaused } }";
+    let state = "{ globalQueueState { isPaused pausedClasses } }";
     let read = |response: Response| {
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         let data = response.data.into_json().unwrap();
         (
             data["globalQueueState"]["isPaused"].as_bool().unwrap(),
-            data["globalQueueState"]["torrentsPaused"]
-                .as_bool()
-                .unwrap(),
+            data["globalQueueState"]["pausedClasses"] == serde_json::json!(["TORRENT"]),
         )
     };
 
-    let response = harness.execute("mutation { pauseTorrents }").await;
+    let response = harness
+        .execute("mutation { pauseClass(class: TORRENT) }")
+        .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    assert!(
-        harness
-            .handle
-            .state()
-            .holds()
-            .held_by(HoldOrigin::Manual, HoldOwner::Torrents)
-    );
+    assert!(harness.handle.state().holds().held_by(
+        HoldOrigin::Manual,
+        HoldOwner::Class(weaver_server_core::torrents::CLASS)
+    ));
     assert_eq!(read(harness.execute(state).await), (false, true));
 
     let response = harness.execute("mutation { pauseQueue { success } }").await;
@@ -547,9 +544,15 @@ async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
     assert!(response.errors.is_empty(), "{:?}", response.errors);
     assert_eq!(read(harness.execute(state).await), (false, true));
 
-    let response = harness.execute("mutation { resumeTorrents }").await;
+    let response = harness
+        .execute("mutation { resumeClass(class: TORRENT) }")
+        .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
     assert_eq!(read(harness.execute(state).await), (false, false));
+
+    // The pipeline has no pause of its own apart from the queue's.
+    let response = harness.execute("mutation { pauseClass(class: NZB) }").await;
+    assert!(!response.errors.is_empty());
 }
 
 // A follower of the torrents gets them as they are, then each change the

@@ -3,12 +3,12 @@
 
 use async_graphql::{Enum, InputObject, InputType, MaybeUndefined, OutputType, SimpleObject};
 use serde::{Deserialize, Serialize};
-use weaver_server_core::jobs::DuplicatePolicy;
+use weaver_server_core::jobs::{DuplicatePolicy, HeldClass, Protocol};
 use weaver_server_core::runtime::HardwareProfile;
 use weaver_server_core::runtime::system_profile::SystemProfile;
 use weaver_server_core::settings::{Leaf, Level};
 
-use crate::jobs::types::DuplicateActionGql;
+use crate::jobs::types::{DuplicateActionGql, ProtocolGql};
 
 #[derive(SimpleObject)]
 pub struct ArchivePasswordSettings {
@@ -451,6 +451,10 @@ pub struct Schedule {
     pub prune_completed: Option<SchedulePruneFiles>,
     pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
+    /// The class of job a `pause_class` or `resume_class` rule holds; null
+    /// for every other action.
+    #[graphql(name = "class")]
+    pub held_class: Option<ProtocolGql>,
     /// Rules on this track hold independently of every other track. A rule
     /// touching several tracks reports the first.
     pub track: ScheduleTrackGql,
@@ -476,7 +480,13 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
         };
         let track = match e.action.tracks().first() {
             Some(ScheduleTrack::Downloads) => ScheduleTrackGql::Downloads,
-            Some(ScheduleTrack::Torrents) => ScheduleTrackGql::Torrents,
+            // A held class keeps its own lane, a fixed value the web lays
+            // out and names; the pipeline has no hold apart and would sit
+            // on the downloads lane.
+            Some(ScheduleTrack::Class(class)) => match class.protocol() {
+                Protocol::Nzb => ScheduleTrackGql::Downloads,
+                Protocol::Torrent => ScheduleTrackGql::Torrents,
+            },
             Some(ScheduleTrack::PostProcessing) => ScheduleTrackGql::PostProcessing,
             Some(ScheduleTrack::WatchFolder) => ScheduleTrackGql::WatchFolder,
             Some(ScheduleTrack::Rss) => ScheduleTrackGql::Rss,
@@ -515,6 +525,12 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             ),
             _ => (None, None, None),
         };
+        let held_class = match e.action {
+            ScheduleAction::PauseClass { class } | ScheduleAction::ResumeClass { class } => {
+                Some(class.protocol().into())
+            }
+            _ => None,
+        };
         let mut hardware_profile = None;
         let mut split_usenet_pct = None;
         let mut speed_limits = Vec::new();
@@ -523,8 +539,8 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             ScheduleAction::Pause => "pause",
             ScheduleAction::Resume => "resume",
             ScheduleAction::PauseAll => "pause_all",
-            ScheduleAction::PauseTorrents => "pause_torrents",
-            ScheduleAction::ResumeTorrents => "resume_torrents",
+            ScheduleAction::PauseClass { .. } => "pause_class",
+            ScheduleAction::ResumeClass { .. } => "resume_class",
             ScheduleAction::PausePostProcessing => "pause_post_processing",
             ScheduleAction::ResumePostProcessing => "resume_post_processing",
             ScheduleAction::PauseWatchFolderScanning => "pause_watch_folder_scanning",
@@ -568,6 +584,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             prune_completed,
             prune_cancelled,
             action_type: action_type.to_string(),
+            held_class,
             speed_limit_bytes,
             speed_limits,
             hardware_profile,
@@ -594,6 +611,10 @@ pub struct ScheduleInput {
     pub prune_completed: Option<SchedulePruneFiles>,
     pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
+    /// The class of job a `pause_class` or `resume_class` rule holds, one
+    /// with a hold of its own; refused for every other action.
+    #[graphql(name = "class")]
+    pub held_class: Option<ProtocolGql>,
     /// A global rate for a `speed_limit` rule, read only when `speedLimits`
     /// is omitted. 0 is no limit.
     #[graphql(deprecation = "Use speedLimits.")]
@@ -657,26 +678,26 @@ impl ScheduleInput {
     // honour: a rule that could never apply is refused by name here rather
     // than saved and skipped every time it fires.
     pub fn validate(&self, probe: &SystemProfile) -> Result<(), String> {
-        if !matches!(
-            self.action_type.as_str(),
-            "pause"
-                | "resume"
-                | "pause_all"
-                | "pause_torrents"
-                | "resume_torrents"
-                | "pause_post_processing"
-                | "resume_post_processing"
-                | "pause_watch_folder_scanning"
-                | "resume_watch_folder_scanning"
-                | "pause_rss"
-                | "resume_rss"
-                | "speed_limit"
-                | "bandwidth_split"
-                | "hardware_profile"
-                | "set_server_active"
-                | "set_quota_metering"
-                | "prune_history"
-        ) {
+        if self.class_action()?.is_none()
+            && !matches!(
+                self.action_type.as_str(),
+                "pause"
+                    | "resume"
+                    | "pause_all"
+                    | "pause_post_processing"
+                    | "resume_post_processing"
+                    | "pause_watch_folder_scanning"
+                    | "resume_watch_folder_scanning"
+                    | "pause_rss"
+                    | "resume_rss"
+                    | "speed_limit"
+                    | "bandwidth_split"
+                    | "hardware_profile"
+                    | "set_server_active"
+                    | "set_quota_metering"
+                    | "prune_history"
+            )
+        {
             return Err(format!("unknown schedule actionType: {}", self.action_type));
         }
         let one_shot = self.action_type == "prune_history";
@@ -741,59 +762,92 @@ impl ScheduleInput {
         }
     }
 
+    // The pause or resume of one class's own hold this rule names, if it
+    // names one: `pause_class` or `resume_class` and a class with a hold of
+    // its own. A class named on any other action is refused.
+    fn class_action(
+        &self,
+    ) -> Result<Option<weaver_server_core::bandwidth::ScheduleAction>, String> {
+        use weaver_server_core::bandwidth::ScheduleAction;
+        let pause = match self.action_type.as_str() {
+            "pause_class" => true,
+            "resume_class" => false,
+            other => {
+                return match self.held_class {
+                    Some(_) => Err(format!("a {other} schedule takes no class")),
+                    None => Ok(None),
+                };
+            }
+        };
+        let protocol = Protocol::from(
+            self.held_class
+                .ok_or_else(|| format!("a {} schedule needs a class", self.action_type))?,
+        );
+        let class = HeldClass::of(protocol)
+            .ok_or_else(|| format!("the {} class has no pause of its own", protocol.as_str()))?;
+        Ok(Some(if pause {
+            ScheduleAction::PauseClass { class }
+        } else {
+            ScheduleAction::ResumeClass { class }
+        }))
+    }
+
     pub fn into_entry(self) -> Result<weaver_server_core::bandwidth::ScheduleEntry, String> {
         use weaver_server_core::bandwidth::{QuotaTarget, ScheduleAction, Weekday};
 
-        let action = match self.action_type.as_str() {
-            "pause" => ScheduleAction::Pause,
-            "resume" => ScheduleAction::Resume,
-            "pause_all" => ScheduleAction::PauseAll,
-            "pause_torrents" => ScheduleAction::PauseTorrents,
-            "resume_torrents" => ScheduleAction::ResumeTorrents,
-            "pause_post_processing" => ScheduleAction::PausePostProcessing,
-            "resume_post_processing" => ScheduleAction::ResumePostProcessing,
-            "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,
-            "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
-            "pause_rss" => ScheduleAction::PauseRss,
-            "resume_rss" => ScheduleAction::ResumeRss,
-            "set_server_active" => ScheduleAction::SetServerActive {
-                server_id: self
-                    .server_id
-                    .ok_or("set_server_active requires serverId")?,
-                active: self
-                    .server_active
-                    .ok_or("set_server_active requires serverActive")?,
-            },
-            "set_quota_metering" => ScheduleAction::SetQuotaMetering {
-                enabled: self
-                    .quota_metering_enabled
-                    .ok_or("set_quota_metering requires quotaMeteringEnabled")?,
-                target: self
-                    .quota_egress_id
-                    .map_or(QuotaTarget::AllEgresses, QuotaTarget::Egress),
-            },
-            "prune_history" => ScheduleAction::PruneHistory {
-                failed: self.prune_failed.map(Into::into),
-                completed: self.prune_completed.map(Into::into),
-                cancelled: self.prune_cancelled.map(Into::into),
-            },
-            "speed_limit" => {
-                let limits = self.speed_limit_changes()?;
-                if limits.is_empty() {
-                    return Err("a speed_limit schedule needs at least one limit".into());
-                }
-                ScheduleAction::SpeedLimit { limits }
-            }
-            "bandwidth_split" => ScheduleAction::BandwidthSplit {
-                usenet_pct: self.split_usenet_pct,
-            },
-            "hardware_profile" => match self.hardware_profile {
-                Some(profile) => ScheduleAction::HardwareProfile {
-                    profile: profile.into(),
+        let action = match self.class_action()? {
+            Some(action) => action,
+            None => match self.action_type.as_str() {
+                "pause" => ScheduleAction::Pause,
+                "resume" => ScheduleAction::Resume,
+                "pause_all" => ScheduleAction::PauseAll,
+                "pause_post_processing" => ScheduleAction::PausePostProcessing,
+                "resume_post_processing" => ScheduleAction::ResumePostProcessing,
+                "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,
+                "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
+                "pause_rss" => ScheduleAction::PauseRss,
+                "resume_rss" => ScheduleAction::ResumeRss,
+                "set_server_active" => ScheduleAction::SetServerActive {
+                    server_id: self
+                        .server_id
+                        .ok_or("set_server_active requires serverId")?,
+                    active: self
+                        .server_active
+                        .ok_or("set_server_active requires serverActive")?,
                 },
-                None => return Err("a hardware_profile schedule needs a hardwareProfile".into()),
+                "set_quota_metering" => ScheduleAction::SetQuotaMetering {
+                    enabled: self
+                        .quota_metering_enabled
+                        .ok_or("set_quota_metering requires quotaMeteringEnabled")?,
+                    target: self
+                        .quota_egress_id
+                        .map_or(QuotaTarget::AllEgresses, QuotaTarget::Egress),
+                },
+                "prune_history" => ScheduleAction::PruneHistory {
+                    failed: self.prune_failed.map(Into::into),
+                    completed: self.prune_completed.map(Into::into),
+                    cancelled: self.prune_cancelled.map(Into::into),
+                },
+                "speed_limit" => {
+                    let limits = self.speed_limit_changes()?;
+                    if limits.is_empty() {
+                        return Err("a speed_limit schedule needs at least one limit".into());
+                    }
+                    ScheduleAction::SpeedLimit { limits }
+                }
+                "bandwidth_split" => ScheduleAction::BandwidthSplit {
+                    usenet_pct: self.split_usenet_pct,
+                },
+                "hardware_profile" => match self.hardware_profile {
+                    Some(profile) => ScheduleAction::HardwareProfile {
+                        profile: profile.into(),
+                    },
+                    None => {
+                        return Err("a hardware_profile schedule needs a hardwareProfile".into());
+                    }
+                },
+                _ => return Err(format!("unknown schedule actionType: {}", self.action_type)),
             },
-            _ => return Err(format!("unknown schedule actionType: {}", self.action_type)),
         };
         // A day the rule names must be a weekday; dropping an unknown one
         // would quietly widen or narrow when the rule fires.
@@ -880,6 +934,7 @@ mod schedule_input_tests {
             prune_completed: None,
             prune_cancelled: None,
             action_type: action_type.into(),
+            held_class: None,
             speed_limit_bytes: None,
             speed_limits: None,
             hardware_profile: None,

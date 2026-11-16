@@ -27,7 +27,7 @@ use weaver_torrent::{
 use weaver_tunnel::pipe::Dialer;
 
 use crate::StateError;
-use crate::bandwidth::TorrentRates;
+use crate::bandwidth::ClassRates;
 use crate::persistence::Database;
 use crate::proxies::{
     Consumer, EgressBinding, EgressHealth, EgressInterface, EgressLimitChanges, FetchOptions,
@@ -390,8 +390,8 @@ pub trait Routes: Send + Sync {
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String>;
     /// What egress `egress_id` lets its sessions move at now: its own caps
     /// under its quota state. No limit by default.
-    fn egress_rates(&self, _egress_id: u32) -> TorrentRates {
-        TorrentRates::default()
+    fn egress_rates(&self, _egress_id: u32) -> ClassRates {
+        ClassRates::default()
     }
     /// What rings as an egress's caps or quota state may change; none when
     /// no egress limits torrents.
@@ -550,7 +550,7 @@ impl Routes for NetworkRoutes {
         ))
     }
 
-    fn egress_rates(&self, egress_id: u32) -> TorrentRates {
+    fn egress_rates(&self, egress_id: u32) -> ClassRates {
         self.network().torrent_egress_rates(egress_id)
     }
 

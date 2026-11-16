@@ -370,10 +370,11 @@ async fn present_staging_dirs(staging_roots: &[PathBuf], job_id: JobId) -> Vec<P
 }
 
 // The marked working directories of `job_ids` under the intermediate root,
-// and which of them are live torrents. A job whose torrent row stands is
-// live: its folders are the torrent's, never a history row's to take, not
-// those it is marked in nor the one its row records. Which have one is read
-// in one batched lookup, before the scan.
+// and which of them are live in a class. A job a class still holds is live:
+// its folders are the class's, never a history row's to take, not those it
+// is marked in nor the one its row records. Which are live is read from the
+// database, one batched lookup per class that keeps live jobs, before the
+// scan: whether or not the class is running.
 async fn scan_marked_dirs(
     db: &crate::Database,
     intermediate_dir: &std::path::Path,
@@ -384,8 +385,7 @@ async fn scan_marked_dirs(
     let db = db.clone();
     match tokio::task::spawn_blocking(move || {
         let ids = owners.iter().copied().collect::<Vec<_>>();
-        let live = db
-            .torrent_job_ids_among(&ids)
+        let live = crate::jobs::Protocol::live_among(&db, &ids)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         owners.retain(|job_id| !live.contains(job_id));
         crate::jobs::working_dir::job_working_dirs(&root, &owners).map(|marked| (marked, live))

@@ -467,7 +467,13 @@ impl Pipeline {
             .shared_state
             .server_transfer_policy()
             .map_or(0, |policy| policy.transfer_registry().received_bytes());
-        let torrents = self.shared_state.torrent_rate();
+        // The split's other side is the torrent class's, when it is seated.
+        let torrents = self
+            .shared_state
+            .classes()
+            .get(crate::jobs::Protocol::Torrent)
+            .cloned();
+        let torrents = torrents.as_deref().and_then(|class| class.rate());
         let Some((then, before)) = self.split_sampled else {
             self.split_sampled = Some((now, usenet));
             if let Some(torrents) = torrents {
@@ -499,7 +505,12 @@ impl Pipeline {
     pub(crate) fn apply_global_rate(&mut self) {
         let cap = self.global_rate(crate::bandwidth::Direction::Download);
         let split = self.split_in_force();
-        let torrents = self.shared_state.torrent_rate();
+        let torrents = self
+            .shared_state
+            .classes()
+            .get(crate::jobs::Protocol::Torrent)
+            .cloned();
+        let torrents = torrents.as_deref().and_then(|class| class.rate());
         let rates = match &torrents {
             Some(_) => crate::bandwidth::split_rates(
                 cap,
@@ -520,7 +531,7 @@ impl Pipeline {
             self.rate_limiter.set_rate(rates.usenet);
         }
         if let Some(torrents) = torrents {
-            torrents.set_rates(crate::bandwidth::TorrentRates {
+            torrents.set_rates(crate::bandwidth::ClassRates {
                 download: rates.torrent,
                 upload: self.global_rate(crate::bandwidth::Direction::Upload),
             });
@@ -557,11 +568,11 @@ impl Pipeline {
         }
         // The operator's holds outlive a restart; the others are put back by
         // whoever holds them.
-        for owner in [HoldOwner::All, HoldOwner::Torrents] {
+        for (owner, setting) in HoldOwner::kept() {
             let held = self.applied_holds.held_by(HoldOrigin::Manual, owner);
             if held != before.held_by(HoldOrigin::Manual, owner)
-                && let Err(error) = self.db.try_queue_write(owner.setting(), move |db| {
-                    db.set_setting(owner.setting(), &held.to_string())
+                && let Err(error) = self.db.try_queue_write(setting, move |db| {
+                    db.set_setting(setting, &held.to_string())
                 })
             {
                 tracing::error!(%error, ?owner, "db write failed for the operator's hold");

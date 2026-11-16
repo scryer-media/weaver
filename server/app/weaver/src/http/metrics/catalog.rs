@@ -420,8 +420,8 @@ metric_families! {
     // ---- schedules ----------------------------------------------------------------
     SCHEDULE_EVALUATIONS = ("weaver_schedule_evaluations_total", Counter, [],
         "Schedule evaluator ticks.");
-    SCHEDULE_ACTIONS = ("weaver_schedule_actions_total", Counter, ["action", "track", "outcome"],
-        "Schedule actions applied, by action kind, the state track it drives, and outcome.");
+    SCHEDULE_ACTIONS = ("weaver_schedule_actions_total", Counter, ["action", "class", "track", "outcome"],
+        "Schedule actions applied, by action kind, the class of job a class action holds (empty for any other), the state track it drives, and outcome.");
     SCHEDULE_ONE_SHOT_FIRES = ("weaver_schedule_one_shot_fires_total", Counter, ["action"],
         "One-shot schedule rules that came due.");
     SCHEDULE_REPLAYS = ("weaver_schedule_replays_total", Counter, ["reason"],

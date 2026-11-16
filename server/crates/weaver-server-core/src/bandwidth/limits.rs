@@ -176,14 +176,8 @@ pub fn lower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-// The rates torrents move at, one per direction: their side of the download
-// split, and the whole upload limit, since usenet uploads nothing. `None` is
-// no limit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TorrentRates {
-    pub download: Option<u64>,
-    pub upload: Option<u64>,
-}
+// The rates a class of job moves at, one per direction.
+pub use crate::jobs::class::ClassRates;
 
 // The split as it stands, as the API shows it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
