@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 
 use crate::disk::{BlockPool, DiskQueue, MAX_QUEUED_CHECK_BYTES, MAX_QUEUED_DISK_BYTES};
 use crate::session_stats::disk::{DiskStats, DiskStatsSnapshot};
-use crate::torrent_state::{DiskWrite, HashJob};
+use crate::torrent_state::{HashJob, WriteJob};
 
 /// Threads of a session that check pieces: one, libtorrent's default
 /// (`settings_pack::hashing_threads`, settings_pack.cpp:353, its one
@@ -49,7 +49,7 @@ pub struct BlockingSpawner {
     // The whole pieces storages hold in memory that wait for their check
     // and their write, counted by the marks the blocks are.
     checks: BlockPool,
-    disk: DiskQueue<DiskWrite>,
+    disk: DiskQueue<WriteJob>,
     // The thread that checks a piece whose last block landed: the session's
     // one, on the session's runtime, there while it has a check to run.
     hash: DiskQueue<HashJob>,
@@ -142,7 +142,7 @@ impl BlockingSpawner {
     }
 
     /// The threads that write received blocks and checked pieces.
-    pub(crate) fn disk(&self) -> &DiskQueue<DiskWrite> {
+    pub(crate) fn disk(&self) -> &DiskQueue<WriteJob> {
         &self.disk
     }
 

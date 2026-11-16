@@ -1544,3 +1544,200 @@ async fn a_server_list_edited_mid_flight_keeps_whom_each_article_was_tried_on() 
         0
     );
 }
+
+// Answer `work`, handed to `server`, with `error` through the result path a
+// lane's BODY reply takes, so the reply's own classification decides.
+async fn answer_nntp(
+    pipeline: &mut Pipeline,
+    server: usize,
+    work: DownloadWork,
+    error: weaver_nntp::NntpError,
+) {
+    let (job_id, segment_id) = (work.segment_id.file_id.job_id, work.segment_id);
+    let (retry_count, exclude_servers) = (work.retry_count, work.exclude_servers);
+    pipeline.hold_test_lane_works(vec![work], false);
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id,
+            runtime_generation: pipeline.pool_generation,
+            segment_id,
+            data: Err(DownloadError::from_nntp(error)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(server),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count,
+            exclude_servers,
+            release_connection_slot: true,
+        })
+        .await;
+}
+
+fn body_reply(code: u16, message: &str) -> weaver_nntp::NntpError {
+    weaver_nntp::NntpError::from_status(weaver_nntp::StatusCode::new(code), message)
+}
+
+async fn one_article_job(pipeline: &mut Pipeline, job_id: JobId) {
+    insert_active_job(
+        pipeline,
+        job_id,
+        segmented_job_spec("Odd Replies", "payload.bin", &[128]),
+    )
+    .await;
+    pipeline.active_download_passes.insert(job_id);
+}
+
+// 503 and 499 to BODY are the server's trouble, as 400 is: the article keeps
+// its tries even with all of them spent, and waits to be asked again.
+#[tokio::test]
+async fn a_503_or_499_to_body_does_not_charge_the_article() {
+    for (job, code) in [(42101, 503), (42102, 499)] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut pipeline = ladder_pipeline(&temp_dir, &[(0, false)]).await;
+        let job_id = JobId(job);
+        one_article_job(&mut pipeline, job_id).await;
+        let mut work = ask(&mut pipeline, 0, 1).pop().unwrap();
+        work.retry_count = MAX_SEGMENT_RETRIES;
+        answer_nntp(&mut pipeline, 0, work, body_reply(code, "internal error")).await;
+
+        assert_eq!(
+            pipeline
+                .metrics
+                .segments_failed_permanent
+                .load(Ordering::Relaxed),
+            0,
+            "{code}"
+        );
+        assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0, "{code}");
+        let due = pipeline.infrastructure_retries.next_deadline().unwrap();
+        let ready = pipeline.infrastructure_retries.take_due(due);
+        assert_eq!(ready.len(), 1, "{code}");
+        assert_eq!(ready[0].work.retry_count, MAX_SEGMENT_RETRIES, "{code}");
+        assert!(ready[0].work.exclude_servers.is_empty(), "{code}");
+    }
+}
+
+// An answer to BODY the client has no class for costs the article its tries
+// on that server as before. Once they are spent and another server may still
+// serve it, the server joins the article's exclusions and the next server is
+// handed it with a fresh count.
+#[tokio::test]
+async fn an_unknown_body_reply_moves_the_article_to_the_next_server_once_its_tries_are_spent() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = ladder_pipeline(&temp_dir, &[(0, false), (0, false)]).await;
+    let job_id = JobId(42103);
+    one_article_job(&mut pipeline, job_id).await;
+
+    // The last try on server 0 spent: the article goes to the other server
+    // at once.
+    let mut work = ask(&mut pipeline, 0, 1).pop().unwrap();
+    work.retry_count = MAX_SEGMENT_RETRIES;
+    answer_nntp(&mut pipeline, 0, work, body_reply(501, "syntax error")).await;
+    assert!(
+        ask(&mut pipeline, 0, 1).is_empty(),
+        "server 0 is done with it"
+    );
+    let moved = ask(&mut pipeline, 1, 1)
+        .pop()
+        .expect("server 1 is handed it");
+    assert_eq!(moved.exclude_servers, [0]);
+    assert_eq!(moved.retry_count, 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0);
+}
+
+// The same with one server: nothing is left to ask, so the spent tries end
+// the article as before.
+#[tokio::test]
+async fn an_unknown_body_reply_on_the_only_server_ends_the_article_once_its_tries_are_spent() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = ladder_pipeline(&temp_dir, &[(0, false)]).await;
+    let job_id = JobId(42104);
+    one_article_job(&mut pipeline, job_id).await;
+
+    let mut work = ask(&mut pipeline, 0, 1).pop().unwrap();
+    let segment_id = work.segment_id;
+    work.retry_count = MAX_SEGMENT_RETRIES;
+    answer_nntp(&mut pipeline, 0, work, body_reply(501, "syntax error")).await;
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pipeline.segment_terminal_states.get(&segment_id),
+        Some(&crate::pipeline::SegmentTerminalState::RetriesExhausted)
+    );
+    assert!(ask(&mut pipeline, 0, 1).is_empty());
+}
+
+// A server that needs a group selected and answers 411 for every newsgroup
+// of the work does not carry the post: the leased article leaves that
+// server for the next as on a 430, and spends no try.
+#[tokio::test]
+async fn every_group_refused_moves_the_lease_to_the_next_server() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = ladder_pipeline(&temp_dir, &[(0, false), (0, false)]).await;
+    let job_id = JobId(42105);
+    one_article_job(&mut pipeline, job_id).await;
+
+    let work = ask(&mut pipeline, 0, 1).pop().unwrap();
+    pipeline.hold_test_lane_works(vec![work.clone()], false);
+    let lease = DownloadBatchLease {
+        body_activity: std::sync::Arc::default(),
+        lane_id: 0,
+        job_id,
+        runtime_generation: pipeline.pool_generation,
+        lane_mode: DownloadLaneMode::Sequential,
+        server_modes: Vec::new(),
+        completion_critical: false,
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        pressure_clear: true,
+        repeated: None,
+        works: vec![work],
+    };
+    pipeline.active_download_connections = 1;
+    pipeline
+        .active_download_connections_by_job
+        .insert(job_id, 1);
+    pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
+    let mut pending = VecDeque::new();
+    pipeline.handle_owned_download_lane_event(
+        OwnedDownloadLaneEvent::AcquireFailed {
+            lease,
+            error: weaver_nntp::client::BlockingBodyLaneAcquireError::GroupsNotCarried {
+                server: weaver_nntp::ServerId(0),
+                error: weaver_nntp::NntpError::NoSuchGroup,
+            },
+        },
+        &mut pending,
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].source_server_idx, Some(0));
+    for result in pending {
+        pipeline.process_released_download_done(result).await;
+    }
+
+    assert!(ask(&mut pipeline, 0, 1).is_empty());
+    let moved = ask(&mut pipeline, 1, 1)
+        .pop()
+        .expect("server 1 is handed it");
+    assert_eq!(moved.exclude_servers, [0]);
+    assert_eq!(moved.retry_count, 0);
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+}

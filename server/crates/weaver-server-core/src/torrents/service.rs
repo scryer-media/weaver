@@ -218,6 +218,9 @@ pub struct JobEnv {
     // job does. None with no pipeline, where a torrent in upload mode
     // tries again by itself.
     pub(crate) capacity: Option<Arc<StorageCapacity>>,
+    // Where every torrent's pieces are written: the volumes' writers the
+    // pipeline writes through too.
+    pub(crate) disk: Arc<crate::torrents::writes::TorrentDisk>,
     pub(crate) slots: usize,
     pub(crate) limits: Arc<ExtractionLimits>,
     // The decode pool the pipeline's jobs share, and where a decode window
@@ -245,13 +248,24 @@ pub struct JobEnv {
 
 impl JobEnv {
     /// The pipeline's own budget: its holds, slots, extraction limits and
-    /// the complete root's free space.
-    pub fn of_pipeline(pipeline: &crate::pipeline::Pipeline) -> Self {
+    /// the complete root's free space; written through the volumes' writers
+    /// the process shares, `writers`, on the limits `buffers` sizes.
+    pub fn of_pipeline(
+        pipeline: &crate::pipeline::Pipeline,
+        writers: Arc<crate::operations::VolumeWriters>,
+        buffers: Arc<crate::operations::VolumeBuffers>,
+    ) -> Self {
         let budget = pipeline.graph_budget();
+        let capacity = pipeline.storage_capacity();
         Self {
             accountant: budget.accountant,
             free_disk: budget.free_disk,
-            capacity: Some(pipeline.storage_capacity()),
+            disk: crate::torrents::writes::TorrentDisk::new(
+                writers,
+                Some(Arc::clone(&capacity)),
+                Some(buffers),
+            ),
+            capacity: Some(capacity),
             slots: budget.slots.max(1),
             limits: budget.limits,
             decode: budget.decode,
@@ -290,6 +304,7 @@ impl JobEnv {
             })),
             free_disk: CapacityReader::unknown(),
             capacity: None,
+            disk: crate::torrents::writes::TorrentDisk::alone(),
             slots: 1,
             limits: Arc::new(ExtractionLimits::unbounded()),
             decode: Arc::new(DecodePool::new(u64::MAX)),
@@ -323,12 +338,17 @@ const ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 impl TorrentService {
     /// The server's torrent client, started: sessions on the proxy
     /// runtime's routes while the settings turn torrents on, jobs on the
-    /// pipeline's budget, and its torrents in the pipeline's queue.
+    /// pipeline's budget, and its torrents in the pipeline's queue. Its
+    /// pieces are written by the volumes' writers the process shares,
+    /// `writers`, on the limits `buffers` sizes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn for_server(
         config: &Config,
         db: Database,
         proxies: &Arc<crate::proxies::ProxyRuntime>,
         pipeline: &crate::pipeline::Pipeline,
+        writers: Arc<crate::operations::VolumeWriters>,
+        buffers: Arc<crate::operations::VolumeBuffers>,
         queue: SchedulerHandle,
         crashed: crate::runtime::panic_trap::CrashMarks,
     ) -> Result<Self, String> {
@@ -338,7 +358,7 @@ impl TorrentService {
             db,
             sessions,
             TorrentSettings::of(config),
-            JobEnv::of_pipeline(pipeline),
+            JobEnv::of_pipeline(pipeline, writers, buffers),
             Arc::new(SystemClock),
         );
         service.wire_to(queue);
@@ -383,12 +403,14 @@ fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
 // is no URL is left out, as a session leaves it out.
 fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
     let mut tidy: Vec<TrackerEntry> = Vec::with_capacity(trackers.len());
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(trackers.len());
     for entry in trackers {
         let url = entry.url.trim();
         if weaver_torrent::Url::parse(url).is_err() {
             continue;
         }
-        if tidy.iter().all(|known| known.url != url) {
+        if seen.insert(url.to_owned()) {
             tidy.push(TrackerEntry {
                 tier: entry.tier,
                 url: url.to_owned(),

@@ -20,6 +20,7 @@ pub mod status;
 pub(crate) mod storage;
 pub(crate) mod store;
 pub(crate) mod tee;
+pub(crate) mod writes;
 
 pub use model::{
     ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentFile, TorrentInsert,

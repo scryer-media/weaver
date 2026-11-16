@@ -17,7 +17,8 @@ use crate::jobs::handle::{CancellationOrigin, QueueAction, QueueMoveTarget};
 use crate::jobs::model::{FieldUpdate, JobUpdate, PRIORITY_ATTRIBUTE_KEY};
 use crate::torrents::metrics::FetchOutcome;
 use crate::torrents::{KeptIntent, TorrentIntent};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Range;
 use std::sync::PoisonError;
 
 pub(super) type Outcome = BTreeMap<JobId, Result<(), ActionError>>;
@@ -474,18 +475,17 @@ impl TorrentService {
                 .collect();
             order.sort_unstable();
             let places: Vec<i64> = order.iter().map(|(place, _)| *place).collect();
-            let mut order: Vec<JobId> = order.into_iter().map(|(_, job_id)| job_id).collect();
+            let mut order = Spliced::new(
+                order.into_iter().map(|(_, job_id)| job_id).collect(),
+                &places,
+            );
             let mut first_change = None;
             for (index, &(job_id, target)) in moves.iter().enumerate() {
                 if !live.contains_key(&job_id) {
                     outcome.insert(job_id, Err(ActionError::NotFound(job_id)));
                     break;
                 }
-                let spliced = crate::jobs::handle::splice_job_order(&mut order, job_id, target)
-                    .unwrap_or(false);
-                // Torrents that share a place are taken by job, as a move
-                // on its own reads them back.
-                ties_by_job(&mut order, &places);
+                let spliced = order.splice(job_id, target);
                 if first_change.is_none() && spliced {
                     first_change = Some(index);
                 }
@@ -495,6 +495,7 @@ impl TorrentService {
                 return outcome;
             };
             let moved: Vec<(JobId, i64)> = order
+                .order
                 .iter()
                 .zip(places.iter().copied())
                 .filter(|(job_id, place)| live[*job_id].record.queue_position != *place)
@@ -559,18 +560,84 @@ fn failed(mut outcome: Outcome, job_ids: &[JobId], error: &StateError) -> Outcom
     outcome
 }
 
-// Torrents given the same place keep the order a fresh read gives them:
-// by job.
-fn ties_by_job(order: &mut [JobId], places: &[i64]) {
-    let mut start = 0;
-    while start < places.len() {
-        let mut end = start + 1;
-        while end < places.len() && places[end] == places[start] {
-            end += 1;
+// The torrents still downloading, in queue order, as one move after
+// another changes it, each move as `splice_job_order` makes it. Each
+// torrent's index is kept, so a move costs the places it moves over, not
+// the length of the queue.
+pub(super) struct Spliced {
+    pub(super) order: Vec<JobId>,
+    at: HashMap<JobId, usize>,
+    // The runs of slots that share a place, in order. Torrents in one run
+    // keep the order a fresh read gives them: by job.
+    ties: Vec<Range<usize>>,
+}
+
+impl Spliced {
+    // `order` sorted by place then job, with `places` the place of each
+    // slot.
+    pub(super) fn new(order: Vec<JobId>, places: &[i64]) -> Self {
+        let at = order
+            .iter()
+            .enumerate()
+            .map(|(index, job_id)| (*job_id, index))
+            .collect();
+        let mut ties = Vec::new();
+        let mut start = 0;
+        while start < places.len() {
+            let mut end = start + 1;
+            while end < places.len() && places[end] == places[start] {
+                end += 1;
+            }
+            if end - start > 1 {
+                ties.push(start..end);
+            }
+            start = end;
         }
-        if end - start > 1 {
-            order[start..end].sort_unstable();
+        Self { order, at, ties }
+    }
+
+    // Moves `job_id` to `target`; false when it did not move, or is not in
+    // the order.
+    pub(super) fn splice(&mut self, job_id: JobId, target: QueueMoveTarget) -> bool {
+        let Some(&current) = self.at.get(&job_id) else {
+            return false;
+        };
+        let last = self.order.len() - 1;
+        let to = match target {
+            QueueMoveTarget::Top => 0,
+            QueueMoveTarget::Bottom => last,
+            QueueMoveTarget::Offset(delta) => {
+                (current as i64).saturating_add(delta).clamp(0, last as i64) as usize
+            }
+        };
+        if to == current {
+            return false;
         }
-        start = end;
+        let (low, high) = (current.min(to), current.max(to));
+        if current < to {
+            self.order[low..=high].rotate_left(1);
+        } else {
+            self.order[low..=high].rotate_right(1);
+        }
+        self.index(low..high + 1);
+        // Only the runs of shared places the move shifted can be out of
+        // job order.
+        let first = self.ties.partition_point(|run| run.end <= low);
+        for run in self.ties[first..]
+            .iter()
+            .take_while(|run| run.start <= high)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.order[run.clone()].sort_unstable();
+            self.index(run);
+        }
+        true
+    }
+
+    fn index(&mut self, slots: Range<usize>) {
+        for slot in slots {
+            self.at.insert(self.order[slot], slot);
+        }
     }
 }

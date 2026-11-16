@@ -424,7 +424,7 @@ impl TorrentService {
         self.view_of(settings, torrent, torrent.reading(now), now)
     }
 
-    fn view_of(
+    pub(super) fn view_of(
         &self,
         settings: &TorrentSettings,
         torrent: &Live,
@@ -502,7 +502,9 @@ impl TorrentService {
             upload_bps: reading.speeds.1,
             upload_limit: record.upload_limit,
             download_limit: record.download_limit,
-            eta_seconds: status::eta_seconds(total.saturating_sub(have), reading.speeds.0),
+            // The wanted bytes still to come: an Ignored file never comes
+            // (qBittorrent `TorrentImpl::eta`, wanted less completed).
+            eta_seconds: status::eta_seconds(wanted.saturating_sub(wanted_have), reading.speeds.0),
             peers: reading.peers.0,
             seeds: reading.peers.1,
             leechers: reading.peers.0.saturating_sub(reading.peers.1),

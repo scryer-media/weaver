@@ -7,7 +7,7 @@
 
 use super::blocks::hash_landed_piece;
 use super::blocks::land_blocks;
-use super::blocks::settle_landed_piece;
+use super::blocks::{piece_passing, piece_stored, settle_landed_piece};
 use std::sync::Arc;
 
 use crate::core::lengths::ChunkInfo;
@@ -20,7 +20,7 @@ use crate::{
 
 use super::peer::PeerTx;
 
-use super::{DiskWrite, HashJob, Landed, PieceCheck, PieceWrite, WriteJob, Written};
+use super::{HashJob, Landed, PieceCheck, Stored, StoredPiece, WriteJob, Written};
 
 impl Drop for Written {
     fn drop(&mut self) {
@@ -30,17 +30,12 @@ impl Drop for Written {
     }
 }
 
-impl DiskJob for DiskWrite {
+impl DiskJob for WriteJob {
     // One torrent's writes run on one thread at a time, in the order
     // queued: writes racing on the same files cost each other more than
-    // they gain, and whole pieces reach the files in the order their
-    // checks ended.
+    // they gain.
     fn key(&self) -> usize {
-        let state = match self {
-            DiskWrite::Block(job) => &job.state,
-            DiskWrite::Piece(PieceWrite(job)) => &job.state,
-        };
-        Arc::as_ptr(state) as usize
+        Arc::as_ptr(&self.state) as usize
     }
 
     fn run(self) {
@@ -48,38 +43,16 @@ impl DiskJob for DiskWrite {
         Self::run_batch(&mut one);
     }
 
-    // Each run of blocks is landed as one batch; a piece is written on its
-    // turn among them.
+    // Each run of blocks is landed as one batch.
     fn run_batch(batch: &mut std::collections::VecDeque<Self>) {
-        let mut blocks = std::collections::VecDeque::new();
-        while let Some(job) = batch.pop_front() {
-            match job {
-                DiskWrite::Block(job) => {
-                    blocks.push_back(job);
-                    while let Some(DiskWrite::Block(_)) = batch.front() {
-                        if let Some(DiskWrite::Block(job)) = batch.pop_front() {
-                            blocks.push_back(job);
-                        }
-                    }
-                    WriteJob::run_batch(&mut blocks);
-                }
-                DiskWrite::Piece(PieceWrite(job)) => {
-                    let state = job.state.clone();
-                    // Dropped unwritten once its run has ended: the piece is
-                    // fetched again in a later run.
-                    if let Some(_turn) = state.storage_turn() {
-                        job.settle(Verdict::Passed);
-                    }
-                }
-            }
-        }
+        WriteJob::land_batch(batch);
     }
 }
 
 impl WriteJob {
     // The batch is landed a torrent at a time: each run of jobs of one
     // torrent takes the torrent's lock twice, not twice per block.
-    fn run_batch(batch: &mut std::collections::VecDeque<Self>) {
+    fn land_batch(batch: &mut std::collections::VecDeque<Self>) {
         let mut landed = Vec::new();
         while let Some(head) = batch.front() {
             let state = head.state.clone();
@@ -151,6 +124,7 @@ impl WriteJob {
                     written: Written(None),
                     queued: Some(spawner.check_queued()),
                     ended: None,
+                    stored: None,
                     _run,
                 });
             }
@@ -207,15 +181,42 @@ impl DiskJob for HashJob {
             return;
         };
         let stats = state.shared.spawner.stats().clone();
+        // Back from its storage: the piece is had, or not, here.
+        if let Some(stored) = self.stored.take() {
+            match stored {
+                Stored::Written(written, epoch) => self.stored(written, epoch),
+                // Dropped unwritten: fetched again as the job is dropped
+                // (`PieceCheck`).
+                Stored::Dropped => drop(self),
+            }
+            stats.hash_thread_worked(since);
+            return;
+        }
         match hash_landed_piece(&self.state, self.chunk.piece_index) {
-            // A piece its storage holds in memory is written whole now: on
-            // the torrent's turn of the write threads, in the order the
-            // checks ended, with the hashing thread on to the next check
-            // (libtorrent hashes on `hashing_threads` and writes on
-            // `aio_threads`, mmap_disk_io.cpp:369-374).
+            // A piece its storage holds in memory is handed to the storage
+            // whole now, which writes it on a thread of its own, in the
+            // order the checks ended, with the hashing thread on to the
+            // next check (libtorrent hashes on `hashing_threads` and writes
+            // on `aio_threads`, mmap_disk_io.cpp:369-374). It is had once
+            // the storage says it wrote it.
+            // A run told to end meanwhile hands its storage nothing more:
+            // the piece is fetched again in a later run, its room kept.
+            Ok(Verdict::Passed)
+                if self.state.files.writes_to_memory()
+                    && state.cancellation_token.is_cancelled() => {}
             Ok(Verdict::Passed) if self.state.files.writes_to_memory() => {
-                let disk = self.state.shared.spawner.disk().clone();
-                disk.push(DiskWrite::Piece(PieceWrite(self)));
+                let piece = self.chunk.piece_index;
+                let epoch = piece_passing(&state, piece);
+                let call = stats.call(DiskOp::PieceWrite);
+                call.bytes(u64::from(state.lengths.piece_length(piece)));
+                state.files.store_verified_piece(
+                    piece,
+                    StoredPiece {
+                        job: Some(self),
+                        epoch,
+                    },
+                );
+                drop(call);
             }
             Ok(verdict) => self.settle(verdict),
             // A check that gave no verdict, its piece unread: the torrent
@@ -241,6 +242,30 @@ impl DiskJob for HashJob {
 impl HashJob {
     // The piece's verdict is acted on, and its check is over.
     fn settle(self, verdict: Verdict) {
+        self.end(|state, addr, counters, chunk, time, senders| {
+            settle_landed_piece(state, addr, counters, chunk, time, senders, verdict)
+        });
+    }
+
+    // The piece passed, and its storage wrote it or refused it: it is had,
+    // or fetched again, and its check is over.
+    fn stored(self, written: anyhow::Result<()>, epoch: u64) {
+        self.end(|state, _, counters, chunk, time, senders| {
+            piece_stored(state, counters, chunk, time, senders, epoch, written)
+        });
+    }
+
+    fn end(
+        self,
+        act: impl FnOnce(
+            &super::TorrentStateLive,
+            PeerHandle,
+            &super::AtomicPeerCounters,
+            &ChunkInfo,
+            Option<std::time::Duration>,
+            crate::piece_tracker::Senders,
+        ) -> anyhow::Result<()>,
+    ) {
         let HashJob {
             state,
             tx,
@@ -254,9 +279,10 @@ impl HashJob {
             written,
             queued: _,
             ended,
+            stored: _,
             _run,
         } = self;
-        let settled = settle_landed_piece(&state, addr, &counters, &chunk, time, senders, verdict);
+        let settled = act(&state, addr, &counters, &chunk, time, senders);
         check.done();
         // The piece waits no more before its connection is told so.
         drop(waiting);
@@ -265,5 +291,31 @@ impl HashJob {
             chunk_failed(&tx, addr, &chunk, e);
         }
         drop(ended);
+    }
+}
+
+impl StoredPiece {
+    /// The storage's write of the piece ended: `written` is its result.
+    /// The piece goes back to its torrent's hashing thread, which has it,
+    /// or fetches it again on an error, as a write's error is handled.
+    /// Called from any thread; it waits on nothing.
+    pub fn stored(mut self, written: anyhow::Result<()>) {
+        let epoch = self.epoch;
+        self.back(Stored::Written(written, epoch));
+    }
+
+    fn back(&mut self, stored: Stored) {
+        if let Some(mut job) = self.job.take() {
+            job.stored = Some(stored);
+            let hash = job.state.shared.spawner.hash().clone();
+            hash.push(job);
+        }
+    }
+}
+
+impl Drop for StoredPiece {
+    // Dropped unsaid: the piece was not written.
+    fn drop(&mut self) {
+        self.back(Stored::Dropped);
     }
 }

@@ -7,7 +7,6 @@ use crate::auth::CallerScope;
 use crate::categories::model;
 use crate::jobs::JobId;
 use crate::pipeline::claim_complete_destination_path;
-use crate::torrents::files::Files;
 use crate::torrents::relocate;
 use crate::torrents::relocate::{Existing, MoveError};
 use crate::torrents::storage::Pieces;
@@ -176,7 +175,7 @@ impl TorrentService {
             )));
         }
         let outcome = tokio::task::spawn_blocking(move || {
-            store.files().relocate(|dir| {
+            store.relocate(|dir| {
                 // Its marker is made for the folder's path, so the moved
                 // folder takes one made for where it went, as the job's own.
                 let owned = crate::jobs::working_dir::output_dir_owner(dir)
@@ -243,13 +242,7 @@ impl TorrentService {
                 .db
                 .set_torrent_storage_dir(job_id, &dir)
                 .map_err(|error| ActionError::State(state_error(error)))?;
-            match store
-                .files()
-                .relocate(|_| Ok::<_, std::convert::Infallible>((to.clone(), ())))
-            {
-                Ok(()) => {}
-                Err(never) => match never {},
-            }
+            store.place(to.clone());
             torrent.record.storage_dir = Some(dir.clone());
             Ok(())
         })
@@ -315,7 +308,7 @@ impl TorrentService {
         });
         let from = from.to_path_buf();
         let outcome =
-            tokio::task::spawn_blocking(move || move_listed(store.files(), &outputs, to, existing))
+            tokio::task::spawn_blocking(move || move_listed(&store, &outputs, to, existing))
                 .await
                 .unwrap_or_else(|error| {
                     Err(MoveError {
@@ -529,18 +522,19 @@ pub(super) enum Moving {
 // there from then on; where they went, and whether a file already there
 // was kept in place of one of them.
 pub(in crate::torrents) fn move_listed(
-    files: &Files,
+    store: &TorrentStore,
     outputs: &[String],
     to: PathBuf,
     existing: Existing,
 ) -> Result<(PathBuf, bool), MoveError> {
-    let names: Vec<PathBuf> = files
+    let names: Vec<PathBuf> = store
+        .files()
         .names()
         .flatten()
         .map(Path::to_path_buf)
         .chain(outputs.iter().map(PathBuf::from))
         .collect();
-    files.relocate(|dir| {
+    store.relocate(|dir| {
         let moves: Vec<(PathBuf, PathBuf)> = names
             .iter()
             .map(|name| (dir.join(name), to.join(name)))

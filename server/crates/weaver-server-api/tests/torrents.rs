@@ -219,6 +219,31 @@ async fn a_metainfo_is_added_and_read_back() {
     assert_eq!(listed["torrent"]["infohash"].as_str().unwrap().len(), 40);
 }
 
+// A list that asks for each torrent's files gets them, as the torrent's own
+// read does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_list_carries_the_files_it_asks_for() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("listed.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let listed = rig
+        .execute(&format!(
+            "{{ torrents {{ id files {{ path length }} }} torrent(id: {id}) {{ files {{ path length }} }} }}"
+        ))
+        .await;
+    assert!(listed.errors.is_empty(), "{:?}", listed.errors);
+    let listed = listed.data.into_json().unwrap();
+    assert_eq!(listed["torrents"][0]["id"], id);
+    assert_eq!(listed["torrents"][0]["files"][0]["path"], "listed.mkv");
+    assert_eq!(listed["torrents"][0]["files"][0]["length"], 3000);
+    assert_eq!(listed["torrents"][0]["files"], listed["torrent"]["files"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_duplicate_is_refused() {
     let rig = rig().await;

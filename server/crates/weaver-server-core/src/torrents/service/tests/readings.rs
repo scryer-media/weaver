@@ -929,3 +929,35 @@ async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
     assert_eq!(seen(), Some(at));
     rig.service.stop().await;
 }
+
+// A torrent's ETA is over the bytes it wants and has not: an Ignored file,
+// never to come, adds nothing to it (qBittorrent `TorrentImpl::eta`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_eta_counts_only_the_wanted_bytes_left() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let files = [
+        ("set/a.bin", &[1u8; 6_000][..]),
+        ("set/b.bin", &[2u8; 30_000][..]),
+    ];
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(metainfo("set", &files, 4_096, false)))
+        })
+        .await
+        .unwrap();
+    let settings = rig.service.settings();
+    let mut live = rig.service.inner.live.lock().await;
+    let torrent = live.get_mut(&job_id).unwrap();
+    torrent.levels = vec![FilePriority::Normal, FilePriority::Ignored];
+    let mut reading = torrent.reading(0);
+    reading.file_have = vec![2_000, 10_000];
+    reading.speeds = (1_000, 0);
+    let view = rig.service.view_of(&settings, torrent, reading, 0);
+    drop(live);
+    assert_eq!((view.wanted_bytes, view.wanted_have_bytes), (6_000, 2_000));
+    assert_eq!(view.eta_seconds, Some(4));
+    rig.service.stop().await;
+}

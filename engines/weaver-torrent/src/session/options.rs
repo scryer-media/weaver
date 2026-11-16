@@ -301,6 +301,12 @@ pub struct ListOnlyResponse {
     pub output_folder: PathBuf,
     pub seen_peers: Vec<SocketAddr>,
     pub torrent_bytes: Bytes,
+    /// The web seeds the add named beside the metainfo:
+    /// [`AddTorrentOptions::web_seeds`], then a magnet link's `ws`. They are not in
+    /// `torrent_bytes`; the run that follows takes them as its
+    /// [`AddTorrentOptions::web_seeds`] (libtorrent keeps a magnet's
+    /// `add_torrent_params::url_seeds` across `torrent::set_metadata`).
+    pub web_seeds: Vec<WebSeed>,
     /// The tracker task the metadata fetch announced from, held for the run
     /// that follows on this session (see
     /// [`AddTorrentOptions::tracker_handover`]). Dropping it first sends

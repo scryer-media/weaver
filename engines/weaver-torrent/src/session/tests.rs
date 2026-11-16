@@ -1404,6 +1404,118 @@ async fn a_torrent_url_past_the_byte_limit_is_refused() {
     assert_eq!(parsed.torrent_bytes, torrent);
 }
 
+// A `.torrent` link's user, password, path and query never reach an error:
+// it is named by scheme, host and port only (SECURITY.md, "Credentials stay
+// with their scope").
+#[tokio::test]
+async fn a_torrent_url_error_names_only_scheme_host_and_port() {
+    let clients = crate::test_support::loopback();
+    let secret = |url: String| {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, _) = rest.split_once('/').unwrap();
+        (
+            format!("{scheme}://u5er:pa55word@{host}/dl/0123passkey/a.torrent?passkey=s3cret"),
+            format!("{scheme}://{host}/…"),
+        )
+    };
+    let check = |error: anyhow::Error, shown: &str| {
+        let text = format!("{error:#} {error:?}");
+        assert!(text.contains(shown), "{text}");
+        for part in ["u5er", "pa55word", "0123passkey", "s3cret", "a.torrent"] {
+            assert!(!text.contains(part), "{part} in {text}");
+        }
+    };
+    // A status that is not success.
+    let (url, shown) = secret(
+        serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into(),
+            Bytes::new(),
+        )
+        .await,
+    );
+    check(
+        super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .err()
+            .unwrap(),
+        &shown,
+    );
+    // A length past the limit.
+    let limit = crate::core::torrent_metainfo::MAX_TORRENT_FILE_BYTES;
+    let (url, shown) = secret(
+        serve_once(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", limit + 1),
+            Bytes::new(),
+        )
+        .await,
+    );
+    check(
+        super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .err()
+            .unwrap(),
+        &shown,
+    );
+    // A body that ends short of its length: the client's error names the URL
+    // unless it is stripped.
+    let (url, shown) = secret(
+        serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".into(),
+            Bytes::from_static(b"d8:announce"),
+        )
+        .await,
+    );
+    check(
+        super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .err()
+            .unwrap(),
+        &shown,
+    );
+    // A request that fails to send: nothing listens at the address.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (url, _) = secret(format!("http://{addr}/a.torrent"));
+    let error = super::torrent_from_url(clients.as_ref(), &url)
+        .await
+        .err()
+        .unwrap();
+    let text = format!("{error:#} {error:?}");
+    for part in ["u5er", "pa55word", "0123passkey", "s3cret", "a.torrent"] {
+        assert!(!text.contains(part), "{part} in {text}");
+    }
+}
+
+// A link of a scheme the session does not fetch is refused by scheme, host
+// and port, not by its user, password, path or query.
+#[tokio::test]
+async fn an_unsupported_torrent_url_is_refused_without_its_secrets() {
+    let dir = TempDir::new().unwrap();
+    let session = Session::new_with_opts(
+        dir.path().to_owned(),
+        crate::test_support::session_options(),
+    )
+    .await
+    .unwrap();
+    let error = session
+        .add_torrent(
+            AddTorrent::Url(
+                "ftp://u5er:pa55word@files.test/0123passkey/a.torrent?pk=s3cret".into(),
+            ),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+    let text = format!("{error:#}");
+    assert!(text.contains("ftp://files.test:21/…"), "{text}");
+    for part in ["u5er", "pa55word", "0123passkey", "s3cret", "a.torrent"] {
+        assert!(!text.contains(part), "{part} in {text}");
+    }
+    session.stop().await;
+}
+
 #[test]
 fn test_metainfo_tracker_tiers() {
     let parsed = torrent_from_bytes(torrent_bytes("x", false)).unwrap();

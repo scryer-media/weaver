@@ -316,6 +316,114 @@ fn infrastructure_admission_failures_do_not_poison_server_health() {
     );
 }
 
+// A plain server that greets with `greeting`, answers GROUP with 411 and
+// anything else with 500, until the client hangs up.
+fn spawn_setup_server(greeting: &'static [u8]) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(greeting).unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let upper = line.to_ascii_uppercase();
+            let reply: &[u8] = if upper.starts_with("GROUP ") {
+                b"411 no such newsgroup\r\n"
+            } else if upper.starts_with("QUIT") {
+                let _ = socket.write_all(b"205 closing\r\n");
+                break;
+            } else {
+                b"500 command not recognized\r\n"
+            };
+            if socket.write_all(reply).is_err() {
+                break;
+            }
+        }
+    });
+    (port, handle)
+}
+
+fn setup_server_client(port: u16) -> NntpClient {
+    NntpClient::new(NntpClientConfig::single(
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            ..Default::default()
+        },
+        2,
+    ))
+}
+
+// A greeting the client has no class for is the server refusing the
+// connection: the dial cools the server as a refused connect does, and the
+// refusal reaches the caller as a server fault, not as an answer about the
+// work's articles.
+#[test]
+fn an_odd_greeting_cools_the_server() {
+    let (port, handle) = spawn_setup_server(b"500 maintenance\r\n");
+    let client = setup_server_client(port);
+
+    let Err(error) = client.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY) else {
+        panic!("a 500 greeting opens no lane");
+    };
+    handle.join().unwrap();
+    assert!(
+        matches!(
+            &error,
+            BlockingBodyLaneAcquireError::Other(NntpError::UnexpectedResponse { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(error.nntp_error().unwrap().is_unclassed_setup_answer());
+    assert_eq!(error.server(), None);
+    let health = client.pool().health().blocking_lock();
+    assert_eq!(
+        health.server(0).failure_count,
+        1,
+        "the server took a failure"
+    );
+}
+
+// A server that needs a group selected and answers 411 for every newsgroup
+// the work lists does not carry the post. The refusal names that server, so
+// the work can leave it for the next one, and the server's health is not
+// touched: carrying a group is not a fault.
+#[test]
+fn every_group_refused_names_the_server_that_does_not_carry_it() {
+    let (port, handle) = spawn_setup_server(b"200 ready\r\n");
+    crate::server_caps::forget("127.0.0.1", port);
+    crate::server_caps::note_group_required("127.0.0.1", port);
+    let client = setup_server_client(port);
+
+    let groups = vec!["alt.binaries.missing".to_string(), "alt.other".to_string()];
+    let Err(error) = client.try_acquire_blocking_body_lane(&groups, crate::ServerSet::EMPTY) else {
+        panic!("no group carried opens no lane");
+    };
+    drop(client);
+    handle.join().unwrap();
+    crate::server_caps::forget("127.0.0.1", port);
+    assert!(
+        matches!(
+            &error,
+            BlockingBodyLaneAcquireError::GroupsNotCarried {
+                server: ServerId(0),
+                error: NntpError::NoSuchGroup,
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.server(), Some(ServerId(0)));
+    assert!(!error.should_requeue_owned_work());
+}
+
 const READER_CAPABILITIES: &[u8] = b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
 
 // A dial the provider declined is paced by the holdoff alone. A lane asked

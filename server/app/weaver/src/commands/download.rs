@@ -146,6 +146,7 @@ pub(crate) async fn run(
         standalone_config,
         weaver_server_core::runtime::StartupDiskGate::opened(),
         std::sync::Arc::new(weaver_server_core::operations::VolumeWriters::new()),
+        std::sync::Arc::new(weaver_server_core::operations::VolumeBuffers::new()),
     )
     .await?;
     let _late_classification_task = wiring::settle_late_classification(

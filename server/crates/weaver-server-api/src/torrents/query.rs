@@ -99,7 +99,7 @@ impl TorrentsQuery {
             .min(MAX_TORRENT_PAGE);
         let field = ctx.look_ahead();
         let shown = Shown {
-            files: false,
+            files: field.field("files").exists(),
             trackers: field.field("trackers").exists(),
             tags: field.field("tags").exists(),
         };
