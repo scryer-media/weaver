@@ -1145,6 +1145,7 @@ fn infrastructure_failures_preserve_article_retry_budget() {
         DownloadFailureKind::Auth,
         DownloadFailureKind::ServerQuota,
         DownloadFailureKind::LaneUnavailable,
+        DownloadFailureKind::RouteCapacity,
         DownloadFailureKind::Unrequested,
     ] {
         assert!(kind.preserves_article_retry_budget(), "kind={kind:?}");

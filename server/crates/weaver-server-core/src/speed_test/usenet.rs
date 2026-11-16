@@ -319,12 +319,17 @@ impl Worker {
     // lost selection race is asked again at once; a seat or the server's
     // one recovery probe held elsewhere is asked again when the server's
     // health changes, or at the instant its hold lapses by itself, the two
-    // wakes the pipeline's dispatch waits on. All of it within `DIAL_WAIT`
-    // of the first ask, one deadline, and never past the run's stop.
+    // wakes the pipeline's dispatch waits on. A full network route is also
+    // asked again when one of the slots it named frees. All of it within
+    // `DIAL_WAIT` of the first ask, one deadline, and never past the run's
+    // stop. A wait that began on a full route and is cut by the stop or the
+    // deadline ends the dial on that full route, and a stop records it on
+    // the leg, since the worker records nothing once the run has stopped.
     fn dial(&self, groups: &[String]) -> Result<BlockingBodyLane, BlockingBodyLaneAcquireError> {
         let pool = self.client.pool();
         let mut changes = pool.server_health_changes();
         let give_up = std::time::Instant::now() + DIAL_WAIT;
+        let mut full_route = None;
         loop {
             // Read before the ask as well as after it: a hold that lapses
             // between the refusal and the read after it leaves the read
@@ -345,11 +350,29 @@ impl Worker {
                 {
                     error
                 }
+                Err(error) if error.should_requeue_owned_work() => {
+                    let error = match full_route.take() {
+                        Some(route) if !error.is_route_capacity() => route,
+                        _ => error,
+                    };
+                    if let BlockingBodyLaneAcquireError::RouteCapacity(route) = &error
+                        && self.stop.is_stopped()
+                    {
+                        self.booking.progress.end_leg_connection(
+                            self.booking.leg,
+                            self.egress,
+                            route.to_string(),
+                        );
+                    }
+                    return Err(error);
+                }
                 outcome => return outcome,
             };
             if matches!(error, BlockingBodyLaneAcquireError::SelectionContended) {
                 continue;
             }
+            let freed = route_slots(&error);
+            full_route = error.is_route_capacity().then_some(error);
             let wake = held_until
                 .into_iter()
                 .chain(pool.next_connection_hold_deadline())
@@ -359,12 +382,45 @@ impl Worker {
             self.runtime.block_on(async {
                 tokio::select! {
                     _ = changes.changed() => {}
+                    _ = any_freed(&freed) => {}
                     _ = stop.stopped() => {}
                     _ = tokio::time::sleep_until(wake.into()) => {}
                 }
             });
         }
     }
+}
+
+// The slots a full route named, each rung when one of them frees. Empty for
+// any other refusal.
+fn route_slots(error: &BlockingBodyLaneAcquireError) -> Vec<Arc<tokio::sync::Notify>> {
+    match error {
+        BlockingBodyLaneAcquireError::RouteCapacity(NntpError::Route(route)) => {
+            match route.as_ref() {
+                weaver_tunnel::pipe::DialError::AtCapacity(slots) => slots.clone(),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+// Ready when any of `slots` rings; never when there are none. A slot that
+// frees before the wait starts is not heard, and the wait's other wakes
+// cover it.
+async fn any_freed(slots: &[Arc<tokio::sync::Notify>]) {
+    let mut freed: Vec<_> = slots.iter().map(|slot| Box::pin(slot.notified())).collect();
+    std::future::poll_fn(|cx| {
+        if freed
+            .iter_mut()
+            .any(|slot| slot.as_mut().poll(cx).is_ready())
+        {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 // How long a dial refused for capacity keeps asking.
@@ -376,11 +432,186 @@ fn dial_error(error: BlockingBodyLaneAcquireError) -> NntpError {
     match error {
         BlockingBodyLaneAcquireError::CredentialsRefused { .. } => NntpError::AuthenticationFailed,
         BlockingBodyLaneAcquireError::ProviderCapacity(error)
+        | BlockingBodyLaneAcquireError::RouteCapacity(error)
         | BlockingBodyLaneAcquireError::Other(error) => error,
         BlockingBodyLaneAcquireError::ServerRecovering => NntpError::ServerRecovering,
         BlockingBodyLaneAcquireError::LocalCapacity
         | BlockingBodyLaneAcquireError::NoEligibleServer
         | BlockingBodyLaneAcquireError::SelectionContended => NntpError::PoolExhausted,
+    }
+}
+
+#[cfg(test)]
+mod dial_error_tests {
+    use super::*;
+
+    // A dial refused because the route is full is waited out like the other
+    // capacity refusals, and one that outlasts the wait is told as the full
+    // route it was, not as a server fault or an exhausted pool.
+    #[test]
+    fn a_full_route_is_waited_out_and_told_as_a_full_route() {
+        let error = BlockingBodyLaneAcquireError::RouteCapacity(NntpError::Route(Arc::new(
+            weaver_tunnel::pipe::DialError::AtCapacity(Vec::new()),
+        )));
+        assert!(error.should_requeue_owned_work());
+        let told = dial_error(error);
+        assert!(told.is_route_capacity(), "{told}");
+    }
+
+    // A route that is full, naming one slot. It tells the test after each
+    // refusal.
+    struct FullRoute {
+        slot: Arc<tokio::sync::Notify>,
+        refused: std::sync::mpsc::Sender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl Dialer for FullRoute {
+        async fn dial(
+            &self,
+            _: &weaver_tunnel::pipe::Target,
+        ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+            let _ = self.refused.send(());
+            Err(weaver_tunnel::pipe::DialError::AtCapacity(vec![
+                self.slot.clone(),
+            ]))
+        }
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(3600)
+        }
+        fn describe(&self) -> String {
+            "full route fixture".into()
+        }
+    }
+
+    struct Rig {
+        runtime: tokio::runtime::Runtime,
+        slot: Arc<tokio::sync::Notify>,
+        refused: std::sync::mpsc::Receiver<()>,
+        progress: Arc<Progress>,
+        halt: tokio::sync::watch::Sender<bool>,
+        _cancel: tokio::sync::watch::Sender<bool>,
+        worker: Worker,
+    }
+
+    fn rig() -> Rig {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let slot = Arc::new(tokio::sync::Notify::new());
+        let (refused_tx, refused) = std::sync::mpsc::channel();
+        let dialer = Arc::new(RouteDialer {
+            inner: Arc::new(FullRoute {
+                slot: slot.clone(),
+                refused: refused_tx,
+            }),
+            plan: None,
+            egress_controls: Arc::new(ServerTransferRegistry::with_scope(TransferScope::Egress)),
+            runtime: runtime.handle().clone(),
+            server: 0,
+        });
+        let client = Arc::new(NntpClient::new(NntpClientConfig::single(
+            weaver_nntp::ServerConfig {
+                host: "nntp-full-route.invalid".into(),
+                port: 119,
+                tls: false,
+                ..weaver_nntp::ServerConfig::new(dialer)
+            },
+            1,
+        )));
+        let progress = Progress::new(1);
+        progress.start();
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let (halt, halt_rx) = tokio::sync::watch::channel(false);
+        let (done, _) = tokio::sync::mpsc::channel(1);
+        let worker = Worker {
+            client,
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            booking: Booking {
+                progress: progress.clone(),
+                metrics: PipelineMetrics::new(),
+                leg: 0,
+            },
+            egress: 0,
+            server_control: None,
+            egress_control: None,
+            server_name: "nntp-full-route.invalid".into(),
+            stop: Stop::new(cancel_rx).with_halt(halt_rx),
+            halt: Arc::new(AtomicBool::new(false)),
+            runtime: runtime.handle().clone(),
+            _done: done,
+        };
+        Rig {
+            runtime,
+            slot,
+            refused,
+            progress,
+            halt,
+            _cancel: cancel,
+            worker,
+        }
+    }
+
+    // The slots a full tunnel names reach the dial's wait, the same handles
+    // the tunnel rings, and a ring ends the wait.
+    #[test]
+    fn a_full_route_names_the_slots_its_wait_wakes_on() {
+        let rig = rig();
+        let error = match rig
+            .worker
+            .client
+            .try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a full route seated a lane"),
+        };
+        let slots = route_slots(&error);
+        assert_eq!(slots.len(), 1, "{error}");
+        assert!(Arc::ptr_eq(&slots[0], &rig.slot));
+        assert!(route_slots(&BlockingBodyLaneAcquireError::ServerRecovering).is_empty());
+
+        rig.runtime.block_on(async {
+            let mut waiting = Box::pin(any_freed(&slots));
+            assert!(futures_poll_once(waiting.as_mut()).await.is_pending());
+            rig.slot.notify_waiters();
+            waiting.await;
+        });
+    }
+
+    async fn futures_poll_once(
+        mut future: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    ) -> std::task::Poll<()> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    // A stop that cuts a wait begun on a full route ends the dial on that
+    // full route and records it on the leg, once: the worker records
+    // nothing after the stop.
+    #[test]
+    fn a_stop_during_a_full_route_wait_records_the_full_route_on_the_leg() {
+        let rig = rig();
+        let Rig {
+            worker,
+            refused,
+            halt,
+            progress,
+            ..
+        } = rig;
+        let dialing = std::thread::spawn(move || worker.dial(&[]).map(|_| ()));
+        refused.recv().unwrap();
+        halt.send_replace(true);
+        let error = dialing.join().unwrap().unwrap_err();
+        assert!(error.is_route_capacity(), "{error}");
+        assert_eq!(progress.connections_per_leg(), vec![1]);
+        let full = weaver_tunnel::pipe::DialError::AtCapacity(Vec::new()).to_string();
+        match progress.first_failure() {
+            Some(crate::speed_test::failure::SpeedTestFailure::Other(told)) => {
+                assert!(told.contains(&full), "{told}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
 

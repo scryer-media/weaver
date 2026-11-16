@@ -19,11 +19,11 @@ mod natpmp;
 mod sockets;
 #[path = "pipe_socks5_udp.rs"]
 mod socks5_udp;
+pub use buffers::{USENET_SEND_BYTES, set_usenet_receive_bytes, socket_buffers};
 pub use inbound::{
     Inbound, InboundListener, LISTEN_BACKLOG, PortForwarding, PortMapping, gateway_of,
 };
 pub use sockets::{SessionSockets, SocketClass, SocketPermit, SocketShares};
-pub use buffers::{USENET_SEND_BYTES, set_usenet_receive_bytes, socket_buffers};
 
 #[cfg(test)]
 #[path = "pipe_tests.rs"]
@@ -420,6 +420,10 @@ pub enum DialError {
     Skipped(String),
     #[error("all route legs are at capacity")]
     AtCapacity(Vec<Arc<Notify>>),
+    // The WireGuard session budget has no session left for the dial. Read as
+    // `Skipped` is everywhere but `is_capacity`: no evidence, the same text.
+    #[error("{}", SESSION_BUDGET_EXHAUSTED)]
+    SessionBudget,
     #[error("egress binding failed: {0}")]
     Bind(io::Error),
     #[error("egress connection failed: {0}")]
@@ -436,9 +440,23 @@ pub enum DialError {
     Fatal(TunnelError),
 }
 
+// The reason a dial gives when the WireGuard session budget has no session
+// left for it: what `DialError::SessionBudget` says.
+pub const SESSION_BUDGET_EXHAUSTED: &str =
+    "WireGuard session budget is exhausted; retry after an idle session retires";
+
 impl DialError {
     pub fn is_evidence(&self) -> bool {
-        !matches!(self, Self::Skipped(_) | Self::AtCapacity(_))
+        !matches!(
+            self,
+            Self::Skipped(_) | Self::AtCapacity(_) | Self::SessionBudget
+        )
+    }
+    // A refusal for room, not a fault: a full tunnel or socket share, or no
+    // session left in the WireGuard session budget. The path works; it has
+    // room again once a socket or a session closes.
+    pub fn is_capacity(&self) -> bool {
+        matches!(self, Self::AtCapacity(_) | Self::SessionBudget)
     }
     // Only positively attributed path failures can cool a leg or rung.
     pub fn is_path_evidence(&self) -> bool {
@@ -495,6 +513,7 @@ impl Replicate for DialError {
         match self {
             Self::Skipped(reason) => Self::Skipped(reason.clone()),
             Self::AtCapacity(waits) => Self::AtCapacity(waits.clone()),
+            Self::SessionBudget => Self::SessionBudget,
             Self::Bind(error) => Self::Bind(error.replicate()),
             Self::Egress(error) => Self::Egress(error.replicate()),
             Self::Hop { proxy, source } => Self::Hop {
@@ -1272,9 +1291,12 @@ impl SessionCapacity {
         };
         let mut permit = self.held.permit.lock().expect("session capacity");
         if permit.is_none() {
-            *permit = Some(Arc::new(budget.clone().try_acquire_owned().map_err(|_| {
-                DialError::Skipped("WireGuard session budget is exhausted; retry after an idle session retires".into())
-            })?));
+            *permit = Some(Arc::new(
+                budget
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| DialError::SessionBudget)?,
+            ));
         }
         Ok(permit.clone())
     }

@@ -88,7 +88,8 @@ impl DialResult {
     pub fn of<T>(result: &Result<T, DialError>) -> Self {
         match result {
             Ok(_) => Self::Success,
-            Err(DialError::Skipped(_)) => Self::Skipped,
+            // Counted as it was before it had a variant of its own.
+            Err(DialError::Skipped(_) | DialError::SessionBudget) => Self::Skipped,
             Err(DialError::AtCapacity(_)) => Self::AtCapacity,
             Err(DialError::Bind(_)) => Self::Bind,
             Err(DialError::Egress(_)) => Self::Egress,

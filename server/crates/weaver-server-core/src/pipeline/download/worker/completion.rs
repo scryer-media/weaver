@@ -499,12 +499,16 @@ impl Pipeline {
         }
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.release_result");
         let stale_generation = result.runtime_generation != self.pool_generation;
+        // The same list the lanes mark a refused lease clean by: none of
+        // these says anything of the server's connection.
         let policy_outcome = matches!(
             &result.data,
             Err(DownloadError::Fetch(failure))
                 if matches!(
                     failure.kind,
-                    DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+                    DownloadFailureKind::ServerQuota
+                        | DownloadFailureKind::Unrequested
+                        | DownloadFailureKind::RouteCapacity
                 )
         );
         if !policy_outcome && !stale_generation {
@@ -1243,7 +1247,11 @@ impl Pipeline {
                     self.maybe_finish_download_pass(job_id);
                     return;
                 }
-                if failure.kind == DownloadFailureKind::LaneUnavailable {
+                if matches!(
+                    failure.kind,
+                    DownloadFailureKind::LaneUnavailable | DownloadFailureKind::RouteCapacity
+                ) {
+                    let route_full = failure.kind == DownloadFailureKind::RouteCapacity;
                     // A work item no server may serve (failure exclusions,
                     // retention, credential refusals) can never be served: the
                     // order it builds is empty, so it would requeue through
@@ -1291,10 +1299,34 @@ impl Pipeline {
                     // local lane capacity was spent. That is self-clearing and
                     // has nothing to do with server health or credentials, so
                     // it neither warns nor sends anyone to their account page.
-                    if matches!(
+                    // A full network route is the same kind of wait, told as
+                    // what it is.
+                    let eligible = matches!(
                         availability,
                         weaver_nntp::pool::BodyServerAvailability::Eligible
-                    ) {
+                    );
+                    if eligible && route_full {
+                        if let Some(suppressed_since_last) = self
+                            .body_lane_capacity_log_throttle
+                            .admit(job_id, BODY_LANE_CAPACITY_LOG_INTERVAL)
+                        {
+                            info!(
+                                job_id = job_id.0,
+                                segment = %result.segment_id,
+                                configured_server_count = server_count,
+                                excluded_server_count = unavailable_server_count,
+                                retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                                failure_kind = ?failure.kind,
+                                suppressed_since_last,
+                                error = %failure.message,
+                                "downloads waiting: the news server's network route is full; the work retries as the route frees"
+                            );
+                            self.dump_job_debug_ring(
+                                job_id,
+                                "downloads waiting: the news server's network route is full",
+                            );
+                        }
+                    } else if eligible {
                         if let Some(suppressed_since_last) = self
                             .body_lane_capacity_log_throttle
                             .admit(job_id, BODY_LANE_CAPACITY_LOG_INTERVAL)
@@ -1343,7 +1375,7 @@ impl Pipeline {
                         result.retry_count,
                         excluded_servers,
                         retry_delay,
-                        DownloadFailureKind::LaneUnavailable,
+                        failure.kind,
                     ) {
                         debug!(
                             job_id = job_id.0,
@@ -1372,6 +1404,7 @@ impl Pipeline {
                     | DownloadFailureKind::ServerQuota
                     | DownloadFailureKind::CapacityUnavailable
                     | DownloadFailureKind::LaneUnavailable
+                    | DownloadFailureKind::RouteCapacity
                     | DownloadFailureKind::ConnectionEstablishment
                     | DownloadFailureKind::EstablishedTransport
                     | DownloadFailureKind::Unanswered
@@ -1393,7 +1426,8 @@ impl Pipeline {
                         .download_failures_article_not_found
                         .fetch_add(1, Ordering::Relaxed),
                     DownloadFailureKind::CapacityUnavailable
-                    | DownloadFailureKind::LaneUnavailable => self
+                    | DownloadFailureKind::LaneUnavailable
+                    | DownloadFailureKind::RouteCapacity => self
                         .metrics
                         .download_failures_capacity_unavailable
                         .fetch_add(1, Ordering::Relaxed),

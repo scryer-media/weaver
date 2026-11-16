@@ -401,7 +401,7 @@ fn recorded_job_ids_among_matches_the_full_read() {
         protocol: crate::jobs::Protocol::Nzb,
     })
     .unwrap();
-    let asked =(1..=40_002u64).collect::<Vec<_>>();
+    let asked = (1..=40_002u64).collect::<Vec<_>>();
     let all = db.recorded_job_ids().unwrap();
     let narrowed = asked
         .iter()
