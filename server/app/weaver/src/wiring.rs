@@ -50,6 +50,30 @@ pub(crate) fn build_runtime_context(profile: SystemProfile) -> RuntimeContext {
     RuntimeContext { profile, backlog }
 }
 
+// When start-up could not learn the working directory's storage in time, the
+// disk owner settles it once the pipeline exists, and the answer goes where
+// the start-up value went: the pipeline's tuner and backlog limits, and the
+// profile the system query reads. Nothing is asked again once it is known.
+pub(crate) fn settle_late_classification(
+    late: Option<weaver_server_core::operations::LateClassification>,
+    storage: Arc<weaver_server_core::operations::StorageCapacity>,
+    handle: weaver_server_core::SchedulerHandle,
+    profile: Option<Arc<std::sync::RwLock<SystemProfile>>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let settled = late?.settle(storage);
+    Some(tokio::spawn(async move {
+        let (storage_class, filesystem) = settled.await;
+        if let Some(profile) = profile {
+            let mut profile = profile
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            profile.disk.storage_class = storage_class.clone();
+            profile.disk.filesystem = filesystem.clone();
+        }
+        handle.update_storage_classification(storage_class, filesystem);
+    }))
+}
+
 pub(crate) fn build_nntp_client(
     config: &Config,
     profile: &SystemProfile,

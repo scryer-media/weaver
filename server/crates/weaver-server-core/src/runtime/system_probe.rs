@@ -17,17 +17,18 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::system_profile::*;
+use crate::operations::{LateClassification, StorageCapacity};
 use tracing::{debug, info, warn};
 
 // Probe the running system and return a fully measured [`SystemProfile`].
 //
 // Detection is best-effort: any individual probe that fails silently
 // falls back to a safe default rather than aborting startup.
-pub async fn detect(output_dir: &Path) -> SystemProfile {
-    let mut profile = detect_startup_profile(output_dir).await;
+pub async fn detect(output_dir: &Path) -> (SystemProfile, Option<LateClassification>) {
+    let (mut profile, late) = detect_startup_profile(output_dir).await;
     let measured = startup_disk_measurement(output_dir);
     profile.disk.random_read_iops = measured.random_read_iops;
-    profile
+    (profile, late)
 }
 
 // Classify the storage behind one directory without measuring it.
@@ -60,15 +61,24 @@ pub fn detect_cpu_and_memory() -> (CpuProfile, MemoryProfile) {
 // The directory's storage is asked of the disk owner without an owner, off
 // the async runtime and within its time limit: the OS's answer comes from
 // a helper process that can take minutes on a busy host, and start-up does
-// not wait on it. Storage that does not answer in time is unknown.
-pub async fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
+// not wait on it. Storage that does not answer in time, or whose look read
+// nothing, is unknown, and comes back as the classification to settle once
+// the disk owner exists.
+pub async fn detect_startup_profile(
+    output_dir: &Path,
+) -> (SystemProfile, Option<LateClassification>) {
     let (cpu, memory) = detect_cpu_and_memory();
-    let (storage_class, filesystem) =
-        crate::operations::StorageCapacity::classifications(None, &[output_dir.to_path_buf()])
-            .await
-            .pop()
-            .flatten()
-            .unwrap_or((StorageClass::Unknown, FilesystemType::Unknown(String::new())));
+    let ((storage_class, filesystem), late) =
+        match StorageCapacity::startup_classification(output_dir.to_path_buf()).await {
+            Ok(class) => (class, None),
+            Err(late) => (
+                (
+                    StorageClass::Unknown,
+                    FilesystemType::Unknown(String::new()),
+                ),
+                Some(late),
+            ),
+        };
     let disk = DiskProfile {
         storage_class,
         filesystem,
@@ -77,7 +87,7 @@ pub async fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
         same_filesystem: true,
     };
 
-    SystemProfile { cpu, memory, disk }
+    (SystemProfile { cpu, memory, disk }, late)
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,63 +1217,13 @@ fn windows_filesystem(output_dir: &Path) -> FilesystemType {
     parse_filesystem_type(&name)
 }
 
-// macOS: `diskutil info` names the filesystem of the mount.
+// macOS: the mount's own record names its filesystem.
 #[cfg(target_os = "macos")]
 fn macos_filesystem(output_dir: &Path) -> FilesystemType {
-    // Resolve the path to handle symlinks, then find its mount point.
-    let target = std::fs::canonicalize(output_dir)
-        .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("/"))))
-        .unwrap_or_else(|_| Path::new("/").to_path_buf());
-
-    let mount_point = find_mount_point_macos(&target);
-
-    let Ok(output) = Command::new("diskutil")
-        .arg("info")
-        .arg(&mount_point)
-        .output()
-    else {
-        return FilesystemType::Unknown(String::new());
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    text.lines()
-        .find(|l| {
-            l.trim_start().starts_with("Type (Bundle):")
-                || l.trim_start().starts_with("File System Personality:")
+    crate::operations::disk::filesystem_name(output_dir)
+        .map_or(FilesystemType::Unknown(String::new()), |name| {
+            parse_filesystem_type(&name)
         })
-        .map(|l| {
-            let val = l.split(':').nth(1).unwrap_or("").trim();
-            parse_filesystem_type(val)
-        })
-        .unwrap_or(FilesystemType::Unknown(String::new()))
-}
-
-// Find the mount point for a given path on macOS using `df`.
-#[cfg(target_os = "macos")]
-fn find_mount_point_macos(path: &Path) -> String {
-    // `df <path>` outputs: "Filesystem ... Mounted on\n/dev/disk3s1 ... /System/Volumes/Data"
-    // The mount point is the last whitespace-separated field on the second line.
-    // However, mount points can contain spaces, so we need to be careful.
-    // Fortunately, `df` also supports custom output format on macOS (BSD df).
-    // We can't use --output (that's GNU df), but the mount point is always
-    // the last field after the percentage column.
-    let output = Command::new("df").arg(path).output();
-    if let Ok(o) = output {
-        let text = String::from_utf8_lossy(&o.stdout);
-        if let Some(line) = text.lines().nth(1) {
-            // macOS df has two % columns (capacity and %iused).
-            // The mount point follows the last "XX%" field.
-            if let Some(pct_pos) = line.rfind('%') {
-                let after_pct = &line[pct_pos + 1..];
-                let mp = after_pct.trim();
-                if !mp.is_empty() {
-                    return mp.to_string();
-                }
-            }
-        }
-    }
-
-    "/".to_string()
 }
 
 // Detect filesystem type on Linux from /proc/mounts.

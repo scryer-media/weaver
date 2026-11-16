@@ -14,11 +14,12 @@
 // name it, and the system report asks here too. None of them is on the
 // async runtime or on a write's path. What the OS says of a disk is kept
 // per device once it answered, so each disk is asked once; a disk that did
-// not answer is asked again next time.
+// not answer is asked again next time. A disk is never asked twice at
+// once: while one ask is out, every other asker waits for its answer.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageKind {
@@ -73,25 +74,85 @@ fn kind_from(network: bool, rotates: impl FnOnce() -> Option<bool>) -> StorageKi
     }
 }
 
-// The disks that answered, by name, and what they said.
-static ANSWERED: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+// What is known of a disk, by name: an ask is out, or what it said.
+#[derive(Clone, Copy)]
+enum Asked {
+    Out,
+    Said(bool),
+}
 
-// Whether `disk` rotates: its kept answer, or `ask` once it gives one.
+struct Disks {
+    asked: BTreeMap<String, Asked>,
+    // Askers waiting on an ask that is out.
+    waiting: usize,
+}
+
+static DISKS: Mutex<Disks> = Mutex::new(Disks {
+    asked: BTreeMap::new(),
+    waiting: 0,
+});
+// Rung when an ask ends, and when an asker starts to wait.
+static DISK_ASKS: Condvar = Condvar::new();
+
+fn disks() -> MutexGuard<'static, Disks> {
+    DISKS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// Ends the ask out for a disk however `ask` returns, a panic included, so
+// no asker waits on it forever.
+struct AskOut(Option<String>);
+
+impl AskOut {
+    fn end(mut self, rotates: Option<bool>) {
+        let disk = self.0.take().expect("an ask ends once");
+        let mut disks = disks();
+        match rotates {
+            Some(rotates) => disks.asked.insert(disk, Asked::Said(rotates)),
+            None => disks.asked.remove(&disk),
+        };
+        DISK_ASKS.notify_all();
+    }
+}
+
+impl Drop for AskOut {
+    fn drop(&mut self) {
+        if let Some(disk) = self.0.take() {
+            disks().asked.remove(&disk);
+            DISK_ASKS.notify_all();
+        }
+    }
+}
+
+// Whether `disk` rotates: its kept answer, the answer of the ask out for
+// it, or `ask` once it gives one. An asker that waited on an ask that did
+// not answer does not ask again itself: the next look does.
 fn cached_rotates(disk: Option<String>, ask: impl FnOnce() -> Option<bool>) -> Option<bool> {
-    let lock = || ANSWERED.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(disk) = &disk
-        && let Some(rotates) = lock().as_ref().and_then(|answered| answered.get(disk))
-    {
-        return Some(*rotates);
+    let Some(disk) = disk else {
+        return ask();
+    };
+    let mut held = disks();
+    let mut waited = false;
+    loop {
+        match held.asked.get(&disk).copied() {
+            Some(Asked::Said(rotates)) => return Some(rotates),
+            Some(Asked::Out) => {
+                waited = true;
+                held.waiting += 1;
+                DISK_ASKS.notify_all();
+                held = DISK_ASKS.wait(held).unwrap_or_else(PoisonError::into_inner);
+                held.waiting -= 1;
+            }
+            None if waited => return None,
+            None => break,
+        }
     }
+    held.asked.insert(disk.clone(), Asked::Out);
+    drop(held);
+    let out = AskOut(Some(disk));
     // Asked outside the lock: an answer may take a moment.
-    let rotates = ask()?;
-    if let Some(disk) = disk {
-        lock()
-            .get_or_insert_with(HashMap::new)
-            .insert(disk, rotates);
-    }
-    Some(rotates)
+    let rotates = ask();
+    out.end(rotates);
+    rotates
 }
 
 // Filesystem magic numbers `statfs` reports for shares: NFS, SMB, CIFS,
@@ -173,6 +234,17 @@ pub(super) fn mount_stat(path: &Path) -> Option<libc::statfs> {
         let mut stat: libc::statfs = std::mem::zeroed();
         (libc::statfs(c_path.as_ptr(), &mut stat) == 0).then_some(stat)
     }
+}
+
+// The name the mount `path` lies on gives its filesystem, such as `apfs`,
+// read at the nearest of its ancestors that exists. The mount's own record
+// answers it, so no helper process is asked.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn filesystem_name(path: &Path) -> Option<String> {
+    let stat = mount_stat(path.ancestors().find(|at| at.exists())?)?;
+    // SAFETY: `f_fstypename` is a NUL-terminated array `statfs` filled.
+    let name = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) };
+    Some(name.to_string_lossy().into_owned())
 }
 
 #[cfg(target_vendor = "apple")]
@@ -411,6 +483,34 @@ mod tests {
         // A disk with no name to keep it by is asked each time.
         assert_eq!(cached_rotates(None, || Some(false)), Some(false));
         assert_eq!(cached_rotates(None, || Some(true)), Some(true));
+    }
+
+    // While one ask of a disk is out, a second asker of that disk waits
+    // for it and takes its answer: the disk is never asked twice at once.
+    #[test]
+    fn a_second_asker_waits_for_the_ask_out_and_takes_its_answer() {
+        let disk = || Some("test:a_second_asker_waits".to_owned());
+        let (asking, asked) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let first = std::thread::spawn(move || {
+            cached_rotates(disk(), || {
+                asking.send(()).unwrap();
+                released.recv().unwrap();
+                Some(true)
+            })
+        });
+        asked.recv().unwrap();
+        let second = std::thread::spawn(move || {
+            cached_rotates(disk(), || panic!("asked while one was out"))
+        });
+        let mut held = disks();
+        while held.waiting == 0 {
+            held = DISK_ASKS.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(held);
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Some(true));
+        assert_eq!(second.join().unwrap(), Some(true));
     }
 
     #[test]

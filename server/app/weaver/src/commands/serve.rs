@@ -132,9 +132,9 @@ pub(crate) async fn run(
         base_url
     };
 
-    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(
-        weaver_server_core::runtime::detect_startup_profile(&data_dir).await,
-    );
+    let (profile, late_classification) =
+        weaver_server_core::runtime::detect_startup_profile(&data_dir).await;
+    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(profile);
     let system_profile = Arc::new(std::sync::RwLock::new(profile.clone()));
 
     // Build the NNTP client from capability values validated when servers were saved.
@@ -309,6 +309,12 @@ pub(crate) async fn run(
     // The pipeline's own free-space samplers: metrics and the NZBGet status
     // read their cached readings and never stat a filesystem themselves.
     let storage_capacity = pipeline.storage_capacity();
+    let _late_classification_task = wiring::settle_late_classification(
+        late_classification,
+        Arc::clone(&storage_capacity),
+        handle.clone(),
+        Some(Arc::clone(&system_profile)),
+    );
     let post_processing_executor = pipeline.post_processing_executor();
     let scheduled_resume =
         weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());

@@ -144,6 +144,24 @@ async fn update_random_read_iops_reaches_scheduler() {
 }
 
 #[tokio::test]
+async fn update_storage_classification_reaches_scheduler() {
+    use crate::runtime::system_profile::{FilesystemType, StorageClass};
+    let (handle, task) = test_scheduler().await;
+
+    handle.update_storage_classification(StorageClass::Hdd, FilesystemType::Ext4);
+    assert_eq!(
+        handle
+            .state
+            .queue
+            .read(|inner| inner.globals.storage_classification.clone()),
+        Some((StorageClass::Hdd, FilesystemType::Ext4))
+    );
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn add_and_list_jobs() {
     let (handle, task) = test_scheduler().await;
 

@@ -831,6 +831,35 @@ impl Pipeline {
         }
     }
 
+    // Apply the working directory's storage class and filesystem, learned
+    // after start-up: the tuner's machine takes them, and the backlog limits
+    // sized on the storage class are sized again.
+    pub(in crate::pipeline) fn apply_storage_classification(
+        &mut self,
+        storage_class: crate::runtime::system_profile::StorageClass,
+        filesystem: crate::runtime::system_profile::FilesystemType,
+    ) {
+        self.applied_storage_classification = Some((storage_class.clone(), filesystem.clone()));
+        self.tuner.set_storage(storage_class, filesystem);
+        let profile = self.tuner.system_profile();
+        self.write_backlog_budget_bytes =
+            super::runtime::compute_write_backlog_budget_bytes(profile, self.backlog_base_bytes);
+        self.decode_backlog_budget_bytes = super::runtime::compute_decode_backlog_budget_bytes(
+            profile,
+            self.backlog_base_bytes,
+            self.write_backlog_budget_bytes,
+        );
+        self.uu_spool_max_bytes =
+            super::runtime::compute_uu_spool_max_bytes(self.write_backlog_budget_bytes);
+        info!(
+            storage = ?profile.disk.storage_class,
+            filesystem = ?profile.disk.filesystem,
+            decode_backlog_budget_mb = self.decode_backlog_budget_bytes / (1024 * 1024),
+            write_backlog_budget_mb = self.write_backlog_budget_bytes / (1024 * 1024),
+            "storage classified after start-up"
+        );
+    }
+
     async fn apply_queue_globals(&mut self) {
         let pending = self
             .shared_state
@@ -846,6 +875,18 @@ impl Pipeline {
         if let Some(iops) = iops.filter(|iops| self.applied_random_read_iops != Some(*iops)) {
             self.applied_random_read_iops = Some(iops);
             self.tuner.set_random_read_iops(iops);
+        }
+        let applied = &self.applied_storage_classification;
+        let storage = self.shared_state.queue.read(|inner| {
+            inner
+                .globals
+                .storage_classification
+                .as_ref()
+                .filter(|storage| applied.as_ref() != Some(*storage))
+                .cloned()
+        });
+        if let Some((storage_class, filesystem)) = storage {
+            self.apply_storage_classification(storage_class, filesystem);
         }
         // An extraction writes what it unpacks under the intermediate
         // directory, or, when the job's destination is on another device, in

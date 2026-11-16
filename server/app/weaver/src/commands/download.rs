@@ -40,9 +40,9 @@ pub(crate) async fn run(
     let nzb_bytes = std::fs::read(nzb_path)?;
     info!(path = %nzb_path.display(), force, "starting standalone NZB submission");
 
-    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(
-        weaver_server_core::runtime::detect_system_profile(data_dir).await,
-    );
+    let (profile, late_classification) =
+        weaver_server_core::runtime::detect_system_profile(data_dir).await;
+    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(profile);
 
     // Build the NNTP client from capability values validated when servers were saved.
     let policy_db = db.clone();
@@ -147,6 +147,12 @@ pub(crate) async fn run(
         weaver_server_core::runtime::StartupDiskGate::opened(),
     )
     .await?;
+    let _late_classification_task = wiring::settle_late_classification(
+        late_classification,
+        pipeline.storage_capacity(),
+        handle.clone(),
+        None,
+    );
 
     // Start the pipeline BEFORE submitting the job; add_job awaits a reply
     // from the pipeline loop, so the loop must be running first.

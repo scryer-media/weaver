@@ -138,7 +138,7 @@ async fn detect_returns_valid_profile() {
     };
     write_stored_disk_measurement(&dir.path().join(DISK_PROBE_RECORD), &stored).unwrap();
 
-    let profile = detect(dir.path()).await;
+    let (profile, _) = detect(dir.path()).await;
     assert!(profile.cpu.logical_cores > 0);
     assert!(profile.cpu.physical_cores > 0);
     assert!(profile.memory.total_bytes > 0);
@@ -149,7 +149,7 @@ async fn detect_returns_valid_profile() {
 
 #[tokio::test]
 async fn startup_profile_defers_disk_measurement() {
-    let profile = detect_startup_profile(Path::new("/tmp")).await;
+    let (profile, _) = detect_startup_profile(Path::new("/tmp")).await;
     assert_eq!(profile.disk.random_read_iops, 0.0);
     assert_eq!(profile.disk.sequential_write_mbps, 0.0);
 }
@@ -159,7 +159,7 @@ async fn startup_profile_defers_disk_measurement() {
 #[tokio::test]
 async fn startup_profile_takes_storage_from_the_disk_owner() {
     let dir = tempfile::tempdir().unwrap();
-    let profile = detect_startup_profile(dir.path()).await;
+    let (profile, _) = detect_startup_profile(dir.path()).await;
     assert_eq!(
         (profile.disk.storage_class, profile.disk.filesystem),
         classify_storage(dir.path())
