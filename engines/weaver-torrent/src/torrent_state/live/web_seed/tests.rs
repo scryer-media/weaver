@@ -1736,3 +1736,51 @@ async fn a_torrent_downloads_from_its_web_seed_alone() -> anyhow::Result<()> {
     assert!(handle.magnet().web_seeds.is_empty());
     Ok(())
 }
+
+// A seed added or removed is found by its URL and kind in one lookup: the
+// seeds kept, in their order, and what each add and remove returns, are
+// what passing over the list says, over seeded adds and removes.
+#[test]
+fn seeds_found_by_lookup_are_those_a_pass_finds() {
+    let mut rng = 0x6a09_e667_f3bc_c908u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _ in 0..50 {
+        let seeds = WebSeeds::default();
+        let mut reference: Vec<WebSeed> = Vec::new();
+        for _ in 0..200 {
+            let r = next();
+            let seed = WebSeed {
+                url: format!("http://seed{}.test/", r % 12),
+                kind: if r & 0x100 != 0 {
+                    WebSeedKind::Url
+                } else {
+                    WebSeedKind::Http
+                },
+                named_by: if r & 0x200 != 0 {
+                    NamedBy::Torrent
+                } else {
+                    NamedBy::Operator
+                },
+            };
+            if r & 0x400 != 0 {
+                let was = reference.iter().position(|s| same_seed(s, &seed));
+                if let Some(at) = was {
+                    reference.remove(at);
+                }
+                assert_eq!(seeds.remove(&seed), was.is_some());
+            } else {
+                let had = reference.iter().any(|s| same_seed(s, &seed));
+                if !had {
+                    reference.push(seed.clone());
+                }
+                assert_eq!(seeds.add(seed), !had);
+            }
+            assert_eq!(seeds.list(), reference);
+        }
+    }
+}

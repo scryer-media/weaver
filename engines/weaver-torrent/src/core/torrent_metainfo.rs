@@ -324,9 +324,11 @@ impl<Buf: AsRef<[u8]>> SeedUrls<Buf> {
         match crate::bencode::from_bytes::<BencodeValue<ByteBuf<'_>>>(self.0.as_ref()) {
             Ok(BencodeValue::Bytes(url)) => out.push(url.0),
             Ok(BencodeValue::List(list)) => {
+                // The URLs kept so far, so a long list is read in one pass.
+                let mut seen: HashSet<&[u8]> = HashSet::new();
                 for url in list {
                     if let BencodeValue::Bytes(url) = url
-                        && !out.contains(&url.0)
+                        && seen.insert(url.0)
                     {
                         out.push(url.0);
                     }

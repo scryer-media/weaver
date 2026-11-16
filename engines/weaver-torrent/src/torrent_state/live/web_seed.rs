@@ -101,6 +101,9 @@ pub(crate) struct WebSeeds {
 #[derive(Default)]
 struct Inner {
     seeds: Vec<Entry>,
+    // The URL and kind of each of `seeds`, so a seed is found in one
+    // lookup, not a pass over them.
+    known: HashSet<(String, WebSeedKind)>,
     next_id: u32,
 }
 
@@ -192,7 +195,7 @@ impl WebSeeds {
     /// it; returns whether it was added.
     pub fn add(&self, seed: WebSeed) -> bool {
         let mut g = self.inner.lock();
-        if g.seeds.iter().any(|e| same_seed(&e.seed, &seed)) {
+        if !g.known.insert(seed_key(&seed)) {
             return false;
         }
         let id = g.next_id;
@@ -216,6 +219,9 @@ impl WebSeeds {
     /// returns whether it was there.
     pub fn remove(&self, seed: &WebSeed) -> bool {
         let mut g = self.inner.lock();
+        if !g.known.contains(&seed_key(seed)) {
+            return false;
+        }
         let Some(at) = g.seeds.iter().position(|e| same_seed(&e.seed, seed)) else {
             return false;
         };
@@ -390,8 +396,14 @@ fn same_seed(a: &WebSeed, b: &WebSeed) -> bool {
     (&a.url, a.kind) == (&b.url, b.kind)
 }
 
+// What `known` holds of a seed.
+fn seed_key(seed: &WebSeed) -> (String, WebSeedKind) {
+    (seed.url.clone(), seed.kind)
+}
+
 fn remove_at(g: &mut Inner, at: usize) {
     let entry = g.seeds.remove(at);
+    g.known.remove(&seed_key(&entry.seed));
     if let Some(c) = entry.connection {
         c.cancel();
     }
