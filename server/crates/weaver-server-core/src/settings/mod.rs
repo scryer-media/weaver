@@ -12,7 +12,7 @@ mod schedules;
 pub mod service;
 
 pub use model::{
-    Config, DeliveryNamingOverrides, DirectStoreOverrides, MetricsConfig, PerJobSeries,
-    RetryOverrides, SharedConfig,
+    Config, DEFAULT_HISTORY_RETENTION_DAYS, DeliveryNamingOverrides, DirectStoreOverrides,
+    MAX_HISTORY_RETENTION_DAYS, MetricsConfig, PerJobSeries, RetryOverrides, SharedConfig,
 };
 pub use service::HARDWARE_PROFILE_SETTING;

@@ -2187,7 +2187,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.3#5deed1204f11ee216f41dc066e08102f555cb9f9"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2200,7 +2200,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.3#5deed1204f11ee216f41dc066e08102f555cb9f9"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
 dependencies = [
  "bytes",
  "futures",
@@ -3373,9 +3373,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6572ee40d3b7dca8bc76bbf9ee58fd60ee293074e2de5f89acaa2729778ea42"
+checksum = "c26ff4dc62c0d93420fe90d87c905c66da3bd13d2a1036a67004a48d00103c8a"
 dependencies = [
  "bytes",
  "cap-std",
@@ -3391,9 +3391,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65be08f04a17afc247c1fed6c5eee3ce0c20411792f244ce2d1dd13dde4c1ba4"
+checksum = "98d461a83eb5c197f7757b0c9980b64956247544d837da9fb470f52e7b2208ed"
 dependencies = [
  "blake3",
  "cap-std",
@@ -3718,8 +3718,8 @@ dependencies = [
 
 [[package]]
 name = "proxy-tunnels"
-version = "0.4.3"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.3#5deed1204f11ee216f41dc066e08102f555cb9f9"
+version = "0.5.2"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5782,9 +5782,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.16.1"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99544e98c65185431a5e022f75ca1e86dd002342f6085bc9acbefd92b438866a"
+checksum = "68a270e0acc3c80936322a437e8ab0bd4affed2745304744e0a81fe4c035b9c8"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
@@ -6005,7 +6005,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "aho-corasick",
  "application-updater",
@@ -6067,7 +6067,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-graph"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "bytes",
  "crc-turbo",
@@ -6080,14 +6080,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6116,7 +6116,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "blake3",
  "html-escape 0.3.0",
@@ -6130,7 +6130,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -6155,7 +6155,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6186,7 +6186,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6263,7 +6263,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6286,7 +6286,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.16.15"
+version = "0.16.16"
 dependencies = [
  "cc",
  "crc-turbo",

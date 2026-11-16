@@ -71,7 +71,6 @@ fn histogram_empty_snapshot_has_a_slot_per_bucket() {
 fn every_shipped_bound_set_fits_the_fixed_bucket_array_and_ascends() {
     for bounds in [
         ARTICLE_LATENCY_BOUNDS,
-        DISK_WRITE_DURATION_BOUNDS,
         DECODE_TASK_DURATION_BOUNDS,
         EXTRACT_MEMBER_DURATION_BOUNDS,
         JOB_DURATION_BOUNDS,
@@ -322,7 +321,7 @@ fn category_byte_counters_are_shared_per_category_and_none_maps_to_empty() {
 fn pipeline_histograms_report_none_until_a_stage_is_actually_timed() {
     let histograms = PipelineHistograms::new();
     let snapshot = histograms.snapshot();
-    assert_eq!(snapshot.disk_write_duration.count, 0);
+    assert_eq!(snapshot.turn_duration.count, 0);
     assert!(snapshot.decode_task_duration.is_none());
     assert!(snapshot.extract_member_duration.is_none());
 
@@ -471,4 +470,34 @@ fn pipeline_phase_codes_are_distinct_and_round_trip() {
     assert_eq!(PipelinePhase::GraphRun as u8, 37);
     assert_eq!(PipelinePhase::GraphRun.as_str(), "graph_run");
     assert!(PipelinePhase::GraphRun.is_busy());
+}
+
+// A server's article outcomes are what it answered, found and not found,
+// over both queues, named by stable id so a reordered pool still reads its
+// own; a failed connection is neither.
+#[test]
+fn article_outcomes_count_found_and_not_found_per_server() {
+    let registry = ServerMetricsRegistry::new();
+    let counters = registry.activate(&[41, 7]);
+    for _ in 0..3 {
+        counters[0].note_attempt(ServerAttemptOutcomeKind::NotFound, false);
+    }
+    counters[0].note_attempt(ServerAttemptOutcomeKind::NotFound, true);
+    counters[0].note_attempt(ServerAttemptOutcomeKind::TransientFailure, false);
+    counters[1].note_attempt(ServerAttemptOutcomeKind::Success, false);
+    counters[1].note_attempt(ServerAttemptOutcomeKind::Success, true);
+
+    let outcome = |stable_server_id, found, not_found| ServerArticleOutcomes {
+        stable_server_id,
+        found,
+        not_found,
+    };
+    assert_eq!(registry.article_outcomes(41), Some(outcome(41, 0, 4)));
+    assert_eq!(registry.article_outcomes(7), Some(outcome(7, 2, 0)));
+    // Reordered: each server keeps its own totals under its new position.
+    registry.activate(&[7, 41]);
+    assert_eq!(registry.article_outcomes(41), Some(outcome(41, 0, 4)));
+    assert_eq!(registry.article_outcomes(7), Some(outcome(7, 2, 0)));
+    // A server that is not in the active list reads none.
+    assert_eq!(registry.article_outcomes(9), None);
 }

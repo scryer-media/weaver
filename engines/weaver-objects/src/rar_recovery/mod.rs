@@ -154,6 +154,12 @@ pub struct RarRecovery {
     // Members of the namespace a range of which the parent refused: a data
     // volume among them is missing for good.
     refused: BTreeSet<MemberId>,
+    // How many bound data volumes are among them, counted where either
+    // changes so a round reads it without walking the set. Not kept: a
+    // restore counts it at its next bind, and till then asks for nothing
+    // early.
+    #[serde(skip)]
+    refused_bound: u64,
 }
 
 // The verdict a repair reached, or that it came up short of recovery
@@ -202,6 +208,7 @@ impl RarRecovery {
             grid: Grid::default(),
             last: None,
             refused: BTreeSet::new(),
+            refused_bound: 0,
         }
     }
 
@@ -254,10 +261,14 @@ impl RarRecovery {
     }
 
     // Every data volume of the set, by index: as many as the header counts,
-    // or as the names reach.
+    // or as the names reach. A RAR3 footer signs nothing, and any seven
+    // bytes may read as one, so it counts the set's volumes only once the
+    // set covers one; a RAR5 header is signed and checksummed, and counts
+    // them always.
     fn slots(&self) -> u32 {
         let named = self.bound.keys().next_back().map_or(0, |last| last + 1);
         self.header()
+            .filter(|header| header.last_described || !self.bound.is_empty())
             .map_or(named, |header| header.data_count.max(named))
     }
 
@@ -350,7 +361,12 @@ impl RarRecovery {
     // the set holds no checksum for counts against it, so a set short of
     // one waits on its recovery volumes like any; once none can come, it
     // rules on nothing rather than short.
+    // A set that covers no data volume rules on nothing: no member is whole
+    // or short by it, whatever its recovery volumes say of a set.
     fn rule(&self, access: &mut dyn MemberAccess) -> (RepairOutcome, BTreeMap<u32, bool>) {
+        if self.bound.is_empty() {
+            return (RepairOutcome::Unread, BTreeMap::new());
+        }
         let header = self.header();
         let mut judged = self
             .last
@@ -426,6 +442,7 @@ impl RarRecovery {
                 file.name = self.name_of(member);
             }
         }
+        access.will_write(self.writes(&staged, judged, access));
         let Some(rebuilt) = restore::restore(&dir, &staged, access) else {
             return impossible(missing, unjudged);
         };
@@ -452,6 +469,43 @@ impl RarRecovery {
             0 => RepairOutcome::Repaired { slices: written },
             left => impossible(left, unjudged),
         }
+    }
+
+    // What a restore writes in all: the whole volumes and the recovery
+    // volumes it stages, and each volume it rebuilds twice, once beside the
+    // staged ones and once into its member. A volume no member is bound to
+    // is taken for the widest of the set, which a rebuilt one never passes.
+    fn writes(
+        &self,
+        staged: &[Staged],
+        judged: &BTreeMap<u32, bool>,
+        access: &dyn MemberAccess,
+    ) -> u64 {
+        let (mut data, mut revs, mut widest) = (0u64, 0u64, 0u64);
+        for file in staged {
+            match file.source {
+                Source::Member(_) => {
+                    data = data.saturating_add(file.length);
+                    widest = widest.max(file.length);
+                }
+                Source::Volume(_) => revs = revs.saturating_add(file.length),
+            }
+        }
+        let mut rebuilt = 0u64;
+        for index in 0..self.slots() {
+            if judged.get(&index) == Some(&true) {
+                continue;
+            }
+            let length = self
+                .bound
+                .get(&index)
+                .and_then(|&member| access.length(member));
+            // A volume not whole is not staged: it is rebuilt.
+            data = data.saturating_sub(length.unwrap_or(0));
+            rebuilt = rebuilt.saturating_add(length.unwrap_or(widest));
+        }
+        data.saturating_add(revs)
+            .saturating_add(rebuilt.saturating_mul(2))
     }
 
     fn name_of(&self, member: MemberId) -> String {
@@ -641,6 +695,10 @@ impl Recovery for RarRecovery {
             self.last = None;
         }
         self.reference = names.values().next().cloned();
+        self.refused_bound = names
+            .keys()
+            .filter(|member| self.refused.contains(member))
+            .count() as u64;
         self.bound = bound;
         self.names = names;
         self.whole = whole;
@@ -707,11 +765,27 @@ impl Recovery for RarRecovery {
     // A recovery volume is spent whole. Once its front is in, the rest
     // waits deferred (what is in hand of it the root leaves be) until the
     // set comes up short, and then as many volumes as the set is short of
-    // are wanted whole. Nothing of the deferral is kept: the same ruling
-    // says it again on every round, after a restart too.
+    // are wanted whole. Before the set has ruled, each bound data volume a
+    // range of which was refused is missing for good and needs a recovery
+    // volume of its own: as many are wanted then, while the set can still
+    // reach them, so its first ruling finds them in hand. Nothing of the
+    // deferral is kept: the same ruling says it again on every round, after
+    // a restart too.
     fn wants(&self, out: &mut Vec<Seek>) {
         let mut short = match self.ruling() {
             Some(Ruling::Short { needed }) => needed.saturating_sub(self.usable()),
+            None if self.refused_bound > 0 => {
+                let reachable = self
+                    .revs
+                    .iter()
+                    .filter(|rev| rev.usable() || (!rev.closed && !rev.lost))
+                    .count() as u64;
+                if self.refused_bound <= reachable {
+                    self.refused_bound.saturating_sub(self.usable())
+                } else {
+                    0
+                }
+            }
             _ => 0,
         };
         for (index, rev) in self.revs.iter().enumerate() {
@@ -749,7 +823,9 @@ impl Recovery for RarRecovery {
     // Kept for every member of the namespace, bound or not: a bind later
     // counts what was refused before.
     fn refused(&mut self, member: MemberId, _range: ByteRange) {
-        self.refused.insert(member);
+        if self.refused.insert(member) && self.names.contains_key(&member) {
+            self.refused_bound += 1;
+        }
     }
 
     fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {

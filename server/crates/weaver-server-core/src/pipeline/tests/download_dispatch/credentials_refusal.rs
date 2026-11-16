@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A server refusing the credentials has answered for the articles it was
-// asked for; a server quarantined for transport or capacity has not. The
-// first is a verdict, booked; the second is a wait.
+// A server that has refused the credentials for its whole give-up time has
+// answered for the articles it was asked for; a server quarantined for
+// transport or capacity has not, and neither has one that began refusing
+// the login within that time. The first is a verdict, booked; the others
+// are a wait.
 
 use super::*;
 
@@ -19,13 +21,7 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
         segmented_job_spec("Refused Once", "payload.bin", &[128]),
     )
     .await;
-    pipeline
-        .nntp
-        .pool()
-        .health()
-        .lock()
-        .await
-        .record_failure(0, true);
+    refuse_login_past_give_up(&pipeline, 0).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
@@ -55,7 +51,7 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -85,16 +81,16 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
     assert!(!Pipeline::server_may_serve(
         pipeline.nntp.pool(),
         0,
-        &ready[0].work.exclude_servers,
-        &retention,
+        ready[0].work.exclude_servers,
+        retention,
     ));
     assert!(Pipeline::server_may_serve(
         pipeline.nntp.pool(),
         1,
-        &ready[0].work.exclude_servers,
-        &retention,
+        ready[0].work.exclude_servers,
+        retention,
     ));
-    assert!(!pipeline.no_server_can_serve(job_id, &ready[0].work.exclude_servers));
+    assert!(!pipeline.no_server_can_serve(job_id, ready[0].work.exclude_servers));
 }
 
 // Every article of a file refused by one server waits to retry on the other,
@@ -153,7 +149,7 @@ async fn refused_articles_of_a_file_retry_holding_its_one_group_list() {
                 source_server_idx: Some(0),
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;
@@ -210,17 +206,10 @@ async fn a_fill_server_refusing_credentials_books_the_article_and_leaves_backfil
         segmented_job_spec("Refused Fill", "payload.bin", &[128]),
     )
     .await;
-    pipeline
-        .nntp
-        .pool()
-        .health()
-        .lock()
-        .await
-        .record_failure(0, true);
-    assert!(pipeline.nntp.pool().refuses_credentials(0));
+    refuse_login_past_give_up(&pipeline, 0).await;
     // Before any refusal reaches the article, nothing may serve it: the
     // fill server refuses and the backfill tier stays closed.
-    assert!(pipeline.no_server_can_serve(job_id, &[]));
+    assert!(pipeline.no_server_can_serve(job_id, weaver_nntp::ServerSet::EMPTY));
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
@@ -250,7 +239,7 @@ async fn a_fill_server_refusing_credentials_books_the_article_and_leaves_backfil
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -268,7 +257,86 @@ async fn a_fill_server_refusing_credentials_books_the_article_and_leaves_backfil
     assert!(!Pipeline::server_may_serve(
         pipeline.nntp.pool(),
         1,
-        &[],
-        &retention,
+        weaver_nntp::ServerSet::EMPTY,
+        retention,
     ));
+}
+
+// A backfill server refusing the login holds nothing: its refusal is the
+// answer at once, with no give-up time. Once the fill server has said "not
+// found", the article it alone could still bring is booked, not held for
+// it.
+#[tokio::test]
+async fn a_backfill_server_refusing_the_login_holds_nothing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let server = |host: &str, backfill| weaver_nntp::pool::ServerPoolConfig {
+        server: weaver_nntp::ServerConfig {
+            host: host.into(),
+            ..Default::default()
+        },
+        max_connections: 2,
+        backfill,
+        ..weaver_nntp::pool::ServerPoolConfig::default()
+    };
+    pipeline.nntp = std::sync::Arc::new(weaver_nntp::client::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig {
+            servers: vec![
+                server("fill.example.com", false),
+                server("backfill.example.com", true),
+            ],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(1),
+        },
+    ));
+    let job_id = JobId(41963);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Refused Backfill", "payload.bin", &[128]),
+    )
+    .await;
+    refuse_login(&pipeline, 1).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+    }
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
+    pipeline.active_download_passes.insert(job_id);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id,
+            runtime_generation: 0,
+            segment_id: held_segment(job_id, 0, 0),
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::ArticleNotFound,
+                "430 no such article",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(pipeline.infrastructure_retries.len(), 0);
+    assert_eq!(pipeline.pending_retries_by_job.get(&job_id).copied(), None);
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pipeline.login_refusal_words(job_id).as_deref(),
+        Some(
+            "server backfill.example.com:563 refuses the login and was never asked for the \
+             articles no other server had"
+        )
+    );
 }

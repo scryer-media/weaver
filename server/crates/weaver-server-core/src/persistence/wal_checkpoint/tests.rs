@@ -9,7 +9,7 @@ use crate::persistence::sql_runtime::{SqlRuntime, StoreDatastore};
 use crate::persistence::sql_services::{
     SqliteServices, sqlite_connect_options, sqlite_url_with_create,
 };
-use crate::persistence::wal_checkpoint::WalSignal;
+use crate::persistence::wal_checkpoint::{WRITE_WAIT_THRESHOLDS, WalSignal};
 use crate::schema_migrations::MigrationMode;
 
 // Small enough that a few commits cross it; each insert below is about 17
@@ -45,7 +45,7 @@ async fn fixture() -> Fixture {
     // The migrations leave their frames in the WAL, so that commit may
     // already have asked the task for a checkpoint: let it finish, then
     // start from an empty WAL.
-    fixture.wal.caught_up().await;
+    fixture.wal.settled().await;
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .execute(fixture.services.pool())
         .await
@@ -78,27 +78,38 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
-// The checkpoint task is held, so any checkpoint would have to come from
-// the commit. The commit that takes the WAL past the threshold returns
-// with nothing copied into the database file: the file has not grown, and
-// the WAL holds every frame. The next write waits for the task; once the
-// task runs, the file has the pages and that write restarts the WAL.
+const WRITE_WAIT: u32 = THRESHOLD * WRITE_WAIT_THRESHOLDS;
+
+// The checkpoint task is held, as a pass on a slow disk holds it, so any
+// checkpoint would have to come from a commit. Commits past the threshold
+// ask for a pass and return with nothing copied into the database file, and
+// the writes after them do not wait for the pass, until the WAL reaches the
+// write-wait bound. The next write waits for the task; once the task runs,
+// the file has the pages and that write restarts the WAL.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_gated_commit_never_checkpoints() {
+async fn writes_wait_for_a_pass_only_past_the_bound() {
     let fixture = fixture().await;
     let start = fixture.file_len();
     fixture.wal.hold(true);
 
     let mut previous = 0;
+    let mut past_threshold = 0;
     loop {
         fixture.write(INSERT).await;
         let frames = fixture.wal.frames();
         assert!(frames > previous, "the WAL restarted with no checkpoint");
         previous = frames;
         if frames >= THRESHOLD {
+            past_threshold += 1;
+        }
+        if frames >= WRITE_WAIT {
             break;
         }
     }
+    assert!(
+        past_threshold > 1,
+        "no write went ahead while a pass was asked for"
+    );
     assert_eq!(fixture.file_len(), start, "a commit copied pages back");
     assert_eq!(fixture.runs(), 0);
 
@@ -123,6 +134,59 @@ async fn a_gated_commit_never_checkpoints() {
     assert!(
         fixture.wal.frames() < previous,
         "the write after the checkpoint did not restart the WAL"
+    );
+}
+
+// A pass begins at the first threshold and is held before it reads the WAL,
+// as a slow pass is still going when writes reach the wait bound. The write
+// that waits is asking for a later pass than the running one took, yet the
+// running pass reads the WAL after the last commit and copies all of it, so
+// that one pass end releases the write, which restarts the WAL. A second
+// pass would be held at its start, so the write cannot have waited for one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_during_a_running_pass_waits_for_its_end_only() {
+    let fixture = fixture().await;
+    let started = fixture.wal.started();
+    fixture.wal.hold_pass(true);
+
+    let mut previous = 0;
+    while previous < THRESHOLD {
+        fixture.write(INSERT).await;
+        previous = fixture.wal.frames();
+    }
+    fixture.wal.until_started(started + 1).await;
+    while previous < WRITE_WAIT {
+        fixture.write(INSERT).await;
+        let frames = fixture.wal.frames();
+        assert!(frames > previous, "the WAL restarted with no checkpoint");
+        previous = frames;
+    }
+    assert_eq!(fixture.runs(), 0);
+
+    let next = {
+        let datastore = fixture.datastore();
+        tokio::spawn(async move {
+            SqlRuntime::execute(datastore.write_exec(), INSERT, &[])
+                .await
+                .map(|_| ())
+        })
+    };
+    let StoreDatastore::Sqlite { writer_gate, .. } = fixture.datastore() else {
+        unreachable!("a file database is SQLite");
+    };
+    writer_gate.until_waiting(1).await;
+
+    fixture.wal.hold(true);
+    fixture.wal.hold_pass(false);
+    next.await.unwrap().unwrap();
+    let (runs, frames) = (fixture.runs(), fixture.wal.frames());
+    // Let the held second pass go before asserting, so a failure does not
+    // leave shutdown waiting on it.
+    fixture.wal.hold(false);
+    assert_eq!(runs, 1, "the write waited for a second pass");
+    assert!(
+        frames < previous,
+        "the write after the pass did not restart the WAL"
     );
 }
 
@@ -158,12 +222,13 @@ async fn an_autocheckpoint_commit_grows_the_file() {
     connection.close().await.unwrap();
 }
 
-// Commits keep coming with nothing held. Every commit that crosses the
-// threshold is followed by a checkpoint before the next write, so the WAL
-// restarts again and again and never holds more than the threshold plus
-// one transaction's frames.
+// Commits keep coming with nothing held, and passes run alongside them.
+// Once a commit that asks for a pass finds the WAL past the write-wait
+// bound, the next write waits for a pass with no commit during it, which
+// copies everything, and that write restarts the WAL. The WAL never holds
+// more than the bound, one threshold and one transaction's frames.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_wal_stays_within_the_threshold_and_one_transaction() {
+async fn the_wal_stays_within_the_write_wait_bound() {
     let fixture = fixture().await;
     let mut previous = 0;
     let mut peak = 0;
@@ -181,10 +246,11 @@ async fn the_wal_stays_within_the_threshold_and_one_transaction() {
         peak = peak.max(frames);
         previous = frames;
     }
-    assert!(restarts >= 5, "the WAL restarted only {restarts} times");
+    assert!(restarts >= 2, "the WAL restarted only {restarts} times");
     assert!(
-        peak <= THRESHOLD + largest_transaction,
-        "the WAL reached {peak} frames, threshold {THRESHOLD}, largest commit {largest_transaction}"
+        peak <= WRITE_WAIT + THRESHOLD + largest_transaction,
+        "the WAL reached {peak} frames, bound {WRITE_WAIT}, threshold {THRESHOLD}, \
+         largest commit {largest_transaction}"
     );
 }
 
@@ -232,9 +298,10 @@ struct Held {
 const HELD_WRITES: usize = 40;
 
 // Writes past the threshold while `reader` stays open. Nothing can restart
-// the WAL, so its frame count only grows. Every write waits for the
-// checkpoint the one before it asked for, and so does the final wait, so
-// every pass asked for has run when this returns. The fixture's TRUNCATE
+// the WAL, so its frame count only grows. After each write the test waits
+// for the pass it asked for, if any, as a write past the write-wait bound
+// does, so passes never overlap commits and every pass asked for has run
+// when this returns. The fixture's TRUNCATE
 // reports no frames, so after it the first write may report fewer frames
 // than the last commit did: that write starts the WAL from empty.
 async fn write_while_held(fixture: &Fixture, _reader: &Reader) -> Held {
@@ -251,8 +318,8 @@ async fn write_while_held(fixture: &Fixture, _reader: &Reader) -> Held {
             written += frames;
         }
         previous = frames;
+        fixture.wal.settled().await;
     }
-    fixture.wal.caught_up().await;
     assert!(written > 4 * THRESHOLD, "too few frames to judge");
     Held {
         written,
@@ -394,7 +461,7 @@ async fn a_short_read_after_a_complete_pass_delays_the_restart_one_threshold() {
     // it holds a read mark past 0, and a pass can still copy every frame.
     let reader = Reader::open(&fixture).await;
     fixture.wal.hold(false);
-    fixture.wal.caught_up().await;
+    fixture.wal.settled().await;
     let metrics = fixture.wal.metrics_snapshot();
     assert_eq!(metrics.log_frames, u64::from(seen));
     assert_eq!(
@@ -410,11 +477,13 @@ async fn a_short_read_after_a_complete_pass_delays_the_restart_one_threshold() {
     previous = frames;
     reader.close().await;
 
-    // No read overlaps from here on.
+    // No read overlaps from here on, and each pass asked for runs before the
+    // next write, so no commit overlaps a pass either.
     let mut peak = previous;
     let mut writes = 0;
     loop {
         fixture.write(INSERT).await;
+        fixture.wal.settled().await;
         writes += 1;
         let frames = fixture.wal.frames();
         if frames < previous {
@@ -434,6 +503,26 @@ async fn a_short_read_after_a_complete_pass_delays_the_restart_one_threshold() {
         "the WAL grew {grown} frames past the complete pass before restarting; \
          threshold {THRESHOLD}, largest commit {largest_transaction}"
     );
+}
+
+// Every statement on a pool connection is timed, on the read path as on the
+// write path, and the checkpoint task's own passes are not.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_pool_statement_is_timed() {
+    let fixture = fixture().await;
+    let before = fixture.wal.metrics_snapshot().statement_duration.count;
+    fixture.write(INSERT).await;
+    let after_write = fixture.wal.metrics_snapshot().statement_duration.count;
+    assert!(after_write > before, "the write was not timed");
+    SqlRuntime::fetch_optional(
+        fixture.datastore().read_exec(),
+        "SELECT count(*) FROM blob",
+        &[],
+    )
+    .await
+    .unwrap();
+    let after_read = fixture.wal.metrics_snapshot().statement_duration.count;
+    assert_eq!(after_read, after_write + 1, "the read was not timed once");
 }
 
 // Pool connections leave checkpoints to the task.

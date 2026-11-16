@@ -153,6 +153,9 @@ pub struct GeneralSettings {
     pub complete_dir: String,
     pub cleanup_after_extract: bool,
     pub delete_failed_job_files: bool,
+    /// Days a history entry is kept after its job finished; 0 keeps history
+    /// forever.
+    pub history_retention_days: u32,
     pub max_download_speed: u64,
     pub max_retries: u32,
     pub propagation_delay_secs: u32,
@@ -168,6 +171,8 @@ pub struct GeneralSettingsInput {
     pub complete_dir: MaybeUndefined<String>,
     pub cleanup_after_extract: Option<bool>,
     pub delete_failed_job_files: Option<bool>,
+    /// Days a history entry is kept, from 0 (forever) to 36500.
+    pub history_retention_days: Option<i32>,
     pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
     pub propagation_delay_secs: Option<u32>,

@@ -9,7 +9,7 @@
 //! index, under the same lock, so the rows agree with the counts beside them.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use weaver_server_core::pipeline::queue::QueueInner;
 use weaver_server_core::pipeline::queue::paging::JobView;
@@ -337,17 +337,27 @@ fn like_contains(text: &str, pieces: &[String]) -> bool {
 }
 
 /// Which rows a page or a batch keeps. One predicate serves both.
+///
+/// The state, priority and category lists are read once per request: states
+/// and priorities into their distinct values, which are never more than the
+/// variants, and categories into a set, so testing a row costs the same however
+/// long the lists are.
 pub(crate) struct QueueSelection<'a> {
     search: Option<SearchQuery>,
-    states: Option<&'a [QueueItemState]>,
-    priorities: Option<&'a [QueuePriority]>,
-    categories: Option<&'a [String]>,
+    states: Option<Vec<QueueItemState>>,
+    priorities: Option<Vec<QueuePriority>>,
+    categories: Option<HashSet<&'a str>>,
 }
 
-fn non_empty<T>(values: Option<&Vec<T>>) -> Option<&[T]> {
-    values
-        .map(Vec::as_slice)
-        .filter(|values| !values.is_empty())
+fn distinct<T: Copy + PartialEq>(values: Option<&Vec<T>>) -> Option<Vec<T>> {
+    let values = values.filter(|values| !values.is_empty())?;
+    let mut distinct = Vec::new();
+    for value in values {
+        if !distinct.contains(value) {
+            distinct.push(*value);
+        }
+    }
+    Some(distinct)
 }
 
 impl<'a> QueueSelection<'a> {
@@ -377,9 +387,11 @@ impl<'a> QueueSelection<'a> {
     ) -> Self {
         Self {
             search: search.and_then(SearchQuery::parse),
-            states: non_empty(states),
-            priorities: non_empty(priorities),
-            categories: non_empty(categories),
+            states: distinct(states),
+            priorities: distinct(priorities),
+            categories: categories
+                .filter(|categories| !categories.is_empty())
+                .map(|categories| categories.iter().map(String::as_str).collect()),
         }
     }
 
@@ -402,6 +414,7 @@ impl<'a> QueueSelection<'a> {
     fn matches_search(&self, row: &WalkedRow) -> bool {
         if self
             .priorities
+            .as_ref()
             .is_some_and(|priorities| !priorities.contains(&row.priority))
         {
             return false;
@@ -433,14 +446,15 @@ impl<'a> QueueSelection<'a> {
 
     // Categories: the stage state counts are taken after.
     fn matches_category(&self, walk: &QueueWalk, row: &WalkedRow) -> bool {
-        self.categories.is_none_or(|categories| {
-            let category = walk.category(row);
-            categories.iter().any(|wanted| wanted == category)
-        })
+        self.categories
+            .as_ref()
+            .is_none_or(|categories| categories.contains(walk.category(row)))
     }
 
     fn matches_state(&self, row: &WalkedRow) -> bool {
-        self.states.is_none_or(|states| states.contains(&row.state))
+        self.states
+            .as_ref()
+            .is_none_or(|states| states.contains(&row.state))
     }
 
     /// Ids of every walked row the selection keeps, in queue order.
@@ -1247,6 +1261,162 @@ mod tests {
         let everything = QueueSelectionInput::default();
         let selection = QueueSelection::of_input(&everything);
         assert_eq!(selection.ids(&walk).len(), 40);
+    }
+
+    // The filter lists as given, each searched in full for every row.
+    fn reference_ids(walk: &QueueWalk, input: &QueueSelectionInput) -> Vec<JobId> {
+        fn given<T: Clone>(values: Option<&Vec<T>>) -> Option<Vec<T>> {
+            values.filter(|values| !values.is_empty()).cloned()
+        }
+        let states = given(input.states.as_ref());
+        let priorities = given(input.priorities.as_ref());
+        let categories = given(input.categories.as_ref());
+        walk.rows
+            .iter()
+            .filter(|row| {
+                priorities
+                    .as_ref()
+                    .is_none_or(|priorities| priorities.contains(&row.priority))
+                    && categories.as_ref().is_none_or(|categories| {
+                        let category = walk.category(row);
+                        categories.iter().any(|wanted| wanted == category)
+                    })
+                    && states
+                        .as_ref()
+                        .is_none_or(|states| states.contains(&row.state))
+            })
+            .map(|row| row.id)
+            .collect()
+    }
+
+    #[test]
+    fn long_filter_lists_keep_the_same_rows_and_cost_the_same_per_row() {
+        let statuses = [
+            JobStatus::Queued,
+            JobStatus::Paused,
+            JobStatus::Downloading,
+            JobStatus::Extracting,
+        ];
+        let categories = [None, Some("tv"), Some("movies"), Some("")];
+        let priorities = ["HIGH", "LOW", "normal", ""];
+        let jobs = (1..=120u64)
+            .map(|id| {
+                let mut job = job(
+                    id,
+                    statuses[id as usize % statuses.len()].clone(),
+                    categories[id as usize / 4 % categories.len()],
+                    1,
+                );
+                let priority = priorities[id as usize / 16 % priorities.len()];
+                if !priority.is_empty() {
+                    job.metadata = vec![(
+                        super::super::types::PRIORITY_ATTRIBUTE_KEY.to_string(),
+                        priority.to_string(),
+                    )];
+                }
+                job
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let walk = QueueWalk::read(&state, WalkNeeds::default());
+
+        let all_states = [
+            QueueItemState::Queued,
+            QueueItemState::Paused,
+            QueueItemState::Downloading,
+            QueueItemState::Extracting,
+            QueueItemState::Completed,
+        ];
+        let all_priorities = [
+            QueuePriority::Low,
+            QueuePriority::Normal,
+            QueuePriority::High,
+        ];
+        let all_categories = ["tv", "movies", "", "absent"];
+        let mut inputs = vec![QueueSelectionInput::default()];
+        for repeat in [1usize, 3, 1_000] {
+            for skip in 0..3 {
+                let pick = |index: usize| !(index + skip).is_multiple_of(3);
+                inputs.push(QueueSelectionInput {
+                    states: Some(
+                        all_states
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| pick(*index))
+                            .map(|(_, value)| *value)
+                            .cycle()
+                            .take(repeat * 4)
+                            .collect(),
+                    ),
+                    priorities: Some(
+                        all_priorities
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| pick(*index))
+                            .map(|(_, value)| *value)
+                            .cycle()
+                            .take(repeat * 2)
+                            .collect(),
+                    ),
+                    categories: Some(
+                        all_categories
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| pick(*index))
+                            .map(|(_, value)| value.to_string())
+                            .cycle()
+                            .take(repeat * 3)
+                            .collect(),
+                    ),
+                    ..Default::default()
+                });
+                inputs.push(QueueSelectionInput {
+                    states: Some(Vec::new()),
+                    categories: Some(vec![all_categories[skip].to_string(); repeat]),
+                    ..Default::default()
+                });
+            }
+        }
+
+        for input in &inputs {
+            let selection = QueueSelection::of_input(input);
+            assert_eq!(
+                selection.ids(&walk),
+                reference_ids(&walk, input),
+                "{input:?}"
+            );
+            // What each row is tested against: the distinct values, never the
+            // list as given.
+            assert!(
+                selection
+                    .states
+                    .as_ref()
+                    .is_none_or(|states| states.len() <= all_states.len())
+            );
+            assert!(
+                selection
+                    .priorities
+                    .as_ref()
+                    .is_none_or(|priorities| priorities.len() <= all_priorities.len())
+            );
+            assert!(
+                selection
+                    .categories
+                    .as_ref()
+                    .is_none_or(|categories| categories.len() <= all_categories.len())
+            );
+        }
+        // Some selections keep rows and some keep none.
+        assert!(
+            inputs
+                .iter()
+                .any(|input| !reference_ids(&walk, input).is_empty())
+        );
+        assert!(
+            inputs
+                .iter()
+                .any(|input| reference_ids(&walk, input).len() < walk.rows.len())
+        );
     }
 
     #[test]

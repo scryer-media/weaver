@@ -95,11 +95,35 @@
 // connection and lane gauges, download quota reservations, activation of the
 // work it was handed, and returning unused work to the queue.
 
+use super::queue::ScanPoint;
 use super::worker::DownloadPressure;
 use super::worker::{BlockedBy, ServableWork, ServableWorkFilter};
 use super::*;
 use crate::jobs::model::JobArticles;
 use crate::operations::metrics::SchedulerBlockClause;
+
+// Whether a walk may start at a server's floor. Always, except in a test
+// that walks every queue whole to hold the floors' answers to it.
+#[cfg(not(test))]
+fn scan_floors_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_FLOORS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn scan_floors_enabled() -> bool {
+    !SCAN_FLOORS_OFF.with(std::cell::Cell::get)
+}
+
+// Walks every queue whole on this thread while `off` holds.
+#[cfg(test)]
+pub(in crate::pipeline) fn set_scan_floors_off(off: bool) {
+    SCAN_FLOORS_OFF.with(|cell| cell.set(off));
+}
 
 // What a server gets when it asks for work.
 pub(in crate::pipeline) enum Handout {
@@ -123,6 +147,12 @@ pub(in crate::pipeline) struct SaturationWake {
     pub(in crate::pipeline) of: Option<JobId>,
     // Answer the lane again once it holds fewer than this many of them.
     pub(in crate::pipeline) below: usize,
+    // Held for the room of the job's volumes instead: the lane is answered
+    // again once each volume the job writes to has fallen to its resume
+    // line, however much it holds; `below` is not read. Each volume was
+    // asked for one wake at that line, so a lane is not asked again while
+    // its volume is still above it.
+    pub(in crate::pipeline) room: bool,
 }
 
 // The asking lane, so what it already holds of a job can be set against
@@ -149,6 +179,27 @@ enum ShareTaken {
     Saturated(SaturationWake),
     // Nothing for this server, refused by these clauses.
     Blocked(BlockedBy),
+    // The job's volume has no room for another whole pipe on the lane: the
+    // lane's room goes to the jobs after it first, and the job is asked
+    // again only when none of them had work.
+    Later,
+}
+
+// A lane's share of a job for the room the job's volume has left, and
+// whether the room itself, not the lane's part of it, set it.
+struct VolumeShare {
+    share: usize,
+    by_room: bool,
+}
+
+// Whether a job whose volume is short of room may pass its turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    // On the walk: a lane with no room left for a whole pipe of the job
+    // passes it by.
+    MayPass,
+    // After the walk found nothing else: the job answers.
+    Last,
 }
 
 // Which class of handout a counter should record.
@@ -208,31 +259,56 @@ impl Pipeline {
             return Handout::Idle;
         };
 
-        match self.take_lane_share(*hot_job, server_idx, want, lane, pressure) {
+        // A job whose volume has no room for another whole pipe on the
+        // lane limits the job, not the lane: the lane passes the job by, so
+        // its room goes to the jobs after it, on volumes that have room.
+        // Such a job is come back to, in the walk's order, when no other
+        // job had work for the lane, and answers then: a whole pipe once
+        // the lane has fetched one of it down.
+        let mut passed: Vec<JobId> = Vec::new();
+        match self.take_lane_share(*hot_job, server_idx, want, lane, pressure, Turn::MayPass) {
             ShareTaken::Works(works) => return self.record_handout(HandoutKind::Hot, works),
             ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
             ShareTaken::Blocked(blocked) => self.note_hot_blocked(blocked),
+            ShareTaken::Later => passed.push(*hot_job),
         }
 
         if let Some(in_flight) = spill_in_flight
             && spill_candidates.contains(&in_flight)
         {
-            match self.take_lane_share(in_flight, server_idx, want, lane, pressure) {
+            match self.take_lane_share(in_flight, server_idx, want, lane, pressure, Turn::MayPass) {
                 ShareTaken::Works(works) => {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
                 ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
-                ShareTaken::Blocked(_) => {}
+                ShareTaken::Blocked(_) | ShareTaken::Later => {}
             }
         }
 
         for job_id in spill_candidates {
-            match self.take_lane_share(*job_id, server_idx, want, lane, pressure) {
+            match self.take_lane_share(*job_id, server_idx, want, lane, pressure, Turn::MayPass) {
                 ShareTaken::Works(works) => {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
                 ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
                 ShareTaken::Blocked(_) => {}
+                ShareTaken::Later => passed.push(*job_id),
+            }
+        }
+
+        for job_id in passed {
+            let kind = if job_id == *hot_job {
+                HandoutKind::Hot
+            } else {
+                HandoutKind::Spill
+            };
+            match self.take_lane_share(job_id, server_idx, want, lane, pressure, Turn::Last) {
+                ShareTaken::Works(works) => return self.record_handout(kind, works),
+                ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
+                ShareTaken::Blocked(blocked) if kind == HandoutKind::Hot => {
+                    self.note_hot_blocked(blocked);
+                }
+                ShareTaken::Blocked(_) | ShareTaken::Later => {}
             }
         }
 
@@ -241,7 +317,10 @@ impl Pipeline {
     }
 
     // The gates that are about the link rather than about any job's queue.
-    fn download_scheduler_link_gate(&mut self, pressure: DownloadPressure) -> Option<YieldReason> {
+    pub(in crate::pipeline) fn download_scheduler_link_gate(
+        &mut self,
+        pressure: DownloadPressure,
+    ) -> Option<YieldReason> {
         if self.shared_state.is_paused() || self.shared_state.schedule_replay_paused() {
             return Some(YieldReason::Paused);
         }
@@ -282,7 +361,10 @@ impl Pipeline {
             .into_iter()
             .filter_map(|(job_id, position)| {
                 let state = self.jobs.get(&job_id)?;
-                if !Self::has_dispatchable_work(state) || self.held_for_added_scripts(job_id) {
+                if !Self::has_dispatchable_work(state)
+                    || self.held_for_added_scripts(job_id)
+                    || self.held_for_full_disk(job_id)
+                {
                     return None;
                 }
                 Some(crate::pipeline::queue::order::DispatchKey::new(
@@ -312,7 +394,7 @@ impl Pipeline {
             .get(&job_id)
             .map_or(0, |state| state.articles.queued_download_len());
         let out_on_lanes = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0);
@@ -321,6 +403,70 @@ impl Pipeline {
             .saturating_add(out_on_lanes)
             .div_ceil(connections)
             .max(depth.max(1) + 1)
+    }
+
+    // How many of a job's articles one lane may hold for the room the
+    // job's volume has left below its lease limit (`Volume::lease_room`),
+    // in articles the size of the job's next one: its part of that room
+    // over every connection, more than it holds now, and never less than a
+    // full pipe, but never more than the room holds either. The next
+    // article is the one a lease reserves next and the one the room wake
+    // is asked for (`Self::ask_room_wake`), so a volume that holds room for
+    // it holds room for one more here: what the lane carries of other jobs,
+    // or the larger articles it holds, do not size it. A job with nothing
+    // queued is sized by what the lane holds. A volume that counts nothing
+    // holds one article whatever its size. `None` when the job writes to
+    // no sized volume: the share stands.
+    //
+    // What the lanes hold is reserved on the volume as it is leased
+    // (`Pipeline::reserve_lane_work`), so the room is what is left after
+    // it, and the lease takes only what fits: this share and the lease
+    // grant by the one rule, and nothing is fetched past the limit.
+    fn volume_share_of_lane(
+        &self,
+        job_id: JobId,
+        lane_id: u64,
+        holds: usize,
+        full_pipe: usize,
+    ) -> Option<VolumeShare> {
+        let room = self.volume_room(job_id)?;
+        let article = match self.next_article_bytes(job_id) {
+            0 => {
+                let (held, held_bytes) = self.download_lane_held_bytes(lane_id);
+                held_bytes.checked_div(held as u64).unwrap_or(0)
+            }
+            next => next,
+        }
+        .max(1);
+        let connections = self.tuner.params().max_concurrent_downloads.max(1) as u64;
+        let articles = |bytes: u64| usize::try_from(bytes / article).unwrap_or(usize::MAX);
+        let fits = if self.volume_counts_nothing(job_id) {
+            articles(room).max(1)
+        } else {
+            articles(room)
+        };
+        let part = holds
+            .saturating_add(articles(room / connections))
+            .max(full_pipe);
+        let room_holds = holds.saturating_add(fits);
+        Some(VolumeShare {
+            share: part.min(room_holds),
+            by_room: room_holds < part,
+        })
+    }
+
+    // The bytes the job's next article is reserved at; zero when nothing
+    // is queued.
+    pub(in crate::pipeline) fn next_article_bytes(&self, job_id: JobId) -> u64 {
+        self.jobs
+            .get(&job_id)
+            .and_then(|state| state.articles.download_queue())
+            .and_then(|queue| {
+                queue
+                    .peek_in_class(false)
+                    .or_else(|| queue.peek_in_class(true))
+            })
+            .map_or(0, |work| Self::reserved_bytes_of(work.byte_estimate))
     }
 
     // One job's answer to one lane: work within the lane's share, a lane
@@ -332,10 +478,14 @@ impl Pipeline {
         want: usize,
         lane: Option<LaneShare>,
         pressure: DownloadPressure,
+        turn: Turn,
     ) -> ShareTaken {
         if let Err(blocked) = self.job_articles_built(job_id) {
             return ShareTaken::Blocked(blocked);
         }
+        // At its volume's hard limit the job's queue answers for it, as
+        // blocked. Below it the lane is handed whole pipes, held to the room
+        // the volume has below.
         let Some(lane) = lane else {
             return match self.take_servable_works(job_id, server_idx, want, pressure) {
                 Ok(works) => ShareTaken::Works(works),
@@ -348,6 +498,63 @@ impl Pipeline {
         // how this one is spread over the link.
         let holds = self.download_lane_holdings_of_job(lane.lane_id, job_id);
         let full_pipe = lane.depth.max(1) + 1;
+        // The volume's room decides only where it is short of the job's
+        // share: the lane is then held to it.
+        let (share, room_short, by_room) =
+            match self.volume_share_of_lane(job_id, lane.lane_id, holds, full_pipe) {
+                Some(volume) if volume.share < share => (volume.share, true, volume.by_room),
+                _ => (share, false, false),
+            };
+        // A lease is a whole pipe; under a lane that asks for less, what it
+        // asks for.
+        let whole = full_pipe.min(want).max(1);
+        // Asked last, a lane the volume's room holds short of a whole pipe
+        // takes what fits: the room is not left unused while the writer may
+        // run out of work, and it is no trickle, since a lane with nothing
+        // that fits waits for the volume's resume line below.
+        let takes_what_fits = turn == Turn::Last && by_room && share > holds;
+        if room_short && holds.saturating_add(whole) > share && !takes_what_fits {
+            // The volume has no room for another whole pipe on this lane.
+            // On the walk, the lane's room goes to the jobs after this one,
+            // on volumes that have room.
+            if turn == Turn::MayPass {
+                return ShareTaken::Later;
+            }
+            // Above its resume line the volume answers for the lane: it is
+            // asked again once the volume has fallen to that line, one wake
+            // for every lane held there. Below the line, where the room is
+            // short only for the lane's part of it, the lane waits until it
+            // has fetched a whole pipe of the job down.
+            //
+            // A share short of a whole pipe here is held by the room itself
+            // (`share` is then what the lane holds: no next article fits),
+            // so the volume is above the line the room wake is asked at,
+            // and the wake is asked. It goes unasked only when the writer
+            // brought the volume to that line between the look at its room
+            // and the ask: the room is there now. The lane is answered again on the
+            // next pass, which this rings, and finds it.
+            return match self.job_servable_work_for_server(job_id, server_idx, pressure, true) {
+                Ok(()) if self.ask_room_wake(job_id) => ShareTaken::Saturated(SaturationWake {
+                    of: Some(job_id),
+                    below: 0,
+                    room: true,
+                }),
+                Ok(()) if share >= whole => ShareTaken::Saturated(SaturationWake {
+                    of: Some(job_id),
+                    below: share + 1 - whole,
+                    room: false,
+                }),
+                Ok(()) => {
+                    self.download_dispatch_wake = true;
+                    ShareTaken::Saturated(SaturationWake {
+                        of: Some(job_id),
+                        below: holds + 1,
+                        room: false,
+                    })
+                }
+                Err(blocked) => ShareTaken::Blocked(blocked),
+            };
+        }
         let wake = if holds == 0 && self.download_lane_holdings(lane.lane_id) >= full_pipe {
             // A lane still full of another job does not open this one. The
             // share above is what keeps one job spread over the link; this
@@ -357,11 +564,13 @@ impl Pipeline {
             Some(SaturationWake {
                 of: None,
                 below: full_pipe,
+                room: false,
             })
         } else if holds >= share {
             Some(SaturationWake {
                 of: Some(job_id),
                 below: share,
+                room: false,
             })
         } else {
             None
@@ -370,7 +579,7 @@ impl Pipeline {
             // Only a job that would actually have served this lane may hold it:
             // one that is blocked here must let the walk go on, or a lane at
             // its share of a job it cannot fetch from would shut out the rest.
-            return match self.job_servable_work_for_server(job_id, server_idx, pressure) {
+            return match self.job_servable_work_for_server(job_id, server_idx, pressure, true) {
                 Ok(()) => ShareTaken::Saturated(wake),
                 Err(blocked) => ShareTaken::Blocked(blocked),
             };
@@ -420,6 +629,18 @@ impl Pipeline {
     // for this call, and names the clauses that refused it. The job's
     // completion-critical heap leads its ordinary one, which is what the
     // queue's own "first matching" scan already does.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn take_servable_works_or_none(
+        &mut self,
+        job_id: JobId,
+        server_idx: usize,
+        want: usize,
+        pressure: DownloadPressure,
+    ) -> Option<Vec<DownloadWork>> {
+        self.take_servable_works(job_id, server_idx, want, pressure)
+            .ok()
+    }
+
     fn take_servable_works(
         &mut self,
         job_id: JobId,
@@ -441,7 +662,7 @@ impl Pipeline {
         let mut filter = match self.servable_work_filter(
             job_id,
             server_idx,
-            bootstrap_files.as_deref(),
+            bootstrap_files.as_ref(),
             uu_cursor_ordinals.as_ref(),
         ) {
             ServableWork::Scan(filter) => filter,
@@ -460,8 +681,11 @@ impl Pipeline {
                 // it as missing now rather than leave the job waiting.
                 let server_count = self.nntp.pool().server_count();
                 let retention = self.job_retention_excludes(job_id);
-                if Self::unavailable_server_count_from_excludes(self.nntp.pool(), &[], &retention)
-                    >= server_count
+                if Self::unavailable_server_count_from_excludes(
+                    self.nntp.pool(),
+                    weaver_nntp::ServerSet::EMPTY,
+                    retention,
+                ) >= server_count
                 {
                     self.retire_unservable_queued_work(job_id);
                 }
@@ -469,31 +693,49 @@ impl Pipeline {
             }
         };
         let mut taken: Vec<DownloadWork> = Vec::new();
-        while taken.len() < want {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
-                break;
+        if let Some(state) = self.jobs.get_mut(&job_id)
+            && let Some(queue) = state.articles.download_queue_mut()
+        {
+            // The walk starts where this server's last one left off while
+            // nothing its refusals rested on has changed, and each article
+            // after the first is looked for past the one before: everything
+            // walked over was refused, and is refused again.
+            let prior = queue
+                .take_scan_floor(server_idx)
+                .filter(|_| scan_floors_enabled());
+            let mut at = match &prior {
+                Some((from, memo)) if filter.resume(memo) => *from,
+                _ => ScanPoint::Head,
             };
-            let popped = state
-                .articles
-                .download_queue_mut()
-                .and_then(|queue| queue.pop_first_matching(|work| filter.allows(work)));
-            let Some(item) = popped else {
-                self.metrics
-                    .download_scheduler_scan_no_match_total
-                    .fetch_add(1, Ordering::Relaxed);
-                break;
-            };
-            let segment_id = item.segment_id;
-            let Some(work) = item.into_work(&state.spec) else {
-                // The job's queue only holds parts of its own article list.
-                error!(
-                    segment = %segment_id,
-                    "queued article is not in its job's article list; dropping it"
-                );
-                continue;
-            };
-            filter.note_taken(&work);
-            taken.push(work);
+            while taken.len() < want {
+                let found = queue.find_from(at, |work| filter.allows(work));
+                let Some(item) = queue.take_at(found) else {
+                    self.metrics
+                        .download_scheduler_scan_no_match_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    at = ScanPoint::End;
+                    break;
+                };
+                at = found;
+                let segment_id = item.segment_id;
+                let Some(work) = item.into_work(&state.spec) else {
+                    // The job's queue only holds parts of its own article list.
+                    error!(
+                        segment = %segment_id,
+                        "queued article is not in its job's article list; dropping it"
+                    );
+                    continue;
+                };
+                filter.note_taken(&work);
+                taken.push(work);
+            }
+            if scan_floors_enabled() && filter.refusals_keep() {
+                queue.set_scan_floor(server_idx, at, filter.memo(prior.map(|(_, memo)| memo)));
+            }
+        } else if want > 0 {
+            self.metrics
+                .download_scheduler_scan_no_match_total
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         self.note_scan_skips(&filter);
@@ -574,9 +816,10 @@ impl Pipeline {
         if !cfg!(debug_assertions) {
             return;
         }
-        let servable = eligible
-            .iter()
-            .any(|job_id| self.job_has_servable_work_for_server(*job_id, server_idx, pressure));
+        // A whole walk, past every floor: the floors are what it checks.
+        let servable = eligible.iter().any(|job_id| {
+            self.job_has_servable_work_for_server(*job_id, server_idx, pressure, false)
+        });
         if servable {
             self.metrics
                 .download_scheduler_idle_with_servable_total
@@ -600,9 +843,9 @@ impl Pipeline {
         (0..server_count)
             .filter(|other| *other != server_idx)
             .any(|other| {
-                eligible
-                    .iter()
-                    .any(|job_id| self.job_has_servable_work_for_server(*job_id, other, pressure))
+                eligible.iter().any(|job_id| {
+                    self.job_has_servable_work_for_server(*job_id, other, pressure, true)
+                })
             })
     }
 
@@ -613,18 +856,22 @@ impl Pipeline {
         job_id: JobId,
         server_idx: usize,
         pressure: DownloadPressure,
+        from_floor: bool,
     ) -> bool {
-        self.job_servable_work_for_server(job_id, server_idx, pressure)
+        self.job_servable_work_for_server(job_id, server_idx, pressure, from_floor)
             .is_ok()
     }
 
     // [`Self::job_has_servable_work_for_server`], naming the clauses that
-    // refused the job when it holds nothing for the server.
+    // refused the job when it holds nothing for the server. `from_floor`
+    // lets the walk start where the server's last one left off; without it
+    // the whole queue is read, as an independent check of those floors is.
     fn job_servable_work_for_server(
         &mut self,
         job_id: JobId,
         server_idx: usize,
         pressure: DownloadPressure,
+        from_floor: bool,
     ) -> Result<(), BlockedBy> {
         if self.propagation_hold_until(job_id).is_some() {
             return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
@@ -634,7 +881,7 @@ impl Pipeline {
         let filter = match self.servable_work_filter(
             job_id,
             server_idx,
-            bootstrap_files.as_deref(),
+            bootstrap_files.as_ref(),
             uu_cursor_ordinals.as_ref(),
         ) {
             ServableWork::Scan(filter) => filter,
@@ -643,15 +890,30 @@ impl Pipeline {
                 return Err(BlockedBy::only(SchedulerBlockClause::Retention));
             }
         };
-        let Some(state) = self.jobs.get(&job_id) else {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
             return Err(BlockedBy::default());
         };
-        let Some(queue) = state.articles.download_queue() else {
+        let Some(queue) = state.articles.download_queue_mut() else {
             return Err(BlockedBy::only(SchedulerBlockClause::Activation));
         };
-        let found = queue
-            .peek_first_matching(|work| filter.allows(work))
-            .is_some();
+        let found = if from_floor {
+            let prior = queue
+                .take_scan_floor(server_idx)
+                .filter(|_| scan_floors_enabled());
+            let from = match &prior {
+                Some((from, memo)) if filter.resume(memo) => *from,
+                _ => ScanPoint::Head,
+            };
+            let at = queue.find_from(from, |work| filter.allows(work));
+            if scan_floors_enabled() && filter.refusals_keep() {
+                queue.set_scan_floor(server_idx, at, filter.memo(prior.map(|(_, memo)| memo)));
+            }
+            at != ScanPoint::End
+        } else {
+            queue
+                .peek_first_matching(|work| filter.allows(work))
+                .is_some()
+        };
         self.note_scan_skips(&filter);
         if found {
             return Ok(());

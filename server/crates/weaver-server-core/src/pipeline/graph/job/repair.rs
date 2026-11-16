@@ -17,7 +17,7 @@ use weaver_graph::slots::Ticket;
 use weaver_graph::{MemberId, NodeId, VolumeIndex};
 
 use super::{GraphError, GraphJob};
-use crate::pipeline::graph::namespace::{Lender, WriteError};
+use crate::pipeline::graph::namespace::{GivingUp, Lender, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
 impl GraphJob {
@@ -35,6 +35,9 @@ impl GraphJob {
     // the walk waits for it, and again after, for what the walk's rulings
     // made due. Under no slot, as for a job paused, held or retiring,
     // nothing goes out and no work is done: the job lends once it runs.
+    // While the job waits for room on a disk, only what writes nothing goes
+    // out: the reads of recovery a restore asked again, and a check of what
+    // was written. Repairs, replays and the objects' work wait with the job.
     pub(crate) fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
         if limit > 0 {
             self.lend_rewalks()?;
@@ -62,7 +65,11 @@ impl GraphJob {
     // slot nothing is lent or done.
     pub(crate) fn lend_work(&mut self, limit: usize) -> Result<(), GraphError> {
         let admit = self.works.admit();
-        if limit == 0 || (admit && self.loans.out()) {
+        if limit == 0
+            || self.writer.disk_held()
+            || self.quieting.is_some()
+            || (admit && self.loans.out())
+        {
             return Ok(());
         }
         loop {
@@ -137,8 +144,13 @@ impl GraphJob {
         // back through, and one with work due has not yet said what it
         // holds: the walk waits for it, and its return walks again. A
         // recovery object yet to hear all that arrived of it again, asked,
-        // being read or cut short, knows too little to rule on.
-        if self.works.out() || self.tree.work_due() || self.tree.rewalks_owed() {
+        // being read or cut short, knows too little to rule on. A give-up
+        // with volumes still to read back holds the tree half applied.
+        if self.works.out()
+            || self.tree.work_due()
+            || self.tree.rewalks_owed()
+            || self.quieting.is_some()
+        {
             return Ok(());
         }
         let mut walked = None;
@@ -177,6 +189,12 @@ impl GraphJob {
             .loans
             .lending(slots.as_mut().map(|(slots, limit)| (&mut **slots, *limit)));
         if !lending.admit() {
+            return Ok(());
+        }
+        // A replay writes what it reads again, and goes first: while the job
+        // waits for room neither it nor a check behind it goes out. A check
+        // with no replay before it writes nothing, and goes.
+        if self.writer.disk_held() && self.writer.rechecks_waiting() {
             return Ok(());
         }
         if let Some(replay) = self
@@ -266,31 +284,162 @@ impl GraphJob {
     // What the losses set going is settled before the object hears quiet.
     // Asked only once every run is started, since a repair's bytes reach a
     // namespace below by its run reading them again. Returns whether
-    // anything changed.
+    // anything changed. An object that gives more than one volume up has
+    // them read back one a turn: the rest waits in `quieting`, and this
+    // returns false, as nothing more is to be stepped until it is done.
     pub(super) fn tell_quiet(&mut self) -> Result<bool, GraphError> {
-        if !self.quiet() {
+        if self.quieting.is_some() || !self.quiet() {
             return Ok(false);
         }
-        let mut changed = false;
-        for node in self.tree.live().into_iter().rev() {
-            let mut effects = Vec::new();
-            self.tree.tell_lost(
-                node,
-                &mut self.writer.placing(&mut *self.builder),
-                &mut effects,
-            );
-            changed |= !effects.is_empty();
-            self.settle(effects)?;
-            let mut effects = Vec::new();
-            self.tree.quiet(
-                node,
-                &mut self.writer.placing(&mut *self.builder),
-                &mut effects,
-            );
-            changed |= !effects.is_empty();
-            self.settle(effects)?;
+        let told = self
+            .tree
+            .live()
+            .into_iter()
+            .rev()
+            .flat_map(|node| [(node, false), (node, true)])
+            .collect();
+        self.quieting = Some(Quieting {
+            told,
+            batch: None,
+            changed: false,
+            rung: false,
+            admitted: Vec::new(),
+        });
+        Ok(self.quieten()?.unwrap_or(false))
+    }
+
+    // Whether a give-up the job went quiet into still has volumes to read
+    // back. Nothing else of the job is stepped meanwhile.
+    pub(crate) fn giving_up(&self) -> bool {
+        self.quieting.is_some()
+    }
+
+    // Whether the pipeline is to wake the job for the next volume of its
+    // give-up: once per volume, and not once the pipeline is stopping,
+    // when the give-up waits where it stands and the job keeps the
+    // checkpoint from before it.
+    pub(crate) fn ring_give_up(&mut self) -> bool {
+        let stopping = self.works.stopping();
+        self.quieting
+            .as_mut()
+            .is_some_and(|quieting| !stopping && !std::mem::replace(&mut quieting.rung, true))
+    }
+
+    // The next volume of the give-up, on a turn of its own. Once the last
+    // is read back the objects left hear quiet, and what that frees is
+    // stepped and lent as the step that went quiet would have.
+    pub(crate) fn give_up_next(
+        &mut self,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        let Some(quieting) = self.quieting.as_mut() else {
+            return Ok(());
+        };
+        quieting.rung = false;
+        if self.works.stopping() {
+            return Ok(());
         }
-        Ok(changed)
+        let mut admitted = std::mem::take(&mut quieting.admitted);
+        if self.quieten()?.is_none() {
+            self.hold_admitted(&mut admitted);
+            return Ok(());
+        }
+        self.step_runs(admitted, limit)?;
+        self.lend(slots, limit)
+    }
+
+    // While a give-up has volumes left, the runs a step admitted wait with
+    // it, and nothing is stepped: true then.
+    pub(super) fn hold_admitted(&mut self, admitted: &mut Vec<NodeId>) -> bool {
+        let Some(quieting) = self.quieting.as_mut() else {
+            return false;
+        };
+        quieting.admitted.append(admitted);
+        true
+    }
+
+    // Tell the objects left what `quieting` holds, deepest first: whether
+    // anything changed once all have heard, `None` while a give-up has
+    // volumes left. A failed step drops what is left, as it always did.
+    fn quieten(&mut self) -> Result<Option<bool>, GraphError> {
+        let quieted = self.quieten_on();
+        if quieted.is_err() {
+            self.quieting = None;
+        }
+        quieted
+    }
+
+    fn quieten_on(&mut self) -> Result<Option<bool>, GraphError> {
+        loop {
+            if let Some(mut batch) = self.quieting.as_mut().and_then(|q| q.batch.take()) {
+                let done = self.writer.give_up_next(
+                    &mut self.tree,
+                    &mut *self.builder,
+                    &self.root,
+                    &mut batch,
+                )?;
+                if !done {
+                    let one_turn = self.one_turn_held();
+                    if let Some(quieting) = self.quieting.as_mut() {
+                        quieting.batch = Some(batch);
+                    }
+                    if one_turn {
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                self.heard(batch.into_out())?;
+            }
+            let Some(quieting) = self.quieting.as_mut() else {
+                return Ok(Some(false));
+            };
+            let Some((node, quiet)) = quieting.told.pop_front() else {
+                let changed = quieting.changed;
+                self.quieting = None;
+                return Ok(Some(changed));
+            };
+            let mut effects = Vec::new();
+            let mut placing = self.writer.placing(&mut *self.builder);
+            if quiet {
+                self.tree.quiet(node, &mut placing, &mut effects);
+            } else {
+                self.tree.tell_lost(node, &mut placing, &mut effects);
+            }
+            if effects.is_empty() {
+                continue;
+            }
+            quieting.changed = true;
+            let mut out = Vec::new();
+            let batch = self.writer.apply_quiet(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                effects,
+                &mut out,
+            )?;
+            let Some(batch) = batch else {
+                self.heard(out)?;
+                continue;
+            };
+            if let Some(quieting) = self.quieting.as_mut() {
+                quieting.batch = Some(batch);
+            }
+            if !self.one_turn_held() {
+                return Ok(None);
+            }
+        }
+    }
+
+    // A test may hold the job to the one turn every give-up took before.
+    #[cfg(test)]
+    fn one_turn_held(&self) -> bool {
+        self.one_turn
+    }
+
+    #[cfg(not(test))]
+    fn one_turn_held(&self) -> bool {
+        false
     }
 
     // The payload is in, no run is reading, no repair is out, no recovery
@@ -338,6 +487,19 @@ pub(super) struct Sealed {
     members: u64,
     sets: Vec<NodeId>,
     standing: BTreeSet<NodeId>,
+}
+
+// The job's objects hearing that it is quiet, held across turns while a
+// give-up reads its volumes back: what each object left is still to hear,
+// its losses (`false`) then quiet (`true`), the batch being applied, whether
+// anything changed so far, whether the pipeline was asked to wake the job
+// for the next volume, and the runs admitted meanwhile.
+pub(super) struct Quieting {
+    told: std::collections::VecDeque<(NodeId, bool)>,
+    batch: Option<GivingUp>,
+    changed: bool,
+    rung: bool,
+    admitted: Vec<NodeId>,
 }
 
 #[cfg(test)]

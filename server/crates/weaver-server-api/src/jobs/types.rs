@@ -165,6 +165,8 @@ pub enum QueueWaitReason {
     RepairCapacity,
     ExtractionCapacity,
     PostProcessingCapacity,
+    // The job waits for room on a disk, in whatever phase it is in.
+    DiskSpace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -1024,11 +1026,36 @@ pub struct JobOutputFile {
     pub size_bytes: u64,
 }
 
+/// One page of a job's output files, and the totals of all of them.
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct JobOutputResult {
     pub output_dir: String,
-    pub files: Vec<JobOutputFile>,
+    /// The bytes of every file, not only of this page.
     pub total_bytes: u64,
+    /// How many files there are in all.
+    pub total_count: u64,
+    /// True when the entry was archived and this is the record kept of its
+    /// files.
+    pub archived: bool,
+    /// The `after` that asks for the next page; null on the last page.
+    pub next_cursor: Option<String>,
+    #[graphql(skip)]
+    pub(crate) source: JobOutputSource,
+}
+
+/// Where a job's output files are read from: loaded only when `files` is
+/// selected.
+#[derive(Debug, Clone)]
+pub(crate) enum JobOutputSource {
+    /// Read from disk with the totals; this page is already in hand.
+    Disk(Vec<JobOutputFile>),
+    /// The record an archive kept, read from `offset` on.
+    Archived {
+        job_id: u64,
+        offset: u64,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -1236,6 +1263,65 @@ pub fn encode_offset_cursor(offset: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("off:{offset}"))
 }
 
+/// Where the next page of a job's output files starts: its position, which
+/// an archived entry's record pages by, and the last file listed, which a
+/// folder on disk pages by so a deep page keeps only its own files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputFilesCursor {
+    pub offset: usize,
+    pub after: Option<weaver_server_core::history::output_files::ListingKey>,
+}
+
+pub fn decode_output_files_cursor(cursor: Option<&str>) -> Result<OutputFilesCursor, String> {
+    let Some(cursor) = cursor else {
+        return Ok(OutputFilesCursor::default());
+    };
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| "cursor is not valid base64".to_string())?;
+    let decoded =
+        String::from_utf8(decoded).map_err(|_| "cursor is not valid UTF-8".to_string())?;
+    if decoded.starts_with("off:") {
+        return Ok(OutputFilesCursor {
+            offset: decode_offset_cursor(Some(cursor))?,
+            after: None,
+        });
+    }
+    let Some(body) = decoded.strip_prefix("fil:") else {
+        return Err("cursor has an invalid prefix".to_string());
+    };
+    let (offset, name, rel_path, raw): (usize, String, String, String) =
+        serde_json::from_str(body).map_err(|_| "cursor does not name a file".to_string())?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| "cursor does not name a file".to_string())?;
+    Ok(OutputFilesCursor {
+        offset,
+        after: Some(weaver_server_core::history::output_files::ListingKey {
+            name,
+            rel_path,
+            raw,
+        }),
+    })
+}
+
+pub fn encode_output_files_cursor(cursor: &OutputFilesCursor) -> String {
+    let body = match &cursor.after {
+        Some(after) => format!(
+            "fil:{}",
+            serde_json::to_string(&(
+                cursor.offset,
+                &after.name,
+                &after.rel_path,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&after.raw),
+            ))
+            .expect("a tuple of a number and three strings serializes")
+        ),
+        None => format!("off:{}", cursor.offset),
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
+}
+
 pub const PRIORITY_ATTRIBUTE_KEY: &str = "priority";
 
 pub fn normalize_priority_value(value: &str) -> std::result::Result<String, String> {
@@ -1350,7 +1436,7 @@ fn queue_item_from_display(
         state,
         download_state: QueueDownloadState::from(info.download_state),
         post_state: QueuePostState::from(info.post_state),
-        wait_reason: wait_reason_for_post_state(info.post_state),
+        wait_reason: wait_reason_for(info),
         download_wait_reason: info.download_wait_reason.clone(),
         download_retry_at_epoch_ms: info.download_retry_at_epoch_ms,
         error: info.error.clone(),
@@ -1706,10 +1792,15 @@ fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
-fn wait_reason_for_post_state(
-    post_state: weaver_server_core::PostState,
-) -> Option<QueueWaitReason> {
-    match post_state {
+// What the job waits for: room on a disk, which holds it in any phase,
+// else the capacity its post-processing state queues it for.
+fn wait_reason_for(info: &weaver_server_core::JobInfo) -> Option<QueueWaitReason> {
+    if info.download_wait_reason.as_deref()
+        == Some(weaver_server_core::jobs::handle::DISK_SPACE_WAIT_REASON)
+    {
+        return Some(QueueWaitReason::DiskSpace);
+    }
+    match info.post_state {
         weaver_server_core::PostState::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
         weaver_server_core::PostState::QueuedExtract => Some(QueueWaitReason::ExtractionCapacity),
         weaver_server_core::PostState::QueuedPostProcessing => {

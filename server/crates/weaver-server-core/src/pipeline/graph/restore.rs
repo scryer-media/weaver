@@ -93,6 +93,9 @@ pub(crate) struct GraphRestore {
     // The parts that arrived and wait to be placed, spooled where the
     // checkpoint names them; the queue does not fetch them again either.
     pub(crate) held: Vec<HeldPart>,
+    // The decoded bytes of the articles in hand: the job's downloaded bytes
+    // a restart resumes from, in the units a run counts them in.
+    pub(crate) in_hand_bytes: u64,
 }
 
 // What a graph job's restore takes from the pipeline, gathered on the
@@ -120,6 +123,14 @@ pub(crate) struct RestoreSeat {
     spec_password: Option<String>,
     data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
     window_ledger: super::window::ScratchLedger,
+    // The volume writers and the disk owner the restored job's files are
+    // written through.
+    volumes: (
+        Arc<crate::operations::disk::writer::VolumeWriters>,
+        Arc<crate::operations::StorageCapacity>,
+        Arc<super::disk::VolumeProbes>,
+        Arc<crate::pipeline::download::volume_pace::VolumeBuffers>,
+    ),
 }
 
 impl Pipeline {
@@ -151,6 +162,12 @@ impl Pipeline {
             spec_password,
             data_dir: Some(self.window_data_dir()),
             window_ledger: self.window_ledgers.intermediate.clone(),
+            volumes: (
+                Arc::clone(&self.volume_writers),
+                Arc::clone(&self.storage_capacity),
+                Arc::clone(&self.volume_probes),
+                Arc::clone(&self.volume_buffers),
+            ),
         }
     }
 }
@@ -186,6 +203,16 @@ impl RestoreSeat {
         self
     }
 
+    // The volumes of the job's directories, read on this thread when memory
+    // does not cover them: a job admitted afresh, with no checkpoint to
+    // rebuild, writes through these. For a thread that may wait on a disk.
+    pub(crate) fn read_volumes(&self) -> super::disk::ReadVolumes {
+        std::iter::once(self.working_dir.as_path())
+            .chain(self.output.as_ref().map(|(dir, _)| dir.as_path()))
+            .map(|dir| (dir.to_path_buf(), self.volumes.1.read_volume(dir)))
+            .collect()
+    }
+
     // The seat for a job whose metadata asks for no memory limit: its runs
     // are granted a window over the ceiling, as the reprocess that set it
     // granted them.
@@ -198,6 +225,12 @@ impl RestoreSeat {
 
     pub(crate) fn working_dir(&self) -> &Path {
         &self.working_dir
+    }
+
+    // The seat for a job whose working directory moved before it started.
+    pub(crate) fn moved_to(mut self, working_dir: PathBuf) -> Self {
+        self.working_dir = working_dir;
+        self
     }
 
     // Read the job's checkpoint back and rebuild the job from it. A
@@ -256,7 +289,28 @@ impl RestoreSeat {
             sweep_unnamed(output_dir, &snapshot, &rows.held_parts)?;
         }
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
+        // This thread may wait on a disk: the volumes of the job's
+        // directories are read here when memory does not cover them, so the
+        // job's disk is never given the volume of an unknown device.
+        let mut read = vec![(
+            self.working_dir.clone(),
+            self.volumes.1.read_volume(&self.working_dir),
+        )];
+        if let Some((output_dir, _)) = &self.output {
+            read.push((output_dir.clone(), self.volumes.1.read_volume(output_dir)));
+        }
+        let disk = super::disk::job_disk(
+            &self.volumes.0,
+            &self.volumes.1,
+            &self.volumes.2,
+            job_id.0,
+            &self.working_dir,
+            self.output.as_ref().map(|(dir, _)| dir.as_path()),
+            &self.volumes.3,
+            &read,
+        );
         let storage = Storage {
+            disk: Some(disk),
             passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref())?,
             caps: caps_for(&self.db, &self.extraction_limits, &files),
             working_dir: self.working_dir,
@@ -277,10 +331,12 @@ impl RestoreSeat {
             job,
             settled,
             refetched,
+            in_hand_bytes,
         } = GraphJob::restore(&snapshot, &files, job_id.0, storage, limit)?;
         // The next checkpoint writes only what it changes of these.
         let feed_verdict = rows.feed_verdict.clone();
         job.pending().written(rows);
+        job.pending().stored_settled(&snapshot.root, &refetched);
         if !refetched.is_empty() {
             tracing::info!(
                 job_id = job_id.0,
@@ -303,6 +359,7 @@ impl RestoreSeat {
             skip,
             held,
             feed_verdict,
+            in_hand_bytes,
         })
     }
 }
@@ -440,15 +497,14 @@ fn restore_passwords(
     db: &crate::Database,
     job_id: JobId,
     spec_password: Option<&str>,
-) -> Result<Vec<String>, LoadError> {
+) -> Result<Vec<crate::jobs::ArchivePasswordCandidate>, LoadError> {
     let (carried, _) = read_job_password_candidates(db, job_id)?;
     let global = db.global_archive_password_candidates()?;
-    Ok(
-        assemble_archive_password_candidates(spec_password, &carried, &global)
-            .iter()
-            .map(|candidate| candidate.value().to_owned())
-            .collect(),
-    )
+    Ok(assemble_archive_password_candidates(
+        spec_password,
+        &carried,
+        &global,
+    ))
 }
 
 #[cfg(test)]

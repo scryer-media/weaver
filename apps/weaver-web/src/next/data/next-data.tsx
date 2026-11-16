@@ -72,7 +72,8 @@ export interface ProviderHealth {
   connectionsMax: number;
   connectionsConfigured: number;
   capacityPenaltyUntilEpochMs: number | null;
-  latencyMs: number;
+  /** The round trip last timed on this server; null until one has been. */
+  measuredLatencyMs: number | null;
   bodyLatencyMs: number | null;
   bodyTransferMs: number | null;
   bodyLatencyBand: string | null;

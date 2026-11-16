@@ -22,7 +22,7 @@ function provider(label: string, active: number, max = 20): ProviderHealth {
     connectionsMax: max,
     connectionsConfigured: max,
     capacityPenaltyUntilEpochMs: null,
-    latencyMs: 0,
+    measuredLatencyMs: null,
     bodyLatencyMs: null,
     bodyLatencyBand: null,
     successCount: 0,
@@ -39,7 +39,7 @@ test("live counts replace the ones server health last read", () => {
     { label: "backup.example.test:563", active: 0, open: 0, busy: 0, max: 10 },
   ]);
   assert.equal(merged[0].connectionsActive, 17);
-  assert.equal(merged[0].latencyMs, 0);
+  assert.equal(merged[0].measuredLatencyMs, null);
   assert.equal(merged[1], providers[1], "an unchanged server keeps its object");
 });
 

@@ -15,8 +15,13 @@ mod ownership;
 mod pressure;
 mod refill;
 mod spawn;
+pub(in crate::pipeline) mod volume_pace;
 
-pub(in crate::pipeline::download) use leases::{BlockedBy, ServableWork, ServableWorkFilter};
+#[cfg(test)]
+pub(in crate::pipeline::download) use leases::queued_files_may_pass;
+pub(in crate::pipeline::download) use leases::{
+    BlockedBy, ScanMemo, ServableWork, ServableWorkFilter,
+};
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
@@ -30,7 +35,7 @@ enum DispatchAttempt {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct DownloadPipelineBacklog {
-    active_downloads: usize,
+    articles_in_flight: usize,
     active_connections: usize,
     active_decodes: usize,
     delayed_retries: usize,
@@ -158,11 +163,11 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
 // queued, before that is reported. Short enough to catch a lane that never
 // opens, long enough that ordinary refill gaps between batches say nothing.
 const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
-const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
-const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+pub(in crate::pipeline) const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration =
+    Duration::from_secs(10);
 // How long a dispatch stall nothing explains may last before the watchdog
 // kicks it: every dispatch-side hold on the stalled jobs is cleared and a
 // pass runs against the result.
@@ -208,7 +213,7 @@ pub(crate) struct DispatchStallWatch {
 // the same window, read as a retry storm rather than as ordinary churn. A
 // healthy pipeline retries a handful of articles per window and finishes
 // others alongside them; a thousand retries and no completion is a loop.
-const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
+pub(in crate::pipeline) const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
@@ -241,7 +246,10 @@ impl Pipeline {
             1
         };
         for attempt in 0..attempts {
-            if let Some(order) = self.nntp.blocking_body_server_order(&[]) {
+            if let Some(order) = self
+                .nntp
+                .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
+            {
                 return Some(order.into_iter().map(|server| server.0).collect());
             }
             if attempt + 1 < attempts {
@@ -273,7 +281,7 @@ impl Pipeline {
         ranked: Option<&[usize]>,
         backfill_flags: &[bool],
         idle_by_server: &HashMap<usize, usize>,
-    ) -> Option<Vec<usize>> {
+    ) -> Option<weaver_nntp::ServerSet> {
         ranked.map(|order| {
             order
                 .iter()
@@ -350,10 +358,8 @@ impl Pipeline {
         // given up on: the scheduler's filter holds a backfill server to
         // articles every available fill server is excluded from.
         if !servers.iter().any(|server| backfill_flags[*server]) {
-            let fill: Vec<usize> = (0..backfill_flags.len())
-                .filter(|idx| !backfill_flags[*idx])
-                .collect();
-            if let Some(order) = self.nntp.blocking_body_server_order(&fill) {
+            let fill = self.nntp.pool().fill_servers();
+            if let Some(order) = self.nntp.blocking_body_server_order(fill) {
                 for server in order {
                     if backfill_flags[server.0] && !servers.contains(&server.0) {
                         servers.push(server.0);
@@ -371,12 +377,14 @@ impl Pipeline {
         });
         for server_idx in servers {
             let spill_in_flight = self.spill_job_in_flight_on(server_idx);
-            let lane_mode = self.download_lane_mode_for_server(server_idx, pressure, true);
-            let want = self.download_refill_want(lane_mode);
             // The lane does not exist yet, so it holds nothing: `lane_id` is
             // taken before the ask so the share is measured against it, and
-            // the scheduler cannot find it saturated.
+            // the scheduler cannot find it saturated. It is taken before the
+            // mode too: on the trial a lapsed pin gets, one lane alone runs
+            // pipelined.
             let lane_id = Self::next_download_lane_id();
+            let lane_mode = self.download_lane_mode_for_lane(server_idx, pressure, true, lane_id);
+            let want = self.download_refill_want(lane_mode);
             let lane_share = crate::pipeline::download::scheduler::LaneShare {
                 lane_id,
                 depth: lane_mode.max_depth(),
@@ -521,10 +529,10 @@ impl Pipeline {
         if limit == 0 {
             return;
         }
-        let exclude_servers = self.effective_exclude_servers(job_id, &[]);
+        let exclude_servers = self.effective_exclude_servers(job_id, weaver_nntp::ServerSet::EMPTY);
         // The servers a lease for this job could be routed to, best first.
         // Provider policy is asked again at the dial.
-        let Some(order) = self.nntp.blocking_body_server_order(&exclude_servers) else {
+        let Some(order) = self.nntp.blocking_body_server_order(exclude_servers) else {
             return;
         };
         let order: Vec<usize> = order.into_iter().map(|server| server.0).collect();
@@ -551,12 +559,11 @@ impl Pipeline {
             &idle_by_server,
             limit,
         );
-        let exclude_servers: Arc<[usize]> = Arc::from(exclude_servers);
         let mut warmed = 0;
         for (server, count) in seats {
             let asked = self.owned_download_lane_pool.warm(
                 &self.nntp,
-                Arc::clone(&exclude_servers),
+                exclude_servers,
                 Self::bandwidth_reservation_estimate(byte_estimate),
                 weaver_nntp::pool::ServerId(server),
                 count,
@@ -638,7 +645,7 @@ impl Pipeline {
 
     pub(crate) fn maybe_finish_download_pass(&mut self, job_id: JobId) {
         let in_flight = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0);
@@ -688,6 +695,15 @@ impl Pipeline {
 
     fn dispatch_download_pass(&mut self, now: Instant) {
         self.download_dispatch_wake = false;
+        // The liveness stall's clock runs until something shows the stall is
+        // over: work in flight here, and below an operator pause, a handoff,
+        // nothing dispatch would serve, or a pass that leaves a connection
+        // running. A gate that only holds this pass back (the rate limit,
+        // byte pressure, a yield) leaves it running, so a stall behind such
+        // a gate is still reported once it has held a whole interval.
+        if self.articles_in_flight != 0 || self.active_download_connections != 0 {
+            self.download_dispatch_liveness_since = None;
+        }
         // Every early return below except an operator pause is a gate that
         // can lift with no event to announce it, so the pass is retried on
         // the idle tick until one gets as far as the eligible jobs.
@@ -699,7 +715,10 @@ impl Pipeline {
             || self.shared_state.schedule_replay_paused()
             || self.rate_limiter.should_wait()
         {
-            if self.active_downloads == 0 {
+            if self.shared_state.is_paused() || self.shared_state.schedule_replay_paused() {
+                self.download_dispatch_liveness_since = None;
+            }
+            if self.articles_in_flight == 0 {
                 debug!(
                     global_paused = self.global_paused,
                     rate_wait = self.rate_limiter.should_wait(),
@@ -709,6 +728,7 @@ impl Pipeline {
             return;
         }
         if self.nntp_handoff_draining {
+            self.download_dispatch_liveness_since = None;
             return;
         }
         // The pass's seat ledger. Health probe batches are seated first: a
@@ -721,7 +741,7 @@ impl Pipeline {
         let pressure = self.refresh_download_pressure();
         if pressure.is_hard() {
             self.update_queue_metrics();
-            if self.active_downloads == 0 {
+            if self.articles_in_flight == 0 {
                 debug!(
                     pressure_state = pressure.state.as_str(),
                     pressure_reason = pressure.reason.as_str(),
@@ -742,7 +762,7 @@ impl Pipeline {
                 .is_some_and(|ready_at| ready_at > now)
             {
                 self.update_queue_metrics();
-                if self.active_downloads == 0 {
+                if self.articles_in_flight == 0 {
                     debug!(
                         pressure_state = pressure.state.as_str(),
                         pressure_reason = pressure.reason.as_str(),
@@ -767,7 +787,7 @@ impl Pipeline {
         // but could not be placed is retried on the tick.
         // A probe batch still waiting for a seat is retried the same way.
         self.download_dispatch_retry = !eligible.is_empty() || !self.post_probes.waiting.is_empty();
-        if eligible.is_empty() && self.active_downloads == 0 {
+        if eligible.is_empty() && self.articles_in_flight == 0 {
             // Only a job holding a slot can download, so only those are
             // looked at one by one; the jobs waiting for a slot are one
             // condition, reported once a window below. Collected rather than
@@ -812,6 +832,15 @@ impl Pipeline {
                             status = ?s.status,
                             queue_len = s.articles.queued_download_len(),
                             "dispatch idle: waiting for scripts that run when a job is added"
+                        );
+                    } else if self.held_for_full_disk(*jid) {
+                        // A write found the disk full: a reading with room
+                        // releases it.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            "dispatch idle: waiting for room after a write found the disk full"
                         );
                     } else if matches!(
                         s.status,
@@ -905,7 +934,7 @@ impl Pipeline {
             }
         }
 
-        if !eligible.is_empty() && self.active_downloads == 0 {
+        if !eligible.is_empty() && self.articles_in_flight == 0 {
             debug!(
                 eligible_count = eligible.len(),
                 max,
@@ -920,6 +949,7 @@ impl Pipeline {
             // Nothing dispatch would serve: no stall to time, and a stall
             // timed before stays behind, not carried to the next job.
             self.download_dispatch_stall = None;
+            self.download_dispatch_liveness_since = None;
             self.update_queue_metrics();
             return;
         }
@@ -966,6 +996,8 @@ impl Pipeline {
                 return;
             }
             self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
+        } else {
+            self.download_dispatch_liveness_since = None;
         }
         self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);

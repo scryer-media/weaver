@@ -1551,7 +1551,7 @@ fn staging_space_requirement(artifact: &UpgradeArtifact) -> u64 {
 
 // The free-space admission check, over Weaver's own disk probe.
 fn ensure_available_space(path: &Path, required_bytes: u64) -> ApplicationUpgradeResult<()> {
-    let space = crate::operations::disk::probe_nearest_disk_space(path).map_err(|error| {
+    let space = crate::operations::StorageCapacity::read_nearest_now(path).map_err(|error| {
         ApplicationUpgradeError::Repository(format!(
             "failed to inspect upgrade filesystem space: {error}"
         ))

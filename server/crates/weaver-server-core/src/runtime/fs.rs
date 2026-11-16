@@ -150,13 +150,8 @@ fn rename_exclusive_with_link(
         Err(error) => return Err(error),
     }
     let source = std::fs::symlink_metadata(src)?;
-    // Some mounts reject the operation before checking whether the target
-    // exists. Resolve aliases and interrupted links before trying a copy;
-    // the copy itself still creates exclusively against a later collision.
-    match std::fs::symlink_metadata(dst) {
-        Ok(_) => return finish_or_refuse(src, dst),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if let Some(settled) = settled_before_copy(src, dst) {
+        return settled;
     }
     if source.is_file() {
         return copy_file_no_overwrite_then_remove_source(src, dst);
@@ -237,17 +232,50 @@ pub(crate) fn paths_equivalent_for_placement(left: &Path, right: &Path) -> bool 
     path_equivalence_key(left) == path_equivalence_key(right)
 }
 
+// Where a move by name alone left an entry.
+#[derive(Debug)]
+pub(crate) enum Placement {
+    // At its destination.
+    Placed,
+    // Still at its source, the destination free when this was said: the
+    // mount could not place it by name (a link or rename across devices,
+    // or one it refuses), and only a copy can. The error says why. The
+    // caller makes that copy where it may take its time, exclusively
+    // created, never over an entry that appears meanwhile.
+    Copy(io::Error),
+}
+
+// Moves a file and never replaces an existing target, copying it when the
+// mount cannot move it by name. A caller that must not spend a copy's time
+// where it stands uses `place_no_overwrite` and copies elsewhere.
 pub(crate) fn rename_no_overwrite(src: &Path, dst: &Path) -> io::Result<()> {
+    match place_no_overwrite(src, dst)? {
+        Placement::Placed => Ok(()),
+        Placement::Copy(_) => copy_file_no_overwrite_then_remove_source(src, dst),
+    }
+}
+
+// `rename_no_overwrite` up to the copy: only metadata changes, a link and
+// an unlink, a rename of the same entry or a symlink made again.
+pub(crate) fn place_no_overwrite(src: &Path, dst: &Path) -> io::Result<Placement> {
+    place_no_overwrite_with_link(src, dst, |src, dst| std::fs::hard_link(src, dst))
+}
+
+pub(crate) fn place_no_overwrite_with_link(
+    src: &Path,
+    dst: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<Placement> {
     if paths_equivalent_for_placement(src, dst) {
         if src == dst {
-            return Ok(());
+            return Ok(Placement::Placed);
         }
-        return rename_equivalent_path(src, dst);
+        return rename_equivalent_path(src, dst).map(|()| Placement::Placed);
     }
 
     let metadata = std::fs::symlink_metadata(src)?;
     if metadata.file_type().is_symlink() {
-        return move_symlink_no_overwrite(src, dst);
+        return move_symlink_no_overwrite(src, dst).map(|()| Placement::Placed);
     }
 
     if metadata.is_dir() {
@@ -264,16 +292,51 @@ pub(crate) fn rename_no_overwrite(src: &Path, dst: &Path) -> io::Result<()> {
         ));
     }
 
-    match std::fs::hard_link(src, dst) {
+    match link(src, dst) {
         Ok(()) => {
             std::fs::remove_file(src)?;
-            Ok(())
+            Ok(Placement::Placed)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("destination already exists: {}", dst.display()),
         )),
-        Err(_) => copy_file_no_overwrite_then_remove_source(src, dst),
+        Err(error) => match settled_before_copy(src, dst) {
+            Some(settled) => settled.map(|()| Placement::Placed).map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("destination already exists: {}", dst.display()),
+                    )
+                } else {
+                    error
+                }
+            }),
+            None => Ok(Placement::Copy(error)),
+        },
+    }
+}
+
+// Some mounts reject a link or rename before checking whether the target
+// exists. A target that is there is settled before any copy: another
+// spelling or link of the source, which finishes the move without taking
+// its only name, or another entry, which refuses it. None when the target
+// is free. The copy itself still creates exclusively against a later
+// collision.
+fn settled_before_copy(src: &Path, dst: &Path) -> Option<io::Result<()>> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(Err(error)),
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Some(finish_or_refuse(src, dst))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = src;
+        Some(Err(io::Error::from(io::ErrorKind::AlreadyExists)))
     }
 }
 
@@ -432,7 +495,48 @@ pub(crate) mod test_devices {
         DEVICES.lock().unwrap().push((dir.to_path_buf(), device));
     }
 
-    pub(super) fn of(path: &Path) -> Option<u64> {
+    // Directories whose device reads are held: each read announces itself
+    // on the sender and waits until the hold is dropped.
+    type Hold = (
+        PathBuf,
+        tokio::sync::mpsc::UnboundedSender<PathBuf>,
+        std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+    );
+    static HELD: Mutex<Vec<Hold>> = Mutex::new(Vec::new());
+
+    // Releases the device reads of its directory when dropped.
+    pub(crate) struct HeldDevice(std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for HeldDevice {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    // Hold every device read of `dir` until the returned hold is dropped;
+    // each read is announced on the receiver as it begins.
+    pub(crate) fn hold(dir: &Path) -> (HeldDevice, tokio::sync::mpsc::UnboundedReceiver<PathBuf>) {
+        let (entered, announced) = tokio::sync::mpsc::unbounded_channel();
+        let gate = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        HELD.lock()
+            .unwrap()
+            .push((dir.to_path_buf(), entered, std::sync::Arc::clone(&gate)));
+        (HeldDevice(gate), announced)
+    }
+
+    pub(crate) fn of(path: &Path) -> Option<u64> {
+        let held = HELD
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(dir, _, _)| path == dir)
+            .map(|(_, entered, gate)| (entered.clone(), std::sync::Arc::clone(gate)));
+        if let Some((entered, gate)) = held {
+            let _ = entered.send(path.to_path_buf());
+            let (released, wake) = &*gate;
+            drop(wake.wait_while(released.lock().unwrap(), |released| !*released));
+        }
         DEVICES
             .lock()
             .unwrap()
@@ -443,40 +547,11 @@ pub(crate) mod test_devices {
     }
 }
 
-// Whether two directories lie on one device, each read at the nearest of
-// its ancestors that exists, as one not yet made will be made there. A
-// device that cannot be read, or a platform with no device to read, counts
-// as one device: nothing changes for it.
-pub(crate) fn same_device(a: &Path, b: &Path) -> bool {
-    match (nearest_device(a), nearest_device(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => true,
-    }
-}
-
-fn nearest_device(path: &Path) -> Option<u64> {
-    #[cfg(test)]
-    if let Some(device) = test_devices::of(path) {
-        return Some(device);
-    }
-    let existing = path
-        .ancestors()
-        .find(|at| std::fs::metadata(at).is_ok_and(|meta| meta.is_dir()))?;
-    let fingerprint = directory_fingerprint_from_path(existing).ok()?;
-    #[cfg(unix)]
-    {
-        Some(fingerprint.dev)
-    }
-    #[cfg(windows)]
-    {
-        Some(u64::from(fingerprint.volume_serial_number))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = fingerprint;
-        None
-    }
-}
+// Whether two directories lie on one device, read on the spot: for tests
+// only. Everything else asks the disk owner,
+// [`crate::operations::StorageCapacity`].
+#[cfg(test)]
+pub(crate) use crate::operations::disk::same_device_now as same_device;
 
 fn directory_fingerprint_from_path(path: &Path) -> io::Result<DirectoryFingerprint> {
     let metadata = std::fs::metadata(path)?;

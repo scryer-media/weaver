@@ -776,7 +776,10 @@ pub(super) async fn setup_handler(
                 "Setup is unavailable. Use the documented administrator recovery procedure.",
             );
         };
-        if let Err(error) = challenge.verify(body.setup_code.as_deref()) {
+        let client = security
+            .resolve_client_ip(Some(peer_addr), &headers)
+            .unwrap_or_else(|| peer_addr.ip());
+        if let Err(error) = challenge.verify(body.setup_code.as_deref(), client) {
             return match error {
                 SetupCodeError::RateLimited => failure(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -809,7 +812,8 @@ pub(super) async fn setup_handler(
         // A name can be pointed at this listener from anywhere, so a codeless
         // setup is only reachable through an address this browser resolved
         // itself: a literal, or `localhost`. Named access stays open once
-        // setup is finished.
+        // setup is finished. A request without a Host cannot show that, and
+        // every browser sends one.
         let request_host = match super::routes::host_header_authority(&headers) {
             Ok(host) => host,
             Err(_) => {
@@ -821,8 +825,9 @@ pub(super) async fn setup_handler(
             }
         };
         if codeless
-            && let Some(host) = request_host.as_ref()
-            && !(host.is_ip_literal() || host.host() == "localhost")
+            && !request_host
+                .as_ref()
+                .is_some_and(|host| host.is_ip_literal() || host.host() == "localhost")
         {
             return failure(
                 StatusCode::FORBIDDEN,

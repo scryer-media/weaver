@@ -359,7 +359,6 @@ const MonitoringStrip = memo(function MonitoringStrip({
         value={buffered.value}
         unit={t("next.monitoring.buffered", { unit: buffered.unit })}
         valueClassName={(metrics?.writeBufferedBytes ?? 0) > 0 ? "text-wv-warn" : undefined}
-        note={`p99 ${formatLatency((metrics?.diskWriteLatencyUs ?? 0) / 1000)}`}
       />
     </div>
   );
@@ -427,7 +426,7 @@ const ProvidersSection = memo(function ProvidersSection() {
                   title={t("next.monitoring.roundTrip")}
                   className={`min-w-[68px] text-right font-wv-mono text-[12.5px] ${degraded ? "text-wv-warn" : "text-wv-secondary"}`}
                 >
-                  {formatLatency(provider.latencyMs)}
+                  {formatLatency(provider.measuredLatencyMs)}
                 </span>
                 <span
                   title={bodyDepthTitle(t, provider)}

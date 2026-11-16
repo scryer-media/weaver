@@ -2,9 +2,18 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::pipeline::download::LoginRefusalView;
 use crate::pipeline::queue::Change;
 
 pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
+
+// How many candidates a walk looked at for a slot, or showed waiting for the
+// disk, on this thread, so a test can pin that a walk visits no more of a
+// long queue than its slots call for.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ADMISSION_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 // One queue row as the admission pass sees it, copied out under the read lock.
 struct AdmissionRow {
@@ -18,6 +27,8 @@ struct AdmissionRow {
     cancelled_or_retiring: bool,
     // The row carries a fresh intake the actor has not installed yet.
     intake: bool,
+    // The job downloaded before: it held a slot, and let it go on a pause.
+    started: bool,
 }
 
 // What a walk over every queue row answers to besides the actor's own state:
@@ -83,10 +94,16 @@ impl Pipeline {
         position: usize,
         row: &crate::pipeline::queue::JobRow,
     ) -> AdmissionRow {
+        // The job's state is looked up where whether it is pending asks for
+        // it, and nowhere else: whether it started reads the same lookup.
+        let mut installed = None;
         let pending = row.admission.is_some()
             || row.intents.restore.is_some()
             || row.intents.paused == Some(false)
-            || self.jobs.contains_key(&row.id)
+            || {
+                installed = self.jobs.get(&row.id);
+                installed.is_some()
+            }
             || self.window_parked(row.id);
         AdmissionRow {
             id: row.id,
@@ -95,6 +112,59 @@ impl Pipeline {
             pending,
             cancelled_or_retiring: row.intents.cancelled.is_some() || row.report.retiring,
             intake: row.admission.is_some(),
+            started: row.report.job.downloaded_bytes > 0
+                || installed.is_some_and(|state| state.downloaded_bytes > 0),
+        }
+    }
+
+    // Whether the working disk has no room over its reserve for a job that
+    // never downloaded to start: once it has not, none starts until a good
+    // reading shows room, or the disk has no reading. A disk with no
+    // reading, or only the last good one held across a failed probe, or no
+    // reserve, is not checked: only a good reading begins the hold. A hold
+    // begun lasts across a stale reading, as a job's wait for room does.
+    fn admission_disk_short(&mut self) -> bool {
+        if self.admission_disk_held {
+            return true;
+        }
+        let short = self.working_disk_short();
+        if short {
+            self.admission_disk_held = true;
+            self.storage_capacity
+                .ledger(crate::operations::StorageRoot::Intermediate)
+                .wait();
+        }
+        short
+    }
+
+    // Whether the working disk's cached reading is a good one with no room
+    // over the reserve. It reads the cache and begins nothing.
+    fn working_disk_short(&self) -> bool {
+        let reserve = self.extraction_limits.min_free_bytes;
+        reserve > 0
+            && self
+                .storage_capacity
+                .free(crate::operations::StorageRoot::Intermediate)
+                .is_some_and(|free| !free.stale && free.bytes <= reserve)
+    }
+
+    // A reading came while jobs are kept from starting for the working
+    // disk: a good one with room over the reserve, or none at all, lets
+    // them start, and the next walk starts them.
+    pub(in crate::pipeline) fn release_admission_disk_hold(&mut self) {
+        if !self.admission_disk_held {
+            return;
+        }
+        let reserve = self.extraction_limits.min_free_bytes;
+        let root = crate::operations::StorageRoot::Intermediate;
+        let room = self
+            .storage_capacity
+            .free(root)
+            .is_none_or(|free| !free.stale && free.bytes > reserve);
+        if room {
+            self.admission_disk_held = false;
+            self.storage_capacity.ledger(root).unwait();
+            self.queue_walk_due = true;
         }
     }
 
@@ -113,7 +183,7 @@ impl Pipeline {
             self.shared_state.queue.write(|inner| {
                 let mut changed = false;
                 for id in &self.nzb_pause_releases {
-                    if let Some(row) = inner.job_mut(*id)
+                    if let Some(mut row) = inner.job_mut(*id)
                         && row.intents.restore.is_some()
                     {
                         row.intents.paused = Some(true);
@@ -221,19 +291,32 @@ impl Pipeline {
         if shutting_down {
             return true;
         }
-        let mut candidates: Vec<_> = rows
-            .iter()
-            .filter(|row| {
-                row.pending
-                    && !row.paused
-                    && !row.cancelled_or_retiring
-                    && !self.nzb_admitted.contains(&row.id)
-                    && !self.nzb_admitting.contains(&row.id)
-            })
-            .map(|row| row.key)
-            .collect();
+        // While the working disk may be short, the candidates that
+        // downloaded before are kept apart as they are found, in the one
+        // pass: only they start then. With room nothing is kept apart.
+        let may_be_short = self.admission_disk_held || self.working_disk_short();
+        let mut candidates = Vec::new();
+        let mut started = Vec::new();
+        for row in rows.iter().filter(|row| {
+            row.pending
+                && !row.paused
+                && !row.cancelled_or_retiring
+                && !self.nzb_admitted.contains(&row.id)
+                && !self.nzb_admitting.contains(&row.id)
+        }) {
+            candidates.push(row.key);
+            if may_be_short && row.started {
+                started.push(row.key);
+            }
+        }
         drop(rows);
+        if !self.disk_unadmitted.is_empty() {
+            self.disk_unadmitted.clear();
+        }
         candidates.sort_unstable();
+        if may_be_short {
+            started.sort_unstable();
+        }
         let propagating: HashSet<_> = candidates
             .iter()
             .filter_map(|key| {
@@ -254,27 +337,55 @@ impl Pipeline {
         for id in expired {
             self.propagation_hold_until(id);
         }
-        for id in candidates.into_iter().map(|key| key.job_id()) {
-            // A settings edit or global hold can arrive while the previous
-            // acquisition awaits its durable commit. Re-read before admitting
-            // the next job rather than using the pass's earlier snapshot.
-            let allowed = self.shared_state.queue.read(|inner| {
-                let globals = &inner.globals;
-                self.nzb_admitted.len() + self.nzb_admitting.len()
-                    < globals
-                        .max_concurrent_nzbs
-                        .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
-                        .get() as usize
-                    && !globals.holds_downloads()
-            });
-            if !allowed {
-                break;
-            }
-            if propagating.contains(&id) {
+        // The disk is judged once per walk, and only when a job that never
+        // downloaded would start. While it is short such a job is passed
+        // over: only as many as there are free slots are shown waiting for
+        // the disk, the next ones to start, and the rest wait for a slot as
+        // they would behind them. Once those are shown, the walk goes on
+        // over the candidates that started before, and no other. A hold
+        // that begins or ends restates no more rows than there are slots.
+        let mut short = None::<bool>;
+        let mut slots = None::<usize>;
+        let mut shown = 0usize;
+        let mut shown_to = None;
+        for key in &candidates {
+            let id = key.job_id();
+            // A job that never downloaded does not start while the working
+            // disk has no room over its reserve: it waits, saying so, and a
+            // reading with room starts it. One that started, then paused and
+            // resumed, starts again whatever the disk holds: what it fetches
+            // is never held for the reserve.
+            if may_be_short
+                && started.binary_search(key).is_err()
+                && *short.get_or_insert_with(|| self.admission_disk_short())
+            {
+                #[cfg(test)]
+                ADMISSION_VISITS.with(|visits| visits.set(visits.get() + 1));
+                let slots = *slots.get_or_insert_with(|| self.admission_slots());
+                if !propagating.contains(&id)
+                    && self.nzb_admitted.len() + self.nzb_admitting.len() + shown < slots
+                {
+                    self.disk_unadmitted.insert(id);
+                    shown += 1;
+                }
+                if self.nzb_admitted.len() + self.nzb_admitting.len() + shown >= slots {
+                    shown_to = Some(*key);
+                    break;
+                }
                 continue;
             }
-            self.queue_slot_write(id, true);
+            if !self.admit_candidate(id, &propagating) {
+                break;
+            }
         }
+        if let Some(last) = shown_to {
+            for key in started.iter().filter(|key| **key > last) {
+                if !self.admit_candidate(key.job_id(), &propagating) {
+                    break;
+                }
+            }
+        }
+        let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
             let mut changed = false;
             for row in &mut inner.jobs {
@@ -286,7 +397,7 @@ impl Pipeline {
                         .map(|(_, epoch)| *epoch as f64);
                     changed = true;
                 }
-                changed |= self.restate_slot(row);
+                changed |= self.restate_slot(row, login_refusals);
             }
             if changed {
                 Change::changed(())
@@ -297,11 +408,52 @@ impl Pipeline {
         true
     }
 
+    // How many jobs may hold a slot now: none while downloads are held.
+    fn admission_slots(&self) -> usize {
+        self.shared_state.queue.read(|inner| {
+            let globals = &inner.globals;
+            match globals.holds_downloads() {
+                true => 0,
+                false => globals
+                    .max_concurrent_nzbs
+                    .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
+                    .get() as usize,
+            }
+        })
+    }
+
+    // The candidate takes a slot if one is free. False once none is, which
+    // ends the walk's admissions.
+    fn admit_candidate(&mut self, id: JobId, propagating: &HashSet<JobId>) -> bool {
+        #[cfg(test)]
+        ADMISSION_VISITS.with(|visits| visits.set(visits.get() + 1));
+        // A settings edit or global hold can arrive while the previous
+        // acquisition awaits its durable commit. Re-read before admitting
+        // the next job rather than using the pass's earlier snapshot.
+        let allowed = self.shared_state.queue.read(|inner| {
+            let globals = &inner.globals;
+            self.nzb_admitted.len() + self.nzb_admitting.len()
+                < globals
+                    .max_concurrent_nzbs
+                    .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
+                    .get() as usize
+                && !globals.holds_downloads()
+        });
+        if !allowed {
+            return false;
+        }
+        if !propagating.contains(&id) {
+            self.queue_slot_write(id, true);
+        }
+        true
+    }
+
     fn forget_retired(&mut self, id: JobId) {
         self.nzb_retired_busy.remove(&id);
         self.nzb_seen.remove(&id);
         self.nzb_pause_releases.remove(&id);
         self.nzb_reprocess_pending.remove(&id);
+        self.resumes_stored.remove(&id);
     }
 
     // The retired ids whose work was in flight: one that came back to the
@@ -330,16 +482,23 @@ impl Pipeline {
     // The wait reason a queue row stores, the one answer every writer of the
     // row gives: a slot while the job would download but holds none (not
     // while its post is still propagating, which the row states by its
-    // deadline), else the dispatcher's wait or hold.
-    pub(crate) fn stored_wait_reason(
+    // deadline), else the dispatcher's wait or hold. `login_refusals` is the
+    // pass's one read of the pool's login refusals, taken before the queue
+    // lock ([`Self::login_refusal_view`]).
+    pub(in crate::pipeline) fn stored_wait_reason(
         &self,
         row: &crate::pipeline::queue::JobRow,
-    ) -> Option<&'static str> {
+        login_refusals: LoginRefusalView,
+    ) -> Option<std::borrow::Cow<'static, str>> {
+        use std::borrow::Cow;
         if self.waits_for_nzb_slot(row) {
+            if !self.disk_unadmitted.is_empty() && self.disk_unadmitted.contains(&row.id) {
+                return Some(Cow::Borrowed(crate::jobs::handle::DISK_SPACE_WAIT_REASON));
+            }
             return (!self.propagation_ready_at.contains_key(&row.id))
-                .then_some(NZB_SLOT_WAIT_REASON);
+                .then_some(Cow::Borrowed(NZB_SLOT_WAIT_REASON));
         }
-        self.dispatch_wait_reason(row.id)
+        self.dispatch_wait_reason(row.id, login_refusals)
     }
 
     // Whether the row's job would download now but holds no slot: an intake,
@@ -427,8 +586,12 @@ impl Pipeline {
         // A slot that moved is walked to: the holder is installed wherever
         // it stands, and a slot let go is free for the next candidate.
         self.queue_walk_due = true;
+        let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
-            if inner.job_mut(id).is_some_and(|row| self.restate_slot(row)) {
+            if inner
+                .job_mut(id)
+                .is_some_and(|mut row| self.restate_slot(&mut row, login_refusals))
+            {
                 Change::changed(())
             } else {
                 Change::unchanged(())
@@ -438,17 +601,24 @@ impl Pipeline {
 
     // States on the row whether its job holds a slot, and the wait that
     // follows from it. Returns whether the row changed.
-    fn restate_slot(&self, row: &mut crate::pipeline::queue::JobRow) -> bool {
+    fn restate_slot(
+        &self,
+        row: &mut crate::pipeline::queue::JobRow,
+        login_refusals: LoginRefusalView,
+    ) -> bool {
         let mut changed = false;
         let admitted = self.nzb_admitted.contains(&row.id);
         if row.report.nzb_admitted != admitted {
             row.report.nzb_admitted = admitted;
             changed = true;
         }
-        let reason = self.stored_wait_reason(row);
-        if row.report.job.download_wait_reason.as_deref() != reason {
-            row.report.job.download_wait_reason = reason.map(str::to_owned);
-            if reason == Some(NZB_SLOT_WAIT_REASON) {
+        let reason = self.stored_wait_reason(row, login_refusals);
+        if row.report.job.download_wait_reason.as_deref() != reason.as_deref() {
+            let slot_wait = reason.as_deref() == Some(NZB_SLOT_WAIT_REASON);
+            row.report.job.download_wait_reason = reason.map(std::borrow::Cow::into_owned);
+            if slot_wait
+                || (!self.disk_unadmitted.is_empty() && self.disk_unadmitted.contains(&row.id))
+            {
                 row.report.job.download_state = crate::DownloadState::Queued;
             }
             changed = true;

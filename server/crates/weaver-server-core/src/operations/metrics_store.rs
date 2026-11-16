@@ -21,6 +21,11 @@ pub const ROLLUP_1H_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 const RAW_CHUNK_SPAN_SECS: i64 = 60 * 60;
 const ROLLUP_CHUNK_SPAN_SECS: i64 = 24 * 60 * 60;
 
+// The key of a slot whose metric is gone. Stored history keeps its values by
+// position, so the slot stays where it was: nothing new is written to it and
+// no series is read from it.
+pub const RETIRED_METRIC_KEY: &str = "";
+
 pub const COUNTER_METRIC_KEYS: [&str; NUM_COUNTER_METRICS] = [
     "weaver_pipeline_bytes_downloaded_total",
     "weaver_pipeline_bytes_decoded_total",
@@ -46,7 +51,7 @@ pub const COUNTER_METRIC_KEYS: [&str; NUM_COUNTER_METRICS] = [
 pub const GAUGE_METRIC_KEYS: [&str; NUM_GAUGE_METRICS] = [
     "weaver_pipeline_current_download_speed_bytes_per_second",
     "weaver_pipeline_download_queue_depth",
-    "weaver_pipeline_active_downloads",
+    "weaver_pipeline_articles_in_flight",
     "weaver_pipeline_active_decodes",
     "weaver_pipeline_decode_pending",
     "weaver_pipeline_decode_pending_bytes",
@@ -65,7 +70,7 @@ pub const GAUGE_METRIC_KEYS: [&str; NUM_GAUGE_METRICS] = [
     "weaver_pipeline_download_pressure_state",
     "weaver_pipeline_download_pressure_reason",
     "weaver_pipeline_download_pressure_current_stall_seconds",
-    "weaver_pipeline_disk_write_latency_microseconds",
+    RETIRED_METRIC_KEY,
     "weaver_pipeline_articles_per_second",
     "weaver_pipeline_decode_rate_mebibytes_per_second",
     "weaver_pipeline_write_pending_bytes",
@@ -275,7 +280,7 @@ impl RawMetricsHistoryPoint {
             gauge_values: [
                 snapshot.current_download_speed as f64,
                 snapshot.download_queue_depth as f64,
-                snapshot.active_downloads as f64,
+                snapshot.articles_in_flight as f64,
                 snapshot.active_decodes as f64,
                 snapshot.decode_pending as f64,
                 snapshot.decode_pending_bytes as f64,
@@ -294,7 +299,8 @@ impl RawMetricsHistoryPoint {
                 snapshot.download_pressure_state.as_code() as f64,
                 snapshot.download_pressure_reason.as_code() as f64,
                 snapshot.download_pressure_current_stall_ms as f64 / 1000.0,
-                snapshot.disk_write_latency_us as f64,
+                // Once the loop's write timing: retired, kept for the position.
+                0.0,
                 snapshot.articles_per_sec,
                 snapshot.decode_rate_mbps,
                 snapshot.write_pending_bytes as f64,

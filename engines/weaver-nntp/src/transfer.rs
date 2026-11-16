@@ -91,10 +91,14 @@ pub struct ServerTransferSnapshot {
 // subtraction, so a check is one clock read and a compare, and the read loop
 // can share that clock read between the progress mark and the read timeout
 // it derives next.
+//
+// A budget may also carry its caller's stop: once set, the transfer ends at
+// its next read turn, whatever the server is still sending.
 #[derive(Debug)]
 pub(crate) struct ActiveTransferBudget {
     limit: Duration,
     deadline: Instant,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 // Far enough that an unrepresentable deadline never expires within the life
@@ -110,7 +114,19 @@ impl ActiveTransferBudget {
         Self {
             limit,
             deadline: Self::deadline_from(now, limit),
+            stop: None,
         }
+    }
+
+    pub(crate) fn with_stop(mut self, stop: Option<Arc<AtomicBool>>) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Acquire))
     }
 
     // The transfer made progress at `now`: bytes arrived, or a deliberate
@@ -159,6 +175,9 @@ pub(crate) fn active_transfer_read_timeout_at(
     let Some(budget) = budget else {
         return Ok((command_timeout, false));
     };
+    if budget.stopped() {
+        return Err(NntpError::Stopped);
+    }
     let remaining = budget.remaining_at(now);
     if remaining.is_zero() {
         return Err(active_transfer_timeout(budget));
@@ -1001,6 +1020,12 @@ impl ServerTransferControl {
         self.quota_epoch.load(Ordering::Acquire)
     }
 
+    // Whether a quota is configured, read without the state lock: the epoch
+    // is published non-zero exactly while one is.
+    pub(crate) fn quota_configured(&self) -> bool {
+        self.current_quota_epoch() != 0
+    }
+
     fn reserve_rate(&self, bytes: u64) -> Option<RateTicket> {
         self.reserve_rate_with_clock(bytes, || self.rate_now_micros())
     }
@@ -1072,6 +1097,29 @@ impl ServerTransferControl {
     #[cfg(test)]
     fn rate_schedule_target_micros(&self) -> u64 {
         self.rate_schedule.load(Ordering::Acquire) & RATE_SCHEDULE_TARGET_MASK
+    }
+
+    // A fingerprint of a server's login identity: its host, port, username
+    // and password. A pool that comes into use with one other than the last
+    // pool's ends the server's run of login refusals, so the next refusal
+    // starts its give-up time afresh; anything else configured for the
+    // server (speed, routes, priority) leaves the run as it is.
+    pub(crate) fn login_fingerprint(
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (host, port, username, password).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // When the server's present run of login refusals becomes the verdict.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn login_refusal_verdict_at(&self) -> Option<Instant> {
+        self.recovery.refusal_verdict_at()
     }
 
     fn reconfigure_rate(&self, rate_bytes_per_sec: u64) {
@@ -1266,10 +1314,6 @@ impl RateCharge {
             + Duration::from_micros(self.ticket.target_micros.saturating_sub(RATE_BURST_MICROS))
     }
 
-    pub(crate) async fn wait_async(self) -> Duration {
-        self.control.wait_async(self.ticket).await
-    }
-
     pub(crate) fn wait_blocking(self) -> Duration {
         self.control.wait_blocking(self.ticket)
     }
@@ -1313,13 +1357,6 @@ impl BodyTransferPermit {
         };
         self.throttle_wait = self.throttle_wait.saturating_add(waited);
         waited
-    }
-
-    // Charge received bytes and preserve rate debt without delaying cleanup.
-    pub(crate) fn record_without_wait(&mut self, bytes: usize) {
-        let bytes = bytes as u64;
-        self.record_bytes(bytes);
-        let _ = self.control.reserve_rate(bytes);
     }
 
     // Charge bytes against the quota without pacing or rate debt, for

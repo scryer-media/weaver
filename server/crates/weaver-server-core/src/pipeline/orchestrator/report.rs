@@ -70,23 +70,25 @@ impl Pipeline {
             .get(&job_id)
             .map(|(_, epoch)| *epoch as f64);
         let cancellable = self.post_processing_cancellable(job_id);
+        let login_refusals = self.login_refusal_view();
         self.shared_state.queue.read(|inner| {
             let Some(row) = inner.job(job_id) else {
                 return false;
             };
-            let reason = self.stored_wait_reason(row);
-            let download_state =
-                if reason == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON) {
-                    crate::DownloadState::Queued
-                } else {
-                    crate::jobs::model::runtime_lanes_from_status_snapshot(status).0
-                };
+            let reason = self.stored_wait_reason(row, login_refusals);
+            let download_state = if reason.as_deref()
+                == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON)
+            {
+                crate::DownloadState::Queued
+            } else {
+                crate::jobs::model::runtime_lanes_from_status_snapshot(status).0
+            };
             let report = &row.report;
             let job = &report.job;
             job.status == *status
                 && job.error.as_deref() == error
                 && job.download_state == download_state
-                && job.download_wait_reason.as_deref() == reason
+                && job.download_wait_reason.as_deref() == reason.as_deref()
                 && job.download_retry_at_epoch_ms == retry_at
                 && job.finalizing_download == finalizing
                 && job.fetching_repair_data == fetching_repair_data
@@ -132,22 +134,23 @@ impl Pipeline {
             .get(&job_id)
             .map(|(_, epoch)| *epoch as f64);
         let cancellable = self.post_processing_cancellable(job_id);
+        let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
             if report.is_none() && event.is_none() {
                 return Change::unchanged(());
             }
             if let Some(job) = report {
-                let Some(row) = inner.job_mut(job_id) else {
+                let Some(mut row) = inner.job_mut(job_id) else {
                     return Change::unchanged(());
                 };
                 row.report.job = job;
                 row.report.moving = moving;
                 row.report.nzb_admitted = self.nzb_admitted.contains(&job_id);
-                let reason = self.stored_wait_reason(row);
-                if reason == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON) {
+                let reason = self.stored_wait_reason(&row, login_refusals);
+                if reason.as_deref() == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON) {
                     row.report.job.download_state = crate::DownloadState::Queued;
                 }
-                row.report.job.download_wait_reason = reason.map(str::to_owned);
+                row.report.job.download_wait_reason = reason.map(std::borrow::Cow::into_owned);
                 row.report.download_active = download_active;
                 row.report.download_work_pending = download_work_pending;
                 row.report.observed_byte_at_ms = row
@@ -300,7 +303,9 @@ impl Pipeline {
             job_hash: Some(state.job_hash),
             name: state.spec.name.clone(),
             error: self.reported_error(state).map(str::to_owned),
-            download_wait_reason: self.dispatch_wait_reason(state.job_id).map(str::to_owned),
+            download_wait_reason: self
+                .dispatch_wait_reason(state.job_id, self.login_refusal_view())
+                .map(std::borrow::Cow::into_owned),
             download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
             status,
             download_state,

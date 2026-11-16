@@ -62,6 +62,9 @@ pub enum DisableReason {
     FailureRatio,
 }
 
+// How long a fill server refusing the login is waited for, by default.
+pub const LOGIN_REFUSAL_GIVE_UP: Duration = Duration::from_hours(1);
+
 // Configuration thresholds for health state transitions.
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
@@ -75,6 +78,10 @@ pub struct HealthConfig {
     pub max_backoff: Duration,
     // How long to disable a server after an authentication failure.
     pub auth_disable_duration: Duration,
+    // How long a fill server must refuse the login without a break before
+    // the refusal is a verdict on the work only it could serve. Until then
+    // that work waits for it, as through any other outage.
+    pub auth_give_up_after: Duration,
     // How long to cool down a server after a transport-level failure.
     pub transient_cooldown: Duration,
     // How long to cool down a server after a capacity-related failure.
@@ -96,6 +103,7 @@ impl Default for HealthConfig {
             base_backoff: Duration::from_secs(30),
             max_backoff: Duration::from_secs(60),
             auth_disable_duration: Duration::from_mins(5),
+            auth_give_up_after: LOGIN_REFUSAL_GIVE_UP,
             transient_cooldown: Duration::from_secs(10),
             capacity_cooldown: Duration::from_secs(5),
             // 10% sustained transport failure over 40+ attempts is pathological
@@ -138,6 +146,9 @@ pub struct ServerHealth {
     ratio_attempts: u32,
     // Failed attempts recorded in the current failure-ratio window.
     ratio_failures: u32,
+    // Where the last refused login left the server's run of refusals, for
+    // the tracker to report once.
+    login_refusal: Option<crate::recovery::LoginRefusalRun>,
 }
 
 impl ServerHealth {
@@ -165,6 +176,7 @@ impl ServerHealth {
             ratio_window_started: None,
             ratio_attempts: 0,
             ratio_failures: 0,
+            login_refusal: None,
         }
     }
 
@@ -257,12 +269,14 @@ impl ServerHealth {
         }
 
         if is_auth {
-            let Some(until) = self
-                .recovery
-                .quarantine_for_credentials(self.config.auth_disable_duration, self.recovery_event)
-            else {
+            let Some((until, run)) = self.recovery.quarantine_for_credentials(
+                self.config.auth_disable_duration,
+                self.config.auth_give_up_after,
+                self.recovery_event,
+            ) else {
                 return;
             };
+            self.login_refusal = Some(run);
             self.disable_count += 1;
             self.recovery_pending = true;
             self.state = ServerState::Disabled {
@@ -385,10 +399,11 @@ impl ServerHealth {
     // back to Degraded. A separate gate admits one fresh demanded connection;
     // cached stragglers cannot decide the recovery outcome.
     pub fn check_reenable(&mut self) {
-        self.check_reenable_at(Instant::now());
+        let _ = self.check_reenable_at(Instant::now());
     }
 
-    fn check_reenable_at(&mut self, now: Instant) {
+    // True when the state changed, so the tracker publishes only then.
+    fn check_reenable_at(&mut self, now: Instant) -> bool {
         match self.state {
             ServerState::Disabled { until, .. } if now >= until => {
                 let probe_failures = 0;
@@ -396,6 +411,7 @@ impl ServerHealth {
                 self.state = ServerState::Degraded {
                     consecutive_failures: probe_failures,
                 };
+                true
             }
             ServerState::CoolingDown {
                 until,
@@ -408,8 +424,9 @@ impl ServerHealth {
                     },
                     None => ServerState::Healthy,
                 };
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -426,6 +443,12 @@ impl ServerHealth {
             self.latency_ewma_us = ALPHA * sample_us + (1.0 - ALPHA) * self.latency_ewma_us;
         }
         self.latency_samples += 1;
+    }
+
+    // The EWMA latency in milliseconds once a request has been timed; a
+    // server nothing has been asked of has no figure.
+    pub fn measured_latency_ms(&self) -> Option<f64> {
+        (self.latency_samples > 0).then(|| self.latency_ewma_us / 1_000.0)
     }
 
     // Returns the EWMA latency in milliseconds, or 50.0 if no samples have
@@ -571,6 +594,15 @@ impl AvailabilityBoard {
         }
     }
 
+    // Every server's entry as stored, for the tests that compare boards.
+    #[cfg(test)]
+    fn raw(&self) -> Vec<u64> {
+        self.until
+            .iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .collect()
+    }
+
     // Whether the server accepts work now.
     pub(crate) fn is_available(&self, idx: usize) -> bool {
         let raw = self
@@ -587,6 +619,17 @@ impl AvailabilityBoard {
         }
         Instant::now()
     }
+}
+
+// The one line said when a server's run of login refusals has lasted its
+// give-up time and the work that waited on it has been weighed.
+pub(crate) fn warn_login_refusal_gave_up(server_idx: usize, give_up_after: Duration) {
+    tracing::warn!(
+        server = server_idx,
+        give_up_after_secs = give_up_after.as_secs(),
+        "server has refused the login for its whole give-up time; the work only it \
+         can serve is booked missing"
+    );
 }
 
 // Manages health state for multiple servers.
@@ -609,6 +652,9 @@ impl HealthTracker {
         idx: usize,
         gate: Arc<crate::recovery::RecoveryGate>,
     ) {
+        // The gate's run of login refusals carries over: a pool rebuilt
+        // over the same server never ends it. What does is said where the
+        // pool becomes the one in use; see `NntpPool::activated`.
         self.servers[idx].recovery = gate;
     }
 
@@ -634,9 +680,33 @@ impl HealthTracker {
         let failures_before = self.servers[server_idx].failure_count;
         self.servers[server_idx].record_connection_outcome(ticket, success, auth, allow_ratio_trip);
         self.publish(server_idx);
+        self.report_login_refusal(server_idx);
         // A ticket reports only its first failure, so the count moves once.
         if probing && self.servers[server_idx].failure_count != failures_before {
             Self::warn_probe_failed(server_idx, &self.servers[server_idx]);
+        }
+    }
+
+    // One line when a server's run of login refusals begins, never per
+    // article or per probe. The line for a run that has lasted its give-up
+    // time is said where the verdict is told; see
+    // `NntpPool::mark_login_refusal_verdicts_told`. A backfill server's
+    // refusal is answered at once and holds nothing, so neither line is
+    // said for it.
+    fn report_login_refusal(&mut self, server_idx: usize) {
+        let backfill = self.backfill.get(server_idx).copied().unwrap_or(false);
+        let health = &mut self.servers[server_idx];
+        let run = health.login_refusal.take();
+        if backfill {
+            return;
+        }
+        match run {
+            Some(crate::recovery::LoginRefusalRun::Began) => tracing::warn!(
+                server = server_idx,
+                give_up_after_secs = health.config.auth_give_up_after.as_secs(),
+                "server refuses the login; the work only it can serve waits for it"
+            ),
+            Some(crate::recovery::LoginRefusalRun::Waiting) | None => {}
         }
     }
 
@@ -650,32 +720,6 @@ impl HealthTracker {
         );
     }
 
-    pub(crate) fn record_connection_cooldown(
-        &mut self,
-        idx: usize,
-        ticket: &crate::recovery::ConnectionHealth,
-        reason: CooldownReason,
-    ) {
-        if !ticket.first_failure() {
-            return;
-        }
-        if !ticket.current() {
-            self.servers[idx].failure_count += 1;
-            return;
-        }
-        self.servers[idx].settle_answered_recovery();
-        if ticket.probing() {
-            Self::warn_probe_failed(idx, &self.servers[idx]);
-            self.servers[idx].recovery_pending = true;
-            self.servers[idx].recovery_attempts = self.servers[idx].recovery_attempts.max(1);
-            self.servers[idx].state = ServerState::Degraded {
-                consecutive_failures: 0,
-            };
-        }
-        self.servers[idx].recovery_event = Some(ticket.event_key());
-        self.record_cooldown(idx, reason);
-        self.servers[idx].recovery_event = None;
-    }
     // Create a tracker for `server_count` servers, all starting Healthy and
     // all treated as fill servers.
     pub fn new(server_count: usize, config: HealthConfig) -> Self {
@@ -727,6 +771,7 @@ impl HealthTracker {
         let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
         self.servers[server_idx].record_failure_gated(is_auth, allow_ratio_trip);
         self.publish(server_idx);
+        self.report_login_refusal(server_idx);
     }
 
     // Record a short-lived cooldown-worthy failure for the given server.
@@ -736,22 +781,25 @@ impl HealthTracker {
         self.publish(server_idx);
     }
 
-    // Whether the given server is available for work.
+    // Whether the given server is available for work. Every other change
+    // of state publishes as it is made, so a re-check that changed nothing
+    // leaves the board as it stands.
     pub fn is_available(&mut self, server_idx: usize) -> bool {
         let now = self.reenable_now();
-        self.servers[server_idx].check_reenable_at(now);
-        self.publish(server_idx);
+        if self.servers[server_idx].check_reenable_at(now) {
+            self.publish(server_idx);
+        }
         self.servers[server_idx].is_available()
     }
 
-    // Check all disabled servers and re-enable any whose backoff has expired.
+    // Check all disabled servers and re-enable any whose backoff has
+    // expired, publishing only the ones that changed.
     pub fn check_reenable_all(&mut self) {
         let now = self.reenable_now();
-        for server in &mut self.servers {
-            server.check_reenable_at(now);
-        }
         for idx in 0..self.servers.len() {
-            self.publish(idx);
+            if self.servers[idx].check_reenable_at(now) {
+                self.publish(idx);
+            }
         }
     }
 
@@ -761,6 +809,15 @@ impl HealthTracker {
             return now;
         }
         Instant::now()
+    }
+
+    // Publish every server whether it changed or not, as every re-check
+    // once did, for the tests that hold the board to that.
+    #[cfg(test)]
+    fn publish_all(&self) {
+        for idx in 0..self.servers.len() {
+            self.publish(idx);
+        }
     }
 
     #[cfg(test)]
@@ -805,6 +862,10 @@ impl HealthTracker {
     }
 
     // Returns the EWMA latency in milliseconds for the given server.
+    pub fn measured_latency_ms(&self, server_idx: usize) -> Option<f64> {
+        self.servers[server_idx].measured_latency_ms()
+    }
+
     pub fn latency_ms(&self, server_idx: usize) -> f64 {
         self.servers[server_idx].latency_ms()
     }
@@ -834,6 +895,7 @@ mod tests {
             base_backoff: NEVER_LAPSES,
             max_backoff: NEVER_LAPSES * 2,
             auth_disable_duration: NEVER_LAPSES,
+            auth_give_up_after: LOGIN_REFUSAL_GIVE_UP,
             transient_cooldown: NEVER_LAPSES,
             capacity_cooldown: NEVER_LAPSES,
             // High sample floor so consecutive-machine tests above never
@@ -1217,6 +1279,61 @@ mod tests {
         assert_eq!(health.consecutive_failures, 0);
     }
 
+    // A re-check publishes only a server whose state it changed. Stepped
+    // from before to after the end of a cooldown and of a disable, the board
+    // holds what publishing every server on every re-check would have left,
+    // and answers and orders the servers as that did.
+    #[test]
+    fn a_recheck_that_changes_nothing_leaves_the_board_as_publishing_would() {
+        let config = HealthConfig {
+            transient_cooldown: Duration::from_secs(60),
+            base_backoff: Duration::from_secs(120),
+            ..test_config()
+        };
+        let mut tracker = HealthTracker::new(3, config);
+        let board = tracker.availability();
+        tracker.record_cooldown(0, CooldownReason::Transport);
+        for _ in 0..5 {
+            tracker.record_failure(1, false);
+        }
+        let ends = |tracker: &HealthTracker, idx: usize| match tracker.server(idx).state() {
+            ServerState::CoolingDown { until, .. } | ServerState::Disabled { until, .. } => *until,
+            state => panic!("server {idx} has no end in {state:?}"),
+        };
+        let cooled = ends(&tracker, 0);
+        let enabled = ends(&tracker, 1);
+        assert!(matches!(
+            tracker.server(1).state(),
+            ServerState::Disabled { .. }
+        ));
+        assert!(cooled < enabled);
+
+        let tick = Duration::from_nanos(1);
+        let steps = [
+            (cooled - tick, [false, false, true], vec![2]),
+            (cooled, [true, false, true], vec![0, 2]),
+            (cooled + tick, [true, false, true], vec![0, 2]),
+            (enabled - tick, [true, false, true], vec![0, 2]),
+            (enabled, [true, true, true], vec![0, 2, 1]),
+            (enabled + tick, [true, true, true], vec![0, 2, 1]),
+        ];
+        for (at, available, order) in steps {
+            tracker.set_reenable_clock(at);
+            let read = |board: &AvailabilityBoard| [0, 1, 2].map(|idx| board.is_available(idx));
+            // The board alone, before the tracker re-checks anything.
+            assert_eq!(read(&board), available, "{at:?}");
+            assert_eq!(tracker.ordered_servers(), order, "{at:?}");
+            let asked = [0, 1, 2].map(|idx| tracker.is_available(idx));
+            let kept = board.raw();
+            assert_eq!(asked, available, "{at:?}");
+            assert_eq!(read(&board), available, "{at:?}");
+
+            tracker.publish_all();
+            assert_eq!(board.raw(), kept, "{at:?}");
+            assert_eq!(read(&board), available, "{at:?}");
+        }
+    }
+
     #[test]
     fn ordered_servers_healthy_first() {
         let config = test_config();
@@ -1387,6 +1504,18 @@ mod tests {
         // EWMA = 0.2 * 200 + 0.8 * 120 = 40 + 96 = 136ms
         health.record_latency(Duration::from_millis(200));
         assert!((health.latency_ms() - 136.0).abs() < 0.01);
+    }
+
+    // A server nothing has been timed on has no measured latency, whatever
+    // start value ranking uses for it.
+    #[test]
+    fn measured_latency_is_absent_until_a_request_is_timed() {
+        let mut tracker = HealthTracker::new(2, test_config());
+        assert_eq!(tracker.measured_latency_ms(0), None);
+        assert!((tracker.latency_ms(0) - 50.0).abs() < f64::EPSILON);
+        tracker.record_latency(0, Duration::from_millis(80));
+        assert!((tracker.measured_latency_ms(0).unwrap() - 80.0).abs() < 0.01);
+        assert_eq!(tracker.measured_latency_ms(1), None);
     }
 
     #[test]

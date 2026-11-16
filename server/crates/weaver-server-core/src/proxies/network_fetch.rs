@@ -289,7 +289,45 @@ impl NetworkRuntime {
             let direct_rung = rungs.len();
             let probing = matches!(health[position].health, LegHealthState::Probing);
             let mut leg_attempts = Vec::new();
+            let mut blocked = false;
             for (rung_index, rung) in rungs.into_iter().enumerate() {
+                // A pool whose every member is blocked ends the leg with the
+                // error a dial through it gives, cooling or not: no later
+                // rung, and no direct fallback, is tried in its place.
+                if let Rung::Pool { id } = rung
+                    && config.pools.get(&id).is_some_and(|pool| pool.enabled)
+                    && let Some(pool) = self
+                        .pools
+                        .lock()
+                        .expect("network pools")
+                        .get(&(id, bottom.id()))
+                        .filter(|pool| pool.blocked().is_some())
+                        .cloned()
+                {
+                    leg_attempts.push(FetchAttempt {
+                        route: route.clone(),
+                        guard: leg.stage.clone(),
+                        stage: Arc::new(BlockedPool(pool)),
+                        position,
+                        purpose: purpose.clone(),
+                        pacing: self
+                            .egress_controls
+                            .get(weaver_nntp::transfer::StableServerId(
+                                leg.definition.egress_id,
+                            )),
+                        legacy_status: legacy_status.clone(),
+                        selected_proxy: None,
+                        ladder: leg.ladder.clone(),
+                        rung: rung_index,
+                        transport_error: Mutex::new(None),
+                        setups: Mutex::new(Vec::new()),
+                        last_member: true,
+                        last_attempt: false,
+                        addresses: Mutex::default(),
+                    });
+                    blocked = true;
+                    break;
+                }
                 if leg
                     .ladder
                     .as_ref()
@@ -350,6 +388,7 @@ impl NetworkRuntime {
                 }
             }
             if direct
+                && !blocked
                 && leg
                     .ladder
                     .as_ref()
@@ -383,5 +422,31 @@ impl NetworkRuntime {
             attempts.extend(leg_attempts.into_iter().map(Arc::new));
         }
         Ok(attempts)
+    }
+}
+
+// A pool rung whose every member is blocked. It fails as a dial through the
+// pool does, until the pool's members change.
+struct BlockedPool(Arc<PoolStage>);
+impl BlockedPool {
+    fn error(&self) -> DialError {
+        self.0
+            .blocked()
+            .unwrap_or_else(|| DialError::Skipped("pool members changed".into()))
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for BlockedPool {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        Err(self.error())
+    }
+    async fn resolve(&self, _: &str) -> Result<Resolution, DialError> {
+        Err(self.error())
+    }
+    fn budget(&self) -> Duration {
+        self.0.budget()
+    }
+    fn describe(&self) -> String {
+        self.0.describe()
     }
 }

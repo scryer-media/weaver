@@ -17,7 +17,7 @@
 pub(crate) mod durable;
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -28,6 +28,10 @@ use super::leaf::{Leaf, LeafError};
 #[derive(Debug)]
 pub(crate) struct Envelopes {
     working_dir: PathBuf,
+    // The writer of the working directory's volume, when the job's files
+    // are written through one.
+    to: Option<Arc<crate::operations::disk::writer::Submitter>>,
+    given: Given,
     shelves: BTreeMap<NodeId, Arc<Shelf>>,
     // The nodes whose kept envelopes changed, under the generation of the
     // latest change: every way to change what a checkpoint says of them
@@ -39,6 +43,8 @@ pub(crate) struct Envelopes {
 #[derive(Debug)]
 pub(crate) struct Shelf {
     dir: PathBuf,
+    to: Option<Arc<crate::operations::disk::writer::Submitter>>,
+    given: Given,
     node: NodeId,
     state: Mutex<Shelved>,
     changed: Condvar,
@@ -111,6 +117,12 @@ impl Kept {
         self.leaf.path()
     }
 
+    // Everything submitted for the envelope's file so far, when it is
+    // written through a volume's writer.
+    pub(crate) fn settled(&self) -> Option<crate::operations::disk::writer::Barrier> {
+        self.leaf.settled()
+    }
+
     pub(crate) fn into_leaf(self) -> Leaf {
         self.leaf
     }
@@ -120,17 +132,39 @@ impl Envelopes {
     pub(crate) fn new(working_dir: PathBuf) -> Self {
         Self {
             working_dir,
+            to: None,
+            given: Given::default(),
             shelves: BTreeMap::new(),
             marks: Marks::default(),
         }
     }
 
+    // Envelopes made from here on are written through `to`. Set before
+    // anything is kept.
+    pub(crate) fn write_through(
+        &mut self,
+        to: Option<Arc<crate::operations::disk::writer::Submitter>>,
+    ) {
+        debug_assert!(self.shelves.is_empty());
+        self.to = to;
+    }
+
+    // The names the job's new files were given while their making may
+    // still be queued.
+    pub(crate) fn given(&self) -> &Given {
+        &self.given
+    }
+
     // The node's shelf, made empty the first time it is asked for.
     pub(crate) fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
         let dir = &self.working_dir;
+        let to = &self.to;
+        let given = &self.given;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
             Arc::new(Shelf {
                 dir: dir.clone(),
+                to: to.clone(),
+                given: given.clone(),
                 node,
                 state: Mutex::default(),
                 changed: Condvar::new(),
@@ -257,11 +291,31 @@ impl Envelopes {
         name: &str,
         on_disk: bool,
     ) -> bool {
+        self.start_after(node, envelope, name, on_disk, 0)
+    }
+
+    // As `start_in`, for a file that the operation numbered `made`, already
+    // submitted to the working directory's writer, puts at `name`: whoever
+    // reads the envelope's file waits through that one.
+    pub(crate) fn start_after(
+        &mut self,
+        node: NodeId,
+        envelope: u32,
+        name: &str,
+        on_disk: bool,
+        made: u64,
+    ) -> bool {
         let shelf = self.shelf(node);
         let started = shelf.update(|state| match state.kept.entry(envelope) {
             Entry::Occupied(_) => false,
             Entry::Vacant(free) => {
-                free.insert(Kept::in_file(Leaf::over(&shelf.dir, name, on_disk)));
+                free.insert(Kept::in_file(Leaf::handed(
+                    &shelf.dir,
+                    name,
+                    on_disk,
+                    shelf.to.as_ref(),
+                    made,
+                )));
                 true
             }
         });
@@ -443,8 +497,12 @@ impl Shelf {
         match state.kept.entry(envelope) {
             Entry::Occupied(kept) => Ok(kept.into_mut()),
             Entry::Vacant(free) => {
-                let name = free_envelope_name(&self.dir, self.node, envelope);
-                let mut leaf = Leaf::at(&self.dir, &name);
+                let name = self.given.free(
+                    self.to.as_ref(),
+                    &self.dir,
+                    &envelope_name(self.node, envelope),
+                );
+                let mut leaf = Leaf::at(&self.dir, &name).through(self.to.as_ref());
                 leaf.truncate()?;
                 Ok(free.insert(Kept::in_file(leaf)))
             }
@@ -454,6 +512,15 @@ impl Shelf {
     // Append the bytes of `range` of an envelope to `into`, or nothing and
     // `false` when any of them were never kept.
     pub(crate) fn read(&self, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        self.read_on(envelope, range, into, false)
+    }
+
+    // The same read for a thread the loop does not wait for.
+    pub(crate) fn read_aside(&self, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        self.read_on(envelope, range, into, true)
+    }
+
+    fn read_on(&self, envelope: u32, range: ByteRange, into: &mut Vec<u8>, aside: bool) -> bool {
         let state = self.lock();
         let Some(kept) = state.kept.get(&envelope) else {
             return range.is_empty();
@@ -461,7 +528,12 @@ impl Shelf {
         let len = usize::try_from(range.len()).expect("an envelope range fits the address space");
         #[cfg(test)]
         READ_MOST.set(READ_MOST.get().max(range.len()));
-        kept.coverage.covered(range) && kept.leaf.read(range.start, len, into).is_ok()
+        kept.coverage.covered(range)
+            && match aside {
+                true => kept.leaf.read_aside(range.start, len, into),
+                false => kept.leaf.read(range.start, len, into),
+            }
+            .is_ok()
     }
 
     // Whether every byte of `range` of an envelope was kept, read from the
@@ -525,10 +597,48 @@ pub(crate) fn envelope_name(node: NodeId, envelope: u32) -> String {
     )
 }
 
-// The file a new envelope starts in: the one its node and number name, or,
-// while a file still sits there, the first free one after it.
-fn free_envelope_name(dir: &Path, node: NodeId, envelope: u32) -> String {
-    free_name(dir, &envelope_name(node, envelope))
+// The names given to new files of a job that writes through a volume's
+// writer, by the directory each lies under. A file made through a writer is
+// not on disk until the writer has run, so the disk alone does not say
+// which names are taken: a name given here stays taken until everything
+// submitted for the directory's volume has returned, when the disk says it
+// all again. A file removed through the writer may still sit on disk: its
+// name is passed over until it is gone, which costs only a longer name.
+// Nothing waits here, and a name is asked for once for each new file kept
+// aside, never for each article.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Given(Arc<Mutex<HashMap<PathBuf, HashSet<String>>>>);
+
+impl Given {
+    // `name` under `dir`, or the first free one after it: one no file sits
+    // at and none was given since the directory's writer was last idle.
+    // With no writer the disk says it all, and nothing is kept.
+    pub(crate) fn free(
+        &self,
+        to: Option<&Arc<crate::operations::disk::writer::Submitter>>,
+        dir: &Path,
+        name: &str,
+    ) -> String {
+        let Some(to) = to else {
+            return free_name(dir, name);
+        };
+        let mut given = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if to.barrier().returned() {
+            given.remove(dir);
+        }
+        let taken = given.entry(dir.to_path_buf()).or_default();
+        let free = |name: &str| !taken.contains(name) && !dir.join(name).exists();
+        let found = if free(name) {
+            name.to_owned()
+        } else {
+            (1u32..)
+                .map(|again| format!("{name}-{again}"))
+                .find(|again| free(again))
+                .expect("an unbounded counter finds a free name")
+        };
+        taken.insert(found.clone());
+        found
+    }
 }
 
 // `name`, or, while a file still sits there, the first free one after it:

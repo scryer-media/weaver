@@ -671,6 +671,21 @@ fn grant(threads: usize) -> weaver_graph::Budget {
     }
 }
 
+// The end header the reader buffers whole is held to the run's memory, as
+// every other buffer is; a run granted nothing keeps the reader's own
+// limits.
+#[test]
+fn a_7z_end_header_is_held_to_the_runs_memory() {
+    let own = sevenz_turbo::ArchiveLimits::default();
+    let granted = crate::lent::sevenz(&grant(1));
+    assert_eq!(granted.memory_limit_bytes, GRANT);
+    assert_eq!(granted.max_end_header_bytes, GRANT);
+    assert_eq!(granted.max_entries, own.max_entries);
+    let ungranted = crate::lent::sevenz(&weaver_graph::Budget::default());
+    assert_eq!(ungranted.memory_limit_bytes, own.memory_limit_bytes);
+    assert_eq!(ungranted.max_end_header_bytes, own.max_end_header_bytes);
+}
+
 // A run whose memory holds the dictionary but not its window: the
 // dictionary stays in RAM, for the owner reserved the run its memory.
 fn room_for_dictionary(threads: usize) -> weaver_graph::Budget {

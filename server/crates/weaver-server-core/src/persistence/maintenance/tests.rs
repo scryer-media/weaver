@@ -371,3 +371,47 @@ fn postgres_maintenance_pass_rejects_non_postgres_datastore() {
     let error = db.run_postgres_maintenance_pass().unwrap_err();
     assert!(matches!(error, StateError::Database(_)));
 }
+
+// The ids asked about that a queue or history row records: the same answer
+// as the full read narrowed to them, for a list longer than one bind chunk.
+#[test]
+fn recorded_job_ids_among_matches_the_full_read() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_active_job(7)).unwrap();
+    db.insert_job_history(&crate::JobHistoryRow {
+        job_id: 40_001,
+        job_hash: None,
+        name: "Kept".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_001_000,
+        metadata: None,
+        server_attribution: None,
+        archived_at: None,
+    })
+    .unwrap();
+    let asked = (1..=40_002u64).collect::<Vec<_>>();
+    let all = db.recorded_job_ids().unwrap();
+    let narrowed = asked
+        .iter()
+        .copied()
+        .filter(|id| all.contains(id))
+        .collect::<HashSet<_>>();
+    assert_eq!(narrowed, HashSet::from([7, 40_001]));
+    assert_eq!(db.recorded_job_ids_among(&asked).unwrap(), narrowed);
+    assert_eq!(
+        db.recorded_job_ids_among(&[3, 40_001]).unwrap(),
+        HashSet::from([40_001])
+    );
+    assert!(db.recorded_job_ids_among(&[]).unwrap().is_empty());
+}

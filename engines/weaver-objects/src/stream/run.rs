@@ -26,24 +26,19 @@ pub(super) struct Run<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
     // The window the stream's front sized against the grant it was built
-    // with.
+    // with: the one its owner reserved for the run.
     window: u64,
-    // The stream's front, which sizes the window again against the grant
-    // the run is given, where that is wider.
+    // The stream's front, which says what a refused window needs.
     first: Vec<u8>,
-    // The volume's length as the stream knew it, which sizes the window
-    // with the front.
-    length: Option<u64>,
 }
 
 impl<D: Decoder> Run<D> {
-    pub(super) fn new(name: String, window: u64, first: Vec<u8>, length: Option<u64>) -> Self {
+    pub(super) fn new(name: String, window: u64, first: Vec<u8>) -> Self {
         Self {
             decoder: PhantomData,
             name,
             window,
             first,
-            length,
         }
     }
 }
@@ -63,16 +58,16 @@ impl<D: Decoder> Extraction for Run<D> {
         // Asked before anything is read, so a volume still growing is
         // never waited on for its tail.
         let closed = volumes.len(weaver_graph::VolumeIndex(0)).is_some();
-        // The window the stream was built to, or the run's grant's where
-        // that is wider: an owner that lets a window go above its ceiling
-        // grants the run the wider one. An owner that reserved the whole
-        // grant for the run gives the decoder all of it, since a later
+        // The window the stream was built to, which is what its owner
+        // reserved for the run, however wide the grant is now: a stream that
+        // needs more is refused with the sizes, and its owner reserves the
+        // wider window before it starts again. An owner that reserved the
+        // whole grant for the run gives the decoder all of it, since a later
         // block or frame may need more than the first declares.
         let window = if budget.window_reserved {
             budget.window_or(self.window).max(self.window)
         } else {
             self.window
-                .max(D::window(&self.first, self.length, &budget))
         };
         // What the front declares the decoder needs, where the decoder's
         // own refusal does not say.

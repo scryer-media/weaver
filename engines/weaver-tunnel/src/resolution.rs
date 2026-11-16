@@ -12,12 +12,12 @@ use std::{
     collections::HashMap,
     future::Future,
     io,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
-use tokio::{net::TcpStream, sync::watch, time::Instant};
+use tokio::{sync::watch, time::Instant};
 
 use crate::{
     TunnelError,
@@ -379,8 +379,11 @@ impl<E: Replicate> ResolutionCache<E> {
     }
 }
 
+// A name with a trailing dot is absolute; one without may be completed from
+// the host's search domains, so the two can resolve differently and are held
+// apart.
 fn key(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
+    name.to_ascii_lowercase()
 }
 
 // A lookup the cache is waiting on. Dropped before it lands, as when the
@@ -501,29 +504,6 @@ pub fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
 pub fn forget_host(host: &str) {
     HOST.forget(host);
 }
-
-// Connects to the first of `host`'s addresses that answers, as
-// `TcpStream::connect` does, resolving with the host's own DNS. When none
-// answers, the name is asked afresh next time.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a leg that dials directly with the host resolver"
-)]
-pub async fn connect_host(host: &str, port: u16) -> io::Result<TcpStream> {
-    let mut last = None;
-    for ip in host_lookup(host).await? {
-        match TcpStream::connect(SocketAddr::new(ip, port)).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last = Some(error),
-        }
-    }
-    forget_host(host);
-    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, NO_ADDRESS)))
-}
-
-// What `connect_host` says of a name with no address, as std says it; `fault`
-// reads it back.
-pub(crate) const NO_ADDRESS: &str = "could not resolve to any address";
 
 fn untimed(found: impl Iterator<Item = IpAddr>) -> Lookup {
     let mut addresses = Vec::new();

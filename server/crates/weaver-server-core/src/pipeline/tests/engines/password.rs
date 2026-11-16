@@ -141,6 +141,35 @@ async fn pw_rar5_stored_hp_wrong_then_right_delivers() {
     assert_body(&graph, &body());
 }
 
+// The history row's summary of that job: the set needed a password, the one
+// that opened it came from the settings list, and neither password tried is
+// in the stored text.
+#[tokio::test]
+async fn pw_summary_names_the_settings_list_and_holds_no_password() {
+    let graph = run(&wrong_then_right(posts(rar5_stored_p()), SECRET)).await;
+    assert_body(&graph, &body());
+    let text = graph.download_summary.clone().expect("a stored summary");
+    assert!(!text.contains(SECRET) && !text.contains(WRONG), "{text}");
+    // Nor in the events the run sent, which the timeline stores, or the
+    // history row's metadata, which keeps the password only sealed.
+    let elsewhere = format!("{:?} {:?}", graph.events, graph.history_metadata);
+    assert!(!graph.events.is_empty());
+    assert!(
+        !elsewhere.contains(SECRET) && !elsewhere.contains(WRONG),
+        "{elsewhere}"
+    );
+    let summary = super::download_summary::summary(&graph);
+    let [node] = &summary.nodes[..] else {
+        panic!("{summary:?}");
+    };
+    assert!(node.encrypted && node.password_needed, "{node:?}");
+    assert_eq!(
+        node.password_source.as_deref(),
+        Some("settings"),
+        "{node:?}"
+    );
+}
+
 #[tokio::test]
 async fn pw_rar5_compressed_p_wrong_then_right_delivers() {
     let scenario = wrong_then_right(posts(fixture("rar5_enc_lz.rar")), FIXTURE_SECRET);

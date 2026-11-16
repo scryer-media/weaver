@@ -296,6 +296,7 @@ mod tests {
                 .unwrap(),
             ),
             server_attribution: None,
+            archived_at: None,
         })
         .unwrap();
         db

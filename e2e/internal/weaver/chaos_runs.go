@@ -848,6 +848,16 @@ func cmdTcpChaosTest() {
 	emitProgressEvent(progressEvent{Kind: "phase_done", Current: phaseTotal, Total: phaseTotal, Status: "pass"})
 }
 
+// adaptiveDispatchSeedsOwnFixture reports whether the adaptive-dispatch run
+// must post its scenario itself. On a preseeded NNTP image the articles are
+// already in the store and FIXTURES_DIR is the profile's shared NZB tree,
+// which the TCP chaos phase reads at the same time in a full run. Seeding
+// there removes and rewrites that NZB under the other phase, which then
+// submits a missing or half-written file. The preseeded corpus is read-only.
+func adaptiveDispatchSeedsOwnFixture() bool {
+	return !envBool(nntpSeedImageActiveEnv, false)
+}
+
 // cmdAdaptiveDispatchTest verifies that Weaver's latency-aware server ordering
 // prefers the lower-latency server within a priority group.
 func cmdAdaptiveDispatchTest() {
@@ -916,8 +926,12 @@ func cmdAdaptiveDispatchTest() {
 	if scenario.expectedOutcome() != "success" {
 		log.Fatalf("adaptive-dispatch scenario %s must be a success-path fixture, got %q", scenario.Slug, scenario.expectedOutcome())
 	}
-	if err := seedFixtureWithRetry(scenarioDir, envInt("ADAPTIVE_DISPATCH_SEED_RETRIES", 3)); err != nil {
-		log.Fatalf("seed adaptive-dispatch scenario %s: %v", scenario.Slug, err)
+	if adaptiveDispatchSeedsOwnFixture() {
+		if err := seedFixtureWithRetry(scenarioDir, envInt("ADAPTIVE_DISPATCH_SEED_RETRIES", 3)); err != nil {
+			log.Fatalf("seed adaptive-dispatch scenario %s: %v", scenario.Slug, err)
+		}
+	} else {
+		log.Printf("adaptive-dispatch fixture %s already present in preseeded image", scenario.Slug)
 	}
 	syncArticlesToBackup()
 

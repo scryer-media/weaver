@@ -298,7 +298,6 @@ impl<D: Decoder> Engine for Stream<D> {
             D::member(&self.name),
             D::window(&self.first, self.length, &self.budget),
             self.first.clone(),
-            self.length,
         ))
     }
 

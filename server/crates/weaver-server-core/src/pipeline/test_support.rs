@@ -118,15 +118,51 @@ pub async fn seed_job(pipeline: &mut Pipeline, job: crate::JobInfo) {
         job.download_wait_reason = pipeline.job_dispatch_hold_reason(id).map(str::to_owned);
     }
     pipeline.shared_state.queue.write(|inner| {
-        let row = inner
-            .jobs
-            .iter_mut()
-            .find(|row| row.id == id)
-            .expect("admitted fixture");
+        let mut row = inner.job_mut(id).expect("admitted fixture");
         row.report.job = job;
         row.report.download_active = false;
         queue::Change::changed(())
     });
+}
+
+/// Mark a history entry archived at `archived_at`, with `listing` as the
+/// record of its files, as archiving it writes them.
+pub fn mark_entry_archived(
+    db: &crate::Database,
+    job_id: crate::JobId,
+    listing: crate::history::output_files::OutputFileListing,
+    archived_at: i64,
+) {
+    db.record_archived_history_files(&[(job_id, listing)])
+        .unwrap();
+    db.stamp_history_archived(&[job_id], archived_at).unwrap();
+}
+
+/// Put `summary` on a finished job's history row, as moving the job into
+/// history copies it from the active row.
+pub fn put_history_download_summary(
+    db: &crate::Database,
+    job_id: crate::JobId,
+    summary: &crate::jobs::download_summary::DownloadSummary,
+) {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let json = summary.to_storage_json().unwrap();
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&datastore, "test_history_download_summary", |tx| {
+            let json = json.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE job_history SET download_summary = {} WHERE job_id = {}",
+                    &[SqlArg::Text(json), SqlArg::I64(job_id.0 as i64)],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
 }
 
 /// Initialize real admission resources without running the data plane.
@@ -152,6 +188,7 @@ pub(crate) fn admission_resources(
             max_concurrent_nzbs: None,
             cleanup_after_extract: None,
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: Default::default(),
             duplicate_policy: Default::default(),
             direct_store: None,

@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 use weaver_graph::holds::ScratchHold;
 use weaver_graph::tree::Mark;
-use weaver_graph::{CoverageRecord, MemberId, MemberRecord, NodeId, NodeRecord};
+use weaver_graph::{ByteRange, CoverageRecord, MemberId, MemberRecord, NodeId, NodeRecord};
 
 use super::GraphJob;
 use crate::pipeline::graph::checkpoint::{FileState, Generations, MemberGenerations, Touched};
@@ -141,6 +141,10 @@ impl GraphJob {
         member: MemberId,
     ) -> Option<(MemberRecord, Vec<CoverageRecord>, FileState)> {
         let (record, coverage) = self.tree.member_record(node, member)?;
+        // A checkpoint describes bytes on disk: what the member holds that
+        // no row gives a home is left out of its coverage, so a restart
+        // fetches it again from the record alone.
+        let coverage = leave_out(coverage, &self.writer.unrecorded(node, member));
         Some((record, coverage, self.writer.file_state(node, member)))
     }
 
@@ -148,7 +152,21 @@ impl GraphJob {
     // it holds anything of; `None` for a node the tree no longer has.
     #[cfg(test)]
     pub(crate) fn node(&self, node: NodeId) -> Option<(NodeRecord, BTreeMap<MemberId, FileState>)> {
-        let record = self.tree.record(node)?;
+        let mut record = self.tree.record(node)?;
+        // As `member` takes each member's coverage.
+        record.coverage = record
+            .members
+            .iter()
+            .flat_map(|member| {
+                let own = record
+                    .coverage
+                    .iter()
+                    .filter(|run| run.member == member.member)
+                    .copied()
+                    .collect();
+                leave_out(own, &self.writer.unrecorded(node, member.member))
+            })
+            .collect();
         let files = record
             .members
             .iter()
@@ -199,9 +217,55 @@ impl GraphJob {
 
     // The post's encoded bytes of the articles the root's facts say this
     // run does not fetch again: what the facts encoded now spare a restore.
+    #[cfg(test)]
     pub(crate) fn settled_bytes(&self) -> u64 {
         self.root.map.settled_bytes()
     }
+
+    // The decoded bytes of the articles in hand: what a checkpoint taken now
+    // spares a restore, in the units the job's downloaded bytes count.
+    pub(crate) fn in_hand_bytes(&self) -> u64 {
+        self.root.map.in_hand_bytes()
+    }
+
+    // Count `bytes` more in hand, as articles a test does not model would.
+    #[cfg(test)]
+    pub(crate) fn add_in_hand_for_test(&mut self, bytes: u64) {
+        self.root.map.add_in_hand_for_test(bytes);
+    }
+}
+
+// `coverage`, one member's runs in offset order, without the bytes of
+// `held`, merged spans in offset order: a run a span cuts keeps its parts
+// outside it. The cost is the runs and the spans, never the holds.
+fn leave_out(coverage: Vec<CoverageRecord>, held: &[ByteRange]) -> Vec<CoverageRecord> {
+    if held.is_empty() {
+        return coverage;
+    }
+    let mut out = Vec::with_capacity(coverage.len() + held.len());
+    let mut next = 0;
+    for run in coverage {
+        let mut at = run.start;
+        while next < held.len() && held[next].end <= at {
+            next += 1;
+        }
+        let mut span = next;
+        while at < run.end && span < held.len() && held[span].start < run.end {
+            if held[span].start > at {
+                out.push(CoverageRecord {
+                    start: at,
+                    end: held[span].start,
+                    ..run
+                });
+            }
+            at = at.max(held[span].end);
+            span += 1;
+        }
+        if at < run.end {
+            out.push(CoverageRecord { start: at, ..run });
+        }
+    }
+    out
 }
 
 #[cfg(test)]

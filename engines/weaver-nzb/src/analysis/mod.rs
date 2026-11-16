@@ -516,16 +516,19 @@ struct AnalyzedFile<'a> {
 
 fn analyze_files<'a>(nzb: &'a Nzb, diagnostics: &ParseDiagnostics) -> Vec<AnalyzedFile<'a>> {
     let mut seen_segment_sets: HashMap<Vec<&str>, FileToken> = HashMap::new();
+    let names: Vec<(Option<String>, NameSource)> = nzb
+        .files
+        .iter()
+        .map(|file| classify::subject_name(&file.subject))
+        .collect();
+    let roles = FileRole::of_post(names.iter().map(|(name, _)| name.as_deref()));
     nzb.files
         .iter()
+        .zip(names.into_iter().zip(roles))
         .enumerate()
-        .map(|(index, file)| {
+        .map(|(index, (file, ((name, name_source), role)))| {
             let token = FileToken(u32::try_from(index + 1).unwrap_or(u32::MAX));
             let notes = diagnostics.files.get(index).cloned().unwrap_or_default();
-            let (name, name_source) = classify::subject_name(&file.subject);
-            let role = name
-                .as_deref()
-                .map_or(FileRole::Unknown, FileRole::from_filename);
             let shape = name.as_deref().map_or(NameShape::None, classify_name);
             let ext = name.as_deref().map_or(FileExt::NONE, file_ext);
             let stem = name
@@ -882,16 +885,10 @@ fn push_group<'f, 'a>(
 }
 
 fn volume_number(file: &AnalyzedFile<'_>) -> Option<u32> {
-    match (&file.role, file.shape) {
-        // `.s00` continues where `.r99` stops; the role alone folds them together.
-        (FileRole::RarVolume { volume_number }, NameShape::SNn) => {
-            Some(volume_number.saturating_add(100))
-        }
-        (FileRole::RarVolume { volume_number }, _) => Some(*volume_number),
-        (FileRole::SevenZipSplit { number }, _) | (FileRole::SplitFile { number }, _) => {
-            Some(*number)
-        }
-        (FileRole::SevenZipArchive, _) => Some(0),
+    match &file.role {
+        FileRole::RarVolume { volume_number } => Some(*volume_number),
+        FileRole::SevenZipSplit { number } | FileRole::SplitFile { number } => Some(*number),
+        FileRole::SevenZipArchive => Some(0),
         _ => None,
     }
 }

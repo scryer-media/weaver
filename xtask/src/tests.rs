@@ -281,7 +281,7 @@ fn sample_release_dry_run_expectations<'a>() -> ReleaseDryRunExpectations<'a> {
 #[test]
 fn release_args_signature_uses_bump_mode_when_version_not_explicit() {
     assert_eq!(
-        release_args_signature(None, VersionBump::Minor, false),
+        release_args_signature(None, VersionBump::Minor, GraphqlOverrides::default()),
         "bump:minor"
     );
 }
@@ -290,7 +290,11 @@ fn release_args_signature_uses_bump_mode_when_version_not_explicit() {
 fn release_args_signature_uses_explicit_version_when_present() {
     let version = Version::parse("1.2.3").unwrap();
     assert_eq!(
-        release_args_signature(Some(&version), VersionBump::Patch, false),
+        release_args_signature(
+            Some(&version),
+            VersionBump::Patch,
+            GraphqlOverrides::default()
+        ),
         "version:1.2.3"
     );
 }
@@ -298,7 +302,14 @@ fn release_args_signature_uses_explicit_version_when_present() {
 #[test]
 fn dangerous_graphql_override_changes_release_cache_identity() {
     let mut cache = sample_release_dry_run_cache();
-    cache.release_args = release_args_signature(None, VersionBump::Patch, true);
+    cache.release_args = release_args_signature(
+        None,
+        VersionBump::Patch,
+        GraphqlOverrides {
+            dangerous: true,
+            breaking: false,
+        },
+    );
     assert_eq!(
         release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations())
             .as_deref(),
@@ -314,6 +325,47 @@ fn release_cli_accepts_explicit_dangerous_graphql_override() {
         panic!("expected release command");
     };
     assert!(args.allow_graphql_dangerous);
+    assert!(!args.allow_graphql_breaking);
+}
+
+#[test]
+fn release_cli_accepts_explicit_breaking_graphql_override() {
+    let cli = Cli::try_parse_from([
+        "xtask",
+        "release",
+        "--patch",
+        "--allow-graphql-breaking",
+        "--allow-graphql-dangerous",
+    ])
+    .unwrap();
+    let Commands::Release(args) = cli.command else {
+        panic!("expected release command");
+    };
+    assert!(args.allow_graphql_breaking);
+    assert!(args.allow_graphql_dangerous);
+}
+
+// Each override changes the dry-run signature on its own, so a dry run made
+// without one is not reused by a release made with it.
+#[test]
+fn release_args_signature_names_each_graphql_override() {
+    let signature = |dangerous, breaking| {
+        release_args_signature(
+            None,
+            VersionBump::Patch,
+            GraphqlOverrides {
+                dangerous,
+                breaking,
+            },
+        )
+    };
+    assert_eq!(signature(false, false), "bump:patch");
+    assert_eq!(signature(true, false), "bump:patch:allow-graphql-dangerous");
+    assert_eq!(signature(false, true), "bump:patch:allow-graphql-breaking");
+    assert_eq!(
+        signature(true, true),
+        "bump:patch:allow-graphql-dangerous:allow-graphql-breaking"
+    );
 }
 
 #[test]
@@ -807,8 +859,8 @@ fn release_hygiene_allows_repo_local_paths() {
 
 #[test]
 fn setup_code_is_read_only_from_the_current_run() {
-    let stale = "AAA-AAA";
-    let current = "K7P-M2X";
+    let stale = "AAAA-AAAA";
+    let current = "K7PM-2XQR";
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("backend.log");
     let bootstrap = format!("{SETUP_CODE_PREFIX}{stale}\n");
@@ -831,29 +883,33 @@ fn setup_code_is_read_only_from_the_current_run() {
 #[test]
 fn setup_code_line_must_carry_a_whole_code() {
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P-M2X\r")),
-        Some("K7P-M2X")
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM-2XQR\r")),
+        Some("K7PM-2XQR")
     );
     assert_eq!(
-        parse_setup_code_line(&format!("#   {SETUP_CODE_PREFIX}K7P-M2X      #")),
-        Some("K7P-M2X")
+        parse_setup_code_line(&format!("#   {SETUP_CODE_PREFIX}K7PM-2XQR      #")),
+        Some("K7PM-2XQR")
     );
     assert_eq!(
         parse_setup_code_line(&format!(
-            r#"{{"fields":{{"message":"ACTION REQUIRED: {SETUP_CODE_PREFIX}K7P-M2X. Open"}}}}"#
+            r#"{{"fields":{{"message":"ACTION REQUIRED: {SETUP_CODE_PREFIX}K7PM-2XQR. Open"}}}}"#
         )),
-        Some("K7P-M2X")
+        Some("K7PM-2XQR")
     );
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P")),
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM")),
         None
     );
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM2X")),
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM2XQR")),
         None
     );
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P-M2XY")),
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM-2XQRS")),
+        None
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM-2X-QR")),
         None
     );
     assert_eq!(parse_setup_code_line("INFO listening"), None);

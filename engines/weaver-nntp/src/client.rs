@@ -1,30 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
-use tokio::time::Instant as TokioInstant;
-use tracing::{debug, trace, warn};
-use weaver_yenc::{CheckpointPlan, YencError};
+use tracing::{debug, warn};
+use weaver_yenc::YencError;
+
+use crate::ServerSet;
 
 use crate::connection::ServerConfig;
-use crate::error::{NntpError, Result};
-use crate::fused_yenc::{FusedArticleBody, FusedYencArticleStats, FusedYencError};
+use crate::error::NntpError;
+use crate::fused_yenc::FusedArticleBody;
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{
-    BodyServerAvailability, FreshConnectAdmission, NntpPool, PoolConfig, PooledConnection,
-    ServerId, ServerPoolConfig,
+    BodyServerAvailability, FreshConnectAdmission, NntpPool, PoolConfig, ServerId, ServerPoolConfig,
 };
 use crate::tls::TransportReadStats;
-use crate::transfer::{
-    ActiveTransferBudget, QuotaRejection, ServerTransferSnapshot, StableServerId,
-};
+use crate::transfer::QuotaRejection;
 
 // Configuration for the high-level NNTP client.
 pub struct NntpClientConfig {
@@ -32,9 +28,8 @@ pub struct NntpClientConfig {
     pub servers: Vec<ServerPoolConfig>,
     // Maximum age for idle connections before eviction.
     pub max_idle_age: Duration,
-    // Maximum number of retries on the same server for transient errors
-    // before failing over to the next server. A value of 1 means try once,
-    // then retry once (2 total attempts per server).
+    // Inert: the download lanes retry by handing an article back to the
+    // scheduler, not on the same server inside the client.
     pub max_retries_per_server: u32,
     // Per-article inactivity budget: how long a BODY may go without bytes
     // arriving. Deliberate local rate-limit waits do not count; exhausting
@@ -58,23 +53,16 @@ impl NntpClientConfig {
     }
 }
 
-// High-level NNTP client with multi-server failover.
+// High-level NNTP client over a server pool.
 //
-// Provides a simple API for fetching articles, automatically managing
-// connection pooling and falling back to backup servers when an article
-// is not found on the primary server.
+// Ranks the servers for an article, hands out blocking BODY lanes on the
+// chosen server, and records what each attempt taught the pool.
 #[derive(Clone)]
 pub struct NntpClient {
     pool: Arc<NntpPool>,
-    work_guard: Option<Arc<dyn Fn(ServerId) -> bool + Send + Sync>>,
-    max_retries_per_server: u32,
     // Per-article inactivity budget, excluding deliberate local rate waits.
     soft_timeout: Duration,
 }
-
-// A queued probe rechecks the same article eligibility and caller lifecycle
-// at its socket owner before issuing commands.
-pub type ProbeWorkGuard = Arc<dyn Fn() -> bool + Send + Sync>;
 
 // How many yielding `try_lock` attempts an owned-lane server selection makes
 // on the shared health mutex before reporting contention. The critical
@@ -155,9 +143,8 @@ impl BlockingBodyLaneAcquireError {
     }
 
     // Whether the leased work should be handed straight back to the scheduler
-    // and retried on the owned fast path, rather than falling back to an
-    // async lane. Capacity admission and selection contention are both
-    // "ask again shortly", not verdicts about the servers.
+    // to be retried on a lane. Capacity admission and selection contention
+    // are both "ask again shortly", not verdicts about the servers.
     pub fn should_requeue_owned_work(&self) -> bool {
         self.is_capacity_admission() || matches!(self, Self::SelectionContended)
     }
@@ -218,8 +205,7 @@ enum QuotaCheck {
 pub enum BlockingBodyLaneCandidacy {
     // At least one eligible server can carry an owned blocking lane.
     Candidate,
-    // No eligible server can. This is the only answer that justifies the
-    // asynchronous path.
+    // No eligible server can.
     None,
     // The shared server health state was busy, so the candidates could not be
     // ranked. Says nothing about the servers: ask again in a moment, on the
@@ -275,49 +261,6 @@ pub enum DecodedBodyError {
     Decode { raw_size: u32, error: YencError },
 }
 
-fn saturating_u32(value: u64) -> u32 {
-    value.min(u32::MAX as u64) as u32
-}
-
-fn decoded_cpu_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyCpu {
-    DecodedBodyCpu {
-        raw_decode: stats.fused_decode_cpu,
-        read_poll: stats.read_poll_cpu,
-        response_line: stats.response_line_cpu,
-        yenc_header: stats.yenc_header_cpu,
-        body_decode: stats.body_decode_cpu,
-        yend_line: stats.yend_line_cpu,
-        nntp_terminator: stats.nntp_terminator_cpu,
-        feed: stats.output_callback_cpu,
-        finish: stats.article_finish_cpu,
-    }
-}
-
-fn decoded_io_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyIo {
-    DecodedBodyIo {
-        read_calls: stats.read_calls,
-        read_bytes: stats.read_bytes,
-        input_chunks: stats.input_chunks,
-        decode_calls: stats.decode_calls,
-        crc_update_calls: stats.crc_update_calls,
-        output_batches: stats.output_batches,
-        leftover_bytes_after_terminator: stats.leftover_bytes_after_terminator,
-        buffer_compactions: stats.buffer_compactions,
-        encoded_bytes_consumed: stats.encoded_bytes_consumed,
-        decoded_bytes_written: stats.decoded_bytes_written,
-        transport_read: stats.transport_read,
-        throttle_wait: stats.throttle_wait,
-    }
-}
-
-fn decoded_raw_size_from_fused_stats(stats: &FusedYencArticleStats) -> u32 {
-    saturating_u32(
-        stats
-            .encoded_bytes_consumed
-            .saturating_sub(stats.nntp_terminator_bytes),
-    )
-}
-
 // Existence results used by the health probe pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeBatchResult {
@@ -357,12 +300,6 @@ pub struct FetchAttemptTrace {
     pub elapsed: Duration,
     pub outcome: FetchAttemptOutcome,
     pub error: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct FetchBodyTrace {
-    pub attempts: Vec<FetchAttemptTrace>,
-    pub result: Result<Bytes>,
 }
 
 #[derive(Debug)]
@@ -410,13 +347,6 @@ pub enum BodyLaneMode {
     Pipelined { depth: u8 },
 }
 
-fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
-    match current {
-        Some(current) => current.mul_f64(0.75) + sample.mul_f64(0.25),
-        None => sample,
-    }
-}
-
 // Whether an owned blocking BODY lane can serve this server.
 //
 // It always can. Owned lanes are the only download engine, and the blocking
@@ -432,22 +362,6 @@ fn supports_blocking_body_lane(_config: &ServerConfig) -> bool {
     true
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct BodyLaneBatchStats {
-    // Work offered to this lane, capped by pipeline depth.
-    pub offered: usize,
-    // BODY commands actually admitted and issued.
-    pub requested: usize,
-    // Offered work left unrequested after quota admission stopped the prefix.
-    pub unrequested: usize,
-    pub quota_rejection: Option<QuotaRejection>,
-    pub completed: usize,
-    pub unresolved: usize,
-    pub connection_discarded: bool,
-    pub response_order_mismatch: bool,
-    pub elapsed: Duration,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct BodyLaneTraceMeta {
     pub batch_complete: bool,
@@ -455,570 +369,43 @@ pub struct BodyLaneTraceMeta {
     pub batch_response_count: u64,
     pub unresolved_count: u64,
     pub connection_discarded: bool,
-}
-
-pub struct BodyLaneLease {
-    client: NntpClient,
-    server_id: ServerId,
-    conn: Option<PooledConnection>,
-    health_lease: Option<Arc<crate::recovery::ConnectionHealthLease>>,
-    remote_ip: Option<IpAddr>,
-    route_feedback: RouteFeedback,
-    groups: Vec<String>,
-    mode: BodyLaneMode,
-    // Command-to-status-line wait, sampled only when nothing else was
-    // outstanding on the connection.
-    latency_ewma: Option<Duration>,
-    // Status-line-to-terminator wait: the article's own cost on the wire.
-    transfer_ewma: Option<Duration>,
-    // Successful responses this connection has produced. The first is cold
-    // and moves neither average; see the blocking lane for why.
-    responses_completed: u64,
-    checkpoint_plan: CheckpointPlan,
-}
-
-struct DecodedBatchItem {
-    elapsed: Duration,
-    result: std::result::Result<DecodedBody, DecodedBodyError>,
-}
-
-#[allow(clippy::large_enum_variant)] // Terminal is the hot path; boxing would allocate per decoded article.
-enum DecodedBatchDisposition {
-    Terminal(std::result::Result<DecodedBody, DecodedBodyError>),
-    Retry,
-}
-
-impl BodyLaneLease {
-    pub fn server_id(&self) -> ServerId {
-        self.server_id
-    }
-
-    pub fn stable_server_id(&self) -> Option<StableServerId> {
-        self.client.pool.stable_server_id(self.server_id)
-    }
-
-    pub fn transfer_snapshot(&self) -> Option<ServerTransferSnapshot> {
-        self.client
-            .pool
-            .server_transfer_control(self.server_id)
-            .map(|control| control.snapshot())
-    }
-
-    pub fn remote_ip(&self) -> Option<IpAddr> {
-        self.remote_ip
-    }
-
-    pub fn mode(&self) -> BodyLaneMode {
-        self.mode
-    }
-
-    pub fn groups(&self) -> &[String] {
-        &self.groups
-    }
-
-    pub fn latency_ewma(&self) -> Option<Duration> {
-        self.latency_ewma
-    }
-
-    pub fn transfer_ewma(&self) -> Option<Duration> {
-        self.transfer_ewma
-    }
-
-    pub fn supports_pipelining(&self) -> bool {
-        self.conn
-            .as_ref()
-            .is_some_and(|conn| conn.capabilities().supports_pipelining())
-    }
-
-    // Checkpoint every decoded article according to the immutable geometry
-    // snapshot captured by its batch.
-    //
-    // A download batch belongs to one job, so the caller sets this once per
-    // batch. It is re-applied before every response, including `None`, so a
-    // pooled connection cannot carry another job's geometry.
-    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
-        self.checkpoint_plan = checkpoint_plan;
-    }
-
-    pub fn park(self) {}
-
-    pub async fn discard(mut self) {
-        self.discard_current().await;
-    }
-
-    pub async fn fetch_decoded_sequential(&mut self, message_id: &str) -> DecodedBodyTrace {
-        self.fetch_decoded_sequential_with_estimate(message_id, 0)
-            .await
-    }
-
-    pub async fn fetch_decoded_sequential_with_estimate(
-        &mut self,
-        message_id: &str,
-        estimated_body_bytes: u64,
-    ) -> DecodedBodyTrace {
-        self.mode = BodyLaneMode::Sequential;
-        let started = Instant::now();
-        let result = if self
-            .conn
-            .as_ref()
-            .is_none_or(|conn| !conn.accepts_new_work())
-        {
-            Err(DecodedBodyError::Nntp(NntpError::PoolExhausted))
-        } else {
-            self.read_decoded_body(message_id, estimated_body_bytes)
-                .await
-        };
-        let elapsed = started.elapsed();
-        let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
-            elapsed.saturating_sub(decoded.io.throttle_wait)
-        });
-        if result.is_ok() {
-            // Nothing else was outstanding, so the status-line wait is a clean
-            // latency sample.
-            let latency = self.take_response_line_wait().min(policy_elapsed);
-            self.book_response(Some(latency), policy_elapsed.saturating_sub(latency));
-        }
-
-        if result.as_ref().is_err_and(
-            |error| matches!(error, DecodedBodyError::Nntp(e) if is_connection_error(e)),
-        ) || self.conn.as_ref().is_some_and(|conn| conn.is_poisoned())
-        {
-            self.discard_current().await;
-        }
-
-        self.trace_item(
-            message_id,
-            DecodedBatchItem {
-                elapsed: policy_elapsed,
-                result,
-            },
-        )
-        .await
-    }
-
-    pub async fn fetch_decoded_pipeline<F, Fut>(
-        &mut self,
-        message_ids: &[&str],
-        depth: usize,
-        on_trace: F,
-    ) -> BodyLaneBatchStats
-    where
-        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.fetch_decoded_pipeline_with_estimates(message_ids, &[], depth, on_trace)
-            .await
-    }
-
-    pub async fn fetch_decoded_pipeline_with_estimates<F, Fut>(
-        &mut self,
-        message_ids: &[&str],
-        estimated_body_bytes: &[u64],
-        depth: usize,
-        on_trace: F,
-    ) -> BodyLaneBatchStats
-    where
-        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.mode = match depth {
-            0 | 1 => BodyLaneMode::Sequential,
-            depth => BodyLaneMode::Pipelined {
-                depth: depth.min(u8::MAX as usize) as u8,
-            },
-        };
-        self.fetch_decoded_pipeline_inner(message_ids, estimated_body_bytes, depth, on_trace)
-            .await
-    }
-
-    async fn fetch_decoded_pipeline_inner<F, Fut>(
-        &mut self,
-        message_ids: &[&str],
-        estimated_body_bytes: &[u64],
-        max_depth: usize,
-        mut on_trace: F,
-    ) -> BodyLaneBatchStats
-    where
-        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        let recovery_depth = self.health_lease.as_ref().map_or(max_depth, |lease| {
-            if !lease.0.current() {
-                0
-            } else if lease.0.probing() {
-                1
-            } else {
-                max_depth
-            }
-        });
-        let offered = if self
-            .conn
-            .as_ref()
-            .is_none_or(|conn| !conn.accepts_new_work())
-        {
-            0
-        } else {
-            message_ids.len().min(recovery_depth)
-        };
-        let batch_started = Instant::now();
-        let mut stats = BodyLaneBatchStats {
-            offered,
-            ..BodyLaneBatchStats::default()
-        };
-        if offered == 0 {
-            return stats;
-        }
-
-        let request_write_error = if let Some(conn) = self.conn.as_mut() {
-            let mut error = None;
-            for (idx, message_id) in message_ids[..offered].iter().enumerate() {
-                let estimate = estimated_body_bytes.get(idx).copied().unwrap_or(0);
-                match conn
-                    .write_body_request_with_estimate(message_id, estimate)
-                    .await
-                {
-                    Ok(()) => stats.requested += 1,
-                    Err(NntpError::QuotaBlocked(rejection)) => {
-                        stats.quota_rejection = Some(*rejection);
-                        stats.unrequested = offered.saturating_sub(stats.requested);
-                        break;
-                    }
-                    Err(write_error) => {
-                        error = Some(write_error);
-                        break;
-                    }
-                }
-            }
-            if stats.requested > 0
-                && error.is_none()
-                && let Err(flush_error) = conn.flush_commands().await
-            {
-                error = Some(flush_error);
-            }
-            error
-        } else {
-            stats.requested = offered;
-            Some(NntpError::ConnectionClosed)
-        };
-
-        let requested = stats.requested;
-        if requested == 0 && stats.quota_rejection.is_none() {
-            stats.elapsed = batch_started.elapsed();
-            return stats;
-        }
-
-        if let Some(error) = request_write_error {
-            let elapsed = batch_started.elapsed();
-            if is_connection_error(&error) {
-                stats.connection_discarded = true;
-                self.discard_current().await;
-            }
-            let make_error = NntpClient::batch_setup_error_factory(&error);
-            for (idx, message_id) in message_ids.iter().take(requested).enumerate() {
-                let is_last = idx + 1 == requested;
-                let trace = self
-                    .trace_item(
-                        message_id,
-                        DecodedBatchItem {
-                            elapsed,
-                            result: Err(DecodedBodyError::Nntp(make_error())),
-                        },
-                    )
-                    .await;
-                stats.completed += 1;
-                on_trace(
-                    idx,
-                    trace,
-                    BodyLaneTraceMeta {
-                        batch_complete: is_last,
-                        batch_clean: false,
-                        batch_response_count: if is_last { stats.completed as u64 } else { 0 },
-                        unresolved_count: 0,
-                        connection_discarded: stats.connection_discarded,
-                    },
-                )
-                .await;
-            }
-            stats.elapsed = batch_started.elapsed();
-            return stats;
-        }
-
-        let mut closed_early = false;
-        let mut batch_clean_so_far = true;
-        for (response_idx, message_id) in message_ids.iter().take(requested).enumerate() {
-            let item_started = Instant::now();
-            let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
-            self.conn
-                .as_mut()
-                .expect("connection is available while reading pipeline body")
-                .set_checkpoint_plan(self.checkpoint_plan.clone());
-            let result = NntpClient::read_decoded_pipelined_body(
-                self.conn
-                    .as_mut()
-                    .expect("connection is available while reading pipeline body"),
-                &mut budget,
-            )
-            .await;
-            let elapsed = item_started.elapsed();
-            let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
-                elapsed.saturating_sub(decoded.io.throttle_wait)
-            });
-            if result.is_ok() {
-                let response_line_wait = self.take_response_line_wait().min(policy_elapsed);
-                // Only the head of the batch was issued with nothing else in
-                // flight; later responses are already queued behind it.
-                self.book_response(
-                    (response_idx == 0).then_some(response_line_wait),
-                    policy_elapsed.saturating_sub(response_line_wait),
-                );
-            }
-            let poisoned = self.conn.as_ref().is_some_and(|conn| conn.is_poisoned());
-
-            let trace = self
-                .trace_item(
-                    message_id,
-                    DecodedBatchItem {
-                        elapsed: policy_elapsed,
-                        result,
-                    },
-                )
-                .await;
-            stats.completed += 1;
-            batch_clean_so_far &= decoded_result_keeps_connection(&trace.result);
-
-            if poisoned {
-                stats.connection_discarded = true;
-                self.discard_current().await;
-                closed_early = true;
-            }
-
-            let terminal_unresolved = if closed_early {
-                requested.saturating_sub(response_idx + 1)
-            } else {
-                0
-            };
-            let is_batch_complete =
-                closed_early || (response_idx + 1 == requested && stats.quota_rejection.is_none());
-            let meta = BodyLaneTraceMeta {
-                batch_complete: is_batch_complete,
-                batch_clean: batch_clean_so_far && !closed_early,
-                batch_response_count: if is_batch_complete {
-                    stats.completed as u64
-                } else {
-                    0
-                },
-                unresolved_count: if is_batch_complete {
-                    terminal_unresolved as u64
-                } else {
-                    0
-                },
-                connection_discarded: stats.connection_discarded,
-            };
-            on_trace(response_idx, trace, meta).await;
-
-            if closed_early {
-                for (unread_idx, unread_message_id) in message_ids
-                    .iter()
-                    .take(requested)
-                    .enumerate()
-                    .skip(response_idx + 1)
-                {
-                    let trace = self
-                        .trace_item(
-                            unread_message_id,
-                            DecodedBatchItem {
-                                elapsed,
-                                result: Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed)),
-                            },
-                        )
-                        .await;
-                    stats.completed += 1;
-                    stats.unresolved += 1;
-                    on_trace(
-                        unread_idx,
-                        trace,
-                        BodyLaneTraceMeta {
-                            batch_complete: false,
-                            batch_clean: false,
-                            batch_response_count: 0,
-                            unresolved_count: 0,
-                            connection_discarded: true,
-                        },
-                    )
-                    .await;
-                }
-                break;
-            }
-        }
-
-        if let Some(source) = stats.quota_rejection.clone() {
-            // Revalidate the tail against whichever control refused the head.
-            let control = match source.scope {
-                crate::transfer::TransferScope::Server => {
-                    self.client.pool.server_transfer_control(self.server_id)
-                }
-                crate::transfer::TransferScope::Egress => self
-                    .conn
-                    .as_ref()
-                    .and_then(|conn| conn.egress_transfer_control()),
-            };
-            for (tail_idx, message_id) in
-                message_ids.iter().enumerate().take(offered).skip(requested)
-            {
-                let estimate = estimated_body_bytes.get(tail_idx).copied().unwrap_or(0);
-                let error = if tail_idx == requested {
-                    NntpError::quota_blocked(source.clone())
-                } else if let Some(rejection) = control
-                    .as_ref()
-                    .and_then(|control| control.quota_rejection_for(estimate))
-                {
-                    NntpError::quota_blocked(rejection)
-                } else {
-                    NntpError::body_not_requested_due_to_quota(source.clone(), estimate)
-                };
-                let trace = self
-                    .trace_item(
-                        message_id,
-                        DecodedBatchItem {
-                            elapsed: Duration::ZERO,
-                            result: Err(DecodedBodyError::Nntp(error)),
-                        },
-                    )
-                    .await;
-                stats.completed += 1;
-                let batch_complete = !closed_early && tail_idx + 1 == offered;
-                on_trace(
-                    tail_idx,
-                    trace,
-                    BodyLaneTraceMeta {
-                        batch_complete,
-                        batch_clean: batch_clean_so_far,
-                        batch_response_count: if batch_complete { requested as u64 } else { 0 },
-                        unresolved_count: 0,
-                        connection_discarded: stats.connection_discarded,
-                    },
-                )
-                .await;
-            }
-        }
-
-        stats.elapsed = batch_started.elapsed();
-        stats
-    }
-
-    async fn read_decoded_body(
-        &mut self,
-        message_id: &str,
-        estimated_body_bytes: u64,
-    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
-        let checkpoint_plan = self.checkpoint_plan.clone();
-        let Some(conn) = self.conn.as_mut() else {
-            return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
-        };
-        conn.set_checkpoint_plan(checkpoint_plan);
-
-        let stream_result = conn
-            .stream_yenc_article_with_active_budget(
-                message_id,
-                estimated_body_bytes,
-                &mut budget,
-                |_| Ok(()),
-            )
-            .await;
-
-        match stream_result {
-            Ok(article) => Ok(DecodedBody {
-                raw_size: decoded_raw_size_from_fused_stats(&article.stats),
-                cpu: decoded_cpu_from_fused_stats(&article.stats),
-                io: decoded_io_from_fused_stats(&article.stats),
-                decoded: article.chunks,
-                body: article.body,
-            }),
-            Err(FusedYencError::Yenc(error)) => {
-                Err(DecodedBodyError::Decode { raw_size: 0, error })
-            }
-            Err(FusedYencError::Nntp(error)) => Err(DecodedBodyError::Nntp(error)),
-        }
-    }
-
-    async fn trace_item(&self, message_id: &str, item: DecodedBatchItem) -> DecodedBodyTrace {
-        let mut attempts = Vec::new();
-        let mut last_error = None;
-        match self
-            .client
-            .classify_decoded_batch_item(
-                self.server_id.0,
-                self.health_lease.as_ref().map(|lease| &*lease.0),
-                self.remote_ip,
-                self.route_feedback.clone(),
-                message_id,
-                item,
-                &mut attempts,
-                &mut last_error,
-            )
-            .await
-        {
-            DecodedBatchDisposition::Terminal(result) => DecodedBodyTrace { attempts, result },
-            DecodedBatchDisposition::Retry => DecodedBodyTrace {
-                attempts,
-                result: Err(
-                    last_error.unwrap_or(DecodedBodyError::Nntp(NntpError::ConnectionClosed))
-                ),
-            },
-        }
-    }
-
-    // Book one successful response. The connection's first response is
-    // skipped: it carries setup costs no later one repeats.
-    fn book_response(&mut self, latency: Option<Duration>, transfer: Duration) {
-        let cold = self.responses_completed == 0;
-        self.responses_completed = self.responses_completed.saturating_add(1);
-        if cold {
-            return;
-        }
-        if let Some(latency) = latency {
-            self.latency_ewma = Some(blend_ewma(self.latency_ewma, latency));
-        }
-        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, transfer));
-    }
-
-    // Consume the last article's status-line wait so one response's latency
-    // cannot be credited to the next.
-    fn take_response_line_wait(&mut self) -> Duration {
-        self.conn
-            .as_mut()
-            .map_or(Duration::ZERO, |conn| conn.take_response_line_wait())
-    }
-
-    async fn discard_current(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            self.client
-                .discard_connection_error(self.server_id.0, conn)
-                .await;
-        }
-    }
+    // The server answered a request on this connection while a later one
+    // was already on the wire, since the connection last had nothing
+    // outstanding. A fault without it hit a connection that never showed it
+    // takes pipelined requests: an idle close, a restart, an outage.
+    pub answered_pipelined: bool,
 }
 
 impl NntpClient {
     // Create a new NNTP client from the given configuration.
     pub fn new(config: NntpClientConfig) -> Self {
-        let max_retries_per_server = config.max_retries_per_server;
         let soft_timeout = config.soft_timeout;
         let pool = NntpPool::new(PoolConfig {
             servers: config.servers,
             max_idle_age: config.max_idle_age,
             ..PoolConfig::default()
         });
+        Self::around(pool, soft_timeout)
+    }
 
+    // A client for settings: refuses, in words, a server list past
+    // `MAX_PROVIDERS` instead of building a pool it cannot index.
+    pub fn try_new(
+        config: NntpClientConfig,
+    ) -> std::result::Result<Self, crate::pool::PoolTooLarge> {
+        let soft_timeout = config.soft_timeout;
+        let pool = NntpPool::try_new(PoolConfig {
+            servers: config.servers,
+            max_idle_age: config.max_idle_age,
+            ..PoolConfig::default()
+        })?;
+        Ok(Self::around(pool, soft_timeout))
+    }
+
+    fn around(pool: NntpPool, soft_timeout: Duration) -> Self {
         let pool = Arc::new(pool);
         pool.start_route_probes();
-        NntpClient {
-            pool,
-            work_guard: None,
-            max_retries_per_server,
-            soft_timeout,
-        }
+        NntpClient { pool, soft_timeout }
     }
 
     // Create a client wrapping an existing pool.
@@ -1026,32 +413,18 @@ impl NntpClient {
         pool.start_route_probes();
         NntpClient {
             pool,
-            work_guard: None,
-            max_retries_per_server: 1,
             soft_timeout: Duration::from_secs(15),
         }
     }
 
-    pub fn with_work_guard(
-        &self,
-        guard: impl Fn(ServerId) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        let mut client = self.clone();
-        let previous = client.work_guard.take();
-        client.work_guard = Some(Arc::new(move |server| {
-            previous.as_ref().is_none_or(|previous| previous(server)) && guard(server)
-        }));
-        client
-    }
-
-    pub async fn body_server_order(&self, exclude: &[usize]) -> Vec<ServerId> {
+    pub async fn body_server_order(&self, exclude: ServerSet) -> Vec<ServerId> {
         self.body_server_selection(exclude).await.eligible
     }
 
     pub async fn body_server_availability(
         &self,
-        failure_excludes: &[usize],
-        retention_excludes: &[usize],
+        failure_excludes: ServerSet,
+        retention_excludes: ServerSet,
         requested_body_bytes: u64,
     ) -> BodyServerAvailability {
         self.pool
@@ -1059,13 +432,13 @@ impl NntpClient {
             .await
     }
 
-    pub async fn body_server_selection(&self, exclude: &[usize]) -> BodyServerSelection {
+    pub async fn body_server_selection(&self, exclude: ServerSet) -> BodyServerSelection {
         self.body_server_selection_with_estimate(exclude, 0).await
     }
 
     pub async fn body_server_selection_with_estimate(
         &self,
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
     ) -> BodyServerSelection {
         let mut eligible = Vec::new();
@@ -1125,1434 +498,6 @@ impl NntpClient {
         saw_fill
     }
 
-    pub async fn acquire_body_lane(
-        &self,
-        server: ServerId,
-        groups: &[String],
-    ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, false).await
-    }
-
-    pub async fn acquire_extra_body_lane(
-        &self,
-        server: ServerId,
-        groups: &[String],
-    ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, true).await
-    }
-
-    async fn acquire_body_lane_inner(
-        &self,
-        server: ServerId,
-        groups: &[String],
-        extra: bool,
-    ) -> Result<BodyLaneLease> {
-        let mut deadline = TokioInstant::now() + self.soft_timeout;
-        // A BODY lane fetches by message-id, which RFC 3977 answers with no
-        // group selected, so the GROUP round trip is pure added latency on
-        // every lane start. The candidate group is still offered to connect:
-        // a server that has proven it insists on one (see `crate::server_caps`)
-        // takes it inside the session-setup write, and only such a server
-        // walks the candidate list below.
-        let initial_group = groups.first().map(String::as_str);
-        let mut conn = if extra {
-            self.pool
-                .acquire_extra_before_deadline(server, initial_group, &mut deadline)
-                .await
-        } else {
-            self.pool
-                .acquire_before_deadline(server, initial_group, true, &mut deadline)
-                .await
-        }
-        .map_err(|error| self.map_acquire_timeout(error))?;
-
-        if !conn.needs_group_prologue() {
-            return Ok(BodyLaneLease {
-                client: self.clone(),
-                server_id: server,
-                health_lease: conn.health_lease.clone(),
-                remote_ip: conn.remote_ip(),
-                route_feedback: conn.route_outcome.clone(),
-                conn: Some(conn),
-                groups: groups.to_vec(),
-                mode: BodyLaneMode::Sequential,
-                latency_ewma: None,
-                transfer_ewma: None,
-                responses_completed: 0,
-                checkpoint_plan: CheckpointPlan::None,
-            });
-        }
-
-        match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups)).await {
-            Ok(Ok(_)) => Ok(BodyLaneLease {
-                client: self.clone(),
-                server_id: server,
-                health_lease: conn.health_lease.clone(),
-                remote_ip: conn.remote_ip(),
-                route_feedback: conn.route_outcome.clone(),
-                conn: Some(conn),
-                groups: groups.to_vec(),
-                mode: BodyLaneMode::Sequential,
-                latency_ewma: None,
-                transfer_ewma: None,
-                responses_completed: 0,
-                checkpoint_plan: CheckpointPlan::None,
-            }),
-            Ok(Err(error)) => {
-                if is_connection_error(&error) {
-                    self.discard_connection_error(server.0, conn).await;
-                }
-                Err(error)
-            }
-            Err(_) => {
-                self.discard_connection_error(server.0, conn).await;
-                Err(self.soft_timeout_error())
-            }
-        }
-    }
-
-    // Check whether articles exist anywhere in the configured server set.
-    //
-    // Returns one boolean per message-id: true if any usable server reports
-    // the article exists, false if every usable server definitively reports it
-    // missing. If a transient server failure leaves the batch inconclusive,
-    // this returns an error so callers do not treat missing samples as
-    // authoritative.
-    pub async fn stat_many(&self, message_ids: &[&str]) -> Result<Vec<bool>> {
-        if message_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let order = self.article_server_order(&[], &[]).await;
-        if order.is_empty() {
-            return Err(NntpError::ServiceUnavailable);
-        }
-        self.stat_many_in_order(message_ids, order).await
-    }
-
-    // [`Self::stat_many`] over an already chosen, non-empty server order.
-    async fn stat_many_in_order(
-        &self,
-        message_ids: &[&str],
-        order: Vec<usize>,
-    ) -> Result<Vec<bool>> {
-        let mut found = vec![false; message_ids.len()];
-        let mut remaining: Vec<usize> = (0..message_ids.len()).collect();
-        let mut had_success = false;
-        let mut last_error: Option<NntpError> = None;
-        let mut had_retryable_uncertainty = false;
-        let mut missing = vec![Vec::new(); message_ids.len()];
-
-        for idx in order {
-            if remaining.is_empty() {
-                break;
-            }
-
-            let policy = self.pool.provider_policy();
-            let selected: Vec<_> = remaining
-                .iter()
-                .copied()
-                .filter(|&i| {
-                    matches!(
-                        policy.eligibility(idx, &missing[i], &[], 1),
-                        crate::provider_policy::ArticleEligibility::Eligible(_)
-                    )
-                })
-                .collect();
-            if selected.is_empty() {
-                continue;
-            }
-            let batch: Vec<&str> = selected.iter().map(|&i| message_ids[i]).collect();
-            let start = Instant::now();
-
-            match self.stat_many_from_server(ServerId(idx), &batch).await {
-                Ok(results) => {
-                    had_success = true;
-                    self.record_server_success(idx, start.elapsed()).await;
-
-                    for (original_idx, exists) in selected.into_iter().zip(results) {
-                        if exists {
-                            found[original_idx] = true;
-                        } else {
-                            missing[original_idx].push(idx);
-                        }
-                    }
-                    remaining.retain(|&i| !found[i]);
-                }
-                Err(NntpError::AuthenticationFailed)
-                | Err(NntpError::AuthenticationRejected)
-                | Err(NntpError::AccessDenied) => {
-                    last_error = Some(NntpError::AuthenticationFailed);
-                }
-                Err(e) if is_retryable_stat_error(&e) => {
-                    had_retryable_uncertainty = true;
-                    last_error = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        had_retryable_uncertainty |= remaining.iter().any(|&i| {
-            (0..self.pool.server_count()).any(|server| {
-                !missing[i].contains(&server) && !self.pool.refuses_credentials(server)
-            })
-        });
-        if remaining.is_empty() {
-            Ok(found)
-        } else if had_retryable_uncertainty {
-            Err(last_error.unwrap_or(NntpError::ServiceUnavailable))
-        } else if had_success {
-            Ok(found)
-        } else {
-            Err(last_error.unwrap_or(NntpError::ServiceUnavailable))
-        }
-    }
-
-    // Confirm article existence for health probes.
-    //
-    // The fast path uses batched pipelined STAT checks. Any article that STAT
-    // reports missing is re-checked with a HEAD before the result is treated
-    // as authoritative — unless no usable server implements HEAD, in which
-    // case the STAT verdict is the final one rather than an excuse to call
-    // the whole batch inconclusive. Transport or probe errors during
-    // confirmation mark the entire batch inconclusive so callers can unwind
-    // without applying projected health damage.
-    pub async fn confirm_exists_for_probe(&self, message_ids: &[&str]) -> ProbeBatchResult {
-        self.confirm_exists_for_probe_excluding(message_ids, &[])
-            .await
-            .unwrap_or_else(|| ProbeBatchResult {
-                exists: vec![false; message_ids.len()],
-                inconclusive: true,
-            })
-    }
-
-    // [`Self::confirm_exists_for_probe`] that leaves the servers in
-    // `exclude` out entirely.
-    //
-    // The caller has usually had those servers answer already, on a warm
-    // connection it is holding — an owned download lane's — and asking them
-    // again here would queue behind the very permits those lanes are sitting
-    // on. Returns `None` when nothing usable is left once they are excluded,
-    // which is not a fault: it means the batch has been put to every server
-    // that could answer and the caller's verdict stands.
-    pub async fn confirm_exists_for_probe_excluding(
-        &self,
-        message_ids: &[&str],
-        exclude: &[usize],
-    ) -> Option<ProbeBatchResult> {
-        self.confirm_exists_for_probe_using(message_ids, exclude, |_, _, _| async { None })
-            .await
-    }
-
-    // Cached and fresh sockets share this per-article walk. The callback may
-    // answer on an owned socket; returning None asks the pool for a socket.
-    pub async fn confirm_exists_for_probe_using<F, Fut>(
-        &self,
-        message_ids: &[&str],
-        exclude: &[usize],
-        mut cached: F,
-    ) -> Option<ProbeBatchResult>
-    where
-        F: FnMut(usize, Vec<String>, ProbeWorkGuard) -> Fut,
-        Fut: Future<Output = Option<ProbeBatchResult>>,
-    {
-        let order = self.article_server_order(exclude, &[]).await;
-        if order.is_empty() && !message_ids.is_empty() {
-            return None;
-        }
-        let mut exists = vec![false; message_ids.len()];
-        let mut missing = vec![Vec::new(); message_ids.len()];
-        for server in order {
-            let policy = self.pool.provider_policy();
-            let selected: Vec<_> = (0..message_ids.len())
-                .filter(|&i| {
-                    !exists[i]
-                        && matches!(
-                            policy.eligibility(server, &missing[i], exclude, 1),
-                            crate::provider_policy::ArticleEligibility::Eligible(_)
-                        )
-                })
-                .collect();
-            if selected.is_empty() {
-                continue;
-            }
-            let batch: Vec<_> = selected
-                .iter()
-                .map(|&i| message_ids[i].to_string())
-                .collect();
-            let pool = Arc::clone(&self.pool);
-            let excluded = exclude.to_vec();
-            let attempted: Vec<_> = selected.iter().map(|&i| missing[i].clone()).collect();
-            let caller_guard = self.work_guard.clone();
-            let guard: ProbeWorkGuard = Arc::new(move || {
-                caller_guard
-                    .as_ref()
-                    .is_none_or(|guard| guard(ServerId(server)))
-                    && {
-                        let policy = pool.provider_policy();
-                        attempted.iter().all(|missing| {
-                            matches!(
-                                policy.eligibility(server, missing, &excluded, 1),
-                                crate::provider_policy::ArticleEligibility::Eligible(_)
-                            )
-                        })
-                    }
-            });
-            let result = match cached(server, batch.clone(), Arc::clone(&guard)).await {
-                Some(result) => result,
-                None => {
-                    let borrowed: Vec<_> = batch.iter().map(String::as_str).collect();
-                    let client = self.with_work_guard(move |_| guard());
-                    client.confirm_probe_on_server(server, &borrowed).await
-                }
-            };
-            for (slot, &original) in selected.iter().enumerate() {
-                if result.exists.get(slot) == Some(&true) {
-                    exists[original] = true;
-                } else if !result.inconclusive {
-                    missing[original].push(server);
-                }
-            }
-        }
-        // An outage, a local wait or a protected Backfill account leaves a
-        // miss unproven. Only actual misses and credential refusals settle it.
-        let inconclusive = (0..message_ids.len()).any(|i| {
-            !exists[i]
-                && (0..self.pool.server_count()).any(|server| {
-                    !exclude.contains(&server)
-                        && !missing[i].contains(&server)
-                        && !self.pool.refuses_credentials(server)
-                })
-        });
-        Some(ProbeBatchResult {
-            exists,
-            inconclusive,
-        })
-    }
-
-    async fn confirm_probe_on_server(&self, server: usize, ids: &[&str]) -> ProbeBatchResult {
-        let Ok(mut exists) = self.stat_many_from_server(ServerId(server), ids).await else {
-            return ProbeBatchResult {
-                exists: vec![false; ids.len()],
-                inconclusive: true,
-            };
-        };
-        let config = &self.pool.server_configs()[server];
-        let missing: Vec<_> = exists
-            .iter()
-            .enumerate()
-            .filter_map(|(i, found)| (!found).then_some(i))
-            .collect();
-        if !missing.is_empty() && crate::server_caps::supports_head(&config.host, config.port) {
-            let batch: Vec<_> = missing.iter().map(|&i| ids[i]).collect();
-            match self.head_many_from_server(ServerId(server), &batch).await {
-                Ok(found) => {
-                    for (i, found) in missing.into_iter().zip(found) {
-                        exists[i] = found;
-                    }
-                }
-                Err(NntpError::CommandNotRecognized) => {}
-                Err(_) => {
-                    return ProbeBatchResult {
-                        exists,
-                        inconclusive: true,
-                    };
-                }
-            }
-        }
-        ProbeBatchResult {
-            exists,
-            inconclusive: false,
-        }
-    }
-
-    // Fetch the body of an article by message-id, with multi-server failover.
-    //
-    // Tries each server in priority order. Falls back to the next server
-    // on `ArticleNotFound` (430). Retries on the same server for transient
-    // errors before escalating.
-    pub async fn fetch_body(&self, message_id: &str) -> Result<Bytes> {
-        self.fetch_with_failover(message_id, FetchKind::Body).await
-    }
-
-    // Fetch the body of an article, selecting a newsgroup first if required.
-    //
-    // Some NNTP servers require a GROUP command before BODY will succeed.
-    // This method tries each group in `groups` until one succeeds, then
-    // issues the BODY command. If `groups` is empty it behaves identically
-    // to [`fetch_body`](Self::fetch_body).
-    pub async fn fetch_body_with_groups(
-        &self,
-        message_id: &str,
-        groups: &[String],
-    ) -> Result<Bytes> {
-        self.fetch_body_with_groups_traced(message_id, groups)
-            .await
-            .result
-    }
-
-    // Like [`fetch_body_with_groups`](Self::fetch_body_with_groups) but skips
-    // the specified servers. Used after decode failures to avoid re-downloading
-    // from a server that returned corrupt data.
-    pub async fn fetch_body_with_groups_excluding(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: &[usize],
-    ) -> Result<Bytes> {
-        self.fetch_body_with_groups_excluding_traced(message_id, groups, exclude)
-            .await
-            .result
-    }
-
-    pub async fn fetch_body_with_groups_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-    ) -> FetchBodyTrace {
-        self.fetch_body_with_groups_excluding_traced(message_id, groups, &[])
-            .await
-    }
-
-    pub async fn fetch_body_with_groups_excluding_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: &[usize],
-    ) -> FetchBodyTrace {
-        self.fetch_body_with_groups_ordered_traced(message_id, groups, exclude, &[])
-            .await
-    }
-
-    async fn fetch_body_with_groups_ordered_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: &[usize],
-        avoid: &[usize],
-    ) -> FetchBodyTrace {
-        if groups.is_empty() {
-            return FetchBodyTrace {
-                attempts: Vec::new(),
-                result: self
-                    .fetch_with_failover_excluding(message_id, FetchKind::Body, exclude)
-                    .await,
-            };
-        }
-
-        let order = self.article_server_order(exclude, avoid).await;
-
-        if order.is_empty() {
-            return FetchBodyTrace {
-                attempts: Vec::new(),
-                result: Err(NntpError::PoolExhausted),
-            };
-        }
-
-        let mut attempts = Vec::new();
-        let mut last_error: Option<NntpError> = None;
-        let mut last_retryable_error: Option<NntpError> = None;
-
-        for idx in order {
-            if !self.article_attempt_eligible(idx, exclude, &attempts).await {
-                if let Some(rejection) = self
-                    .pool
-                    .server_transfer_control(ServerId(idx))
-                    .and_then(|control| control.quota_rejection_for(1))
-                {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: Duration::ZERO,
-                        outcome: FetchAttemptOutcome::QuotaBlocked,
-                        error: Some("server download quota blocked".into()),
-                    });
-                    last_error = Some(NntpError::quota_blocked(rejection));
-                }
-                continue;
-            }
-            let server = ServerId(idx);
-            let start = Instant::now();
-
-            match self
-                .fetch_from_server_with_groups(server, message_id, groups)
-                .await
-            {
-                Ok((data, remote_ip, route_feedback)) => {
-                    let elapsed = start.elapsed();
-                    self.record_server_success(idx, elapsed).await;
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip,
-                        elapsed,
-                        outcome: FetchAttemptOutcome::Success,
-                        error: None,
-                    });
-                    return FetchBodyTrace {
-                        attempts,
-                        result: Ok(data),
-                    };
-                }
-                Err(NntpError::ArticleNotFound)
-                | Err(NntpError::NoSuchArticle { .. })
-                | Err(NntpError::NoArticleWithNumber) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::NotFound,
-                        error: Some("article not found".to_string()),
-                    });
-                    last_error = Some(NntpError::NoSuchArticle {
-                        message_id: message_id.to_string(),
-                    });
-                    continue;
-                }
-                Err(e @ NntpError::QuotaBlocked(_)) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: Duration::ZERO,
-                        outcome: FetchAttemptOutcome::QuotaBlocked,
-                        error: Some(e.to_string()),
-                    });
-                    last_error = Some(e);
-                    continue;
-                }
-                Err(NntpError::AuthenticationFailed)
-                | Err(NntpError::AuthenticationRejected)
-                | Err(NntpError::AccessDenied) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::AuthenticationFailure,
-                        error: Some("authentication/access failure".to_string()),
-                    });
-                    last_error = Some(NntpError::AuthenticationFailed);
-                    continue;
-                }
-                // Nothing was asked of the server: no attempt to trace.
-                Err(NntpError::WorkObsolete) => {
-                    return FetchBodyTrace {
-                        attempts,
-                        result: Err(NntpError::WorkObsolete),
-                    };
-                }
-                Err(e) if is_transient(&e) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::transient(&e),
-                        error: Some(e.to_string()),
-                    });
-                    last_retryable_error = Some(e);
-                    continue;
-                }
-                Err(e) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::PermanentFailure,
-                        error: Some(e.to_string()),
-                    });
-                    return FetchBodyTrace {
-                        attempts,
-                        result: Err(e),
-                    };
-                }
-            }
-        }
-
-        FetchBodyTrace {
-            attempts,
-            result: Err(last_retryable_error
-                .or(last_error)
-                .unwrap_or(NntpError::PoolExhausted)),
-        }
-    }
-
-    pub async fn fetch_body_with_groups_prefer_excluding_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: &[usize],
-    ) -> FetchBodyTrace {
-        self.fetch_body_with_groups_ordered_traced(message_id, groups, &[], exclude)
-            .await
-    }
-
-    // Fetch and decode a yEnc BODY by message-id using streamed NNTP chunks.
-    pub async fn fetch_body_decoded_with_groups(
-        &self,
-        message_id: &str,
-        groups: &[String],
-    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        self.fetch_body_decoded_with_groups_excluding(message_id, groups, &[])
-            .await
-    }
-
-    pub async fn fetch_body_decoded_with_groups_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-    ) -> DecodedBodyTrace {
-        self.fetch_body_decoded_with_groups_excluding_traced(message_id, groups, &[])
-            .await
-    }
-
-    pub async fn fetch_body_decoded_with_groups_prefer_excluding_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: &[usize],
-    ) -> DecodedBodyTrace {
-        self.fetch_body_decoded_with_groups_ordered_traced(message_id, groups, &[], exclude)
-            .await
-    }
-
-    pub async fn fetch_bodies_decoded_with_groups_prefer_excluding_traced(
-        &self,
-        message_ids: &[&str],
-        groups: &[String],
-        exclude: &[usize],
-    ) -> Vec<DecodedBodyTrace> {
-        let mut traces: Vec<Option<DecodedBodyTrace>> =
-            (0..message_ids.len()).map(|_| None).collect();
-
-        self.fetch_bodies_decoded_with_groups_prefer_excluding_traced_each(
-            message_ids,
-            groups,
-            exclude,
-            |message_idx, trace| {
-                traces[message_idx] = Some(trace);
-                std::future::ready(())
-            },
-        )
-        .await;
-
-        traces
-            .into_iter()
-            .map(|trace| {
-                trace.unwrap_or(DecodedBodyTrace {
-                    attempts: Vec::new(),
-                    result: Err(DecodedBodyError::Nntp(NntpError::PoolExhausted)),
-                })
-            })
-            .collect()
-    }
-
-    pub async fn fetch_bodies_decoded_with_groups_prefer_excluding_traced_each<F, Fut>(
-        &self,
-        message_ids: &[&str],
-        groups: &[String],
-        exclude: &[usize],
-        mut on_trace: F,
-    ) where
-        F: FnMut(usize, DecodedBodyTrace) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        if message_ids.is_empty() {
-            return;
-        }
-
-        if message_ids.len() == 1 {
-            let trace = self
-                .fetch_body_decoded_with_groups_prefer_excluding_traced(
-                    message_ids[0],
-                    groups,
-                    exclude,
-                )
-                .await;
-            on_trace(0, trace).await;
-            return;
-        }
-
-        let order = self.article_server_order(&[], exclude).await;
-
-        if order.is_empty() {
-            for message_idx in 0..message_ids.len() {
-                on_trace(
-                    message_idx,
-                    DecodedBodyTrace {
-                        attempts: Vec::new(),
-                        result: Err(DecodedBodyError::Nntp(NntpError::PoolExhausted)),
-                    },
-                )
-                .await;
-            }
-            return;
-        }
-
-        let mut attempts_by_index: Vec<Vec<FetchAttemptTrace>> =
-            (0..message_ids.len()).map(|_| Vec::new()).collect();
-        let mut last_errors: Vec<Option<DecodedBodyError>> =
-            (0..message_ids.len()).map(|_| None).collect();
-        let mut pending: Vec<usize> = (0..message_ids.len()).collect();
-        let mut providers = order.into_iter();
-        let mut continuation = None;
-        loop {
-            let (idx, pending_now) = if let Some(next) = continuation.take() {
-                next
-            } else {
-                let Some(idx) = providers.next() else { break };
-                if pending.is_empty() {
-                    break;
-                }
-                (idx, std::mem::take(&mut pending))
-            };
-            let mut eligible = Vec::with_capacity(pending_now.len());
-            for message_idx in pending_now {
-                if self
-                    .article_attempt_eligible(idx, &[], &attempts_by_index[message_idx])
-                    .await
-                {
-                    eligible.push(message_idx);
-                } else {
-                    pending.push(message_idx);
-                }
-            }
-            let pending_now = eligible;
-            if pending_now.is_empty() {
-                continue;
-            }
-            let pending_ids: Vec<String> = pending_now
-                .iter()
-                .map(|message_idx| message_ids[*message_idx].to_string())
-                .collect();
-
-            let mut setup_deadline = TokioInstant::now() + self.soft_timeout;
-            let batch_started = Instant::now();
-            let mut conn = match self
-                .acquire_before_deadline(ServerId(idx), &mut setup_deadline)
-                .await
-            {
-                Ok(conn) => conn,
-                Err(error) => {
-                    let make_error = Self::batch_setup_error_factory(&error);
-                    for message_idx in pending_now {
-                        let item = DecodedBatchItem {
-                            elapsed: batch_started.elapsed(),
-                            result: Err(DecodedBodyError::Nntp(make_error())),
-                        };
-                        match self
-                            .classify_decoded_batch_item(
-                                idx,
-                                None,
-                                None,
-                                None,
-                                message_ids[message_idx],
-                                item,
-                                &mut attempts_by_index[message_idx],
-                                &mut last_errors[message_idx],
-                            )
-                            .await
-                        {
-                            DecodedBatchDisposition::Terminal(result) => {
-                                on_trace(
-                                    message_idx,
-                                    DecodedBodyTrace {
-                                        attempts: std::mem::take(
-                                            &mut attempts_by_index[message_idx],
-                                        ),
-                                        result,
-                                    },
-                                )
-                                .await;
-                            }
-                            DecodedBatchDisposition::Retry => pending.push(message_idx),
-                        }
-                    }
-                    continue;
-                }
-            };
-            let remote_ip = conn.remote_ip();
-            let route_feedback = conn.route_outcome.clone();
-            let health_lease = conn.health_lease.clone();
-
-            let group_result = match tokio::time::timeout_at(
-                setup_deadline,
-                Self::try_select_group(&mut conn, groups),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    self.discard_connection_error(idx, conn).await;
-                    let error = self.soft_timeout_error();
-                    let make_error = Self::batch_setup_error_factory(&error);
-                    for message_idx in pending_now {
-                        let item = DecodedBatchItem {
-                            elapsed: batch_started.elapsed(),
-                            result: Err(DecodedBodyError::Nntp(make_error())),
-                        };
-                        match self
-                            .classify_decoded_batch_item(
-                                idx,
-                                health_lease.as_ref().map(|lease| &*lease.0),
-                                remote_ip,
-                                route_feedback.clone(),
-                                message_ids[message_idx],
-                                item,
-                                &mut attempts_by_index[message_idx],
-                                &mut last_errors[message_idx],
-                            )
-                            .await
-                        {
-                            DecodedBatchDisposition::Terminal(result) => {
-                                on_trace(
-                                    message_idx,
-                                    DecodedBodyTrace {
-                                        attempts: std::mem::take(
-                                            &mut attempts_by_index[message_idx],
-                                        ),
-                                        result,
-                                    },
-                                )
-                                .await;
-                            }
-                            DecodedBatchDisposition::Retry => pending.push(message_idx),
-                        }
-                    }
-                    continue;
-                }
-            };
-
-            if let Err(error) = group_result {
-                if is_connection_error(&error) {
-                    self.discard_connection_error(idx, conn).await;
-                }
-                let make_error = Self::batch_setup_error_factory(&error);
-                for message_idx in pending_now {
-                    let item = DecodedBatchItem {
-                        elapsed: batch_started.elapsed(),
-                        result: Err(DecodedBodyError::Nntp(make_error())),
-                    };
-                    match self
-                        .classify_decoded_batch_item(
-                            idx,
-                            health_lease.as_ref().map(|lease| &*lease.0),
-                            remote_ip,
-                            route_feedback.clone(),
-                            message_ids[message_idx],
-                            item,
-                            &mut attempts_by_index[message_idx],
-                            &mut last_errors[message_idx],
-                        )
-                        .await
-                    {
-                        DecodedBatchDisposition::Terminal(result) => {
-                            on_trace(
-                                message_idx,
-                                DecodedBodyTrace {
-                                    attempts: std::mem::take(&mut attempts_by_index[message_idx]),
-                                    result,
-                                },
-                            )
-                            .await;
-                        }
-                        DecodedBatchDisposition::Retry => pending.push(message_idx),
-                    }
-                }
-                continue;
-            }
-
-            let mut request_write_error = None;
-            let mut admitted = 0usize;
-            let mut quota_rejection = None;
-            let recovery_probe = health_lease.as_ref().is_some_and(|lease| lease.0.probing());
-            let admission_limit = if recovery_probe { 1 } else { pending_ids.len() };
-            for (pending_idx, message_id) in pending_ids.iter().take(admission_limit).enumerate() {
-                match conn.write_body_request(message_id).await {
-                    Ok(()) => admitted += 1,
-                    Err(NntpError::QuotaBlocked(rejection)) => {
-                        quota_rejection = Some((pending_idx, rejection));
-                        break;
-                    }
-                    Err(error) => {
-                        request_write_error = Some(error);
-                        break;
-                    }
-                }
-            }
-
-            if admitted > 0
-                && request_write_error.is_none()
-                && let Err(error) = conn.flush_commands().await
-            {
-                request_write_error = Some(error);
-            }
-
-            let deferred = if recovery_probe && admitted == 1 && request_write_error.is_none() {
-                pending_now.iter().copied().skip(1).collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-
-            if let Some(error) = request_write_error {
-                if is_connection_error(&error) {
-                    self.discard_connection_error(idx, conn).await;
-                }
-                let make_error = Self::batch_setup_error_factory(&error);
-                for message_idx in pending_now {
-                    let item = DecodedBatchItem {
-                        elapsed: batch_started.elapsed(),
-                        result: Err(DecodedBodyError::Nntp(make_error())),
-                    };
-                    match self
-                        .classify_decoded_batch_item(
-                            idx,
-                            health_lease.as_ref().map(|lease| &*lease.0),
-                            remote_ip,
-                            route_feedback.clone(),
-                            message_ids[message_idx],
-                            item,
-                            &mut attempts_by_index[message_idx],
-                            &mut last_errors[message_idx],
-                        )
-                        .await
-                    {
-                        DecodedBatchDisposition::Terminal(result) => {
-                            on_trace(
-                                message_idx,
-                                DecodedBodyTrace {
-                                    attempts: std::mem::take(&mut attempts_by_index[message_idx]),
-                                    result,
-                                },
-                            )
-                            .await;
-                        }
-                        DecodedBatchDisposition::Retry => pending.push(message_idx),
-                    }
-                }
-                continue;
-            }
-
-            if let Some((pending_idx, rejection)) = quota_rejection {
-                let message_idx = pending_now[pending_idx];
-                let item = DecodedBatchItem {
-                    elapsed: Duration::ZERO,
-                    result: Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(rejection))),
-                };
-                match self
-                    .classify_decoded_batch_item(
-                        idx,
-                        health_lease.as_ref().map(|lease| &*lease.0),
-                        remote_ip,
-                        route_feedback.clone(),
-                        message_ids[message_idx],
-                        item,
-                        &mut attempts_by_index[message_idx],
-                        &mut last_errors[message_idx],
-                    )
-                    .await
-                {
-                    DecodedBatchDisposition::Terminal(result) => {
-                        on_trace(
-                            message_idx,
-                            DecodedBodyTrace {
-                                attempts: std::mem::take(&mut attempts_by_index[message_idx]),
-                                result,
-                            },
-                        )
-                        .await;
-                    }
-                    DecodedBatchDisposition::Retry => pending.push(message_idx),
-                }
-                pending.extend(pending_now.iter().copied().skip(pending_idx + 1));
-            }
-
-            if admitted == 0 {
-                continue;
-            }
-
-            let mut conn = Some(conn);
-            let mut closed_early = false;
-            for (response_idx, message_idx) in
-                pending_now.iter().copied().take(admitted).enumerate()
-            {
-                let item_started = Instant::now();
-                let mut budget = ActiveTransferBudget::new(self.soft_timeout);
-                let result = Self::read_decoded_pipelined_body(
-                    conn.as_mut()
-                        .expect("connection is available while reading"),
-                    &mut budget,
-                )
-                .await;
-                let elapsed = item_started.elapsed();
-                let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
-                    elapsed.saturating_sub(decoded.io.throttle_wait)
-                });
-                let item = DecodedBatchItem {
-                    elapsed: policy_elapsed,
-                    result,
-                };
-
-                let poisoned = conn.as_ref().is_some_and(|conn| conn.is_poisoned());
-                match self
-                    .classify_decoded_batch_item(
-                        idx,
-                        health_lease.as_ref().map(|lease| &*lease.0),
-                        remote_ip,
-                        route_feedback.clone(),
-                        message_ids[message_idx],
-                        item,
-                        &mut attempts_by_index[message_idx],
-                        &mut last_errors[message_idx],
-                    )
-                    .await
-                {
-                    DecodedBatchDisposition::Terminal(result) => {
-                        on_trace(
-                            message_idx,
-                            DecodedBodyTrace {
-                                attempts: std::mem::take(&mut attempts_by_index[message_idx]),
-                                result,
-                            },
-                        )
-                        .await;
-                    }
-                    DecodedBatchDisposition::Retry => pending.push(message_idx),
-                }
-
-                if poisoned {
-                    conn.take()
-                        .expect("poisoned connection is still owned by batch reader")
-                        .discard();
-                    closed_early = true;
-                }
-
-                if closed_early {
-                    for unread_idx in pending_now
-                        .iter()
-                        .copied()
-                        .take(admitted)
-                        .skip(response_idx + 1)
-                    {
-                        let item = DecodedBatchItem {
-                            elapsed: item_started.elapsed(),
-                            result: Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed)),
-                        };
-                        match self
-                            .classify_decoded_batch_item(
-                                idx,
-                                health_lease.as_ref().map(|lease| &*lease.0),
-                                remote_ip,
-                                route_feedback.clone(),
-                                message_ids[unread_idx],
-                                item,
-                                &mut attempts_by_index[unread_idx],
-                                &mut last_errors[unread_idx],
-                            )
-                            .await
-                        {
-                            DecodedBatchDisposition::Terminal(result) => {
-                                on_trace(
-                                    unread_idx,
-                                    DecodedBodyTrace {
-                                        attempts: std::mem::take(
-                                            &mut attempts_by_index[unread_idx],
-                                        ),
-                                        result,
-                                    },
-                                )
-                                .await;
-                            }
-                            DecodedBatchDisposition::Retry => pending.push(unread_idx),
-                        }
-                    }
-                    break;
-                }
-            }
-            if !deferred.is_empty() {
-                if self.pool.requires_recovery(idx) {
-                    pending.extend(deferred);
-                } else {
-                    // The probe settled transport recovery. Its unsent tail
-                    // still deserves this provider before normal failover.
-                    continuation = Some((idx, deferred));
-                }
-            }
-        }
-
-        for message_idx in pending {
-            on_trace(
-                message_idx,
-                DecodedBodyTrace {
-                    attempts: std::mem::take(&mut attempts_by_index[message_idx]),
-                    result: Err(last_errors[message_idx]
-                        .take()
-                        .unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted))),
-                },
-            )
-            .await;
-        }
-    }
-
-    // Like [`fetch_body_decoded_with_groups`](Self::fetch_body_decoded_with_groups)
-    // but skips the specified servers.
-    pub async fn fetch_body_decoded_with_groups_excluding(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: &[usize],
-    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        self.fetch_body_decoded_with_groups_excluding_traced(message_id, groups, exclude)
-            .await
-            .result
-    }
-
-    // Keep socket provenance separate from article identity and the caller's
-    // attempt/error accumulators; all three survive different retry boundaries.
-    #[allow(clippy::too_many_arguments)]
-    async fn classify_decoded_batch_item(
-        &self,
-        server_idx: usize,
-        ticket: Option<&crate::recovery::ConnectionHealth>,
-        remote_ip: Option<IpAddr>,
-        route_feedback: RouteFeedback,
-        message_id: &str,
-        item: DecodedBatchItem,
-        attempts: &mut Vec<FetchAttemptTrace>,
-        last_error: &mut Option<DecodedBodyError>,
-    ) -> DecodedBatchDisposition {
-        let elapsed = item.elapsed;
-        if let Some(ticket) = ticket {
-            self.record_decoded_connection_outcome(server_idx, ticket, &item.result)
-                .await;
-        }
-        match item.result {
-            Ok(decoded) => {
-                attempts.push(FetchAttemptTrace {
-                    route_feedback: route_feedback.clone(),
-                    connection_health: None,
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::Success,
-                    error: None,
-                });
-                DecodedBatchDisposition::Terminal(Ok(decoded))
-            }
-            Err(DecodedBodyError::Decode { raw_size, error }) => {
-                attempts.push(FetchAttemptTrace {
-                    route_feedback: route_feedback.clone(),
-                    connection_health: None,
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::Success,
-                    error: None,
-                });
-                DecodedBatchDisposition::Terminal(Err(DecodedBodyError::Decode { raw_size, error }))
-            }
-            // Nothing was asked of the server: no attempt to trace.
-            Err(DecodedBodyError::Nntp(NntpError::WorkObsolete)) => {
-                DecodedBatchDisposition::Terminal(Err(DecodedBodyError::Nntp(
-                    NntpError::WorkObsolete,
-                )))
-            }
-            Err(DecodedBodyError::Nntp(
-                NntpError::ArticleNotFound
-                | NntpError::NoSuchArticle { .. }
-                | NntpError::NoArticleWithNumber,
-            )) => {
-                attempts.push(FetchAttemptTrace {
-                    route_feedback: route_feedback.clone(),
-                    connection_health: None,
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::NotFound,
-                    error: Some("article not found".to_string()),
-                });
-                *last_error = Some(DecodedBodyError::Nntp(NntpError::NoSuchArticle {
-                    message_id: message_id.to_string(),
-                }));
-                DecodedBatchDisposition::Retry
-            }
-            Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(rejection))) => {
-                attempts.push(FetchAttemptTrace {
-                    route_feedback: route_feedback.clone(),
-                    connection_health: None,
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::QuotaBlocked,
-                    error: Some("server download quota blocked".to_string()),
-                });
-                *last_error = Some(DecodedBodyError::Nntp(NntpError::QuotaBlocked(rejection)));
-                DecodedBatchDisposition::Retry
-            }
-            Err(DecodedBodyError::Nntp(error @ NntpError::BodyNotRequestedDueToQuota { .. })) => {
-                attempts.push(FetchAttemptTrace {
-                    route_feedback: route_feedback.clone(),
-                    connection_health: None,
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::QuotaUnrequested,
-                    error: Some("BODY was not issued after quota rejection".to_string()),
-                });
-                *last_error = Some(DecodedBodyError::Nntp(error));
-                DecodedBatchDisposition::Retry
-            }
-            Err(DecodedBodyError::Nntp(
-                NntpError::AuthenticationFailed
-                | NntpError::AuthenticationRejected
-                | NntpError::AccessDenied,
-            )) => {
-                attempts.push(FetchAttemptTrace {
-                    route_feedback: route_feedback.clone(),
-                    connection_health: None,
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::AuthenticationFailure,
-                    error: Some("authentication/access failure".to_string()),
-                });
-                *last_error = Some(DecodedBodyError::Nntp(NntpError::AuthenticationFailed));
-                DecodedBatchDisposition::Retry
-            }
-            Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
-                attempts.push(FetchAttemptTrace {
-                    route_feedback: route_feedback.clone(),
-                    connection_health: None,
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::transient(&e),
-                    error: Some(e.to_string()),
-                });
-                *last_error = Some(DecodedBodyError::Nntp(e));
-                DecodedBatchDisposition::Retry
-            }
-            Err(other) => {
-                attempts.push(FetchAttemptTrace {
-                    route_feedback: route_feedback.clone(),
-                    connection_health: None,
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::PermanentFailure,
-                    error: Some(format!("{other:?}")),
-                });
-                DecodedBatchDisposition::Terminal(Err(other))
-            }
-        }
-    }
-
-    pub async fn fetch_body_decoded_with_groups_excluding_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: &[usize],
-    ) -> DecodedBodyTrace {
-        self.fetch_body_decoded_with_groups_ordered_traced(message_id, groups, exclude, &[])
-            .await
-    }
-
-    async fn fetch_body_decoded_with_groups_ordered_traced(
-        &self,
-        message_id: &str,
-        groups: &[String],
-        exclude: &[usize],
-        avoid: &[usize],
-    ) -> DecodedBodyTrace {
-        let order = self.article_server_order(exclude, avoid).await;
-
-        if order.is_empty() {
-            return DecodedBodyTrace {
-                attempts: Vec::new(),
-                result: Err(DecodedBodyError::Nntp(NntpError::PoolExhausted)),
-            };
-        }
-
-        let mut last_error: Option<DecodedBodyError> = None;
-        let mut last_retryable_error: Option<DecodedBodyError> = None;
-        let mut attempts = Vec::new();
-
-        for idx in order {
-            if !self.article_attempt_eligible(idx, exclude, &attempts).await {
-                if let Some(rejection) = self
-                    .pool
-                    .server_transfer_control(ServerId(idx))
-                    .and_then(|control| control.quota_rejection_for(1))
-                {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: Duration::ZERO,
-                        outcome: FetchAttemptOutcome::QuotaBlocked,
-                        error: Some("server download quota blocked".into()),
-                    });
-                    last_error = Some(DecodedBodyError::Nntp(NntpError::quota_blocked(rejection)));
-                }
-                continue;
-            }
-            let server = ServerId(idx);
-            let start = Instant::now();
-
-            match self
-                .fetch_decoded_from_server_with_groups(server, message_id, groups)
-                .await
-            {
-                Ok((decoded, remote_ip, route_feedback)) => {
-                    let elapsed = start.elapsed().saturating_sub(decoded.io.throttle_wait);
-                    self.record_server_success(idx, elapsed).await;
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip,
-                        elapsed,
-                        outcome: FetchAttemptOutcome::Success,
-                        error: None,
-                    });
-                    return DecodedBodyTrace {
-                        attempts,
-                        result: Ok(decoded),
-                    };
-                }
-                Err(DecodedBodyError::Decode { raw_size, error }) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::Success,
-                        error: None,
-                    });
-                    return DecodedBodyTrace {
-                        attempts,
-                        result: Err(DecodedBodyError::Decode { raw_size, error }),
-                    };
-                }
-                Err(DecodedBodyError::Nntp(
-                    NntpError::ArticleNotFound
-                    | NntpError::NoSuchArticle { .. }
-                    | NntpError::NoArticleWithNumber,
-                )) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::NotFound,
-                        error: Some("article not found".to_string()),
-                    });
-                    last_error = Some(DecodedBodyError::Nntp(NntpError::NoSuchArticle {
-                        message_id: message_id.to_string(),
-                    }));
-                    continue;
-                }
-                Err(DecodedBodyError::Nntp(e @ NntpError::QuotaBlocked(_))) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: Duration::ZERO,
-                        outcome: FetchAttemptOutcome::QuotaBlocked,
-                        error: Some(e.to_string()),
-                    });
-                    last_error = Some(DecodedBodyError::Nntp(e));
-                    continue;
-                }
-                Err(DecodedBodyError::Nntp(
-                    NntpError::AuthenticationFailed
-                    | NntpError::AuthenticationRejected
-                    | NntpError::AccessDenied,
-                )) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::AuthenticationFailure,
-                        error: Some("authentication/access failure".to_string()),
-                    });
-                    last_error = Some(DecodedBodyError::Nntp(NntpError::AuthenticationFailed));
-                    continue;
-                }
-                // Nothing was asked of the server: no attempt to trace.
-                Err(DecodedBodyError::Nntp(NntpError::WorkObsolete)) => {
-                    return DecodedBodyTrace {
-                        attempts,
-                        result: Err(DecodedBodyError::Nntp(NntpError::WorkObsolete)),
-                    };
-                }
-                Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::transient(&e),
-                        error: Some(e.to_string()),
-                    });
-                    last_retryable_error = Some(DecodedBodyError::Nntp(e));
-                    continue;
-                }
-                Err(other) => {
-                    attempts.push(FetchAttemptTrace {
-                        route_feedback: None,
-                        connection_health: None,
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::PermanentFailure,
-                        error: Some(format!("{other:?}")),
-                    });
-                    return DecodedBodyTrace {
-                        attempts,
-                        result: Err(other),
-                    };
-                }
-            }
-        }
-
-        DecodedBodyTrace {
-            attempts,
-            result: Err(last_retryable_error
-                .or(last_error)
-                .unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted))),
-        }
-    }
-
-    // Fetch the headers of an article by message-id, with multi-server failover.
-    pub async fn fetch_head(&self, message_id: &str) -> Result<Bytes> {
-        self.fetch_with_failover(message_id, FetchKind::Head).await
-    }
-
-    // Fetch a complete article (headers + body) by message-id, with multi-server failover.
-    pub async fn fetch_article(&self, message_id: &str) -> Result<Bytes> {
-        self.fetch_with_failover(message_id, FetchKind::Article)
-            .await
-    }
-
     // Gracefully shut down the client and all pooled connections.
     pub async fn shutdown(&self) {
         self.pool.shutdown().await;
@@ -2603,7 +548,7 @@ impl NntpClient {
     pub fn try_acquire_blocking_body_lane(
         &self,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         self.try_acquire_blocking_body_lane_with_estimate(groups, exclude, 0)
     }
@@ -2617,7 +562,7 @@ impl NntpClient {
     // momentary lock collision.
     pub fn try_blocking_body_server_selection_with_estimate(
         &self,
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
     ) -> Option<BodyServerSelection> {
         self.try_blocking_body_server_selection(exclude, requested_body_bytes, QuotaCheck::Dispatch)
@@ -2626,7 +571,7 @@ impl NntpClient {
     pub fn try_acquire_blocking_body_lane_with_estimate(
         &self,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         self.acquire_blocking_lane(groups, exclude, requested_body_bytes, None)
@@ -2641,7 +586,7 @@ impl NntpClient {
     pub fn try_warm_blocking_body_lane(
         &self,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
         seat: ServerId,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
@@ -2651,7 +596,7 @@ impl NntpClient {
     fn acquire_blocking_lane(
         &self,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
         warm_seat: Option<ServerId>,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
@@ -2676,6 +621,7 @@ impl NntpClient {
         }
 
         let mut saw_local_capacity = false;
+        let mut saw_contention = false;
         let mut saw_recovery_gate = false;
         let mut credentials_refused = None;
         let mut provider_capacity_error = None;
@@ -2686,7 +632,7 @@ impl NntpClient {
             }
             let policy = self.pool.provider_policy();
             if !matches!(
-                policy.eligibility(server.0, exclude, &[], requested_body_bytes),
+                policy.eligibility(server.0, exclude, ServerSet::EMPTY, requested_body_bytes),
                 crate::provider_policy::ArticleEligibility::Eligible(_)
             ) {
                 // An occupied permit in a higher group cannot turn this
@@ -2694,10 +640,17 @@ impl NntpClient {
                 saw_local_capacity = true;
                 continue;
             }
-            let permit = match self
+            let Some(permit) = self
                 .pool
-                .try_acquire_blocking_permit_for_work(server, demanded)
-            {
+                .try_acquire_blocking_permit_uncontended(server, demanded)
+            else {
+                // Another caller held the server's reconnect stamp for the
+                // moment: a lost race, retried at once like a contended
+                // selection, never waited on as if capacity were short.
+                saw_contention = true;
+                continue;
+            };
+            let permit = match permit {
                 Ok(permit) => permit,
                 // Kept apart from a permit or socket shortage: one is a queue
                 // to wait in, the other is a server holding itself open for a
@@ -2738,17 +691,20 @@ impl NntpClient {
             };
             let started = Instant::now();
             let health_lease = Arc::clone(&permit.health_lease);
-            match self.pool.with_blocking_connect_admission(server, || {
-                crate::blocking::BlockingBodyLane::connect(
-                    server,
-                    self.pool.stable_server_id(server).unwrap_or_default(),
-                    self.pool.server_transfer_control(server),
-                    &config,
-                    groups,
-                    self.soft_timeout,
-                    permit,
-                )
-            }) {
+            let probe = health_lease.0.probing();
+            match self
+                .pool
+                .with_blocking_connect_admission(server, probe, || {
+                    crate::blocking::BlockingBodyLane::connect(
+                        server,
+                        self.pool.stable_server_id(server).unwrap_or_default(),
+                        self.pool.server_transfer_control(server),
+                        &config,
+                        groups,
+                        self.soft_timeout,
+                        permit,
+                    )
+                }) {
                 Ok(lane) => {
                     self.pool.note_provider_admitted(server, admission);
                     return Ok(lane);
@@ -2763,7 +719,7 @@ impl NntpClient {
                     // Debug for every failure, and one WARN per server per
                     // window carrying how many it stands for. A lane that
                     // cannot connect is invisible otherwise: the work is
-                    // requeued or handed to an async lane, so the download
+                    // requeued for another lane, so the download
                     // keeps running — slowly, on a fraction of its lanes, with
                     // nothing above debug to say why.
                     debug!(
@@ -2804,6 +760,8 @@ impl NntpClient {
             Err(BlockingBodyLaneAcquireError::ProviderCapacity(error))
         } else if let Some(error) = other_error {
             Err(BlockingBodyLaneAcquireError::Other(error))
+        } else if saw_contention {
+            Err(BlockingBodyLaneAcquireError::SelectionContended)
         } else if saw_local_capacity {
             Err(BlockingBodyLaneAcquireError::LocalCapacity)
         } else if saw_recovery_gate {
@@ -2824,12 +782,12 @@ impl NntpClient {
     // server out of the ranking, so without this its refusal would read as
     // "no eligible server", which waits: the work it alone may serve would
     // sit in the queue for as long as the credentials stay wrong.
-    fn credentials_refusal(&self, exclude: &[usize]) -> Option<BlockingBodyLaneAcquireError> {
+    fn credentials_refusal(&self, exclude: ServerSet) -> Option<BlockingBodyLaneAcquireError> {
         let backfill_flags = self.pool.server_backfill_flags();
         let backfill_unlocked = self.pool.fill_servers_exhausted(exclude);
         (0..self.pool.server_count())
             .find(|idx| {
-                !exclude.contains(idx)
+                !exclude.contains(*idx)
                     && self.pool.route_available(*idx)
                     && (!backfill_flags[*idx] || backfill_unlocked)
                     && self.pool.refuses_credentials(*idx)
@@ -2846,18 +804,16 @@ impl NntpClient {
     // [`BlockingBodyLaneCandidacy::Contended`] is the reason this is not a
     // `bool`: the shared health state was busy for the length of the spin, so
     // nothing is known about the servers. Treating that as "no candidate"
-    // sends the work to the asynchronous lanes, which then queue for the very
-    // connection permits the idle owned lanes are holding and wait out the
-    // whole acquire deadline for it.
+    // fails work the servers were never asked about.
     // The servers a new owned lane would try, in the order the pool ranks
     // them right now. A question, not a dispatch: it reserves nothing and
     // clears no quota latch. `None` while the health state is contended.
-    pub fn blocking_body_server_order(&self, exclude: &[usize]) -> Option<Vec<ServerId>> {
+    pub fn blocking_body_server_order(&self, exclude: ServerSet) -> Option<Vec<ServerId>> {
         self.try_blocking_body_server_selection(exclude, 0, QuotaCheck::ReadOnly)
             .map(|selection| selection.eligible)
     }
 
-    pub fn blocking_body_lane_candidacy(&self, exclude: &[usize]) -> BlockingBodyLaneCandidacy {
+    pub fn blocking_body_lane_candidacy(&self, exclude: ServerSet) -> BlockingBodyLaneCandidacy {
         // A question, not a dispatch: it asks for no bytes, so every server
         // with any headroom "fits", and letting that fit clear a server's
         // blocked latch erased the refusal the last real dispatch recorded —
@@ -2888,7 +844,7 @@ impl NntpClient {
         }
     }
 
-    pub fn has_blocking_body_lane_candidate(&self, exclude: &[usize]) -> bool {
+    pub fn has_blocking_body_lane_candidate(&self, exclude: ServerSet) -> bool {
         matches!(
             self.blocking_body_lane_candidacy(exclude),
             BlockingBodyLaneCandidacy::Candidate
@@ -2958,7 +914,7 @@ impl NntpClient {
     // tiering verdict and silently pushed the work off the owned fast path.
     fn try_blocking_body_server_selection(
         &self,
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
         quota_check: QuotaCheck,
     ) -> Option<BodyServerSelection> {
@@ -2985,9 +941,7 @@ impl NntpClient {
         let mut candidates = Vec::with_capacity(server_count);
         let mut quota_blocked = None;
         for (idx, group) in server_groups.iter().copied().enumerate().take(server_count) {
-            if exclude.contains(&idx)
-                || !health.is_available(idx)
-                || !self.pool.route_available(idx)
+            if exclude.contains(idx) || !health.is_available(idx) || !self.pool.route_available(idx)
             {
                 continue;
             }
@@ -3083,233 +1037,10 @@ impl NntpClient {
         self.pool.retire_quarantined_idle(server_idx);
     }
 
-    async fn record_server_success(&self, server_idx: usize, elapsed: Duration) {
-        let mut health = self.pool.health().lock().await;
-        health.record_latency(server_idx, elapsed);
-    }
-
-    async fn record_connection_reply(
-        &self,
-        idx: usize,
-        ticket: &crate::recovery::ConnectionHealth,
-        error: Option<&NntpError>,
-    ) {
-        let success = error.is_none_or(|error| {
-            matches!(
-                error,
-                NntpError::ArticleNotFound
-                    | NntpError::NoSuchArticle { .. }
-                    | NntpError::NoArticleWithNumber
-            )
-        });
-        let auth = error.is_some_and(|error| {
-            matches!(
-                error,
-                NntpError::AuthenticationFailed
-                    | NntpError::AuthenticationRejected
-                    | NntpError::AuthenticationRequired
-                    | NntpError::AccessDenied
-            )
-        });
-        let failure = error.is_some_and(|error| {
-            stat_cooldown_reason(error).is_some()
-                && !matches!(
-                    error,
-                    NntpError::PoolExhausted
-                        | NntpError::PoolShutdown
-                        | NntpError::TooManyConnections
-                        | NntpError::ServerOverLimit { .. }
-                        | NntpError::AcquireTimeout(_)
-                )
-        });
-        if success || auth || failure {
-            self.pool
-                .health()
-                .lock()
-                .await
-                .record_connection_outcome(idx, ticket, success, auth);
-            self.pool.retire_quarantined_idle(idx);
-        }
-    }
-
-    async fn record_decoded_connection_outcome(
-        &self,
-        idx: usize,
-        ticket: &crate::recovery::ConnectionHealth,
-        result: &std::result::Result<DecodedBody, DecodedBodyError>,
-    ) {
-        let error = match result {
-            Err(DecodedBodyError::Nntp(error)) => Some(error),
-            _ => None,
-        };
-        self.record_connection_reply(idx, ticket, error).await;
-    }
-
-    async fn record_metadata_reply(
-        &self,
-        idx: usize,
-        ticket: &crate::recovery::ConnectionHealth,
-        error: Option<&NntpError>,
-    ) {
-        if let Some(reason) = error.and_then(stat_cooldown_reason) {
-            self.pool
-                .health()
-                .lock()
-                .await
-                .record_connection_cooldown(idx, ticket, reason);
-            self.pool.retire_quarantined_idle(idx);
-        } else {
-            self.record_connection_reply(idx, ticket, error).await;
-        }
-    }
-
-    async fn record_premature_death_if_needed(&self, server_idx: usize, age: Duration) {
-        if age < crate::health::ServerHealth::MIN_CONNECTION_LIFETIME {
-            let mut health = self.pool.health().lock().await;
-            health.record_premature_death(server_idx);
-        }
-    }
-
-    // Drop the connection that just failed, and only that one.
-    //
-    // One socket's fault says nothing about the server's other sockets: they
-    // were opened at different times, may run over different addresses, and
-    // are the warm capacity the next request is about to reuse. Throwing them
-    // away turned a single refused command into a fleet-wide cold dial.
-    async fn discard_connection_error(&self, server_idx: usize, conn: PooledConnection) {
-        let age = conn.created_at().elapsed();
-        if let Some(lease) = &conn.health_lease {
-            self.record_connection_reply(server_idx, &lease.0, Some(&NntpError::ConnectionClosed))
-                .await;
-        }
-        conn.discard();
-        self.record_premature_death_if_needed(server_idx, age).await;
-    }
-
     // Whether `server` could hand out a normal lease right now without
     // waiting on its connection semaphore.
     pub fn has_available_permit(&self, server: ServerId) -> bool {
         self.pool.has_available_permit(server)
-    }
-
-    async fn acquire_before_deadline(
-        &self,
-        server: ServerId,
-        deadline: &mut TokioInstant,
-    ) -> Result<PooledConnection> {
-        self.pool
-            .acquire_guarded_before_deadline(
-                server,
-                None,
-                true,
-                deadline,
-                self.work_guard.as_deref(),
-            )
-            .await
-            .and_then(|conn| self.validate_acquired_work(server, conn))
-            .map_err(|error| self.map_acquire_timeout(error))
-    }
-
-    async fn acquire_metadata_before_deadline(
-        &self,
-        server: ServerId,
-        deadline: &mut TokioInstant,
-    ) -> Result<PooledConnection> {
-        self.pool
-            .acquire_guarded_before_deadline(
-                server,
-                None,
-                false,
-                deadline,
-                self.work_guard.as_deref(),
-            )
-            .await
-            .and_then(|conn| self.validate_acquired_work(server, conn))
-            .map_err(|error| self.map_acquire_timeout(error))
-    }
-
-    fn validate_acquired_work(
-        &self,
-        server: ServerId,
-        conn: PooledConnection,
-    ) -> Result<PooledConnection> {
-        if self.work_guard.as_ref().is_some_and(|guard| !guard(server)) {
-            return Err(NntpError::WorkObsolete);
-        }
-        Ok(conn)
-    }
-
-    fn map_acquire_timeout(&self, error: NntpError) -> NntpError {
-        match error {
-            // Zero is the pool reporting that it never waited: the deadline was
-            // already spent, or every connection belongs to a busy download
-            // lane. Restamping it with the soft timeout would claim a wait that
-            // never happened and hide the difference from whoever reads the log.
-            NntpError::AcquireTimeout(0) => NntpError::AcquireTimeout(0),
-            NntpError::AcquireTimeout(_) => self.acquire_timeout_error(),
-            other => other,
-        }
-    }
-
-    async fn sleep_before_deadline(&self, delay: Duration, deadline: TokioInstant) -> Result<()> {
-        match tokio::time::timeout_at(deadline, tokio::time::sleep(delay)).await {
-            Ok(()) => Ok(()),
-            Err(_) => Err(self.soft_timeout_error()),
-        }
-    }
-
-    fn soft_timeout_error(&self) -> NntpError {
-        NntpError::SoftTimeout(self.soft_timeout.as_secs())
-    }
-
-    // The acquire-side twin of [`Self::soft_timeout_error`], for deadlines
-    // that expire while we are still queued behind our own connection
-    // semaphore.
-    fn acquire_timeout_error(&self) -> NntpError {
-        NntpError::AcquireTimeout(self.soft_timeout.as_secs())
-    }
-
-    // Rank candidates without granting permission to use them. Eligibility
-    // is evaluated for each article immediately before its next attempt.
-    async fn article_server_order(&self, exclude: &[usize], avoid: &[usize]) -> Vec<usize> {
-        let mut groups = std::collections::BTreeMap::new();
-        for idx in 0..self.pool.server_count() {
-            if !exclude.contains(&idx) {
-                groups
-                    .entry((
-                        self.pool.server_backfill_flags()[idx],
-                        self.pool.server_groups()[idx],
-                    ))
-                    .or_insert_with(Vec::new)
-                    .push(idx);
-            }
-        }
-        let mut order = Vec::new();
-        for group in groups.into_values() {
-            let mut ranked = self.rank_servers_in_group(&group).await;
-            ranked.sort_by_key(|idx| avoid.contains(idx));
-            order.extend(ranked);
-        }
-        order
-    }
-
-    async fn article_attempt_eligible(
-        &self,
-        server: usize,
-        exclude: &[usize],
-        attempts: &[FetchAttemptTrace],
-    ) -> bool {
-        let missing: Vec<_> = attempts
-            .iter()
-            .filter(|attempt| matches!(attempt.outcome, FetchAttemptOutcome::NotFound))
-            .map(|attempt| attempt.server_idx)
-            .collect();
-        matches!(
-            self.pool
-                .provider_policy()
-                .eligibility(server, &missing, exclude, 1),
-            crate::provider_policy::ArticleEligibility::Eligible(_)
-        )
     }
 
     // Build the server try-order, exhausting lower-priority fill groups
@@ -3331,7 +1062,7 @@ impl NntpClient {
     // ([`crate::provider_policy::backfill_unlocked`]). Within a priority group, immediately acquirable
     // servers are preferred over fully saturated peers.
     #[allow(clippy::needless_range_loop)]
-    async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
+    async fn build_server_order(&self, exclude: ServerSet) -> Vec<usize> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
         let backfill_flags = self.pool.server_backfill_flags();
@@ -3354,9 +1085,7 @@ impl NntpClient {
         let mut backfill_groups: std::collections::BTreeMap<u32, GroupCandidates> =
             std::collections::BTreeMap::new();
         for idx in 0..server_count {
-            if exclude.contains(&idx)
-                || !health.is_available(idx)
-                || !self.pool.route_available(idx)
+            if exclude.contains(idx) || !health.is_available(idx) || !self.pool.route_available(idx)
             {
                 continue;
             }
@@ -3478,739 +1207,6 @@ impl NntpClient {
 
         result
     }
-
-    // Internal: fetch with multi-server failover logic.
-    async fn fetch_with_failover(&self, message_id: &str, kind: FetchKind) -> Result<Bytes> {
-        self.fetch_with_failover_excluding(message_id, kind, &[])
-            .await
-    }
-
-    async fn fetch_with_failover_excluding(
-        &self,
-        message_id: &str,
-        kind: FetchKind,
-        exclude: &[usize],
-    ) -> Result<Bytes> {
-        let order = self.article_server_order(exclude, &[]).await;
-        let mut last_error: Option<NntpError> = None;
-        let mut last_retryable_error: Option<NntpError> = None;
-
-        let mut missing = Vec::new();
-        for idx in order {
-            if !matches!(
-                self.pool
-                    .provider_policy()
-                    .eligibility(idx, &missing, exclude, 1),
-                crate::provider_policy::ArticleEligibility::Eligible(_)
-            ) {
-                continue;
-            }
-            let server = ServerId(idx);
-            let start = Instant::now();
-
-            match self.fetch_from_server(server, message_id, kind).await {
-                Ok(data) => {
-                    let elapsed = start.elapsed();
-                    self.record_server_success(idx, elapsed).await;
-                    return Ok(data);
-                }
-                Err(NntpError::ArticleNotFound)
-                | Err(NntpError::NoSuchArticle { .. })
-                | Err(NntpError::NoArticleWithNumber) => {
-                    missing.push(idx);
-                    debug!(
-                        server = idx,
-                        message_id, "article not found, trying next server"
-                    );
-                    last_error = Some(NntpError::NoSuchArticle {
-                        message_id: message_id.to_string(),
-                    });
-                    continue;
-                }
-                Err(e @ NntpError::QuotaBlocked(_)) => {
-                    last_error = Some(e);
-                    continue;
-                }
-                Err(NntpError::AuthenticationFailed)
-                | Err(NntpError::AuthenticationRejected)
-                | Err(NntpError::AccessDenied) => {
-                    warn!(
-                        server = idx,
-                        message_id, "authentication/access failure, trying next server"
-                    );
-                    last_error = Some(NntpError::AuthenticationFailed);
-                    continue;
-                }
-                Err(e) if is_transient(&e) => {
-                    if matches!(
-                        e,
-                        NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
-                    ) {
-                        // The holdoff already reported itself once for this
-                        // window; every later article that lands on the same
-                        // server must stay quiet.
-                        trace!(
-                            server = idx,
-                            message_id, "provider capacity rejected connection"
-                        );
-                    } else {
-                        warn!(
-                            server = idx,
-                            error = %e,
-                            message_id,
-                            "transient error, trying next server"
-                        );
-                    }
-                    last_retryable_error = Some(e);
-                    continue;
-                }
-                Err(e) => {
-                    // Non-recoverable error (pool shutdown, etc.)
-                    return Err(e);
-                }
-            }
-        }
-
-        // All servers exhausted.
-        Err(last_retryable_error
-            .or(last_error)
-            .unwrap_or(NntpError::PoolExhausted))
-    }
-
-    // Try to select one of the given groups on the connection.
-    //
-    // Returns `Ok(true)` if a group was selected, `Ok(false)` if none were
-    // accepted, or `Err` on a connection-level error.
-    async fn try_select_group(conn: &mut PooledConnection, groups: &[String]) -> Result<bool> {
-        for group in groups {
-            match conn.select_group(group).await {
-                Ok(()) => return Ok(true),
-                Err(e) if is_connection_error(&e) => return Err(e),
-                Err(_) => continue,
-            }
-        }
-        Ok(false)
-    }
-
-    // Fetch from a specific server, selecting a newsgroup first.
-    //
-    // Tries each group in order. If selecting a group fails, tries the next.
-    // Once a group is selected, issues the BODY command. Retries on transient
-    // errors up to `max_retries_per_server` times.
-    //
-    // Connection acquisition, group setup, and retry delay are bounded by a
-    // per-attempt soft timeout. BODY payload reads use an inactivity budget
-    // that restarts whenever bytes arrive or a transfer-policy wait ends.
-    async fn fetch_from_server_with_groups(
-        &self,
-        server: ServerId,
-        message_id: &str,
-        groups: &[String],
-    ) -> Result<(Bytes, Option<IpAddr>, RouteFeedback)> {
-        let mut attempts = 0u32;
-
-        loop {
-            let mut deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = self.acquire_before_deadline(server, &mut deadline).await?;
-            let remote_ip = conn.remote_ip();
-
-            // Try to select a group — iterate through the list on failure.
-            let group_result =
-                match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        self.discard_connection_error(server.0, conn).await;
-                        return Err(self.soft_timeout_error());
-                    }
-                };
-
-            match group_result {
-                Err(e) if is_retryable_stat_error(&e) => {
-                    if should_discard_stat_connection(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        // Delay before retry to avoid hammering during reconnect throttle.
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await?;
-                        debug!(
-                            server = server.0,
-                            attempt = attempts,
-                            error = %e,
-                            message_id,
-                            "connection error during group selection, retrying"
-                        );
-                        continue;
-                    }
-                    return Err(e);
-                }
-                Err(e) => return Err(e),
-                Ok(false) => {
-                    // None of the groups were accepted; still attempt the BODY command
-                    // in case the server doesn't require GROUP first.
-                    debug!(
-                        message_id,
-                        "no group could be selected, attempting BODY anyway"
-                    );
-                }
-                Ok(true) => {}
-            }
-
-            let mut budget = ActiveTransferBudget::new(self.soft_timeout);
-            let result = conn
-                .body_by_id_raw_with_active_budget(message_id, &mut budget)
-                .await;
-            if let Some(lease) = &conn.health_lease {
-                self.record_connection_reply(server.0, &lease.0, result.as_ref().err())
-                    .await;
-            }
-            match result {
-                Ok(response) => return Ok((response.data, remote_ip, conn.route_outcome.clone())),
-                Err(NntpError::ArticleNotFound)
-                | Err(NntpError::NoSuchArticle { .. })
-                | Err(NntpError::NoArticleWithNumber) => {
-                    return Err(result.unwrap_err());
-                }
-                Err(e) if is_transient(&e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await?;
-                        debug!(
-                            server = server.0,
-                            attempt = attempts,
-                            error = %e,
-                            message_id,
-                            "transient error, retrying on same server"
-                        );
-                        continue;
-                    }
-                    return Err(e);
-                }
-                Err(e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    } else if is_egress_quota_rejection(&e) {
-                        conn.discard();
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    async fn fetch_decoded_from_server_with_groups(
-        &self,
-        server: ServerId,
-        message_id: &str,
-        groups: &[String],
-    ) -> std::result::Result<(DecodedBody, Option<IpAddr>, RouteFeedback), DecodedBodyError> {
-        let mut attempts = 0u32;
-
-        loop {
-            let mut deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = self
-                .acquire_before_deadline(server, &mut deadline)
-                .await
-                .map_err(DecodedBodyError::Nntp)?;
-
-            let group_result =
-                match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        self.discard_connection_error(server.0, conn).await;
-                        return Err(DecodedBodyError::Nntp(self.soft_timeout_error()));
-                    }
-                };
-
-            match group_result {
-                Err(e) if is_transient(&e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await
-                        .map_err(DecodedBodyError::Nntp)?;
-                        continue;
-                    }
-                    return Err(DecodedBodyError::Nntp(e));
-                }
-                Err(e) => return Err(DecodedBodyError::Nntp(e)),
-                Ok(false) => {}
-                Ok(true) => {}
-            }
-
-            let mut budget = ActiveTransferBudget::new(self.soft_timeout);
-            let stream_result = conn
-                .stream_yenc_article_with_active_budget(message_id, 0, &mut budget, |_| Ok(()))
-                .await;
-
-            if let Some(lease) = &conn.health_lease {
-                let error = match &stream_result {
-                    Err(FusedYencError::Nntp(error)) => Some(error),
-                    _ => None,
-                };
-                self.record_connection_reply(server.0, &lease.0, error)
-                    .await;
-            }
-            match stream_result {
-                Ok(article) => {
-                    return Ok((
-                        DecodedBody {
-                            raw_size: decoded_raw_size_from_fused_stats(&article.stats),
-                            cpu: decoded_cpu_from_fused_stats(&article.stats),
-                            io: decoded_io_from_fused_stats(&article.stats),
-                            decoded: article.chunks,
-                            body: article.body,
-                        },
-                        conn.remote_ip(),
-                        conn.route_outcome.clone(),
-                    ));
-                }
-                Err(FusedYencError::Yenc(error)) => {
-                    return Err(DecodedBodyError::Decode { raw_size: 0, error });
-                }
-                Err(FusedYencError::Nntp(
-                    e @ (NntpError::ArticleNotFound
-                    | NntpError::NoSuchArticle { .. }
-                    | NntpError::NoArticleWithNumber),
-                )) => {
-                    return Err(DecodedBodyError::Nntp(e));
-                }
-                Err(FusedYencError::Nntp(e)) if is_transient(&e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await
-                        .map_err(DecodedBodyError::Nntp)?;
-                        continue;
-                    }
-                    return Err(DecodedBodyError::Nntp(e));
-                }
-                Err(FusedYencError::Nntp(e)) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    } else if is_egress_quota_rejection(&e) {
-                        conn.discard();
-                    }
-                    return Err(DecodedBodyError::Nntp(e));
-                }
-            }
-        }
-    }
-
-    async fn read_decoded_pipelined_body(
-        conn: &mut PooledConnection,
-        budget: &mut ActiveTransferBudget,
-    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let stream_result = conn
-            .stream_next_yenc_article_with_active_budget(budget, |_| Ok(()))
-            .await;
-
-        match stream_result {
-            Ok(article) => Ok(DecodedBody {
-                raw_size: decoded_raw_size_from_fused_stats(&article.stats),
-                cpu: decoded_cpu_from_fused_stats(&article.stats),
-                io: decoded_io_from_fused_stats(&article.stats),
-                decoded: article.chunks,
-                body: article.body,
-            }),
-            Err(FusedYencError::Yenc(error)) => {
-                Err(DecodedBodyError::Decode { raw_size: 0, error })
-            }
-            Err(FusedYencError::Nntp(error)) => Err(DecodedBodyError::Nntp(error)),
-        }
-    }
-
-    fn batch_setup_error_factory(error: &NntpError) -> Box<dyn Fn() -> NntpError + Send> {
-        match error {
-            NntpError::PoolExhausted => Box::new(|| NntpError::PoolExhausted),
-            NntpError::SoftTimeout(duration) => {
-                let duration = *duration;
-                Box::new(move || NntpError::SoftTimeout(duration))
-            }
-            NntpError::AcquireTimeout(duration) => {
-                let duration = *duration;
-                Box::new(move || NntpError::AcquireTimeout(duration))
-            }
-            NntpError::WorkObsolete => Box::new(|| NntpError::WorkObsolete),
-            _ if is_transient(error) => Box::new(|| NntpError::ConnectionClosed),
-            _ => {
-                let message = error.to_string();
-                Box::new(move || NntpError::MalformedResponse(message.clone()))
-            }
-        }
-    }
-
-    // Check a batch of articles on a specific server, retrying on transient
-    // errors and using pipelining when the server supports it.
-    // Whether `server` still answers STAT, as far as this process has been
-    // able to tell.
-    fn server_supports_stat(&self, server: ServerId) -> bool {
-        self.pool
-            .server_configs()
-            .get(server.0)
-            .is_none_or(|config| crate::server_caps::supports_stat(&config.host, config.port))
-    }
-
-    // Existence by HEAD, for a server that has refused STAT outright and for
-    // re-checking what STAT reported missing.
-    //
-    // One connection serves the whole batch. On a server that pipelines it is
-    // one write and one round trip, exactly as a STAT batch is; otherwise a
-    // round trip per article, but still no extra dials. Transient faults are
-    // retried on the same server the way a STAT batch is, so a re-check is
-    // not turned inconclusive by one dropped socket.
-    async fn head_many_from_server(
-        &self,
-        server: ServerId,
-        message_ids: &[&str],
-    ) -> Result<Vec<bool>> {
-        if message_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut deadline = TokioInstant::now() + self.soft_timeout;
-        let mut attempts = 0u32;
-
-        loop {
-            let mut conn = self
-                .acquire_metadata_before_deadline(server, &mut deadline)
-                .await?;
-            let result = match tokio::time::timeout_at(deadline, async {
-                if conn.capabilities().supports_pipelining() {
-                    conn.head_pipeline(message_ids).await
-                } else {
-                    let mut results = Vec::with_capacity(message_ids.len());
-                    for message_id in message_ids {
-                        match conn.head_by_id(message_id).await {
-                            Ok(_) => results.push(true),
-                            Err(
-                                NntpError::ArticleNotFound
-                                | NntpError::NoSuchArticle { .. }
-                                | NntpError::NoArticleWithNumber,
-                            ) => results.push(false),
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    Ok(results)
-                }
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    if let Some(lease) = &conn.health_lease {
-                        self.record_metadata_reply(
-                            server.0,
-                            &lease.0,
-                            Some(&self.soft_timeout_error()),
-                        )
-                        .await;
-                    }
-                    self.discard_connection_error(server.0, conn).await;
-                    return Err(self.soft_timeout_error());
-                }
-            };
-
-            if let Some(lease) = &conn.health_lease {
-                self.record_metadata_reply(server.0, &lease.0, result.as_ref().err())
-                    .await;
-            }
-            match result {
-                Ok(results) => return Ok(results),
-                Err(error) if is_retryable_stat_error(&error) => {
-                    if should_discard_stat_connection(&error) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await?;
-                        debug!(
-                            server = server.0,
-                            attempt = attempts,
-                            error = %error,
-                            batch_size = message_ids.len(),
-                            "retryable error during HEAD batch, retrying on same server"
-                        );
-                        continue;
-                    }
-                    return Err(error);
-                }
-                Err(error) => {
-                    if is_connection_error(&error) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    return Err(error);
-                }
-            }
-        }
-    }
-
-    async fn stat_many_from_server(
-        &self,
-        server: ServerId,
-        message_ids: &[&str],
-    ) -> Result<Vec<bool>> {
-        if message_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // A server that has already refused STAT is asked with HEAD directly,
-        // instead of spending a refusal per batch to relearn it.
-        if !self.server_supports_stat(server) {
-            return self.head_many_from_server(server, message_ids).await;
-        }
-
-        let mut deadline = TokioInstant::now() + self.soft_timeout;
-        let mut attempts = 0u32;
-
-        loop {
-            let mut conn = self
-                .acquire_metadata_before_deadline(server, &mut deadline)
-                .await?;
-
-            let result = match tokio::time::timeout_at(deadline, async {
-                if conn.capabilities().supports_pipelining() {
-                    conn.stat_pipeline(message_ids).await
-                } else {
-                    let mut results = Vec::with_capacity(message_ids.len());
-                    for message_id in message_ids {
-                        results.push(conn.stat_by_id(message_id).await?);
-                    }
-                    Ok(results)
-                }
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    if let Some(lease) = &conn.health_lease {
-                        self.record_metadata_reply(
-                            server.0,
-                            &lease.0,
-                            Some(&self.soft_timeout_error()),
-                        )
-                        .await;
-                    }
-                    self.discard_connection_error(server.0, conn).await;
-                    return Err(self.soft_timeout_error());
-                }
-            };
-
-            if let Some(lease) = &conn.health_lease {
-                self.record_metadata_reply(server.0, &lease.0, result.as_ref().err())
-                    .await;
-            }
-            match result {
-                Ok(results) => return Ok(results),
-                // The server has just told us it does not implement STAT. The
-                // socket is fine — the refusal is an answer — so it goes back
-                // to the pool and the batch is re-asked with HEAD.
-                Err(NntpError::CommandNotRecognized) if !self.server_supports_stat(server) => {
-                    drop(conn);
-                    return self.head_many_from_server(server, message_ids).await;
-                }
-                Err(e) if is_retryable_stat_error(&e) => {
-                    if should_discard_stat_connection(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await?;
-                        debug!(
-                            server = server.0,
-                            attempt = attempts,
-                            error = %e,
-                            batch_size = message_ids.len(),
-                            "retryable error during STAT batch, retrying on same server"
-                        );
-                        continue;
-                    }
-                    return Err(e);
-                }
-                Err(e) => {
-                    if should_discard_stat_connection(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    // Fetch from a specific server, retrying on transient errors.
-    //
-    // Connection acquisition and retry delay are bounded by a per-attempt
-    // soft timeout. BODY payload reads use an inactivity budget that restarts
-    // whenever bytes arrive or a transfer-policy wait ends.
-    async fn fetch_from_server(
-        &self,
-        server: ServerId,
-        message_id: &str,
-        kind: FetchKind,
-    ) -> Result<Bytes> {
-        let mut attempts = 0u32;
-
-        loop {
-            let mut deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = if matches!(kind, FetchKind::Body) {
-                self.acquire_before_deadline(server, &mut deadline).await?
-            } else {
-                self.acquire_metadata_before_deadline(server, &mut deadline)
-                    .await?
-            };
-
-            let result = match kind {
-                FetchKind::Body => {
-                    let mut budget = ActiveTransferBudget::new(self.soft_timeout);
-                    conn.body_by_id_raw_with_active_budget(message_id, &mut budget)
-                        .await
-                }
-                FetchKind::Head | FetchKind::Article => {
-                    match tokio::time::timeout_at(deadline, async {
-                        match kind {
-                            FetchKind::Head => conn.head_by_id(message_id).await,
-                            FetchKind::Article => conn.article_by_id(message_id).await,
-                            FetchKind::Body => unreachable!(),
-                        }
-                    })
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            self.discard_connection_error(server.0, conn).await;
-                            return Err(self.soft_timeout_error());
-                        }
-                    }
-                }
-            };
-
-            if let Some(lease) = &conn.health_lease {
-                self.record_connection_reply(server.0, &lease.0, result.as_ref().err())
-                    .await;
-            }
-            match result {
-                Ok(response) => return Ok(response.data),
-                Err(NntpError::ArticleNotFound) | Err(NntpError::NoSuchArticle { .. }) => {
-                    // Article not found — do not retry, return immediately.
-                    return Err(result.unwrap_err());
-                }
-                Err(e) if is_transient(&e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    }
-                    if attempts < self.max_retries_per_server {
-                        attempts += 1;
-                        self.sleep_before_deadline(
-                            Duration::from_millis(200 * attempts as u64),
-                            deadline,
-                        )
-                        .await?;
-                        debug!(
-                            server = server.0,
-                            attempt = attempts,
-                            error = %e,
-                            message_id,
-                            "transient error, retrying on same server"
-                        );
-                        continue;
-                    }
-                    return Err(e);
-                }
-                Err(e) => {
-                    if is_connection_error(&e) {
-                        self.discard_connection_error(server.0, conn).await;
-                    } else if is_egress_quota_rejection(&e) {
-                        conn.discard();
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-}
-
-// The type of article fetch to perform.
-#[derive(Debug, Clone, Copy)]
-enum FetchKind {
-    Body,
-    Head,
-    Article,
-}
-
-// Whether a decoded BODY outcome left the connection fully consumed and
-// reusable for the rest of the pipelined batch.
-//
-// See the blocking lane's twin of this helper: a 430 is a complete server
-// response with no body to drain, so it must not mark a batch dirty and
-// block the server's pipelining proof. Decode failures stay dirty because
-// the decoder can fail on a body the transport never finished delivering.
-fn decoded_result_keeps_connection(
-    result: &std::result::Result<DecodedBody, DecodedBodyError>,
-) -> bool {
-    match result {
-        Ok(_) => true,
-        Err(DecodedBodyError::Nntp(error)) => error.is_article_not_found(),
-        Err(DecodedBodyError::Decode { .. }) => false,
-    }
-}
-
-// Returns true if the error is transient and the request might succeed on retry.
-fn is_transient(err: &NntpError) -> bool {
-    matches!(
-        err,
-        NntpError::Io(_)
-            | NntpError::Timeout
-            | NntpError::ConnectionClosed
-            | NntpError::TruncatedMultilineBody
-            | NntpError::ServerDisconnectedMidBody
-            | NntpError::MalformedMultilineTerminator
-            // The next connection can select the group learned from this 412.
-            | NntpError::NoGroupSelected
-            | NntpError::ServiceUnavailable
-            | NntpError::TooManyConnections
-            | NntpError::ServerOverLimit { .. }
-            | NntpError::PoolExhausted
-            | NntpError::SoftTimeout(_)
-            | NntpError::AcquireTimeout(_)
-    )
-}
-
-fn is_retryable_stat_error(err: &NntpError) -> bool {
-    is_transient(err) || matches!(err, NntpError::MalformedResponse(_))
 }
 
 fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
@@ -4234,49 +1230,6 @@ fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
         NntpError::AcquireTimeout(_) => None,
         _ => None,
     }
-}
-
-fn stat_cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
-    cooldown_reason(err).or_else(|| {
-        matches!(err, NntpError::MalformedResponse(_)).then_some(CooldownReason::Transport)
-    })
-}
-
-// Whether the egress the connection runs over refused the body for quota.
-//
-// The socket is sound, but it is bound to a route leg with no quota left;
-// pooling it would hand the next request the same refusal. It is dropped
-// without a health penalty so the next dial takes whatever leg the route
-// now offers.
-fn is_egress_quota_rejection(err: &NntpError) -> bool {
-    matches!(
-        err,
-        NntpError::QuotaBlocked(rejection) if rejection.scope == crate::transfer::TransferScope::Egress
-    )
-}
-
-// Returns true if the error indicates the connection itself is bad
-// and should be discarded rather than returned to the pool.
-fn is_connection_error(err: &NntpError) -> bool {
-    matches!(
-        err,
-        NntpError::Io(_)
-            | NntpError::Timeout
-            | NntpError::ConnectionClosed
-            | NntpError::TruncatedMultilineBody
-            | NntpError::ServerDisconnectedMidBody
-            | NntpError::MalformedMultilineTerminator
-            | NntpError::TooManyConnections
-            | NntpError::AccessDenied
-            // The batch's remaining replies are still queued on that socket,
-            // so nothing else may be sent down it.
-            | NntpError::SessionExpired
-            | NntpError::SoftTimeout(_)
-    )
-}
-
-fn should_discard_stat_connection(err: &NntpError) -> bool {
-    is_connection_error(err) || matches!(err, NntpError::MalformedResponse(_))
 }
 
 #[cfg(test)]

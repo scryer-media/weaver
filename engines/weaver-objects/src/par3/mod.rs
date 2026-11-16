@@ -9,9 +9,10 @@
 // fingerprint, not a CRC32, so the segment checksums fold into nothing it
 // can compare; it reads members back to verify them instead. It keeps the
 // front of each volume to learn early which members it describes, and reads
-// every arrived run of each volume back when it repairs. Only packets that
-// lie wholly in a volume's readable ranges count: one a hole cuts is
-// dropped, and the scan carries on past it.
+// every arrived run of each volume back when it repairs, a piece at a time,
+// leaving its data and recovery blocks where they lie until the rebuild
+// spends them. Only packets that lie wholly in a volume's readable ranges
+// count: one a hole cuts is dropped, and the scan carries on past it.
 //
 // A member binds to a described file by its path or bare name, or, when no
 // described name answers to it, by its bytes: the repair reads it back and
@@ -21,11 +22,13 @@
 pub(crate) mod facts;
 mod identity;
 mod rebuild;
+mod volumes;
 
 #[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use par3_rs::layout::{BlockLayout, FileLayout};
@@ -41,6 +44,7 @@ use weaver_graph::{
     Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
 };
 
+use crate::elimination::{self, Length};
 use crate::par2::combine;
 use crate::recovery_volume::{self, Refusal, Shown};
 
@@ -100,9 +104,23 @@ struct Volume {
     named_blocks: Option<u64>,
     // The name it was bound under, which a later volume of the set continues.
     name: Option<String>,
+    // How many times what its front reads as has changed.
+    changes: u64,
 }
 
 impl Volume {
+    // The packets the readable spans of the kept front hold, in order.
+    fn front_packets(&self) -> Vec<Packet> {
+        let mut packets = Vec::new();
+        for span in readable(&self.arrived) {
+            let end = span.end.min(self.front.len() as u64);
+            if let Some(bytes) = self.front.get(span.start as usize..end as usize) {
+                scan(bytes, &mut packets);
+            }
+        }
+        packets
+    }
+
     // Whether the volume shows it carries recovery blocks: its packets,
     // header by header from its start through what arrived of its front,
     // reach a recovery packet, or its name says it carries some and its
@@ -156,14 +174,233 @@ impl Unnamed {
         })
     }
 
-    // Whether the member could be a described file of `long` bytes.
-    fn fits(self, long: u64) -> bool {
+    // What is known of its length: exact once a byte of it checked.
+    fn bound(self) -> Length {
         if self.intact {
-            self.length == long
+            Length::Exact(self.length)
         } else {
-            long <= self.length
+            Length::AtMost(self.length)
         }
     }
+}
+
+// What a group of unnamed members could be by length: the exact lengths
+// of those with a checked byte, and the longest bound of the rest. Any of
+// them fits a file exactly when the group does.
+#[derive(Debug, Default)]
+struct Fitting {
+    exact: BTreeSet<u64>,
+    at_most: Option<u64>,
+}
+
+impl Fitting {
+    fn add(&mut self, unnamed: Unnamed) {
+        match unnamed.bound() {
+            Length::Exact(length) => {
+                self.exact.insert(length);
+            }
+            Length::AtMost(bound) => {
+                self.at_most = Some(self.at_most.map_or(bound, |was| was.max(bound)));
+            }
+        }
+    }
+
+    // Whether any member of the group could be a described file of `long`.
+    fn fits(&self, long: u64) -> bool {
+        self.exact.contains(&long) || self.at_most.is_some_and(|bound| long <= bound)
+    }
+}
+
+// The lengths of a group of described files. A member fits one of them
+// exactly when it fits the group.
+#[derive(Debug, Default)]
+struct Lengths(BTreeSet<u64>);
+
+impl Lengths {
+    fn fitted_by(&self, unnamed: Unnamed) -> bool {
+        match unnamed.bound() {
+            Length::Exact(length) => self.0.contains(&length),
+            Length::AtMost(bound) => self.0.range(..=bound).next().is_some(),
+        }
+    }
+}
+
+// Of `files`, each described path and size in order, those `missing` says
+// no member carries or is bound to and no unnamed member may yet turn out
+// to be, onto `out` once each. An unnamed member a readback identified may
+// be only that file; one not identified may be any it fits. Each file and
+// each unnamed member is looked at a bounded number of times, each look
+// counted in `work`.
+fn absent<'f>(
+    files: impl Iterator<Item = (&'f str, u64)>,
+    (unnamed, identified): (&BTreeMap<MemberId, Unnamed>, &BTreeMap<MemberId, String>),
+    missing: impl Fn(&str) -> bool,
+    out: &mut Vec<(String, u64)>,
+    work: &mut u64,
+) {
+    let mut anything = Fitting::default();
+    let mut only: BTreeMap<&str, Fitting> = BTreeMap::new();
+    for (member, unnamed) in unnamed {
+        *work += 1;
+        match identified.get(member) {
+            None => anything.add(*unnamed),
+            Some(path) => only.entry(path).or_default().add(*unnamed),
+        }
+    }
+    let mut listed: BTreeSet<(String, u64)> = out.iter().cloned().collect();
+    for (path, size) in files {
+        *work += 1;
+        let maybe = anything.fits(size) || only.get(path).is_some_and(|group| group.fits(size));
+        if missing(path) && !maybe {
+            let named = (path.to_owned(), size);
+            if !listed.contains(&named) {
+                listed.insert(named.clone());
+                out.push(named);
+            }
+        }
+    }
+}
+
+// A described file as binding by name sees it.
+#[derive(Clone, Copy, Debug)]
+struct Described<'f> {
+    path: &'f str,
+    name: &'f str,
+    size: u64,
+}
+
+impl<'f> Described<'f> {
+    fn of(file: &'f par3_rs::Par3File) -> Self {
+        Self {
+            path: file.path(),
+            name: file.name(),
+            size: file.size(),
+        }
+    }
+}
+
+// The members' names, each with the first member that carries it and how
+// many do. A described file is answered to by the members carrying its
+// path or its bare name.
+struct Names<'n>(BTreeMap<&'n str, (MemberId, usize)>);
+
+impl<'n> Names<'n> {
+    fn of(members: impl Iterator<Item = (&'n str, MemberId)>, work: &mut u64) -> Self {
+        let mut names: BTreeMap<&'n str, (MemberId, usize)> = BTreeMap::new();
+        for (name, member) in members {
+            *work += 1;
+            names.entry(name).or_insert((member, 0)).1 += 1;
+        }
+        Self(names)
+    }
+
+    // The names the file answers to that members carry, each once.
+    fn answering(&self, file: Described<'_>) -> impl Iterator<Item = (MemberId, usize)> {
+        let path = self.0.get(file.path);
+        let name = (file.name != file.path)
+            .then(|| self.0.get(file.name))
+            .flatten();
+        path.into_iter().chain(name).copied()
+    }
+
+    // The one member that answers to the file, when only one does.
+    fn only(&self, file: Described<'_>) -> Option<MemberId> {
+        let mut answering = self.answering(file);
+        match (answering.next(), answering.next()) {
+            (Some((member, 1)), None) => Some(member),
+            _ => None,
+        }
+    }
+
+    // Whether any member answers to the file.
+    fn carried(&self, file: Described<'_>) -> bool {
+        self.answering(file).next().is_some()
+    }
+}
+
+// What the members' names say of the described files.
+struct ByName<'f> {
+    // Each path exactly one member answers to, and that member.
+    bound: BTreeMap<String, MemberId>,
+    // Every described path, and whether a member answers to it.
+    described: BTreeMap<String, bool>,
+    // The members no described file answers to whose length fits a file
+    // none does.
+    unnamed: BTreeMap<MemberId, Unnamed>,
+    // The length of each described path, as the first file of it says.
+    lengths: BTreeMap<&'f str, u64>,
+}
+
+// Binding by name over `files`, every file the sets describe in order, and
+// `others`, the namespace's members the object does not own. Each file and
+// each member is looked at a bounded number of times, each look counted in
+// `work`.
+fn by_name<'f, 'm, I>(files: &[Described<'f>], others: impl Fn() -> I, work: &mut u64) -> ByName<'f>
+where
+    I: Iterator<Item = &'m Member>,
+{
+    let names = Names::of(
+        others().map(|member| (member.name.as_str(), member.id)),
+        work,
+    );
+    let mut bound = BTreeMap::new();
+    let mut described = BTreeMap::new();
+    // Every path and bare name a described file answers to, and the length
+    // of each path.
+    let mut answered: BTreeSet<&str> = BTreeSet::new();
+    let mut lengths: BTreeMap<&'f str, u64> = BTreeMap::new();
+    for &file in files {
+        *work += 1;
+        if let Some(member) = names.only(file) {
+            bound.insert(file.path.to_owned(), member);
+        }
+        described.insert(file.path.to_owned(), names.carried(file));
+        answered.insert(file.path);
+        answered.insert(file.name);
+        lengths.entry(file.path).or_insert(file.size);
+    }
+    // The lengths of the files no member answers to.
+    let free = Lengths(
+        files
+            .iter()
+            .filter(|file| described.get(file.path) == Some(&false))
+            .map(|file| file.size)
+            .collect(),
+    );
+    let unnamed = others()
+        .filter(|member| {
+            *work += 1;
+            !answered.contains(member.name.as_str())
+        })
+        .filter_map(|member| {
+            Some((
+                member.id,
+                Unnamed::of(member).filter(|u| free.fitted_by(*u))?,
+            ))
+        })
+        .collect();
+    ByName {
+        bound,
+        described,
+        unnamed,
+        lengths,
+    }
+}
+
+// The free files the members with no intact byte are by elimination, each
+// with the member it is: longest file first, each free file no member is
+// takes the member it fits most tightly, once the files those members could
+// be are no more than they are.
+fn by_elimination(
+    free: &[(String, u64)],
+    blank: &[(MemberId, Unnamed)],
+    work: &mut u64,
+) -> Vec<(String, MemberId)> {
+    let unnamed = blank
+        .iter()
+        .map(|(member, unnamed)| (*member, unnamed.bound()))
+        .collect();
+    elimination::by_elimination(free, unnamed, work)
 }
 
 pub struct Par3 {
@@ -171,6 +408,8 @@ pub struct Par3 {
     volumes: Vec<Volume>,
     // Described paths and the member each is bound to.
     bound: BTreeMap<String, MemberId>,
+    // The members `bound` names, each once.
+    covered: BTreeSet<MemberId>,
     // Members that may be a free described file. Those complete are what a
     // repair reads back to identify.
     unnamed: BTreeMap<MemberId, Unnamed>,
@@ -199,6 +438,19 @@ pub struct Par3 {
     // either changes.
     shown: Shown,
     refused_blocks: u64,
+    // What the kept fronts were last read as.
+    fronts: Mutex<Fronts>,
+}
+
+// The packets each volume's kept front held when it was last scanned, and
+// the sets they all described, each with the changes of the fronts it was
+// read at.
+#[derive(Default)]
+struct Fronts {
+    packets: Vec<Option<(u64, Vec<Packet>)>>,
+    sets: Option<(Vec<u64>, Arc<Vec<Par3Set>>)>,
+    // How many fronts were scanned.
+    scans: u64,
 }
 
 impl Par3 {
@@ -207,6 +459,7 @@ impl Par3 {
             id,
             volumes: Vec::new(),
             bound: BTreeMap::new(),
+            covered: BTreeSet::new(),
             unnamed: BTreeMap::new(),
             described: BTreeMap::new(),
             identified: BTreeMap::new(),
@@ -218,7 +471,15 @@ impl Par3 {
             memory_limit: REPAIR_MEMORY_LIMIT,
             shown: Shown::default(),
             refused_blocks: 0,
+            fronts: Mutex::new(Fronts::default()),
         }
+    }
+
+    // The described paths and the members they are bound to, with the
+    // members they name.
+    fn set_bound(&mut self, bound: BTreeMap<String, MemberId>) {
+        self.covered = bound.values().copied().collect();
+        self.bound = bound;
     }
 
     fn volume(&mut self, index: VolumeIndex) -> &mut Volume {
@@ -230,17 +491,31 @@ impl Par3 {
     }
 
     // The sets as far as the readable spans of the kept fronts describe them.
-    fn front_sets(&self) -> Vec<Par3Set> {
-        let mut packets = Vec::new();
-        for volume in &self.volumes {
-            for span in readable(&volume.arrived) {
-                let end = span.end.min(volume.front.len() as u64);
-                if let Some(bytes) = volume.front.get(span.start as usize..end as usize) {
-                    scan(bytes, &mut packets);
-                }
-            }
+    // Only a front that changed since it was last read is scanned again.
+    fn front_sets(&self) -> Arc<Vec<Par3Set>> {
+        let mut fronts = self.fronts.lock().unwrap_or_else(PoisonError::into_inner);
+        let changes: Vec<u64> = self.volumes.iter().map(|volume| volume.changes).collect();
+        if let Some((at, sets)) = &fronts.sets
+            && *at == changes
+        {
+            return Arc::clone(sets);
         }
-        sets(packets)
+        let Fronts { packets, scans, .. } = &mut *fronts;
+        packets.resize_with(self.volumes.len(), || None);
+        let mut all = Vec::new();
+        for (volume, kept) in self.volumes.iter().zip(packets.iter_mut()) {
+            let found = match kept {
+                Some((at, found)) if *at == volume.changes => found,
+                _ => {
+                    *scans += 1;
+                    &kept.insert((volume.changes, volume.front_packets())).1
+                }
+            };
+            all.extend(found.iter().cloned());
+        }
+        let sets = Arc::new(sets(all));
+        fronts.sets = Some((changes, Arc::clone(&sets)));
+        sets
     }
 
     fn coming(&self) -> bool {
@@ -323,6 +598,60 @@ impl Par3 {
         (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
     }
 
+    // Whether the refusals show the object will be short before any repair
+    // has said so: whole blocks of bound files will never come, no repair
+    // has ruled since what it binds last changed, none has settled a set,
+    // and the blocks its volumes can bring are known and may cover them.
+    // Its first repair then finds the blocks in hand rather than waiting on
+    // them; a repair's ruling takes over from there.
+    fn refused_wanting(&self) -> bool {
+        self.refused_blocks > 0
+            && self.last.is_none()
+            && self.settled.is_empty()
+            && self
+                .reach()
+                .is_some_and(|reach| self.refused_blocks <= reach)
+    }
+
+    // The volumes wanted whole now, by index. While the last repair waits
+    // on damaged blocks, every open one. While only the refusals show the
+    // object will be short, the fewest that bring the refused blocks past
+    // those the closed volumes hold, fewest blocks first: the order a
+    // shortfall reads them in, so none is fetched that the repair would not
+    // have asked for. Otherwise none.
+    fn raised(&self) -> Vec<bool> {
+        if self.needed > 0 {
+            return vec![true; self.volumes.len()];
+        }
+        let mut raised = vec![false; self.volumes.len()];
+        if !self.refused_wanting() {
+            return raised;
+        }
+        let held: u64 = self
+            .volumes
+            .iter()
+            .filter(|volume| volume.closed)
+            .filter_map(|volume| volume.named_blocks)
+            .sum();
+        let mut shortfall = self.refused_blocks.saturating_sub(held);
+        let mut order: Vec<usize> = (0..self.volumes.len())
+            .filter(|index| !self.volumes[*index].closed)
+            .collect();
+        order.sort_by_key(|index| (self.volumes[*index].named_blocks, *index));
+        for index in order {
+            if shortfall == 0 {
+                break;
+            }
+            let blocks = self.volumes[index].named_blocks.unwrap_or(0);
+            if blocks == 0 {
+                continue;
+            }
+            shortfall = shortfall.saturating_sub(blocks);
+            raised[index] = true;
+        }
+        raised
+    }
+
     // Whether the namespace shows damage the sets not yet read may cover: a
     // member, none of the object's own volumes, held damaged or refused,
     // that no described file is bound to. Only then is a volume read for
@@ -403,35 +732,34 @@ impl Par3 {
             .filter_map(|set| BlockLayout::new(set, &ExecutionOptions::default()).ok())
             .collect();
         let files: Vec<&FileLayout> = layouts.iter().flat_map(BlockLayout::files).collect();
+        let candidates = identity::Candidates::new(&files, |path| self.free(path));
         let mut read = 0;
         for (&member, unnamed) in &self.unnamed {
             if !unnamed.complete || !unnamed.intact || self.identified.contains_key(&member) {
                 continue;
             }
-            let free = |path: &str| self.free(path);
             let len = unnamed.length;
-            if let Some(path) = identity::identify(&files, free, access, member, len, &mut read) {
+            if let Some(path) = candidates.identify(access, member, len, &mut read) {
                 self.identified.insert(member, path.to_owned());
             }
         }
         // A member with no intact byte has nothing to say what it is, so it
-        // is what is left, as a PAR2 member no slice named is: longest file
-        // first, each free file no member is takes the member it fits most
-        // tightly, once the files those members could be are no more than
-        // they are. The repair makes every byte of it over.
+        // is what is left, as a PAR2 member no slice named is. The repair
+        // makes every byte of it over.
+        let taken: BTreeSet<&str> = self.identified.values().map(String::as_str).collect();
         let mut free: Vec<(String, u64)> = files
             .iter()
             .filter(|file| {
                 file.len != 0
                     && self.free(&file.path)
                     && !self.bound.contains_key(&file.path)
-                    && !self.identified.values().any(|path| *path == file.path)
+                    && !taken.contains(file.path.as_str())
             })
             .map(|file| (file.path.clone(), file.len))
             .collect();
         free.sort_by_key(|(_, long)| std::cmp::Reverse(*long));
         free.dedup();
-        let mut blank: Vec<(MemberId, Unnamed)> = self
+        let blank: Vec<(MemberId, Unnamed)> = self
             .unnamed
             .iter()
             .filter(|(member, unnamed)| {
@@ -439,40 +767,33 @@ impl Par3 {
             })
             .map(|(member, unnamed)| (*member, *unnamed))
             .collect();
-        while let Some((at, member)) = free.iter().enumerate().find_map(|(at, (_, long))| {
-            let fitting: Vec<usize> = (0..blank.len())
-                .filter(|candidate| blank[*candidate].1.fits(*long))
-                .collect();
-            let could_be = free
-                .iter()
-                .filter(|(_, other)| fitting.iter().any(|c| blank[*c].1.fits(*other)))
-                .count();
-            let tightest = fitting
-                .iter()
-                .copied()
-                .min_by_key(|candidate| blank[*candidate].1.length)
-                .filter(|_| could_be <= fitting.len())?;
-            Some((at, tightest))
-        }) {
-            let (path, _) = free.remove(at);
-            self.identified.insert(blank.swap_remove(member).0, path);
+        let mut work = 0;
+        for (path, member) in by_elimination(&free, &blank, &mut work) {
+            self.identified.insert(member, path);
         }
-        let found = self.by_content();
-        self.bound.extend(found);
+        let mut bound = std::mem::take(&mut self.bound);
+        bound.extend(self.by_content());
+        self.set_bound(bound);
     }
 
     // A free file of the set that a member still arriving may turn out to
     // be is not missing yet: the set waits for that member, and asks for no
     // recovery on its account.
-    fn identifying(&self, set: &Par3Set) -> bool {
+    fn identifying(&self, set: &Par3Set, arriving: &Fitting) -> bool {
         set.files().iter().any(|file| {
             !self.bound.contains_key(file.path())
                 && self.free(file.path())
-                && self
-                    .unnamed
-                    .values()
-                    .any(|member| !member.complete && member.fits(file.size()))
+                && arriving.fits(file.size())
         })
+    }
+
+    // The unnamed members still arriving, which `identifying` asks of.
+    fn arriving(&self) -> Fitting {
+        let mut arriving = Fitting::default();
+        for member in self.unnamed.values().filter(|member| !member.complete) {
+            arriving.add(*member);
+        }
+        arriving
     }
 }
 
@@ -551,6 +872,7 @@ impl Object for Par3 {
         if offset >= FRONT_CAP {
             return;
         }
+        volume.changes += 1;
         let end = offset.saturating_add(delivery.bytes.len()).min(FRONT_CAP);
         if end > volume.front.len() {
             volume.front.resize(end, 0);
@@ -601,6 +923,7 @@ impl Object for Par3 {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
             found.arrived.erase(range);
             found.closed = false;
+            found.changes += 1;
         }
     }
 
@@ -677,35 +1000,26 @@ impl Recovery for Par3 {
             self.damage_shown();
         }
         let sets = self.front_sets();
-        let files = || sets.iter().flat_map(Par3Set::files);
-        let answers =
-            |name: &str, file: &par3_rs::Par3File| name == file.path() || name == file.name();
-        let others = || {
-            namespace
-                .members()
-                .filter(|member| member.bound_to != Some(self.id))
-        };
-        let mut bound = BTreeMap::new();
-        for file in files() {
-            let mut matches = others().filter(|member| answers(&member.name, file));
-            if let (Some(member), None) = (matches.next(), matches.next()) {
-                bound.insert(file.path().to_owned(), member.id);
-            }
-        }
-        let described: BTreeMap<String, bool> = files()
-            .map(|file| {
-                let carried = others().any(|member| answers(&member.name, file));
-                (file.path().to_owned(), carried)
-            })
+        let files: Vec<Described<'_>> = sets
+            .iter()
+            .flat_map(Par3Set::files)
+            .map(Described::of)
             .collect();
-        let fits_free = |unnamed: Unnamed| {
-            files()
-                .any(|file| unnamed.fits(file.size()) && described.get(file.path()) == Some(&false))
-        };
-        let unnamed: BTreeMap<MemberId, Unnamed> = others()
-            .filter(|member| !files().any(|file| answers(&member.name, file)))
-            .filter_map(|member| Some((member.id, Unnamed::of(member).filter(|u| fits_free(*u))?)))
-            .collect();
+        let id = self.id;
+        let ByName {
+            mut bound,
+            described,
+            unnamed,
+            lengths,
+        } = by_name(
+            &files,
+            || {
+                namespace
+                    .members()
+                    .filter(move |member| member.bound_to != Some(id))
+            },
+            &mut 0,
+        );
         // A verdict stands on what the object could bind when it ruled: the
         // files described, the members bound, and the members it may yet
         // identify once it is complete. A rename only moves a member from
@@ -721,10 +1035,7 @@ impl Recovery for Par3 {
         self.identified
             .retain(|member, _| unnamed.contains_key(member));
         for (path, member) in self.by_content() {
-            let Some(length) = files()
-                .find(|file| file.path() == path)
-                .map(|file| file.size())
-            else {
+            let Some(&length) = lengths.get(path.as_str()) else {
                 continue;
             };
             if namespace.recognise(member, &path, length).is_some() {
@@ -742,10 +1053,7 @@ impl Recovery for Par3 {
             ))
         );
         for (path, member) in &bound {
-            let Some(size) = files()
-                .find(|file| file.path() == path)
-                .map(|file| file.size())
-            else {
+            let Some(&size) = lengths.get(path.as_str()) else {
                 continue;
             };
             if namespace.take_described(*member, size, verified) {
@@ -755,7 +1063,7 @@ impl Recovery for Par3 {
         if learned || bound != self.bound {
             self.last = None;
         }
-        self.bound = bound;
+        self.set_bound(bound);
         self.count_refused(&sets);
     }
 
@@ -764,23 +1072,18 @@ impl Recovery for Par3 {
     // file's size that no described name answers to may be it until a
     // readback says what it is.
     fn absent(&self, out: &mut Vec<(String, u64)>) {
-        for set in self.front_sets() {
-            for file in set.files() {
-                let path = file.path();
-                let maybe = self.unnamed.iter().any(|(member, unnamed)| {
-                    unnamed.fits(file.size())
-                        && self.identified.get(member).is_none_or(|was| was == path)
-                });
-                let named = (path.to_owned(), file.size());
-                if self.free(path)
-                    && !self.bound.contains_key(path)
-                    && !maybe
-                    && !out.contains(&named)
-                {
-                    out.push(named);
-                }
-            }
-        }
+        let sets = self.front_sets();
+        let files = sets
+            .iter()
+            .flat_map(Par3Set::files)
+            .map(|file| (file.path(), file.size()));
+        absent(
+            files,
+            (&self.unnamed, &self.identified),
+            |path| self.free(path) && !self.bound.contains_key(path),
+            out,
+            &mut 0,
+        );
     }
 
     // No front read so far describes a file: the description is in a volume
@@ -790,7 +1093,7 @@ impl Recovery for Par3 {
     }
 
     fn covers(&self, member: MemberId) -> bool {
-        self.bound.values().any(|bound| *bound == member)
+        self.covered.contains(&member)
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
@@ -827,11 +1130,14 @@ impl Recovery for Par3 {
     // volume that may describe them is, all of it, then the next once that
     // one is read through without one. Otherwise every volume whose head
     // shows it carries recovery is deferred: the rest waits until a repair
-    // is short. Nothing of the deferral is kept: the same fronts say it
-    // again on every round.
+    // is short, or until a refusal shows it will be, and then only the
+    // volumes that cover the refused blocks are (`raised`). Nothing of the
+    // deferral is kept: the same fronts say it again on every round.
     fn wants(&self, out: &mut Vec<Seek>) {
         let describing = self.describing();
+        let raised = self.raised();
         for (index, volume) in self.volumes.iter().enumerate() {
+            let short = raised[index];
             if volume.closed {
                 continue;
             }
@@ -845,7 +1151,7 @@ impl Recovery for Par3 {
                 });
                 continue;
             }
-            if self.needed == 0 {
+            if !short {
                 if volume.shows_recovery() {
                     recovery_volume::gaps(&volume.arrived, |range| {
                         out.push(Seek::deferred(VolumeIndex(index as u32), range))
@@ -876,21 +1182,24 @@ impl Recovery for Par3 {
         if let Some(short) = self.refused_short() {
             return short;
         }
-        // Every readable span of every volume, read back and scanned one at
-        // a time; a span that does not read back whole is left out.
-        let mut packets = Vec::new();
-        let mut bytes = Vec::new();
-        for (index, volume) in self.volumes.iter().enumerate() {
-            for span in readable(&volume.arrived) {
-                bytes.clear();
-                if access.read_volume(VolumeIndex(index as u32), span, &mut bytes)
-                    && bytes.len() as u64 == span.len()
-                {
-                    scan(&bytes, &mut packets);
-                }
-            }
-        }
-        let sets = sets(packets);
+        // Every readable span of every volume, scanned one at a time a piece
+        // at a time; a span that does not read back whole is left out. The
+        // data and recovery blocks stay in the volumes until spent.
+        let spans = self
+            .volumes
+            .iter()
+            .enumerate()
+            .flat_map(|(index, volume)| {
+                readable(&volume.arrived)
+                    .into_iter()
+                    .map(move |span| (VolumeIndex(index as u32), span))
+            })
+            .collect();
+        let volumes::Read {
+            sets,
+            payloads,
+            volumes,
+        } = volumes::read(spans, ScanLimits::default(), MAX_SETS, access);
         // With no set described by anything read, the object waits on a
         // volume that may carry a description while damage shows; with no
         // damage, or none left open, it checked nothing.
@@ -912,7 +1221,8 @@ impl Recovery for Par3 {
         let mut outcome = RepairOutcome::Unread;
         let mut waiting = 0;
         self.ruled.clear();
-        for set in sets {
+        let arriving = self.arriving();
+        for (set, payloads) in sets.into_iter().zip(payloads) {
             // The digest of the set's root packet, which its recovery packets
             // name it by.
             let id: String = set
@@ -930,14 +1240,14 @@ impl Recovery for Par3 {
                 outcome = combine(outcome, settled.outcome);
                 continue;
             }
-            let result = if self.identifying(&set) {
+            let result = if self.identifying(&set, &arriving) {
                 rebuild::SetRepair {
                     outcome: RepairOutcome::Waiting,
                     lost: 0,
                 }
             } else {
                 rebuild::repair_set(
-                    &set,
+                    (&set, &payloads, &volumes),
                     &self.bound,
                     coming,
                     weaver_graph::Budget {
@@ -957,7 +1267,7 @@ impl Recovery for Par3 {
             let settled = Settled {
                 members,
                 slice_size: set.block_size(),
-                blocks_reachable: rebuild::usable_recovery(&set).len() as u64,
+                blocks_reachable: rebuild::usable_recovery(&set, &payloads).len() as u64,
                 damaged_slices: result.lost,
                 outcome: result.outcome,
             };

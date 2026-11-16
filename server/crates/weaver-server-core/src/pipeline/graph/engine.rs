@@ -98,6 +98,16 @@ pub(crate) enum Heard {
     CheckpointDue {
         control: crate::persistence::checkpoint_write::CheckpointControl,
     },
+    // The volumes' writers returned everything the job had submitted when
+    // a checkpoint or the job's end began to wait for it. Addressed to the
+    // root, under no run's generation.
+    DiskReturned,
+    // A volume's writer could not complete an operation on one of the
+    // job's files. Addressed to the root, under no run's generation.
+    DiskFailed(Box<crate::operations::disk::writer::Failure>),
+    // The job's give-up has another volume to read back, on a turn of its
+    // own. Addressed to the root, under no run's generation.
+    GivingUp,
 }
 
 // Where every graph job's runs speak, and where the database says a
@@ -208,6 +218,9 @@ struct Run {
     // The scratch refused it once: from here it is not lent, and its window
     // is placed in RAM.
     in_ram: bool,
+    // The scratch refused it and the machine could never hold its window
+    // in RAM: the job waits for the scratch's room.
+    no_ram: bool,
     // The run refused a window its policy lets it have: it starts again,
     // wider, once it ends, and what it says before then is not heard.
     rerun: bool,
@@ -229,6 +242,7 @@ impl Run {
             lends: false,
             lent: None,
             in_ram: false,
+            no_ram: false,
             rerun: false,
             whole: false,
         }
@@ -312,6 +326,12 @@ pub(crate) struct Runs {
     // refused node's run is forgotten, so this outlives it; a node that
     // runs again leaves it.
     held_back: BTreeSet<NodeId>,
+    // How many of `runs` have ended, so whether one is live is a count,
+    // not a walk of them.
+    ended: usize,
+    // The volumes the job's files are written through: a run waits on
+    // their budget, on its own thread, before it says more.
+    disk: Option<super::disk::JobDisk>,
 }
 
 impl Runs {
@@ -332,7 +352,17 @@ impl Runs {
             clock: DecodeClock::default(),
             windows: None,
             held_back: BTreeSet::new(),
+            ended: 0,
+            disk: None,
         }
+    }
+
+    // The runs, each waiting on the budget of the volumes of `disk` before
+    // it says more, so what a run unpacks is never queued for a slow
+    // volume faster than the volume takes it.
+    pub(crate) fn writing(mut self, disk: Option<super::disk::JobDisk>) -> Self {
+        self.disk = disk;
+        self
     }
 
     // The runs, lending their decoders windows from `windows`.
@@ -373,9 +403,14 @@ impl Runs {
     // A run is waiting for a slot, waiting for memory, running, or stopped
     // before it finished.
     pub(crate) fn live(&self) -> bool {
-        self.runs
-            .values()
-            .any(|run| !matches!(run.life, Life::Ended { .. }))
+        debug_assert_eq!(
+            self.ended,
+            self.runs
+                .values()
+                .filter(|run| matches!(run.life, Life::Ended { .. }))
+                .count(),
+        );
+        self.runs.len() > self.ended
     }
 
     pub(crate) fn in_flight(&self) -> bool {
@@ -573,10 +608,14 @@ impl Runs {
             }
             Err(room) => room,
         };
-        run.life = Life::Starved {
-            freed: room.freed,
-            limit: room.limit,
-        };
+        turn(
+            &mut self.ended,
+            &mut run.life,
+            Life::Starved {
+                freed: room.freed,
+                limit: room.limit,
+            },
+        );
         self.marks.mark(node);
         let admissions = run
             .ticket
@@ -598,7 +637,7 @@ impl Runs {
             return;
         };
         let generation = shelf.begin();
-        run.life = Life::Running { generation };
+        turn(&mut self.ended, &mut run.life, Life::Running { generation });
         self.marks.mark(node);
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
@@ -623,6 +662,7 @@ impl Runs {
             budget.window_reserved = true;
         }
         let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
+        let disk = self.disk.clone();
         let said = move |heard| Said {
             scope,
             node,
@@ -651,6 +691,12 @@ impl Runs {
                 }
                 let _waiting = decoding.wait();
                 extracting_hook(&volumes);
+                // What the run said before is with the volumes' writers
+                // or on its way: no more is said while a volume holds
+                // its budget of it.
+                if let Some(disk) = &disk {
+                    disk.wait_below();
+                }
                 volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok()
             };
             extraction.run(reader, &mut sink, budget);
@@ -661,6 +707,7 @@ impl Runs {
             if volumes.lost() {
                 sink(Emit::Refuse(Why::Unrepairable));
             }
+            volumes.decoded(decoding.spent());
             drop(decoding);
             extracting_hook(&volumes);
         });
@@ -671,12 +718,41 @@ impl Runs {
     pub(crate) fn ended(&mut self, node: NodeId, generation: u64, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         if let Some(run) = self.runs.get_mut(&node)
+            && run.volumes.as_ref().is_some_and(|volumes| volumes.parked())
+        {
+            // Stopped for the job to wait for room: it gives back what it
+            // reserved and its slot, and waits for a slot again, to run
+            // again from the start of its volumes. While the job waits its
+            // limit is none, so the slot goes to no one of the job's. Its
+            // part of the job's decoding clock is given back: it decodes
+            // all of it again.
+            if let Some(volumes) = &run.volumes {
+                self.clock.discard(volumes.decode_time());
+            }
+            turn(&mut self.ended, &mut run.life, Life::Queued);
+            run.volumes = None;
+            run.placed = Placed::Grant;
+            run.rerun = false;
+            give_back(&self.pool, run);
+            self.pool.stop_waiting(&mut run.whole);
+            let admissions = run
+                .ticket
+                .take()
+                .map(|ticket| self.slots.release(ticket))
+                .unwrap_or_default();
+            self.marks.mark(node);
+            admitted.extend(self.admit(admissions));
+            admitted.extend(self.queue(node));
+            admitted.extend(self.wake());
+            return admitted;
+        }
+        if let Some(run) = self.runs.get_mut(&node)
             && std::mem::take(&mut run.rerun)
         {
             // Widened: it gives back what it reserved at the narrower
             // window and starts again under the slot it holds, reserving
             // the wider one.
-            run.life = Life::Queued;
+            turn(&mut self.ended, &mut run.life, Life::Queued);
             run.volumes = None;
             run.placed = Placed::Grant;
             give_back(&self.pool, run);
@@ -688,7 +764,7 @@ impl Runs {
             return admitted;
         }
         if let Some(run) = self.runs.get_mut(&node) {
-            run.life = Life::Ended { generation };
+            turn(&mut self.ended, &mut run.life, Life::Ended { generation });
             self.marks.mark(node);
             admitted.extend(self.free(node));
         }
@@ -723,9 +799,8 @@ impl Runs {
         // run in RAM is lent nothing, so the scratch cannot refuse it again,
         // and what its decoder refuses from there is weighed as any run's
         // refusal is. Only what its lender heard under this start counts.
-        // Where the policy lets nothing go above the ceiling, the scratch's
-        // refusal stands, with the sizes, as a decoder's refusal over the
-        // ceiling does.
+        // Where the policy lets nothing go above the ceiling, the job waits
+        // for the room the window takes (`window_needs`).
         let refused = self
             .windows
             .as_ref()
@@ -736,8 +811,20 @@ impl Runs {
         if let Some(refused) = refused
             && running
         {
+            // The run starts again in RAM only when the machine could ever
+            // hold it there. One it never could is not refused for want of
+            // disk room: the job waits for the room the window takes, as
+            // under a policy that lets nothing go above the ceiling.
+            let wide = run.window.max(refused).max(needed.unwrap_or(0));
+            if !self
+                .pool
+                .could_fit_above(wide.saturating_add(RUN_OVERHEAD), grant.above_ceiling())
+            {
+                run.no_ram = true;
+                return false;
+            }
             run.in_ram = true;
-            run.wide = Some(run.window.max(refused).max(needed.unwrap_or(0)));
+            run.wide = Some(wide);
             run.rerun = true;
             if let Some(volumes) = &run.volumes {
                 volumes.stop();
@@ -794,6 +881,28 @@ impl Runs {
         windows.refused(node, start).map(|_| grant.held())
     }
 
+    // What the disk has to show free for the window the scratch refused the
+    // node's run for want of room, under a policy that holds runs to the
+    // ceiling: the widest window the run asked for and the free space the
+    // disk keeps. The job waits for that room; it is not failed.
+    pub(crate) fn window_needs(&self, node: NodeId) -> Option<u64> {
+        let grant = self.hardware.grant();
+        let run = self.runs.get(&node).filter(|run| {
+            run.lends && (grant.over_limit == OverLimit::ScratchThenFail || run.no_ram)
+        })?;
+        let (windows, start) = self.windows.as_ref().zip(run.lent)?;
+        windows
+            .refused(node, start)
+            .map(|widest| widest.saturating_add(windows.kept_free()))
+    }
+
+    // Whether a quota refused a window's file since this was last asked.
+    pub(crate) fn window_quota(&self) -> bool {
+        self.windows
+            .as_ref()
+            .is_some_and(|windows| windows.take_quota())
+    }
+
     // Whether a refusal stands in the job only because the policy holds runs
     // to the ceiling, so a reprocess with no memory limit could finish it.
     pub(crate) fn held_to_ceiling(&self) -> bool {
@@ -803,6 +912,30 @@ impl Runs {
     // Whether the node's run was widened and is ending, to start again.
     pub(crate) fn rerunning(&self, node: NodeId) -> bool {
         self.runs.get(&node).is_some_and(|run| run.rerun)
+    }
+
+    // The node's run wrote while its job waited for room on a disk: it
+    // stops where it stands, and once it ended it gives back its memory and
+    // its slot, and runs again from the start once the job has room. What
+    // it said already landed; nothing it says from here is heard.
+    // A run widened, stopped already to start again, is parked as well: it
+    // starts again at the wider window once the job has room.
+    pub(crate) fn park(&mut self, node: NodeId) {
+        if let Some(run) = self.runs.get(&node)
+            && let Some(volumes) = run.volumes.as_ref()
+            && (volumes.current() || run.rerun)
+        {
+            volumes.park();
+        }
+    }
+
+    // Whether the run stopped for its job to wait for room on a disk, and is
+    // ending to run again from the start.
+    pub(crate) fn parked(&self, node: NodeId) -> bool {
+        self.runs.get(&node).is_some_and(|run| {
+            matches!(run.life, Life::Running { .. })
+                && run.volumes.as_ref().is_some_and(|volumes| volumes.parked())
+        })
     }
 
     // Stop every run where it stands: the job is going down. What a run read
@@ -823,13 +956,14 @@ impl Runs {
             self.free(node);
             if let Some(run) = self.runs.get_mut(&node) {
                 self.marks.mark(node);
-                run.life = match run.life {
+                let life = match run.life {
                     Life::Queued | Life::Starved { .. } => Life::Stopped { generation: None },
                     Life::Running { generation } => Life::Stopped {
                         generation: Some(generation),
                     },
                     life @ (Life::Ended { .. } | Life::Stopped { .. }) => life,
                 };
+                turn(&mut self.ended, &mut run.life, life);
             }
         }
     }
@@ -843,8 +977,10 @@ impl Runs {
     }
 
     // Forget the runs of `gone`, nodes no longer engines: refused,
-    // retracted or unbound. Their threads may still be out: what they say
-    // is under a generation no run holds, and is not heard. Their slots and
+    // retracted, unbound or taken away. Each is stopped where it stands, as
+    // a stopped job's runs are, so a reader waiting on a shelf nothing feeds
+    // again wakes and its thread returns. What a thread says from here is
+    // under a generation no run holds, and is not heard. Their slots and
     // their memory go to whoever waits; returns the nodes that may start
     // now, as a raised limit or released memory admits them even when
     // nothing is gone.
@@ -857,7 +993,13 @@ impl Runs {
         }
         for node in gone {
             admitted.extend(self.free(node));
-            if self.runs.remove(&node).is_some() {
+            if let Some(run) = self.runs.remove(&node) {
+                if matches!(run.life, Life::Ended { .. }) {
+                    self.ended -= 1;
+                }
+                if let Some(volumes) = &run.volumes {
+                    volumes.stop();
+                }
                 self.marks.mark(node);
             }
         }
@@ -900,7 +1042,7 @@ impl Runs {
     // The node waits for a slot, or takes a free one.
     fn queue(&mut self, node: NodeId) -> Option<NodeId> {
         let run = self.runs.get_mut(&node)?;
-        run.life = Life::Queued;
+        turn(&mut self.ended, &mut run.life, Life::Queued);
         self.marks.mark(node);
         match self.slots.ask(asker(node)) {
             Asked::Admitted(ticket) => {
@@ -922,6 +1064,7 @@ impl Runs {
         run.lends = false;
         run.lent = None;
         run.in_ram = false;
+        run.no_ram = false;
         run.rerun = false;
         let admissions = run
             .ticket
@@ -962,6 +1105,18 @@ fn give_back(pool: &DecodePool, run: &mut Run) {
         pool.release_above(len);
     } else {
         pool.release(len);
+    }
+}
+
+// A run moves on in its life, and the count of runs ended follows it.
+fn turn(ended: &mut usize, life: &mut Life, to: Life) {
+    let was = matches!(*life, Life::Ended { .. });
+    let is = matches!(to, Life::Ended { .. });
+    *life = to;
+    match (was, is) {
+        (false, true) => *ended += 1,
+        (true, false) => *ended -= 1,
+        _ => {}
     }
 }
 

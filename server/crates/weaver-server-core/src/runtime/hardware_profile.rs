@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::system_profile::SystemProfile;
 
+const KIB: usize = 1024;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
@@ -57,6 +58,20 @@ pub struct ProfileTuning {
     // machine's memory. It never touches a configured limit. `None` leaves
     // the derived value alone.
     pub direct_store_resident_default_cap_bytes: Option<u64>,
+    // The receive buffer of each usenet socket inside a WireGuard tunnel:
+    // the window a news server may fill on one connection before it waits,
+    // so one connection moves at most this much per round trip. A socket
+    // dialled after a change gets the new size; one already open keeps its
+    // own.
+    //
+    // A tunnel holds at most 256 sockets, and each socket holds the buffers
+    // its dial asked for: 2 MiB at the tunnel's own sizes, this profile's
+    // usenet receive buffer plus 64 KiB for a usenet connection. A tunnel
+    // full of the largest of those is the most it can hold: 512 MiB on every
+    // profile, inside what a tunnel is charged when the number of tunnels is
+    // limited. So no usenet socket holds more than 2 MiB: the largest
+    // receive buffer is 2 MiB less the send buffer.
+    pub wireguard_usenet_receive_bytes: usize,
     // What a run whose decode window is wider than the profile's ceiling
     // gets.
     pub over_limit: OverLimit,
@@ -109,6 +124,7 @@ struct ProfileRow {
     max_concurrent_extractions: usize,
     par3_memory: MemoryShare,
     direct_store_resident_default_cap_bytes: Option<u64>,
+    wireguard_usenet_receive_bytes: usize,
     over_limit: OverLimit,
 }
 
@@ -126,9 +142,10 @@ const TABLE: [ProfileRow; 3] = [
         max_concurrent_extractions: 2,
         par3_memory: MemoryShare {
             divisor: 16,
-            cap_bytes: 256 * MIB,
+            cap_bytes: 128 * MIB,
         },
         direct_store_resident_default_cap_bytes: Some(256 * MIB),
+        wireguard_usenet_receive_bytes: 256 * KIB,
         over_limit: OverLimit::ScratchThenFail,
     },
     ProfileRow {
@@ -142,9 +159,10 @@ const TABLE: [ProfileRow; 3] = [
         max_concurrent_extractions: 4,
         par3_memory: MemoryShare {
             divisor: 8,
-            cap_bytes: GIB,
+            cap_bytes: 512 * MIB,
         },
         direct_store_resident_default_cap_bytes: None,
+        wireguard_usenet_receive_bytes: MIB as usize,
         over_limit: OverLimit::ScratchThenRam,
     },
     ProfileRow {
@@ -158,9 +176,10 @@ const TABLE: [ProfileRow; 3] = [
         max_concurrent_extractions: 6,
         par3_memory: MemoryShare {
             divisor: 8,
-            cap_bytes: 2 * GIB,
+            cap_bytes: GIB,
         },
         direct_store_resident_default_cap_bytes: None,
+        wireguard_usenet_receive_bytes: 2 * MIB as usize - 64 * KIB,
         over_limit: OverLimit::ScratchThenRam,
     },
 ];
@@ -309,6 +328,7 @@ impl HardwareProfile {
                 Self::Performance => None,
             },
             direct_store_resident_default_cap_bytes: row.direct_store_resident_default_cap_bytes,
+            wireguard_usenet_receive_bytes: row.wireguard_usenet_receive_bytes,
             over_limit: row.over_limit,
         }
     }

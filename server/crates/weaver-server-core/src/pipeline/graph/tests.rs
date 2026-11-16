@@ -92,6 +92,10 @@ async fn decode_as(
     let offset = ordinal as usize * ARTICLE;
     let crc = par2_rs::checksum::crc32(&body);
     let len = body.len() as u64;
+    // The article arrives and the loop hands it on, as a lane's result is:
+    // its bytes count on the volume from arrival and are the credit its
+    // writes take.
+    let credit = pipeline.begin_hand_on_for_test(job_id, len);
     pipeline
         .handle_decode_success(
             DecodeResult {
@@ -120,11 +124,15 @@ async fn decode_as(
                 }],
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
+    pipeline.end_hand_on_for_test(job_id, credit);
 }
 
 async fn decode_all(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], index: u32) {
@@ -438,6 +446,108 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     );
     assert_eq!(read(&working_dir.join("lantern.bin")), data);
     assembly_wrote_nothing(&pipeline, job_id, 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// Where the articles of a recovery volume past its head wait: raised into
+// the download queue as recovery, or parked in the recovery queue.
+fn volume_raised(pipeline: &Pipeline, job_id: JobId, posts: &[Post], index: u32) -> Option<bool> {
+    let active = pipeline.jobs[&job_id].articles.active().unwrap();
+    let count = posts[index as usize].articles(ARTICLE).count() as u32;
+    let raised = (1..count).all(|ordinal| {
+        let id = segment_id(job_id, index, ordinal);
+        active.download_queue.count_matching(|work| {
+            work.segment_id == id && work.is_recovery && work.completion_critical
+        }) == 1
+    });
+    let parked = (1..count).all(|ordinal| {
+        let id = segment_id(job_id, index, ordinal);
+        active
+            .recovery_queue
+            .count_matching(|work| work.segment_id == id)
+            == 1
+    });
+    match (raised, parked) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
+// An article lost while the payload still comes raises the one recovery
+// volume its slice needs at once, the smallest, and leaves the others
+// parked; it arrives beside the payload, and the first repair, once the
+// payload is in, finds its block in hand and rebuilds the slice.
+#[tokio::test]
+async fn a_lost_article_raises_its_recovery_before_the_payload_is_in() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_041);
+    let data = payload(8 * ARTICLE, 41);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_volumes("lantern", &[("lantern.bin", &data)], 7, 3));
+    assert_eq!(posts.len(), 5, "the payload, the index and three volumes");
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    for volume in 2..5 {
+        decode(&mut pipeline, job_id, &posts, volume, 0, true).await;
+    }
+    // The articles either side of the one to be lost, which place it.
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    decode(&mut pipeline, job_id, &posts, 0, 2, true).await;
+    for volume in 2..5 {
+        assert_eq!(
+            volume_raised(&pipeline, job_id, &posts, volume),
+            Some(false),
+            "nothing lost, volume {volume} parked"
+        );
+    }
+
+    // The loss: the smallest volume is raised now, the payload still
+    // coming, nothing ruled.
+    pipeline.book_terminal_segment(segment_id(job_id, 0, 1), SegmentTerminalState::Missing);
+    let raised: Vec<u32> = (2..5)
+        .filter(|volume| {
+            let at = volume_raised(&pipeline, job_id, &posts, *volume);
+            assert!(at.is_some(), "volume {volume} wholly raised or parked");
+            at == Some(true)
+        })
+        .collect();
+    let blocks = |volume: &u32| posts[*volume as usize].articles(ARTICLE).count();
+    let smallest = (2..5).map(|volume| blocks(&volume)).min().unwrap();
+    assert_eq!(raised.len(), 1, "one block wanted, one volume raised");
+    assert_eq!(blocks(&raised[0]), smallest, "the smallest volume");
+    assert!(!pipeline.graph_jobs[&job_id].repair_out());
+    assert_eq!(
+        pipeline
+            .graph_jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .recovery_summary()[0]
+            .outcome,
+        None
+    );
+
+    // The raised volume arrives beside the rest of the payload; the first
+    // repair rebuilds.
+    let volume = raised[0];
+    for ordinal in 1..blocks(&volume) as u32 {
+        decode(&mut pipeline, job_id, &posts, volume, ordinal, true).await;
+    }
+    for ordinal in 3..8 {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    hear_repair(&mut pipeline, job_id).await;
+    let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
+    assert_eq!(
+        job.recovery_summary()[0].outcome,
+        Some(RepairOutcome::Repaired { slices: 1 })
+    );
+    assert!(job.namespace().is_clean());
+    for other in (2..5).filter(|other| *other != volume) {
+        assert_eq!(volume_raised(&pipeline, job_id, &posts, other), Some(false));
+    }
+    assert_eq!(read(&working_dir.join("lantern.bin")), data);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1228,7 +1338,7 @@ async fn an_archive_handed_to_its_engine_writes_what_the_engine_read() {
     }
     // The volumes are the engine's input, not files of the job.
     assert!(job.member_files().is_empty());
-    assert_eq!(job.phase(), RootPhase::Done);
+    assert_eq!(job.checked_phase(), RootPhase::Done);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1485,7 +1595,10 @@ async fn an_engine_waits_at_a_damaged_article_until_its_repair_and_reads_it_once
         started,
         "never retracted"
     );
-    assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
+    assert_eq!(
+        pipeline.graph_jobs[&job_id].checked_phase(),
+        RootPhase::Done
+    );
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1518,11 +1631,15 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
         .expect("the member read again has a file");
     assert_ne!(written, echoed);
     assert_eq!(read(&written), body);
-    assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
+    assert_eq!(
+        pipeline.graph_jobs[&job_id].checked_phase(),
+        RootPhase::Done
+    );
     retire_pipeline_database(pipeline).await;
 }
 
 mod refusals;
+mod threads;
 
 // The articles of a recovery volume's head: enough for its first recovery
 // packet to pass, which is what tells the PAR2 object what the volume is.
@@ -1946,8 +2063,11 @@ async fn decode_declaring(
                 }],
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;

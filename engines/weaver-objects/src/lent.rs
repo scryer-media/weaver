@@ -138,8 +138,9 @@ impl sevenz_turbo::WindowAllocator for Lender {
 }
 
 // The 7z decoder's limits for a run: the memory the run was granted, or the
-// decoder's own limits when none was. Without a lender that is all, as it
-// always was.
+// decoder's own limits when none was. The end header, which the reader
+// buffers whole at the size the archive's first bytes state, is held to the
+// same memory. Without a lender that is all, as it always was.
 //
 // With a lender, every decode buffer over the window the run was granted (a
 // dictionary, a PPMd arena, a threaded LZMA2 worker's buffer) is borrowed,
@@ -149,8 +150,10 @@ impl sevenz_turbo::WindowAllocator for Lender {
 // decoded side by side, borrows several windows at once (`sevenz_threads`).
 pub(crate) fn sevenz(budget: &Budget) -> sevenz_turbo::ArchiveLimits {
     let own = sevenz_turbo::ArchiveLimits::default();
+    let memory = budget.memory_or(own.memory_limit_bytes);
     let limits = sevenz_turbo::ArchiveLimits {
-        memory_limit_bytes: budget.memory_or(own.memory_limit_bytes),
+        memory_limit_bytes: memory,
+        max_end_header_bytes: memory.min(own.max_end_header_bytes),
         ..own
     };
     let Some(lender) = Lender::of(budget) else {

@@ -239,6 +239,7 @@ fn archive_seeded(db: &Database, id: u64, name: &str, metadata: Option<String>) 
             completed_at: 2,
             metadata,
             server_attribution: None,
+            archived_at: None,
         },
     )
     .expect("archive job");
@@ -269,6 +270,7 @@ fn plain_local() -> sanitize::LocalNames {
         home_dir: None,
         user: None,
         hostname: None,
+        volumes: Vec::new(),
     }
 }
 
@@ -354,6 +356,7 @@ async fn a_package_takes_its_names_from_one_read() {
             "queue.json",
             &serde_json::json!({
                 "category": CATEGORY,
+                "downloadWaitReason": format!("login_refused:{PROVIDER}:563"),
                 "metadata": [
                     { "key": "tvdb_id", "value": "81189" },
                     { "key": "request", "value": HISTORY_ATTRIBUTE },
@@ -400,7 +403,7 @@ async fn a_package_takes_its_names_from_one_read() {
     let member = |name: &str| member_text(&members, name);
     let log = member("weaver.log");
     assert!(
-        log.contains("INFO job-17 wrote job-17/file-1.part01.rar\n"),
+        log.contains("INFO job-17 wrote job-17.part01.rar\n"),
         "{log}"
     );
     assert!(
@@ -413,7 +416,7 @@ async fn a_package_takes_its_names_from_one_read() {
         "{rotated}"
     );
     assert!(
-        rotated.contains("extracted job-17/file-2.mkv to dir-1/x\n"),
+        rotated.contains("extracted job-17/file-1.mkv to dir-1/name-1\n"),
         "{rotated}"
     );
     // A category or metadata value is replaced where it is a whole value.
@@ -421,6 +424,9 @@ async fn a_package_takes_its_names_from_one_read() {
     for stand_in in ["category-5", "job-17/meta-1", "job-23/meta-1"] {
         assert!(queue.contains(&format!("\"{stand_in}\"")), "{queue}");
     }
+    // A job waiting on a server refusing the login names the server by its
+    // stand-in.
+    assert!(queue.contains("\"login_refused:provider-3\""), "{queue}");
 
     // The manifest counts the whole history.
     let manifest: archive::Manifest =
@@ -959,6 +965,7 @@ async fn an_answering_pipeline_writes_its_own_snapshot() {
             max_download_speed: None,
             cleanup_after_extract: None,
             delete_failed_job_files: None,
+            history_retention_days: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
@@ -1033,6 +1040,22 @@ fn database_manifest_errors(members: &[(String, Vec<u8>)]) -> usize {
         .count()
 }
 
+fn synthetic_tables() -> database_facts::TableOutcome {
+    use weaver_server_core::jobs::diagnostic_tables::DiagnosticTableSize;
+    database_facts::TableOutcome::Read(vec![
+        DiagnosticTableSize {
+            table: "job_events".to_string(),
+            rows_upper_bound: Some(1_250_000),
+            rows_estimated_at_last_analyze: Some(1_100_000),
+        },
+        DiagnosticTableSize {
+            table: "settings".to_string(),
+            rows_upper_bound: None,
+            rows_estimated_at_last_analyze: None,
+        },
+    ])
+}
+
 fn synthetic_database_sizes() -> weaver_server_core::persistence::connection::SqliteFileSizes {
     use weaver_server_core::persistence::connection::{SqliteFileSize, SqliteFileSizes};
     SqliteFileSizes {
@@ -1059,6 +1082,7 @@ async fn database_facts_keep_what_was_read_and_name_what_was_not() {
     let members = archive_through_the_pass(database_facts::database_components(
         &synthetic_database_sizes(),
         &pages,
+        &synthetic_tables(),
     ))
     .await;
 
@@ -1071,6 +1095,21 @@ async fn database_facts_keep_what_was_read_and_name_what_was_not() {
     assert_eq!(database["files"]["shm"]["state"], "unreadable");
     assert_eq!(database["page_size"], 4096);
     assert!(database["page_count"].is_null());
+    assert_eq!(
+        database["tables"],
+        serde_json::json!([
+            {
+                "table": "job_events",
+                "rows_upper_bound": 1_250_000,
+                "rows_estimated_at_last_analyze": 1_100_000,
+            },
+            {
+                "table": "settings",
+                "rows_upper_bound": null,
+                "rows_estimated_at_last_analyze": null,
+            },
+        ])
+    );
     assert_eq!(database["freelist_count"], 12);
     assert_eq!(database["journal_mode"], "wal");
     assert_eq!(
@@ -1094,16 +1133,25 @@ async fn database_facts_keep_what_was_read_and_name_what_was_not() {
 // with `timed_out`, and the package is built.
 #[tokio::test]
 async fn a_stalled_database_still_leaves_its_file_sizes() {
-    let never_answers = std::future::pending();
-    let components =
-        database_facts::collect_within(synthetic_database_sizes(), never_answers, Duration::ZERO)
-            .await;
+    let components = database_facts::collect_within(
+        synthetic_database_sizes(),
+        std::future::pending(),
+        std::future::pending(),
+        Duration::ZERO,
+    )
+    .await;
     let members = archive_through_the_pass(components).await;
 
     let database = package_member_json(&members, database_facts::FILE);
     assert_eq!(database["files"]["database"]["bytes"], 8_192_000);
     assert_eq!(database["files"]["wal"]["state"], "absent");
-    for value in ["page_size", "page_count", "freelist_count", "journal_mode"] {
+    for value in [
+        "page_size",
+        "page_count",
+        "freelist_count",
+        "journal_mode",
+        "tables",
+    ] {
         assert!(database[value].is_null(), "{value}");
     }
     let timed_out = bounded::REASON_TIMED_OUT.to_string();
@@ -1117,10 +1165,11 @@ async fn a_stalled_database_still_leaves_its_file_sizes() {
             ("page_size".to_string(), timed_out.clone()),
             ("page_count".to_string(), timed_out.clone()),
             ("freelist_count".to_string(), timed_out.clone()),
-            ("journal_mode".to_string(), timed_out),
+            ("journal_mode".to_string(), timed_out.clone()),
+            ("tables".to_string(), timed_out),
         ]
     );
-    assert_eq!(database_manifest_errors(&members), 5);
+    assert_eq!(database_manifest_errors(&members), 6);
 }
 
 fn manifest_of(members: &[(String, Vec<u8>)]) -> archive::Manifest {
@@ -1345,7 +1394,11 @@ async fn database_facts_ship_without_the_table_and_drop_error_text() {
         journal_mode: Ok("wal".to_string()),
     });
     let mut components = named_components();
-    components.extend(database_facts::database_components(&sizes, &pages));
+    components.extend(database_facts::database_components(
+        &sizes,
+        &pages,
+        &synthetic_tables(),
+    ));
     let members = archive_without_the_table(components).await;
 
     let database = package_member_json(&members, database_facts::FILE);
@@ -1395,6 +1448,7 @@ async fn an_unknown_journal_mode_does_not_ship_without_the_table() {
     components.extend(database_facts::database_components(
         &synthetic_database_sizes(),
         &pages,
+        &synthetic_tables(),
     ));
     let members = archive_without_the_table(components).await;
 
@@ -1482,20 +1536,27 @@ async fn a_healthy_table_leaves_database_facts_unchanged() {
             journal_mode: Ok("wal".to_string()),
         })
     };
-    let marked = database_facts::database_components(&synthetic_database_sizes(), &pages());
+    let marked = database_facts::database_components(
+        &synthetic_database_sizes(),
+        &pages(),
+        &synthetic_tables(),
+    );
     assert!(
         marked
             .iter()
             .all(|component| component.without_table.is_some())
     );
-    let unmarked: Vec<Component> =
-        database_facts::database_components(&synthetic_database_sizes(), &pages())
-            .into_iter()
-            .map(|component| Component {
-                without_table: None,
-                ..component
-            })
-            .collect();
+    let unmarked: Vec<Component> = database_facts::database_components(
+        &synthetic_database_sizes(),
+        &pages(),
+        &synthetic_tables(),
+    )
+    .into_iter()
+    .map(|component| Component {
+        without_table: None,
+        ..component
+    })
+    .collect();
     let marked = archive_through_the_pass(marked).await;
     let unmarked = archive_through_the_pass(unmarked).await;
     assert_eq!(marked, unmarked);

@@ -835,6 +835,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	if err != nil {
 		log.Fatalf("create full-suite temp root: %v", err)
 	}
+	recordFullRunLockTempRoot(tempRoot)
 
 	phases, err := newFullPhaseContextsFor(tempRoot, options.includePhase)
 	if err != nil {
@@ -1390,6 +1391,7 @@ func runSelfWithEnv(ctx context.Context, phase *fullPhaseContext, command string
 	configureFullPhaseCommandCancellation(cmd)
 	cmd.Dir = e2eDir()
 	cmd.Env = mergeChildEnv(os.Environ(), phase.env())
+	passFullRunLock(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

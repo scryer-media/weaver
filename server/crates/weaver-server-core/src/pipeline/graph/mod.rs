@@ -6,6 +6,7 @@
 
 pub(crate) mod checkpoint;
 pub(crate) mod decoding;
+pub(crate) mod disk;
 pub(crate) mod engine;
 pub(crate) mod envelope;
 pub(crate) mod hardware;
@@ -20,6 +21,7 @@ pub(crate) mod restore;
 pub(crate) mod root;
 pub(crate) mod sparse;
 pub(crate) mod status;
+pub(crate) mod summary;
 pub(crate) mod window;
 
 // The one priority every article of a graph job is queued at. The root is

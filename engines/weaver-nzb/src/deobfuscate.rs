@@ -129,12 +129,12 @@ pub fn is_obfuscated(filename: &str) -> bool {
     if let Some(rest) = bare.strip_prefix("Backup_") {
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 5 {
-            let after = &rest[digits.len()..];
-            if after.starts_with('S')
-                && after.len() >= 6
-                && after[1..3].chars().all(|c| c.is_ascii_digit())
-                && after.as_bytes().get(3) == Some(&b'-')
-                && after[4..6].chars().all(|c| c.is_ascii_digit())
+            let after = &rest.as_bytes()[digits.len()..];
+            if after.len() >= 6
+                && after[0] == b'S'
+                && after[1..3].iter().all(u8::is_ascii_digit)
+                && after[3] == b'-'
+                && after[4..6].iter().all(u8::is_ascii_digit)
             {
                 return true;
             }
@@ -601,6 +601,25 @@ mod tests {
     fn backup_pattern_is_obfuscated() {
         assert!(is_obfuscated("Backup_12345S01-02"));
         assert!(is_obfuscated("Backup_999999S99-99"));
+    }
+
+    #[test]
+    fn backup_pattern_takes_multibyte_characters() {
+        // A character of 2, 3 or 4 bytes where the pattern expects a digit
+        // or the dash is no match, at every position.
+        for name in [
+            "Backup_12345S1é-02",
+            "Backup_12345S12-1é",
+            "Backup_12345S1€-02",
+            "Backup_12345S12-1€",
+            "Backup_12345S12€02",
+            "Backup_12345S𝄞2-02",
+            "Backup_12345S12-𝄞",
+            "Backup_12345Sé",
+        ] {
+            assert!(!is_obfuscated(name), "{name}");
+        }
+        assert!(is_obfuscated("Backup_12345S01-02é"));
     }
 
     #[test]

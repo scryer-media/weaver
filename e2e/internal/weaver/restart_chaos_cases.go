@@ -144,9 +144,9 @@ func nzbFileSubjects(slug string) ([]string, error) {
 }
 
 // C1. The news server starts refusing the account mid-job: every BODY asks
-// for authentication again and every AUTHINFO is refused. With the only
-// server refusing credentials, the queued articles are retired in one sweep
-// and the job settles instead of requeueing.
+// for authentication again and every AUTHINFO is refused. Until its give-up
+// time a refused login is a wait for the server: the job says it waits on
+// it, books no article missing, and completes once the login is taken again.
 func runCredentialsRefusedMidJobSettles(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "single-mkv"
 	segments, err := nzbSegments(slug)
@@ -154,52 +154,71 @@ func runCredentialsRefusedMidJobSettles(ctx *restartCaseContext) (restartCaseRes
 		return restartCaseResult{}, err
 	}
 	ids := segmentIDs(segments)
-	if err := ctx.startWeaverWithOptions("", 8); err != nil {
+	shapes, err := segmentArticleShapes(nntpHost(), nntpPort(), segments)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := setNntpChaos("slow_body=1"); err != nil {
+	const connections = 8
+	if err := ctx.startWeaverWithOptions("", connections); err != nil {
+		return restartCaseResult{}, err
+	}
+	// Ten bodies come through and then every body is held, so the refusal
+	// starts mid-job whatever the machine's speed.
+	const before = 10
+	if _, err := holdAfterBodies(shapes, ids, before, connections); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	served, started, err := ctx.waitForBodies(jobID, ids, 10)
+	served, started, err := ctx.waitForBodies(jobID, ids, before)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
 	if !started {
 		return classifyRestartResult(ctx.Profile, false, "", false, "", "the job ended before the refusal could start"), nil
 	}
-	logBefore, _ := os.ReadFile(ctx.caseLogPath)
 	// The refusal also refuses the harness, so the gate is set and cleared
-	// over one control session that authenticated before it.
-	releaseRefusal, err := holdNntpChaosOnServer(nntpHost(), nntpPort(), "slow_body=1,reauth_body=100,reject_auth=100")
+	// over one control session that authenticated before it. It replaces the
+	// hold, so the bodies the hold caught finish and every later BODY is
+	// refused.
+	releaseRefusal, err := holdNntpChaosOnServer(nntpHost(), nntpPort(), "reauth_body=100,reject_auth=100")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
+	// A refused login is a wait for the server until its give-up time, not a
+	// verdict: the job says it waits on that server, books nothing missing,
+	// and stays in the queue.
+	wait, waitErr := ctx.waitForLoginRefusalWait(jobID, nntpPort())
 	if releaseErr := releaseRefusal(); releaseErr != nil {
 		return restartCaseResult{}, releaseErr
 	}
+	if waitErr != nil {
+		_, _, _, _ = ctx.captureEvidence("pre_timeout", "")
+		return classifyRestartResult(ctx.Profile, false, "", false, "", fmt.Sprintf("the job never reported waiting on the refusing server: %v", waitErr)), nil
+	}
+	// The login is taken again: the server's next recovery probe finds it,
+	// and the job completes from it.
+	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if err != nil {
 		_, _, _, _ = ctx.captureEvidence("pre_timeout", "")
-		return classifyRestartResult(ctx.Profile, false, "", false, "", fmt.Sprintf("the job never settled once credentials were refused: %v", err)), nil
+		return classifyRestartResult(ctx.Profile, false, "", false, "", fmt.Sprintf("the job never completed once the login was taken again: %v", err)), nil
 	}
 	_, _, post, err := ctx.captureEvidence("post_refusal", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	full, _ := os.ReadFile(ctx.caseLogPath)
-	after := string(full[len(logBefore):])
-	jobField := fmt.Sprintf("job_id=%d", jobID)
-	sweeps := countLogLines(after, "no server may fetch these queued articles", jobField)
-	refusals := countLogLines(after, "refusing_credentials=[0]")
+	size, digest, err := singleMKVSource()
+	if err != nil {
+		return restartCaseResult{}, err
+	}
 	final := statuses[jobID]
-	detail := fmt.Sprintf("bodies_before_refusal=%d bodies_total=%d of %d sweep_lines=%d lines_naming_the_refusing_server=%d final=%s",
-		served, totalBodiesFor(post, ids), len(ids), sweeps, refusals, final)
-	pass := sweeps == 1 && final != "COMPLETE" && final != ""
-	return classifyRestartResult(ctx.Profile, pass, "credentials refused mid-job retired the queue in one sweep and the job settled: "+detail, false, "", "credentials refused mid-job: "+detail), nil
+	outputOK := final == "COMPLETE" && deliveredCopy(completeDirOf(caseDBPath(ctx), jobID), size, digest)
+	detail := fmt.Sprintf("bodies_before_refusal=%d bodies_total=%d of %d while_refused={state=%s wait=%q failed_bytes=%d} final=%s output_ok=%t",
+		served, totalBodiesFor(post, ids), len(ids), wait.State, wait.WaitReason, wait.FailedBytes, final, outputOK)
+	pass := wait.State != "FAILED" && wait.FailedBytes == 0 && outputOK
+	return classifyRestartResult(ctx.Profile, pass, "credentials refused mid-job left the job waiting on the server, and it completed once the login was taken: "+detail, false, "", "credentials refused mid-job: "+detail), nil
 }
 
 // C2. The operator stops Weaver while pipelined batches are in flight. The
@@ -212,17 +231,26 @@ func runShutdownMidBatchIsNotAnUncleanBatch(ctx *restartCaseContext) (restartCas
 		return restartCaseResult{}, err
 	}
 	ids := segmentIDs(segments)
-	if err := ctx.startWeaverWithOptions("", 8); err != nil {
+	shapes, err := segmentArticleShapes(nntpHost(), nntpPort(), segments)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := setNntpChaos("slow_body=1"); err != nil {
+	const connections = 8
+	if err := ctx.startWeaverWithOptions("", connections); err != nil {
+		return restartCaseResult{}, err
+	}
+	// Thirty bodies come through and then every body is held mid-transfer,
+	// so the Ctrl-C finds pipelined batches in flight whatever the
+	// machine's speed.
+	const before = 30
+	if _, err := holdAfterBodies(shapes, ids, before, connections); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if _, started, err := ctx.waitForBodies(jobID, ids, 30); err != nil {
+	if _, started, err := ctx.waitForBodies(jobID, ids, before); err != nil {
 		return restartCaseResult{}, err
 	} else if !started {
 		return classifyRestartResult(ctx.Profile, false, "", false, "", "the job ended before the shutdown point"), nil
@@ -232,7 +260,7 @@ func runShutdownMidBatchIsNotAnUncleanBatch(ctx *restartCaseContext) (restartCas
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.interruptWeaverAndWaitForExit(); err != nil {
+	if err := ctx.interruptHeldWeaverAndWaitForExit(liftPrimaryHold); err != nil {
 		return restartCaseResult{}, err
 	}
 	firstRun, _ := os.ReadFile(ctx.caseLogPath)
@@ -312,6 +340,11 @@ func runEarlyGapDoesNotThrottle(ctx *restartCaseContext) (restartCaseResult, err
 	endedFirst := ""
 	servedRest := 0
 	for time.Now().Before(deadline) {
+		// The status is read before the counts. A job that ends between the
+		// two reads is then judged on counts taken after its end, never on
+		// counts from before its last articles were served.
+		status, ended := restartJobStatusFromDB(caseDBPath(ctx), jobID)
+		ended = ended && dbStatusTerminal(normalizeDBStatus(status))
 		metrics, err := fetchNntpBodyMetrics("")
 		if err != nil {
 			return restartCaseResult{}, err
@@ -326,7 +359,7 @@ func runEarlyGapDoesNotThrottle(ctx *restartCaseContext) (restartCaseResult, err
 			everyOther = true
 			break
 		}
-		if status, ok := restartJobStatusFromDB(caseDBPath(ctx), jobID); ok && dbStatusTerminal(normalizeDBStatus(status)) {
+		if ended {
 			endedFirst = normalizeDBStatus(status)
 			break
 		}

@@ -18,6 +18,7 @@ use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Wei
 use super::facts::Packets;
 use super::repair::SetRepair;
 use super::walker::Walker;
+pub(super) use crate::elimination::Length;
 use crate::lost::Lost;
 use crate::recovery_volume;
 
@@ -303,6 +304,8 @@ pub(super) struct Volume {
     pub(super) sets: BTreeSet<[u8; 16]>,
     // The name it was bound under, which a later volume of the set continues.
     pub(super) name: Option<String>,
+    // The volume's length, once known.
+    pub(super) length: Option<u64>,
 }
 
 impl Volume {
@@ -348,21 +351,33 @@ impl Volume {
     }
 
     // The most recovery blocks the volume may still bring: what its name
-    // says it carries, less what was walked. A loss inside it is not counted
-    // against it, so this never falls short of the blocks really there.
-    pub(super) fn left(&self) -> u64 {
+    // says it carries, less what was walked. A name that gives no count
+    // bounds nothing: then it is what the bytes past the walk's front have
+    // room for, `packet` the smallest recovery packet any known set writes,
+    // and with no length or packet known yet no bound is known, `u64::MAX`.
+    // A loss inside it is not counted against it, so this never falls short
+    // of the blocks really there.
+    pub(super) fn left(&self, packet: Option<u64>) -> u64 {
         if self.closed {
             return 0;
         }
-        self.named_blocks
-            .unwrap_or(0)
-            .saturating_sub(self.walked_blocks)
+        match (self.named_blocks, self.length, packet) {
+            (Some(named), _, _) => named.saturating_sub(self.walked_blocks),
+            (None, Some(length), Some(packet)) if packet > 0 => {
+                length.saturating_sub(self.walker.front()).div_ceil(packet)
+            }
+            (None, _, _) => u64::MAX,
+        }
     }
 
     // The fewest recovery blocks the volume will still bring: what is left,
     // less what a lost range could have held. `packet` is the smallest
     // recovery packet any known set writes, so a loss is never undercounted.
+    // A name that gives no count promises none.
     pub(super) fn coming(&self, packet: Option<u64>) -> u64 {
+        if self.named_blocks.is_none() {
+            return 0;
+        }
         let lost: u64 = match packet {
             Some(packet) if packet > 0 => self
                 .lost
@@ -370,9 +385,9 @@ impl Volume {
                 .map(|range| range.len().div_ceil(packet) + 1)
                 .sum(),
             _ if self.lost.is_empty() => 0,
-            _ => self.left(),
+            _ => self.left(packet),
         };
-        self.left().saturating_sub(lost)
+        self.left(packet).saturating_sub(lost)
     }
 }
 
@@ -508,30 +523,5 @@ fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Resu
 fn par2_resource_error(reason: &str) -> par2_rs::Par2Error {
     par2_rs::Par2Error::ResourceLimitExceeded {
         reason: format!("WEAVER_RESOURCE_LIMIT[par2_metadata]: {reason}"),
-    }
-}
-
-// What is known of an unnamed member's length. A member some byte of which
-// decoded knows its length exactly; one none of whose did is only bounded
-// by its post's encoded size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Length {
-    Exact(u64),
-    AtMost(u64),
-}
-
-impl Length {
-    // Whether the member could be a described file of `long`.
-    pub(super) fn fits(self, long: u64) -> bool {
-        match self {
-            Self::Exact(length) => length == long,
-            Self::AtMost(bound) => long <= bound,
-        }
-    }
-
-    pub(super) fn bound(self) -> u64 {
-        match self {
-            Self::Exact(length) | Self::AtMost(length) => length,
-        }
     }
 }

@@ -20,7 +20,7 @@ fn safe_move_uses_rename_without_copy_on_the_same_filesystem() {
         Arc::clone(&counters),
         |src, dst| {
             rename_calls.set(rename_calls.get() + 1);
-            crate::runtime::fs::rename_no_overwrite(src, dst)
+            crate::runtime::fs::place_no_overwrite(src, dst)
         },
         |_, _, _| {
             copy_calls.set(copy_calls.get() + 1);
@@ -86,10 +86,10 @@ fn safe_move_uses_exactly_one_copy_after_cross_device_rename_failure() {
         Arc::clone(&counters),
         |_, _| {
             rename_calls.set(rename_calls.get() + 1);
-            Err(std::io::Error::new(
+            Ok(crate::runtime::fs::Placement::Copy(std::io::Error::new(
                 std::io::ErrorKind::CrossesDevices,
                 "simulated EXDEV",
-            ))
+            )))
         },
         |src, dst, counters| {
             copy_calls.set(copy_calls.get() + 1);
@@ -323,6 +323,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     {
@@ -427,6 +428,7 @@ async fn final_move_refuses_symlink_entries_and_releases_its_empty_destination_c
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap_err();
@@ -467,6 +469,7 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
         }),
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -499,6 +502,7 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -528,6 +532,7 @@ async fn final_move_removes_the_working_directory_with_its_chunk_workspace() {
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -655,6 +660,7 @@ async fn final_move_publishes_the_staged_delivery_without_its_marker_and_joins_s
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -825,6 +831,7 @@ async fn deliver_one_file(pipeline: &Pipeline, job_id: JobId, category: Option<&
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -851,6 +858,9 @@ async fn a_job_stages_on_the_device_its_category_delivers_to() {
     crate::runtime::fs::test_devices::assign(&complete, 2);
     crate::runtime::fs::test_devices::assign(&movies, 3);
     crate::runtime::fs::test_devices::assign(&beside, 1);
+    // The roots read their devices at each look; the pipeline's first looks
+    // came before the devices above were assigned.
+    pipeline.storage_capacity.reread_roots();
     pipeline.config.write().await.categories = vec![
         staging_category("movies", Some(&movies)),
         staging_category("beside", Some(&beside)),
@@ -919,6 +929,9 @@ async fn a_category_change_still_delivers_into_the_new_folder() {
     crate::runtime::fs::test_devices::assign(&complete, 2);
     crate::runtime::fs::test_devices::assign(&movies, 3);
     crate::runtime::fs::test_devices::assign(&shows, 4);
+    // The roots read their devices at each look; the pipeline's first looks
+    // came before the devices above were assigned.
+    pipeline.storage_capacity.reread_roots();
     pipeline.config.write().await.categories = vec![
         staging_category("movies", Some(&movies)),
         staging_category("shows", Some(&shows)),
@@ -986,4 +999,277 @@ async fn a_category_change_still_delivers_into_the_new_folder() {
     let dest = deliver_one_file(&pipeline, started, Some("shows")).await;
     assert_eq!(dest.parent(), Some(shows.as_path()));
     assert!(!staging.exists());
+}
+
+// A directory whose copy found no room after part of it had moved: the move
+// needs room for what is still under it, not for what already left. An
+// entry refused for any other reason, or with nothing removed by a copy,
+// names no figure.
+#[tokio::test]
+async fn a_part_moved_directory_needs_room_for_what_is_left_of_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("season");
+    std::fs::create_dir_all(dir.join("extras")).unwrap();
+    std::fs::write(dir.join("one.bin"), vec![1u8; 700]).unwrap();
+    std::fs::write(dir.join("two.bin"), vec![2u8; 200]).unwrap();
+    std::fs::write(dir.join("extras").join("three.bin"), vec![3u8; 50]).unwrap();
+    let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+    assert_eq!(left_to_copy(&dir, &full).await, 950);
+
+    // The first file moved before the disk filled.
+    std::fs::remove_file(dir.join("one.bin")).unwrap();
+    assert_eq!(left_to_copy(&dir, &full).await, 250);
+    assert_eq!(left_to_copy(&dir.join("two.bin"), &full).await, 200);
+
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert_eq!(left_to_copy(&dir, &denied).await, 0);
+}
+
+// A mount that refuses the link a delivery is placed by, as FUSE, SMB and
+// exFAT mounts do: only a copy can place the file.
+fn links_refused(src: &Path, dst: &Path) -> std::io::Result<Placement> {
+    rename_path_for_publication_with(src, dst, |_, _| {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    })
+}
+
+// The destination volume's writer, on its own thread as outside tests, and
+// a second caller of it.
+fn destination_writer() -> (
+    crate::operations::disk::writer::VolumeWriters,
+    Arc<crate::operations::disk::volume::Volume>,
+    Renames,
+    Arc<crate::operations::disk::writer::Submitter>,
+) {
+    let writers = crate::operations::disk::writer::VolumeWriters::new(|_| {});
+    let volume = Arc::new(crate::operations::disk::volume::Volume::new(
+        None,
+        "complete".into(),
+    ));
+    let renames = Renames::through(writers.submitter(&volume, 1));
+    let other = writers.submitter(&volume, 2);
+    (writers, volume, renames, other)
+}
+
+// What the writer runs for `other` has run.
+fn writer_runs(other: &crate::operations::disk::writer::Submitter) {
+    let (ran, heard) = std::sync::mpsc::channel();
+    other.ask(PathBuf::from("other"), move || {
+        let _ = ran.send(());
+    });
+    heard.recv().expect("the volume's writer ran the operation");
+}
+
+// A delivery that only a copy can place is copied by the mover on its own
+// thread: the destination volume's writer goes on with what else is queued
+// for it while the copy is held, and the move's progress grows as the copy
+// lands, not in one step at its end.
+#[test]
+fn a_delivery_only_a_copy_can_place_is_copied_off_the_volumes_thread() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let complete = temp.path().join("complete");
+    std::fs::create_dir_all(&working).unwrap();
+    std::fs::create_dir_all(&complete).unwrap();
+    let (src, dst) = (working.join("lantern.mkv"), complete.join("lantern.mkv"));
+    let payload: Vec<u8> = (0..3 * 1024 * 1024 + 17)
+        .map(|at| (at % 251) as u8)
+        .collect();
+    std::fs::write(&src, &payload).unwrap();
+    let total = payload.len() as u64;
+    let (writers, volume, renames, other) = destination_writer();
+    let counters = Arc::new(PhaseCounters::default());
+
+    let (started, held_at) = std::sync::mpsc::channel::<u64>();
+    let (gate, gate_heard) = std::sync::mpsc::channel::<()>();
+    let mover = std::thread::spawn({
+        let (src, dst, counters) = (src.clone(), dst.clone(), Arc::clone(&counters));
+        move || {
+            move_path_through_using(
+                Some(&renames),
+                &src,
+                &dst,
+                total,
+                counters,
+                links_refused,
+                move |src, dst, counters| {
+                    let mut hold = Some((started, gate_heard));
+                    move_path_by_copy(src, dst, &mut |copied| {
+                        counters
+                            .completed_bytes
+                            .fetch_add(copied, Ordering::Relaxed);
+                        if let Some((started, gate)) = hold.take() {
+                            let _ = started.send(counters.completed_bytes.load(Ordering::Relaxed));
+                            let _ = gate.recv();
+                        }
+                        Ok(())
+                    })
+                },
+            )
+        }
+    });
+
+    // Without a copy of the mover's own the move ends without reaching the
+    // hold, and the channel closes unanswered.
+    let at_hold = held_at
+        .recv()
+        .expect("the mover copied the file on its own thread");
+    assert!(at_hold > 0 && at_hold < total, "{at_hold} of {total}");
+    writer_runs(&other);
+    assert_eq!(counters.completed_bytes.load(Ordering::Relaxed), at_hold);
+    assert_eq!(std::fs::read(&src).unwrap(), payload);
+
+    gate.send(()).unwrap();
+    mover.join().unwrap().unwrap();
+    assert!(!src.exists());
+    assert_eq!(std::fs::read(&dst).unwrap(), payload);
+    assert_eq!(counters.completed_bytes.load(Ordering::Relaxed), total);
+    drop(other);
+    writers.wait_ended(&volume);
+}
+
+// Through the split, a destination already there is never written over:
+// the move is refused before any copy.
+#[test]
+fn a_delivery_only_a_copy_can_place_never_overwrites_its_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let (src, dst) = (temp.path().join("source.bin"), temp.path().join("dest.bin"));
+    std::fs::write(&src, b"source payload").unwrap();
+    std::fs::write(&dst, b"existing payload").unwrap();
+    let (writers, volume, renames, other) = destination_writer();
+    let copies = std::cell::Cell::new(0usize);
+
+    let error = move_path_through_using(
+        Some(&renames),
+        &src,
+        &dst,
+        14,
+        Arc::new(PhaseCounters::default()),
+        links_refused,
+        |src, dst, counters| {
+            copies.set(copies.get() + 1);
+            move_path_with_copy_fallback(src, dst, counters)
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.0.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(copies.get(), 0);
+    assert_eq!(std::fs::read(&src).unwrap(), b"source payload");
+    assert_eq!(std::fs::read(&dst).unwrap(), b"existing payload");
+    drop((renames, other));
+    writers.wait_ended(&volume);
+}
+
+// Another spelling of the source's own entry is no destination to copy
+// into: nothing is copied, and its only name stays.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_delivery_to_another_spelling_of_its_source_copies_nothing_and_keeps_its_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    let alias = temp.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let (src, dst) = (real.join("payload.bin"), alias.join("payload.bin"));
+    std::fs::write(&src, b"only copy").unwrap();
+    let (writers, volume, renames, other) = destination_writer();
+    let copies = std::cell::Cell::new(0usize);
+
+    move_path_through_using(
+        Some(&renames),
+        &src,
+        &dst,
+        9,
+        Arc::new(PhaseCounters::default()),
+        links_refused,
+        |_, _, _| {
+            copies.set(copies.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(copies.get(), 0);
+    assert_eq!(std::fs::read(&src).unwrap(), b"only copy");
+    drop((renames, other));
+    writers.wait_ended(&volume);
+}
+
+// A move cut off between its link and its unlink finishes through the
+// split: the source's extra name goes, the destination keeps the file, and
+// nothing is copied.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_delivery_cut_off_between_link_and_unlink_finishes_without_a_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let complete = temp.path().join("complete");
+    std::fs::create_dir_all(&working).unwrap();
+    std::fs::create_dir_all(&complete).unwrap();
+    let (src, dst) = (working.join("payload.bin"), complete.join("payload.bin"));
+    std::fs::write(&src, b"linked payload").unwrap();
+    std::fs::hard_link(&src, &dst).unwrap();
+    let (writers, volume, renames, other) = destination_writer();
+    let copies = std::cell::Cell::new(0usize);
+
+    move_path_through_using(
+        Some(&renames),
+        &src,
+        &dst,
+        14,
+        Arc::new(PhaseCounters::default()),
+        links_refused,
+        |_, _, _| {
+            copies.set(copies.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(copies.get(), 0);
+    assert!(!src.exists());
+    assert_eq!(std::fs::read(&dst).unwrap(), b"linked payload");
+    drop((renames, other));
+    writers.wait_ended(&volume);
+}
+
+// A copy that fails part way removes the file it created and nothing else:
+// the destination's other entries and the source stay.
+#[test]
+fn a_delivery_copy_that_fails_removes_only_the_file_it_created() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let complete = temp.path().join("complete");
+    std::fs::create_dir_all(&working).unwrap();
+    std::fs::create_dir_all(&complete).unwrap();
+    let (src, dst) = (working.join("lantern.mkv"), complete.join("lantern.mkv"));
+    let neighbour = complete.join("neighbour.mkv");
+    let payload = vec![7u8; 2 * 1024 * 1024 + 3];
+    std::fs::write(&src, &payload).unwrap();
+    std::fs::write(&neighbour, b"another job's file").unwrap();
+    let (writers, volume, renames, other) = destination_writer();
+
+    let error = move_path_through_using(
+        Some(&renames),
+        &src,
+        &dst,
+        payload.len() as u64,
+        Arc::new(PhaseCounters::default()),
+        links_refused,
+        |src, dst, _| {
+            // The disk fills once the first piece has landed.
+            move_path_by_copy(src, dst, &mut |_| {
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            })
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.1.kind(), std::io::ErrorKind::StorageFull);
+    assert!(!dst.exists(), "the copy's own file was removed");
+    assert_eq!(std::fs::read(&neighbour).unwrap(), b"another job's file");
+    assert_eq!(std::fs::read(&src).unwrap(), payload);
+    drop((renames, other));
+    writers.wait_ended(&volume);
 }

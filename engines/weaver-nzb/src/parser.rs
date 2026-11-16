@@ -260,6 +260,7 @@ fn visit_nzb_files<R: BufRead>(
     let mut meta_title: Option<String> = None;
     let mut meta_password: Option<String> = None;
     let mut meta_passwords = Vec::new();
+    let mut seen_passwords = HashSet::<String>::new();
     let mut meta_tags: Vec<(String, String)> = Vec::new();
 
     // File accumulation
@@ -431,9 +432,12 @@ fn visit_nzb_files<R: BufRead>(
                             if key.eq_ignore_ascii_case("title") {
                                 meta_title = Some(text_buf.trim().to_owned());
                             } else if key.eq_ignore_ascii_case("password") {
+                                #[cfg(test)]
+                                tests::PASSWORD_PROBES.with(|n| n.set(n.get() + 1));
                                 if !text_buf.trim().is_empty()
-                                    && !meta_passwords.contains(&text_buf)
+                                    && !seen_passwords.contains(text_buf.as_str())
                                 {
+                                    seen_passwords.insert(text_buf.clone());
                                     if meta_password.is_none() {
                                         meta_password = Some(text_buf.clone());
                                     }
@@ -445,9 +449,15 @@ fn visit_nzb_files<R: BufRead>(
                         }
                     }
                     "group" if current_file.is_some() => {
+                        // A group name is one word on the command line it is
+                        // sent in, so whitespace or a control character inside
+                        // one is no group, as an empty one is.
                         let group = text_buf.trim();
                         if let Some(ref mut f) = current_file
                             && !group.is_empty()
+                            && !group
+                                .bytes()
+                                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
                         {
                             f.groups.push(group.to_owned());
                         }
@@ -949,6 +959,12 @@ impl SegmentBuilder {
             return Some("missing message id");
         }
 
+        // A message-ID is written into a command line, so a line break or any
+        // other control character inside one makes it no message-ID.
+        if message_id.bytes().any(|byte| byte.is_ascii_control()) {
+            return Some("control character in message id");
+        }
+
         None
     }
 }
@@ -976,6 +992,91 @@ mod tests {
         assert_eq!(nzb.meta.password.as_deref(), Some("1"));
         assert_eq!(nzb.meta.passwords, ["1", "true", "  synthetic & <key> Ω  "]);
         assert!(!format!("{:?}", nzb.meta).contains("synthetic"));
+    }
+
+    thread_local! {
+        /// Password elements the parser checked against the passwords it
+        /// already holds, one set probe each.
+        pub(super) static PASSWORD_PROBES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// The pairwise deduplication the parser used before the set: each
+    /// password is compared with every kept one. Returns the first password,
+    /// the list and the string comparisons made.
+    fn reference_password_dedup(texts: &[String]) -> (Option<String>, Vec<String>, usize) {
+        let mut first = None;
+        let mut list: Vec<String> = Vec::new();
+        let mut comparisons = 0usize;
+        for text in texts {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let mut found = false;
+            for kept in &list {
+                comparisons += 1;
+                if kept == text {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                if first.is_none() {
+                    first = Some(text.clone());
+                }
+                list.push(text.clone());
+            }
+        }
+        (first, list, comparisons)
+    }
+
+    fn nzb_with_passwords(texts: &[String]) -> String {
+        let mut head = String::from("  <head>\n");
+        for text in texts {
+            writeln!(head, "    <meta type=\"password\">{text}</meta>").unwrap();
+        }
+        head.push_str("  </head><file");
+        std::str::from_utf8(MINIMAL_NZB)
+            .unwrap()
+            .replace("  <file", &head)
+    }
+
+    #[test]
+    fn password_dedup_matches_pairwise_reference_with_one_probe_each() {
+        // Seeded inputs: repeats, whitespace-only entries, entries that differ
+        // only by surrounding whitespace, and many distinct entries.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..8 {
+            let count = 50 + round * 40;
+            let texts: Vec<String> = (0..count)
+                .map(|_| match next() % 6 {
+                    0 => "   ".to_owned(),
+                    1 => format!(" pw{} ", next() % 16),
+                    _ => format!("pw{}", next() % 64),
+                })
+                .collect();
+            let (first, list, _) = reference_password_dedup(&texts);
+            let nzb = parse_nzb(nzb_with_passwords(&texts).as_bytes()).unwrap();
+            assert_eq!(nzb.meta.password, first, "round {round}");
+            assert_eq!(nzb.meta.passwords, list, "round {round}");
+        }
+
+        // Many distinct passwords: the pairwise reference compares each with
+        // every earlier one; the parser probes its set once per element.
+        let distinct: Vec<String> = (0..2_000).map(|i| format!("pw{i}")).collect();
+        let (first, list, comparisons) = reference_password_dedup(&distinct);
+        assert_eq!(comparisons, 2_000 * 1_999 / 2);
+        PASSWORD_PROBES.with(|n| n.set(0));
+        let nzb = parse_nzb(nzb_with_passwords(&distinct).as_bytes()).unwrap();
+        assert_eq!(PASSWORD_PROBES.with(std::cell::Cell::get), 2_000);
+        assert_eq!(nzb.meta.password, first);
+        assert_eq!(nzb.meta.passwords, list);
     }
 
     #[test]
@@ -1765,6 +1866,194 @@ mod tests {
         assert_eq!(segments[1].message_ids, ["second"]);
         assert_eq!(diagnostics.files[0].duplicate_segment_numbers, 2);
     }
+
+    #[test]
+    fn command_breaking_groups_are_no_groups() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="s">
+    <groups>
+      <group>alt.binaries.test&#13;&#10;QUIT</group>
+      <group>alt.binaries.a&#10;b</group>
+      <group>alt.binaries.a&#13;b</group>
+      <group>alt.binaries.a&#9;b</group>
+      <group>alt.binaries.a b</group>
+      <group>alt.binaries.a&#127;b</group>
+      <group>  alt.binaries.kept  </group>
+      <group>alt.binaries&nbsp;caf&eacute;</group>
+    </groups>
+    <segments>
+      <segment bytes="1" number="1">a@host</segment>
+    </segments>
+  </file>
+  <file poster="p" date="0" subject="t">
+    <groups><group>g&#13;&#10;ARTICLE &lt;x@y&gt;</group></groups>
+    <segments>
+      <segment bytes="1" number="1">b@host</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let nzb = parse_nzb(xml).unwrap();
+        assert_eq!(
+            nzb.files[0].groups,
+            ["alt.binaries.kept", "alt.binaries\u{a0}caf\u{e9}"]
+        );
+        // A file whose only group breaks the command line is a file with no
+        // group, as a file whose only group is empty is.
+        assert!(nzb.files[1].groups.is_empty());
+        assert_eq!(nzb.files[1].segments.len(), 1);
+    }
+
+    #[test]
+    fn command_breaking_message_ids_are_malformed_segments() {
+        let xml = "<?xml version=\"1.0\"?>
+<nzb>
+  <file poster=\"p\" date=\"0\" subject=\"s\">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes=\"1\" number=\"1\">a@host&#13;&#10;QUIT</segment>
+      <segment bytes=\"1\" number=\"2\">&lt;b@host&gt;&#13;&#10;GROUP x</segment>
+      <segment bytes=\"1\" number=\"3\">c@ho&#10;st</segment>
+      <segment bytes=\"1\" number=\"4\">d@ho&#13;st</segment>
+      <segment bytes=\"1\" number=\"5\">e@ho&#9;st</segment>
+      <segment bytes=\"1\" number=\"6\">f@ho\tst</segment>
+      <segment bytes=\"1\" number=\"7\">g@ho&#127;st</segment>
+      <segment bytes=\"1\" number=\"8\">  &lt;kept@host&gt;  </segment>
+      <segment bytes=\"1\" number=\"9\">with space@host</segment>
+      <segment bytes=\"1\" number=\"10\">caf\u{e9}@h\u{f4}st</segment>
+    </segments>
+  </file>
+</nzb>";
+        let (nzb, diagnostics) = parse_nzb_with_diagnostics(xml.as_bytes()).unwrap();
+        let file = &nzb.files[0];
+        assert_eq!(
+            file.segments
+                .iter()
+                .map(|segment| (segment.number, segment.message_id()))
+                .collect::<Vec<_>>(),
+            [
+                (8, "kept@host"),
+                (9, "with space@host"),
+                (10, "caf\u{e9}@h\u{f4}st")
+            ]
+        );
+        assert_eq!(diagnostics.files[0].malformed_segments, 7);
+    }
+
+    // What a parse produced, as plain values: per file, its groups and, per
+    // segment, its number, size and message-IDs.
+    fn parse_summary(xml: &[u8]) -> String {
+        let (nzb, diagnostics) = parse_nzb_with_diagnostics(xml).unwrap();
+        let mut out = String::new();
+        for (file, notes) in nzb.files.iter().zip(&diagnostics.files) {
+            write!(
+                out,
+                "{:?}|{:?}|{}|",
+                file.subject, file.groups, notes.malformed_segments
+            )
+            .unwrap();
+            for segment in &file.segments {
+                write!(
+                    out,
+                    "{}:{}:{:?},",
+                    segment.number, segment.bytes, segment.message_ids
+                )
+                .unwrap();
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn ordinary_nzbs_parse_as_before() {
+        let entities: &[u8] = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p&amp;q" date="0" subject="Title &amp; More - &quot;file.rar&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="1" number="1">&lt;abc@host&gt;</segment></segments>
+  </file>
+</nzb>"#;
+        let namespaced: &[u8] = br#"<?xml version="1.0"?>
+<n:nzb xmlns:n="http://www.newzbin.com/DTD/2003/nzb">
+  <n:file poster="p" date="0" subject="namespaced.bin">
+    <n:groups><n:group>alt.binaries.test</n:group></n:groups>
+    <n:segments><n:segment bytes="1" number="1">id@example</n:segment></n:segments>
+  </n:file>
+</n:nzb>"#;
+        let malformed: &[u8] = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="mixed-segments.bin">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="bad" number="1">bad-bytes</segment>
+      <segment bytes="1" number="bad">bad-number</segment>
+      <segment bytes="0" number="2">zero-bytes</segment>
+      <segment bytes="1" number="0">zero-number</segment>
+      <segment bytes="33554433" number="3">too-large</segment>
+      <segment bytes="1">missing-number</segment>
+      <segment number="4">missing-bytes</segment>
+      <segment bytes="1" number="5"></segment>
+      <segment bytes="42" number="6">valid</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let duplicates: &[u8] = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="duplicates.bin">
+    <groups>
+      <group>g</group>
+      <group>  alt.binaries&nbsp;caf&eacute;  </group>
+      <group>   </group>
+    </groups>
+    <segments>
+      <segment bytes="3" number="3">third</segment>
+      <segment bytes="1" number="1">same-id</segment>
+      <segment bytes="2" number="1">duplicate-number</segment>
+      <segment bytes="2" number="2">same-id</segment>
+      <segment bytes="100" number="100">
+        &lt;sparse@host&gt;
+      </segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let fixtures: [(&str, &[u8]); 6] = [
+            ("minimal", MINIMAL_NZB),
+            ("full", FULL_NZB),
+            ("entities", entities),
+            ("namespaced", namespaced),
+            ("malformed", malformed),
+            ("duplicates", duplicates),
+        ];
+        let mut all = String::new();
+        for (name, xml) in fixtures {
+            writeln!(all, "== {name}").unwrap();
+            all.push_str(&parse_summary(xml));
+        }
+        assert_eq!(all, ORDINARY_NZB_SUMMARY);
+    }
+
+    // The parse of the ordinary NZBs above.
+    const ORDINARY_NZB_SUMMARY: &str = concat!(
+        "== minimal\n",
+        "\"test file - \\\"movie.part01.rar\\\" yEnc (1/5)\"|[\"alt.binaries.test\"]|0|",
+        "1:500000:[\"abc123@example.com\"],\n",
+        "== full\n",
+        "\"Title - [01/10] - \\\"file.rar\\\" yEnc (1/5)\"|[\"alt.binaries.test\"]|0|",
+        "1:500000:[\"abc123@example.com\"],2:500000:[\"def456@example.com\"],\n",
+        "\"Title - [02/10] - \\\"file.r00\\\" yEnc (1/3)\"|",
+        "[\"alt.binaries.test\", \"alt.binaries.misc\"]|0|1:300000:[\"ghi789@example.com\"],\n",
+        "== entities\n",
+        "\"Title & More - \\\"file.rar\\\" yEnc (1/1)\"|[\"alt.binaries.test\"]|0|",
+        "1:1:[\"abc@host\"],\n",
+        "== namespaced\n",
+        "\"namespaced.bin\"|[\"alt.binaries.test\"]|0|1:1:[\"id@example\"],\n",
+        "== malformed\n",
+        "\"mixed-segments.bin\"|[\"g\"]|7|0:1:[\"zero-number\"],6:42:[\"valid\"],\n",
+        "== duplicates\n",
+        "\"duplicates.bin\"|[\"g\", \"alt.binaries\\u{a0}café\"]|0|",
+        "1:1:[\"same-id\", \"duplicate-number\"],3:3:[\"third\"],100:100:[\"sparse@host\"],\n",
+    );
 
     #[test]
     fn duplicate_segment_message_ids_are_skipped() {

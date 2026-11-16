@@ -1060,7 +1060,7 @@ const TEST_CRYPT_KDF_LG2: u8 = 4;
 // cross-check the conventional path (`persist_rar_volume_facts`) holds the
 // layout against — so the realistic fixture states it.
 fn build_test_rar4_end_header_numbered(more_volumes: bool, volume: u16) -> Vec<u8> {
-    let mut flags: u16 = 0x0004; // VOLUME_NUMBER
+    let mut flags: u16 = 0x0008; // VOLUME_NUMBER
     if more_volumes {
         flags |= 0x0001; // NEXT_VOLUME
     }

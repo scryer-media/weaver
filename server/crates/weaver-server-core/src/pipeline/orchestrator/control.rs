@@ -95,13 +95,14 @@ impl Pipeline {
         // stand, then the rest in queue order, so the jobs that download
         // start while the rest install. A restore out of the window is not
         // installed: its job is read back from the database once it enters.
-        let (tickets, entering, parking) = self.shared_state.queue.write(|inner| {
+        let (tickets, entering, outlines, parking) = self.shared_state.queue.write(|inner| {
             if inner.globals.shutting_down {
-                return Change::unchanged((Vec::new(), Vec::new(), Vec::new()));
+                return Change::unchanged((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
             }
-            // A restore with no stored outline yet installs wherever it
-            // stands, so its row says what it holds; one out of the window
-            // leaves it again at the end of the walk.
+            // A restore with no stored outline yet is taken wherever it
+            // stands, so its row says what it holds: in the window it
+            // installs, and out of it only its outline is read, after which
+            // it waits as its row.
             let enters = |row: &crate::pipeline::queue::JobRow| {
                 (row.intents.restore.is_some() || self.window_parked(row.id))
                     && !self.window_unreadable.contains(&row.id)
@@ -129,10 +130,15 @@ impl Pipeline {
             };
             let mut tickets = Vec::new();
             let mut entering = Vec::new();
+            let mut outlines = Vec::new();
             for position in order {
                 let row = &mut inner.jobs[position];
                 let paused = row.intents.paused == Some(true);
+                // Out of the window, an unread outline is all a restore
+                // reads: the job is not installed to read it.
+                let outline_only = outline_pending(row) && !self.in_queue_window(&ranked, row);
                 match row.intents.restore.take() {
+                    Some(request) if outline_only => outlines.push((request, paused)),
                     Some(request) => tickets.push(paused_restore(request, paused)),
                     None => entering.push((row.id, paused)),
                 }
@@ -163,16 +169,17 @@ impl Pipeline {
                 }
             }
             if parking.is_empty() {
-                Change::unchanged((tickets, entering, parking))
+                Change::unchanged((tickets, entering, outlines, parking))
             } else {
-                Change::changed((tickets, entering, parking))
+                Change::changed((tickets, entering, outlines, parking))
             }
         });
         // A full batch may have left more behind; the next turn looks. While
         // a batch is out the pass stands as it was, and its answer brings the
         // next walk.
         if self.installing.is_empty() {
-            self.restores_waiting = tickets.len() + entering.len() == RESTORE_BATCH;
+            self.restores_waiting =
+                tickets.len() + entering.len() + outlines.len() == RESTORE_BATCH;
             self.queue_walk_due |= self.restores_waiting;
         }
         if !parking.is_empty() {
@@ -187,7 +194,7 @@ impl Pipeline {
                 .get_or_insert_with(|| (Instant::now(), 0))
                 .1 += tickets.len();
         }
-        self.read_install_batch(tickets, entering);
+        self.read_install_batch(tickets, entering, outlines);
         self.note_restore_pass_done();
         let mut deferred = false;
         let admissions = self.shared_state.queue.write(|inner| {
@@ -298,15 +305,18 @@ impl Pipeline {
                     .then_some(*id)
                 })
                 .collect();
-            for id in &ids {
-                self.shared_state.cancel_active_job_work(*id);
-            }
             if !ids.is_empty() {
                 self.start_cancel_jobs(ids, origin);
             }
         }
         for (job_id, intents, apply_pause) in pending {
-            if intents.cancelled.is_some() || !self.jobs.contains_key(&job_id) {
+            if intents.cancelled.is_some() {
+                // A cancelled job's stored resume goes with it: the id may
+                // come back from history before its row is seen to leave.
+                self.resumes_stored.remove(&job_id);
+                continue;
+            }
+            if !self.jobs.contains_key(&job_id) {
                 continue;
             }
             if intents.cancel_post_processing {
@@ -321,9 +331,24 @@ impl Pipeline {
             let mut refused = false;
             if let Some(paused) = intents.paused.filter(|_| apply_pause) {
                 // A resume waits for its slot; the admission pass states the
-                // wait, and the walk after the slot is taken applies it.
+                // wait, and the walk after the slot is taken applies it. The
+                // resume is stored once, as it is asked for, so a restart
+                // before the slot comes keeps it. Its slot is already given
+                // up, so the interrupted-pause marker goes with it, on the
+                // same lane, or a restart would pause it again.
                 if !paused && !self.nzb_admitted.contains(&job_id) {
+                    if self.resumes_stored.insert(job_id) {
+                        self.persist_waiting_resume(job_id);
+                        self.queue_pause_release_write(job_id, false);
+                        self.nzb_pause_releases.remove(&job_id);
+                    }
                     continue;
+                }
+                // A stored resume the job never reached is undone by a
+                // pause, and spent by the resume it waited for.
+                let stored_resume = self.resumes_stored.remove(&job_id);
+                if paused && stored_resume {
+                    self.persist_active_runtime(job_id);
                 }
                 if paused {
                     self.queue_pause_release_write(job_id, true);
@@ -356,6 +381,11 @@ impl Pipeline {
                     }
                     Err(error) => {
                         warn!(job_id = job_id.0, paused, %error, "pipeline refused the job's pause intent");
+                        // A refused resume that was stored as asked is
+                        // stored as the job stands again.
+                        if !paused && stored_resume {
+                            self.persist_active_runtime(job_id);
+                        }
                         if paused {
                             self.queue_pause_release_write(job_id, false);
                         }
@@ -385,7 +415,7 @@ impl Pipeline {
             }
             self.apply_pending_job_update(job_id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.job_mut(job_id) {
+                if let Some(mut row) = inner.job_mut(job_id) {
                     row.report.seen_intent_seq = intents.seq;
                     if refused && row.intents.pause_seq == intents.pause_seq {
                         row.intents.paused = None;
@@ -457,7 +487,7 @@ impl Pipeline {
             }
             self.pending_renames.remove(&id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.job_mut(id)
+                if let Some(mut row) = inner.job_mut(id)
                     && row.intents.rename_to.as_ref() == Some(&name)
                 {
                     row.intents.rename_to = None;
@@ -493,11 +523,12 @@ impl Pipeline {
 
     // Restate the wait reason the rows of the jobs named store.
     fn restate_wait_reasons(&self, ids: impl Iterator<Item = JobId>) {
+        let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
             for id in ids {
-                if let Some(row) = inner.job_mut(id) {
-                    let reason = self.stored_wait_reason(row);
-                    row.report.job.download_wait_reason = reason.map(str::to_owned);
+                if let Some(mut row) = inner.job_mut(id) {
+                    let reason = self.stored_wait_reason(&row, login_refusals);
+                    row.report.job.download_wait_reason = reason.map(std::borrow::Cow::into_owned);
                 }
             }
             Change::changed(())
@@ -506,15 +537,26 @@ impl Pipeline {
 
     // Read a batch of installs off the pipeline thread: the restores a
     // restart handed over, and the jobs entering the window, read back from
-    // their rows first. The batch comes back as a [`DbReply::Installs`].
+    // their rows first, and the outlines of the restores out of the window
+    // that have none, read across the cores. The batch comes back as a
+    // [`DbReply::Installs`].
     fn read_install_batch(
         &mut self,
         tickets: Vec<RestoreJobRequest>,
         entering: Vec<(JobId, bool)>,
+        outlines: Vec<(RestoreJobRequest, bool)>,
     ) {
-        if tickets.is_empty() && entering.is_empty() {
+        if tickets.is_empty() && entering.is_empty() && outlines.is_empty() {
             return;
         }
+        let outlines: Vec<_> = outlines
+            .into_iter()
+            .map(|(request, paused)| {
+                self.installing.insert(request.job_id);
+                (self.install_seat(request.job_id), request, paused)
+            })
+            .collect();
+        let db = self.db.clone();
         let tickets: Vec<_> = tickets
             .into_iter()
             .map(|request| {
@@ -531,20 +573,87 @@ impl Pipeline {
             .collect();
         let loads = self.parked_loads(entering.iter().map(|(id, _, _)| *id).collect());
         let replies = self.db_reply_tx.clone();
+        let rows_db = self.db.clone();
+        // The outlines read on their own: the window's installs reply
+        // without waiting for the slowest of them.
+        if !outlines.is_empty() {
+            let replies = replies.clone();
+            tokio::spawn(async move {
+                let read_db = db.clone();
+                let read = tokio::task::spawn_blocking(move || {
+                    use rayon::prelude::*;
+                    outlines
+                        .into_par_iter()
+                        .map(|(seat, mut request, paused)| {
+                            let read = crate::jobs::service::read_outline(&read_db, &mut request);
+                            (seat, paused, request, read)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .expect("outline read panicked");
+                let mut entries = Vec::with_capacity(read.len());
+                for (seat, paused, request, read) in read {
+                    entries.push(match read {
+                        Ok(()) => crate::jobs::service::InstallEntry::Outlined(request),
+                        // A failed outline is rare: its rows are read alone.
+                        Err(failed) => {
+                            let rows = crate::jobs::service::prefetch_one(&db, &request).await;
+                            crate::jobs::service::InstallEntry::Ticket(
+                                crate::jobs::service::read_install_after(
+                                    seat,
+                                    paused_restore(request, paused),
+                                    Some(failed),
+                                    rows,
+                                )
+                                .await,
+                            )
+                        }
+                    });
+                }
+                let _ = replies.send(crate::pipeline::db_reply::DbReply::Installs(entries));
+            });
+        }
+        if tickets.is_empty() && entering.is_empty() {
+            return;
+        }
         tokio::spawn(async move {
+            let loaded = loads.read().await;
+            // Every row the batch's installs read, in one pass for the batch.
+            let jobs = tickets
+                .iter()
+                .map(|(_, request)| (request.job_id, request.restart.is_some()))
+                .chain(loaded.iter().filter_map(|(job_id, loaded)| match loaded {
+                    Ok(Some(request)) => Some((*job_id, request.restart.is_some())),
+                    _ => None,
+                }))
+                .collect::<Vec<_>>();
+            let mut rows = tokio::task::spawn_blocking(move || {
+                crate::jobs::service::prefetch_installs(&rows_db, &jobs)
+            })
+            .await
+            .expect("install rows read panicked");
+            let mut rows_of = move |job_id: JobId| {
+                rows.remove(&job_id)
+                    .unwrap_or_else(|| Err("its rows were not read".to_string()))
+            };
             let mut entries = Vec::new();
             for (seat, request) in tickets {
+                let rows = rows_of(request.job_id);
                 entries.push(crate::jobs::service::InstallEntry::Ticket(
-                    crate::jobs::service::read_install(seat, request).await,
+                    crate::jobs::service::read_install_after(seat, request, None, rows).await,
                 ));
             }
-            for ((job_id, paused, seat), (_, loaded)) in
-                entering.into_iter().zip(loads.read().await)
-            {
+            for ((job_id, paused, seat), (_, loaded)) in entering.into_iter().zip(loaded) {
                 let read = match loaded {
                     Ok(Some(request)) => Ok(Some(
-                        crate::jobs::service::read_install(seat, paused_restore(request, paused))
-                            .await,
+                        crate::jobs::service::read_install_after(
+                            seat,
+                            paused_restore(request, paused),
+                            None,
+                            rows_of(job_id),
+                        )
+                        .await,
                     )),
                     Ok(None) => Ok(None),
                     Err(error) => Err(error),
@@ -567,6 +676,22 @@ impl Pipeline {
                         restores.push((read, true));
                     }
                 }
+                // Its row states the files read, and the ticket waits in it
+                // again: the next walk parks it, or installs it if it has
+                // entered the window meanwhile.
+                crate::jobs::service::InstallEntry::Outlined(request) => {
+                    let id = request.job_id;
+                    self.installing.remove(&id);
+                    self.shared_state
+                        .queue
+                        .write(|inner| match inner.job_mut(id) {
+                            Some(mut row) => {
+                                crate::pipeline::queue::outline_read(&mut row, request);
+                                Change::changed(())
+                            }
+                            None => Change::unchanged(()),
+                        });
+                }
             }
         }
         if !restores.is_empty() {
@@ -585,7 +710,7 @@ impl Pipeline {
             }
             self.report_job(id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.job_mut(id) {
+                if let Some(mut row) = inner.job_mut(id) {
                     row.report.restoring = false;
                 }
                 Change::changed(())
@@ -682,7 +807,7 @@ impl Pipeline {
             return;
         };
         let update = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.job_mut(job_id) else {
+            let Some(mut row) = inner.job_mut(job_id) else {
                 return Change::unchanged(None);
             };
             let Some(update) = row.intents.update.take() else {
@@ -706,6 +831,35 @@ impl Pipeline {
         }
     }
 
+    // Apply the working directory's storage class and filesystem, learned
+    // after start-up: the tuner's machine takes them, and the backlog limits
+    // sized on the storage class are sized again.
+    pub(in crate::pipeline) fn apply_storage_classification(
+        &mut self,
+        storage_class: crate::runtime::system_profile::StorageClass,
+        filesystem: crate::runtime::system_profile::FilesystemType,
+    ) {
+        self.applied_storage_classification = Some((storage_class.clone(), filesystem.clone()));
+        self.tuner.set_storage(storage_class, filesystem);
+        let profile = self.tuner.system_profile();
+        self.write_backlog_budget_bytes =
+            super::runtime::compute_write_backlog_budget_bytes(profile, self.backlog_base_bytes);
+        self.decode_backlog_budget_bytes = super::runtime::compute_decode_backlog_budget_bytes(
+            profile,
+            self.backlog_base_bytes,
+            self.write_backlog_budget_bytes,
+        );
+        self.uu_spool_max_bytes =
+            super::runtime::compute_uu_spool_max_bytes(self.write_backlog_budget_bytes);
+        info!(
+            storage = ?profile.disk.storage_class,
+            filesystem = ?profile.disk.filesystem,
+            decode_backlog_budget_mb = self.decode_backlog_budget_bytes / (1024 * 1024),
+            write_backlog_budget_mb = self.write_backlog_budget_bytes / (1024 * 1024),
+            "storage classified after start-up"
+        );
+    }
+
     async fn apply_queue_globals(&mut self) {
         let pending = self
             .shared_state
@@ -722,15 +876,55 @@ impl Pipeline {
             self.applied_random_read_iops = Some(iops);
             self.tuner.set_random_read_iops(iops);
         }
-        let write_mbps = self
-            .shared_state
-            .queue
-            .read(|inner| inner.globals.sequential_write_mbps);
-        if let Some(write_mbps) =
-            write_mbps.filter(|mbps| self.applied_sequential_write_mbps != Some(*mbps))
-        {
-            self.applied_sequential_write_mbps = Some(write_mbps);
-            self.tuner.set_sequential_write_mbps(write_mbps);
+        let applied = &self.applied_storage_classification;
+        let storage = self.shared_state.queue.read(|inner| {
+            inner
+                .globals
+                .storage_classification
+                .as_ref()
+                .filter(|storage| applied.as_ref() != Some(*storage))
+                .cloned()
+        });
+        if let Some((storage_class, filesystem)) = storage {
+            self.apply_storage_classification(storage_class, filesystem);
+        }
+        // An extraction writes what it unpacks under the intermediate
+        // directory, or, when the job's destination is on another device, in
+        // its staging directory on the destination's device. Admission is
+        // one limit for every job, so it reads the slowest live write rate
+        // among the volumes of the intermediate directory, the complete
+        // directory and each category's folder. A volume not measured yet
+        // says nothing; none measured is "no figure", applied as such.
+        //
+        // Nothing here looks at a disk or waits: while the settings are being
+        // written the figure in force stays until the next turn.
+        if let Ok(config) = self.config.try_read() {
+            let storage = &self.storage_capacity;
+            let folders: Vec<PathBuf> = config
+                .categories
+                .iter()
+                .map(|category| {
+                    crate::pipeline::queue::destination_root(
+                        &self.complete_dir,
+                        std::slice::from_ref(category),
+                        Some(&category.name),
+                    )
+                })
+                .collect();
+            drop(config);
+            // Each category's folder may be a mount of its own inside the
+            // complete directory: the disk owner is told the folders as
+            // they stand, and reads the device of one it had not heard of
+            // on a thread of its own.
+            storage.set_folders(&folders);
+            let write_mbps = storage.slowest_write_mbps(
+                &[self.intermediate_dir.as_path(), self.complete_dir.as_path()],
+                &folders,
+            );
+            if self.applied_sequential_write_mbps != Some(write_mbps) {
+                self.applied_sequential_write_mbps = Some(write_mbps);
+                self.tuner.set_sequential_write_mbps(write_mbps);
+            }
         }
         let globals = self.shared_state.queue.read(|inner| inner.globals.clone());
         if globals.paused != self.global_paused || globals.scheduled_pause != self.scheduled_pause {
@@ -815,6 +1009,8 @@ impl Pipeline {
             return;
         }
         self.terminal_post_processing_executor.resume();
+        // A job held in its final move stayed held through the pause.
+        self.wake_full_disk();
         let deferred_moves: Vec<_> = self.deferred_moves.drain().collect();
         for job_id in deferred_moves {
             if self.shared_state.queue.read(|inner| {

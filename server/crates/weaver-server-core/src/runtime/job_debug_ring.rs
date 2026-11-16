@@ -8,7 +8,7 @@
 // report fired. The binary installs a tracing layer that feeds every such
 // event carrying a `job_id` field into a small ring per job, and the code that
 // reports a stall calls [`dump`] to write that ring out beside the report, as
-// a short burst of "stall diagnostics" records.
+// one "stall diagnostics" record per episode.
 //
 // A job's ring is replayed once per stall episode. A report names the job's
 // progress, its downloaded wire bytes, and the ring remembers the progress of
@@ -26,10 +26,10 @@
 // the job's runtime is purged, so a process that never stalls pays only the
 // capture itself.
 //
-// A replayed record never repeats the captured event's own line shape. It
-// carries the event's level, target, message and fields as separate
-// `replayed_*` values, so a reader scanning the log for an event's message
-// can tell the event itself from a later replay of it.
+// A replay never repeats the captured event's own record. The episode's one
+// record carries every captured line as text in its `replayed` field, so a
+// reader scanning the log for an event's message can tell the event itself
+// from a later replay of it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -204,11 +204,12 @@ pub fn forget(job_id: u64) {
     }
 }
 
-// Writes the job's ring out at WARN, once per stall episode, and clears it: a
-// header record giving the count, then one record per captured line, so a log
-// viewer shows one row per line. Each record carries the captured event in
-// parts, as `replayed_level`, `replayed_target`, `replayed_message` and
-// `replayed_fields`, never as the event's own rendered line.
+// Writes the job's ring out at WARN, once per stall episode, and clears it,
+// as one record: the count, the first and last capture times, and every
+// captured line in `replayed`, oldest first. A replayed
+// line is a DEBUG or TRACE event, so it is written inside the episode's one
+// record rather than as a WARN record of its own: an episode is one warning,
+// however many lines explain it.
 //
 // Callers are the throttled stall reports, each naming the job's `progress`.
 // Only the first report at a given progress writes; the rest, and any report
@@ -218,28 +219,123 @@ pub fn dump(job_id: u64, progress: u64, reason: &'static str) {
         return;
     };
     let lines = rings.replay(job_id, progress);
-    if lines.is_empty() {
+    let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
         return;
-    }
+    };
     warn!(
         job_id,
         reason,
         lines = lines.len(),
-        "stall diagnostics: {} recent debug lines follow",
-        lines.len()
+        first_at = %first.timestamp(),
+        last_at = %last.timestamp(),
+        replayed = render(&lines).as_str(),
+        "stall diagnostics: the job's recent debug lines"
     );
-    for line in &lines {
-        warn!(
-            job_id,
-            reason,
-            at = %line.timestamp(),
-            replayed_level = %line.event.level,
-            replayed_target = line.event.target,
-            replayed_message = line.event.message.as_str(),
-            replayed_fields = line.event.fields.trim_start(),
-            "stall diagnostics line"
-        );
+}
+
+// The replayed lines as one line of text, oldest first, each `at=.. level=..
+// target=.. message=".."` and its fields, joined by ` | ` so a text log keeps
+// the record on one line. A replay never takes the captured event's own
+// `LEVEL target: message` shape, so a search for an event's message finds
+// the event itself apart from a replay.
+//
+// A record longer than the log delivery limit is dropped on every sink, so
+// the text keeps within [`MAX_REPLAYED_BYTES`]: it keeps the newest lines that
+// fit and opens with how many earlier lines it cut.
+fn render(lines: &[DebugLine]) -> String {
+    render_within(lines, MAX_REPLAYED_BYTES)
+}
+
+// Bytes the replayed text may take once written out. Half the delivery limit
+// leaves the other half for the record's own fields and timestamps.
+const MAX_REPLAYED_BYTES: usize = super::log_delivery::MAX_EVENT_BYTES / 2;
+
+// Room kept for the note naming the cut lines.
+const CUT_NOTE_BYTES: usize = 48;
+
+const SEPARATOR: &str = " | ";
+
+// Ends a line trimmed to fit.
+const TRIMMED_MARK: &str = " [trimmed]";
+
+fn render_within(lines: &[DebugLine], budget: usize) -> String {
+    let budget = budget.saturating_sub(CUT_NOTE_BYTES);
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev() {
+        let piece = render_line(line);
+        let cost = written_len(&piece) + SEPARATOR.len();
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept.push(piece);
     }
+    // The newest line alone is longer than the budget: it is kept trimmed,
+    // at a character boundary, rather than leaving the note alone.
+    if kept.is_empty()
+        && let Some(newest) = lines.last()
+    {
+        let piece = render_line(newest);
+        let room = budget.saturating_sub(SEPARATOR.len() + TRIMMED_MARK.len());
+        let mut end = 0;
+        let mut written = 0;
+        for (at, c) in piece.char_indices() {
+            written += written_len(c.encode_utf8(&mut [0; 4]));
+            if written > room {
+                break;
+            }
+            end = at + c.len_utf8();
+        }
+        let mut trimmed = piece[..end].to_owned();
+        trimmed.push_str(TRIMMED_MARK);
+        used = written_len(&trimmed) + SEPARATOR.len();
+        kept.push(trimmed);
+    }
+    let cut = lines.len() - kept.len();
+    let mut text = String::with_capacity(used + CUT_NOTE_BYTES);
+    if cut > 0 {
+        text.push_str(&format!("{cut} earlier lines cut"));
+    }
+    for piece in kept.iter().rev() {
+        if !text.is_empty() {
+            text.push_str(SEPARATOR);
+        }
+        text.push_str(piece);
+    }
+    text
+}
+
+fn render_line(line: &DebugLine) -> String {
+    let mut text = String::new();
+    text.push_str("at=");
+    text.push_str(&line.timestamp());
+    text.push_str(" level=");
+    text.push_str(line.event.level.as_str());
+    text.push_str(" target=");
+    text.push_str(line.event.target);
+    text.push_str(&format!(" message={:?}", line.event.message));
+    text.push_str(&line.event.fields);
+    text
+}
+
+// The length of `text` once a sink writes it as a quoted debug string. Each
+// character costs what `escape_debug` writes for it: two bytes for a quote
+// or backslash, and `\u{..}` for a control, format or other unprintable
+// character (six bytes for DEL, eight for U+200E). Costed a character at a
+// time, which is never less than the string's own escaping.
+fn written_len(text: &str) -> usize {
+    text.chars()
+        .map(|c| {
+            let escaped = c.escape_debug();
+            // One character out means it is written as itself.
+            if c == '\'' || escaped.len() == 1 {
+                c.len_utf8()
+            } else {
+                escaped.len()
+            }
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -338,6 +434,169 @@ mod tests {
         assert!(rings.replay(6, 10).is_empty(), "nothing new was captured");
         rings.record(6, event("next line"));
         assert_eq!(texts(rings.replay(6, 10)), vec!["next line"]);
+    }
+
+    #[test]
+    fn an_episode_renders_every_line_in_one_text_oldest_first() {
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+        let lines = vec![
+            DebugLine {
+                at,
+                event: CapturedEvent {
+                    fields: " job_id=5 rows=3".to_string(),
+                    ..event("checkpoint written")
+                },
+            },
+            DebugLine {
+                at,
+                event: event("lane parked"),
+            },
+        ];
+
+        let text = render(&lines);
+        let stamp = lines[0].timestamp();
+        assert_eq!(
+            text,
+            format!(
+                "at={stamp} level=DEBUG target=weaver_test message=\"checkpoint written\" \
+                 job_id=5 rows=3 | at={stamp} level=DEBUG target=weaver_test \
+                 message=\"lane parked\""
+            )
+        );
+    }
+
+    #[test]
+    fn a_long_episode_keeps_its_newest_lines_within_the_delivery_limit() {
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+        // Field episodes ran to about 150 lines of about 236 bytes; 400 such
+        // lines with quoted fields is well past the delivery limit.
+        let lines: Vec<DebugLine> = (0..400)
+            .map(|index| DebugLine {
+                at,
+                event: CapturedEvent {
+                    fields: format!(
+                        " job_id=5 lane=3 server=\"news.example\" reason=\"waiting on a connection\" index={index}"
+                    ),
+                    ..event(&format!("line {index} of a long stall episode"))
+                },
+            })
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .map(|line| render_line(line).len())
+                .sum::<usize>()
+                > super::super::log_delivery::MAX_EVENT_BYTES
+        );
+
+        let text = render(&lines);
+
+        assert!(written_len(&text) <= MAX_REPLAYED_BYTES, "{}", text.len());
+        assert!(text.ends_with("index=399"), "the newest line is kept last");
+        let kept = text.split(SEPARATOR).count() - 1;
+        assert!(kept > 0);
+        assert!(
+            text.starts_with(&format!("{} earlier lines cut | ", 400 - kept)),
+            "{}",
+            &text[..80]
+        );
+        let first_kept = 400 - kept;
+        assert!(text.contains(&format!("message=\"line {first_kept} of")));
+        assert!(!text.contains(&format!("message=\"line {} of", first_kept - 1)));
+    }
+
+    // A newest line longer than the budget is kept trimmed at a character
+    // boundary, and only the lines before it count as cut.
+    #[test]
+    fn a_newest_line_longer_than_the_budget_is_trimmed_to_fit() {
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+        let line = |message: &str, fields: String| DebugLine {
+            at,
+            event: CapturedEvent {
+                fields,
+                ..event(message)
+            },
+        };
+        // Multi-byte characters and quotes, so neither a byte cut nor the
+        // escaping can push the text over.
+        let huge = format!(" detail=\"{}\"", "é\"".repeat(MAX_REPLAYED_BYTES));
+        let lines = vec![
+            line("older one", String::new()),
+            line("older two", String::new()),
+            line("the newest", huge),
+        ];
+
+        let text = render(&lines);
+
+        assert!(written_len(&text) <= MAX_REPLAYED_BYTES, "{}", text.len());
+        assert!(
+            text.starts_with("2 earlier lines cut | at="),
+            "{}",
+            &text[..60]
+        );
+        assert!(text.contains("message=\"the newest\""));
+        assert!(text.ends_with(TRIMMED_MARK));
+        assert!(!text.contains("older"));
+
+        // Alone, it is trimmed with no cut note.
+        let text = render(&lines[2..]);
+        assert!(text.starts_with("at="), "{}", &text[..60]);
+        assert!(text.ends_with(TRIMMED_MARK));
+        assert!(written_len(&text) <= MAX_REPLAYED_BYTES);
+    }
+
+    // A character the sink writes as an escape is costed at the escape's
+    // length, so an episode full of them still fits once written.
+    #[test]
+    fn unprintable_characters_are_costed_as_they_are_written() {
+        assert_eq!(written_len("\u{7f}"), 6);
+        assert_eq!(written_len("\u{200e}"), 8);
+        assert_eq!(written_len("\u{1}"), 5);
+        assert_eq!(written_len("\n\"\\"), 6);
+        assert_eq!(written_len("it's é"), 7);
+        for sample in ["\u{7f}", "\u{200e}", "a\u{200e}b\u{7f}\u{1}\t\"é\u{feff}"] {
+            let quoted = format!("{sample:?}");
+            assert!(
+                written_len(sample) >= quoted.len() - 2,
+                "{quoted} is written longer than it was costed"
+            );
+        }
+
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+        let lines: Vec<DebugLine> = (0..200)
+            .map(|index| DebugLine {
+                at,
+                event: CapturedEvent {
+                    fields: format!(" name=\"{}\" index={index}", "\u{200e}\u{7f}".repeat(20)),
+                    ..event("a line of marks and deletes")
+                },
+            })
+            .collect();
+
+        let text = render(&lines);
+
+        // What a sink writes for the text, less its two quotes.
+        let as_written = format!("{text:?}").len() - 2;
+        assert!(as_written <= MAX_REPLAYED_BYTES, "{as_written}");
+        assert!(text.ends_with("index=199"));
+        assert!(text.contains("earlier lines cut | "));
+    }
+
+    #[test]
+    fn a_short_episode_renders_whole_without_a_cut_note() {
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+        let lines: Vec<DebugLine> = (0..3)
+            .map(|index| DebugLine {
+                at,
+                event: event(&format!("line {index}")),
+            })
+            .collect();
+
+        let text = render(&lines);
+
+        let whole: Vec<String> = lines.iter().map(render_line).collect();
+        assert_eq!(text, whole.join(SEPARATOR));
+        assert!(!text.contains("earlier lines cut"));
     }
 
     #[test]

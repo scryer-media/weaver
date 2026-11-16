@@ -173,6 +173,20 @@ fn queue_item_collapses_internal_waiting_states() {
     );
 }
 
+// A job that waits for room on a disk says so in any phase, ahead of the
+// capacity its phase queues it for.
+#[test]
+fn a_job_waiting_for_disk_space_says_so_in_any_phase() {
+    for status in [JobStatus::Downloading, JobStatus::QueuedExtract] {
+        let mut info = base_job(status);
+        info.download_wait_reason =
+            Some(weaver_server_core::jobs::handle::DISK_SPACE_WAIT_REASON.to_string());
+        let item = queue_item_from_job(&info);
+        assert_eq!(item.wait_reason, Some(QueueWaitReason::DiskSpace));
+        assert_eq!(item.download_wait_reason, info.download_wait_reason);
+    }
+}
+
 #[test]
 fn a_partial_job_reads_as_failed() {
     let item = queue_item_from_job(&base_job(JobStatus::Partial));

@@ -10,5 +10,17 @@
     "escapeNames": [
       "../../adv-overlong-escape.txt"
     ]
+  },
+  "expectedOutputBLAKE3": {
+    "..└»..└»adv-overlong-escape.txt": "6fc4e57f056e6a94326753a331f8d9ef4c8d4c2215ee772629ffd89c1964ba74",
+    "COM1.mkv": "5cf96c88ab815950c7d054c5a683b2746c3d3aeccb1569978ae2f785b1f9f5ae",
+    "CON.txt": "6b91c4a98c7db21ad1cfa9b1e1154eb84535c2fca08149e1a2101c4f1452f05d",
+    "LPT1": "a13af80919325fdca84984706e824bf130c774f473f38a7383f7080024083821",
+    "aux.srt": "1b0930dec6f5c608bf2aa3b822bd5e2b965b156456980f688d47e76e20b75860",
+    "control-\u0001\u0007\u001b[31m-name.txt": "70788bdc9a0d9d406f153f2a9b94db2e10b0f1d25ac4fd1b2b85a876a48a3d35",
+    "nul": "0ecf710aaad1bde951e171baa597905cb4946e7162db23222072a07a9b2e17aa",
+    "nul-_-hidden.txt": "b6cf1cb9d1d17dc98dd1da0d8d32c960946831f66673a086a8a8c845a229bd0a",
+    "ordinary.txt": "675371183ad6afaaef9a9bedeb97167b30817dd8417f4aa2716fa28d68306a9b",
+    "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé.txt": "e2ce55589e331dd82f400d17b45053e7f3a194e8e81c6911bd16a224f66e58ec"
   }
 }

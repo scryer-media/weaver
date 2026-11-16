@@ -12,9 +12,9 @@
 // moves every piece after it: their bytes are asked for again, read back
 // from where they were placed, and placed where they go now.
 //
-// The set counts from `.001`, and any piece founds it. A set missing a
-// number, or its first piece, is no file of its own: its pieces go back as
-// they came. A set is one file cut in pieces, so only its first piece starts
+// The set counts from `.001`, or from `.000` when that piece founds it, and
+// any piece founds it (`opening`). A set missing a number, or its first
+// piece, is no file of its own: its pieces go back as they came. A set is one file cut in pieces, so only its first piece starts
 // with a head: a later piece whose front opens on a signature that stands
 // only at a file's head refutes the set, whichever piece came first, and its
 // pieces go back as they came to be claimed by their own bytes, nothing
@@ -42,8 +42,15 @@ use crate::split;
 // The one member: the file the pieces were cut from.
 const MEMBER: MemberId = MemberId(0);
 
-// The number a set's first piece carries.
+// The number a set's first piece carries, unless it is numbered from zero.
 const FIRST: u32 = 1;
+
+// The first piece of the set `piece` founds: `.001`, or `.000` when that is
+// the founder. A founder numbered past one leaves the set its `.001` to
+// miss, so a set without its first piece is no file of its own.
+fn opening(piece: &split::Piece) -> split::Piece {
+    piece.numbered(piece.number().min(FIRST))
+}
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct SplitStore {
@@ -215,16 +222,16 @@ impl SplitStore {
         }
     }
 
-    // The place a piece's name numbers in my set, counted from one (`FIRST`):
-    // `None` for a piece of another set. A set whose lowest number is above
-    // one has no first piece here, so a front of any of its pieces that
-    // opens on a head refutes it (`refutes`).
+    // The place a piece's name numbers in my set, counted from its first
+    // (`opening`): `None` for a piece of another set. A set whose lowest
+    // number is above one has no first piece here, so a front of any of its
+    // pieces that opens on a head refutes it (`refutes`).
     fn place(&self, name: &str) -> Option<VolumeIndex> {
         if self.stated {
             return None;
         }
         let piece = split::parse(name)?;
-        let first = self.first.clone().unwrap_or_else(|| piece.numbered(FIRST));
+        let first = self.first.clone().unwrap_or_else(|| opening(&piece));
         piece.index_from(&first).map(VolumeIndex)
     }
 
@@ -624,7 +631,7 @@ impl Object for SplitStore {
         match split::parse(name) {
             Some(piece) if !self.stated => {
                 if self.first.is_none() {
-                    self.first = Some(piece.numbered(FIRST));
+                    self.first = Some(opening(&piece));
                 }
             }
             // A piece no name numbers is where it was bound, and so is

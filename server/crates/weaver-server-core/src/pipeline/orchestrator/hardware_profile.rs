@@ -64,6 +64,24 @@ impl Pipeline {
         }
     }
 
+    // Size every volume's buffer limits on the profile in force, the
+    // machine's memory and the configured connections: when either of the
+    // first and last changes. A job stopped at a volume's old limit looks
+    // again.
+    pub(in crate::pipeline) fn size_volume_buffers(&mut self) {
+        let (figure_bytes, memory_ceiling_bytes) = super::runtime::volume_buffer_figure(
+            self.hardware_profile_in_force().active,
+            self.tuner.system_profile(),
+            self.tuner.connection_limit(),
+        );
+        if self
+            .volume_buffers
+            .set_figure(figure_bytes, memory_ceiling_bytes)
+        {
+            self.volume_room_changed();
+        }
+    }
+
     // Put the limits of the profile in force behind everything that starts
     // from now on.
     //
@@ -77,7 +95,9 @@ impl Pipeline {
     fn apply_hardware_profile_in_force(&mut self) {
         let in_force = self.hardware_profile_in_force();
         self.shared_state.set_hardware_profile_in_force(in_force);
+        self.size_volume_buffers();
         let tuning = in_force.active.tuning(self.tuner.system_profile());
+        weaver_tunnel::pipe::set_usenet_receive_bytes(tuning.wireguard_usenet_receive_bytes);
         if tuning == self.tuner.profile_tuning() {
             return;
         }

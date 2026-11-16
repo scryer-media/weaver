@@ -19,22 +19,51 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
+use bytes::Bytes;
 use weaver_graph::{Algorithm, ByteRange, Digest, Evidenced};
 
-use crate::pipeline::graph::sparse::{PlatformMarker, create_sparse};
+use crate::operations::disk::writer::{Barrier, Create, Opened, Submitter};
+use crate::pipeline::graph::limits::Device;
+use crate::pipeline::graph::sparse::{
+    PlatformMarker, create_sized, create_sized_known, create_sparse,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
     #[error("{}: {source}", path.display())]
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+        // The device the file lies on: the output directory's for a file
+        // the job delivers, else the working directory's.
+        device: Device,
+    },
 }
 
 impl LeafError {
-    fn io(path: &Path) -> impl FnOnce(io::Error) -> LeafError + '_ {
+    fn on(path: &Path, device: Device) -> impl FnOnce(io::Error) -> LeafError + '_ {
         move |source| LeafError::Io {
             path: path.to_path_buf(),
             source,
+            device,
+        }
+    }
+
+    // Whether the file system refused the name itself: too long for it, or
+    // one it never takes. A full disk, a permission or a read-only volume
+    // is another error.
+    fn into_io(self) -> io::Error {
+        match self {
+            LeafError::Io { source, .. } => source,
+        }
+    }
+
+    pub(crate) fn names_unusable(&self) -> bool {
+        match self {
+            LeafError::Io { source, .. } => source.kind() == io::ErrorKind::InvalidFilename,
         }
     }
 }
@@ -48,6 +77,8 @@ pub(crate) struct Leaf {
     // The directory the leaf's names join under: the job's output root for
     // a member it delivers, its working directory for one it keeps.
     root: PathBuf,
+    // The device that root lies on, for the error a write there ends in.
+    device: Device,
     path: PathBuf,
     // The name the file sits at, as `path` joins it under the directory.
     name: String,
@@ -74,6 +105,194 @@ pub(crate) struct Leaf {
     // a close cut off or a start over emptied. A byte written for the first
     // time changes nothing anyone read.
     changed: BTreeMap<(u64, u64), u64>,
+    // The volume writer the file's operations go to, when the leaf does not
+    // run them itself. Everything the leaf records of its file is as it
+    // will be once what it submitted has returned; whoever needs the disk
+    // to agree waits for `settled` first.
+    queued: Option<Queued>,
+}
+
+#[derive(Debug)]
+struct Queued {
+    to: Arc<Submitter>,
+    // The leaf's identity, which names its file to the writer.
+    file: u64,
+    // Whether the writer holds the file open, as far as the leaf knows.
+    open: bool,
+    // The last operation submitted for the file.
+    last: u64,
+    // The release that gave the file's handle back, while it is still the
+    // last operation submitted for the file: the writer holds no handle
+    // then, and another release would have nothing to give back.
+    released: u64,
+    // The loop's own handle on the file, for its reads while the writer
+    // holds the file open: one open for every read of the file then, as a
+    // leaf that writes the file itself reads through its handle. Given up
+    // before any operation that closes, cuts, moves or removes the file is
+    // submitted, so no operation of the writer finds it held.
+    reader: OnceLock<File>,
+    // The last operation submitted for the file that is not a write of
+    // bytes into it as it stands: the write that made or opened it, a cut,
+    // a close, a start over, a move. Every read of the file waits for it.
+    shaped: u64,
+    // The writes submitted since, that may still be out, keyed by where
+    // each starts and its number, to where it ends, and the same in the
+    // order they were submitted, so those that returned are let go. A read
+    // waits beside `shaped` only for the writes it overlaps: bytes written
+    // long ago are not waited for again behind the file's newest write.
+    out: BTreeMap<(u64, u64), u64>,
+    sent: std::collections::VecDeque<(u64, u64)>,
+    // The longest write in `out`, which bounds how far before a read one
+    // that overlaps it can start.
+    longest: u64,
+    // The last close of a file already made, and the length it gave it: it
+    // changes no byte below that length, so only a read that reaches past
+    // it waits for the close.
+    closed: Option<(u64, u64)>,
+}
+
+impl Queued {
+    fn new(to: &Arc<Submitter>, file: u64) -> Self {
+        Self {
+            to: Arc::clone(to),
+            file,
+            open: false,
+            last: 0,
+            released: 0,
+            reader: OnceLock::new(),
+            shaped: 0,
+            out: BTreeMap::new(),
+            sent: std::collections::VecDeque::new(),
+            longest: 0,
+            closed: None,
+        }
+    }
+
+    // The loop's handle goes before the writer is asked to close, cut,
+    // move or remove the file.
+    fn let_go(&mut self) {
+        self.reader.take();
+    }
+
+    // `seq` changes the file as a whole: every read after waits for it, so
+    // no write before it needs to be kept apart.
+    fn shape(&mut self, seq: u64) {
+        self.last = seq;
+        self.shaped = seq;
+        self.out.clear();
+        self.sent.clear();
+        self.longest = 0;
+        self.closed = None;
+    }
+
+    // `seq` closes the file, already made, at `length`.
+    fn close(&mut self, seq: u64, length: u64) {
+        self.last = seq;
+        self.closed = Some(match self.closed {
+            Some((_, before)) => (seq, before.min(length)),
+            None => (seq, length),
+        });
+    }
+
+    // `seq` writes `offset..end` of the file as it stands. The writes before
+    // it that returned are let go first: the oldest is looked at, one look
+    // for each write, so the work stays constant per write.
+    fn wrote(&mut self, seq: u64, offset: u64, end: u64) {
+        self.last = seq;
+        while let Some(&(oldest, start)) = self.sent.front() {
+            if !self.to.barrier_at(oldest).returned() {
+                break;
+            }
+            self.sent.pop_front();
+            self.out.remove(&(start, oldest));
+        }
+        if self.out.is_empty() {
+            self.longest = 0;
+        }
+        if end == offset {
+            return;
+        }
+        self.out.insert((offset, seq), end);
+        self.sent.push_back((seq, offset));
+        self.longest = self.longest.max(end - offset);
+    }
+
+    // The operation a read of `offset..end` waits for: the last that shaped
+    // the file, a close that cut short of the range's end, or the last write
+    // still kept that overlaps the range.
+    fn read_after(&self, offset: u64, end: u64) -> u64 {
+        let closed = self
+            .closed
+            .filter(|(_, length)| end > *length)
+            .map_or(0, |(seq, _)| seq);
+        let from = (offset.saturating_sub(self.longest), 0);
+        self.out
+            .range(from..(end, 0))
+            .filter(|(_, written_to)| **written_to > offset)
+            .map(|((_, seq), _)| *seq)
+            .fold(self.shaped.max(closed), u64::max)
+    }
+}
+
+impl Drop for Queued {
+    // A leaf that goes gives its handle back, as dropping its own file
+    // would.
+    fn drop(&mut self) {
+        self.let_go();
+        if self.last > 0 {
+            self.to.release(self.file);
+        }
+    }
+}
+
+thread_local! {
+    // The buffer the bytes now being placed are slices of, so a write
+    // handed to a volume's writer shares it instead of copying.
+    static LENT: std::cell::RefCell<Option<Bytes>> = const { std::cell::RefCell::new(None) };
+}
+
+// While it lives, writes of slices of `bytes` on this thread share it.
+pub(crate) struct Lent(Option<Bytes>);
+
+pub(crate) fn lend(bytes: &Bytes) -> Lent {
+    Lent(LENT.with(|lent| lent.borrow_mut().replace(bytes.clone())))
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        LENT.with(|lent| *lent.borrow_mut() = self.0.take());
+    }
+}
+
+// `bytes` as owned bytes: a share of the lent buffer when they lie in it,
+// else a copy.
+fn owned(bytes: &[u8]) -> Bytes {
+    LENT.with(|lent| {
+        let lent = lent.borrow();
+        match lent.as_ref() {
+            Some(whole)
+                if !bytes.is_empty()
+                    && whole.as_ptr_range().start <= bytes.as_ptr_range().start
+                    && bytes.as_ptr_range().end <= whole.as_ptr_range().end =>
+            {
+                whole.slice_ref(bytes)
+            }
+            _ => Bytes::copy_from_slice(bytes),
+        }
+    })
+}
+
+// Open the file at `path` for a volume's writer, as a leaf opens its own,
+// with the length it was left at when that is known.
+fn open_sized(path: &Path, length: Option<u64>) -> io::Result<Opened> {
+    let began = std::time::Instant::now();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let folders = began.elapsed();
+    let mut opened = create_sized_known(path, &PlatformMarker, length)?;
+    opened.steps.create = opened.steps.create.map(|create| create + folders);
+    Ok(opened)
 }
 
 static NEXT_LEAF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -105,7 +324,10 @@ impl Leaf {
     // name is the leaf's own file.
     pub(crate) fn found(dir: &Path, output_name: &str) -> Result<Self, LeafError> {
         let mut leaf = Self::at(dir, output_name);
-        leaf.on_disk = leaf.path.try_exists().map_err(LeafError::io(&leaf.path))?;
+        leaf.on_disk = leaf
+            .path
+            .try_exists()
+            .map_err(LeafError::on(&leaf.path, leaf.device))?;
         Ok(leaf)
     }
 
@@ -117,6 +339,7 @@ impl Leaf {
             identity: NEXT_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             revision: 0,
             root: dir.to_path_buf(),
+            device: Device::Working,
             path: Self::path_at(dir, output_name),
             name: output_name.to_owned(),
             wants: None,
@@ -125,7 +348,84 @@ impl Leaf {
             on_disk,
             written: BTreeMap::new(),
             changed: BTreeMap::new(),
+            queued: None,
         }
+    }
+
+    // The leaf for a file at `output_name` under `dir` that another leaf,
+    // through the writer `to`, hands it while that leaf may still have
+    // operations queued for the file. The writer tells files apart by the
+    // leaf that names them, and within one batch runs one leaf's operations
+    // before or after another's as their files' closes and opens say, so
+    // the first leaf's truncate or writes still queued could run after this
+    // one's writes and close and cut the file back. An operation that names
+    // no file stands between them: the writer runs it after everything
+    // submitted before it and before everything after, and every read of
+    // the file waits for it. `made`, when not zero, is such an operation
+    // already submitted, one that puts the file at its name; otherwise one
+    // that does nothing is submitted here.
+    pub(crate) fn handed(
+        dir: &Path,
+        output_name: &str,
+        on_disk: bool,
+        to: Option<&Arc<Submitter>>,
+        made: u64,
+    ) -> Self {
+        let leaf = Self::over(dir, output_name, on_disk).through(to);
+        let Some(to) = to else {
+            return leaf;
+        };
+        let fence = match made {
+            0 => to.run(None, leaf.path.clone(), || Ok(())),
+            made => made,
+        };
+        leaf.after(fence)
+    }
+
+    // The leaf's file operations go to a volume's writer from here on.
+    pub(crate) fn through(mut self, to: Option<&Arc<Submitter>>) -> Self {
+        self.queued = to.map(|to| Queued::new(to, self.identity));
+        self
+    }
+
+    // The file is put at the leaf's path by the operation numbered `made`,
+    // which its writer already has: whoever reads it waits through that
+    // one. Nothing for a leaf that runs its own operations.
+    pub(crate) fn after(mut self, made: u64) -> Self {
+        if let Some(queued) = &mut self.queued {
+            let made = queued.last.max(made);
+            queued.shape(made);
+        }
+        self
+    }
+
+    // Everything submitted for the file so far: whoever reads the file by
+    // its path waits for this first. `None` for a leaf that runs its own
+    // operations, whose file is always as the leaf says.
+    pub(crate) fn settled(&self) -> Option<Barrier> {
+        self.queued
+            .as_ref()
+            .filter(|queued| queued.last > 0)
+            .map(|queued| queued.to.barrier_at(queued.last))
+    }
+
+    fn create(&self, length: Option<u64>) -> Create {
+        Create {
+            path: self.path.clone(),
+            length,
+            open: open_sized,
+        }
+    }
+
+    // The directory the leaf's name is under.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    // The leaf lies on `device`: said by the writer that placed it.
+    pub(crate) fn on(mut self, device: Device) -> Self {
+        self.device = device;
+        self
     }
 
     pub(crate) fn revision(&self) -> (u64, u64) {
@@ -179,7 +479,8 @@ impl Leaf {
 
     #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
-        self.file.is_some()
+        // A handle the volume's writer holds for the leaf counts.
+        self.file.is_some() || self.queued.as_ref().is_some_and(|queued| queued.open)
     }
 
     // A directory member is a name ending in a separator. It has no bytes,
@@ -189,15 +490,34 @@ impl Leaf {
     }
 
     pub(crate) fn create_directory(&mut self) -> Result<(), LeafError> {
-        std::fs::create_dir_all(&self.path).map_err(LeafError::io(&self.path))?;
+        if let Some(queued) = &mut self.queued {
+            let path = self.path.clone();
+            let made = queued
+                .to
+                .run(None, path.clone(), move || std::fs::create_dir_all(&path));
+            queued.shape(made);
+            self.on_disk = true;
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.path).map_err(LeafError::on(&self.path, self.device))?;
         self.on_disk = true;
         Ok(())
     }
 
+    // The bytes the leaf holds written, summed over its runs: asked only
+    // when a write failed, never per write.
+    pub(crate) fn written_bytes(&self) -> u64 {
+        self.written.iter().fold(0u64, |sum, (start, run)| {
+            sum.saturating_add(run.end - start)
+        })
+    }
+
     // Write `bytes` at `offset`, folding nothing: a file whose bytes no
-    // check is stated for. Writes grow the file only as far as their bytes.
-    // A declared length must not allocate unwritten space on a mount that
-    // stores ordinary files instead of sparse ones; close sets the final size.
+    // check is stated for. A new file is made at its declared length, all
+    // of it holes, where its filesystem is known to make holes
+    // (`sparse::create_sized` has the rule); anywhere else writes grow the
+    // file only as far as their bytes, so a declared length never takes
+    // unwritten space. Close sets the final size either way.
     pub(crate) fn write(
         &mut self,
         offset: u64,
@@ -227,15 +547,41 @@ impl Leaf {
         length: Option<u64>,
     ) -> Result<(), LeafError> {
         self.revision += 1;
-        self.open(length)?;
+        if self.queued.is_none() {
+            self.open(length)?;
+        }
         let span = (offset, offset + bytes.len() as u64);
         let overlapped = self.overlapped(span);
         for (from, to) in &overlapped {
             self.change(*from, *to);
         }
         let replaced = self.replaced(&overlapped, fold.map(|(algorithm, _)| algorithm))?;
-        let file = self.file.as_ref().expect("opened above");
-        write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))?;
+        if let Some(open) = self.queued.as_ref().map(|queued| queued.open) {
+            // A test's full disk refuses the write as it is handed over, as
+            // the disk would refuse it in place.
+            #[cfg(test)]
+            if counting::full(bytes.len()) {
+                return Err(LeafError::on(&self.path, self.device)(io::Error::from(
+                    counting::refusal(),
+                )));
+            }
+            let create = (!open).then(|| self.create(length));
+            let queued = self.queued.as_mut().expect("checked above");
+            queued.open = true;
+            let made = create.is_some();
+            let seq = queued.to.write(self.identity, offset, owned(bytes), create);
+            // A write that opens the file makes it, or opens it again at a
+            // declared length: every read waits for it.
+            if made {
+                queued.shape(seq);
+            } else {
+                queued.wrote(seq, span.0, span.1);
+            }
+            self.on_disk = true;
+        } else {
+            let file = self.file.as_ref().expect("opened above");
+            write_all_at(file, offset, bytes).map_err(LeafError::on(&self.path, self.device))?;
+        }
         self.wrote(span, fold, &overlapped, &replaced);
         Ok(())
     }
@@ -273,7 +619,7 @@ impl Leaf {
             let digest = match (fold, run.digest) {
                 (Some(algorithm), Some(digest)) if digest.algorithm == algorithm => {
                     let mut old = Vec::new();
-                    self.read(*from, index(to - from), &mut old)?;
+                    self.read_back(*from, index(to - from), &mut old)?;
                     Some(algorithm.hash(&old).value)
                 }
                 _ => None,
@@ -399,7 +745,7 @@ impl Leaf {
         let digest = match run.digest {
             Some(whole) => {
                 let mut lost = Vec::new();
-                self.read(length, index(run.end - length), &mut lost)?;
+                self.read_back(length, index(run.end - length), &mut lost)?;
                 let algorithm = whole.algorithm;
                 let lost = algorithm.hash(&lost).value;
                 algorithm
@@ -423,10 +769,11 @@ impl Leaf {
     // the runs something else vouches for, each with its digest, joined
     // where they abut, and nothing is read. A file lost, or cut short,
     // since its bytes passed holds no bytes that passed past its length, and
-    // folds nothing there.
+    // folds nothing there. Neither waits for the disk: a restored leaf has
+    // nothing submitted, and one that has something still out folds nothing.
     pub(crate) fn fold_passed(&mut self, length: u64, digest: Digest) {
         self.written.clear();
-        if length > 0 && self.len().is_ok_and(|held| held >= length) {
+        if length > 0 && self.len_settled().is_some_and(|held| held >= length) {
             self.written.insert(
                 0,
                 Written {
@@ -438,7 +785,7 @@ impl Leaf {
     }
 
     pub(crate) fn fold_vouched(&mut self, runs: impl IntoIterator<Item = (ByteRange, Digest)>) {
-        let held = self.len().unwrap_or(0);
+        let held = self.len_settled().unwrap_or(0);
         for (range, digest) in runs {
             if range.is_empty()
                 || range.end > held
@@ -454,6 +801,22 @@ impl Leaf {
                 },
             );
             self.join(range.start, range.end);
+        }
+    }
+
+    // The fold of a member its check read back whole, `length` bytes that
+    // hashed to `digest`: the read proved the file holds them, so the disk
+    // is not asked again.
+    pub(crate) fn fold_read(&mut self, length: u64, digest: Digest) {
+        self.written.clear();
+        if length > 0 {
+            self.written.insert(
+                0,
+                Written {
+                    end: length,
+                    digest: Some(digest),
+                },
+            );
         }
     }
 
@@ -475,9 +838,13 @@ impl Leaf {
     // Create the file in the directory it lies in, which must already be
     // there: nothing above the file is made. A file already open is kept.
     pub(crate) fn create_within(&mut self) -> Result<(), LeafError> {
+        debug_assert!(
+            self.queued.is_none(),
+            "a queued leaf is made by its first write"
+        );
         if self.file.is_none() {
-            let file =
-                create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
+            let file = create_sparse(&self.path, &PlatformMarker)
+                .map_err(LeafError::on(&self.path, self.device))?;
             self.file = Some(file);
             self.on_disk = true;
         }
@@ -486,12 +853,42 @@ impl Leaf {
 
     // How far the file reaches: every byte written to it lies below.
     pub(crate) fn len(&self) -> Result<u64, LeafError> {
+        if let Some(settled) = self.settled() {
+            settled.wait();
+            // A write that failed, or one still out when a stop gave the
+            // volume up, left the file short of what was sent to it: its
+            // length is not the length of what the leaf holds.
+            if settled.unwritten() {
+                return Err(LeafError::Io {
+                    device: self.device,
+                    path: self.path.clone(),
+                    source: io::Error::other(
+                        "a write of the file failed or is still out, so its length on disk is not its own",
+                    ),
+                });
+            }
+        }
         match &self.file {
             Some(file) => file.metadata(),
             None => std::fs::metadata(&self.path),
         }
         .map(|metadata| metadata.len())
-        .map_err(LeafError::io(&self.path))
+        .map_err(LeafError::on(&self.path, self.device))
+    }
+
+    // How far the file reaches, without waiting: `None` while something
+    // submitted for it is still out or did not land, or the OS gave no
+    // length.
+    fn len_settled(&self) -> Option<u64> {
+        if self.settled().is_some_and(|settled| settled.unwritten()) {
+            return None;
+        }
+        match &self.file {
+            Some(file) => file.metadata(),
+            None => std::fs::metadata(&self.path),
+        }
+        .ok()
+        .map(|metadata| metadata.len())
     }
 
     // Fill `into` with `len` bytes from `offset`. The caller only asks for
@@ -502,6 +899,68 @@ impl Leaf {
         len: usize,
         into: &mut Vec<u8>,
     ) -> Result<(), LeafError> {
+        // Through a writer, the read waits only for this file's operations
+        // that put the bytes read there: the last that shaped the file, and
+        // the writes still out that overlap them, whatever else its volume
+        // has queued. A read of bytes written long ago does not stand behind
+        // a write the loop just made elsewhere in the file, so a repair's
+        // slices, a replay and a delivery said again, which read one piece
+        // and write the one before it, never wait on their own writes.
+        if let Some(queued) = self.queued.as_ref().filter(|queued| queued.last > 0) {
+            let end = offset.saturating_add(len as u64);
+            queued
+                .to
+                .wait_for(queued.read_after(offset, end))
+                .map_err(LeafError::on(&self.path, self.device))?;
+            let began = Instant::now();
+            let start = into.len();
+            into.resize(start + len, 0);
+            let read = queued_read(queued, &self.path, offset, &mut into[start..]);
+            queued.to.loop_read(began);
+            return read.map_err(|source| {
+                into.truncate(start);
+                LeafError::Io {
+                    device: self.device,
+                    path: self.path.clone(),
+                    source,
+                }
+            });
+        }
+        self.read_here(offset, len, into)
+    }
+
+    // Whether the loop holds a handle of its own on the writer's file.
+    #[cfg(test)]
+    pub(crate) fn holds_reader(&self) -> bool {
+        self.queued
+            .as_ref()
+            .is_some_and(|queued| queued.reader.get().is_some())
+    }
+
+    // The same read for a thread the loop does not wait for: a repair or a
+    // replay on a thread of its own.
+    pub(crate) fn read_aside(
+        &self,
+        offset: u64,
+        len: usize,
+        into: &mut Vec<u8>,
+    ) -> Result<(), LeafError> {
+        if let Some(settled) = self.settled() {
+            settled.wait_aside();
+            if settled.unwritten() {
+                return Err(LeafError::Io {
+                    device: self.device,
+                    path: self.path.clone(),
+                    source: io::Error::other(
+                        "the writes of the file are not down for it to be read",
+                    ),
+                });
+            }
+        }
+        self.read_here(offset, len, into)
+    }
+
+    fn read_here(&self, offset: u64, len: usize, into: &mut Vec<u8>) -> Result<(), LeafError> {
         let start = into.len();
         into.resize(start + len, 0);
         let read = match &self.file {
@@ -512,24 +971,52 @@ impl Leaf {
         read.map_err(|source| {
             into.truncate(start);
             LeafError::Io {
+                device: self.device,
                 path: self.path.clone(),
                 source,
             }
         })
     }
 
-    // Every byte is in: the file takes its final length and its handle is
-    // released, so finalize can move it. A directory has no bytes to take:
-    // it is made.
+    // The bytes a write replaces or a close cuts off. Through a writer the
+    // read waits through the file's own last operation, as `read` does, and
+    // not for everything else the job has queued on the volume: only this
+    // file's operations put those bytes there.
+    fn read_back(&self, offset: u64, len: usize, into: &mut Vec<u8>) -> Result<(), LeafError> {
+        self.read(offset, len, into)
+    }
+
+    // Every byte is in: the file takes its final length. The writer keeps
+    // its handle for a repair's writes and later closes; a move, a removal,
+    // a release at delivery or the job's end lets it go. A directory has no
+    // bytes to take: it is made.
     pub(crate) fn close(&mut self, length: u64) -> Result<(), LeafError> {
         if self.directory {
             return self.create_directory();
         }
         self.revision += 1;
+        if self.queued.is_some() {
+            self.cut(length)?;
+            let create = self.create(Some(length));
+            let made = self.on_disk;
+            let queued = self.queued.as_mut().expect("checked above");
+            queued.let_go();
+            let closed = queued.to.close(self.identity, length, create);
+            // A close of a file not made yet makes it: every read waits.
+            if made {
+                queued.close(closed, length);
+            } else {
+                queued.shape(closed);
+            }
+            queued.open = false;
+            self.on_disk = true;
+            return Ok(());
+        }
         self.open(Some(length))?;
         self.cut(length)?;
         let file = self.file.as_ref().expect("opened above");
-        file.set_len(length).map_err(LeafError::io(&self.path))?;
+        file.set_len(length)
+            .map_err(LeafError::on(&self.path, self.device))?;
         self.file = None;
         Ok(())
     }
@@ -538,6 +1025,21 @@ impl Leaf {
     // coverage. A spent or partial file need not have closed at a whole
     // length, but must still release its handle before unlink or delivery.
     pub(crate) fn release_handle(&mut self) {
+        // Asked again with nothing submitted for the file since, it queues
+        // nothing: a delivery that looks again while it waits for the
+        // volume's writer must find the writer's work done at some point,
+        // not one more release behind every look.
+        if let Some(queued) = &mut self.queued
+            && queued.last > 0
+            && queued.last != queued.released
+        {
+            queued.let_go();
+            // A release changes no byte, length or name of the file: a read
+            // after it waits for what it waited for before.
+            queued.last = queued.to.release(self.identity);
+            queued.released = queued.last;
+            queued.open = false;
+        }
         self.file = None;
     }
 
@@ -547,11 +1049,24 @@ impl Leaf {
         self.revision += 1;
         self.written.clear();
         self.change(0, u64::MAX);
-        if self.file.is_none() && !self.path.try_exists().map_err(LeafError::io(&self.path))? {
+        let create = self.queued.is_some().then(|| self.create(None));
+        if let (Some(create), Some(queued)) = (create, self.queued.as_mut()) {
+            queued.let_go();
+            let emptied = queued.to.truncate(self.identity, create);
+            queued.shape(emptied);
+            return Ok(());
+        }
+        if self.file.is_none()
+            && !self
+                .path
+                .try_exists()
+                .map_err(LeafError::on(&self.path, self.device))?
+        {
             return Ok(());
         }
         let file = self.open(None)?;
-        file.set_len(0).map_err(LeafError::io(&self.path))
+        file.set_len(0)
+            .map_err(LeafError::on(&self.path, self.device))
     }
 
     // The member was named again: the file is to follow it, once the
@@ -574,16 +1089,42 @@ impl Leaf {
         // missing owned file must fail the move, and a file this leaf never
         // made must not be taken merely because its old name now exists.
         let had_file = self.on_disk;
-        if had_file && path != self.path && self.directory {
+        if let Some(queued) = self
+            .queued
+            .as_mut()
+            .filter(|_| had_file && path != self.path)
+        {
+            // The move follows everything submitted for the file, and
+            // everything submitted after follows the move.
+            let (from, to, directory) = (self.path.clone(), path.clone(), self.directory);
+            let wanted = wants.clone();
+            queued.let_go();
+            queued.open = false;
+            let moved = queued.to.run(Some(self.identity), from.clone(), move || {
+                if directory {
+                    std::fs::create_dir_all(&to)?;
+                    return remove_directory(&from).map_err(LeafError::into_io);
+                }
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::runtime::fs::rename_path_exclusive(&from, &to)?;
+                // The file sits at its new name and nothing records that yet.
+                crate::e2e_failpoint::fire_rename(&wanted);
+                Ok(())
+            });
+            queued.shape(moved);
+        } else if had_file && path != self.path && self.directory {
             // A directory is shared and holds no bytes of its own: it is
             // made where it is wanted, whoever else already made it, and
             // the empty one it waited in goes.
-            std::fs::create_dir_all(&path).map_err(LeafError::io(&path))?;
+            std::fs::create_dir_all(&path).map_err(LeafError::on(&path, self.device))?;
             remove_directory(&self.path)?;
         } else if had_file && path != self.path {
-            create_parent(&path)?;
+            create_parent(&path, self.device)?;
             crate::runtime::fs::rename_path_exclusive(&self.path, &path)
-                .map_err(LeafError::io(&self.path))?;
+                .map_err(LeafError::on(&self.path, self.device))?;
+            crate::e2e_failpoint::fire_rename(&wants);
         }
         self.path = path;
         self.wants = None;
@@ -593,6 +1134,25 @@ impl Leaf {
     // The member is gone with its subtree. A directory goes only once
     // nothing is left in it.
     pub(crate) fn remove(mut self) -> Result<(), LeafError> {
+        if let Some(mut queued) = self.queued.take() {
+            if !self.directory && !self.on_disk {
+                return Ok(());
+            }
+            // The removal closes the handle itself.
+            queued.let_go();
+            queued.last = 0;
+            let (path, directory) = (self.path.clone(), self.directory);
+            queued.to.run(Some(self.identity), self.path, move || {
+                if directory {
+                    return remove_directory(&path).map_err(LeafError::into_io);
+                }
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                    _ => Ok(()),
+                }
+            });
+            return Ok(());
+        }
         self.file = None;
         if self.directory {
             return remove_directory(&self.path);
@@ -602,6 +1162,7 @@ impl Leaf {
         }
         match std::fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(LeafError::Io {
+                device: self.device,
                 path: self.path,
                 source: error,
             }),
@@ -609,16 +1170,36 @@ impl Leaf {
         }
     }
 
-    fn open(&mut self, _length: Option<u64>) -> Result<&File, LeafError> {
+    // Opens the file, making it when it is not there. A file made with a
+    // declared `length` takes it where its filesystem is known to make
+    // holes (`sparse::create_sized`); close still sets the final length.
+    fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
-            create_parent(&self.path)?;
-            let file =
-                create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
+            create_parent(&self.path, self.device)?;
+            let file = create_sized(&self.path, &PlatformMarker, length)
+                .map_err(LeafError::on(&self.path, self.device))?;
             self.on_disk = true;
             self.file = Some(file);
         }
         Ok(self.file.as_ref().expect("opened above"))
     }
+}
+
+// A read of a file its writer writes, after the wait for the file's own
+// operations: through the loop's handle while the writer holds the file
+// open, opened once and kept; by a fresh open once it does not, when the
+// file may since have been closed, cut, moved or removed.
+fn queued_read(queued: &Queued, path: &Path, offset: u64, into: &mut [u8]) -> io::Result<()> {
+    if !queued.open {
+        return File::open(path).and_then(|file| read_exact_at(&file, offset, into));
+    }
+    if let Some(file) = queued.reader.get() {
+        return read_exact_at(file, offset, into);
+    }
+    let file = File::open(path)?;
+    let read = read_exact_at(&file, offset, into);
+    let _ = queued.reader.set(file);
+    read
 }
 
 // An output name as a path relative to the directory it is written under.
@@ -661,6 +1242,7 @@ fn remove_directory(path: &Path) -> Result<(), LeafError> {
             ) =>
         {
             Err(LeafError::Io {
+                device: Device::Working,
                 path: path.to_path_buf(),
                 source: error,
             })
@@ -669,9 +1251,9 @@ fn remove_directory(path: &Path) -> Result<(), LeafError> {
     }
 }
 
-fn create_parent(path: &Path) -> Result<(), LeafError> {
+fn create_parent(path: &Path, device: Device) -> Result<(), LeafError> {
     match path.parent() {
-        Some(parent) => std::fs::create_dir_all(parent).map_err(LeafError::io(parent)),
+        Some(parent) => std::fs::create_dir_all(parent).map_err(LeafError::on(parent, device)),
         None => Ok(()),
     }
 }
@@ -679,7 +1261,7 @@ fn create_parent(path: &Path) -> Result<(), LeafError> {
 fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
     #[cfg(test)]
     if counting::full(bytes.len()) {
-        return Err(io::Error::from(io::ErrorKind::StorageFull));
+        return Err(io::Error::from(counting::refusal()));
     }
     #[cfg(test)]
     counting::wrote(bytes.len());
@@ -754,6 +1336,23 @@ pub(crate) mod counting {
         static WRITTEN: Cell<u64> = const { Cell::new(0) };
         // The bytes this thread may still write before the disk is full.
         static ROOM: Cell<Option<u64>> = const { Cell::new(None) };
+        // Whether a write refused for room is refused by a quota.
+        static QUOTA: Cell<bool> = const { Cell::new(false) };
+    }
+
+    // A write this thread refuses for room is refused by a quota, or by the
+    // disk again.
+    pub(crate) fn refuse_by_quota(quota: bool) {
+        QUOTA.with(|cell| cell.set(quota));
+    }
+
+    // What a write refused for room fails with.
+    pub(super) fn refusal() -> std::io::ErrorKind {
+        if QUOTA.with(Cell::get) {
+            std::io::ErrorKind::QuotaExceeded
+        } else {
+            std::io::ErrorKind::StorageFull
+        }
     }
 
     // The disk fills once this thread has written `room` more bytes, or
@@ -845,12 +1444,43 @@ mod tests {
         assert!(leaf.truncate().is_err());
     }
 
+    // A name the file system will not take is told apart from a full disk
+    // and every other error, and nothing is made for it.
+    #[test]
+    fn a_refused_name_is_told_apart_from_other_write_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("{}.mkv", "a".repeat(300));
+        let mut leaf = Leaf::at(dir.path(), &name);
+        let error = leaf.write(0, b"lantern", None).unwrap_err();
+        assert!(error.names_unusable(), "{error}");
+        assert!(!leaf.on_disk());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let mut full = Leaf::at(dir.path(), "full.bin");
+        counting::fill_after(Some(0));
+        let error = full.write(0, b"lantern", None).unwrap_err();
+        counting::fill_after(None);
+        assert!(!error.names_unusable(), "{error}");
+    }
+
+    // A new file starts at its declared length exactly where its
+    // filesystem makes holes, and is as long as its bytes anywhere else. The
+    // length is never space: the unwritten tail takes none. Either way
+    // close cuts the file to its final length.
     #[test]
     fn a_write_does_not_preallocate_the_declared_unwritten_tail() {
         let dir = tempfile::tempdir().unwrap();
+        let sized = crate::pipeline::graph::sparse::sizes_files_in(dir.path());
         let mut leaf = Leaf::at(dir.path(), "payload.bin");
         leaf.write(0, b"a", Some(1 << 30)).unwrap();
-        assert_eq!(leaf.len().unwrap(), 1);
+        let length = leaf.len().unwrap();
+        assert_eq!(length, if sized { 1 << 30 } else { 1 });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let taken = std::fs::metadata(leaf.path()).unwrap().blocks() * 512;
+            assert!(taken < 1 << 30, "{taken} bytes taken for one written");
+        }
         leaf.write(1, b"b", None).unwrap();
         leaf.close(2).unwrap();
         assert_eq!(std::fs::read(leaf.path()).unwrap(), b"ab");
@@ -939,5 +1569,242 @@ mod tests {
         assert_eq!(cut.folded(7000, crc), None);
         folding(&mut cut, 3000, bytes(4000, 3));
         assert_eq!(cut.folded(7000, crc), Some(file_crc(&cut, 7000)));
+    }
+
+    struct Through {
+        writers: crate::operations::disk::writer::VolumeWriters,
+        volume: Arc<crate::operations::disk::volume::Volume>,
+        to: Arc<Submitter>,
+    }
+
+    fn through() -> Through {
+        let writers = crate::operations::disk::writer::VolumeWriters::new(|_| {});
+        let volume = Arc::new(crate::operations::disk::volume::Volume::new(
+            None,
+            "test".to_owned(),
+        ));
+        let to = writers.submitter(&volume, 1);
+        Through {
+            writers,
+            volume,
+            to,
+        }
+    }
+
+    impl Through {
+        // How many times, and for how long in all, the loop stood for the
+        // writer before a read.
+        fn read_waits(&self) -> u64 {
+            use crate::operations::disk::volume::LoopWait;
+            self.volume.writer.loop_waits_by_kind[LoopWait::Read as usize]
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    // A read through a volume's writer waits only for the writes that put
+    // its bytes there, never behind a later write elsewhere in the file. A
+    // repair's slices, a replay and a delivery said again each read one
+    // piece and then write it: while the writer is held on the write of one
+    // piece, the read back of the next is made at once, the loop goes on
+    // with another file, and once the writer is let through the file and
+    // its fold hold every write. The loop stood for the writer not once.
+    #[test]
+    fn a_read_back_does_not_wait_for_a_later_write_of_other_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let through = through();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin").through(Some(&through.to));
+        let mut other = Leaf::at(dir.path(), "other.bin").through(Some(&through.to));
+        folding(&mut leaf, 0, bytes(4096, 1));
+        folding(&mut leaf, 4096, bytes(4096, 2));
+        other.write(0, &bytes(4096, 7), None).unwrap();
+        through.writers.settle();
+        let hold = through.writers.hold(&through.volume);
+        // Each rewrite reads back what it replaces, folded with a digest,
+        // and the second reads behind the first, which the writer holds.
+        folding(&mut leaf, 4096, bytes(4096, 3));
+        folding(&mut leaf, 0, bytes(4096, 4));
+        hold.wait_held();
+        let held = through.to.barrier();
+        assert!(held.test_held() && !held.returned(), "the rewrites are out");
+        // Another file's work goes on meanwhile, its close and a read below
+        // the length it closed at included.
+        other.write(4096, &bytes(4096, 8), None).unwrap();
+        other.close(8192).unwrap();
+        let mut read = Vec::new();
+        other.read(0, 4096, &mut read).unwrap();
+        assert_eq!(read, bytes(4096, 7));
+        assert!(!held.returned(), "nothing was let through");
+        assert_eq!(through.read_waits(), 0);
+        hold.open();
+        through.writers.settle();
+        let mut all = Vec::new();
+        leaf.read(0, 8192, &mut all).unwrap();
+        assert_eq!(&all[..4096], &bytes(4096, 4)[..]);
+        assert_eq!(&all[4096..], &bytes(4096, 3)[..]);
+        let crc = Algorithm::Crc32;
+        assert_eq!(leaf.folded(8192, crc), Some(crc.hash(&all).value));
+        assert_eq!(
+            std::fs::read(other.path()).unwrap(),
+            [bytes(4096, 7), bytes(4096, 8)].concat()
+        );
+        assert_eq!(through.read_waits(), 0);
+    }
+
+    // A file handed from one leaf to another keeps what the second writes.
+    // An archive keeps its stream in a file it starts over and writes the
+    // head of; refused, it hands that file to its member, whose leaf writes
+    // the rest and closes it. With both leaves' operations in one batch the
+    // writer would run the closing leaf first and the first leaf's start
+    // over last, leaving the head alone. `kept` says which leaf wrote.
+    fn handed_over(handed: impl FnOnce(&Path, &Arc<Submitter>) -> Leaf) -> (Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let through = through();
+        let all = bytes(67_584, 5);
+        let length = all.len() as u64;
+        let mut other = Leaf::at(dir.path(), "other.bin").through(Some(&through.to));
+        let hold = through.writers.hold(&through.volume);
+        other.write(0, &bytes(16, 1), None).unwrap();
+        hold.wait_held();
+        let mut first = Leaf::at(dir.path(), "bundle.tar").through(Some(&through.to));
+        first.truncate().unwrap();
+        first.write(0, &all[..512], None).unwrap();
+        let mut second = handed(dir.path(), &through.to);
+        second.write(512, &all[512..], Some(length)).unwrap();
+        second.close(length).unwrap();
+        first.release_handle();
+        hold.open();
+        through.writers.settle();
+        (std::fs::read(second.path()).unwrap(), all)
+    }
+
+    #[test]
+    fn a_file_handed_to_another_leaf_keeps_what_that_leaf_writes() {
+        let (kept, all) =
+            handed_over(|dir, to| Leaf::handed(dir, "bundle.tar", false, Some(to), 0));
+        assert_eq!(kept.len(), all.len());
+        assert!(kept == all, "every byte of the stream is kept");
+    }
+
+    // Without the operation between them the first leaf's start over runs
+    // after the second's close: this is the order `handed` exists to stop.
+    #[test]
+    fn two_leaves_over_one_file_are_not_ordered_by_the_writer() {
+        let (kept, all) = handed_over(|dir, to| Leaf::at(dir, "bundle.tar").through(Some(to)));
+        assert_eq!(kept.len(), 512);
+        assert!(kept != all);
+    }
+
+    // A read of bytes whose write is still out waits for that write, and
+    // reads what it put there; so does a read after anything that shapes
+    // the file as a whole, a start over here.
+    #[test]
+    fn a_read_of_bytes_still_out_waits_for_their_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let through = through();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin").through(Some(&through.to));
+        leaf.write(0, &bytes(4096, 1), None).unwrap();
+        leaf.write(4096, &bytes(4096, 2), None).unwrap();
+        through.writers.settle();
+        let hold = through.writers.hold(&through.volume);
+        leaf.write(1000, &bytes(100, 3), None).unwrap();
+        let barrier = through.to.barrier();
+        hold.wait_held();
+        std::thread::scope(|scope| {
+            let read = scope.spawn(|| {
+                let mut read = Vec::new();
+                leaf.read(900, 300, &mut read).unwrap();
+                read
+            });
+            barrier.wait_waiters(1);
+            hold.open();
+            let read = read.join().unwrap();
+            assert_eq!(&read[..100], &bytes(4096, 1)[900..1000]);
+            assert_eq!(&read[100..200], &bytes(100, 3)[..]);
+            assert_eq!(&read[200..], &bytes(4096, 1)[1100..1200]);
+        });
+        assert_eq!(through.read_waits(), 1);
+        through.writers.settle();
+        let hold = through.writers.hold(&through.volume);
+        leaf.truncate().unwrap();
+        leaf.write(0, &bytes(10, 4), None).unwrap();
+        let barrier = through.to.barrier();
+        hold.wait_held();
+        std::thread::scope(|scope| {
+            // Bytes from before the start over are not read: the read waits
+            // for it, and for the write after it.
+            let read = scope.spawn(|| {
+                let mut read = Vec::new();
+                leaf.read(0, 10, &mut read).unwrap();
+                read
+            });
+            barrier.wait_waiters(1);
+            hold.open();
+            assert_eq!(read.join().unwrap(), bytes(10, 4));
+        });
+        assert_eq!(through.read_waits(), 2);
+    }
+
+    // What a read waits for: the operation that shaped the file, the writes
+    // it overlaps, and a close only when it reaches past the closed length.
+    #[test]
+    fn a_read_waits_for_what_put_its_bytes_there() {
+        let through = through();
+        let mut queued = Queued::new(&through.to, 1);
+        queued.shape(1);
+        queued.wrote(2, 0, 100);
+        queued.wrote(3, 100, 200);
+        assert_eq!(queued.read_after(0, 50), 2);
+        assert_eq!(queued.read_after(150, 160), 3);
+        assert_eq!(queued.read_after(50, 150), 3);
+        assert_eq!(queued.read_after(300, 400), 1);
+        queued.close(4, 150);
+        assert_eq!(queued.read_after(0, 50), 2);
+        assert_eq!(queued.read_after(100, 150), 3);
+        assert_eq!(queued.read_after(100, 151), 4);
+        queued.close(5, 300);
+        assert_eq!(queued.read_after(140, 200), 5, "cut at 150 before");
+        queued.shape(6);
+        assert_eq!(queued.read_after(0, 50), 6);
+        assert_eq!(queued.read_after(0, 1000), 6);
+    }
+
+    // Runs either side of 4 GiB, in a sparse file that writes a few
+    // KiB: a write across the line, a rewrite inside it, and a close that
+    // cuts the run just past it each keep the run's digest equal to the
+    // bytes the file holds.
+    #[test]
+    fn a_fold_across_four_gib_keeps_its_digest() {
+        const LINE: u64 = 1 << 32;
+        let dir = tempfile::tempdir().unwrap();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin");
+        let crc = Algorithm::Crc32;
+        let held = |leaf: &Leaf, from: u64, to: u64| {
+            let mut bytes = Vec::new();
+            leaf.read(from, index(to - from), &mut bytes).unwrap();
+            bytes
+        };
+        let run = |leaf: &Leaf| {
+            assert_eq!(leaf.written.len(), 1, "{:?}", leaf.written);
+            let (start, run) = leaf.written.iter().next().unwrap();
+            (*start, run.end, run.digest.map(|digest| digest.value))
+        };
+        let first = bytes(8192, 5);
+        folding(&mut leaf, LINE - 4096, first.clone());
+        assert_eq!(held(&leaf, LINE - 4096, LINE + 4096), first);
+        let (start, end, digest) = run(&leaf);
+        assert_eq!((start, end), (LINE - 4096, LINE + 4096));
+        assert_eq!(digest, Some(crc.hash(&first).value));
+
+        folding(&mut leaf, LINE - 50, bytes(100, 6));
+        let now = held(&leaf, LINE - 4096, LINE + 4096);
+        assert_eq!(&now[4046..4146], &bytes(100, 6)[..]);
+        assert_eq!(run(&leaf).2, Some(crc.hash(&now).value));
+
+        leaf.close(LINE + 10).unwrap();
+        assert_eq!(leaf.len().unwrap(), LINE + 10);
+        let kept = held(&leaf, LINE - 4096, LINE + 10);
+        let (start, end, digest) = run(&leaf);
+        assert_eq!((start, end), (LINE - 4096, LINE + 10));
+        assert_eq!(digest, Some(crc.hash(&kept).value));
     }
 }

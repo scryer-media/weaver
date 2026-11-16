@@ -155,8 +155,13 @@ pub struct Metrics {
     pub bytes_downloaded: u64,
     pub bytes_decoded: u64,
     pub bytes_committed: u64,
+    /// Articles still to fetch across every queued job, recovery articles
+    /// and jobs outside the queue window included; not connections or jobs.
     pub download_queue_depth: u32,
-    pub active_downloads: u32,
+    /// Articles the download lanes hold right now: sent or about to be sent
+    /// to a server and not yet answered. Roughly busy connections times
+    /// pipeline depth. Not the number of jobs or files downloading.
+    pub articles_in_flight: u32,
     pub active_decodes: u32,
     pub decode_pending: u32,
     pub decode_pending_bytes: u64,
@@ -201,14 +206,20 @@ pub struct Metrics {
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
+    /// Articles booked missing: every server and every message id was tried
+    /// and none had it. Per-server refusals are in
+    /// `downloadFailuresArticleNotFound`.
     pub articles_not_found: u64,
     pub decode_errors: u64,
     pub verify_active: u32,
     pub repair_active: u32,
     pub extract_active: u32,
-    pub disk_write_latency_us: u64,
     pub segments_retried: u64,
+    /// Articles that downloaded but never decoded into place and were left
+    /// to repair; articles no server had are in `articlesNotFound`.
     pub segments_failed_permanent: u64,
+    /// Article fetches a server answered as not found, one per server asked;
+    /// an article another server then delivers still counts here.
     pub download_failures_article_not_found: u64,
     pub download_failures_capacity_unavailable: u64,
     pub download_failures_transient: u64,
@@ -216,16 +227,28 @@ pub struct Metrics {
     pub download_failures_permanent: u64,
     pub current_download_speed: u64,
     pub crc_errors: u64,
+    /// Recovery articles still to fetch across the jobs in the queue window;
+    /// part of `downloadQueueDepth`.
     pub recovery_queue_depth: u32,
     pub articles_per_sec: f64,
     pub decode_rate_mbps: f64,
 }
 
-// The direct-store set counters, kept in the schema at 0 for the clients that
-// still read them: the graph engine routes no set directly.
+// Fields kept in the schema at 0 for the clients that still read them: the
+// loop's disk write time, which the volume writers left nothing to measure,
+// and the direct-store set counters, as the graph engine routes no set
+// directly.
 // TODO(0.17.0): remove
 #[ComplexObject]
 impl Metrics {
+    /// Once the time of the last disk write on the pipeline loop. The volume
+    /// writers write off the loop, so there is no such time: each volume's own
+    /// counters say what its disk took.
+    #[graphql(deprecation = "always 0 since the volume writers; removed in 0.17.0")]
+    async fn disk_write_latency_us(&self) -> u64 {
+        0
+    }
+
     /// Lifetime count of archive sets direct-store admitted. Together with
     /// the two below this is the external answer to "did direct routing carry
     /// this work, or quietly fall back?" — output bytes are identical either
@@ -302,7 +325,7 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             bytes_decoded: m.bytes_decoded,
             bytes_committed: m.bytes_committed,
             download_queue_depth: m.download_queue_depth as u32,
-            active_downloads: m.active_downloads as u32,
+            articles_in_flight: m.articles_in_flight as u32,
             active_decodes: m.active_decodes as u32,
             decode_pending: m.decode_pending as u32,
             decode_pending_bytes: m.decode_pending_bytes,
@@ -353,7 +376,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             verify_active: m.verify_active as u32,
             repair_active: m.repair_active as u32,
             extract_active: m.extract_active as u32,
-            disk_write_latency_us: m.disk_write_latency_us,
             segments_retried: m.segments_retried,
             segments_failed_permanent: m.segments_failed_permanent,
             download_failures_article_not_found: m.download_failures_article_not_found,
@@ -1230,7 +1252,30 @@ pub struct ConfiguredStorage {
     pub error: Option<String>,
 }
 
+/// One volume as the operating system presents it: what it takes and what
+/// is being written to it now.
 #[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct StorageVolumeWriteRate {
+    /// The mount path or drive root.
+    pub label: String,
+    /// "ssd", "platter", "network" or "unknown".
+    pub storage_kind: String,
+    /// What the volume takes, in bytes per second; null until measured.
+    pub write_rate_bytes_per_second: Option<u64>,
+    /// What Weaver wrote to the volume over the last window, in bytes per
+    /// second, whether or not the volume was the limit; null when nothing
+    /// was written.
+    pub throughput_bytes_per_second: Option<u64>,
+    /// Bytes waiting in memory to be written to the volume.
+    pub buffered_bytes: u64,
+    /// The most bytes Weaver lets wait in memory for the volume before it
+    /// stops fetching for the jobs that write to it; null until the volume
+    /// has been given a limit.
+    pub buffer_limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct SystemInfo {
     pub version: String,
     pub uptime_seconds: f64,
@@ -1242,6 +1287,37 @@ pub struct SystemInfo {
     pub memory: SystemMemoryInfo,
     pub primary_storage: SystemStorageProfile,
     pub configured_storage: Vec<ConfiguredStorage>,
+}
+
+#[ComplexObject]
+impl SystemInfo {
+    /// Every volume Weaver writes to, each with what it takes and what is
+    /// being written to it. Read
+    /// from what the disk owner holds; asks no disk.
+    async fn volumes(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<StorageVolumeWriteRate>> {
+        let storage = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .storage_capacity();
+        Ok(storage
+            .map(|storage| storage.volume_snapshots())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|volume| StorageVolumeWriteRate {
+                label: volume.label,
+                storage_kind: volume.kind.to_string(),
+                // Zero is "not measured" and "nothing written".
+                write_rate_bytes_per_second: (volume.write_rate > 0).then_some(volume.write_rate),
+                throughput_bytes_per_second: (volume.throughput > 0).then_some(volume.throughput),
+                buffered_bytes: volume.buffered_bytes,
+                // Zero is "not sized yet".
+                buffer_limit_bytes: (volume.buffer_limit_bytes > 0)
+                    .then_some(volume.buffer_limit_bytes),
+            })
+            .collect())
+    }
 }
 
 /// Whether this deployment can restart Weaver from the browser.
@@ -1283,7 +1359,8 @@ pub struct ServerHealth {
     pub port: u16,
     /// `host:port` label.
     pub label: String,
-    /// "PRIMARY" for the highest-priority server, "BACKUP" otherwise.
+    /// "PRIMARY" for every fill server on the top priority level, "BACKUP"
+    /// for every other server (lower levels and backfill servers).
     pub tier: String,
     /// One of "healthy", "degraded", "cooling_down", "disabled".
     pub state: String,
@@ -1312,8 +1389,13 @@ pub struct ServerHealth {
     pub capacity_penalty_until_epoch_ms: Option<u64>,
     /// Active NNTP runtime generation.
     pub runtime_generation: u64,
-    /// EWMA request latency in milliseconds.
+    /// EWMA request latency in milliseconds. Reads 50.0, the figure server
+    /// ranking starts from, until a first request has been timed; use
+    /// `measuredLatencyMs` to tell a measurement from that start value.
     pub latency_ms: f64,
+    /// EWMA request latency in milliseconds, absent until a first request
+    /// to this server has been timed.
+    pub measured_latency_ms: Option<f64>,
     /// EWMA command-to-status-line wait for BODY fetches, in milliseconds.
     /// Absent until the download lanes have taken an unbiased sample.
     pub body_latency_ms: Option<f64>,
@@ -1322,12 +1404,22 @@ pub struct ServerHealth {
     pub body_transfer_ms: Option<f64>,
     /// "good", "moderate" or "slow" for `bodyLatencyMs`.
     pub body_latency_band: Option<String>,
-    /// BODY pipelining depth the lanes currently run at; 1 is sequential.
+    /// BODY pipelining depth the lanes currently run at; 1 is sequential,
+    /// and a server pinned sequential always reads 1.
     pub body_pipeline_depth: u32,
-    /// Set once the server has twice failed to answer a pipelined batch
-    /// cleanly, which holds it sequential for the rest of the process.
+    /// Set while the server is held sequential after twice failing to answer
+    /// a pipelined batch cleanly. The hold ends in a trial at depth 2: a
+    /// clean trial clears this, an unclean one holds the server again for
+    /// twice as long, up to two hours. A reorder or a priority change keeps
+    /// the hold; a change of host, port or username, or a restart, starts
+    /// the server afresh.
     pub body_pipelining_pinned_sequential: bool,
+    /// Requests the connection answered, whatever the answer: a server
+    /// that says "no such article" is a working connection and counts here.
+    /// What it had is in `articlesFound` and `articlesNotFound`.
     pub success_count: u64,
+    /// Requests the connection failed: refused, timed out, dropped or
+    /// answered out of protocol. A "no such article" answer is not one.
     pub failure_count: u64,
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
@@ -1338,10 +1430,39 @@ pub struct ServerHealth {
     #[graphql(skip)]
     #[serde(skip)]
     pub pool_index: usize,
+    /// The server's configured id, which its counters are kept under.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub stable_server_id: Option<u32>,
+}
+
+impl ServerHealth {
+    // What this server answered to article requests, read only when a query
+    // asks for one of the two figures, and found by the server's id.
+    fn article_outcomes(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Option<weaver_server_core::ServerArticleOutcomes> {
+        ctx.data_opt::<weaver_server_core::SchedulerHandle>()?
+            .server_article_outcomes(self.stable_server_id?)
+    }
 }
 
 #[ComplexObject]
 impl ServerHealth {
+    /// Article requests this server answered with the article, counted
+    /// since Weaver last started. The count starts again at every start.
+    async fn articles_found(&self, ctx: &Context<'_>) -> u64 {
+        self.article_outcomes(ctx)
+            .map_or(0, |outcomes| outcomes.found)
+    }
+    /// Article requests this server answered "no such article", counted
+    /// since Weaver last started; the article may still have come from
+    /// another server. The count starts again at every start.
+    async fn articles_not_found(&self, ctx: &Context<'_>) -> u64 {
+        self.article_outcomes(ctx)
+            .map_or(0, |outcomes| outcomes.not_found)
+    }
     async fn legs(&self, ctx: &Context<'_>) -> Vec<crate::networking::NetworkLegFlow> {
         let Some(handle) = ctx.data_opt::<weaver_server_core::SchedulerHandle>() else {
             return Vec::new();

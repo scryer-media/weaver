@@ -46,6 +46,19 @@ pub struct SharedProvider<T>(pub(crate) T);
 // The kind of session a shared provider holds.
 pub(crate) trait SessionKind {
     const KIND: crate::metrics::TunnelKind;
+
+    // Open a stream whose socket holds `buffers`, when this kind of session
+    // keeps a socket of its own for each stream. `None` when it does not,
+    // and the stream is dialled as any other.
+    fn dial_sized(
+        &self,
+        _host: &str,
+        _port: u16,
+        _buffers: crate::wireguard::TcpBuffers,
+    ) -> impl std::future::Future<Output = Option<Result<Box<dyn TunnelStream>, TunnelError>>> + Send
+    {
+        async { None }
+    }
 }
 
 #[async_trait::async_trait]
@@ -67,6 +80,20 @@ impl<T: proxy_tunnels::TunnelProvider + SessionKind> TunnelProvider for SharedPr
     }
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
         self.0.dial(host, port).await
+    }
+    async fn dial_sized(
+        &self,
+        host: &str,
+        port: u16,
+        outcome: Arc<crate::bridge::ConnectionOutcome>,
+        buffers: Option<crate::wireguard::TcpBuffers>,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        if let Some(buffers) = buffers
+            && let Some(dialed) = self.0.dial_sized(host, port, buffers).await
+        {
+            return dialed;
+        }
+        self.dial_observed(host, port, outcome).await
     }
     fn describe(&self) -> String {
         self.0.describe()

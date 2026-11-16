@@ -279,7 +279,7 @@ impl Pipeline {
         let Some(uu) = self.uu_files.get(&seg_id.file_id) else {
             return false;
         };
-        if seg_id.segment_number != uu.next_index {
+        if seg_id.segment_number != uu.next_index.get() {
             // Only the ordinal the cursor is actually waiting on can wedge it.
             // A later failure is passed when the cursor reaches it.
             return false;
@@ -287,7 +287,7 @@ impl Pipeline {
         self.pass_given_up_uu(seg_id.file_id);
         self.uu_files
             .get(&seg_id.file_id)
-            .is_some_and(|uu| uu.parked.contains_key(&uu.next_index))
+            .is_some_and(|uu| uu.parked.contains_key(&uu.next_index.get()))
     }
 
     // Drop the job's terminal states, and the ledger derived from them.
@@ -306,6 +306,10 @@ impl Pipeline {
         }
         self.files_counted_missing
             .retain(|file_id| file_id.job_id != job_id);
+        // A job that ends whole keeps the cause an article recorded; a run
+        // under the same id later must not read it back.
+        self.semantic_terminal_causes.remove(&job_id);
+        self.login_refusals.remove(&job_id);
     }
 
     pub(in crate::pipeline) fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
@@ -359,6 +363,7 @@ impl Pipeline {
         lease: DownloadBatchLease,
     ) {
         for work in lease.works {
+            self.release_lane_work(&work);
             self.enqueue_download_work(work);
         }
         self.update_queue_metrics();
@@ -456,12 +461,29 @@ impl Pipeline {
         }
 
         if observation.mode != DownloadLaneMode::Sequential && observation.batch_complete {
+            let depth = observation.mode.depth();
             if observation.batch_clean {
+                // The server answered with a later request on the wire, so
+                // the batch really ran pipelined.
+                change = explorer
+                    .note_clean_batch(now, depth, observation.answered_pipelined, result.lane_id)
+                    .or(change);
                 self.metrics
                     .download_pipeline_trial_success_total
                     .fetch_add(1, Ordering::Relaxed);
             } else if unclean_server_fault {
-                change = explorer.note_unclean_batch(now).or(change);
+                change = explorer
+                    .note_unclean_batch_at(
+                        now,
+                        depth,
+                        // The server had taken pipelined requests on this
+                        // connection before it failed. A connection that
+                        // died before answering anything (an idle close, a
+                        // restart, an outage) is no strike.
+                        observation.answered_pipelined,
+                        result.lane_id,
+                    )
+                    .or(change);
                 self.metrics
                     .download_pipeline_trial_failure_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -515,13 +537,24 @@ impl Pipeline {
                     from, to, "download pipeline batch was unclean; depth dropped"
                 );
             }
-            RungChange::PinnedSequential => {
+            RungChange::PinnedSequential { hold } => {
                 self.metrics
                     .download_pipeline_cooldown_total
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     server = server_idx,
-                    "second unclean pipelined batch; server pinned to sequential BODY fetches"
+                    hold_mins = hold.as_secs() / 60,
+                    "unclean pipelined batch inside the hold; server pinned to sequential BODY \
+                     fetches until a trial at depth 2"
+                );
+            }
+            RungChange::PinLifted { depth } => {
+                self.metrics
+                    .download_pipeline_proof_pass_total
+                    .fetch_add(1, Ordering::Relaxed);
+                info!(
+                    server = server_idx,
+                    depth, "download pipeline trial was clean; sequential pin lifted"
                 );
             }
         }
@@ -564,7 +597,7 @@ impl Pipeline {
                     .map(|transfer| transfer.as_secs_f64() * 1000.0),
                 latency_band: explorer.latency_band().map(|band| band.label().to_string()),
                 pipeline_depth: u32::from(explorer.current_depth()),
-                pinned_sequential: explorer.pinned_sequential(),
+                pinned_sequential: explorer.pin_held(),
             })
             .collect();
         health.sort_unstable_by_key(|entry| entry.server_idx);
@@ -595,12 +628,19 @@ impl Pipeline {
         // already holds the new generation and every old position has been
         // renumbered underneath it.
         let previous_stable_ids = std::mem::take(&mut self.download_lane_runtime.stable_ids);
-        let carried: HashMap<u32, ServerPipelineExplorer> = self
+        let previous_identities = std::mem::replace(
+            &mut self.download_lane_runtime.identities,
+            self.nntp.pool().server_identities(),
+        );
+        let carried: HashMap<u32, (usize, ServerPipelineExplorer)> = self
             .download_lane_runtime
             .servers
             .drain()
             .filter_map(|(server_idx, explorer)| {
-                Some((*previous_stable_ids.get(&server_idx)?, explorer))
+                Some((
+                    *previous_stable_ids.get(&server_idx)?,
+                    (server_idx, explorer),
+                ))
             })
             .collect();
         #[expect(clippy::type_complexity, reason = "one-shot seeding tuple")]
@@ -627,7 +667,9 @@ impl Pipeline {
                     .pool()
                     .stable_server_id(weaver_nntp::pool::ServerId(server_idx))
                     .map(|stable_id| stable_id.0);
-                let prior = stable_id.and_then(|stable_id| carried.get(&stable_id));
+                let prior = stable_id
+                    .and_then(|stable_id| carried.get(&stable_id))
+                    .map(|(_, explorer)| explorer);
                 let latency = prior
                     .and_then(|explorer| explorer.latency())
                     .or_else(|| self.probe_latency(server_idx));
@@ -649,6 +691,14 @@ impl Pipeline {
         for (server_idx, stable_id, supports_pipelining, proven_depth, latency, transfer) in seeds {
             let mut explorer = ServerPipelineExplorer::seeded(proven_depth, latency, transfer);
             explorer.note_supports_pipelining(supports_pipelining);
+            // The verdict was earned by one host, port and login. A server
+            // edited to another keeps its measurements and starts unpinned.
+            if let Some((was_at, prior)) = stable_id.and_then(|stable_id| carried.get(&stable_id))
+                && previous_identities.get(*was_at)
+                    == self.download_lane_runtime.identities.get(server_idx)
+            {
+                explorer.carry_pipelining_verdict(prior);
+            }
             self.download_lane_runtime
                 .servers
                 .insert(server_idx, explorer);
@@ -730,8 +780,8 @@ impl Pipeline {
         &mut self,
         lease: DownloadBatchLease,
     ) {
-        for work in lease.works {
-            if !self.accept_lane_work(lease.lane_id, work.segment_id) {
+        for mut work in lease.works {
+            if !self.accept_returned_lane_work(lease.lane_id, &mut work) {
                 continue;
             }
             self.restore_owned_lane_unrequested_work(lease.lane_id, work);
@@ -771,9 +821,8 @@ impl Pipeline {
                     return;
                 }
                 // Capacity admission and health-mutex contention are both
-                // "ask again shortly": the work goes back to the scheduler on
-                // the owned fast path instead of being demoted to an async
-                // lane on what is not a verdict about the servers at all.
+                // "ask again shortly": the work goes back to the scheduler,
+                // since neither is a verdict about the servers at all.
                 self.note_owned_lane_acquire_failure(&lease, &error);
                 if error.should_requeue_owned_work() {
                     let DownloadBatchLease {
@@ -794,8 +843,8 @@ impl Pipeline {
                         "download.owned_lane.acquire_failed_capacity_requeue",
                         1,
                     );
-                    for work in works {
-                        if self.accept_lane_work(lane_id, work.segment_id) {
+                    for mut work in works {
+                        if self.accept_returned_lane_work(lane_id, &mut work) {
                             self.restore_owned_lane_unrequested_work(lane_id, work);
                         }
                     }
@@ -870,6 +919,7 @@ impl Pipeline {
                             batch_clean: policy_outcome,
                             unresolved_count: u64::from(!policy_outcome),
                             connection_discarded: false,
+                            answered_pipelined: false,
                         }),
                         source_server_idx,
                         origin: DownloadResultOrigin::from_work(
@@ -877,7 +927,7 @@ impl Pipeline {
                             work.completion_critical,
                         ),
                         retry_count: work.retry_count,
-                        exclude_servers: work.exclude_servers.clone(),
+                        exclude_servers: work.exclude_servers,
                         release_connection_slot: false,
                     };
                     if !self.release_download_result(&result) {
@@ -958,8 +1008,8 @@ impl Pipeline {
                     );
                     pending.push_back(result);
                 }
-                for work in unrequested_works {
-                    if !self.accept_lane_work(lane_id, work.segment_id) {
+                for mut work in unrequested_works {
+                    if !self.accept_returned_lane_work(lane_id, &mut work) {
                         continue;
                     }
                     self.restore_owned_lane_unrequested_work(lane_id, work);
@@ -971,7 +1021,7 @@ impl Pipeline {
     // Counts one owned-lane acquire failure by kind, and warns about it at
     // most once a minute per job.
     //
-    // Both arms of the caller — requeue and async fallback — keep the download
+    // Both arms of the caller, requeue and failing the lease, keep the download
     // running, so nothing above debug said that a lane had failed to open. A
     // job whose owned lanes all fail this way still finishes, on a fraction of
     // the connections it was given, with no line in the log to explain it.

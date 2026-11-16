@@ -64,6 +64,9 @@ pub enum RssServiceError {
     Parse(String),
     #[error("HTTP error: {0}")]
     Http(String),
+    // The proxy routes were mid-reload: not a feed failure.
+    #[error("{}", crate::proxies::ROUTES_CHANGING)]
+    RoutesChanging,
 }
 
 #[derive(Clone)]
@@ -290,7 +293,13 @@ impl RssService {
             },
         )
         .await
-        .map_err(RssServiceError::Http)
+        .map_err(|error| {
+            if error == crate::proxies::ROUTES_CHANGING {
+                RssServiceError::RoutesChanging
+            } else {
+                RssServiceError::Http(error)
+            }
+        })
     }
 
     pub(super) fn record_seen(

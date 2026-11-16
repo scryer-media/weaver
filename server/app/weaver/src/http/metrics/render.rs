@@ -16,8 +16,8 @@ use weaver_server_core::bandwidth::schedule_metrics::{
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
-    JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    ServerMetricsSnapshot,
+    JobLifecycleMetricsSnapshot, LOOP_WAIT_KINDS, PipelineHistogramsSnapshot,
+    ProcessMetricsSnapshot, ServerMetricsSnapshot, VolumeSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
@@ -96,6 +96,8 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) wal_checkpoint: Option<&'a WalCheckpointMetricsSnapshot>,
     pub(crate) process: Option<&'a ProcessMetricsSnapshot>,
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
+    // One row per volume the download side writes to.
+    pub(crate) volumes: &'a [VolumeSnapshot],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
 }
 
@@ -143,6 +145,7 @@ impl<'a> PrometheusRenderInput<'a> {
             wal_checkpoint: None,
             process: None,
             disk_space: &[],
+            volumes: &[],
             http_metrics: None,
         }
     }
@@ -200,6 +203,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         wal_checkpoint,
         process,
         disk_space,
+        volumes,
         http_metrics,
     } = *input;
 
@@ -280,6 +284,8 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_process(&mut out, process, start_time_seconds);
     }
     render_disk_space(&mut out, disk_space);
+    render_volumes(&mut out, volumes);
+    render_volume_throughput(&mut out, volumes);
     if let Some(http) = http_metrics {
         render_http(&mut out, http);
     }
@@ -297,7 +303,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_schedules(&mut out, metrics);
     }
     if let Some(metrics) = network {
-        render_network(&mut out, metrics);
+        render_network(&mut out, metrics, server_health);
     }
     if let Some(metrics) = tunnel {
         render_tunnel(&mut out, metrics);
@@ -424,7 +430,11 @@ fn render_queues(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &[],
         snapshot.download_queue_depth as u64,
     );
-    out.sample(&f::ACTIVE_DOWNLOADS, &[], snapshot.active_downloads as u64);
+    out.sample(
+        &f::ARTICLES_IN_FLIGHT,
+        &[],
+        snapshot.articles_in_flight as u64,
+    );
     out.sample(&f::ACTIVE_DECODES, &[], snapshot.active_decodes as u64);
     out.sample(&f::DECODE_PENDING, &[], snapshot.decode_pending as u64);
     out.sample(&f::DECODE_PENDING_BYTES, &[], snapshot.decode_pending_bytes);
@@ -884,6 +894,12 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     ] {
         out.sample(&f::LANE_REFILLS, &[("result", result)], value);
     }
+    for (event, value) in [
+        ("held", snapshot.download_lane_room_held_total),
+        ("woken", snapshot.download_lane_room_woken_total),
+    ] {
+        out.sample(&f::LANE_ROOM_WAITS, &[("event", event)], value);
+    }
     for (kind, value) in [
         ("hot", snapshot.download_scheduler_handouts_total_hot),
         ("spill", snapshot.download_scheduler_handouts_total_spill),
@@ -969,16 +985,6 @@ fn render_stalls_and_workers(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     out.sample(&f::VERIFY_ACTIVE, &[], snapshot.verify_active);
     out.sample(&f::REPAIR_ACTIVE, &[], snapshot.repair_active);
     out.sample(&f::EXTRACT_ACTIVE, &[], snapshot.extract_active);
-    out.sample(
-        &f::DISK_WRITE_LATENCY_US,
-        &[],
-        snapshot.disk_write_latency_us,
-    );
-    out.sample_f64(
-        &f::DISK_WRITE_LATENCY_SECONDS,
-        &[],
-        snapshot.disk_write_latency_us as f64 / 1_000_000.0,
-    );
 }
 
 fn render_rates(out: &mut Encoder, snapshot: &MetricsSnapshot) {
@@ -1134,10 +1140,8 @@ fn render_servers(out: &mut Encoder, server_health: &[ServerHealthInfo], runtime
         for (phase, count) in [
             ("physical", srv.sockets.physical),
             ("dialing", srv.sockets.dialing),
-            ("async_idle", srv.sockets.async_idle),
             ("owned_idle", srv.sockets.owned_idle),
             ("closing", srv.sockets.closing),
-            ("replacement", srv.sockets.replacement),
         ] {
             out.sample(
                 &f::SERVER_SOCKETS,
@@ -1254,10 +1258,12 @@ fn render_server_transfers(
 
     for transfer in server_transfers {
         let server_id = transfer.stable_server_id.0.to_string();
-        let label = labels_by_id
-            .get(server_id.as_str())
-            .copied()
-            .unwrap_or_default();
+        // A server the pool does not run has no `server` label to give and
+        // nothing moving to report: its series are left out, not sent with
+        // an empty label.
+        let Some(&label) = labels_by_id.get(server_id.as_str()) else {
+            continue;
+        };
         let id: &[(&str, &str)] = &[("server_id", server_id.as_str()), ("server", label)];
 
         out.sample(
@@ -1375,10 +1381,10 @@ fn render_server_articles(
 
     for server in server_metrics {
         let server_id = server.stable_server_id.to_string();
-        let label = labels_by_id
-            .get(server_id.as_str())
-            .copied()
-            .unwrap_or_default();
+        // As for transfers: only the servers the pool runs.
+        let Some(&label) = labels_by_id.get(server_id.as_str()) else {
+            continue;
+        };
         let id: &[(&str, &str)] = &[("server_id", server_id.as_str()), ("server", label)];
 
         for attempt in &server.attempts {
@@ -1451,12 +1457,6 @@ fn render_job_lifecycle(out: &mut Encoder, lifecycle: &JobLifecycleMetricsSnapsh
 
 fn render_pipeline_histograms(out: &mut Encoder, histograms: &PipelineHistogramsSnapshot) {
     render_histogram(out, &f::TURN_DURATION, &[], &histograms.turn_duration);
-    render_histogram(
-        out,
-        &f::DISK_WRITE_DURATION,
-        &[],
-        &histograms.disk_write_duration,
-    );
     // These two stay absent until their stage has actually been timed: an
     // all-zero histogram would read as "measured, nothing happened" rather than
     // "not measured".
@@ -1499,6 +1499,7 @@ fn render_wal_checkpoint(out: &mut Encoder, wal: &WalCheckpointMetricsSnapshot) 
     out.sample(&f::DB_WAL_CHECKPOINTED_FRAMES, &[], wal.checkpointed_frames);
     out.sample(&f::DB_WAL_CHECKPOINT_COPIED_FRAMES, &[], wal.copied_frames);
     out.sample(&f::DB_WAL_BYTES, &[], wal.wal_bytes);
+    render_histogram(out, &f::DB_STATEMENT_DURATION, &[], &wal.statement_duration);
 }
 
 // Standard `process_*` collector series.
@@ -1539,6 +1540,134 @@ fn render_disk_space(out: &mut Encoder, disk_space: &[DiskSpaceSnapshot]) {
         let labels: &[(&str, &str)] = &[("role", disk.role), ("path", disk.path.as_str())];
         out.sample(&f::DISK_TOTAL_BYTES, labels, disk.total_bytes);
         out.sample(&f::DISK_AVAILABLE_BYTES, labels, disk.available_bytes);
+    }
+}
+
+fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
+    for volume in volumes {
+        let labels: &[(&str, &str)] = &[("volume", volume.label.as_str())];
+        out.sample(&f::VOLUME_WRITTEN_BYTES, labels, volume.written_bytes);
+        out.sample_f64(
+            &f::VOLUME_WRITE_SECONDS,
+            labels,
+            volume.write_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_WRITE_CALLS, labels, volume.write_calls);
+        out.sample(&f::VOLUME_WRITE_SEEKS, labels, volume.write_seeks);
+        // Zero is "not measured", which is told by the series being absent.
+        if volume.write_rate > 0 {
+            out.sample(&f::VOLUME_WRITE_RATE, labels, volume.write_rate);
+        }
+        out.sample(&f::VOLUME_BUFFERED_BYTES, labels, volume.buffered_bytes);
+        out.sample(&f::VOLUME_ARRIVED_BYTES, labels, volume.arrived_bytes);
+        out.sample(&f::VOLUME_COUNTED_BYTES, labels, volume.counted_bytes);
+        out.sample(&f::VOLUME_COUNTED_PEAK_BYTES, labels, volume.peak_bytes);
+        // Zero is "not sized yet", which is told by the series being absent.
+        if volume.buffer_limit_bytes > 0 {
+            out.sample(
+                &f::VOLUME_BUFFER_LIMIT_BYTES,
+                labels,
+                volume.buffer_limit_bytes,
+            );
+            out.sample(
+                &f::VOLUME_BUFFER_SOFT_LIMIT_BYTES,
+                labels,
+                volume.buffer_soft_bytes,
+            );
+        }
+        let writer = &volume.writer;
+        out.sample(&f::VOLUME_WRITER_BATCHES, labels, writer.batches);
+        out.sample(&f::VOLUME_WRITER_OPERATIONS, labels, writer.operations);
+        out.sample(
+            &f::VOLUME_WRITER_FAILED_OPERATIONS,
+            labels,
+            writer.failed_operations,
+        );
+        out.sample(
+            &f::VOLUME_WRITER_ABANDONED_OPERATIONS,
+            labels,
+            writer.abandoned_operations,
+        );
+        for (at, kind) in LOOP_WAIT_KINDS.iter().enumerate() {
+            let labels: &[(&str, &str)] = &[("volume", volume.label.as_str()), ("kind", kind)];
+            out.sample(&f::VOLUME_LOOP_WAITS, labels, writer.loop_waits_by_kind[at]);
+            out.sample_f64(
+                &f::VOLUME_LOOP_WAIT_SECONDS,
+                labels,
+                writer.loop_wait_nanos_by_kind[at] as f64 / 1e9,
+            );
+        }
+        out.sample(&f::VOLUME_LOOP_READS, labels, writer.loop_reads);
+        out.sample_f64(
+            &f::VOLUME_LOOP_READ_SECONDS,
+            labels,
+            writer.loop_read_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_ASIDE_WAITS, labels, writer.aside_waits);
+        out.sample_f64(
+            &f::VOLUME_ASIDE_WAIT_SECONDS,
+            labels,
+            writer.aside_wait_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_WRITER_OPENS, labels, writer.opens);
+        out.sample_f64(
+            &f::VOLUME_WRITER_OPEN_SECONDS,
+            labels,
+            writer.open_nanos as f64 / 1e9,
+        );
+        for (count, seconds, opens, nanos) in [
+            (
+                &f::VOLUME_WRITER_OPEN_CREATES,
+                &f::VOLUME_WRITER_OPEN_CREATE_SECONDS,
+                writer.open_creates,
+                writer.open_create_nanos,
+            ),
+            (
+                &f::VOLUME_WRITER_OPEN_SPARSE_MARKS,
+                &f::VOLUME_WRITER_OPEN_SPARSE_MARK_SECONDS,
+                writer.open_marks,
+                writer.open_mark_nanos,
+            ),
+            (
+                &f::VOLUME_WRITER_OPEN_LENGTH_SETS,
+                &f::VOLUME_WRITER_OPEN_LENGTH_SET_SECONDS,
+                writer.open_sizes,
+                writer.open_size_nanos,
+            ),
+        ] {
+            out.sample(count, labels, opens);
+            out.sample_f64(seconds, labels, nanos as f64 / 1e9);
+        }
+        out.sample(&f::VOLUME_WRITER_LENGTH_SETS, labels, writer.length_sets);
+        out.sample_f64(
+            &f::VOLUME_WRITER_LENGTH_SET_SECONDS,
+            labels,
+            writer.length_set_nanos as f64 / 1e9,
+        );
+        out.sample(
+            &f::VOLUME_WRITER_LENGTH_SETS_SKIPPED,
+            labels,
+            writer.length_sets_skipped,
+        );
+        out.sample(&f::VOLUME_WRITER_CLOSES, labels, writer.closes);
+        out.sample_f64(
+            &f::VOLUME_WRITER_CLOSE_SECONDS,
+            labels,
+            writer.close_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_WRITER_THREADS, labels, writer.threads);
+        out.sample(&f::VOLUME_WRITER_WOKEN, labels, writer.woken);
+    }
+}
+
+// What is being written to each volume now. A volume nothing is written to
+// has no figure, which is told by the series being absent.
+fn render_volume_throughput(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
+    for volume in volumes {
+        if volume.throughput > 0 {
+            let labels: &[(&str, &str)] = &[("volume", volume.label.as_str())];
+            out.sample(&f::VOLUME_WRITE_THROUGHPUT, labels, volume.throughput);
+        }
     }
 }
 
@@ -1607,7 +1736,7 @@ fn observed_download_limiter(
     // `idle` — "nothing to do" — when the truth is "nowhere to fetch from",
     // which is the exact state the next check exists to name.
     if required_queue_depth == 0
-        && snapshot.active_downloads == 0
+        && snapshot.articles_in_flight == 0
         && snapshot.parked_infrastructure_work == 0
     {
         return "idle";
@@ -1619,7 +1748,7 @@ fn observed_download_limiter(
     // `dispatch_limited` here would point the operator at the decode/write
     // path or at Weaver's own scheduler, when the problem is upstream of both.
     // It cannot mask an ordinary busy pipeline, which has active downloads.
-    if snapshot.parked_infrastructure_work > 0 && snapshot.active_downloads == 0 {
+    if snapshot.parked_infrastructure_work > 0 && snapshot.articles_in_flight == 0 {
         return "infrastructure_unavailable";
     }
     if snapshot.download_pressure_state != DownloadPressureState::Clear {
@@ -1649,13 +1778,13 @@ fn observed_download_limiter(
         .map(|server| server.connections_available)
         .sum::<usize>();
     if required_queue_depth > 0
-        && snapshot.active_downloads > 0
+        && snapshot.articles_in_flight > 0
         && total_connections > 0
         && available_connections == 0
     {
         return "network_limited";
     }
-    if snapshot.active_downloads > 0 {
+    if snapshot.articles_in_flight > 0 {
         return "active";
     }
     "dispatch_limited"
@@ -1904,10 +2033,25 @@ pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnaps
 // One per-leg gauge's value, or `None` to leave the leg's series out.
 type LegValue = fn(&LegMetrics) -> Option<f64>;
 
-pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot) {
+// A leg of a server the pool does not run is left out: no connection is made
+// on it, so its state (`up` until something says otherwise) says nothing.
+pub(crate) fn render_network(
+    out: &mut Encoder,
+    metrics: &NetworkMetricsSnapshot,
+    server_health: &[ServerHealthInfo],
+) {
+    let running: std::collections::HashSet<&str> = server_health
+        .iter()
+        .map(|srv| srv.server_id.as_str())
+        .collect();
     let legs: Vec<(String, String, &LegMetrics)> = metrics
         .legs
         .iter()
+        .filter(|leg| {
+            leg.consumer
+                .strip_prefix("server:")
+                .is_none_or(|id| running.contains(id))
+        })
         .map(|leg| (leg.position.to_string(), leg.egress_id.to_string(), leg))
         .collect();
     for (position, egress, leg) in &legs {

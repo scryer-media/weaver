@@ -14,19 +14,7 @@ use tokio::time::Instant;
 mod tests;
 use super::*;
 use crate::Database;
-use weaver_tunnel::{
-    Http3TunnelProvider, SshTunnelProvider, TunnelError, TunnelObserver, TunnelProvider,
-    TunnelStream, WireGuardTunnelProvider,
-    bridge::Bridge,
-    fault,
-    transport::{TransportKind, TransportProxy},
-};
-
-fn bridge_credentials() -> Result<(String, String), String> {
-    let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).map_err(|_| "could not generate bridge credentials")?;
-    Ok(("weaver".into(), hex::encode(secret)))
-}
+use weaver_tunnel::{TunnelError, TunnelObserver};
 
 pub(super) struct Observer {
     pub(super) db: Database,
@@ -49,45 +37,6 @@ impl TunnelObserver for Observer {
     }
 }
 
-pub struct ProxyHop {
-    pub profile: ProxyProfile,
-    pub provider: Arc<dyn TunnelProvider>,
-}
-impl ProxyHop {
-    fn new(profile: ProxyProfile, db: &Database) -> Result<Arc<Self>, String> {
-        profile.validate().map_err(|e| e.to_string())?;
-        Self::provide(profile, db).map_err(|e| e.to_string())
-    }
-    // A hop for a profile that has been validated.
-    fn provide(profile: ProxyProfile, db: &Database) -> Result<Arc<Self>, TunnelError> {
-        let observer = Arc::new(Observer {
-            db: db.clone(),
-            id: profile.id,
-            revision: profile.revision,
-        });
-        let provider: Arc<dyn TunnelProvider> = match profile.kind {
-            ProxyKind::Http3Connect => Arc::new(Http3TunnelProvider::new(profile.http3_spec()?)?),
-            ProxyKind::Ssh => Arc::new(SshTunnelProvider::new(profile.ssh_spec(), observer)),
-            ProxyKind::WireGuard => Arc::new(WireGuardTunnelProvider::new(
-                profile.wireguard_spec()?,
-                observer,
-            )),
-            kind @ (ProxyKind::HttpConnect | ProxyKind::Socks5) => Arc::new(TransportProxy {
-                kind: if kind == ProxyKind::Socks5 {
-                    TransportKind::Socks5
-                } else {
-                    TransportKind::HttpConnect
-                },
-                host: profile.host.clone(),
-                port: profile.port,
-                username: profile.secrets.username.clone(),
-                password: profile.secrets.password.clone(),
-            }),
-        };
-        Ok(Arc::new(Self { profile, provider }))
-    }
-}
-
 struct Cooldown {
     until: Instant,
     probing: bool,
@@ -103,15 +52,11 @@ fn legacy_policy_changed(current: &RoutingPolicy, next: &RoutingPolicy) -> bool 
 
 pub struct ConsumerRoute {
     pub policy: RoutingPolicy,
-    pub hops: Vec<Option<Arc<ProxyHop>>>,
     cooldowns: Mutex<HashMap<u32, Cooldown>>,
     status: Mutex<RoutingStatus>,
     revoked: AtomicBool,
     cancellation: tokio::sync::Notify,
     pub sockets: Arc<weaver_nntp::revocation::SocketRegistry>,
-    bridges: Mutex<Vec<Arc<Bridge>>>,
-    http_bridges: Mutex<HashMap<u32, Arc<Bridge>>>,
-    handle: tokio::runtime::Handle,
     timeout: Duration,
 }
 
@@ -191,66 +136,10 @@ impl ConsumerRoute {
         s.state = RouteState::Blocked;
         s.selected_proxy_id = None;
     }
-    pub fn bridge(self: &Arc<Self>) -> Result<Arc<Bridge>, String> {
-        let mut bridges = self.bridges.lock().expect("route bridges");
-        if self.is_revoked() {
-            return Err("proxy route was revoked".into());
-        }
-        if let Some(bridge) = bridges.first() {
-            return Ok(bridge.clone());
-        }
-        let provider: Arc<dyn TunnelProvider> = Arc::new(BridgeLadder(Arc::downgrade(self)));
-        let bridge = Bridge::start(
-            &self.handle,
-            provider,
-            self.timeout * (self.hops.len() as u32 + 1),
-            bridge_credentials()?,
-        )
-        .map_err(|e| e.to_string())?;
-        bridges.push(bridge.clone());
-        Ok(bridge)
-    }
-    pub fn hop_bridge(&self, hop: &Arc<ProxyHop>) -> Result<Arc<Bridge>, String> {
-        self.http_bridge(hop.profile.id, hop.provider.clone())
-    }
-    pub fn direct_bridge(&self) -> Result<Arc<Bridge>, String> {
-        if !self.policy.allow_direct {
-            return Err("direct access is blocked".into());
-        }
-        self.http_bridge(0, Arc::new(DirectProvider))
-    }
-    fn http_bridge(
-        &self,
-        id: u32,
-        provider: Arc<dyn TunnelProvider>,
-    ) -> Result<Arc<Bridge>, String> {
-        let mut bridges = self.http_bridges.lock().expect("HTTP route bridges");
-        if self.is_revoked() {
-            return Err("proxy route was revoked".into());
-        }
-        if let Some(bridge) = bridges.get(&id) {
-            return Ok(bridge.clone());
-        }
-        if bridges.len() >= 9 {
-            return Err("too many HTTP route bridges".into());
-        }
-        let bridge = Bridge::start(&self.handle, provider, self.timeout, bridge_credentials()?)
-            .map_err(|e| e.to_string())?;
-        bridges.insert(id, bridge.clone());
-        Ok(bridge)
-    }
     pub async fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
         self.cancellation.notify_waiters();
         self.sockets.revoke();
-        let bridges = std::mem::take(&mut *self.bridges.lock().expect("route bridges"));
-        for bridge in bridges {
-            bridge.revoke().await;
-        }
-        let bridges = std::mem::take(&mut *self.http_bridges.lock().expect("HTTP route bridges"));
-        for (_, bridge) in bridges {
-            bridge.revoke().await;
-        }
     }
 }
 
@@ -284,144 +173,23 @@ impl Drop for RouteAttempt {
     }
 }
 
-struct Ladder(Arc<ConsumerRoute>);
-// The bridge task must not retain its owner through a route → bridge → task cycle.
-struct BridgeLadder(std::sync::Weak<ConsumerRoute>);
-#[async_trait::async_trait]
-impl TunnelProvider for BridgeLadder {
-    async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        self.dial_observed(host, port, Arc::default()).await
-    }
-    async fn dial_observed(
-        &self,
-        host: &str,
-        port: u16,
-        outcome: Arc<weaver_tunnel::bridge::ConnectionOutcome>,
-    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        let route = self
-            .0
-            .upgrade()
-            .ok_or_else(|| TunnelError::Engine("proxy route was closed".into()))?;
-        let ladder = Ladder(route.clone());
-        tokio::select! {
-            biased;
-            _ = route.cancelled() => Err(TunnelError::Engine("proxy route was revoked".into())),
-            result = ladder.dial_observed(host, port, outcome) => result,
-        }
-    }
-    fn describe(&self) -> String {
-        "consumer routing ladder".into()
-    }
-}
-struct DirectProvider;
-#[async_trait::async_trait]
-impl TunnelProvider for DirectProvider {
-    #[expect(clippy::disallowed_methods, reason = "a route's direct leg")]
-    async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        weaver_tunnel::resolution::connect_host(host, port)
-            .await
-            .map(|s| Box::new(s) as Box<dyn TunnelStream>)
-            .map_err(|error| TunnelError::Dial {
-                host: host.into(),
-                port,
-                detail: error.to_string(),
-            })
-    }
-    fn describe(&self) -> String {
-        "direct host access".into()
-    }
-}
-#[async_trait::async_trait]
-impl TunnelProvider for Ladder {
-    async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        self.dial_observed(host, port, Arc::default()).await
-    }
-    async fn dial_observed(
-        &self,
-        host: &str,
-        port: u16,
-        outcome: Arc<weaver_tunnel::bridge::ConnectionOutcome>,
-    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        let route = &self.0;
-        for (id, hop) in route.policy.proxy_ids.iter().zip(&route.hops) {
-            let Some(attempt) = route.begin(*id) else {
-                continue;
-            };
-            let Some(hop) = hop.as_ref().filter(|h| h.profile.enabled) else {
-                attempt.fail(ProxyFault::ProxyUnavailable);
-                continue;
-            };
-            match tokio::time::timeout(route.timeout, hop.provider.dial(host, port)).await {
-                Ok(Ok(stream)) => {
-                    attempt.success();
-                    let route = Arc::downgrade(route);
-                    let id = *id;
-                    outcome.on_failure(move || {
-                        if let Some(route) = route.upgrade().filter(|r| !r.is_revoked()) {
-                            route.fail(id, ProxyFault::StreamFailed);
-                        }
-                    });
-                    return Ok(stream);
-                }
-                Ok(Err(error @ TunnelError::HostKeyMismatch { .. })) => {
-                    attempt.fail(fault::classify(&error, route.timeout));
-                    route.blocked();
-                    return Err(error);
-                }
-                Ok(Err(error)) => attempt.fail(fault::classify(&error, route.timeout)),
-                Err(_) => attempt.fail(ProxyFault::TimedOut {
-                    seconds: fault::seconds(route.timeout),
-                }),
-            }
-        }
-        #[expect(clippy::disallowed_methods, reason = "a route's direct fallback")]
-        if route.policy.allow_direct
-            && !route.is_revoked()
-            && let Ok(Ok(stream)) = tokio::time::timeout(
-                route.timeout,
-                weaver_tunnel::resolution::connect_host(host, port),
-            )
-            .await
-        {
-            route.success(None);
-            return Ok(Box::new(stream));
-        }
-        route.blocked();
-        Err(TunnelError::Engine(
-            "routing ladder exhausted; no permitted connection succeeded".into(),
-        ))
-    }
-    fn describe(&self) -> String {
-        "consumer routing ladder".into()
-    }
-}
-
 pub struct ProxyRuntime {
     pub network: Arc<NetworkRuntime>,
     db: Database,
-    handle: tokio::runtime::Handle,
-    profiles: RwLock<HashMap<u32, Arc<ProxyHop>>>,
     policies: RwLock<HashMap<String, RoutingPolicy>>,
     consumers: RwLock<std::collections::HashSet<Consumer>>,
     routes: Mutex<HashMap<Consumer, Arc<ConsumerRoute>>>,
     pub mutations: tokio::sync::Mutex<()>,
     updating: AtomicBool,
+    // A feed was turned away while the routes were changing; the reload's
+    // end wakes the feed poller for it. Set and taken under `routes`.
+    feeds_passed_over: AtomicBool,
     stopped: AtomicBool,
     // Whether feeds and Default outbound may reach private addresses: the
     // one switch, `WEAVER_RSS_ALLOW_PRIVATE_NETWORK`.
     allow_private_network: AtomicBool,
 }
 impl ProxyRuntime {
-    #[cfg(test)]
-    pub(crate) fn install_http3_fixture(&self, id: u32, provider: Arc<dyn TunnelProvider>) {
-        self.network.install_fixture(id, provider.clone());
-        assert!(self.routes.lock().unwrap().is_empty());
-        let mut profiles = self.profiles.write().unwrap();
-        let profile = profiles.get(&id).unwrap().profile.clone();
-        assert_eq!(profile.kind, ProxyKind::Http3Connect);
-        profiles.insert(id, Arc::new(ProxyHop { profile, provider }));
-    }
-
     pub fn nntp_sockets(
         &self,
         id: u32,
@@ -434,17 +202,6 @@ impl ProxyRuntime {
             .sockets
             .clone())
     }
-    pub fn nntp_bridge(&self, id: u32) -> Result<Option<Arc<Bridge>>, String> {
-        let route = self.route(
-            Consumer::Server(id),
-            crate::servers::connectivity::SERVER_CONNECT_TIMEOUT,
-        )?;
-        if route.policy.is_direct() {
-            Ok(None)
-        } else {
-            route.bridge().map(Some)
-        }
-    }
     pub fn new(db: Database, handle: tokio::runtime::Handle) -> Result<Arc<Self>, String> {
         Self::with_quota_policy(db, handle, None)
     }
@@ -455,12 +212,6 @@ impl ProxyRuntime {
         handle: tokio::runtime::Handle,
         quota_policy: Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>,
     ) -> Result<Arc<Self>, String> {
-        let profiles = db
-            .list_proxy_profiles()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|p| Ok((p.id, ProxyHop::new(p, &db)?)))
-            .collect::<Result<_, String>>()?;
         let policies = db
             .list_proxy_routes()
             .map_err(|e| e.to_string())?
@@ -468,15 +219,14 @@ impl ProxyRuntime {
             .collect();
         let consumers = Self::load_consumers(&db).map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {
-            network: NetworkRuntime::with_quota_policy(db.clone(), handle.clone(), quota_policy)?,
+            network: NetworkRuntime::with_quota_policy(db.clone(), handle, quota_policy)?,
             db,
-            handle,
-            profiles: RwLock::new(profiles),
             policies: RwLock::new(policies),
             consumers: RwLock::new(consumers),
             routes: Mutex::new(HashMap::new()),
             mutations: tokio::sync::Mutex::new(()),
             updating: AtomicBool::new(false),
+            feeds_passed_over: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             allow_private_network: AtomicBool::new(true),
         }))
@@ -505,6 +255,25 @@ impl ProxyRuntime {
             .expect("proxy consumers")
             .contains(&consumer)
     }
+    // Whether a feed can be polled now: it is a consumer and the routes are
+    // not mid-reload. A feed turned away by a reload is polled when the
+    // reload ends, through the wake it sends.
+    pub fn feed_routable(&self, consumer: Consumer) -> bool {
+        let _routes = self.routes.lock().expect("proxy routes");
+        if self.changing(consumer) {
+            return false;
+        }
+        self.routes_consumer(consumer)
+    }
+    // Whether the routes are mid-reload, noting a feed turned away for it.
+    // Called with `routes` held, so the reload's end cannot slip between.
+    fn changing(&self, consumer: Consumer) -> bool {
+        let changing = self.updating.load(Ordering::Acquire);
+        if changing && matches!(consumer, Consumer::Rss(_)) {
+            self.feeds_passed_over.store(true, Ordering::Release);
+        }
+        changing
+    }
     pub fn set_allow_private_network(&self, allow: bool) {
         self.allow_private_network.store(allow, Ordering::Release);
     }
@@ -525,8 +294,11 @@ impl ProxyRuntime {
         timeout: Duration,
     ) -> Result<Arc<ConsumerRoute>, String> {
         let mut routes = self.routes.lock().expect("proxy routes");
-        if self.updating.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
-            return Err("proxy runtime is changing or stopped".into());
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("proxy runtime is stopped".into());
+        }
+        if self.changing(consumer) {
+            return Err(ROUTES_CHANGING.into());
         }
         if !self
             .consumers
@@ -552,132 +324,79 @@ impl ProxyRuntime {
         timeout: Duration,
     ) -> Result<Arc<ConsumerRoute>, String> {
         policy.validate()?;
-        let profiles = self.profiles.read().expect("proxy profiles");
-        let hops = policy
-            .proxy_ids
-            .iter()
-            .map(|id| profiles.get(id).cloned())
-            .collect();
         Ok(Arc::new(ConsumerRoute {
             policy,
-            hops,
             cooldowns: Mutex::new(HashMap::new()),
             status: Mutex::new(RoutingStatus::default()),
             revoked: AtomicBool::new(false),
             cancellation: tokio::sync::Notify::new(),
             sockets: Arc::new(weaver_nntp::revocation::SocketRegistry::default()),
-            bridges: Mutex::new(Vec::new()),
-            http_bridges: Mutex::new(HashMap::new()),
-            handle: self.handle.clone(),
             timeout,
         }))
     }
-    pub async fn reload(&self) -> Result<(), String> {
+    // Marks the routes as changing until the returned guard drops.
+    pub(crate) fn begin_reload(&self) -> Result<Reloading<'_>, String> {
         if self.updating.swap(true, Ordering::AcqRel) {
             return Err("proxy runtime reload already in progress".into());
         }
-        struct Reset<'a>(&'a AtomicBool);
-        impl Drop for Reset<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _reset = Reset(&self.updating);
+        Ok(Reloading {
+            runtime: self,
+            new_feeds: false,
+        })
+    }
+    pub async fn reload(&self) -> Result<(), String> {
+        let mut reloading = self.begin_reload()?;
         let db = self.db.clone();
-        let (profiles, policies, consumers) = tokio::task::spawn_blocking(move || {
-            Ok::<_, crate::StateError>((
-                db.list_proxy_profiles()?,
-                db.list_proxy_routes()?,
-                Self::load_consumers(&db)?,
-            ))
+        let (policies, consumers) = tokio::task::spawn_blocking(move || {
+            Ok::<_, crate::StateError>((db.list_proxy_routes()?, Self::load_consumers(&db)?))
         })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-        let profiles = {
-            let previous = self.profiles.read().expect("proxy profiles");
-            profiles
-                .into_iter()
-                .map(|p| {
-                    let hop = match previous
-                        .get(&p.id)
-                        .filter(|old| old.profile.revision == p.revision)
-                    {
-                        Some(old) => old.clone(),
-                        None => ProxyHop::new(p, &self.db)?,
-                    };
-                    Ok((hop.profile.id, hop))
-                })
-                .collect::<Result<HashMap<_, _>, String>>()?
-        };
         let policies: HashMap<_, _> = policies.into_iter().collect();
-        let stale_profiles: Vec<_> = self
-            .profiles
-            .read()
-            .expect("proxy profiles")
-            .iter()
-            .filter(|(id, old)| profiles.get(id).is_none_or(|new| !Arc::ptr_eq(old, new)))
-            .map(|(_, hop)| hop.clone())
-            .collect();
-        let obsolete =
-            {
-                let mut routes = self.routes.lock().expect("proxy routes");
-                let keys: Vec<_> =
-                    routes
-                        .iter()
-                        .filter(|(consumer, route)| {
-                            !consumers.contains(*consumer)
-                                || legacy_policy_changed(
-                                    &route.policy,
-                                    &policies.get(&consumer.key()).cloned().unwrap_or_default(),
-                                )
-                                || route.policy.proxy_ids.iter().zip(&route.hops).any(
-                                    |(id, prior)| match (prior, profiles.get(id)) {
-                                        (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-                                        (None, None) => false,
-                                        _ => true,
-                                    },
-                                )
-                        })
-                        .map(|(consumer, _)| *consumer)
-                        .collect();
-                let obsolete: Vec<_> = keys
-                    .into_iter()
-                    .filter_map(|consumer| routes.remove(&consumer))
-                    .collect();
-                for route in &obsolete {
-                    route.revoked.store(true, Ordering::Release);
-                    route.sockets.revoke();
-                }
-                *self.profiles.write().expect("proxy profiles") = profiles;
-                *self.policies.write().expect("proxy policies") = policies;
-                let previous = std::mem::replace(
-                    &mut *self.consumers.write().expect("proxy consumers"),
-                    consumers,
-                );
-                let new_feeds =
-                    self.consumers
-                        .read()
-                        .expect("proxy consumers")
-                        .iter()
-                        .any(|consumer| {
-                            matches!(consumer, Consumer::Rss(_)) && !previous.contains(consumer)
-                        });
-                (obsolete, new_feeds)
-            };
-        let (obsolete, new_feeds) = obsolete;
+        let (obsolete, new_feeds) = {
+            let mut routes = self.routes.lock().expect("proxy routes");
+            let keys: Vec<_> = routes
+                .iter()
+                .filter(|(consumer, route)| {
+                    !consumers.contains(*consumer)
+                        || legacy_policy_changed(
+                            &route.policy,
+                            &policies.get(&consumer.key()).cloned().unwrap_or_default(),
+                        )
+                })
+                .map(|(consumer, _)| *consumer)
+                .collect();
+            let obsolete: Vec<_> = keys
+                .into_iter()
+                .filter_map(|consumer| routes.remove(&consumer))
+                .collect();
+            for route in &obsolete {
+                route.revoked.store(true, Ordering::Release);
+                route.sockets.revoke();
+            }
+            *self.policies.write().expect("proxy policies") = policies;
+            let previous = std::mem::replace(
+                &mut *self.consumers.write().expect("proxy consumers"),
+                consumers,
+            );
+            let new_feeds =
+                self.consumers
+                    .read()
+                    .expect("proxy consumers")
+                    .iter()
+                    .any(|consumer| {
+                        matches!(consumer, Consumer::Rss(_)) && !previous.contains(consumer)
+                    });
+            (obsolete, new_feeds)
+        };
         for route in obsolete {
             route.revoke().await;
         }
-        for hop in stale_profiles {
-            hop.provider.shutdown().await;
-        }
+        // The poller skipped these feeds while they had no route; once the
+        // reload ends, poll them through it without waiting a tick.
+        reloading.new_feeds = new_feeds;
         self.network.reload().await?;
-        if new_feeds {
-            // The poller skipped these feeds while they had no route; now
-            // that one exists, poll them through it without waiting a tick.
-            self.db.wake_rss_scheduler();
-        }
         Ok(())
     }
     pub async fn stop_all(&self) {
@@ -687,15 +406,34 @@ impl ProxyRuntime {
         for (_, route) in routes {
             route.revoke().await;
         }
-        let profiles: Vec<_> = self
-            .profiles
-            .read()
-            .expect("proxy profiles")
-            .values()
-            .cloned()
-            .collect();
-        for hop in profiles {
-            hop.provider.shutdown().await;
+    }
+}
+
+// The refusal a consumer meets while the routes are mid-reload. It is a short
+// internal state, not a failure of the consumer: a feed meeting it is left
+// due and polled when the reload ends.
+pub const ROUTES_CHANGING: &str = "proxy routes are changing";
+
+// A reload in progress. Dropping it, on success or error, ends the reload and
+// then wakes the feed poller if a feed was turned away meanwhile or new feeds
+// appeared, so the wake never lands while the routes still refuse.
+pub(crate) struct Reloading<'a> {
+    runtime: &'a ProxyRuntime,
+    new_feeds: bool,
+}
+impl Drop for Reloading<'_> {
+    fn drop(&mut self) {
+        let runtime = self.runtime;
+        let passed_over = {
+            let _routes = runtime
+                .routes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            runtime.updating.store(false, Ordering::Release);
+            runtime.feeds_passed_over.swap(false, Ordering::AcqRel)
+        };
+        if passed_over || self.new_feeds {
+            runtime.db.wake_rss_scheduler();
         }
     }
 }

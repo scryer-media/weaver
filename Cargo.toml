@@ -16,7 +16,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.16.15"
+version = "0.16.16"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -117,7 +117,7 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 # Authenticated recovery scanning and source-change handling.
-par2-rs = { version = "=0.11.0", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "=0.12.0", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -133,7 +133,7 @@ par2-rs = { version = "=0.11.0", default-features = false, features = ["crypto-a
 # backup, rather than renaming the rebuilt file over it.
 # 0.8 drops RAR PAR-inside (`inside::rar5`, `RarCipher`), which weaver never
 # used; the ZIP and 7z `inside` it does use are unchanged.
-par3-rs = { version = "=0.8.1", default-features = false }
+par3-rs = { version = "=0.8.2", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
@@ -166,7 +166,12 @@ par3-rs = { version = "=0.8.1", default-features = false }
 # has been read, and an extraction merges the continuation headers it read.
 # 0.15.0 states a RAR5 member's hash-MAC flag, opens `rar rc`-rebuilt RAR4 -hp
 # volumes, and chains continuation volumes by split header, not by name.
-unrar-rs = { version = "0.16.1", default-features = false, features = ["crypto-aws-lc"] }
+# 0.16.2 reads the RAR4 end record's flags as RAR writes them: 0x0004 reserves
+# seven bytes, 0x0008 states the volume number. RAR 3.1 to 3.3 set the first
+# and state no number, and every such volume had read as number 0. 0.16.3
+# reads a RAR 3.0 recovery volume's name against its set's base name and
+# holds a caller's volume index to the volume limit.
+unrar-rs = { version = "0.16.3", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

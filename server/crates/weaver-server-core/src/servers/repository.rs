@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, TimeZone, Utc};
 
 use crate::StateError;
@@ -145,6 +147,48 @@ impl Database {
         })
     }
 
+    // The stored usage of the servers in `ids`, in one read of a table that
+    // holds a row per server. See `usages_of`.
+    pub fn server_download_usages(
+        &self,
+        ids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError> {
+        self.download_usages(
+            "SELECT server_id, lifetime_bytes, quota_baseline_bytes,
+                    window_start_epoch_seconds, window_end_epoch_seconds,
+                    updated_at_epoch_seconds
+               FROM server_download_usage",
+            ids,
+        )
+    }
+
+    // The stored usage of the egresses in `ids`, in one read of a table that
+    // holds a row per egress. See `usages_of`.
+    pub fn egress_download_usages(
+        &self,
+        ids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError> {
+        self.download_usages(
+            "SELECT egress_id AS server_id, lifetime_bytes, quota_baseline_bytes,
+                    window_start_epoch_seconds, window_end_epoch_seconds,
+                    updated_at_epoch_seconds
+               FROM egress_download_usage",
+            ids,
+        )
+    }
+
+    fn download_usages(
+        &self,
+        statement: &'static str,
+        ids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError> {
+        let datastore = self.datastore();
+        let rows = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(datastore.read_exec(), statement, &[]).await
+        })?;
+        usages_of(rows, ids)
+    }
+
     // Store download usage counted against an egress, whose id is carried
     // in `server_id`. Usage for an egress that no longer exists is dropped.
     pub fn upsert_egress_download_usage(
@@ -197,6 +241,25 @@ fn server_download_usage_from_row(row: SqlRow) -> Result<ServerDownloadUsage, St
         window_end: optional_timestamp(row.opt_i64("window_end_epoch_seconds")?, "window end")?,
         updated_at: timestamp(row.i64("updated_at_epoch_seconds")?, "updated at")?,
     })
+}
+
+// Decodes only the rows whose id is in `ids`, as a read of each of those
+// rows by id would have: a bad row of a server or egress no longer
+// configured is skipped undecoded and fails nothing, while a bad row of one
+// in `ids` fails the read.
+fn usages_of(
+    rows: Vec<SqlRow>,
+    ids: &HashSet<u32>,
+) -> Result<HashMap<u32, ServerDownloadUsage>, StateError> {
+    let mut usages = HashMap::with_capacity(ids.len());
+    for row in rows {
+        let wanted = u32::try_from(row.i64("server_id")?).is_ok_and(|id| ids.contains(&id));
+        if wanted {
+            let usage = server_download_usage_from_row(row)?;
+            usages.insert(usage.server_id, usage);
+        }
+    }
+    Ok(usages)
 }
 
 fn server_download_usage_args(usage: &ServerDownloadUsage) -> Result<Vec<SqlArg>, StateError> {

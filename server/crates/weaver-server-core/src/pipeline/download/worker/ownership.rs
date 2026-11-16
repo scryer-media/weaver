@@ -3,6 +3,10 @@
 
 use super::*;
 
+// What an article the post gives no size is reserved at
+// (`Pipeline::reserved_bytes_of`).
+const UNSIZED_ARTICLE_BYTES: u64 = 1 << 20;
+
 impl Pipeline {
     pub(in crate::pipeline) fn next_download_lane_id() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -35,6 +39,7 @@ impl Pipeline {
                 server_idx: None,
                 connection,
                 outstanding: HashMap::new(),
+                outstanding_bytes: 0,
             });
         owner.mode = lease.lane_mode;
         owner
@@ -52,35 +57,52 @@ impl Pipeline {
     // Record that a live lane now holds `works`.
     //
     // This and [`Self::accept_lane_work`] are the only writers of the
-    // in-flight gauges (`active_downloads`, `active_recovery`,
-    // `active_downloads_by_job`, `active_downloads_by_file`): an article
+    // in-flight gauges (`articles_in_flight`, `active_recovery`,
+    // `articles_in_flight_by_job`, `articles_in_flight_by_file`): an article
     // raises them when it enters a lane's `outstanding` record and lowers them
     // when it leaves, so each gauge is the count of what the live lanes hold
     // and cannot drift from it. A lease that names an article the lane already
     // holds adds nothing, because the lane owes one result for it, not two.
+    //
+    // Each work comes reserved on its job's volume (`reserve_lane_work`).
+    // The record gives the reservation back as the article leaves it
+    // (`note_lane_work_left`); one it does not take, the one a duplicate
+    // replaces or all of them on a lane that is gone, is given back here.
     fn hold_lane_works(&mut self, lane_id: u64, works: impl IntoIterator<Item = DownloadWork>) {
         let Some(owner) = self.download_lane_owners.get_mut(&lane_id) else {
+            for work in works {
+                self.release_lane_work(&work);
+            }
             return;
         };
         let mut entered = Vec::new();
+        let mut replaced_works = Vec::new();
         for work in works {
             let segment_id = work.segment_id;
             let is_recovery = work.is_recovery;
-            if owner.outstanding.insert(segment_id, work).is_none() {
-                entered.push((segment_id, is_recovery));
+            owner.outstanding_bytes += u64::from(work.byte_estimate);
+            match owner.outstanding.insert(segment_id, work) {
+                None => entered.push((segment_id, is_recovery)),
+                Some(replaced) => {
+                    owner.outstanding_bytes -= u64::from(replaced.byte_estimate);
+                    replaced_works.push(replaced);
+                }
             }
         }
+        for replaced in replaced_works {
+            self.release_lane_work(&replaced);
+        }
         for (segment_id, is_recovery) in entered {
-            self.active_downloads += 1;
+            self.articles_in_flight += 1;
             if is_recovery {
                 self.active_recovery += 1;
             }
             *self
-                .active_downloads_by_job
+                .articles_in_flight_by_job
                 .entry(segment_id.file_id.job_id)
                 .or_default() += 1;
             *self
-                .active_downloads_by_file
+                .articles_in_flight_by_file
                 .entry(segment_id.file_id)
                 .or_default() += 1;
         }
@@ -100,6 +122,10 @@ impl Pipeline {
         };
         let job_id = first.segment_id.file_id.job_id;
         let completion_critical = works.iter().any(|work| work.completion_critical);
+        // Booked as a lease books them: reserved, whatever room is left.
+        for work in &works {
+            self.reserve_test_lane_work(work);
+        }
         self.download_lane_owners
             .entry(0)
             .or_insert_with(|| DownloadLaneOwner {
@@ -110,6 +136,7 @@ impl Pipeline {
                 server_idx: None,
                 connection,
                 outstanding: HashMap::new(),
+                outstanding_bytes: 0,
             });
         self.hold_lane_works(0, works);
     }
@@ -142,25 +169,121 @@ impl Pipeline {
         }
     }
 
+    // The bytes an article is reserved at on its job's volume: its size in
+    // the post, which is never less than what arrives for it. An article
+    // the post gives no size is reserved at a whole article's worth.
+    pub(in crate::pipeline) fn reserved_bytes_of(byte_estimate: u32) -> u64 {
+        match byte_estimate {
+            0 => UNSIZED_ARTICLE_BYTES,
+            bytes => u64::from(bytes),
+        }
+    }
+
+    // The volume the job's articles are written to, when it writes through
+    // a writer.
+    fn article_volume(
+        &self,
+        job_id: JobId,
+    ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
+        if let Some((volume, _)) = self.volume_reserved_by_job.get(&job_id) {
+            return Some(Arc::clone(volume));
+        }
+        self.graph_jobs
+            .get(&job_id)
+            .and_then(|graph| graph.disk())
+            .map(|disk| Arc::clone(disk.working().volume()))
+    }
+
+    // Reserve `work` on the volume its job writes to, as it is leased:
+    // false when it does not fit there (`Volume::reserve`). A job that
+    // writes through no writer reserves nothing.
+    pub(in crate::pipeline) fn reserve_lane_work(&mut self, work: &DownloadWork) -> bool {
+        let job_id = work.segment_id.file_id.job_id;
+        let Some(volume) = self.article_volume(job_id) else {
+            return true;
+        };
+        let bytes = Self::reserved_bytes_of(work.byte_estimate);
+        if !volume.reserve(bytes) {
+            return false;
+        }
+        self.volume_reserved_by_job
+            .entry(job_id)
+            .or_insert_with(|| (volume, 0))
+            .1 += bytes;
+        true
+    }
+
+    // Standalone fixtures book articles no lease reserved: they are
+    // reserved here, whatever room the volume has, so what they release
+    // was counted.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn reserve_test_lane_work(&mut self, work: &DownloadWork) {
+        let job_id = work.segment_id.file_id.job_id;
+        let Some(volume) = self.article_volume(job_id) else {
+            return;
+        };
+        let bytes = Self::reserved_bytes_of(work.byte_estimate);
+        volume.charge(bytes);
+        self.volume_reserved_by_job
+            .entry(job_id)
+            .or_insert_with(|| (volume, 0))
+            .1 += bytes;
+    }
+
+    // Give back the reservation of `work`, which left its lane or was
+    // never booked on one.
+    pub(in crate::pipeline) fn release_lane_work(&mut self, work: &DownloadWork) {
+        self.settle_lane_work(work, 0);
+    }
+
+    // Give back the reservation of `work`, which left its lane with
+    // `arrived` bytes of it: those count from here as arrived, in the same
+    // step (`Volume::settle`), until the loop hands them on. Whoever asked
+    // to be woken at the line the volume has now reached is woken.
+    fn settle_lane_work(&mut self, work: &DownloadWork, arrived: u64) {
+        let job_id = work.segment_id.file_id.job_id;
+        let Some((volume, held)) = self.volume_reserved_by_job.get_mut(&job_id) else {
+            if arrived != 0 {
+                self.note_volume_arrived(job_id, arrived);
+            }
+            return;
+        };
+        let volume = Arc::clone(volume);
+        let bytes = Self::reserved_bytes_of(work.byte_estimate).min(*held);
+        *held -= bytes;
+        if *held == 0 {
+            self.volume_reserved_by_job.remove(&job_id);
+        }
+        if arrived != 0 {
+            self.hold_volume_arrived(job_id, &volume, arrived);
+        }
+        volume.settle(bytes, arrived);
+        if volume.take_wake() {
+            self.volume_room_changed();
+        }
+    }
+
     // The other half of [`Self::hold_lane_works`]: `work` has left the lane
-    // that held it.
-    fn note_lane_work_left(&mut self, work: &DownloadWork) {
+    // that held it, and its reservation with it: `arrived` bytes of it,
+    // the article's result, count on as arrived (`settle_lane_work`).
+    fn note_lane_work_left(&mut self, work: &DownloadWork, arrived: u64) {
+        self.settle_lane_work(work, arrived);
         let segment_id = work.segment_id;
-        self.active_downloads = self.active_downloads.saturating_sub(1);
+        self.articles_in_flight = self.articles_in_flight.saturating_sub(1);
         if work.is_recovery {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
         let job_id = segment_id.file_id.job_id;
-        if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
+        if let Some(in_flight) = self.articles_in_flight_by_job.get_mut(&job_id) {
             *in_flight = in_flight.saturating_sub(1);
             if *in_flight == 0 {
-                self.active_downloads_by_job.remove(&job_id);
+                self.articles_in_flight_by_job.remove(&job_id);
             }
         }
-        if let Some(in_flight) = self.active_downloads_by_file.get_mut(&segment_id.file_id) {
+        if let Some(in_flight) = self.articles_in_flight_by_file.get_mut(&segment_id.file_id) {
             *in_flight = in_flight.saturating_sub(1);
             if *in_flight == 0 {
-                self.active_downloads_by_file.remove(&segment_id.file_id);
+                self.articles_in_flight_by_file.remove(&segment_id.file_id);
             }
         }
     }
@@ -180,6 +303,9 @@ impl Pipeline {
         works: Vec<DownloadWork>,
     ) {
         let Some(owner) = self.download_lane_owners.get_mut(&lane_id) else {
+            for work in &works {
+                self.release_lane_work(work);
+            }
             return;
         };
         let previous_job = owner.job_id;
@@ -247,25 +373,83 @@ impl Pipeline {
     // gauges once. `false` when the lane does not hold it — it was retired,
     // reset or never handed this article, or already gave it back — and then
     // nothing is lowered, because whatever took the article off the lane's
-    // record lowered them already.
+    // record lowered them already. A result comes back through
+    // `accept_lane_result`; this is for fixtures that end lanes whole.
+    #[cfg(test)]
     pub(super) fn accept_lane_work(&mut self, lane_id: u64, segment: SegmentId) -> bool {
+        self.accept_lane_work_with(lane_id, segment, 0, |_| {})
+    }
+
+    // Take back the article whose result came back with `arrived` bytes,
+    // as `accept_lane_work` does: what arrived stays counted on its volume
+    // in place of the article's reservation.
+    pub(in crate::pipeline) fn accept_lane_result(
+        &mut self,
+        lane_id: u64,
+        segment: SegmentId,
+        arrived: u64,
+    ) -> bool {
+        self.accept_lane_work_with(lane_id, segment, arrived, |_| {})
+    }
+
+    // Take back an article a lane returns unasked, as `accept_lane_work`
+    // does, with the tried servers and hint from the lane's record rather
+    // than the lease's copy: the record is carried across a pool rebuild,
+    // the copy a lane holds is numbered by the pool that leased it.
+    pub(super) fn accept_returned_lane_work(
+        &mut self,
+        lane_id: u64,
+        work: &mut DownloadWork,
+    ) -> bool {
+        let segment = work.segment_id;
+        self.accept_lane_work_with(lane_id, segment, 0, |held| {
+            work.exclude_servers = held.exclude_servers;
+            work.avoid_server = held.avoid_server;
+        })
+    }
+
+    // Carry the tried servers and hint of every article a lane holds into
+    // a rebuilt pool. One pass over the held articles per rebuild.
+    pub(in crate::pipeline) fn remap_lane_holdings(&mut self, remap: &weaver_nntp::ServerRemap) {
+        for owner in self.download_lane_owners.values_mut() {
+            for work in owner.outstanding.values_mut() {
+                work.exclude_servers = remap.set(work.exclude_servers);
+                work.avoid_server = work.avoid_server.and_then(|server| remap.index(server));
+            }
+        }
+    }
+
+    fn accept_lane_work_with(
+        &mut self,
+        lane_id: u64,
+        segment: SegmentId,
+        arrived: u64,
+        held: impl FnOnce(&DownloadWork),
+    ) -> bool {
         let Some(owner) = self.download_lane_owners.get_mut(&lane_id) else {
             // Standalone fixtures inject outcomes from lane 0 without
             // booking it; such an outcome was never counted.
             #[cfg(test)]
             if lane_id == 0 {
+                if arrived != 0 {
+                    self.note_volume_arrived(segment.file_id.job_id, arrived);
+                }
                 return true;
             }
             return false;
         };
         let work = owner.outstanding.remove(&segment);
+        if let Some(work) = &work {
+            owner.outstanding_bytes -= u64::from(work.byte_estimate);
+        }
         if owner.outstanding.is_empty() && !owner.connection {
             self.download_lane_owners.remove(&lane_id);
         }
         let Some(work) = work else {
             return false;
         };
-        self.note_lane_work_left(&work);
+        held(&work);
+        self.note_lane_work_left(&work, arrived);
         true
     }
 
@@ -284,11 +468,15 @@ impl Pipeline {
             .extract_if(|segment, _| take(segment))
             .map(|(_, work)| work)
             .collect();
+        owner.outstanding_bytes -= works
+            .iter()
+            .map(|work| u64::from(work.byte_estimate))
+            .sum::<u64>();
         if owner.outstanding.is_empty() && !owner.connection {
             self.download_lane_owners.remove(&lane_id);
         }
         for work in &works {
-            self.note_lane_work_left(work);
+            self.note_lane_work_left(work, 0);
         }
         works
     }
@@ -375,10 +563,10 @@ impl Pipeline {
             }
         }
         let mut discrepancies = Vec::new();
-        if self.active_downloads != total {
+        if self.articles_in_flight != total {
             discrepancies.push(format!(
-                "active_downloads = {}, lanes hold {total}",
-                self.active_downloads
+                "articles_in_flight = {}, lanes hold {total}",
+                self.articles_in_flight
             ));
         }
         if self.active_recovery != recovery {
@@ -393,22 +581,22 @@ impl Pipeline {
                 .map(|(job_id, count)| (*job_id, *count))
                 .collect()
         };
-        if nonzero(&self.active_downloads_by_job) != by_job {
+        if nonzero(&self.articles_in_flight_by_job) != by_job {
             discrepancies.push(format!(
-                "active_downloads_by_job = {:?}, lanes hold {by_job:?}",
-                self.active_downloads_by_job
+                "articles_in_flight_by_job = {:?}, lanes hold {by_job:?}",
+                self.articles_in_flight_by_job
             ));
         }
         let files: HashMap<NzbFileId, usize> = self
-            .active_downloads_by_file
+            .articles_in_flight_by_file
             .iter()
             .filter(|(_, count)| **count != 0)
             .map(|(file_id, count)| (*file_id, *count))
             .collect();
         if files != by_file {
             discrepancies.push(format!(
-                "active_downloads_by_file = {:?}, lanes hold {by_file:?}",
-                self.active_downloads_by_file
+                "articles_in_flight_by_file = {:?}, lanes hold {by_file:?}",
+                self.articles_in_flight_by_file
             ));
         }
         // The connection gauges of a job that is gone are dropped with it,

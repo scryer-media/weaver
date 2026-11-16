@@ -128,7 +128,6 @@ const de: LocaleDictionary = {
   "metrics.commitPending": "Schreibvorgang ausstehend",
   "metrics.writeBufferedBytes": "Gepufferte Bytes",
   "metrics.writeBufferedSegments": "Gepufferte Segmente",
-  "metrics.diskWriteLatency": "Festplatte-Schreiblatenz",
   "metrics.segmentsDownloaded": "Segmente heruntergeladen",
   "metrics.segmentsDecoded": "Segmente dekodiert",
   "metrics.segmentsCommitted": "Segmente geschrieben",

@@ -201,54 +201,38 @@ mod tests {
         });
 
         let records = records.0.lock().unwrap();
-        let headers: Vec<_> = records
-            .iter()
-            .filter(|(message, _)| message.starts_with("stall diagnostics:"))
-            .collect();
         assert_eq!(
-            headers.len(),
+            records.len(),
             1,
-            "an emptied ring writes nothing: {records:?}"
+            "one record per episode, and an emptied ring writes nothing: {records:?}"
         );
-        assert!(headers[0].0.contains("2 recent debug lines"), "{records:?}");
-        assert!(headers[0].1.contains("job_id=91002"), "{records:?}");
-
-        let lines: Vec<&String> = records
-            .iter()
-            .filter(|(message, _)| message == "stall diagnostics line")
-            .map(|(_, fields)| fields)
-            .collect();
-        assert_eq!(lines.len(), 2, "one record per captured line: {records:?}");
+        let (message, fields) = &records[0];
+        assert_eq!(message, "stall diagnostics: the job's recent debug lines");
+        assert!(fields.starts_with(" job_id=91002 "), "{records:?}");
+        assert!(fields.contains("reason=test stall"), "{records:?}");
+        assert!(fields.contains(" lines=2"), "{records:?}");
+        assert!(fields.contains(" first_at="), "{records:?}");
+        assert!(fields.contains(" last_at="), "{records:?}");
+        let before = fields
+            .find("message=\"before the stall\"")
+            .expect("the first line is replayed");
+        let just_before = fields
+            .find("message=\"just before the stall\"")
+            .expect("the second line is replayed");
+        assert!(before < just_before, "oldest first: {records:?}");
+        assert!(fields.contains(" level=DEBUG"), "{records:?}");
         assert!(
-            lines[0].contains(" replayed_message=before the stall"),
+            fields.contains(&format!(" target={}", module_path!())),
             "{records:?}"
         );
+        // The replay never carries the captured event's own line shape, so a
+        // reader looking for "LEVEL target: message" finds the event, not its
+        // replay.
+        assert!(!fields.contains(": before the stall"), "{records:?}");
         assert!(
-            lines[1].contains(" replayed_message=just before the stall"),
+            !fields.contains(&format!("DEBUG {}", module_path!())),
             "{records:?}"
         );
-        for fields in &lines {
-            assert!(fields.starts_with(" job_id=91002 "), "{records:?}");
-            assert!(fields.contains("reason=test stall"), "{records:?}");
-            assert!(fields.contains(" at="), "{records:?}");
-            assert!(fields.contains(" replayed_level=DEBUG"), "{records:?}");
-            assert!(
-                fields.contains(&format!(" replayed_target={}", module_path!())),
-                "{records:?}"
-            );
-            assert!(
-                fields.contains(" replayed_fields=job_id=91002"),
-                "{records:?}"
-            );
-            // The replay never carries the captured event's own line shape, so
-            // a reader looking for "LEVEL target: message" finds the event,
-            // not its replay.
-            assert!(!fields.contains(": before the stall"), "{records:?}");
-            assert!(
-                !fields.contains(&format!("DEBUG {}", module_path!())),
-                "{records:?}"
-            );
-        }
         assert!(job_debug_ring::take(91_002).is_empty());
     }
 }

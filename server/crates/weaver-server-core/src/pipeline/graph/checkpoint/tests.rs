@@ -848,6 +848,49 @@ fn a_step_writes_only_the_rows_and_parts_it_changed() {
     assert_eq!(root_parts(&fresh.take().0.unwrap()), written);
 }
 
+// What a restore leaves as in hand from the stored checkpoint is every
+// article its facts say is not waiting, less the ones the restore found
+// not on disk and fetches again.
+#[test]
+fn what_a_restore_fetches_again_is_not_in_hand() {
+    let volume = |articles| VolumeFacts {
+        articles,
+        known: Vec::new(),
+        ordered_only: false,
+        segments: Vec::new(),
+        raised: Vec::new(),
+    };
+    let root = RootFacts {
+        pending_verifications: Vec::new(),
+        next_node: 1,
+        posted: vec!["alpha.bin".to_owned(), "beta.bin".to_owned()],
+        volumes: vec![
+            volume(vec![
+                (0, ArticleFacts::Arrived(Some((0, 400)))),
+                (1, ArticleFacts::Arrived(Some((400, 800)))),
+                (2, ArticleFacts::Waiting),
+                (3, ArticleFacts::Lost { damaged: true }),
+            ]),
+            volume(vec![(0, ArticleFacts::Arrived(None))]),
+        ],
+        read_backs: 0,
+        reported: None,
+    };
+    let pending = Pending::default();
+    pending.written(GraphCheckpoint::default());
+    pending.stored_settled(&root, &[]);
+    assert_eq!(
+        pending.checkpoint_settled(0),
+        std::collections::HashSet::from([0, 1, 3])
+    );
+    pending.stored_settled(&root, &[(VolumeIndex(0), 1), (VolumeIndex(1), 0)]);
+    assert_eq!(
+        pending.checkpoint_settled(0),
+        std::collections::HashSet::from([0, 3])
+    );
+    assert!(pending.checkpoint_settled(1).is_empty());
+}
+
 #[test]
 fn a_pending_writes_what_the_database_does_not_hold() {
     let (job, _dir) = long_post(20);
@@ -1256,6 +1299,7 @@ fn restored(
             metrics: None,
             data_dir: None,
             window_ledger: Default::default(),
+            disk: None,
         },
         0,
     )
@@ -1496,6 +1540,97 @@ async fn age_and_force_share_one_write_behind_an_in_flight_checkpoint() {
     }
 }
 
+// A change that waits on a volume's writer while the job's last write is
+// still queued is not left behind: the job hears once the volume returns
+// its writes, and a move waiting on that change hears it committed then,
+// without the clock moving. Nothing else asks for the write: at a stop no
+// later step comes, and the stop would wait on the word for ever.
+#[tokio::test(start_paused = true)]
+async fn a_change_held_behind_a_queued_write_is_written_once_its_writes_return() {
+    use crate::operations::disk::volume::Volume;
+    use crate::operations::disk::writer::VolumeWriters;
+    use crate::pipeline::graph::disk::JobDisk;
+    use crate::pipeline::graph::root::tests::job_through;
+
+    const PIECE: u32 = 4 * 1024;
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let writers = VolumeWriters::new(|_| {});
+    let volume = Arc::new(Volume::new(None, "test".to_owned()));
+    let disk = JobDisk::new(writers.submitter(&volume, 1), None);
+    let files: Vec<RootFile> = (0..2)
+        .map(|index| file(&format!("part{index}.mkv"), &[PIECE; 2]))
+        .collect();
+    let (mut job, _dir, _) = job_through(&files, Vec::new(), |_| Some(disk.clone()));
+    let arrive = |job: &mut GraphJob, volume: u32| {
+        job.intake(
+            decoded(
+                volume,
+                0,
+                0,
+                &vec![volume as u8 + 1; PIECE as usize],
+                Some(u64::from(2 * PIECE)),
+            ),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    };
+    let pending = Pending::default();
+    let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+
+    // The database's writer is busy, so the first change's write waits
+    // queued behind what it runs.
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    db.try_queue_write("held_database_writer", move |_| {
+        entered.send(()).unwrap();
+        released.recv().unwrap();
+        Ok(())
+    })
+    .unwrap();
+    waiting.await.unwrap();
+    arrive(&mut job, 0);
+    disk.barrier().wait();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, true);
+    assert!(pending.slot().enqueued);
+
+    // The next change waits for writes the volume holds.
+    let hold = writers.hold(&volume);
+    arrive(&mut job, 1);
+    assert!(!pending.put(&job, Vec::new()));
+    assert!(pending.gated());
+    let stamp = pending.stamp();
+    let now = tokio::time::Instant::now();
+    assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+    assert!(
+        pending.slot().gated.iter().all(|gated| gated.told),
+        "the held change is told of whether or not a write is queued"
+    );
+
+    // The queued write runs and takes only the first change.
+    release.send(()).unwrap();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    assert!(pending.slot().committed < stamp);
+    assert!(heard.try_recv().is_err(), "the word owed is not met yet");
+
+    // The volume returns the held writes: the job hears, and its write goes.
+    let barrier = disk.barrier();
+    hold.open();
+    barrier.wait();
+    let said = heard.recv().await.unwrap();
+    assert!(matches!(said.heard, super::Heard::DiskReturned));
+    pending.queue_released(&db, id, &mail);
+    let said = heard.recv().await.unwrap();
+    assert!(
+        matches!(said.heard, super::Heard::Written { stamp: Some(written), .. } if written == stamp)
+    );
+    assert_eq!(writes(&db), 2);
+    assert_eq!(tokio::time::Instant::now(), now);
+}
+
 #[tokio::test(start_paused = true)]
 async fn awaiting_a_stamp_forces_its_write_without_advancing_time() {
     let _clock = ClockHeld::new();
@@ -1528,7 +1663,12 @@ async fn dirty_bytes_at_the_barrier_force_a_write() {
     let pending = Pending::default();
     let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
     pending.put(&job, Vec::new());
-    pending.slot().dirty_bytes = super::CHECKPOINT_BYTES - 64;
+    // The first article is held in memory until the member is decided, so
+    // the checkpoint says none of it: a held byte is no checkpoint's to
+    // save. The second completes the member and both go to its file, which
+    // is when their 128 bytes count.
+    assert_eq!(pending.slot().dirty_bytes, 0);
+    pending.slot().dirty_bytes = super::CHECKPOINT_BYTES - 128;
     pending.queue(&db, id, &mail, false);
     db.flush_write_queue().await.unwrap();
     assert_eq!(writes(&db), 0);

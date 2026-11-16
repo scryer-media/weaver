@@ -47,7 +47,7 @@ fn held_works(segments: &[SegmentId]) -> Vec<DownloadWork> {
             retry_count: 0,
             is_recovery: false,
             completion_critical: false,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             avoid_server: None,
         })
         .collect()
@@ -78,8 +78,10 @@ fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {
     spec
 }
 
+mod alternate_message_ids;
 mod article_scheduler;
 mod article_slots;
+mod blocking_lane_guards;
 mod checkpoint_progress;
 mod credentials_refusal;
 mod dispatch_ineligible_log;
@@ -92,5 +94,7 @@ mod lane_failure_visibility;
 mod lane_holdings;
 mod owned_download_lane_pool;
 mod propagation_delay;
+mod server_ladder;
 mod stall_recovery;
 mod stall_retry;
+mod volume_budget;

@@ -9,7 +9,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use weaver_nntp::{BlockingNntpConnection, NntpConnection, ServerConfig, commands::Command};
+use weaver_nntp::{BlockingNntpConnection, ServerConfig, commands::Command};
 use weaver_tunnel::{
     NoopTunnelObserver, SshTunnelProvider, TunnelProvider, TunnelStream, WireGuardTunnelProvider,
     bridge::Bridge,
@@ -19,6 +19,33 @@ use weaver_tunnel::{
     },
     transport::{TransportKind, TransportProxy},
 };
+
+// An HTTP CONNECT or SOCKS5 proxy fixture on loopback, reached at its
+// address and asked for each destination.
+struct LoopbackProxy {
+    proxy: TransportProxy,
+    at: SocketAddr,
+}
+#[async_trait::async_trait]
+impl TunnelProvider for LoopbackProxy {
+    fn kind(&self) -> Option<weaver_tunnel::metrics::TunnelKind> {
+        Some(self.proxy.kind.tunnel_kind())
+    }
+    async fn dial(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Box<dyn TunnelStream>, weaver_tunnel::TunnelError> {
+        let mut stream = tokio::net::TcpStream::connect(self.at)
+            .await
+            .map_err(|error| weaver_tunnel::TunnelError::Engine(error.to_string()))?;
+        self.proxy.negotiate(&mut stream, host, port).await?;
+        Ok(Box::new(stream))
+    }
+    fn describe(&self) -> String {
+        format!("loopback proxy {}", self.at)
+    }
+}
 
 struct BridgeDialer(Arc<weaver_tunnel::bridge::Bridge>);
 #[async_trait::async_trait]
@@ -101,6 +128,10 @@ impl Origin {
         ));
         std::fs::write(&ca, cert.cert.pem()).unwrap();
         let body_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut complete = b"222 1 <retry@fixture>\r\n".to_vec();
+        weaver_yenc::encode(b"complete", &mut complete, 128, "fixture.bin").unwrap();
+        complete.extend_from_slice(b".\r\n");
+        let complete = Arc::new(complete);
         let stalled = Arc::new(tokio::sync::Notify::new());
         let stalled_for_task = stalled.clone();
         let task = tokio::spawn(async move {
@@ -110,6 +141,7 @@ impl Origin {
                     accepted = listener.accept() => {
                         let Ok((stream,_)) = accepted else { break; }; let acceptor = acceptor.clone();
                         let body_attempts = body_attempts.clone();
+                        let complete = complete.clone();
                         let stalled = stalled_for_task.clone();
                         tasks.spawn(async move {
                             let stream: Box<dyn TunnelStream> = Box::new(stream);
@@ -127,10 +159,10 @@ impl Origin {
                                     else if line.starts_with("DATE") { b"111 20260907120000\r\n" }
                                     else if line.starts_with("BODY <retry@fixture>") {
                                         if body_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                                            let _ = stream.write_all(b"222 1 <retry@fixture>\r\npartial\r\n").await;
+                                            let _ = stream.write_all(b"222 1 <retry@fixture>\r\n=ybegin line=128 size=8 name=fixture.bin\r\n").await;
                                             return;
                                         }
-                                        b"222 1 <retry@fixture>\r\ncomplete\r\n.\r\n"
+                                        complete.as_slice()
                                     }
                                     else if line.starts_with("BODY <stall@fixture>") {
                                         stalled.notify_one();
@@ -182,12 +214,15 @@ async fn profile(kind: u8, destination: SocketAddr) -> (Fixture, Arc<dyn TunnelP
             let proxy =
                 ProxyServerDouble::start(kind, Some(("user".into(), "password".into())), mapping)
                     .await;
-            let provider = TransportProxy {
-                kind,
-                host: proxy.addr.ip().to_string(),
-                port: proxy.addr.port(),
-                username: Some("user".into()),
-                password: Some("password".into()),
+            let provider = LoopbackProxy {
+                proxy: TransportProxy {
+                    kind,
+                    host: proxy.addr.ip().to_string(),
+                    port: proxy.addr.port(),
+                    username: Some("user".into()),
+                    password: Some("password".into()),
+                },
+                at: proxy.addr,
             };
             (Fixture::Standard(proxy), Arc::new(provider))
         }
@@ -252,50 +287,43 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
         connect_timeout: Duration::from_secs(5),
         ..ServerConfig::new(bridge_dialer(bridge.clone()))
     };
-    let mut client = NntpConnection::connect(&config).await.unwrap();
-    assert_eq!(
-        client.remote_ip(),
-        None,
-        "the bridge is not the provider's IP"
-    );
-    assert_eq!(
-        client
-            .send_command(&Command::Date)
-            .await
-            .unwrap()
-            .code
-            .raw(),
-        111
-    );
-    assert!(client.body_by_id("missing@fixture").await.is_err());
-    client.quit().await.unwrap();
-    let pooled = weaver_nntp::NntpClient::new(weaver_nntp::client::NntpClientConfig::single(
-        config.clone(),
-        1,
-    ));
-    let recovered = pooled.fetch_body("retry@fixture").await.unwrap();
-    assert_eq!(
-        std::str::from_utf8(&recovered).unwrap().trim(),
-        "complete",
-        "article retry must discard the partial first response"
-    );
-    pooled.shutdown().await;
-    if !starttls {
-        let blocking_config = config.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut client = BlockingNntpConnection::connect(&blocking_config).unwrap();
-            assert_eq!(client.remote_ip(), None);
-            assert_eq!(client.send_command(&Command::Date).unwrap().code.raw(), 111);
-            client.quit().unwrap();
-        })
-        .await
-        .unwrap();
-    }
+    let blocking_config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut client = BlockingNntpConnection::connect(&blocking_config).unwrap();
+        assert_eq!(
+            client.remote_ip(),
+            None,
+            "the bridge is not the provider's IP"
+        );
+        assert_eq!(client.send_command(&Command::Date).unwrap().code.raw(), 111);
+        assert!(client.stream_yenc_article("missing@fixture").is_err());
+        client.quit().unwrap();
+        // The server drops the first answer part-way: that connection's fetch
+        // fails, and the partial body never becomes an article. The retry, on
+        // a fresh connection, gets the whole one.
+        let mut first = BlockingNntpConnection::connect(&blocking_config).unwrap();
+        assert!(first.stream_yenc_article("retry@fixture").is_err());
+        let mut retry = BlockingNntpConnection::connect(&blocking_config).unwrap();
+        let recovered = retry.stream_yenc_article("retry@fixture").unwrap();
+        assert_eq!(
+            recovered.chunks.concat(),
+            b"complete",
+            "article retry must discard the partial first response"
+        );
+        retry.quit().unwrap();
+    })
+    .await
+    .unwrap();
     if implicit {
         let mut wrong = config.clone();
         wrong.host = "wrong.invalid".into();
+        let wrong_config = wrong.clone();
         assert!(
-            NntpConnection::connect(&wrong).await.is_err(),
+            tokio::task::spawn_blocking(move || {
+                BlockingNntpConnection::connect(&wrong_config).is_err()
+            })
+            .await
+            .unwrap(),
             "hostname checks use the original destination"
         );
         let certificate = weaver_nntp::tls::inspect_tls_name_mismatch_certificate_via(
@@ -343,7 +371,11 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
     }
     bridge.revoke().await;
     provider.shutdown().await;
-    assert!(NntpConnection::connect(&config).await.is_err());
+    assert!(
+        tokio::task::spawn_blocking(move || BlockingNntpConnection::connect(&config).is_err())
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

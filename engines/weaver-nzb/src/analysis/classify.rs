@@ -173,8 +173,9 @@ pub fn classify_name(name: &str) -> NameShape {
             NameShape::Nnn
         };
     }
-    if ext.len() == 3 && all_digits(&ext[1..]) {
-        match ext.as_bytes()[0] {
+    let ext_bytes = ext.as_bytes();
+    if ext_bytes.len() == 3 && ext_bytes[1..].iter().all(u8::is_ascii_digit) {
+        match ext_bytes[0] {
             b'r' => return NameShape::RNn,
             b's' => return NameShape::SNn,
             _ => {}

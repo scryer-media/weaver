@@ -4,21 +4,27 @@
 use super::*;
 
 pub(super) mod owned_lane;
+pub(crate) use owned_lane::acquire_owned_lane_through_contention;
 pub mod queue;
 pub(crate) mod repeated;
 mod retention;
 pub(in crate::pipeline) mod scheduler;
 pub(crate) mod transport;
 mod worker;
+pub(in crate::pipeline) use worker::volume_pace;
 
 #[cfg(test)]
 pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;
 
+pub(in crate::pipeline) use retention::LoginRefusalView;
+#[cfg(test)]
+pub(in crate::pipeline) use retention::LoginRefusalWait;
 pub(super) use worker::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use worker::{
     DISPATCH_INELIGIBLE_LOG_INTERVAL, DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
-    DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+    DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL, DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+    DOWNLOAD_RETRY_STORM_THRESHOLD,
 };
 pub(crate) use worker::{
     DOWNLOAD_STALL_RECOVERY_ENV, DispatchStallWatch, JobLogThrottle, KeyedLogThrottle,

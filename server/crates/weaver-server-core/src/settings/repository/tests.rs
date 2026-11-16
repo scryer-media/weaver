@@ -130,6 +130,7 @@ fn config_roundtrip() {
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(false),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig {
             mode: crate::watch_folder::WatchFolderMode::Polling,
             path: Some("/incoming/nzbs".to_string()),

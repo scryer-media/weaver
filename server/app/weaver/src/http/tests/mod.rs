@@ -170,6 +170,7 @@ fn nzbget_history_row(
         completed_at,
         metadata,
         server_attribution: None,
+        archived_at: None,
     }
 }
 
@@ -219,6 +220,7 @@ fn test_config() -> SharedConfig {
         max_download_speed: None,
         cleanup_after_extract: None,
         delete_failed_job_files: None,
+        history_retention_days: None,
         propagation_delay_secs: None,
         max_concurrent_nzbs: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
@@ -780,7 +782,7 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         bytes_decoded: 8,
         bytes_committed: 7,
         download_queue_depth: 5,
-        active_downloads: 6,
+        articles_in_flight: 6,
         active_decodes: 2,
         decode_pending: 4,
         decode_pending_bytes: 4096,
@@ -837,6 +839,8 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         download_lane_refill_parked_total: 45,
         download_lane_refill_deferred_total: 0,
         download_lane_refill_saturated_total: 0,
+        download_lane_room_held_total: 0,
+        download_lane_room_woken_total: 0,
         download_pipeline_trial_success_total: 46,
         download_pipeline_trial_failure_total: 47,
         download_pipeline_proof_pass_total: 48,
@@ -850,7 +854,6 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         verify_active: 1,
         repair_active: 0,
         extract_active: 2,
-        disk_write_latency_us: 16,
         segments_retried: 17,
         segments_failed_permanent: 18,
         parked_infrastructure_work: 29,
@@ -1353,7 +1356,6 @@ fn sample_job_lifecycle() -> instr::JobLifecycleMetricsSnapshot {
 fn sample_pipeline_histograms() -> instr::PipelineHistogramsSnapshot {
     instr::PipelineHistogramsSnapshot {
         turn_duration: sample_histogram(),
-        disk_write_duration: sample_histogram(),
         decode_task_duration: Some(sample_histogram()),
         extract_member_duration: Some(sample_histogram()),
     }
@@ -1380,6 +1382,7 @@ fn sample_wal_checkpoint() -> weaver_server_core::persistence::WalCheckpointMetr
         checkpointed_frames: 19,
         copied_frames: 0,
         wal_bytes: 3_218_032,
+        statement_duration: sample_histogram(),
     }
 }
 
@@ -1408,6 +1411,79 @@ fn sample_disk_space() -> Vec<instr::DiskSpaceSnapshot> {
             path: "/var/lib/weaver/complete".to_string(),
             total_bytes: 2_000_000,
             available_bytes: 50_000,
+        },
+    ]
+}
+
+fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
+    vec![
+        instr::VolumeSnapshot {
+            label: "/mnt/nas".to_string(),
+            kind: "network",
+            device: Some(41),
+            written_bytes: 8_000_000,
+            write_nanos: 2_500_000_000,
+            write_calls: 120,
+            write_seeks: 9,
+            write_rate: 3_200_000,
+            throughput: 1_100_000,
+            buffered_bytes: 65_536,
+            arrived_bytes: 4_096,
+            counted_bytes: 69_632,
+            peak_bytes: 900_000,
+            buffer_soft_bytes: 700_000,
+            buffer_limit_bytes: 1_000_000,
+            idle_turns: 12,
+            writer: instr::VolumeWriterSnapshot {
+                batches: 40,
+                operations: 130,
+                loop_waits: 3,
+                loop_wait_nanos: 1_500_000_000,
+                loop_waits_by_kind: [1, 2, 0],
+                loop_wait_nanos_by_kind: [250_000_000, 1_250_000_000, 0],
+                loop_reads: 6,
+                loop_read_nanos: 750_000_000,
+                aside_waits: 4,
+                aside_wait_nanos: 2_000_000_000,
+                opens: 11,
+                open_nanos: 500_000_000,
+                open_creates: 11,
+                open_create_nanos: 250_000_000,
+                open_marks: 10,
+                open_mark_nanos: 125_000_000,
+                open_sizes: 4,
+                open_size_nanos: 75_000_000,
+                length_sets: 3,
+                length_set_nanos: 1_250_000_000,
+                length_sets_skipped: 8,
+                closes: 10,
+                close_nanos: 250_000_000,
+                failed_operations: 2,
+                abandoned_operations: 5,
+                threads: 1,
+                woken: 4,
+            },
+        },
+        // Seen, never written to: its rate is not measured, and it has
+        // no buffer limits yet.
+        instr::VolumeSnapshot {
+            label: "/mnt/scratch".to_string(),
+            kind: "unknown",
+            device: None,
+            written_bytes: 0,
+            write_nanos: 0,
+            write_calls: 0,
+            write_seeks: 0,
+            write_rate: 0,
+            throughput: 0,
+            buffered_bytes: 0,
+            arrived_bytes: 0,
+            counted_bytes: 0,
+            peak_bytes: 0,
+            buffer_soft_bytes: 0,
+            buffer_limit_bytes: 0,
+            idle_turns: 0,
+            writer: Default::default(),
         },
     ]
 }
@@ -1443,6 +1519,7 @@ struct CollectionFixtures {
     wal_checkpoint: weaver_server_core::persistence::WalCheckpointMetricsSnapshot,
     process: instr::ProcessMetricsSnapshot,
     disk_space: Vec<instr::DiskSpaceSnapshot>,
+    volumes: Vec<instr::VolumeSnapshot>,
     http_metrics: instr::HttpMetricsSnapshot,
 }
 
@@ -1456,6 +1533,7 @@ impl CollectionFixtures {
             wal_checkpoint: sample_wal_checkpoint(),
             process: sample_process_metrics(),
             disk_space: sample_disk_space(),
+            volumes: sample_volumes(),
             http_metrics: sample_http_metrics(),
         }
     }
@@ -1470,6 +1548,7 @@ impl CollectionFixtures {
         input.wal_checkpoint = Some(&self.wal_checkpoint);
         input.process = Some(&self.process);
         input.disk_space = &self.disk_space;
+        input.volumes = &self.volumes;
         input.http_metrics = Some(&self.http_metrics);
     }
 }

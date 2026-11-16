@@ -815,11 +815,18 @@ pub struct JobState {
     // relative to it: set when the move begins, or read back from the row of
     // a move a restart interrupted.
     pub delivery_left_behind: Vec<PathBuf>,
+    // The working directory the final move delivers from: set when the move
+    // begins, or read back from the row of a move a restart interrupted.
+    pub delivery_source: Option<PathBuf>,
     // Per-job working directory (subdirectory under intermediate_dir).
     // All download/decode/verify/repair/extract I/O happens here.
     pub working_dir: PathBuf,
     // Bytes downloaded for this specific job.
     pub downloaded_bytes: u64,
+    // What `downloaded_bytes` read as the job's last checkpoint was taken:
+    // the figure the job goes back to with that checkpoint, when a write
+    // that found the disk full sends it back there.
+    pub checkpointed_download_bytes: u64,
     // Encoded bytes received off the wire for this job, credited when an
     // article lands and before it is decoded. Includes retries and articles
     // that failed to decode, so it is never a progress measure: it feeds only

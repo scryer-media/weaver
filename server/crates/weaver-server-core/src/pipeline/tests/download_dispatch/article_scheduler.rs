@@ -43,7 +43,7 @@ fn taken(handout: Handout) -> Vec<DownloadWork> {
 // A lane booked as holding `holds` of `job_id`'s articles, at `depth`.
 fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usize) -> LaneShare {
     let lane_id = Pipeline::next_download_lane_id();
-    let outstanding = (0..holds)
+    let outstanding: std::collections::HashMap<SegmentId, DownloadWork> = (0..holds)
         .map(|index| {
             let segment_id = SegmentId {
                 file_id: NzbFileId {
@@ -62,7 +62,7 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
                 retry_count: 0,
                 is_recovery: false,
                 completion_critical: false,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 avoid_server: None,
             };
             (segment_id, work)
@@ -77,6 +77,10 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
             completion_critical: false,
             server_idx: Some(SERVER_A),
             connection: true,
+            outstanding_bytes: outstanding
+                .values()
+                .map(|work| u64::from(work.byte_estimate))
+                .sum(),
             outstanding,
         },
     );
@@ -378,7 +382,15 @@ async fn a_retention_excluded_hot_job_is_blocked_on_that_server_alone() {
     add_job(&mut pipeline, next, "Fresh Post Reel", 200).await;
     pipeline
         .job_retention_exclude_cache
-        .insert(hot, (std::time::Instant::now(), Arc::new(vec![SERVER_B])));
+        .get_mut()
+        .unwrap()
+        .insert(
+            hot,
+            (
+                std::time::Instant::now(),
+                weaver_nntp::ServerSet::from([SERVER_B]),
+            ),
+        );
 
     let on_b = taken(ask(&mut pipeline, SERVER_B, 4, None));
     assert_eq!(single_job(&on_b), next);
@@ -506,7 +518,7 @@ async fn soft_pressure_raised_by_a_hot_job_blocked_everywhere_does_not_idle_the_
     }
     // The hot job's remaining articles are refused on both servers.
     rewrite_queue(&mut pipeline, hot, |work| {
-        work.exclude_servers = vec![SERVER_A, SERVER_B];
+        work.exclude_servers = weaver_nntp::ServerSet::from([SERVER_A, SERVER_B]);
     });
     // Its reorder buffers alone put the write backlog at the soft mark.
     let (_, _, write_soft, _) = pipeline.download_pressure_limits();
@@ -657,12 +669,12 @@ async fn per_article_exclusions_decide_which_server_a_job_is_blocked_on() {
     add_job(&mut pipeline, next, "Untouched Reel", 40).await;
     // Both servers are up in this dispatch attempt, so a rotated article
     // has somewhere else to go.
-    pipeline.download_pass_fill_servers = Some(vec![SERVER_A, SERVER_B]);
+    pipeline.download_pass_fill_servers = Some(weaver_nntp::ServerSet::from([SERVER_A, SERVER_B]));
     // Half the hot job's articles failed on this server, the other half were
     // merely rotated away from it: neither may come back to it.
     rewrite_queue(&mut pipeline, hot, |work| {
         if work.segment_id.segment_number % 2 == 0 {
-            work.exclude_servers = vec![SERVER_A];
+            work.exclude_servers = weaver_nntp::ServerSet::from([SERVER_A]);
         } else {
             work.avoid_server = Some(SERVER_A);
         }
@@ -692,7 +704,7 @@ async fn a_rotated_article_returns_to_its_server_while_the_alternative_is_down()
     rewrite_queue(&mut pipeline, job_id, |work| {
         work.avoid_server = Some(SERVER_A);
     });
-    pipeline.download_pass_fill_servers = Some(vec![SERVER_A]);
+    pipeline.download_pass_fill_servers = Some(weaver_nntp::ServerSet::from([SERVER_A]));
 
     let on_a = taken(ask(&mut pipeline, SERVER_A, 8, None));
     assert_eq!(on_a.len(), 4);
@@ -711,7 +723,7 @@ async fn a_rotated_article_goes_to_the_alternative_while_it_is_up() {
     rewrite_queue(&mut pipeline, job_id, |work| {
         work.avoid_server = Some(SERVER_A);
     });
-    pipeline.download_pass_fill_servers = Some(vec![SERVER_A, SERVER_B]);
+    pipeline.download_pass_fill_servers = Some(weaver_nntp::ServerSet::from([SERVER_A, SERVER_B]));
 
     assert!(taken(ask(&mut pipeline, SERVER_A, 8, None)).is_empty());
     assert_eq!(queued(&pipeline, job_id), 4);
@@ -856,7 +868,7 @@ async fn the_guard_counters_account_for_a_shuffled_multi_server_run() {
             2 => {
                 let server = rng.below(2) as usize;
                 rewrite_queue(&mut pipeline, victim, |work| {
-                    work.exclude_servers = vec![server];
+                    work.exclude_servers = weaver_nntp::ServerSet::from([server]);
                 });
             }
             _ => rewrite_queue(&mut pipeline, victim, |work| {
@@ -950,7 +962,14 @@ async fn a_small_job_is_shared_over_every_connection() {
     assert_eq!(works.len(), 9);
     let held = lane_holding(&mut pipeline, hot, works.len(), lane.depth);
     match ask_as_lane(&mut pipeline, SERVER_A, 18, held) {
-        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9 }),
+        Handout::Saturated(wake) => assert_eq!(
+            wake,
+            SaturationWake {
+                of: None,
+                below: 9,
+                room: false
+            }
+        ),
         other => panic!(
             "a full lane does not open the next job, got {:?}",
             taken(other).len()
@@ -990,7 +1009,8 @@ async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
             wake,
             SaturationWake {
                 of: Some(hot),
-                below: share
+                below: share,
+                room: false,
             }
         ),
         other => panic!(
@@ -1020,7 +1040,14 @@ async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
     // and is not opened to it: it waits on its own pipe, not on any share.
     let full_elsewhere = lane_holding(&mut pipeline, next, 17, 8);
     match ask_as_lane(&mut pipeline, SERVER_A, 18, full_elsewhere) {
-        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9 }),
+        Handout::Saturated(wake) => assert_eq!(
+            wake,
+            SaturationWake {
+                of: None,
+                below: 9,
+                room: false
+            }
+        ),
         other => panic!(
             "a full lane does not open another job, got {:?}",
             taken(other).len()
@@ -1040,7 +1067,7 @@ async fn the_share_counts_articles_already_out_on_lanes() {
     add_job(&mut pipeline, hot, "Half Fetched Pack", 10_000).await;
 
     assert_eq!(pipeline.lane_share_of_job(hot, 8), 100);
-    pipeline.active_downloads_by_job.insert(hot, 10_000);
+    pipeline.articles_in_flight_by_job.insert(hot, 10_000);
     assert_eq!(
         pipeline.lane_share_of_job(hot, 8),
         200,
@@ -1077,7 +1104,7 @@ async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
     add_job(&mut pipeline, hot, "Elsewhere Only Reel", 600).await;
     add_job(&mut pipeline, next, "Here Too Reel", 600).await;
     rewrite_queue(&mut pipeline, hot, |work| {
-        work.exclude_servers = vec![SERVER_A];
+        work.exclude_servers = weaver_nntp::ServerSet::from([SERVER_A]);
     });
 
     let share = pipeline.lane_share_of_job(hot, 8);
@@ -1085,7 +1112,11 @@ async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
     match ask_as_lane(&mut pipeline, SERVER_A, 18, lane) {
         Handout::Saturated(wake) => assert_eq!(
             wake,
-            SaturationWake { of: None, below: 9 },
+            SaturationWake {
+                of: None,
+                below: 9,
+                room: false
+            },
             "the walk went on to the next job; only the lane's full pipe holds it"
         ),
         other => panic!(
@@ -1126,6 +1157,110 @@ async fn the_share_never_starves_a_pipe() {
         3,
         "everything the job has, well inside the floor"
     );
+}
+
+// What the lanes hold is reserved on the volume as it is leased, so a lane
+// may lease only its part of the room the job's volume has left below its
+// lease limit, over every connection, and never more than that room holds.
+// On the slow disk run the lanes held 262 MB of a job's queue while its
+// volume read near empty, and all of it arrived at once: 354.9 MB against
+// 268.4 MB.
+#[tokio::test]
+async fn a_lane_leases_only_its_part_of_the_room_its_jobs_volume_has_left() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(4);
+    let hot = JobId(71351);
+    add_job(&mut pipeline, hot, "Slow Disk Reel", 20_000).await;
+    assert_eq!(pipeline.lane_share_of_job(hot, 8), 5_000);
+    let volume = Arc::clone(
+        pipeline.graph_jobs[&hot]
+            .disk()
+            .expect("the job writes through its volume's writer")
+            .working()
+            .volume(),
+    );
+    let hard = 87_382;
+    volume.set_buffer_limits(hard, hard);
+    let limit = volume.lease_limit();
+    assert_eq!(limit, 81_921);
+    assert_eq!(pipeline.volume_room(hot), Some(limit));
+    // The volume counts so much that room for 10 articles of 512 bytes is
+    // left on each of the 4 connections.
+    let room_for = |articles: u64| limit - articles * 512;
+
+    // A lane holding 30 is given the 10 more its part of the room takes,
+    // though its ask and its share of the queue are larger, and they are
+    // reserved as they are leased.
+    volume.count_for_test(room_for(40));
+    let lane = lane_holding(&mut pipeline, hot, 30, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
+    assert_eq!(works.len(), 10);
+    assert_eq!(single_job(&works), hot);
+    lease_to_lane(&mut pipeline, lane, works);
+    assert_eq!(volume.unwritten_bytes(), room_for(30));
+
+    // Below the volume's resume line, a lane whose part of the room is
+    // short of a whole pipe of 9, with room left for others, is answered
+    // once it has fetched its pipe down to where one fits, never trickled.
+    volume.count_for_test(volume.resume_line() - 6 * 512);
+    let part = ((limit - volume.unwritten_bytes()) / 4 / 512) as usize;
+    assert!(part + 1 < 9, "{part}");
+    let full = lane_holding(&mut pipeline, hot, 40, 8);
+    assert_eq!(
+        saturation(ask_as_lane(&mut pipeline, SERVER_A, 18, full)),
+        SaturationWake {
+            of: Some(hot),
+            below: 40 + part + 1 - 9,
+            room: false,
+        }
+    );
+
+    // The room itself holds less than a whole pipe: the lane takes what
+    // fits, so the room is not left unused while the writer may run dry.
+    volume.count_for_test(room_for(4));
+    let short = lane_holding(&mut pipeline, hot, 2, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, short));
+    assert_eq!(works.len(), 4, "what the room holds");
+    lease_to_lane(&mut pipeline, short, works);
+    assert_eq!(volume.unwritten_bytes(), limit);
+
+    // No article fits: the lane waits for the volume's line, not for what
+    // it holds, and is never handed one past the limit.
+    volume.count_for_test(limit - 100);
+    assert!(volume.unwritten_bytes() > volume.resume_line());
+    let none_fits = lane_holding(&mut pipeline, hot, 2, 8);
+    assert_eq!(
+        saturation(ask_as_lane(&mut pipeline, SERVER_A, 18, none_fits)),
+        SaturationWake {
+            of: Some(hot),
+            below: 0,
+            room: true,
+        }
+    );
+    assert!(
+        pipeline.ask_room_wake(hot),
+        "the volume holds a wake at its line"
+    );
+    assert_eq!(volume.unwritten_bytes(), limit - 100);
+    assert!(volume.peak_bytes() <= hard);
+}
+
+// Lease a lane's handout, as dispatch does once it is taken: what it
+// takes is reserved on the job's volume.
+fn lease_to_lane(pipeline: &mut Pipeline, lane: LaneShare, works: Vec<DownloadWork>) {
+    let pressure = pipeline.refresh_download_pressure();
+    let lane_mode = pipeline.download_lane_mode_for_server(SERVER_A, pressure, true);
+    pipeline
+        .lease_for_handout(lane.lane_id, SERVER_A, lane_mode, pressure, works)
+        .expect("the handout is leased");
+}
+
+fn saturation(handout: Handout) -> SaturationWake {
+    match handout {
+        Handout::Saturated(wake) => wake,
+        other => panic!("the lane must be held, was handed {}", taken(other).len()),
+    }
 }
 
 fn scan_skips(pipeline: &Pipeline) -> u64 {

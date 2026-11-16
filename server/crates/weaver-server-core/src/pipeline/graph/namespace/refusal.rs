@@ -26,10 +26,95 @@ use weaver_graph::{
     Provenance, Segment, Tree, VolumeIndex,
 };
 
-use super::{Arrival, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
+use super::{Arrival, BatchEnd, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
 use crate::pipeline::graph::leaf::Leaf;
 
+// A batch the tree raised as an object heard the job was quiet, that gives
+// more than one volume up: each volume given up is read back into its own
+// file on a turn of its own, a stored set's volume by volume, so the loop
+// turns between them. What it leaves to do once all are applied, and what
+// it passed on, are kept with it, so the batch ends as it would in one turn.
+pub(crate) struct GivingUp {
+    effects: std::collections::VecDeque<Effect>,
+    end: BatchEnd,
+    out: Vec<Effect>,
+}
+
+impl GivingUp {
+    // What the batch passed on to the owner, once it is applied.
+    pub(crate) fn into_out(self) -> Vec<Effect> {
+        self.out
+    }
+}
+
+// An effect that reads a volume given up back into its own file.
+fn gives_up(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Refused { .. } | Effect::NeedsEngine { .. } | Effect::Disclaimed { .. }
+    )
+}
+
 impl NamespaceWriter {
+    // Effects the tree raised as an object heard the job was quiet, as
+    // [`Self::apply_all`] applies them, the ones left for the owner going to
+    // `out`. A batch that gives more than one volume up applies the first
+    // here and is handed back, to go on with [`Self::give_up_next`].
+    pub(crate) fn apply_quiet(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        effects: Vec<Effect>,
+        out: &mut Vec<Effect>,
+    ) -> Result<Option<GivingUp>, WriteError> {
+        if effects.iter().filter(|effect| gives_up(effect)).count() < 2 {
+            return self
+                .apply_all(tree, builder, segments, effects, out)
+                .map(|()| None);
+        }
+        let mut batch = GivingUp {
+            end: BatchEnd::of(&effects),
+            effects: effects.into(),
+            out: Vec::new(),
+        };
+        Ok((!self.give_up_next(tree, builder, segments, &mut batch)?).then_some(batch))
+    }
+
+    // The batch's effects up to the next volume given up after the first,
+    // in order: true once none is left and the batch has ended as
+    // [`Self::apply_all`] ends one. On an error the effects not yet applied
+    // are dropped, as they always were.
+    pub(crate) fn give_up_next(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        batch: &mut GivingUp,
+    ) -> Result<bool, WriteError> {
+        let mut gave_up = false;
+        while let Some(effect) = batch.effects.pop_front() {
+            if gave_up && gives_up(&effect) {
+                batch.effects.push_front(effect);
+                return Ok(false);
+            }
+            gave_up |= gives_up(&effect);
+            self.apply(
+                tree,
+                builder,
+                segments,
+                effect,
+                Write::Again,
+                &mut batch.out,
+            )?;
+            self.apply_unnamed(tree, builder, segments, &mut batch.out)?;
+        }
+        let end = std::mem::take(&mut batch.end);
+        self.finish_batch(tree, builder, segments, end, &mut batch.out)?;
+        self.release_held(tree, builder, segments, &mut batch.out)?;
+        Ok(true)
+    }
+
     pub(super) fn materialise(
         &mut self,
         tree: &mut Tree,
@@ -93,37 +178,29 @@ impl NamespaceWriter {
             self.release_to_leaf(tree, node, member)?;
         }
         self.release_subtree(tree, retired)?;
-        for (range, provenance) in runs {
-            let mut at = range.start;
-            while at < range.end {
-                let chunk = ByteRange::new(at, range.end.min(at.saturating_add(READ_BACK)));
-                at = chunk.end;
-                for (piece, bytes) in self.read_back(tree, retired, volume, chunk) {
-                    let arrival = Arrival {
-                        node,
-                        member,
-                        offset: piece.start,
-                        provenance: bytes.as_ref().map_or(Provenance::Damaged, |_| provenance),
-                        bytes: bytes
-                            .unwrap_or_else(|| Bytes::from(vec![0; super::index(piece.len())]))
-                            .into(),
-                    };
-                    // Reproduced bytes were evidence when they first came;
-                    // damage is new, and the recovery objects hear it.
-                    if arrival.provenance == provenance {
-                        self.route_as_brought(tree, builder, segments, arrival, out)?;
-                    } else {
-                        // The member no longer holds what its record says
-                        // came there, a repair's bytes too: the damage is
-                        // what lies there now.
-                        if let Some(record) = tree
-                            .namespace_mut(node)
-                            .and_then(|namespace| namespace.get_mut(member))
-                        {
-                            record.coverage.erase(piece);
-                        }
-                        self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
-                    }
+        for (run, provenance) in runs {
+            // A loss brought no bytes: only what reached the object's
+            // sources over it since, a repair's, goes down again, and the
+            // rest stays the loss it is, a hole in the file that its length
+            // covers once it closes.
+            let parts = if provenance.arrived() {
+                vec![run]
+            } else {
+                self.arrived_within(tree, (retired, volume), run)
+            };
+            for range in parts {
+                let mut at = range.start;
+                while at < range.end {
+                    let chunk = ByteRange::new(at, range.end.min(at.saturating_add(READ_BACK)));
+                    at = chunk.end;
+                    self.materialise_chunk(
+                        tree,
+                        builder,
+                        segments,
+                        (node, member, retired, volume),
+                        (chunk, provenance),
+                        out,
+                    )?;
                 }
             }
         }
@@ -134,6 +211,83 @@ impl NamespaceWriter {
             self.envelopes.take(retired, envelope);
         }
         self.close_if_leaf(tree, node, member)
+    }
+
+    // One chunk of a run the member's record holds, read back through the
+    // retired object and delivered again. A piece of a loss that does not
+    // read back stays the loss.
+    fn materialise_chunk(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, member, retired, volume): (NodeId, MemberId, NodeId, VolumeIndex),
+        (chunk, provenance): (ByteRange, Provenance),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        for (piece, bytes) in self.read_back(tree, retired, volume, chunk) {
+            if bytes.is_none() && !provenance.arrived() {
+                continue;
+            }
+            let arrival = Arrival {
+                node,
+                member,
+                offset: piece.start,
+                provenance: bytes.as_ref().map_or(Provenance::Damaged, |_| provenance),
+                bytes: bytes
+                    .unwrap_or_else(|| Bytes::from(vec![0; super::index(piece.len())]))
+                    .into(),
+            };
+            // Reproduced bytes were evidence when they first came; damage is
+            // new, and the recovery objects hear it.
+            if arrival.provenance == provenance {
+                self.route_as_brought(tree, builder, segments, arrival, out)?;
+            } else {
+                // The member no longer holds what its record says came
+                // there, a repair's bytes too: the damage is what lies there
+                // now.
+                if let Some(record) = tree
+                    .namespace_mut(node)
+                    .and_then(|namespace| namespace.get_mut(member))
+                {
+                    record.coverage.erase(piece);
+                }
+                self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    // The parts of `range` of the retired node's volume that the object's
+    // sources hold as bytes that arrived, in volume order: what reached a
+    // member or an envelope over a loss, as a repair's bytes do. Nothing is
+    // read, and the cost is the runs the sources record, not the bytes the
+    // range spans.
+    fn arrived_within(
+        &self,
+        tree: &Tree,
+        (retired, volume): (NodeId, VolumeIndex),
+        range: ByteRange,
+    ) -> Vec<ByteRange> {
+        let mut placements = Vec::new();
+        tree.locate(retired, volume, range, &mut placements);
+        if placements.iter().map(Placement::len).sum::<u64>() != range.len() {
+            return Vec::new();
+        }
+        let mut parts: Vec<ByteRange> = Vec::new();
+        let mut at = range.start;
+        for placement in &placements {
+            let piece = ByteRange::at(at, placement.len());
+            at = piece.end;
+            for kept in self.kept(tree, retired, placement, true) {
+                let part = kept.shift(piece.start as i64);
+                match parts.last_mut() {
+                    Some(last) if last.end == part.start => last.end = part.end,
+                    _ => parts.push(part),
+                }
+            }
+        }
+        parts
     }
 
     // The retired object's envelope holds every byte the member took, at
@@ -169,7 +323,13 @@ impl NamespaceWriter {
             }
             Some(_) => false,
             None => {
-                let leaf = Leaf::over(&self.working_dir, &kept.name, kept.on_disk);
+                let leaf = Leaf::handed(
+                    &self.working_dir,
+                    &kept.name,
+                    kept.on_disk,
+                    self.disk_under(&self.working_dir).as_ref(),
+                    0,
+                );
                 self.files_mut(node).leaves.insert(member, leaf);
                 self.intend(node, member, output_name);
                 true
@@ -248,7 +408,7 @@ impl NamespaceWriter {
 
     fn close_if_leaf(
         &mut self,
-        tree: &Tree,
+        tree: &mut Tree,
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {
@@ -306,7 +466,7 @@ impl NamespaceWriter {
             // of its end, are its to give back.
             let mut skip = 0;
             let mut parts = Vec::new();
-            for kept in self.kept(tree, retired, placement) {
+            for kept in self.kept(tree, retired, placement, false) {
                 if kept.start > skip {
                     parts.push(ByteRange::new(skip, kept.start));
                 }
@@ -331,11 +491,21 @@ impl NamespaceWriter {
     // The parts of a placement its source holds, as offsets into the
     // placement, in order: what the envelope kept, or what reached the
     // member. They cut the placement's parts; the object says which it can
-    // post again.
-    fn kept(&self, tree: &Tree, retired: NodeId, placement: &Placement) -> Vec<ByteRange> {
+    // post again. With `arrived`, only the parts whose bytes arrived: a
+    // loss the source records is no part.
+    fn kept(
+        &self,
+        tree: &Tree,
+        retired: NodeId,
+        placement: &Placement,
+        arrived: bool,
+    ) -> Vec<ByteRange> {
         let held = |coverage: &Coverage, range: ByteRange| {
             let mut parts: Vec<ByteRange> = Vec::new();
-            for run in coverage.overlapping(range) {
+            for run in coverage
+                .overlapping(range)
+                .filter(|run| !arrived || run.provenance.arrived())
+            {
                 let Some(part) = run.range.intersect(range) else {
                     continue;
                 };

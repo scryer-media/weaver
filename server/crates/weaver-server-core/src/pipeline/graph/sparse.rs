@@ -18,6 +18,10 @@
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::time::Instant;
+
+use crate::operations::disk::holes;
+use crate::operations::disk::writer::{OpenSteps, Opened};
 
 // Marks a freshly created file sparse.
 //
@@ -48,16 +52,175 @@ impl SparseMarker for PlatformMarker {
 // A marking failure keeps the open file, including any pre-existing bytes.
 // Only an actual open failure prevents the caller from using it.
 pub(crate) fn create_sparse<M: SparseMarker>(path: &Path, marker: &M) -> io::Result<File> {
+    create_sized_with(path, marker, None, holes::makes_holes)
+}
+
+// Whether this platform can tell a filesystem that makes holes, and so ever
+// gives a file its declared length when it is made. Where it cannot, every
+// file grows as it is written. Read by tests, which accept a sized file only
+// where one can be made.
+// Whether a new file made in `dir` is given its declared length: the mark
+// and the filesystem asked directly, about a file of their own, with nothing
+// held. What a test on a real directory expects of it.
+#[cfg(test)]
+pub(crate) fn sizes_files_in(dir: &Path) -> bool {
+    let probe = dir.join(".sizes-files-probe");
+    let file = std::fs::File::create(&probe).expect("a probe file");
+    let sizes = SIZES_FILES
+        && PlatformMarker.mark_sparse(&file).is_ok()
+        && holes::filesystem_makes_holes(&file) == Some(true);
+    drop(file);
+    std::fs::remove_file(&probe).expect("the probe removed");
+    sizes
+}
+
+// Creates `path` as `create_sparse` does and gives it `length` when its
+// filesystem is known to make holes; any other file grows as it is written.
+//
+// A file set to its length first is written into holes inside it, and its
+// end of file does not move with every write at a scattered offset. That is
+// only free where the unwritten length takes no space: on a filesystem that
+// would fill it with zeroes, or one that cannot be told, the length would be
+// space and writes for bytes never downloaded. No space is ever reserved:
+// the length is set, never allocated.
+//
+// Only Windows sizes a file (`SIZES_FILES`). There the sparse mark is the
+// test, taken first and the length after it: a mount that refuses the mark
+// is not sized, and neither is one whose type of filesystem is not known to
+// make holes; a share over the network is not sized. The type is asked once for each device
+// and held by the disk module ([`holes`]): a file made on a device already
+// asked about costs no filesystem call.
+//
+// Only an empty file is sized: one that already holds bytes is a restart's,
+// whose length the restore reads as how far its bytes reach.
+pub(crate) fn create_sized<M: SparseMarker>(
+    path: &Path,
+    marker: &M,
+    length: Option<u64>,
+) -> io::Result<File> {
+    create_sized_known(path, marker, length).map(|opened| opened.file)
+}
+
+// `create_sized`, with the length the file was left at when it is known
+// without another call: the length it was given, or the one the look at it
+// before sizing read. `None` for a file that was not looked at: one with no
+// declared length, or whose mark was refused. The steps it ran are timed.
+pub(crate) fn create_sized_known<M: SparseMarker>(
+    path: &Path,
+    marker: &M,
+    length: Option<u64>,
+) -> io::Result<Opened> {
+    #[cfg(test)]
+    if let Some(sized) = sizing::said() {
+        return create_sized_known_with(path, marker, length, |_, _| sized);
+    }
+    create_sized_known_with(path, marker, length, |file, metadata| {
+        SIZES_FILES && holes::makes_holes(file, metadata)
+    })
+}
+
+// Whether a new file is ever given its declared length. Only on Windows,
+// where a file that grows write by write across scattered offsets keeps
+// moving its end of file and NTFS keeps its cached pages out of the standby
+// list. On Unix a write past the end makes a hole as cheaply, and the extra
+// length call is one more `ftruncate` per file for nothing: counted on the
+// hot-path bench on macOS, the volume writer made one per file that the
+// writes on the pipeline before it did not.
+const SIZES_FILES: bool = cfg!(windows);
+
+// A test that must see one outcome whatever filesystem it runs on says
+// whether every new file is given its length, for as long as it holds the
+// word. The word is the process's: a test run of its own, as the runner
+// gives each test, is the only one that hears it.
+#[cfg(test)]
+pub(crate) mod sizing {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static SAID: AtomicU8 = AtomicU8::new(0);
+
+    pub(crate) struct Sizing(());
+
+    // Every new file with a declared length is given it.
+    pub(crate) fn always() -> Sizing {
+        SAID.store(1, Ordering::SeqCst);
+        Sizing(())
+    }
+
+    // Every new file grows as it is written.
+    pub(crate) fn never() -> Sizing {
+        SAID.store(2, Ordering::SeqCst);
+        Sizing(())
+    }
+
+    pub(super) fn said() -> Option<bool> {
+        match SAID.load(Ordering::SeqCst) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
+    }
+
+    impl Drop for Sizing {
+        fn drop(&mut self) {
+            SAID.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+fn create_sized_with<M: SparseMarker>(
+    path: &Path,
+    marker: &M,
+    length: Option<u64>,
+    makes_holes: impl FnOnce(&File, &std::fs::Metadata) -> bool,
+) -> io::Result<File> {
+    create_sized_known_with(path, marker, length, makes_holes).map(|opened| opened.file)
+}
+
+fn create_sized_known_with<M: SparseMarker>(
+    path: &Path,
+    marker: &M,
+    length: Option<u64>,
+    makes_holes: impl FnOnce(&File, &std::fs::Metadata) -> bool,
+) -> io::Result<Opened> {
+    let mut steps = OpenSteps::default();
+    let began = Instant::now();
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;
-    if marker.mark_sparse(&file).is_err() {
+    let marking = Instant::now();
+    steps.create = Some(marking - began);
+    let marked = marker.mark_sparse(&file).is_ok();
+    steps.mark = Some(marking.elapsed());
+    if !marked {
         crate::runtime::perf_probe::record_value("graph.sparse.mark_failed", 1);
     }
-    Ok(file)
+    let Some(length) = length.filter(|length| marked && *length > 0) else {
+        return Ok(Opened {
+            file,
+            length: None,
+            steps,
+        });
+    };
+    // Sizing is an allocation hint like the mark: a file it fails on stays
+    // usable and grows by its writes. The filesystem is asked about last,
+    // and only for a file that would be sized.
+    let sizing = Instant::now();
+    let sized = file.metadata().and_then(|metadata| match metadata.len() {
+        0 if makes_holes(&file, &metadata) => file.set_len(length).map(|()| length),
+        held => Ok(held),
+    });
+    steps.size = Some(sizing.elapsed());
+    if sized.is_err() {
+        crate::runtime::perf_probe::record_value("graph.sparse.presize_failed", 1);
+    }
+    Ok(Opened {
+        file,
+        length: sized.ok(),
+        steps,
+    })
 }
 
 // `FSCTL_SET_SPARSE` with no input buffer, which is the "make it sparse" form
@@ -143,5 +306,172 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"routed");
+    }
+
+    // A filesystem that takes the sparse attribute.
+    struct Taking;
+
+    impl SparseMarker for Taking {
+        fn mark_sparse(&self, _file: &File) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn sized(
+        marker: &impl SparseMarker,
+        held: Option<&[u8]>,
+        length: Option<u64>,
+        makes_holes: bool,
+    ) -> Vec<u8> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ember.bin");
+        if let Some(held) = held {
+            std::fs::write(&path, held).unwrap();
+        }
+        let mut file = create_sized_with(&path, marker, length, |_, _| makes_holes).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    // On a filesystem that makes holes, a new file the mark took reaches its
+    // declared length from the start, every byte of it a hole.
+    #[test]
+    fn a_marked_new_file_takes_its_declared_length() {
+        assert_eq!(sized(&Taking, None, Some(4096), true), vec![0; 4096]);
+    }
+
+    // A mount that refuses the mark gets no length: it would be zero-filled
+    // space for bytes never written.
+    #[test]
+    fn a_refused_mark_leaves_the_file_unsized() {
+        assert!(sized(&Refusing, None, Some(4096), true).is_empty());
+    }
+
+    // On a filesystem not known to make holes, the file stays as long as
+    // what is written to it.
+    #[test]
+    fn a_filesystem_not_known_to_make_holes_leaves_the_file_unsized() {
+        assert!(sized(&Taking, None, Some(4096), false).is_empty());
+    }
+
+    // A file that already holds bytes, a restart's, keeps its length: the
+    // restore reads it as how far its bytes reach.
+    #[test]
+    fn a_file_holding_bytes_keeps_its_length() {
+        assert_eq!(sized(&Taking, Some(b"routed"), Some(4096), true), b"routed");
+    }
+
+    // No declared length, nothing to size.
+    #[test]
+    fn a_file_with_no_declared_length_stays_unsized() {
+        assert!(sized(&Taking, None, None, true).is_empty());
+    }
+
+    // The filesystem is asked about only for a file that would be sized:
+    // never for one with no length, a refused mark, or bytes already in it.
+    #[test]
+    fn the_filesystem_is_asked_about_only_for_a_file_that_would_be_sized() {
+        let asked = |marker_takes: bool, held: Option<&[u8]>, length: Option<u64>| {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("ember.bin");
+            if let Some(held) = held {
+                std::fs::write(&path, held).unwrap();
+            }
+            let asked = std::cell::Cell::new(false);
+            let makes_holes = |_: &File, _: &std::fs::Metadata| {
+                asked.set(true);
+                true
+            };
+            if marker_takes {
+                create_sized_with(&path, &Taking, length, makes_holes).unwrap();
+            } else {
+                create_sized_with(&path, &Refusing, length, makes_holes).unwrap();
+            }
+            asked.get()
+        };
+        assert!(asked(true, None, Some(4096)));
+        assert!(!asked(true, None, None));
+        assert!(!asked(true, None, Some(0)));
+        assert!(!asked(false, None, Some(4096)));
+        assert!(!asked(true, Some(b"routed"), Some(4096)));
+    }
+
+    // On the filesystem that holds the test, a new file is given its whole
+    // declared length exactly when the mark is taken and the filesystem makes
+    // holes, and is left empty when not. A sized file takes no space for its
+    // length.
+    #[test]
+    fn the_platform_rule_sizes_a_file_exactly_where_holes_are_made() {
+        const LENGTH: u64 = 64 << 20;
+        let temp = tempfile::tempdir().unwrap();
+        let expected = if sizes_files_in(temp.path()) {
+            LENGTH
+        } else {
+            0
+        };
+        let path = temp.path().join("ember.bin");
+        let file = create_sized(&path, &PlatformMarker, Some(LENGTH)).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.len(), expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // `st_blocks` counts 512-byte units whatever the block size.
+            assert!(
+                metadata.blocks() * 512 <= LENGTH / 64,
+                "{} blocks held for an empty file",
+                metadata.blocks()
+            );
+        }
+    }
+
+    // Every file made on one device after the first is sized from the held
+    // answer: the filesystem's type is asked once, not once a file.
+    #[test]
+    fn files_made_on_one_device_ask_the_filesystem_type_once() {
+        const FILES: usize = 40;
+        let temp = tempfile::tempdir().unwrap();
+        // The sizer here is the test's own, so whether a file is sized is
+        // the filesystem's answer, held: every file is sized as the first.
+        let mut expected = None;
+        let answers = holes::HoleAnswers::new();
+        let asked = std::cell::Cell::new(0);
+        for index in 0..FILES {
+            let path = temp.path().join(format!("ember-{index}.bin"));
+            let file = create_sized_with(&path, &PlatformMarker, Some(4096), |file, metadata| {
+                answers.answer(holes::device_of(metadata), || {
+                    asked.set(asked.get() + 1);
+                    holes::filesystem_makes_holes(file)
+                })
+            })
+            .unwrap();
+            let len = file.metadata().unwrap().len();
+            assert!(len == 0 || len == 4096, "file {index}: {len}");
+            assert_eq!(len, *expected.get_or_insert(len), "file {index}");
+        }
+        // Where the mark is refused no file would be sized and none asks;
+        // where metadata names no device there is nothing to hold by.
+        // The mark is asked of a file open for writing, as a new file is.
+        let first = File::options()
+            .write(true)
+            .open(temp.path().join("ember-0.bin"))
+            .unwrap();
+        let marked = PlatformMarker.mark_sparse(&first).is_ok();
+        let asks = match (marked, cfg!(unix)) {
+            (false, _) => 0,
+            (true, true) => 1,
+            (true, false) => FILES,
+        };
+        assert_eq!(asked.get(), asks);
+    }
+
+    // A file made with no declared length is never sized, on any platform.
+    #[test]
+    fn a_file_made_without_a_length_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ember.bin");
+        let file = create_sparse(&path, &PlatformMarker).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
     }
 }

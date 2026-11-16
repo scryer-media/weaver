@@ -341,6 +341,16 @@ pub enum Emit {
         volume: VolumeIndex,
         range: ByteRange,
     },
+    // "My volumes from `first` up to `end` never came, and I hold nothing
+    // of any of them": each is bad at `range`, as a `Damaged` for each
+    // would say, in one report however many volumes the run spans. A
+    // volume of the run its object holds anything of is said by `Damaged`
+    // instead, since only a volume held places anywhere.
+    Gap {
+        first: VolumeIndex,
+        end: VolumeIndex,
+        range: ByteRange,
+    },
     // "I cannot read further without a password."
     NeedsPassword,
     // "This is readable, but not by streaming; hand it to an engine."
@@ -355,6 +365,10 @@ pub enum Emit {
     // claim that bound it was provisional: the member goes back to its
     // namespace, with what I parsed of it, to be offered again.
     GiveBack(VolumeIndex),
+    // "My headers say the volume at this place, which I do not hold, is
+    // mine": a sibling holding there a volume it may carry lets it go to
+    // me, where I claim it at that place. Said once per place.
+    Wants(VolumeIndex),
 }
 
 #[cfg(test)]

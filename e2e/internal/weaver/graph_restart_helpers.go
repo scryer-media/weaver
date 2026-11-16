@@ -81,6 +81,46 @@ func (ctx *restartCaseContext) pollJob(what, dbPath string, jobID int, check fun
 	})
 }
 
+// loginRefusalWait is what the queue says of a job while a fill server
+// refuses the login: its state, what it waits on, and the bytes it has booked
+// missing.
+type loginRefusalWait struct {
+	State       string `json:"state"`
+	WaitReason  string `json:"downloadWaitReason"`
+	FailedBytes uint64 `json:"failedBytes"`
+}
+
+// waitForLoginRefusalWait waits until the queue says the job waits on the
+// news server at `port` refusing the login, and returns what it said then. A
+// refusal is a wait for the server, not a verdict, until its give-up time.
+func (ctx *restartCaseContext) waitForLoginRefusalWait(jobID int, port string) (loginRefusalWait, error) {
+	var seen loginRefusalWait
+	err := ctx.pollJob("the job reports it waits on the refusing server", caseDBPath(ctx), jobID, func() (bool, error) {
+		var out struct {
+			QueueItem *loginRefusalWait `json:"queueItem"`
+		}
+		if err := graphQLMutate(ctx.weaverURL, `query($id: Int!) { queueItem(id: $id) { state downloadWaitReason failedBytes } }`,
+			map[string]any{"id": jobID}, &out); err != nil {
+			return false, err
+		}
+		if out.QueueItem == nil {
+			return false, nil
+		}
+		seen = *out.QueueItem
+		servers, ok := strings.CutPrefix(seen.WaitReason, "login_refused:")
+		if !ok {
+			return false, nil
+		}
+		for _, server := range strings.Split(servers, ", ") {
+			if strings.HasSuffix(server, ":"+port) {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	return seen, err
+}
+
 func endedFirst(dbPath string, jobID int) error {
 	status, ok := restartJobStatusFromDB(dbPath, jobID)
 	if status = normalizeDBStatus(status); ok && (dbStatusTerminal(status) || status == "cancelled") {
@@ -466,10 +506,13 @@ type schemaRewind struct {
 
 // rustStepReverse undoes one Rust migration step: the tables whose columns it
 // reads from the shape, and the statements that undo the step on a database
-// of that shape.
+// of that shape. Refuse, when set, reads the database before anything is
+// planned and names a state the reverse cannot undo, so the rewind stops
+// there instead of leaving the step's work in place.
 type rustStepReverse struct {
 	Tables []string
 	Plan   func(shape schemaShape) []string
+	Refuse func(db *stateConn) error
 }
 
 // rustStepReverses is every Rust migration step a rewind can undo, by hook.
@@ -483,6 +526,32 @@ var rustStepReverses = map[string]rustStepReverse{
 	// function and, where pg_trgm installs, an index: both go first, so the
 	// step makes them again when it is replayed.
 	"fill_history_search_keys_v88": {Plan: reverseHistorySearchV88},
+	// Migration 89 writes history_retention_days = 0 when history has rows
+	// and the key is not saved yet. No schema before 89 knew the key, so an
+	// older build never left it: the rewind deletes it, and the replayed
+	// step writes it again from the history the case left.
+	"seed_history_retention_v89": {Plan: func(schemaShape) []string {
+		return []string{`DELETE FROM settings WHERE key = 'history_retention_days'`}
+	}},
+	// Migration 92 deletes servers only past the limit of 50, and a list of
+	// 50 or fewer it leaves as it is, so on such a list there is nothing to
+	// undo. A list past the limit is one the rewind cannot put back: it is
+	// refused, never passed through.
+	"trim_servers_to_limit_v92": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseServersPastLimitV92},
+}
+
+// serverLimitV92 is the server limit migration 92 trims a stored list to.
+const serverLimitV92 = 50
+
+func refuseServersPastLimitV92(db *stateConn) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM servers`).Scan(&count); err != nil {
+		return err
+	}
+	if count > serverLimitV92 {
+		return fmt.Errorf("the database stores %d servers, past the limit of %d migration 92 trims to; the rewind cannot undo that trim", count, serverLimitV92)
+	}
+	return nil
 }
 
 func reverseHistorySearchV88(shape schemaShape) []string {
@@ -639,6 +708,13 @@ func readSchemaShape(db *stateConn, rewind schemaRewind) (schemaShape, error) {
 // plant what the older build would have left in it.
 func applySchemaRewind(dbPath string, rewind schemaRewind, plant []string) error {
 	return withStateDB(dbPath, func(db *stateConn) error {
+		for _, hook := range rewind.Reverses {
+			if refuse := rustStepReverses[hook].Refuse; refuse != nil {
+				if err := refuse(db); err != nil {
+					return fmt.Errorf("reverse of %s: %w", hook, err)
+				}
+			}
+		}
 		shape, err := readSchemaShape(db, rewind)
 		if err != nil {
 			return err

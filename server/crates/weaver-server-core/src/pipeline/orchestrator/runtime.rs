@@ -3,6 +3,9 @@
 
 use super::*;
 use crate::operations::instrumentation::PipelinePhase;
+use crate::runtime::shutdown_steps::{
+    bounded_shutdown_step, waited_shutdown_step, waited_shutdown_write,
+};
 
 const UU_SPOOL_MIN_BYTES: usize = 64 * 1024 * 1024;
 const UU_SPOOL_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -12,7 +15,7 @@ const UU_SPOOL_MAX_SEGMENTS: usize = 16_384;
 const UU_SPOOL_SEGMENT_MULTIPLIER: usize = 64;
 const UU_SPOOL_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
-fn compute_uu_spool_max_bytes(write_backlog_budget_bytes: usize) -> usize {
+pub(super) fn compute_uu_spool_max_bytes(write_backlog_budget_bytes: usize) -> usize {
     write_backlog_budget_bytes
         .saturating_mul(UU_SPOOL_WRITE_BACKLOG_MULTIPLIER)
         .clamp(UU_SPOOL_MIN_BYTES, UU_SPOOL_MAX_BYTES)
@@ -51,9 +54,9 @@ impl Pipeline {
         std::time::Duration::from_secs(1);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const SHUTDOWN_DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    // Bound on how long `drain` waits to join detached fire-and-forget writes.
-    const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
+    // Delayed retries re-entered per busy turn: the retry channel's capacity.
+    const RETRY_DRAIN_LIMIT: usize = 256;
     // Released results processed per orchestrator turn before the turn's
     // dispatch pass, barrier poll and chase reap run again. One result per
     // turn made every lane batch of 64 articles cost 64 full dispatch passes
@@ -148,7 +151,12 @@ impl Pipeline {
             download::DOWNLOAD_STALL_RECOVERY_ENV,
         );
         let profile_tuning = hardware_profile.tuning(&profile);
+        let (volume_figure_bytes, volume_memory_ceiling_bytes) =
+            volume_buffer_figure(hardware_profile, &profile, total_connections);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
+        weaver_tunnel::pipe::set_usenet_receive_bytes(
+            profile_tuning.wireguard_usenet_receive_bytes,
+        );
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
         shared_state.set_hardware_profile_in_force(crate::HardwareProfileInForce {
             active: hardware_profile,
@@ -190,6 +198,59 @@ impl Pipeline {
             complete_dir.clone(),
             startup_disk_work,
         ));
+        shared_state.set_storage_capacity(&storage_capacity);
+        let (volume_report_tx, volume_reports) = mpsc::unbounded_channel();
+        let graph_runs = crate::pipeline::graph::engine::RunMail::default();
+        let disk_mail = graph_runs.written();
+        // A pipeline under test reads its files right after it writes
+        // them, so its writers run each operation as it is submitted,
+        // unless the test asked for a thread per volume.
+        #[cfg(test)]
+        let volume_writers_of = |report| {
+            if crate::pipeline::graph::disk::threads::asked() {
+                crate::operations::disk::writer::VolumeWriters::new(report)
+            } else {
+                crate::operations::disk::writer::VolumeWriters::inline(report)
+            }
+        };
+        #[cfg(not(test))]
+        let volume_writers_of = crate::operations::disk::writer::VolumeWriters::new;
+        let volume_rates = storage_capacity.volume_rate_signal();
+        let volume_writers = Arc::new(
+            volume_writers_of(move |mut report: crate::operations::disk::writer::Report| {
+                // A failure is the job's to hear, with its other mail. What
+                // is left tells the loop a volume it stopped dispatch for
+                // fell below its line, or that a failure may have freed
+                // one; a writer with neither to say sends nothing. A
+                // pipeline that has gone hears nothing, and needs to.
+                let wakes = report.below || !report.failures.is_empty();
+                for failure in report.failures.drain(..) {
+                    let _ = disk_mail.send(crate::pipeline::graph::engine::Said {
+                        scope: failure.key,
+                        node: weaver_graph::NodeId::ROOT,
+                        generation: 0,
+                        heard: crate::pipeline::graph::engine::Heard::DiskFailed(Box::new(failure)),
+                    });
+                }
+                if wakes {
+                    let _ = volume_report_tx.send(report);
+                }
+            })
+            .ringing(volume_rates),
+        );
+        // Each volume's first write rate comes from a probe queued on its
+        // writer; the figures an earlier run kept are read here, off the
+        // runtime. A pipeline under test probes nothing.
+        let volume_probes = Arc::new(if cfg!(test) {
+            crate::pipeline::graph::disk::VolumeProbes::none()
+        } else {
+            let data_dir = data_dir.clone();
+            let store = tokio::task::spawn_blocking(move || {
+                crate::operations::disk::ProbeStore::open(&data_dir)
+            })
+            .await?;
+            crate::pipeline::graph::disk::VolumeProbes::stored(store)
+        });
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
             profile_tuning.extraction_memory_bytes,
@@ -208,6 +269,14 @@ impl Pipeline {
         let (failed_release_tx, failed_release_rx) = mpsc::channel(32);
         let (job_activated_tx, job_activated_rx) = mpsc::channel(32);
         let (db_reply_tx, db_reply_rx) = mpsc::unbounded_channel();
+        // The one listener for the history archives the writer keeps for
+        // want of room: each is told to the loop as a database reply.
+        db.hear_archive_news({
+            let replies = db_reply_tx.clone();
+            move |news| {
+                let _ = replies.send(crate::pipeline::db_reply::DbReply::Archive(news));
+            }
+        });
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
         let script_effects_rx = db.subscribe_script_effects();
@@ -271,12 +340,13 @@ impl Pipeline {
             scheduled_hardware_profile: None,
             metrics,
             jobs: HashMap::new(),
-            graph_jobs: HashMap::new(),
+            graph_jobs: Default::default(),
             retiring_graph_jobs: HashMap::new(),
+            moving_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
             graph_decode,
-            graph_runs: Default::default(),
+            graph_runs,
             #[cfg(test)]
             graph_mail_stamps: None,
             post_probes: Default::default(),
@@ -285,6 +355,7 @@ impl Pipeline {
             nzb_retired_busy: HashSet::new(),
             pending_renames: HashMap::new(),
             nzb_pause_releases,
+            resumes_stored: HashSet::new(),
             nzb_reprocess_pending: HashSet::new(),
             nzb_admitting: HashSet::new(),
             nzb_releasing: HashSet::new(),
@@ -302,25 +373,38 @@ impl Pipeline {
             queue_positions: Some(queue_positions),
             queue_positions_lost: Arc::default(),
             semantic_terminal_causes: HashMap::new(),
+            login_refusals: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
             stored_queue_order: Vec::new(),
-            active_downloads: 0,
+            articles_in_flight: 0,
             active_download_connections: 0,
             active_completion_critical_connections: 0,
             active_recovery: 0,
             download_lane_runtime: DownloadLaneRuntimeState::default(),
             held_download_refills: Vec::new(),
             download_dispatch_wake: false,
+            disk_waiting: std::collections::BTreeSet::new(),
+            disk_tickets_seen: [0; 2],
+            disk_rings_seen: 0,
+            disk_idle: std::collections::BTreeSet::new(),
+            admission_disk_held: false,
+            disk_unadmitted: std::collections::BTreeSet::new(),
+            full_disk: std::collections::BTreeMap::new(),
+            full_disk_moves: Vec::new(),
+            full_disk_promised: std::collections::BTreeMap::new(),
+            archive_wait: None,
+            #[cfg(test)]
+            full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             pending_released_download_results_by_job: HashMap::new(),
             pending_released_download_result_bytes_by_job: HashMap::new(),
-            active_downloads_by_job: HashMap::new(),
+            articles_in_flight_by_job: HashMap::new(),
             active_download_connections_by_job: HashMap::new(),
             active_completion_critical_connections_by_job: HashMap::new(),
-            active_downloads_by_file: HashMap::new(),
+            articles_in_flight_by_file: HashMap::new(),
             active_decodes_by_job: Default::default(),
             active_decodes_by_file: HashMap::new(),
             active_decode_bytes: HashMap::new(),
@@ -345,9 +429,12 @@ impl Pipeline {
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_park_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
+            unanchored_park_max_parts: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
+            #[cfg(test)]
+            probe_waits_on_for_test: None,
             dirty_server_attribution: HashSet::new(),
             dirty_support_facts: HashSet::new(),
             reports_due: HashSet::new(),
@@ -375,6 +462,7 @@ impl Pipeline {
             retry_rx,
             infrastructure_retries: infrastructure_retry::InfrastructureRetryQueue::default(),
             pool_generation: 0,
+            pool_layouts: Default::default(),
             server_counters,
             job_stage_started_at: HashMap::new(),
             nntp_handoff_drained_tx,
@@ -401,6 +489,8 @@ impl Pipeline {
             applied_speed_test_pause: false,
             applied_random_read_iops: None,
             applied_sequential_write_mbps: None,
+            applied_storage_classification: None,
+            backlog_base_bytes,
             scheduled_pause: false,
             rate_limit_reservations: HashMap::new(),
             configured_rate_limit: 0,
@@ -424,33 +514,58 @@ impl Pipeline {
             download_lane_owners: HashMap::new(),
             #[cfg(test)]
             audit_lane_holdings: false,
+            #[cfg(test)]
+            move_gates: Default::default(),
             propagation_ready_at: HashMap::new(),
             propagation_delay,
             #[cfg(test)]
             propagation_delay_forced: None,
+            #[cfg(test)]
+            unservable_booking_depth: (0, 0),
+            #[cfg(test)]
+            spent_message_ids: Vec::new(),
+            #[cfg(test)]
+            dispatch_hold_items_examined: Default::default(),
+            #[cfg(test)]
+            login_refusal_sets_examined: Default::default(),
             last_download_dispatch_stall_log_at: None,
+            download_dispatch_liveness_since: None,
             download_dispatch_stall: None,
             download_stall_recovery,
             download_pass_fill_servers: None,
             download_pass_provider_policy: None,
             download_retry_storm_window: None,
+            download_retry_storm: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),
             dispatch_slot_wait_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
-            last_download_lanes_under_cap_log_at: None,
+            download_lanes_under_cap_reported: false,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
             uu_spooled_segments: 0,
             uu_parked_segments: 0,
-            uu_files: HashMap::new(),
+            uu_files: Default::default(),
             uu_park_requeues: HashMap::new(),
-            unanchored_parked: HashMap::new(),
+            unanchored_parked: UnanchoredPark::default(),
             unanchored_requeues: HashMap::new(),
             pending_unanchored_release: Vec::new(),
             storage_capacity,
+            volume_writers,
+            volume_reports,
+            volume_budget_held: std::sync::atomic::AtomicBool::new(false),
+            shutdown_settle: crate::operations::disk::writer::SettleBound::wall(
+                Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT,
+            ),
+            volume_probes,
+            volume_buffers: Arc::new(download::volume_pace::VolumeBuffers::new(
+                volume_figure_bytes,
+                volume_memory_ceiling_bytes,
+            )),
+            volume_arrived_by_job: HashMap::new(),
+            volume_reserved_by_job: HashMap::new(),
             window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,
@@ -462,7 +577,7 @@ impl Pipeline {
             repeated_articles: HashMap::new(),
             decode_retries: HashMap::new(),
             phase_progress: HashMap::new(),
-            job_retention_exclude_cache: HashMap::new(),
+            job_retention_exclude_cache: std::sync::Mutex::default(),
             no_eligible_server_warn_throttle: Default::default(),
             body_lane_capacity_log_throttle: Default::default(),
             body_fetch_failure_log_throttle: Default::default(),
@@ -470,6 +585,7 @@ impl Pipeline {
             releasing_failed_jobs: HashSet::new(),
             pending_graph_terminals: HashMap::new(),
             deferred_moves: HashSet::new(),
+            moves_awaiting_disk: HashMap::new(),
             reserved_complete_destinations: HashMap::new(),
             shared_state,
             db,
@@ -560,10 +676,11 @@ impl Pipeline {
         crate::runtime::perf_probe::record("pipeline.db_fire_and_forget.submit", started.elapsed());
     }
 
-    // Join all outstanding [`Self::db_fire_and_forget`] writes with a bounded
-    // timeout so shutdown does not drop in-flight persistence. Called from
-    // `drain` after the explicit awaited flushes. The JoinSet is moved out from
-    // under the lock first so no lock is held across the await.
+    // Join all outstanding [`Self::db_fire_and_forget`] writes so shutdown
+    // does not drop in-flight persistence: waited for to the last one, with
+    // one warning when they are slow. Called from `drain` after the explicit
+    // awaited flushes. The JoinSet is moved out from under the lock first so
+    // no lock is held across the await.
     async fn join_fire_and_forget_tasks(&self) {
         let mut tasks = {
             let mut guard = self
@@ -575,17 +692,10 @@ impl Pipeline {
         if tasks.is_empty() {
             return;
         }
-        let drain = async { while tasks.join_next().await.is_some() {} };
-        if tokio::time::timeout(Self::FIRE_AND_FORGET_DRAIN_TIMEOUT, drain)
-            .await
-            .is_err()
-        {
-            warn!(
-                remaining = tasks.len(),
-                timeout_secs = Self::FIRE_AND_FORGET_DRAIN_TIMEOUT.as_secs(),
-                "timed out joining fire-and-forget database writes during shutdown"
-            );
-        }
+        waited_shutdown_write("fire-and-forget database writes", async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
     }
 
     pub fn nntp_pool(&self) -> Arc<weaver_nntp::pool::NntpPool> {
@@ -720,6 +830,7 @@ impl Pipeline {
         self.checkpoint_progress_articles.remove(&job_id);
         self.released_remaining.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
+        self.drop_full_disk_hold(job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -728,6 +839,11 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_download_finished_if_active(&mut self, job_id: JobId) {
+        // A job held for a full disk fetches again what it lost: its
+        // download is not finished while it waits.
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);
             let finalization_pending = self.job_has_pending_download_pipeline_work(job_id);
@@ -744,6 +860,9 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_download_pipeline_drained_if_pending(&mut self, job_id: JobId) {
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if self.jobs_finalizing_download.remove(&job_id) {
             self.emit_job_event(PipelineEvent::DownloadPipelineDrained { job_id });
         }
@@ -837,7 +956,7 @@ impl Pipeline {
                 }
 
                 let in_flight = self
-                    .active_downloads_by_job
+                    .articles_in_flight_by_job
                     .get(job_id)
                     .copied()
                     .unwrap_or(0);
@@ -896,7 +1015,7 @@ impl Pipeline {
         if !self.pending_decode.is_empty() {
             return true;
         }
-        self.active_downloads > 0
+        self.articles_in_flight > 0
             || !self.active_download_connections_by_job.is_empty()
             || !self.active_decodes_by_job.is_empty()
             || !self.held_download_refills.is_empty()
@@ -1101,6 +1220,7 @@ impl Pipeline {
                 break;
             }
             self.run_queue_intents().await;
+            self.resume_full_disk_moves().await;
             turn_timer.phase(PipelinePhase::ReadyResults);
             // Whether this turn was woken by, or found, anything other than a
             // periodic tick. Only such a turn can have changed what the job
@@ -1109,6 +1229,7 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
+            turn_active |= self.hear_volume_reports();
             #[cfg(test)]
             self.pump_decode_queue();
 
@@ -1184,6 +1305,20 @@ impl Pipeline {
                     || tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
                     tokio::time::Instant::from_std,
                 ));
+            // A fill server's run of login refusals becomes the verdict at
+            // this instant, with no connection outcome to announce it. One
+            // already due, the hour having come up in a busy turn or a
+            // login having been refused past it, is told here, so no turn
+            // that skips the wait below skips it.
+            let mut login_verdict_at = self.nntp.pool().next_login_refusal_verdict();
+            if login_verdict_at.is_some_and(|at| at <= std::time::Instant::now()) {
+                self.tell_login_refusal_verdicts();
+                login_verdict_at = self.nntp.pool().next_login_refusal_verdict();
+            }
+            let login_verdict_sleep = tokio::time::sleep_until(login_verdict_at.map_or_else(
+                || tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+                tokio::time::Instant::from_std,
+            ));
 
             self.drain_ready_lane_control_messages();
             if self.take_download_dispatch_wake() {
@@ -1198,7 +1333,14 @@ impl Pipeline {
                 )
                 .await;
             turn_active |= processed_results > 0;
-            if processed_results == 0 {
+            if processed_results > 0 {
+                // A busy turn skips the wait below: it hears a reading, room
+                // given back or a waiter left idle as the wait would.
+                self.hear_disk_on_busy_turn();
+                // It skips the retries heard there too, and a link that keeps
+                // answering would keep them waiting for as long as it does.
+                self.drain_ready_retries();
+            } else {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
                 let mut idle_tick = false;
@@ -1210,6 +1352,11 @@ impl Pipeline {
                 // A batch out is waited on as any answer is.
                 let restoring = self.restores_waiting;
                 let next_batch = restoring && self.installing.is_empty();
+                // A job that waits for room on a disk wakes on a reading of
+                // a disk someone waits on, never on a timer of its own.
+                let disk_readings = self.storage_capacity.readings();
+                self.reconcile_disk_waits();
+                let disk_waiting = self.waits_for_disk_room();
                 turn_timer.pause();
                 macro_rules! turn_select {
                     ($($biased:tt)?) => {
@@ -1253,9 +1400,17 @@ impl Pipeline {
                                     );
                                 }
                             }
+                            Some(report) = self.volume_reports.recv() => {
+                                turn_timer.resume(PipelinePhase::GraphRun);
+                                self.volume_batch_returned(report);
+                            }
                             Some(mail) = self.post_probes.recv() => {
                                 turn_timer.resume(PipelinePhase::PostProbe);
                                 self.post_probe_mail(mail);
+                            }
+                            _ = disk_readings.notified(), if disk_waiting => {
+                                turn_timer.resume(PipelinePhase::GraphRun);
+                                self.disk_reading();
                             }
                             Some(result) = self.decode_done_rx.recv() => {
                                 turn_timer.resume(PipelinePhase::DecodeDone);
@@ -1348,6 +1503,12 @@ impl Pipeline {
                                 turn_timer.resume(PipelinePhase::ConnectionHold);
                                 self.download_dispatch_wake = true;
                             }
+                            // The hour of a refused login is up: the work
+                            // that waited for the server is weighed again.
+                            _ = login_verdict_sleep, if login_verdict_at.is_some() => {
+                                turn_timer.resume(PipelinePhase::ConnectionHold);
+                                self.tell_login_refusal_verdicts();
+                            }
                             // The next turn's queue pass retries the rename.
                             _ = rename_retry_sleep, if rename_retry_at.is_some() => {
                                 turn_timer.resume(PipelinePhase::RenameRetry);
@@ -1358,11 +1519,19 @@ impl Pipeline {
                                 count_periodic_tick();
                                 self.refresh_download_pressure();
                                 self.publish_download_transport_health();
+                                // A volume whose measured rate moved has every
+                                // volume's limits sized again, and limits
+                                // sized as a volume gained its first job or
+                                // lost its last are heard here. With neither
+                                // nothing is written.
+                                if self.volume_buffers.follow_rates() {
+                                    self.volume_room_changed();
+                                }
 
                                 if tracing::enabled!(tracing::Level::DEBUG) {
                                 let live = self.pipeline_is_live();
                                 let snapshot = self.metrics.raw_snapshot();
-                                let not_found = snapshot.articles_not_found;
+                                let articles_not_found = snapshot.articles_not_found;
                                 // Folded over every job, so only while something
                                 // is moving; an idle pipeline's health is unchanged.
                                 let min_health: Option<u32> = live.then(|| self.jobs.values()
@@ -1371,7 +1540,7 @@ impl Pipeline {
                                     .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
                                     .min()).flatten();
                                 debug!(
-                                    active = self.active_downloads,
+                                    active = self.articles_in_flight,
                                     queue = snapshot.download_queue_depth,
                                     speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),
                                     downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
@@ -1384,7 +1553,8 @@ impl Pipeline {
                                     pressure_state = snapshot.download_pressure_state.as_str(),
                                     pressure_reason = snapshot.download_pressure_reason.as_str(),
                                     direct_write_evictions = snapshot.direct_write_evictions,
-                                    not_found,
+                                    articles_not_found,
+                                    not_found_answers = snapshot.download_failures_article_not_found,
                                     health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                                     "pipeline tick"
                                 );
@@ -1395,7 +1565,7 @@ impl Pipeline {
                                 count_periodic_tick();
                                 // A stall needs a transfer in flight; with none the
                                 // walk over every job would find nothing.
-                                idle_tick = self.active_downloads_by_job.is_empty();
+                                idle_tick = self.articles_in_flight_by_job.is_empty();
                                 if !idle_tick {
                                     self.auto_pause_stalled_downloads();
                                 }
@@ -1636,6 +1806,22 @@ impl Pipeline {
         }
     }
 
+    // Re-enters the delayed retries whose wait is over, at most one channel's
+    // worth a turn so a burst never holds the turn up.
+    fn drain_ready_retries(&mut self) {
+        let mut jobs = HashSet::new();
+        for _ in 0..Self::RETRY_DRAIN_LIMIT {
+            let Ok(retry) = self.retry_rx.try_recv() else {
+                break;
+            };
+            jobs.insert(retry.work.segment_id.file_id.job_id);
+            self.receive_retry_work(retry);
+        }
+        for job_id in jobs {
+            self.report_job_soon(job_id);
+        }
+    }
+
     fn drain_ready_lane_control_messages(&mut self) {
         loop {
             match self.download_lane_parked_rx.try_recv() {
@@ -1678,14 +1864,20 @@ impl Pipeline {
         if scheduled_pool_generation != self.pool_generation
             && (!work.exclude_servers.is_empty() || work.avoid_server.is_some())
         {
+            // Scheduled under an older pool: carry the tried servers and the
+            // hint over by server identity, never read them unmapped.
+            work.exclude_servers = self
+                .pool_layouts
+                .set(scheduled_pool_generation, work.exclude_servers);
+            work.avoid_server = work
+                .avoid_server
+                .and_then(|server| self.pool_layouts.index(scheduled_pool_generation, server));
             debug!(
                 segment = %work.segment_id,
                 scheduled_generation = scheduled_pool_generation,
                 current_generation = self.pool_generation,
-                "dropping stale server exclusions on retry after NNTP pool rebuild"
+                "carried server exclusions on retry across an NNTP pool rebuild"
             );
-            work.exclude_servers.clear();
-            work.avoid_server = None;
         }
         if infrastructure_retry {
             self.note_infrastructure_retry_requeued(work.segment_id.file_id.job_id);
@@ -1707,6 +1899,25 @@ impl Pipeline {
     // for fresh work would cancel some other segment's real pending retry and
     // let the download pass end before that retry fires.
     pub(crate) fn enqueue_download_work(&mut self, work: DownloadWork) {
+        // Work every server is excluded from can never be seated by a lane:
+        // the queue would hold it, and the job with it, indefinitely. Every
+        // producer of a re-queue passes through here, so this is where the
+        // article is retired instead.
+        if let Some(work) = self.enqueue_servable_download_work(work) {
+            let job_id = work.segment_id.file_id.job_id;
+            self.book_unservable_work(&work);
+            self.update_queue_metrics();
+            self.maybe_finish_download_pass(job_id);
+        }
+    }
+
+    // [`Self::enqueue_download_work`], except that work no server may serve
+    // is handed back instead of booked.
+    #[inline]
+    pub(crate) fn enqueue_servable_download_work(
+        &mut self,
+        work: DownloadWork,
+    ) -> Option<DownloadWork> {
         let job_id = work.segment_id.file_id.job_id;
         let segment_id = work.segment_id;
         if self
@@ -1719,7 +1930,7 @@ impl Pipeline {
                 segment = %segment_id,
                 "dropping download work for a job that is gone or terminal"
             );
-            return;
+            return None;
         }
         // A lane or delayed retry may return work after the feed's verdict.
         // It must not put an abandoned file back into dispatch.
@@ -1736,17 +1947,10 @@ impl Pipeline {
             self.book_terminal_segment(segment_id, SegmentTerminalState::Abandoned);
             self.update_queue_metrics();
             self.maybe_finish_download_pass(job_id);
-            return;
+            return None;
         }
-        // Work every server is excluded from can never be seated by a lane:
-        // the queue would hold it, and the job with it, indefinitely. Every
-        // producer of a re-queue passes through here, so this is where the
-        // article is retired instead.
-        if self.no_server_can_serve(job_id, &work.exclude_servers) {
-            self.book_unservable_work(&work);
-            self.update_queue_metrics();
-            self.maybe_finish_download_pass(job_id);
-            return;
+        if self.no_server_can_serve(job_id, work.exclude_servers) {
+            return Some(work);
         }
         // The job's root classes the work.
         let mut work = work;
@@ -1763,37 +1967,114 @@ impl Pipeline {
                 active.download_queue.push(work);
             }
         }
+        None
+    }
+
+    // Wait, off the runtime, for every volume's writer to put down what it
+    // holds, until the stop's settle clock reads `end`. Each volume that
+    // still holds writes then is warned of and left.
+    async fn settle_volumes_until(&self, end: std::time::Duration, lost: &'static str) {
+        let writers = Arc::clone(&self.volume_writers);
+        let clock = Arc::clone(&self.shutdown_settle.clock);
+        match tokio::task::spawn_blocking(move || writers.settle_until(&*clock, end)).await {
+            Ok(left) => {
+                for volume in left {
+                    warn!(
+                        volume = %volume.label,
+                        operations = volume.operations,
+                        bytes = volume.bytes,
+                        "a volume's writer stood still at shutdown; what it held is left unwritten"
+                    );
+                }
+            }
+            Err(_) => warn!("{lost}"),
+        }
     }
 
     pub(crate) async fn drain(&mut self) {
         self.db.stop_checkpoint_retries();
         // A failed job whose working directory is still being released
         // records its history before the pipeline is down.
-        while !self.releasing_failed_jobs.is_empty() {
-            let Some(released) = self.failed_release_rx.recv().await else {
-                break;
-            };
-            self.handle_failed_job_released(released);
-        }
+        self.hear_failed_job_releases().await;
+        // From here on the loop stands still for no volume without an end:
+        // a wait of its own for a volume that does not move is given up
+        // when the stop's span is over, and the job it was made for is
+        // left at its last checkpoint. The work still out has one span to
+        // come in.
+        self.volume_writers.end_loop_waits_at(
+            Arc::clone(&self.shutdown_settle.clock),
+            self.shutdown_settle.end(),
+        );
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.drain_inflight_download_and_decode_work().await;
+        // Every volume's writer puts down what it holds before the last
+        // checkpoint is taken, so that checkpoint records all of it. Every
+        // wait for a volume from here to the end of the stop shares one
+        // span, begun here: the settles, each of which has what the one
+        // before left of it, and the loop's own waits while it takes back
+        // what the runs came to. A volume that still holds writes when the
+        // span is over is left behind: what it holds is in no checkpoint,
+        // so it is fetched again.
+        let settle_end = self.shutdown_settle.end();
+        self.volume_writers
+            .end_loop_waits_at(Arc::clone(&self.shutdown_settle.clock), settle_end);
         // A graph job's run or repair still out on a thread speaks through
         // the run mail; heard here, so nothing of a job is out when the
         // pipeline is down and the checkpoint holds what it came to.
-        self.drain_graph_runs().await;
+        //
+        // A repair or a replay out on its thread writes the job's files, and
+        // the checkpoint this drain takes must follow what it wrote, so with
+        // one out the drain is waited for to its end; each stops at its next
+        // read once shutdown has begun, so the wait is short. With only runs
+        // out the wait is for threads that write nothing the checkpoint
+        // depends on, so it is bounded. A job with a run still out when the
+        // bound ends is left as a kill would leave it: `checkpoint_graph_holds`
+        // passes it over and it keeps the checkpoint it last wrote.
+        if self.graph_drain_waits_for_loans() {
+            waited_shutdown_step("graph repairs", self.drain_graph_runs()).await;
+        } else {
+            bounded_shutdown_step("graph runs", self.drain_graph_runs()).await;
+        }
         // A graph failure may start its release when the last worker ends.
-        while !self.releasing_failed_jobs.is_empty() {
-            let Some(released) = self.failed_release_rx.recv().await else {
-                break;
-            };
-            self.handle_failed_job_released(released);
+        self.hear_failed_job_releases().await;
+        self.settle_volumes_until(
+            settle_end,
+            "the volume writers could not be drained at shutdown",
+        )
+        .await;
+        self.hear_volume_reports();
+        self.hear_graph_runs();
+        // A repair the stop ended while its job's volume still held writes
+        // is taken back now that the volume had its time. What taking it
+        // back queued is put down within the same span, so the checkpoint
+        // records it as it does any other job's.
+        if self.take_back_stopped_repairs() {
+            self.drain_graph_runs().await;
+            self.settle_volumes_until(
+                settle_end,
+                "the volume writers could not be drained after a stopped repair was taken back",
+            )
+            .await;
+            self.hear_volume_reports();
+            self.hear_graph_runs();
         }
         self.checkpoint_graph_holds();
+        // What the page-out put on scratch went through the writers too,
+        // and the checkpoint that records it waits for those writes: they
+        // are put down as the rest was, and the checkpoints they bear out
+        // are queued as the jobs hear it.
+        self.settle_volumes_until(
+            settle_end,
+            "the volume writers could not be drained after the last checkpoint",
+        )
+        .await;
+        self.hear_volume_reports();
+        self.hear_graph_runs();
 
-        if self.active_downloads > 0 || self.has_queued_or_active_decode() {
+        if self.articles_in_flight > 0 || self.has_queued_or_active_decode() {
             warn!(
-                active_downloads = self.active_downloads,
+                articles_in_flight = self.articles_in_flight,
                 active_decodes = self.active_decodes_by_job.total(),
                 "shutdown drain ended with in-flight pipeline work"
             );
@@ -1801,32 +2082,56 @@ impl Pipeline {
             info!("shutdown drain completed active download/decode work");
         }
 
-        if self.active_downloads > 0 {
+        if self.articles_in_flight > 0 {
             info!(
-                active = self.active_downloads,
+                active = self.articles_in_flight,
                 "draining in-flight downloads"
             );
         }
         self.flush_server_attribution();
         self.flush_support_facts();
-        if let Err(error) = self.shared_state.queue.sample_bandwidth(true) {
-            warn!(error = %error, "failed to flush pending bandwidth usage during drain");
+        // The database writes of the drain are waited for to their end: the
+        // process must not exit or start again while one of them runs. A slow
+        // one is warned about once, by name.
+        if let Err(error) = waited_shutdown_write(
+            "bandwidth usage flush",
+            self.shared_state.queue.clone().flush_bandwidth(),
+        )
+        .await
+        {
+            warn!(error = %error, "failed to flush pending bandwidth usage during drain")
         }
 
         // Join any detached fire-and-forget writes still in flight (runtime
         // writes such as a proven pipelining depth) so shutdown does not drop
-        // them. Bounded so a stuck write cannot hang shutdown forever.
+        // them.
         self.join_fire_and_forget_tasks().await;
-        match tokio::time::timeout(
-            Self::FIRE_AND_FORGET_DRAIN_TIMEOUT,
-            self.db.flush_write_queue(),
-        )
-        .await
+        self.retry_kept_archives_at_drain();
+        if let Err(error) =
+            waited_shutdown_write("ordered database writes", self.db.flush_write_queue()).await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!(%error, "failed to flush ordered database writes during drain"),
-            Err(_) => warn!("timed out flushing ordered database writes during drain"),
+            warn!(%error, "failed to flush ordered database writes during drain")
         }
+        self.warn_of_kept_archives();
+    }
+
+    // The release of a failed job's working directory is file work on
+    // another thread; the job's Failed outcome and history row are written
+    // here once it reports, because the history lists what the release left
+    // in the folder. The wait is not abandoned: a bound would leave the job
+    // an active row whose folder may already be gone, and the next start
+    // would restore it and download it again. A slow release is warned
+    // about once.
+    async fn hear_failed_job_releases(&mut self) {
+        waited_shutdown_step("failed job folder release", async {
+            while !self.releasing_failed_jobs.is_empty() {
+                let Some(released) = self.failed_release_rx.recv().await else {
+                    break;
+                };
+                self.handle_failed_job_released(released);
+            }
+        })
+        .await;
     }
 
     // A decode running, or an undecoded body queued for one. Only tests
@@ -1845,7 +2150,7 @@ impl Pipeline {
     }
 
     fn has_download_or_decode_drain_work(&self) -> bool {
-        self.active_downloads > 0 || self.has_decode_drain_work()
+        self.articles_in_flight > 0 || self.has_decode_drain_work()
     }
 
     async fn drain_inflight_download_and_decode_work(&mut self) {
@@ -1855,10 +2160,10 @@ impl Pipeline {
         while self.has_download_or_decode_drain_work() {
             let event = tokio::time::timeout(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, async {
                 tokio::select! {
-                    result = self.download_done_rx.recv(), if self.active_downloads > 0 => {
+                    result = self.download_done_rx.recv(), if self.articles_in_flight > 0 => {
                         result.map(ShutdownDrainEvent::Download)
                     }
-                    result = self.owned_download_lane_event_rx.recv(), if self.active_downloads > 0 => {
+                    result = self.owned_download_lane_event_rx.recv(), if self.articles_in_flight > 0 => {
                         result.map(ShutdownDrainEvent::OwnedDownload)
                     }
                     result = self.decode_done_rx.recv(), if self.has_decode_drain_work() => {
@@ -1896,7 +2201,7 @@ impl Pipeline {
                 }
                 Err(_) => {
                     warn!(
-                        active_downloads = self.active_downloads,
+                        articles_in_flight = self.articles_in_flight,
                         active_decodes = self.active_decodes_by_job.total(),
                         decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed),
                         idle_timeout_secs = Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT.as_secs(),
@@ -1916,12 +2221,41 @@ impl Pipeline {
     fn checkpoint_graph_holds(&mut self) {
         let jobs: Vec<JobId> = self.graph_jobs.keys().copied().collect();
         for job_id in jobs {
+            // A job with an operation still out on a volume whose writer
+            // stood still through the drain, or with a repair the stop
+            // ended before the volume let go, is left as its last checkpoint
+            // has it: reading its files here would wait on that writer,
+            // and no checkpoint taken now could be borne out.
+            // A repair that came back stopped after the writers had their
+            // time is not waited for again: its job is left the same way.
+            let left = self.graph_jobs.get_mut(&job_id).is_some_and(|graph| {
+                graph.leave_stopped_repair();
+                graph.pending().given_up() || graph.disk().is_some_and(|disk| !disk.quiet())
+            });
+            if left {
+                warn!(
+                    job_id = job_id.0,
+                    "a volume's writer still holds the job's files at shutdown; its holds are not paged out"
+                );
+                continue;
+            }
             // The steps no checkpoint has read yet are taken before the
             // page-out, so a failed one leaves the checkpoint of every step.
             self.take_stepped_graph_checkpoint(job_id);
             let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
                 continue;
             };
+            if graph.awaits_mail() {
+                // Its run or repair outlasted the bound on the drain and
+                // still works on the job's files: nothing new is written
+                // about it.
+                warn!(
+                    job_id = job_id.0,
+                    "graph job still has work out at shutdown; keeping its last checkpoint"
+                );
+                self.flush_graph_checkpoint(job_id);
+                continue;
+            }
             if let Err(error) = graph.page_out_holds() {
                 warn!(job_id = job_id.0, %error, "could not page graph holds out at shutdown");
                 self.flush_graph_checkpoint(job_id);
@@ -1932,12 +2266,32 @@ impl Pipeline {
         }
     }
 
+    // Whether a graph job, live or retiring, has a repair, a replay or a
+    // verification out on its thread, which the shutdown drain waits for.
+    pub(in crate::pipeline) fn graph_drain_waits_for_loans(&self) -> bool {
+        self.graph_jobs
+            .values()
+            .chain(self.retiring_graph_jobs.values())
+            .any(|job| job.loan_out())
+    }
+
     // Every run is heard out and stopped where it stands: a run waits for
     // bytes, or for a member's owner, that nothing will bring once the
     // pipeline is down, and what it read is on its shelf for the restored
     // job. A repair out on its thread is heard to its end, and whatever its
     // ruling starts is stopped in turn.
     async fn drain_graph_runs(&mut self) {
+        // A run or a repair that stands still for a volume's writer on its
+        // own thread goes on and ends as stopped, reading back nothing: its
+        // last mail is not waited for behind a volume that does not move.
+        // What the volume holds has the stop's span to be put down, after
+        // this. The runs are stopped first, so one that goes on says no
+        // more.
+        let limit = self.graph_slot_limit();
+        for job in self.graph_jobs.values_mut() {
+            job.stop_runs(limit);
+        }
+        self.volume_writers.stop_waits();
         loop {
             self.hear_graph_runs();
             let limit = self.graph_slot_limit();
@@ -1969,8 +2323,10 @@ enum ShutdownDrainEvent {
     Decode(DecodeDone),
 }
 
-// The decoded bytes that may wait for the writer, sized from the memory
-// tier's base size (`BacklogSizing::base_bytes`) and the machine's memory.
+// The decoded bytes that may be parked in memory outside the volume
+// writers, sized from the memory tier's base size
+// (`BacklogSizing::base_bytes`) and the machine's memory. What waits on a
+// volume has that volume's own limits (`volume_buffer_figure`).
 pub(crate) fn compute_write_backlog_budget_bytes(
     profile: &SystemProfile,
     backlog_base_bytes: usize,
@@ -2021,6 +2377,24 @@ pub(crate) fn compute_decode_backlog_budget_bytes(
         .max(write_backlog_budget_bytes);
 
     target.min(memory_cap).max(1)
+}
+
+// The figure every volume's buffer limits are sized on, and the memory that
+// caps it: from the hardware profile in force, the machine's memory and what
+// the configured connections hold in flight.
+pub(in crate::pipeline) fn volume_buffer_figure(
+    hardware_profile: crate::runtime::HardwareProfile,
+    profile: &SystemProfile,
+    connections: usize,
+) -> (u64, u64) {
+    let memory_ceiling_bytes = backlog_memory_ceiling_bytes(profile) as u64;
+    let figure_bytes = download::volume_pace::total_buffer_budget_bytes(
+        hardware_profile,
+        memory_ceiling_bytes,
+        connections,
+        download::volume_pace::TYPICAL_ARTICLE_BYTES,
+    );
+    (figure_bytes, memory_ceiling_bytes)
 }
 
 // The memory both backlog budgets are carved from: available memory with a

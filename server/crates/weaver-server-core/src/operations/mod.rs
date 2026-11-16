@@ -13,9 +13,10 @@ pub mod metrics_store;
 pub mod recovery;
 
 pub use async_ops::{
+    ArchiveHistoryAcceptOutcome, ArchiveHistoryAcceptance, ArchiveHistorySettlement,
     AsyncOperationState, AsyncOperationTargetState, HistoryDeleteOperationInsertError,
     HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
-    HistoryDeleteRowState, HistoryDeleteTargetWork,
+    HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryOperationAction,
 };
 pub use backup::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,
@@ -23,9 +24,9 @@ pub use backup::{
     RestoreOptions, RestoreReport, StableStateExport, apply_pending_restore,
 };
 pub use disk::{
-    Capacity, CapacityDebits, CapacityReader, CapacityReading, CapacitySampler, DiskProbeError,
-    DiskSpace, StorageCapacity, StorageRoot, disk_space, is_out_of_space, probe_disk_space,
-    probe_nearest_disk_space,
+    Capacity, CapacityDebits, CapacityReader, CapacityReading, DiskProbeError, DiskSpace,
+    LateClassification, OnDemandSpace, Reach, StorageCapacity, StorageRoot, is_out_of_space,
+    is_quota_exceeded,
 };
 pub use health::{
     BrowseDirectoryError, CreateDirectoryError, DirectoryBrowseEntry, DirectoryBrowseListing,
@@ -33,12 +34,12 @@ pub use health::{
 };
 pub use instrumentation::{
     ARTICLE_LATENCY_BOUNDS, AtomicHistogram, DB_OP_DURATION_BOUNDS, DECODE_TASK_DURATION_BOUNDS,
-    DISK_WRITE_DURATION_BOUNDS, DbRuntimeMetrics, DbRuntimeMetricsSnapshot, DiskSpaceSnapshot,
-    EXTRACT_MEMBER_DURATION_BOUNDS, HISTOGRAM_MAX_BUCKETS, HTTP_REQUEST_DURATION_BOUNDS,
-    HistogramSnapshot, HttpMetricsSnapshot, HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount,
-    JobLifecycleMetrics, JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind,
-    JobSubmissionCount, PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    STAGE_DURATION_BOUNDS, ServerAttemptCount, ServerAttemptOutcomeKind, ServerCounters,
+    DbRuntimeMetrics, DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, EXTRACT_MEMBER_DURATION_BOUNDS,
+    HISTOGRAM_MAX_BUCKETS, HTTP_REQUEST_DURATION_BOUNDS, HistogramSnapshot, HttpMetricsSnapshot,
+    HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount, JobLifecycleMetrics,
+    JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind, JobSubmissionCount,
+    PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot, STAGE_DURATION_BOUNDS,
+    ServerArticleOutcomes, ServerAttemptCount, ServerAttemptOutcomeKind, ServerCounters,
     ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind, VerificationOutcomeKind,
 };
 pub use logs::snapshot_service_logs;
@@ -47,9 +48,9 @@ pub use metrics_store::{
     COUNTER_METRIC_KEYS, CounterRollupValue, GAUGE_METRIC_KEYS, GaugeRollupValue, JOB_STATUS_KEYS,
     JobStatusCounts, MetricsHistoryCadence, MetricsHistoryChunkRow, MetricsHistoryQueryData,
     MetricsHistoryQueryResult, MetricsHistoryTier, MetricsHistoryWritePlan,
-    RAW_METRICS_RESOLUTION_SECS, RAW_METRICS_RETENTION_SECS, ROLLUP_1H_RESOLUTION_SECS,
-    ROLLUP_1H_RETENTION_SECS, ROLLUP_5M_RESOLUTION_SECS, ROLLUP_5M_RETENTION_SECS,
-    RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
+    RAW_METRICS_RESOLUTION_SECS, RAW_METRICS_RETENTION_SECS, RETIRED_METRIC_KEY,
+    ROLLUP_1H_RESOLUTION_SECS, ROLLUP_1H_RETENTION_SECS, ROLLUP_5M_RESOLUTION_SECS,
+    ROLLUP_5M_RETENTION_SECS, RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
 };
 pub use recovery::{RecoveredServerState, RestoreCandidate, recover_server_state};
 pub(crate) use recovery::{apply_password_override, read_stored_files, restore_request};

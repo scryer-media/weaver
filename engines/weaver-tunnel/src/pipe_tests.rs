@@ -991,6 +991,10 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
     // The lower session is busy for as long as the upper tunnel rides on it.
     assert!(!lower.retire_idle().await);
     assert!(upper.retire_idle().await);
+    // The upper tunnel's tasks are cancelled by its retire and let go of the
+    // socket they hold in the lower session as they end, which can be after
+    // the retire returns: wait for the last rider to leave.
+    drop(lower.activity.write().await);
     assert!(lower.retire_idle().await);
     assert_eq!(budget.available_permits(), 2);
 
@@ -1734,4 +1738,135 @@ async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
         }),
     );
     assert_eq!(handing_on.budget(), Duration::from_secs(31));
+}
+
+// A tunnel that records the buffers each dial through it asked for.
+#[derive(Default)]
+struct SizedRecorder(std::sync::Mutex<Vec<Option<crate::wireguard::TcpBuffers>>>);
+
+#[async_trait::async_trait]
+impl TunnelProvider for SizedRecorder {
+    async fn dial(&self, _: &str, _: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        Ok(Box::new(tokio::io::duplex(64).0))
+    }
+    async fn dial_sized(
+        &self,
+        host: &str,
+        port: u16,
+        _outcome: Arc<ConnectionOutcome>,
+        buffers: Option<crate::wireguard::TcpBuffers>,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        self.0.lock().unwrap().push(buffers);
+        self.dial(host, port).await
+    }
+    fn describe(&self) -> String {
+        "sized recorder".into()
+    }
+}
+
+fn recording_session(provider: Arc<SizedRecorder>) -> SessionHop {
+    SessionHop {
+        capacity: Default::default(),
+        activity: Default::default(),
+        id: 3,
+        provider,
+        inner: bottom(),
+        transport: None,
+        path: DialPath::default(),
+        endpoint: Some("127.0.0.1:22".parse().unwrap()),
+        timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
+        resolver: None,
+        failure: Default::default(),
+    }
+}
+
+fn aimed(purpose: Purpose) -> Target {
+    Target {
+        purpose,
+        ..target("192.0.2.9:119".parse().unwrap())
+    }
+}
+
+// Every dial through a tunnel asks for the buffers its traffic needs: a
+// usenet connection or a test of a usenet server the receive buffer the
+// profile sets and the command-sized send buffer, everything else the
+// tunnel's own sizes. Each profile's receive buffer reaches the next usenet
+// dial; a stream dialled before a change keeps what it was dialled with, and
+// nothing is dialled again for it.
+//
+// The receive size is one value for the whole process, so this is the only
+// test in the crate that sets it.
+#[tokio::test]
+async fn a_dial_through_a_tunnel_asks_for_the_buffers_of_its_traffic() {
+    use crate::wireguard::TcpBuffers;
+    let provider = Arc::new(SizedRecorder::default());
+    let hop = recording_session(provider.clone());
+    let nntp = Purpose::Nntp { server: 1, leg: 0 };
+    let probe = Purpose::NntpProbe { server: 1, leg: 0 };
+    let sized = |receive| Some(TcpBuffers::new(receive, 64 * 1024));
+
+    // Before any profile is in force, a usenet socket asks for 1 MiB.
+    let cases = [
+        (nntp.clone(), sized(1024 * 1024)),
+        (probe.clone(), sized(1024 * 1024)),
+        (Purpose::ProxyEndpoint { proxy: 4 }, None),
+        (Purpose::Feed { feed: 2 }, None),
+        (Purpose::Outbound, None),
+        (Purpose::Probe, None),
+        (Purpose::Dns, None),
+    ];
+    for (purpose, _) in &cases {
+        hop.dial(&aimed(purpose.clone())).await.unwrap();
+    }
+    let asked = std::mem::take(&mut *provider.0.lock().unwrap());
+    let expected: Vec<_> = cases.iter().map(|(_, buffers)| *buffers).collect();
+    assert_eq!(asked, expected);
+
+    let mut open = Vec::new();
+    for receive in [256 * 1024, 1024 * 1024, 4 * 1024 * 1024] {
+        set_usenet_receive_bytes(receive);
+        open.push(hop.dial(&aimed(nntp.clone())).await.unwrap());
+        hop.dial(&aimed(probe.clone())).await.unwrap();
+    }
+    let asked = provider.0.lock().unwrap().clone();
+    assert_eq!(
+        asked,
+        vec![
+            sized(256 * 1024),
+            sized(256 * 1024),
+            sized(1024 * 1024),
+            sized(1024 * 1024),
+            sized(4 * 1024 * 1024),
+            sized(4 * 1024 * 1024),
+        ]
+    );
+    assert_eq!(USENET_SEND_BYTES, 64 * 1024);
+    assert_eq!(open.len(), 3);
+}
+
+// A usenet dial on a direct route opens an ordinary socket, sized by the
+// system as any other direct dial is: a profile's tunnel sizes never reach
+// it.
+#[tokio::test]
+async fn a_direct_usenet_dial_is_not_sized_by_the_profile() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let egress = bottom();
+    let plain = egress.dial(&target(address)).await.unwrap();
+    let usenet = egress
+        .dial(&Target {
+            purpose: Purpose::Nntp { server: 1, leg: 0 },
+            ..target(address)
+        })
+        .await
+        .unwrap();
+    let sizes = |dialed: &Dialed| {
+        let socket = socket2::SockRef::from(dialed.stream.tcp().expect("a real socket"));
+        (
+            socket.recv_buffer_size().unwrap(),
+            socket.send_buffer_size().unwrap(),
+        )
+    };
+    assert_eq!(sizes(&usenet), sizes(&plain));
 }

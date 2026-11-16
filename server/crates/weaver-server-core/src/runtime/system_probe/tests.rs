@@ -129,31 +129,41 @@ fn parse_startup_iops_override() {
 
 // A stored measurement stands in for the probe, so this reads the host's
 // facts without writing hundreds of megabytes to the test machine's disk.
-#[test]
-fn detect_returns_valid_profile() {
+#[tokio::test]
+async fn detect_returns_valid_profile() {
     let dir = tempfile::tempdir().unwrap();
     let stored = StoredDiskMeasurement {
         measured_at: unix_seconds(SystemTime::now()),
-        sequential_write_mbps: 420.0,
         random_read_iops: 3_000.0,
     };
     write_stored_disk_measurement(&dir.path().join(DISK_PROBE_RECORD), &stored).unwrap();
 
-    let profile = detect(dir.path());
+    let (profile, _) = detect(dir.path()).await;
     assert!(profile.cpu.logical_cores > 0);
     assert!(profile.cpu.physical_cores > 0);
     assert!(profile.memory.total_bytes > 0);
     if startup_iops_override().is_none() {
-        assert_eq!(profile.disk.sequential_write_mbps, 420.0);
         assert_eq!(profile.disk.random_read_iops, 3_000.0);
     }
 }
 
-#[test]
-fn startup_profile_defers_disk_measurement() {
-    let profile = detect_startup_profile(Path::new("/tmp"));
+#[tokio::test]
+async fn startup_profile_defers_disk_measurement() {
+    let (profile, _) = detect_startup_profile(Path::new("/tmp")).await;
     assert_eq!(profile.disk.random_read_iops, 0.0);
     assert_eq!(profile.disk.sequential_write_mbps, 0.0);
+}
+
+// The start-up profile's storage is the disk owner's classification of the
+// directory, the one a direct read finds when the look answers.
+#[tokio::test]
+async fn startup_profile_takes_storage_from_the_disk_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (profile, _) = detect_startup_profile(dir.path()).await;
+    assert_eq!(
+        (profile.disk.storage_class, profile.disk.filesystem),
+        classify_storage(dir.path())
+    );
 }
 
 const DAY: u64 = 24 * 60 * 60;
@@ -173,11 +183,9 @@ fn no_probe(_: &Path) -> Option<DiskMeasurement> {
 fn a_fresh_stored_measurement_skips_the_probe_and_an_old_one_is_retaken() {
     let dir = tempfile::tempdir().unwrap();
     let first = DiskMeasurement {
-        sequential_write_mbps: 420.0,
         random_read_iops: 3_000.0,
     };
     let second = DiskMeasurement {
-        sequential_write_mbps: 90.0,
         random_read_iops: 180.0,
     };
 
@@ -203,6 +211,28 @@ fn a_fresh_stored_measurement_skips_the_probe_and_an_old_one_is_retaken() {
     );
 }
 
+// A record an earlier version stored also holds a write throughput. Its read
+// IOPS are still used and the write figure is not read.
+#[test]
+fn a_record_with_the_old_write_figure_keeps_its_read_iops() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(DISK_PROBE_RECORD),
+        format!(
+            r#"{{"measured_at":{MEASURED_AT},"sequential_write_mbps":42.0,"random_read_iops":3000.0}}"#
+        ),
+    )
+    .unwrap();
+
+    let measured = stored_or_measured_disk_profile(dir.path(), || at(MEASURED_AT + DAY), no_probe);
+    assert_eq!(
+        measured,
+        DiskMeasurement {
+            random_read_iops: 3_000.0
+        }
+    );
+}
+
 // A record that cannot be read, or one dated after the clock, is measured
 // again rather than trusted.
 #[test]
@@ -210,7 +240,6 @@ fn an_unreadable_or_future_record_is_measured_again() {
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join(DISK_PROBE_RECORD);
     let measured = DiskMeasurement {
-        sequential_write_mbps: 250.0,
         random_read_iops: 8_000.0,
     };
 
@@ -222,7 +251,6 @@ fn an_unreadable_or_future_record_is_measured_again() {
 
     let future = StoredDiskMeasurement {
         measured_at: MEASURED_AT + DAY,
-        sequential_write_mbps: 1.0,
         random_read_iops: 1.0,
     };
     write_stored_disk_measurement(&record, &future).unwrap();
@@ -239,7 +267,6 @@ fn a_failed_probe_falls_back_and_stores_nothing() {
     let dir = tempfile::tempdir().unwrap();
 
     let fallback = stored_or_measured_disk_profile(dir.path(), || at(MEASURED_AT), |_| None);
-    assert_eq!(fallback.sequential_write_mbps, 0.0, "writes unmeasured");
     assert_eq!(fallback.random_read_iops, DISK_PROBE_FALLBACK_IOPS);
     assert!(!dir.path().join(DISK_PROBE_RECORD).exists());
 }
@@ -254,6 +281,29 @@ fn the_probe_file_is_removed_when_its_guard_drops() {
         std::fs::write(&path, b"probe").unwrap();
     }
     assert!(!path.exists());
+}
+
+// The file the reads are spread over grows with the disk's write speed, by
+// the same chunks and the same one-second budget as before the write speed
+// stopped being measured: 16 MiB on a very slow disk, 224 MiB on an ordinary
+// spinning one, 480 MiB on a fast one.
+#[test]
+fn the_probe_file_grows_with_the_disks_write_speed() {
+    const MIB: u64 = 1024 * 1024;
+    let file_at = |bytes_per_second: f64| {
+        probe_file_bytes(|repeats| {
+            Some(Duration::from_secs_f64(
+                (repeats * PROBE_CHUNK_BYTES) as f64 / bytes_per_second,
+            ))
+        })
+        .map(|write| write.bytes)
+    };
+    assert_eq!(file_at(10_000_000.0), Some(16 * MIB));
+    assert_eq!(file_at(60_000_000.0), Some(80 * MIB));
+    assert_eq!(file_at(150_000_000.0), Some(224 * MIB));
+    assert_eq!(file_at(2_000_000_000.0), Some(480 * MIB));
+    // A chunk that cannot be written ends the probe.
+    assert_eq!(probe_file_bytes(|_| None), None);
 }
 
 #[test]
@@ -317,16 +367,29 @@ async fn the_startup_disk_gate_releases_every_kind_of_waiter() {
 }
 
 #[test]
-fn storage_seek_penalty_requires_device_evidence() {
+fn the_report_names_each_kind_of_storage_the_volumes_read() {
+    use crate::operations::disk::StorageKind;
+    assert_eq!(storage_class_of(StorageKind::Rotational), StorageClass::Hdd);
+    assert_eq!(storage_class_of(StorageKind::Solid), StorageClass::Ssd);
     assert_eq!(
-        storage_class_from_seek_penalty(Some(true)),
-        StorageClass::Hdd
+        storage_class_of(StorageKind::Network),
+        StorageClass::Network
     );
     assert_eq!(
-        storage_class_from_seek_penalty(Some(false)),
-        StorageClass::Ssd
+        storage_class_of(StorageKind::Unknown),
+        StorageClass::Unknown
     );
-    assert_eq!(storage_class_from_seek_penalty(None), StorageClass::Unknown);
+}
+
+// The report and the volumes read the same kind of storage.
+#[test]
+fn the_report_reads_the_kind_the_volumes_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (class, _) = detect_disk_info(dir.path());
+    assert_eq!(
+        class,
+        storage_class_of(crate::operations::disk::storage_kind(dir.path()))
+    );
 }
 
 // Memory and filesystem queries must answer on the runner. A device may
@@ -343,12 +406,11 @@ fn windows_probes_read_real_memory_and_disk() {
     assert_eq!(detect_total_memory_bytes(), Some(total));
 
     let dir = std::env::temp_dir();
-    let (storage_class, filesystem) = windows_disk_info(&dir);
+    let filesystem = windows_filesystem(&dir);
     assert!(
         !matches!(&filesystem, FilesystemType::Unknown(name) if name.is_empty()),
         "temp dir filesystem must be named, got {filesystem:?}"
     );
-    let (class_again, fs_again) = detect_disk_info(&dir);
-    assert_eq!(class_again, storage_class);
+    let (_, fs_again) = detect_disk_info(&dir);
     assert_eq!(fs_again, filesystem);
 }

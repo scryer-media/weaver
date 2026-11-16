@@ -64,7 +64,7 @@ impl Replay {
         shutdown: &Shutdown,
         mut chunk_read: impl FnMut(),
     ) -> Replayed {
-        self.access.shutdown = shutdown.clone();
+        self.access.begin(shutdown);
         let mut provenance = Vec::new();
         let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // A write the staging refused ends it: nothing more is read.
@@ -111,6 +111,7 @@ impl Replay {
         }));
         if staged.is_err() {
             self.access.repaired.failed = Some(LeafError::Io {
+                device: crate::pipeline::graph::limits::Device::Working,
                 path: self.access.repaired.output.path().to_path_buf(),
                 source: std::io::Error::other("posted-input reconstruction worker panicked"),
             });
@@ -204,6 +205,11 @@ impl NamespaceWriter {
                 set: node,
                 recovery: None,
                 defer_holds: true,
+                scratch_read: None,
+                held_scratch: BTreeMap::new(),
+                settled: self.unsettled(),
+                scratch_later: BTreeMap::new(),
+                unwritten: false,
                 internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
                 members: BTreeMap::new(),
                 usage: RefCell::default(),
@@ -221,6 +227,7 @@ impl NamespaceWriter {
                 diagnostics: Vec::new(),
                 scratch: None,
                 shutdown: Shutdown::default(),
+                withheld: std::collections::BTreeSet::new(),
             };
             let mut seen = BTreeSet::new();
             for member in volumes.values() {
@@ -252,6 +259,7 @@ impl NamespaceWriter {
         mut replayed: Replayed,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.gave_back(&replayed.bytes);
         if let Some(error) = replayed.bytes.failed() {
             let _ = replayed.remove();
             return Err(error.into());
@@ -362,6 +370,7 @@ impl NamespaceWriter {
         for ((volume, offset, bytes), provenance) in
             replayed.bytes.slices().zip(&replayed.provenance)
         {
+            self.below_budget()?;
             let mut effects = Vec::new();
             tree.replay_piece(
                 replayed.node,

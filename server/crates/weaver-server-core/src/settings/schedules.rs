@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use crate::StateError;
 use crate::bandwidth::{QuotaTarget, ScheduleAction, ScheduleEntry, SpeedTarget};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlConn, SqlRuntime, SqlTx};
 
 // The row every schedule read and write takes first, so saves and the
 // tidying a load does never interleave. The value is only a lock sentinel.
@@ -20,11 +20,11 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "list_schedules", |tx| {
                 Box::pin(async move {
-                    lock(tx).await?;
-                    let mut entries = read_schedules(tx).await?;
+                    lock(&mut tx.conn()).await?;
+                    let mut entries = read_schedules(&mut tx.conn()).await?;
                     let holders = Holders::load(tx).await?;
                     if holders.prune(&mut entries) {
-                        write_schedules(tx, &entries).await?;
+                        write_schedules(&mut tx.conn(), &entries).await?;
                     }
                     Ok(entries)
                 })
@@ -40,12 +40,12 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "save_schedule_tracks", |tx| {
                 let entries = entries.clone();
                 Box::pin(async move {
-                    lock(tx).await?;
+                    lock(&mut tx.conn()).await?;
                     let holders = Holders::load(tx).await?;
                     for entry in &entries {
                         holders.check(&entry.action)?;
                     }
-                    write_schedules(tx, &entries).await
+                    write_schedules(&mut tx.conn(), &entries).await
                 })
             })
             .await
@@ -54,18 +54,18 @@ impl Database {
 
     // Drop every rule and every speed limit for a server being deleted.
     pub(crate) async fn remove_server_schedules(
-        tx: &mut SqlTx<'_>,
+        conn: &mut SqlConn<'_>,
         server_id: u32,
     ) -> Result<(), StateError> {
-        lock(tx).await?;
-        let mut entries = read_schedules(tx).await?;
+        lock(conn).await?;
+        let mut entries = read_schedules(conn).await?;
         entries.retain(|entry| !matches!(entry.action, ScheduleAction::SetServerActive { server_id: id, .. } if id == server_id));
         for entry in &mut entries {
             if let ScheduleAction::SpeedLimit { limits } = &mut entry.action {
                 limits.retain(|limit| limit.target != SpeedTarget::Server(server_id));
             }
         }
-        write_schedules(tx, &entries).await
+        write_schedules(conn, &entries).await
     }
 
     // Drop every quota rule and every speed limit for an egress being
@@ -74,8 +74,9 @@ impl Database {
         tx: &mut SqlTx<'_>,
         egress_id: u32,
     ) -> Result<(), StateError> {
-        lock(tx).await?;
-        let mut entries = read_schedules(tx).await?;
+        let conn = &mut tx.conn();
+        lock(conn).await?;
+        let mut entries = read_schedules(conn).await?;
         entries.retain(|entry| {
             !matches!(
                 entry.action,
@@ -90,19 +91,20 @@ impl Database {
                 limits.retain(|limit| limit.target != SpeedTarget::Egress(egress_id));
             }
         }
-        write_schedules(tx, &entries).await
+        write_schedules(conn, &entries).await
     }
 }
 
 // Each rule as saved. One that cannot be read is left out with a warning
 // rather than keeping every other rule from loading.
-async fn read_schedules(tx: &mut SqlTx<'_>) -> Result<Vec<ScheduleEntry>, StateError> {
-    let json = tx
-        .fetch_optional(
+async fn read_schedules(conn: &mut SqlConn<'_>) -> Result<Vec<ScheduleEntry>, StateError> {
+    let json = conn
+        .fetch_all(
             "SELECT value FROM settings WHERE key = {}",
             &[SqlArg::Text("schedules".into())],
         )
         .await?
+        .first()
         .map(|row| row.text("value"))
         .transpose()?
         .unwrap_or_else(|| "[]".into());
@@ -236,28 +238,35 @@ fn rule_name(entry: &ScheduleEntry) -> &str {
 
 // Serialize schedule reads and saves on both SQL backends, including the
 // first save on an empty installation.
-async fn lock(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
-    tx.execute(
+async fn lock(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
+    conn.execute(
         "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO NOTHING",
         &[SqlArg::Text(LOCK_KEY.into()), SqlArg::Text("1".into())],
     )
     .await?;
-    let sql = match tx {
-        SqlTx::Postgres(_) => "SELECT value FROM settings WHERE key = {} FOR UPDATE",
-        SqlTx::Sqlite(_) => "SELECT value FROM settings WHERE key = {}",
+    let sql = match conn {
+        SqlConn::Postgres(_) => "SELECT value FROM settings WHERE key = {} FOR UPDATE",
+        SqlConn::Sqlite(_) => "SELECT value FROM settings WHERE key = {}",
     };
-    tx.fetch_optional(sql, &[SqlArg::Text(LOCK_KEY.into())])
+    if conn
+        .fetch_all(sql, &[SqlArg::Text(LOCK_KEY.into())])
         .await?
-        .ok_or_else(|| StateError::Database("missing schedule lock row".into()))?;
+        .is_empty()
+    {
+        return Err(StateError::Database("missing schedule lock row".into()));
+    }
     Ok(())
 }
 
-async fn write_schedules(tx: &mut SqlTx<'_>, entries: &[ScheduleEntry]) -> Result<(), StateError> {
+async fn write_schedules(
+    conn: &mut SqlConn<'_>,
+    entries: &[ScheduleEntry],
+) -> Result<(), StateError> {
     if entries
         .iter()
         .any(|entry| entry.enabled && matches!(entry.action, ScheduleAction::PauseAll))
     {
-        tx.execute(
+        conn.execute(
             "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO NOTHING",
             &[
                 SqlArg::Text("schedule_pause_all_used".into()),
@@ -268,7 +277,7 @@ async fn write_schedules(tx: &mut SqlTx<'_>, entries: &[ScheduleEntry]) -> Resul
     }
     let json =
         serde_json::to_string(entries).map_err(|error| StateError::Database(error.to_string()))?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         &[SqlArg::Text("schedules".into()), SqlArg::Text(json)],
     )

@@ -65,8 +65,12 @@ impl Pipeline {
     // holds the scheduler keeps on it — a propagation deferral, a restart
     // durable-lead retry, a timed infrastructure retry of one of its
     // articles — or the soft byte-pressure delay every job shares. A job
-    // whose articles are being built waits until now, so the stall counts
-    // from now while that lasts. A stalled job with none of these is waiting
+    // whose articles are being built, or all of whose queued download work
+    // waits on a fill server refusing the login
+    // ([`Self::job_login_refusal_wait`]), waits until now, so the stall
+    // counts from now while that lasts; a job with other queued work that
+    // does not wait on the login is not explained by it. A
+    // stalled job with none of these is waiting
     // on nothing anyone scheduled, and the stall is unexplained: `None`.
     // Otherwise the earliest wait across the stalled jobs, which is when the
     // stall starts counting.
@@ -100,12 +104,29 @@ impl Pipeline {
                 .and_modify(|earliest| *earliest = (*earliest).min(deadline))
                 .or_insert(deadline);
         }
+        // A fill server refusing the login is waited for until its run of
+        // refusals reaches the verdict, as through an outage. The wait has
+        // no deadline the watchdog can hold to: like a wait for articles,
+        // the clock restarts while it lasts and the ordinary windows run
+        // from when it ends.
+        let login_refusals = self.login_refusal_view();
         let mut waits = HashMap::new();
         for job_id in self.download_scheduler_eligible_jobs() {
             // A job whose articles are being built waits on that, which has
             // no deadline: the clock restarts while it lasts, as under a
             // quota, and a slow read never kicks the other jobs.
-            if self.awaits_job_articles(job_id) {
+            if self.awaits_job_articles(job_id)
+                || self
+                    .job_login_refusal_wait(job_id, login_refusals, None)
+                    .is_some_and(|wait| wait.every)
+            {
+                waits.insert(job_id, now);
+                continue;
+            }
+            // A job held by a volume at its hard limit waits on the disk,
+            // which has no deadline either: a slow or hung disk restarts
+            // the clock and never has the job's articles called unservable.
+            if self.volume_holds_budget(job_id) {
                 waits.insert(job_id, now);
                 continue;
             }
@@ -135,7 +156,7 @@ impl Pipeline {
     // contended, since that answer says nothing about them.
     fn dispatchable_server_count(&self) -> usize {
         self.nntp
-            .blocking_body_server_order(&[])
+            .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
             .map_or(0, |order| order.len())
     }
 
@@ -162,7 +183,7 @@ impl Pipeline {
         if !self.download_stall_recovery {
             return false;
         }
-        if self.active_downloads != 0
+        if self.articles_in_flight != 0
             || self.active_download_connections != 0
             || eligible_count == 0
         {
@@ -198,7 +219,9 @@ impl Pipeline {
         // contended ranking says nothing about the servers and holds the
         // clock too. Accepted narrower case: while any server is available,
         // a stalled job whose articles only a cooled-down server holds still
-        // escalates after the windows.
+        // escalates after the windows. A fill server refusing the login is
+        // the exception: while the job's work waits on it alone, the clock
+        // restarts (see `explained_dispatch_waits`).
         if self.dispatchable_server_count() == 0 {
             if let Some(watch) = self.download_dispatch_stall.as_mut() {
                 watch.since = now;
@@ -338,7 +361,10 @@ impl Pipeline {
 
     // Books every queued article of each job the kick did not move as work
     // no server can serve, so the job leaves its download phase with them
-    // missing and its completion check decides what it becomes.
+    // missing and its completion check decides what it becomes. The articles
+    // that wait on a fill server refusing the login
+    // ([`Self::login_refusal_waited_by`]) are left queued: they wait for
+    // that server's verdict, whatever wedged the rest of the job.
     fn release_download_dispatch_stall(
         &mut self,
         now: Instant,
@@ -383,21 +409,49 @@ impl Pipeline {
             max_connections,
             eligible_count,
         );
+        let login_refusals = self.login_refusal_view();
         for job_id in released {
-            let Some(active) = self
-                .jobs
-                .get_mut(&job_id)
-                .and_then(|state| state.articles.active_mut())
-            else {
-                continue;
-            };
-            let queued = active.download_queue.extract_matching(|_| true);
+            let queued = self.take_stall_released_work(job_id, login_refusals);
             for work in &queued {
-                self.book_unservable_segment(work.segment_id, &work.exclude_servers);
+                self.book_unservable_segment(work.segment_id, work.exclude_servers);
             }
             self.update_queue_metrics();
             self.maybe_finish_download_pass(job_id);
         }
+    }
+
+    // The queued download work of `job_id` a stall release books, taken out
+    // of its queue: everything but the articles waiting on a fill server
+    // refusing the login, which stay queued for that server's verdict.
+    pub(in crate::pipeline) fn take_stall_released_work(
+        &mut self,
+        job_id: JobId,
+        login_refusals: crate::pipeline::download::LoginRefusalView,
+    ) -> Vec<crate::pipeline::download::queue::QueueItem> {
+        let waits_on_login = !login_refusals.waiting.is_empty();
+        let retention = if waits_on_login {
+            self.job_retention_excludes(job_id)
+        } else {
+            weaver_nntp::ServerSet::EMPTY
+        };
+        let pool = Arc::clone(self.nntp.pool());
+        let Some(active) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.active_mut())
+        else {
+            return Vec::new();
+        };
+        active.download_queue.extract_matching(|work| {
+            !waits_on_login
+                || Self::login_refusal_waited_by_in(
+                    &pool,
+                    login_refusals,
+                    work.exclude_servers,
+                    retention,
+                )
+                .is_none()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -430,7 +484,7 @@ impl Pipeline {
                     stalled_secs = stalled_for.as_secs(),
                     eligible_count,
                     dispatchable_queue_depth,
-                    active_downloads = self.active_downloads,
+                    articles_in_lanes = self.articles_in_flight,
                     active_connections = self.active_download_connections,
                     max_connections,
                     pressure_state = pressure.state.as_str(),
@@ -454,7 +508,7 @@ impl Pipeline {
                     rotation_hints_cleared,
                     eligible_count,
                     dispatchable_queue_depth,
-                    active_downloads = self.active_downloads,
+                    articles_in_lanes = self.articles_in_flight,
                     active_connections = self.active_download_connections,
                     max_connections,
                     pressure_state = pressure.state.as_str(),
@@ -476,13 +530,24 @@ impl Pipeline {
         max_connections: usize,
         eligible_count: usize,
     ) {
-        if self.active_downloads != 0 || self.active_download_connections != 0 {
+        if self.articles_in_flight != 0 || self.active_download_connections != 0 {
+            self.download_dispatch_liveness_since = None;
             return;
         }
 
         let dispatchable_queue_depth = self.dispatchable_queue_depth();
         if dispatchable_queue_depth == 0 {
+            self.download_dispatch_liveness_since = None;
             self.last_download_dispatch_stall_log_at = None;
+            return;
+        }
+        // A pass that opens nothing is ordinary for a moment: right after a
+        // job is added or a restart installs its jobs, before the volume it
+        // writes to is sized, and between one job's or lane's end and the
+        // next. Only a condition that has held for a whole interval is
+        // reported.
+        let since = *self.download_dispatch_liveness_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL {
             return;
         }
         if self
@@ -504,13 +569,41 @@ impl Pipeline {
             .unwrap_or_default();
         let stall_recovery = self.download_stall_recovery;
         let servers_available = self.dispatchable_server_count();
-        if let Some(job_id) = self.job_order.iter().copied().find(|job_id| {
-            self.nzb_admitted.contains(job_id)
-                && self
+        // A job its volume holds at the hard limit waits on the disk: that
+        // is the buffer doing its work, not a stall. The warning is for the first dispatchable job that is
+        // not so held; when every one is, the wait is said plainly once.
+        let mut held_on_disk = None;
+        let unheld = self.job_order.iter().copied().find(|job_id| {
+            if !self.nzb_admitted.contains(job_id)
+                || !self
                     .jobs
                     .get(job_id)
                     .is_some_and(Self::has_dispatchable_work)
-        }) {
+            {
+                return false;
+            }
+            let held = self
+                .volume_holds_budget(*job_id)
+                .then_some("the job's volume holds its buffer limit");
+            if let Some(reason) = held {
+                held_on_disk.get_or_insert((*job_id, reason));
+                return false;
+            }
+            true
+        });
+        if unheld.is_none()
+            && let Some((job_id, reason)) = held_on_disk
+        {
+            info!(
+                job_id = job_id.0,
+                dispatchable_queue_depth,
+                stalled_ms = now.saturating_duration_since(since).as_millis() as u64,
+                reason,
+                "download dispatch waits on the disk"
+            );
+            return;
+        }
+        if let Some(job_id) = unheld {
             let state = self
                 .jobs
                 .get(&job_id)
@@ -529,7 +622,7 @@ impl Pipeline {
                 status_allows_dispatch = Self::status_allows_download_dispatch(&state.status),
                 eligible_count,
                 dispatchable_queue_depth,
-                active_downloads = self.active_downloads,
+                articles_in_lanes = self.articles_in_flight,
                 active_connections = self.active_download_connections,
                 max_connections,
                 pressure_state = pressure.state.as_str(),
@@ -539,7 +632,7 @@ impl Pipeline {
                 explained_wait_ms,
                 servers_available,
                 stall_recovery,
-                active_downloads_by_job = backlog.active_downloads,
+                articles_in_lanes_by_job = backlog.articles_in_flight,
                 active_connections_by_job = backlog.active_connections,
                 active_decodes_by_job = backlog.active_decodes,
                 delayed_retries_by_job = backlog.delayed_retries,
@@ -552,7 +645,7 @@ impl Pipeline {
             warn!(
                 eligible_count,
                 dispatchable_queue_depth,
-                active_downloads = self.active_downloads,
+                articles_in_lanes = self.articles_in_flight,
                 active_connections = self.active_download_connections,
                 max_connections,
                 pressure_state = pressure.state.as_str(),
@@ -570,9 +663,14 @@ impl Pipeline {
     //
     // The liveness stall above only speaks when nothing is in flight, so a
     // loop that keeps a lane busy re-fetching the same articles is invisible
-    // to it: connections are up, downloads are active, and the only sign is
-    // a retry counter climbing without a download counter to match.
-    pub(in crate::pipeline::download::worker) fn log_download_retry_storm(&mut self, now: Instant) {
+    // to it: connections are up, lanes hold articles, and the only sign is a
+    // retry counter climbing without a download counter to match.
+    //
+    // Each window is judged as it closes, and the line follows the state,
+    // not the window: one warning when a window first finds the storm, one
+    // line when a later window finds it over, and nothing in between however
+    // long it lasts.
+    pub(in crate::pipeline) fn log_download_retry_storm(&mut self, now: Instant) {
         let retried = self.metrics.segments_retried.load(Ordering::Relaxed);
         let downloaded = self.metrics.segments_downloaded.load(Ordering::Relaxed);
         let Some((opened_at, retried_at_open, downloaded_at_open)) =
@@ -587,20 +685,33 @@ impl Pipeline {
         let retries = retried.saturating_sub(retried_at_open);
         let downloads = downloaded.saturating_sub(downloaded_at_open);
         self.download_retry_storm_window = Some((now, retried, downloaded));
-        if downloads != 0 || retries < DOWNLOAD_RETRY_STORM_THRESHOLD {
-            return;
+        let storming = downloads == 0 && retries >= DOWNLOAD_RETRY_STORM_THRESHOLD;
+        match (self.download_retry_storm, storming) {
+            (None, true) => {
+                self.download_retry_storm = Some((now, retried, downloaded));
+                warn!(
+                    retries,
+                    window_secs = DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL.as_secs(),
+                    articles_in_lanes = self.articles_in_flight,
+                    active_connections = self.active_download_connections,
+                    articles_not_found_without_new_server = self
+                        .metrics
+                        .articles_not_found_without_new_server
+                        .load(Ordering::Relaxed),
+                    "download retry storm: articles are being retried without any completing"
+                );
+            }
+            (Some((started_at, retried_at_start, downloaded_at_start)), false) => {
+                self.download_retry_storm = None;
+                info!(
+                    lasted_secs = now.saturating_duration_since(started_at).as_secs(),
+                    retries_since_start = retried.saturating_sub(retried_at_start),
+                    downloads_since_start = downloaded.saturating_sub(downloaded_at_start),
+                    "download retry storm over: articles are completing again"
+                );
+            }
+            _ => {}
         }
-        warn!(
-            retries,
-            window_secs = DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL.as_secs(),
-            active_downloads = self.active_downloads,
-            active_connections = self.active_download_connections,
-            articles_not_found_without_new_server = self
-                .metrics
-                .articles_not_found_without_new_server
-                .load(Ordering::Relaxed),
-            "download retry storm: articles are being retried without any completing"
-        );
     }
 
     // Reports lanes that are not being filled: work is queued, dispatch is
@@ -617,7 +728,10 @@ impl Pipeline {
     // byte pressure, a hot job whose spillover is blocked, the tail of a job
     // with fewer articles left than lanes — so an underfill alone says
     // nothing. It is reported only when a lane actually failed to open inside
-    // the window, which is the one cause this line exists to name.
+    // the window, which is the one cause this line exists to name. The failed
+    // acquire is warned about where it happens, so this line is detail
+    // beside it: one debug line when the underfill qualifies, one when it
+    // ends, nothing while it lasts.
     pub(in crate::pipeline) fn log_download_lanes_under_cap(
         &mut self,
         now: Instant,
@@ -627,28 +741,29 @@ impl Pipeline {
         // Nothing to fill the lanes with, or the lanes are full: either way
         // this is not the condition, and the window restarts from here.
         if dispatchable_queue_depth == 0 || self.active_download_connections >= max_connections {
-            self.download_lanes_under_cap_since = None;
+            if let Some(since) = self.download_lanes_under_cap_since.take()
+                && std::mem::take(&mut self.download_lanes_under_cap_reported)
+            {
+                debug!(
+                    dispatchable_queue_depth,
+                    active_connections = self.active_download_connections,
+                    max_connections,
+                    under_cap_for_ms = now.saturating_duration_since(since).as_millis() as u64,
+                    "download lanes are back at their connection cap or out of work"
+                );
+            }
             return;
         }
         let since = *self.download_lanes_under_cap_since.get_or_insert(now);
-        if now.saturating_duration_since(since) < DOWNLOAD_LANES_UNDER_CAP_WINDOW {
-            return;
-        }
-        if !self
-            .last_owned_lane_acquire_failure_at
-            .is_some_and(|failed_at| failed_at >= since)
+        if self.download_lanes_under_cap_reported
+            || now.saturating_duration_since(since) < DOWNLOAD_LANES_UNDER_CAP_WINDOW
+            || !self
+                .last_owned_lane_acquire_failure_at
+                .is_some_and(|failed_at| failed_at >= since)
         {
             return;
         }
-        if self
-            .last_download_lanes_under_cap_log_at
-            .is_some_and(|last| {
-                now.saturating_duration_since(last) < DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL
-            })
-        {
-            return;
-        }
-        self.last_download_lanes_under_cap_log_at = Some(now);
+        self.download_lanes_under_cap_reported = true;
         let pool = self.nntp.pool();
         let per_server: Vec<(usize, usize, usize)> = (0..pool.server_count())
             .map(|idx| {
@@ -656,10 +771,10 @@ impl Pipeline {
                 (idx, configured.saturating_sub(available), configured)
             })
             .collect();
-        info!(
+        debug!(
             dispatchable_queue_depth,
             active_connections = self.active_download_connections,
-            active_downloads = self.active_downloads,
+            articles_in_lanes = self.articles_in_flight,
             max_connections,
             under_cap_for_ms = now.saturating_duration_since(since).as_millis() as u64,
             per_server_active_of_configured = ?per_server,

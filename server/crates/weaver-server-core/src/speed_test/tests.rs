@@ -8,7 +8,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use super::fixture::{
-    FixtureArticle, HttpFixture, NntpFixture, SilentFixture, librespeed_list, loopback_tls, nzb,
+    FixtureArticle, HttpFixture, NntpBehaviour, NntpFixture, SilentFixture, librespeed_list,
+    loopback_tls, nzb,
 };
 use super::*;
 use crate::proxies::{Consumer, Failover, LegPath, ProxyRuntime, Route, RouteLeg};
@@ -39,6 +40,7 @@ async fn rig() -> Rig {
         max_concurrent_nzbs: None,
         cleanup_after_extract: None,
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
@@ -75,13 +77,22 @@ fn direct_route() -> Route {
 }
 
 async fn add_server(rig: &Rig, nntp: &NntpFixture, tls_ca: Option<&std::path::Path>) -> u32 {
+    add_server_with_login(rig, nntp, tls_ca, None).await
+}
+
+async fn add_server_with_login(
+    rig: &Rig,
+    nntp: &NntpFixture,
+    tls_ca: Option<&std::path::Path>,
+    login: Option<(&str, &str)>,
+) -> u32 {
     let server: crate::servers::ServerConfig = serde_json::from_value(serde_json::json!({
         "id": 1,
         "host": "127.0.0.1",
         "port": nntp.addr.port(),
         "tls": tls_ca.is_some(),
-        "username": null,
-        "password": null,
+        "username": login.map(|(user, _)| user),
+        "password": login.map(|(_, password)| password),
         "connections": 2,
         "active": true,
         "tls_ca_cert": tls_ca,
@@ -193,6 +204,193 @@ async fn usenet_run_over_tls_books_raw_bytes_and_counts_missing_articles() {
     );
     assert_eq!(run.tested.legs[0].target, 2);
     assert!(!rig.handle.is_globally_paused(), "the queue is given back");
+    assert_eq!(
+        usenet::lane_fetches::on(nntp.addr.port()),
+        5,
+        "every article is fetched on a download lane's connection"
+    );
+    assert!(
+        !nntp.log().iter().any(|entry| entry == "GROUP"),
+        "no 412 asked for a group, so none is selected: {:?}",
+        nntp.log()
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_answers_412_is_sent_a_group_only_after_it() {
+    let rig = rig().await;
+    let articles: Vec<FixtureArticle> = (0..3)
+        .map(|i| FixtureArticle::patterned(&format!("grp{i}@fixture"), 9_000))
+        .collect();
+    let nntp = NntpFixture::start_with(
+        articles,
+        None,
+        None,
+        NntpBehaviour {
+            require_group: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let listed: Vec<(String, u64)> = (0..3).map(|i| (format!("grp{i}@fixture"), 9_000)).collect();
+    let listed: Vec<(&str, u64)> = listed.iter().map(|(id, b)| (id.as_str(), *b)).collect();
+    let http = HttpFixture::start(nzb(&listed), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Completed, "{:?}", run.error);
+    let result = run.result.unwrap();
+    let usenet = result.usenet.clone().unwrap();
+    assert_eq!(usenet.articles_requested, 3);
+    assert_eq!(
+        usenet.delivered,
+        3,
+        "{:?} {:?}",
+        result.connections,
+        nntp.log()
+    );
+    assert_eq!(usenet.failed, 0);
+    let log = nntp.log();
+    let first_412 = log.iter().position(|entry| entry == "BODY 412");
+    let first_group = log.iter().position(|entry| entry == "GROUP");
+    assert!(
+        matches!((first_412, first_group), (Some(refused), Some(group)) if refused < group),
+        "a GROUP is sent only after a 412 asked for one: {log:?}"
+    );
+    assert!(usenet::lane_fetches::on(nntp.addr.port()) >= 4);
+}
+
+#[tokio::test]
+async fn a_refused_login_fails_the_run_with_the_refusal() {
+    let rig = rig().await;
+    let nntp = NntpFixture::start_with(
+        vec![FixtureArticle::patterned("only@fixture", 9_000)],
+        None,
+        None,
+        NntpBehaviour {
+            refuse_login: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
+    let server = add_server_with_login(&rig, &nntp, None, Some(("user", "wrong"))).await;
+
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert_eq!(
+        run.error,
+        Some(SpeedTestFailure::Other(
+            "no bytes were received: authentication failed (481)".into()
+        ))
+    );
+    assert!(nntp.log().is_empty(), "no BODY is sent: {:?}", nntp.log());
+    assert_eq!(usenet::lane_fetches::on(nntp.addr.port()), 0);
+}
+
+#[tokio::test]
+async fn a_cancel_while_measuring_stops_every_connection_after_its_article() {
+    let rig = rig().await;
+    let articles: Vec<FixtureArticle> = (0..6)
+        .map(|i| FixtureArticle::patterned(&format!("held{i}@fixture"), 9_000))
+        .collect();
+    let nntp = NntpFixture::start(articles, Some(1), None).await;
+    let listed: Vec<(String, u64)> = (0..6)
+        .map(|i| (format!("held{i}@fixture"), 9_000))
+        .collect();
+    let listed: Vec<(&str, u64)> = listed.iter().map(|(id, b)| (id.as_str(), *b)).collect();
+    let http = HttpFixture::start(nzb(&listed), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    nntp.served().wait_for(|served| *served >= 1).await.unwrap();
+    assert!(rig.service.cancel(started.id));
+    // The answers held behind the first are let go only after the cancel.
+    nntp.release();
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Cancelled);
+    let answered = nntp
+        .log()
+        .iter()
+        .filter(|entry| *entry == "BODY 222")
+        .count();
+    assert!(
+        answered <= 3,
+        "each of the two connections stops after the article it had asked for: {:?}",
+        nntp.log()
+    );
+    assert!(!rig.handle.is_globally_paused());
+}
+
+// A slow server keeps an article arriving long after the operator cancels.
+// The cancel cuts it at its next read: the run ends Cancelled while the
+// server is still sending, rather than when the article would end.
+#[tokio::test]
+async fn a_cancel_cuts_an_article_that_is_still_arriving() {
+    let rig = rig().await;
+    let nntp = NntpFixture::start_with(
+        vec![FixtureArticle::patterned("endless@fixture", 9_000)],
+        None,
+        None,
+        NntpBehaviour {
+            endless_body: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let http = HttpFixture::start(nzb(&[("endless@fixture", 9_000)]), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let mut trickled = nntp.trickled();
+    nntp.trickle();
+    trickled.wait_for(|lines| *lines >= 1).await.unwrap();
+    assert!(rig.service.cancel(started.id));
+    // The article keeps arriving, one line for each the run ends without.
+    let run = loop {
+        nntp.trickle();
+        tokio::select! {
+            run = finished(&rig, started.id) => break run,
+            changed = trickled.changed() => changed.unwrap(),
+        }
+    };
+
+    assert_eq!(run.status, SpeedTestStatus::Cancelled);
+    assert_eq!(nntp.log(), vec!["BODY endless".to_string()]);
+    assert!(!rig.handle.is_globally_paused());
 }
 
 #[tokio::test]
@@ -237,7 +435,7 @@ async fn a_cancel_while_draining_ends_without_a_result_and_resumes_the_queue() {
     .await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
 
     let started = rig
         .service
@@ -275,7 +473,7 @@ async fn a_later_operator_pause_survives_speed_test_cancellation() {
     let nntp = NntpFixture::start(vec![], None, None).await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let started = rig
         .service
         .start(usenet_request(
@@ -349,7 +547,7 @@ async fn a_server_removed_while_draining_cannot_bypass_its_pool_loan() {
     let nntp = NntpFixture::start(vec![], None, None).await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let started = rig
         .service
         .start(usenet_request(
@@ -373,7 +571,7 @@ async fn a_server_removed_while_draining_cannot_bypass_its_pool_loan() {
         .set_nntp_pool(Arc::new(weaver_nntp::pool::NntpPool::new(
             Default::default(),
         )));
-    rig.metrics.set_active_downloads(0);
+    rig.metrics.set_articles_in_flight(0);
     let run = finished(&rig, started.id).await;
     assert_eq!(run.status, SpeedTestStatus::Failed);
     assert_eq!(
@@ -390,7 +588,7 @@ async fn a_server_whose_connections_drop_while_draining_is_refused_its_loan() {
     let nntp = NntpFixture::start(vec![], None, None).await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let started = rig
         .service
         .start(usenet_request(
@@ -421,7 +619,7 @@ async fn a_server_whose_connections_drop_while_draining_is_refused_its_loan() {
                 ..Default::default()
             },
         )));
-    rig.metrics.set_active_downloads(0);
+    rig.metrics.set_articles_in_flight(0);
     let run = finished(&rig, started.id).await;
     assert_eq!(run.status, SpeedTestStatus::Failed);
     assert!(
@@ -475,7 +673,7 @@ async fn a_second_run_is_refused_while_one_runs() {
     .await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let url = format!("http://{}/test.nzb", http.addr);
     let first = rig
         .service
@@ -494,7 +692,7 @@ async fn a_second_run_is_refused_while_one_runs() {
             run: first.id
         })
     );
-    rig.metrics.set_active_downloads(0);
+    rig.metrics.set_articles_in_flight(0);
     assert_eq!(
         finished(&rig, first.id).await.status,
         SpeedTestStatus::Completed

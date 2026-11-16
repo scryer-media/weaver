@@ -86,8 +86,8 @@ func AdversarialRecipes() []Recipe {
 		},
 		{
 			Slug: "adv-zip-bomb-reserve", Family: "adversarial", ByteReproducible: true,
-			Notes: "One deflated member of 3 GiB of zeros. The lane runs it with the free-space reserve set just under what the disk holds, " +
-				"so the disk reserve is what refuses it.",
+			Notes: "One deflated member of 3 GiB of zeros. The lane runs it with the free-space reserve set just under what the disk holds free, " +
+				"so the job runs short of room and waits for it, and is not refused.",
 			Build: writeAdversarialZipBomb("reserve.zip", "zeros.bin", 3<<30),
 		},
 		{
@@ -156,7 +156,8 @@ func AdversarialRecipes() []Recipe {
 			Slug: "adv-zip-hostile-names", Family: "adversarial", ByteReproducible: true,
 			Notes: "Members named with control characters, an embedded NUL, an overlong UTF-8 encoding of '/', reserved Windows device names, " +
 				"an over-long run of two-byte characters and one 4 KiB name. The UTF-8 flag is set on every record. unicode-filenames covers well-formed CJK names.",
-			Build: writeAdversarialZip("names.zip", hostileNameEntries()),
+			Build:           writeAdversarialZip("names.zip", hostileNameEntries()),
+			ExpectedOutputs: expectPayloads(hostileNamesDelivered()),
 		},
 		{
 			Slug: "adv-zip-many-members", Family: "adversarial", ByteReproducible: true,
@@ -517,6 +518,30 @@ func hostileNameEntries() []rawZipEntry {
 		entries = append(entries, entry)
 	}
 	return entries
+}
+
+// hostileNamesDelivered maps each member the job delivers whole, by the
+// name it is delivered under, to the name its payload was written for. The
+// NUL becomes '_', the overlong '/' bytes read as code page 437, and the
+// 4 KiB name is refused by the file system, so the job ends partial.
+func hostileNamesDelivered() map[string]string {
+	delivered := map[string]string{
+		"control-\x01\x07\x1b[31m-name.txt":                   "control-\x01\x07\x1b[31m-name.txt",
+		"nul-_-hidden.txt":                                    "nul-\x00-hidden.txt",
+		"..\u2514\u00bb..\u2514\u00bbadv-overlong-escape.txt": "..\xc0\xaf..\xc0\xafadv-overlong-escape.txt",
+		"CON.txt":      "CON.txt",
+		"nul":          "nul",
+		"COM1.mkv":     "COM1.mkv",
+		"aux.srt":      "aux.srt",
+		"LPT1":         "LPT1",
+		"ordinary.txt": "ordinary.txt",
+	}
+	long := strings.Repeat("\u00e9", 200) + ".txt"
+	delivered[long] = long
+	for name, source := range delivered {
+		delivered[name] = strconv.Quote(source)
+	}
+	return delivered
 }
 
 func manyMemberEntries(count int) []rawZipEntry {

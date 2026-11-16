@@ -6,10 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{heartbeat, http, restart, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
+use weaver_server_core::runtime::shutdown_steps::{
+    bounded_shutdown_step, waited_shutdown_step, waited_shutdown_write,
+};
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::{Database, Pipeline, SchedulerHandle};
@@ -129,9 +132,9 @@ pub(crate) async fn run(
         base_url
     };
 
-    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(
-        weaver_server_core::runtime::detect_startup_profile(&data_dir),
-    );
+    let (profile, late_classification) =
+        weaver_server_core::runtime::detect_startup_profile(&data_dir).await;
+    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(profile);
     let system_profile = Arc::new(std::sync::RwLock::new(profile.clone()));
 
     // Build the NNTP client from capability values validated when servers were saved.
@@ -306,6 +309,12 @@ pub(crate) async fn run(
     // The pipeline's own free-space samplers: metrics and the NZBGet status
     // read their cached readings and never stat a filesystem themselves.
     let storage_capacity = pipeline.storage_capacity();
+    let _late_classification_task = wiring::settle_late_classification(
+        late_classification,
+        Arc::clone(&storage_capacity),
+        handle.clone(),
+        Some(Arc::clone(&system_profile)),
+    );
     let post_processing_executor = pipeline.post_processing_executor();
     let scheduled_resume =
         weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
@@ -530,21 +539,20 @@ pub(crate) async fn run(
                 Err(error) => {
                     warn!(error = %error, "disk probe task failed; using fallback IOPS");
                     weaver_server_core::runtime::DiskMeasurement {
-                        sequential_write_mbps: 0.0,
                         random_read_iops: 10_000.0,
                     }
                 }
             };
             drop(opener);
-            match handle.update_disk_measurement(measurement).await {
+            match handle
+                .update_random_read_iops(measurement.random_read_iops)
+                .await
+            {
                 Ok(()) => {
                     let mut profile = system_profile
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     profile.disk.random_read_iops = measurement.random_read_iops;
-                    if measurement.sequential_write_mbps > 0.0 {
-                        profile.disk.sequential_write_mbps = measurement.sequential_write_mbps;
-                    }
                 }
                 Err(error) => {
                     warn!(error = %error, "failed to apply startup disk measurement");
@@ -597,51 +605,67 @@ pub(crate) async fn run(
         action = restart_controller.requested() => ServeStop::from(action),
         result = &mut pipeline_task => {
             auto_backup_scheduler.abort();
-            let _ = auto_backup_scheduler.await;
-            tokio::join!(backup.shutdown(), schedule_task.shutdown());
-            proxies.stop_all().await;
+            bounded_shutdown_step("automatic backup scheduler", auto_backup_scheduler).await;
+            tokio::join!(
+                waited_shutdown_write("backup in progress", backup.shutdown()),
+                waited_shutdown_write("schedule actions", schedule_task.shutdown()),
+            );
+            bounded_shutdown_step("proxies", proxies.stop_all()).await;
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             server_task.abort();
             rss_task.abort();
-            watch_folder.stop().await;
+            bounded_shutdown_step("watch folder", watch_folder.stop()).await;
             metrics_history_task.abort();
             heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
             semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
-            wiring::flush_server_transfer_usage(
-                Arc::clone(&server_transfer_policy),
-                "serve pipeline exit",
+            waited_shutdown_write(
+                "server download usage flush",
+                wiring::flush_server_transfer_usage(
+                    Arc::clone(&server_transfer_policy),
+                    "serve pipeline exit",
+                ),
             )
             .await;
             return Err(error.into());
         }
         result = &mut server_task => {
             auto_backup_scheduler.abort();
-            let _ = auto_backup_scheduler.await;
-            tokio::join!(backup.shutdown(), schedule_task.shutdown());
+            bounded_shutdown_step("automatic backup scheduler", auto_backup_scheduler).await;
+            tokio::join!(
+                waited_shutdown_write("backup in progress", backup.shutdown()),
+                waited_shutdown_write("schedule actions", schedule_task.shutdown()),
+            );
             // The pipeline learns it is stopping before the network goes:
             // a batch torn down by the shutdown is then not read as the
-            // server failing it.
+            // server failing it. It sets flags and waits on nothing, so it
+            // has no bound.
             handle.shutdown().await.ok();
-            proxies.stop_all().await;
+            bounded_shutdown_step("proxies", proxies.stop_all()).await;
+            // The pipeline's end is its drain, and the drain ends in database
+            // writes, so it is waited for and never left behind. Each wait
+            // inside it bounds or names itself.
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
             }
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             rss_task.abort();
-            watch_folder.stop().await;
+            bounded_shutdown_step("watch folder", watch_folder.stop()).await;
             metrics_history_task.abort();
             heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
             semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
-            wiring::flush_server_transfer_usage(
-                Arc::clone(&server_transfer_policy),
-                "serve HTTP exit",
+            waited_shutdown_write(
+                "server download usage flush",
+                wiring::flush_server_transfer_usage(
+                    Arc::clone(&server_transfer_policy),
+                    "serve HTTP exit",
+                ),
             )
             .await;
             return match result {
@@ -664,11 +688,15 @@ pub(crate) async fn run(
     }
     update_check_task.abort();
     auto_backup_scheduler.abort();
-    let _ = auto_backup_scheduler.await;
-    tokio::join!(backup.shutdown(), schedule_task.shutdown());
+    bounded_shutdown_step("automatic backup scheduler", auto_backup_scheduler).await;
+    tokio::join!(
+        waited_shutdown_write("backup in progress", backup.shutdown()),
+        waited_shutdown_write("schedule actions", schedule_task.shutdown()),
+    );
     // Before the network stops; see the HTTP shutdown arm above.
     handle.shutdown().await.ok();
-    proxies.stop_all().await;
+    bounded_shutdown_step("proxies", proxies.stop_all()).await;
+    // Waited for, not bounded: see the HTTP shutdown arm above.
     if let Err(join_error) = pipeline_task.await {
         error!(error = %join_error, "pipeline task failed during shutdown");
     }
@@ -676,17 +704,29 @@ pub(crate) async fn run(
     server_task.abort();
     // Awaited, not just aborted: a restart rebinds this port immediately, and
     // on Windows a listening socket that outlives this process by a moment is
-    // enough to fail that bind.
-    let _ = server_task.await;
+    // enough to fail that bind. So a restart waits for the listener however
+    // long it takes; any other stop ends this process for good, which
+    // closes the socket, and leaves a server that does not end behind.
+    if matches!(stop, ServeStop::Restart) {
+        let _ = waited_shutdown_step("HTTP server", server_task).await;
+    } else {
+        bounded_shutdown_step("HTTP server", server_task).await;
+    }
     rss_task.abort();
-    watch_folder.stop().await;
+    bounded_shutdown_step("watch folder", watch_folder.stop()).await;
     metrics_history_task.abort();
     heartbeat_task.abort();
     maintenance_task.abort();
     semantic_promotion_task.abort();
     server_transfer_maintenance.abort();
-    wiring::flush_server_transfer_usage(Arc::clone(&server_transfer_policy), stop.flush_context())
-        .await;
+    waited_shutdown_write(
+        "server download usage flush",
+        wiring::flush_server_transfer_usage(
+            Arc::clone(&server_transfer_policy),
+            stop.flush_context(),
+        ),
+    )
+    .await;
     // The last thing an orderly run says about itself: how much memory it ever
     // held. A run that ended on purpose and one that was killed for its size
     // are only distinguishable if the orderly one leaves this behind.
@@ -695,17 +735,28 @@ pub(crate) async fn run(
     Ok(stop)
 }
 
+// Start-up says once how many jobs it queued for restoration; each job's own
+// line is DEBUG. A job that could not be queued is an error of its own.
 async fn enqueue_restore_tickets(
     handle: &SchedulerHandle,
     candidates: Vec<weaver_server_core::operations::RestoreCandidate>,
 ) {
+    let total = candidates.len();
+    let mut failed = 0usize;
     for candidate in candidates {
         match handle.restore_job(candidate.request).await {
-            Ok(()) => info!(job_id = candidate.job_id.0, "job queued for restoration"),
+            Ok(()) => debug!(job_id = candidate.job_id.0, "job queued for restoration"),
             Err(e) => {
+                failed += 1;
                 error!(job_id = candidate.job_id.0, error = %e, "failed to queue job restoration")
             }
         }
+    }
+    if total > 0 {
+        info!(
+            queued = total - failed,
+            failed, "jobs queued for restoration"
+        );
     }
 }
 
@@ -977,7 +1028,8 @@ impl ServeStop {
 }
 
 // Signal the event-persistence task to stop and await its final
-// `flush_write_queue`, bounded so a stuck flush cannot hang process exit.
+// `flush_write_queue`. That is a database write, so it is waited for to its
+// end; a slow one is warned about once.
 // Called after the pipeline task has completed (its broadcast sender dropped),
 // so the only remaining reason the task is still running is the long-lived
 // senders held by `SchedulerHandle` and its service clones.
@@ -985,20 +1037,10 @@ async fn finalize_event_persistence(
     task: tokio::task::JoinHandle<()>,
     shutdown: &Arc<tokio::sync::Notify>,
 ) {
-    const EVENT_PERSISTENCE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     // `notify_one` (not `notify_waiters`) stores a permit if the task is mid-batch
     // rather than parked on `notified()`, so the shutdown signal cannot be lost.
     shutdown.notify_one();
-    match tokio::time::timeout(EVENT_PERSISTENCE_FLUSH_TIMEOUT, task).await {
-        Ok(Ok(())) => {}
-        Ok(Err(join_error)) => {
-            error!(error = %join_error, "event persistence task failed during shutdown");
-        }
-        Err(_) => {
-            warn!(
-                timeout_secs = EVENT_PERSISTENCE_FLUSH_TIMEOUT.as_secs(),
-                "timed out flushing event persistence during shutdown"
-            );
-        }
+    if let Err(join_error) = waited_shutdown_write("event persistence flush", task).await {
+        error!(error = %join_error, "event persistence task failed during shutdown");
     }
 }

@@ -342,6 +342,91 @@ async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
     server_task.abort();
 }
 
+// Keeps the fields of every WARN event the code under test emits.
+struct WarnRecorder(Arc<StdMutex<Vec<std::collections::BTreeMap<String, String>>>>);
+
+impl tracing::Subscriber for WarnRecorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = Fields(Default::default());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// A failed fetch leaves one WARN line naming the feed and the error, beside
+// the failure the feed row records; a feed that fetches cleanly in the same
+// pass leaves none.
+#[tokio::test]
+async fn a_failed_feed_fetch_logs_one_warning_per_poll() {
+    let warnings = Arc::new(StdMutex::new(Vec::new()));
+    let _subscriber = tracing::subscriber::set_default(WarnRecorder(warnings.clone()));
+    let temp = TempDir::new().unwrap();
+    let db = Database::open(&temp.path().join("rss-failure-log.sqlite")).unwrap();
+    let state = TestHttpState {
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server_task) = start_test_server(state.clone()).await;
+    let mut broken = scheduled_feed(1, None);
+    broken.name = "Broken Feed".into();
+    broken.url = format!("{base_url}/missing");
+    db.insert_rss_feed(&broken).unwrap();
+    let mut working = scheduled_feed(2, None);
+    working.url = format!("{base_url}/feed");
+    db.insert_rss_feed(&working).unwrap();
+
+    let service = build_service(temp.path(), db.clone());
+    let report = service.run_all_sync().await.unwrap();
+    assert_eq!(report.feeds_polled, 2);
+    assert_eq!(state.feed_requests.load(Ordering::SeqCst), 1);
+
+    let logged = warnings.lock().unwrap().clone();
+    assert_eq!(
+        logged.len(),
+        1,
+        "one warning for the one failed feed: {logged:?}"
+    );
+    let line = &logged[0];
+    assert_eq!(line["message"], "RSS feed poll failed");
+    assert_eq!(line["feed_id"], "1");
+    assert_eq!(line["feed"], "Broken Feed");
+    assert!(line["error"].contains("HTTP 404"), "error field: {line:?}");
+    let row = db.get_rss_feed(1).unwrap().unwrap();
+    assert!(
+        row.last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("HTTP 404"))
+    );
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(db.get_rss_feed(2).unwrap().unwrap().last_error, None);
+    server_task.abort();
+}
+
 #[tokio::test]
 async fn background_due_sync_skips_when_manual_sync_is_active() {
     let temp = TempDir::new().unwrap();
@@ -738,6 +823,7 @@ fn build_service_with_security(
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
@@ -1017,6 +1103,65 @@ async fn a_feed_without_a_route_waits_for_the_runtime_reload() {
             .collect::<Vec<_>>(),
         [1]
     );
+}
+
+// A poll that meets a route reload is not a feed failure: nothing is fetched
+// or recorded, the feed stays due, and the reload's end wakes the poller,
+// which then reads it.
+#[tokio::test]
+async fn a_poll_during_a_route_reload_records_nothing_and_runs_when_it_ends() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open(&temp.path().join("state.db")).unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (base_url, server) = start_test_server(TestHttpState {
+        feed_body: "<rss version=\"2.0\"><channel><title>Empty</title></channel></rss>".into(),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: requests.clone(),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    })
+    .await;
+    let mut feed = scheduled_feed(1, None);
+    feed.url = format!("{base_url}/feed");
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service(temp.path(), db.clone());
+    let runtime = service.inner.handle.proxy_runtime().unwrap();
+    let untouched = |db: &Database| {
+        let feed = db.get_rss_feed(1).unwrap().unwrap();
+        assert_eq!(feed.last_error, None);
+        assert_eq!(feed.consecutive_failures, 0);
+        assert_eq!(feed.last_polled_at, None);
+    };
+
+    let reloading = runtime.begin_reload().unwrap();
+    // The due sweep passes the feed over.
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    // A poll that gets as far as the route meets its refusal.
+    let report = service.run_feed_sync(1).await.unwrap();
+    assert_eq!(report.feeds_polled, 0);
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    untouched(&db);
+
+    let mut changed = db.rss_schedule_cache.changed.subscribe();
+    drop(reloading);
+    changed.changed().await.unwrap();
+    let DueSyncOutcome::Completed(report) = service.try_run_due_sync().await.unwrap() else {
+        panic!("the feed passed over by the reload is due once it ends");
+    };
+    assert_eq!(report.feeds_polled, 1);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let feed = db.get_rss_feed(1).unwrap().unwrap();
+    assert_eq!(feed.last_error, None);
+    assert!(feed.last_polled_at.is_some());
+    server.abort();
 }
 
 #[tokio::test(start_paused = true)]

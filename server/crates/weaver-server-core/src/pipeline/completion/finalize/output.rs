@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
+use crate::pipeline::full_disk::{Stage, Wants};
 use crate::post_processing::model::PostProcessingSettings;
+use crate::runtime::fs::Placement;
 use crate::runtime::{file_cache, fs as runtime_fs};
 
 #[derive(Debug)]
@@ -227,6 +229,21 @@ fn move_path_with_copy_fallback(
     dst: &std::path::Path,
     phase_counters: &PhaseCounters,
 ) -> std::io::Result<()> {
+    move_path_by_copy(src, dst, &mut |copied| {
+        phase_counters
+            .completed_bytes
+            .fetch_add(copied, Ordering::Relaxed);
+        Ok(())
+    })
+}
+
+// The copy that stands in for a move, each file created exclusively and
+// told to `on_copied` as it lands, which may stop it.
+fn move_path_by_copy(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    on_copied: &mut dyn FnMut(u64) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(src)?;
 
     if metadata.file_type().is_symlink() {
@@ -250,22 +267,14 @@ fn move_path_with_copy_fallback(
         })?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            move_path_with_copy_fallback(
-                &entry.path(),
-                &dst.join(entry.file_name()),
-                phase_counters,
-            )?;
+            move_path_by_copy(&entry.path(), &dst.join(entry.file_name()), on_copied)?;
         }
         std::fs::remove_dir(src)?;
         return Ok(());
     }
 
     let parent_fingerprint = runtime_fs::prepare_destination_parent(dst)?;
-    file_cache::copy_large_file_with_progress(src, dst, |copied| {
-        phase_counters
-            .completed_bytes
-            .fetch_add(copied, Ordering::Relaxed);
-    })?;
+    file_cache::copy_large_file_with_progress(src, dst, on_copied)?;
     if !runtime_fs::destination_parent_matches(dst, &parent_fingerprint)? {
         return Err(std::io::Error::other(format!(
             "destination parent changed during copy: {}",
@@ -276,13 +285,24 @@ fn move_path_with_copy_fallback(
     Ok(())
 }
 
+// The step of a delivery move made by name alone: the metadata change, a
+// rename or a link and unlink, never a copy. What only a copy can place is
+// said, for the mover to copy.
 fn rename_path_for_publication(
     src: &std::path::Path,
     dst: &std::path::Path,
-) -> std::io::Result<()> {
+) -> std::io::Result<Placement> {
+    rename_path_for_publication_with(src, dst, |src, dst| std::fs::hard_link(src, dst))
+}
+
+fn rename_path_for_publication_with(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    link: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<Placement> {
     let metadata = std::fs::symlink_metadata(src)?;
     if !metadata.is_dir() {
-        return runtime_fs::rename_no_overwrite(src, dst);
+        return runtime_fs::place_no_overwrite_with_link(src, dst, link);
     }
 
     match std::fs::symlink_metadata(dst) {
@@ -295,8 +315,17 @@ fn rename_path_for_publication(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    std::fs::rename(src, dst)
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(Placement::Placed),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            Ok(Placement::Copy(error))
+        }
+        Err(error) => Err(error),
+    }
 }
+
+// The step a move makes by name, given where it is made.
+type Place = fn(&std::path::Path, &std::path::Path) -> std::io::Result<Placement>;
 
 fn move_path_with_safe_rename_or_copy_fallback(
     src: &std::path::Path,
@@ -304,7 +333,46 @@ fn move_path_with_safe_rename_or_copy_fallback(
     source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
-    move_path_with_safe_rename_or_copy_fallback_using(
+    move_path_through(None, src, dst, source_bytes, phase_counters)
+}
+
+// The writer of the volume a delivery lands on. Each rename into the
+// destination runs on that volume's thread, behind whatever else is queued
+// for the volume, and its own result comes back to the mover, which waits
+// for it on a thread of its own. The volume's thread makes only the
+// metadata change: a move that only a copy can make, across devices or on
+// a mount without links, comes back to the mover, which copies it on its
+// own thread, never the volume's.
+#[derive(Clone)]
+pub(crate) struct Renames(Arc<crate::operations::disk::writer::Submitter>);
+
+impl Renames {
+    pub(crate) fn through(to: Arc<crate::operations::disk::writer::Submitter>) -> Self {
+        Self(to)
+    }
+
+    fn place(&self, src: &Path, dst: &Path, place: Place) -> std::io::Result<Placement> {
+        let (answer, answered) = std::sync::mpsc::sync_channel(1);
+        let (from, to) = (src.to_path_buf(), dst.to_path_buf());
+        // The writer hears no failure: the mover judges the result, and a
+        // volume with no thread is none either.
+        self.0.ask(src.to_path_buf(), move || {
+            let _ = answer.send(place(&from, &to));
+        });
+        // A volume with no thread drops the rename unrun: it is made here.
+        answered.recv().unwrap_or_else(|_| place(src, dst))
+    }
+}
+
+fn move_path_through(
+    renames: Option<&Renames>,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_bytes: u64,
+    phase_counters: Arc<PhaseCounters>,
+) -> Result<(), (std::io::Error, std::io::Error)> {
+    move_path_through_using(
+        renames,
         src,
         dst,
         source_bytes,
@@ -314,6 +382,34 @@ fn move_path_with_safe_rename_or_copy_fallback(
     )
 }
 
+fn move_path_through_using<C>(
+    renames: Option<&Renames>,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_bytes: u64,
+    phase_counters: Arc<PhaseCounters>,
+    place: Place,
+    copy: C,
+) -> Result<(), (std::io::Error, std::io::Error)>
+where
+    C: FnOnce(&std::path::Path, &std::path::Path, &PhaseCounters) -> std::io::Result<()>,
+{
+    move_path_with_safe_rename_or_copy_fallback_using(
+        src,
+        dst,
+        source_bytes,
+        phase_counters,
+        |src, dst| match renames {
+            Some(renames) => renames.place(src, dst, place),
+            None => place(src, dst),
+        },
+        copy,
+    )
+}
+
+// The one place a move's copy is decided: the step by name says whether
+// only a copy can place the entry, and the copy then runs here, on the
+// mover's thread, reporting each file as it lands.
 fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -323,11 +419,11 @@ fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
     copy: C,
 ) -> Result<(), (std::io::Error, std::io::Error)>
 where
-    R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<Placement>,
     C: FnOnce(&std::path::Path, &std::path::Path, &PhaseCounters) -> std::io::Result<()>,
 {
     match rename(src, dst) {
-        Ok(()) => {
+        Ok(Placement::Placed) => {
             if source_bytes > 0 {
                 phase_counters
                     .completed_bytes
@@ -335,12 +431,12 @@ where
             }
             Ok(())
         }
-        Err(rename_err) if rename_err.kind() == std::io::ErrorKind::CrossesDevices => {
+        Ok(Placement::Copy(rename_err)) => {
             copy(src, dst, &phase_counters).map_err(|copy_err| (rename_err, copy_err))
         }
         Err(rename_err) => Err((
             rename_err,
-            std::io::Error::other("copy fallback not attempted for a non-cross-device error"),
+            std::io::Error::other("copy fallback not attempted for an error a copy cannot mend"),
         )),
     }
 }
@@ -410,7 +506,15 @@ where
         }
         let (from, to) = (entry.path(), working_dir.join(&name));
         let moved = if std::fs::symlink_metadata(&to).is_ok() {
-            merge_delivered_dir(&from, &to, Arc::clone(&counters)).map(|_| ())
+            merge_delivered_dir(
+                None,
+                &from,
+                &to,
+                Arc::clone(&counters),
+                &HashSet::new(),
+                &mut Vec::new(),
+            )
+            .map(|_| ())
         } else {
             let bytes = entry.metadata().map_or(0, |metadata| metadata.len());
             move_entry(&from, &to, bytes, Arc::clone(&counters))
@@ -422,12 +526,17 @@ where
 
 // Move what `src` holds into `dst` when both are real directories, entry by
 // entry, a directory both hold joined the same way. An entry whose name is
-// already taken in `dst` stays where it is. Whether they were directories
-// to join.
+// already taken in `dst` stays where it is, but one of `again`, a name whose
+// copy found no room before: what stands under it is that copy cut short,
+// and gives way. A name whose copy finds no room now is added to
+// `cut_short`. Whether they were directories to join.
 fn merge_delivered_dir(
+    renames: Option<&Renames>,
     src: &std::path::Path,
     dst: &std::path::Path,
     phase_counters: Arc<PhaseCounters>,
+    again: &HashSet<PathBuf>,
+    cut_short: &mut Vec<PathBuf>,
 ) -> Result<bool, (std::io::Error, std::io::Error)> {
     let real_dir = |path: &std::path::Path| {
         std::fs::symlink_metadata(path)
@@ -445,37 +554,117 @@ fn merge_delivered_dir(
     for entry in std::fs::read_dir(src).map_err(unread)? {
         let entry = entry.map_err(unread)?;
         let (from, to) = (entry.path(), dst.join(entry.file_name()));
-        if std::fs::symlink_metadata(&to).is_ok() {
-            merge_delivered_dir(&from, &to, Arc::clone(&phase_counters))?;
+        let retried = again.contains(&to);
+        if !retried && std::fs::symlink_metadata(&to).is_ok() {
+            merge_delivered_dir(
+                renames,
+                &from,
+                &to,
+                Arc::clone(&phase_counters),
+                again,
+                cut_short,
+            )?;
             continue;
         }
         let bytes = std::fs::symlink_metadata(&from)
             .ok()
             .filter(std::fs::Metadata::is_file)
             .map_or(0, |metadata| metadata.len());
-        move_path_with_safe_rename_or_copy_fallback(
-            &from,
-            &to,
-            bytes,
-            Arc::clone(&phase_counters),
-        )?;
+        let counters = Arc::clone(&phase_counters);
+        let moved = if retried {
+            move_delivered_entry(renames, &from, &to, bytes, counters, true)
+        } else {
+            move_path_through(renames, &from, &to, bytes, counters)
+        };
+        moved.inspect_err(|(_, copy_err)| {
+            if crate::operations::is_out_of_space(copy_err) {
+                cut_short.push(to.clone());
+            }
+        })?;
     }
     let _ = std::fs::remove_dir(src);
     Ok(true)
 }
 
+// Whether an entry's move failed because its destination had no room, in
+// the rename or in the copy that stood in for it.
+fn entry_found_no_room(rename_err: &std::io::Error, copy_err: &std::io::Error) -> bool {
+    crate::operations::is_out_of_space(rename_err) || crate::operations::is_out_of_space(copy_err)
+}
+
+// Whether the entry's move was refused by a quota, not by the disk.
+fn entry_found_quota(rename_err: &std::io::Error, copy_err: &std::io::Error) -> bool {
+    crate::operations::is_quota_exceeded(rename_err)
+        || crate::operations::is_quota_exceeded(copy_err)
+}
+
+// What an entry whose copy found no room still has to deliver: the bytes
+// left under it, since a copy takes each file out of the source as it
+// lands. An entry whose rename was refused for room copied nothing and took
+// nothing out, so it adds nothing to what the move waits for.
+async fn left_to_copy(src: &std::path::Path, copy_err: &std::io::Error) -> u64 {
+    if !crate::operations::is_out_of_space(copy_err) {
+        return 0;
+    }
+    fn under(path: &std::path::Path) -> u64 {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if metadata.is_file() {
+            return metadata.len();
+        }
+        if !metadata.is_dir() {
+            return 0;
+        }
+        std::fs::read_dir(path).map_or(0, |entries| {
+            entries
+                .flatten()
+                .fold(0u64, |sum, entry| sum.saturating_add(under(&entry.path())))
+        })
+    }
+    let src = src.to_path_buf();
+    crate::runtime::panic_trap::spawn_blocking(move || under(&src))
+        .await
+        .unwrap_or(0)
+}
+
 fn move_delivered_entry(
+    renames: Option<&Renames>,
     src: &std::path::Path,
     dst: &std::path::Path,
     source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
     resumed: bool,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
+    #[cfg(test)]
+    {
+        let mut room = DESTINATION_ROOM.lock().unwrap();
+        match room.as_mut() {
+            Some(0) => {
+                // The copy writes until the disk is full, then removes what
+                // it wrote, as the copy that stands in for a rename does.
+                if std::fs::symlink_metadata(dst).is_err()
+                    && let Ok(bytes) = std::fs::read(src)
+                {
+                    let _ = std::fs::write(dst, &bytes[..bytes.len() / 2]);
+                    if !PARTIAL_STAYS.load(Ordering::Acquire) {
+                        let _ = std::fs::remove_file(dst);
+                    }
+                }
+                return Err((
+                    std::io::Error::from(std::io::ErrorKind::CrossesDevices),
+                    std::io::Error::from(std::io::ErrorKind::StorageFull),
+                ));
+            }
+            Some(left) => *left -= 1,
+            None => {}
+        }
+    }
     let interrupted = resumed
         && std::fs::symlink_metadata(dst).is_ok()
         && !runtime_fs::paths_equivalent_for_placement(src, dst);
     if !interrupted {
-        return move_path_with_safe_rename_or_copy_fallback(src, dst, source_bytes, phase_counters);
+        return move_path_through(renames, src, dst, source_bytes, phase_counters);
     }
     let not_cleared = |error: std::io::Error| {
         (
@@ -493,6 +682,7 @@ fn move_delivered_entry(
         for entry in std::fs::read_dir(src).map_err(not_cleared)? {
             let entry = entry.map_err(not_cleared)?;
             move_delivered_entry(
+                renames,
                 &entry.path(),
                 &dst.join(entry.file_name()),
                 0,
@@ -507,7 +697,7 @@ fn move_delivered_entry(
     } else {
         std::fs::remove_file(dst).map_err(not_cleared)?;
     }
-    move_path_with_safe_rename_or_copy_fallback(src, dst, source_bytes, phase_counters)
+    move_path_through(renames, src, dst, source_bytes, phase_counters)
 }
 
 async fn validate_script_move_destination(
@@ -547,17 +737,25 @@ async fn validate_script_move_destination(
 // lane that closed before running it, fails the move before any file has
 // left the working directory, and the still-empty claim is given back.
 async fn moving_row_committed(
-    durable: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    durable: tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>,
     dest: &std::path::Path,
 ) -> Result<(), MoveToCompleteFailure> {
-    let outcome = durable
-        .await
-        .unwrap_or_else(|_| Err("the database writer closed before it ran".into()));
+    let outcome = durable.await.unwrap_or_else(|_| {
+        Err(crate::persistence::error::WriteFailed::other(
+            "the database writer closed before it ran",
+        ))
+    });
     if let Err(error) = outcome {
         let _ = tokio::fs::remove_dir(dest).await;
-        return Err(MoveToCompleteFailure::Operational(format!(
-            "could not record the move before starting it: {error}"
-        )));
+        let message = format!("could not record the move before starting it: {error}");
+        // The database's disk had no room for the row: the job waits for
+        // room there and records the move again. Any other failure of the
+        // write fails the move.
+        return Err(if error.out_of_space {
+            MoveToCompleteFailure::RowFull(message)
+        } else {
+            MoveToCompleteFailure::Operational(message)
+        });
     }
     Ok(())
 }
@@ -570,6 +768,38 @@ pub(crate) type MoveHook = Box<dyn FnOnce(JobId) + Send>;
 pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<MoveHook>> =
     std::sync::Mutex::new(None);
 
+// A destination that fills: how many more entries it has room for. Each
+// entry past that finds no room and leaves nothing of itself there, as the
+// copy does, which removes what it wrote.
+#[cfg(test)]
+pub(crate) static DESTINATION_ROOM: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+// The copy that finds no room leaves what it wrote in the destination, as a
+// copy stopped before it could remove it does.
+#[cfg(test)]
+pub(crate) static PARTIAL_STAYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// A disk with no room for the category folder or the job's own: claiming a
+// destination finds it full while this is set.
+#[cfg(test)]
+pub(crate) static CLAIM_FULL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Why a destination could not be claimed.
+#[derive(Debug)]
+pub(in crate::pipeline) enum ClaimFailure {
+    // The disk had no room for the folder: the job waits for room on the
+    // disk `path` lies on, the nearest folder above it that exists.
+    // `quota` says a quota refused it, not the disk.
+    Full {
+        path: PathBuf,
+        message: String,
+        quota: bool,
+    },
+    Other(String),
+}
+
 #[cfg(test)]
 pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
 
@@ -579,12 +809,17 @@ pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
 pub(crate) static BEFORE_SPENT_REMOVAL: std::sync::Mutex<Option<SpentHook>> =
     std::sync::Mutex::new(None);
 
-// Where a final move delivers: a directory it claimed empty, or the one
-// the moving row of a job interrupted by a restart names, which already
-// holds what moved before the restart.
+// Where a final move delivers: a directory it claimed empty, the one the
+// moving row of a job interrupted by a restart names, which already holds
+// what moved before the restart, or the one a move that waited for room
+// goes on into. A move that waited was not cut short: every copy that failed
+// removed what it wrote, so a name the destination holds is whole, and the
+// working directory's entries meet it as a first move's do.
 enum MoveInto {
     Claimed(PathBuf),
     Resumed(PathBuf),
+    // With the names whose copy found no room before the wait.
+    Held(PathBuf, HashSet<PathBuf>),
 }
 
 // What a final move's task is given.
@@ -595,7 +830,11 @@ struct FinalMove {
     dest: PathBuf,
     // Answers once the moving row has committed. A resumed move has none:
     // its row was already moving when it was read.
-    durable: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    durable:
+        Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>,
+    // The move goes on after a wait for room, not after a restart: the
+    // names whose copy found no room before it.
+    held: Option<HashSet<PathBuf>>,
     script_validation: Option<(
         crate::Database,
         crate::post_processing::runner::JobExecutionContext,
@@ -618,6 +857,7 @@ async fn run_move_to_complete(
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
     left_behind: HashSet<PathBuf>,
+    renames: Option<Renames>,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     let claimed_dest = dest.clone();
     let result = run_move_to_claimed_destination(
@@ -629,9 +869,14 @@ async fn run_move_to_complete(
         naming,
         policy_source,
         left_behind,
+        renames,
     )
     .await;
-    if result.is_err() {
+    // A move that waits for room goes on into its claim, even an empty one.
+    if result
+        .as_ref()
+        .is_err_and(|error| !matches!(error, MoveToCompleteFailure::OutOfSpace { .. }))
+    {
         // The actor exclusively created this directory before launching the
         // worker. Remove the abandoned claim only when it is still empty;
         // partial output is deliberately retained for diagnosis and retry.
@@ -652,11 +897,24 @@ async fn run_move_to_claimed_destination(
     // Consumed inputs that could not be removed: they stay in the working
     // directory and are neither scanned nor moved.
     left_behind: HashSet<PathBuf>,
+    // The writer of the destination's volume, which makes each rename into
+    // it. None for a move made where it is called.
+    renames: Option<Renames>,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
-    let (dest, resumed) = match dest {
-        MoveInto::Claimed(dest) => (dest, false),
-        MoveInto::Resumed(dest) => (dest, true),
+    // Whether the destination may already hold entries, and whether an
+    // entry of the working directory replaces one of its name there: only
+    // after a restart, when that one is a copy cut short. The staging
+    // directory goes first into an empty destination, so a name of its own
+    // it meets there is always its own, part moved.
+    // `again` are the names whose copy found no room before a wait: each
+    // is replaced from the working directory whatever the destination holds
+    // under it, since a copy cut short may have left part of itself there.
+    let (dest, resumed, replaces, again) = match dest {
+        MoveInto::Claimed(dest) => (dest, false, false, HashSet::new()),
+        MoveInto::Resumed(dest) => (dest, true, true, HashSet::new()),
+        MoveInto::Held(dest, again) => (dest, true, false, again),
     };
+    let again = Arc::new(again);
     let policy = match policy_source {
         DeliveryPolicySource::Persisted(database) => {
             crate::runtime::panic_trap::spawn_blocking(move || database.post_processing_settings())
@@ -734,6 +992,13 @@ async fn run_move_to_claimed_destination(
 
     let mut moved = 0u32;
     let mut failures = Vec::new();
+    // Whether an entry failed for want of room at the destination, and what
+    // those entries hold: what the move needs free to go on.
+    let mut full = false;
+    let mut quota = false;
+    let mut needs = 0u64;
+    // The names in the destination whose copy found no room this time.
+    let mut cut_short: Vec<PathBuf> = Vec::new();
 
     if let Some(ref staging) = staging_dir
         && let Ok(mut entries) = tokio::fs::read_dir(staging).await
@@ -763,8 +1028,16 @@ async fn run_move_to_claimed_destination(
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
+            let through = renames.clone();
             match crate::runtime::panic_trap::spawn_blocking(move || {
-                move_delivered_entry(&src_fb, &dst_fb, source_bytes, counters, resumed)
+                move_delivered_entry(
+                    through.as_ref(),
+                    &src_fb,
+                    &dst_fb,
+                    source_bytes,
+                    counters,
+                    resumed,
+                )
             })
             .await
             {
@@ -772,6 +1045,14 @@ async fn run_move_to_claimed_destination(
                     moved += 1;
                 }
                 Ok(Err((rename_err, copy_err))) => {
+                    if entry_found_no_room(&rename_err, &copy_err) {
+                        full = true;
+                        quota |= entry_found_quota(&rename_err, &copy_err);
+                        needs = needs.saturating_add(left_to_copy(&src, &copy_err).await);
+                        if crate::operations::is_out_of_space(&copy_err) {
+                            cut_short.push(dst.clone());
+                        }
+                    }
                     failures.push(format!(
                         "{}: rename failed: {}; fallback failed: {}",
                         file_name.to_string_lossy(),
@@ -805,26 +1086,52 @@ async fn run_move_to_claimed_destination(
                 continue;
             }
             let dst = dest.join(&file_name);
-            if !resumed && dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
+            if !replaces
+                && !again.contains(&dst)
+                && dst.exists()
+                && !runtime_fs::paths_equivalent_for_placement(&src, &dst)
+            {
                 // A directory the staging directory delivered first, which
                 // the working directory also holds delivered files of: they
                 // join it, and a name the staging directory already filled
                 // keeps what it holds.
                 let counters = Arc::clone(&phase_counters);
                 let (src_fb, dst_fb) = (src.clone(), dst.clone());
-                match crate::runtime::panic_trap::spawn_blocking(move || {
-                    merge_delivered_dir(&src_fb, &dst_fb, counters)
+                let through = renames.clone();
+                let again = Arc::clone(&again);
+                let joined = crate::runtime::panic_trap::spawn_blocking(move || {
+                    let mut cut_short = Vec::new();
+                    let joined = merge_delivered_dir(
+                        through.as_ref(),
+                        &src_fb,
+                        &dst_fb,
+                        counters,
+                        &again,
+                        &mut cut_short,
+                    );
+                    (joined, cut_short)
                 })
                 .await
-                {
+                .map(|(joined, names)| {
+                    cut_short.extend(names);
+                    joined
+                });
+                match joined {
                     Ok(Ok(true)) => moved += 1,
                     Ok(Ok(false)) => {}
-                    Ok(Err((rename_err, copy_err))) => failures.push(format!(
-                        "{}: rename failed: {}; fallback failed: {}",
-                        file_name.to_string_lossy(),
-                        rename_err,
-                        copy_err
-                    )),
+                    Ok(Err((rename_err, copy_err))) => {
+                        if entry_found_no_room(&rename_err, &copy_err) {
+                            full = true;
+                            quota |= entry_found_quota(&rename_err, &copy_err);
+                            needs = needs.saturating_add(left_to_copy(&src, &copy_err).await);
+                        }
+                        failures.push(format!(
+                            "{}: rename failed: {}; fallback failed: {}",
+                            file_name.to_string_lossy(),
+                            rename_err,
+                            copy_err
+                        ));
+                    }
                     Err(join_err) => failures.push(format!(
                         "{}: move task failed: {}",
                         file_name.to_string_lossy(),
@@ -837,8 +1144,16 @@ async fn run_move_to_claimed_destination(
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
+            let through = renames.clone();
             match crate::runtime::panic_trap::spawn_blocking(move || {
-                move_delivered_entry(&src_fb, &dst_fb, source_bytes, counters, resumed)
+                move_delivered_entry(
+                    through.as_ref(),
+                    &src_fb,
+                    &dst_fb,
+                    source_bytes,
+                    counters,
+                    resumed,
+                )
             })
             .await
             {
@@ -846,6 +1161,14 @@ async fn run_move_to_claimed_destination(
                     moved += 1;
                 }
                 Ok(Err((rename_err, copy_err))) => {
+                    if entry_found_no_room(&rename_err, &copy_err) {
+                        full = true;
+                        quota |= entry_found_quota(&rename_err, &copy_err);
+                        needs = needs.saturating_add(left_to_copy(&src, &copy_err).await);
+                        if crate::operations::is_out_of_space(&copy_err) {
+                            cut_short.push(dst.clone());
+                        }
+                    }
                     failures.push(format!(
                         "{}: rename failed: {}; fallback failed: {}",
                         file_name.to_string_lossy(),
@@ -868,12 +1191,28 @@ async fn run_move_to_claimed_destination(
         for failure in &failures {
             warn!(job_id = job_id.0, error = %failure, "failed to move entry to complete directory");
         }
-        return Err(MoveToCompleteFailure::Operational(format!(
+        let message = format!(
             "failed to move {} entr{} to complete directory: {}",
             failures.len(),
             if failures.len() == 1 { "y" } else { "ies" },
             failures[0]
-        )));
+        );
+        // An entry the destination had no room for: the job waits for room
+        // on the destination's disk, and the move goes on from what it left.
+        return Err(if full {
+            // The names cut short before this attempt stay with those cut
+            // short in it: one not reached this time is still to replace.
+            cut_short.extend(again.iter().cloned());
+            MoveToCompleteFailure::OutOfSpace {
+                path: dest,
+                message,
+                needs,
+                again: cut_short,
+                quota,
+            }
+        } else {
+            MoveToCompleteFailure::Operational(message)
+        });
     }
 
     // Both delivery routes have landed in `dest` and nothing else will be added
@@ -913,7 +1252,7 @@ async fn run_move_to_claimed_destination(
 
     let output_dir = dest.clone();
     match crate::runtime::panic_trap::spawn_blocking(move || {
-        mark_weaver_owned_output_dir(&output_dir)
+        mark_weaver_owned_output_dir(&output_dir, job_id)
     })
     .await
     {
@@ -1051,6 +1390,10 @@ async fn claim_complete_destination_path(
     job_id: JobId,
     reserved: &HashSet<PathBuf>,
 ) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    if CLAIM_FULL.load(Ordering::Acquire) {
+        return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    }
     tokio::fs::create_dir_all(parent).await?;
 
     let mut attempt = 0u32;
@@ -1207,10 +1550,11 @@ impl Pipeline {
         job_id: JobId,
         dir_name: &str,
         category: Option<&str>,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, ClaimFailure> {
         let parent = {
             let cfg = self.config.read().await;
-            complete_parent_for_category(&self.complete_dir, &cfg.categories, category)?
+            complete_parent_for_category(&self.complete_dir, &cfg.categories, category)
+                .map_err(ClaimFailure::Other)?
         };
         let reserved: HashSet<PathBuf> = self
             .reserved_complete_destinations
@@ -1218,14 +1562,32 @@ impl Pipeline {
             .filter(|(reserved_job_id, _)| **reserved_job_id != job_id)
             .map(|(_, path)| path.clone())
             .collect();
-        claim_complete_destination_path(&parent, dir_name, job_id, &reserved)
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to reserve a complete directory under {}: {error}",
-                    parent.display()
-                )
-            })
+        let error =
+            match claim_complete_destination_path(&parent, dir_name, job_id, &reserved).await {
+                Ok(dest) => return Ok(dest),
+                Err(error) => error,
+            };
+        let message = format!(
+            "failed to reserve a complete directory under {}: {error}",
+            parent.display()
+        );
+        if !crate::operations::is_out_of_space(&error) {
+            return Err(ClaimFailure::Other(message));
+        }
+        // The folder that could not be made may not exist: the disk to wait
+        // on is that of the nearest folder above it that does.
+        let mut path = parent.as_path();
+        while tokio::fs::symlink_metadata(path).await.is_err() {
+            match path.parent() {
+                Some(above) => path = above,
+                None => break,
+            }
+        }
+        Err(ClaimFailure::Full {
+            path: path.to_path_buf(),
+            message,
+            quota: crate::operations::is_quota_exceeded(&error),
+        })
     }
 
     // Resolves everything the delivery rename pass needs, on this task, before
@@ -1287,7 +1649,8 @@ impl Pipeline {
         job_id: JobId,
         hold: Option<&'static str>,
     ) -> Result<(), String> {
-        if self.inflight_moves.contains(&job_id) {
+        // A job held for room in its move starts it again only when let go.
+        if self.inflight_moves.contains(&job_id) || self.held_for_full_disk(job_id) {
             return Ok(());
         }
         if self.shared_state.is_post_processing_paused() {
@@ -1308,7 +1671,7 @@ impl Pipeline {
         // An intent recorded before this boundary must hold the move.
         self.report_job(job_id);
         let (move_allowed, paused) = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.job_mut(job_id) else {
+            let Some(mut row) = inner.job_mut(job_id) else {
                 return crate::pipeline::queue::Change::unchanged((false, false));
             };
             if row.intents.cancelled.is_some() {
@@ -1342,6 +1705,33 @@ impl Pipeline {
             .transpose()
             .map_err(str::to_owned)?
             .unwrap_or_default();
+        // Those closes, and every write before them, go through the volumes'
+        // writers. Nothing is removed or moved until the last of them has
+        // returned and none failed. The loop does not wait for that here:
+        // the delivery steps back, and starts again when the job's mail
+        // says the operations returned. One that failed says so in the
+        // same mail, after it returned: a refused name skips its member
+        // and the delivery is judged again, and anything else fails the
+        // job with its own error, once.
+        if let Some(barrier) = self
+            .graph_jobs
+            .get(&job_id)
+            .and_then(|graph| graph.disk_barrier())
+            && !barrier.passed_or_tell(job_id, &self.graph_runs.written())
+        {
+            self.moves_awaiting_disk.insert(job_id, barrier);
+            self.shared_state
+                .queue
+                .write(|inner| match inner.job_mut(job_id) {
+                    Some(mut row) => {
+                        row.report.moving = false;
+                        crate::pipeline::queue::Change::changed(())
+                    }
+                    None => crate::pipeline::queue::Change::unchanged(()),
+                });
+            return Ok(());
+        }
+        self.moves_awaiting_disk.remove(&job_id);
         #[cfg(test)]
         {
             let hook = BEFORE_SPENT_REMOVAL.lock().unwrap().take();
@@ -1370,7 +1760,21 @@ impl Pipeline {
                 }
             }
         }
+        self.launch_move(job_id, hold, left_behind).await
+    }
 
+    // The move's destination is claimed and its task started. A disk with
+    // no room for the destination's folder holds the job for room there,
+    // and the job comes back here, with the inputs it leaves, once let go.
+    pub(in crate::pipeline) async fn launch_move(
+        &mut self,
+        job_id: JobId,
+        hold: Option<&'static str>,
+        left_behind: HashSet<PathBuf>,
+    ) -> Result<(), String> {
+        // A job let go in its download on the room its step needed has
+        // taken that room by the time it moves: it is promised no longer.
+        self.end_full_disk_promise(job_id);
         let (working_dir, staging_dir, job_name, folder_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return Err(format!("job {} not found for final move", job_id.0));
@@ -1419,11 +1823,30 @@ impl Pipeline {
             }
             (path, Some((self.db.clone(), context)))
         } else {
-            (
-                self.claim_complete_destination(job_id, &folder_name, category.as_deref())
-                    .await?,
-                None,
-            )
+            match self
+                .claim_complete_destination(job_id, &folder_name, category.as_deref())
+                .await
+            {
+                Ok(dest) => (dest, None),
+                Err(ClaimFailure::Other(error)) => return Err(error),
+                Err(ClaimFailure::Full {
+                    path,
+                    message,
+                    quota,
+                }) => {
+                    self.hold_move_for_full_disk(
+                        job_id,
+                        Stage::Claim(left_behind),
+                        &path,
+                        &message,
+                        Wants {
+                            quota,
+                            ..Wants::default()
+                        },
+                    );
+                    return Ok(());
+                }
+            }
         };
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);
@@ -1443,19 +1866,20 @@ impl Pipeline {
                 .collect();
             kept.sort();
             state.delivery_left_behind = kept;
+            // And where the move comes from, so a restart goes on from
+            // there whatever the temp folder is by then.
+            state.delivery_source = Some(working_dir.clone());
         }
         // The moving row, naming `dest`, must be durable before the first file
         // leaves the working directory: a restart then finds the delivery and
-        // never fetches the job again. SABnzbd keeps a finished download in
-        // its saved postprocessor queue (sabnzbd/postproc.py:144) and marks it
-        // moving before the first file moves (sabnzbd/postproc.py:517);
-        // NZBGet writes the post stage into its queue file
-        // (daemon/queue/DiskState.cpp:552).
+        // never fetches the job again.
         let durable = self
             .transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"))
             .unwrap_or_else(|| {
                 let (failed, durable) = tokio::sync::oneshot::channel();
-                let _ = failed.send(Err("the write could not be queued".into()));
+                let _ = failed.send(Err(crate::persistence::error::WriteFailed::other(
+                    "the write could not be queued",
+                )));
                 durable
             });
         self.inflight_moves.insert(job_id);
@@ -1470,6 +1894,7 @@ impl Pipeline {
             staging_dir,
             dest,
             durable: Some(durable),
+            held: None,
             script_validation,
             hold,
             phase_counters,
@@ -1496,8 +1921,20 @@ impl Pipeline {
         let category = state.spec.category.clone();
         let root = self.intermediate_dir.clone();
         let named = recorded.clone();
+        // Where the moving row says the move comes from. While that
+        // directory stands the move had not finished, wherever the temp
+        // folder points now and whether or not it carries the job's marker:
+        // nothing is looked for. A row from before this was kept has none,
+        // and its working directory is looked for by its marker.
+        let kept = state.delivery_source.clone();
         let found = tokio::task::spawn_blocking(move || {
-            let source = crate::jobs::working_dir::find_job_working_dir(&root, job_id)?;
+            let kept = kept.filter(|dir| {
+                std::fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+            });
+            let source = match kept {
+                Some(dir) => Some(dir),
+                None => crate::jobs::working_dir::find_job_working_dir(&root, job_id)?,
+            };
             let own = source.as_ref() == Some(&named)
                 || crate::jobs::working_dir::is_job_working_dir(&root, &named, job_id)?;
             Ok::<_, std::io::Error>((source, own))
@@ -1527,8 +1964,27 @@ impl Pipeline {
                 .await
             {
                 Ok(dest) => dest,
-                Err(error) => {
+                Err(ClaimFailure::Other(error)) => {
                     self.fail_job(job_id, error);
+                    return;
+                }
+                // No room for the destination's folder: the job waits for
+                // room there, and comes back here once let go.
+                Err(ClaimFailure::Full {
+                    path,
+                    message,
+                    quota,
+                }) => {
+                    self.hold_move_for_full_disk(
+                        job_id,
+                        Stage::Restored,
+                        &path,
+                        &message,
+                        Wants {
+                            quota,
+                            ..Wants::default()
+                        },
+                    );
                     return;
                 }
             }
@@ -1573,8 +2029,72 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.working_dir = working_dir.clone();
         }
+        self.resume_move_into(job_id, working_dir, staging_dir, dest, job_name, None)
+            .await;
+    }
+
+    // A job let go from a wait for room in its final move goes on with it,
+    // from the working directory it has into the destination the move had
+    // claimed, both as the job knew them when the move stopped: nothing is
+    // looked for, and a destination that is there is never taken for a move
+    // that finished, since the wait is the proof it had not.
+    pub(in crate::pipeline) async fn resume_held_move(
+        &mut self,
+        job_id: JobId,
+        dest: PathBuf,
+        again: HashSet<PathBuf>,
+    ) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let working_dir = state.working_dir.clone();
+        let staging_dir = state.staging_dir.clone();
+        let job_name = state.spec.name.clone();
+        // A destination removed while the job waited is made again: the
+        // move delivers what the job still has.
+        if let Err(error) = tokio::fs::create_dir_all(&dest).await {
+            let message = format!(
+                "could not make the destination {} again: {error}",
+                dest.display()
+            );
+            if crate::operations::is_out_of_space(&error) {
+                let path = dest.parent().unwrap_or(&dest).to_path_buf();
+                self.hold_move_for_full_disk(
+                    job_id,
+                    Stage::Moving(dest, again),
+                    &path,
+                    &message,
+                    Wants::of(&error, None),
+                );
+            } else {
+                self.fail_job(job_id, message);
+            }
+            return;
+        }
+        self.resume_move_into(
+            job_id,
+            working_dir,
+            staging_dir,
+            dest,
+            job_name,
+            Some(again),
+        )
+        .await;
+    }
+
+    // The move of a job whose row already says moving starts again into
+    // `dest`: after a restart, or (`held`) after a wait for room.
+    async fn resume_move_into(
+        &mut self,
+        job_id: JobId,
+        working_dir: PathBuf,
+        staging_dir: Option<PathBuf>,
+        dest: PathBuf,
+        job_name: String,
+        held: Option<HashSet<PathBuf>>,
+    ) {
         self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.job_mut(job_id) else {
+            let Some(mut row) = inner.job_mut(job_id) else {
                 return crate::pipeline::queue::Change::unchanged(());
             };
             row.report.moving = true;
@@ -1589,7 +2109,8 @@ impl Pipeline {
         info!(
             job_id = job_id.0,
             dest = %dest.display(),
-            "resuming final move after a restart"
+            held = held.is_some(),
+            "resuming final move"
         );
         let naming = self.delivery_naming_plan(job_id, &job_name).await;
         // The consumed inputs the move was told to leave before the restart
@@ -1611,6 +2132,7 @@ impl Pipeline {
             staging_dir,
             dest,
             durable: None,
+            held,
             script_validation: None,
             hold: None,
             phase_counters,
@@ -1627,6 +2149,7 @@ impl Pipeline {
             staging_dir,
             dest,
             durable,
+            held,
             script_validation,
             hold,
             phase_counters,
@@ -1635,6 +2158,10 @@ impl Pipeline {
             left_behind,
         } = final_move;
         let move_done_tx = self.move_done_tx.clone();
+        let (writers, capacity) = (
+            Arc::clone(&self.volume_writers),
+            Arc::clone(&self.storage_capacity),
+        );
         debug!(
             job_id = job_id.0,
             dest = %dest.display(),
@@ -1658,7 +2185,10 @@ impl Pipeline {
                         moving_row_committed(durable, &dest).await?;
                         MoveInto::Claimed(dest.clone())
                     }
-                    None => MoveInto::Resumed(dest.clone()),
+                    None => match held {
+                        Some(again) => MoveInto::Held(dest.clone(), again),
+                        None => MoveInto::Resumed(dest.clone()),
+                    },
                 };
                 #[cfg(test)]
                 {
@@ -1670,6 +2200,19 @@ impl Pipeline {
                 if let Some((db, context)) = script_validation {
                     validate_script_move_destination(db, context, &dest).await?;
                 }
+                // The destination's volume is found off the loop, and its
+                // writer makes the renames into it. With none found the
+                // mover makes them itself.
+                // The volume is asked by the directory the destination is
+                // made in, one of a few, so the volumes remember no path
+                // per job.
+                let landing = dest.parent().unwrap_or(&dest).to_path_buf();
+                let renames = crate::runtime::panic_trap::spawn_blocking(move || {
+                    let volume = capacity.read_volume(&landing);
+                    Renames::through(writers.submitter(&volume, job_id.0))
+                })
+                .await
+                .ok();
                 match into {
                     MoveInto::Claimed(dest) => {
                         run_move_to_complete(
@@ -1681,6 +2224,7 @@ impl Pipeline {
                             naming,
                             policy_source,
                             left_behind,
+                            renames,
                         )
                         .await
                     }
@@ -1694,6 +2238,7 @@ impl Pipeline {
                             naming,
                             policy_source,
                             left_behind,
+                            renames,
                         )
                         .await
                     }
@@ -1735,6 +2280,8 @@ impl Pipeline {
         self.phase_end(job_id, JobPhase::Moving);
         self.inflight_moves.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
+        // The move ended: the room it was let go on is promised no longer.
+        self.end_full_disk_promise(job_id);
 
         match result {
             Ok(outcome) => {
@@ -1768,6 +2315,55 @@ impl Pipeline {
                 self.fail_delivery_security_check(job_id, error);
             }
             Err(MoveToCompleteFailure::Operational(error)) => self.fail_job(job_id, error),
+            Err(MoveToCompleteFailure::RowFull(message)) => {
+                // Nothing moved and the claim was given back: the job waits
+                // on the database's disk, and when let go claims its
+                // destination and records the move again, as a move whose
+                // claim found no room does. The write names no figure: what
+                // the database needs to take a row is its own to know, so
+                // the job waits for the free figure to rise by the reserve.
+                let left_behind = self
+                    .jobs
+                    .get(&job_id)
+                    .map(|state| {
+                        state
+                            .delivery_left_behind
+                            .iter()
+                            .map(|path| state.working_dir.join(path))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let data_dir = self.database_dir();
+                self.hold_move_for_full_disk(
+                    job_id,
+                    Stage::Claim(left_behind),
+                    &data_dir,
+                    &message,
+                    Wants::default(),
+                );
+            }
+            Err(MoveToCompleteFailure::OutOfSpace {
+                path,
+                message,
+                needs,
+                again,
+                quota,
+            }) => {
+                // What the entries that found no room still hold in the
+                // working directory is what the move needs free; an entry
+                // refused before it copied anything names no figure.
+                self.hold_move_for_full_disk(
+                    job_id,
+                    Stage::Moving(dest, again.into_iter().collect()),
+                    &path,
+                    &message,
+                    Wants {
+                        needs: (needs > 0).then_some(needs),
+                        left: None,
+                        quota,
+                    },
+                );
+            }
         }
     }
 
@@ -1950,10 +2546,15 @@ impl Pipeline {
             0
         };
         let delivered = verdict.filter(|_| pipeline_failure_stage.is_none());
-        let left_behind = self
+        let (left_behind, source) = self
             .jobs
             .get(&job_id)
-            .map(|state| state.delivery_left_behind.clone())
+            .map(|state| {
+                (
+                    state.delivery_left_behind.clone(),
+                    state.delivery_source.clone(),
+                )
+            })
             .unwrap_or_default();
         crate::post_processing::model::PostProcessingFacts {
             outcome,
@@ -1961,6 +2562,7 @@ impl Pipeline {
             unpack_status,
             delivered,
             left_behind,
+            source,
         }
     }
 

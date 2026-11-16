@@ -28,11 +28,23 @@ enum UuPlacement {
 pub(in crate::pipeline) struct SegmentWriteError {
     file_id: NzbFileId,
     source: io::Error,
+    // The size of the write that was refused, where the site knows it.
+    refused: Option<u64>,
 }
 
 impl SegmentWriteError {
-    fn new(file_id: NzbFileId, source: io::Error) -> Self {
-        Self { file_id, source }
+    pub(in crate::pipeline) fn new(file_id: NzbFileId, source: io::Error) -> Self {
+        Self {
+            file_id,
+            source,
+            refused: None,
+        }
+    }
+
+    // The write that failed was of `bytes`.
+    pub(in crate::pipeline) fn of_bytes(mut self, bytes: usize) -> Self {
+        self.refused = Some(bytes as u64);
+        self
     }
 }
 
@@ -50,10 +62,18 @@ impl std::error::Error for SegmentWriteError {
 
 impl Pipeline {
     // Whether a download or decode result for the job is still taken: the job
-    // is here, has not ended, and is not publishing what it delivered. Once
-    // the final move begins, cleanup has chosen what the delivery holds, and
-    // a late duplicate must not make an input file again.
+    // still downloads, and is not held for a full disk. A held job has no
+    // graph to take a result, and fetches again from its last checkpoint
+    // whatever is still out, so a result that comes back for it is dropped
+    // whole: not placed, and not counted.
     pub(in crate::pipeline) fn job_takes_results(&self, job_id: JobId) -> bool {
+        self.job_downloads(job_id) && !self.held_for_full_disk(job_id)
+    }
+
+    // Whether the job is here, has not ended, and is not publishing what it
+    // delivered. Once the final move begins, cleanup has chosen what the
+    // delivery holds, and a late duplicate must not make an input file again.
+    pub(in crate::pipeline) fn job_downloads(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
             !is_terminal_status(&state.status)
                 && !matches!(
@@ -117,14 +137,12 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn decode_retry_exclude_servers(
-        existing_excludes: &[usize],
+        existing_excludes: weaver_nntp::ServerSet,
         source_server_idx: Option<usize>,
-    ) -> Vec<usize> {
-        let mut exclude_servers = existing_excludes.to_vec();
-        if let Some(source_server_idx) = source_server_idx
-            && !exclude_servers.contains(&source_server_idx)
-        {
-            exclude_servers.push(source_server_idx);
+    ) -> weaver_nntp::ServerSet {
+        let mut exclude_servers = existing_excludes;
+        if let Some(source_server_idx) = source_server_idx {
+            exclude_servers.insert(source_server_idx);
         }
         exclude_servers
     }
@@ -152,11 +170,10 @@ impl Pipeline {
                 segment_id,
                 raw_size: _,
                 error,
-                source_server_idx,
-                exclude_servers,
+                servers,
             } => {
                 let _job = crate::runtime::panic_trap::JobScope::enter(segment_id.file_id.job_id);
-                self.handle_decode_failure(segment_id, &error, &exclude_servers, source_server_idx);
+                self.handle_decode_failure(segment_id, &error, servers);
             }
         }
 
@@ -204,7 +221,11 @@ impl Pipeline {
     // downloads, and the article holds another message-id, or has decode
     // retries left and a server that has not served it. With neither, none
     // configured among them, the damage stands as it came.
-    pub(crate) fn decode_retry_left(&mut self, segment_id: SegmentId, exclude: &[usize]) -> bool {
+    pub(crate) fn decode_retry_left(
+        &mut self,
+        segment_id: SegmentId,
+        exclude: weaver_nntp::ServerSet,
+    ) -> bool {
         let job_id = segment_id.file_id.job_id;
         if self
             .jobs
@@ -229,14 +250,20 @@ impl Pipeline {
     // body (immediately on a one-server setup) or `MAX_SEGMENT_RETRIES`
     // decode failures have accrued, the segment is marked permanently
     // failed and health is updated so repair can take over.
+    //
+    // `servers` are read as the current pool numbers them: a body fetched
+    // before a rebuild has its servers renumbered to the pool as it is now.
+    // Only one stamped under a layout no longer kept names no server, and
+    // its failure is retried on every server of the pool.
     pub(crate) fn handle_decode_failure(
         &mut self,
         segment_id: SegmentId,
         error: &str,
-        exclude_servers: &[usize],
-        source_server_idx: Option<usize>,
+        servers: PoolServers,
     ) {
         let job_id = segment_id.file_id.job_id;
+        let (source_server_idx, exclude_servers) =
+            servers.under(&self.pool_layouts, self.pool_generation);
 
         if !self.job_takes_results(job_id) {
             debug!(
@@ -276,7 +303,7 @@ impl Pipeline {
         // Re-queuing it would leave work no lane may serve sitting in the
         // queue forever while the job reports downloading at 0 B/s.
         let exclude = Self::decode_retry_exclude_servers(exclude_servers, source_server_idx);
-        let no_server_left = self.no_server_can_serve(job_id, &exclude);
+        let no_server_left = self.no_server_can_serve(job_id, exclude);
 
         if retry_count > MAX_SEGMENT_RETRIES || no_server_left {
             if no_server_left {
@@ -320,7 +347,7 @@ impl Pipeline {
                     retry_count: 0,
                     is_recovery: file_spec.role.is_recovery(),
                     completion_critical: self.segment_is_completion_critical(segment_id),
-                    exclude_servers: exclude.clone(),
+                    exclude_servers: exclude,
                     avoid_server: None,
                 };
                 self.metrics
@@ -402,7 +429,7 @@ impl Pipeline {
             segment_id.segment_number,
         );
         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-        self.handle_decode_failure(other_id, &error, &[], None);
+        self.handle_decode_failure(other_id, &error, PoolServers::none());
         true
     }
 
@@ -702,12 +729,7 @@ impl Pipeline {
                         );
                         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         drop(_cpu_scope);
-                        self.handle_decode_failure(
-                            segment_id,
-                            &error,
-                            &source.exclude_servers,
-                            source.source_server_idx,
-                        );
+                        self.handle_decode_failure(segment_id, &error, source.servers);
                         return;
                     }
                 }
@@ -823,12 +845,7 @@ impl Pipeline {
                     file_offset.saturating_add(u64::from(decoded_size)),
                 );
                 self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                self.handle_decode_failure(
-                    segment_id,
-                    &error,
-                    &source.exclude_servers,
-                    source.source_server_idx,
-                );
+                self.handle_decode_failure(segment_id, &error, source.servers);
                 return;
             }
 
@@ -836,13 +853,12 @@ impl Pipeline {
             // failed its checksum goes to another server while one remains,
             // and only the last server's copy stands as damage.
             if retain_damage
-                && self.decode_retry_left(
-                    segment_id,
-                    &Self::decode_retry_exclude_servers(
-                        &source.exclude_servers,
-                        source.source_server_idx,
-                    ),
-                )
+                && self.decode_retry_left(segment_id, {
+                    let (source_server_idx, excluded) = source
+                        .servers
+                        .under(&self.pool_layouts, self.pool_generation);
+                    Self::decode_retry_exclude_servers(excluded, source_server_idx)
+                })
             {
                 if !crc_valid {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
@@ -850,8 +866,7 @@ impl Pipeline {
                 self.handle_decode_failure(
                     segment_id,
                     "damaged yEnc article; another server is asked before its bytes stand",
-                    &source.exclude_servers,
-                    source.source_server_idx,
+                    source.servers,
                 );
                 return;
             }
@@ -867,6 +882,11 @@ impl Pipeline {
                 declared_part_end(expected_layout, yenc_layout),
                 segments,
             );
+            // The write of it found the disk full: the job is held, and the
+            // article is fetched and counted once the job runs on.
+            if self.held_for_full_disk(job_id) {
+                return;
+            }
             if retain_damage && !encoding.is_uu() {
                 // The damaged copy stands. Its extent, and the range its header
                 // named, still say where the part behind it begins.
@@ -955,15 +975,15 @@ impl Pipeline {
             return UuPlacement::Place(offset);
         }
 
-        if segment_number == uu.next_index {
+        if segment_number == uu.next_index.get() {
             let offset = uu.next_offset;
-            uu.next_index = uu.next_index.saturating_add(1);
+            uu.next_index.set(uu.next_index.get().saturating_add(1));
             uu.next_offset = uu.next_offset.saturating_add(decoded_len as u64);
             self.pass_given_up_uu(file_id);
             return UuPlacement::Place(offset);
         }
 
-        if segment_number < uu.next_index {
+        if segment_number < uu.next_index.get() {
             // Behind the cursor with no recorded placement: the cursor was
             // advanced past this ordinal because it failed permanently, and the
             // file was shifted to close the gap. Its bytes no longer have a
@@ -1029,7 +1049,7 @@ impl Pipeline {
                 io::Error::other(format!("UU spool task failed: {error}")),
             )
         })?
-        .map_err(|error| SegmentWriteError::new(file_id, error))?;
+        .map_err(|error| SegmentWriteError::new(file_id, error).of_bytes(decoded_bytes))?;
         Ok(entry)
     }
 
@@ -1056,6 +1076,17 @@ impl Pipeline {
             }
             match self.spill_job_parts(job_id).await {
                 Ok(()) => self.park_spilled_job(job_id),
+                // The spool had no room for a part: the job parks without
+                // it, and fetches it again once it resumes.
+                Err(error) if crate::operations::is_out_of_space(&error.source) => {
+                    warn!(
+                        job_id = job_id.0,
+                        file_id = %error.file_id,
+                        error = %error.source,
+                        "held part spool write found no room; the part is fetched again"
+                    );
+                    self.park_spilled_job(job_id);
+                }
                 Err(error) => self.fail_job_for_disk_write(error, "held part spool write failed"),
             }
         }
@@ -1125,10 +1156,7 @@ impl Pipeline {
             if !self.admit_spool_bytes(bytes) {
                 continue;
             }
-            let Some(parked) = self.unanchored_parked.get_mut(&file_id) else {
-                continue;
-            };
-            let Some(mut part) = parked.remove(&ordinal) else {
+            let Some(mut part) = self.unanchored_parked.remove(file_id, ordinal) else {
                 continue;
             };
             let ParkedBytes::Memory(data) = part.bytes else {
@@ -1138,10 +1166,7 @@ impl Pipeline {
             self.release_write_buffered(bytes, 1);
             part.bytes = spilled?;
             self.note_uu_spooled(bytes, 1);
-            self.unanchored_parked
-                .entry(file_id)
-                .or_default()
-                .insert(ordinal, part);
+            self.unanchored_parked.insert(file_id, ordinal, part);
         }
         Ok(())
     }
@@ -1160,6 +1185,18 @@ impl Pipeline {
                 {
                     warn!(path = %path.display(), %error, "could not remove a held part's spool file");
                 }
+            }
+        }
+    }
+
+    // Let a held part go as its job goes back to its checkpoint: its ledger
+    // is released, and a spooled part's file stays, for the checkpoint that
+    // may name it.
+    pub(in crate::pipeline) fn forget_parked_bytes(&mut self, bytes: ParkedBytes) {
+        match bytes {
+            ParkedBytes::Memory(data) => self.release_write_buffered(data.len_bytes(), 1),
+            ParkedBytes::Spilled { decoded_bytes, .. } => {
+                self.release_uu_spooled(decoded_bytes, 1);
             }
         }
     }
@@ -1272,8 +1309,7 @@ impl Pipeline {
         self.handle_decode_failure(
             segment_id,
             "uuencode reorder park displaced this segment repeatedly",
-            &[],
-            None,
+            PoolServers::none(),
         );
     }
 
@@ -1323,15 +1359,20 @@ impl Pipeline {
             .write_buffered_bytes
             .saturating_sub(replaced.unwrap_or(0))
             .saturating_add(bytes);
+        // A copy of a held part takes its place; anything else needs room in
+        // its file's share and in the park as a whole.
         let fits = (resident as u64) < write_soft
-            && (replaced.is_some() || parked_parts < self.uu_park_max_segments);
+            && (replaced.is_some()
+                || (parked_parts < self.uu_park_max_segments
+                    && self.unanchored_parked.parts() < self.unanchored_park_max_parts));
         if !fits {
             self.requeue_segment_awaiting_predecessor(segment_id);
             return;
         }
         let data = std::mem::replace(&mut result.data, DecodedChunk::from(Vec::<u8>::new()));
         self.note_write_buffered(bytes, 1);
-        let replaced = self.unanchored_parked.entry(file_id).or_default().insert(
+        let replaced = self.unanchored_parked.insert(
+            file_id,
             ordinal,
             UnanchoredPart {
                 result,
@@ -1382,15 +1423,11 @@ impl Pipeline {
         if !anchored {
             return None;
         }
-        let parked = self.unanchored_parked.get_mut(&file_id)?;
         let UnanchoredPart {
             mut result,
             bytes,
             source,
-        } = parked.remove(&successor)?;
-        if parked.is_empty() {
-            self.unanchored_parked.remove(&file_id);
-        }
+        } = self.unanchored_parked.remove(file_id, successor)?;
         match self.take_parked_bytes(file_id, bytes).await {
             Ok(data) => {
                 result.data = data;
@@ -1419,20 +1456,17 @@ impl Pipeline {
     // after it has lost its only way to be placed.
     pub(crate) fn take_unanchored_dependents(&mut self, segment_id: SegmentId) -> Vec<SegmentId> {
         let file_id = segment_id.file_id;
-        let Some(parked) = self.unanchored_parked.get_mut(&file_id) else {
+        if !self.unanchored_parked.contains_key(&file_id) {
             return Vec::new();
-        };
+        }
         let mut released = Vec::new();
         let mut next = segment_id.segment_number;
         while let Some(ordinal) = next.checked_add(1) {
-            let Some(part) = parked.remove(&ordinal) else {
+            let Some(part) = self.unanchored_parked.remove(file_id, ordinal) else {
                 break;
             };
             released.push(part);
             next = ordinal;
-        }
-        if parked.is_empty() {
-            self.unanchored_parked.remove(&file_id);
         }
         released
             .into_iter()
@@ -1517,8 +1551,7 @@ impl Pipeline {
         self.handle_decode_failure(
             segment_id,
             "article declared no usable start and its predecessor never arrived",
-            &[],
-            None,
+            PoolServers::none(),
         );
     }
 
@@ -1528,7 +1561,7 @@ impl Pipeline {
         let cursor = self
             .uu_files
             .get(&segment_id.file_id)
-            .map(|uu| uu.next_index)
+            .map(|uu| uu.next_index.get())
             .unwrap_or(0);
         let (attempts, seen_at) = self
             .uu_park_requeues
@@ -1563,7 +1596,8 @@ impl Pipeline {
     // put, rather than because anything was wrong with what was served.
     pub(in crate::pipeline) fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let Some(work) = self.download_retry_work(segment_id, 0, Vec::new()) else {
+        let Some(work) = self.download_retry_work(segment_id, 0, weaver_nntp::ServerSet::EMPTY)
+        else {
             return false;
         };
         if !self.jobs.contains_key(&job_id) {
@@ -1586,7 +1620,7 @@ impl Pipeline {
         file_id: NzbFileId,
     ) -> Result<Option<(u32, UuSegmentFacts, DecodedChunk, SegmentSource)>, SegmentWriteError> {
         let next = self.uu_files.get_mut(&file_id).and_then(|uu| {
-            let index = uu.next_index;
+            let index = uu.next_index.get();
             uu.parked.remove(&index).map(|entry| (index, entry))
         });
         let Some((index, entry)) = next else {
@@ -1666,19 +1700,47 @@ impl Pipeline {
     ) {
         let job_id = error.file_id.job_id;
         let out_of_space = crate::operations::is_out_of_space(&error.source);
-        let message = if out_of_space {
-            format!(
-                "{context} for {}: filesystem out of space or over quota ({})",
-                error.file_id, error.source
-            )
-        } else {
-            format!("{context} for {}: {}", error.file_id, error.source)
-        };
+        // A write that found no room holds the job until the disk has room:
+        // what it did not write is fetched again.
+        if out_of_space && self.job_downloads(job_id) {
+            warn!(
+                job_id = job_id.0,
+                file_id = %error.file_id,
+                error = %error.source,
+                context,
+                "disk write found no room; the job waits for room"
+            );
+            // A spool write gives nothing back as it fails: the job waits
+            // for the free figure to rise by the part that was refused.
+            self.hold_job_for_full_disk(
+                job_id,
+                crate::operations::StorageRoot::Intermediate,
+                crate::pipeline::full_disk::Wants {
+                    left: error.refused,
+                    ..crate::pipeline::full_disk::Wants::of(&error.source, None)
+                },
+            );
+            return;
+        }
+        // No room for a part of a job that no longer fetches: it has ended,
+        // or its final move has begun and chosen what it delivers, so the
+        // part is one nothing will read. The write is dropped, and the job
+        // is not failed for it.
+        if out_of_space {
+            warn!(
+                job_id = job_id.0,
+                file_id = %error.file_id,
+                error = %error.source,
+                context,
+                "disk write found no room for a job that no longer fetches; the part is dropped"
+            );
+            return;
+        }
+        let message = format!("{context} for {}: {}", error.file_id, error.source);
         error!(
             job_id = job_id.0,
             file_id = %error.file_id,
             error = %error.source,
-            out_of_space,
             context,
             "disk write failed; failing job"
         );

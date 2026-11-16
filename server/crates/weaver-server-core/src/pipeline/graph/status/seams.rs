@@ -3,7 +3,7 @@
 
 // The pipeline's hooks into a graph job's status.
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use weaver_graph::recovery::{RepairOutcome, SetRuling};
 use weaver_graph::slots::AskerId;
 use weaver_graph::{MemberId, NodeId};
@@ -372,9 +372,22 @@ impl Pipeline {
             return Err(message);
         }
 
+        // An unnamed file that never arrived beside a set extracted whole,
+        // such as a recovery volume the repair never needed, is no shortfall.
+        let excused: std::collections::HashSet<&str> = if delivery.extracted() {
+            delivery.unnamed.iter().map(String::as_str).collect()
+        } else {
+            Default::default()
+        };
         for row in &census {
             match row.claim {
                 Claim::Complete => {}
+                Claim::Missing { bytes } if excused.contains(row.name.as_str()) => debug!(
+                    job_id = job_id.0,
+                    member = %row.name,
+                    missing_bytes = bytes,
+                    "an unnamed posted file never arrived beside a set extracted whole"
+                ),
                 Claim::Damaged { bytes } => info!(
                     job_id = job_id.0,
                     member = %row.name,
@@ -588,14 +601,18 @@ impl Pipeline {
             // Read by the name the member is delivered under, so a file a
             // recovery set renamed to what it is counts as that. A piece is
             // no usable file at any depth: a joined split or an archive an
-            // archive held is a piece as much as a posted volume is.
+            // archive held is a piece as much as a posted volume is. A
+            // member whose name the file system refused has no file at all,
+            // and is no usable file either, however long it is.
             |node, member| {
-                job.tree()
-                    .namespace(node)
-                    .and_then(|ns| ns.get(member))
-                    .is_some_and(|member| {
-                        crate::pipeline::post_health::names_a_piece(&member.output_name)
-                    })
+                job.writer().unnamable(node, member)
+                    || job
+                        .tree()
+                        .namespace(node)
+                        .and_then(|ns| ns.get(member))
+                        .is_some_and(|member| {
+                            crate::pipeline::post_health::names_a_piece(&member.output_name)
+                        })
             },
             unarrived,
         );

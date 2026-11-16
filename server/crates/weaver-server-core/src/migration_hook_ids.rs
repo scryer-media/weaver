@@ -17,6 +17,8 @@ pub(crate) fn is_known_migration_hook_id(hook_id: &str) -> bool {
             | "move_nzbs_and_outlines_v85"
             | "fill_history_release_names_v87"
             | "fill_history_search_keys_v88"
+            | "seed_history_retention_v89"
+            | "trim_servers_to_limit_v92"
     )
 }
 

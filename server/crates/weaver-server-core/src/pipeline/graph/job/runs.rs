@@ -54,7 +54,10 @@ impl GraphJob {
             Heard::Emit(_)
             | Heard::Ended
             | Heard::CheckpointBlocked { .. }
-            | Heard::CheckpointDue { .. } => {}
+            | Heard::CheckpointDue { .. }
+            | Heard::DiskReturned
+            | Heard::DiskFailed(_)
+            | Heard::GivingUp => {}
         }
         Ok(())
     }
@@ -134,6 +137,17 @@ impl GraphJob {
                             return Ok(());
                         }
                         match piece {
+                            // A hold the piece read on scratch moved since
+                            // the rewalk was lent: what it read is not
+                            // trusted, and the piece is fetched again as one
+                            // that did not read back is.
+                            Ok(posted) if !self.writer.scratch_stands(&rewalked.scratch) => {
+                                let range = weaver_graph::ByteRange::at(
+                                    posted.offset,
+                                    posted.bytes.len() as u64,
+                                );
+                                self.unread(node, volume, range, limit)?;
+                            }
                             Ok(posted) => {
                                 self.tree.rewalked(
                                     node,
@@ -181,14 +195,33 @@ impl GraphJob {
                     Ok(())
                 };
             }
-            Heard::CheckpointBlocked { .. } | Heard::CheckpointDue { .. } => return Ok(()),
+            Heard::GivingUp => return self.give_up_next(slots, limit),
+            Heard::CheckpointBlocked { .. }
+            | Heard::CheckpointDue { .. }
+            | Heard::DiskReturned
+            | Heard::DiskFailed(_) => return Ok(()),
             _ if !self.runs.current(node, said.generation) => return Ok(()),
             // A run widened is ending, to start again at the wider window.
             Heard::Emit(_) if self.runs.rerunning(node) => return Ok(()),
+            // A run parked for room runs again from the start: what it says
+            // on the way out is not heard.
+            Heard::Emit(_) if self.runs.parked(node) => return Ok(()),
+            // Parked, it ended: what it built is taken back, and it waits for
+            // a slot to build it again once the job has room. Every member
+            // that goes, its own or one buried under them, is written again
+            // then, and its part of the decoding clock is given back as it
+            // ends, so it is not counted twice.
+            Heard::Ended if self.runs.parked(node) => {
+                self.retract_run(node)?;
+                let limit = self.run_limit(limit);
+                self.runs.ended(node, said.generation, limit)
+            }
             // A wider window than the run had, which the grant lets it have:
             // what it built is retracted, and it starts again once it ends,
             // its window reserved whole. A decoder that cannot say what it
-            // needs is given the widest its format has.
+            // needs is given the widest its format has. While the job waits
+            // for room it is parked too: it gives back its slot as it ends,
+            // and starts again at the wider window once the job has room.
             Heard::Emit(Emit::Refuse(Why::TooLarge { needed, .. }))
                 if self.runs.widen(
                     node,
@@ -197,9 +230,21 @@ impl GraphJob {
                 ) =>
             {
                 self.retract_run(node)?;
+                if self.writer.disk_held() {
+                    self.runs.park(node);
+                }
                 return Ok(());
             }
             Heard::Emit(emit) => {
+                // A window no folder had room for, asked by a run held to
+                // the ceiling: the job waits for that room as for any full
+                // disk, and runs again from its checkpoint once it shows.
+                if let Emit::Refuse(Why::TooLarge { .. }) = &emit
+                    && let Some(needs) = self.runs.window_needs(node)
+                {
+                    let quota = self.runs.window_quota();
+                    return Err(self.writer.window_found_no_room(needs, quota).into());
+                }
                 // A window the scratch refused a run held to the ceiling is
                 // refused with the window it was held to.
                 let emit = match emit {
@@ -217,6 +262,15 @@ impl GraphJob {
                 if emit == Emit::NeedsPassword {
                     self.tree.run_asked(node);
                 }
+                // A run that writes while the job waits for room is parked
+                // once what it wrote landed: what it says from here is not
+                // heard, and it runs again from the start once the job has
+                // room. What writes nothing lands whether or not the job
+                // waits, so a run whose last write crossed the reserve
+                // still closes what it wrote. The job is read before the
+                // write, so the write that begins a wait lands as any other
+                // and parks nothing.
+                let parks = self.writer.disk_held() && writes(&emit);
                 let mut out = Vec::new();
                 self.writer.said(
                     &mut self.tree,
@@ -227,12 +281,16 @@ impl GraphJob {
                     &mut out,
                 )?;
                 self.heard(out)?;
+                if parks {
+                    self.runs.park(node);
+                }
                 Vec::new()
             }
             Heard::Ended => {
                 // A member is closed by its engine alone, once it verified
                 // every byte of it: one a run left open stays open, and
                 // nothing more is announced, so the namespace is in.
+                let limit = self.run_limit(limit);
                 self.runs.ended(node, said.generation, limit)
             }
         };
@@ -257,6 +315,70 @@ impl GraphJob {
         if !self.loans.returned(set, serial) {
             return Ok(returned.repaired.remove().map_err(WriteError::from)?);
         }
+        // A repair the stop ended while a volume's writer still holds
+        // operations of the job is not taken back yet: taking it back reads
+        // the job's files, and the loop would stand behind that writer,
+        // which may never move. It is kept until the stop has given the
+        // writers their time (`take_back_stopped_repair`).
+        if returned.stopped() && self.disk().is_some_and(|disk| !disk.quiet()) {
+            self.stopped_repair = Some(Box::new(returned));
+            return Ok(());
+        }
+        self.take_back(returned, slots, limit)
+    }
+
+    // Whether a repair the stop ended is kept for the writers to settle.
+    pub(in crate::pipeline) fn keeps_stopped_repair(&self) -> bool {
+        self.stopped_repair.is_some()
+    }
+
+    // The stop has given the volumes' writers their time. A repair kept for
+    // them is taken back now when the job's writes are all down, as any
+    // repair is. When a writer still holds some, the job is left as its
+    // last checkpoint has it and no checkpoint is taken of it again: what
+    // it says now could not be borne out. Whether the repair was taken
+    // back.
+    pub(in crate::pipeline) fn take_back_stopped_repair(
+        &mut self,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<bool, GraphError> {
+        let Some(returned) = self.stopped_repair.take() else {
+            return Ok(false);
+        };
+        if self.disk().is_some_and(|disk| !disk.quiet()) {
+            self.pending().left_at_stop();
+            let _ = returned.repaired.remove();
+            return Ok(false);
+        }
+        self.take_back(*returned, slots, limit)?;
+        #[cfg(test)]
+        {
+            self.stopped_repairs_taken_back += 1;
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn stopped_repairs_taken_back(&self) -> u32 {
+        self.stopped_repairs_taken_back
+    }
+
+    // A repair still kept is given up with its job's later checkpoints: the
+    // job restarts from the last one written.
+    pub(in crate::pipeline) fn leave_stopped_repair(&mut self) {
+        if let Some(returned) = self.stopped_repair.take() {
+            self.pending().left_at_stop();
+            let _ = returned.repaired.remove();
+        }
+    }
+
+    fn take_back(
+        &mut self,
+        returned: Returned,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         let mut out = Vec::new();
         let objects = self.runs.hardware();
         let rebuilt = self.writer.returned(
@@ -291,9 +413,16 @@ impl GraphJob {
     pub(super) fn step_runs(
         &mut self,
         mut admitted: Vec<NodeId>,
-        limit: usize,
+        pipeline_limit: usize,
     ) -> Result<(), GraphError> {
+        // A give-up with volumes left holds the tree half applied: nothing
+        // starts until its last volume is read back, which steps again with
+        // what was admitted meanwhile.
+        if self.hold_admitted(&mut admitted) {
+            return Ok(());
+        }
         loop {
+            let limit = self.run_limit(pipeline_limit);
             let (engines, gone) = self.touched_engines();
             admitted.extend(self.runs.forget(gone, limit));
             for (&node, &facts) in &engines {
@@ -331,6 +460,13 @@ impl GraphJob {
                 admitted.extend(self.start_run(node)?);
             }
         }
+    }
+
+    // The slots the job's runs may hold under the pipeline's `limit`: none
+    // while the job waits for room on a disk, since every run writes what
+    // it builds.
+    fn run_limit(&self, limit: usize) -> usize {
+        if self.writer.disk_held() { 0 } else { limit }
     }
 
     // Start the node's run once its memory is reserved. A run whose memory
@@ -373,18 +509,24 @@ impl GraphJob {
         Ok(Vec::new())
     }
 
-    // Everything the run built was built on bytes a repair replaced. The
-    // members start over; the envelope keeps the repaired bytes in place.
+    // Everything the run built was built on bytes a repair replaced, at a
+    // window too narrow, or while the job waits for room. The members start
+    // over; the envelope keeps the repaired bytes in place. The run runs
+    // again from the start in every case, and writes them again: while the
+    // job waits for room, it wakes only once its disk has room for them.
     fn retract_run(&mut self, node: NodeId) -> Result<(), GraphError> {
         let retracts = self.members(node).into_iter().map(Emit::Retract).collect();
         let mut effects = Vec::new();
+        self.writer.rewriting(true);
         self.tree.emitted(
             node,
             retracts,
             &mut self.writer.placing(&mut *self.builder),
             &mut effects,
         );
-        self.settle(effects)
+        let settled = self.settle(effects);
+        self.writer.rewriting(false);
+        settled
     }
 
     fn members(&self, node: NodeId) -> Vec<MemberId> {
@@ -614,3 +756,14 @@ struct FedAt {
 #[cfg(test)]
 #[path = "runs_tests.rs"]
 mod tests;
+
+// Whether what a run said takes room on a disk where it lands: the members
+// it announces and the bytes it writes, and the bytes it hands to be placed
+// or read again. What it says of a member it wrote, its closing and its
+// checksum, and every other word, writes nothing.
+fn writes(emit: &Emit) -> bool {
+    matches!(
+        emit,
+        Emit::Member { .. } | Emit::Bytes { .. } | Emit::Unkept { .. } | Emit::Again { .. }
+    )
+}

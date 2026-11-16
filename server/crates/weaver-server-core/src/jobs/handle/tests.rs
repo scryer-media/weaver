@@ -131,42 +131,31 @@ async fn update_random_read_iops_reaches_scheduler() {
     let (handle, task) = test_scheduler().await;
 
     handle.update_random_read_iops(1_500.0).await.unwrap();
+    assert_eq!(
+        handle
+            .state
+            .queue
+            .read(|inner| inner.globals.random_read_iops),
+        Some(1_500.0)
+    );
 
     handle.shutdown().await.unwrap();
     task.await.unwrap();
 }
 
 #[tokio::test]
-async fn update_disk_measurement_publishes_both_figures() {
+async fn update_storage_classification_reaches_scheduler() {
+    use crate::runtime::system_profile::{FilesystemType, StorageClass};
     let (handle, task) = test_scheduler().await;
-    let published = |handle: &SchedulerHandle| {
-        handle.state.queue.read(|inner| {
-            (
-                inner.globals.random_read_iops,
-                inner.globals.sequential_write_mbps,
-            )
-        })
-    };
 
-    handle
-        .update_disk_measurement(crate::runtime::DiskMeasurement {
-            sequential_write_mbps: 80.0,
-            random_read_iops: 1_500.0,
-        })
-        .await
-        .unwrap();
-    assert_eq!(published(&handle), (Some(1_500.0), Some(80.0)));
-
-    // A pinned read figure comes with no write measurement, which leaves
-    // the last measured one in place.
-    handle
-        .update_disk_measurement(crate::runtime::DiskMeasurement {
-            sequential_write_mbps: 0.0,
-            random_read_iops: 900.0,
-        })
-        .await
-        .unwrap();
-    assert_eq!(published(&handle), (Some(900.0), Some(80.0)));
+    handle.update_storage_classification(StorageClass::Hdd, FilesystemType::Ext4);
+    assert_eq!(
+        handle
+            .state
+            .queue
+            .read(|inner| inner.globals.storage_classification.clone()),
+        Some((StorageClass::Hdd, FilesystemType::Ext4))
+    );
 
     handle.shutdown().await.unwrap();
     task.await.unwrap();
@@ -626,4 +615,59 @@ fn job_download_rates_report_only_transferring_download_phases() {
         job_download_rates(&jobs),
         vec![(JobId(1), 61_000_000), (JobId(5), 1_000)]
     );
+}
+
+// The archive password, and a password kept among the job's attributes,
+// never reach a job's debug text.
+#[test]
+fn a_job_s_debug_text_never_shows_its_password() {
+    const SECRET: &str = "hunter-secret-7731";
+    let info = JobInfo {
+        job_id: JobId(9),
+        job_hash: None,
+        name: "job-9".into(),
+        status: JobStatus::Downloading,
+        download_state: crate::jobs::model::DownloadState::Downloading,
+        finalizing_download: false,
+        fetching_repair_data: false,
+        post_state: crate::jobs::model::PostState::Idle,
+        run_state: crate::jobs::model::RunState::Active,
+        progress: 0.0,
+        total_bytes: 100,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
+        failed_bytes: 0,
+        health: 1000,
+        terminal_discards: Vec::new(),
+        total_files: 0,
+        completed_files: 0,
+        remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: 0,
+        wanted_bytes: 0,
+        password: Some(SECRET.into()),
+        category: None,
+        metadata: vec![
+            (
+                crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY.into(),
+                SECRET.into(),
+            ),
+            ("source".into(), "rss".into()),
+        ],
+        output_dir: None,
+        error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
+        server_attribution: Vec::new(),
+        created_at_epoch_ms: 0.0,
+    };
+
+    for text in [format!("{info:?}"), format!("{info:#?}")] {
+        assert!(!text.contains(SECRET), "{text}");
+        assert!(text.contains("[REDACTED]"));
+        assert!(text.contains("rss"));
+    }
 }

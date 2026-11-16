@@ -47,7 +47,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     assert!(rendered.contains("weaver_pipeline_paused 1"));
     assert!(rendered.contains("weaver_pipeline_current_download_speed_bytes_per_second 19"));
-    assert!(rendered.contains("weaver_pipeline_active_downloads 6"));
+    assert!(rendered.contains("weaver_pipeline_articles_in_flight 6"));
     assert!(rendered.contains("weaver_pipeline_decode_pending_bytes 4096"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_state{state=\"soft\"} 1"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_reason{reason=\"decode\"} 1"));
@@ -133,8 +133,10 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     // Fixed units and dual-emitted renames.
     assert!(rendered.contains("weaver_pipeline_download_pressure_stall_seconds_total 1.5"));
-    assert!(rendered.contains("weaver_pipeline_disk_write_latency_microseconds 16"));
-    assert!(rendered.contains("weaver_pipeline_disk_write_latency_seconds 0.000016"));
+    // The old loop-side write timings are gone: each volume's own rows say
+    // what its disk took.
+    assert!(!rendered.contains("weaver_pipeline_disk_write_latency"));
+    assert!(!rendered.contains("weaver_pipeline_disk_write_duration"));
     assert!(rendered.contains("weaver_pipeline_download_lanes 3"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_mebibytes_per_second 23.5"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_bytes_per_second 24641536"));
@@ -200,7 +202,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         bytes_decoded: 0,
         bytes_committed: 0,
         download_queue_depth: 10,
-        active_downloads: 20,
+        articles_in_flight: 20,
         active_decodes: 0,
         decode_pending: 0,
         decode_pending_bytes: 0,
@@ -256,6 +258,8 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_lane_refill_parked_total: 0,
         download_lane_refill_deferred_total: 0,
         download_lane_refill_saturated_total: 0,
+        download_lane_room_held_total: 0,
+        download_lane_room_woken_total: 0,
         download_pipeline_trial_success_total: 0,
         download_pipeline_trial_failure_total: 0,
         download_pipeline_proof_pass_total: 0,
@@ -269,7 +273,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         verify_active: 0,
         repair_active: 0,
         extract_active: 0,
-        disk_write_latency_us: 0,
         segments_retried: 0,
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,
@@ -386,7 +389,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.decode_rate_mbps = 0.0;
     snapshot.download_queue_depth = 10;
     snapshot.recovery_queue_depth = 0;
-    snapshot.active_downloads = 0;
+    snapshot.articles_in_flight = 0;
     snapshot.parked_infrastructure_work = 10;
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Soft;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::Write;
@@ -420,7 +423,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     // Parked work alongside live downloads is an ordinary busy pipeline, not an
     // outage: the new value must not mask it.
     snapshot.download_queue_depth = 10;
-    snapshot.active_downloads = 4;
+    snapshot.articles_in_flight = 4;
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Clear;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::None;
     let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
@@ -440,7 +443,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Clear;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::None;
     snapshot.download_queue_depth = 0;
-    snapshot.active_downloads = 0;
+    snapshot.articles_in_flight = 0;
     let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
     assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
 
@@ -585,6 +588,12 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
     );
     assert_label_set(
         &rendered,
+        "weaver_pipeline_download_lane_room_waits_total",
+        "event",
+        &["held", "woken"],
+    );
+    assert_label_set(
+        &rendered,
         "weaver_pipeline_download_scheduler_handouts_total",
         "kind",
         &["hot", "spill", "probe"],
@@ -603,6 +612,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "uu_cursor",
             "checkpoint",
             "activation",
+            "write_buffer",
         ],
     );
     assert_label_set(
@@ -825,11 +835,12 @@ fn renders_collected_instrumentation_snapshots() {
         "weaver_server_article_latency_seconds",
         "weaver_job_duration_seconds",
         "weaver_job_stage_duration_seconds",
-        "weaver_pipeline_disk_write_duration_seconds",
+        "weaver_pipeline_turn_duration_seconds",
         "weaver_pipeline_decode_task_duration_seconds",
         "weaver_pipeline_extract_member_duration_seconds",
         "weaver_db_op_duration_seconds",
         "weaver_db_wal_checkpoint_duration_seconds",
+        "weaver_db_statement_duration_seconds",
         "weaver_http_request_duration_seconds",
     ] {
         assert!(
@@ -903,6 +914,7 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_db_wal_checkpointed_frames 19"));
     assert!(rendered.contains("weaver_db_wal_checkpoint_copied_frames 0"));
     assert!(rendered.contains("weaver_db_wal_bytes 3218032"));
+    assert!(rendered.contains("weaver_db_statement_duration_seconds_count 6"));
 
     // Process collector names are deliberately unprefixed.
     assert!(rendered.contains("process_cpu_seconds_total 12.5"));
@@ -922,6 +934,93 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains(
         "weaver_disk_available_bytes{role=\"complete\",path=\"/var/lib/weaver/complete\"} 50000"
     ));
+
+    // Volumes: a measured one carries its rate, an unmeasured one does not.
+    assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/nas\"} 8000000"));
+    assert!(rendered.contains("weaver_volume_write_seconds_total{volume=\"/mnt/nas\"} 2.5"));
+    assert!(
+        rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/nas\"} 3200000")
+    );
+    assert!(rendered.contains("weaver_volume_buffered_bytes{volume=\"/mnt/nas\"} 65536"));
+    assert!(rendered.contains("weaver_volume_arrived_bytes{volume=\"/mnt/nas\"} 4096"));
+    assert!(rendered.contains("weaver_volume_counted_bytes{volume=\"/mnt/nas\"} 69632"));
+    assert!(rendered.contains("weaver_volume_counted_peak_bytes{volume=\"/mnt/nas\"} 900000"));
+    // A sized volume carries its limits; one not sized yet carries neither.
+    assert!(rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/nas\"} 1000000"));
+    assert!(rendered.contains("weaver_volume_buffer_soft_limit_bytes{volume=\"/mnt/nas\"} 700000"));
+    assert!(!rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/scratch\"}"));
+    assert!(!rendered.contains("weaver_volume_buffer_soft_limit_bytes{volume=\"/mnt/scratch\"}"));
+    assert!(rendered.contains("weaver_volume_write_calls_total{volume=\"/mnt/nas\"} 120"));
+    assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/nas\"} 9"));
+    assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/scratch\"} 0"));
+    for (row, value) in [
+        ("weaver_volume_writer_batches_total", "40"),
+        ("weaver_volume_writer_operations_total", "130"),
+        ("weaver_volume_writer_failed_operations_total", "2"),
+        ("weaver_volume_writer_abandoned_operations_total", "5"),
+        ("weaver_volume_writer_threads_total", "1"),
+        ("weaver_volume_writer_woken_total", "4"),
+        ("weaver_volume_loop_reads_total", "6"),
+        ("weaver_volume_loop_read_seconds_total", "0.75"),
+        ("weaver_volume_aside_waits_total", "4"),
+        ("weaver_volume_aside_wait_seconds_total", "2"),
+        ("weaver_volume_writer_opens_total", "11"),
+        ("weaver_volume_writer_open_seconds_total", "0.5"),
+        ("weaver_volume_writer_open_creates_total", "11"),
+        ("weaver_volume_writer_open_create_seconds_total", "0.25"),
+        ("weaver_volume_writer_open_sparse_marks_total", "10"),
+        (
+            "weaver_volume_writer_open_sparse_mark_seconds_total",
+            "0.125",
+        ),
+        ("weaver_volume_writer_open_length_sets_total", "4"),
+        (
+            "weaver_volume_writer_open_length_set_seconds_total",
+            "0.075",
+        ),
+        ("weaver_volume_writer_length_sets_total", "3"),
+        ("weaver_volume_writer_length_set_seconds_total", "1.25"),
+        ("weaver_volume_writer_length_sets_skipped_total", "8"),
+        ("weaver_volume_writer_closes_total", "10"),
+        ("weaver_volume_writer_close_seconds_total", "0.25"),
+    ] {
+        let line = format!("{row}{{volume=\"/mnt/nas\"}} {value}");
+        assert!(rendered.contains(&line), "{line}");
+    }
+    // The loop's waits on a volume, by what it waited for.
+    for (kind, waits, seconds) in [
+        ("read", "1", "0.25"),
+        ("settle", "2", "1.25"),
+        ("budget", "0", "0"),
+    ] {
+        let line = format!(
+            "weaver_volume_loop_waits_total{{volume=\"/mnt/nas\",kind=\"{kind}\"}} {waits}"
+        );
+        assert!(rendered.contains(&line), "{line}");
+        let line = format!(
+            "weaver_volume_loop_wait_seconds_total{{volume=\"/mnt/nas\",kind=\"{kind}\"}} {seconds}"
+        );
+        assert!(rendered.contains(&line), "{line}");
+    }
+    assert!(
+        rendered
+            .contains("weaver_volume_loop_waits_total{volume=\"/mnt/scratch\",kind=\"settle\"} 0")
+    );
+    assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/scratch\"} 0"));
+    assert!(
+        !rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/scratch\"}")
+    );
+    // What is being written now sits beside what the volume takes, and is
+    // absent for a volume nothing is written to.
+    assert!(
+        rendered.contains(
+            "weaver_volume_write_throughput_bytes_per_second{volume=\"/mnt/nas\"} 1100000"
+        )
+    );
+    assert!(
+        !rendered
+            .contains("weaver_volume_write_throughput_bytes_per_second{volume=\"/mnt/scratch\"}")
+    );
 
     // HTTP.
     assert!(rendered.contains(
@@ -951,13 +1050,15 @@ fn absent_instrumentation_omits_its_families() {
         "weaver_server_article_latency_seconds",
         "weaver_jobs_submitted_total",
         "weaver_job_duration_seconds",
-        "weaver_pipeline_disk_write_duration_seconds",
+        "weaver_pipeline_turn_duration_seconds",
         "weaver_db_runtime_info",
         "weaver_db_wal_checkpoint_passes_total",
         "weaver_db_wal_bytes",
+        "weaver_db_statement_duration_seconds",
         "process_cpu_seconds_total",
         "process_start_time_seconds",
         "weaver_disk_total_bytes",
+        "weaver_volume_written_bytes_total",
         "weaver_http_requests_total",
     ] {
         assert!(!bare.contains(family), "{family} should be absent");
@@ -966,7 +1067,6 @@ fn absent_instrumentation_omits_its_families() {
     // Pipeline histograms present, but the two optional stages unmeasured.
     let pipeline = instr::PipelineHistogramsSnapshot {
         turn_duration: sample_histogram(),
-        disk_write_duration: sample_histogram(),
         decode_task_duration: None,
         extract_member_duration: None,
     };
@@ -979,7 +1079,7 @@ fn absent_instrumentation_omits_its_families() {
     let partial = metrics::render_prometheus_metrics_input(&input);
     assert_valid_prometheus_exposition(&partial);
 
-    assert!(partial.contains("weaver_pipeline_disk_write_duration_seconds_bucket"));
+    assert!(partial.contains("weaver_pipeline_turn_duration_seconds_bucket"));
     assert!(!partial.contains("weaver_pipeline_decode_task_duration_seconds"));
     assert!(!partial.contains("weaver_pipeline_extract_member_duration_seconds"));
 
@@ -1447,9 +1547,11 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     let network = sample_network();
     let tunnel = sample_tunnel();
     let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let server_health = vec![sample_server_health()];
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
+    input.server_health = &server_health;
     let rendered = render_area(&input);
 
     assert_label_set(
@@ -1518,6 +1620,128 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     assert!(!rendered.contains("member_id=\"12\""));
     assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
     assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
+}
+
+// Samples written one server at a time come out exactly as if they had been
+// written one family at a time: the same lines, each family one group, the
+// families in first-seen order.
+#[test]
+fn the_encoder_groups_each_familys_lines_whatever_the_write_order() {
+    use metrics::encode::{Encoder, MetricFamily, MetricKind};
+    static FIRST: MetricFamily = MetricFamily {
+        name: "weaver_example_first",
+        kind: MetricKind::Gauge,
+        labels: &["server_id"],
+        help: "First.",
+        deprecated_by: None,
+    };
+    static SECOND: MetricFamily = MetricFamily {
+        name: "weaver_example_second",
+        kind: MetricKind::Counter,
+        labels: &["server_id"],
+        help: "Second.",
+        deprecated_by: None,
+    };
+    let servers = ["1", "2", "3"];
+
+    let mut by_server = Encoder::new();
+    for server in servers {
+        by_server.sample(&FIRST, &[("server_id", server)], 1);
+        by_server.sample(&SECOND, &[("server_id", server)], 2);
+    }
+    let mut by_family = Encoder::new();
+    for server in servers {
+        by_family.sample(&FIRST, &[("server_id", server)], 1);
+    }
+    for server in servers {
+        by_family.sample(&SECOND, &[("server_id", server)], 2);
+    }
+
+    let rendered = by_server.finish();
+    assert_eq!(rendered, by_family.finish());
+    assert_eq!(interleaved_family(&rendered), None, "{rendered}");
+    assert_eq!(rendered.matches("# HELP weaver_example_first ").count(), 1);
+}
+
+// Every per-server family stays one group when the pool runs more than one
+// server: health, address plan, transfers, article outcomes and network legs.
+#[test]
+fn per_server_families_stay_whole_across_servers() {
+    let mut network = sample_network();
+    let mut second_leg = network.legs[0].clone();
+    second_leg.consumer = "server:8".into();
+    network.legs.push(second_leg);
+    let mut second_health = sample_server_health();
+    second_health.server_id = "8".into();
+    second_health.label = "news2.example:563".into();
+    let server_health = vec![sample_server_health(), second_health];
+    let mut second_transfer = sample_transfer_snapshot();
+    second_transfer.stable_server_id = weaver_nntp::transfer::StableServerId(8);
+    let transfers = vec![sample_transfer_snapshot(), second_transfer];
+    let mut second_articles = sample_server_metrics();
+    second_articles.stable_server_id = 8;
+    let articles = vec![sample_server_metrics(), second_articles];
+    let jobs = vec![
+        sample_job(42, "Silver Horizon", JobStatus::Downloading),
+        sample_job(43, "Copper Valley", JobStatus::Queued),
+    ];
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.network = Some(&network);
+    input.server_health = &server_health;
+    input.server_transfers = &transfers;
+    input.egress_transfers = &transfers;
+    input.server_metrics = &articles;
+    input.jobs = &jobs;
+    input.per_job_series = weaver_server_core::settings::PerJobSeries::All;
+    let rendered = render_area(&input);
+
+    for server in ["7", "8"] {
+        for family in [
+            "weaver_server_info",
+            "weaver_server_address_info",
+            "weaver_server_address_connect_seconds",
+            "weaver_server_download_bytes_total",
+            "weaver_server_article_attempts_total",
+        ] {
+            assert!(
+                rendered.contains(&format!("{family}{{server_id=\"{server}\"")),
+                "{family} for {server}"
+            );
+        }
+        assert!(rendered.contains(&format!("consumer=\"server:{server}\"")));
+    }
+}
+
+// A server the pool does not run (in the transfer registry, the article
+// counters or a network leg, but not in the health list) sends no series: no
+// empty `server` label, no leg reported up for a server nothing connects to.
+#[test]
+fn a_server_the_pool_does_not_run_sends_no_series() {
+    let mut network = sample_network();
+    let mut idle_leg = network.legs[0].clone();
+    idle_leg.consumer = "server:9".into();
+    network.legs.push(idle_leg);
+    let mut idle_transfer = sample_transfer_snapshot();
+    idle_transfer.stable_server_id = weaver_nntp::transfer::StableServerId(9);
+    let transfers = vec![sample_transfer_snapshot(), idle_transfer];
+    let mut idle_articles = sample_server_metrics();
+    idle_articles.stable_server_id = 9;
+    let articles = vec![sample_server_metrics(), idle_articles];
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let server_health = vec![sample_server_health()];
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.network = Some(&network);
+    input.server_health = &server_health;
+    input.server_transfers = &transfers;
+    input.server_metrics = &articles;
+    let rendered = render_area(&input);
+
+    assert!(!rendered.contains("server=\"\""), "{rendered}");
+    assert!(!rendered.contains("server_id=\"9\""));
+    assert!(!rendered.contains("consumer=\"server:9\""));
+    assert!(rendered.contains("server_id=\"7\",server=\"news.example:563\""));
+    assert!(rendered.contains("consumer=\"server:7\""));
 }
 
 #[test]

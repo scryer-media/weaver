@@ -6,7 +6,7 @@ mod classify;
 mod sanitize;
 
 pub use archive_name::archive_base_name;
-pub use classify::FileRole;
+pub use classify::{FileRole, names_a_z_part};
 pub(crate) use sanitize::role_filename_view;
 pub use sanitize::{
     DOWNLOAD_FILENAME_MAX_BYTES, allocate_unique_download_filename,

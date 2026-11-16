@@ -682,11 +682,14 @@ fn a_zstd_frame_wider_than_the_granted_window_is_refused() {
     );
 }
 
-// A run granted a wider window than the stream was built with, as an owner
-// grants a run whose window it lets go above its ceiling, decodes a frame
-// the build's grant refused; it never holds less than the build's window.
+// A run granted a wider window than the stream was built with, as a profile
+// raised after the build grants it, holds only the window the build sized
+// and its owner reserved: a frame wider than that is refused with both
+// sizes, never held uncharged. Reserved whole at the window the frame
+// needs, as its owner reserves it on that refusal, the run decodes it; a
+// narrower grant never holds less than the build's window.
 #[test]
-fn a_run_granted_a_wider_window_than_the_build_decodes_the_wider_frame() {
+fn a_run_granted_a_wider_window_than_the_build_holds_only_the_window_reserved() {
     let built = weaver_graph::Budget {
         memory_bytes: Some(GIB),
         window_bytes: Some(MIB),
@@ -705,14 +708,21 @@ fn a_run_granted_a_wider_window_than_the_build_decodes_the_wider_frame() {
         &mut |_, _| false,
         &mut Vec::new(),
     );
-    let wider = weaver_graph::Budget {
-        memory_bytes: Some(2 * MIB),
-        window_bytes: Some(2 * MIB),
+    stream.volume_closed(VolumeIndex(0), &mut Vec::new());
+    assert_eq!(stream.reserve(), Some(MIB));
+    let raised = weaver_graph::Budget {
+        memory_bytes: Some(GIB),
+        window_bytes: Some(GIB),
         threads: 1,
         ..Default::default()
     };
+    too_large(
+        &closed_run(&mut stream, bytes.clone(), raised),
+        Some(2 * MIB),
+        Some(MIB),
+    );
     assert_eq!(
-        closed_run(&mut stream, bytes.clone(), wider),
+        closed_run(&mut stream, bytes.clone(), granted(2 * MIB, true)),
         decoded("a", b"z".to_vec())
     );
     let narrower = weaver_graph::Budget {
@@ -795,9 +805,10 @@ fn a_later_xz_block_wider_than_the_first_decodes_within_a_window_reserved_whole(
     );
 }
 
-// The same for zstd, past the decoder's own 128 MiB: a later frame of
-// 256 MiB is refused unless the run's window was reserved whole for it. Its
-// refusal cannot say what the later frame needs.
+// The same for zstd: a later frame of 256 MiB is refused unless the run's
+// window was reserved whole for it, at the window the build reserved
+// however wide the grant is. Its refusal cannot say what the later frame
+// needs.
 #[test]
 fn a_later_zstd_frame_wider_than_the_first_decodes_within_a_window_reserved_whole() {
     let mut bytes = zstd_window(20);
@@ -806,11 +817,52 @@ fn a_later_zstd_frame_wider_than_the_first_decodes_within_a_window_reserved_whol
     too_large(
         &closed_run(&mut stream, bytes.clone(), granted(512 * MIB, false)),
         None,
-        Some(128 * MIB),
+        Some(MIB),
     );
     assert_eq!(
         closed_run(&mut stream, bytes, granted(512 * MIB, true)),
         decoded("a", b"zz".to_vec())
+    );
+}
+
+// What a zstd run is charged is the most its decoder holds, whatever comes
+// after the first frame: a narrow first frame reserves the decoder's own
+// 128 MiB, and a later frame wider than that is refused at its header, with
+// the window it was held to, before its window is held. That holds past a
+// skippable frame at the start, and for a later single-segment frame whose
+// content size is its window. Two thousand frames of the same window decode
+// whole under the one charge.
+#[test]
+fn a_later_zstd_frame_is_never_held_past_what_the_run_was_charged() {
+    let charged = 128 * MIB;
+    // Single segment, four content-size bytes: 256 MiB, one raw byte.
+    let mut single = vec![0x28, 0xB5, 0x2F, 0xFD, 0xA0];
+    single.extend_from_slice(&(256u32 << 20).to_le_bytes());
+    single.extend_from_slice(&[0x09, 0x00, 0x00, b'z']);
+    let skipped = [0x50, 0x2A, 0x4D, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
+    let later = [
+        [zstd_window(20), zstd_window(28)].concat(),
+        [skipped.to_vec(), zstd_window(20), zstd_window(28)].concat(),
+        [zstd_window(20), single].concat(),
+    ];
+    for bytes in later {
+        let mut stream = fronted_within::<Zstd>("a.zst", &bytes, 512 * MIB);
+        stream.volume_closed(VolumeIndex(0), &mut Vec::new());
+        assert_eq!(stream.reserve(), Some(charged));
+        too_large(
+            &closed_run(&mut stream, bytes, granted(512 * MIB, false)),
+            None,
+            Some(charged),
+        );
+    }
+
+    let equal = zstd_window(20).repeat(2_000);
+    let mut stream = fronted_within::<Zstd>("a.zst", &equal, 512 * MIB);
+    stream.volume_closed(VolumeIndex(0), &mut Vec::new());
+    assert_eq!(stream.reserve(), Some(charged));
+    assert_eq!(
+        closed_run(&mut stream, equal, granted(512 * MIB, false)),
+        decoded("a", vec![b'z'; 2_000])
     );
 }
 

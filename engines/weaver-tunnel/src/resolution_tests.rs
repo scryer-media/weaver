@@ -167,17 +167,44 @@ async fn a_failed_lookup_is_never_held() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn names_differing_in_case_or_a_trailing_dot_share_an_answer() {
+async fn names_differing_in_case_share_an_answer() {
     let cache = Counted::default();
-    cache
-        .resolve("Mixed.TEST.", Ok(answer(Ttl::Seconds(30))))
-        .await
-        .unwrap();
-    cache
-        .resolve("mixed.test", Ok(answer(Ttl::Seconds(30))))
-        .await
-        .unwrap();
+    for name in ["Mixed.TEST", "mixed.test", "MIXED.test"] {
+        cache
+            .resolve(name, Ok(answer(Ttl::Seconds(30))))
+            .await
+            .unwrap();
+    }
     assert_eq!(cache.asked(), 1);
+    assert!(cache.cache.held("mixed.TEST"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_absolute_name_and_a_relative_one_are_held_apart() {
+    let cache = Counted::default();
+    let absolute: IpAddr = "192.0.2.8".parse().unwrap();
+    let found = cache.resolve(
+        "Mixed.TEST.",
+        Ok(Lookup {
+            addresses: vec![absolute],
+            ttl: Ttl::Seconds(30),
+            nonexistent: false,
+        }),
+    );
+    assert_eq!(found.await.unwrap(), [absolute]);
+    let relative = cache.resolve("mixed.test", Ok(answer(Ttl::Seconds(30))));
+    assert_eq!(relative.await.unwrap(), [address()]);
+    assert_eq!(cache.asked(), 2);
+
+    // Each spelling keeps its own answer, and forgetting one leaves the other.
+    let held = cache.resolve("mixed.test.", Err(io::Error::other("not asked")));
+    assert_eq!(held.await.unwrap(), [absolute]);
+    let held = cache.resolve("MIXED.test", Err(io::Error::other("not asked")));
+    assert_eq!(held.await.unwrap(), [address()]);
+    assert_eq!(cache.asked(), 2);
+    cache.cache.forget("mixed.test.");
+    assert!(!cache.cache.held("mixed.test."));
+    assert!(cache.cache.held("mixed.test"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -379,13 +406,4 @@ fn a_replicated_failure_keeps_its_kind_message_and_source() {
 fn the_host_order_is_kept_without_repeats() {
     let [a, b]: [IpAddr; 2] = ["2001:db8::1".parse().unwrap(), "192.0.2.1".parse().unwrap()];
     assert_eq!(untimed([a, b, a].into_iter()).addresses, [a, b]);
-}
-
-#[tokio::test]
-async fn a_host_that_answers_on_no_address_is_asked_for_again() {
-    host_lookup("localhost").await.unwrap();
-    assert!(HOST.held("localhost"));
-    // Nothing listens on port zero.
-    connect_host("localhost", 0).await.unwrap_err();
-    assert!(!HOST.held("localhost"));
 }

@@ -15,6 +15,7 @@ pub(crate) mod restore;
 mod runs;
 mod works;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ use self::works::Works;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
 use super::leaf::LeafError;
-use super::limits::Caps;
+use super::limits::{Caps, Device};
 use super::namespace::{Coming, NamespaceWriter, SetState, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, Activity, RootPhase};
@@ -54,6 +55,28 @@ pub(crate) enum GraphError {
 }
 
 impl GraphError {
+    // The device a write found no room on, when that is all that failed:
+    // the job waits for room there rather than failing.
+    pub(crate) fn out_of_space(&self) -> Option<Device> {
+        match self {
+            Self::Write(WriteError::Leaf(LeafError::Io { source, device, .. }))
+                if crate::operations::is_out_of_space(source) =>
+            {
+                Some(*device)
+            }
+            _ => None,
+        }
+    }
+
+    // Whether the write that found no room was refused by a quota.
+    pub(crate) fn quota(&self) -> bool {
+        matches!(
+            self,
+            Self::Write(WriteError::Leaf(LeafError::Io { source, .. }))
+                if crate::operations::is_quota_exceeded(source)
+        )
+    }
+
     // What the failure is to the job: a file's I/O error classed as the
     // extractors class theirs, and named as a full disk when it is one, a
     // refusal as the refusal, anything else terminal.
@@ -75,7 +98,8 @@ impl GraphError {
                 ExtractionError::from_io(message, source)
             }
             WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
-            WriteError::UnknownMember { .. }
+            WriteError::LeftAtStop
+            | WriteError::UnknownMember { .. }
             | WriteError::StaleRecovery { .. }
             | WriteError::ProofUnreadable { .. } => ExtractionError::terminal(message),
         }
@@ -98,8 +122,9 @@ pub(crate) struct Storage {
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
     pub(crate) mail: mpsc::Sender<Said>,
-    // The job's password candidates, in the order they are tried.
-    pub(crate) passwords: Vec<String>,
+    // The job's password candidates, in the order they are tried, each with
+    // where it came from.
+    pub(crate) passwords: Vec<crate::jobs::ArchivePasswordCandidate>,
     // The job's extraction budget.
     pub(crate) caps: Caps,
     // How deep the job's namespaces may nest, the root's being 0.
@@ -108,6 +133,9 @@ pub(crate) struct Storage {
     pub(crate) hardware: super::hardware::Hardware,
     // Where the job's writes publish what they take, in a pipeline.
     pub(crate) metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    // The volume writers the job's files are written through; `None` for a
+    // job that writes its files itself as each byte is placed.
+    pub(crate) disk: Option<super::disk::JobDisk>,
     // Weaver's data folder and the free space of its disk: where a decode
     // window goes when the working directory cannot hold it.
     pub(crate) data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
@@ -153,6 +181,12 @@ pub(crate) struct GraphJob {
     // A member's file waits to move on a checkpoint the database has not
     // said it committed, and the run mail will say when it has.
     mail_owed: Option<u64>,
+    // A repair the stop ended while a volume's writer still held operations
+    // of the job, kept until the stop has given that writer its time.
+    stopped_repair: Option<Box<crate::pipeline::graph::namespace::Returned>>,
+    // How many repairs the stop ended were kept and then taken back.
+    #[cfg(test)]
+    stopped_repairs_taken_back: u32,
     // The checkpoints committed through this stamp while a rewalk read its
     // volumes' files where they lay as it was lent: what they move or
     // remove waits for the last piece to be heard.
@@ -164,6 +198,17 @@ pub(crate) struct GraphJob {
     // Where root members were last asked whether the sets proved them;
     // `None` before the first.
     sealed_at: Option<repair::Sealed>,
+    // The give-up the job went quiet into, while it has volumes to read
+    // back, one a turn.
+    quieting: Option<repair::Quieting>,
+    // Every give-up is applied in the one turn it was raised in.
+    #[cfg(test)]
+    one_turn: bool,
+    // Counts the mutable borrows of this job: nothing of it changes without
+    // one, so what was derived from it at a count holds while the count does.
+    moved: u64,
+    // The recovery indexes still to come as of a count.
+    indexes_kept: Option<(u64, Option<Arc<[u32]>>)>,
 }
 
 // Something a step of the job did that the job's events say.
@@ -195,7 +240,8 @@ impl GraphJob {
         let windows = storage.windows(scope);
         let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
             .on(storage.hardware)
-            .lending(windows);
+            .lending(windows)
+            .writing(storage.disk.clone());
         let writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
@@ -203,6 +249,7 @@ impl GraphJob {
             storage.free_disk,
         )
         .delivering(storage.output)
+        .writing_through(storage.disk)
         .capped(storage.caps)
         .metered(storage.metrics);
         Self::new(
@@ -212,7 +259,7 @@ impl GraphJob {
             runs,
             storage.nesting,
         )
-        .offering(storage.passwords)
+        .offering_candidates(storage.passwords)
     }
 
     pub(crate) fn new(
@@ -263,11 +310,56 @@ impl GraphJob {
             reported: None,
             pending: Pending::default(),
             mail_owed: None,
+            stopped_repair: None,
+            #[cfg(test)]
+            stopped_repairs_taken_back: 0,
             commit_held: None,
             notes: Vec::new(),
             fed: runs::Fed::default(),
             sealed_at: None,
+            quieting: None,
+            #[cfg(test)]
+            one_turn: false,
+            moved: 0,
+            indexes_kept: None,
         }
+    }
+
+    // The job is about to be borrowed mutably: what was derived from it no
+    // longer holds unasked.
+    pub(crate) fn touched(&mut self) {
+        self.moved = self.moved.wrapping_add(1);
+    }
+
+    // [`Self::indexes_to_come`] by posted file number, as one shared list
+    // for as long as the job was not borrowed mutably. A borrow that left
+    // the answer as it was keeps the list it had, so its holders still
+    // match by pointer. The spec's declared roles do not change after the
+    // job is built, so `declared` is read only when the list is made again;
+    // a debug build makes it again on every ask and checks the kept one.
+    pub(crate) fn indexes_to_come_kept(
+        &mut self,
+        declared: impl IntoIterator<Item = (MemberId, super::metadata::RecoveryFormat)>,
+    ) -> Option<Arc<[u32]>> {
+        let numbered =
+            |held: Vec<MemberId>| -> Vec<u32> { held.into_iter().map(|member| member.0).collect() };
+        if let Some((at, kept)) = &self.indexes_kept
+            && *at == self.moved
+        {
+            debug_assert_eq!(
+                self.indexes_to_come(declared).map(numbered).as_deref(),
+                kept.as_deref(),
+                "the recovery indexes to come changed without a mutable borrow of the job"
+            );
+            return kept.clone();
+        }
+        let now = self.indexes_to_come(declared).map(numbered);
+        let kept = match (self.indexes_kept.take(), now) {
+            (Some((_, Some(kept))), Some(now)) if *kept == *now => Some(kept),
+            (_, now) => now.map(Arc::from),
+        };
+        self.indexes_kept = Some((self.moved, kept.clone()));
+        kept
     }
 
     // What the job did since this was last asked.
@@ -288,8 +380,19 @@ impl GraphJob {
     }
 
     // The candidates offered to an object that asks for a password.
+    #[cfg(test)]
     pub(crate) fn offering(mut self, candidates: Vec<String>) -> Self {
         self.passwords = Passwords::new(candidates);
+        self
+    }
+
+    // The candidates offered to an object that asks for a password, each
+    // with its source, which the download summary reads back.
+    pub(crate) fn offering_candidates(
+        mut self,
+        candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
+    ) -> Self {
+        self.passwords = Passwords::from_candidates(candidates);
         self
     }
 
@@ -309,11 +412,19 @@ impl GraphJob {
         self.loans.out()
     }
 
-    // Whether an object of the job is out for its work. No checkpoint is
-    // taken meanwhile: its facts as it left hold the work undone, which a
-    // restart could not always do without the tree.
+    // Whether an object of the job is out for its work, or a give-up has
+    // volumes left to read back. No checkpoint is taken meanwhile: its facts
+    // as it left hold the work undone, which a restart could not always do
+    // without the tree, and a tree half given up is no state to restore. A
+    // restart gives up again from the checkpoint before.
     pub(crate) fn working(&self) -> bool {
-        self.works.working()
+        self.works.working() || self.quieting.is_some()
+    }
+
+    // Every give-up from here on is applied in the turn it was raised in.
+    #[cfg(test)]
+    pub(crate) fn give_up_in_one_turn(&mut self) {
+        self.one_turn = true;
     }
 
     // Every work loan from here on stays in the test's hand.
@@ -329,7 +440,7 @@ impl GraphJob {
     }
 
     #[cfg(test)]
-    pub(crate) fn held_loans(&mut self) -> Vec<(NodeId, u64, Box<dyn weaver_graph::Object>)> {
+    pub(crate) fn held_loans(&mut self) -> Vec<works::HeldLoan> {
         self.works.take_held()
     }
 
@@ -338,14 +449,14 @@ impl GraphJob {
     #[cfg(test)]
     pub(crate) fn return_loan(
         &mut self,
-        (node, serial, mut object): (NodeId, u64, Box<dyn weaver_graph::Object>),
+        (node, serial, mut object, stop): works::HeldLoan,
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
         let mut said = Vec::new();
         {
             let _decoding = self.works.decoding();
-            object.work(&mut said);
+            object.work_until(&stop, &mut said);
         }
         let said = super::engine::Said {
             scope: self.works.scope(),
@@ -366,6 +477,20 @@ impl GraphJob {
     // through the run mail: a run, or a repair.
     pub(in crate::pipeline) fn awaits_mail(&self) -> bool {
         self.runs.in_flight() || self.loans.out() || self.works.out() || self.mail_owed.is_some()
+    }
+
+    // Whether a stopped job must be kept: mail of it is still to come, or a
+    // volume's writer still holds an operation on its files. Nothing may
+    // remove, move or hand on those files before both are over.
+    pub(in crate::pipeline) fn holds_retirement(&self) -> bool {
+        self.awaits_mail() || self.writer.disk().is_some_and(|disk| !disk.quiet())
+    }
+
+    // The job's files are given up: nothing still queued for them runs.
+    pub(in crate::pipeline) fn abandon_disk(&self) {
+        if let Some(disk) = self.writer.disk() {
+            disk.abandon();
+        }
     }
 
     // The checkpoint `stamp` records every name the job's files want and
@@ -441,10 +566,50 @@ impl GraphJob {
         Ok(())
     }
 
-    // Keep ownership until stopped workers report that they ended.
-    pub(in crate::pipeline) fn request_stop(&self) {
+    // The file system refused the name of a file a volume's writer was to
+    // make: its member is skipped as damaged, as a refusal met while
+    // writing it would skip it.
+    //
+    // False when the refusal skips nothing and stands as a failure: the
+    // job has no such file, or an object reads the member.
+    pub(crate) fn name_refused(&mut self, file: u64) -> Result<bool, GraphError> {
+        let mut out = Vec::new();
+        let Some(node) = self.writer.name_refused(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            file,
+            &mut out,
+        )?
+        else {
+            return Ok(false);
+        };
+        // The object that made the member left it out: what it unpacked
+        // is short of what it holds, by bytes nothing brings. A run that
+        // meets such bytes refuses its object as it ends; this refusal may
+        // come after the run has, so the object is refused here, and its
+        // volumes are handed over as they stand.
+        if node != NodeId::ROOT {
+            self.writer.said(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                node,
+                weaver_graph::Emit::Refuse(weaver_graph::Why::Unrepairable),
+                &mut out,
+            )?;
+        }
+        self.heard(out)?;
+        Ok(true)
+    }
+
+    // Keep ownership until stopped workers report that they ended. A
+    // give-up's volumes not yet read back are not: the job goes.
+    pub(in crate::pipeline) fn request_stop(&mut self) {
+        self.quieting = None;
         self.runs.request_stop();
         self.loans.request_stop();
+        self.works.request_stop();
     }
 
     // The pipeline is going down. Every run stops where it stands and keeps
@@ -454,6 +619,12 @@ impl GraphJob {
     pub(in crate::pipeline) fn stop_runs(&mut self, limit: usize) {
         self.loans.request_stop();
         self.runs.stop(limit);
+    }
+
+    // Whether a repair, a replay or a verification of the job is out on its
+    // thread. A repair and a replay write the job's files as they go.
+    pub(in crate::pipeline) fn loan_out(&self) -> bool {
+        self.loans.out()
     }
 
     // Seam for status: whether a repair of the job is out on a thread.
@@ -466,6 +637,7 @@ impl GraphJob {
     pub(crate) fn work_pending(&self) -> bool {
         self.loans.out()
             || self.works.out()
+            || self.quieting.is_some()
             || self.tree.rewalks_owed()
             || self.writer.rechecks_waiting()
             || self.verifications_due()
@@ -513,15 +685,55 @@ impl GraphJob {
         self.writer.learn_policy()
     }
 
+    // Everything the job has submitted to its volumes' writers so far;
+    // `None` for a job that writes its files itself.
+    pub(crate) fn disk_barrier(&self) -> Option<super::disk::JobBarrier> {
+        self.writer.disk().map(|disk| disk.barrier())
+    }
+
+    pub(crate) fn disk(&self) -> Option<&super::disk::JobDisk> {
+        self.writer.disk()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn move_disk_for_test(&mut self, disk: super::disk::JobDisk) {
+        self.writer.move_disk_for_test(disk);
+    }
+
     pub(crate) fn pending(&self) -> &Pending {
         &self.pending
     }
 
     // Seam for completion, status and health: where the job stands, read
-    // off the tree. Stable.
+    // off the tree. Stable. Payload still to fetch wins over everything
+    // else, so while it is there, which is every article but the last, the
+    // walks of the sets and members are not taken.
     pub(crate) fn phase(&self) -> RootPhase {
+        if self.payload_waiting() {
+            return RootPhase::Downloading;
+        }
+        let extracting = phase::extracting(&self.tree) || self.runs.live();
+        RootPhase::derive(false, self.activity(), extracting)
+    }
+
+    // The phase read the long way, every walk taken, for the tests that hold
+    // the short way to it.
+    #[cfg(test)]
+    fn full_phase(&self) -> RootPhase {
         let extracting = phase::extracting(&self.tree) || self.runs.live();
         RootPhase::derive(self.payload_waiting(), self.activity(), extracting)
+    }
+
+    // The phase, checked against the long way.
+    #[cfg(test)]
+    pub(crate) fn checked_phase(&self) -> RootPhase {
+        let phase = self.phase();
+        assert_eq!(
+            phase,
+            self.full_phase(),
+            "the short way reads another phase"
+        );
+        phase
     }
 
     // What the recovery sets are doing: repairing while a repair run is out
@@ -861,12 +1073,8 @@ impl GraphJob {
         }
         for (volume, ordinal) in under {
             self.unarrive(volume, ordinal, limit)?;
-            if let Some(found) = self
-                .tree
-                .namespace_mut(NodeId::ROOT)
-                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
-            {
-                found.closed = false;
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(MemberId(volume.0));
             }
             self.notes.push(Note::Unread(volume, ordinal));
         }
@@ -885,6 +1093,12 @@ impl GraphJob {
     // Whether the root holds the article or has ruled it lost.
     pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
         self.root.map.article_settled(volume, ordinal)
+    }
+
+    // The volumes whose first article began or stopped being waited on
+    // since the last call; `None` on the first, when every one counts.
+    pub(crate) fn take_first_changes(&mut self) -> Option<std::collections::BTreeSet<VolumeIndex>> {
+        self.root.map.take_first_changes()
     }
 
     // Every article the root holds lost, with its declared encoded size.
@@ -919,6 +1133,62 @@ impl GraphJob {
     // it was turned away, by this job or another.
     pub(crate) fn memory_freed(&self) -> bool {
         self.runs.wakeable()
+    }
+
+    // The device a file at `path` lies on, as a write there would say.
+    pub(crate) fn device_of(&self, path: &std::path::Path) -> Device {
+        self.writer.device_of(path)
+    }
+
+    // The ledger of the disk `device` is to this job: the one its writes
+    // there spend from.
+    pub(crate) fn disk_ledger(&self, device: Device) -> &crate::operations::disk::DiskLedger {
+        self.writer.capacity(device).ledger()
+    }
+
+    // Whether the job waits for room on a disk, and its place among the
+    // jobs that wait.
+    pub(crate) fn disk_held(&self) -> bool {
+        self.writer.disk_held()
+    }
+
+    // What the step that just failed gave back to the disk as it failed.
+    pub(crate) fn take_gave_back(&mut self) -> Option<u64> {
+        self.writer.take_gave_back()
+    }
+
+    // What was left to write of the file whose write just found no room.
+    pub(crate) fn take_left_to_write(&mut self) -> Option<u64> {
+        self.writer.take_left_to_write()
+    }
+
+    pub(crate) fn disk_ticket(&self) -> Option<u64> {
+        self.writer.disk_ticket()
+    }
+
+    // A reading came: whether the job has room again. If it has, what it
+    // owes is promised again, and the runs parked for room, queued again,
+    // start on the next step. A job that waits idle wakes whatever the
+    // disk reads.
+    pub(crate) fn wake_disk(&mut self) -> bool {
+        if self.disk_idle() {
+            return self.writer.wake_idle();
+        }
+        self.writer.wake_disk()
+    }
+
+    // Whether the job waits for room though nothing of it would take any:
+    // it owes nothing, has nothing to write again, and no run of it is
+    // running or waits to. Its last write crossed the reserve and closed,
+    // and it wakes on the next turn. A run still live could write again,
+    // and keeps the job waiting for a reading with room.
+    pub(crate) fn disk_idle(&self) -> bool {
+        self.writer.disk_held() && self.writer.owes_nothing() && !self.runs.live()
+    }
+
+    // What the job waits for room for, and the folder it waits on.
+    pub(crate) fn disk_wait(&self) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
+        self.writer.disk_wait()
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step
@@ -1110,7 +1380,12 @@ impl GraphJob {
     }
 
     // The phase, when it changed since the last call.
+    // Under test every report is held to the long way, so each step of the
+    // pipeline tests checks the short way too.
     pub(crate) fn phase_change(&mut self) -> Option<RootPhase> {
+        #[cfg(test)]
+        let phase = self.checked_phase();
+        #[cfg(not(test))]
         let phase = self.phase();
         (self.reported != Some(phase)).then(|| {
             self.reported = Some(phase);
@@ -1163,6 +1438,7 @@ impl GraphJob {
                 }
             }
             if !offered {
+                self.fetch_unkept();
                 return Ok(());
             }
             self.writer.apply_all(
@@ -1172,6 +1448,42 @@ impl GraphJob {
                 effects,
                 &mut out,
             )?;
+        }
+    }
+
+    // What a give-back left of a root member not in hand comes again: the
+    // root waits on the articles under it again, the queue fetches them as
+    // first dispatched, and the member is open until they are in. Without
+    // them the member never closes, and a set covering it never rules.
+    fn fetch_unkept(&mut self) {
+        let mut unkept: BTreeMap<MemberId, Vec<weaver_graph::ByteRange>> = BTreeMap::new();
+        for (member, range) in self.writer.take_unkept() {
+            unkept.entry(member).or_default().push(range);
+        }
+        for (member, ranges) in unkept {
+            let volume = VolumeIndex(member.0);
+            let under: Vec<(u32, weaver_graph::ByteRange)> = self
+                .root
+                .map
+                .arrived_ranges(volume)
+                .into_iter()
+                .filter(|(_, placed)| {
+                    ranges
+                        .iter()
+                        .any(|range| placed.start < range.end && range.start < placed.end)
+                })
+                .collect();
+            if under.is_empty() {
+                continue;
+            }
+            for (ordinal, placed) in under {
+                self.root.map.unarrive(volume, ordinal);
+                self.tree.uncover(NodeId::ROOT, volume, placed);
+                self.notes.push(Note::Unread(volume, ordinal));
+            }
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(member);
+            }
         }
     }
 }

@@ -41,6 +41,25 @@ struct NntpShared {
     release: watch::Sender<bool>,
     connections: watch::Sender<usize>,
     started: std::sync::Mutex<usize>,
+    behaviour: NntpBehaviour,
+    // Lines of an endless body each connection may send, and the lines
+    // sent so far across them.
+    trickle: watch::Sender<usize>,
+    trickled: watch::Sender<usize>,
+    // Each GROUP and each BODY answer code, in the order sent.
+    log: std::sync::Mutex<Vec<String>>,
+}
+
+// How the NNTP fixture departs from an ordinary server.
+#[derive(Clone, Copy, Default)]
+pub struct NntpBehaviour {
+    // Answer 412 to a BODY on a connection that has selected no group.
+    pub require_group: bool,
+    // Answer 481 to every login.
+    pub refuse_login: bool,
+    // Answer each BODY with an article that never ends: its header, then
+    // one more line each time `trickle` allows one.
+    pub endless_body: bool,
 }
 
 pub struct NntpFixture {
@@ -55,6 +74,15 @@ impl NntpFixture {
         articles: Vec<FixtureArticle>,
         hold_after: Option<usize>,
         tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> Self {
+        Self::start_with(articles, hold_after, tls, NntpBehaviour::default()).await
+    }
+
+    pub async fn start_with(
+        articles: Vec<FixtureArticle>,
+        hold_after: Option<usize>,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+        behaviour: NntpBehaviour,
     ) -> Self {
         let bodies = articles
             .into_iter()
@@ -72,6 +100,10 @@ impl NntpFixture {
             release: watch::channel(false).0,
             connections: watch::channel(0).0,
             started: std::sync::Mutex::new(0),
+            behaviour,
+            trickle: watch::channel(0).0,
+            trickled: watch::channel(0).0,
+            log: std::sync::Mutex::new(Vec::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -105,14 +137,59 @@ impl NntpFixture {
         self.shared.connections.subscribe()
     }
 
+    // Each GROUP sent and each BODY answer code, in order: `GROUP`,
+    // `BODY 222`, `BODY 412`, `BODY 430`.
+    pub fn log(&self) -> Vec<String> {
+        self.shared.log.lock().unwrap().clone()
+    }
+
     pub fn release(&self) {
         self.shared.release.send_replace(true);
+    }
+
+    // Let each endless body send one more line.
+    pub fn trickle(&self) {
+        self.shared.trickle.send_modify(|lines| *lines += 1);
+    }
+
+    // Lines of endless bodies sent so far.
+    pub fn trickled(&self) -> watch::Receiver<usize> {
+        self.shared.trickled.subscribe()
     }
 
     // The raw (wire) size of one article's body, as a BODY answer carries it
     // between its status line and terminator.
     pub fn raw_size(&self, message_id: &str) -> usize {
         self.shared.bodies[message_id].len()
+    }
+}
+
+// An article that is still arriving for as long as the client reads it:
+// a yEnc header declaring far more than is ever sent, then one 128-byte line
+// per `trickle`. Ends when the client goes.
+async fn serve_endless_body(
+    stream: &mut (impl AsyncWrite + Unpin),
+    id: &str,
+    shared: &NntpShared,
+) -> std::io::Result<()> {
+    stream
+        .write_all(
+            format!("222 0 <{id}>\r\n=ybegin line=128 size=1073741824 name=endless.bin\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    stream.flush().await?;
+    let mut trickle = shared.trickle.subscribe();
+    let mut sent = 0;
+    loop {
+        if trickle.wait_for(|allowed| *allowed > sent).await.is_err() {
+            return Ok(());
+        }
+        stream.write_all(&[b'a'; 128]).await?;
+        stream.write_all(b"\r\n").await?;
+        stream.flush().await?;
+        sent += 1;
+        shared.trickled.send_modify(|lines| *lines += 1);
     }
 }
 
@@ -151,6 +228,8 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
     let mut stream = BufReader::new(stream);
     stream.write_all(b"200 fixture ready\r\n").await?;
     let mut line = String::new();
+    let mut group_selected = false;
+    let note = |entry: &str| shared.log.lock().unwrap().push(entry.to_owned());
     loop {
         line.clear();
         if stream.read_line(&mut line).await? == 0 {
@@ -168,10 +247,13 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
             "MODE" => stream.write_all(b"200 reader\r\n").await?,
             "AUTHINFO" => match words.next().map(str::to_ascii_uppercase).as_deref() {
                 Some("USER") => stream.write_all(b"381 password\r\n").await?,
+                _ if shared.behaviour.refuse_login => stream.write_all(b"481 rejected\r\n").await?,
                 _ => stream.write_all(b"281 welcome\r\n").await?,
             },
             "GROUP" => {
                 let group = words.next().unwrap_or("");
+                group_selected = true;
+                note("GROUP");
                 stream
                     .write_all(format!("211 0 0 0 {group}\r\n").as_bytes())
                     .await?
@@ -179,10 +261,22 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
             "BODY" => {
                 let id = words.next().unwrap_or("");
                 let id = id.trim_start_matches('<').trim_end_matches('>');
+                if shared.behaviour.require_group && !group_selected {
+                    note("BODY 412");
+                    stream.write_all(b"412 no newsgroup selected\r\n").await?;
+                    stream.flush().await?;
+                    continue;
+                }
                 let Some(body) = shared.bodies.get(id) else {
+                    note("BODY 430");
                     stream.write_all(b"430 no such article\r\n").await?;
+                    stream.flush().await?;
                     continue;
                 };
+                if shared.behaviour.endless_body {
+                    note("BODY endless");
+                    return serve_endless_body(&mut stream, id, &shared).await;
+                }
                 let position = {
                     let mut started = shared.started.lock().unwrap();
                     *started += 1;
@@ -198,6 +292,7 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
                 stream.write_all(body).await?;
                 stream.write_all(b".\r\n").await?;
                 stream.flush().await?;
+                note("BODY 222");
                 shared.served.send_modify(|served| *served += 1);
             }
             "DATE" => stream.write_all(b"111 20260101000000\r\n").await?,

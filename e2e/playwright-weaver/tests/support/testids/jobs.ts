@@ -15,5 +15,28 @@ export const jobIds = {
   scriptEventGroup: (event: string) => `script-event-${event}`,
   scriptRun: "script-run",
   scriptRunStatus: (status: string) => `script-run-status-${status}`,
+
+  // Archiving a history entry: the action, and the mark on an archived entry.
+  historyArchive: "history-archive",
+  historyArchived: (jobId: string | number) => `history-archived-${jobId}`,
+  // A history row's own actions, keyed by the job's id. Not under the row's
+  // `history-row-` prefix, which finds rows.
+  historyRowArchive: (jobId: string | number) => `history-entry-archive-${jobId}`,
+  historyRowDelete: (jobId: string | number) => `history-entry-delete-${jobId}`,
+  jobArchive: "job-archive",
+  jobArchived: "job-archived",
+
+  // A job page's lists past one page: the control that loads the next, and a file kept only as a record.
+  jobFilesShowMore: "job-files-show-more",
+  jobFileArchived: "job-file-archived",
+  jobEventsShowMore: "job-events-show-more",
+
+  // A job page's download panel: the panel, its archive lines keyed by node id, and a password's source group.
+  jobDownload: "job-download",
+  jobDownloadNode: (nodeId: string | number) => `job-download-node-${nodeId}`,
+  jobDownloadPasswordOrigin: (group: string) => `job-download-password-${group}`,
+  jobDownloadRecovery: "job-download-recovery",
+  jobDownloadPending: "job-download-pending",
+  jobDownloadUnrecorded: "job-download-unrecorded",
 } as const;
 // testids:end

@@ -106,6 +106,14 @@ struct Open {
     // The volumes that began or stopped being waited on since the bootstrap
     // last read them.
     reopened: BTreeSet<VolumeIndex>,
+    // The volumes whose first article began or stopped being waited on
+    // since the feed last read them. `None` until the feed first reads
+    // them, when every volume counts as changed, so nothing is filed.
+    firsts: Option<BTreeSet<VolumeIndex>>,
+    // The decoded bytes of the articles in hand across every volume: the sum
+    // of their `arrived_decoded`, kept beside them so it is read without
+    // walking the volumes.
+    in_hand: u64,
     // The volumes and articles the readers looked at, for the tests that
     // hold them to the ones still open.
     #[cfg(test)]
@@ -214,7 +222,7 @@ struct Volume {
     // class, a boundary, the order the volume is placed in.
     changes: u64,
     // The seeks answered since the last change, and what each was told.
-    answered: Vec<(ByteRange, Option<Class>, Pull)>,
+    answered: HashMap<(ByteRange, Option<Class>), Pull>,
 }
 
 impl Volume {
@@ -253,7 +261,7 @@ impl Volume {
             cuts: Vec::new(),
             marks: Marks::default(),
             changes: 0,
-            answered: Vec::new(),
+            answered: HashMap::new(),
         }
     }
 
@@ -278,6 +286,11 @@ impl Volume {
                 State::Waiting => self.settled_bytes - size,
                 _ => self.settled_bytes + size,
             };
+            if ordinal == self.articles[0].ordinal
+                && let Some(firsts) = open.firsts.as_mut()
+            {
+                firsts.insert(self.at);
+            }
         }
         let decoded = |state: State| match state {
             State::Arrived(Some(range)) => range.end - range.start,
@@ -285,6 +298,7 @@ impl Volume {
             State::Waiting | State::Lost { .. } => 0,
         };
         self.arrived_decoded = self.arrived_decoded - decoded(was) + decoded(state);
+        open.in_hand = open.in_hand - decoded(was) + decoded(state);
         self.articles[index].state = state;
         open.file(self.at, index, state);
         self.file_parkable(index);
@@ -585,7 +599,18 @@ impl Volume {
                 untold = true;
                 continue;
             }
-            let range = self.span(start, end)?;
+            let mut range = self.span(start, end)?;
+            // A volume placed in order lays each article where the one
+            // before it ended, so a run behind an article in hand starts
+            // there: never over bytes that arrived, which would be told lost.
+            if self.ordered_only
+                && let Some(State::Arrived(Some(before))) = start
+                    .checked_sub(1)
+                    .and_then(|before| self.articles.get(before))
+                    .map(|article| article.state)
+            {
+                range = ByteRange::new(range.start.max(before.end).min(range.end), range.end);
+            }
             if !range.is_empty() {
                 out.push(range);
             }
@@ -764,6 +789,19 @@ impl ArticleMap {
                 article.intact && matches!(article.state, State::Arrived(Some(_)))
             })
         })
+    }
+
+    // The volumes whose first article began or stopped being waited on
+    // since the last call. `None` on the first call: every volume counts as
+    // changed, and the volumes are filed from then on.
+    pub(crate) fn take_first_changes(&mut self) -> Option<BTreeSet<VolumeIndex>> {
+        match self.open.firsts.as_mut() {
+            Some(firsts) => Some(std::mem::take(firsts)),
+            None => {
+                self.open.firsts = Some(BTreeSet::new());
+                None
+            }
+        }
     }
 
     // Every server failed the article.
@@ -1046,10 +1084,7 @@ impl ArticleMap {
         // what it was, without mapping its range again: one that moved
         // articles changed them, so only an answer that moved none stands.
         if let Some(found) = self.volumes.get(volume.0 as usize)
-            && let Some(&(_, _, pull)) = found
-                .answered
-                .iter()
-                .find(|(asked, of, _)| *asked == range && *of == class)
+            && let Some(&pull) = found.answered.get(&(range, class))
         {
             #[cfg(test)]
             {
@@ -1069,7 +1104,7 @@ impl ArticleMap {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize)
             && Some(found.changes) == changes
         {
-            found.answered.push((range, class, pull));
+            found.answered.insert((range, class), pull);
         }
         pull
     }

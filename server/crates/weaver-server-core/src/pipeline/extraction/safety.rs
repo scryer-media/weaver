@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::info;
 
-use crate::operations::disk::probe_nearest_disk_space;
+use crate::operations::StorageCapacity;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -15,6 +15,10 @@ const TIB: u64 = 1024 * GIB;
 const MIN_MEMORY_LIMIT: u64 = 64 * MIB;
 const MAX_MEMORY_LIMIT: u64 = 64 * GIB;
 const MAX_MEMORY_ENV: &str = "WEAVER_EXTRACTION_MAX_MEMORY_BYTES";
+// The records a job's archives may hold, the most the 7z reader parses from
+// one end header: a header the reader takes whole is never refused for its
+// count. The memory limit bounds what many records cost.
+const DEFAULT_MAX_ENTRIES: u64 = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractionLimits {
@@ -69,7 +73,7 @@ impl ExtractionLimits {
         // The completed-download directory may not exist yet at startup; its
         // nearest existing ancestor answers for the filesystem the reserve is
         // derived from.
-        let total_filesystem_bytes = probe_nearest_disk_space(complete_dir)
+        let total_filesystem_bytes = StorageCapacity::read_nearest_now(complete_dir)
             .ok()
             .map(|space| space.total_bytes);
         let default_min_free = default_disk_reserve_bytes(total_filesystem_bytes);
@@ -86,7 +90,7 @@ impl ExtractionLimits {
         Ok(Self {
             max_job_bytes: parse_positive_u64("WEAVER_EXTRACTION_MAX_JOB_BYTES", 2 * TIB)?,
             max_member_bytes: parse_positive_u64("WEAVER_EXTRACTION_MAX_MEMBER_BYTES", TIB)?,
-            max_entries: parse_positive_u64("WEAVER_EXTRACTION_MAX_ENTRIES", 100_000)?,
+            max_entries: parse_positive_u64("WEAVER_EXTRACTION_MAX_ENTRIES", DEFAULT_MAX_ENTRIES)?,
             max_ratio: parse_positive_u64("WEAVER_EXTRACTION_MAX_RATIO", 100)?,
             ratio_floor_bytes: parse_positive_u64("WEAVER_EXTRACTION_RATIO_FLOOR_BYTES", GIB)?,
             max_seconds: parse_positive_u64("WEAVER_EXTRACTION_MAX_SECONDS", 43_200)?,
@@ -118,12 +122,12 @@ impl ExtractionLimits {
 }
 
 // The free space a filesystem of `total_filesystem_bytes` should keep: a
-// twentieth of it, between 512 MiB and 20 GiB, and 512 MiB when the size is
+// twentieth of it, between 512 MiB and 5 GiB, and 512 MiB when the size is
 // unknown. The extractor's default output reserve, and the same rule the
 // direct-store holds scratch keeps for the working directory.
 pub(crate) fn default_disk_reserve_bytes(total_filesystem_bytes: Option<u64>) -> u64 {
     total_filesystem_bytes
-        .map(|total| (total / 20).clamp(512 * MIB, 20 * GIB))
+        .map(|total| (total / 20).clamp(512 * MIB, 5 * GIB))
         .unwrap_or(512 * MIB)
 }
 
@@ -153,7 +157,6 @@ pub(crate) enum ExtractionRejectionReason {
     Entries,
     Deadline,
     Memory,
-    DiskReserve,
     ContentPolicy,
 }
 
@@ -166,7 +169,6 @@ impl ExtractionRejectionReason {
             Self::Entries => "entries",
             Self::Deadline => "deadline",
             Self::Memory => "memory",
-            Self::DiskReserve => "disk_reserve",
             Self::ContentPolicy => "content_policy",
         }
     }
@@ -376,6 +378,35 @@ mod tests {
             min_free_bytes: 1,
             max_memory_bytes: 64 * MIB,
         }
+    }
+
+    // The default reserve is a twentieth of the filesystem, never under
+    // 512 MiB and never over 5 GiB, and 512 MiB when the size is unknown.
+    #[test]
+    fn the_default_disk_reserve_is_a_twentieth_between_512_mib_and_5_gib() {
+        assert_eq!(default_disk_reserve_bytes(None), 512 * MIB);
+        assert_eq!(default_disk_reserve_bytes(Some(0)), 512 * MIB);
+        assert_eq!(
+            default_disk_reserve_bytes(Some(20 * 512 * MIB - 1)),
+            512 * MIB
+        );
+        assert_eq!(default_disk_reserve_bytes(Some(20 * 512 * MIB)), 512 * MIB);
+        assert_eq!(default_disk_reserve_bytes(Some(20 * GIB)), GIB);
+        assert_eq!(default_disk_reserve_bytes(Some(100 * GIB)), 5 * GIB);
+        assert_eq!(default_disk_reserve_bytes(Some(100 * GIB + 20)), 5 * GIB);
+        assert_eq!(default_disk_reserve_bytes(Some(4 * TIB)), 5 * GIB);
+        assert_eq!(default_disk_reserve_bytes(Some(u64::MAX)), 5 * GIB);
+    }
+
+    // The default entry cap is the 7z reader's own: every end header it
+    // parses is under the cap.
+    #[test]
+    fn the_default_entry_cap_is_the_7z_readers_own() {
+        assert_eq!(DEFAULT_MAX_ENTRIES, 1_000_000);
+        assert_eq!(
+            DEFAULT_MAX_ENTRIES,
+            sevenz_turbo::ArchiveLimits::default().max_entries
+        );
     }
 
     #[test]

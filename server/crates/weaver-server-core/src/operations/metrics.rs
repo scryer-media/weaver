@@ -79,10 +79,12 @@ pub enum SchedulerBlockClause {
     ProviderPriority,
     // The job's articles are still being read back from its stored NZB.
     Activation,
+    // A volume the job writes to holds its budget of bytes for its writer.
+    WriteBuffer,
 }
 
 impl SchedulerBlockClause {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Propagation,
         Self::Retention,
@@ -93,6 +95,7 @@ impl SchedulerBlockClause {
         Self::Checkpoint,
         Self::ProviderPriority,
         Self::Activation,
+        Self::WriteBuffer,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -106,6 +109,7 @@ impl SchedulerBlockClause {
             Self::Checkpoint => "checkpoint",
             Self::ProviderPriority => "provider_priority",
             Self::Activation => "activation",
+            Self::WriteBuffer => "write_buffer",
         }
     }
 
@@ -355,8 +359,8 @@ pub struct PipelineMetrics {
 
     // Queue depths
     pub download_queue_depth: AtomicUsize,
-    pub active_downloads: AtomicUsize,
-    // Woken when `active_downloads` is published at zero after being above it.
+    pub articles_in_flight: AtomicUsize,
+    // Woken when `articles_in_flight` is published at zero after being above it.
     pub downloads_drained: tokio::sync::Notify,
     pub active_decodes: AtomicUsize,
     // Raw article bodies waiting for decode scheduling.
@@ -437,6 +441,11 @@ pub struct PipelineMetrics {
     pub download_lane_refill_parked_total: AtomicU64,
     pub download_lane_refill_deferred_total: AtomicU64,
     pub download_lane_refill_saturated_total: AtomicU64,
+    // Refills held for their volume's room: saturated at its resume line,
+    // or idle while a volume held its job's budget. And those answered
+    // once the volume fell to its line or had room again.
+    pub download_lane_room_held_total: AtomicU64,
+    pub download_lane_room_woken_total: AtomicU64,
     pub download_pipeline_trial_success_total: AtomicU64,
     pub download_pipeline_trial_failure_total: AtomicU64,
     pub download_pipeline_proof_pass_total: AtomicU64,
@@ -447,6 +456,10 @@ pub struct PipelineMetrics {
     pub segments_downloaded: AtomicU64,
     pub segments_decoded: AtomicU64,
     pub segments_committed: AtomicU64,
+    // Articles booked missing: every server that could answer was asked and
+    // none had it. One per article, never one per server asked; a single
+    // server's "no such article" answer is `download_failures_article_not_found`
+    // and that server's `not_found` attempt count.
     pub articles_not_found: AtomicU64,
     // Articles booked missing because a 430 taught the retry nothing: the
     // exclusion set came back the same size it went out. Every increment is
@@ -461,7 +474,6 @@ pub struct PipelineMetrics {
     pub repair_active: AtomicUsize,
     pub extract_active: AtomicUsize,
     extraction_rejections: [AtomicU64; 9],
-    pub disk_write_latency_us: AtomicU64,
 
     // Retry tracking
     pub segments_retried: AtomicU64,
@@ -550,8 +562,8 @@ impl PipelineMetrics {
     }
 
     // Publish the in-flight article count; waiters on a drain wake at zero.
-    pub fn set_active_downloads(&self, active: usize) {
-        let previous = self.active_downloads.swap(active, Ordering::AcqRel);
+    pub fn set_articles_in_flight(&self, active: usize) {
+        let previous = self.articles_in_flight.swap(active, Ordering::AcqRel);
         if active == 0 && previous != 0 {
             self.downloads_drained.notify_waiters();
         }
@@ -563,7 +575,7 @@ impl PipelineMetrics {
             let drained = self.downloads_drained.notified();
             tokio::pin!(drained);
             drained.as_mut().enable();
-            if self.active_downloads.load(Ordering::Acquire) == 0 {
+            if self.articles_in_flight.load(Ordering::Acquire) == 0 {
                 return;
             }
             drained.await;
@@ -576,7 +588,7 @@ impl PipelineMetrics {
             bytes_decoded: AtomicU64::new(0),
             bytes_committed: AtomicU64::new(0),
             download_queue_depth: AtomicUsize::new(0),
-            active_downloads: AtomicUsize::new(0),
+            articles_in_flight: AtomicUsize::new(0),
             downloads_drained: tokio::sync::Notify::new(),
             active_decodes: AtomicUsize::new(0),
             decode_pending: AtomicUsize::new(0),
@@ -633,6 +645,8 @@ impl PipelineMetrics {
             download_lane_refill_parked_total: AtomicU64::new(0),
             download_lane_refill_deferred_total: AtomicU64::new(0),
             download_lane_refill_saturated_total: AtomicU64::new(0),
+            download_lane_room_held_total: AtomicU64::new(0),
+            download_lane_room_woken_total: AtomicU64::new(0),
             download_pipeline_trial_success_total: AtomicU64::new(0),
             download_pipeline_trial_failure_total: AtomicU64::new(0),
             download_pipeline_proof_pass_total: AtomicU64::new(0),
@@ -648,7 +662,6 @@ impl PipelineMetrics {
             repair_active: AtomicUsize::new(0),
             extract_active: AtomicUsize::new(0),
             extraction_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
-            disk_write_latency_us: AtomicU64::new(0),
             segments_retried: AtomicU64::new(0),
             segments_failed_permanent: AtomicU64::new(0),
             parked_infrastructure_work: AtomicUsize::new(0),
@@ -749,7 +762,7 @@ impl PipelineMetrics {
             bytes_decoded,
             bytes_committed: self.bytes_committed.load(Ordering::Relaxed),
             download_queue_depth: self.download_queue_depth.load(Ordering::Relaxed),
-            active_downloads: self.active_downloads.load(Ordering::Relaxed),
+            articles_in_flight: self.articles_in_flight.load(Ordering::Relaxed),
             active_decodes: self.active_decodes.load(Ordering::Relaxed),
             decode_pending: self.decode_pending.load(Ordering::Relaxed),
             decode_pending_bytes: self.decode_pending_bytes.load(Ordering::Relaxed),
@@ -875,6 +888,12 @@ impl PipelineMetrics {
             download_lane_refill_saturated_total: self
                 .download_lane_refill_saturated_total
                 .load(Ordering::Relaxed),
+            download_lane_room_held_total: self
+                .download_lane_room_held_total
+                .load(Ordering::Relaxed),
+            download_lane_room_woken_total: self
+                .download_lane_room_woken_total
+                .load(Ordering::Relaxed),
             download_pipeline_trial_success_total: self
                 .download_pipeline_trial_success_total
                 .load(Ordering::Relaxed),
@@ -898,7 +917,6 @@ impl PipelineMetrics {
             verify_active: self.verify_active.load(Ordering::Relaxed),
             repair_active: self.repair_active.load(Ordering::Relaxed),
             extract_active: self.extract_active.load(Ordering::Relaxed),
-            disk_write_latency_us: self.disk_write_latency_us.load(Ordering::Relaxed),
             segments_retried: self.segments_retried.load(Ordering::Relaxed),
             segments_failed_permanent: self.segments_failed_permanent.load(Ordering::Relaxed),
             parked_infrastructure_work: self.parked_infrastructure_work.load(Ordering::Relaxed),
@@ -999,7 +1017,7 @@ pub struct MetricsSnapshot {
     pub bytes_decoded: u64,
     pub bytes_committed: u64,
     pub download_queue_depth: usize,
-    pub active_downloads: usize,
+    pub articles_in_flight: usize,
     pub active_decodes: usize,
     pub decode_pending: usize,
     pub decode_pending_bytes: u64,
@@ -1059,6 +1077,8 @@ pub struct MetricsSnapshot {
     pub download_lane_refill_parked_total: u64,
     pub download_lane_refill_deferred_total: u64,
     pub download_lane_refill_saturated_total: u64,
+    pub download_lane_room_held_total: u64,
+    pub download_lane_room_woken_total: u64,
     pub download_pipeline_trial_success_total: u64,
     pub download_pipeline_trial_failure_total: u64,
     pub download_pipeline_proof_pass_total: u64,
@@ -1072,7 +1092,6 @@ pub struct MetricsSnapshot {
     pub verify_active: usize,
     pub repair_active: usize,
     pub extract_active: usize,
-    pub disk_write_latency_us: u64,
     pub segments_retried: u64,
     pub segments_failed_permanent: u64,
     #[serde(default)]

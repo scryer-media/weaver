@@ -10,6 +10,8 @@
 // delivery of its own after that, unless the object is a recovery object,
 // whose volumes live in their files.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Coverage, Effect, MemberId, NodeId, Tree};
 
@@ -53,13 +55,10 @@ impl NamespaceWriter {
         // A member can have both: a file a refusal read it back into, and
         // holds for what came after an object took it again. What the holds
         // carry never reached the file, so it goes on from the holds, and
-        // the file is read only around them.
+        // the file is read only around them, and around what the delivery
+        // that bound the member gave its object, which no file holds either.
         self.share_file(tree, node, member, said);
-        let held = self
-            .files
-            .get(&node)
-            .map(|files| files.holds.held_ranges(super::held_volume(member)))
-            .unwrap_or_default();
+        let held = self.not_in_file(tree, node, member);
         let owner = tree.child_of(node, member);
         let mut at = 0;
         while tree.child_of(node, member) == owner
@@ -151,7 +150,7 @@ impl NamespaceWriter {
         let Some(leaf) = files.leaves.get(&member) else {
             return;
         };
-        let held = files.holds.held_ranges(super::held_volume(member));
+        let held = self.not_in_file(tree, node, member);
         let ranges: Vec<ByteRange> = coverage
             .runs()
             .flat_map(|run| outside(run.range, &held))
@@ -161,15 +160,51 @@ impl NamespaceWriter {
         }) else {
             return;
         };
-        let name = free_name(&self.working_dir, &envelope_name(child, envelope));
+        let Some(disk) = &self.disk else {
+            let name = free_name(&self.working_dir, &envelope_name(child, envelope));
+            let link = self.working_dir.join(&name);
+            let linked = second_name(leaf.path(), &link);
+            if linked && !self.envelopes.start_in(child, envelope, &name, true) {
+                let _ = std::fs::remove_file(&link);
+            }
+            return;
+        };
+        // The second name is given by the writer of the working directory's
+        // volume, behind everything submitted for the file, so the loop
+        // never waits for the file to lie as said. Only a file that writer
+        // writes can be given it: one on another volume has no second name
+        // here, and its bytes are written afresh.
+        let to = Arc::clone(disk.working());
+        if !leaf.on_disk() || !Arc::ptr_eq(&to, disk.under(leaf.root())) {
+            return;
+        }
+        let name = self.envelopes.given().free(
+            Some(&to),
+            &self.working_dir,
+            &envelope_name(child, envelope),
+        );
         let link = self.working_dir.join(&name);
-        let linked = link
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::hard_link(leaf.path(), &link))
-            .is_ok();
-        if linked && !self.envelopes.start_in(child, envelope, &name, true) {
-            let _ = std::fs::remove_file(&link);
+        let (from, at) = (leaf.path().to_path_buf(), link.clone());
+        // Where the file system gives a file no second name, an empty file
+        // is made at the name and nothing fails: the bytes that go down to
+        // the envelope after, which are all of them, are written afresh as
+        // any envelope's are. The envelope's leaf is told its file is there,
+        // and it is either way, so a move, a length read or a removal that
+        // comes before the first of those bytes finds a file.
+        let made = to.run(None, link.clone(), move || {
+            second_name_or_empty(&from, &at);
+            Ok(())
+        });
+        if !self
+            .envelopes
+            .start_after(child, envelope, &name, true, made)
+        {
+            to.run(None, link.clone(), move || {
+                match std::fs::remove_file(&link) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                    _ => Ok(()),
+                }
+            });
         }
     }
 
@@ -192,5 +227,91 @@ impl NamespaceWriter {
             }
         }
         Ok(())
+    }
+}
+
+// Give the file at `from` the second name `at`. Whether it has it: a file
+// system that gives a file no second name leaves nothing at `at`.
+fn second_name(from: &std::path::Path, at: &std::path::Path) -> bool {
+    #[cfg(test)]
+    if refused::SECOND_NAMES.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    at.parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::hard_link(from, at))
+        .is_ok()
+}
+
+// As `second_name`, for a name that must be a file after: where the file
+// system gives no second name, an empty file is made there. A disk that
+// cannot make even that says so on the first write to the file.
+fn second_name_or_empty(from: &std::path::Path, at: &std::path::Path) {
+    if second_name(from, at) {
+        return;
+    }
+    let _ = at
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(at)
+        });
+}
+
+// A test's file system that gives no file a second name.
+#[cfg(test)]
+pub(crate) mod refused {
+    pub(crate) static SECOND_NAMES: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::graph::leaf::Leaf;
+
+    // A file system that gives no second name leaves a file at the name all
+    // the same, so the leaf that is told its file is there can be moved and
+    // measured before a byte is written to it.
+    #[test]
+    fn a_refused_second_name_still_leaves_a_file_the_leaf_can_move() {
+        refused::SECOND_NAMES.store(true, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("lantern.part2.rar");
+        std::fs::write(&from, b"volume").unwrap();
+        let at = dir.path().join("kept").join("envelope-1");
+
+        second_name_or_empty(&from, &at);
+
+        let mut leaf = Leaf::over(dir.path(), "kept/envelope-1", true);
+        assert_eq!(leaf.len().unwrap(), 0, "nothing was copied");
+        leaf.intend("kept/moved");
+        assert_eq!(leaf.move_on().unwrap().as_deref(), Some("kept/envelope-1"));
+        assert!(dir.path().join("kept").join("moved").is_file());
+        assert!(!at.exists());
+        assert_eq!(std::fs::read(&from).unwrap(), b"volume");
+    }
+
+    // Where the second name is given, it is the file itself and nothing
+    // else is made.
+    #[cfg(unix)]
+    #[test]
+    fn a_given_second_name_is_the_file_itself() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("lantern.part2.rar");
+        std::fs::write(&from, b"volume").unwrap();
+        let at = dir.path().join("envelope-1");
+
+        second_name_or_empty(&from, &at);
+
+        assert_eq!(
+            std::fs::metadata(&from).unwrap().ino(),
+            std::fs::metadata(&at).unwrap().ino()
+        );
     }
 }

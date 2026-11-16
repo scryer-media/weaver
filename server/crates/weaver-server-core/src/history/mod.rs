@@ -7,6 +7,7 @@ pub mod delete_queue;
 pub mod failure_kind;
 pub mod model;
 pub mod nzbget_state;
+pub mod output_files;
 pub mod persistence;
 pub mod queries;
 pub mod record;

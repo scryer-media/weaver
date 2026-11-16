@@ -223,6 +223,10 @@ pub(crate) struct ScriptRuntime {
         Option<std::sync::Arc<Vec<super::instances::ScriptInstance>>>,
     )>,
     admissions: std::sync::Mutex<QueueAdmissions>,
+    // Raised each time a job gains a script: an admission, a queued row or
+    // a run. A reader that took it before a look at which jobs hold one
+    // knows that look still stands while it is unchanged.
+    starts: std::sync::atomic::AtomicU64,
     durable_events_seen: std::sync::atomic::AtomicBool,
     background: BackgroundLane,
     pub(super) tests: super::test_run::TestRuns,
@@ -259,6 +263,25 @@ struct QueueClaimRegistration {
     runtime: std::sync::Arc<ScriptRuntime>,
     run_id: String,
     cancellation: watch::Receiver<bool>,
+}
+
+impl ScriptRuntime {
+    // A job gained a script, now visible to a look at which jobs hold one.
+    fn started(&self) {
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Database {
+    // How many times a job has gained a script. Taken before
+    // `jobs_with_live_script_events`, an unchanged count says no job has
+    // gained one since that look.
+    pub(crate) fn script_starts(&self) -> u64 {
+        self.script_runtime
+            .starts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Drop for QueueClaimRegistration {
@@ -485,6 +508,7 @@ pub async fn run_event(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(run_id.into(), (context.job_id, cancel_tx.clone()));
+    runtime.started();
     let forwarding = cancellation.map(|mut external| {
         tokio::spawn(async move {
             while external.changed().await.is_ok() {
@@ -1119,6 +1143,7 @@ impl Database {
             context,
             completion: Some(sender),
         });
+        self.script_runtime.started();
         if !admissions.running {
             admissions.running = true;
             let db = self.clone();
@@ -1127,6 +1152,91 @@ impl Database {
             });
         }
         receiver
+    }
+
+    // Which of `job_ids` have a script event being admitted, queued, started
+    // or running: what `wait_for_job_events_stopped` would wait on, asked of
+    // a whole list in one statement per bind-sized chunk.
+    pub(crate) fn jobs_with_live_script_events(
+        &self,
+        job_ids: &[u64],
+    ) -> Result<std::collections::HashSet<u64>, StateError> {
+        // Each registry is walked once, not once per asked job.
+        let held = self.jobs_with_scripts_held();
+        let mut live = job_ids
+            .iter()
+            .copied()
+            .filter(|id| held.contains(id))
+            .collect::<std::collections::HashSet<_>>();
+        if job_ids.is_empty() {
+            return Ok(live);
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+        let queued = self.run_sql_blocking_read(async move {
+            let mut queued = Vec::new();
+            for chunk in ids.chunks(crate::persistence::sql_runtime::max_rows_for_engine(
+                datastore.engine(),
+                1,
+            )) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT DISTINCT job_id FROM script_event_queue \
+                         WHERE job_id IN ({placeholders}) AND state IN ('queued', 'started')"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    queued.push(row.i64("job_id")? as u64);
+                }
+            }
+            Ok(queued)
+        })?;
+        live.extend(queued);
+        Ok(live)
+    }
+
+    // The jobs with a script waiting to be admitted, admitted, claimed or
+    // being cancelled: what `has_pending_script_admission` and
+    // `active_script_run_for_job` answer job by job, read in one walk of
+    // each registry.
+    fn jobs_with_scripts_held(&self) -> std::collections::HashSet<u64> {
+        let mut held = std::collections::HashSet::new();
+        {
+            let admissions = self
+                .script_runtime
+                .admissions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            held.extend(admissions.active_job);
+            held.extend(
+                admissions
+                    .pending
+                    .iter()
+                    .filter_map(|entry| entry.context.job_id),
+            );
+        }
+        held.extend(
+            self.script_runtime
+                .claimed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .filter_map(|(job, _)| *job),
+        );
+        held.extend(
+            self.script_runtime
+                .cancellations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .filter_map(|(job, _)| *job),
+        );
+        held
     }
 
     fn has_pending_script_admission(&self, job_id: u64) -> bool {
@@ -1178,6 +1288,20 @@ impl Database {
         )
     }
     pub fn cancel_event_scripts(&self, job_id: u64) {
+        self.cancel_event_scripts_where(|job| job == job_id);
+    }
+
+    // `cancel_event_scripts` for every job of `job_ids`, walking each
+    // registry once for the whole list.
+    pub(crate) fn cancel_event_scripts_of(&self, job_ids: &std::collections::HashSet<u64>) {
+        if !job_ids.is_empty() {
+            self.cancel_event_scripts_where(|job| job_ids.contains(&job));
+        }
+    }
+
+    // Signal every run, queued, running or fire-and-forget, of a job `of`
+    // picks to stop.
+    fn cancel_event_scripts_where(&self, of: impl Fn(u64) -> bool) {
         for registry in [
             &self.script_runtime.claimed,
             &self.script_runtime.cancellations,
@@ -1187,12 +1311,23 @@ impl Database {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .values()
             {
-                if *job == Some(job_id) {
+                if job.is_some_and(&of) {
                     sender.send_replace(true);
                 }
             }
         }
-        self.cancel_background_scripts(job_id);
+        for (job, sender) in self
+            .script_runtime
+            .background
+            .runs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            if job.is_some_and(&of) {
+                sender.send_replace(true);
+            }
+        }
     }
 
     // Signal every fire-and-forget run of `job_id` to stop. Returns whether
@@ -1245,6 +1380,19 @@ impl Database {
     }
 
     fn enqueue_script_event_inner(
+        &self,
+        context: &EventContext,
+        now_ms: i64,
+        require_job: bool,
+    ) -> Result<Option<String>, StateError> {
+        let queued = self.enqueue_script_event_row(context, now_ms, require_job);
+        if matches!(queued, Ok(Some(_))) {
+            self.script_runtime.started();
+        }
+        queued
+    }
+
+    fn enqueue_script_event_row(
         &self,
         context: &EventContext,
         now_ms: i64,
@@ -1851,6 +1999,7 @@ pub fn hold_test_event_run(db: &Database, job_id: u64, run_id: &str) -> impl Dro
         .lock()
         .unwrap()
         .insert(run_id.into(), (Some(job_id), cancel));
+    db.script_runtime.started();
     RunRegistration {
         runtime: db.script_runtime.clone(),
         run_id: run_id.into(),

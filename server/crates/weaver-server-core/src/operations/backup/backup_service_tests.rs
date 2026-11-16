@@ -165,6 +165,7 @@ fn sample_config() -> Config {
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
@@ -195,6 +196,7 @@ fn populate_source_db(db: &Database) {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     })
     .unwrap();
 }
@@ -697,6 +699,7 @@ async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() 
                     completed_at: 2,
                     metadata: None,
                     server_attribution: None,
+                    archived_at: None,
                 })
                 .unwrap();
             writer_db
@@ -1186,6 +1189,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
@@ -1210,6 +1214,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
@@ -2248,7 +2253,51 @@ fn finished_job(job_id: u64) -> JobHistoryRow {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     }
+}
+
+// A bundle written before schema 92 never passed through the step that
+// trims a stored server list, so the restore runs it: 53 servers come back
+// as 50, by the upgrade's rule. Server 1 is the primary; of the others, on
+// level 1, the two disabled go first and then the newest. The same bundle
+// written at the current schema is restored as it is.
+#[test]
+fn a_bundle_older_than_the_server_limit_step_restores_within_the_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let source = Database::open(&root.path().join("source.db")).unwrap();
+    for id in 1..=53u32 {
+        let mut server = sample_server(id);
+        server.priority = u32::from(id != 1);
+        server.active = id != 10 && id != 20;
+        source.insert_server_past_limit(&server).unwrap();
+    }
+    let export = source.export_logical_backup().unwrap();
+    let tables = export.staging.path().join("tables");
+    let ids = |db: &Database| {
+        db.list_servers()
+            .unwrap()
+            .into_iter()
+            .map(|server| server.id)
+            .collect::<Vec<_>>()
+    };
+
+    let older = Database::open(&root.path().join("older.db")).unwrap();
+    older
+        .import_logical_backup(&tables, &export.tables, 91)
+        .unwrap();
+    assert_eq!(
+        ids(&older),
+        (1..=52)
+            .filter(|id| ![10, 20].contains(id))
+            .collect::<Vec<_>>()
+    );
+
+    let current = Database::open(&root.path().join("current.db")).unwrap();
+    current
+        .import_logical_backup(&tables, &export.tables, export.schema_version)
+        .unwrap();
+    assert_eq!(ids(&current).len(), 53);
 }
 
 // A finished job's stored NZB travels with its history in a backup, and

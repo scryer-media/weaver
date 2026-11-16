@@ -22,6 +22,9 @@ pub(crate) struct Verification {
     stated: u32,
     coverage: Coverage,
     folded: Option<u32>,
+    // Everything submitted for the file when the check was lent: the
+    // worker reads once it has returned.
+    settled: Option<crate::operations::disk::writer::Barrier>,
     pub(crate) stop: Arc<AtomicBool>,
     #[cfg(test)]
     barrier: Option<ReadBarrier>,
@@ -79,6 +82,7 @@ impl Verification {
     pub(super) fn run_with(self, shutdown: &Shutdown, mut read: impl FnMut(usize)) -> Verified {
         let stopped = || self.stop.load(Ordering::Relaxed) || shutdown.started();
         let io = |source| LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
             path: self.path.clone(),
             source,
         };
@@ -88,6 +92,16 @@ impl Verification {
             }
             if let Some(folded) = self.folded {
                 return Ok(Some(folded));
+            }
+            // The check runs on a thread of its own, which the loop never
+            // waits for.
+            if let Some(settled) = &self.settled {
+                settled.wait_aside();
+                // A write of the file failed: there is nothing to check,
+                // and the failure fails the job.
+                if settled.unwritten() {
+                    return Ok(None);
+                }
             }
             let file = File::open(&self.path).map_err(io)?;
             let mut bytes = vec![0; READ_BACK as usize];
@@ -205,6 +219,7 @@ impl NamespaceWriter {
             folded: leaf
                 .folded(length, Algorithm::Crc32)
                 .map(|folded| folded as u32),
+            settled: leaf.settled(),
             stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             barrier: None,
@@ -254,7 +269,7 @@ impl NamespaceWriter {
             .leaves
             .get_mut(&check.member)
             .expect("the current backing was checked above")
-            .fold_passed(check.length, Digest::crc32(actual));
+            .fold_read(check.length, Digest::crc32(actual));
         self.verifications.remove(&key);
         if actual != check.stated {
             let mut effects = Vec::new();

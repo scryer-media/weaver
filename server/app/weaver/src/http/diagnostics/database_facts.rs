@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// `database.json`: how a SQLite database is stored, the sizes of its files
-// and how its pages are laid out. The package is asked for when the database
+// `database.json`: how a SQLite database is stored, the sizes of its files,
+// how its pages are laid out and how large each table is, as bounds read
+// without counting a row (see `diagnostic_tables`). The package is asked for when the database
 // may be stalled, so the two halves are read apart: the file sizes need no
 // database and are always written; the page facts wait on the read executor,
 // and only for a short while. A value that cannot be read is `null`, named
@@ -16,6 +17,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use weaver_server_core::Database;
+use weaver_server_core::jobs::diagnostic_tables::DiagnosticTableSize;
 use weaver_server_core::persistence::connection::{
     SqliteFileSize, SqliteFileSizes, SqlitePageFacts,
 };
@@ -44,18 +46,37 @@ pub(super) async fn collect_database_facts(db: &Database) -> Vec<Component> {
             )];
         }
     };
-    let db = db.clone();
-    let page_facts = bounded::blocking(move || Ok(db.sqlite_page_facts()));
-    collect_within(sizes, page_facts, bounded::DATABASE_WAIT).await
+    let page_db = db.clone();
+    let page_facts = bounded::blocking(move || Ok(page_db.sqlite_page_facts()));
+    let table_db = db.clone();
+    let table_sizes = bounded::blocking(move || {
+        table_db
+            .diagnostic_table_sizes()
+            .transpose()
+            .map_err(|error| error.to_string())
+    });
+    collect_within(sizes, page_facts, table_sizes, bounded::DATABASE_WAIT).await
 }
 
+// Both reads wait until one deadline, side by side.
 pub(super) async fn collect_within(
     sizes: SqliteFileSizes,
     page_facts: impl Future<Output = Result<Option<SqlitePageFacts>, String>>,
+    table_sizes: impl Future<Output = Result<Option<Vec<DiagnosticTableSize>>, String>>,
     wait: Duration,
 ) -> Vec<Component> {
     let deadline = tokio::time::Instant::now() + wait;
-    let pages = match bounded::within(deadline, page_facts).await {
+    let (pages, tables) = tokio::join!(
+        bounded::within(deadline, page_facts),
+        bounded::within(deadline, table_sizes)
+    );
+    let tables = match tables {
+        Ok(Some(tables)) => TableOutcome::Read(tables),
+        Ok(None) => TableOutcome::Failed("the database engine is not SQLite".to_string()),
+        Err(refused) if refused.reason == REASON_TIMED_OUT => TableOutcome::TimedOut(wait),
+        Err(refused) => TableOutcome::Failed(refused.message),
+    };
+    let pages = match pages {
         Ok(Some(facts)) => PageOutcome::Read(facts),
         // The engine was SQLite a moment ago; a page read that now finds
         // another has nothing to report.
@@ -63,11 +84,17 @@ pub(super) async fn collect_within(
         Err(refused) if refused.reason == REASON_TIMED_OUT => PageOutcome::TimedOut(wait),
         Err(refused) => PageOutcome::Failed(refused.message),
     };
-    database_components(&sizes, &pages)
+    database_components(&sizes, &pages, &tables)
 }
 
 pub(super) enum PageOutcome {
     Read(SqlitePageFacts),
+    Failed(String),
+    TimedOut(Duration),
+}
+
+pub(super) enum TableOutcome {
+    Read(Vec<DiagnosticTableSize>),
     Failed(String),
     TimedOut(Duration),
 }
@@ -80,6 +107,9 @@ struct DatabaseFacts<'a> {
     page_count: Option<u64>,
     freelist_count: Option<u64>,
     journal_mode: Option<&'a str>,
+    // Each table by name, with its size as bounds; `null` when they could
+    // not be read.
+    tables: Option<Vec<TableSize<'a>>>,
     // The values that could not be read, each by name, with why.
     errors: Vec<ValueError>,
 }
@@ -99,6 +129,15 @@ struct FileSize {
     bytes: Option<u64>,
 }
 
+// The field names say how exact each figure is: an upper bound read from the
+// largest rowid, and the count `ANALYZE` stored when it last ran.
+#[derive(Serialize)]
+struct TableSize<'a> {
+    table: &'a str,
+    rows_upper_bound: Option<u64>,
+    rows_estimated_at_last_analyze: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct ValueError {
     value: &'static str,
@@ -115,9 +154,13 @@ const PAGE_VALUES: [&str; 4] = ["page_size", "page_count", "freelist_count", "jo
 // which ships when the stand-in table cannot be built: the same numbers,
 // codes and reasons, with every error sentence, which may hold OS or
 // database text and so a path, replaced by a fixed one for its reason.
-pub(super) fn database_components(sizes: &SqliteFileSizes, pages: &PageOutcome) -> Vec<Component> {
-    let as_read = components_with(sizes, pages, Sentences::AsRead);
-    let fixed = components_with(sizes, pages, Sentences::Fixed);
+pub(super) fn database_components(
+    sizes: &SqliteFileSizes,
+    pages: &PageOutcome,
+    tables: &TableOutcome,
+) -> Vec<Component> {
+    let as_read = components_with(sizes, pages, tables, Sentences::AsRead);
+    let fixed = components_with(sizes, pages, tables, Sentences::Fixed);
     as_read
         .into_iter()
         .zip(fixed)
@@ -141,9 +184,10 @@ fn fixed_sentence(reason: &str) -> &'static str {
     }
 }
 
-fn components_with(
+fn components_with<'a>(
     sizes: &SqliteFileSizes,
-    pages: &PageOutcome,
+    pages: &'a PageOutcome,
+    tables: &'a TableOutcome,
     sentences: Sentences,
 ) -> Vec<Component> {
     let mut errors = Vec::new();
@@ -178,6 +222,34 @@ fn components_with(
                 });
             }
             (None, None, None, None)
+        }
+    };
+    let tables = match tables {
+        TableOutcome::Read(tables) => Some(
+            tables
+                .iter()
+                .map(|size| TableSize {
+                    table: &size.table,
+                    rows_upper_bound: size.rows_upper_bound,
+                    rows_estimated_at_last_analyze: size.rows_estimated_at_last_analyze,
+                })
+                .collect(),
+        ),
+        TableOutcome::Failed(error) => {
+            errors.push(ValueError {
+                value: "tables",
+                reason: REASON_READ_FAILED,
+                error: error.clone(),
+            });
+            None
+        }
+        TableOutcome::TimedOut(wait) => {
+            errors.push(ValueError {
+                value: "tables",
+                reason: REASON_TIMED_OUT,
+                error: format!("the database did not answer within {}ms", wait.as_millis()),
+            });
+            None
         }
     };
     // Both forms carry the same manifest entries, one per value read as
@@ -227,6 +299,7 @@ fn components_with(
             page_count,
             freelist_count,
             journal_mode,
+            tables,
             errors,
         },
     ));

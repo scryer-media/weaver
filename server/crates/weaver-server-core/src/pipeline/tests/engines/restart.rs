@@ -129,7 +129,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                 from_disk.insert(article);
             }
             let server = (0..)
-                .find(|server| !work.exclude_servers.contains(server))
+                .find(|server| !work.exclude_servers.contains(*server))
                 .unwrap();
             if scenario.spoils(server, article) {
                 spoiled.insert(article);
@@ -326,7 +326,7 @@ async fn shut_down(pipeline: &mut Pipeline) {
 
 // The pipeline goes down with what it held in memory, and a new one restores
 // the job from what reached the database.
-async fn restart(
+pub(in crate::pipeline::tests) async fn restart(
     temp_dir: &tempfile::TempDir,
     pipeline: Pipeline,
     scenario: &Scenario,
@@ -352,6 +352,20 @@ async fn restart_heard(
     // the coverage a crash loses before the writer's barrier is due.
     pipeline.flush_graph_checkpoint(JOB);
     in_memory.extend(pipeline.graph_jobs[&JOB].in_memory());
+    // Boxed: the restore's future is large, and a caller's frame holds it
+    // once already.
+    Box::pin(restart_as_it_stands(temp_dir, pipeline, scenario, inspect)).await
+}
+
+// The pipeline dropped as it stands and the next made over the same
+// folders, the job restored from the database's rows: a restart of a job
+// whose graph is not live, as one held for a full disk.
+pub(in crate::pipeline::tests) async fn restart_as_it_stands(
+    temp_dir: &tempfile::TempDir,
+    pipeline: Pipeline,
+    scenario: &Scenario,
+    inspect: Inspect<'_>,
+) -> (Pipeline, tokio::sync::broadcast::Receiver<PipelineEvent>) {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;
@@ -709,11 +723,15 @@ pub(in crate::pipeline::tests) async fn run_restarted_while_repairing(
             lent_again = true;
         }
         if repair_out && !restarted {
+            // A repair out writes the job's files: the drain waits for it to
+            // its end rather than for a bound.
+            assert!(pipeline.graph_drain_waits_for_loans());
             pipeline.drain().await;
             assert!(
                 !pipeline.graph_jobs[&JOB].awaits_mail(),
                 "the drain left the job's repair out on its thread"
             );
+            assert!(!pipeline.graph_drain_waits_for_loans());
             drain(&mut sent, &mut events);
             (pipeline, sent) =
                 restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;
@@ -997,6 +1015,83 @@ async fn a_job_with_no_checkpoint_is_admitted_afresh_at_restore() {
     assert_eq!(queued, scenario.spec().files[0].segments.len());
 }
 
+// A post declares each article's encoded size, which is more than the bytes
+// the article decodes to; a run counts each arrival's decoded bytes. A
+// restart resumes the job's downloaded bytes from what its checkpoint has in
+// hand, in the same decoded units, so a stopped and restarted job ends on
+// the figure an uninterrupted one does. A stop at 3,429 articles of a slow
+// disk run had resumed from their encoded sizes: 76 MB more than it had
+// counted, and the job ended 73 MB above the uninterrupted run.
+#[tokio::test]
+async fn a_restart_resumes_the_downloaded_bytes_the_run_counted_not_the_posts_encoded_sizes() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 73))]);
+    // The post declares about 3% over each article's decoded bytes, as yEnc
+    // does.
+    let declared = || {
+        let mut spec = scenario.spec();
+        for segment in spec.files.iter_mut().flat_map(|file| &mut file.segments) {
+            segment.bytes += segment.bytes / 32;
+        }
+        spec.total_bytes = spec
+            .files
+            .iter()
+            .flat_map(|file| &file.segments)
+            .map(|segment| u64::from(segment.bytes))
+            .sum();
+        spec
+    };
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    let working_dir = insert_active_job(&mut pipeline, JOB, declared()).await;
+    let mut declared_served = 0u64;
+    for _ in 0..4 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        declared_served += u64::from(work.byte_estimate);
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    let counted = pipeline.jobs[&JOB].downloaded_bytes;
+    assert_eq!(counted, 4 * ARTICLE as u64, "a run counts decoded bytes");
+    assert!(declared_served > counted, "the post declares more");
+
+    pipeline.flush_graph_checkpoint(JOB);
+    retire_pipeline_database(pipeline).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id: JOB,
+            job_hash: [0; 32],
+            spec: declared(),
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+            restart: None,
+        })
+        .await
+        .unwrap();
+    assert!(pipeline.graph_jobs.contains_key(&JOB), "the job restored");
+    let state = &pipeline.jobs[&JOB];
+    assert_eq!(state.downloaded_bytes, counted);
+    assert_eq!(state.restored_download_floor_bytes, counted);
+    assert_eq!(Pipeline::effective_downloaded_bytes(state), counted);
+}
+
 // A restored graph job's durable download floor is what its checkpoints
 // settle. The graph writes the job's files and its checkpoint is the barrier,
 // so the floor moves with every checkpoint the restored job takes and with
@@ -1041,19 +1136,21 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
     assert_eq!(pipeline.durable_download_floor_bytes_for_job(JOB), restored);
     pipeline.advance_durable_download_floor(JOB);
     let floor = pipeline.durable_download_floor_bytes_for_job(JOB);
-    assert_eq!(
-        floor,
-        restored + served,
+    assert!(
+        floor > restored,
         "the floor is what the graph checkpoint settles"
     );
+    assert!(floor <= restored + served, "no more than came in");
+    // The floor and the downloaded bytes count in the same units, the
+    // decoded bytes of what is in hand: with every article checkpointed,
+    // nothing the job downloaded is counted as not durable. A floor in the
+    // post's encoded bytes stood about 3% above them.
+    assert_eq!(floor, pipeline.jobs[&JOB].downloaded_bytes);
+    assert_eq!(pipeline.estimated_undurable_download_bytes_for_job(JOB), 0);
 
-    // Accepted bytes placed so that a floor frozen at the restored one leaves
-    // the job past its lead limit, and the checkpointed floor leaves room for
-    // a lease of more than one article.
+    // With what is in hand checkpointed, the job has room for a lease of
+    // more than one article.
     let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
-    let estimate = u64::from(work.byte_estimate);
-    let limit = Pipeline::restart_durable_lead_limit_bytes();
-    pipeline.jobs.get_mut(&JOB).unwrap().downloaded_bytes = floor + limit - 2 * estimate;
     let admission = pipeline.checkpoint_admission(JOB);
     assert_eq!(
         admission.decision(&work.view(), &[]).as_str(),
@@ -1066,6 +1163,97 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
         "within_limit",
         "a restored graph job must not drop to one article at a time"
     );
+    retire_pipeline_database(pipeline).await;
+}
+
+// The restart lead gate counts what is in hand as the checkpoint does: each
+// article once. A restored job's downloaded bytes count every copy decoded,
+// so an article that arrives again (a damaged copy, then the copy that
+// replaced it) is counted twice there and once in hand. Against the
+// checkpoint's floor those extra copies were not durable for good: nothing
+// a checkpoint settles takes them off. Repeated, they passed the gate's
+// limit and held the job to one article at a time for the rest of its run.
+#[tokio::test]
+async fn copies_of_an_article_that_arrive_again_are_never_counted_as_not_durable() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 73))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    for _ in 0..4 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    let mut in_memory = BTreeSet::new();
+    let mut pipeline = restart(&temp_dir, pipeline, &scenario, &mut in_memory, &mut |_| {}).await;
+    assert!(
+        pipeline.jobs[&JOB].restored_download_floor_bytes > 0,
+        "the gate holds a restored job"
+    );
+
+    // One more article, then three more copies of it.
+    let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+    let article = (
+        work.segment_id.file_id.file_index,
+        work.segment_id.segment_number,
+    );
+    let before = pipeline.jobs[&JOB].downloaded_bytes;
+    for _ in 0..4 {
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    let counted = pipeline.jobs[&JOB].downloaded_bytes - before;
+    assert_eq!(counted, 4 * ARTICLE as u64, "every copy decoded is counted");
+
+    // The checkpoint takes the article once, and the gate counts nothing
+    // as not durable: the extra copies were never in hand twice.
+    pipeline.advance_durable_download_floor(JOB);
+    assert_eq!(pipeline.estimated_undurable_download_bytes_for_job(JOB), 0);
+    assert!(
+        !pipeline
+            .checkpoint_admission(JOB)
+            .holds_every_payload_article()
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
+// A restored job that had lost articles reports the failed bytes and the
+// health it reported before the stop: the articles the run before lost are
+// given up again on restore, and the job's running figure follows them.
+#[tokio::test]
+async fn a_restored_job_reports_the_failed_bytes_it_had() {
+    let scenario =
+        Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 74))]).lost(0, 1);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    for _ in 0..4 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    let figures = |pipeline: &Pipeline| {
+        let state = &pipeline.jobs[&JOB];
+        (
+            state.failed_bytes,
+            crate::pipeline::health_milli(state.spec.total_bytes, state.failed_bytes),
+        )
+    };
+    let before = figures(&pipeline);
+    assert_eq!(before.0, ARTICLE as u64, "the lost article is counted");
+    let mut in_memory = BTreeSet::new();
+    let pipeline = restart(&temp_dir, pipeline, &scenario, &mut in_memory, &mut |_| {}).await;
+    assert_eq!(figures(&pipeline), before);
+    assert_eq!(pipeline.derived_failed_bytes(JOB), before.0);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1489,6 +1677,51 @@ async fn plain_files_under_par3_restarted_after_every_article_are_repaired_with_
     ];
     let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
     restart_row(Scenario::new(posts).damaged(0, 2)).await;
+}
+
+// Every file is given its declared length when it is made, on whatever
+// filesystem the test runs: a file's length then says nothing of how far its
+// bytes reach. Articles a restored member holds in memory, undecided under
+// its set, are in no file, and each restart fetches them again from what the
+// checkpoint says alone. One that took the file's length for them would
+// leave holes of zeros where they lay, more than the set's blocks mend.
+#[tokio::test]
+async fn articles_held_in_memory_over_a_sized_file_are_fetched_again_after_every_restart() {
+    let _sized = crate::pipeline::graph::sparse::sizing::always();
+    let files = [
+        ("lantern.bin", payload(6 * ARTICLE, 83)),
+        ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
+    ];
+    let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
+    restart_row(Scenario::new(posts).damaged(0, 2)).await;
+}
+
+// No file is given a length before its bytes, so each is as long as its
+// last byte written. The second file is small enough to be decided at its
+// first article: its first and last articles come first and go to its
+// file, which then reaches its end. Every article between them comes after
+// a restart, while the member is undecided under its set, and is held in
+// memory below the file's length. Each restart fetches those again: the
+// file's length covers them, and the checkpoint does not.
+#[tokio::test]
+async fn articles_held_in_memory_below_a_files_length_are_fetched_again_after_every_restart() {
+    let _grown = crate::pipeline::graph::sparse::sizing::never();
+    let files = [
+        ("lantern.bin", payload(6 * ARTICLE, 83)),
+        ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
+    ];
+    let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
+    // Sixteen bytes an article: the second file is thirteen of them.
+    let scenario = Scenario::new(posts).framed(16).first(&[(1, 0), (1, 12)]);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert_restarted(&restarted, &whole);
+    assert!(
+        (1..12).any(|ordinal| restarted.in_memory.contains(&(1, ordinal))),
+        "some article between the file's ends was held in memory at a restart: {:?}",
+        restarted.in_memory
+    );
 }
 
 // The members are bound by their bytes, so the restored set must still
@@ -2122,7 +2355,7 @@ impl Reopened {
         // A blocked job holds no articles until its restore goes through.
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         // The pause goes on the job's writer lane.
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
@@ -2177,7 +2410,7 @@ impl Reopened {
         );
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
             .db
@@ -2770,6 +3003,49 @@ async fn a_paused_job_counts_only_the_articles_its_checkpoint_does_not_hold_as_q
         crate::jobs::model::JobArticles::Queued(_)
     ));
     assert_eq!(articles.queued_download_len(), 100);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job built again from its checkpoint keeps the staging it has, so its
+// activation asks the disk owner nothing.
+#[tokio::test]
+async fn a_job_restored_from_its_checkpoint_asks_nothing_of_the_disk() {
+    let body = payload(40 * ARTICLE + 5, 74);
+    let scenario = Scenario::new(vec![Post::plain("beacon.bin.xz", xz(&body))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    while !pipeline.graph_jobs[&JOB].awaits_mail() {
+        let work =
+            next_work(&mut pipeline, &scenario).expect("the run starts before the post ends");
+        serve_work(&mut pipeline, &scenario, &work).await;
+    }
+    pipeline.pause_job_runtime(JOB).unwrap();
+    pipeline.resume_job_runtime(JOB).unwrap();
+    while pipeline.retiring_graph_jobs.contains_key(&JOB) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the stopped run ends");
+        pipeline.graph_run_said(said);
+    }
+    let asks = crate::operations::disk::same_filesystem_asks();
+    pipeline.request_job_activation(JOB);
+    let read = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the read replies");
+    assert!(
+        read.result.as_ref().is_ok_and(|read| read.restored()),
+        "built from its checkpoint"
+    );
+    assert_eq!(crate::operations::disk::same_filesystem_asks(), asks);
+    pipeline.hear_graph_runs();
+    pipeline.handle_job_activated(read);
     retire_pipeline_database(pipeline).await;
 }
 

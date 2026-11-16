@@ -34,9 +34,11 @@ const (
 
 const (
 	// An archive's engine still producing members once every volume it reads
-	// is in: the job is extracting, so it cannot terminalize.
-	restartExtractDelayEnv = "WEAVER_E2E_DELAY=status.enter_extracting=20000"
-	restartPar2AliasSet    = "a31f592e0b874d3ea8c44161b77f3049"
+	// is in: the first job to enter extraction parks there until the process
+	// stops, so it is extracting, cannot terminalize, and the job behind it
+	// queues for the extraction.
+	restartExtractHoldEnv = "WEAVER_E2E_HOLD=status.enter_extracting"
+	restartPar2AliasSet   = "a31f592e0b874d3ea8c44161b77f3049"
 )
 
 type restartClassification string
@@ -297,7 +299,7 @@ func restartCases() []restartCase {
 		},
 		{
 			Name:        "credentials_refused_mid_job_settles",
-			Description: "The only server refuses the account mid-job; the queued articles are retired in one sweep and the job settles",
+			Description: "The only server refuses the account mid-job; the job waits on that server with nothing booked missing, and completes once the login is taken again",
 			Slugs:       []string{"single-mkv"},
 			Timeout:     10 * time.Minute,
 			Run:         runCredentialsRefusedMidJobSettles,
@@ -1000,6 +1002,14 @@ func validateNntpChaosResponse(resp string) error {
 	return nil
 }
 
+// serverUnavailableChaos makes a server unavailable until the gate is
+// released: new sessions are refused at the greeting, and a pooled session is
+// dropped at its next BODY, so earlier scenarios cannot leave a connection
+// around the gate. It drops rather than answering 480: a 480 again right
+// after the login it asked for is the server refusing the account, which
+// Weaver holds for its whole login quarantine, long past the gate's release.
+const serverUnavailableChaos = "greet_400=100,drop_conn=100"
+
 // holdNntpChaosOnServer keeps the authenticated control connection alive so
 // greeting failures cannot lock the harness out of clearing its own gate.
 func holdNntpChaosOnServer(host, port, config string) (func() error, error) {
@@ -1474,7 +1484,7 @@ func jobArchived(dbPath string, jobID int) (bool, error) {
 // never resolves.
 func waitForJobArchived(dbPath string, jobID int) error {
 	return awaitJobArchived(func() (bool, error) { return jobArchived(dbPath, jobID) }, func() {
-		time.Sleep(2 * time.Second)
+		time.Sleep(250 * time.Millisecond)
 	})
 }
 
@@ -1928,7 +1938,7 @@ func (ctx *restartCaseContext) waitForAllTerminal(jobIDs []int, timeout time.Dur
 		if complete {
 			return statuses, nil
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(250 * time.Millisecond)
 	}
 	return statuses, fmt.Errorf("timeout waiting for terminal status for jobs %v", jobIDs)
 }
@@ -2575,7 +2585,7 @@ func runQueuedRepairSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseR
 }
 
 func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractHoldEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobIDs, err := ctx.submitSlugNTimes("rar5-multi-member", 2)
@@ -2594,7 +2604,9 @@ func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, err
 	}
 
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	// The restarted process holds nothing: what is under test is that both
+	// jobs come back from their durable files and complete.
+	if err := ctx.startWeaverWithOptions("", 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	postDB, err := ctx.waitForDB(2*time.Minute, func(snapshot restartDBSnapshot) bool {
@@ -2638,7 +2650,7 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 	// mid-download. Refuse every BODY until the job has been observed in the
 	// state under test; the job then waits on the provider instead of racing
 	// the harness.
-	const articleGate = "greet_400=100,reauth_body=100"
+	const articleGate = serverUnavailableChaos
 	var releaseArticleGate func() error
 	defer func() {
 		if releaseArticleGate != nil {

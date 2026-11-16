@@ -48,6 +48,28 @@ pub const AGAIN_PIECE: u64 = 1 << 20;
 // What objects parsed of the members they gave back, by namespace and member.
 type Given = BTreeMap<(NodeId, MemberId), Carried>;
 
+// How many members given back a removed node's forgetting read, for the
+// tests that count it.
+#[cfg(test)]
+thread_local! {
+    static GIVEN_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Every member of `node` given back goes. The node's own range of the map is
+// read, never every member given back, so removing many nodes costs each
+// node its own members.
+fn forget_given<V>(given: &mut BTreeMap<(NodeId, MemberId), V>, node: NodeId) {
+    let members: Vec<(NodeId, MemberId)> = given
+        .range((node, MemberId(0))..=(node, MemberId(u32::MAX)))
+        .map(|(at, _)| *at)
+        .collect();
+    #[cfg(test)]
+    GIVEN_READ.with(|read| read.set(read.get() + members.len()));
+    for at in members {
+        given.remove(&at);
+    }
+}
+
 // How many members a changed front looked at, for the tests that count it.
 #[cfg(test)]
 thread_local! {
@@ -467,6 +489,11 @@ pub struct Tree {
     rewalks: BTreeMap<NodeId, Vec<(VolumeIndex, ByteRange)>>,
     // The nodes whose restart asks are being read: see `rewalk`.
     rewalking: BTreeSet<NodeId>,
+    // The places an object said are its own and none of its siblings could
+    // yet give it, by the namespace they are in: a volume bound there to a
+    // sibling later is offered to it at once. Never recorded: a restored
+    // object walks its volumes again and says them again.
+    wanting: BTreeSet<(NodeId, VolumeIndex, NodeId)>,
 }
 
 impl Default for Tree {
@@ -495,6 +522,7 @@ impl Tree {
             again_depth: 0,
             rewalks: BTreeMap::new(),
             rewalking: BTreeSet::new(),
+            wanting: BTreeSet::new(),
         }
     }
 
@@ -2064,6 +2092,13 @@ impl Tree {
             }
         }
         self.forget_empty(node, empty, effects);
+        // An object that gave volumes up and still holds some has places
+        // free that its siblings' volumes may be: it takes what they can
+        // carry and it claims, before the members given up are offered
+        // again. Only on a give-back, never per volume bound.
+        if !empty && !self.founded_by_name(node) {
+            self.take_claimed(parent, node, effects);
+        }
         for member in offered {
             self.identify_again(parent, member, builder, effects);
         }
@@ -2151,6 +2186,12 @@ impl Tree {
         self.report_moves(moved, effects);
     }
 
+    // The bytes the name ledger keeps for the parts of every path it holds,
+    // for every namespace of the job: see `NameLedger::resident`.
+    pub fn names_resident(&self) -> u64 {
+        self.names.resident()
+    }
+
     // Whether the member holds its output name only while the name it wants
     // is leaving, and moves to that one once it is vacated.
     pub fn held_off(&self, node: NodeId, member: MemberId) -> bool {
@@ -2227,7 +2268,9 @@ impl Tree {
     // moved into its namespace is homed where it was posted again.
     fn remove_node(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
-        self.given.retain(|(at, _), _| *at != node);
+        forget_given(&mut self.given, node);
+        self.wanting
+            .retain(|(parent, _, wanter)| *parent != node && *wanter != node);
         for record in removed.namespace.members() {
             self.release_name((node, record.id), effects);
         }
@@ -2994,11 +3037,27 @@ impl Tree {
     // volume it accepts. The existing give-back/adopt path keeps its bytes
     // in place.
     fn take_claimed(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
-        let siblings: Vec<NodeId> = self
-            .bound_below(node)
-            .into_iter()
-            .filter(|sibling| *sibling != child && !self.lent(*sibling))
-            .collect();
+        self.take_claimed_at(node, child, None, None, effects);
+    }
+
+    // As `take_claimed`, keeping only the volumes the object claims at one
+    // of `wanted`'s places, when it names any, and asking only `from`, when
+    // it names one.
+    fn take_claimed_at(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        wanted: Option<&[VolumeIndex]>,
+        from: Option<NodeId>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let siblings: Vec<NodeId> = match from {
+            Some(from) => vec![from],
+            None => self.bound_below(node),
+        }
+        .into_iter()
+        .filter(|sibling| *sibling != child && !self.lent(*sibling))
+        .collect();
         for sibling in siblings {
             let named = self.founded_by_name(sibling);
             let held = self.transferable(sibling, named);
@@ -3035,7 +3094,9 @@ impl Tree {
                                 })
                         })
                 };
-                let Some(place) = place else {
+                let Some(place) =
+                    place.filter(|place| wanted.is_none_or(|wanted| wanted.contains(place)))
+                else {
                     continue;
                 };
                 // A place the object holds already: the member is another
@@ -3481,6 +3542,7 @@ impl Tree {
             self.bound(node, member, kind, child, effects);
         }
         self.offer_given(node, child, effects);
+        self.offer_wanted(node, child, volume, effects);
     }
 
     // An object's set grew, which is evidence for the members given back
@@ -3715,6 +3777,7 @@ impl Tree {
         // back as the object stood before any of them comes again.
         let mut given = Vec::new();
         let mut again = Vec::new();
+        let mut wanted = Vec::new();
         for emit in emits.drain(..) {
             match emit {
                 Emit::Pending => {}
@@ -3802,6 +3865,7 @@ impl Tree {
                 } => self.unkept(node, (volume, range), (envelope, at), effects),
                 Emit::Again { volume, range } => again.push((volume, range)),
                 Emit::Damaged { volume, range } => self.damaged(node, volume, range, effects),
+                Emit::Gap { first, end, range } => self.gap(node, (first, end), range, effects),
                 Emit::NeedsPassword => effects.push(Effect::NeedsPassword { node }),
                 Emit::NeedsEngine(why) => {
                     self.unbind(node, Unbinding::Engine(why), builder, effects);
@@ -3812,6 +3876,7 @@ impl Tree {
                     self.unbind(node, refuted, builder, effects);
                 }
                 Emit::GiveBack(volume) => given.push(volume),
+                Emit::Wants(volume) => wanted.push(volume),
             }
             if self.nodes.get(&node).is_none_or(|found| found.retired) {
                 // Whatever the object said after giving its volumes up is
@@ -3827,6 +3892,75 @@ impl Tree {
         }
         if !given.is_empty() {
             self.give_back(node, &given, builder, effects);
+        }
+        if !wanted.is_empty() {
+            self.take_wanted(node, &wanted, effects);
+        }
+    }
+
+    // An object whose headers say volumes it does not hold are its own
+    // takes them from its siblings, as it would at its founding, but only
+    // where it claims them at those places. Only when it says so, once per
+    // place, never per volume bound.
+    fn take_wanted(&mut self, node: NodeId, wanted: &[VolumeIndex], effects: &mut Vec<Effect>) {
+        let Some(parent) = self
+            .nodes
+            .get(&node)
+            .filter(|found| !found.retired)
+            .and_then(|found| found.binding.as_ref())
+            .filter(|binding| binding.window.is_none())
+            .map(|binding| binding.parent)
+        else {
+            return;
+        };
+        if self.founded_by_name(node) {
+            return;
+        }
+        self.take_claimed_at(parent, node, Some(wanted), None, effects);
+        for place in wanted {
+            let held = self
+                .nodes
+                .get(&node)
+                .and_then(|found| found.binding.as_ref())
+                .is_some_and(|binding| binding.volumes.contains_key(place));
+            if !held {
+                self.wanting.insert((parent, *place, node));
+            }
+        }
+    }
+
+    // A member just bound at `volume` of `child` in `node`'s namespace, at a
+    // place a sibling said is its own: that sibling takes it from `child`
+    // where it claims it there. Only the siblings that said the place are
+    // asked, never every object of the namespace.
+    fn offer_wanted(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        volume: VolumeIndex,
+        effects: &mut Vec<Effect>,
+    ) {
+        self.wanting.remove(&(node, volume, child));
+        let wanters: Vec<NodeId> = self
+            .wanting
+            .range((node, volume, NodeId(0))..=(node, volume, NodeId(u32::MAX)))
+            .map(|(_, _, wanter)| *wanter)
+            .collect();
+        for wanter in wanters {
+            if !self.nodes.get(&wanter).is_some_and(|found| !found.retired) {
+                self.wanting.remove(&(node, volume, wanter));
+                continue;
+            }
+            self.take_claimed_at(node, wanter, Some(&[volume]), Some(child), effects);
+            let taken = self
+                .nodes
+                .get(&wanter)
+                .and_then(|found| found.binding.as_ref())
+                .is_some_and(|binding| binding.volumes.contains_key(&volume));
+            if taken {
+                self.wanting.remove(&(node, volume, wanter));
+                return;
+            }
         }
     }
 
@@ -4428,6 +4562,33 @@ impl Tree {
                 self.descend(pending, Down::Refuted, effects);
             }
             None => self.damage(node, volume, range, effects),
+        }
+    }
+
+    // A run of an object's volumes never came, and the object holds nothing
+    // of any of them. A volume of the run bound as a member is judged as
+    // `damaged` judges it. One not bound would descend as a loss, and the
+    // object, which is in its node as its word is applied, places none of
+    // its bytes anywhere but held: the loss marks nothing, so the run costs
+    // its bound volumes and no more.
+    fn gap(
+        &mut self,
+        node: NodeId,
+        (first, end): (VolumeIndex, VolumeIndex),
+        range: ByteRange,
+        effects: &mut Vec<Effect>,
+    ) {
+        if first >= end {
+            return;
+        }
+        let bound: Vec<VolumeIndex> = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .map(|binding| binding.volumes.range(first..end).map(|(v, _)| *v).collect())
+            .unwrap_or_default();
+        for volume in bound {
+            self.damaged(node, volume, range, effects);
         }
     }
 
@@ -5190,6 +5351,37 @@ mod tests {
     const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
     const HEADER: u64 = 7;
     const VOLUME_LEN: u64 = 100;
+
+    // Over seeded maps of members given back across many nodes, forgetting
+    // a node leaves what a scan of every member keeping the others would,
+    // and reads only that node's members.
+    #[test]
+    fn a_removed_node_forgets_its_members_given_back_alone() {
+        for seed in [1u64, 7, 42, 0x9e37_79b9_7f4a_7c15] {
+            let mut draw = seed;
+            let mut next = |bound: u32| {
+                draw ^= draw << 13;
+                draw ^= draw >> 7;
+                draw ^= draw << 17;
+                (draw % u64::from(bound)) as u32
+            };
+            let mut given = BTreeMap::new();
+            for _ in 0..2_000 {
+                let at = (NodeId(next(64)), MemberId(next(u32::MAX)));
+                given.insert(at, next(1_000));
+            }
+            for node in [0, u32::MAX].into_iter().chain((0..64).map(|_| next(66))) {
+                let node = NodeId(node);
+                let mut scanned = given.clone();
+                scanned.retain(|(at, _), _| *at != node);
+                let own = given.len() - scanned.len();
+                let before = GIVEN_READ.with(std::cell::Cell::get);
+                forget_given(&mut given, node);
+                assert_eq!(given, scanned, "seed {seed} node {node:?}");
+                assert_eq!(GIVEN_READ.with(std::cell::Cell::get) - before, own);
+            }
+        }
+    }
 
     // The root's `copy` folded into `into`, whatever it brought before.
     fn folded(effects: &[Effect], copy: MemberId, into: MemberId) -> bool {
@@ -6275,6 +6467,36 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // A gap over a run that takes in a bound volume judges that volume as a
+    // damage report for it alone does, and marks nothing for the rest.
+    #[test]
+    fn a_gap_over_a_bound_volume_marks_what_its_own_report_marks() {
+        let said = |emit: Emit| {
+            let (mut tree, _, child, _) = bound_tree();
+            let mut effects = Vec::new();
+            tree.emitted(child, vec![emit], &mut Build, &mut effects);
+            effects
+        };
+        let range = ByteRange::new(7, 12);
+        let alone = said(Emit::Damaged {
+            volume: VolumeIndex(0),
+            range,
+        });
+        assert!(!alone.is_empty());
+        let gap = said(Emit::Gap {
+            first: VolumeIndex(0),
+            end: VolumeIndex(u32::MAX),
+            range,
+        });
+        assert_eq!(gap, alone);
+        let past = said(Emit::Gap {
+            first: VolumeIndex(1),
+            end: VolumeIndex(u32::MAX),
+            range,
+        });
+        assert!(past.is_empty(), "{past:?}");
     }
 
     #[test]

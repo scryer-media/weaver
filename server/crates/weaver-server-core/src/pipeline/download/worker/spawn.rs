@@ -59,8 +59,7 @@ fn send_blocking_decode_failure(
     tx: &mpsc::Sender<DecodeDone>,
     segment_id: SegmentId,
     raw_size: u64,
-    source_server_idx: Option<usize>,
-    exclude_servers: Vec<usize>,
+    servers: PoolServers,
     error: String,
 ) {
     let _profile_scope = crate::runtime::perf_probe::scope("download.decode.send_failure");
@@ -70,8 +69,7 @@ fn send_blocking_decode_failure(
         segment_id,
         raw_size,
         error,
-        source_server_idx,
-        exclude_servers,
+        servers,
     });
     crate::runtime::perf_probe::record(
         "download.decode.done_channel.blocking_send",
@@ -98,8 +96,7 @@ impl Pipeline {
         let PendingDecodeWork {
             segment_id,
             raw,
-            source_server_idx,
-            exclude_servers,
+            servers,
         } = work;
         let raw_size = raw.len() as u64;
         let counters = self
@@ -185,10 +182,7 @@ impl Pipeline {
                                 Vec::new()
                             },
                         },
-                        source: SegmentSource {
-                            source_server_idx,
-                            exclude_servers,
-                        },
+                        source: SegmentSource { servers },
                     });
                     crate::runtime::perf_probe::record(
                         "download.decode.done_channel.blocking_send",
@@ -199,14 +193,7 @@ impl Pipeline {
                     let error = e.to_string();
                     metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                     warn!(segment = %segment_id, error = %error, "yEnc decode failed");
-                    send_blocking_decode_failure(
-                        &tx,
-                        segment_id,
-                        raw_size,
-                        source_server_idx,
-                        exclude_servers,
-                        error,
-                    );
+                    send_blocking_decode_failure(&tx, segment_id, raw_size, servers, error);
                 }
             }
         });
@@ -257,18 +244,12 @@ impl Pipeline {
     // config can describe is lane-served — plaintext, implicit TLS, STARTTLS,
     // and a TLS server whose preferred backend cannot build trust for it,
     // which the rustls backend picks up — so no server needs a second
-    // download path and none exists. The only lease that leaves here by
-    // another route is one whose articles are already in the repeated-article
-    // cache, which is answered from memory rather than fetched at all.
+    // download path and none exists. An article several files share goes
+    // the same way: the lane fetches it once and answers its other
+    // references from the job's repeated-article cache, which the lease
+    // carries.
     pub(crate) fn spawn_download_batch(&mut self, initial_lease: DownloadBatchLease) {
         if initial_lease.works.is_empty() {
-            return;
-        }
-
-        if !self.repeated_articles.is_empty()
-            && let Some(cache) = self.repeated_articles.get(&initial_lease.job_id)
-        {
-            self.spawn_repeated_download_batch(initial_lease, Arc::clone(cache));
             return;
         }
 

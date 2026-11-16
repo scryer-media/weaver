@@ -15,12 +15,13 @@
 // pipeline loop would report "not ready" precisely when the box is busiest,
 // which is the opposite of useful.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use tokio::sync::watch;
 
 use weaver_server_core::{Database, SchedulerHandle};
 
@@ -32,7 +33,98 @@ const DB_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 // a probe flood would queue `SELECT 1`s in front of segment commits. One
 // probe every couple of seconds is plenty for any orchestrator.
 const DB_PROBE_CACHE_TTL: Duration = Duration::from_secs(2);
-static DB_PROBE_CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+static DB_PROBE: ProbeCache = ProbeCache::new(DB_PROBE_CACHE_TTL, DB_PROBE_TIMEOUT);
+
+// The last database verdict and the probe running now, if any.
+//
+// At most one probe runs at a time. A request that finds the verdict stale
+// while a probe runs waits on that probe instead of starting another, so a
+// slow database sees one `SELECT 1`, not one per request. A verdict is
+// stamped when its probe ends.
+struct ProbeCache {
+    ttl: Duration,
+    timeout: Duration,
+    state: Mutex<ProbeState>,
+}
+
+struct ProbeState {
+    verdict: Option<(Instant, bool)>,
+    running: Option<Arc<watch::Sender<Option<bool>>>>,
+}
+
+impl ProbeCache {
+    const fn new(ttl: Duration, timeout: Duration) -> Self {
+        Self {
+            ttl,
+            timeout,
+            state: Mutex::new(ProbeState {
+                verdict: None,
+                running: None,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProbeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // The fresh verdict, or the probe to wait on, starting `probe` on a
+    // blocking worker when none runs.
+    async fn verdict(&'static self, probe: impl FnOnce() -> bool + Send + 'static) -> bool {
+        let mut waiting = {
+            let mut state = self.lock();
+            if let Some((probed_at, verdict)) = state.verdict
+                && probed_at.elapsed() < self.ttl
+            {
+                return verdict;
+            }
+            match &state.running {
+                Some(running) => running.subscribe(),
+                None => {
+                    let (sender, receiver) = watch::channel(None);
+                    let sender = Arc::new(sender);
+                    state.running = Some(Arc::clone(&sender));
+                    let finish = ProbeFinish {
+                        cache: self,
+                        sender,
+                        verdict: false,
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        let mut finish = finish;
+                        finish.verdict = probe();
+                    });
+                    receiver
+                }
+            }
+        };
+        matches!(
+            tokio::time::timeout(self.timeout, waiting.wait_for(Option::is_some)).await,
+            Ok(Ok(verdict)) if *verdict == Some(true)
+        )
+    }
+}
+
+// Records the verdict and ends the running probe when the probe returns. A
+// probe that panics records a failed verdict, so the next request can probe
+// again.
+struct ProbeFinish {
+    cache: &'static ProbeCache,
+    sender: Arc<watch::Sender<Option<bool>>>,
+    verdict: bool,
+}
+
+impl Drop for ProbeFinish {
+    fn drop(&mut self) {
+        {
+            let mut state = self.cache.lock();
+            state.verdict = Some((Instant::now(), self.verdict));
+            state.running = None;
+        }
+        self.sender.send_replace(Some(self.verdict));
+    }
+}
 
 // Liveness. Returns 200 as soon as the HTTP server is serving.
 pub(super) async fn healthz_handler() -> Response {
@@ -109,24 +201,8 @@ fn scheduler_is_alive(handle: &SchedulerHandle) -> bool {
 // blocking an axum worker thread on it would be a readiness probe that can
 // itself take the server down.
 async fn database_is_responsive(db: &Database) -> bool {
-    let now = Instant::now();
-    if let Some((probed_at, verdict)) = *DB_PROBE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        && now.duration_since(probed_at) < DB_PROBE_CACHE_TTL
-    {
-        return verdict;
-    }
     let db = db.clone();
-    let probe = tokio::task::spawn_blocking(move || db.probe_liveness());
-    let verdict = matches!(
-        tokio::time::timeout(DB_PROBE_TIMEOUT, probe).await,
-        Ok(Ok(Ok(())))
-    );
-    *DB_PROBE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((now, verdict));
-    verdict
+    DB_PROBE.verdict(move || db.probe_liveness().is_ok()).await
 }
 
 #[cfg(test)]
@@ -191,5 +267,127 @@ mod tests {
     #[tokio::test]
     async fn healthz_is_always_ok_once_it_can_answer() {
         assert_eq!(healthz_handler().await.status(), StatusCode::OK);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A probe that counts its runs and answers `answer` once its gate opens.
+    fn gated_probe(
+        runs: &Arc<AtomicUsize>,
+        gate: &Arc<(Mutex<bool>, std::sync::Condvar)>,
+        answer: bool,
+    ) -> impl FnOnce() -> bool + Send + 'static {
+        let runs = Arc::clone(runs);
+        let gate = Arc::clone(gate);
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            let (open, opened) = &*gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = opened.wait(open).unwrap();
+            }
+            answer
+        }
+    }
+
+    fn open_gate(gate: &(Mutex<bool>, std::sync::Condvar)) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    // How many requests wait on the running probe.
+    fn waiters(cache: &ProbeCache) -> usize {
+        cache
+            .lock()
+            .running
+            .as_ref()
+            .map_or(0, |running| running.receiver_count())
+    }
+
+    // A stale verdict and many concurrent requests: one probe, and every
+    // request answers with its verdict.
+    async fn concurrent_requests_share_one_probe(answer: bool) {
+        const REQUESTS: usize = 32;
+        // Every verdict is stale at once; the wait bound is never reached.
+        let cache: &'static ProbeCache = Box::leak(Box::new(ProbeCache::new(
+            Duration::ZERO,
+            Duration::from_secs(24 * 60 * 60),
+        )));
+        cache.lock().verdict = Some((Instant::now(), !answer));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let requests: Vec<_> = (0..REQUESTS)
+            .map(|_| tokio::spawn(cache.verdict(gated_probe(&runs, &gate, answer))))
+            .collect();
+        while waiters(cache) < REQUESTS {
+            tokio::task::yield_now().await;
+        }
+        open_gate(&gate);
+        for request in requests {
+            assert_eq!(request.await.unwrap(), answer);
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cache.lock().verdict.map(|(_, verdict)| verdict),
+            Some(answer)
+        );
+        assert!(cache.lock().running.is_none());
+
+        // The probe has ended, so the next stale request probes again.
+        let gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+        assert_eq!(
+            cache.verdict(gated_probe(&runs, &gate, answer)).await,
+            answer
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_healthy_database_is_probed_once_for_concurrent_requests() {
+        concurrent_requests_share_one_probe(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unhealthy_database_is_probed_once_for_concurrent_requests() {
+        concurrent_requests_share_one_probe(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_fresh_verdict_answers_without_a_probe() {
+        let cache: &'static ProbeCache = Box::leak(Box::new(ProbeCache::new(
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+        )));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+        for answer in [true, false] {
+            cache.lock().verdict = Some((Instant::now(), answer));
+            assert_eq!(
+                cache.verdict(gated_probe(&runs, &gate, !answer)).await,
+                answer
+            );
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_hung_probe_answers_unready_without_starting_another() {
+        // A zero wait bound gives up on a probe that has not answered yet.
+        let cache: &'static ProbeCache =
+            Box::leak(Box::new(ProbeCache::new(Duration::ZERO, Duration::ZERO)));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        for _ in 0..8 {
+            assert!(!cache.verdict(gated_probe(&runs, &gate, true)).await);
+        }
+        assert!(cache.lock().running.is_some());
+        assert!(runs.load(Ordering::SeqCst) <= 1);
+        let mut ended = cache.lock().running.as_ref().unwrap().subscribe();
+        open_gate(&gate);
+        ended.wait_for(Option::is_some).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(cache.lock().running.is_none());
+        assert_eq!(cache.lock().verdict.map(|(_, verdict)| verdict), Some(true));
     }
 }

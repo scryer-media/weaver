@@ -154,7 +154,14 @@ export class Rules {
   }
 }
 
-/** Run `body` with a rule tracker whose rules are removed afterwards. */
+/**
+ * Run `body` with a rule tracker whose rules are removed afterwards.
+ *
+ * Rules are deleted in the order they were created. Deleting the rule in
+ * force exposes the next one on its track, and the evaluator applies it on
+ * its next tick, so a test that ends with a hold behind its last rule in
+ * force calls `releaseLast` before it ends.
+ */
 export async function withRules(request: APIRequestContext, tag: string, body: (rules: Rules) => Promise<void>): Promise<void> {
   const rules = new Rules(request, tag);
   try {
@@ -162,6 +169,18 @@ export async function withRules(request: APIRequestContext, tag: string, body: (
   } finally {
     await rules.clear();
   }
+}
+
+/**
+ * Put a release rule at the current minute in force, before the test's rules
+ * are removed. Created last, it wins every earlier rule on its tracks and is
+ * deleted last, so removing the others exposes no older hold. The witness
+ * tick proves the evaluator applied it on every track. The test must not use
+ * the global Speed track.
+ */
+export async function releaseLast(request: APIRequestContext, rules: Rules, release: Record<string, unknown> & { actionType: string }): Promise<void> {
+  await rules.create({ ...release, time: hhmm(readClock()) });
+  await witnessTick(request);
 }
 
 let witnessSerial = 0;
@@ -415,8 +434,25 @@ export async function deleteFeed(request: APIRequestContext, id: number): Promis
   await graphql(request, "mutation($id: Int!) { deleteRssFeed(id: $id) }", { id });
 }
 
-export async function feedCount(key: string): Promise<number> {
-  const response = await fetch(`${RSS_FIXTURE}/count/${key}`);
-  expect(response.ok, `count for ${key}`).toBe(true);
+// Through the test's request context, so each read lands in the trace.
+export async function feedCount(request: APIRequestContext, key: string): Promise<number> {
+  const response = await request.get(`${RSS_FIXTURE}/count/${key}`);
+  expect(response.ok(), `count for ${key}`).toBe(true);
   return ((await response.json()) as { count: number }).count;
+}
+
+/**
+ * Waits for the poller's own record that it read feed `id`, then fails on
+ * the error that poll recorded. A failed fetch counts as the poll, and the
+ * feed is not due again for an hour, so a wait on the fixture's count alone
+ * would never end. Secondary evidence: the feed row, through the API, and
+ * the fixture's count of reads of `key`.
+ */
+export async function waitFeedRead(request: APIRequestContext, id: number, key: string, message: string): Promise<void> {
+  const poll = async () => (await graphql<{ rssFeed: { lastPolledAt: number | null; lastError: string | null } | null }>(request,
+    "query($id: Int!) { rssFeed(id: $id) { lastPolledAt lastError } }", { id })).rssFeed;
+  await expect.poll(async () => (await poll())?.lastPolledAt ?? null,
+    { message: `${message}: feed ${id} polled`, timeout: 0 }).not.toBeNull();
+  expect((await poll())?.lastError ?? null, `${message}: feed ${id} fetched without error`).toBeNull();
+  expect(await feedCount(request, key), `${message}: the fixture served feed ${id} once`).toBe(1);
 }

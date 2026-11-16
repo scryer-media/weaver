@@ -53,6 +53,9 @@ pub(crate) struct Restored {
     pub(crate) settled: Vec<(VolumeIndex, u32)>,
     // Articles the checkpoint had that were not on disk.
     pub(crate) refetched: Vec<(VolumeIndex, u32)>,
+    // The decoded bytes of the articles in hand once those are taken out:
+    // what the job had downloaded, counted as a run counts it.
+    pub(crate) in_hand_bytes: u64,
 }
 
 impl GraphJob {
@@ -70,7 +73,8 @@ impl GraphJob {
         let windows = storage.windows(scope);
         let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
             .on(storage.hardware)
-            .lending(windows);
+            .lending(windows)
+            .writing(storage.disk.clone());
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
@@ -78,10 +82,12 @@ impl GraphJob {
             storage.free_disk,
         )
         .delivering(storage.output)
+        .writing_through(storage.disk.clone())
         .capped(storage.caps)
         .metered(storage.metrics);
         writer.restore_verifications(&snapshot.root.pending_verifications);
         writer.restore_members(&tree);
+        writer.note_recorded_holds(&tree, &snapshot.holds);
         for ((node, member), state) in &snapshot.files {
             if tree
                 .namespace(*node)
@@ -117,14 +123,22 @@ impl GraphJob {
             works: super::works::Works::new(runs.scope(), runs.mail(), runs.hardware())
                 .timed(runs.clock()),
             runs,
-            passwords: Passwords::new(storage.passwords),
+            passwords: Passwords::from_candidates(storage.passwords),
             reported: snapshot.root.reported,
             pending: Pending::default(),
             mail_owed: None,
+            stopped_repair: None,
+            #[cfg(test)]
+            stopped_repairs_taken_back: 0,
             commit_held: None,
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
             sealed_at: None,
+            quieting: None,
+            #[cfg(test)]
+            one_turn: false,
+            moved: 0,
+            indexes_kept: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;
@@ -159,6 +173,9 @@ impl GraphJob {
         job.pending.restored(&job);
         Ok(Restored {
             settled: job.root.map.settled(),
+            in_hand_bytes: (0..job.root.map.volume_count())
+                .map(|volume| job.root.map.arrived_bytes(VolumeIndex(volume as u32)))
+                .sum(),
             refetched,
             job,
         })
@@ -252,15 +269,12 @@ impl GraphJob {
         // Nothing is lent inside a restore: the job lends once installed.
         for (volume, ordinal) in missing {
             self.unarrive(volume, ordinal, 0)?;
-            if let Some(found) = self
-                .tree
-                .namespace_mut(NodeId::ROOT)
-                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
-            {
-                found.closed = false;
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(MemberId(volume.0));
             }
             refetched.push((volume, ordinal));
         }
+        self.writer.forget_recorded_holds();
         Ok(refetched)
     }
 

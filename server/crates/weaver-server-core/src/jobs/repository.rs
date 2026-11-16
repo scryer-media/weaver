@@ -56,6 +56,27 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
     "graph_held_parts",
 ];
 
+// The jobs numbered below the bound, which every `{}` binds, that have rows
+// in `table` and no active row. The job ids are walked one seek each, from
+// each id to the next above it on the table's job-id key: a `DISTINCT` read
+// every row of every job, every file and article of the whole queue, to
+// find a few thousand ids.
+pub(super) fn orphan_jobs_sql(table: &str) -> String {
+    format!(
+        "WITH RECURSIVE ids(job_id) AS (
+             SELECT (SELECT MIN(job_id) FROM {table} WHERE job_id < {{}})
+             UNION ALL
+             SELECT (SELECT MIN(job_id) FROM {table}
+                      WHERE job_id > ids.job_id AND job_id < {{}})
+               FROM ids WHERE ids.job_id IS NOT NULL
+         )
+         SELECT job_id FROM ids
+          WHERE job_id IS NOT NULL AND NOT EXISTS (
+              SELECT 1 FROM active_jobs WHERE active_jobs.job_id = ids.job_id
+          )"
+    )
+}
+
 // Deletes the rows these jobs left in `table`, for each job that has no
 // active row. One statement for the whole chunk.
 async fn delete_orphan_rows(
@@ -158,6 +179,7 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::OptText(history.server_attribution.clone()),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::I64(job_id.0 as i64),
+        SqlArg::I64(job_id.0 as i64),
     ]
 }
 
@@ -214,7 +236,8 @@ async fn archive_job_sql(
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path,
                   created_at, completed_at, metadata, release_name, search_key,
-                  post_processing_summary, script_results_json, server_attribution, support_facts)
+                  post_processing_summary, script_results_json, server_attribution, support_facts,
+                  archived_at, download_summary)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
@@ -222,7 +245,9 @@ async fn archive_job_sql(
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
                          (SELECT script_results_json FROM active_jobs WHERE job_id = {}),
                          COALESCE({}, (SELECT server_attribution FROM active_jobs WHERE job_id = {})),
-                         (SELECT support_facts FROM active_jobs WHERE job_id = {}))
+                         (SELECT support_facts FROM active_jobs WHERE job_id = {}),
+                         NULL,
+                         (SELECT download_summary FROM active_jobs WHERE job_id = {}))
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
@@ -247,19 +272,30 @@ async fn archive_job_sql(
                     server_attribution =
                         COALESCE(excluded.server_attribution, job_history.server_attribution),
                     support_facts =
-                        COALESCE(excluded.support_facts, job_history.support_facts)
+                        COALESCE(excluded.support_facts, job_history.support_facts),
+                    -- A job that finishes again has its files again, so it is
+                    -- no longer archived,
+                    archived_at = NULL,
+                    archived_file_count = NULL,
+                    archived_file_bytes = NULL,
+                    -- and is swept again once it fails again.
+                    files_swept_at = NULL,
+                    -- Built afresh each time the job finishes.
+                    download_summary = excluded.download_summary
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
-                    created_at, completed_at, metadata, server_attribution",
+                    created_at, completed_at, metadata, server_attribution, archived_at",
                 &args,
             )
             .await?
             .map(history::queries::job_history_row_from_sql)
             .transpose()?;
             if let Some(row) = &archived {
-                // Set on every archive so a re-archived job never keeps the
-                // kind of an earlier failure.
+                crate::history::persistence::clear_archived_history_files_tx(tx, job_id.0 as i64)
+                    .await?;
+                // Set each time the job moves into history, so a job that
+                // finishes again never keeps the kind of an earlier failure.
                 tx.execute(
                     "UPDATE job_history SET failure_kind = {} WHERE job_id = {}",
                     &[
@@ -358,14 +394,7 @@ impl Database {
         let finders = ACTIVE_TABLES
             .into_iter()
             .chain(crate::jobs::graph_checkpoint::TABLES)
-            .map(|table| {
-                format!(
-                    "SELECT DISTINCT job_id FROM {table}
-                     WHERE job_id < {{}} AND NOT EXISTS (
-                         SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
-                     )"
-                )
-            })
+            .map(orphan_jobs_sql)
             .chain(std::iter::once(
                 "SELECT job_id FROM job_nzbs
                   WHERE job_id < {} AND NOT EXISTS (
@@ -377,8 +406,9 @@ impl Database {
             ));
         for sql in finders {
             let datastore = self.datastore();
+            let args = vec![SqlArg::I64(below); sql.matches("{}").count()];
             let ids = self.run_sql_blocking_read(async move {
-                SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[SqlArg::I64(below)])
+                SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args)
                     .await?
                     .into_iter()
                     .map(|row| row.i64("job_id"))

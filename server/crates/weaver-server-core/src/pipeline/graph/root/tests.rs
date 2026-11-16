@@ -143,6 +143,16 @@ pub(in crate::pipeline::graph) fn job_with(
     files: &[RootFile],
     wants: Vec<Seek>,
 ) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
+    job_through(files, wants, |_| None)
+}
+
+// [`job_with`], its files written through what `disk` gives for the job's
+// directory, or by the job itself when it gives nothing.
+pub(in crate::pipeline::graph) fn job_through(
+    files: &[RootFile],
+    wants: Vec<Seek>,
+    disk: impl FnOnce(&std::path::Path) -> Option<crate::pipeline::graph::disk::JobDisk>,
+) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
     let answers = Arc::new(Mutex::new(Vec::new()));
     let builder = Probes {
         wants,
@@ -160,7 +170,8 @@ pub(in crate::pipeline::graph) fn job_with(
         dir.path().to_path_buf(),
         accountant,
         CapacityReader::unknown(),
-    );
+    )
+    .writing_through(disk(dir.path()));
     let runs = Runs::new(
         1,
         1,
@@ -355,7 +366,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Downloading);
+    assert_eq!(job.checked_phase(), RootPhase::Downloading);
 
     job.intake(
         decoded(0, 0, 0, &zip_front(90), Some(180)),
@@ -363,7 +374,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Downloading);
+    assert_eq!(job.checked_phase(), RootPhase::Downloading);
 
     // Every volume in and the probe never closes the member it announced:
     // the object refuses itself as unmapped once the job is quiet, in the
@@ -374,7 +385,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Done);
+    assert_eq!(job.checked_phase(), RootPhase::Done);
     assert_eq!(
         job.writer().refused(NodeId::ROOT, MemberId(0)),
         Some(Why::Unmapped)
@@ -388,7 +399,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
             1,
         )
         .unwrap();
-    assert_eq!(plain.phase(), RootPhase::Done);
+    assert_eq!(plain.checked_phase(), RootPhase::Done);
 }
 
 #[test]
@@ -732,7 +743,7 @@ async fn moves_by_segment_leave_the_queues_as_walks_of_them_do() {
                         continue;
                     };
                     if *steered {
-                        work.exclude_servers = vec![1];
+                        work.exclude_servers = weaver_nntp::ServerSet::from([1]);
                         active.download_queue.push(work);
                     }
                 }
@@ -910,7 +921,11 @@ async fn retried_articles_of_a_file_share_the_one_group_list_the_queue_holds() {
     let retries: Vec<_> = (0..segments)
         .map(|ordinal| {
             pipeline
-                .download_retry_work(segment_id(job_id, 1, ordinal), 1, Vec::new())
+                .download_retry_work(
+                    segment_id(job_id, 1, ordinal),
+                    1,
+                    weaver_nntp::ServerSet::EMPTY,
+                )
                 .unwrap()
         })
         .collect();
@@ -977,7 +992,7 @@ async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles
     // retry rebuilt from the post says so; the root holds it ordinary.
     let first_volume = segment_id(job_id, 3, 1);
     let retry = pipeline
-        .download_retry_work(first_volume, 1, Vec::new())
+        .download_retry_work(first_volume, 1, weaver_nntp::ServerSet::EMPTY)
         .unwrap();
     assert_eq!(
         retry.priority,
@@ -1267,8 +1282,11 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
                 segments: Vec::new(),
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -2629,4 +2647,75 @@ fn an_unchanged_seek_is_answered_without_mapping_its_range_again() {
     root.map.seek(VolumeIndex(0), whole, critical);
     root.map.seek(VolumeIndex(0), whole, critical);
     assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 1);
+}
+
+// A round of seeks over many gaps, asked again with nothing changed, is told
+// the same answers in the same order and maps none of them again. Each memo
+// answer is also checked against a fresh mapping inside `seek`.
+#[test]
+fn a_repeated_round_over_many_gaps_is_answered_from_the_memo() {
+    let mut root = ArticleRoot::new(&[file("volume.vol", &[100; 64])]);
+    for ordinal in (1..64).step_by(2) {
+        root.map.lost(VolumeIndex(0), ordinal);
+    }
+    let asks: Vec<(ByteRange, Option<Class>)> = (1..64u64)
+        .step_by(2)
+        .flat_map(|ordinal| {
+            let gap = ByteRange::new(ordinal * 100, ordinal * 100 + 100);
+            [(gap, None), (gap, Some(Class::Critical))]
+        })
+        .collect();
+    let round = |root: &mut ArticleRoot| -> Vec<Pull> {
+        asks.iter()
+            .map(|(range, class)| root.map.seek(VolumeIndex(0), *range, *class))
+            .collect()
+    };
+    // The first round raises what can still come; the second settles.
+    round(&mut root);
+    let settled = round(&mut root);
+    SEEK_MAPPED.with(|calls| calls.set(0));
+    for _ in 0..3 {
+        assert_eq!(round(&mut root), settled);
+    }
+    assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 0);
+    root.map.lost(VolumeIndex(0), 0);
+    round(&mut root);
+    assert!(SEEK_MAPPED.with(std::cell::Cell::get) > 0);
+}
+
+// A volume placed only in order, as uuencode is, declares no part ends: each
+// part lands where the one before it ended, and one every server failed is
+// passed, so the parts after it land one hole early. The lost run starts
+// where the part in hand before it ended, never over that part's bytes: a
+// recovery set reads bytes told lost back as nothing, so a slice that
+// arrived whole and was proved whole would feed its repair as zeros.
+#[test]
+fn an_ordered_volume_tells_a_lost_run_from_the_end_of_the_part_before_it() {
+    const ARTICLES: u32 = 32;
+    const PART: u64 = 768;
+    // uuencode's encoded size, about four thirds of the part and its lines.
+    const ENCODED: u32 = 1050;
+    const LOST: u32 = 16;
+    let sizes: Vec<(u32, u32)> = (0..ARTICLES).map(|ordinal| (ordinal, ENCODED)).collect();
+    let mut map = super::source::ArticleMap::new(&[sizes]);
+    let volume = VolumeIndex(0);
+    map.set_ordered_only(volume);
+    for ordinal in (0..ARTICLES).filter(|ordinal| *ordinal != LOST) {
+        let place = u64::from(if ordinal < LOST { ordinal } else { ordinal - 1 });
+        map.arrived(
+            volume,
+            ordinal,
+            ByteRange::at(place * PART, PART),
+            None,
+            false,
+        );
+    }
+    map.lost(volume, LOST);
+    let mut told = Vec::new();
+    map.take_damage(&mut told).unwrap();
+    assert_eq!(told.len(), 1, "{told:?}");
+    let (at, range) = told[0];
+    assert_eq!(at, volume);
+    // Part 15 arrived at 11520..12288: the run starts at its end.
+    assert_eq!(range.start, u64::from(LOST) * PART, "{range:?}");
 }

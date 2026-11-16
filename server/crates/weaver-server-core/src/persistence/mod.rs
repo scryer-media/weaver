@@ -17,6 +17,7 @@ pub(crate) mod wal_checkpoint;
 #[cfg(test)]
 pub(crate) mod write_guard_tests;
 
+pub(crate) use connection::ArchiveNews;
 pub use connection::Database;
 pub(crate) use connection::DatabaseWriterExecutor;
 pub use error::{LoadError, Refusal, StateError};

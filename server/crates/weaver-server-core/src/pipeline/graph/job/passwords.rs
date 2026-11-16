@@ -18,10 +18,14 @@ use std::fmt;
 use weaver_graph::{Builder, Effect, Marked, NodeId, Why};
 
 use super::GraphJob;
+use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 
 #[derive(Default)]
 pub(super) struct Passwords {
     candidates: Vec<String>,
+    // Where each candidate came from, by the same index, recorded as the
+    // job's candidates are set; empty when they came without one.
+    sources: Vec<ArchivePasswordSource>,
     // How many candidates each node was offered, marked for every node an
     // offer moves on, so a checkpoint reads again only those.
     offered: Marked<NodeId, usize>,
@@ -38,9 +42,26 @@ impl fmt::Debug for Passwords {
 }
 
 impl Passwords {
+    #[cfg(test)]
     pub(super) fn new(candidates: Vec<String>) -> Self {
         Self {
             candidates,
+            ..Self::default()
+        }
+    }
+
+    // The candidates in the order they are tried, each with its source.
+    pub(super) fn from_candidates(candidates: Vec<ArchivePasswordCandidate>) -> Self {
+        let sources = candidates
+            .iter()
+            .map(|candidate| candidate.source())
+            .collect();
+        Self {
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| candidate.value().to_owned())
+                .collect(),
+            sources,
             ..Self::default()
         }
     }
@@ -87,20 +108,45 @@ impl GraphJob {
     // still trying an offer. `None` when no object needed a password or
     // none opened.
     pub(crate) fn opening_password(&self) -> Option<&str> {
+        self.passwords
+            .offered
+            .keys()
+            .find_map(|node| self.opened_with(*node))
+    }
+
+    // The candidate that opened the object at `node`, by the same test as
+    // `opening_password`; `None` when it was offered none or none opened it.
+    pub(crate) fn opened_with(&self, node: NodeId) -> Option<&str> {
+        self.opened_index(node)
+            .and_then(|index| self.passwords.candidates.get(index))
+            .map(String::as_str)
+    }
+
+    // Where the candidate that opened the object at `node` came from, as
+    // recorded when the job's candidates were set; `None` when none opened
+    // it or its candidates came without a source.
+    pub(crate) fn opened_source(&self, node: NodeId) -> Option<ArchivePasswordSource> {
+        self.opened_index(node)
+            .and_then(|index| self.passwords.sources.get(index))
+            .copied()
+    }
+
+    // The index of the candidate that opened the object at `node`.
+    fn opened_index(&self, node: NodeId) -> Option<usize> {
         let password =
             |why: Option<Why>| matches!(why, Some(Why::Encrypted | Why::EncryptedHeader));
-        self.passwords.offered.iter().find_map(|(node, offered)| {
-            let candidate = self.passwords.candidates.get(offered.checked_sub(1)?)?;
-            let record = self.tree.record(*node)?;
-            let withheld = password(record.reason)
-                || record.parent.is_some_and(|parent| {
-                    record
-                        .volumes
-                        .iter()
-                        .any(|(_, member)| password(self.writer.refused(parent, *member)))
-                });
-            (!withheld && !record.members.is_empty()).then_some(candidate.as_str())
-        })
+        let offered = *self.passwords.offered.get(&node)?;
+        let index = offered.checked_sub(1)?;
+        self.passwords.candidates.get(index)?;
+        let record = self.tree.record(node)?;
+        let withheld = password(record.reason)
+            || record.parent.is_some_and(|parent| {
+                record
+                    .volumes
+                    .iter()
+                    .any(|(_, member)| password(self.writer.refused(parent, *member)))
+            });
+        (!withheld && !record.members.is_empty()).then_some(index)
     }
 
     // How many candidates each node has been offered, by node.

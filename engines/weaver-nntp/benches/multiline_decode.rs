@@ -234,6 +234,15 @@ fn bench_yenc_article_decode(c: &mut Criterion) {
             );
         }
     }
+    // A small part, where an article's last decode calls weigh the most.
+    let small = build_yenc_transcript(4096, YencBenchPattern::Clean);
+    group.bench_with_input(
+        BenchmarkId::new("fused", "clean_4k"),
+        &small,
+        |b, payload| {
+            b.iter(|| black_box(decode_fused_yenc(black_box(payload))));
+        },
+    );
     group.finish();
 }
 

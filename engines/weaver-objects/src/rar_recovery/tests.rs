@@ -705,6 +705,39 @@ fn a_rebuilt_volume_is_judged_again_from_what_was_rebuilt() {
     assert_eq!(verdict(&job, lost), vec![SliceVerdict::Intact]);
 }
 
+// The same restore over volumes past the 1 MiB the set is staged,
+// written back and judged in: every piece of the rebuilt volume lands.
+#[test]
+fn a_rebuilt_volume_past_one_chunk_is_written_back_whole() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut job = job();
+    job.store.scratch = Some(dir.path().to_owned());
+    let part = 2 * (1 << 20) + 4099;
+    let volumes: Vec<Vec<u8>> = (0..3)
+        .map(|at| rar4_volume(&payload(at + 41, part), at as u16, at == 2))
+        .collect();
+    rev(&mut job, "lantern.part1.rev", &rar3_rev(&volumes));
+    volume(&mut job, &rar4_name(0), &volumes[0]);
+    volume(&mut job, &rar4_name(2), &volumes[2]);
+    let lost = job
+        .namespace
+        .announce(&rar4_name(1), Some(volumes[1].len() as u64));
+    job.namespace.get_mut(lost).expect("announced").closed = true;
+    job.store.members.insert(lost, vec![0; volumes[1].len()]);
+    job.store
+        .holes
+        .insert(lost, vec![ByteRange::new(0, volumes[1].len() as u64)]);
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&lost] == volumes[1], "rebuilt bytes");
+    assert!(job.store.writes >= 3, "{} writes", job.store.writes);
+    assert_eq!(verdict(&job, lost), vec![SliceVerdict::Intact]);
+}
+
 // The restore rebuilds the volume, but its member, which has no length, takes
 // none of it: nothing was written, and the volume is still not whole.
 #[test]
@@ -723,6 +756,32 @@ fn a_restore_that_writes_nothing_leaves_a_volume_that_is_not_whole_unsound() {
     );
     assert_eq!(job.store.writes, 0);
     assert_eq!(verdict(&job, lost), vec![SliceVerdict::Damaged]);
+}
+
+// A scratch directory that refuses the staged files is told to the namespace,
+// each refusal with its cause, so a disk with no room is not lost in a set
+// ruled beyond repair.
+#[test]
+fn a_scratch_directory_that_refuses_the_staged_files_is_told_to_the_namespace() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut job = job();
+    let (bytes, lost) = rar4_restore(&mut job, &dir);
+    job.store.scratch = Some(dir.path().join("gone"));
+    job.store.members.insert(lost, vec![0; bytes.len()]);
+    job.store
+        .holes
+        .insert(lost, vec![ByteRange::new(0, bytes.len() as u64)]);
+    bind(&mut job);
+    job.object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert_eq!(job.store.writes, 0);
+    assert!(!job.store.scratch_failures.is_empty());
+    assert!(
+        job.store
+            .scratch_failures
+            .iter()
+            .all(|kind| *kind == std::io::ErrorKind::NotFound)
+    );
 }
 
 #[test]
@@ -1072,4 +1131,279 @@ fn a_volume_posted_twice_binds_the_posting_that_arrived() {
             .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Clean
     );
+}
+
+// A data volume a range of which will never come asks, before the set has
+// ruled, for the one recovery volume it needs, the one a ruling short of it
+// would raise, and leaves the rest deferred. Nothing refused, nothing asked.
+#[test]
+fn a_refused_data_volume_raises_its_recovery_volume_before_any_ruling() {
+    let mut job = job();
+    let sizes = [300, 300, 300];
+    let first = sampled(&mut job, "lantern.part1.rev", &rev5(3, 2, 3, &sizes));
+    let second = sampled(&mut job, "lantern.part2.rev", &rev5(3, 2, 4, &[]));
+    data(&mut job, "lantern.part01.rar");
+    let lost = data(&mut job, "lantern.part02.rar");
+    data(&mut job, "lantern.part03.rar");
+    bind(&mut job);
+    let deferred = vec![
+        Seek::deferred(first, ByteRange::new(0, u64::MAX)),
+        Seek::deferred(second, ByteRange::new(0, u64::MAX)),
+    ];
+    assert_eq!(wants(&job.object), deferred);
+    Recovery::refused(&mut job.object, lost, ByteRange::new(0, 100));
+    Recovery::refused(&mut job.object, lost, ByteRange::new(100, 200));
+    assert_eq!(
+        wants(&job.object),
+        vec![
+            Seek::recovery(first, ByteRange::new(0, u64::MAX), Weight::FIRST),
+            Seek::deferred(second, ByteRange::new(0, u64::MAX)),
+        ]
+    );
+    // A ruling takes over from the refusals: a set ruled whole asks for
+    // nothing more.
+    ruled(&mut job, RepairOutcome::Repaired { slices: 1 });
+    assert_eq!(wants(&job.object), deferred);
+}
+
+// More data volumes refused than recovery volumes can come: the set rules
+// impossible as it did, and asks for none of them.
+#[test]
+fn refusals_past_every_recovery_volume_ask_for_nothing() {
+    let mut job = job();
+    let sizes = [300, 300, 300];
+    let first = sampled(&mut job, "lantern.part1.rev", &rev5(3, 2, 3, &sizes));
+    let second = sampled(&mut job, "lantern.part2.rev", &rev5(3, 2, 4, &[]));
+    for name in [
+        "lantern.part01.rar",
+        "lantern.part02.rar",
+        "lantern.part03.rar",
+    ] {
+        let member = data(&mut job, name);
+        Recovery::refused(&mut job.object, member, ByteRange::new(0, 100));
+    }
+    bind(&mut job);
+    assert_eq!(
+        wants(&job.object),
+        vec![
+            Seek::deferred(first, ByteRange::new(0, u64::MAX)),
+            Seek::deferred(second, ByteRange::new(0, u64::MAX)),
+        ]
+    );
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Impossible {
+            damaged: 3,
+            reachable: 2
+        })
+    );
+}
+
+// The rest of a sampled recovery volume arrives and it closes.
+fn rest(job: &mut Job<RarRecovery>, volume: VolumeIndex, name: &str, bytes: &[u8]) {
+    let member = job.namespace.announce(name, Some(bytes.len() as u64));
+    job.arrive(member, 0, bytes, Provenance::Fresh);
+    job.namespace.bind(member, OWN);
+    job.store.volumes.insert(volume, bytes.to_vec());
+    let mut out = Vec::new();
+    job.object.deliver(
+        Delivery {
+            volume,
+            offset: 64,
+            bytes: &weaver_graph::Evidenced::from(bytes[64..].to_vec()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut out,
+    );
+    job.object.volume_closed(volume, &mut out);
+}
+
+// A data volume refused while the set downloads raises its recovery volume
+// whole before any ruling; with it in hand the first ruling restores the
+// volume: one repair, no ruling short of it.
+#[test]
+fn a_refused_data_volume_is_restored_by_the_first_repair() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut job = job();
+    job.store.scratch = Some(dir.path().to_owned());
+    let volumes = rar4_volumes();
+    let rev_bytes = rar3_rev(&volumes);
+    let rev = sampled(&mut job, "lantern.part1.rev", &rev_bytes);
+    volume(&mut job, &rar4_name(0), &volumes[0]);
+    volume(&mut job, &rar4_name(2), &volumes[2]);
+    let lost = job
+        .namespace
+        .announce(&rar4_name(1), Some(volumes[1].len() as u64));
+    job.store.members.insert(lost, vec![0; volumes[1].len()]);
+    bind(&mut job);
+    let whole = Seek::recovery(rev, ByteRange::new(0, u64::MAX), Weight::FIRST);
+    assert!(!wants(&job.object).contains(&whole), "nothing refused");
+    Recovery::refused(&mut job.object, lost, ByteRange::new(64, 128));
+    assert!(wants(&job.object).contains(&whole));
+    rest(&mut job, rev, "lantern.part1.rev", &rev_bytes);
+    job.namespace.get_mut(lost).expect("announced").closed = true;
+    job.store.holes.insert(lost, vec![ByteRange::new(64, 128)]);
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert_eq!(job.store.members[&lost], volumes[1]);
+}
+
+// A data volume refused in two ranges whose other bytes came damaged as
+// well is one volume missing: it raises one recovery volume, not two.
+#[test]
+fn a_refused_volume_that_also_came_damaged_raises_one_recovery_volume() {
+    let mut job = job();
+    let sizes = [300, 300, 300];
+    let first = sampled(&mut job, "lantern.part1.rev", &rev5(3, 2, 3, &sizes));
+    let second = sampled(&mut job, "lantern.part2.rev", &rev5(3, 2, 4, &[]));
+    data(&mut job, "lantern.part01.rar");
+    let lost = data(&mut job, "lantern.part02.rar");
+    data(&mut job, "lantern.part03.rar");
+    job.namespace
+        .get_mut(lost)
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(200, 240), Provenance::Damaged);
+    bind(&mut job);
+    Recovery::refused(&mut job.object, lost, ByteRange::new(0, 100));
+    Recovery::refused(&mut job.object, lost, ByteRange::new(50, 150));
+    assert_eq!(job.object.refused_bound, 1);
+    assert_eq!(
+        wants(&job.object),
+        vec![
+            Seek::recovery(first, ByteRange::new(0, u64::MAX), Weight::FIRST),
+            Seek::deferred(second, ByteRange::new(0, u64::MAX)),
+        ]
+    );
+}
+
+// A RAR set proves a data volume only by its checksum at a ruling, so a
+// volume whose bytes came damaged raises nothing while the set downloads;
+// the ruling short of it raises its recovery volume, as before.
+#[test]
+fn damaged_bytes_raise_no_recovery_volume_before_a_ruling() {
+    let mut job = job();
+    let sizes = [300, 300, 300];
+    let first = sampled(&mut job, "lantern.part1.rev", &rev5(3, 2, 3, &sizes));
+    let second = sampled(&mut job, "lantern.part2.rev", &rev5(3, 2, 4, &[]));
+    data(&mut job, "lantern.part01.rar");
+    let damaged = data(&mut job, "lantern.part02.rar");
+    data(&mut job, "lantern.part03.rar");
+    job.store.members.get_mut(&damaged).unwrap()[10] ^= 1;
+    job.namespace
+        .get_mut(damaged)
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(0, 64), Provenance::Damaged);
+    bind(&mut job);
+    let deferred = vec![
+        Seek::deferred(first, ByteRange::new(0, u64::MAX)),
+        Seek::deferred(second, ByteRange::new(0, u64::MAX)),
+    ];
+    assert_eq!(wants(&job.object), deferred);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    assert_eq!(
+        wants(&job.object),
+        vec![
+            Seek::recovery(first, ByteRange::new(0, u64::MAX), Weight::FIRST),
+            Seek::deferred(second, ByteRange::new(0, u64::MAX)),
+        ]
+    );
+}
+
+// A recovery volume of noise: the last seven bytes read as a RAR3 footer
+// when `footer` gives counts a set could have.
+fn noise_rev(seed: u64, footer: [u8; 3]) -> Vec<u8> {
+    let mut rev = payload(seed, 1024 - RAR3_FOOTER);
+    rev.extend_from_slice(&footer);
+    rev.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
+    rev
+}
+
+// Sixty-four recovery volumes of noise beside an archive none of their names
+// covers. One footer reads as a RAR3 set of twenty-one data volumes. The set
+// covers no data volume, so it rules on nothing, and says the same whether
+// it ruled before that footer arrived or after.
+#[test]
+fn a_set_that_covers_no_data_volume_rules_on_nothing_whenever_its_footers_arrive() {
+    const COUNT: u64 = 64;
+    const LOOKALIKE: u64 = 27;
+    let footer = |index: u64| {
+        if index == LOOKALIKE {
+            [20, 63, 0]
+        } else {
+            [0xFF, 0xFF, 0xFF]
+        }
+    };
+
+    // Ruled before any recovery volume's footer arrived.
+    let mut early = job();
+    volume(&mut early, "archive.rar", &payload(5, 300));
+    for index in 0..COUNT {
+        let name = format!("stem-{index:02}.rev");
+        let bytes = noise_rev(index, footer(index));
+        let front = &bytes[..64];
+        let volume = match early.object.claim(&name, front, None)[..] {
+            [volume] => volume,
+            [] if early.store.volumes.is_empty() => VolumeIndex(0),
+            _ => panic!("{name} is a volume of the set"),
+        };
+        let member = early.namespace.announce(&name, Some(bytes.len() as u64));
+        early.namespace.bind(member, OWN);
+        early.object.bound(volume, &name, front, None);
+        early.store.volumes.insert(volume, bytes);
+    }
+    bind(&mut early);
+    assert!(early.object.header().is_none(), "no footer is in yet");
+    let before = early
+        .object
+        .repair(&mut early.store, weaver_graph::Budget::default());
+
+    // Ruled once every recovery volume is in, the lookalike footer with it.
+    let mut late = job();
+    volume(&mut late, "archive.rar", &payload(5, 300));
+    for index in 0..COUNT {
+        rev(
+            &mut late,
+            &format!("stem-{index:02}.rev"),
+            &noise_rev(index, footer(index)),
+        )
+        .expect("a volume of the set");
+    }
+    bind(&mut late);
+    assert_eq!(
+        late.object.header().map(|header| header.data_count),
+        Some(21),
+        "the lookalike footer reads as a RAR3 set"
+    );
+    assert!(late.object.bound.is_empty(), "{:?}", late.object.bound);
+    assert_eq!(late.object.slots(), 0);
+    let after = late
+        .object
+        .repair(&mut late.store, weaver_graph::Budget::default());
+
+    assert_eq!(before, RepairOutcome::Unread);
+    assert_eq!(after, before);
+    assert_eq!(late.object.outcome(), Some(RepairOutcome::Unread));
+    assert_eq!(early.object.outcome(), Some(RepairOutcome::Unread));
+}
+
+// A RAR3 footer counts the volumes of a set that covers one: one data volume
+// in, a footer naming three, and the two absent ones are missing.
+#[test]
+fn a_rar3_footer_counts_the_volumes_of_a_set_that_covers_one() {
+    let mut job = job();
+    rev(&mut job, "lantern.part1.rev", &rev3(3, 300));
+    data(&mut job, "lantern.part01.rar");
+    bind(&mut job);
+    assert_eq!(job.object.slots(), 3);
 }

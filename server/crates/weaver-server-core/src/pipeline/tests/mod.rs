@@ -43,6 +43,7 @@ macro_rules! segment_spec {
     };
 }
 
+mod archive_history;
 mod archive_output_contract;
 mod archive_passwords;
 mod archive_topology;
@@ -73,6 +74,7 @@ mod queue_window;
 mod restore_history;
 mod script_events;
 mod server_attribution;
+mod shared_articles;
 mod terminal_settlement;
 mod uu_assembly;
 mod yenc_compatibility;
@@ -162,6 +164,7 @@ impl TestHarness {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: Some(crate::settings::DirectStoreOverrides {
@@ -364,8 +367,10 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         failure_error: None,
         delivered: None,
         delivery_left_behind: Vec::new(),
+        delivery_source: None,
         working_dir,
         downloaded_bytes: 0,
+        checkpointed_download_bytes: 0,
         restored_download_floor_bytes: 0,
         downloaded_wire_bytes: 0,
         server_attribution: Default::default(),
@@ -444,6 +449,7 @@ fn history_row_with_output_dir(
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     }
 }
 
@@ -566,7 +572,7 @@ async fn new_direct_pipeline_with(
 // The cross-device probe in `direct_store/scenarios/cross_device.rs` hands in two roots on
 // genuinely different mounts.
 #[allow(clippy::too_many_arguments)]
-async fn new_direct_pipeline_at_roots(
+pub(in crate::pipeline) async fn new_direct_pipeline_at_roots(
     data_dir: PathBuf,
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
@@ -642,6 +648,7 @@ async fn new_direct_pipeline_on_machine(
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: Some(direct_store),
@@ -700,6 +707,12 @@ async fn new_direct_pipeline_on_machine(
     )
     .await
     .unwrap();
+    // Each root's volume is known once its first reading returns, as a
+    // running server's is soon after start-up: a test starts from there,
+    // not racing the reading of the disk's kind and name.
+    for root in crate::operations::disk::StorageRoot::ALL {
+        pipeline.storage_capacity.wait_for_probes(root, 1);
+    }
 
     // Reserve-specific scenarios install their own limits after construction.
     Arc::make_mut(&mut pipeline.extraction_limits).min_free_bytes = 1;
@@ -1133,8 +1146,8 @@ fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
 // shape whose headers state no per-volume number anywhere: RAR4's main header
 // has no number field (that is RAR5's), and these end records carry no
 // `VOLUME_NUMBER` flag (a numbered `ENDARC` is what modern `.partNN` writers
-// emit). Every volume of such a set parses as volume 0; only the filename
-// says which volume a file is.
+// emit). No volume of such a set states its number; only the filename says
+// which volume a file is.
 pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
     base: &str,
     member_name: &str,
@@ -1180,6 +1193,48 @@ pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
                 format!("{base}.r{:02}", volume - 1)
             };
             (filename, bytes)
+        })
+        .collect()
+}
+
+// [`single_member_rar4_old_numbering_set`], its end records as the RAR
+// versions that wrote such sets wrote them, and every header's CRC16 filled
+// in. Each end record states the CRC32 of the volume's bytes before it and
+// reserves seven zero bytes for a recovery volume (0x0004). With no
+// `number`, as RAR 3.1 to 3.3 write it: flags 0x4007, 0x4006 on the last
+// volume. With one, as RAR 3.4 on write it, the number after the CRC
+// (0x0008): flags 0x400f, 0x400e on the last, every volume stating that
+// same number.
+pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set_ending(
+    base: &str,
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    number: Option<u16>,
+) -> Vec<(String, Vec<u8>)> {
+    let bare_end = build_test_rar4_end_header(false).len();
+    single_member_rar4_old_numbering_set(base, member_name, payload, volume_count)
+        .into_iter()
+        .enumerate()
+        .map(|(volume, (name, mut bytes))| {
+            bytes.truncate(bytes.len() - bare_end);
+            let mut bytes = with_rar4_header_crcs(bytes);
+            let next = if volume + 1 == volume_count {
+                0
+            } else {
+                0x0001
+            };
+            let mut body = checksum::crc32(&bytes).to_le_bytes().to_vec();
+            let flags = match number {
+                None => 0x4006 | next,
+                Some(number) => {
+                    body.extend_from_slice(&number.to_le_bytes());
+                    0x400e | next
+                }
+            };
+            body.extend_from_slice(&[0; 7]);
+            bytes.extend_from_slice(&build_test_rar4_block(0x7b, flags, &body));
+            (name, with_rar4_header_crcs(bytes))
         })
         .collect()
 }
@@ -1744,8 +1799,10 @@ async fn insert_active_job_with_persisted_nzb_named(
             failure_error: None,
             delivered: None,
             delivery_left_behind: Vec::new(),
+            delivery_source: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
+            checkpointed_download_bytes: 0,
             restored_download_floor_bytes: 0,
             downloaded_wire_bytes: 0,
             server_attribution: Default::default(),
@@ -1760,7 +1817,7 @@ async fn insert_active_job_with_persisted_nzb_named(
         },
     );
     // The fixture's articles are built as a job's first handout builds them.
-    pipeline.activate_job_articles(job_id, &HashSet::new(), None, None, Vec::new());
+    pipeline.activate_job_articles(job_id, &HashSet::new(), None, None, Vec::new(), &[]);
     pipeline.job_order.push(job_id);
     pipeline.report_all_for_test();
     working_dir
@@ -1806,7 +1863,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -2026,8 +2083,11 @@ async fn submit_decoded_segment_declaring(
                 segments,
             },
             SegmentSource {
-                source_server_idx: None,
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    None,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -2144,6 +2204,62 @@ fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(1),
     })
+}
+
+// A client of the `retention_client` servers named by `hosts`, in that
+// order: host `n` is the same server in every client built here.
+fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
+    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+        servers: hosts
+            .iter()
+            .map(|host| weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    host: format!("retention-{host}.example.com"),
+                    ..Default::default()
+                },
+                max_connections: 2,
+                ..weaver_nntp::pool::ServerPoolConfig::default()
+            })
+            .collect(),
+        max_idle_age: std::time::Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: std::time::Duration::from_secs(1),
+    })
+}
+
+// Pool server `server` refuses the login. A fill server's refusal waits: the
+// server may still serve the work only it could serve, as through any
+// outage. A backfill server's refusal is the answer at once.
+async fn refuse_login(pipeline: &Pipeline, server: usize) {
+    let pool = pipeline.nntp.pool();
+    pool.health().lock().await.record_failure(server, true);
+    if pool.is_backfill(server) {
+        assert!(
+            pool.refuses_credentials(server),
+            "backfill is never waited for"
+        );
+        return;
+    }
+    assert!(!pool.refuses_credentials(server), "a fresh refusal waits");
+    assert!(Pipeline::server_may_serve(
+        pool,
+        server,
+        weaver_nntp::ServerSet::EMPTY,
+        weaver_nntp::ServerSet::EMPTY,
+    ));
+}
+
+// Pool server `server` refuses the login, waits as [`refuse_login`] does,
+// and then has refused it for its whole give-up time: the refusal is the
+// verdict on the work only it could serve.
+async fn refuse_login_past_give_up(pipeline: &Pipeline, server: usize) {
+    refuse_login(pipeline, server).await;
+    let pool = pipeline.nntp.pool();
+    pool.set_login_refusal_clock(
+        server,
+        std::time::Instant::now() + weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP,
+    );
+    assert!(pool.refuses_credentials(server));
 }
 
 // Two fill servers: index 0 holds 5 days of retention, index 1 is unlimited.
