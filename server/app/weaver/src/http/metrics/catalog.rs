@@ -505,6 +505,20 @@ metric_families! {
         "Connections a ladder made on a rung past the first, by the rung that connected.");
     NETWORK_LEG_REVOCATIONS = ("weaver_network_leg_revocations_total", Counter, [],
         "Route stages revoked, closing the connections that ran over them.");
+    NETWORK_SOCKET_GIVE_BACKS = ("weaver_network_socket_give_backs_total", Counter, [],
+        "Times a WireGuard tunnel asked a class holding more than its share of the tunnel's socket memory to give some back while another class waited.");
+    NETWORK_SOCKET_GIVE_BACK_BYTES = ("weaver_network_socket_give_back_bytes_total", Counter, [],
+        "Socket memory WireGuard tunnels asked classes over their share to give back, in bytes.");
+    NETWORK_SOCKET_PEERS_DROPPED = ("weaver_network_socket_peers_dropped_total", Counter, [],
+        "Torrent peers closed to give a WireGuard tunnel's socket memory back.");
+    NETWORK_SOCKET_IDLE_RETIRED = ("weaver_network_socket_idle_retired_total", Counter, [],
+        "Idle usenet connections closed early to give a WireGuard tunnel's socket memory back.");
+    NETWORK_TUNNEL_SOCKET_BYTES = ("weaver_network_tunnel_socket_bytes", Gauge,
+        ["egress_id", "proxy_id", "via"],
+        "Socket memory a WireGuard tunnel holds now, its own overhead included, by egress, WireGuard proxy and the proxies beneath it.");
+    NETWORK_TUNNEL_SOCKET_LIMIT_BYTES = ("weaver_network_tunnel_socket_limit_bytes", Gauge,
+        ["egress_id", "proxy_id", "via"],
+        "Socket memory a WireGuard tunnel may hold, by egress, WireGuard proxy and the proxies beneath it.");
 
     // ---- torrents ----------------------------------------------------------------
     // Each torrent's series carry its category (empty when it has none) and the

@@ -2166,6 +2166,19 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     assert!(!rendered.contains("member_id=\"12\""));
     assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
     assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
+    assert!(rendered.contains("weaver_network_socket_give_backs_total 2"));
+    assert!(rendered.contains("weaver_network_socket_give_back_bytes_total 4096"));
+    assert!(rendered.contains("weaver_network_socket_peers_dropped_total 5"));
+    assert!(rendered.contains("weaver_network_socket_idle_retired_total 6"));
+    assert!(rendered.contains(
+        "weaver_network_tunnel_socket_bytes{egress_id=\"2\",proxy_id=\"11\",via=\"\"} 125829120"
+    ));
+    assert!(rendered.contains(
+        "weaver_network_tunnel_socket_bytes{egress_id=\"2\",proxy_id=\"13\",via=\"11,12\"} 41943040"
+    ));
+    assert!(rendered.contains(
+        "weaver_network_tunnel_socket_limit_bytes{egress_id=\"2\",proxy_id=\"13\",via=\"11,12\"} 541065216"
+    ));
     assert!(rendered.contains("weaver_egress_upload_bytes_total{egress_id=\"2\"} 4096"));
 }
 

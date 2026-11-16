@@ -814,6 +814,13 @@ impl Pipeline {
                 self.restore_stopped_owned_lane_lease(lease);
             }
             OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
+                // Heard, whatever comes of it: a press this report left waits
+                // on a pass after it (see `JobCounters::drained_through`).
+                if let Some(counters) = lease.works.iter().find_map(|work| work.counters.as_ref()) {
+                    counters
+                        .lane_refusals_heard
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 if !self.download_lane_is_live(lease.lane_id) {
                     return;
                 }

@@ -254,6 +254,39 @@ pub fn over_limit_holdoff(refusals: u32) -> Duration {
         .min(OVER_LIMIT_HOLDOFF_MAX)
 }
 
+// How many of `max` connections each server gives back, by what each
+// `holds` on the tunnel: in proportion to those, and never a server's last
+// one. Each round shares what is left among the servers with room, in
+// proportion; a round whose shares all round down gives one apiece, the
+// largest holder first. At most one round per server caps it, so the work
+// is bounded by the server count, not by `max`. Asks more than the floor
+// lets go are cut to what it does.
+pub(crate) fn spread_give_back(max: usize, holds: &[usize]) -> Vec<usize> {
+    let room: Vec<usize> = holds.iter().map(|held| held.saturating_sub(1)).collect();
+    let mut out = vec![0; holds.len()];
+    let mut left = max.min(room.iter().sum());
+    let mut open: Vec<usize> = (0..holds.len()).filter(|&i| room[i] > 0).collect();
+    open.sort_by_key(|&i| std::cmp::Reverse(holds[i]));
+    while left > 0 && !open.is_empty() {
+        let weight: usize = open.iter().map(|&i| holds[i]).sum();
+        let mut given = 0;
+        for &i in &open {
+            let share = (left.saturating_mul(holds[i]) / weight).min(room[i] - out[i]);
+            out[i] += share;
+            given += share;
+        }
+        if given == 0 {
+            for &i in open.iter().take(left) {
+                out[i] += 1;
+                given += 1;
+            }
+        }
+        left -= given;
+        open.retain(|&i| out[i] < room[i]);
+    }
+    out
+}
+
 fn duration_to_epoch_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -797,6 +830,38 @@ impl NntpPool {
                 "drained all idle connections (suspected network change)"
             );
         }
+    }
+
+    // Cover `owed` connections whose socket was dialled over a path `on`
+    // accepts, less those already marked to close for it, and say how many
+    // that still needed and how many were asked to close. The answer reads
+    // a level, so asking again covers again whatever a dropped mark left:
+    // what is needed is spread over the servers in proportion to what each
+    // holds there, and each keeps its last one. Idle ones close now, and
+    // for the rest busy ones close once their work ends, if anything is
+    // still owed (`stands`) then. What the floor leaves uncovered is not
+    // given: it comes back as connections close by themselves. As in
+    // [`Self::drain_all_idle`], no health failure is recorded: they close to
+    // give the tunnel they ride its bytes back, and the servers are fine.
+    pub fn retire_idle_on(
+        &self,
+        owed: usize,
+        on: impl Fn(&weaver_tunnel::pipe::DialPath) -> bool,
+        stands: crate::socket_budget::GiveBackStands,
+    ) -> (usize, usize) {
+        let (holds, marked): (Vec<usize>, Vec<usize>) = self
+            .socket_budgets
+            .iter()
+            .map(|budget| budget.give_back_holds(&on))
+            .unzip();
+        let needed = owed.saturating_sub(marked.iter().sum());
+        let retired = spread_give_back(needed, &holds)
+            .into_iter()
+            .zip(&self.socket_budgets)
+            .filter(|(ask, _)| *ask > 0)
+            .map(|(ask, budget)| budget.recall_idle_on(ask, &on, &stands))
+            .sum();
+        (needed, retired)
     }
 
     // Shut down the pool and wait for active leases to drain.
@@ -2226,6 +2291,262 @@ mod tests {
     fn pool_creation() {
         let pool = NntpPool::new(test_pool_config(10));
         assert_eq!(pool.server_count(), 1);
+    }
+
+    // A give-back is spread over the servers on the tunnel in proportion to
+    // what each holds there, never in list order: two servers holding 20
+    // each, asked for 20, keep 10 each. The first server's work does not
+    // move to the second.
+    #[test]
+    fn a_give_back_is_spread_over_the_servers_by_what_each_holds() {
+        let mut config = test_pool_config(20);
+        let mut second = test_pool_config(20).servers.remove(0);
+        second.server.host = "news2.example.com".into();
+        second.stable_id = StableServerId(2);
+        config.servers.push(second);
+        let pool = NntpPool::new(config);
+        let tunnel = weaver_tunnel::pipe::DialPath {
+            egress: 1,
+            proxies: vec![3],
+            ..Default::default()
+        };
+        let on = |path: &weaver_tunnel::pipe::DialPath| path.egress == 1 && path.proxies == [3];
+        let mut closed = Vec::new();
+        let mut slots = Vec::new();
+        for idx in 0..2 {
+            let (tx, rx) = std::sync::mpsc::channel::<u64>();
+            for _ in 0..20 {
+                let slot = pool.socket_budgets[idx].try_acquire().unwrap();
+                slot.set_path(Some(&tunnel));
+                slot.active();
+                let tx = tx.clone();
+                slot.idle(
+                    crate::socket_budget::SocketPhase::OwnedIdle,
+                    Arc::new(move |id| tx.send(id).unwrap()),
+                );
+                slots.push(slot);
+            }
+            closed.push(rx);
+        }
+        assert_eq!(pool.retire_idle_on(20, on, Arc::new(|| true)), (20, 20));
+        let given: Vec<usize> = closed.iter().map(|rx| rx.try_iter().count()).collect();
+        assert_eq!(given, [10, 10]);
+    }
+
+    // A lone side is given every byte; two sides pressing, half each.
+    struct LoneOrHalves;
+
+    impl weaver_tunnel::pipe::SocketDivider for LoneOrHalves {
+        fn shares(&self, cap: u64) -> [u64; weaver_tunnel::pipe::SIDES] {
+            [cap / 2, cap - cap / 2]
+        }
+
+        fn share_out(&self, cap: u64, shares: &[u64], _: &[Option<u64>], used: &[u64]) -> Vec<u64> {
+            match used {
+                [_, 0] => vec![cap, 0],
+                [0, _] => vec![0, cap],
+                _ => shares.to_vec(),
+            }
+        }
+
+        fn presses(&self, used: u64, given: u64) -> bool {
+            used >= given
+        }
+    }
+
+    // Usenet marks busy connections to cover what it owes. The press
+    // lapses, and connections whose article ended meanwhile drop their
+    // marks and keep working. When the press returns usenet is woken, and
+    // the answer covers the whole level again, not only what grew: the
+    // marks dropped are made again. Once the marked connections close, both
+    // sides hold their share.
+    #[test]
+    fn a_returning_press_covers_again_the_marks_a_lapse_dropped() {
+        use weaver_tunnel::pipe::{
+            DialPath, SessionSockets, SocketBudget, SocketClass, overhead_bytes, stream_bytes,
+        };
+        let peer = stream_bytes(None);
+        let tunnel = Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(1420) + 4 * peer + 100 * peer,
+                reserve: 4 * peer,
+                torrent_kept: 0,
+                mtu: 1420,
+            },
+            Arc::new(LoneOrHalves),
+        ));
+        let pool = NntpPool::new(test_pool_config(100));
+        let path = DialPath {
+            egress: 1,
+            proxies: vec![3],
+            ..Default::default()
+        };
+        let on = |path: &DialPath| path.egress == 1 && path.proxies == [3];
+        // Usenet alone fills the tunnel, then closes one that torrents take:
+        // 99 busy connections on the tunnel, each with its socket.
+        let mut connections = Vec::new();
+        while tunnel.has_room(SocketClass::Nntp, peer) {
+            let permit = tunnel.take(SocketClass::Nntp, peer).ok().flatten().unwrap();
+            let slot = pool.socket_budgets[0].try_acquire().unwrap();
+            slot.set_path(Some(&path));
+            slot.active();
+            connections.push((slot, permit));
+        }
+        assert_eq!(connections.len(), 100);
+        drop(connections.pop());
+        let mut peers = vec![
+            tunnel
+                .take(SocketClass::Torrent, peer)
+                .ok()
+                .flatten()
+                .unwrap(),
+        ];
+        let owed = |tunnel: &SessionSockets| {
+            usize::try_from(tunnel.owed(SocketClass::Nntp).div_ceil(peer)).unwrap()
+        };
+        let stands: crate::socket_budget::GiveBackStands = {
+            let tunnel = Arc::clone(&tunnel);
+            Arc::new(move || tunnel.owes(SocketClass::Nntp))
+        };
+        let press = || {
+            let Err(refused) = tunnel.wait_room(SocketClass::Torrent, peer) else {
+                panic!("usenet holds the room");
+            };
+            refused.demand.expect("crowded out")
+        };
+
+        let want = press();
+        assert_eq!(tunnel.woken(), [true, false]);
+        assert_eq!(owed(&tunnel), 49);
+        assert_eq!(
+            pool.retire_idle_on(owed(&tunnel), on, Arc::clone(&stands)),
+            (49, 49)
+        );
+
+        // The press lapses; 15 marked connections end their article and
+        // take the next, their marks gone.
+        drop(want);
+        assert!(!tunnel.owes(SocketClass::Nntp));
+        for (slot, _) in &connections[..15] {
+            assert!(slot.claim_reuse(), "a lapsed mark closed its connection");
+        }
+
+        // The press returns: usenet is woken and covers the level again.
+        let want = press();
+        assert_eq!(tunnel.woken(), [true, false], "usenet woken again");
+        assert_eq!(owed(&tunnel), 49);
+        assert_eq!(
+            pool.retire_idle_on(owed(&tunnel), on, Arc::clone(&stands)),
+            (15, 15),
+            "the dropped marks are made again"
+        );
+
+        // Every connection ends its article: the marked ones close.
+        connections.retain(|(slot, _)| slot.claim_reuse());
+        assert_eq!(connections.len(), 50);
+        assert!(!tunnel.owes(SocketClass::Nntp));
+        while tunnel.has_room(SocketClass::Torrent, peer) {
+            peers.push(
+                tunnel
+                    .take(SocketClass::Torrent, peer)
+                    .ok()
+                    .flatten()
+                    .unwrap(),
+            );
+        }
+        drop(want);
+        assert_eq!(
+            tunnel.held(SocketClass::Nntp),
+            50 * peer,
+            "usenet at its share"
+        );
+        assert_eq!(
+            tunnel.held(SocketClass::Torrent),
+            50 * peer,
+            "torrents at theirs"
+        );
+    }
+
+    // A server holding one connected socket and one still dialling owes the
+    // tunnel one: the answer counts the dial as nothing, keeps the last, and
+    // finds nothing to give, so usenet is marked dry. Once the dial connects
+    // usenet is woken again and covers it.
+    #[test]
+    fn a_dial_that_connects_wakes_a_dry_usenet_again() {
+        use weaver_tunnel::bridge::ConnectionOutcome;
+        use weaver_tunnel::pipe::{
+            DialPath, SessionSockets, SocketBudget, SocketClass, overhead_bytes, stream_bytes,
+        };
+        let peer = stream_bytes(None);
+        let tunnel = Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(1420) + 2 * peer,
+                reserve: 0,
+                torrent_kept: 0,
+                mtu: 1420,
+            },
+            Arc::new(LoneOrHalves),
+        ));
+        let pool = NntpPool::new(test_pool_config(10));
+        let path = DialPath {
+            egress: 1,
+            proxies: vec![3],
+            ..Default::default()
+        };
+        let on = |path: &DialPath| path.egress == 1 && path.proxies == [3];
+        let stands: crate::socket_budget::GiveBackStands = {
+            let tunnel = Arc::clone(&tunnel);
+            Arc::new(move || tunnel.owes(SocketClass::Nntp))
+        };
+        // Each socket holds its bytes from the dial, as a tunnel stream does,
+        // and its outcome is told when it connects.
+        let dial = || {
+            let permit = tunnel.take(SocketClass::Nntp, peer).ok().flatten().unwrap();
+            let outcome = Arc::new(ConnectionOutcome::default());
+            outcome.on_connected(permit.connected_signal());
+            let slot = pool.socket_budgets[0].try_acquire().unwrap();
+            slot.set_path(Some(&path));
+            slot.observe_outcome(Some(&outcome));
+            (slot, permit, outcome)
+        };
+        let connected = dial();
+        connected.0.active();
+        let dialling = dial();
+
+        let Err(refused) = tunnel.wait_room(SocketClass::Torrent, peer) else {
+            panic!("usenet holds the room");
+        };
+        let _want = refused.demand.expect("crowded out");
+        assert_eq!(tunnel.woken(), [true, false]);
+        assert_eq!(tunnel.owed(SocketClass::Nntp), peer);
+        assert_eq!(
+            pool.retire_idle_on(1, on, Arc::clone(&stands)),
+            (1, 0),
+            "the dial counts as nothing and the last is kept"
+        );
+        tunnel.dry(SocketClass::Nntp);
+
+        dialling.0.active();
+        assert_eq!(tunnel.woken(), [true, false], "usenet woken again");
+        assert_eq!(
+            pool.retire_idle_on(1, on, Arc::clone(&stands)),
+            (1, 1),
+            "the connected dial is covered"
+        );
+        drop(connected);
+    }
+
+    // The spread keeps each server's last connection, and asks no more than
+    // that floor lets go.
+    #[test]
+    fn a_give_back_spread_keeps_each_servers_last_connection() {
+        assert_eq!(spread_give_back(20, &[20, 20]), [10, 10]);
+        assert_eq!(spread_give_back(20, &[30, 10]), [15, 5]);
+        assert_eq!(spread_give_back(5, &[1, 4]), [0, 3]);
+        assert_eq!(spread_give_back(1, &[1]), [0]);
+        assert_eq!(spread_give_back(3, &[2, 2, 2]), [1, 1, 1]);
+        assert_eq!(spread_give_back(1, &[2, 3]), [0, 1]);
+        assert_eq!(spread_give_back(0, &[5, 5]), [0, 0]);
     }
 
     #[test]

@@ -48,6 +48,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.peers.encrypt_outgoing(self.addr)
     }
 
+    fn tcp_wants(&self) -> Option<&crate::stream_connect::TcpWants> {
+        Some(&self.state.tcp_wants)
+    }
+
     fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
         if let Some(transport) = self.transport() {
             let direction = if self.incoming {

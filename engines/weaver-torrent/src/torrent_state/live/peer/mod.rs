@@ -955,6 +955,11 @@ impl Peer {
         })
     }
 
+    /// Whether the peer is connected over TCP now.
+    pub(crate) fn live_over_tcp(&self) -> bool {
+        matches!(&self.state, PeerState::Live(live) if live.connection_kind == ConnectionKind::Tcp)
+    }
+
     /// Asks the peer's connection, if it has one, to close. The close is no
     /// failure.
     pub(crate) fn disconnect(&self) {

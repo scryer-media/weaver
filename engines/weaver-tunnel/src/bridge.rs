@@ -26,6 +26,8 @@ struct OutcomeCallbacks {
     failed: bool,
     closed: bool,
     retiring: bool,
+    connected: bool,
+    connect: Vec<Box<dyn Fn() + Send + Sync>>,
     failure: Vec<Box<dyn Fn() + Send + Sync>>,
     close: Vec<Box<dyn Fn() + Send + Sync>>,
     retire: Vec<Box<dyn Fn() + Send + Sync>>,
@@ -122,6 +124,31 @@ impl ConnectionOutcome {
             callback(bytes, wire);
         }
     }
+    // Run once the socket's owner counts it connected, not still dialling:
+    // the tunnel then reads the owner's holdings as moved.
+    pub fn on_connected(&self, callback: impl Fn() + Send + Sync + 'static) {
+        let mut callbacks = self.callbacks.lock().expect("connection outcome");
+        if callbacks.connected {
+            drop(callbacks);
+            callback();
+        } else if !callbacks.closed {
+            callbacks.connect.push(Box::new(callback));
+        }
+    }
+    // The socket's owner counts it connected. Once; nothing after closure.
+    pub fn connected(&self) {
+        let callbacks = {
+            let mut callbacks = self.callbacks.lock().expect("connection outcome");
+            if callbacks.connected || callbacks.closed {
+                return;
+            }
+            callbacks.connected = true;
+            std::mem::take(&mut callbacks.connect)
+        };
+        for callback in callbacks {
+            callback();
+        }
+    }
     pub fn on_failure(&self, callback: impl Fn() + Send + Sync + 'static) {
         let mut callbacks = self.callbacks.lock().expect("connection outcome");
         if callbacks.failed {
@@ -162,6 +189,7 @@ impl ConnectionOutcome {
             }
             callbacks.closed = true;
             callbacks.failure.clear();
+            callbacks.connect.clear();
             std::mem::take(&mut callbacks.close)
         };
         for callback in callbacks {

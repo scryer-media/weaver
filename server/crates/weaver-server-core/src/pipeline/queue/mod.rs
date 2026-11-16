@@ -127,6 +127,9 @@ pub struct QueueInner {
     #[cfg(test)]
     pub(crate) restarts_clearing: usize,
     pub(crate) nntp: Option<(u64, weaver_nntp::client::NntpClient, usize)>,
+    // What WireGuard tunnels asked usenet to give back, for the pipeline to
+    // answer on its next turn. Drained by every turn.
+    pub(crate) socket_give_backs: Vec<crate::jobs::TunnelGiveBack>,
     // The endpoint's request count and the pipeline's latest answer, tagged
     // with the request count it answers.
     pub(crate) diagnostics_requested: u64,
@@ -312,6 +315,19 @@ pub struct JobCounters {
     pub placed: AtomicU64,
     pub articles_done: AtomicU32,
     pub last_byte_at_ms: AtomicU64,
+    // What a lane's press for a full route waits on. A press stands while
+    // the job has download work still to hand out, since only that work can
+    // want the dial the route refused. Each refused dial a lane reports takes
+    // the next `lane_refusals_sent`; the pipeline counts each report it hears
+    // in `lane_refusals_heard`; a dispatch pass that leaves the job nothing
+    // queued and no paced retry stores the reports it had heard by then in
+    // `drained_through`, and any other pass stores 0. A press is over once
+    // `drained_through` reaches its own report: its work was heard of, and a
+    // later pass found nothing left for a dial (the work went to another
+    // lane, or the job moved past its download).
+    pub(crate) lane_refusals_sent: AtomicU64,
+    pub(crate) lane_refusals_heard: AtomicU64,
+    pub(crate) drained_through: AtomicU64,
 }
 
 impl JobCounters {

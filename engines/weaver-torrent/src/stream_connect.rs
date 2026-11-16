@@ -41,6 +41,7 @@ pub(crate) enum Guard<'a> {
 
 mod dial;
 mod kind;
+pub(crate) use dial::TcpWants;
 pub(crate) use dial::UtpRebind;
 use dial::{DialPlan, PeerDialer, Tally, TcpDialer, UtpDialer};
 pub use kind::{ByKind, Capabilities, ConnectionKind, Names};
@@ -345,6 +346,7 @@ impl StreamConnector {
         encrypt: impl FnOnce() -> bool,
         connect_timeout: Duration,
         rw_timeout: Duration,
+        wants: Option<&TcpWants>,
     ) -> Result<(Link<mse::Outbound>, Meter, Encryption)> {
         // The attempts still running when the time runs out end as timed
         // out: the flag is set before the dial, and with it its attempts, is
@@ -358,7 +360,7 @@ impl StreamConnector {
             home,
             caps,
         } = {
-            let dial = self.dial(addr, transports, &expired);
+            let dial = self.dial(addr, transports, &expired, wants);
             tokio::pin!(dial);
             match tokio::time::timeout(connect_timeout, &mut dial).await {
                 Ok(dialed) => dialed?,
@@ -467,12 +469,14 @@ impl StreamConnector {
 
     // Open a link to the peer at `addr` over `transports`, the first step of
     // `connect_link`. An attempt dropped unfinished counts as timed out when
-    // `expired` is set by then, and as failed otherwise.
+    // `expired` is set by then, and as failed otherwise. The torrent that
+    // dials holds its TCP want in `wants`.
     async fn dial(
         &self,
         addr: SocketAddr,
         transports: Transports,
         expired: &AtomicBool,
+        wants: Option<&TcpWants>,
     ) -> Result<Link> {
         let addr = crate::network::canonical_socket_addr(addr);
         if addr.port() == 0 {
@@ -499,6 +503,7 @@ impl StreamConnector {
             },
             addr,
             transports,
+            wants,
         )
         .await
     }
@@ -528,7 +533,7 @@ mod tests {
             addr: SocketAddr,
             transports: Transports,
         ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
-            self.dial(addr, transports, &AtomicBool::new(false))
+            self.dial(addr, transports, &AtomicBool::new(false), None)
                 .await
                 .map(|link| (link.kind, link.read, link.write))
         }
@@ -561,6 +566,7 @@ mod tests {
                 encrypt,
                 connect_timeout,
                 rw_timeout,
+                None,
             )
             .await
             .map(|(link, meter, encryption)| (link.kind, link.read, link.write, meter, encryption))
@@ -623,8 +629,12 @@ mod tests {
     }
 
     impl SocketFactory for Room {
-        fn tcp_room(&self) -> bool {
-            self.tcp
+        fn tcp_room(&self) -> crate::network::TcpRoom {
+            if self.tcp {
+                crate::network::TcpRoom::Free
+            } else {
+                crate::network::TcpRoom::Full
+            }
         }
 
         fn connect_tcp<'a>(
@@ -968,7 +978,7 @@ mod tests {
         let (connector, mut dialed) = dialing(EncryptionPolicy::Disabled).await;
         let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 6881).into();
         let link = connector
-            .dial(addr, Transports::Any, &AtomicBool::new(false))
+            .dial(addr, Transports::Any, &AtomicBool::new(false), None)
             .await
             .unwrap();
         assert_eq!((link.kind, link.remote), (ConnectionKind::Tcp, addr));

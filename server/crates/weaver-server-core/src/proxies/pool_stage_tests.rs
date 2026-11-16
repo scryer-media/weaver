@@ -72,7 +72,7 @@ impl Dialer for Fixture {
             self.full.lock().unwrap().clone()
         };
         if let Some(freed) = full {
-            return Err(DialError::AtCapacity(vec![freed]));
+            return Err(DialError::AtCapacity(vec![freed].into()));
         }
         self.gate.acquire().await.unwrap().forget();
         let (stream, _) = tokio::io::duplex(64);
@@ -237,9 +237,10 @@ async fn a_pool_dial_at_capacity_carries_every_full_members_signal() {
     let Err(DialError::AtCapacity(waits)) = pool.dial(&target()).await else {
         panic!("a pool whose members are all full is at capacity");
     };
-    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed[0])));
+    assert!(waits.waits.iter().any(|wait| Arc::ptr_eq(wait, &freed[0])));
     assert!(
         waits
+            .waits
             .iter()
             .any(|wait| Arc::ptr_eq(wait, &pool.state.changed))
     );

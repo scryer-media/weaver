@@ -173,6 +173,9 @@ pub(crate) struct PeerStates {
     // libtorrent keeps a web seed's peer in its `web_seed_t`, so it counts
     // against no `max_peerlist_size`.
     web_seeds: AtomicUsize,
+    // How many dials to swarm peers are under way: peers connecting that are
+    // not web seeds. An incoming connection joins live, never connecting.
+    dialling: AtomicUsize,
     // Whether peers at one address may each have a connection (libtorrent
     // `allow_multiple_connections_per_ip`, off by default). The session's
     // setting, read at each judgment as libtorrent reads it into each
@@ -584,6 +587,7 @@ impl PeerStates {
             went_live: Arc::new(Notify::new()),
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
+            dialling: AtomicUsize::new(0),
             allow_multiple_connections_per_ip: Default::default(),
             finished: AtomicBool::new(false),
             smart_ban: Mutex::new(list.smart_ban),
@@ -1216,15 +1220,42 @@ impl PeerStates {
     /// Closes the connections of the `n` peers that rank lowest to keep
     /// (libtorrent `torrent::disconnect_peers`); see [`Peer::disconnect_rank`].
     pub fn disconnect_lowest(&self, n: usize, now: Instant) {
+        self.disconnect_lowest_of(n, now, |_, _| true);
+    }
+
+    /// Closes up to `n` of the live TCP connections at addresses `among`
+    /// takes, those it would keep least first, as [`Self::disconnect_lowest`]
+    /// ranks them, and says how many. uTP connections hold no socket of a
+    /// tunnel and are left alone.
+    pub fn disconnect_lowest_tcp(
+        &self,
+        n: usize,
+        now: Instant,
+        among: &dyn Fn(SocketAddr) -> bool,
+    ) -> usize {
+        self.disconnect_lowest_of(n, now, |handle, peer| {
+            peer.live_over_tcp() && handle.addr().is_some_and(among)
+        })
+    }
+
+    fn disconnect_lowest_of(
+        &self,
+        n: usize,
+        now: Instant,
+        among: impl Fn(PeerHandle, &Peer) -> bool,
+    ) -> usize {
         let mut ranked = self
             .states
             .iter()
+            .filter(|e| among(*e.key(), e.value()))
             .filter_map(|e| Some((e.value().disconnect_rank(now)?, *e.key())))
             .collect::<Vec<_>>();
         ranked.sort_unstable();
+        let closed = ranked.len().min(n);
         for (_, addr) in ranked.into_iter().take(n) {
             self.with_peer(addr, Peer::disconnect);
         }
+        closed
     }
 
     // The peers on the peer list: every one but the web seeds.
@@ -1392,9 +1423,16 @@ impl PeerStates {
         }
     }
 
-    /// Returns once the connect candidates may have changed.
+    /// Returns once the connect candidates may have changed, or a dial to a
+    /// swarm peer ended (went live or failed).
     pub async fn candidates_changed(&self) {
         self.candidates_changed.notified().await
+    }
+
+    /// How many dials to swarm peers are under way. Web seeds are not
+    /// counted: a connection to one is no TCP dial the connect loop waits on.
+    pub(crate) fn dialling(&self) -> usize {
+        self.dialling.load(Ordering::Relaxed)
     }
 
     /// Starts connecting to the connect candidate due at `now` that ranks
@@ -1651,6 +1689,9 @@ impl PeerStates {
         if let Some(at) = connected_addr(addr, state) {
             self.index.lock().connection_opened(at);
         }
+        if matches!(state, PeerState::Connecting(_)) && !matches!(addr, PeerHandle::WebSeed(_)) {
+            self.dialling.fetch_add(1, Ordering::Relaxed);
+        }
         if let PeerState::Live(live) = state {
             self.live.lock().insert(addr);
             self.pex_changed();
@@ -1668,6 +1709,12 @@ impl PeerStates {
         }
         if let Some(at) = connected_addr(addr, state) {
             self.index.lock().connection_closed(at);
+        }
+        // A dial that ends, live or not, wakes the connect loop: one waiting
+        // on dials under way looks again, and waits idle once none is.
+        if matches!(state, PeerState::Connecting(_)) && !matches!(addr, PeerHandle::WebSeed(_)) {
+            self.dialling.fetch_sub(1, Ordering::Relaxed);
+            self.candidates_changed.notify_one();
         }
         if let PeerState::Live(live) = state {
             self.live.lock().swap_remove(&addr);

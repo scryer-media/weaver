@@ -2592,6 +2592,8 @@ impl SchedulerHandle {
     }
 
     pub fn set_proxy_runtime(&self, runtime: Arc<crate::proxies::ProxyRuntime>) {
+        // The classes answer the WireGuard tunnels' asks to give bytes back.
+        runtime.network.attach_classes(self.state.classes().clone());
         *self.state.proxy_runtime.write().expect("proxy runtime") = Some(runtime);
     }
 

@@ -527,6 +527,8 @@ impl Pipeline {
         };
         self.split_applied = rates;
         self.split_held = self.split_held.lower(rates);
+        // Each WireGuard tunnel's bytes divide by the same split.
+        crate::bandwidth::publish_split_in_force(split);
         if self.rate_limiter.rate() != rates.usenet {
             self.rate_limiter.set_rate(rates.usenet);
         }

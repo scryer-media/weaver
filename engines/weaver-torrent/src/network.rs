@@ -36,6 +36,45 @@ pub use crate::vectored_traits::{
     AsyncReadToVectoredCompat, AsyncReadVectored, AsyncReadVectoredIntoCompat,
 };
 
+/// What a look before a TCP peer dial finds on the route.
+#[derive(Debug)]
+pub enum TcpRoom {
+    /// A socket is free for the dial.
+    Free,
+    /// None is free, and the torrent has none owed to it.
+    Full,
+    /// None is free only because others hold past their share. The torrent
+    /// that wants the socket holds the [`TcpWant`] while it still has peers
+    /// to dial over TCP, and the route works to free the room meanwhile.
+    Crowded(TcpWant),
+}
+
+impl TcpRoom {
+    pub fn is_free(&self) -> bool {
+        matches!(self, Self::Free)
+    }
+}
+
+/// A torrent's want for a TCP socket its route held for others: the route
+/// counts the torrent pressing for the room while it is held.
+pub struct TcpWant {
+    _held: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl TcpWant {
+    pub fn new(held: impl std::any::Any + Send + Sync) -> Self {
+        Self {
+            _held: Box::new(held),
+        }
+    }
+}
+
+impl std::fmt::Debug for TcpWant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TcpWant")
+    }
+}
+
 /// A listening stream socket, the shape of a TCP listener.
 pub trait StreamListener: Send + Sync + 'static {
     /// The local address the listener is bound to. Its port is announced to
@@ -105,9 +144,11 @@ pub trait SocketFactory: Send + Sync + 'static {
 
     /// Whether a TCP peer connection finds a socket free now. A route that
     /// holds its TCP peers to a share says no once the share is full, and
-    /// peers then connect over uTP alone.
-    fn tcp_room(&self) -> bool {
-        true
+    /// peers then connect over uTP alone; one held from its share by others
+    /// says why, with the want the torrent holds while it still has peers
+    /// to dial over TCP.
+    fn tcp_room(&self) -> TcpRoom {
+        TcpRoom::Free
     }
 
     /// Whether a datagram socket bind finds a socket free now. A route that

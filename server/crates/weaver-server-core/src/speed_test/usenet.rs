@@ -397,7 +397,7 @@ fn route_slots(error: &BlockingBodyLaneAcquireError) -> Vec<Arc<tokio::sync::Not
     match error {
         BlockingBodyLaneAcquireError::RouteCapacity(NntpError::Route(route)) => {
             match route.as_ref() {
-                weaver_tunnel::pipe::DialError::AtCapacity(slots) => slots.clone(),
+                weaver_tunnel::pipe::DialError::AtCapacity(capacity) => capacity.waits.clone(),
                 _ => Vec::new(),
             }
         }
@@ -451,7 +451,7 @@ mod dial_error_tests {
     #[test]
     fn a_full_route_is_waited_out_and_told_as_a_full_route() {
         let error = BlockingBodyLaneAcquireError::RouteCapacity(NntpError::Route(Arc::new(
-            weaver_tunnel::pipe::DialError::AtCapacity(Vec::new()),
+            weaver_tunnel::pipe::DialError::AtCapacity(Default::default()),
         )));
         assert!(error.should_requeue_owned_work());
         let told = dial_error(error);
@@ -472,9 +472,9 @@ mod dial_error_tests {
             _: &weaver_tunnel::pipe::Target,
         ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
             let _ = self.refused.send(());
-            Err(weaver_tunnel::pipe::DialError::AtCapacity(vec![
-                self.slot.clone(),
-            ]))
+            Err(weaver_tunnel::pipe::DialError::AtCapacity(
+                vec![self.slot.clone()].into(),
+            ))
         }
         fn budget(&self) -> std::time::Duration {
             std::time::Duration::from_secs(3600)
@@ -605,7 +605,7 @@ mod dial_error_tests {
         let error = dialing.join().unwrap().unwrap_err();
         assert!(error.is_route_capacity(), "{error}");
         assert_eq!(progress.connections_per_leg(), vec![1]);
-        let full = weaver_tunnel::pipe::DialError::AtCapacity(Vec::new()).to_string();
+        let full = weaver_tunnel::pipe::DialError::AtCapacity(Default::default()).to_string();
         match progress.first_failure() {
             Some(crate::speed_test::failure::SpeedTestFailure::Other(told)) => {
                 assert!(told.contains(&full), "{told}")

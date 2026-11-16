@@ -412,10 +412,6 @@ impl TorrentService {
     /// unless a wind-down asked for keeps them running until they end.
     pub async fn set_settings(&self, settings: TorrentSettings) {
         let enabled = settings.torrent.enabled;
-        let peer_limit = |torrent: &TorrentConfig| {
-            crate::torrents::sessions::session_limits(torrent).connections_limit
-        };
-        let peers = peer_limit(&settings.torrent);
         self.inner.sessions.set_config(settings.torrent.clone());
         let was = std::mem::replace(
             &mut *self
@@ -443,14 +439,6 @@ impl TorrentService {
         }
         if turned_on {
             self.resume_wound_down().await;
-        }
-        // Each torrent leg says how far its tunnel holds TCP peers below the
-        // peer limit, so a new limit reads the routes again.
-        if peers != peer_limit(&was)
-            && let Some(proxies) = self.queue().and_then(|queue| queue.proxy_runtime())
-            && let Err(error) = proxies.reload().await
-        {
-            tracing::warn!(error, "the routes did not take the new torrent peer limit");
         }
         // The download limit and the seeding levels take hold now, not at
         // the next tick.

@@ -30,9 +30,9 @@ static USENET_RECEIVE_BYTES: AtomicUsize = AtomicUsize::new(USENET_RECEIVE_BEFOR
 const USENET_RECEIVE_BEFORE_PROFILE_BYTES: usize = 1024 * KIB;
 
 // Put `bytes` in force as the receive buffer of every usenet socket dialled
-// from now on.
-pub fn set_usenet_receive_bytes(bytes: usize) {
-    USENET_RECEIVE_BYTES.store(bytes, Ordering::Relaxed);
+// from now on. Says whether that changed the size in force.
+pub fn set_usenet_receive_bytes(bytes: usize) -> bool {
+    USENET_RECEIVE_BYTES.swap(bytes, Ordering::Relaxed) != bytes
 }
 
 // The buffers a socket for `purpose` asks for, or `None` for the tunnel's
@@ -49,6 +49,7 @@ pub fn socket_buffers(purpose: &Purpose) -> Option<TcpBuffers> {
         | Purpose::Outbound
         | Purpose::Torrent
         | Purpose::TorrentHttp
+        | Purpose::TorrentWebSeed
         | Purpose::Probe
         | Purpose::Dns
         | Purpose::Datagram => None,

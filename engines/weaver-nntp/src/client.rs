@@ -603,7 +603,21 @@ impl NntpClient {
         exclude: ServerSet,
         requested_body_bytes: u64,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
-        self.acquire_blocking_lane(groups, exclude, requested_body_bytes, None)
+        self.acquire_blocking_lane(groups, exclude, requested_body_bytes, None, &mut Vec::new())
+    }
+
+    // As `try_acquire_blocking_body_lane_with_estimate`, for work waiting on
+    // the lane: a refusal leaves in `route_demand` the demand of every full
+    // route a server's dial was refused on, whichever error is returned, so
+    // the work presses on each of those tunnels while it holds them.
+    pub fn try_acquire_blocking_body_lane_pressing(
+        &self,
+        groups: &[String],
+        exclude: ServerSet,
+        requested_body_bytes: u64,
+        route_demand: &mut Vec<weaver_tunnel::pipe::Demand>,
+    ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
+        self.acquire_blocking_lane(groups, exclude, requested_body_bytes, None, route_demand)
     }
 
     // Open a connection no work is waiting on yet, on `seat` only.
@@ -619,7 +633,14 @@ impl NntpClient {
         requested_body_bytes: u64,
         seat: ServerId,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
-        self.acquire_blocking_lane(groups, exclude, requested_body_bytes, Some(seat))
+        // A warm is no work waiting: its refusals leave no press.
+        self.acquire_blocking_lane(
+            groups,
+            exclude,
+            requested_body_bytes,
+            Some(seat),
+            &mut Vec::new(),
+        )
     }
 
     fn acquire_blocking_lane(
@@ -628,7 +649,9 @@ impl NntpClient {
         exclude: ServerSet,
         requested_body_bytes: u64,
         warm_seat: Option<ServerId>,
+        route_demand: &mut Vec<weaver_tunnel::pipe::Demand>,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
+        route_demand.clear();
         // Work is waiting on every dial except a warm.
         let demanded = warm_seat.is_none();
         let Some(selection) = self.try_blocking_body_server_selection(
@@ -737,6 +760,8 @@ impl NntpClient {
                 }) {
                 Ok(lane) => {
                     self.pool.note_provider_admitted(server, admission);
+                    // The lane is fed: the work presses for no route.
+                    route_demand.clear();
                     return Ok(lane);
                 }
                 Err(error) => {
@@ -792,6 +817,9 @@ impl NntpClient {
                             provider_capacity_error = Some(error);
                         }
                         BlockingBodyLaneAcquireError::RouteCapacity(error) => {
+                            // Each full route's demand is kept, not only the
+                            // one whose error is kept.
+                            route_demand.extend(error.route_demand());
                             route_capacity_error = Some(error);
                         }
                         // A server's real fault is kept over a later

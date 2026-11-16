@@ -1249,6 +1249,105 @@ fn turnover_closes_the_connections_worth_least_first() {
     }
 }
 
+// Bytes a tunnel asks back close TCP peers alone, those worth least first,
+// exactly as many as asked: a uTP peer holds no socket of the tunnel and
+// stays, however little it is worth.
+#[test]
+fn a_give_back_closes_the_tcp_peers_worth_least() {
+    let peers = make_peer_states();
+    let now = Instant::now();
+    let mut tcp = Vec::new();
+    for i in 1..=4 {
+        tcp.push(add_live_peer(&peers, &format!("10.0.0.{i}:6881")));
+    }
+    let mut utp = Vec::new();
+    for i in 5..=6 {
+        let addr: SocketAddr = format!("10.0.0.{i}:6881").parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        peers
+            .add_incoming(addr, Id20::default(), tx, ConnectionKind::Utp, OUR_PORT)
+            .unwrap();
+        utp.push(rx);
+    }
+    // The first TCP peer is uninteresting; the rest sent 10, 1000 and 2000.
+    for ((addr, _), fetched) in tcp[1..].iter().zip([10, 1000, 2000]) {
+        peers.with_live_mut((*addr).into(), "test", |live| live.interest(true, now));
+        peers.with_peer((*addr).into(), |peer| {
+            peer.stats
+                .counters
+                .fetched_bytes
+                .fetch_add(fetched, Ordering::Relaxed)
+        });
+    }
+
+    assert_eq!(peers.disconnect_lowest_tcp(2, now, &|_| true), 2);
+    let closed: Vec<bool> = tcp.iter_mut().map(|(_, rx)| told_to_close(rx)).collect();
+    assert_eq!(closed, [true, true, false, false]);
+    assert!(
+        utp.iter_mut().all(|rx| !told_to_close(rx)),
+        "a uTP peer closed"
+    );
+}
+
+// A give-back closes only the TCP peers `among` takes, the asking tunnel's,
+// those worth least first among them: a peer on another tunnel stays,
+// however little it is worth, and fewer close than asked when the tunnel
+// holds fewer.
+#[test]
+fn a_give_back_closes_only_the_peers_among_takes() {
+    let peers = make_peer_states();
+    let now = Instant::now();
+    let mut tcp = Vec::new();
+    for i in 1..=4 {
+        tcp.push(add_live_peer(&peers, &format!("10.0.0.{i}:6881")));
+    }
+    // The two worth least, 10.0.0.1 and 10.0.0.2, ride another tunnel.
+    for ((addr, _), fetched) in tcp[1..].iter().zip([10, 1000, 2000]) {
+        peers.with_live_mut((*addr).into(), "test", |live| live.interest(true, now));
+        peers.with_peer((*addr).into(), |peer| {
+            peer.stats
+                .counters
+                .fetched_bytes
+                .fetch_add(fetched, Ordering::Relaxed)
+        });
+    }
+    let asking: Vec<SocketAddr> = tcp[2..].iter().map(|(addr, _)| *addr).collect();
+    let among = |addr: SocketAddr| asking.contains(&addr);
+
+    // Asked for three, the tunnel holds two.
+    assert_eq!(peers.disconnect_lowest_tcp(3, now, &among), 2);
+    let closed: Vec<bool> = tcp.iter_mut().map(|(_, rx)| told_to_close(rx)).collect();
+    assert_eq!(closed, [false, false, true, true]);
+}
+
+// Of the asking tunnel's peers, the one worth least closes first.
+#[test]
+fn a_give_back_among_a_tunnel_closes_its_peer_worth_least_first() {
+    let peers = make_peer_states();
+    let now = Instant::now();
+    let mut tcp = Vec::new();
+    for i in 1..=3 {
+        tcp.push(add_live_peer(&peers, &format!("10.0.0.{i}:6881")));
+    }
+    for ((addr, _), fetched) in tcp.iter().zip([10, 2000, 1000]) {
+        peers.with_live_mut((*addr).into(), "test", |live| live.interest(true, now));
+        peers.with_peer((*addr).into(), |peer| {
+            peer.stats
+                .counters
+                .fetched_bytes
+                .fetch_add(fetched, Ordering::Relaxed)
+        });
+    }
+    // 10.0.0.1, worth least, rides another tunnel.
+    let asking: Vec<SocketAddr> = tcp[1..].iter().map(|(addr, _)| *addr).collect();
+    assert_eq!(
+        peers.disconnect_lowest_tcp(1, now, &|addr| asking.contains(&addr)),
+        1
+    );
+    let closed: Vec<bool> = tcp.iter_mut().map(|(_, rx)| told_to_close(rx)).collect();
+    assert_eq!(closed, [false, false, true]);
+}
+
 /// How an outgoing connection in [`attempt_at`] ends.
 #[derive(Clone, Copy)]
 enum Ends {
@@ -1810,4 +1909,37 @@ fn a_saved_ban_refuses_the_peer() {
         Some(IncomingRefused::Banned)
     );
     assert_eq!(peers.resume_peers().banned, vec![banned.ip()]);
+}
+
+// The connect loop waits on dials to swarm peers under way: a web seed's
+// connection is none of them, though it counts as connecting. A dial that
+// ends, live or not, wakes the loop to look again.
+#[test]
+fn a_dial_that_ends_wakes_the_connect_loop_and_a_web_seed_is_no_dial() {
+    use futures::FutureExt;
+    let peers = make_peer_states();
+    let seed = PeerHandle::WebSeed(1);
+    peers.admit_web_seed(seed).unwrap();
+    assert_eq!(peers.stats().connecting, 1);
+    assert_eq!(peers.dialling(), 0, "a web seed is no dial");
+
+    let addr = peer_addr(1);
+    peers.add_peer(addr, PeerSourceFlag::Tracker);
+    let (dialled, _rx, _tx) = peers.connect_next(Instant::now()).unwrap();
+    assert_eq!(dialled, addr);
+    assert_eq!(peers.dialling(), 1);
+    // What woke the loop before the dial ended is taken first.
+    let _ = peers.candidates_changed().now_or_never();
+    assert!(peers.candidates_changed().now_or_never().is_none());
+
+    peers
+        .with_peer_mut(addr.into(), "test", |peer| {
+            peer.take_state(&peers);
+        })
+        .unwrap();
+    assert_eq!(peers.dialling(), 0);
+    assert!(
+        peers.candidates_changed().now_or_never().is_some(),
+        "the dial's end wakes the connect loop"
+    );
 }

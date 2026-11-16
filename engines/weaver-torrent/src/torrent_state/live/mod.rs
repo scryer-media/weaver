@@ -280,6 +280,9 @@ pub struct TorrentStateLive {
     // no longer counts, as libtorrent drops a disconnecting connection from
     // `torrent::m_connections` at once. Taken before `peers`.
     places: Mutex<HashMap<PeerHandle, Place>>,
+    // The torrent's want for a TCP socket its route held for others, while
+    // it still has peers to dial: the route counts it pressing for as long.
+    pub(crate) tcp_wants: crate::stream_connect::TcpWants,
 
     finished_notify: Notify,
     // Rings when the torrent may want pieces again after it finished: more
@@ -450,6 +453,12 @@ impl TorrentStateLive {
         let g = self.lock_read("checkpoint");
         Ok(g.get_chunks()?
             .checkpoint(&*self.files, self.metadata.file_infos.len()))
+    }
+
+    /// The torrent's peer list, for tests outside the run's own module.
+    #[cfg(test)]
+    pub(crate) fn peer_states(&self) -> &PeerStates {
+        &self.peers
     }
 
     /// The peers and bans a restart is to begin with; see

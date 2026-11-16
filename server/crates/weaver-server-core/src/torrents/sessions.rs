@@ -37,7 +37,9 @@ use crate::proxies::{
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
-use crate::torrents::net::{Exposure, LegKind, LegNames, LegSockets, Shape, tracker_client};
+use crate::torrents::net::{
+    Exposure, LegKind, LegNames, LegSockets, PeerTunnels, Shape, tracker_client,
+};
 use crate::torrents::rate::SessionRates;
 
 /// The most sessions that run at once.
@@ -337,6 +339,9 @@ pub struct OpenLeg {
     /// The route's leg the factory dials through, kept while the session
     /// lives.
     pub leg: Option<Arc<TorrentLeg>>,
+    /// The path each of the session's live TCP peer connections rides, on a
+    /// leg whose sockets are its dialer's.
+    pub tunnels: Option<Arc<PeerTunnels>>,
 }
 
 impl OpenLeg {
@@ -351,18 +356,35 @@ impl OpenLeg {
         bridge: Option<crate::proxies::PathBridge>,
         leg: Option<Arc<TorrentLeg>>,
     ) -> Result<Self, String> {
-        let factory: Arc<dyn SocketFactory> = if kind.own_sockets() {
-            Arc::new(KernelSockets::new(kind.bind_device()).map_err(|error| format!("{error:#}"))?)
+        let (factory, tunnels): (Arc<dyn SocketFactory>, _) = if kind.own_sockets() {
+            let kernel =
+                KernelSockets::new(kind.bind_device()).map_err(|error| format!("{error:#}"))?;
+            (Arc::new(kernel), None)
         } else {
-            Arc::new(LegSockets::new(Arc::clone(&dialer), &kind))
+            let sockets = LegSockets::new(Arc::clone(&dialer), &kind);
+            let tunnels = sockets.tunnels();
+            (Arc::new(sockets), Some(tunnels))
         };
+        // A leg's web seed transfers ride its own seed bridge, started the
+        // first time a web seed is asked. The clients hold the leg weakly, so
+        // its drop revokes both bridges without waiting on them; a web seed
+        // asked after it fails as a revoked route does.
+        let seeds = leg.as_ref().map(|leg| {
+            let leg = Arc::downgrade(leg);
+            Arc::new(move || {
+                leg.upgrade()
+                    .ok_or_else(|| "leg revoked".to_owned())?
+                    .seed_bridge()
+            }) as crate::torrents::net::SeedBridge
+        });
         Ok(Self {
             shape: kind.shape(Some(&dialer)),
             factory,
-            http: tracker_client(&kind, Arc::clone(&dialer), bridge)?,
+            http: tracker_client(&kind, Arc::clone(&dialer), bridge, seeds)?,
             names: Arc::new(LegNames(dialer)),
             kind,
             leg,
+            tunnels,
         })
     }
 }
@@ -912,6 +934,8 @@ enum Slot {
         plan: RoutePlan,
         mappings: PortMappings,
         opening: Box<Opening>,
+        // The path each of its live TCP peer connections rides.
+        tunnels: Option<Arc<PeerTunnels>>,
     },
     // `failed` when it holds closed because its session could not be built.
     Held {
@@ -1468,13 +1492,13 @@ impl Sessions {
             let now = self
                 .off()
                 .or_else(|| slots.get(&plan.key).and_then(Slot::held));
-            if let Ok((session, leg, _, maps, _)) = built {
+            if let Ok((session, leg, _, maps, _, _)) = built {
                 self.closing.close(&plan.key, session, leg, maps);
             }
             return Err(SessionError::RouteDown(now.unwrap_or(REVOKED)));
         }
         match built {
-            Ok((session, leg, port, maps, opening)) => {
+            Ok((session, leg, port, maps, opening, tunnels)) => {
                 self.rates.add(
                     &session,
                     plan.egress_id,
@@ -1506,6 +1530,7 @@ impl Sessions {
                         plan: plan.clone(),
                         mappings,
                         opening: Box::new(opening),
+                        tunnels,
                     },
                 );
                 Ok(session)
@@ -1572,6 +1597,7 @@ impl Sessions {
             u16,
             Option<u16>,
             Opening,
+            Option<Arc<PeerTunnels>>,
         ),
         RouteFailure,
     > {
@@ -1665,7 +1691,7 @@ impl Sessions {
                 if let Some(leg) = &leg.leg {
                     leg.opened(true);
                 }
-                Ok((session, leg.leg, port, maps, opening))
+                Ok((session, leg.leg, port, maps, opening, leg.tunnels))
             }
             // A session that could not open on a leg whose path has a
             // failing hop could not open for that hop: a tunnel that never
@@ -1737,6 +1763,26 @@ impl Sessions {
         slots
             .iter()
             .filter_map(|(key, slot)| Some((key.clone(), Arc::clone(slot.running()?))))
+            .collect()
+    }
+
+    /// Every running session with the paths its live TCP peer connections
+    /// ride, on a leg whose sockets are its dialer's.
+    pub async fn running_on_tunnels(&self) -> BTreeMap<RouteKey, (Arc<Session>, Arc<PeerTunnels>)> {
+        let slots = self.slots.lock().await;
+        slots
+            .iter()
+            .filter_map(|(key, slot)| {
+                let session = slot.running()?;
+                let Slot::Open {
+                    tunnels: Some(tunnels),
+                    ..
+                } = slot
+                else {
+                    return None;
+                };
+                Some((key.clone(), (Arc::clone(session), Arc::clone(tunnels))))
+            })
             .collect()
     }
 

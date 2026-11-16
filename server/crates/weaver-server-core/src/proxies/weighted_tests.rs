@@ -147,9 +147,10 @@ async fn a_full_share_sends_dials_to_the_leg_with_room() {
     assert!(streams.iter().all(|s| s.path.leg == Some(1)));
     assert!(stages[0].dialed.lock().unwrap().is_empty());
     assert!(!route.has_room(&target().purpose));
-    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed)));
+    assert!(waits.waits.iter().any(|wait| Arc::ptr_eq(wait, &freed)));
     assert!(
         waits
+            .waits
             .iter()
             .any(|wait| Arc::ptr_eq(wait, &route.budget_changed()))
     );
