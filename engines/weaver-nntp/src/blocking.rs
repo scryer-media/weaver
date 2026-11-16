@@ -1058,8 +1058,7 @@ impl BlockingBodyLane {
         message_id: &str,
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let mut budget =
-            ActiveTransferBudget::new(self.soft_timeout).with_stop(self.stop.clone());
+        let mut budget = ActiveTransferBudget::new(self.soft_timeout).with_stop(self.stop.clone());
         self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self.conn.stream_yenc_article_with_active_budget(
             message_id,
@@ -1075,8 +1074,7 @@ impl BlockingBodyLane {
     }
 
     fn read_next_decoded_body(&mut self) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let mut budget =
-            ActiveTransferBudget::new(self.soft_timeout).with_stop(self.stop.clone());
+        let mut budget = ActiveTransferBudget::new(self.soft_timeout).with_stop(self.stop.clone());
         self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self
             .conn
