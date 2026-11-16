@@ -116,8 +116,9 @@ fn compute_only_files(
         }
         (None, Some(filename_re)) => {
             let only_files = compute_only_files_regex(info, &filename_re)?;
+            let selected = selected_files(&only_files, info.iter_file_lengths().count());
             for (idx, fd) in info.iter_file_details().enumerate() {
-                if !only_files.contains(&idx) {
+                if !selected[idx] {
                     continue;
                 }
                 if !list_only {
@@ -128,6 +129,19 @@ fn compute_only_files(
         }
         (None, None) => Ok(None),
     }
+}
+
+// Whether each of a torrent's `files` files is one `only_files` names, one
+// flag a file, built in one pass so a pass over the files does not search
+// the list for each. An index past the files names none.
+fn selected_files(only_files: &[usize], files: usize) -> Vec<bool> {
+    let mut selected = vec![false; files];
+    for &index in only_files {
+        if let Some(flag) = selected.get_mut(index) {
+            *flag = true;
+        }
+    }
+    selected
 }
 
 // Each file's level at the start: those given, one a file; or Normal for the
@@ -152,9 +166,10 @@ fn compute_file_priorities(
             }
             given
         }
-        (None, Some(only_files)) => (0..file_infos.len())
-            .map(|index| {
-                if only_files.contains(&index) {
+        (None, Some(only_files)) => selected_files(only_files, file_infos.len())
+            .into_iter()
+            .map(|selected| {
+                if selected {
                     FilePriority::Normal
                 } else {
                     FilePriority::Ignored
@@ -919,5 +934,36 @@ fn own_peers(
         peers.filter(|addr| !found.contains(addr)).collect()
     } else {
         peers.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_files;
+
+    // The flags built once say what searching the list for each file said,
+    // over seeded lists with repeats, gaps and indexes past the files.
+    #[test]
+    fn selected_files_say_what_searching_the_list_says() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..500 {
+            let files = usize::try_from(next() % 64).unwrap();
+            let named = usize::try_from(next() % 80).unwrap();
+            let only: Vec<usize> = (0..named)
+                .map(|_| usize::try_from(next() % 80).unwrap())
+                .collect();
+            let searched: Vec<bool> = (0..files).map(|i| only.contains(&i)).collect();
+            assert_eq!(
+                selected_files(&only, files),
+                searched,
+                "{only:?} of {files}"
+            );
+        }
     }
 }
