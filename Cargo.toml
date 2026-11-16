@@ -46,6 +46,11 @@ sha1 = { version = "0.11", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
 aws-lc-rs = { version = "1.19", default-features = false, features = ["non-fips"] }
+rsa = { version = "0.10", default-features = false, features = ["pkcs1v15", "sha1"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
+ml-dsa = { version = "0.1.2", default-features = false }
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"] }
 getrandom = { version = "0.4", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["std"] }
@@ -307,6 +312,11 @@ opt-level = 3
 opt-level = 3
 
 [profile.test.package.aws-lc-sys]
+opt-level = 3
+
+# The DNSSEC validator's tests sign with P-256; under its pure-Rust backend
+# unoptimised verification takes most of that suite's time.
+[profile.test.package.p256]
 opt-level = 3
 
 [profile.matrix]

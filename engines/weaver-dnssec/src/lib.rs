@@ -5,6 +5,22 @@
 //!
 //! The caller supplies transport and time. Validation performs no I/O and
 //! requests the additional DNSKEY and DS messages needed to prove an answer.
+//!
+//! # Features
+//!
+//! Exactly one crypto backend verifies signatures and computes digests. Both
+//! accept and reject the same inputs.
+//!
+//! - `aws-lc-rs` (the default): the aws-lc-rs crate, which builds aws-lc, a C
+//!   library.
+//! - `rust-crypto`: pure Rust, from the RustCrypto and dalek crates. Build
+//!   with `default-features = false, features = ["rust-crypto"]` to leave C
+//!   out.
+//! - With both enabled, aws-lc-rs is used.
+//! - With neither, the crate does not compile.
+//! - `test-support`: signing test equipment in the `testing` module. It signs with
+//!   aws-lc-rs, so it builds aws-lc under either backend. Running this crate's
+//!   own tests always builds aws-lc too, since the tests sign with it.
 
 #![forbid(unsafe_code)]
 
@@ -12,6 +28,7 @@ mod algorithm;
 mod anchor;
 mod cache;
 mod canonical;
+mod crypto;
 mod denial;
 mod keys;
 #[cfg(test)]

@@ -3,9 +3,11 @@
 
 //! DNSSEC cryptographic primitives. Callers apply policy and work budgets first.
 
-use aws_lc_rs::{digest, signature};
-
-use crate::{Name, Policy, rdata::Dnskey};
+use crate::{
+    Name, Policy,
+    crypto::{self, Backend, Curve, Digest, RsaHash},
+    rdata::Dnskey,
+};
 
 pub(crate) fn supported_algorithm(algorithm: u8, policy: &Policy) -> bool {
     match algorithm {
@@ -102,6 +104,10 @@ pub(crate) fn key_usable(key: &Dnskey) -> bool {
 }
 
 pub(crate) fn verify(key: &Dnskey, message: &[u8], signed: &[u8]) -> bool {
+    verify_with::<crypto::Selected>(key, message, signed)
+}
+
+pub(crate) fn verify_with<B: Backend>(key: &Dnskey, message: &[u8], signed: &[u8]) -> bool {
     match key.algorithm {
         5 | 7 | 8 | 10 => {
             let Some(key_parts) = rsa_key(&key.public_key) else {
@@ -110,57 +116,36 @@ pub(crate) fn verify(key: &Dnskey, message: &[u8], signed: &[u8]) -> bool {
             if !(1024..=8192).contains(&key_parts.bits) {
                 return false;
             }
-            let parameters = match key.algorithm {
-                5 | 7 => &signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY,
-                8 => &signature::RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY,
-                10 => &signature::RSA_PKCS1_1024_8192_SHA512_FOR_LEGACY_USE_ONLY,
+            let hash = match key.algorithm {
+                5 | 7 => RsaHash::Sha1,
+                8 => RsaHash::Sha256,
+                10 => RsaHash::Sha512,
                 _ => return false,
             };
-            signature::RsaPublicKeyComponents {
-                n: key_parts.modulus,
-                e: key_parts.exponent,
-            }
-            .verify(parameters, message, signed)
-            .is_ok()
+            B::verify_rsa(hash, key_parts.modulus, key_parts.exponent, message, signed)
         }
-        13 => verify_ec(
-            &key.public_key,
-            64,
-            &signature::ECDSA_P256_SHA256_FIXED,
-            message,
-            signed,
-        ),
-        14 => verify_ec(
-            &key.public_key,
-            96,
-            &signature::ECDSA_P384_SHA384_FIXED,
-            message,
-            signed,
-        ),
+        13 => verify_ec::<B>(&key.public_key, 64, Curve::P256, message, signed),
+        14 => verify_ec::<B>(&key.public_key, 96, Curve::P384, message, signed),
         15 => {
             key.public_key.len() == 32
                 && signed.len() == 64
-                && signature::UnparsedPublicKey::new(&signature::ED25519, &key.public_key)
-                    .verify(message, signed)
-                    .is_ok()
+                && B::verify_ed25519(&key.public_key, message, signed)
         }
         18 => {
             // DNSSEC uses raw ML-DSA-44 with empty context and no prehash.
             // Reject DER keys and other parameter sets before the backend.
             key.public_key.len() == 1312
                 && signed.len() == 2420
-                && signature::UnparsedPublicKey::new(&signature::ML_DSA_44, &key.public_key)
-                    .verify(message, signed)
-                    .is_ok()
+                && B::verify_ml_dsa_44(&key.public_key, message, signed)
         }
         _ => false,
     }
 }
 
-fn verify_ec(
+fn verify_ec<B: Backend>(
     key: &[u8],
     size: usize,
-    algorithm: &'static dyn signature::VerificationAlgorithm,
+    curve: Curve,
     message: &[u8],
     signed: &[u8],
 ) -> bool {
@@ -169,34 +154,36 @@ fn verify_ec(
     }
     let mut point = vec![4];
     point.extend_from_slice(key);
-    signature::UnparsedPublicKey::new(algorithm, point)
-        .verify(message, signed)
-        .is_ok()
+    B::verify_ecdsa(curve, &point, message, signed)
 }
 
 /// The policy is applied by the DS selector; this primitive supports SHA-1 too.
 pub(crate) fn ds_digest(owner: &Name, key: &Dnskey, digest_type: u8) -> Option<Vec<u8>> {
     let algorithm = match digest_type {
-        1 => &digest::SHA1_FOR_LEGACY_USE_ONLY,
-        2 => &digest::SHA256,
-        4 => &digest::SHA384,
+        1 => Digest::Sha1,
+        2 => Digest::Sha256,
+        4 => Digest::Sha384,
         _ => return None,
     };
     let mut input = owner.to_lowercase().as_wire().to_vec();
     input.extend(dnskey_bytes(key));
-    Some(digest::digest(algorithm, &input).as_ref().to_vec())
+    Some(
+        crypto::Selected::digest(algorithm, &input)
+            .as_ref()
+            .to_vec(),
+    )
 }
 
 /// RFC 5155 section 5. The caller enforces iteration and hash budgets.
 pub(crate) fn nsec3_hash(owner: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     let mut input = owner.to_lowercase().as_wire().to_vec();
     input.extend_from_slice(salt);
-    let mut output = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &input);
+    let mut output = crypto::Selected::digest(Digest::Sha1, &input);
     for _ in 0..iterations {
         input.clear();
         input.extend_from_slice(output.as_ref());
         input.extend_from_slice(salt);
-        output = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &input);
+        output = crypto::Selected::digest(Digest::Sha1, &input);
     }
     output.as_ref().to_vec()
 }
