@@ -1110,6 +1110,68 @@ async fn a_truncated_body_fails_after_its_whole_blocks() {
     assert!(entry(&seeds, |e| e.lacks.files.is_empty() && !e.disabled));
 }
 
+// A web seed's URL can carry a credential in its user, its path or its
+// query. The error a failed connection ends with, which the torrent logs
+// and keeps as the peer's error, names the seed by scheme, host and port
+// only, whatever failed: an error status, a body cut short, a refused
+// connection, a move with no location, the SSRF check (SECURITY.md,
+// "Credentials stay with their scope").
+#[tokio::test(start_paused = true)]
+async fn a_failed_web_seed_names_no_credential() {
+    const SECRET: &str = "s3cret";
+    let a = content(PIECE as usize, 7);
+    let layout = layout(&[("a", u64::from(PIECE), false)]);
+    // A port nothing listens on.
+    let refused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let replies: Vec<Reply> = vec![
+        Reply::status(404),
+        Reply {
+            sent: Some(20000),
+            ..Reply::status(206)
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", a.len() - 1, a.len()),
+                )
+                .body(a.clone())
+        },
+        Reply::status(302),
+        Reply::status(200),
+        Reply::status(200),
+    ];
+    for (case, reply) in replies.into_iter().enumerate() {
+        let reply = Mutex::new(Some(reply));
+        // Holds the paused clock while the request is out (see Server).
+        let server = Server::start(move |_| reply.lock().take().unwrap());
+        let at = match case {
+            3 => refused,
+            _ => server.addr,
+        };
+        let url = match case {
+            // A query to a local address: refused before it is asked.
+            4 => format!("http://user:{SECRET}@{at}/{SECRET}/a?pk={SECRET}"),
+            _ => format!("http://user:{SECRET}@{at}/{SECRET}/a"),
+        };
+        let (_seeds, link) = one_seed(url, WebSeedKind::Url);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
+        let Err(e) = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 2).await else {
+            panic!("case {case}: the connection did not fail");
+        };
+        let shown = format!("{e:#} {e:?}");
+        assert!(!shown.contains(SECRET), "case {case}: {shown}");
+        assert!(!shown.contains("user"), "case {case}: {shown}");
+        // A request that got no answer is named by its error alone.
+        if case != 3 {
+            assert!(
+                shown.contains(&format!("http://{at}/…")),
+                "case {case}: {shown}"
+            );
+        }
+    }
+}
+
 // A response must answer the range asked for: one naming none disables
 // the seed, one naming another fails the connection (libtorrent
 // `get_range`, `web_peer_connection::on_receive`).
@@ -1673,4 +1735,114 @@ async fn a_torrent_downloads_from_its_web_seed_alone() -> anyhow::Result<()> {
     assert_eq!(handle.web_seeds(), [http_seed]);
     assert!(handle.magnet().web_seeds.is_empty());
     Ok(())
+}
+
+// A seed added or removed is found by its URL and kind in one lookup: the
+// seeds kept, in their order, and what each add and remove returns, are
+// what passing over the list says, over seeded adds and removes.
+#[test]
+fn seeds_found_by_lookup_are_those_a_pass_finds() {
+    let mut rng = 0x6a09_e667_f3bc_c908u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _ in 0..50 {
+        let seeds = WebSeeds::default();
+        let mut reference: Vec<WebSeed> = Vec::new();
+        for _ in 0..200 {
+            let r = next();
+            let seed = WebSeed {
+                url: format!("http://seed{}.test/", r % 12),
+                kind: if r & 0x100 != 0 {
+                    WebSeedKind::Url
+                } else {
+                    WebSeedKind::Http
+                },
+                named_by: if r & 0x200 != 0 {
+                    NamedBy::Torrent
+                } else {
+                    NamedBy::Operator
+                },
+            };
+            if r & 0x400 != 0 {
+                let was = reference.iter().position(|s| same_seed(s, &seed));
+                if let Some(at) = was {
+                    reference.remove(at);
+                }
+                assert_eq!(seeds.remove(&seed), was.is_some());
+            } else {
+                let had = reference.iter().any(|s| same_seed(s, &seed));
+                if !had {
+                    reference.push(seed.clone());
+                }
+                assert_eq!(seeds.add(seed), !had);
+            }
+            assert_eq!(seeds.list(), reference);
+        }
+    }
+}
+
+// The slices found from a binary search for the first file are those a
+// pass over every file finds, over seeded layouts with empty and pad files
+// and ranges anywhere in the torrent.
+#[test]
+fn slices_found_by_search_are_those_a_pass_finds() {
+    // The pass over every file the search replaced.
+    fn every_file(layout: &Layout, offset: u64, len: u64) -> Vec<Slice> {
+        let end = offset + len;
+        layout
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.len > 0 && f.offset < end && f.offset + f.len > offset)
+            .map(|(file, f)| {
+                let start = offset.max(f.offset);
+                let stop = end.min(f.offset + f.len);
+                Slice {
+                    file,
+                    offset: start - f.offset,
+                    len: stop - start,
+                }
+            })
+            .collect()
+    }
+    let mut rng = 0xbb67_ae85_84ca_a73bu64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _ in 0..300 {
+        let names: Vec<String> = (0..1 + next() % 20).map(|i| format!("f{i}")).collect();
+        let files: Vec<(&str, u64, bool)> = names
+            .iter()
+            .map(|name| {
+                let r = next();
+                let len = match r % 4 {
+                    0 => 0,
+                    1 => 1 + (r >> 8) % 100,
+                    _ => 1 + (r >> 8) % 100_000,
+                };
+                (name.as_str(), len, r & 0x80 != 0)
+            })
+            .collect();
+        if files.iter().all(|f| f.1 == 0) {
+            continue;
+        }
+        let layout = layout(&files);
+        let total: u64 = files.iter().map(|f| f.1).sum();
+        for _ in 0..50 {
+            let offset = next() % total;
+            let len = 1 + next() % (total - offset);
+            assert_eq!(
+                layout.slices(offset, len),
+                every_file(&layout, offset, len),
+                "{files:?} {offset}+{len}"
+            );
+        }
+    }
 }

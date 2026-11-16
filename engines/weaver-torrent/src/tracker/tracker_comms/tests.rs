@@ -2954,3 +2954,71 @@ async fn the_tracker_task_announces_through_the_scheme_table() {
     ));
     drop(peers);
 }
+
+// The rows found through the map of first rows are those a search of the
+// table for each entry finds: the same rows change, to the same values, and
+// the same answer is given on whether one did, over seeded tables with
+// repeated URLs, entries with no row and entries that repeat a URL.
+#[test]
+fn rows_written_through_a_map_are_those_a_search_writes() {
+    use std::time::{Duration as Wait, SystemTime};
+
+    use super::{TrackerAnnounce, write_rows};
+
+    // The search as it was before the map.
+    fn searched(
+        rows: &mut [TrackerAnnounce],
+        entries: &[(String, u8, Option<SystemTime>)],
+    ) -> bool {
+        let mut modified = false;
+        for (url, fails, next) in entries {
+            let Some(row) = rows.iter_mut().find(|a| a.url == *url) else {
+                continue;
+            };
+            if (row.fails, row.next_announce) != (*fails, *next) {
+                (row.fails, row.next_announce) = (*fails, *next);
+                modified = true;
+            }
+        }
+        modified
+    }
+
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let url = |n: u64| format!("http://tracker{}.test/announce", n % 12);
+    let value = |n: u64| {
+        let fails = u8::try_from(n % 3).unwrap();
+        let next = (n & 0x10 != 0).then(|| SystemTime::UNIX_EPOCH + Wait::from_secs((n >> 8) % 4));
+        (fails, next)
+    };
+    for run in 0..500 {
+        let rows: Vec<TrackerAnnounce> = (0..next() % 10)
+            .map(|_| {
+                let n = next();
+                let (fails, next_announce) = value(n >> 4);
+                TrackerAnnounce {
+                    url: url(n),
+                    fails,
+                    next_announce,
+                    ..TrackerAnnounce::default()
+                }
+            })
+            .collect();
+        let entries: Vec<(String, u8, Option<SystemTime>)> = (0..next() % 10)
+            .map(|_| {
+                let n = next();
+                let (fails, next) = value(n >> 4);
+                (url(n), fails, next)
+            })
+            .collect();
+        let (mut mapped, mut reference) = (rows.clone(), rows);
+        let changed = write_rows(&mut mapped, &entries, |e| e.0.as_str(), |e| (e.1, e.2));
+        assert_eq!(changed, searched(&mut reference, &entries), "run {run}");
+        assert_eq!(mapped, reference, "run {run}");
+    }
+}

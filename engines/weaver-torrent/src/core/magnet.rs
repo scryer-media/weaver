@@ -11,6 +11,13 @@ use anyhow::Context;
 
 use crate::core::hash_id::{Id20, Id32, InfoHashes};
 
+/// The highest file index a magnet's `so` may select: a larger one, or a
+/// range reaching past it, is passed over (libtorrent `parse_magnet_uri`,
+/// `max_index`, src/magnet_uri.cpp:452 at v2.0.15). With each index kept
+/// once, a link selects at most this many files and one more, however
+/// long it is.
+const MAX_SELECT_ONLY_INDEX: usize = 10_000;
+
 /// A parsed magnet link.
 pub struct Magnet {
     id20: Option<Id20>,
@@ -131,6 +138,8 @@ impl Magnet {
         let mut peers = Vec::<SocketAddr>::new();
         let mut web_seeds = Vec::<String>::new();
         let mut files = Vec::<usize>::new();
+        // The files `so` named so far, each named once.
+        let mut selected: Option<Vec<bool>> = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "xt" => {
@@ -164,17 +173,26 @@ impl Magnet {
                             continue;
                         }
                         // Handling ranges of file indices
-                        if let Some((start, end)) = file_desc.split_once('-') {
-                            let maybe_start_idx: Result<usize, _> = start.parse();
-                            let maybe_end_idx: Result<usize, _> = end.parse();
-                            if let (Ok(start_idx), Ok(end_idx)) = (maybe_start_idx, maybe_end_idx) {
-                                files.extend(start_idx..=end_idx);
-                            }
-                        } else {
+                        let (start, end) = match file_desc.split_once('-') {
+                            Some((start, end)) => (start.parse(), end.parse()),
                             // Handling single file index
-                            let idx = file_desc.parse();
-                            if let Ok(idx) = idx {
-                                files.push(idx);
+                            None => (file_desc.parse(), file_desc.parse()),
+                        };
+                        let (Ok::<usize, _>(start), Ok::<usize, _>(end)) = (start, end) else {
+                            continue;
+                        };
+                        // An index past the bound is passed over, as is a
+                        // range that reaches past it.
+                        if start > MAX_SELECT_ONLY_INDEX || end > MAX_SELECT_ONLY_INDEX {
+                            continue;
+                        }
+                        let selected =
+                            selected.get_or_insert_with(|| vec![false; MAX_SELECT_ONLY_INDEX + 1]);
+                        for (index, seen) in
+                            selected.iter_mut().enumerate().take(end + 1).skip(start)
+                        {
+                            if !std::mem::replace(seen, true) {
+                                files.push(index);
                             }
                         }
                     }
@@ -441,6 +459,28 @@ mod tests {
         // An escaped value is read unescaped, and reads back as written.
         let m = Magnet::parse(&m.to_string()).unwrap();
         assert_eq!(m.web_seeds, ["http://foo.com/bar", "http://bar.com/foo"]);
+    }
+
+    // libtorrent `parse_magnet_uri`: a `so` index past 10000, or a range
+    // reaching past it, is passed over, and an index named twice selects
+    // its file once, so a link of any length selects at most 10001 files.
+    #[test]
+    fn select_only_is_bounded_as_libtorrent_bounds_it() {
+        let cd20 = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let so = |value: &str| {
+            Magnet::parse(&format!("magnet:?xt=urn:btih:{cd20}&so={value}"))
+                .unwrap()
+                .get_select_only()
+        };
+        assert_eq!(so("0-20000"), None);
+        assert_eq!(so("10001"), None);
+        assert_eq!(so("0-18446744073709551615"), None);
+        assert_eq!(so("1,10001,2,9999-10001"), Some(vec![1, 2]));
+        assert_eq!(so("9999-10000,3"), Some(vec![9999, 10000, 3]));
+        assert_eq!(so("0-3,2-5,1"), Some(vec![0, 1, 2, 3, 4, 5]));
+        assert_eq!(so("5-3,x,-2,7-"), None);
+        let many = vec!["0-10000"; 64].join(",");
+        assert_eq!(so(&many), Some((0..=10000).collect()));
     }
 
     // libtorrent test_magnet.cpp `parse_peer`, and the endpoints

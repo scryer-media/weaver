@@ -46,7 +46,26 @@ impl SentBlock {
 pub(crate) struct SmartBan {
     // Every block of each piece that failed and has not passed since, one
     // per block and sender (libtorrent `smart_ban_plugin::m_block_hashes`).
-    failed: HashMap<ValidPieceIndex, Vec<SentBlock>>,
+    failed: HashMap<ValidPieceIndex, Records>,
+}
+
+/// The blocks remembered of one piece, in the order they were first read,
+/// and where each block and sender is among them.
+#[derive(Debug, Default, Clone)]
+struct Records {
+    blocks: Vec<SentBlock>,
+    at: HashMap<(u32, PeerHandle), usize>,
+}
+
+impl Records {
+    fn index(&mut self) {
+        self.at = self
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, r)| ((r.chunk.chunk_index, r.sender), i))
+            .collect();
+    }
 }
 
 impl SmartBan {
@@ -62,14 +81,16 @@ impl SmartBan {
         let records = self.failed.entry(piece).or_default();
         let mut liars = BTreeSet::new();
         for block in blocks {
-            match records.iter().find(|r| {
-                r.chunk.chunk_index == block.chunk.chunk_index && r.sender == block.sender
-            }) {
+            let key = (block.chunk.chunk_index, block.sender);
+            match records.at.get(&key).map(|&i| &records.blocks[i]) {
                 Some(earlier) if earlier.digest != block.digest => {
                     liars.insert(block.sender);
                 }
                 Some(_) => {}
-                None => records.push(block),
+                None => {
+                    records.at.insert(key, records.blocks.len());
+                    records.blocks.push(block);
+                }
             }
         }
         liars
@@ -79,7 +100,10 @@ impl SmartBan {
     /// failures, which leave with it (libtorrent
     /// `smart_ban_plugin::on_piece_pass`).
     pub fn piece_passed(&mut self, piece: ValidPieceIndex) -> Vec<SentBlock> {
-        self.failed.remove(&piece).unwrap_or_default()
+        self.failed
+            .remove(&piece)
+            .map(|records| records.blocks)
+            .unwrap_or_default()
     }
 
     /// `peer` left the peer list: what it sent goes with it, and blames
@@ -88,8 +112,12 @@ impl SmartBan {
     /// peer stays on the list, and so do its records.
     pub fn forget(&mut self, peer: PeerHandle) {
         self.failed.retain(|_, records| {
-            records.retain(|r| r.sender != peer);
-            !records.is_empty()
+            let had = records.blocks.len();
+            records.blocks.retain(|r| r.sender != peer);
+            if records.blocks.len() != had {
+                records.index();
+            }
+            !records.blocks.is_empty()
         });
     }
 }
@@ -305,6 +333,104 @@ mod tests {
         smart_ban.forget(a);
         smart_ban.forget(b);
         assert!(smart_ban.failed.is_empty());
+    }
+
+    /// The records as they were kept before they were indexed: a list
+    /// searched for each block. The reference the indexed records are
+    /// compared with.
+    #[derive(Default)]
+    struct Listed(HashMap<ValidPieceIndex, Vec<SentBlock>>);
+
+    impl Listed {
+        fn piece_failed(
+            &mut self,
+            piece: ValidPieceIndex,
+            blocks: impl IntoIterator<Item = SentBlock>,
+        ) -> BTreeSet<PeerHandle> {
+            let records = self.0.entry(piece).or_default();
+            let mut liars = BTreeSet::new();
+            for block in blocks {
+                match records.iter().find(|r| {
+                    r.chunk.chunk_index == block.chunk.chunk_index && r.sender == block.sender
+                }) {
+                    Some(earlier) if earlier.digest != block.digest => {
+                        liars.insert(block.sender);
+                    }
+                    Some(_) => {}
+                    None => records.push(block),
+                }
+            }
+            liars
+        }
+
+        fn piece_passed(&mut self, piece: ValidPieceIndex) -> Vec<SentBlock> {
+            self.0.remove(&piece).unwrap_or_default()
+        }
+
+        fn forget(&mut self, peer: PeerHandle) {
+            self.0.retain(|_, records| {
+                records.retain(|r| r.sender != peer);
+                !records.is_empty()
+            });
+        }
+    }
+
+    // The indexed records name the same liars at each failure, and give the
+    // same blocks in the same order at each pass, as the listed ones did,
+    // over seeded runs of failures (some with a block sent twice in one
+    // read), passes and forgotten peers.
+    #[test]
+    fn indexed_records_say_what_a_search_of_the_list_says() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        const PIECES: u32 = 4;
+        let lengths =
+            Lengths::new(u64::from(CHUNK_SIZE * BLOCKS * PIECES), CHUNK_SIZE * BLOCKS).unwrap();
+        for run in 0..40 {
+            let mut indexed = SmartBan::default();
+            let mut listed = Listed::default();
+            for step in 0..400 {
+                let r = next();
+                let piece = lengths
+                    .validate_piece_index(u32::try_from(r % u64::from(PIECES)).unwrap())
+                    .unwrap();
+                match (r >> 8) % 5 {
+                    0..=2 => {
+                        let chunks: Vec<ChunkInfo> = lengths.iter_chunk_infos(piece).collect();
+                        let blocks: Vec<SentBlock> = (0..1 + (r >> 16) % 8)
+                            .map(|_| {
+                                let b = next();
+                                SentBlock {
+                                    chunk: chunks[usize::try_from(b % u64::from(BLOCKS)).unwrap()],
+                                    sender: peer(u8::try_from(1 + (b >> 8) % 5).unwrap()),
+                                    digest: [u8::try_from((b >> 16) % 3).unwrap(); 20],
+                                }
+                            })
+                            .collect();
+                        assert_eq!(
+                            indexed.piece_failed(piece, blocks.clone()),
+                            listed.piece_failed(piece, blocks),
+                            "run {run} step {step}"
+                        );
+                    }
+                    3 => assert_eq!(
+                        indexed.piece_passed(piece),
+                        listed.piece_passed(piece),
+                        "run {run} step {step}"
+                    ),
+                    _ => {
+                        let gone = peer(u8::try_from(1 + (r >> 16) % 5).unwrap());
+                        indexed.forget(gone);
+                        listed.forget(gone);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

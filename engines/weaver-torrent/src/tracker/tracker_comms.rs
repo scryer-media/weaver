@@ -2310,21 +2310,17 @@ impl TrackerComms {
     fn publish(&self, now: Instant, at: SystemTime) {
         let list = self.list.lock();
         self.status.0.announces.send_if_modified(|announces| {
-            let mut modified = false;
-            for entry in &list.entries {
-                let url = entry.tracker.url().as_str();
-                let Some(row) = announces.iter_mut().find(|a| a.url == url) else {
-                    continue;
-                };
-                let asked = entry.start_sent.any() || entry.fails > 0;
-                let next = (list.announcing && asked)
-                    .then(|| wall(entry.next_announce.max(entry.min_announce), now, at));
-                if (row.fails, row.next_announce) != (entry.fails, next) {
-                    (row.fails, row.next_announce) = (entry.fails, next);
-                    modified = true;
-                }
-            }
-            modified
+            write_rows(
+                announces,
+                &list.entries,
+                |entry| entry.tracker.url().as_str(),
+                |entry| {
+                    let asked = entry.start_sent.any() || entry.fails > 0;
+                    let next = (list.announcing && asked)
+                        .then(|| wall(entry.next_announce.max(entry.min_announce), now, at));
+                    (entry.fails, next)
+                },
+            )
         });
     }
 
@@ -2808,6 +2804,37 @@ impl UdpTracker {
             }
         }
     }
+}
+
+/// Writes each entry's failures and next announce to the first row of its
+/// URL, in the entries' order; an entry with no row is passed over. Says
+/// whether a row changed.
+fn write_rows<'a, E>(
+    rows: &mut [TrackerAnnounce],
+    entries: &'a [E],
+    url: impl Fn(&'a E) -> &'a str,
+    value: impl Fn(&'a E) -> (u8, Option<SystemTime>),
+) -> bool {
+    // The first row of each entry's URL, found in one pass over the rows.
+    let mut first: HashMap<&str, Option<usize>> = entries.iter().map(|e| (url(e), None)).collect();
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(at @ None) = first.get_mut(row.url.as_str()) {
+            *at = Some(i);
+        }
+    }
+    let mut modified = false;
+    for entry in entries {
+        let Some(&Some(i)) = first.get(url(entry)) else {
+            continue;
+        };
+        let row = &mut rows[i];
+        let value = value(entry);
+        if (row.fails, row.next_announce) != value {
+            (row.fails, row.next_announce) = value;
+            modified = true;
+        }
+    }
+    modified
 }
 
 #[cfg(test)]
