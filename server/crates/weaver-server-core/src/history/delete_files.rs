@@ -334,10 +334,38 @@ async fn delete_owned_output_dir(dir: &std::path::Path, job_id: JobId, legacy_ok
 // Which of the recorded output folders more than one job records: a folder
 // whose marker predates job-named markers is removed only when no other
 // job records it. One read for the whole request.
+// Which jobs of a batch wait at the script-stop barrier: those with a
+// script queued, running or waiting to be admitted, read for the whole
+// batch at once. A script a job gains after that read, such as one a mark
+// queues while earlier jobs are removed, is seen before that job's turn:
+// the jobs still to go are read again, in one statement, whenever any job
+// gained a script since the last read.
+struct LiveScripts {
+    starts: u64,
+    live: std::collections::HashSet<u64>,
+}
+
+impl LiveScripts {
+    async fn read(db: &crate::Database, job_ids: Vec<u64>) -> Self {
+        let starts = db.script_starts();
+        let live = jobs_with_live_scripts(db, job_ids).await;
+        Self { starts, live }
+    }
+
+    // Whether `rest[0]` waits at its barrier; `rest` is that job and the
+    // ones after it.
+    async fn waits(&mut self, db: &crate::Database, rest: &[u64]) -> bool {
+        if db.script_starts() != self.starts {
+            *self = Self::read(db, rest.to_vec()).await;
+        }
+        rest.first()
+            .is_some_and(|job_id| self.live.contains(job_id))
+    }
+}
+
 // The jobs among `job_ids` with a script queued, running or waiting to be
-// admitted, in one read per bind-safe chunk: only those wait at the
-// script-stop barrier. A read that fails counts every job live, so each
-// keeps its own barrier.
+// admitted, in one read per bind-safe chunk. A read that fails counts every
+// job live, so each keeps its own barrier.
 async fn jobs_with_live_scripts(
     db: &crate::Database,
     job_ids: Vec<u64>,
@@ -547,10 +575,10 @@ pub(crate) async fn delete_history_rows(
     // row. No pipeline state participates in a history deletion.
     let removed = delete_ids.iter().copied().collect::<BTreeSet<_>>();
     let mut deleted = BTreeMap::new();
-    let scripted =
-        jobs_with_live_scripts(db, cleanup.keys().map(|id: &JobId| id.0).collect()).await;
-    for (job_id, dirs) in cleanup {
-        if scripted.contains(&job_id.0)
+    let order: Vec<u64> = cleanup.keys().map(|id: &JobId| id.0).collect();
+    let mut scripted = LiveScripts::read(db, order.clone()).await;
+    for (turn, (job_id, dirs)) in cleanup.into_iter().enumerate() {
+        if scripted.waits(db, &order[turn..]).await
             && let Err(error) = retry_script_stop_wait(job_id, || {
                 crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
             })
@@ -765,10 +793,10 @@ pub(crate) async fn archive_history(
     // Proven and listed before anything of any job goes.
     let mut proven = Vec::with_capacity(planned.len());
     let mut records = Vec::new();
-    let scripted =
-        jobs_with_live_scripts(db, planned.iter().map(|(id, _, _)| id.0).collect()).await;
-    for (job_id, recorded, dirs) in planned {
-        if scripted.contains(&job_id.0)
+    let order: Vec<u64> = planned.iter().map(|(id, _, _)| id.0).collect();
+    let mut scripted = LiveScripts::read(db, order.clone()).await;
+    for (turn, (job_id, recorded, dirs)) in planned.into_iter().enumerate() {
+        if scripted.waits(db, &order[turn..]).await
             && let Err(error) = retry_script_stop_wait(job_id, || {
                 crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
             })
@@ -1018,6 +1046,21 @@ mod tests {
             working_dir_on_record(intermediate, &working, &destinations),
             Some(working)
         );
+    }
+
+    // A job no script held when the batch was read, then given one before
+    // its turn, waits at its barrier: the jobs still to go are read again.
+    #[tokio::test]
+    async fn a_script_a_later_job_gains_after_the_batch_read_holds_its_barrier() {
+        let db = crate::Database::open_in_memory().unwrap();
+        let order = [61, 62, 63];
+        let mut scripted = LiveScripts::read(&db, order.to_vec()).await;
+        assert!(!scripted.waits(&db, &order[0..]).await);
+        // Job 62's script starts while job 61's files go.
+        let held = crate::post_processing::events::hold_test_event_run(&db, 62, "marked");
+        assert!(scripted.waits(&db, &order[1..]).await);
+        assert!(!scripted.waits(&db, &order[2..]).await);
+        drop(held);
     }
 
     #[tokio::test(start_paused = true)]
