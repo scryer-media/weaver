@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -196,6 +196,8 @@ pub struct BlockingBodyLane {
     // request-by-request instead of batch-by-batch.
     ring: BodyRing,
     idle_since: std::sync::Mutex<Option<Instant>>,
+    // The caller's stop, when it has one. See [`Self::set_stop`].
+    stop: Option<Arc<AtomicBool>>,
     _permit: BlockingConnectionPermit,
 }
 
@@ -264,6 +266,14 @@ impl BlockingBodyLane {
         self.checkpoint_plan = checkpoint_plan;
     }
 
+    // Once `stop` is set, a BODY in flight ends at its next read turn with
+    // [`NntpError::Stopped`] and the connection is let go, even while the
+    // server is still sending: a caller that is done with the answer does
+    // not wait out a slow article.
+    pub fn set_stop(&mut self, stop: Arc<AtomicBool>) {
+        self.stop = Some(stop);
+    }
+
     pub fn connect(
         server_id: ServerId,
         stable_server_id: StableServerId,
@@ -313,6 +323,7 @@ impl BlockingBodyLane {
                 ring: BodyRing::default(),
                 _permit: permit,
                 idle_since: std::sync::Mutex::new(None),
+                stop: None,
             });
         }
         for group in groups {
@@ -334,6 +345,7 @@ impl BlockingBodyLane {
                         soft_timeout,
                         ring: BodyRing::default(),
                         idle_since: std::sync::Mutex::new(None),
+                        stop: None,
                         _permit: permit,
                     });
                 }
@@ -359,6 +371,7 @@ impl BlockingBodyLane {
                 soft_timeout,
                 ring: BodyRing::default(),
                 idle_since: std::sync::Mutex::new(None),
+                stop: None,
                 _permit: permit,
             })
         } else {
@@ -1045,7 +1058,8 @@ impl BlockingBodyLane {
         message_id: &str,
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        let mut budget =
+            ActiveTransferBudget::new(self.soft_timeout).with_stop(self.stop.clone());
         self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self.conn.stream_yenc_article_with_active_budget(
             message_id,
@@ -1061,7 +1075,8 @@ impl BlockingBodyLane {
     }
 
     fn read_next_decoded_body(&mut self) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        let mut budget =
+            ActiveTransferBudget::new(self.soft_timeout).with_stop(self.stop.clone());
         self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self
             .conn
@@ -1895,6 +1910,10 @@ impl BlockingNntpConnection {
             if let Some(outcome) = &self.route_outcome {
                 outcome.failed();
             }
+            self.poisoned = true;
+            self.current_group = None;
+        } else if matches!(error, NntpError::Stopped) {
+            // A request may be on the wire with its answer unread.
             self.poisoned = true;
             self.current_group = None;
         }
@@ -3467,6 +3486,7 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::TlsRequired => NntpError::TlsRequired,
         NntpError::PoolExhausted => NntpError::PoolExhausted,
         NntpError::PoolShutdown => NntpError::PoolShutdown,
+        NntpError::Stopped => NntpError::Stopped,
         NntpError::SoftTimeout(seconds) => NntpError::SoftTimeout(*seconds),
         NntpError::AcquireTimeout(seconds) => NntpError::AcquireTimeout(*seconds),
         NntpError::QuotaBlocked(rejection) => NntpError::QuotaBlocked(rejection.clone()),

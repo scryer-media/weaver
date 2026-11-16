@@ -148,6 +148,11 @@ pub enum NntpError {
     #[error("pool is shut down")]
     PoolShutdown,
 
+    // The caller stopped a transfer before its answer had arrived. The
+    // server is not implicated; the socket is mid-response and is let go.
+    #[error("transfer stopped by its caller")]
+    Stopped,
+
     // An article fetch exceeded the soft timeout, triggering failover to the next server.
     //
     // This is a *live connection* condition: the command was sent (or the
