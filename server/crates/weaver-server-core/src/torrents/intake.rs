@@ -23,6 +23,8 @@ use crate::operations::disk::{
 use crate::operations::room_wait::{Disk, Wants};
 use crate::pipeline::ExtractionLimits;
 use crate::torrents::storage::Pieces;
+use crate::torrents::writes::{Done, Paid, VolumeRoom};
+use tokio::sync::Notify;
 
 // Where a torrent's pieces land: the disk the folder they are written to
 // lies on, by the choice a usenet job held for a full disk is placed by,
@@ -355,19 +357,28 @@ impl Intake {
     }
 }
 
-impl Pieces for Intake {
-    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
-        let bytes = held.len() as u64;
-        let Some(booked) = self.room.admits(bytes) else {
+impl Intake {
+    // Book a piece of `bytes` on the disk's ledger: refused when it would eat
+    // into the reserve, which the torrent hears.
+    fn book(&self, bytes: u64) -> anyhow::Result<Booked> {
+        self.room.admits(bytes).ok_or_else(|| {
             (self.hear)(Heard::NotBooked(bytes));
-            return Err(
-                anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context(format!(
-                    "{bytes} bytes more would eat into the disk reserve"
-                )),
-            );
-        };
-        // A write that fails or panics gives its booking back as it drops.
-        let error = match self.inner.verified(piece, held) {
+            anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context(format!(
+                "{bytes} bytes more would eat into the disk reserve"
+            ))
+        })
+    }
+
+    // What came of a booked piece's write, heard: a write that failed gives
+    // its booking back, as one that was given up or panicked does as it
+    // drops.
+    fn settled(
+        &self,
+        booked: Booked,
+        bytes: u64,
+        written: anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let error = match written {
             Ok(()) => {
                 booked.landed();
                 if self.room.promised.swap(false, Ordering::AcqRel) {
@@ -394,6 +405,41 @@ impl Pieces for Intake {
             (self.hear)(Heard::Refused(format!("{error:#}")));
         }
         Err(error)
+    }
+}
+
+impl Pieces for Intake {
+    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
+        let bytes = held.len() as u64;
+        let booked = self.book(bytes)?;
+        let written = self.inner.verified(piece, held);
+        self.settled(booked, bytes, written)
+    }
+
+    fn store(self: Arc<Self>, piece: u32, held: Bytes, paid: Option<Paid>, done: Done) {
+        let bytes = held.len() as u64;
+        let booked = match self.book(bytes) {
+            Ok(booked) => booked,
+            Err(error) => {
+                drop(paid);
+                return done(Err(error));
+            }
+        };
+        let inner = Arc::clone(&self.inner);
+        inner.store(
+            piece,
+            held,
+            paid,
+            Box::new(move |written| done(self.settled(booked, bytes, written))),
+        );
+    }
+
+    fn reserve(&self, bytes: u64, room: &Arc<Notify>) -> VolumeRoom {
+        self.inner.reserve(bytes, room)
+    }
+
+    fn stop_writes(&self) {
+        self.inner.stop_writes();
     }
 
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {

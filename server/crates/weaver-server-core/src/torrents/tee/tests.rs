@@ -239,6 +239,7 @@ async fn a_piece_the_job_lacks_is_replayed_from_the_files_once() {
         files,
         Some(&kept),
         Some(Arc::clone(&tee)),
+        crate::torrents::writes::Writes::for_test(),
     );
     assert_eq!(
         store.initial_have(false).unwrap().count_ones(),
@@ -248,7 +249,7 @@ async fn a_piece_the_job_lacks_is_replayed_from_the_files_once() {
     assert_eq!(store.replay_had().taken, 1);
     assert!((0..pieces).all(|index| settled(&tee, index)));
     assert_eq!(store.replay_had().taken, 0);
-    store.forget();
+    store.forget().await;
 }
 
 // The reverse: the job took a piece the torrent then lost, its hash failing
@@ -265,7 +266,13 @@ async fn a_piece_the_torrent_lost_is_fetched_again_and_not_delivered_twice() {
     let lost = pieces / 2;
     let tee = tee(&layout, &dir.path().join("work"), &mail);
     let files = Files::new(&layout, dir.path().join("files")).unwrap();
-    let store = TorrentStore::new(Arc::clone(&layout), files, None, Some(Arc::clone(&tee)));
+    let store = TorrentStore::new(
+        Arc::clone(&layout),
+        files,
+        None,
+        Some(Arc::clone(&tee)),
+        crate::torrents::writes::Writes::for_test(),
+    );
     for index in 0..pieces {
         store
             .verified(index, &piece(&layout, ARCHIVE, index))
@@ -276,7 +283,13 @@ async fn a_piece_the_torrent_lost_is_fetched_again_and_not_delivered_twice() {
     assert!(store.failed(lost).unwrap());
     let kept = store.kept();
     let files = Files::new(&layout, dir.path().join("files")).unwrap();
-    let again = TorrentStore::new(Arc::clone(&layout), files, Some(&kept), None);
+    let again = TorrentStore::new(
+        Arc::clone(&layout),
+        files,
+        Some(&kept),
+        None,
+        crate::torrents::writes::Writes::for_test(),
+    );
     let have = again.initial_have(false).unwrap();
     assert!(!have[lost as usize]);
     assert_eq!(have.count_ones(), pieces as usize - 1);
@@ -289,7 +302,7 @@ async fn a_piece_the_torrent_lost_is_fetched_again_and_not_delivered_twice() {
         std::fs::read(dir.path().join("files/set.rar")).unwrap(),
         ARCHIVE
     );
-    store.forget();
+    store.forget().await;
 }
 
 // A restored tee's nodes retry the torrent's current list of passwords from

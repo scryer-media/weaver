@@ -73,6 +73,7 @@ pub async fn idle_pipeline(
         config,
         crate::runtime::StartupDiskGate::opened(),
         writers,
+        std::sync::Arc::new(crate::operations::VolumeBuffers::new()),
     )
     .await
     .expect("isolated pipeline initialization");

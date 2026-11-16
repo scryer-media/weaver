@@ -133,7 +133,7 @@ impl TorrentService {
             let _ = task.await;
         }
         if let Some(store) = &torrent.store {
-            store.forget();
+            store.forget().await;
             // Its side store goes with it: nothing else reads it.
             if let Some(side) = store.side_path() {
                 let removed = tokio::task::spawn_blocking(move || Side::remove(&side)).await;
@@ -547,7 +547,7 @@ impl TorrentService {
         }
         // Nothing holds its files open as they go.
         if let Some(store) = &torrent.store {
-            store.forget();
+            store.forget().await;
         }
         let written = if delete_files {
             let deleted = tokio::task::spawn_blocking(move || {

@@ -2193,7 +2193,7 @@ pub struct Pipeline {
     // What queues each volume's first write-rate probe on its writer, once.
     pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
     // The keeper of every volume's buffer limits.
-    pub(super) volume_buffers: Arc<download::volume_pace::VolumeBuffers>,
+    pub(super) volume_buffers: Arc<crate::operations::VolumeBuffers>,
     // For each job with released results waiting for the loop: their bytes,
     // counted as arrived on the one volume they are held on.
     pub(super) volume_arrived_by_job: HashMap<JobId, crate::operations::disk::volume::Reservation>,

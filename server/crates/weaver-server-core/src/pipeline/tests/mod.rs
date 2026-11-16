@@ -230,6 +230,7 @@ impl TestHarness {
             config.clone(),
             crate::runtime::StartupDiskGate::opened(),
             crate::pipeline::graph::disk::threads::writers(),
+            std::sync::Arc::new(crate::operations::VolumeBuffers::new()),
         )
         .await
         .unwrap();
@@ -717,6 +718,7 @@ async fn new_direct_pipeline_on_machine(
         config,
         crate::runtime::StartupDiskGate::opened(),
         crate::pipeline::graph::disk::threads::writers(),
+        std::sync::Arc::new(crate::operations::VolumeBuffers::new()),
     )
     .await
     .unwrap();

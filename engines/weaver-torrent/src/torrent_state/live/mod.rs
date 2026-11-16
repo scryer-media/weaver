@@ -865,16 +865,26 @@ pub(crate) struct WriteJob {
 /// again once its writes are done.
 struct Written(Option<Arc<PeerDisk>>);
 
-/// A write for the disk threads: a received block, or a whole piece its
-/// storage held in memory, checked and now to be written.
-pub(crate) enum DiskWrite {
-    Block(WriteJob),
-    Piece(PieceWrite),
+/// A whole piece its storage held in memory, checked and passed, handed to
+/// the storage to write (`TorrentStorage::store_verified_piece`). The
+/// storage writes it on a thread of its own and says how the write ended
+/// with [`StoredPiece::stored`]; the piece is had only then, on the hashing
+/// thread, as it would be had the write been made there. Dropped unsaid,
+/// the piece was not written and is fetched again, as a check dropped
+/// unrun is.
+pub struct StoredPiece {
+    job: Option<HashJob>,
+    // The upload epoch taken before the storage was handed the piece, which
+    // its refusal is judged at (`handle_disk_error`).
+    epoch: u64,
 }
 
-/// A piece that passed its check on the hashing thread, and what its check
-/// carried: the storage writes it whole, and it is had once it did.
-pub(crate) struct PieceWrite(HashJob);
+/// How the storage's write of a passed piece ended, carried back to the
+/// hashing thread.
+pub(crate) enum Stored {
+    Written(anyhow::Result<()>, u64),
+    Dropped,
+}
 
 /// The check of a piece whose last block was written. Like the write, it
 /// belongs to the torrent and runs whatever became of the connection
@@ -890,8 +900,9 @@ pub(crate) struct HashJob {
     senders: crate::piece_tracker::Senders,
     check: PieceCheck,
     // The piece counted while it waits whole in its storage's memory, and
-    // the connection told when it waits no more: both until the piece is
-    // written, or its check failed, or the job is dropped.
+    // the connection told when it waits no more: both until the storage
+    // said the piece is written, or its check failed, or the job is
+    // dropped.
     waiting: Option<crate::disk::Span>,
     written: Written,
     // Counted among its session's checks that wait for the hashing thread,
@@ -899,6 +910,9 @@ pub(crate) struct HashJob {
     queued: Option<crate::spawn_utils::QueuedCheck>,
     // Dropped when the check is over, for a connection that waits for it.
     ended: Option<tokio::sync::oneshot::Sender<()>>,
+    // Set on a passed piece its storage has written or dropped: the job is
+    // back on the hashing thread to act on that, not to hash.
+    stored: Option<Stored>,
     _run: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 

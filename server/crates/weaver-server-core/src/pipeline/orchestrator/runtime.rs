@@ -85,6 +85,7 @@ impl Pipeline {
         config: crate::settings::SharedConfig,
         startup_disk_work: crate::runtime::StartupDiskGate,
         volume_writers: Arc<crate::operations::VolumeWriters>,
+        volume_buffers: Arc<crate::operations::VolumeBuffers>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::clone(shared_state.metrics());
         initial_history.truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
@@ -154,6 +155,9 @@ impl Pipeline {
         let profile_tuning = hardware_profile.tuning(&profile);
         let (volume_figure_bytes, volume_memory_ceiling_bytes) =
             volume_buffer_figure(hardware_profile, &profile, total_connections);
+        // The figure every volume's limits are sized on from here; no
+        // volume has a job yet, so none is sized now.
+        volume_buffers.set_figure(volume_figure_bytes, volume_memory_ceiling_bytes);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         crate::proxies::set_usenet_receive_bytes(
             profile_tuning.wireguard_usenet_receive_bytes,
@@ -534,10 +538,7 @@ impl Pipeline {
                 Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT,
             ),
             volume_probes,
-            volume_buffers: Arc::new(download::volume_pace::VolumeBuffers::new(
-                volume_figure_bytes,
-                volume_memory_ceiling_bytes,
-            )),
+            volume_buffers,
             volume_arrived_by_job: HashMap::new(),
             volume_reserved_by_job: HashMap::new(),
             window_ledgers: Default::default(),

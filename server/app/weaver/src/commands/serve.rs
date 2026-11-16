@@ -283,9 +283,11 @@ pub(crate) async fn run(
     // skipped. Database maintenance and the free-space samplers wait on it,
     // so their first disk work does not land on top of the probe's.
     let startup_disk_work = weaver_server_core::runtime::StartupDiskGate::closed();
-    // The volumes' writer threads, one set for the process: the pipeline
-    // writes through them now, and the torrent service is to as well.
+    // The volumes' writer threads, one set for the process, and the one
+    // keeper of their buffer limits: the pipeline and the torrent service
+    // both write through them.
     let volume_writers = std::sync::Arc::new(weaver_server_core::operations::VolumeWriters::new());
+    let volume_buffers = std::sync::Arc::new(weaver_server_core::operations::VolumeBuffers::new());
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
@@ -303,6 +305,7 @@ pub(crate) async fn run(
         pipeline_config,
         startup_disk_work.clone(),
         std::sync::Arc::clone(&volume_writers),
+        std::sync::Arc::clone(&volume_buffers),
     )
     .await?;
     pipeline.park_crashed_jobs(crashed);
@@ -351,6 +354,8 @@ pub(crate) async fn run(
             db.clone(),
             &proxies,
             &pipeline,
+            volume_writers,
+            volume_buffers,
             handle.clone(),
             crashed_torrents,
         )

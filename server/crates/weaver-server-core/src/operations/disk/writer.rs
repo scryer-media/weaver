@@ -161,6 +161,11 @@ impl Default for Owners {
 }
 
 impl Owners {
+    // An owner is a download service (the pipeline, the torrents, and a
+    // third that downloads over HTTP), made known once for the process:
+    // never one per job, torrent or session, which key their writes
+    // instead. A wake asked is one bit of a word, so there are at most
+    // `OWNERS`.
     fn add(&self, owner: Arc<dyn DiskOwner>) -> Owner {
         let at = self.next.fetch_add(1, Ordering::Relaxed);
         assert!(
@@ -1018,14 +1023,34 @@ impl Submitter {
     // write to any other file that is neither open nor given a way to open
     // fails the key.
     //
-    // Only the queuing thread writes. What it queues counts against the
-    // volume's hard limit before it is queued: first out of what its owner
-    // prepaid (`Owner::prepay`); past that, counted once it fits
-    // (`Volume::fits`), the queuing thread standing still for the writer
-    // until then. A write longer than `Volume::write_piece` is queued in
-    // pieces of that size, each counted as it fits. When that wait is
-    // given up at the end of a stop, the rest of the write is not queued
-    // (`Submitter::gave_up`).
+    // What is queued counts against the volume's hard limit before it is
+    // queued: first out of `from`, a reservation on this volume, whose
+    // bytes move to the write and are given back by the writer once it is
+    // written; past that, counted once it fits (`Volume::fits`), the
+    // caller standing still for the writer until then. A write longer than
+    // `Volume::write_piece` is queued in pieces of that size, each counted
+    // as it fits. When that wait is given up at the end of a stop, the rest
+    // of the write is not queued (`Submitter::gave_up`).
+    pub(crate) fn write_from(
+        &self,
+        from: &mut Reservation,
+        file: u64,
+        offset: u64,
+        bytes: Bytes,
+        create: Option<Create>,
+    ) -> u64 {
+        debug_assert!(
+            Arc::ptr_eq(from.volume(), &self.lane.state.volume),
+            "a write is paid on its own volume"
+        );
+        let paid = (bytes.len() as u64).min(from.bytes());
+        from.hand_over(paid);
+        self.queue_paid(file, offset, bytes, create, paid)
+    }
+
+    // `write_from` for the queuing thread, paid out of what its owner
+    // prepaid (`Owner::prepay`) instead of a reservation in hand: the one
+    // thread that prepays and writes needs no reservation passed along.
     pub(crate) fn write(
         &self,
         file: u64,
@@ -1033,13 +1058,30 @@ impl Submitter {
         bytes: Bytes,
         create: Option<Create>,
     ) -> u64 {
-        let volume = &self.lane.state.volume;
-        let len = bytes.len() as u64;
-        let prepaid = &volume.prepaid[self.key.owner.slot];
+        let prepaid = &self.lane.state.volume.prepaid[self.key.owner.slot];
         let credit = prepaid.load(Ordering::Relaxed);
-        if credit >= len {
-            prepaid.store(credit - len, Ordering::Relaxed);
-            volume.buffered_bytes.fetch_add(len, Ordering::Relaxed);
+        let paid = (bytes.len() as u64).min(credit);
+        prepaid.store(credit - paid, Ordering::Relaxed);
+        self.queue_paid(file, offset, bytes, create, paid)
+    }
+
+    // Queue the write, `paid` of its bytes already counted on the volume.
+    #[inline]
+    fn queue_paid(
+        &self,
+        file: u64,
+        offset: u64,
+        bytes: Bytes,
+        create: Option<Create>,
+        paid: u64,
+    ) -> u64 {
+        let len = bytes.len() as u64;
+        if paid >= len {
+            self.lane
+                .state
+                .volume
+                .buffered_bytes
+                .fetch_add(len, Ordering::Relaxed);
             return self.submit(Op::Write {
                 file,
                 offset,
@@ -1047,11 +1089,10 @@ impl Submitter {
                 create: create.map(Box::new),
             });
         }
-        prepaid.store(0, Ordering::Relaxed);
-        self.write_charged(file, offset, bytes, create, credit)
+        self.write_charged(file, offset, bytes, create, paid)
     }
 
-    // `write` past what was prepaid: `credit` of the bytes are paid.
+    // A write past what was paid: `credit` of the bytes are paid.
     #[cold]
     fn write_charged(
         &self,

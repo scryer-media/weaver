@@ -122,6 +122,7 @@ impl Harness {
             config,
             weaver_server_core::runtime::StartupDiskGate::opened(),
             std::sync::Arc::new(weaver_server_core::operations::VolumeWriters::new()),
+            std::sync::Arc::new(weaver_server_core::operations::VolumeBuffers::new()),
         )
         .await
         .unwrap();
