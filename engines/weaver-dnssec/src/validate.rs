@@ -227,18 +227,11 @@ struct ProvenKeys {
 
 struct ParsedReply {
     message: Message,
-    answers: BTreeMap<(Name, RecordType), usize>,
     denials: Vec<usize>,
 }
 
 impl ParsedReply {
     fn new(message: Message) -> Self {
-        let answers = message
-            .answer
-            .iter()
-            .enumerate()
-            .map(|(i, set)| ((set.owner.clone(), set.rtype), i))
-            .collect();
         let denials = message
             .authority
             .iter()
@@ -247,17 +240,11 @@ impl ParsedReply {
             .take(MAX_DENIAL_RRSETS)
             .map(|(i, _)| i)
             .collect();
-        Self {
-            message,
-            answers,
-            denials,
-        }
+        Self { message, denials }
     }
 
     fn answer(&self, name: &Name, rtype: RecordType) -> Option<&Rrset> {
-        self.answers
-            .get(&(name.clone(), rtype))
-            .and_then(|i| self.message.answer.get(*i))
+        self.message.answer_set(name, rtype)
     }
 
     fn dname(&self, name: &Name) -> Option<&Rrset> {
@@ -1199,20 +1186,10 @@ impl Validation<'_> {
             }
         };
         // Only for answers nothing can authenticate: an unsigned zone's SOA,
-        // the first owned by the name or a zone above it, as dnsmasq takes
-        // it. With none, the answer is not to be held.
-        let raw_ttl = reply
-            .message
-            .authority
-            .iter()
-            .filter(|set| set.rtype == RecordType::SOA && name.is_at_or_below(&set.owner))
-            .find_map(|set| {
-                set.records.iter().find_map(|record| match &record.kind {
-                    RdataKind::Soa(soa) => Some(set.ttl.min(soa.minimum)),
-                    _ => None,
-                })
-            })
-            .unwrap_or(0);
+        // the first received owned by the name or a zone above it, as
+        // dnsmasq takes it and as `Reply::read` does. With none, the answer
+        // is not to be held.
+        let raw_ttl = reply.message.negative_ttl(name).unwrap_or(0);
         if self.validator.private(name) {
             return Ok((outcome(), Some(InsecureReason::PrivateName), 0, raw_ttl));
         }
@@ -1305,7 +1282,8 @@ impl Validation<'_> {
                 .map_err(|reason| self.fail(query, reason, &set.owner, set.rtype))?;
             for record in &set.records {
                 if let RdataKind::Soa(soa) = &record.kind {
-                    let held = verified.ttl_bound.min(soa.minimum);
+                    // An SOA short of its minimum holds nothing.
+                    let held = verified.ttl_bound.min(soa.minimum().unwrap_or(0));
                     soa_ttl = Some(soa_ttl.map_or(held, |ttl| ttl.min(held)));
                 }
             }

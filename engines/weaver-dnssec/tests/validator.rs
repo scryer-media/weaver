@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_dnssec::testing::{
-    self, DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, drive, signature_checks,
+    self, DenialMode, FakeReply, FakeResolver, KeyAlgorithm, Record, Zone, drive, signature_checks,
 };
 use weaver_dnssec::{
     BogusReason, Name, Outcome, Policy, Query, Question, RecordType as T, Step, SupplyError,
@@ -82,7 +82,7 @@ fn nsec(owner: &str, next: &str, types: &[T]) -> Record {
     }
     Record::new(n(owner), T::NSEC, 300, rdata)
 }
-fn replace_reply(resolver: &mut FakeResolver, query: Query, reply: Reply) {
+fn replace_reply(resolver: &mut FakeResolver, query: Query, reply: FakeReply) {
     resolver.set_reply(query.clone(), Some(reply.encode(&query).unwrap()));
 }
 fn nsec3_mode(opt_out: bool, iterations: u16) -> DenialMode {
@@ -540,9 +540,9 @@ fn mldsa_answer_rejects_bad_missing_expired_and_future_signatures() {
             replace_reply(
                 &mut resolver,
                 q("news.example", T::A),
-                Reply {
+                FakeReply {
                     answer: signer.signed_rrset(&n("news.example"), T::A).unwrap(),
-                    ..Reply::default()
+                    ..FakeReply::default()
                 },
             );
         } else {
@@ -969,11 +969,11 @@ fn bogus_signature_expired() {
     replace_reply(
         &mut resolver,
         q("example.com", T::DNSKEY),
-        Reply {
+        FakeReply {
             answer: valid_keys
                 .signed_rrset(&n("example.com"), T::DNSKEY)
                 .unwrap(),
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     bogus(
@@ -994,11 +994,11 @@ fn bogus_signature_not_yet_valid() {
     replace_reply(
         &mut resolver,
         q("example.com", T::DNSKEY),
-        Reply {
+        FakeReply {
             answer: valid_keys
                 .signed_rrset(&n("example.com"), T::DNSKEY)
                 .unwrap(),
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     bogus(
@@ -1420,17 +1420,17 @@ fn unanswered_case(target: Query, cause: UnansweredCause) {
         UnansweredCause::Truncated => replace_reply(
             &mut resolver,
             target.clone(),
-            Reply {
+            FakeReply {
                 truncated: true,
-                ..Reply::default()
+                ..FakeReply::default()
             },
         ),
         UnansweredCause::Rcode(rcode) => replace_reply(
             &mut resolver,
             target.clone(),
-            Reply {
+            FakeReply {
                 rcode,
-                ..Reply::default()
+                ..FakeReply::default()
             },
         ),
         other => panic!("no fixture for {other:?}"),
@@ -1487,9 +1487,9 @@ fn secure_when_ds_query_at_a_plain_name_gets_servfail() {
     replace_reply(
         &mut resolver,
         q("b", T::DS),
-        Reply {
+        FakeReply {
             rcode: 2,
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     secure(&run(&resolver, "news.a.b", T::A).0, records("news.a.b"));
@@ -1500,9 +1500,9 @@ fn bogus_when_ds_servfail_hides_a_signed_child() {
     replace_reply(
         &mut resolver,
         q("example.com", T::DS),
-        Reply {
+        FakeReply {
             rcode: 2,
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     bogus(
@@ -1516,9 +1516,9 @@ fn bogus_when_ds_servfail_and_answer_unsigned() {
     replace_reply(
         &mut resolver,
         q("example.com", T::DS),
-        Reply {
+        FakeReply {
             rcode: 2,
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     resolver.tamper(|query, reply| {
@@ -1538,9 +1538,9 @@ fn ds_servfail_is_not_cached() {
     replace_reply(
         &mut resolver,
         q("example.com", T::DS),
-        Reply {
+        FakeReply {
             rcode: 2,
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     let v = validator(&resolver);
@@ -1562,7 +1562,7 @@ fn bogus_dnskey_step_is_not_cached() {
     let mut resolver = tree();
     let key_query = q("example.com", T::DNSKEY);
     let good = resolver.answer(&key_query).unwrap();
-    replace_reply(&mut resolver, key_query.clone(), Reply::default());
+    replace_reply(&mut resolver, key_query.clone(), FakeReply::default());
     let v = validator(&resolver);
     bogus(
         &drive(&v, &resolver, question("news.example.com", T::A), NOW).0,
@@ -1586,7 +1586,7 @@ fn work_limit_queries() {
     replace_reply(
         &mut resolver,
         main.clone(),
-        Reply {
+        FakeReply {
             answer: attacker
                 .sign_records(vec![Record::new(
                     main.name().clone(),
@@ -1595,7 +1595,7 @@ fn work_limit_queries() {
                     IP.to_vec(),
                 )])
                 .unwrap(),
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     for count in 1..=45 {
@@ -1607,9 +1607,9 @@ fn work_limit_queries() {
         replace_reply(
             &mut resolver,
             Query::new(owner.clone(), T::DS),
-            Reply {
+            FakeReply {
                 answer: root.signed_rrset(&owner, T::CNAME).unwrap(),
-                ..Reply::default()
+                ..FakeReply::default()
             },
         );
     }
@@ -1650,10 +1650,10 @@ fn work_limit_signatures() {
     replace_reply(
         &mut resolver,
         q("missing", T::A),
-        Reply {
+        FakeReply {
             rcode: 3,
             authority,
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     let v = validator(&resolver);

@@ -35,9 +35,9 @@ fn ds(bytes: &[u8]) -> Ds {
 }
 fn dnskeys(zone: &Zone) -> Message {
     let query = query(&zone.apex, RecordType::DNSKEY);
-    let reply = Reply {
+    let reply = FakeReply {
         answer: zone.signed_rrset(&zone.apex, RecordType::DNSKEY).unwrap(),
-        ..Reply::default()
+        ..FakeReply::default()
     };
     Message::parse(&reply.encode(&query).unwrap(), &query).unwrap()
 }
@@ -56,9 +56,9 @@ fn generated_keys_sign_and_independent_validator_verifies() {
         zone.add_record(owner.clone(), RecordType::A, vec![192, 0, 2, 1]);
         zone.add_record(owner.clone(), RecordType::A, vec![192, 0, 2, 2]);
         let query = query(&owner, RecordType::A);
-        let reply = Reply {
+        let reply = FakeReply {
             answer: zone.signed_rrset(&owner, RecordType::A).unwrap(),
-            ..Reply::default()
+            ..FakeReply::default()
         };
         let parsed = Message::parse(&reply.encode(&query).unwrap(), &query).unwrap();
         let mut budget = WorkBudget::default();

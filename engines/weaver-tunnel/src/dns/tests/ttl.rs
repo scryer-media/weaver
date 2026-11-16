@@ -261,13 +261,17 @@ fn a_ttl_with_the_top_bit_set_is_read_as_zero() {
         &[rr(&ASKED, 1, 0x8000_0001, &[192, 0, 2, 7])],
         &[],
     );
-    let parsed = parse_response(&reply, 9, "fixture.test", 1).unwrap();
-    assert_eq!(parsed.ttl, 0);
+    let query = weaver_dnssec::Query::new(
+        weaver_dnssec::Name::from_text("fixture.test.").unwrap(),
+        weaver_dnssec::RecordType::A,
+    );
+    let parsed = weaver_dnssec::Reply::read(&query, &reply).unwrap();
+    assert_eq!(parsed.answer().ttl(), 0);
 }
 
 // What a test recording says of a lookup through `carrier` that found
 // nothing.
-async fn why(carrier: &dyn Carrier, servers: &[DnsServer], host: &str) -> LookupError {
+pub(super) async fn why(carrier: &dyn Carrier, servers: &[DnsServer], host: &str) -> LookupError {
     let recording = Arc::new(Recording::default());
     recording
         .scope(async {

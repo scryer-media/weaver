@@ -8,8 +8,8 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use weaver_dnssec::testing::{
-    DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, SignatureWindow, Zone, base32hex, drive,
-    nsec3_hash,
+    DenialMode, FakeReply, FakeResolver, KeyAlgorithm, Record, SignatureWindow, Zone, base32hex,
+    drive, nsec3_hash,
 };
 use weaver_dnssec::{Name, Policy, Query, Question, RecordType as T, Validator, Verdict};
 
@@ -74,7 +74,7 @@ fn negative(id: &'static str, intended: &'static str, mode: DenialMode, now: u32
     case
 }
 
-fn replace(resolver: &mut FakeResolver, query: Query, reply: Reply) {
+fn replace(resolver: &mut FakeResolver, query: Query, reply: FakeReply) {
     resolver.set_reply(query.clone(), Some(reply.encode(&query).unwrap()));
 }
 
@@ -220,9 +220,9 @@ fn cases(now: u32) -> Vec<Case> {
         replace(
             &mut resolver,
             query("news.example.", T::A),
-            Reply {
+            FakeReply {
                 answer: signer.signed_rrset(&n("news.example."), T::A).unwrap(),
-                ..Reply::default()
+                ..FakeReply::default()
             },
         );
         cases.push(case(

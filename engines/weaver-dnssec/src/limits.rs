@@ -24,9 +24,10 @@
 /// The longest reply read, in bytes: the DNS over TCP length field's
 /// maximum.
 pub const MAX_MESSAGE_BYTES: usize = 65_535;
-/// The most compression pointers followed while reading one name. A name
-/// that needs more makes the reply unreadable.
-pub const MAX_POINTER_HOPS: usize = 32;
+/// The most compression pointers followed while reading one name, as
+/// dnsmasq's 255 (unbound allows 256). A name that needs more makes the
+/// reply unreadable.
+pub const MAX_POINTER_HOPS: usize = 255;
 /// The most queries one validation sends, of every kind together, as
 /// dnsmasq's LIMIT_WORK.
 pub const MAX_QUERIES: usize = 40;

@@ -5,6 +5,8 @@
 //!
 //! The caller supplies transport and time. Validation performs no I/O and
 //! requests the additional DNSKEY and DS messages needed to prove an answer.
+//! A caller that does not validate reads a reply with [`Reply::read`], by
+//! the same parser.
 //!
 //! # How it works
 //!
@@ -550,6 +552,86 @@ impl Answer {
     }
 }
 
+/// One reply read as the server sent it, with nothing validated, for a
+/// caller that does not validate. Made by [`Reply::read`].
+///
+/// ```
+/// use weaver_dnssec::{Name, Query, RecordType, Reply};
+///
+/// let name = Name::from_text("www.example.").unwrap();
+/// let query = Query::new(name, RecordType::A);
+/// // A NOERROR reply with one A record, owned by the question's name.
+/// let mut message = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+/// message.extend_from_slice(b"\x03www\x07example\0\0\x01\0\x01");
+/// message.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+/// let reply = Reply::read(&query, &message).unwrap();
+/// assert_eq!(reply.answer().addresses(), ["192.0.2.1".parse::<std::net::IpAddr>().unwrap()]);
+/// assert_eq!(reply.answer().ttl(), 60);
+/// assert_eq!(reply.alias(), None);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub(crate) answer: Answer,
+    pub(crate) rcode: u16,
+    pub(crate) negative_ttl: Option<u32>,
+}
+
+impl Reply {
+    /// What the reply says about the query, as [`Reply::read`] describes.
+    pub fn answer(&self) -> &Answer {
+        &self.answer
+    }
+
+    /// The header's response code: 0 (NOERROR) or 3 (NXDOMAIN). A reply
+    /// with any other is [`ReplyError::Rcode`].
+    pub fn rcode(&self) -> u16 {
+        self.rcode
+    }
+
+    /// The name to ask about next: under NOERROR, the last name of the
+    /// alias chain, when an alias was followed and the reply holds no
+    /// records of the type there. None otherwise.
+    pub fn alias(&self) -> Option<&Name> {
+        let followed = self.rcode == 0
+            && self.answer.alias_chain.len() > 1
+            && !matches!(self.answer.outcome, Outcome::Records { .. });
+        followed.then(|| self.answer.alias_chain.last()).flatten()
+    }
+
+    /// How long the reply's lack of usable records holds, when it says: the
+    /// lower of the aliases' TTLs and the hold of the first SOA, in
+    /// received order, owned by the answer's last name or a zone above it.
+    /// That hold is the lower of the SOA's TTL and its minimum (RFC 2308
+    /// section 5). None when there is no such SOA, or the first is short of
+    /// its minimum; a later SOA is not taken in its place. This is
+    /// dnsmasq's rule.
+    pub fn negative_ttl(&self) -> Option<u32> {
+        self.negative_ttl
+    }
+}
+
+/// Why a reply could not be read as an answer to its query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReplyError {
+    /// The reply is not a well-formed DNS message answering the query, or
+    /// its aliases loop or run past
+    /// [`MAX_ALIAS_LINKS`](limits::MAX_ALIAS_LINKS). This is so whatever
+    /// its response code says.
+    #[error("the reply could not be read as a DNS message for its query")]
+    Malformed,
+    /// The reply had the TC bit set.
+    #[error("the reply was truncated")]
+    Truncated,
+    /// The header's response code was neither NOERROR nor NXDOMAIN.
+    #[error("the server answered with response code {0}")]
+    Rcode(u16),
+    /// The query asked for RRSIG or OPT records, which are never read as
+    /// an answer.
+    #[error("record type {0} cannot be read as an answer")]
+    UnsupportedType(RecordType),
+}
+
 /// A failed proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bogus {
@@ -712,6 +794,8 @@ mod tests {
         send_sync::<InsecureReason>();
         send_sync::<UnansweredCause>();
         send_sync::<SupplyError>();
+        send_sync::<Reply>();
+        send_sync::<ReplyError>();
         send_sync::<QuestionError>();
         send_sync::<AnchorError>();
         send_sync::<NameError>();
@@ -753,6 +837,11 @@ mod tests {
         error(&InsecureReason::PrivateName);
         error(&UnansweredCause::FetchFailed);
         error(&SupplyError::UnexpectedQuery);
+        error(&ReplyError::Malformed);
+        assert_eq!(
+            ReplyError::Rcode(2).to_string(),
+            "the server answered with response code 2"
+        );
         assert_eq!(
             QuestionError::UnsupportedType(RecordType::CNAME).to_string(),
             "record type CNAME cannot be requested as a final answer"

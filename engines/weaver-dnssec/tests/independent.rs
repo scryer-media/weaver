@@ -674,7 +674,6 @@ fn malformed_replies_at_every_chain_stage_fail_closed_and_do_not_poison_retry() 
                 "wrong_type",
                 "wrong_class",
                 "missing_record",
-                "trailing_byte",
                 "short_rdata",
                 "oversized_packet",
             ] {
@@ -696,7 +695,6 @@ fn malformed_replies_at_every_chain_stage_fail_closed_and_do_not_poison_retry() 
                     "wrong_type" => malformed[question_end + 1] ^= 1,
                     "wrong_class" => malformed[question_end + 3] = 3,
                     "missing_record" => malformed[6..8].copy_from_slice(&u16::MAX.to_be_bytes()),
-                    "trailing_byte" => malformed.push(0),
                     "short_rdata" => {
                         malformed.pop();
                     }
@@ -722,6 +720,31 @@ fn malformed_replies_at_every_chain_stage_fail_closed_and_do_not_poison_retry() 
                     "malformed reply must not be cached"
                 );
             }
+        }
+    }
+}
+
+// Bytes after the last record are passed over at every stage, as unbound
+// passes them (msgparse.c, "spurious data at end of packet"): the chain
+// proves the same answer.
+#[test]
+fn trailing_bytes_at_every_chain_stage_are_passed_over() {
+    for target in [
+        query(HOST, 1),
+        query(ROOT, 48),
+        query(CHILD, 43),
+        query(CHILD, 48),
+    ] {
+        for trailing in [&[0][..], &[0; 7], &[0xff, 0xc0, 12]] {
+            let mut fixture = Fixture::new();
+            fixture
+                .replies
+                .get_mut(&target)
+                .unwrap()
+                .extend_from_slice(trailing);
+            let validator = fixture.validator(Policy::default());
+            let (verdict, _) = fixture.run(&validator, NOW);
+            assert_eq!(secure_ttl(verdict), 300, "{target:?}, {trailing:?}");
         }
     }
 }

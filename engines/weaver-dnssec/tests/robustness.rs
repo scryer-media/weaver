@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use weaver_dnssec::testing::{
-    DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, drive, signed_records,
+    DenialMode, FakeReply, FakeResolver, KeyAlgorithm, Record, Zone, drive, signed_records,
 };
 use weaver_dnssec::{Name, Policy, Query, Question, RecordType as T, Step, Validator, Verdict};
 
@@ -295,7 +295,7 @@ fn splice_sweep(exchange: &Exchange, resolver: &FakeResolver) -> usize {
     else {
         panic!("{}: baseline {baseline:?}", exchange.label);
     };
-    let replies: Vec<(Query, Reply)> = exchange
+    let replies: Vec<(Query, FakeReply)> = exchange
         .replies
         .iter()
         .map(|(query, _)| (query.clone(), resolver.reply(query).unwrap()))

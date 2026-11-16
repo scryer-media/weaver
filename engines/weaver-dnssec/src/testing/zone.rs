@@ -437,7 +437,7 @@ fn substitute(name: &Name, owner: &Name, target: &Name) -> Result<Name, Equipmen
 
 /// Sections are public so attacks can be expressed without byte-offset coupling.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Reply {
+pub struct FakeReply {
     pub rcode: u16,
     pub truncated: bool,
     pub answer: Vec<Record>,
@@ -445,7 +445,7 @@ pub struct Reply {
     pub additional: Vec<Record>,
 }
 
-impl Reply {
+impl FakeReply {
     pub fn encode(&self, query: &Query) -> Result<Vec<u8>, EquipmentError> {
         let mut bytes = vec![0, 0];
         let flags = 0x8190_u16 | (self.rcode & 15) | if self.truncated { 0x0200 } else { 0 };
@@ -484,7 +484,7 @@ impl Reply {
     }
 }
 
-type ReplyHook = Box<dyn Fn(&Query, &mut Reply) + Send + Sync>;
+type ReplyHook = Box<dyn Fn(&Query, &mut FakeReply) + Send + Sync>;
 type BytesHook = Box<dyn Fn(&Query, &mut Vec<u8>) + Send + Sync>;
 
 /// An in-memory recursive resolver. Construction joins each child to its nearest parent.
@@ -586,7 +586,7 @@ impl FakeResolver {
     pub fn set_reply(&mut self, query: Query, reply: Option<Vec<u8>>) {
         self.overrides.insert(query, reply);
     }
-    pub fn tamper(&mut self, hook: impl Fn(&Query, &mut Reply) + Send + Sync + 'static) {
+    pub fn tamper(&mut self, hook: impl Fn(&Query, &mut FakeReply) + Send + Sync + 'static) {
         self.reply_hooks.push(Box::new(hook));
     }
     pub fn tamper_bytes(&mut self, hook: impl Fn(&Query, &mut Vec<u8>) + Send + Sync + 'static) {
@@ -609,8 +609,8 @@ impl FakeResolver {
     }
 
     /// Build a reply before applying hooks; can be reused under another query.
-    pub fn reply(&self, query: &Query) -> Result<Reply, EquipmentError> {
-        let mut reply = Reply::default();
+    pub fn reply(&self, query: &Query) -> Result<FakeReply, EquipmentError> {
+        let mut reply = FakeReply::default();
         if query.rtype == RecordType::DS {
             let zone = query
                 .name

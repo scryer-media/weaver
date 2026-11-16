@@ -2,7 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_dnssec::testing::{
-    self, DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, base32hex, drive, nsec3_hash,
+    self, DenialMode, FakeReply, FakeResolver, KeyAlgorithm, Record, Zone, base32hex, drive,
+    nsec3_hash,
 };
 use weaver_dnssec::{
     BogusReason, Name, Outcome, Policy, Query, Question, RecordType as T, Validator, Verdict,
@@ -62,7 +63,7 @@ fn sign(resolver: &mut FakeResolver, records: Vec<Record>) -> Vec<Record> {
         .collect()
 }
 
-fn install(resolver: &mut FakeResolver, q: &Query, records: Vec<Record>) -> Reply {
+fn install(resolver: &mut FakeResolver, q: &Query, records: Vec<Record>) -> FakeReply {
     let mut reply = resolver.reply(q).unwrap();
     reply.authority.retain(|record| {
         !matches!(record.rtype, T::NSEC | T::NSEC3)
@@ -360,9 +361,9 @@ fn high_iteration_ds_denial_is_bogus_and_leaves_no_insecure_cut() {
     };
     let authority = parent.denial_records().unwrap();
     parent.delegate(n("example."), original_ds);
-    let bad = Reply {
+    let bad = FakeReply {
         authority,
-        ..Reply::default()
+        ..FakeReply::default()
     };
     resolver.set_reply(ds_query.clone(), Some(bad.encode(&ds_query).unwrap()));
     let v = validator(&resolver);

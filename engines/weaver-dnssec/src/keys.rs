@@ -175,6 +175,7 @@ mod tests {
             rcode: 0,
             answer: vec![],
             authority: vec![],
+            soas: vec![],
             signatures: 0,
             extended_errors: vec![],
         };

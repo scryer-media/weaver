@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use weaver_dnssec::testing::{
-    self, DenialMode, FakeResolver, KeyAlgorithm, Record, Reply, Zone, drive,
+    self, DenialMode, FakeReply, FakeResolver, KeyAlgorithm, Record, Zone, drive,
 };
 use weaver_dnssec::{
     BogusReason, InsecureReason, Name, Outcome, Policy, Query, Question, RecordType as T, Source,
@@ -55,7 +55,7 @@ fn cold_queries(first: &str) -> Vec<Query> {
 fn records(name: &str) -> Outcome {
     testing::records(n(name), vec![IP.to_vec()])
 }
-fn replace_reply(resolver: &mut FakeResolver, query: Query, reply: Reply) {
+fn replace_reply(resolver: &mut FakeResolver, query: Query, reply: FakeReply) {
     resolver.set_reply(query.clone(), Some(reply.encode(&query).unwrap()));
 }
 fn secure(verdict: &Verdict, expected: Outcome) -> u32 {
@@ -108,7 +108,7 @@ fn tamper_address(resolver: &mut FakeResolver) {
     });
 }
 
-// Reply::encode ends every message with an 11-byte OPT record whose last two
+// FakeReply::encode ends every message with an 11-byte OPT record whose last two
 // bytes are its RDLENGTH.
 const OPT_BYTES: usize = 11;
 fn remove_opt(bytes: &mut Vec<u8>) {
@@ -169,18 +169,18 @@ fn private_names_are_insecure_without_any_chain_query() {
     replace_reply(
         &mut resolver,
         printer.clone(),
-        Reply {
+        FakeReply {
             answer: vec![Record::new(printer.name().clone(), T::A, 60, IP.to_vec())],
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     let missing = q("gone.home.arpa", T::AAAA);
     replace_reply(
         &mut resolver,
         missing.clone(),
-        Reply {
+        FakeReply {
             rcode: 3,
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     for v in [validator(&resolver), Validator::with_root_anchors()] {
@@ -212,9 +212,9 @@ fn a_signed_alias_into_a_private_name_is_insecure_and_asks_nothing_below_it() {
     replace_reply(
         &mut resolver,
         q("nas.example.com", T::A),
-        Reply {
+        FakeReply {
             answer,
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     let (verdict, queries) = run(&resolver, "nas.example.com", T::A);
@@ -530,9 +530,9 @@ fn an_alias_loop_across_follow_up_replies_is_refused() {
     replace_reply(
         &mut resolver,
         q("news.example.net", T::A),
-        Reply {
+        FakeReply {
             answer: back,
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     resolver.tamper(|query, reply| {
@@ -713,9 +713,9 @@ fn transport_failures_and_malformed_replies_are_never_held() {
         (None, Some(UnansweredCause::FetchFailed)),
         (
             Some(
-                Reply {
+                FakeReply {
                     rcode: 2,
-                    ..Reply::default()
+                    ..FakeReply::default()
                 }
                 .encode(&target)
                 .unwrap(),
@@ -785,9 +785,9 @@ fn extended_errors_ride_on_failures_and_never_change_a_verdict() {
 
     let mut resolver = tree();
     let target = q("news.example.com", T::A);
-    let mut servfail = Reply {
+    let mut servfail = FakeReply {
         rcode: 2,
-        ..Reply::default()
+        ..FakeReply::default()
     }
     .encode(&target)
     .unwrap();
@@ -956,7 +956,7 @@ fn parallel_queries_share_the_forty_query_total() {
     replace_reply(
         &mut resolver,
         main.clone(),
-        Reply {
+        FakeReply {
             answer: attacker
                 .sign_records(vec![Record::new(
                     main.name().clone(),
@@ -965,7 +965,7 @@ fn parallel_queries_share_the_forty_query_total() {
                     IP.to_vec(),
                 )])
                 .unwrap(),
-            ..Reply::default()
+            ..FakeReply::default()
         },
     );
     for count in 1..=45 {
@@ -977,9 +977,9 @@ fn parallel_queries_share_the_forty_query_total() {
         replace_reply(
             &mut resolver,
             Query::new(owner.clone(), T::DS),
-            Reply {
+            FakeReply {
                 answer: root.signed_rrset(&owner, T::CNAME).unwrap(),
-                ..Reply::default()
+                ..FakeReply::default()
             },
         );
     }

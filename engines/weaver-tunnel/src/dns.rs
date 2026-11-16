@@ -21,7 +21,7 @@ pub(crate) use list::ListResolver;
 use list::resolve_judged;
 pub use list::resolve_through;
 #[cfg(test)]
-use message::{parse_response, read_name, u16_at};
+use message::u16_at;
 use model::{Carrier, FAMILIES, Found, SERVER_TIMEOUT, Stage};
 pub use model::{DnsServer, Trust, Wire, WireKind, unresolved};
 pub(crate) use model::{INVALID, NOT_VALIDATED, UNRESOLVED};
@@ -78,13 +78,24 @@ mod tests {
         record::{self, LookupFailure, TrustOutcome},
     };
     mod families;
+    mod reading;
     mod trust;
     mod ttl;
     mod wires;
+    // Replies are read by the DNSSEC crate's parser, on both paths.
     #[test]
     fn compression_cycles_and_truncation_are_rejected() {
-        assert!(read_name(&[0xc0, 0], &mut 0).is_err());
-        assert!(read_name(&[3, b'a'], &mut 0).is_err());
-        assert!(parse_response(&[0; 12], 1, "test", 1).is_err());
+        use weaver_dnssec::{Name, Query, RecordType, Reply};
+        let query = Query::new(Name::from_text("test.").unwrap(), RecordType::A);
+        let header = [0, 1, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
+        // A question name that points at itself.
+        let mut reply = header.to_vec();
+        reply.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1]);
+        assert!(Reply::read(&query, &reply).is_err());
+        // One whose label runs past the end of the message.
+        let mut reply = header.to_vec();
+        reply.extend_from_slice(&[4, b't', b'e', b's']);
+        assert!(Reply::read(&query, &reply).is_err());
+        assert!(Reply::read(&query, &[0; 12]).is_err());
     }
 }

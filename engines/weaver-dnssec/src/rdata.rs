@@ -72,15 +72,21 @@ pub(crate) struct Nsec3 {
     pub(crate) types: TypeBitmap,
 }
 
+/// What an SOA is read for: the last of its five numbers, when all twenty
+/// of their bytes are there after its two names. Bytes after the numbers
+/// are passed over, and an SOA short of them reads with none, as dnsmasq
+/// reads it (rfc1035.c, find_soa). The names and the other numbers are
+/// kept only in the record's wire and signed forms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Soa {
-    pub(crate) mname: Name,
-    pub(crate) rname: Name,
-    pub(crate) serial: u32,
-    pub(crate) refresh: u32,
-    pub(crate) retry: u32,
-    pub(crate) expire: u32,
-    pub(crate) minimum: u32,
+    minimum: Option<u32>,
+}
+
+impl Soa {
+    /// The zone's negative TTL (RFC 2308 section 4), when the record holds it.
+    pub(crate) fn minimum(&self) -> Option<u32> {
+        self.minimum
+    }
 }
 
 /// RFC 4034 section 4.1.2 windows, kept sorted for logarithmic lookup.
@@ -304,15 +310,19 @@ pub(crate) fn parse(
                 types,
             })
         }
-        6 => RdataKind::Soa(Soa {
-            mname: cursor.name(true)?,
-            rname: cursor.name(true)?,
-            serial: cursor.u32()?,
-            refresh: cursor.u32()?,
-            retry: cursor.u32()?,
-            expire: cursor.u32()?,
-            minimum: cursor.u32()?,
-        }),
+        6 => {
+            cursor.name(true)?;
+            cursor.name(true)?;
+            // Serial, refresh, retry and expire, then the minimum.
+            let minimum = if end.saturating_sub(cursor.offset) >= 20 {
+                cursor.take(16)?;
+                Some(cursor.u32()?)
+            } else {
+                None
+            };
+            cursor.rest(false)?;
+            RdataKind::Soa(Soa { minimum })
+        }
         2 | 5 | 12 | 39 => RdataKind::Name(cursor.name(true)?),
         // RFC 4034 section 6.2, corrected by RFC 6840 section 5.1.
         3 | 4 | 7 | 8 | 9 => {
@@ -624,37 +634,41 @@ mod tests {
     }
 
     #[test]
-    fn soa_parses_rfc5155_and_rejects_every_prefix_and_trailing_byte() {
+    fn soa_parses_rfc5155_passes_over_trailing_bytes_and_reads_short_numbers_as_none() {
         // rfc5155.txt lines 1935..1936, SOA example.
         let mut bytes = Name::from_text("ns1.example.").unwrap().as_wire().to_vec();
         bytes.extend(Name::from_text("bugs.x.w.example.").unwrap().as_wire());
+        let names = bytes.len();
         for value in [1_u32, 3600, 300, 3_600_000, 3600] {
             bytes.extend(value.to_be_bytes());
         }
-        let parsed = parse(&bytes, 0, bytes.len(), 6).unwrap();
-        let RdataKind::Soa(data) = parsed.kind else {
-            panic!("SOA type lost")
+        let soa = |bytes: &[u8]| {
+            let parsed = parse(bytes, 0, bytes.len(), 6).unwrap();
+            assert_eq!(parsed.canonical, bytes);
+            let RdataKind::Soa(data) = parsed.kind else {
+                panic!("SOA type lost")
+            };
+            data
         };
-        assert_eq!(data.mname, Name::from_text("ns1.example.").unwrap());
-        assert_eq!(data.rname, Name::from_text("bugs.x.w.example.").unwrap());
-        assert_eq!(
-            (
-                data.serial,
-                data.refresh,
-                data.retry,
-                data.expire,
-                data.minimum
-            ),
-            (1, 3600, 300, 3_600_000, 3600)
-        );
-        for end in 0..bytes.len() {
+        // The names and numbers stay in the signed form, checked above; the
+        // minimum is the last number.
+        assert_eq!(soa(&bytes).minimum(), Some(3600));
+        let last = bytes.len() - 1;
+        bytes[last] = 7;
+        assert_eq!(soa(&bytes).minimum(), Some(3591));
+        bytes[last] = 0x10;
+        // A cut name breaks the layout; a cut number leaves no minimum.
+        for end in 0..names {
             assert_eq!(parse(&bytes, 0, end, 6), Err(ParseError::MalformedReply));
         }
-        bytes.push(0);
-        assert_eq!(
-            parse(&bytes, 0, bytes.len(), 6),
-            Err(ParseError::MalformedReply)
-        );
+        for end in names..bytes.len() {
+            assert_eq!(soa(&bytes[..end]).minimum(), None, "{end}");
+        }
+        // Bytes after the numbers are passed over and kept in the signed form.
+        for extra in 1..=3 {
+            bytes.push(0);
+            assert_eq!(soa(&bytes).minimum(), Some(3600), "{extra}");
+        }
     }
 
     #[test]
@@ -714,7 +728,9 @@ mod tests {
                     "type {rtype} end {end}"
                 );
             }
-            if ![24, 30, 46].contains(&rtype) {
+            // An SOA passes over bytes after its numbers; the opaque tails
+            // take them in.
+            if ![6, 24, 30, 46].contains(&rtype) {
                 message.push(0);
                 assert_eq!(
                     parse(&message, start, message.len(), rtype),

@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_dnssec::testing::{
-    self, FakeResolver, KeyAlgorithm, Reply, Zone, drive, signature_checks,
+    self, FakeReply, FakeResolver, KeyAlgorithm, Zone, drive, signature_checks,
 };
 use weaver_dnssec::{
     BogusReason, Name, Policy, Query, Question, RecordType as T, Step, TrustAnchor, Validator,
@@ -207,9 +207,9 @@ fn signature_time_includes_both_endpoints_with_the_minimum_hour_of_skew() {
         root.signature_window.inception = inception;
         root.signature_window.expiration = expiration;
         let query = Query::new(name("host"), T::A);
-        let reply = Reply {
+        let reply = FakeReply {
             answer: root.signed_rrset(query.name(), T::A).unwrap(),
-            ..Reply::default()
+            ..FakeReply::default()
         };
         resolver.set_reply(query.clone(), Some(reply.encode(&query).unwrap()));
         let validator =

@@ -11,7 +11,7 @@ mod signer;
 mod zone;
 
 pub use signer::{EquipmentError, KeyAlgorithm, Record, SigningKey, base32hex, nsec3_hash};
-pub use zone::{DenialMode, FakeResolver, Reply, SignatureWindow, Zone};
+pub use zone::{DenialMode, FakeReply, FakeResolver, SignatureWindow, Zone};
 
 /// Number of signature verification attempts made by this validation.
 pub fn signature_checks(validation: &crate::Validation<'_>) -> usize {

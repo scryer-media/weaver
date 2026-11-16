@@ -4,16 +4,18 @@
 // Answers taken as the server sent them: each family's walk along the
 // aliases its answers name.
 use super::{Asking, Judge, host_name};
-use crate::dns::{
-    Exchanged, FAMILIES, Found, exchange,
-    message::{parse_response, refusal},
-};
+use crate::dns::{Exchanged, FAMILIES, Found, exchange, message::refusal};
+use weaver_dnssec::{Name, Query, RecordType, Reply};
+
+// The most queries one walk sends, and the most aliases one reply's answer
+// may follow.
+const MOST: usize = 8;
 
 // One family's walk along the aliases its answers name, under `AsSent`.
 struct Walk {
     qtype: u16,
-    // The name asked next.
-    name: String,
+    // The name asked next, in lower case.
+    name: Name,
     // The shortest TTL of the aliases followed so far.
     ttl: u32,
     // Queries sent so far.
@@ -33,7 +35,8 @@ impl Walk {
         if self.done.is_some() {
             return None;
         }
-        if self.sent == 8 || !host_name(&self.name) {
+        // The root is no name to ask for.
+        if self.sent == MOST || self.name.label_count() == 0 {
             self.done = Some(Err(Exchanged::Invalid));
             return None;
         }
@@ -42,18 +45,15 @@ impl Walk {
         let mut packet = Vec::from(self.id.to_be_bytes());
         // Recursion desired.
         packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-        for label in self.name.split('.') {
-            packet.push(label.len() as u8);
-            packet.extend_from_slice(label.as_bytes());
-        }
-        packet.push(0);
+        packet.extend_from_slice(self.name.as_wire());
         packet.extend_from_slice(&self.qtype.to_be_bytes());
         packet.extend_from_slice(&[0, 1]);
         Some(packet)
     }
 
     // Takes the reply to the walk's last query: an answer, or an alias to
-    // ask for next.
+    // ask for next. A reply is taken only under the id its query went out
+    // with.
     fn take(&mut self, reply: exchange::Reply) {
         let bytes = match reply {
             Ok(bytes) => bytes,
@@ -62,36 +62,66 @@ impl Walk {
                 return;
             }
         };
-        let reply = match parse_response(&bytes, self.id, &self.name, self.qtype) {
-            Ok(reply) => reply,
+        if bytes.get(..2) != Some(&self.id.to_be_bytes()[..]) {
+            self.done = Some(Err(Exchanged::Invalid));
+            return;
+        }
+        let query = Query::new(self.name.clone(), RecordType::new(self.qtype));
+        let reply = match Reply::read(&query, &bytes) {
+            Ok(reply) if reply.answer().alias_chain().len() <= MOST + 1 => reply,
+            Ok(_) => {
+                self.done = Some(Err(Exchanged::Invalid));
+                return;
+            }
+            // A refusal is read from the header alone, so one without a
+            // question to answer still says what it refused.
             Err(_) => {
                 let failed = refusal(&bytes, self.id).map_or(Exchanged::Invalid, Exchanged::Rcode);
                 self.done = Some(Err(failed));
                 return;
             }
         };
-        self.ttl = self.ttl.min(reply.ttl);
-        if !reply.addresses.is_empty() {
+        let answer = reply.answer();
+        let addresses = answer.addresses();
+        if !addresses.is_empty() {
             self.done = Some(Ok(Found {
-                addresses: reply.addresses,
-                ttl: Some(self.ttl),
+                addresses,
+                ttl: Some(self.ttl.min(answer.ttl())),
                 nonexistent: false,
                 insecure: None,
             }));
             return;
         }
-        match reply.alias {
-            Some(alias) => self.name = alias,
+        match reply.alias() {
+            Some(alias) => {
+                self.ttl = self.ttl.min(answer.ttl());
+                self.name = alias.to_lowercase();
+            }
             None => {
                 self.done = Some(Ok(Found {
                     addresses: Vec::new(),
-                    ttl: reply.negative.map(|negative| negative.min(self.ttl)),
-                    nonexistent: reply.nonexistent,
+                    ttl: reply.negative_ttl().map(|negative| negative.min(self.ttl)),
+                    nonexistent: reply.rcode() == 3,
                     insecure: None,
                 }));
             }
         }
     }
+}
+
+// The wire name of `host`, a name `host_name` passes: its dot-separated
+// labels, each taken as it is.
+fn wire_name(host: &str) -> Option<Name> {
+    if !host_name(host) {
+        return None;
+    }
+    let mut wire = Vec::with_capacity(host.len() + 2);
+    for label in host.split('.') {
+        wire.push(u8::try_from(label.len()).ok()?);
+        wire.extend_from_slice(label.as_bytes());
+    }
+    wire.push(0);
+    Name::from_wire(&wire).ok()
 }
 
 // Both families' walks at one server. Each walk takes its reply as it comes
@@ -102,10 +132,13 @@ impl Walk {
 pub(super) struct AsSent([Walk; 2]);
 
 impl AsSent {
+    // Walks from `name`, lower case. A name no query may ask for is held as
+    // the root, so each walk ends invalid before it asks anything.
     pub(super) fn new(name: &str) -> Self {
+        let wire = wire_name(name);
         Self(FAMILIES.map(|qtype| Walk {
             qtype,
-            name: name.to_owned(),
+            name: wire.clone().unwrap_or_else(Name::root),
             ttl: u32::MAX,
             sent: 0,
             id: 0,
