@@ -137,9 +137,19 @@ Everything below is new since 0.16.15.
   counts as refusing the login. Such a server was asked again without
   end, so the jobs waiting on it kept their slots and the rest of the
   queue did not start.
-- **No GROUP is sent to a server that has not asked for one,** on the
-  speed test and on an article several files share, as on every other
-  download.
+- **One kind of connection does everything.** The server test, the
+  speed test and an article several files share now use the connection
+  downloads use. The second, async connection is removed. So no GROUP is
+  sent there to a server that has not asked for one, and the server test
+  picks its TLS stack as a download does.
+- **An article several files share is fetched once, by a download
+  lane.** The other files get the server's own answer: the body, or its
+  refusal. A lost connection or a busy server is not handed on; each
+  file then asks for itself.
+- **A speed test dial that is refused waits for the server.** It asks
+  again when the server's health changes or its hold ends, not on a
+  timer, and gives up after 15 seconds. A cancel waits for the article
+  in flight.
 - **A held server recovers.** Its recovery probe carries real work and is
   never left unanswered, so jobs no longer stall after body timeouts or a
   refused login.
@@ -215,6 +225,10 @@ This release changes the GraphQL API in ways that can break a client.
 - **The count of articles the download lanes hold is named articles in
   flight** in the API, the Prometheus gauge, the diagnostics bundle and
   the web history. The old name is gone.
+- **The per-server socket gauge no longer has the `async_idle` and
+  `replacement` phases,** and the diagnostics bundle no longer has
+  `async_idle_sockets` and `replacement_sockets`. Nothing can be in
+  those states now.
 - **New:** `archiveHistory` and its types, `HistoryItem.archivedAt`, and
   one row per volume in the system query.
 - **`jobOutputFiles` and `jobEvents` page at 100.** A `jobOutputFiles`
