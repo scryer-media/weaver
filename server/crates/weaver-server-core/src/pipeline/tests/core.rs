@@ -476,20 +476,23 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
     // Finish one real rejection before dispatching the concurrent workload.
     // Sockets admitted before holdoff may reach accept() after it is armed;
     // counting those as reconnects made this assertion depend on scheduling.
-    assert!(matches!(
-        pool.acquire(weaver_nntp::ServerId(0)).await,
-        Err(weaver_nntp::NntpError::TooManyConnections)
-    ));
+    let client = tokio::task::spawn_blocking(move || {
+        assert!(matches!(
+            client.try_acquire_blocking_body_lane(&[], weaver_nntp::ServerSet::EMPTY),
+            Err(
+                weaver_nntp::client::BlockingBodyLaneAcquireError::ProviderCapacity(
+                    weaver_nntp::NntpError::TooManyConnections
+                )
+            )
+        ));
+        client
+    })
+    .await
+    .unwrap();
     assert!(pool.is_over_limit(weaver_nntp::ServerId(0)));
     assert_eq!(pool.active_connections(0), 0);
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
-    // Exercise both acquisition paths after the admission boundary is known.
-    for _ in 0..CONNECTIONS {
-        assert!(matches!(
-            pool.acquire(weaver_nntp::ServerId(0)).await,
-            Err(weaver_nntp::NntpError::ServerOverLimit { .. })
-        ));
-    }
+    // Every later lane meets the holdoff without a socket.
     let client = tokio::task::spawn_blocking(move || {
         for _ in 0..CONNECTIONS {
             assert!(matches!(

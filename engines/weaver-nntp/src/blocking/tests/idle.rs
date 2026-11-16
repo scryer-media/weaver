@@ -116,54 +116,6 @@ fn s2n_idle_inspection_preserves_fragments_and_detects_close_notify() {
     inspect_fragmented_shutdown(|| transport.idle_terminal(), fixture);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_rustls_idle_inspection_preserves_fragments_and_detects_close_notify() {
-    for manual in [true, false] {
-        let fixture = idle_tls_fixture();
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", fixture.port))
-            .await
-            .unwrap();
-        let config =
-            crate::tls::build_tls_config(Some(&fixture.ca), TlsCipherPreference::Auto).unwrap();
-        let name = crate::tls::make_server_name("localhost").unwrap();
-        let mut transport = if manual {
-            crate::tls::NntpTransport::ManualTls {
-                inner: crate::tls::ManualTlsStream::connect(tcp, config, name)
-                    .await
-                    .unwrap(),
-                remote_addr: None,
-            }
-        } else {
-            crate::tls::NntpTransport::Tls {
-                inner: tokio_rustls::TlsConnector::from(config)
-                    .connect(name, tcp.into())
-                    .await
-                    .unwrap(),
-                remote_addr: None,
-            }
-        };
-        inspect_fragmented_shutdown(|| transport.idle_terminal(), fixture);
-    }
-}
-
-#[cfg(not(windows))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_s2n_idle_inspection_preserves_fragments_and_detects_close_notify() {
-    let fixture = idle_tls_fixture();
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", fixture.port))
-        .await
-        .unwrap();
-    let config = crate::tls::build_s2n_tls_config(Some(&fixture.ca)).unwrap();
-    let mut transport = crate::tls::NntpTransport::S2nTls {
-        inner: s2n_tls_tokio::TlsConnector::new(config)
-            .connect("localhost", tcp.into())
-            .await
-            .unwrap(),
-        remote_addr: None,
-    };
-    inspect_fragmented_shutdown(|| transport.idle_terminal(), fixture);
-}
-
 // A lane waiting for work may free its read buffer. The idle probe must still
 // tell an open session from a closed one rather than read a zero-length
 // buffer as the peer going away.

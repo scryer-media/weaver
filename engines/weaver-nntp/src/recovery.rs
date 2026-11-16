@@ -557,8 +557,8 @@ impl ConnectionHealth {
     }
 
     // Whether the connection may be kept idle: the one rule for every place
-    // a connection rests (the async idle list, an owned lane's cache, the
-    // seat of an existence probe). The gate holds every other connection to
+    // a connection rests (an owned lane's cache, the seat of an existence
+    // probe). The gate holds every other connection to
     // the server while its probe is out, so an unanswered probe kept idle
     // would hold them with nothing on the wire to answer for. Such a probe
     // is dropped instead, and dropping its lease gives the probe back.

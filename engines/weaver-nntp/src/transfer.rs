@@ -1295,10 +1295,6 @@ impl RateCharge {
             + Duration::from_micros(self.ticket.target_micros.saturating_sub(RATE_BURST_MICROS))
     }
 
-    pub(crate) async fn wait_async(self) -> Duration {
-        self.control.wait_async(self.ticket).await
-    }
-
     pub(crate) fn wait_blocking(self) -> Duration {
         self.control.wait_blocking(self.ticket)
     }
@@ -1342,13 +1338,6 @@ impl BodyTransferPermit {
         };
         self.throttle_wait = self.throttle_wait.saturating_add(waited);
         waited
-    }
-
-    // Charge received bytes and preserve rate debt without delaying cleanup.
-    pub(crate) fn record_without_wait(&mut self, bytes: usize) {
-        let bytes = bytes as u64;
-        self.record_bytes(bytes);
-        let _ = self.control.reserve_rate(bytes);
     }
 
     // Charge bytes against the quota without pacing or rate debt, for

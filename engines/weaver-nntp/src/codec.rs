@@ -54,9 +54,6 @@ pub struct NntpCodec {
     // When a streaming decode sees data and the final terminator in the same
     // chunk, emit `Data` first and then a synthetic `End` on the next call.
     streaming_end_pending: bool,
-    // Raw NNTP multiline payload bytes consumed by the most recent decode,
-    // before dot-unstuffing and excluding the terminator.
-    last_multiline_payload_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -75,7 +72,6 @@ impl NntpCodec {
             raw_multiline: false,
             raw_multiline_scan_offset: 0,
             streaming_end_pending: false,
-            last_multiline_payload_bytes: 0,
         }
     }
 
@@ -114,10 +110,6 @@ impl NntpCodec {
         self.multiline || self.streaming_multiline
     }
 
-    pub(crate) fn last_multiline_payload_bytes(&self) -> usize {
-        self.last_multiline_payload_bytes
-    }
-
     // Set the codec into streaming multiline mode.
     pub fn set_streaming_multiline(&mut self, streaming: bool) {
         self.streaming_multiline = streaming;
@@ -134,7 +126,6 @@ impl NntpCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> Result<Option<StreamChunk>, NntpError> {
-        self.last_multiline_payload_bytes = 0;
         if self.streaming_end_pending {
             self.streaming_end_pending = false;
             return Ok(Some(StreamChunk::End));
@@ -144,7 +135,6 @@ impl NntpCodec {
             return Ok(None);
         };
 
-        self.last_multiline_payload_bytes = scan.data_end;
         let chunk = take_multiline_output(src, scan);
         if chunk.terminator_len > 0 {
             self.streaming_multiline = false;
@@ -165,7 +155,6 @@ impl NntpCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> Result<Option<StreamChunk>, NntpError> {
-        self.last_multiline_payload_bytes = 0;
         if self.streaming_end_pending {
             self.streaming_end_pending = false;
             return Ok(Some(StreamChunk::End));
@@ -181,7 +170,6 @@ impl NntpCodec {
             ));
         }
 
-        self.last_multiline_payload_bytes = scan.data_end;
         let chunk = take_multiline_output(src, scan);
         self.raw_multiline_scan_offset = 0;
         if chunk.terminator_len > 0 {
@@ -226,7 +214,6 @@ impl NntpCodec {
 
     // Decode a multi-line data block terminated by `\r\n.\r\n` (or bare `\n` variants).
     fn decode_multiline(&mut self, src: &mut BytesMut) -> Result<Option<NntpFrame>, NntpError> {
-        self.last_multiline_payload_bytes = 0;
         let scan_result = if self.raw_multiline {
             scan_multiline_raw(src, &mut self.raw_multiline_scan_offset)
         } else {
@@ -240,7 +227,6 @@ impl NntpCodec {
                         "multi-line response too large".into(),
                     ));
                 }
-                self.last_multiline_payload_bytes = scan.data_end;
                 let chunk = take_multiline_output(src, scan);
                 self.raw_multiline_scan_offset = 0;
                 Ok(Some(NntpFrame::MultiLineData(chunk.data)))
@@ -613,10 +599,6 @@ mod tests {
         // Server sends "..hello" (dot-stuffed) -> should become ".hello"
         let mut buf = BytesMut::from("..hello\r\nnormal\r\n.\r\n");
         let frame = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(
-            codec.last_multiline_payload_bytes(),
-            b"..hello\r\nnormal\r\n".len()
-        );
 
         match frame {
             NntpFrame::MultiLineData(data) => {
@@ -733,10 +715,6 @@ mod tests {
         // "..hello" is dot-stuffed, should become ".hello"
         let mut buf = BytesMut::from("..hello\r\nnormal\r\n.\r\n");
         let first = codec.decode_streaming_chunk(&mut buf).unwrap().unwrap();
-        assert_eq!(
-            codec.last_multiline_payload_bytes(),
-            b"..hello\r\nnormal\r\n".len()
-        );
         match first {
             StreamChunk::Data(data) => {
                 assert_eq!(&data[..], b".hello\r\nnormal\r\n");
@@ -795,10 +773,6 @@ mod tests {
 
         let mut buf = BytesMut::from("line one\r\nline two\r\n.\r\n");
         let first = codec.decode_streaming_raw_chunk(&mut buf).unwrap().unwrap();
-        assert_eq!(
-            codec.last_multiline_payload_bytes(),
-            b"line one\r\nline two\r\n".len()
-        );
         match first {
             StreamChunk::Data(data) => {
                 assert_eq!(&data[..], b"line one\r\nline two\r\n");

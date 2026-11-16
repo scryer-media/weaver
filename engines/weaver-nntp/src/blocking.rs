@@ -202,7 +202,7 @@ pub struct BlockingBodyLane {
 pub struct BlockingNntpConnection {
     pub route_path: Option<weaver_tunnel::pipe::DialPath>,
     egress_control: Option<Arc<ServerTransferControl>>,
-    route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+    pub(crate) route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
     transport: BlockingTransport,
     codec: NntpCodec,
     read_buf: BytesMut,
@@ -523,9 +523,8 @@ impl BlockingBodyLane {
     // assumed, because a probe written behind an unread BODY response would
     // read that article's payload as its own status line.
     //
-    // `inconclusive` carries the same meaning as it does for the async
-    // client — nothing here may be reported as a missing article unless the
-    // server actually said so.
+    // `inconclusive` means nothing here may be reported as a missing article
+    // unless the server actually said so.
     pub fn probe_exists(&mut self, message_ids: &[String]) -> ProbeBatchResult {
         if message_ids.is_empty() {
             return ProbeBatchResult {
@@ -2036,7 +2035,7 @@ impl BlockingNntpConnection {
                 Ok(results) => stat_verdict = Some(results),
                 // The server has just retired STAT, which `stat_batch` has
                 // recorded. HEAD alone has to settle the batch now.
-                Err(error) if crate::connection::reports_unsupported_command(&error) => {}
+                Err(error) if reports_unsupported_command(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2065,7 +2064,7 @@ impl BlockingNntpConnection {
             Ok(confirmed) => confirmed,
             // HEAD is gone too. If STAT answered, its verdict is the final
             // one; if it did not, nothing here can settle the batch.
-            Err(error) if crate::connection::reports_unsupported_command(&error) => {
+            Err(error) if reports_unsupported_command(&error) => {
                 return if have_stat {
                     Ok(exists)
                 } else {
@@ -2459,7 +2458,7 @@ impl BlockingNntpConnection {
                 }
                 Ok(Some(mut article)) => {
                     let chunks = std::mem::take(&mut article.chunks);
-                    if let Err(error) = crate::connection::deliver_fused_output_chunks(
+                    if let Err(error) = deliver_fused_output_chunks(
                         chunks,
                         &mut article_chunks,
                         &mut on_chunk,
@@ -2485,7 +2484,7 @@ impl BlockingNntpConnection {
                     return Ok(article);
                 }
                 Ok(None) => {
-                    if let Err(error) = crate::connection::deliver_fused_output_chunks(
+                    if let Err(error) = deliver_fused_output_chunks(
                         decoder.drain_output_chunks(),
                         &mut article_chunks,
                         &mut on_chunk,
@@ -3378,6 +3377,54 @@ fn decoded_raw_size_from_fused_stats(stats: &FusedYencArticleStats) -> u32 {
         .min(u32::MAX as u64) as u32
 }
 
+// Hand every decoded batch the fused decoder has produced to `on_chunk`, in
+// order, before appending it to the article's own chunk list.
+//
+// This is what makes the streaming design observable to a caller: batches are
+// delivered as they are decoded, not once at article finish.
+fn deliver_fused_output_chunks<F>(
+    chunks: Vec<Box<[u8]>>,
+    article_chunks: &mut Vec<Box<[u8]>>,
+    on_chunk: &mut F,
+    output_callback_cpu: &mut Duration,
+    profile_cpu: bool,
+) -> std::result::Result<(), FusedYencError>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    if chunks.is_empty() {
+        return Ok(());
+    }
+
+    let cpu_started = profile_cpu
+        .then(crate::fused_yenc::thread_cpu_time)
+        .flatten();
+    for chunk in chunks {
+        if let Err(err) = on_chunk(&chunk) {
+            crate::fused_yenc::add_cpu_delta(output_callback_cpu, cpu_started);
+            return Err(err.into());
+        }
+        article_chunks.push(chunk);
+    }
+    crate::fused_yenc::add_cpu_delta(output_callback_cpu, cpu_started);
+    Ok(())
+}
+
+// Whether an error is the server refusing the command itself (500/501)
+// rather than answering it.
+//
+// 500 is mapped to its own variant; 501 arrives as an unexpected response,
+// so both shapes have to be recognised here.
+fn reports_unsupported_command(error: &NntpError) -> bool {
+    match error {
+        NntpError::CommandNotRecognized => true,
+        NntpError::UnexpectedResponse { code, .. } => {
+            crate::server_caps::is_command_unsupported(code.raw())
+        }
+        _ => false,
+    }
+}
+
 fn profile_cpu_timings_enabled() -> bool {
     matches!(
         std::env::var("WEAVER_PROFILE_NNTP_CPU")
@@ -3423,7 +3470,6 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::PoolShutdown => NntpError::PoolShutdown,
         NntpError::SoftTimeout(seconds) => NntpError::SoftTimeout(*seconds),
         NntpError::AcquireTimeout(seconds) => NntpError::AcquireTimeout(*seconds),
-        NntpError::WorkObsolete => NntpError::WorkObsolete,
         NntpError::QuotaBlocked(rejection) => NntpError::QuotaBlocked(rejection.clone()),
         NntpError::BodyNotRequestedDueToQuota {
             preceding_rejection,
