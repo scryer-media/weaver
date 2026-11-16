@@ -154,6 +154,9 @@ impl Pipeline {
         let (volume_figure_bytes, volume_memory_ceiling_bytes) =
             volume_buffer_figure(hardware_profile, &profile, total_connections);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
+        weaver_tunnel::pipe::set_usenet_receive_bytes(
+            profile_tuning.wireguard_usenet_receive_bytes,
+        );
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
         shared_state.set_hardware_profile_in_force(crate::HardwareProfileInForce {
             active: hardware_profile,
