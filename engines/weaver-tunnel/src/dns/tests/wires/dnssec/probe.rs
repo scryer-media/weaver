@@ -1221,7 +1221,10 @@ impl Carrier for AtPort<'_> {
 // A server test keeps and reuses nothing, on every encrypted wire: once it
 // returns, every connection it opened has ended on the server's side and
 // nothing is open, and a lookup by a naming on the same sessions, through a
-// stage that could take a kept connection, dials afresh.
+// stage that could take a kept connection, dials afresh. The clock is
+// paused, and an await that finds nothing to run moves it on, past a kept
+// connection's idle close: so nothing kept is checked before any await, and
+// the clock is checked not to have moved while the connections end.
 #[tokio::test(start_paused = true)]
 async fn a_server_test_keeps_no_connection_and_a_lookup_after_it_dials_afresh() {
     let resolver = tree(KeyAlgorithm::P256);
@@ -1256,6 +1259,8 @@ async fn a_server_test_keeps_no_connection_and_a_lookup_after_it_dials_afresh() 
         let carrier = AtPort(&servers, listed.address.port());
         let sessions = probing(&authority, &resolver);
         let probe = probe_on(&carrier, &sessions, &listed).await;
+        let left = tokio::time::Instant::now();
+        assert_eq!(sessions.kept().len(), 0, "{wire}");
         assert!(probe.dnssec.supported, "{wire}: {:?}", probe.dnssec);
         let probed = servers.dials().len();
         assert!(probed > 0, "{wire}");
@@ -1265,6 +1270,7 @@ async fn a_server_test_keeps_no_connection_and_a_lookup_after_it_dials_afresh() 
             .await
             .unwrap()
             .forget();
+        assert_eq!(tokio::time::Instant::now(), left, "{wire}");
         assert_eq!(servers.open_now(), 0, "{wire}");
         assert_eq!(sessions.kept().len(), 0, "{wire}");
 

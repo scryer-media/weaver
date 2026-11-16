@@ -491,13 +491,16 @@ impl<'a> Doh<'a> {
 
 // One query over HTTP/1.1, on the free connection `taken` when there is one,
 // else on a new one. A connection that answered before and is found closed
-// before any byte of the reply is replaced once; so is the connection a
-// naming kept, when `kept`, once it fails in any way before a response, or
-// stays silent for `REUSED_WAIT`: what it said while kept (a 408 written
-// before the server closed it) is not this query's answer, and it is
-// dropped unread. The connection comes back with the reply while it stays
-// open. A dial that fails ends the call with its failure, the query not
-// sent on it. Each write of the query counts as one sent, when `counts`.
+// before any byte of the reply is replaced once. The connection a naming
+// kept, when `kept`, is replaced once on any failure of its first exchange,
+// whatever it is (found closed, a bad status, a reply that does not read),
+// or when it stays silent for `REUSED_WAIT`: what it said while kept (a 408
+// written before the server closed it) is not this query's answer, and it
+// is dropped. The query then goes once more on a new connection, whose
+// failure is the call's. The connection comes back with the reply while it
+// stays open. A dial that fails ends the call with its failure, the query
+// not sent on it. Each write of the query counts as one sent, when
+// `counts`.
 async fn one_call(
     provider: &dyn Carrier,
     wires: &Wires,

@@ -66,6 +66,9 @@ struct Claim {
     provider: Weak<dyn TunnelProvider>,
     resolver: Weak<WireGuardTunnelProvider>,
     held: Weak<Held>,
+    // The session's socket share, whose keeper holds what the session keeps
+    // open for later: cut before the session is judged busy.
+    sockets: Weak<super::SessionSockets>,
     // The activity of the session this one rides on, when it is carried.
     carrier: Option<Weak<RwLock<()>>>,
     probe: bool,
@@ -156,6 +159,7 @@ pub(super) async fn claim(hop: &SessionHop) -> Option<Lent> {
                 provider: Arc::downgrade(&hop.provider),
                 resolver: Arc::downgrade(resolver),
                 held: Arc::downgrade(&hop.capacity.held),
+                sockets: Arc::downgrade(&hop.sockets),
                 carrier,
                 probe,
             });
@@ -231,11 +235,16 @@ fn carried_first(claims: &[Claim], claim: &Claim, order: &mut Vec<Claim>) {
 impl Claim {
     // Stops the session's tunnel when nothing uses the session. A probe's
     // runs for a bounded time, so it is waited out; anyone else's busy
-    // session is left up.
+    // session is left up. What the session keeps open for later (a DNS
+    // connection) is not use: it is closed first, as `retire_idle` does, so
+    // it never keeps the old session up beside the new one.
     async fn retire(&self) {
         let Some(activity) = self.activity.upgrade() else {
             return;
         };
+        if let Some(sockets) = self.sockets.upgrade() {
+            sockets.keeper().cut();
+        }
         let _idle = if self.probe {
             activity.write_owned().await
         } else {
@@ -450,6 +459,44 @@ mod tests {
         new.prepare().await.unwrap();
         assert_eq!(taken(&events), ["up old", "up new"]);
         drop(stream);
+    }
+
+    // What a session keeps open for later is not use: a rival claiming the
+    // same identity closes it and retires the session at once.
+    #[tokio::test]
+    async fn a_session_holding_only_a_kept_connection_is_retired_by_a_rival() {
+        let events = Events::default();
+        let old = session("old", 1, 2, None, &events);
+        let new = session("new", 1, 2, None, &events);
+        old.prepare().await.unwrap();
+        // A kept connection: it holds the session's activity, as a kept DNS
+        // stream does, and its far end sees it end when it is closed.
+        let (kept, mut far) = tokio::io::duplex(64);
+        let riding = Mutex::new(Some((old.activity.clone().read_owned().await, kept)));
+        let riding = Arc::new(riding);
+        let closing = riding.clone();
+        let _registration = old
+            .sockets
+            .keeper()
+            .handle()
+            .hold(
+                super::super::SocketClass::ReserveCore,
+                Box::new(move || drop(closing.lock().unwrap().take())),
+            )
+            .unwrap();
+        assert_eq!(taken(&events), ["up old"]);
+
+        new.prepare().await.unwrap();
+        assert_eq!(taken(&events), ["down old", "up new"]);
+        assert_eq!(old.sockets.keeper().holding(), 0);
+        assert!(riding.lock().unwrap().is_none());
+        let mut rest = Vec::new();
+        assert_eq!(
+            tokio::io::AsyncReadExt::read_to_end(&mut far, &mut rest)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     // A session the old one carries holds it busy, so the carried session is

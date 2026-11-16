@@ -103,7 +103,7 @@ const fn index(class: SocketClass) -> usize {
 
 // Every share of a session, under one lock so a re-budget and the sockets
 // ending during it are settled together.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Ledger {
     size: [usize; 4],
     held: [usize; 4],
@@ -212,17 +212,28 @@ impl SessionSockets {
     }
 
     // Which kept sockets would make room for a claim of `class` the share
-    // refuses now: one of `class` itself, or of a share that holds more than
-    // its size while another grows.
+    // refuses now. The rule: a class counts only when ending one of its
+    // sockets, on a copy of the ledger, leaves `class` more room (its limit
+    // less what it holds) than it has now. A socket freed above a shrunk
+    // share's size goes to the growing shares in order (`limits`), so it
+    // may raise another share's limit and not this one's: that class does
+    // not count, and nothing is closed for a claim it cannot let through.
     fn reclaimable(inner: &Shares, class: SocketClass) -> impl Fn(SocketClass) -> bool {
-        let over: Vec<SocketClass> = {
+        let i = index(class);
+        let room = |ledger: &Ledger| ledger.limits()[i] as isize - ledger.held[i] as isize;
+        let helps: [bool; 4] = {
             let ledger = inner.ledger();
-            CLASSES
-                .into_iter()
-                .filter(|other| ledger.held[index(*other)] > ledger.size[index(*other)])
-                .collect()
+            let now = room(&ledger);
+            std::array::from_fn(|other| {
+                ledger.held[other] > 0 && {
+                    let mut after = ledger.clone();
+                    after.held[other] -= 1;
+                    after.settle();
+                    room(&after) > now
+                }
+            })
         };
-        move |kept| kept == class || over.contains(&kept)
+        move |kept| helps[index(kept)]
     }
 
     // Closes one kept connection that would make room for a claim of
@@ -494,6 +505,35 @@ mod tests {
         assert!(closed[1].load(Ordering::Relaxed));
         assert!(sockets.take(SocketClass::Nntp).is_err());
         drop((kept, busy, third, fourth));
+    }
+
+    // The reserve shrinks 2 to 0 while usenet grows and the torrent share is
+    // full: what the kept reserve connections free goes to usenet, so a
+    // torrent claim closes none of them and is refused, and a usenet claim
+    // that needs the room still closes one.
+    #[test]
+    fn a_claim_closes_no_kept_connection_whose_socket_it_would_not_get() {
+        let sockets = SessionSockets::new(SocketShares { core: 2, ..SHARES });
+        let (kept, closed) = kept(&sockets, SocketClass::ReserveCore, 2);
+        let torrent = sockets.take(SocketClass::Torrent).unwrap().unwrap();
+        sockets.set_shares(SocketShares {
+            nntp: 4,
+            core: 0,
+            ..SHARES
+        });
+        assert!(!sockets.has_room(SocketClass::Torrent));
+        assert!(sockets.take(SocketClass::Torrent).is_err());
+        assert!(closed.iter().all(|closed| !closed.load(Ordering::Relaxed)));
+        assert_eq!(sockets.held(SocketClass::ReserveCore), 2);
+        assert_eq!(sockets.keeper().holding(), 2);
+
+        let busy: Vec<_> = (0..2)
+            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
+            .collect();
+        let third = sockets.take(SocketClass::Nntp).unwrap().unwrap();
+        assert!(closed[0].load(Ordering::Relaxed));
+        assert!(!closed[1].load(Ordering::Relaxed));
+        drop((kept, torrent, busy, third));
     }
 
     // A keeper cut closes everything it keeps.

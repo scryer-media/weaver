@@ -885,3 +885,90 @@ fn a_keeper_dropped_outside_a_runtime_closes_what_it_kept() {
         assert_eq!(sessions.kept().len(), 0);
     });
 }
+
+// A lookup's talk holds a healthy connection when its runtime shuts down:
+// tokio drops the task, the talk leaves the connection to the naming, and
+// the sweep that keeping starts is dropped at once with the runtime. The
+// drop returns, and the connection is kept.
+#[test]
+fn a_talk_dropped_as_its_runtime_shuts_down_keeps_its_connection_and_returns() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let authority = Authority::new();
+    // The servers and the stage outlive the runtime, as a hop does: what
+    // the talk leaves stays kept through the stage.
+    let servers: &'static Servers = Box::leak(Box::new(
+        Servers::new(Speaks::Dot { close_after: None }, answers)
+            .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot")),
+    ));
+    let stage: &'static Instance<'static> = Box::leak(Box::new(Instance::of(servers)));
+    let sessions = Arc::new(naming_on(&authority.wires()));
+    let listed = dot("192.0.2.53", None);
+    let (answered, heard) = tokio::sync::oneshot::channel();
+    {
+        let (sessions, listed) = (sessions.clone(), listed.clone());
+        runtime.spawn(async move {
+            let keeping = crate::dns::list::Keeping::of(&sessions);
+            let mut session = Session::keeping(stage, keeping, &listed);
+            let mut reached = false;
+            let mut talk = session.talk(&mut reached);
+            let id = talk.id();
+            let name = weaver_dnssec::Name::from_text("a.test.").unwrap();
+            talk.send(0, 0, crate::dns::judge::as_sent::packet(id, &name, 1));
+            let reply = talk.next().await;
+            let _ = answered.send(matches!(reply, Ok(Some((0, Ok(_))))));
+            // Held, with its connection healthy, until the runtime goes.
+            std::future::pending::<()>().await;
+            drop(talk);
+        });
+    }
+    assert!(runtime.block_on(heard).unwrap());
+    assert_eq!(sessions.kept().len(), 0);
+    drop(runtime);
+    assert_eq!(sessions.kept().len(), 1);
+    assert_eq!(servers.open_now(), 1);
+    assert_eq!(stage.keeper.holding(), 1);
+}
+
+// A connection kept on a runtime that no longer runs its sweep is never
+// handed out past its close time: a lookup on another runtime after the idle
+// time closes it and dials afresh, with no wait on it. The first runtime is
+// kept, not driven, so the stale connection would sit silent if it were
+// taken, and the lookup would wait `REUSED_WAIT` on it.
+#[test]
+fn a_kept_connection_past_its_close_time_is_never_taken() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    };
+    let authority = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"));
+    let (wires, listed) = (authority.wires(), dot("192.0.2.53", None));
+    let sessions = naming_on(&wires);
+    let stage = Instance::of(&servers);
+    let first = runtime();
+    first.block_on(async {
+        kept_lookup_of(&stage, &sessions, std::slice::from_ref(&listed), "a.test").await;
+    });
+    assert_eq!(sessions.kept().len(), 1);
+
+    runtime().block_on(async {
+        tokio::time::advance(IDLE).await;
+        let asked = tokio::time::Instant::now();
+        let resolution =
+            kept_lookup_of(&stage, &sessions, std::slice::from_ref(&listed), "b.test").await;
+        assert_eq!(resolution.addresses, seven());
+        assert_eq!(tokio::time::Instant::now(), asked);
+        assert_eq!(servers.dials().len(), 2);
+        assert_eq!(sessions.kept().len(), 1);
+        assert_eq!(stage.keeper.holding(), 1);
+    });
+    drop(first);
+}

@@ -65,12 +65,15 @@ struct Held {
 }
 
 impl Kept {
-    // The connection kept for `server`, if one is and it was dialled
-    // through the stage `through` names: it is no longer kept. One dialled through another stage instance, or one
-    // that is gone, is closed instead.
+    // The connection kept for `server`, if one is, it was dialled through
+    // the stage `through` names, and its close time has not come: it is no
+    // longer kept. One dialled through another stage instance, one whose
+    // stage is gone, or one past its time (its sweep went with a runtime
+    // before closing it) is closed instead. Closed outside the lock.
     pub(super) fn take(&self, server: &DnsServer, through: Option<&KeeperRef>) -> Option<Link> {
         let mut held = lock(&self.links).by_server.remove(server)?;
-        let ours = through.is_some_and(|through| held.dialled.is(through));
+        let ours =
+            through.is_some_and(|through| held.dialled.is(through)) && held.closes > Instant::now();
         if ours { held.link.take() } else { None }
     }
 
@@ -80,6 +83,10 @@ impl Kept {
     // closes when any of them cuts or reclaims it. With no stage to tie it
     // to, a stage already gone, or outside a runtime, where there is no
     // timer to close it, it closes now.
+    //
+    // The sweep is spawned after the lock is let go: on a runtime shutting
+    // down, tokio drops a new task at once, and the sweep's drop takes the
+    // lock.
     pub(super) fn keep(&self, server: &DnsServer, link: Link, rides: &[KeeperRef]) {
         let Some(dialled) = rides.first() else {
             return;
@@ -102,10 +109,7 @@ impl Kept {
                 }
             }
         }
-        if !links.sweeping {
-            links.sweeping = true;
-            runtime.spawn(sweep(Sweeping(Some(Arc::downgrade(&self.links)))));
-        }
+        let start = !std::mem::replace(&mut links.sweeping, true);
         let replaced = links.by_server.insert(
             server.clone(),
             Held {
@@ -118,6 +122,9 @@ impl Kept {
         );
         drop(links);
         drop(replaced);
+        if start {
+            runtime.spawn(sweep(Sweeping(Some(Arc::downgrade(&self.links)))));
+        }
     }
 
     // How many connections are kept now.

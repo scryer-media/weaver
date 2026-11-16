@@ -251,6 +251,14 @@ impl<'a> Keeping<'a> {
     }
 }
 
+// A test's own talk that keeps its connection, as a lookup's does.
+#[cfg(test)]
+impl<'a> Keeping<'a> {
+    pub(super) fn of(sessions: &'a DnsSessions) -> Self {
+        Self(sessions)
+    }
+}
+
 // What the servers asked so far for one lookup have come to, as the list
 // is walked in order.
 struct Failover {

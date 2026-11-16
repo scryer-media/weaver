@@ -293,7 +293,10 @@ fn sent(counts: bool, queries: usize) {
 // three tunnels measured 2.1 s to 4.0 s, through one 1.5 s to 2.0 s. A
 // lookup that cannot finish in what is left fails over to the next server,
 // as a cold lookup that slow does. A reply slower than the wait costs one
-// redial and no more.
+// redial and no more. A warm reply also takes the server's own recursion
+// when it has not cached the name, which can run past the wait: that query
+// is then sent again on a new connection, and the redial is charged to
+// nothing, neither the server nor the lookup.
 pub(in crate::dns) const REUSED_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 // The times one query goes out on a kept connection, DNS over TLS or an
