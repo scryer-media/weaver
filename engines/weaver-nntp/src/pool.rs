@@ -985,6 +985,9 @@ impl NntpPool {
         demanded: bool,
         guard: Option<&(dyn Fn(ServerId) -> bool + Send + Sync)>,
     ) -> Result<PooledConnection> {
+        // Whether the one redial a refusal from past the tunnel share earns
+        // is spent. A woken wait earns it back.
+        let mut redialled = false;
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
             if guard.is_some_and(|guard| !guard(ServerId(idx))) {
@@ -1087,13 +1090,19 @@ impl NntpPool {
                                 for notification in &mut notifications {
                                     notification.as_mut().enable();
                                 }
-                                // Room freed before the wait was armed: dial again
-                                // at once. A route with leg capacity whose tunnel
-                                // share is full waits for a socket to close, and
-                                // also on the signals its room check names, which
-                                // can differ from the dial's: a rung the dial
+                                // A route with leg capacity whose tunnel share
+                                // is full waits for a socket to close, and also
+                                // on the signals its room check names, which can
+                                // differ from the dial's: a rung the dial
                                 // skipped while it cooled, or a member that had
                                 // room when the dial began.
+                                //
+                                // A share with room means something past it
+                                // refused: a tunnel's own socket count, or a
+                                // session limit, which the room check does not
+                                // see. Room may have come between the dial and
+                                // the check, so dial once more after a yield.
+                                // After that, wait on the dial's own signals.
                                 let inner = &self.configs[idx].dialer.inner;
                                 let purpose = weaver_tunnel::pipe::Purpose::Nntp {
                                     server: self.configs[idx].dialer.server,
@@ -1101,21 +1110,30 @@ impl NntpPool {
                                     probing: false,
                                 };
                                 if inner.has_capacity() {
-                                    freed = match inner.room(&purpose) {
-                                        Ok(()) => continue,
-                                        Err(freed) => freed,
-                                    };
-                                    let start = notifications.len();
-                                    notifications.extend(
-                                        freed.iter().map(|freed| Box::pin(freed.notified())),
-                                    );
-                                    for notification in &mut notifications[start..] {
-                                        notification.as_mut().enable();
-                                    }
-                                    // Room freed between the check and arming
-                                    // its signals.
-                                    if inner.has_room(&purpose) {
-                                        continue;
+                                    match inner.room(&purpose) {
+                                        Ok(()) if !redialled => {
+                                            redialled = true;
+                                            tokio::task::yield_now().await;
+                                            continue;
+                                        }
+                                        Ok(()) => {}
+                                        Err(more) => {
+                                            freed = more;
+                                            let start = notifications.len();
+                                            notifications.extend(
+                                                freed
+                                                    .iter()
+                                                    .map(|freed| Box::pin(freed.notified())),
+                                            );
+                                            for notification in &mut notifications[start..] {
+                                                notification.as_mut().enable();
+                                            }
+                                            // Room freed between the check and
+                                            // arming its signals.
+                                            if inner.has_room(&purpose) {
+                                                continue;
+                                            }
+                                        }
                                     }
                                 }
                                 acquisition_budget(deadline.as_deref(), async {
@@ -1131,6 +1149,9 @@ impl NntpPool {
                                             }) => Ok(()),
                                         }
                                     }).await?;
+                                // A signal woke the wait: a slot freed, so the
+                                // next refusal earns its one redial again.
+                                redialled = false;
                                 continue;
                             }
                             let provider_evidence = !matches!(&e, NntpError::Route(error) if error.is_path_evidence() || !error.is_evidence());
@@ -2530,6 +2551,85 @@ mod tests {
         route.freed.notify_waiters();
         assert!(acquiring.await.unwrap().is_err());
         assert_eq!(route.dials.load(Ordering::Acquire), 2);
+        pool.shutdown().await;
+    }
+
+    // A tunnel past the share can refuse with AtCapacity while the share's
+    // room check says Ok: the tunnel's own socket count, or a session
+    // limit. The connect dials once more after a yield, then waits for the
+    // dial's own signal instead of redialling at once, and dials again when
+    // it fires.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_past_the_share_redials_once_then_parks_until_freed() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Purpose, Target};
+        struct FullTunnel {
+            freed_up: AtomicBool,
+            dials: AtomicUsize,
+            freed: Arc<tokio::sync::Notify>,
+            asked: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+        #[async_trait::async_trait]
+        impl Dialer for FullTunnel {
+            fn has_capacity(&self) -> bool {
+                true
+            }
+            fn room(&self, _: &Purpose) -> std::result::Result<(), Vec<Arc<tokio::sync::Notify>>> {
+                self.asked.send(()).ok();
+                Ok(())
+            }
+            async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
+                let dials = self.dials.fetch_add(1, Ordering::AcqRel) + 1;
+                if self.freed_up.load(Ordering::Acquire) {
+                    return Err(DialError::Egress(std::io::Error::other("fixture leg down")));
+                }
+                assert!(dials <= 2, "dialled again before the tunnel freed a slot");
+                Err(DialError::AtCapacity(vec![self.freed.clone()]))
+            }
+            fn budget(&self) -> Duration {
+                Duration::from_secs(30)
+            }
+            fn describe(&self) -> String {
+                "full tunnel fixture".into()
+            }
+        }
+        let (asked, mut asks) = tokio::sync::mpsc::unbounded_channel();
+        let route = Arc::new(FullTunnel {
+            freed_up: AtomicBool::new(false),
+            dials: AtomicUsize::new(0),
+            freed: Arc::new(tokio::sync::Notify::new()),
+            asked,
+        });
+        let mut config = test_pool_config(4);
+        config.servers[0].server.tls = false;
+        config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+            inner: route.clone(),
+            plan: None,
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        });
+        let pool = Arc::new(NntpPool::new(config));
+        let mut acquiring = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.acquire(ServerId(0)).await.map(|_| ()) }
+        });
+        // One room check after each refused dial: the first earns the
+        // redial, the second sends the connect to wait on the dial's signal.
+        for _ in 0..2 {
+            tokio::select! {
+                asked = asks.recv() => asked.unwrap(),
+                ended = &mut acquiring => panic!("the connect ended without parking: {ended:?}"),
+            }
+        }
+        assert_eq!(route.dials.load(Ordering::Acquire), 2);
+        assert!(asks.try_recv().is_err());
+        assert!(!acquiring.is_finished());
+
+        route.freed_up.store(true, Ordering::Release);
+        route.freed.notify_waiters();
+        assert!(acquiring.await.unwrap().is_err());
+        assert_eq!(route.dials.load(Ordering::Acquire), 3);
         pool.shutdown().await;
     }
 
