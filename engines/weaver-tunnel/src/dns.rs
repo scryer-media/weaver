@@ -270,6 +270,9 @@ enum Failed {
     Unreached(TunnelError),
     // The connection closed before any byte of the reply came.
     Closed,
+    // In plain DNS, the stream failed before any byte of the reply came,
+    // for this fixed reason: reset by the server, or another I/O error.
+    Io(&'static str),
     // The connection closed part way through the reply.
     Cut,
     // The server reset the HTTP/2 stream carrying the query.
@@ -301,6 +304,7 @@ impl Failed {
                 error => TunnelError::Engine(error.to_string()),
             }),
             Self::Closed => Self::Closed,
+            Self::Io(reason) => Self::Io(reason),
             Self::Cut => Self::Cut,
             Self::Reset => Self::Reset,
             Self::Refused => Self::Refused,
@@ -362,6 +366,9 @@ impl Why {
             Ok(Err(Failed::Closed)) => self.consider(LookupFailure::NoReply, || {
                 format!("{server}: the connection closed without a reply")
             }),
+            Ok(Err(Failed::Io(reason))) => {
+                self.consider(LookupFailure::NoReply, || format!("{server}: {reason}"))
+            }
             Ok(Err(Failed::Cut)) => self.consider(LookupFailure::NoReply, || {
                 format!("{server}: the connection closed part way through a reply")
             }),

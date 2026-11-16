@@ -936,6 +936,92 @@ async fn a_test_refuses_a_route_its_save_would_refuse_before_dialling() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// A test of listed servers through a drafted route that its save would
+// refuse is refused the same way, before any server is dialled: the proxy
+// cannot answer on a leg with no proxy.
+#[tokio::test]
+async fn a_dns_server_test_refuses_a_route_its_save_would_refuse_before_dialling() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let h = harness().await;
+    let code = |result: &async_graphql::Response| {
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        let error = serde_json::to_value(&result.errors[0]).unwrap();
+        (
+            error["extensions"]["code"].as_str().unwrap().to_owned(),
+            error["extensions"]["params"].clone(),
+        )
+    };
+    // The server counts each connection a probe opens to it, and closes it
+    // before it is answered. A probe waits on its answer, so a test that
+    // asked it has been counted by the time the test answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = listener.local_addr().unwrap();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counted = dials.clone();
+    let server_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let result = h
+        .execute(
+            r#"mutation { saveDnsProfile(input: {
+        name: "proxy answers", kind: ROUTE, who: PROXY, trust: AS_SENT
+    }) { id } }"#,
+        )
+        .await;
+    assert_no_errors(&result);
+    let profile = response_data(&result)["saveDnsProfile"]["id"]
+        .as_u64()
+        .unwrap();
+    let route = |profile: u64| {
+        format!(
+            "{{ legs: [{{ egressId: 0, weight: 100, path: {{ direct: true }} }}], dnsProfileId: {profile} }}"
+        )
+    };
+    let test = |profile: u64| {
+        format!(
+            r#"mutation {{ testDnsServers(route: {}, servers: [{{ wire: PLAIN, address: "{server}" }}]) {{ index }} }}"#,
+            route(profile)
+        )
+    };
+
+    // The save is refused, and names the route it refuses.
+    let (saved, params) = code(
+        &h.execute(&format!(
+            "mutation {{ saveNetworkRoute(kind: OUTBOUND, id: 0, input: {}) {{ consumer }} }}",
+            route(profile)
+        ))
+        .await,
+    );
+    assert_eq!(saved, "DNS_PROFILE_NEEDS_PROXY");
+    assert_eq!(params["routes"].as_array().unwrap().len(), 1, "{params}");
+
+    // The test is refused with the same code, naming no route: a draft has
+    // no holder. Nothing was dialled.
+    assert_eq!(
+        code(&h.execute(&test(profile)).await),
+        (
+            "DNS_PROFILE_NEEDS_PROXY".to_owned(),
+            serde_json::json!({ "routes": [] })
+        )
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
+
+    // The same route on the host's names asks the server from the egress.
+    let result = h.execute(&test(0)).await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["testDnsServers"],
+        serde_json::json!([{ "index": 0 }])
+    );
+    assert!(dials.load(Ordering::SeqCst) > 0);
+    server_task.abort();
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 // A pool under test carries a target through the member it picks, and is
 // tried member by member without one; the old pool test stays member by
 // member.

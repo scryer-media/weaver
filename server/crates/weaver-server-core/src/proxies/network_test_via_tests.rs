@@ -1468,3 +1468,49 @@ async fn a_test_on_a_proxy_name_profile_is_refused_as_its_save_is() {
     assert_eq!(refused, NOT_A_ROUTE_PROFILE);
     runtime.shutdown().await;
 }
+
+// A test of listed servers is refused where a save of its route would be,
+// before anything is built or dialled: the proxy cannot answer on a leg with
+// no proxy, and a WireGuard proxy is reached only by the path a saved route
+// holds it on, when the servers are asked through the first path's proxies.
+#[tokio::test]
+async fn a_dns_server_test_is_refused_where_its_route_could_not_be_saved() {
+    let (near, far) = stacked_peers().await;
+    let runtime = runtime_with(
+        vec![
+            wireguard_profile(1, &near, "127.0.0.1".into(), near.endpoint().port()),
+            wireguard_profile(2, &far, "127.0.0.1".into(), far.endpoint().port()),
+        ],
+        vec![],
+        vec![(Consumer::Server(1), wireguard_ladder(Rung::Proxy { id: 2 }))],
+    );
+    store_dns(&runtime, stored_dns(crate::proxies::DnsTransit::Proxy, &[]));
+    let test = |path: LegPath, dns: u32| {
+        runtime
+            .dns_server_test(
+                &draft(path),
+                dns,
+                vec![weaver_tunnel::dns::DnsServer::plain(ip("192.0.2.53"))],
+            )
+            .err()
+    };
+    let chained = || ladder(vec![Rung::Chain { ids: vec![1, 2] }]);
+    assert_eq!(
+        test(LegPath::Direct, PROXY_DNS),
+        Some(NetworkRefusal::DnsProfileNeedsProxy { routes: vec![] })
+    );
+    assert_eq!(
+        test(chained(), WEAVER_DNS),
+        Some(NetworkRefusal::WireGuardPathConflict {
+            proxy: 2,
+            egress: SYSTEM_EGRESS_ID,
+            paths: vec![vec![1, 2], vec![2]],
+        })
+    );
+    // On the saved route's own path the servers are asked through it, and
+    // on the egress nothing is asked through the chain.
+    assert_eq!(test(ladder(vec![Rung::Proxy { id: 2 }]), WEAVER_DNS), None);
+    assert_eq!(test(LegPath::Direct, WEAVER_DNS), None);
+    assert_eq!(test(chained(), SYSTEM_DNS_PROFILE_ID), None);
+    runtime.shutdown().await;
+}

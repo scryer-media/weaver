@@ -400,6 +400,31 @@ impl Dialer for FreshSignals {
     }
 }
 
+// A stage past a share with room that refuses the first five dials at
+// capacity, each with a new signal it keeps, and opens the sixth.
+#[derive(Default)]
+struct NamesFive {
+    named: Mutex<Vec<Arc<tokio::sync::Notify>>>,
+}
+
+#[async_trait::async_trait]
+impl Dialer for NamesFive {
+    async fn dial(&self, _target: &Target) -> Result<crate::pipe::Dialed, DialError> {
+        let mut named = self.named.lock().unwrap();
+        if named.len() == 5 {
+            return Ok(dialed(Box::new(tokio::io::duplex(64).0)));
+        }
+        named.push(Arc::new(tokio::sync::Notify::new()));
+        Err(DialError::AtCapacity(vec![named[named.len() - 1].clone()]))
+    }
+    fn budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "names five".into()
+    }
+}
+
 // A plain server at 192.0.2.53 that opens at once, or after `dial` when
 // set, and answers nothing it is asked.
 fn plain_server(dial: Option<Duration>) -> Servers {
@@ -412,6 +437,16 @@ fn plain_server(dial: Option<Duration>) -> Servers {
         Some(dial) => servers.delayed(dial),
         None => servers,
     }
+}
+
+// Until `count` probes on this thread wait for a socket, their clocks
+// stopped.
+async fn waiting(count: usize) {
+    let mut stopped = crate::dns::probe::STOPPED.with(|stopped| stopped.subscribe());
+    stopped
+        .wait_for(|stopped| *stopped >= count)
+        .await
+        .expect("the probes' count lasts the test");
 }
 
 // A probe that only opens one stream through `slotted`.
@@ -492,8 +527,8 @@ async fn a_wait_for_a_socket_is_not_counted_against_the_probes_time_limit() {
     let slotted = crate::dns::probe::Slotted(&*shared);
     let server = first();
     let (probe, ()) = tokio::join!(probe_on(&slotted, &sessions, &server), async {
-        // Each of the four probes found the share full.
-        shared.refusals(4).await;
+        // Each of the four probes found the share full and waits.
+        waiting(4).await;
         tokio::time::advance(SERVER_TIMEOUT * 2).await;
         drop(held);
     });
@@ -559,6 +594,26 @@ async fn a_dialer_naming_a_new_signal_each_refusal_is_dialled_a_bounded_number_o
     );
     assert_eq!(probed.elapsed, Duration::ZERO);
     assert_eq!(started.elapsed(), SOCKET_WAIT);
+}
+
+// Once four signals are known, a refusal that names a fifth is waited on
+// with them: a free of only the fifth wakes the probe, whose next dial
+// opens, with no time passed.
+#[tokio::test(start_paused = true)]
+async fn a_free_of_the_newest_signal_past_the_bound_wakes_the_probe() {
+    let names = NamesFive::default();
+    let slotted = Slotted(&names);
+    let server = first();
+    let started = tokio::time::Instant::now();
+    let (probed, ()) = tokio::join!(timed(&server, opens(&slotted, &server)), async {
+        waiting(1).await;
+        let named = names.named.lock().unwrap().clone();
+        assert_eq!(named.len(), 5);
+        named[4].notify_waiters();
+    });
+    assert!(probed.supported, "{probed:?}");
+    assert_eq!(names.named.lock().unwrap().len(), 5);
+    assert_eq!(started.elapsed(), Duration::ZERO);
 }
 
 // A socket freed after a dial is refused, and before the probe begins to

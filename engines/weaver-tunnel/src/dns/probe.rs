@@ -87,8 +87,8 @@ impl Carrier for Slotted<'_> {
             CLOCK.try_with(|_| ()).is_ok(),
             "a probe's carrier runs under `timed`"
         );
-        // Every signal a refusal or the share has named so far, up to about
-        // MOST_SIGNALS.
+        // The signals refusals and the share have named, the latest of
+        // them past about MOST_SIGNALS.
         let mut known: Vec<Arc<Notify>> = Vec::new();
         loop {
             // Armed before the dial, so a socket freed after the dial is
@@ -118,25 +118,40 @@ impl Carrier for Slotted<'_> {
             if let Err(more) = self.0.room(&Purpose::Dns) {
                 named.extend(more);
             }
-            if known.len() >= MOST_SIGNALS
-                || named.iter().all(|signal| armed_already(&known, signal))
-            {
+            let mut fresh: Vec<Arc<Notify>> = Vec::new();
+            for signal in named {
+                if !armed_already(&known, &signal) && !armed_already(&fresh, &signal) {
+                    fresh.push(signal);
+                }
+            }
+            if fresh.is_empty() || known.len() >= MOST_SIGNALS {
                 // Everything the refusal names was armed before the dial,
                 // or enough signals are known that a new one is not worth a
-                // dial at once: wait for those armed, off the clock.
-                let _waiting = Counted::new(false);
-                any(&mut signals).await;
+                // dial at once: wait for those armed, and for the new ones,
+                // off the clock. A new one takes the place of the oldest
+                // known, so a free of only what the refusal named is seen.
+                let mut late = armed(&fresh);
+                {
+                    let _waiting = Counted::new(false);
+                    tokio::select! {
+                        () = any(&mut signals) => {}
+                        () = any(&mut late) => {}
+                    }
+                }
+                drop((late, signals));
+                for signal in fresh {
+                    if known.len() >= MOST_SIGNALS {
+                        known.remove(0);
+                    }
+                    known.push(signal);
+                }
                 continue;
             }
             // The refusal names a signal not armed before the dial, so a
             // free before now may have gone unseen. Arm it and dial again
             // at once: that dial is the check.
             drop(signals);
-            for signal in named {
-                if !armed_already(&known, &signal) {
-                    known.push(signal);
-                }
-            }
+            known.extend(fresh);
         }
     }
 }
@@ -145,7 +160,8 @@ impl Carrier for Slotted<'_> {
 // at once. A dial is refused by the route's share or by something past it
 // (a tunnel's own socket count, a session limit); a refusal from a ladder
 // of stages can name one of each. A dialer that named a new signal on every
-// refusal would otherwise be dialled again without end.
+// refusal would otherwise be dialled again without end. Past this many, a
+// new signal is waited on with those known, and takes the oldest's place.
 const MOST_SIGNALS: usize = 4;
 
 // Whether `signal` is one of `known`.
@@ -184,6 +200,15 @@ async fn any(signals: &mut [Signal<'_>]) {
 tokio::task_local! {
     // The clock of the probe being run.
     static CLOCK: Arc<Clock>;
+}
+
+#[cfg(test)]
+thread_local! {
+    // How many probes run on this thread have their clocks stopped now,
+    // each waiting for a socket with no stream open or dialling: what a
+    // test waits on to know its probes are waiting.
+    pub(super) static STOPPED: tokio::sync::watch::Sender<usize> =
+        tokio::sync::watch::channel(0).0;
 }
 
 // One probe's clock. It stops while the probe waits for a socket and has no
@@ -256,6 +281,16 @@ impl Clock {
             &mut stops.waiting
         });
         let changed = stops.settle();
+        #[cfg(test)]
+        if changed {
+            let stopped = stops.since.is_some();
+            STOPPED.with(|count| {
+                count.send_modify(|count| match stopped {
+                    true => *count += 1,
+                    false => *count -= 1,
+                })
+            });
+        }
         drop(stops);
         if changed {
             self.changed.notify_waiters();
