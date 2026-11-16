@@ -323,8 +323,13 @@ impl NamespaceWriter {
             }
             Some(_) => false,
             None => {
-                let leaf = Leaf::over(&self.working_dir, &kept.name, kept.on_disk)
-                    .through(self.disk_under(&self.working_dir).as_ref());
+                let leaf = Leaf::handed(
+                    &self.working_dir,
+                    &kept.name,
+                    kept.on_disk,
+                    self.disk_under(&self.working_dir).as_ref(),
+                    0,
+                );
                 self.files_mut(node).leaves.insert(member, leaf);
                 self.intend(node, member, output_name);
                 true
