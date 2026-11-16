@@ -16,6 +16,7 @@
 // seed-mode piece's check passes, is read from the torrent's files and
 // handed to it the same way; no byte goes to it that no check passed.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -39,6 +40,8 @@ use crate::pipeline::graph::status::RepairSlots;
 use crate::runtime::panic_trap::JobScope;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[cfg(test)]
+mod outputs_tests;
 #[cfg(test)]
 mod tests;
 
@@ -1024,14 +1027,17 @@ pub(crate) fn plan_outputs(
 ) -> Outputs {
     let mut found = Vec::new();
     walk(work, Path::new(""), &mut found);
+    // Looked up once per file found, so each is a set.
+    let listed: HashSet<&Path> = listed.iter().map(PathBuf::as_path).collect();
+    let spent: HashSet<&Path> = spent.iter().map(PathBuf::as_path).collect();
     let moves: Vec<(PathBuf, PathBuf)> = found
         .into_iter()
         .filter(|relative| {
             let own = relative.components().next().is_some_and(|first| {
                 crate::pipeline::graph::restore::the_jobs(Path::new(first.as_os_str()))
             });
-            !own && !listed.contains(relative)
-                && !spent.contains(&work.join(relative))
+            !own && !listed.contains(relative.as_path())
+                && !spent.contains(work.join(relative).as_path())
                 && !dir.join(relative).exists()
         })
         .map(|relative| (work.join(&relative), dir.join(relative)))

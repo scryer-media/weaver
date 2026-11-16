@@ -178,3 +178,78 @@ fn a_script_is_given_its_jobs_tags() {
     db.refresh_script_job_inputs(job.0, &mut facts).unwrap();
     assert_eq!(facts.tags, ["hd", "tv"]);
 }
+
+// Changes over hundreds of jobs and many tags, written a few statements at
+// a time, leave each job the tags a statement per job and tag left it.
+#[test]
+fn tag_changes_to_many_jobs_end_as_one_statement_per_pair_ended() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let db = Database::open_in_memory().unwrap();
+    let jobs: Vec<JobId> = (40_000..40_600).map(JobId).collect();
+    for job in &jobs {
+        db.insert_job_history(&history_row(job.0)).unwrap();
+    }
+    let tags: Vec<String> = (0..500).map(|index| format!("tag{index}")).collect();
+    let tag_refs = |range: std::ops::Range<usize>| -> Vec<&str> {
+        tags[range].iter().map(String::as_str).collect()
+    };
+    let mut model: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    let mut made: BTreeSet<String> = BTreeSet::new();
+    let put = |model: &mut BTreeMap<u64, BTreeSet<String>>, jobs: &[JobId], names: &[&str]| {
+        for job in jobs {
+            for name in names {
+                model.entry(job.0).or_default().insert((*name).to_owned());
+            }
+        }
+    };
+
+    // Three tags on every job, and a new job's own.
+    db.add_job_tags(&jobs, tag_refs(0..3)).unwrap();
+    put(&mut model, &jobs, &tag_refs(0..3));
+    made.extend(tag_refs(0..3).into_iter().map(str::to_owned));
+    // Many tags on a few jobs, some already on them.
+    db.add_job_tags(&jobs[..4], tag_refs(1..500)).unwrap();
+    put(&mut model, &jobs[..4], &tag_refs(1..500));
+    made.extend(tag_refs(1..500).into_iter().map(str::to_owned));
+    // Many tags off half the jobs.
+    db.remove_job_tags(&jobs[..300], tag_refs(2..480)).unwrap();
+    for job in &jobs[..300] {
+        for name in tag_refs(2..480) {
+            model.entry(job.0).or_default().remove(name);
+        }
+    }
+    // A set of two on a third.
+    db.set_job_tags(&jobs[400..], tag_refs(7..9)).unwrap();
+    for job in &jobs[400..] {
+        model.insert(
+            job.0,
+            tag_refs(7..9).into_iter().map(str::to_owned).collect(),
+        );
+    }
+    // Every tag off a few.
+    db.remove_job_tags(&jobs[100..110], []).unwrap();
+    for job in &jobs[100..110] {
+        model.remove(&job.0);
+    }
+    // Deleting many tags takes them off every job.
+    db.delete_tags(tag_refs(0..2).into_iter().chain(tag_refs(450..500)))
+        .unwrap();
+    for name in tag_refs(0..2).into_iter().chain(tag_refs(450..500)) {
+        made.remove(name);
+        for carried in model.values_mut() {
+            carried.remove(name);
+        }
+    }
+
+    let snapshot = db.tag_snapshot().unwrap();
+    for job in &jobs {
+        let expected = sorted_tags(
+            model
+                .get(&job.0)
+                .map(|carried| carried.iter().cloned().collect())
+                .unwrap_or_default(),
+        );
+        assert_eq!(snapshot.of(*job), expected.as_slice(), "job {}", job.0);
+    }
+    assert_eq!(snapshot.made(), sorted_tags(made.into_iter().collect()));
+}

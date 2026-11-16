@@ -1150,7 +1150,7 @@ async fn torrents(
             None => not_found(),
         },
         "files" => files(ctx, params).await,
-        "export" => export(ctx, params).await,
+        "export" => export(ctx, params, scope).await,
         "delete" => delete(ctx, params).await,
         // Every torrent at once is one hold, which leaves each torrent's
         // own stop or start standing; named torrents are each stopped.
@@ -4150,8 +4150,10 @@ async fn set_location(
 }
 
 // qBittorrent `exportAction`: the torrent's metainfo as it was added. A
-// torrent added by magnet whose metadata has not come has none.
-async fn export(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+// torrent added by magnet whose metadata has not come has none. A web
+// seed's URL can carry a secret only an Admin may read: any other key has
+// the metainfo without it.
+async fn export(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScope) -> Response {
     let Some(torrents) = &ctx.inner.torrents else {
         return text(StatusCode::NOT_FOUND, "Not Found");
     };
@@ -4181,6 +4183,19 @@ async fn export(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     } else {
         name
     };
+    let metainfo = if scope.is_admin() {
+        metainfo
+    } else {
+        match without_web_seed_secrets(&metainfo) {
+            Some(metainfo) => bytes::Bytes::from(metainfo),
+            None => {
+                return text(
+                    StatusCode::CONFLICT,
+                    "Unable to export torrent file. Error: the metainfo could not be read",
+                );
+            }
+        }
+    };
     let disposition = format!("attachment; filename=\"{}.torrent\"", name.replace('"', ""));
     let mut response = (
         StatusCode::OK,
@@ -4194,6 +4209,120 @@ async fn export(ctx: &TorrentFacadeContext, params: &Params) -> Response {
             .insert(header::CONTENT_DISPOSITION, value);
     }
     response
+}
+
+// The metainfo with its web seeds' (BEP 19 `url-list`, BEP 17
+// `httpseeds`) user names, passwords, queries and fragments taken out, and
+// a URL that does not parse left out. Every other byte is as added, so its
+// info hash is the torrent's. None when the metainfo does not parse.
+fn without_web_seed_secrets(metainfo: &[u8]) -> Option<Vec<u8>> {
+    if metainfo.first() != Some(&b'd') {
+        return None;
+    }
+    let mut out = Vec::with_capacity(metainfo.len());
+    out.push(b'd');
+    let mut at = 1;
+    while *metainfo.get(at)? != b'e' {
+        let (key, value_at) = bencoded_string(metainfo, at)?;
+        let value_end = bencoded_end(metainfo, value_at)?;
+        out.extend_from_slice(&metainfo[at..value_at]);
+        let value = &metainfo[value_at..value_end];
+        if key == b"url-list" || key == b"httpseeds" {
+            out.extend_from_slice(&web_seeds_without_secrets(value));
+        } else {
+            out.extend_from_slice(value);
+        }
+        at = value_end;
+    }
+    out.push(b'e');
+    (at + 1 == metainfo.len()).then_some(out)
+}
+
+// A web seed value as `without_web_seed_secrets` gives it: one URL stays
+// one string, a list stays a list of the URLs in it, and anything else is
+// an empty list.
+fn web_seeds_without_secrets(value: &[u8]) -> Vec<u8> {
+    fn bencoded(url: &str, out: &mut Vec<u8>) {
+        out.extend_from_slice(format!("{}:", url.len()).as_bytes());
+        out.extend_from_slice(url.as_bytes());
+    }
+    fn without_secrets(url: &[u8]) -> Option<String> {
+        let mut url = reqwest::Url::parse(std::str::from_utf8(url).ok()?).ok()?;
+        url.set_username("").ok()?;
+        url.set_password(None).ok()?;
+        url.set_query(None);
+        url.set_fragment(None);
+        Some(url.into())
+    }
+    let mut out = Vec::new();
+    if let Some((url, end)) = bencoded_string(value, 0)
+        && end == value.len()
+    {
+        bencoded(&without_secrets(url).unwrap_or_default(), &mut out);
+        return out;
+    }
+    out.push(b'l');
+    if value.first() == Some(&b'l') {
+        let mut at = 1;
+        while let Some(&next) = value.get(at)
+            && next != b'e'
+        {
+            let Some(end) = bencoded_end(value, at) else {
+                break;
+            };
+            if let Some((url, _)) = bencoded_string(value, at)
+                && let Some(url) = without_secrets(url)
+            {
+                bencoded(&url, &mut out);
+            }
+            at = end;
+        }
+    }
+    out.push(b'e');
+    out
+}
+
+// The bytes of the bencoded string at `at`, and where it ends.
+fn bencoded_string(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
+    let colon = at
+        + buf
+            .get(at..)?
+            .iter()
+            .take(21)
+            .position(|&byte| byte == b':')?;
+    let digits = &buf[at..colon];
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let length: usize = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    let end = (colon + 1).checked_add(length)?;
+    Some((buf.get(colon + 1..end)?, end))
+}
+
+// Where the bencoded value at `at` ends, its lists and dictionaries walked
+// without recursion and no deeper than `DEPTH`.
+fn bencoded_end(buf: &[u8], mut at: usize) -> Option<usize> {
+    const DEPTH: usize = 64;
+    let mut depth = 0usize;
+    loop {
+        match *buf.get(at)? {
+            b'i' => at += 2 + buf.get(at + 1..)?.iter().position(|&byte| byte == b'e')?,
+            b'l' | b'd' if depth < DEPTH => {
+                depth += 1;
+                at += 1;
+                continue;
+            }
+            b'e' if depth > 0 => {
+                depth -= 1;
+                at += 1;
+            }
+            b'0'..=b'9' => at = bencoded_string(buf, at)?.1,
+            _ => return None,
+        }
+        if depth == 0 {
+            return Some(at);
+        }
+    }
 }
 
 // Save the global limits: `None` leaves one as it is, `Some(None)` lifts
@@ -4349,7 +4478,7 @@ async fn feed_by_name(
     Ok(feeds(ctx).await?.into_iter().find(|feed| feed.name == name))
 }
 
-// An article's link as a caller that cannot control reads it: the scheme,
+// An article's link as a caller that is not an Admin reads it: the scheme,
 // host and port of a link to a host, and only the scheme of one without a
 // host, such as a magnet, whose trackers can carry a passkey.
 fn redacted_article_link(link: &str) -> String {
@@ -4361,8 +4490,8 @@ fn redacted_article_link(link: &str) -> String {
 
 // qBittorrent `itemsAction`: the root folder, each feed by its name.
 // A feed's URL, and each article's link, which is its download link, can
-// carry the indexer's key or a tracker's passkey; a caller that cannot
-// control reads only their scheme, host and port.
+// carry the indexer's key or a tracker's passkey; a caller that is not an
+// Admin reads only their scheme, host and port.
 async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool, scope: CallerScope) -> Response {
     let feeds = match feeds(ctx).await {
         Ok(feeds) => feeds,
@@ -4392,7 +4521,7 @@ async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool, scope: CallerSco
     for feed in feeds {
         let mut item = Map::new();
         item.insert("uid".to_owned(), json!(feed_uid(feed.id)));
-        let url = if scope.can_control() {
+        let url = if scope.is_admin() {
             feed.url.clone()
         } else {
             redacted_tracker_url(&feed.url)
@@ -4411,7 +4540,7 @@ async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool, scope: CallerSco
                     .map(|date| date.to_rfc2822())
                     .unwrap_or_default();
                     let url = match &article.item_url {
-                        Some(url) if scope.can_control() => url.clone(),
+                        Some(url) if scope.is_admin() => url.clone(),
                         Some(url) => redacted_article_link(url),
                         None => String::new(),
                     };
