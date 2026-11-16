@@ -1784,3 +1784,65 @@ fn seeds_found_by_lookup_are_those_a_pass_finds() {
         }
     }
 }
+
+// The slices found from a binary search for the first file are those a
+// pass over every file finds, over seeded layouts with empty and pad files
+// and ranges anywhere in the torrent.
+#[test]
+fn slices_found_by_search_are_those_a_pass_finds() {
+    // The pass over every file the search replaced.
+    fn every_file(layout: &Layout, offset: u64, len: u64) -> Vec<Slice> {
+        let end = offset + len;
+        layout
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.len > 0 && f.offset < end && f.offset + f.len > offset)
+            .map(|(file, f)| {
+                let start = offset.max(f.offset);
+                let stop = end.min(f.offset + f.len);
+                Slice {
+                    file,
+                    offset: start - f.offset,
+                    len: stop - start,
+                }
+            })
+            .collect()
+    }
+    let mut rng = 0xbb67_ae85_84ca_a73bu64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _ in 0..300 {
+        let names: Vec<String> = (0..1 + next() % 20).map(|i| format!("f{i}")).collect();
+        let files: Vec<(&str, u64, bool)> = names
+            .iter()
+            .map(|name| {
+                let r = next();
+                let len = match r % 4 {
+                    0 => 0,
+                    1 => 1 + (r >> 8) % 100,
+                    _ => 1 + (r >> 8) % 100_000,
+                };
+                (name.as_str(), len, r & 0x80 != 0)
+            })
+            .collect();
+        if files.iter().all(|f| f.1 == 0) {
+            continue;
+        }
+        let layout = layout(&files);
+        let total: u64 = files.iter().map(|f| f.1).sum();
+        for _ in 0..50 {
+            let offset = next() % total;
+            let len = 1 + next() % (total - offset);
+            assert_eq!(
+                layout.slices(offset, len),
+                every_file(&layout, offset, len),
+                "{files:?} {offset}+{len}"
+            );
+        }
+    }
+}

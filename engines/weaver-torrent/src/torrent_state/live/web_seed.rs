@@ -649,13 +649,18 @@ impl Layout {
     }
 
     // The parts of `len` bytes at `offset` of the torrent in each file, in
-    // order (libtorrent `file_storage::map_block`).
+    // order (libtorrent `file_storage::map_block`). The files lie end to end
+    // in torrent order, so the first is found by a binary search and only
+    // the files the bytes reach are looked at.
     fn slices(&self, offset: u64, len: u64) -> Vec<Slice> {
         let end = offset + len;
-        self.files
+        let first = self.files.partition_point(|f| f.offset + f.len <= offset);
+        self.files[first..]
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.len > 0 && f.offset < end && f.offset + f.len > offset)
+            .map(|(i, f)| (first + i, f))
+            .take_while(|(_, f)| f.offset < end)
+            .filter(|(_, f)| f.len > 0 && f.offset + f.len > offset)
             .map(|(file, f)| {
                 let start = offset.max(f.offset);
                 let stop = end.min(f.offset + f.len);
