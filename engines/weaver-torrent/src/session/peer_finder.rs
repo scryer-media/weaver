@@ -59,7 +59,7 @@ impl<'a> PeerAsk<'a> {
                 identity,
                 tiers: Vec::new(),
                 force_interval: None,
-                trackers_only: true,
+                private: true,
                 running: None,
             },
         }
@@ -71,9 +71,9 @@ pub(super) struct TrackerAsk<'a> {
     pub identity: &'a Identity,
     pub tiers: Vec<Vec<Tracker>>,
     pub force_interval: Option<Duration>,
-    /// It takes peers from its own trackers alone, and announces to no
-    /// tracker of the session's.
-    pub trackers_only: bool,
+    /// It is private, or taken to be (a magnet until its metadata says),
+    /// and announces to no tracker of the session's.
+    pub private: bool,
     /// A tracker task already running for the torrent, taken over in place
     /// of starting its own.
     pub running: Option<TrackerTask>,
@@ -475,12 +475,12 @@ mod tests {
     }
 
     // Every finder the session runs keeps the rules it had: a private
-    // torrent, or one added to take peers from its trackers alone, starts
-    // its trackers and its own list and nothing else, whatever else it was
-    // added with, and hears from nothing else; a public one starts each
-    // finder its options leave on. A magnet's fetch, taken to be private,
-    // starts the same two first, and once its trackers' phase is over
-    // starts only the others its options leave on, announcing on none.
+    // torrent starts its trackers and its own list and nothing else,
+    // whatever else it was added with, and hears from nothing else; a
+    // public one starts each finder its options leave on, all of them off
+    // included. A magnet's fetch, taken to be private, starts the same two
+    // first, and once its trackers' phase is over starts only the others
+    // its options leave on, announcing on none.
     #[tokio::test]
     async fn a_private_torrent_starts_and_hears_only_its_trackers_and_own_list() {
         use PeerSourceFlag::{Dht, Lsd, ResumeData, Tracker};
@@ -491,25 +491,20 @@ mod tests {
         for (disable_dht, disable_lsd) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
-            let opts = |trackers_only| AddTorrentOptions {
+            let opts = AddTorrentOptions {
                 disable_dht,
                 disable_lsd,
-                trackers_only,
                 ..Default::default()
             };
-            // Private, or added trackers-only: its trackers and own list.
-            for discovery in [
-                Discovery::added(true, &opts(false)),
-                Discovery::added(false, &opts(true)),
-            ] {
-                let finders = stand_ins();
-                let (started, named) = run(&session, &finders, Asked::Run(discovery)).await;
-                assert_eq!(own(&started), vec![Tracker, ResumeData], "{discovery:?}");
-                assert_eq!(named, vec![(addr(1), Tracker), (addr(2), ResumeData)]);
-            }
+            // Private: its trackers and own list.
+            let discovery = Discovery::added(true, &opts);
+            let finders = stand_ins();
+            let (started, named) = run(&session, &finders, Asked::Run(discovery)).await;
+            assert_eq!(own(&started), vec![Tracker, ResumeData], "{discovery:?}");
+            assert_eq!(named, vec![(addr(1), Tracker), (addr(2), ResumeData)]);
             // Public: every finder its options leave on.
             let finders = stand_ins();
-            let discovery = Discovery::added(false, &opts(false));
+            let discovery = Discovery::added(false, &opts);
             let (started, _) = run(&session, &finders, Asked::Run(discovery)).await;
             let mut want = vec![Tracker, ResumeData];
             want.extend((!disable_dht).then_some(Dht));

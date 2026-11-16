@@ -29,7 +29,8 @@ pub use weaver_utp::{
 };
 
 pub use crate::core::net::{
-    BoxFuture, DatagramSend, DatagramSocket, Fragmenting, NoNames, Resolved, Resolver,
+    BoxFuture, DatagramSend, DatagramSocket, Departure, DepartureSlot, Fragmenting, NoNames,
+    RecordsDeparture, Resolved, Resolver,
 };
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 pub use crate::vectored_traits::{
@@ -164,9 +165,8 @@ pub trait SocketFactory: Send + Sync + 'static {
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>>;
 
     /// Bind the datagram socket uTP runs over on `addr`, with a receive
-    /// buffer of `receive_buffer` bytes where the factory sets one, and its
-    /// datagrams never fragmented. A factory that sets neither binds it as
-    /// any other.
+    /// buffer of `receive_buffer` bytes where the factory sets one. A factory
+    /// that sets none binds it as any other.
     fn bind_utp<'a>(
         &'a self,
         addr: SocketAddr,
@@ -1047,9 +1047,9 @@ pub(crate) struct KernelUdp {
     unregistered: parking_lot::Mutex<Option<std::net::UdpSocket>>,
     local: SocketAddr,
     dual_stack: bool,
-    // Held by the sends that test a uTP path's size alone: a send that
-    // allows fragmenting, while don't-fragment is off, and a size probe, so
-    // it never goes out while it is off. Ordinary sends never take it.
+    // Held by the sends that test a uTP path's size alone: a size probe,
+    // while don't-fragment is on, and a send given up on as too large, so it
+    // never goes out while it is on. Ordinary sends never take it.
     size_sends: parking_lot::Mutex<()>,
     // The host can send several datagrams in one call on this socket.
     runs: bool,
@@ -1336,9 +1336,10 @@ impl KernelUdp {
 }
 
 /// A kernel datagram socket bound at `requested`, made for uTP to run over,
-/// as [`SocketFactory::bind_utp`] asks: its datagrams never fragmented, its
-/// receive buffer `receive_buffer` bytes as far as the host allows, and its
-/// I/O registered by uTP with the runtime uTP reads and sends it on.
+/// as [`SocketFactory::bind_utp`] asks: its receive buffer `receive_buffer`
+/// bytes as far as the host allows, its datagrams fragmented as the host
+/// does, all but its size probes to IPv4 peers, and its I/O registered by
+/// uTP with the runtime uTP reads and sends it on.
 pub fn utp_datagrams(
     socket: std::net::UdpSocket,
     requested: SocketAddr,
@@ -1514,12 +1515,13 @@ impl DatagramSocket for KernelUdp {
     }
 
     // One datagram from every slice, as the vectored send above, under the
-    // socket's lock for sends that test the path's size. One that may be
-    // fragmented goes with don't-fragment off for its family, switched on
-    // again before the lock is released. An ordinary datagram another task
-    // sends inside that window may go out without don't-fragment too; that
-    // is harmless, as it is no larger than the size the path has proven,
-    // and the DHT's and trackers' datagrams keep no such setting.
+    // socket's lock for sends that test the path's size. A probe to an IPv4
+    // peer goes with don't-fragment on, switched off again before the lock
+    // is released; one given up on as too large goes as any datagram, which
+    // the socket lets the path fragment. An ordinary datagram another task
+    // sends inside a probe's window may go out with don't-fragment too, as
+    // libtorrent's own sends may on its shared socket; one the host refuses
+    // as too large goes again as given up on.
     fn poll_send_to_vectored_fragmenting(
         &self,
         cx: &mut Context<'_>,
@@ -1544,10 +1546,8 @@ impl DatagramSocket for KernelUdp {
                     let send =
                         || socket2::SockRef::from(socket).send_to_vectored(bufs, &target.into());
                     match fragmenting {
-                        Fragmenting::Never => send(),
-                        Fragmenting::Allowed => {
-                            crate::udp_options::send_fragmenting(socket, family, send)
-                        }
+                        Fragmenting::Never => crate::udp_options::send_probe(socket, family, send),
+                        Fragmenting::Allowed => send(),
                     }
                 })
             };

@@ -134,13 +134,12 @@ const RESTORES_AT_ONCE: usize = 8;
 pub const CHECKPOINT_PIECES: u32 = 16;
 
 // What a torrent's session holds its peers to under its tracker rule:
-// whether it takes them from its trackers alone, whether it looks for them
-// on the DHT, on the local network and by peer exchange, and the encryption
+// whether it looks for them on the DHT, on the local network and by peer
+// exchange, each switch on its own, and the encryption
 // its connections are made under over the session's. A change of any takes
 // the torrent through its session again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PeerTerms {
-    trackers_only: bool,
     disable_dht: bool,
     disable_pex: bool,
     disable_lsd: bool,
@@ -154,7 +153,6 @@ impl PeerTerms {
         let off =
             |field: &Field<bool>| settings.levels(field, None, None, rule).resolve() == Some(false);
         Self {
-            trackers_only: rule.is_some_and(TrackerRule::trackers_only),
             disable_dht: off(&DHT),
             disable_pex: off(&PEX),
             disable_lsd: off(&LSD),
@@ -164,7 +162,6 @@ impl PeerTerms {
 
     // `options` under these terms.
     fn apply(self, options: &mut AddTorrentOptions) {
-        options.trackers_only = self.trackers_only;
         options.disable_dht = self.disable_dht;
         options.disable_pex = self.disable_pex;
         options.disable_lsd = self.disable_lsd;

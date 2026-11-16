@@ -161,8 +161,6 @@ pub(crate) struct ManagedTorrentOptions {
     /// Every live run picks through this one flag, so a change reaches the
     /// running peers and outlives pause/unpause.
     pub sequential: AtomicBool,
-    /// [`AddTorrentOptions::trackers_only`](crate::AddTorrentOptions::trackers_only).
-    pub trackers_only: bool,
     /// [`AddTorrentOptions::disable_dht`](crate::AddTorrentOptions::disable_dht).
     pub disable_dht: bool,
     /// [`AddTorrentOptions::disable_lsd`](crate::AddTorrentOptions::disable_lsd).
@@ -494,38 +492,34 @@ impl ManagedTorrent {
         &self.shared.options.output_folder
     }
 
-    /// Whether the torrent takes peers from its trackers alone (see
-    /// [`AddTorrentOptions::trackers_only`](crate::AddTorrentOptions::trackers_only)):
-    /// its metainfo marks it private, or it was added so.
-    pub fn takes_peers_from_trackers_only(&self) -> bool {
-        crate::session::trackers_only(
-            self.with_metadata(|m| m.info.info().private)
-                .unwrap_or(false),
-            self.shared.options.trackers_only,
-        )
+    /// Whether its metainfo marks the torrent private (BEP 27): it takes
+    /// peers from its trackers alone. Nothing else makes a torrent so; a
+    /// torrent whose metadata has not arrived is not.
+    pub fn is_private(&self) -> bool {
+        self.with_metadata(|m| m.info.info().private)
+            .unwrap_or(false)
     }
 
     /// Where the torrent looks for peers beside its trackers: none when it
-    /// takes them from its trackers alone, else the DHT and the local
-    /// network unless it was added without either.
+    /// is private, else the DHT and the local network unless it was added
+    /// without either.
     pub fn discovery(&self) -> crate::session::Discovery {
         crate::session::Discovery::of(
-            self.takes_peers_from_trackers_only(),
+            self.is_private(),
             self.shared.options.disable_dht,
             self.shared.options.disable_lsd,
         )
     }
 
     /// Whether the torrent speaks peer exchange: its session runs it, it
-    /// was not added without it, and it takes peers from more than its
-    /// trackers.
+    /// was not added without it, and it is not private.
     pub fn speaks_pex(&self) -> bool {
         crate::session::speaks_pex(
             self.shared
                 .session
                 .upgrade()
                 .is_some_and(|session| !session.disable_pex),
-            self.takes_peers_from_trackers_only(),
+            self.is_private(),
             self.shared.options.disable_pex,
         )
     }
@@ -1107,7 +1101,7 @@ impl ManagedTorrent {
         else {
             return;
         };
-        status.replace(session.announce_tiers(tiers, self.takes_peers_from_trackers_only()));
+        status.replace(session.announce_tiers(tiers, self.is_private()));
     }
 
     /// Adds `tiers` after the torrent's last tier, a tracker it has already

@@ -133,7 +133,8 @@ async fn the_tighter_of_a_torrents_limit_and_its_upload_cap_holds() {
 }
 
 // A tracker rule's terms reach its torrents: one admitted under it starts
-// forced, takes peers from its trackers alone, makes its connections under
+// forced, looks for peers on none of the DHT, local discovery and peer
+// exchange while staying public, makes its connections under
 // the rule's encryption and uploads under the rule's limit in place of the
 // global seeding cap. A change of the rule reaches the running torrent at
 // the next tick, through its session again; a torrent under no rule keeps
@@ -199,11 +200,19 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
     assert!(rig.db.get_torrent(ruled).unwrap().unwrap().forced);
     assert!(!rig.service.torrent(unruled).await.unwrap().forced);
     let handle = handle_of(&rig.service, ruled).await;
-    assert!(handle.takes_peers_from_trackers_only());
+    assert!(!handle.is_private());
+    assert_eq!(
+        handle.discovery(),
+        weaver_torrent::Discovery {
+            dht: false,
+            lsd: false
+        }
+    );
+    assert!(!handle.speaks_pex());
     assert_eq!(handle.encryption(), Some(EncryptionPolicy::Prefer));
     assert_eq!(handle.ratelimits().upload_bps, LimitKind::Unlimited);
     let other = handle_of(&rig.service, unruled).await;
-    assert!(!other.takes_peers_from_trackers_only());
+    assert!(other.discovery().dht && other.discovery().lsd && other.speaks_pex());
     assert_eq!(other.encryption(), None);
     assert_eq!(other.ratelimits().upload_bps, bps(2_000));
 
@@ -224,7 +233,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
     rig.service.tick().await;
     let again = handle_of(&rig.service, ruled).await;
     assert!(!Arc::ptr_eq(&handle, &again));
-    assert!(!again.takes_peers_from_trackers_only());
+    assert!(again.discovery().dht && again.discovery().lsd && again.speaks_pex());
     assert_eq!(again.encryption(), Some(EncryptionPolicy::Require));
     assert_eq!(again.ratelimits().upload_bps, bps(1_000));
     assert!(Arc::ptr_eq(&other, &handle_of(&rig.service, unruled).await));
@@ -234,8 +243,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
 
 // Each of a tracker rule's DHT, peer exchange and local discovery switches
 // reaches its torrents on its own: one turned off holds them off that one
-// source, one unset leaves it on, and a torrent with any source left is not
-// held to its trackers. A change reaches the running torrent at the next
+// source, one unset leaves it on, and the torrent stays public. A change reaches the running torrent at the next
 // tick, through its session again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rules_dht_pex_and_lsd_each_reach_its_torrents() {
@@ -271,7 +279,7 @@ async fn a_tracker_rules_dht_pex_and_lsd_each_reach_its_torrents() {
         .unwrap();
 
     let handle = handle_of(&rig.service, ruled).await;
-    assert!(!handle.takes_peers_from_trackers_only());
+    assert!(!handle.is_private());
     assert_eq!(
         handle.discovery(),
         Discovery {
@@ -296,7 +304,7 @@ async fn a_tracker_rules_dht_pex_and_lsd_each_reach_its_torrents() {
     rig.service.tick().await;
     let again = handle_of(&rig.service, ruled).await;
     assert!(!Arc::ptr_eq(&handle, &again));
-    assert!(!again.takes_peers_from_trackers_only());
+    assert!(!again.is_private());
     assert_eq!(
         again.discovery(),
         Discovery {

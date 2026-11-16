@@ -152,24 +152,30 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.decode_threads, 16);
     assert_eq!(performance.extract_threads, 8);
     assert_eq!(performance.max_concurrent_downloads_cap, None);
-    assert_eq!(performance.wireguard_usenet_receive_bytes, 1984 * 1024);
+    assert_eq!(performance.wireguard_usenet_receive_bytes, 4 * 1024 * 1024);
 }
 
-// On every profile a usenet socket holds no more of its tunnel's bytes than
-// a socket at the tunnel's own 2 MiB: its receive buffer and 64 KiB send
-// buffer come to at most that.
+// On every profile the tunnel gives a usenet socket the receive buffer the
+// profile names, unclamped, beside the 64 KiB send buffer.
 #[test]
-fn a_usenet_socket_holds_no_more_than_the_tunnels_own() {
+fn a_usenet_socket_gets_its_profiles_receive_buffer_whole() {
     let large = machine(16, 32);
-    let tunnel_own = 2 * 1024 * 1024;
     for profile in [
         HardwareProfile::Efficient,
         HardwareProfile::Balanced,
         HardwareProfile::Performance,
     ] {
-        let usenet = profile.tuning(&large).wireguard_usenet_receive_bytes
-            + weaver_tunnel::pipe::USENET_SEND_BYTES;
-        assert!(usenet <= tunnel_own, "{profile:?}");
+        let receive = profile.tuning(&large).wireguard_usenet_receive_bytes;
+        let buffers = weaver_tunnel::wireguard::TcpBuffers::new(
+            receive,
+            weaver_tunnel::pipe::USENET_SEND_BYTES,
+        );
+        assert_eq!(buffers.receive(), receive, "{profile:?}");
+        assert_eq!(
+            buffers.send(),
+            weaver_tunnel::pipe::USENET_SEND_BYTES,
+            "{profile:?}"
+        );
     }
 }
 

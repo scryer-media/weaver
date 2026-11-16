@@ -1458,7 +1458,7 @@ async fn test_private_torrent_announces_only_to_its_own_tiers() {
     .await
     .unwrap();
 
-    let add = |name: &'static str, private: bool, trackers_only: bool| {
+    let add = |name: &'static str, private: bool, all_off: bool| {
         let session = session.clone();
         let output_folder = dir.path().join(name).to_str().unwrap().to_owned();
         async move {
@@ -1469,7 +1469,9 @@ async fn test_private_torrent_announces_only_to_its_own_tiers() {
                         paused: true,
                         output_folder: Some(output_folder),
                         trackers: Some(vec!["http://added.test/announce".to_owned()]),
-                        trackers_only,
+                        disable_dht: all_off,
+                        disable_lsd: all_off,
+                        disable_pex: all_off,
                         ..Default::default()
                     }),
                 )
@@ -1481,35 +1483,35 @@ async fn test_private_torrent_announces_only_to_its_own_tiers() {
     };
 
     let private = add("private", true, false).await;
-    assert!(private.takes_peers_from_trackers_only());
+    assert!(private.is_private());
     assert_eq!(private.shared().tracker_tiers(), own_tiers());
     assert_eq!(
         session.announce_tiers(private.shared().tracker_tiers(), true),
         own_tiers()
     );
 
-    // A torrent its metainfo does not mark private, added to take peers
-    // from its trackers alone, is held to the same.
-    let trackers_only = add("trackers_only", false, true).await;
-    assert!(trackers_only.takes_peers_from_trackers_only());
-    assert_eq!(trackers_only.shared().tracker_tiers(), own_tiers());
-    assert_eq!(
-        session.announce_tiers(
-            trackers_only.shared().tracker_tiers(),
-            trackers_only.takes_peers_from_trackers_only()
-        ),
-        own_tiers()
-    );
-
     let public = add("public", false, false).await;
-    assert!(!public.takes_peers_from_trackers_only());
+    assert!(!public.is_private());
     let mut with_added = own_tiers();
     with_added.push(operator("http://added.test/announce"));
     assert_eq!(public.shared().tracker_tiers(), with_added);
-    let mut with_session = with_added;
+    let mut with_session = with_added.clone();
     with_session.push(operator("http://session.test/announce"));
     assert_eq!(
-        session.announce_tiers(public.shared().tracker_tiers(), false),
+        session.announce_tiers(public.shared().tracker_tiers(), public.is_private()),
+        with_session
+    );
+
+    // A public torrent added without the DHT, local discovery and peer
+    // exchange is still public: it announces to the added and the
+    // session's trackers as any public one does. libtorrent's
+    // `disable_dht`, `disable_lsd` and `disable_pex` touch no tracker;
+    // only `priv()` keeps a torrent from them.
+    let all_off = add("all_off", false, true).await;
+    assert!(!all_off.is_private());
+    assert_eq!(all_off.shared().tracker_tiers(), with_added);
+    assert_eq!(
+        session.announce_tiers(all_off.shared().tracker_tiers(), all_off.is_private()),
         with_session
     );
 
@@ -1520,8 +1522,9 @@ async fn test_private_torrent_announces_only_to_its_own_tiers() {
 // added without the DHT or the local network looks for peers on neither,
 // while the session runs them for its other torrents. A private torrent
 // looks on neither whatever it was added with
-// (`torrent::should_announce_dht`, `torrent::lsd_announce`), and neither
-// does one added to take peers from its trackers alone.
+// (`torrent::should_announce_dht`, `torrent::lsd_announce`). A public
+// torrent added without all three of the DHT, local discovery and peer
+// exchange stays public: each flag turns off its own source only.
 #[tokio::test]
 async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
     use crate::lsd::RecordingSocket;
@@ -1571,6 +1574,7 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
 
     let public = add("public", false, AddTorrentOptions::default()).await;
     assert_eq!(public.discovery(), everywhere);
+    assert!(public.speaks_pex());
     let no_dht = add(
         "no_dht",
         false,
@@ -1587,6 +1591,35 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
             lsd: true
         }
     );
+    assert!(no_dht.speaks_pex());
+    let no_lsd = add(
+        "no_lsd",
+        false,
+        AddTorrentOptions {
+            disable_lsd: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        no_lsd.discovery(),
+        Discovery {
+            dht: true,
+            lsd: false
+        }
+    );
+    assert!(no_lsd.speaks_pex());
+    let no_pex = add(
+        "no_pex",
+        false,
+        AddTorrentOptions {
+            disable_pex: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(no_pex.discovery(), everywhere);
+    assert!(!no_pex.speaks_pex());
     let neither = add(
         "neither",
         false,
@@ -1600,16 +1633,20 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
     assert_eq!(neither.discovery(), nowhere);
     let private = add("private", true, AddTorrentOptions::default()).await;
     assert_eq!(private.discovery(), nowhere);
-    let trackers_only = add(
-        "trackers_only",
+    let all_off = add(
+        "all_off",
         false,
         AddTorrentOptions {
-            trackers_only: true,
+            disable_dht: true,
+            disable_lsd: true,
+            disable_pex: true,
             ..Default::default()
         },
     )
     .await;
-    assert_eq!(trackers_only.discovery(), nowhere);
+    assert_eq!(all_off.discovery(), nowhere);
+    assert!(!all_off.is_private());
+    assert!(!all_off.speaks_pex());
 
     // The session runs local discovery: a torrent that looks there is
     // handed its peers, one that looks nowhere is handed none.
@@ -1625,6 +1662,8 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
     };
     assert!(peers(&public).is_some());
     assert!(peers(&no_dht).is_some());
+    assert!(peers(&no_lsd).is_none());
+    assert!(peers(&no_pex).is_some());
     assert!(peers(&neither).is_none());
     assert!(peers(&private).is_none());
 

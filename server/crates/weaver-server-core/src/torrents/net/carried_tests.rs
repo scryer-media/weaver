@@ -132,9 +132,13 @@ async fn carried_utp_packet_bound_includes_the_active_send_and_wakes_the_oldest_
     let waker = Waker::from(Arc::clone(&one));
     assert!(
         one_sender
-            .poll_enqueue(&mut Context::from_waker(&waker), 1, target, || panic!(
-                "a full queue must not copy a packet"
-            ))
+            .poll_enqueue(
+                &mut Context::from_waker(&waker),
+                1,
+                target,
+                || panic!("a full queue must not copy a packet"),
+                || panic!("a full queue must not keep a departure"),
+            )
             .is_pending()
     );
     let sends = carried.sends.as_ref().unwrap();
@@ -424,4 +428,99 @@ async fn carried_utp_canceled_senders_unregister_while_live_senders_still_progre
     ));
     assert_eq!(waiters(), 0);
     carried.shutdown().await.unwrap();
+}
+
+// The departures recorded for the uTP data packets a test queues.
+#[derive(Default)]
+struct Departed {
+    at: Mutex<Vec<Option<tokio::time::Instant>>>,
+    recorded: tokio::sync::Notify,
+}
+
+impl weaver_torrent::network::RecordsDeparture for Departed {
+    fn record(&self, at: Option<tokio::time::Instant>) {
+        self.at.lock().unwrap().push(at);
+        self.recorded.notify_one();
+    }
+}
+
+impl Departed {
+    // Waits until `count` departures are recorded; what they are.
+    async fn first(&self, count: usize) -> Vec<Option<tokio::time::Instant>> {
+        loop {
+            let at = self.at.lock().unwrap().clone();
+            if at.len() >= count {
+                return at;
+            }
+            self.recorded.notified().await;
+        }
+    }
+}
+
+// libtorrent stamps a uTP packet as late as it can, just before its send
+// (utp_stream.cpp v2.0.15:1789-1793), and times it from then. A data packet
+// queued for the tunnel at t0 while the worker is held on a packet ahead,
+// and handed to the tunnel at t1, departs at t1. One the tunnel refuses for
+// its target, one in the tunnel's hands and one still queued when the
+// socket stops never left.
+#[tokio::test(start_paused = true)]
+async fn carried_utp_a_data_packet_departs_when_the_worker_hands_it_to_the_tunnel() {
+    let (socket, mut observed, results) = controlled(None);
+    let carried = Carried::new(socket, ([0, 0, 0, 0], 0).into(), true);
+    let target = ([198, 51, 100, 1], 7001).into();
+    let refused = "[2001:db8::1]:7001".parse().unwrap();
+    // The worker is held on the packet ahead.
+    accepted(&carried, b"ahead", target);
+    observed.recv().await.unwrap();
+
+    let departed = Arc::new(Departed::default());
+    let mut sender = carried.send_handle().unwrap();
+    let waker = Waker::from(Arc::new(Woken::default()));
+    let mut queue = |bytes: &'static [u8], to: SocketAddr| {
+        let departure = weaver_torrent::network::Departure::new(departed.clone());
+        sender.poll_enqueue(
+            &mut Context::from_waker(&waker),
+            bytes.len(),
+            to,
+            || bytes.to_vec(),
+            || Some(departure),
+        )
+    };
+    let queued_at = tokio::time::Instant::now();
+    for (bytes, to) in [
+        (&b"data"[..], target),
+        (&b"refused"[..], refused),
+        (&b"in hand"[..], target),
+        (&b"queued"[..], target),
+    ] {
+        assert!(matches!(queue(bytes, to), Poll::Ready(Ok(len)) if len == bytes.len()));
+    }
+    assert!(departed.at.lock().unwrap().is_empty());
+
+    // The worker's turn comes 250 ms later.
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    let handed_at = tokio::time::Instant::now();
+    assert!(handed_at > queued_at);
+    results.send(Ok(())).unwrap();
+    assert_eq!(observed.recv().await.unwrap(), (b"data".to_vec(), target));
+    results.send(Ok(())).unwrap();
+    assert_eq!(departed.first(1).await, [Some(handed_at)]);
+
+    assert_eq!(
+        observed.recv().await.unwrap(),
+        (b"refused".to_vec(), refused)
+    );
+    results
+        .send(Err(io::Error::new(
+            io::ErrorKind::NetworkUnreachable,
+            "unreachable",
+        )))
+        .unwrap();
+    assert_eq!(departed.first(2).await, [Some(handed_at), None]);
+
+    // The next is handed to the tunnel too; the socket stops before that
+    // send ends, with the last still queued.
+    observed.recv().await.unwrap();
+    carried.shutdown().await.unwrap();
+    assert_eq!(departed.first(4).await, [Some(handed_at), None, None, None]);
 }
