@@ -5,8 +5,9 @@
 // opens a stream per query. DNS over TLS (RFC 7858) and over HTTPS (RFC
 // 8484) wrap the stream the stage dials in TLS, and keep that one
 // connection for the lookup's queries while the server keeps it open.
-use super::{Carrier, DnsServer, Failed, Wire, dnssec::Dnssec};
+use super::{Carrier, DnsServer, Failed, Wire, dnssec::Dnssec, https::Connection};
 use crate::TunnelStream;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,9 +106,12 @@ impl DnsSessions {
 
 pub(super) type Tls = TlsStream<Box<dyn TunnelStream>>;
 
+// One query's reply, or why it got none.
+pub(super) type Reply = Result<Vec<u8>, Failed>;
+
 enum Link {
     Tls(Box<Tls>),
-    Https(Box<super::https::Connection>),
+    Https(Box<Connection>),
 }
 
 // One server, asked for one lookup.
@@ -179,131 +183,43 @@ impl<'a> Session<'a> {
                 Err(failed) => return Err(failed),
             }
         }
-        let mut link = self.connect(reached).await?;
+        let link = self.connect(reached).await?;
+        self.first(link, packet).await
+    }
+
+    // The first query on a connection just made. Unlike a kept one, it is
+    // not replaced if it closes before the reply.
+    async fn first(&mut self, mut link: Link, packet: &[u8]) -> Reply {
         self.sent(1);
         let reply = link.exchange(self.server, packet).await?;
         Ok(self.keep(link, reply))
     }
 
-    // The reply to each of `packets`, in order, each packet's first two
-    // bytes its id. Plain DNS dials a stream per query and asks them all at
-    // once. DNS over TLS writes them all on the one kept connection, then
-    // reads the replies in whatever order they come, matched by id. Over
-    // HTTP/2 the first opens or rides the kept connection and the rest go
-    // out on it together, one stream each; a stream that found the
-    // connection gone is asked again as `ask` would. HTTP/1.1 asks them in
-    // turn on its kept connection. A server that cannot be reached, or fails
-    // TLS, fails the whole batch, as does a DNS over TLS reply whose id no
-    // query of the batch went out with.
-    pub(super) async fn ask_all(
-        &mut self,
-        packets: &[Vec<u8>],
-        reached: &mut bool,
-    ) -> Result<Vec<Result<Vec<u8>, Failed>>, Failed> {
-        match self.server.wire {
-            Wire::Plain => {
-                plain_all(self.provider, self.server, self.counts, packets, reached).await
-            }
-            Wire::Tls { .. } => self.pipelined(packets, reached).await,
-            Wire::Https { .. } => self.https_all(packets, reached).await,
+    // A talk with the server: queries given one at a time, each sent as it
+    // is given while others are still out, and each reply handed back as it
+    // comes. `reached` is set once the server answers a dial. The talk's
+    // connections are its own, and go when it is dropped.
+    pub(super) fn talk<'s>(&'s mut self, reached: &'s mut bool) -> Talk<'s, 'a> {
+        let flight = match self.server.wire {
+            Wire::Plain => Flight::Plain {
+                calls: Vec::new(),
+                dialled: Arc::new(AtomicBool::new(false)),
+            },
+            Wire::Tls { .. } => Flight::Tls {
+                stream: None,
+                answered: 0,
+                out: BTreeMap::new(),
+                wary: false,
+            },
+            Wire::Https { .. } => Flight::Https(Box::default()),
+        };
+        Talk {
+            session: self,
+            reached,
+            waiting: VecDeque::new(),
+            ready: VecDeque::new(),
+            flight,
         }
-    }
-
-    async fn https_all(
-        &mut self,
-        packets: &[Vec<u8>],
-        reached: &mut bool,
-    ) -> Result<Vec<Result<Vec<u8>, Failed>>, Failed> {
-        let mut replies = Vec::with_capacity(packets.len());
-        let mut packets = packets.iter();
-        while let Some(packet) = packets.next() {
-            let together = packets.len() > 0
-                && matches!(&self.link, Some(Link::Https(connection)) if connection.multiplexes());
-            if !together {
-                replies.push(ends(self.ask(packet, reached).await)?);
-                continue;
-            }
-            let rest: Vec<Vec<u8>> = std::iter::once(packet)
-                .chain(packets.by_ref())
-                .cloned()
-                .collect();
-            let Some(Link::Https(mut connection)) = self.link.take() else {
-                unreachable!("checked above")
-            };
-            *reached = true;
-            let Wire::Https { path } = &self.server.wire else {
-                unreachable!("an HTTPS link is kept only for an HTTPS server")
-            };
-            self.sent(rest.len());
-            let (answered, open) = connection.exchange_all(self.server, path, &rest).await;
-            if open {
-                self.link = Some(Link::Https(connection));
-            }
-            for (packet, reply) in rest.iter().zip(answered) {
-                let reply = match reply {
-                    Err(Failed::Closed) => self.ask(packet, reached).await,
-                    reply => reply,
-                };
-                replies.push(ends(reply)?);
-            }
-        }
-        Ok(replies)
-    }
-
-    // DNS over TLS: the batch written at once on the kept connection, or a
-    // new one, and the replies read as they come. A connection that closes
-    // before every reply came is replaced for the rest, as `ask` replaces
-    // it: a kept one always, a new one only after it answered something. So
-    // a batch opens at most one connection per query, and one more.
-    async fn pipelined(
-        &mut self,
-        packets: &[Vec<u8>],
-        reached: &mut bool,
-    ) -> Result<Vec<Result<Vec<u8>, Failed>>, Failed> {
-        let mut replies: Vec<Option<Result<Vec<u8>, Failed>>> =
-            packets.iter().map(|_| None).collect();
-        loop {
-            let waiting: Vec<usize> = (0..packets.len())
-                .filter(|at| replies[*at].is_none())
-                .collect();
-            if waiting.is_empty() {
-                break;
-            }
-            let (mut stream, kept) = match self.link.take() {
-                Some(Link::Tls(stream)) => {
-                    *reached = true;
-                    (stream, true)
-                }
-                Some(Link::Https(_)) => {
-                    unreachable!("an HTTPS link is kept only for an HTTPS server")
-                }
-                None => match self.connect(reached).await? {
-                    Link::Tls(stream) => (stream, false),
-                    Link::Https(_) => unreachable!("a TLS server opens a TLS link"),
-                },
-            };
-            self.sent(waiting.len());
-            let (piped, answered) =
-                pipeline(stream.as_mut(), packets, &waiting, &mut replies).await;
-            let failed: fn() -> Failed = match piped {
-                Piped::Done => {
-                    self.link = Some(Link::Tls(stream));
-                    break;
-                }
-                Piped::Closed if kept || answered > 0 => continue,
-                Piped::Stranger => return Err(Failed::Invalid),
-                Piped::Closed => || Failed::Closed,
-                Piped::Cut => || Failed::Cut,
-                Piped::Invalid => || Failed::Invalid,
-            };
-            for reply in replies.iter_mut().filter(|reply| reply.is_none()) {
-                *reply = Some(Err(failed()));
-            }
-        }
-        Ok(replies
-            .into_iter()
-            .map(|reply| reply.unwrap_or(Err(Failed::Invalid)))
-            .collect())
     }
 
     fn keep(&mut self, link: Link, (reply, open): (Vec<u8>, bool)) -> Vec<u8> {
@@ -314,37 +230,42 @@ impl<'a> Session<'a> {
     }
 
     async fn connect(&mut self, reached: &mut bool) -> Result<Link, Failed> {
-        let (config, name) = match &self.server.wire {
-            Wire::Tls { name } => (&self.wires.dot, name.as_deref()),
-            Wire::Https { .. } => (&self.wires.doh, None),
-            Wire::Plain => unreachable!("plain DNS keeps no connection"),
-        };
-        // The certificate must name the server's address, or the name given.
-        let verified = match name {
-            Some(name) => {
-                ServerName::try_from(name.to_owned()).map_err(|_| Failed::Tls(NOT_A_SERVER_NAME))?
-            }
-            None => ServerName::IpAddress(self.server.address.ip().into()),
-        };
-        let stream = self
-            .provider
-            .open(self.server)
-            .await
-            .map_err(Failed::Unreached)?;
-        *reached = true;
-        // A failed handshake or certificate fails this server. It is never
-        // asked in plain instead.
-        let tls = TlsConnector::from(config.clone())
-            .connect(verified, stream)
-            .await
-            .map_err(|error| Failed::Tls(reason(&error)))?;
-        if let Wire::Tls { .. } = self.server.wire {
-            return Ok(Link::Tls(Box::new(tls)));
-        }
-        Ok(Link::Https(Box::new(
-            super::https::Connection::new(tls).await?,
-        )))
+        dial(self.provider, self.wires, self.server, || *reached = true).await
     }
+}
+
+// A new connection to `server` over its encrypted wire. `reached` is called
+// once the server answers the dial, before the handshake.
+async fn dial(
+    provider: &dyn Carrier,
+    wires: &Wires,
+    server: &DnsServer,
+    reached: impl FnOnce(),
+) -> Result<Link, Failed> {
+    let (config, name) = match &server.wire {
+        Wire::Tls { name } => (&wires.dot, name.as_deref()),
+        Wire::Https { .. } => (&wires.doh, None),
+        Wire::Plain => unreachable!("plain DNS keeps no connection"),
+    };
+    // The certificate must name the server's address, or the name given.
+    let verified = match name {
+        Some(name) => {
+            ServerName::try_from(name.to_owned()).map_err(|_| Failed::Tls(NOT_A_SERVER_NAME))?
+        }
+        None => ServerName::IpAddress(server.address.ip().into()),
+    };
+    let stream = provider.open(server).await.map_err(Failed::Unreached)?;
+    reached();
+    // A failed handshake or certificate fails this server. It is never
+    // asked in plain instead.
+    let tls = TlsConnector::from(config.clone())
+        .connect(verified, stream)
+        .await
+        .map_err(|error| Failed::Tls(reason(&error)))?;
+    if let Wire::Tls { .. } = server.wire {
+        return Ok(Link::Tls(Box::new(tls)));
+    }
+    Ok(Link::Https(Box::new(Connection::new(tls).await?)))
 }
 
 // Why a TLS connection failed, in a few fixed words. Nothing the peer sent,
@@ -355,7 +276,8 @@ const UNKNOWN_ISSUER: &str = "unknown issuer";
 const OUT_OF_DATE: &str = "certificate expired or not yet valid";
 const OTHER_CERTIFICATE: &str = "other certificate error";
 const HANDSHAKE: &str = "handshake failed";
-const CLOSED: &str = "connection closed";
+const RESET: &str = "connection reset by the server";
+const CLOSED: &str = "connection closed by the server";
 
 fn reason(error: &std::io::Error) -> &'static str {
     use tokio_rustls::rustls::Error;
@@ -363,7 +285,7 @@ fn reason(error: &std::io::Error) -> &'static str {
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<Error>())
     else {
-        return CLOSED;
+        return io_reason(error.kind());
     };
     match error {
         Error::InvalidCertificate(
@@ -378,6 +300,28 @@ fn reason(error: &std::io::Error) -> &'static str {
         ) => OUT_OF_DATE,
         Error::InvalidCertificate(_) => OTHER_CERTIFICATE,
         _ => HANDSHAKE,
+    }
+}
+
+// Why the stream under a TLS connection failed: the server reset it or ended
+// it, or else the kind of I/O error by name, never its message.
+fn io_reason(kind: std::io::ErrorKind) -> &'static str {
+    use std::io::ErrorKind;
+    match kind {
+        ErrorKind::ConnectionReset => RESET,
+        ErrorKind::UnexpectedEof => CLOSED,
+        ErrorKind::ConnectionAborted => "I/O error: ConnectionAborted",
+        ErrorKind::BrokenPipe => "I/O error: BrokenPipe",
+        ErrorKind::NotConnected => "I/O error: NotConnected",
+        ErrorKind::TimedOut => "I/O error: TimedOut",
+        ErrorKind::Interrupted => "I/O error: Interrupted",
+        ErrorKind::WriteZero => "I/O error: WriteZero",
+        ErrorKind::InvalidData => "I/O error: InvalidData",
+        ErrorKind::InvalidInput => "I/O error: InvalidInput",
+        ErrorKind::WouldBlock => "I/O error: WouldBlock",
+        ErrorKind::OutOfMemory => "I/O error: OutOfMemory",
+        ErrorKind::Other => "I/O error: Other",
+        _ => "I/O error: other kind",
     }
 }
 
@@ -409,125 +353,685 @@ fn sent(counts: bool, queries: usize) {
     }
 }
 
-// A batch's failure for the server: one that cannot be reached, or fails
-// TLS, would fail every other query the same way.
-fn ends(reply: Result<Vec<u8>, Failed>) -> Result<Result<Vec<u8>, Failed>, Failed> {
-    match reply {
-        Err(failed @ (Failed::Unreached(_) | Failed::Tls(_))) => Err(failed),
-        reply => Ok(reply),
-    }
+// Plain DNS streams dialled at once for one server. A lookup's DNSSEC check
+// can need some forty queries, each its own TCP stream through the route;
+// eight in flight keeps one lookup well inside the TCP children a resolver
+// serves at once (dnsmasq allows 20, Pi-hole's build 60) while still
+// carrying both families' widest round together.
+const PLAIN_DIALS: usize = 8;
+
+// The times one query goes out on a kept connection, DNS over TLS or an
+// HTTP/2 stream: the first, and up to two more after the connection went
+// with it unanswered, or its stream was refused. Queries out together can
+// all find their connection gone, and on the next one the server's limit on
+// streams at once is not known until its settings come.
+const SENDS: u8 = 3;
+
+// A query given to a talk, the lanes that want it, lowest first, whether
+// one of them cannot go on without its reply, the lane it goes out in, and
+// how many times it has gone out.
+struct Asked {
+    key: usize,
+    lanes: Vec<usize>,
+    awaited: bool,
+    lane: usize,
+    packet: Vec<u8>,
+    sends: u8,
 }
 
-// Plain DNS: a stream dialled for each of `packets`, all at once, on the
-// same route to the same server, and each query asked on its own. `reached`
-// is set as soon as any dial is answered, so a batch cut off by the ceiling
-// still says so. The first dial that fails ends the batch.
-async fn plain_all(
-    provider: &dyn Carrier,
-    server: &DnsServer,
-    counts: bool,
-    packets: &[Vec<u8>],
-    reached: &mut bool,
-) -> Result<Vec<Result<Vec<u8>, Failed>>, Failed> {
-    type Call<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, Failed>> + Send + 'a>>;
-    let dialled = AtomicBool::new(false);
-    let dialled = &dialled;
-    let mut calls: Vec<Call<'_>> = packets
-        .iter()
-        .map(|packet| {
-            Box::pin(async move {
-                let mut stream = provider.open(server).await.map_err(Failed::Unreached)?;
-                dialled.store(true, Ordering::Relaxed);
-                sent(counts, 1);
-                framed(&mut stream, packet).await
-            }) as Call<'_>
-        })
-        .collect();
-    let mut replies: Vec<Option<Result<Vec<u8>, Failed>>> = packets.iter().map(|_| None).collect();
-    poll_fn(|cx| {
-        for (call, reply) in calls.iter_mut().zip(replies.iter_mut()) {
-            if reply.is_none()
-                && let Poll::Ready(answered) = call.as_mut().poll(cx)
-            {
-                *reply = Some(answered);
+// Takes from `waiting` the queries whose turn has come, where each lane has
+// one query out at a time and `busy` says which lanes have one out. The
+// queries a lane cannot go on without come first, then those asked ahead,
+// each in the order they were given, and each goes in the lowest of its
+// lanes that has nothing out. So a query two lanes want goes in whichever
+// lane is free first, and a silent query asked ahead holds back nothing a
+// lane waits on. Each query goes out once. Each query sent has its lane
+// set; the rest stay waiting, in order.
+fn turns(waiting: &mut VecDeque<Asked>, busy: impl Fn(usize) -> bool) -> Vec<Asked> {
+    let mut going: Vec<Asked> = Vec::new();
+    for awaited in [true, false] {
+        let mut held = VecDeque::new();
+        for mut asked in waiting.drain(..) {
+            let free = asked.lanes.iter().copied().find(|lane| {
+                asked.awaited == awaited
+                    && !busy(*lane)
+                    && going.iter().all(|sent| sent.lane != *lane)
+            });
+            match free {
+                Some(lane) => {
+                    asked.lane = lane;
+                    going.push(asked);
+                }
+                None => held.push_back(asked),
             }
         }
-        if dialled.load(Ordering::Relaxed) {
-            *reached = true;
-        }
-        let ended = replies
-            .iter()
-            .any(|reply| matches!(reply, Some(Err(Failed::Unreached(_)))));
-        if ended || replies.iter().all(Option::is_some) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
-    drop(calls);
-    let mut answered = Vec::with_capacity(replies.len());
-    for reply in replies {
-        answered.push(ends(reply.unwrap_or(Err(Failed::Closed)))?);
+        *waiting = held;
     }
-    Ok(answered)
+    going
 }
 
-// How a pipelined batch on one connection ended.
-enum Piped {
-    // Every reply came.
-    Done,
-    // The connection closed between replies, or before the batch went out.
-    Closed,
-    // The connection closed part way through a reply.
-    Cut,
-    // A reply's length was out of bounds.
-    Invalid,
-    // A reply came with an id no waiting query went out with.
-    Stranger,
+type PlainCall<'a> = Pin<Box<dyn Future<Output = Reply> + Send + 'a>>;
+
+// One HTTP/1.1 query out, ending with its reply and the connection, when it
+// stays open for the next; or with the failure of the dial for it, the
+// query not sent.
+type OneCall<'a> =
+    Pin<Box<dyn Future<Output = Result<(Option<Box<Connection>>, Reply), Failed>> + Send + 'a>>;
+
+// What a talk has out on its wire.
+enum Flight<'a> {
+    // A stream per query, each with the caller's key. `dialled` is set by
+    // the first dial the server answers.
+    Plain {
+        calls: Vec<(usize, PlainCall<'a>)>,
+        dialled: Arc<AtomicBool>,
+    },
+    // One connection, the queries written on it by id, and the replies read
+    // in whatever order they come. `answered` counts the replies the
+    // connection has given. `wary` once a connection that answered closed
+    // with queries out: from then on one query is out at a time.
+    Tls {
+        stream: Option<Box<Tls>>,
+        answered: usize,
+        out: BTreeMap<[u8; 2], Asked>,
+        wary: bool,
+    },
+    Https(Box<Https<'a>>),
 }
 
-// Writes the queries at `waiting` together, then reads one reply for each,
-// in any order, putting each in its query's slot of `replies` by id. Says
-// how it ended, and how many replies came.
-async fn pipeline<S>(
-    stream: &mut S,
-    packets: &[Vec<u8>],
-    waiting: &[usize],
-    replies: &mut [Option<Result<Vec<u8>, Failed>>],
-) -> (Piped, usize)
-where
-    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
-{
-    let mut ids = std::collections::BTreeMap::new();
-    let mut framed = Vec::new();
-    for at in waiting {
-        let packet = &packets[*at];
-        if let Some(id) = packet.get(..2) {
-            ids.insert([id[0], id[1]], *at);
+// What a talk has out over HTTPS. The first connection's handshake says
+// which HTTP the server speaks.
+#[derive(Default)]
+struct Https<'a> {
+    // HTTP/2: the one connection, and its streams out by key. `spent` once a
+    // stream found the connection gone: it takes no new stream, and goes
+    // once none is out. `wary` once a stream was dropped or refused: from
+    // then on each lane has at most one stream out, so a server that takes
+    // fewer streams than were sent answers each lane in turn, and a stream
+    // that stays silent holds up only its own lane. `old` is a spent
+    // connection whose streams still out run on beside `two`.
+    two: Option<Box<Connection>>,
+    old: Option<Box<Connection>>,
+    spent: bool,
+    wary: bool,
+    out: BTreeMap<usize, Asked>,
+    // HTTP/1.1, once a connection said so. Each lane asks in turn, one
+    // query out at a time, on a connection that is free, or on a new one
+    // when none is: so a query that stays silent holds up only its own
+    // lane, and the talk opens at most one connection per lane. Each free
+    // connection says whether it has answered before. `undialled` once a
+    // new connection could not be made: from then on a query waits for one
+    // of the talk's connections to come free, and a new one is dialled only
+    // when the talk has none out.
+    one: bool,
+    idle: Vec<(Box<Connection>, bool)>,
+    calls: Vec<(Asked, OneCall<'a>)>,
+    undialled: bool,
+}
+
+// One server's queries for one lookup, sent as they are given and answered
+// as they come, so a query that stays silent holds up only what waits on
+// its reply. Each key is the caller's own, one per query out at once.
+pub(super) struct Talk<'s, 'a> {
+    session: &'s mut Session<'a>,
+    reached: &'s mut bool,
+    // Given, not yet sent.
+    waiting: VecDeque<Asked>,
+    // Ended, not yet handed back.
+    ready: VecDeque<(usize, Reply)>,
+    flight: Flight<'a>,
+}
+
+impl<'a> Talk<'_, 'a> {
+    // Gives the server `packet`, its first two bytes the query's id, to be
+    // sent on the next call to `next`. A `lane` is one chain of queries, such
+    // as one family's: where queries go out one at a time, HTTP/1.1 and an
+    // HTTP/2 server that dropped or refused a stream, each lane has its own
+    // turn, so a query that stays silent holds up only its own lane.
+    // The lane cannot go on until the reply comes.
+    pub(super) fn send(&mut self, key: usize, lane: usize, packet: Vec<u8>) {
+        self.give(key, lane, true, packet);
+    }
+
+    // As `send`, for a query asked ahead of its need: where a lane takes
+    // its turn, a query it waits on goes before this one.
+    pub(super) fn ahead(&mut self, key: usize, lane: usize, packet: Vec<u8>) {
+        self.give(key, lane, false, packet);
+    }
+
+    fn give(&mut self, key: usize, lane: usize, awaited: bool, packet: Vec<u8>) {
+        self.waiting.push_back(Asked {
+            key,
+            lanes: vec![lane],
+            awaited,
+            lane,
+            packet,
+            sends: 0,
+        });
+    }
+
+    // Adds `lane` to the lanes that want the query given under `key`, while
+    // it waits to go out, and says whether the lane waits on it: it then
+    // goes out in the turn of whichever of them comes first.
+    pub(super) fn wanted_by(&mut self, key: usize, lane: usize, awaited: bool) {
+        for asked in self.waiting.iter_mut().filter(|asked| asked.key == key) {
+            asked.awaited |= awaited;
+            if let Err(at) = asked.lanes.binary_search(&lane) {
+                asked.lanes.insert(at, lane);
+            }
         }
-        framed.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-        framed.extend_from_slice(packet);
     }
-    if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
-        return (Piped::Closed, 0);
+
+    // Takes back the query given under `key` if it has not gone out yet:
+    // nothing waits on it any more. Whether it was taken back.
+    pub(super) fn withdraw(&mut self, key: usize) -> bool {
+        let before = self.waiting.len();
+        self.waiting.retain(|asked| asked.key != key);
+        self.waiting.len() < before
     }
-    let mut answered = 0;
-    while answered < waiting.len() {
-        let bytes = match reply(stream).await {
-            Ok(bytes) => bytes,
-            Err(Failed::Closed) => return (Piped::Closed, answered),
-            Err(Failed::Cut) => return (Piped::Cut, answered),
-            Err(_) => return (Piped::Invalid, answered),
+
+    // Sends what was given, and returns the next reply to come, with its
+    // query's key: None once nothing is given or out. A server that cannot
+    // be reached, or fails TLS, on the talk's first dial ends the talk with
+    // that failure; a later dial that fails fails only its own queries.
+    pub(super) async fn next(&mut self) -> Result<Option<(usize, Reply)>, Failed> {
+        match self.flight {
+            Flight::Plain { .. } => self.plain().await,
+            Flight::Tls { .. } => self.tls().await,
+            Flight::Https(_) => self.https().await,
+        }
+    }
+
+    // Plain DNS: a stream dialled for each query, at most `PLAIN_DIALS` at
+    // once. Until the server has answered a dial only one is dialled, so a
+    // route that reaches nothing is dialled once and fails the server. A
+    // dial that fails after one was answered fails only its own query.
+    async fn plain(&mut self) -> Result<Option<(usize, Reply)>, Failed> {
+        let Flight::Plain { calls, dialled } = &mut self.flight else {
+            unreachable!("a plain server talks in plain")
         };
-        // Each id is taken once: a second reply to one query is a stranger.
-        let Some(at) = ids.remove(&[bytes[0], bytes[1]]) else {
-            return (Piped::Stranger, answered);
-        };
-        replies[at] = Some(Ok(bytes));
-        answered += 1;
+        let (provider, server, counts) = (
+            self.session.provider,
+            self.session.server,
+            self.session.counts,
+        );
+        loop {
+            while calls.len() < PLAIN_DIALS && (calls.is_empty() || *self.reached) {
+                let Some(asked) = self.waiting.pop_front() else {
+                    break;
+                };
+                let dialled = dialled.clone();
+                let call: PlainCall<'a> = Box::pin(async move {
+                    let mut stream = provider.open(server).await.map_err(Failed::Unreached)?;
+                    dialled.store(true, Ordering::Relaxed);
+                    sent(counts, 1);
+                    framed(&mut stream, &asked.packet).await
+                });
+                calls.push((asked.key, call));
+            }
+            if calls.is_empty() {
+                return Ok(None);
+            }
+            let before = *self.reached;
+            let ended = poll_fn(|cx| {
+                for at in 0..calls.len() {
+                    if let Poll::Ready(reply) = calls[at].1.as_mut().poll(cx) {
+                        let (key, _) = calls.swap_remove(at);
+                        return Poll::Ready(Some((key, reply)));
+                    }
+                }
+                // The first dial was answered: start the rest.
+                if !before && dialled.load(Ordering::Relaxed) {
+                    return Poll::Ready(None);
+                }
+                Poll::Pending
+            })
+            .await;
+            *self.reached |= dialled.load(Ordering::Relaxed);
+            match ended {
+                None => continue,
+                Some((_, Err(failed @ Failed::Unreached(_)))) if !*self.reached => {
+                    return Err(failed);
+                }
+                ended => return Ok(ended),
+            }
+        }
     }
-    (Piped::Done, answered)
+
+    // A new connection for the queries waiting. The talk's first dial that
+    // fails ends the talk; a later one fails the queries waiting.
+    async fn connect(&mut self) -> Result<Option<Link>, Failed> {
+        let first = !*self.reached;
+        match self.session.connect(self.reached).await {
+            Ok(link) => Ok(Some(link)),
+            Err(failed) if first => Err(failed),
+            Err(failed) => {
+                for asked in self.waiting.drain(..) {
+                    self.ready.push_back((asked.key, Err(failed.copy())));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    // DNS over TLS: each query written on the connection as it is given,
+    // and the replies read one at a time, each matched to its query by id
+    // and question. A query waits while another with its id is out. A reply
+    // with no query's id is passed over, as plain DNS and HTTPS never see it;
+    // one with a query's id but another question fails that query, as it
+    // would there. A connection that closes with queries out after it
+    // answered something is replaced for them, so a talk opens at most one
+    // connection per reply, and one more. From then on the talk is wary:
+    // each connection has one query out at a time, one a lane waits on
+    // first, so on a server that closes after every reply a query goes out
+    // at most twice. Each query is written at most `SENDS` times; one the
+    // connection went with that often fails as closed.
+    async fn tls(&mut self) -> Result<Option<(usize, Reply)>, Failed> {
+        loop {
+            if let Some(ended) = self.ready.pop_front() {
+                return Ok(Some(ended));
+            }
+            let Flight::Tls { stream, out, .. } = &mut self.flight else {
+                unreachable!("a TLS server talks over TLS")
+            };
+            if self.waiting.is_empty() && out.is_empty() {
+                return Ok(None);
+            }
+            if stream.is_none() {
+                match self.connect().await? {
+                    Some(Link::Tls(connection)) => {
+                        let Flight::Tls {
+                            stream, answered, ..
+                        } = &mut self.flight
+                        else {
+                            unreachable!("a TLS server talks over TLS")
+                        };
+                        *stream = Some(connection);
+                        *answered = 0;
+                    }
+                    Some(Link::Https(_)) => unreachable!("a TLS server opens a TLS link"),
+                    None => {}
+                }
+                continue;
+            }
+            let Flight::Tls {
+                stream: Some(connection),
+                out,
+                wary,
+                ..
+            } = &mut self.flight
+            else {
+                unreachable!("a TLS server talks over TLS, on a connection made above")
+            };
+            let mut given = std::mem::take(&mut self.waiting);
+            if *wary {
+                // One query out at a time: one a lane waits on first.
+                let next = given
+                    .iter()
+                    .position(|asked| asked.awaited)
+                    .or((!given.is_empty()).then_some(0))
+                    .filter(|_| out.is_empty())
+                    .and_then(|at| given.remove(at));
+                self.waiting = given;
+                given = next.into_iter().collect();
+            }
+            let mut framed = Vec::new();
+            let mut sending = 0;
+            for mut asked in given {
+                let id = asked.packet.get(..2).map_or([0; 2], |id| [id[0], id[1]]);
+                if out.contains_key(&id) {
+                    self.waiting.push_back(asked);
+                    continue;
+                }
+                framed.extend_from_slice(&(asked.packet.len() as u16).to_be_bytes());
+                framed.extend_from_slice(&asked.packet);
+                sending += 1;
+                asked.sends += 1;
+                out.insert(id, asked);
+            }
+            self.session.sent(sending);
+            let wrote = framed.is_empty()
+                || (connection.write_all(&framed).await.is_ok()
+                    && connection.flush().await.is_ok());
+            let read = if wrote {
+                reply(connection.as_mut()).await
+            } else {
+                Err(Failed::Closed)
+            };
+            let Flight::Tls {
+                stream,
+                answered,
+                out,
+                wary,
+            } = &mut self.flight
+            else {
+                unreachable!("a TLS server talks over TLS")
+            };
+            match read {
+                Ok(bytes) => {
+                    let Some(asked) = out.remove(&[bytes[0], bytes[1]]) else {
+                        continue;
+                    };
+                    *answered += 1;
+                    let reply = if asks(&asked.packet, &bytes) {
+                        Ok(bytes)
+                    } else {
+                        Err(Failed::Invalid)
+                    };
+                    return Ok(Some((asked.key, reply)));
+                }
+                Err(Failed::Closed) if *answered > 0 => {
+                    *stream = None;
+                    *wary |= !out.is_empty();
+                    for asked in std::mem::take(out).into_values() {
+                        if asked.sends < SENDS {
+                            self.waiting.push_back(asked);
+                        } else {
+                            self.ready.push_back((asked.key, Err(Failed::Closed)));
+                        }
+                    }
+                }
+                Err(failed) => {
+                    *stream = None;
+                    for asked in std::mem::take(out).into_values() {
+                        self.ready.push_back((asked.key, Err(failed.copy())));
+                    }
+                }
+            }
+        }
+    }
+
+    // DNS over HTTPS, over the HTTP the first connection's handshake picks.
+    async fn https(&mut self) -> Result<Option<(usize, Reply)>, Failed> {
+        loop {
+            if let Some(ended) = self.ready.pop_front() {
+                return Ok(Some(ended));
+            }
+            let Flight::Https(https) = &mut self.flight else {
+                unreachable!("an HTTPS server talks over HTTPS")
+            };
+            if https.one {
+                return self.one().await;
+            }
+            if https.two.is_some() || https.old.is_some() {
+                if let Some(ended) = self.two().await {
+                    return Ok(ended);
+                }
+                let Flight::Https(https) = &mut self.flight else {
+                    unreachable!("an HTTPS server talks over HTTPS")
+                };
+                if https.two.is_some() || self.waiting.is_empty() {
+                    continue;
+                }
+            }
+            if self.waiting.is_empty() {
+                return Ok(None);
+            }
+            let link = self.connect().await?;
+            let Flight::Https(https) = &mut self.flight else {
+                unreachable!("an HTTPS server talks over HTTPS")
+            };
+            match link {
+                Some(Link::Https(connection)) if connection.multiplexes() => {
+                    https.two = Some(connection);
+                    https.spent = false;
+                }
+                Some(Link::Https(connection)) => {
+                    https.one = true;
+                    https.idle.push((connection, false));
+                }
+                Some(Link::Tls(_)) => unreachable!("an HTTPS server opens an HTTPS link"),
+                None => {}
+            }
+        }
+    }
+
+    // HTTP/2: each query goes out on a stream of its own as it is given,
+    // beside those still out. A stream the server refused is sent again on
+    // the connection; one that found the connection gone, on a new one,
+    // opened as soon as a query waits while the old one's streams still out
+    // run on beside it: at most two connections at once. Either is sent at
+    // most `SENDS` times in all, so a server that refuses or drops every
+    // stream ends the query. None when a new connection is wanted or the
+    // talk is to look again, and Some(None) once nothing is given or out.
+    async fn two(&mut self) -> Option<Option<(usize, Reply)>> {
+        let Flight::Https(https) = &mut self.flight else {
+            unreachable!("an HTTPS server talks over HTTPS")
+        };
+        if https
+            .old
+            .as_ref()
+            .is_some_and(|connection| !connection.carrying())
+        {
+            https.old = None;
+        }
+        // A spent connection goes once its streams have ended, or drains
+        // beside a new one once a query waits for it.
+        if let Some(connection) = https.two.as_ref()
+            && (https.spent || !connection.open())
+        {
+            if !connection.carrying() {
+                https.two = None;
+            } else if https.old.is_none() && !self.waiting.is_empty() {
+                https.old = https.two.take();
+            }
+        }
+        if https.two.is_none() && !self.waiting.is_empty() {
+            return None;
+        }
+        let Wire::Https { path } = &self.session.server.wire else {
+            unreachable!("an HTTPS link is made only for an HTTPS server")
+        };
+        if let Some(connection) = https.two.as_mut()
+            && connection.open()
+            && !https.spent
+        {
+            let given = if https.wary {
+                let out = &https.out;
+                turns(&mut self.waiting, |lane| {
+                    out.values().any(|asked| asked.lane == lane)
+                })
+            } else {
+                self.waiting.drain(..).collect()
+            };
+            for mut asked in given {
+                match connection.start(self.session.server, path, asked.key, &asked.packet) {
+                    Ok(()) => {
+                        sent(self.session.counts, 1);
+                        asked.sends += 1;
+                        https.out.insert(asked.key, asked);
+                    }
+                    Err(failed) => self.ready.push_back((asked.key, Err(failed))),
+                }
+            }
+        }
+        let carrying = |connection: &Option<Box<Connection>>| {
+            connection
+                .as_ref()
+                .is_some_and(|connection| connection.carrying())
+        };
+        let (key, reply, on_two) = match (carrying(&https.two), carrying(&https.old)) {
+            (false, false) => {
+                return match self.ready.pop_front() {
+                    Some(ended) => Some(Some(ended)),
+                    None if self.waiting.is_empty() => Some(None),
+                    None => None,
+                };
+            }
+            (true, false) => {
+                let (key, reply) = https.two.as_mut()?.next().await?;
+                (key, reply, true)
+            }
+            (false, true) => {
+                let (key, reply) = https.old.as_mut()?.next().await?;
+                (key, reply, false)
+            }
+            (true, true) => {
+                let (two, old) = (https.two.as_mut()?, https.old.as_mut()?);
+                tokio::select! {
+                    ended = two.next() => {
+                        let (key, reply) = ended?;
+                        (key, reply, true)
+                    }
+                    ended = old.next() => {
+                        let (key, reply) = ended?;
+                        (key, reply, false)
+                    }
+                }
+            }
+        };
+        if on_two {
+            // A stream that found the connection gone may end before this
+            // side sees the connection end.
+            https.spent |= https.two.as_ref().is_some_and(|two| !two.open());
+        }
+        let asked = https.out.remove(&key)?;
+        match reply {
+            Err(Failed::Refused) if asked.sends < SENDS => {
+                https.wary = true;
+                self.waiting.push_front(asked);
+                None
+            }
+            Err(Failed::Closed) if asked.sends < SENDS => {
+                https.wary = true;
+                https.spent |= on_two;
+                self.waiting.push_front(asked);
+                None
+            }
+            Err(Failed::Closed) => {
+                https.spent |= on_two;
+                Some(Some((key, Err(Failed::Closed))))
+            }
+            reply => Some(Some((key, reply))),
+        }
+    }
+
+    // HTTP/1.1: each lane's next query goes out as soon as the lane has
+    // none out, on a free connection or a new one. A query whose new
+    // connection could not be made waits for one the talk has; it fails
+    // with the dial only when the talk has no other.
+    async fn one(&mut self) -> Result<Option<(usize, Reply)>, Failed> {
+        let Flight::Https(https) = &mut self.flight else {
+            unreachable!("an HTTPS server talks over HTTPS")
+        };
+        let (provider, wires, server, counts) = (
+            self.session.provider,
+            self.session.wires,
+            self.session.server,
+            self.session.counts,
+        );
+        loop {
+            let calls = &https.calls;
+            let given = turns(&mut self.waiting, |lane| {
+                calls.iter().any(|(out, _)| out.lane == lane)
+            });
+            let mut held = Vec::new();
+            for asked in given {
+                let taken = https.idle.pop();
+                // No new connection while one could not be made and another
+                // is still out: the query waits for that one to come free.
+                if taken.is_none() && https.undialled && !https.calls.is_empty() {
+                    held.push(asked);
+                    continue;
+                }
+                let call: OneCall<'a> = Box::pin(one_call(
+                    provider,
+                    wires,
+                    server,
+                    counts,
+                    taken,
+                    asked.packet.clone(),
+                ));
+                https.calls.push((asked, call));
+            }
+            for asked in held.into_iter().rev() {
+                self.waiting.push_front(asked);
+            }
+            if https.calls.is_empty() {
+                return Ok(None);
+            }
+            let (asked, ended) = poll_fn(|cx| {
+                for at in 0..https.calls.len() {
+                    if let Poll::Ready(ended) = https.calls[at].1.as_mut().poll(cx) {
+                        let (asked, _) = https.calls.swap_remove(at);
+                        return Poll::Ready((asked, ended));
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+            match ended {
+                Ok((connection, reply)) => {
+                    if let Some(connection) = connection {
+                        https.idle.push((connection, true));
+                    }
+                    return Ok(Some((asked.key, reply)));
+                }
+                // A dial that failed while another connection is out or
+                // free: the query waits for one of those.
+                Err(_) if !https.calls.is_empty() || !https.idle.is_empty() => {
+                    https.undialled = true;
+                    self.waiting.push_front(asked);
+                }
+                Err(failed) => return Ok(Some((asked.key, Err(failed)))),
+            }
+        }
+    }
+}
+
+// One query over HTTP/1.1, on the free connection `taken` when there is one,
+// else on a new one. A connection that answered before and is found closed
+// before any byte of the reply is replaced once, as `ask` replaces a kept
+// one. The connection comes back with the reply while it stays open. A dial
+// that fails ends the call with its failure, the query not sent on it.
+async fn one_call(
+    provider: &dyn Carrier,
+    wires: &Wires,
+    server: &DnsServer,
+    counts: bool,
+    mut taken: Option<(Box<Connection>, bool)>,
+    packet: Vec<u8>,
+) -> Result<(Option<Box<Connection>>, Reply), Failed> {
+    let Wire::Https { path } = &server.wire else {
+        unreachable!("an HTTPS query goes only to an HTTPS server")
+    };
+    loop {
+        let (mut connection, used) = match taken.take() {
+            Some(taken) => taken,
+            None => match dial(provider, wires, server, || {}).await? {
+                Link::Https(connection) => (connection, false),
+                Link::Tls(_) => unreachable!("an HTTPS server opens an HTTPS link"),
+            },
+        };
+        sent(counts, 1);
+        match connection.exchange(server, path, &packet).await {
+            Ok((reply, open)) => return Ok((open.then_some(connection), Ok(reply))),
+            Err(Failed::Closed) if used => {}
+            Err(failed) => return Ok((None, Err(failed))),
+        }
+    }
+}
+
+// Whether `reply` asks the question `query` asked: the same question count,
+// the same name in any case, as a reply's name is read, and the same type
+// and class. With several queries out on one connection, an id alone could
+// match a reply to the wrong one.
+fn asks(query: &[u8], reply: &[u8]) -> bool {
+    let mut end = 12;
+    while let Some(&label) = query.get(end) {
+        if label == 0 {
+            break;
+        }
+        end += 1 + usize::from(label);
+    }
+    // The root label.
+    end += 1;
+    end + 4 <= query.len()
+        && query.get(4..6) == reply.get(4..6)
+        && reply
+            .get(12..end)
+            .is_some_and(|name| name.eq_ignore_ascii_case(&query[12..end]))
+        && query.get(end..end + 4) == reply.get(end..end + 4)
 }
 
 // One query over a stream, with the two-byte length prefix of DNS over TCP.

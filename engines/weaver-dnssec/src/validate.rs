@@ -1003,21 +1003,20 @@ impl Validation<'_> {
                 Outcome::NoData
             }
         };
-        // Only for answers nothing can authenticate: an unsigned zone's SOA.
+        // Only for answers nothing can authenticate: an unsigned zone's SOA,
+        // the first owned by the name or a zone above it, as dnsmasq takes
+        // it. With none, the answer is not to be held.
         let raw_ttl = reply
             .message
             .authority
             .iter()
-            .filter(|set| set.rtype == RecordType::SOA)
-            .flat_map(|set| {
-                set.records
-                    .iter()
-                    .filter_map(move |record| match &record.kind {
-                        RdataKind::Soa(soa) => Some(set.ttl.min(soa.minimum)),
-                        _ => None,
-                    })
+            .filter(|set| set.rtype == RecordType::SOA && name.is_at_or_below(&set.owner))
+            .find_map(|set| {
+                set.records.iter().find_map(|record| match &record.kind {
+                    RdataKind::Soa(soa) => Some(set.ttl.min(soa.minimum)),
+                    _ => None,
+                })
             })
-            .min()
             .unwrap_or(0);
         if self.validator.private(name) {
             return Ok((outcome(), Some(InsecureReason::PrivateName), 0, raw_ttl));
@@ -1099,8 +1098,9 @@ impl Validation<'_> {
             return Err(self.fail(query, reason, name, query.rtype));
         }
         // The zone is signed, so its SOA must validate, and the TTL a caller
-        // may cache comes only from validated records.
-        let mut ttl = proof.ttl_bound;
+        // may cache comes only from validated records. With no SOA, the
+        // answer is not to be held, as dnsmasq holds none.
+        let mut soa_ttl: Option<u32> = None;
         for set in &reply.message.authority {
             if set.rtype != RecordType::SOA || set.owner != signer {
                 continue;
@@ -1110,10 +1110,12 @@ impl Validation<'_> {
                 .map_err(|reason| self.fail(query, reason, &set.owner, set.rtype))?;
             for record in &set.records {
                 if let RdataKind::Soa(soa) = &record.kind {
-                    ttl = ttl.min(verified.ttl_bound).min(soa.minimum);
+                    let held = verified.ttl_bound.min(soa.minimum);
+                    soa_ttl = Some(soa_ttl.map_or(held, |ttl| ttl.min(held)));
                 }
             }
         }
+        let ttl = soa_ttl.map_or(0, |held| held.min(proof.ttl_bound));
         if proof.proof == Proof::Insecure {
             Ok((
                 outcome(),

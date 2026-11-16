@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use weaver_dnssec::{
-    BogusReason, InsecureReason, Name, Outcome, Question, RecordType, Step, UnansweredCause,
+    BogusReason, InsecureReason, Name, Outcome, Query, Question, RecordType, Step, UnansweredCause,
     Validator, Verdict,
 };
 
@@ -57,7 +57,6 @@ impl Dnssec {
 
 // Asks the session's server for `name`'s records of `qtype`, and for every
 // key, delegation and denial that proves them, and checks the signatures.
-// A reply whose id is not the query's is a failed query, never one taken.
 // The caller says whether the session counts the queries it sends.
 pub(super) async fn validated(
     session: &mut Session<'_>,
@@ -66,54 +65,170 @@ pub(super) async fn validated(
     qtype: u16,
     reached: &mut bool,
 ) -> Result<Found, Failed> {
-    let question = Name::from_text(&format!("{name}."))
-        .ok()
-        .and_then(|name| Question::new(name, RecordType(qtype)).ok())
-        .ok_or(Failed::Invalid)?;
+    let mut found = [None];
+    validated_all(session, dnssec, name, &[qtype], &mut found, reached).await;
+    let [found] = found;
+    found.unwrap_or(Err(Failed::Invalid))
+}
+
+// Checks `name`'s records of each of `qtypes` at the session's server, all
+// at once, and puts each verdict in its slot of `found` as it is reached.
+// A check steps as soon as the reply it waits on comes, and the queries it
+// then needs go out at once, while the other check's are still out: one
+// silent query holds up only the check waiting on it. A query out for one
+// check that the other needs too is not sent again, and its reply is given
+// to both. The query a check cannot go on without goes before those it
+// asks ahead, where queries take turns. A family's chain shares the keys
+// and delegations the other proved, through the validator's cache. A reply
+// is taken only under the id its query went out with. A server that
+// cannot be reached, or fails TLS, fails every check still running: the other queries would only fail
+// the same way. Once every check has its verdict the talk ends, and a query
+// no running check still waits on is not sent.
+pub(super) async fn validated_all(
+    session: &mut Session<'_>,
+    dnssec: &Dnssec,
+    name: &str,
+    qtypes: &[u16],
+    found: &mut [Option<Result<Found, Failed>>],
+    reached: &mut bool,
+) {
     let source = source(session.server());
-    let mut validation = dnssec
-        .validator()
-        .begin_from(source, question, dnssec.now());
-    // Why each query that got no reply failed, for an unanswered verdict to
-    // say.
-    let mut failures = BTreeMap::new();
-    let verdict = loop {
-        let query = match off_the_workers(|| validation.step()).await {
-            Step::Done(verdict) => break verdict,
-            Step::Need(query) => query,
-        };
-        let mut queries = vec![query];
-        queries.extend(validation.also_needed());
-        // DNS over HTTPS sends id 0, as the address queries do.
-        let ids: Vec<u16> = queries
-            .iter()
-            .map(|_| match session.server().wire {
-                Wire::Https { .. } => 0,
-                Wire::Plain | Wire::Tls { .. } => NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            })
-            .collect();
-        let packets: Vec<Vec<u8>> = queries
-            .iter()
-            .zip(&ids)
-            .map(|(query, id)| query.encode(*id))
-            .collect();
-        // A server that cannot be reached, or fails TLS, fails the check:
-        // the other queries would only fail the same way.
-        let replies = session.ask_all(&packets, reached).await?;
-        for ((query, id), reply) in queries.iter().zip(ids).zip(replies) {
-            let failed = match reply {
-                Ok(bytes) if bytes.get(..2) == Some(&id.to_be_bytes()[..]) => {
-                    // The query is this validation's own and outstanding.
-                    let _ = validation.supply(query, &bytes);
+    let https = matches!(session.server().wire, Wire::Https { .. });
+    let now = dnssec.now();
+    let mut checks: Vec<_> = qtypes
+        .iter()
+        .zip(found.iter_mut())
+        .map(|(qtype, found)| {
+            let question = Name::from_text(&format!("{name}."))
+                .ok()
+                .and_then(|name| Question::new(name, RecordType(*qtype)).ok());
+            match question {
+                Some(question) => Some(dnssec.validator().begin_from(source, question, now)),
+                None => {
+                    *found = Some(Err(Failed::Invalid));
+                    None
+                }
+            }
+        })
+        .collect();
+    // Why each query that got no reply failed, for each check, for an
+    // unanswered verdict to say.
+    let mut failures: Vec<BTreeMap<Query, Failed>> =
+        qtypes.iter().map(|_| BTreeMap::new()).collect();
+    // Each query sent, by its key: the query, its id, and the checks that
+    // wait on its reply, until the reply comes.
+    let mut sent: Vec<(Query, u16, Option<Vec<usize>>)> = Vec::new();
+    // The key of each query still out, by the query.
+    let mut out: BTreeMap<Query, usize> = BTreeMap::new();
+    // The key of the query each check's last step waits on.
+    let mut blocked: Vec<Option<usize>> = qtypes.iter().map(|_| None).collect();
+    // The checks to step: every one at the start, then each whose awaited
+    // reply came.
+    let mut due: Vec<usize> = (0..checks.len()).rev().collect();
+    let mut talk = session.talk(reached);
+    loop {
+        while let Some(at) = due.pop() {
+            let Some(validation) = &mut checks[at] else {
+                continue;
+            };
+            let query = match off_the_workers(|| validation.step()).await {
+                Step::Done(verdict) => {
+                    found[at] = Some(judged(verdict, &mut failures[at]));
+                    checks[at] = None;
+                    // A query only this check waited on, and not yet sent,
+                    // is not sent at all.
+                    out.retain(|_, key| {
+                        let Some(wanting) = &mut sent[*key].2 else {
+                            return false;
+                        };
+                        wanting.retain(|wants| *wants != at);
+                        !(wanting.is_empty() && talk.withdraw(*key))
+                    });
                     continue;
                 }
-                Ok(_) => Failed::Invalid,
-                Err(failed) => failed,
+                Step::Need(query) => query,
             };
-            failures.insert(query.clone(), failed);
-            let _ = validation.failed(query);
+            let hints = validation.also_needed();
+            for (hint, query) in std::iter::once(query).chain(hints).enumerate() {
+                let key = match out.get(&query) {
+                    Some(&key) => {
+                        talk.wanted_by(key, at, hint == 0);
+                        key
+                    }
+                    None => {
+                        // DNS over HTTPS sends id 0, as the address queries
+                        // do.
+                        let id = if https {
+                            0
+                        } else {
+                            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+                        };
+                        if hint == 0 {
+                            talk.send(sent.len(), at, query.encode(id));
+                        } else {
+                            talk.ahead(sent.len(), at, query.encode(id));
+                        }
+                        out.insert(query.clone(), sent.len());
+                        sent.push((query, id, Some(Vec::new())));
+                        sent.len() - 1
+                    }
+                };
+                let wanting = sent[key].2.get_or_insert_with(Vec::new);
+                if !wanting.contains(&at) {
+                    wanting.push(at);
+                }
+                if hint == 0 {
+                    blocked[at] = Some(key);
+                }
+            }
         }
-    };
+        if checks.iter().all(Option::is_none) {
+            return;
+        }
+        let (key, reply) = match talk.next().await {
+            Ok(Some(ended)) => ended,
+            Ok(None) => return,
+            Err(failed) => {
+                for (at, check) in checks.iter_mut().enumerate() {
+                    if check.take().is_some() {
+                        found[at] = Some(Err(failed.copy()));
+                    }
+                }
+                return;
+            }
+        };
+        let (query, id, wanting) = &mut sent[key];
+        let wanting = wanting.take().unwrap_or_default();
+        out.remove(query);
+        let failed = match reply {
+            Ok(bytes) if bytes.get(..2) == Some(&id.to_be_bytes()[..]) => {
+                for at in &wanting {
+                    if let Some(validation) = &mut checks[*at] {
+                        // The query is this check's own and outstanding.
+                        let _ = validation.supply(query, &bytes);
+                    }
+                }
+                None
+            }
+            Ok(_) => Some(Failed::Invalid),
+            Err(failed) => Some(failed),
+        };
+        for at in wanting {
+            if let Some(validation) = &mut checks[at] {
+                if let Some(failed) = &failed {
+                    failures[at].insert(query.clone(), failed.copy());
+                    let _ = validation.failed(query);
+                }
+                if blocked[at] == Some(key) {
+                    due.push(at);
+                }
+            }
+        }
+    }
+}
+
+// What a check's verdict comes to for the lookup.
+fn judged(verdict: Verdict, failures: &mut BTreeMap<Query, Failed>) -> Result<Found, Failed> {
     match verdict {
         Verdict::Secure(answer) | Verdict::Insecure(answer) => Ok(Found {
             addresses: answer.addresses(),

@@ -187,7 +187,14 @@ fn bogus(server: &str, words: &str) -> Option<LookupError> {
 #[tokio::test(start_paused = true)]
 async fn a_signed_answer_validates_on_every_wire() {
     let resolver = tree(KeyAlgorithm::P256);
-    for (servers, wires, listed) in every_wire(serving(&resolver, &[])) {
+    // The connections each wire makes for the whole check: plain dials a
+    // stream per query, DNS over TLS and HTTP/2 keep one, and HTTP/1.1 one
+    // per family.
+    let connections = [None, Some(1), Some(2), Some(1)];
+    for ((servers, wires, listed), connections) in every_wire(serving(&resolver, &[]))
+        .into_iter()
+        .zip(connections)
+    {
         let dnssec = trusting(&resolver, NOW);
         let before = counted();
         let sent = crate::metrics::dnssec_queries();
@@ -220,19 +227,16 @@ async fn a_signed_answer_validates_on_every_wire() {
             servers.dials().iter().all(|dial| *dial == listed.address),
             "{listed:?}"
         );
-        match listed.wire {
-            // A stream per query.
-            Wire::Plain => assert_eq!(servers.dials().len(), answered, "{listed:?}"),
-            // One connection for the whole check.
-            Wire::Tls { .. } | Wire::Https { .. } => {
-                assert_eq!(servers.dials().len(), 1, "{listed:?}")
-            }
-        }
+        assert_eq!(
+            servers.dials().len(),
+            connections.unwrap_or(answered),
+            "{listed:?}"
+        );
     }
 }
 
 // www.example.com's address, checked against a plain fixture server of its
-// own. The check is driven without the ceiling on a family's query, so a
+// own. The check is driven without the time limit a server has, so a
 // runtime whose clock cannot be paused sets no deadline.
 async fn validated_seven() -> Vec<IpAddr> {
     let resolver = tree(KeyAlgorithm::P256);
@@ -243,15 +247,9 @@ async fn validated_seven() -> Vec<IpAddr> {
     let listed = first();
     let mut session = Session::new(&servers, &wires, &listed);
     let mut reached = false;
-    let found = query(
-        &mut session,
-        &dnssec,
-        "www.example.com",
-        1,
-        Trust::Validate,
-        &mut reached,
-    )
-    .await;
+    let found =
+        crate::dns::dnssec::validated(&mut session, &dnssec, "www.example.com", 1, &mut reached)
+            .await;
     found.map_or_else(|_| Vec::new(), |found| found.addresses)
 }
 
@@ -309,19 +307,17 @@ async fn a_signed_answer_validates_on_a_runtime_with_one_thread() {
     assert_eq!(in_a_set.trust, Some(TrustOutcome::Validated));
 }
 
-// The root, com and example.com signed, with www.example.com's address in
-// both families.
+// The root, com and example.com signed, with the addresses of
+// www.example.com and api.example.com in both families.
 fn dual() -> Arc<FakeResolver> {
     let root = Signed::new(Name::root(), KeyAlgorithm::P256).unwrap();
     let com = Signed::new(name("com."), KeyAlgorithm::P256).unwrap();
     let mut example = Signed::new(name("example.com."), KeyAlgorithm::P256).unwrap();
-    example.add_record(name("www.example.com."), RecordType::A, vec![192, 0, 2, 7]);
-    let six: std::net::Ipv6Addr = "2001:db8::7".parse().unwrap();
-    example.add_record(
-        name("www.example.com."),
-        RecordType::AAAA,
-        six.octets().to_vec(),
-    );
+    for (host, last) in [("www.example.com.", 7u8), ("api.example.com.", 8)] {
+        example.add_record(name(host), RecordType::A, vec![192, 0, 2, last]);
+        let six = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last.into());
+        example.add_record(name(host), RecordType::AAAA, six.octets().to_vec());
+    }
     Arc::new(FakeResolver::new(vec![root, com, example]).unwrap())
 }
 
@@ -369,9 +365,10 @@ async fn a_family_that_fails_the_check_is_counted_bogus_when_the_other_answers()
 #[tokio::test(start_paused = true)]
 async fn each_dnssec_query_is_counted_as_it_goes_out() {
     let resolver = tree(KeyAlgorithm::P256);
-    // A plain server that takes each stream and never says anything: each
-    // family's first batch waits out the ceiling. Each plain stream carries
-    // one query, so every dial is a query sent.
+    // A plain server that takes each stream and never says anything: every
+    // query sent waits out the server's time limit, and no check gets past
+    // its first step. Each plain stream carries one query, so every dial is
+    // a query sent.
     let silent = Servers::new(Speaks::Dot { close_after: None }, serving(&resolver, &[]))
         .silent_at("192.0.2.53");
     let wires = Authority::new().wires();
@@ -383,12 +380,13 @@ async fn each_dnssec_query_is_counted_as_it_goes_out() {
     assert!(dials >= 2);
     assert_eq!(crate::metrics::dnssec_queries() - sent, dials as u64);
 
-    // An HTTP/2 server that sends each connection away after two requests.
+    // An HTTP/2 server that sends its first connection away at its first
+    // stream.
     let authority = Authority::new();
     let servers = Servers::new(
         Speaks::H2 {
             respond: Arc::new(h2_message),
-            goaway_after: Some(2),
+            goaway_after: Some(1),
             misstep: H2Misstep::None,
         },
         serving(&resolver, &[]),
@@ -414,8 +412,8 @@ async fn each_dnssec_query_is_counted_as_it_goes_out() {
 }
 
 // DNS over TLS writes a batch at once; a server that closes after every
-// reply has the rest of the batch sent again on a new connection, one per
-// reply, and the check still validates.
+// reply has the rest of the batch sent again on new connections, one query
+// out at a time, and the check still validates.
 #[tokio::test(start_paused = true)]
 async fn dot_validates_through_a_server_that_closes_after_every_reply() {
     let resolver = tree(KeyAlgorithm::P256);
@@ -430,6 +428,7 @@ async fn dot_validates_through_a_server_that_closes_after_every_reply() {
     let wires = authority.wires();
     let dnssec = trusting(&resolver, NOW);
     let listed = dot("192.0.2.53", None);
+    let sent = crate::metrics::dnssec_queries();
     let resolution = checked(
         &servers,
         &wires,
@@ -440,7 +439,13 @@ async fn dot_validates_through_a_server_that_closes_after_every_reply() {
     .await;
     assert_eq!(resolution.addresses, seven());
     assert_eq!(resolution.trust, Some(TrustOutcome::Validated));
-    assert!(servers.answered().iter().all(|answered| *answered <= 1));
+    // The server read each query it answered once, on a connection of its
+    // own. After the first batch the talk is wary and writes one query at a
+    // time, so each query goes out at most three times: in the batch, on a
+    // connection that closed after its last reply, and answered on the next.
+    // Seven queries on seven connections, seventeen writes in all.
+    assert_eq!(servers.answered(), [1; 7]);
+    assert_eq!(crate::metrics::dnssec_queries() - sent, 17);
 }
 
 #[tokio::test(start_paused = true)]
@@ -465,9 +470,18 @@ async fn each_reply_carries_the_id_its_query_went_out_with() {
         )
         .await;
         assert!(resolution.addresses.is_empty(), "{listed:?}");
+        // DNS over TLS has every query out on the one connection by id, so
+        // a reply under an id it did not send is no reply to any of them:
+        // it is passed over, and the queries run out the server's time.
+        // Elsewhere each reply has its own stream, and one under the wrong
+        // id fails its query.
+        let failure = match listed.wire {
+            Wire::Tls { .. } => LookupFailure::TimedOut,
+            _ => LookupFailure::Other,
+        };
         assert_eq!(
             resolution.error.map(|error| error.failure),
-            Some(LookupFailure::Other),
+            Some(failure),
             "{listed:?}"
         );
         assert_eq!(resolution.trust, None, "{listed:?}");
@@ -750,57 +764,542 @@ async fn a_naming_holds_validated_answers_apart_and_never_asks_the_host() {
     }
 }
 
-// A cold check of a three-level chain through a route with a 300 ms round
-// trip, on the paused clock: each dial costs one round trip, and each reply
-// the client waits on one more. The address family is checked cold, then
-// the other family with the keys it proved. The six queries of the cold
-// check come in three batches. Plain dials each batch's streams together
-// and DNS over TLS writes each batch at once, so each costs a batch's
-// round trips, not a query's. HTTP/1.1 asks in turn.
+// A validated lookup of both families of a name three labels down, through
+// a route with a 300 ms round trip, on the paused clock: each dial costs
+// one round trip, and each reply the client waits on one more. Cold, then a
+// second name in the same zone, with the keys and delegations the first
+// proved. Both families are checked side by side, each stepping as its own
+// replies come, and a query both families need goes once: seven queries
+// cold, two for the second name. Plain dials the first stream alone, then
+// the rest as they are asked; DNS over TLS writes what is asked at once and
+// HTTP/2 sends it on streams of the one connection, so queries asked
+// together cost one round trip, not one each. Waits that overlap are each
+// counted, so the round trips in all may pass those one after another.
+// HTTP/1.1 asks each family's chain in turn on a connection of the family's
+// own: the first connection's handshake says the server speaks HTTP/1.1,
+// and the other family's connection opens once the first is busy, so it
+// costs a dial and a handshake of its own, two connections per lookup.
+// DNS over TLS and HTTP/2 make one connection, so one TLS handshake, per
+// lookup.
 #[tokio::test(start_paused = true)]
-async fn a_cold_check_takes_these_round_trips_on_each_wire() {
+async fn a_validated_lookup_takes_these_round_trips_on_each_wire() {
     const RTT: std::time::Duration = std::time::Duration::from_millis(300);
-    let resolver = tree(KeyAlgorithm::P256);
-    // Per wire: for each family, the queries sent, the round trips waited
-    // in all, and those one after another, which the time is.
+    let resolver = dual();
+    // Per wire: for the cold lookup, then the second, the queries sent, the
+    // dials made, the round trips waited in all, and those one after
+    // another, which the time is.
     let expected = [
-        ("plain", [(6, 12, 6), (1, 2, 2)]),
-        ("tls", [(6, 5, 5), (1, 1, 1)]),
-        ("https/1.1", [(6, 8, 8), (1, 1, 1)]),
-        ("https/2", [(6, 6, 6), (1, 1, 1)]),
+        ("plain", [(7, 7, 14, 6), (2, 2, 4, 3)]),
+        ("tls", [(7, 1, 5, 5), (2, 1, 3, 3)]),
+        ("https/1.1", [(7, 2, 11, 7), (2, 2, 6, 5)]),
+        ("https/2", [(7, 1, 5, 5), (2, 1, 4, 3)]),
     ];
-    for ((servers, wires, listed), (wire, families)) in every_wire(serving(&resolver, &[]))
+    for ((servers, wires, listed), (wire, lookups)) in every_wire(serving(&resolver, &[]))
         .into_iter()
         .zip(expected)
     {
         let servers = servers.delayed(RTT);
         let dnssec = trusting(&resolver, NOW);
-        let mut session = Session::new(&servers, &wires, &listed);
-        for (qtype, (queries, waits, serial)) in [1u16, 28].into_iter().zip(families) {
-            let (waited, answered) = (servers.waits(), servers.answered().iter().sum::<usize>());
-            let mut reached = false;
+        for (host, (queries, dials, waits, serial)) in ["www.example.com", "api.example.com"]
+            .into_iter()
+            .zip(lookups)
+        {
+            let answered = servers.answered().iter().sum::<usize>();
+            let (dialled, waited) = (servers.dials().len(), servers.waits());
             let started = tokio::time::Instant::now();
-            let found = query(
-                &mut session,
+            let (resolved, _) = resolve_judged(
+                &servers,
+                &wires,
                 &dnssec,
-                "www.example.com",
-                qtype,
+                std::slice::from_ref(&listed),
                 Trust::Validate,
-                &mut reached,
+                host,
             )
             .await;
             let spent = started.elapsed();
-            assert!(found.is_ok(), "{wire} {qtype}");
+            assert_eq!(resolved.unwrap().addresses.len(), 2, "{wire} {host}");
             assert_eq!(
                 (
                     servers.answered().iter().sum::<usize>() - answered,
+                    servers.dials().len() - dialled,
                     servers.waits() - waited,
                     spent,
                 ),
-                (queries, waits, RTT * serial),
-                "{wire} {qtype}"
+                (queries, dials, waits, RTT * serial),
+                "{wire} {host}"
             );
         }
+    }
+}
+
+// The servers asked in the tests below, over TLS: 192.0.2.53 and .54
+// trusted, .55 with a certificate the client does not trust.
+fn three_over_tls(
+    answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static,
+) -> (Servers, Wires) {
+    let trusted = Authority::new();
+    let stranger = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answer)
+        .at("192.0.2.53", trusted.server(&["192.0.2.53"], b"dot"))
+        .at("192.0.2.54", trusted.server(&["192.0.2.54"], b"dot"))
+        .at("192.0.2.55", stranger.server(&["192.0.2.55"], b"dot"));
+    (servers, trusted.wires())
+}
+
+// Under `Validate`, a first server that takes the dial and never answers
+// spends its own time limit only. The next server's cold check, five round
+// trips of 900 ms, runs on a whole limit of its own.
+#[tokio::test(start_paused = true)]
+async fn a_cold_check_at_the_next_server_has_a_whole_time_limit_of_its_own() {
+    const RTT: std::time::Duration = std::time::Duration::from_millis(900);
+    let resolver = dual();
+    let authority = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, serving(&resolver, &[]))
+        .silent_at("192.0.2.53")
+        .at("192.0.2.54", authority.server(&["192.0.2.54"], b"dot"))
+        .delayed(RTT);
+    let dnssec = trusting(&resolver, NOW);
+    let started = tokio::time::Instant::now();
+    let (resolved, account) = resolve_judged(
+        &servers,
+        &authority.wires(),
+        &dnssec,
+        &[dot("192.0.2.53", None), dot("192.0.2.54", None)],
+        Trust::Validate,
+        "www.example.com",
+    )
+    .await;
+    assert_eq!(resolved.unwrap().addresses.len(), 2);
+    assert_eq!(account.judged, Some(TrustOutcome::Validated));
+    assert_eq!(
+        account.from.map(|from| from.address),
+        Some("192.0.2.54".parse::<IpAddr>().unwrap())
+    );
+    // One connection to each: the first took nothing it answered, the
+    // second the whole cold check.
+    let dials: Vec<String> = servers
+        .dials()
+        .iter()
+        .map(|dial| dial.ip().to_string())
+        .collect();
+    assert_eq!(dials, ["192.0.2.53", "192.0.2.54"]);
+    assert_eq!(servers.answered(), [0, 7]);
+    assert_eq!(started.elapsed(), SERVER_TIMEOUT + RTT * 5);
+}
+
+// A server that answers every query of www.example.com's chain but its
+// query for the `silent` family: an empty reply is no reply.
+fn silent_for(
+    resolver: &Arc<FakeResolver>,
+    silent: RecordType,
+) -> impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + Clone + 'static {
+    let resolver = resolver.clone();
+    move |_, _, query| {
+        if question(query).0 == name_query(name("www.example.com."), silent) {
+            return Vec::new();
+        }
+        reply(&resolver, Serves::Signed, query)
+    }
+}
+
+// The address of the family that is not `silent`.
+fn the_other(silent: RecordType) -> Vec<IpAddr> {
+    let [seven, six] = <[IpAddr; 2]>::try_from(seven_and_six()).unwrap();
+    vec![if silent == RecordType::A { six } else { seven }]
+}
+
+// A resolver that drops one family's query and answers the rest, under
+// either trust: the other family's answer, or under `Validate` its check,
+// comes while the silent query is still out, and stands when the server's
+// time limit ends the silent one. Each family silent in turn, on every wire.
+#[tokio::test(start_paused = true)]
+async fn a_silent_family_leaves_the_others_answer_on_every_wire_under_either_trust() {
+    let resolver = dual();
+    for trust in [Trust::AsSent, Trust::Validate] {
+        for silent in [RecordType::A, RecordType::AAAA] {
+            for (servers, wires, listed) in every_wire(silent_for(&resolver, silent)) {
+                let dnssec = trusting(&resolver, NOW);
+                let started = tokio::time::Instant::now();
+                let (resolved, account) = resolve_judged(
+                    &servers,
+                    &wires,
+                    &dnssec,
+                    std::slice::from_ref(&listed),
+                    trust,
+                    "www.example.com",
+                )
+                .await;
+                let case = format!("{listed} {trust:?} {silent:?} silent");
+                let lookup = resolved.expect(&case);
+                assert_eq!(lookup.addresses, the_other(silent), "{case}");
+                let judged = match trust {
+                    Trust::AsSent => TrustOutcome::AsSent,
+                    Trust::Validate => TrustOutcome::Validated,
+                };
+                assert_eq!(account.judged, Some(judged), "{case}");
+                // The silent query ran out the server's limit, and no more.
+                assert_eq!(started.elapsed(), SERVER_TIMEOUT, "{case}");
+            }
+        }
+    }
+}
+
+// Under `AsSent`, one family's query names an alias still to ask for while
+// the other family's query stays silent: the alias is followed at once and
+// its address kept when the time limit ends the silent query. Each family
+// silent in turn, on every wire.
+#[tokio::test(start_paused = true)]
+async fn an_alias_is_followed_while_the_other_family_stays_silent_on_every_wire() {
+    for silent in [1, 28] {
+        let answer = move |_: IpAddr, qtype: u16, query: &[u8]| {
+            let target = query.windows(6).any(|name| name == b"target");
+            match (qtype == silent, target, qtype) {
+                (true, _, _) => Vec::new(),
+                (false, false, _) => {
+                    respond(query, 0, &[rr(&ASKED, 5, 60, &wire("target.test"))], &[])
+                }
+                (false, true, 1) => v4(query, 60),
+                (false, true, _) => respond(query, 0, &[rr(&ASKED, 28, 60, &SIX)], &[]),
+            }
+        };
+        let kept = the_other(if silent == 1 {
+            RecordType::A
+        } else {
+            RecordType::AAAA
+        });
+        for (servers, wires, listed) in every_wire(answer) {
+            let started = tokio::time::Instant::now();
+            let lookup = resolve(
+                &servers,
+                &wires,
+                std::slice::from_ref(&listed),
+                Trust::AsSent,
+                "alias.test",
+            )
+            .await
+            .unwrap();
+            assert_eq!(lookup.addresses, kept, "{listed} {silent}");
+            // The silent query was read too.
+            assert_eq!(
+                servers.answered().iter().sum::<usize>(),
+                3,
+                "{listed} {silent}"
+            );
+            assert_eq!(started.elapsed(), SERVER_TIMEOUT, "{listed} {silent}");
+        }
+    }
+}
+
+// SERVFAIL, with the question alone.
+fn servfail(query: &[u8]) -> Vec<u8> {
+    let (_, end) = question(query);
+    let mut failed = query[..end].to_vec();
+    failed[2..4].copy_from_slice(&[0x81, 0x82]);
+    failed[6..12].fill(0);
+    failed
+}
+
+// Both address queries failed with SERVFAIL and every DNSKEY query silent:
+// both checks have their verdicts from the first replies, and the lookup
+// ends then, with nothing waited on the silent queries. Over HTTP/1.1,
+// where the queries the checks also asked for wait for their lane, none of
+// them goes out after the verdicts.
+#[tokio::test(start_paused = true)]
+async fn a_lookup_ends_once_both_checks_have_their_verdicts_on_every_wire() {
+    let resolver = dual();
+    let signed = resolver.clone();
+    let answer = move |_: IpAddr, _: u16, query: &[u8]| {
+        let (asked, _) = question(query);
+        if asked.name == name("www.example.com.")
+            && matches!(asked.rtype, RecordType::A | RecordType::AAAA)
+        {
+            return servfail(query);
+        }
+        if asked.rtype == RecordType::DNSKEY {
+            return Vec::new();
+        }
+        reply(&signed, Serves::Signed, query)
+    };
+    // The wires in turn: plain, DNS over TLS, HTTP/1.1, HTTP/2.
+    for (wire, (servers, wires, listed)) in every_wire(answer).into_iter().enumerate() {
+        let dnssec = trusting(&resolver, NOW);
+        let started = tokio::time::Instant::now();
+        let resolution = checked(
+            &servers,
+            &wires,
+            &dnssec,
+            std::slice::from_ref(&listed),
+            "www.example.com",
+        )
+        .await;
+        assert!(resolution.addresses.is_empty(), "{listed:?}");
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{listed:?}");
+        // Over HTTP/1.1 each family's connection carried its address query
+        // alone.
+        if wire == 2 {
+            assert_eq!(servers.answered(), [1, 1], "{listed:?}");
+        }
+    }
+}
+
+// Over HTTP/1.1, the IPv4 check ends at a refused DS query while the IPv6
+// check still waits on its silent address query: the queries only the IPv4
+// check asked ahead, still waiting for their turn, never go out.
+#[tokio::test(start_paused = true)]
+async fn a_finished_check_leaves_its_unsent_queries_unsent_while_the_other_runs() {
+    let resolver = dual();
+    let signed = resolver.clone();
+    let answer = move |_: IpAddr, _: u16, query: &[u8]| {
+        let (asked, _) = question(query);
+        if asked.rtype == RecordType::AAAA {
+            return Vec::new();
+        }
+        if asked.rtype == RecordType::DS {
+            // REFUSED, with the question alone.
+            let mut refused = servfail(query);
+            refused[3] = 0x85;
+            return refused;
+        }
+        reply(&signed, Serves::Signed, query)
+    };
+    // The wires in turn: plain, DNS over TLS, HTTP/1.1, HTTP/2.
+    let (servers, wires, listed) = every_wire(answer).swap_remove(2);
+    let dnssec = trusting(&resolver, NOW);
+    let started = tokio::time::Instant::now();
+    let resolution = checked(
+        &servers,
+        &wires,
+        &dnssec,
+        std::slice::from_ref(&listed),
+        "www.example.com",
+    )
+    .await;
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(started.elapsed(), SERVER_TIMEOUT);
+    let asked: Vec<RecordType> = servers
+        .log
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .map(|seen| question(&seen.body).0.rtype)
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::DNSKEY,
+            RecordType::DS
+        ]
+    );
+}
+
+// A check whose chain fails part way at the first server, or whose TLS
+// check fails there, is made again at the next server, which proves it.
+#[tokio::test(start_paused = true)]
+async fn a_check_that_fails_part_way_or_at_tls_moves_to_the_next_server() {
+    let resolver = dual();
+    let signed = resolver.clone();
+    // 192.0.2.53 answers the addresses but fails every DNSKEY query.
+    let (servers, wires) = three_over_tls(move |asked, _, query| {
+        if asked.to_string() == "192.0.2.53" && question(query).0.rtype == RecordType::DNSKEY {
+            servfail(query)
+        } else {
+            reply(&signed, Serves::Signed, query)
+        }
+    });
+    for first in ["192.0.2.53", "192.0.2.55"] {
+        let dnssec = trusting(&resolver, NOW);
+        let dialled = servers.dials().len();
+        let (resolved, account) = resolve_judged(
+            &servers,
+            &wires,
+            &dnssec,
+            &[dot(first, None), dot("192.0.2.54", None)],
+            Trust::Validate,
+            "www.example.com",
+        )
+        .await;
+        assert_eq!(resolved.unwrap().addresses.len(), 2, "{first}");
+        assert_eq!(account.judged, Some(TrustOutcome::Validated), "{first}");
+        assert_eq!(
+            account.from.map(|from| from.address),
+            Some("192.0.2.54".parse::<IpAddr>().unwrap()),
+            "{first}"
+        );
+        let dials: Vec<String> = servers.dials()[dialled..]
+            .iter()
+            .map(|dial| dial.ip().to_string())
+            .collect();
+        assert_eq!(dials, [first, "192.0.2.54"], "{first}");
+    }
+}
+
+// Keys and delegations proven from one server's good answer are held, and
+// the next lookup at another server sends only its two address queries.
+// The held chain proves nothing about an answer: the A record that server
+// tampered with still fails the check, and only the AAAA answer it left
+// alone stands. Asked again, the A record is refused by the validator's
+// hold on what that server was seen to fail, without being asked for.
+#[tokio::test(start_paused = true)]
+async fn a_held_chain_never_makes_a_tampered_answer_pass() {
+    let resolver = dual();
+    let (servers, wires) = three_over_tls(serving(&resolver, &[("192.0.2.54", Serves::Tampered)]));
+    let dnssec = trusting(&resolver, NOW);
+    let (carrier, wires, dnssec) = (&servers, &wires, &dnssec);
+    let lookup = |server: &'static str| async move {
+        let listed = [dot(server, None)];
+        resolve_judged(
+            carrier,
+            wires,
+            dnssec,
+            &listed,
+            Trust::Validate,
+            "www.example.com",
+        )
+        .await
+    };
+    let (good, _) = lookup("192.0.2.53").await;
+    assert_eq!(good.unwrap().addresses.len(), 2);
+    for sent in [2, 1] {
+        let answered = servers.answered().iter().sum::<usize>();
+        let before = counted();
+        let (tampered, account) = lookup("192.0.2.54").await;
+        assert_eq!(servers.answered().iter().sum::<usize>() - answered, sent);
+        let six: IpAddr = "2001:db8::7".parse().unwrap();
+        assert_eq!(tampered.unwrap().addresses, [six]);
+        assert_eq!(account.judged, Some(TrustOutcome::Validated));
+        assert_eq!(
+            since(&before),
+            [TrustOutcome::Bogus, TrustOutcome::Validated]
+        );
+    }
+}
+
+// A change of the route's DNS setting makes its names anew, and the chain
+// the old setting proved goes with them: the same zone is checked cold
+// again. Under one setting, a second lookup in the zone uses what the first
+// proved.
+#[tokio::test(start_paused = true)]
+async fn a_dns_setting_change_empties_the_held_chain() {
+    let resolver = dual();
+    let (servers, wires) = three_over_tls(serving(&resolver, &[]));
+    let tunnel = [dot("192.0.2.53", None)];
+    let choice = crate::pipe::DnsChoice::Proxy {
+        trust: Trust::Validate,
+        system_fallback: false,
+    };
+    let fresh = |names: &crate::pipe::Names| {
+        let naming = names.at_hop("hop", Some(&tunnel));
+        sessions(&naming).trust(&wires);
+        sessions(&naming)
+            .dnssec()
+            .anchored(resolver.zones()[0].anchors().unwrap(), NOW);
+        naming
+    };
+    let asked = |servers: &Servers| servers.answered().iter().sum::<usize>();
+    let names = crate::pipe::Names::new(choice.clone(), None);
+    let naming = fresh(&names);
+    let before = asked(&servers);
+    let first = through_naming(&naming, &servers, "www.example.com").await;
+    assert_eq!(first.trust, Some(TrustOutcome::Validated));
+    assert_eq!(asked(&servers) - before, 7);
+    // The same setting: the zone's chain is held.
+    let again = names.at_hop("hop", Some(&tunnel));
+    let before = asked(&servers);
+    let second = through_naming(&again, &servers, "api.example.com").await;
+    assert_eq!(second.trust, Some(TrustOutcome::Validated));
+    assert_eq!(asked(&servers) - before, 2);
+    // The setting changes.
+    let changed = crate::pipe::Names::new(choice, None);
+    let naming = fresh(&changed);
+    let before = asked(&servers);
+    let cold = through_naming(&naming, &servers, "api.example.com").await;
+    assert_eq!(cold.trust, Some(TrustOutcome::Validated));
+    assert_eq!(asked(&servers) - before, 7);
+}
+
+// What a negative reply's authority section keeps of its SOA.
+#[derive(Clone, Copy, Debug)]
+enum Soa {
+    Kept,
+    // The SOA and its signatures left out.
+    Dropped,
+    // The SOA said to be another zone's.
+    Elsewhere,
+}
+
+// Under `Validate`, a negative answer holds as dnsmasq holds one: by its
+// SOA, signed or not, and for no time when the reply has no SOA owned by
+// the name or a zone above it. It is still the answer.
+#[tokio::test(start_paused = true)]
+async fn a_validated_negative_answer_holds_by_its_soa_and_for_no_time_without_one() {
+    let resolver = tree(KeyAlgorithm::P256);
+    for (host, soa, held, judged) in [
+        (
+            "missing.example.com",
+            Soa::Kept,
+            300,
+            TrustOutcome::Validated,
+        ),
+        (
+            "missing.example.com",
+            Soa::Dropped,
+            0,
+            TrustOutcome::Validated,
+        ),
+        ("missing.plain.com", Soa::Kept, 300, TrustOutcome::Unsigned),
+        (
+            "missing.plain.com",
+            Soa::Elsewhere,
+            0,
+            TrustOutcome::Unsigned,
+        ),
+        ("missing.plain.com", Soa::Dropped, 0, TrustOutcome::Unsigned),
+    ] {
+        let signed = resolver.clone();
+        let servers = Servers::new(Speaks::Dot { close_after: None }, move |_, _, query| {
+            let (asked, _) = question(query);
+            let Ok(mut reply) = signed.reply(&asked) else {
+                return servfail(query);
+            };
+            if asked.name == name(&format!("{host}.")) {
+                let is_soa = |record: &weaver_dnssec::testing::Record| {
+                    record.rtype == RecordType::SOA
+                        || (record.rtype == RecordType::RRSIG
+                            && record.rdata.get(..2) == Some(&RecordType::SOA.0.to_be_bytes()[..]))
+                };
+                match soa {
+                    Soa::Kept => {}
+                    Soa::Dropped => reply.authority.retain(|record| !is_soa(record)),
+                    Soa::Elsewhere => {
+                        for record in reply.authority.iter_mut().filter(|record| is_soa(record)) {
+                            record.owner = name("elsewhere.");
+                        }
+                    }
+                }
+            }
+            let mut bytes = reply.encode(&asked).unwrap();
+            bytes[..2].copy_from_slice(&query[..2]);
+            bytes
+        })
+        .plain_at("192.0.2.53");
+        let dnssec = trusting(&resolver, NOW);
+        let (resolved, account) = resolve_judged(
+            &servers,
+            &Authority::new().wires(),
+            &dnssec,
+            &[first()],
+            Trust::Validate,
+            host,
+        )
+        .await;
+        let lookup = resolved.unwrap();
+        assert!(lookup.addresses.is_empty(), "{host} {soa:?}");
+        assert!(lookup.nonexistent, "{host} {soa:?}");
+        assert_eq!(lookup.ttl, Ttl::Seconds(held), "{host} {soa:?}");
+        assert_eq!(account.judged, Some(judged), "{host} {soa:?}");
     }
 }
 

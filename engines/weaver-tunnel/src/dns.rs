@@ -129,8 +129,14 @@ fn invalid() -> TunnelError {
 }
 static NEXT_ID: AtomicU16 = AtomicU16::new(1);
 
-// Ceiling on one address-family query, dial and CNAME walk included.
-const FAMILY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Ceiling on what one listed server is asked for one lookup: the dial, TLS,
+// both address families with the aliases they follow, and under `Validate`
+// every query of the DNSSEC check. Each server asked gets all of it, however
+// long the servers before it took. When it runs out the next server is asked.
+const SERVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+// The address families a lookup asks for: A, then AAAA.
+const FAMILIES: [u16; 2] = [1, 28];
 
 // What a query is asked over.
 #[async_trait::async_trait]
@@ -246,7 +252,8 @@ pub(crate) async fn resolve_routed(
 
 // What one family's query found, and for how long that holds: the
 // shortest TTL of the records the answer used, or for no address the
-// zone's negative TTL, when the answer gives one.
+// zone's negative TTL. None for no address and no SOA to give one: such an
+// answer is given but held for no time, as dnsmasq holds none by default.
 struct Found {
     addresses: Vec<IpAddr>,
     ttl: Option<u32>,
@@ -267,6 +274,9 @@ enum Failed {
     Cut,
     // The server reset the HTTP/2 stream carrying the query.
     Reset,
+    // The server refused the HTTP/2 stream unhandled (RFC 9113 §8.7): the
+    // connection still runs, and the query may be sent again on it.
+    Refused,
     // The server answered with this error code instead of an answer.
     Rcode(u16),
     Invalid,
@@ -279,6 +289,29 @@ enum Failed {
     Bogus(weaver_dnssec::BogusReason, Vec<u16>),
     // Under `Validate`, a signed zone's answer came with no DNSSEC records.
     Stripped(Vec<u16>),
+}
+
+impl Failed {
+    // The same failure, for another query it ended too. A stage's error is
+    // carried by its words, which are all a lookup says of it.
+    fn copy(&self) -> Self {
+        match self {
+            Self::Unreached(error) => Self::Unreached(match error {
+                TunnelError::Engine(said) => TunnelError::Engine(said.clone()),
+                error => TunnelError::Engine(error.to_string()),
+            }),
+            Self::Closed => Self::Closed,
+            Self::Cut => Self::Cut,
+            Self::Reset => Self::Reset,
+            Self::Refused => Self::Refused,
+            Self::Rcode(rcode) => Self::Rcode(*rcode),
+            Self::Invalid => Self::Invalid,
+            Self::Tls(reason) => Self::Tls(reason),
+            Self::Http(status) => Self::Http(*status),
+            Self::Bogus(reason, codes) => Self::Bogus(*reason, codes.clone()),
+            Self::Stripped(codes) => Self::Stripped(codes.clone()),
+        }
+    }
 }
 
 // Why a lookup found nothing, from what each server it asked said: the
@@ -332,9 +365,10 @@ impl Why {
             Ok(Err(Failed::Cut)) => self.consider(LookupFailure::NoReply, || {
                 format!("{server}: the connection closed part way through a reply")
             }),
-            Ok(Err(Failed::Reset)) => self.consider(LookupFailure::NoReply, || {
-                format!("{server}: the server reset the query")
-            }),
+            Ok(Err(Failed::Reset | Failed::Refused)) => self
+                .consider(LookupFailure::NoReply, || {
+                    format!("{server}: the server reset the query")
+                }),
             Ok(Err(Failed::Rcode(rcode))) => self.consider(LookupFailure::ServerFailure, || {
                 let said = match rcode {
                     2 => "SERVFAIL".to_owned(),
@@ -369,10 +403,7 @@ impl Why {
                 })
             }
             Err(_) => self.consider(LookupFailure::TimedOut, || {
-                format!(
-                    "{server}: no answer within {}s",
-                    FAMILY_QUERY_TIMEOUT.as_secs()
-                )
+                format!("{server}: no answer within {}s", SERVER_TIMEOUT.as_secs())
             }),
         }
     }
@@ -482,35 +513,28 @@ async fn resolve_judged(
         }
         encrypted_before |= server.wire != Wire::Plain;
         // An encrypted wire keeps one connection to the server for both
-        // families and every alias followed.
+        // families, every alias followed and every DNSSEC query.
         let mut session = Session::new(provider, wires, server);
+        // Set as soon as the server answers a dial, so a server cut off by
+        // its time limit still says it was reached.
+        let mut reached = false;
+        let answered = asked(&mut session, dnssec, host, trust, &mut reached).await;
+        reached_any |= reached;
         let mut addresses = Vec::new();
         // The shortest TTL either family's answer gave.
         let mut ttl: Option<u32> = None;
         let mut said_none = 0;
+        // A family said no address and gave no SOA, so a negative answer
+        // from this server holds for no time.
+        let mut without_soa = false;
         // Whether a reply used for this server's answer was unsigned.
         let mut unsigned = false;
         // The families whose answer from this server failed the DNSSEC
         // check, or came without its records.
         let mut bogus = Vec::new();
-        for qtype in [1u16, 28] {
-            // A resolver may answer for only one family. A failing or silent
-            // peer query must neither erase the answers already collected nor
-            // stop the other family from being asked, and its own wait is
-            // bounded so it cannot spend the caller's whole deadline.
-            //
-            // A route that cannot reach the server at all is different: the
-            // other family would only dial the same dead route again, and the
-            // caller's ladder moves on sooner for being told once.
-            // `query` marks `reached` as soon as the server answers the
-            // dial, so a query cut off by the ceiling still says so.
-            let mut reached = false;
-            let answered = tokio::time::timeout(
-                FAMILY_QUERY_TIMEOUT,
-                query(&mut session, dnssec, host, qtype, trust, &mut reached),
-            )
-            .await;
-            reached_any |= reached;
+        for (qtype, answered) in FAMILIES.into_iter().zip(answered) {
+            // A family the server's time limit cut off.
+            let answered = answered.ok_or(());
             why.query(server, &answered);
             match answered {
                 Ok(Ok(found)) => {
@@ -523,16 +547,14 @@ async fn resolve_judged(
                         );
                         unsigned = true;
                     }
-                    if let Some(held) = found.ttl {
-                        ttl = Some(ttl.map_or(held, |ttl| ttl.min(held)));
-                        said_none += usize::from(found.addresses.is_empty());
+                    match found.ttl {
+                        Some(held) => ttl = Some(ttl.map_or(held, |ttl| ttl.min(held))),
+                        None => without_soa = true,
                     }
+                    said_none += usize::from(found.addresses.is_empty());
                     addresses.extend(found.addresses);
                 }
                 Ok(Err(Failed::Bogus(..) | Failed::Stripped(_))) => bogus.push(qtype),
-                _ if !reached => break,
-                // The other family would only fail the same handshake.
-                Ok(Err(Failed::Tls(_))) => break,
                 _ => {}
             }
         }
@@ -558,10 +580,11 @@ async fn resolve_judged(
             };
             return (Ok(lookup), account);
         }
+        let held = if without_soa { Some(0) } else { ttl };
         negative = negative
-            .zip(ttl)
+            .zip(held)
             .filter(|_| said_none == 2)
-            .map(|(negative, ttl)| negative.min(ttl));
+            .map(|(negative, held)| negative.min(held));
         negative_unsigned |= unsigned;
     }
     let nonexistent = matches!(why.0, Some((LookupFailure::NoSuchName, _)));
@@ -624,72 +647,185 @@ fn never_in_plain(server: &DnsServer, encrypted_before: bool) -> bool {
     encrypted_before && server.wire == Wire::Plain
 }
 
-async fn query(
+// What one server says of each of `host`'s families, A then AAAA, within
+// the server's time limit: each family's outcome, or None for one the limit
+// cut off. Both families are asked together on the one session, and each
+// sends its next query as soon as the reply it waits on comes, so neither
+// waits on the other's. A resolver may answer for one family only, so a
+// family that fails or stays silent leaves the other's answer standing. A
+// server that cannot be reached, or fails TLS, fails both at once, so a dead
+// route is dialled once.
+async fn asked(
     session: &mut Session<'_>,
     dnssec: &Dnssec,
     host: &str,
-    qtype: u16,
     trust: Trust,
     reached: &mut bool,
-) -> Result<Found, Failed> {
-    let mut name = host.trim_end_matches('.').to_ascii_lowercase();
-    // Under `Validate` the validator asks for the name, its aliases and
-    // what proves them, by the same session.
-    if trust == Trust::Validate {
-        // A backslash would be read as an escape in the validator's name.
-        if !host_name(&name) || name.contains('\\') {
-            return Err(Failed::Invalid);
+) -> [Option<Result<Found, Failed>>; 2] {
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    match trust {
+        Trust::AsSent => {
+            let mut walks = Walks::new(&name);
+            let _ = tokio::time::timeout(SERVER_TIMEOUT, walks.run(session, reached)).await;
+            walks.found()
         }
-        session.counting();
-        return dnssec::validated(session, dnssec, &name, qtype, reached).await;
+        // The validator asks for the name, its aliases and what proves
+        // them, by the same session.
+        Trust::Validate => {
+            // A backslash would be read as an escape in the validator's name.
+            if !host_name(&name) || name.contains('\\') {
+                return FAMILIES.map(|_| Some(Err(Failed::Invalid)));
+            }
+            session.counting();
+            let mut found = FAMILIES.map(|_| None);
+            let checks =
+                dnssec::validated_all(session, dnssec, &name, &FAMILIES, &mut found, reached);
+            let _ = tokio::time::timeout(SERVER_TIMEOUT, checks).await;
+            found
+        }
     }
+}
+
+// One family's walk along the aliases its answers name, under `AsSent`.
+struct Walk {
+    qtype: u16,
+    // The name asked next.
+    name: String,
     // The shortest TTL of the aliases followed so far.
-    let mut ttl = u32::MAX;
-    for _ in 0..8 {
-        // DNS over HTTPS sends id 0, so a cache between can serve it (RFC
-        // 8484 §4.1).
-        let id = match session.server().wire {
-            Wire::Https { .. } => 0,
-            Wire::Plain | Wire::Tls { .. } => NEXT_ID.fetch_add(1, Ordering::Relaxed),
+    ttl: u32,
+    // Queries sent so far.
+    sent: usize,
+    // The id the last query went out with.
+    id: u16,
+    // What the walk came to, once it has.
+    done: Option<Result<Found, Failed>>,
+}
+
+impl Walk {
+    // The query for the name the walk is at, or None when it is done. DNS
+    // over HTTPS sends id 0, so a cache between can serve it (RFC 8484
+    // §4.1).
+    fn packet(&mut self, https: bool) -> Option<Vec<u8>> {
+        if self.done.is_some() {
+            return None;
+        }
+        if self.sent == 8 || !host_name(&self.name) {
+            self.done = Some(Err(Failed::Invalid));
+            return None;
+        }
+        self.sent += 1;
+        self.id = if https {
+            0
+        } else {
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         };
-        let mut packet = Vec::from(id.to_be_bytes());
+        let mut packet = Vec::from(self.id.to_be_bytes());
         // Recursion desired.
         packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-        if !host_name(&name) {
-            return Err(Failed::Invalid);
-        }
-        for label in name.split('.') {
+        for label in self.name.split('.') {
             packet.push(label.len() as u8);
             packet.extend_from_slice(label.as_bytes());
         }
         packet.push(0);
-        packet.extend_from_slice(&qtype.to_be_bytes());
+        packet.extend_from_slice(&self.qtype.to_be_bytes());
         packet.extend_from_slice(&[0, 1]);
-        let bytes = session.ask(&packet, reached).await?;
-        let reply = parse_response(&bytes, id, &name, qtype)
-            .map_err(|_| refusal(&bytes, id).map_or(Failed::Invalid, Failed::Rcode))?;
-        ttl = ttl.min(reply.ttl);
+        Some(packet)
+    }
+
+    // Takes the reply to the walk's last query: an answer, or an alias to
+    // ask for next.
+    fn take(&mut self, reply: wire::Reply) {
+        let bytes = match reply {
+            Ok(bytes) => bytes,
+            Err(failed) => {
+                self.done = Some(Err(failed));
+                return;
+            }
+        };
+        let reply = match parse_response(&bytes, self.id, &self.name, self.qtype) {
+            Ok(reply) => reply,
+            Err(_) => {
+                let failed = refusal(&bytes, self.id).map_or(Failed::Invalid, Failed::Rcode);
+                self.done = Some(Err(failed));
+                return;
+            }
+        };
+        self.ttl = self.ttl.min(reply.ttl);
         if !reply.addresses.is_empty() {
-            return Ok(Found {
+            self.done = Some(Ok(Found {
                 addresses: reply.addresses,
-                ttl: Some(ttl),
+                ttl: Some(self.ttl),
                 nonexistent: false,
                 insecure: None,
-            });
+            }));
+            return;
         }
         match reply.alias {
-            Some(alias) => name = alias,
+            Some(alias) => self.name = alias,
             None => {
-                return Ok(Found {
+                self.done = Some(Ok(Found {
                     addresses: Vec::new(),
-                    ttl: reply.negative.map(|negative| negative.min(ttl)),
+                    ttl: reply.negative.map(|negative| negative.min(self.ttl)),
                     nonexistent: reply.nonexistent,
                     insecure: None,
-                });
+                }));
             }
         }
     }
-    Err(Failed::Invalid)
+}
+
+// Both families' walks at one server. Each walk takes its reply as it comes
+// and sends its next query at once, so a family whose query stays silent
+// holds up only itself, and a walk that ended before the server's time limit
+// ran out keeps its answer.
+struct Walks([Walk; 2]);
+
+impl Walks {
+    fn new(name: &str) -> Self {
+        Self(FAMILIES.map(|qtype| Walk {
+            qtype,
+            name: name.to_owned(),
+            ttl: u32::MAX,
+            sent: 0,
+            id: 0,
+            done: None,
+        }))
+    }
+
+    async fn run(&mut self, session: &mut Session<'_>, reached: &mut bool) {
+        let https = matches!(session.server().wire, Wire::Https { .. });
+        let mut talk = session.talk(reached);
+        for (at, walk) in self.0.iter_mut().enumerate() {
+            if let Some(packet) = walk.packet(https) {
+                talk.send(at, at, packet);
+            }
+        }
+        loop {
+            match talk.next().await {
+                Ok(Some((at, reply))) => {
+                    let walk = &mut self.0[at];
+                    walk.take(reply);
+                    if let Some(packet) = walk.packet(https) {
+                        talk.send(at, at, packet);
+                    }
+                }
+                Ok(None) => return,
+                Err(failed) => {
+                    for walk in &mut self.0 {
+                        if walk.done.is_none() {
+                            walk.done = Some(Err(failed.copy()));
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    // Each walk's outcome, None for one still under way.
+    fn found(self) -> [Option<Result<Found, Failed>>; 2] {
+        self.0.map(|walk| walk.done)
+    }
 }
 
 // A name a query may ask for: ASCII labels of 1 to 63 bytes, 253 bytes in
@@ -820,7 +956,8 @@ struct Reply {
     // The shortest TTL of the records the answer used.
     ttl: u32,
     // For no address, how long that holds: the zone's negative TTL, from
-    // the SOA in the authority section, when there is one.
+    // the first SOA in the authority section owned by the name or a zone
+    // above it, when there is one.
     negative: Option<u32>,
     // The server said the name does not exist.
     nonexistent: bool,
@@ -905,12 +1042,13 @@ fn parse_response(bytes: &[u8], id: u16, host: &str, qtype: u16) -> Result<Reply
         }
     }
     // A name that does not exist leaves no alias to ask for.
-    let alias = (canonical != host && rcode == 0).then_some(canonical);
-    let negative = if addresses.is_empty() && alias.is_none() {
-        negative_ttl(bytes, at, authority)
+    let follow = canonical != host && rcode == 0;
+    let negative = if addresses.is_empty() && !follow {
+        negative_ttl(bytes, at, authority, &canonical)
     } else {
         None
     };
+    let alias = follow.then_some(canonical);
     Ok(Reply {
         addresses,
         alias,
@@ -920,27 +1058,40 @@ fn parse_response(bytes: &[u8], id: u16, host: &str, qtype: u16) -> Result<Reply
     })
 }
 
-// The negative TTL from the SOA among the `count` authority records at
-// `at`: the lower of the record's own TTL and the SOA's minimum (RFC 2308
-// §5). A malformed authority section gives none rather than failing the
+// The negative TTL from the first SOA among the `count` authority records
+// at `at` that is owned by `name` or a zone above it: the lower of the
+// record's own TTL and the SOA's minimum (RFC 2308 §5), as dnsmasq takes
+// it. A malformed authority section gives none rather than failing the
 // answer.
-fn negative_ttl(bytes: &[u8], mut at: usize, count: usize) -> Option<u32> {
+fn negative_ttl(bytes: &[u8], mut at: usize, count: usize, name: &str) -> Option<u32> {
     for _ in 0..count {
         let record = record(bytes, &mut at).ok()?;
-        if record.kind != 6 || record.class != 1 {
+        if record.kind != 6 || record.class != 1 || !at_or_below(name, &record.owner) {
             continue;
         }
         let mut cursor = record.data;
         read_name(bytes, &mut cursor).ok()?;
         read_name(bytes, &mut cursor).ok()?;
-        // Serial, refresh, retry and expire come before the minimum.
-        if cursor + 20 != record.data + record.size {
+        // Serial, refresh, retry and expire come before the minimum. Bytes
+        // after them are passed over, as dnsmasq passes them (rfc1035.c,
+        // find_soa: CHECK_LEN for 20).
+        if cursor + 20 > record.data + record.size {
             return None;
         }
         let minimum = u32_at(bytes, cursor + 16).ok()?;
         return Some(record.ttl.min(minimum));
     }
     None
+}
+
+// Whether `name` is `zone` or a name inside it. Both are lower case with no
+// final dot, the root empty.
+fn at_or_below(name: &str, zone: &str) -> bool {
+    zone.is_empty()
+        || name == zone
+        || name
+            .strip_suffix(zone)
+            .is_some_and(|head| head.ends_with('.'))
 }
 
 #[cfg(test)]

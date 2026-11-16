@@ -192,7 +192,63 @@ async fn a_dead_route_is_dialled_once_per_server_not_once_per_family() {
             "hang={hang}"
         );
         if hang {
-            assert_eq!(started.elapsed(), FAMILY_QUERY_TIMEOUT * 2);
+            assert_eq!(started.elapsed(), SERVER_TIMEOUT * 2);
         }
     }
+}
+
+// Each listed server gets the whole time limit for both families, however
+// long the servers before it took. Ten that take the dial and never answer
+// cost ten limits, 50 seconds, one each and not one per family.
+#[tokio::test(start_paused = true)]
+async fn each_server_gets_one_full_time_limit_for_both_families() {
+    let servers: Vec<DnsServer> = (1..=10)
+        .map(|n| DnsServer::plain(format!("192.0.2.{n}").parse().unwrap()))
+        .collect();
+    let started = tokio::time::Instant::now();
+    let unanswered = resolve_name(&super::ttl::Silent::default(), &servers, "fixture.invalid")
+        .await
+        .unwrap_err();
+    assert!(unanswered.reached);
+    assert_eq!(started.elapsed(), SERVER_TIMEOUT * 10);
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(50));
+}
+
+// The first server takes the dial and never answers; the second answers at
+// once, on a fresh limit of its own.
+struct SilentFirst(super::ttl::Silent, super::ttl::Zone);
+
+#[async_trait::async_trait]
+impl Carrier for SilentFirst {
+    async fn open(&self, server: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+        if server.to_string() == "192.0.2.53" {
+            self.0.open(server).await
+        } else {
+            self.1.open(server).await
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_server_costs_one_time_limit_and_the_next_is_asked_afresh() {
+    let carrier = SilentFirst(
+        super::ttl::Silent::default(),
+        super::ttl::Zone::new(|_, qtype, query| match qtype {
+            1 => super::ttl::v4(query, 300),
+            _ => super::ttl::respond(query, 0, &[], &[super::ttl::soa(300, 300)]),
+        }),
+    );
+    let started = tokio::time::Instant::now();
+    let lookup = resolve_name(
+        &carrier,
+        &[
+            DnsServer::plain("192.0.2.53".parse().unwrap()),
+            DnsServer::plain("192.0.2.54".parse().unwrap()),
+        ],
+        "fixture.invalid",
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookup.addresses, ["192.0.2.7".parse::<IpAddr>().unwrap()]);
+    assert_eq!(started.elapsed(), SERVER_TIMEOUT);
 }

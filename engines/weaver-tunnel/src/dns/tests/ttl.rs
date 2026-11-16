@@ -171,33 +171,83 @@ async fn an_alias_to_a_name_that_does_not_exist_is_a_negative_answer() {
     assert_eq!(lookup.ttl, Ttl::Seconds(30));
 }
 
+// As dnsmasq by default: a negative answer with no SOA is passed on but not
+// held (rfc1035.c, `if (have_soa || daemon->neg_ttl)` with `neg_ttl` 0).
 #[tokio::test]
-async fn no_address_without_an_soa_stays_unanswered() {
-    let zone = Zone::new(|_, _, query| respond(query, 3, &[], &[]));
-    let unanswered = resolve_name(&zone, &[server()], "missing.test")
-        .await
-        .unwrap_err();
-    assert!(unanswered.reached);
+async fn a_negative_answer_without_an_soa_is_given_and_held_for_no_time() {
+    for (rcode, nonexistent) in [(3, true), (0, false)] {
+        let zone = Zone::new(move |_, _, query| respond(query, rcode, &[], &[]));
+        let lookup = resolve_name(&zone, &[server()], "missing.test")
+            .await
+            .unwrap();
+        assert!(lookup.addresses.is_empty(), "{rcode}");
+        assert_eq!(lookup.nonexistent, nonexistent, "{rcode}");
+        assert_eq!(lookup.ttl, Ttl::Seconds(0), "{rcode}");
+    }
+}
+
+// An SOA in the authority section, owned by `owner`.
+fn soa_at(owner: &str, ttl: u32, minimum: u32) -> Vec<u8> {
+    let mut record = soa(ttl, minimum);
+    let test = wire("test");
+    record.splice(..test.len(), wire(owner));
+    record
+}
+
+// As dnsmasq's find_soa: only an SOA owned by the name or a zone above it
+// says how long the name's having no address holds, and the first such
+// wins. One for another zone, or below the name, is passed over.
+#[tokio::test]
+async fn only_the_first_soa_at_or_above_the_name_bounds_a_negative_answer() {
+    for (authority, held) in [
+        (vec![soa_at("elsewhere", 900, 300)], 0),
+        (vec![soa_at("deeper.missing.test", 900, 300)], 0),
+        (vec![soa_at("ng.test", 900, 300)], 0),
+        (vec![soa_at("elsewhere", 900, 30), soa(900, 120)], 120),
+        (vec![soa_at("missing.test", 900, 60), soa(900, 120)], 60),
+        (vec![soa(900, 120), soa_at("missing.test", 900, 60)], 120),
+    ] {
+        let zone = Zone::new({
+            let authority = authority.clone();
+            move |_, _, query| respond(query, 3, &[], &authority)
+        });
+        let lookup = resolve_name(&zone, &[server()], "missing.test")
+            .await
+            .unwrap();
+        assert_eq!(lookup.ttl, Ttl::Seconds(held), "{authority:?}");
+    }
 }
 
 #[tokio::test]
 async fn a_negative_answer_needs_every_server_asked_to_give_one() {
     let other: IpAddr = "192.0.2.54".parse().unwrap();
+    let both = [server(), DnsServer::plain(other)];
     let zone = Zone::new(move |asked, _, query| {
         if asked == other {
-            respond(query, 3, &[], &[])
+            respond(query, 2, &[], &[])
         } else {
             respond(query, 3, &[], &[soa(900, 120)])
         }
     });
-    let unanswered = resolve_name(&zone, &[server(), DnsServer::plain(other)], "missing.test")
+    let unanswered = resolve_name(&zone, &both, "missing.test")
         .await
         .unwrap_err();
     assert!(unanswered.reached);
     let zone = Zone::new(|_, _, query| respond(query, 3, &[], &[soa(900, 120)]));
-    let both = [server(), DnsServer::plain(other)];
     let lookup = resolve_name(&zone, &both, "missing.test").await.unwrap();
     assert_eq!(lookup.ttl, Ttl::Seconds(120));
+    // One server's negative answer with no SOA holds for no time, so
+    // neither does the lookup's.
+    let zone = Zone::new(move |asked, _, query| {
+        let authority = if asked == other {
+            vec![]
+        } else {
+            vec![soa(900, 120)]
+        };
+        respond(query, 3, &[], &authority)
+    });
+    let lookup = resolve_name(&zone, &both, "missing.test").await.unwrap();
+    assert_eq!(lookup.ttl, Ttl::Seconds(0));
 }
 
 #[test]
@@ -329,4 +379,38 @@ async fn a_plain_server_off_port_53_is_dialled_there_and_named_with_its_port() {
         failure(LookupFailure::ServerFailure, "192.0.2.53:5353: SERVFAIL")
     );
     assert_eq!(*ports.lock().unwrap(), [5353, 5353]);
+}
+
+// An SOA with `fixed` of the twenty bytes of its five numbers, then
+// `trailing`.
+fn soa_cut(fixed: usize, trailing: &[u8]) -> Vec<u8> {
+    let mut data = wire("ns.test");
+    data.extend(wire("hostmaster.test"));
+    let numbers: Vec<u8> = [1u32, 7200, 900, 1_209_600, 120]
+        .iter()
+        .flat_map(|number| number.to_be_bytes())
+        .collect();
+    data.extend_from_slice(&numbers[..fixed]);
+    data.extend_from_slice(trailing);
+    rr(&wire("test"), 6, 900, &data)
+}
+
+// An SOA is read for the negative answer's bound when its record holds its
+// five numbers whole, whatever follows them. One short of them bounds
+// nothing, as no SOA does.
+#[tokio::test]
+async fn an_soa_bounds_a_negative_answer_with_bytes_after_its_numbers_and_not_short_of_them() {
+    for (fixed, trailing, held) in [
+        (20, &[][..], 120),
+        (20, &[0, 0, 0][..], 120),
+        (19, &[][..], 0),
+    ] {
+        let soa = soa_cut(fixed, trailing);
+        let zone = Zone::new(move |_, _, query| respond(query, 3, &[], std::slice::from_ref(&soa)));
+        let lookup = resolve_name(&zone, &[server()], "missing.test")
+            .await
+            .unwrap();
+        assert!(lookup.addresses.is_empty(), "{fixed} {trailing:?}");
+        assert_eq!(lookup.ttl, Ttl::Seconds(held), "{fixed} {trailing:?}");
+    }
 }

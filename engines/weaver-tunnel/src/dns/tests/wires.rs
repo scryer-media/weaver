@@ -151,8 +151,9 @@ enum Speaks {
         dribble: bool,
     },
     // HTTP/2. `respond` makes the response from the reply. With
-    // `goaway_after`, the request after that many is met with a GOAWAY and
-    // the connection closed. `misstep` is what each stream does first.
+    // `goaway_after`, each of the first that many connections meets its
+    // first stream with a GOAWAY, answers nothing, and closes; later ones
+    // answer. `misstep` is what each stream does first.
     H2 {
         respond: Arc<H2Respond>,
         goaway_after: Option<usize>,
@@ -170,6 +171,16 @@ enum H2Misstep {
     Interims(usize),
     // Tries to push a response first, and logs what came of it.
     Push,
+    // Refuses the second stream on each connection unhandled, as a server
+    // over its limit of streams at once does (RFC 9113 §8.7), and answers
+    // the rest.
+    RefuseSecond,
+    // Refuses every stream unhandled.
+    RefuseEvery,
+    // On the connections `goaway_after` sends away: holds the first stream
+    // unanswered and sends the connection away gracefully, keeping that
+    // stream, and refuses each stream after it unhandled.
+    Graceful,
 }
 
 type H2Respond = dyn Fn(Vec<u8>) -> hyper::Response<Vec<u8>> + Send + Sync;
@@ -185,6 +196,8 @@ struct Log {
     requests: Vec<Seen>,
     // What each HTTP/2 push the server tried came to.
     pushes: Vec<Result<(), String>>,
+    // HTTP/2 streams refused unhandled.
+    refused: usize,
 }
 
 // DNS servers, by address, in process: encrypted ones, plain ones, and
@@ -204,6 +217,64 @@ struct Servers {
     // on the paused clock, when set; and how many such waits there were.
     rtt: Option<std::time::Duration>,
     waits: Arc<AtomicUsize>,
+    // The dial, counted from 0, that finds nothing listening, when set.
+    unreached: Option<usize>,
+    // Client streams being dialled or open now, and the most at once.
+    open: Arc<AtomicUsize>,
+    most_open: Arc<AtomicUsize>,
+    // A permit for each HTTP/2 stream held unanswered, and for each HTTP/2
+    // connection that has ended.
+    holding: Arc<tokio::sync::Semaphore>,
+    ended: Arc<tokio::sync::Semaphore>,
+}
+
+// One client stream counted from its dial until it is dropped.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn new(open: &Arc<AtomicUsize>, most: &AtomicUsize) -> Self {
+        let now = open.fetch_add(1, Ordering::Relaxed) + 1;
+        most.fetch_max(now, Ordering::Relaxed);
+        Self(open.clone())
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+// A client's end of a connection, with its slot.
+struct Counted {
+    inner: Box<dyn crate::TunnelStream>,
+    _slot: Slot,
+}
+
+impl AsyncRead for Counted {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Counted {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 // A client's end of a connection with a round trip's latency: a read that
@@ -269,7 +340,20 @@ impl Servers {
             log: Default::default(),
             rtt: None,
             waits: Arc::default(),
+            unreached: None,
+            open: Arc::default(),
+            most_open: Arc::default(),
+            holding: Arc::new(tokio::sync::Semaphore::new(0)),
+            ended: Arc::new(tokio::sync::Semaphore::new(0)),
         }
+    }
+    fn unreached_at(mut self, dial: usize) -> Self {
+        self.unreached = Some(dial);
+        self
+    }
+    // The most client streams being dialled or open at once.
+    fn most_open(&self) -> usize {
+        self.most_open.load(Ordering::Relaxed)
     }
     fn delayed(mut self, rtt: std::time::Duration) -> Self {
         self.rtt = Some(rtt);
@@ -321,12 +405,17 @@ impl Carrier for Servers {
         let (client, inner) = tokio::io::duplex(65536);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let queries = Arc::new(AtomicUsize::new(0));
-        {
+        let dial = {
             let mut log = self.log.lock().unwrap();
             log.dials.push(server.address);
             log.sent.push(seen.clone());
             log.queries.push(queries.clone());
+            log.dials.len() - 1
+        };
+        if self.unreached == Some(dial) {
+            return Err(TunnelError::Engine(format!("dial {dial} reaches nothing")));
         }
+        let slot = Slot::new(&self.open, &self.most_open);
         let client: Box<dyn crate::TunnelStream> = match self.rtt {
             Some(rtt) => {
                 self.waits.fetch_add(1, Ordering::Relaxed);
@@ -341,6 +430,10 @@ impl Carrier for Servers {
             }
             None => Box::new(client),
         };
+        let client: Box<dyn crate::TunnelStream> = Box::new(Counted {
+            inner: client,
+            _slot: slot,
+        });
         let asked = server.address.ip();
         let answer = self.answer.clone();
         let replies = self.replies.clone();
@@ -361,6 +454,7 @@ impl Carrier for Servers {
         let acceptor = TlsAcceptor::from(config.clone());
         let speaks = self.speaks.clone();
         let log = self.log.clone();
+        let (holding, ended) = (self.holding.clone(), self.ended.clone());
         tokio::spawn(async move {
             let Ok(mut tls) = acceptor.accept(Tap { inner, seen }).await else {
                 return;
@@ -395,6 +489,12 @@ impl Carrier for Servers {
                     let body = seen.body.clone();
                     log.lock().unwrap().requests.push(seen);
                     let reply = answer(asked, u16_at(&body, body.len() - 4).unwrap(), &body);
+                    // No reply made: the request is never answered, and the
+                    // connection stays open.
+                    if reply.is_empty() {
+                        let _held = tls;
+                        return std::future::pending().await;
+                    }
                     let response = respond(&body, reply);
                     let sent = if dribble {
                         let mut sent = Ok(());
@@ -424,11 +524,11 @@ impl Carrier for Servers {
                         asked,
                         answer,
                         (respond, misstep),
-                        goaway_after,
-                        queries,
-                        log,
+                        goaway_after.is_some_and(|connections| dial < connections),
+                        (queries, log, holding),
                     )
-                    .await
+                    .await;
+                    ended.add_permits(1);
                 }
             }
         });
@@ -443,9 +543,12 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
     asked: IpAddr,
     answer: Arc<Answer>,
     (respond, misstep): (Arc<H2Respond>, H2Misstep),
-    goaway_after: Option<usize>,
-    queries: Arc<AtomicUsize>,
-    log: Arc<Mutex<Log>>,
+    goaway: bool,
+    (queries, log, holding): (
+        Arc<AtomicUsize>,
+        Arc<Mutex<Log>>,
+        Arc<tokio::sync::Semaphore>,
+    ),
 ) {
     let Ok(mut connection) = h2::server::handshake(stream).await else {
         return;
@@ -453,15 +556,41 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
     let mut accepted = 0;
     while let Some(Ok((request, mut send))) = connection.accept().await {
         accepted += 1;
-        if goaway_after.is_some_and(|after| accepted > after) {
+        if goaway && matches!(misstep, H2Misstep::Graceful) {
+            if accepted == 1 {
+                connection.graceful_shutdown();
+                let holding = holding.clone();
+                tokio::spawn(async move {
+                    let _held = (request, send);
+                    holding.add_permits(1);
+                    std::future::pending::<()>().await
+                });
+            } else {
+                log.lock().unwrap().refused += 1;
+                send.send_reset(h2::Reason::REFUSED_STREAM);
+            }
+            continue;
+        }
+        if goaway {
             connection.abrupt_shutdown(h2::Reason::NO_ERROR);
             continue;
         }
-        let (answer, respond, queries, log) = (
+        let refuse = match misstep {
+            H2Misstep::RefuseSecond => accepted == 2,
+            H2Misstep::RefuseEvery => true,
+            _ => false,
+        };
+        if refuse {
+            log.lock().unwrap().refused += 1;
+            send.send_reset(h2::Reason::REFUSED_STREAM);
+            continue;
+        }
+        let (answer, respond, queries, log, holding) = (
             answer.clone(),
             respond.clone(),
             queries.clone(),
             log.clone(),
+            holding.clone(),
         );
         tokio::spawn(async move {
             let (parts, mut body) = request.into_parts();
@@ -469,6 +598,15 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
             while let Some(Ok(chunk)) = body.data().await {
                 let _ = body.flow_control().release_capacity(chunk.len());
                 query.extend_from_slice(&chunk);
+            }
+            // The connection went before the query came whole: fewer bytes
+            // than the request's length says, or none.
+            let length = parts
+                .headers
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|length| length.to_str().ok()?.parse::<usize>().ok());
+            if query.is_empty() || length.is_some_and(|length| query.len() != length) {
+                return;
             }
             queries.fetch_add(1, Ordering::Relaxed);
             log.lock().unwrap().requests.push(Seen {
@@ -482,7 +620,10 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
                 body: query.clone(),
             });
             match misstep {
-                H2Misstep::None => {}
+                H2Misstep::None
+                | H2Misstep::RefuseSecond
+                | H2Misstep::RefuseEvery
+                | H2Misstep::Graceful => {}
                 H2Misstep::Reset { after } if accepted > after => {
                     return send.send_reset(h2::Reason::INTERNAL_ERROR);
                 }
@@ -507,6 +648,12 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             let reply = answer(asked, u16_at(&query, query.len() - 4).unwrap(), &query);
+            // No reply made: the stream is held open and never answered.
+            if reply.is_empty() {
+                let _held = send;
+                holding.add_permits(1);
+                return std::future::pending().await;
+            }
             let (head, bytes) = respond(reply).into_parts();
             let Ok(mut stream) = send.send_response(hyper::Response::from_parts(head, ()), false)
             else {
@@ -548,6 +695,10 @@ async fn framed_replies<S: AsyncRead + AsyncWrite + Unpin>(
         }
         queries.fetch_add(1, Ordering::Relaxed);
         let reply = answer(asked, u16_at(&query, query.len() - 4).unwrap(), &query);
+        // No reply made: the query goes unanswered, the connection open.
+        if reply.is_empty() {
+            continue;
+        }
         let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
         framed.extend(reply);
         if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
@@ -986,7 +1137,8 @@ async fn a_kept_connection_found_dead_is_replaced_once_and_no_more() {
         "fixture.test",
     )
     .await;
-    // A new connection that closes is not retried: one for each family.
+    // A new connection that closes before any reply is not retried. Both
+    // families went out on it together, so it is the only one.
     assert!(resolution.addresses.is_empty());
     assert_eq!(
         resolution.error,
@@ -995,7 +1147,7 @@ async fn a_kept_connection_found_dead_is_replaced_once_and_no_more() {
             "192.0.2.53: the connection closed without a reply"
         ))
     );
-    assert_eq!(servers.dials().len(), 2);
+    assert_eq!(servers.dials().len(), 1);
 }
 
 fn doh_fixture(
@@ -1046,7 +1198,8 @@ async fn doh_posts_the_query_with_id_zero_to_the_path_at_the_servers_address() {
             assert_eq!(seen.body[..2], [0, 0]);
         }
     }
-    assert_eq!(servers.dials().len(), 2);
+    // HTTP/1.1 asks each family on a connection of its own.
+    assert_eq!(servers.dials().len(), 4);
 }
 
 fn doh_servers(
@@ -1056,8 +1209,15 @@ fn doh_servers(
 }
 
 fn doh_servers_speaking(speaks: Speaks) -> (Servers, Wires) {
+    doh_servers_answering(speaks, answers)
+}
+
+fn doh_servers_answering(
+    speaks: Speaks,
+    answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static,
+) -> (Servers, Wires) {
     let authority = Authority::new();
-    let servers = Servers::new(speaks, answers)
+    let servers = Servers::new(speaks, answer)
         .at("192.0.2.53", authority.server(&["192.0.2.53"], b"http/1.1"));
     (servers, authority.wires())
 }
@@ -1148,7 +1308,7 @@ async fn doh_fails_a_reply_over_the_size_cap() {
 
 #[tokio::test(start_paused = true)]
 async fn doh_decodes_a_chunked_body() {
-    let (servers, wires) = doh_servers(|_, reply| {
+    let respond = |_: &[u8], reply: Vec<u8>| {
         http(
             "200 OK",
             &[
@@ -1157,11 +1317,13 @@ async fn doh_decodes_a_chunked_body() {
             ],
             &chunked(&reply, 7),
         )
-    });
+    };
+    let (servers, wires) = doh_servers_answering(doh_fixture(respond, false), alias);
     let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
     assert_eq!(resolution.addresses, seven());
-    // The trailer was read whole, so the connection carried both families.
-    assert_eq!(servers.dials().len(), 1);
+    // The trailer was read whole, so the first family's connection carried
+    // its alias and the alias's target; the other family has its own.
+    assert_eq!(servers.answered(), [2, 1]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1277,14 +1439,14 @@ async fn doh_opens_a_new_connection_after_one_that_says_it_closes() {
     assert_eq!(answered, [1, 1]);
 }
 
+// The first family asks its alias, then the alias's target, on the one
+// connection kept alive; the other family asks on a connection of its own.
 #[tokio::test(start_paused = true)]
 async fn doh_asks_two_queries_on_one_connection_kept_alive() {
-    let (servers, wires) = doh_servers(plain_reply);
+    let (servers, wires) = doh_servers_answering(doh_fixture(plain_reply, false), alias);
     let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
     assert_eq!(resolution.addresses, seven());
-    let log = servers.log.lock().unwrap();
-    assert_eq!(log.dials.len(), 1);
-    assert_eq!(log.queries[0].load(Ordering::Relaxed), 2);
+    assert_eq!(servers.answered(), [2, 1]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1299,10 +1461,11 @@ async fn doh_reads_a_response_that_arrives_a_byte_at_a_time() {
             &chunked(&reply, 5),
         )
     }] {
-        let (servers, wires) = doh_servers_speaking(doh_fixture(respond, true));
+        let (servers, wires) = doh_servers_answering(doh_fixture(respond, true), alias);
         let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
         assert_eq!(resolution.addresses, seven());
-        assert_eq!(servers.dials().len(), 1);
+        // The response was read whole, so its connection was kept.
+        assert_eq!(servers.answered(), [2, 1]);
     }
 }
 
@@ -1695,8 +1858,8 @@ async fn doh_speaks_http_1_1_to_a_server_that_offers_only_it_or_no_alpn() {
             .at("192.0.2.53", authority.server(&["192.0.2.53"], alpn));
         let resolution = doh_lookup(&servers, &authority.wires(), Trust::AsSent).await;
         assert_eq!(resolution.addresses, seven(), "{alpn:?}");
-        assert_eq!(servers.dials().len(), 1, "{alpn:?}");
-        assert_eq!(servers.answered(), [2], "{alpn:?}");
+        // A connection per family.
+        assert_eq!(servers.answered(), [1, 1], "{alpn:?}");
     }
 }
 
@@ -1738,6 +1901,10 @@ async fn doh_over_http_2_fails_another_status_another_type_or_an_over_long_body(
     }
 }
 
+// The server's first connection meets its first stream with a GOAWAY and
+// answers nothing. Both families went out on it and both are cut off; each
+// is asked again on a new connection, as a query that found its connection
+// gone is, and the second connection answers both.
 #[tokio::test(start_paused = true)]
 async fn doh_over_http_2_completes_on_a_new_connection_after_a_goaway() {
     let (servers, wires) = h2_servers(h2_message, Some(1), seven_then_six);
@@ -1745,7 +1912,52 @@ async fn doh_over_http_2_completes_on_a_new_connection_after_a_goaway() {
     assert_eq!(resolution.addresses, seven_and_six());
     assert_eq!(resolution.error, None);
     assert_eq!(servers.dials().len(), 2);
-    assert_eq!(servers.answered(), [1, 1]);
+    assert_eq!(servers.answered(), [0, 2]);
+}
+
+// The server's first connection keeps its first stream unanswered and sends
+// the connection away gracefully, refusing the stream after it. That stream
+// is asked again at once on a new connection, while the old one still
+// carries the first: its family's reply comes with no time passed, and the
+// lookup keeps it when the time limit ends the first.
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_after_a_graceful_goaway_asks_again_on_a_new_connection_at_once() {
+    let (servers, wires) =
+        h2_servers_doing(h2_message, Some(1), H2Misstep::Graceful, seven_then_six);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses.len(), 1);
+    assert_eq!(servers.dials().len(), 2);
+    assert_eq!(servers.answered(), [0, 1]);
+
+    let (servers, wires) =
+        h2_servers_doing(h2_message, Some(1), H2Misstep::Graceful, seven_then_six);
+    let listed = doh("192.0.2.53:443");
+    let mut session = Session::new(&servers, &wires, &listed);
+    let mut reached = false;
+    let mut talk = session.talk(&mut reached);
+    talk.send(0, 0, query_packet(0, "fixture.test", 1));
+    talk.send(1, 1, query_packet(0, "fixture.test", 28));
+    let started = tokio::time::Instant::now();
+    let next = talk.next().await;
+    assert!(matches!(next, Ok(Some((_, Ok(_))))));
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    assert_eq!(servers.dials().len(), 2);
+}
+
+// The server refuses the second stream on its connection unhandled, as one
+// over its limit of streams at once does. A refused stream was never
+// handled, so it is sent again on the same connection, and both families
+// come back from one dial, whichever family's stream the server took
+// second.
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_sends_a_refused_stream_again_on_the_connection() {
+    let (servers, wires) =
+        h2_servers_doing(h2_message, None, H2Misstep::RefuseSecond, seven_then_six);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven_and_six());
+    assert_eq!(resolution.error, None);
+    assert_eq!(servers.dials().len(), 1);
+    assert_eq!(servers.answered(), [2]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1782,8 +1994,8 @@ fn padded(over: fn(u16) -> bool) -> impl Fn(Vec<u8>) -> hyper::Response<Vec<u8>>
 
 #[tokio::test(start_paused = true)]
 async fn doh_over_http_2_fails_a_header_list_over_the_cap_as_invalid_and_dials_no_more() {
-    // Only the IPv6 reply is over the cap: it rides the connection the IPv4
-    // query left open, and is not asked again on another.
+    // Only the IPv6 reply is over the cap: it rides the connection beside
+    // the IPv4 query, and is not asked again on another.
     let (servers, wires) = h2_servers(padded(|qtype| qtype == 28), None, answers);
     let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
     assert_eq!(resolution.addresses, seven());
@@ -1793,8 +2005,8 @@ async fn doh_over_http_2_fails_a_header_list_over_the_cap_as_invalid_and_dials_n
     let (servers, wires) = h2_servers(padded(|_| true), None, answers);
     let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
     assert_eq!(resolution.error, invalid(), "{resolution:?}");
-    // One connection for each family, none redialled.
-    assert_eq!(servers.dials().len(), 2);
+    // Both families on one connection, neither redialled.
+    assert_eq!(servers.dials().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1817,7 +2029,8 @@ async fn doh_over_http_2_a_stream_the_server_resets_fails_without_saying_the_con
             "192.0.2.53: the server reset the query"
         ))
     );
-    assert_eq!(servers.dials().len(), 2);
+    // Both families' streams were reset on the one connection.
+    assert_eq!(servers.dials().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1831,7 +2044,8 @@ async fn doh_over_http_2_takes_a_few_interim_responses_and_fails_an_endless_run_
     let (servers, wires) = h2_servers_doing(h2_message, None, H2Misstep::Interims(20_000), answers);
     let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
     assert_eq!(resolution.error, invalid(), "{resolution:?}");
-    assert_eq!(servers.dials().len(), 2);
+    // Both families on one connection, neither redialled.
+    assert_eq!(servers.dials().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1932,16 +2146,268 @@ async fn tls_sessions_resume_through_a_naming_and_its_clones_and_never_across_tw
         sessions(&first).trust(&wires);
         sessions(&second).trust(&wires);
         // A name apiece, so none is answered from what the naming holds.
+        // Each lookup's first connection is the one held to account: a
+        // second one in the same lookup, as HTTP/1.1 opens for the other
+        // family, may resume the first's session.
+        let mut firsts = Vec::new();
         for (naming, host) in [(&first, "a.test"), (&clone, "b.test"), (&second, "c.test")] {
+            firsts.push(servers.dials().len());
             let resolution = through_naming(naming, &servers, host).await;
             assert_eq!(resolution.addresses, seven(), "{listed} {host}");
         }
         let sent = servers.sent();
-        assert_eq!(sent.len(), 3, "{listed}");
-        assert!(!offers_a_session(&sent[0]), "{listed}");
+        let per_lookup = if alpn == b"http/1.1" { 2 } else { 1 };
+        assert_eq!(sent.len(), 3 * per_lookup, "{listed}");
+        assert!(!offers_a_session(&sent[firsts[0]]), "{listed}");
         // The clone resumes the first naming's session.
-        assert!(offers_a_session(&sent[1]), "{listed}");
+        assert!(offers_a_session(&sent[firsts[1]]), "{listed}");
         // The other naming offers nothing from the first.
-        assert!(!offers_a_session(&sent[2]), "{listed}");
+        assert!(!offers_a_session(&sent[firsts[2]]), "{listed}");
+    }
+}
+
+// Under a GOAWAY the client grows wary of HTTP/2 and has one stream out per
+// family. The first connection meets its first stream with a GOAWAY; on the
+// second, one family's stream stays silent, and the other family still
+// answers, at its own turn, when the server's time limit ends the silent
+// one. Each family silent in turn.
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_grown_wary_keeps_a_family_apart_from_the_others_silent_stream() {
+    for (silent, kept) in [(1, vec!["2001:db8::7".parse().unwrap()]), (28, seven())] {
+        let (servers, wires) = h2_servers(h2_message, Some(1), move |asked, qtype, query| {
+            if qtype == silent {
+                return Vec::new();
+            }
+            seven_then_six(asked, qtype, query)
+        });
+        let started = tokio::time::Instant::now();
+        let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+        assert_eq!(resolution.addresses, kept, "{silent}");
+        assert_eq!(servers.dials().len(), 2, "{silent}");
+        assert_eq!(started.elapsed(), SERVER_TIMEOUT, "{silent}");
+    }
+}
+
+// A server that refuses every stream unhandled: each family's query goes
+// out three times on the one connection and ends there.
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_a_query_whose_stream_is_refused_every_time_goes_three_times_in_all() {
+    let (servers, wires) =
+        h2_servers_doing(h2_message, None, H2Misstep::RefuseEvery, seven_then_six);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(
+        resolution.error,
+        Some(failure(
+            LookupFailure::NoReply,
+            "192.0.2.53: the server reset the query"
+        ))
+    );
+    assert_eq!(servers.dials().len(), 1);
+    assert_eq!(servers.log.lock().unwrap().refused, 6);
+}
+
+// A server that meets the first stream of every connection with a GOAWAY:
+// each family's query goes out on three connections and ends there.
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_a_query_whose_connection_goes_away_every_time_goes_three_times_in_all() {
+    let (servers, wires) = h2_servers(h2_message, Some(usize::MAX), seven_then_six);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(
+        resolution.error,
+        Some(failure(
+            LookupFailure::NoReply,
+            "192.0.2.53: the connection closed without a reply"
+        ))
+    );
+    assert_eq!(servers.dials().len(), 3);
+    assert_eq!(servers.answered(), [0, 0, 0]);
+}
+
+// A lookup dropped while its HTTP/2 streams are still out ends without a
+// panic, and its connection closes.
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_a_lookup_dropped_with_streams_out_closes_its_connection() {
+    let (servers, wires) = h2_servers(h2_message, None, |_, _, _| Vec::new());
+    let (holding, ended) = (servers.holding.clone(), servers.ended.clone());
+    {
+        let lookup = doh_lookup(&servers, &wires, Trust::AsSent);
+        tokio::pin!(lookup);
+        tokio::select! {
+            resolution = &mut lookup => panic!("a silent server answered: {resolution:?}"),
+            held = holding.acquire_many(2) => held.unwrap().forget(),
+        }
+    }
+    ended.acquire().await.unwrap().forget();
+    assert_eq!(servers.dials().len(), 1);
+}
+
+// A query for `name` of `qtype`, under `id`.
+fn query_packet(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+    let mut packet = id.to_be_bytes().to_vec();
+    packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    packet.extend(wire(name));
+    packet.extend_from_slice(&qtype.to_be_bytes());
+    packet.extend_from_slice(&[0, 1]);
+    packet
+}
+
+// A plain server has at most eight streams dialled or open at once for a
+// talk: twelve queries given together go out on twelve streams, the first
+// alone, then the rest eight at a time, the first among them while it waits
+// on its reply.
+#[tokio::test(start_paused = true)]
+async fn plain_dns_opens_at_most_eight_streams_at_once() {
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .plain_at("192.0.2.53")
+        .delayed(std::time::Duration::from_millis(300));
+    let wires = Authority::new().wires();
+    let listed = DnsServer::plain("192.0.2.53".parse().unwrap());
+    let mut session = Session::new(&servers, &wires, &listed);
+    let mut reached = false;
+    let mut talk = session.talk(&mut reached);
+    for key in 0..12 {
+        talk.send(key, key, query_packet(key as u16, "fixture.test", 1));
+    }
+    let mut keys = Vec::new();
+    while let Ok(Some((key, reply))) = talk.next().await {
+        assert!(reply.is_ok(), "{key}");
+        keys.push(key);
+    }
+    keys.sort_unstable();
+    assert_eq!(keys, (0..12).collect::<Vec<_>>());
+    assert_eq!(servers.dials().len(), 12);
+    assert_eq!(servers.most_open(), 8);
+}
+
+// A plain dial that reaches nothing after the server answered an earlier
+// one fails only its own query: the IPv4 address stands.
+#[tokio::test(start_paused = true)]
+async fn plain_dns_a_dial_that_reaches_nothing_after_one_answered_fails_only_its_query() {
+    let servers = Servers::new(Speaks::Dot { close_after: None }, seven_then_six)
+        .plain_at("192.0.2.53")
+        .unreached_at(1);
+    let wires = Authority::new().wires();
+    let resolution = recorded(
+        &servers,
+        &wires,
+        &[DnsServer::plain("192.0.2.53".parse().unwrap())],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(resolution.addresses, seven());
+    assert_eq!(servers.dials().len(), 2);
+    assert_eq!(servers.answered(), [1, 0]);
+}
+
+// A DNS over TLS server that keeps its connection open has every query given
+// together written at once on one connection: three queries take no longer,
+// on a route with a round trip of its own, than one.
+#[tokio::test(start_paused = true)]
+async fn dot_writes_queries_given_together_at_once_on_one_connection() {
+    let mut took = Vec::new();
+    for count in [1, 3] {
+        let authority = Authority::new();
+        let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+            .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"))
+            .delayed(std::time::Duration::from_millis(300));
+        let wires = authority.wires();
+        let listed = dot("192.0.2.53", None);
+        let mut session = Session::new(&servers, &wires, &listed);
+        let mut reached = false;
+        let mut talk = session.talk(&mut reached);
+        for key in 0..count {
+            talk.send(key, key, query_packet(key as u16, "fixture.test", 1));
+        }
+        let started = tokio::time::Instant::now();
+        let mut keys = Vec::new();
+        while let Ok(Some((key, reply))) = talk.next().await {
+            assert!(reply.is_ok(), "{count} {key}");
+            keys.push(key);
+        }
+        keys.sort_unstable();
+        assert_eq!(keys, (0..count).collect::<Vec<_>>());
+        assert_eq!(servers.answered(), [count], "{count}");
+        took.push(started.elapsed());
+    }
+    assert_eq!(took[0], took[1]);
+}
+
+// Over HTTP/1.1, where each lane has one query out at a time, a query a lane
+// waits on goes before one asked ahead of its need, whatever the order they
+// were given in. Lane 1 waits on a silent query; lane 0 asked a silent query
+// ahead, then waits, as lane 1 does too, on a query the server answers: that
+// one takes lane 0 and comes back with no time passed.
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_1_1_a_query_waited_on_goes_before_one_asked_ahead() {
+    let answer = |asked: IpAddr, qtype: u16, query: &[u8]| {
+        if query.windows(6).any(|name| name == b"silent") {
+            return Vec::new();
+        }
+        seven_then_six(asked, qtype, query)
+    };
+    let (servers, wires) = doh_servers_answering(doh_fixture(plain_reply, false), answer);
+    let listed = doh("192.0.2.53:443");
+    let mut session = Session::new(&servers, &wires, &listed);
+    let mut reached = false;
+    let mut talk = session.talk(&mut reached);
+    talk.send(0, 1, query_packet(0, "silent.test", 1));
+    talk.ahead(1, 0, query_packet(0, "silent.ahead.test", 1));
+    talk.send(2, 0, query_packet(0, "fixture.test", 1));
+    talk.wanted_by(2, 1, true);
+    let started = tokio::time::Instant::now();
+    let next = talk.next().await;
+    assert!(matches!(next, Ok(Some((2, Ok(_))))));
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    // The query asked ahead is still waiting: only the two lanes' queries
+    // went out.
+    assert_eq!(servers.log.lock().unwrap().requests.len(), 2);
+}
+
+// Over HTTP/1.1 the second family's connection reaches nothing: its query
+// waits for the first family's connection to come free and is answered on
+// it, so both families come back.
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_1_1_a_query_whose_connection_reaches_nothing_waits_for_the_first() {
+    let (servers, wires) = doh_servers_answering(doh_fixture(plain_reply, false), seven_then_six);
+    let servers = servers.unreached_at(1);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven_and_six());
+    assert_eq!(resolution.error, None);
+    assert_eq!(servers.dials().len(), 2);
+    assert_eq!(servers.answered(), [2, 0]);
+}
+
+// DNS over TLS takes a reply only for the question its id went out with,
+// whatever the case of the name: one under the right id that asks another
+// name fails that family's query alone.
+#[tokio::test(start_paused = true)]
+async fn dot_takes_a_reply_for_its_own_question_in_any_case_and_fails_another() {
+    for (changed, kept) in [(false, seven_and_six()), (true, seven())] {
+        let authority = Authority::new();
+        let answer = move |asked: IpAddr, qtype: u16, query: &[u8]| {
+            let mut reply = seven_then_six(asked, qtype, query);
+            // The name's first label, "fixture", in capitals.
+            reply[13..20].make_ascii_uppercase();
+            if changed && qtype == 28 {
+                // "gixture": another name.
+                reply[13] = b'G';
+            }
+            reply
+        };
+        let servers = Servers::new(Speaks::Dot { close_after: None }, answer)
+            .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"));
+        let resolution = recorded(
+            &servers,
+            &authority.wires(),
+            &[dot("192.0.2.53", None)],
+            Trust::AsSent,
+            "fixture.test",
+        )
+        .await;
+        assert_eq!(resolution.addresses, kept, "{changed}");
+        assert_eq!(servers.dials().len(), 1, "{changed}");
     }
 }
