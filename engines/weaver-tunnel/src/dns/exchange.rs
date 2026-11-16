@@ -286,12 +286,15 @@ fn sent(counts: bool, queries: usize) {
 // without a close (NAT or tunnel state dropped, a peer gone) never says so,
 // and would hold the lookup for all of `SERVER_TIMEOUT` and charge the
 // server a time-out. On a warm connection, with no dial or handshake first,
-// a server answers in a round trip plus its own lookup time; 2 s is far past
-// that for a server in use. After the wait the redial has what is left of
-// `SERVER_TIMEOUT` for its dial, handshake and reply. A lookup that cannot
-// finish in that, as a validated one with a slow chain may not, fails over
-// to the next server, as a cold lookup that slow does.
-pub(in crate::dns) const REUSED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+// a server answers in a round trip plus its own lookup time: 0.2 s to 0.7 s
+// measured through one tunnel and through a chain of three. After the wait
+// the redial has what is left of `SERVER_TIMEOUT` for its dial, handshake
+// and reply, and 1 s leaves 4 s: a cold validated lookup through a chain of
+// three tunnels measured 2.1 s to 4.0 s, through one 1.5 s to 2.0 s. A
+// lookup that cannot finish in what is left fails over to the next server,
+// as a cold lookup that slow does. A reply slower than the wait costs one
+// redial and no more.
+pub(in crate::dns) const REUSED_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 // The times one query goes out on a kept connection, DNS over TLS or an
 // HTTP/2 stream: the first, and up to two more after the connection went
