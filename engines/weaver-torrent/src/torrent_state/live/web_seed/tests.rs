@@ -1110,6 +1110,68 @@ async fn a_truncated_body_fails_after_its_whole_blocks() {
     assert!(entry(&seeds, |e| e.lacks.files.is_empty() && !e.disabled));
 }
 
+// A web seed's URL can carry a credential in its user, its path or its
+// query. The error a failed connection ends with, which the torrent logs
+// and keeps as the peer's error, names the seed by scheme, host and port
+// only, whatever failed: an error status, a body cut short, a refused
+// connection, a move with no location, the SSRF check (SECURITY.md,
+// "Credentials stay with their scope").
+#[tokio::test(start_paused = true)]
+async fn a_failed_web_seed_names_no_credential() {
+    const SECRET: &str = "s3cret";
+    let a = content(PIECE as usize, 7);
+    let layout = layout(&[("a", u64::from(PIECE), false)]);
+    // A port nothing listens on.
+    let refused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let replies: Vec<Reply> = vec![
+        Reply::status(404),
+        Reply {
+            sent: Some(20000),
+            ..Reply::status(206)
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", a.len() - 1, a.len()),
+                )
+                .body(a.clone())
+        },
+        Reply::status(302),
+        Reply::status(200),
+        Reply::status(200),
+    ];
+    for (case, reply) in replies.into_iter().enumerate() {
+        let reply = Mutex::new(Some(reply));
+        // Holds the paused clock while the request is out (see Server).
+        let server = Server::start(move |_| reply.lock().take().unwrap());
+        let at = match case {
+            3 => refused,
+            _ => server.addr,
+        };
+        let url = match case {
+            // A query to a local address: refused before it is asked.
+            4 => format!("http://user:{SECRET}@{at}/{SECRET}/a?pk={SECRET}"),
+            _ => format!("http://user:{SECRET}@{at}/{SECRET}/a"),
+        };
+        let (_seeds, link) = one_seed(url, WebSeedKind::Url);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
+        let Err(e) = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 2).await else {
+            panic!("case {case}: the connection did not fail");
+        };
+        let shown = format!("{e:#} {e:?}");
+        assert!(!shown.contains(SECRET), "case {case}: {shown}");
+        assert!(!shown.contains("user"), "case {case}: {shown}");
+        // A request that got no answer is named by its error alone.
+        if case != 3 {
+            assert!(
+                shown.contains(&format!("http://{at}/…")),
+                "case {case}: {shown}"
+            );
+        }
+    }
+}
+
 // A response must answer the range asked for: one naming none disables
 // the seed, one naming another fails the connection (libtorrent
 // `get_range`, `web_peer_connection::on_receive`).
