@@ -153,8 +153,9 @@ Everything below is new since 0.16.15.
   slow article to end.
 - **A usenet connection inside a WireGuard tunnel sizes its buffers for
   a download.** It sends through 64 KiB, and receives through 256 KiB on
-  Efficient, 1 MiB on Balanced and 4 MiB on Performance. A change of
-  profile applies to the next connection dialled.
+  Efficient, 1 MiB on Balanced and just under 2 MiB on Performance. A
+  full tunnel holds no more than before. A change of profile applies to
+  the next connection dialled.
 - **A failed feed poll is logged as a warning,** with the feed and the
   error.
 - **A held server recovers.** Its recovery probe carries real work and is

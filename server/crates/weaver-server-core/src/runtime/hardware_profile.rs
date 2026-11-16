@@ -67,8 +67,10 @@ pub struct ProfileTuning {
     // A tunnel holds at most 256 sockets, and each socket holds the buffers
     // its dial asked for: 2 MiB at the tunnel's own sizes, this profile's
     // usenet receive buffer plus 64 KiB for a usenet connection. A tunnel
-    // full of the largest of those is the most it can hold: 512 MiB on
-    // Efficient, 512 MiB on Balanced, 1040 MiB on Performance.
+    // full of the largest of those is the most it can hold: 512 MiB on every
+    // profile, inside what a tunnel is charged when the number of tunnels is
+    // limited. So no usenet socket holds more than 2 MiB: the largest
+    // receive buffer is 2 MiB less the send buffer.
     pub wireguard_usenet_receive_bytes: usize,
     // What a run whose decode window is wider than the profile's ceiling
     // gets.
@@ -177,7 +179,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: GIB,
         },
         direct_store_resident_default_cap_bytes: None,
-        wireguard_usenet_receive_bytes: 4 * MIB as usize,
+        wireguard_usenet_receive_bytes: 2 * MIB as usize - 64 * KIB,
         over_limit: OverLimit::ScratchThenRam,
     },
 ];
