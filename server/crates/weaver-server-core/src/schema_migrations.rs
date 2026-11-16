@@ -29,6 +29,7 @@ mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
 pub(crate) mod script_instances_v55;
 pub(crate) mod server_limit_v92;
+pub(crate) mod torrent_private_v125;
 pub(crate) mod tracker_hosts_v105;
 pub(crate) mod unwanted_extensions_v56;
 
@@ -41,7 +42,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 124;
+const CURRENT_SCHEMA_VERSION: i64 = 125;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -914,6 +915,9 @@ async fn run_rust_hook(
         tracker_hosts_v105::HOOK_ID => {
             tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
         }
+        torrent_private_v125::HOOK_ID => {
+            torrent_private_v125::fill_torrent_private(&mut SqlConn::Sqlite(tx)).await
+        }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
         ))),
@@ -1488,7 +1492,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 124);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 125);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -1873,9 +1877,11 @@ mod tests {
         replay_catalog_into_fresh_db(&fresh, &catalog, &payload, None, true)
             .await
             .unwrap();
+        // Of the three, only the privacy is back, from 125, as a column the
+        // add writes.
         assert_eq!(
             pragma_column_count(&fresh, "torrents", &gone_torrents).await,
-            0
+            1
         );
         assert_eq!(
             pragma_column_count(&fresh, "torrent_counters", &gone_counters).await,
@@ -1926,7 +1932,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         assert_eq!(
             pragma_column_count(&pool, "torrents", &gone_torrents).await,
-            0
+            1
         );
         assert_eq!(
             pragma_column_count(&pool, "torrent_counters", &gone_counters).await,
@@ -2054,6 +2060,8 @@ mod tests {
             [
                 "idx_torrents_added",
                 "idx_torrents_category_added",
+                "idx_torrents_category_private_added",
+                "idx_torrents_private_added",
                 "idx_torrents_retiring"
             ]
         );
@@ -2105,6 +2113,7 @@ mod tests {
                     known: vec![3, 4, 5],
                 }),
                 hashes: None,
+                private: None,
             };
             let statements = list_statements(SqlEngine::Sqlite, &filter, 0, Some(10));
             assert_eq!(statements.len(), 1);
@@ -2152,6 +2161,200 @@ mod tests {
                     .collect()
             };
             assert_eq!(rows, kept, "{ids:?}, none {none}");
+        }
+        pool.close().await;
+    }
+
+    // Migration 125 keeps a torrent's privacy in the table: each torrent
+    // kept before it takes the privacy its metainfo reads as, a page of rows
+    // at a time across more than one page, a magnet with none and a
+    // metainfo that does not read stay public, and the list's own
+    // statements for a privacy, alone or in a category, walk the privacy's
+    // indexes in the order of adding, unsorted.
+    #[tokio::test]
+    async fn sqlite_migration_125_fills_each_torrents_privacy_from_its_metainfo() {
+        use crate::persistence::sql_runtime::{SqlArg, SqlEngine};
+        use crate::schema_migrations::torrent_private_v125::tiny_metainfo;
+        use crate::torrents::queries::{
+            CategoryIds, TorrentListFilter, count_statements, list_statements,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-list-private.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(124), true)
+            .await
+            .unwrap();
+        // 200 torrents, more than three pages of the step's 64: by job id,
+        // private, public, a magnet with no metainfo, and one whose
+        // metainfo does not read.
+        let kind = |job_id: i64| job_id % 4;
+        for job_id in 1..=200_i64 {
+            let metainfo = match kind(job_id) {
+                0 => Some(tiny_metainfo(&format!("t{job_id}"), true)),
+                1 => Some(tiny_metainfo(&format!("t{job_id}"), false)),
+                2 => None,
+                _ => Some(b"not bencode".to_vec()),
+            };
+            sqlx::query(
+                "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state,
+                                       category_id, metainfo)
+                 VALUES (?, ?, 'privacy', 'magnet', ?, 'queued', ?, ?)",
+            )
+            .bind(job_id)
+            .bind(job_id.to_be_bytes().repeat(3)[..20].to_vec())
+            .bind(1000 - job_id / 2)
+            .bind((job_id % 3 == 0).then_some(3_i64))
+            .bind(metainfo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let private: Vec<i64> =
+            sqlx::query_scalar("SELECT job_id FROM torrents WHERE private = 1 ORDER BY job_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            private,
+            (1..=200)
+                .filter(|job_id| kind(*job_id) == 0)
+                .collect::<Vec<_>>()
+        );
+        let public: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM torrents WHERE private = 0")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(public, 150);
+
+        let bind_all = |query: String, args: &[SqlArg]| {
+            let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+            for arg in args {
+                statement = match arg {
+                    SqlArg::I64(value) => statement.bind(*value),
+                    SqlArg::Bool(value) => statement.bind(*value),
+                    other => panic!("a privacy list binds no {other:?}"),
+                };
+            }
+            statement
+        };
+        for (categories, index) in [
+            (None, "idx_torrents_private_added"),
+            (
+                Some(CategoryIds {
+                    ids: vec![3],
+                    none: false,
+                    known: vec![3, 4],
+                }),
+                "idx_torrents_category_private_added",
+            ),
+            (
+                Some(CategoryIds {
+                    ids: vec![3],
+                    none: true,
+                    known: vec![3, 4],
+                }),
+                "idx_torrents_category_private_added",
+            ),
+        ] {
+            for private in [true, false] {
+                let filter = TorrentListFilter {
+                    categories: categories.clone(),
+                    hashes: None,
+                    private: Some(private),
+                };
+                let statements = list_statements(SqlEngine::Sqlite, &filter, 5, Some(20));
+                assert_eq!(statements.len(), 1);
+                let (sql, args) = &statements[0];
+                let sql = sql.replace("{}", "?");
+                let plan: Vec<String> = {
+                    use sqlx::Row;
+                    bind_all(format!("EXPLAIN QUERY PLAN {sql}"), args)
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.get::<String, _>("detail"))
+                        .collect()
+                };
+                assert!(
+                    plan.iter().any(|step| step.contains(index)),
+                    "{sql}: {plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                    "{sql}: {plan:?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|step| step.starts_with("SCAN torrents") && !step.contains("INDEX")),
+                    "{sql}: {plan:?}"
+                );
+                // The page is the one `ORDER BY` over the privacy gives.
+                let rows: Vec<i64> = {
+                    use sqlx::Row;
+                    bind_all(sql.clone(), args)
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.get::<i64, _>("job_id"))
+                        .collect()
+                };
+                let in_category = |category: Option<i64>| match &categories {
+                    None => true,
+                    Some(categories) => {
+                        category.is_some_and(|id| categories.ids.contains(&(id as u32)))
+                            || (categories.none
+                                && category
+                                    .is_none_or(|id| !categories.known.contains(&(id as u32))))
+                    }
+                };
+                let every: Vec<(i64, i64, Option<i64>)> = sqlx::query_as(
+                    "SELECT added_at_ms, job_id, category_id FROM torrents
+                      WHERE private = ? ORDER BY added_at_ms, job_id",
+                )
+                .bind(private)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+                let kept: Vec<i64> = every
+                    .iter()
+                    .filter(|(_, _, category)| in_category(*category))
+                    .map(|(_, job_id, _)| *job_id)
+                    .collect();
+                assert_eq!(
+                    rows,
+                    kept.iter().skip(5).take(20).copied().collect::<Vec<_>>(),
+                    "{categories:?}, private {private}"
+                );
+                for (sql, args) in count_statements(SqlEngine::Sqlite, &filter) {
+                    let sql = sql.replace("{}", "?");
+                    let plan: Vec<String> = {
+                        use sqlx::Row;
+                        bind_all(format!("EXPLAIN QUERY PLAN {sql}"), &args)
+                            .fetch_all(&pool)
+                            .await
+                            .unwrap()
+                            .iter()
+                            .map(|row| row.get::<String, _>("detail"))
+                            .collect()
+                    };
+                    assert!(
+                        !plan.iter().any(
+                            |step| step.starts_with("SCAN torrents") && !step.contains("INDEX")
+                        ),
+                        "{sql}: {plan:?}"
+                    );
+                }
+            }
         }
         pool.close().await;
     }

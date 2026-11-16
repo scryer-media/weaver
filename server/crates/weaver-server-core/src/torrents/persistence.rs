@@ -1129,6 +1129,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptText(torrent.move_to.clone()),
         SqlArg::I64(torrent.queue_position),
         SqlArg::OptI64(torrent.pool_member.map(i64::from)),
+        SqlArg::Bool(torrent.private),
     ])
 }
 
@@ -1757,7 +1758,8 @@ impl Database {
     }
 
     // A magnet's metainfo once its peers sent it: the hashes and name it
-    // carries, the file, the directory its files go to and the folder they
+    // carries, the file and whether it marks the torrent private, the
+    // directory its files go to and the folder they
     // sit in when that is not it, the files and trackers it lists, and what
     // it holds there (`torrent_held_paths`), all in one transaction: a crash
     // leaves the torrent holding its whole folder as a magnet does, or what
@@ -1771,6 +1773,7 @@ impl Database {
         infohash_v2: Option<[u8; 32]>,
         name: &str,
         metainfo: &[u8],
+        private: bool,
         storage_dir: &str,
         files_dir: Option<&str>,
         trackers: &[TrackerEntry],
@@ -1784,6 +1787,7 @@ impl Database {
             SqlArg::OptBytes(infohash_v2.map(|hash| hash.to_vec())),
             SqlArg::Text(name.to_owned()),
             SqlArg::Bytes(metainfo.to_vec()),
+            SqlArg::Bool(private),
             SqlArg::Text(storage_dir.to_owned()),
             SqlArg::OptText(files_dir.map(str::to_owned)),
             SqlArg::Bool(true),
@@ -1802,7 +1806,7 @@ impl Database {
                     let changed = tx
                         .execute(
                             "UPDATE torrents SET infohash_v1 = {}, infohash_v2 = {}, name = {}, metainfo = {},
-                                     storage_dir = {}, files_dir = {}, held_set = {}, adopted = {}
+                                     private = {}, storage_dir = {}, files_dir = {}, held_set = {}, adopted = {}
                               WHERE job_id = {}",
                             &head,
                         )

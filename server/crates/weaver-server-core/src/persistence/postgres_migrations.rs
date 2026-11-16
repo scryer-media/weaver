@@ -17,8 +17,8 @@ use crate::persistence::sql_runtime::SqlConn;
 use crate::schema_migrations::{
     MigrationMode, egress_quotas_v53, history_release_name_v87, history_retention_v89,
     history_search_key_v88, networking_bandwidth_v94, nzb_tables_v85, proxy_resolver_v64,
-    script_concurrency_v58, script_instances_v55, server_limit_v92, tracker_hosts_v105,
-    unwanted_extensions_v56,
+    script_concurrency_v58, script_instances_v55, server_limit_v92, torrent_private_v125,
+    tracker_hosts_v105, unwanted_extensions_v56,
 };
 
 #[derive(Clone, Debug)]
@@ -649,6 +649,9 @@ async fn run_postgres_rust_hook(
         tracker_hosts_v105::HOOK_ID => {
             tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Postgres(tx)).await
         }
+        torrent_private_v125::HOOK_ID => {
+            torrent_private_v125::fill_torrent_private(&mut SqlConn::Postgres(tx)).await
+        }
         other => Err(StateError::Database(format!(
             "PostgreSQL migration hook '{other}' is not implemented"
         ))),
@@ -670,6 +673,7 @@ fn implemented_postgres_rust_hooks() -> &'static [&'static str] {
         server_limit_v92::HOOK_ID,
         networking_bandwidth_v94::HOOK_ID,
         tracker_hosts_v105::HOOK_ID,
+        torrent_private_v125::HOOK_ID,
     ]
 }
 
@@ -1005,6 +1009,62 @@ mod tests {
             );
             assert!(
                 !indexes.contains_key("idx_torrents_category"),
+                "{indexes:?}"
+            );
+        })
+        .await;
+    }
+
+    // 0125: a torrent row keeps its privacy, filled for each torrent kept
+    // before it from its metainfo, a page at a time across more than one
+    // page; a magnet with none and a metainfo that does not read stay
+    // public. Two indexes serve a privacy's list in the order of adding.
+    #[tokio::test]
+    async fn postgres_0125_fills_each_torrents_privacy_when_configured() {
+        use crate::schema_migrations::torrent_private_v125::tiny_metainfo;
+        in_scoped_schema(|pool| async move {
+            upgrade_from(&pool, 124, |pool| async move {
+                for job_id in 1..=200_i64 {
+                    let metainfo = match job_id % 4 {
+                        0 => Some(tiny_metainfo(&format!("t{job_id}"), true)),
+                        1 => Some(tiny_metainfo(&format!("t{job_id}"), false)),
+                        2 => None,
+                        _ => Some(b"not bencode".to_vec()),
+                    };
+                    sqlx::query(
+                        "INSERT INTO torrents
+                            (job_id, infohash_v1, name, source, added_at_ms, state, metainfo)
+                         VALUES ($1, $2, 'privacy', 'magnet', $1, 'queued', $3)",
+                    )
+                    .bind(job_id)
+                    .bind(job_id.to_be_bytes().repeat(3)[..20].to_vec())
+                    .bind(metainfo)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+            })
+            .await;
+            let private: Vec<i64> =
+                sqlx::query_scalar("SELECT job_id FROM torrents WHERE private ORDER BY job_id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                private,
+                (1..=200)
+                    .filter(|job_id| job_id % 4 == 0)
+                    .collect::<Vec<_>>()
+            );
+            let indexes = indexes_of(&pool, "torrents").await;
+            assert!(
+                indexes["idx_torrents_private_added"]
+                    .ends_with("(private, added_at_ms, job_id, category_id)"),
+                "{indexes:?}"
+            );
+            assert!(
+                indexes["idx_torrents_category_private_added"]
+                    .ends_with("(category_id, private, added_at_ms, job_id)"),
                 "{indexes:?}"
             );
         })

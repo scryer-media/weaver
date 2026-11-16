@@ -1755,3 +1755,25 @@ kind = "sql"
 file = "migrations/0124_torrent_found_peers/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 125
+description = "a torrent list keeps a privacy in the table"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0125_torrent_list_private/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0125_torrent_list_private/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_torrent_private_v125"
+scope = "upgrade_only"

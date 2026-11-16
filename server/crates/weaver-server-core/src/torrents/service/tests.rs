@@ -975,6 +975,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
     };
     let rule = TrackerRule {
         id: 1,
+        private: false,
         host_pattern: "tracker.test".into(),
         seeding: None,
         never_pause: false,

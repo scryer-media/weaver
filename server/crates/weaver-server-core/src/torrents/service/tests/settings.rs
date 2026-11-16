@@ -780,6 +780,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         unpack: None,
         client: None,
         torrent_route: false,
+        private: false,
         dht: None,
         pex: None,
         lsd: None,

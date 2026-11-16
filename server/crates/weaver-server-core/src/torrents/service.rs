@@ -76,6 +76,7 @@ use checkpoints::Landing;
 pub use disk_room::disk_warning;
 use disk_room::{DiskWait, NoRoom, Relook, RunMark};
 use intake::client_of;
+pub(crate) use intake::metainfo_is_private;
 pub use intake::{AddError, AddRequest, AddSource, Placement};
 use live::{Live, Timed};
 #[cfg(test)]

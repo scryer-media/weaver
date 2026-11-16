@@ -215,6 +215,12 @@ fn infohashes(hashes: InfoHashes) -> Vec<Infohash> {
         .collect()
 }
 
+// Whether a torrent of this metainfo reads as private: what a restore of
+// it reads, false for a metainfo that does not read.
+pub(crate) fn metainfo_is_private(bytes: &[u8]) -> bool {
+    parse(bytes).is_ok_and(|parsed| parsed.private)
+}
+
 pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
     let invalid =
         |error: &dyn std::fmt::Display| AddError::Invalid(format!("not a torrent: {error}"));
@@ -378,6 +384,7 @@ impl TorrentService {
                 record.storage_dir = Some(dir.clone());
                 record.files_dir = files_dir;
                 record.seed_mode = request.placement.seed_mode;
+                record.private = parsed.private;
                 let held = held_at(
                     &record,
                     held_tops(parsed.manifest.paths.iter().map(String::as_str)),
@@ -730,6 +737,7 @@ impl TorrentService {
                 .next_queue_position
                 .fetch_add(1, Ordering::Relaxed),
             pool_member: None,
+            private: false,
         }
     }
 
@@ -998,6 +1006,7 @@ impl TorrentService {
         torrent.record.storage_dir = Some(dir.clone());
         torrent.record.files_dir = files_dir.clone();
         torrent.record.metainfo = Some(bytes.clone());
+        torrent.record.private = parsed.private;
         // The trackers the magnet listed stay, edits included, each as
         // whoever named it; the metainfo's own join after them as the
         // torrent's.
@@ -1012,6 +1021,7 @@ impl TorrentService {
                 torrent.record.infohash_v2,
                 &parsed.manifest.name,
                 &bytes,
+                parsed.private,
                 &dir,
                 files_dir.as_deref(),
                 &trackers,

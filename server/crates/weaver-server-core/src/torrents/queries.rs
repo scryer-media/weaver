@@ -16,7 +16,7 @@ pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name
      category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
      policy_override, unpack, unpack_in_force, metadata, upload_limit, download_limit, \
      sequential, first_last_piece_first, save_path, content_layout, files_dir, seed_mode, move_to, \
-     queue_position, pool_member";
+     queue_position, pool_member, private";
 
 fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
     StateError::Database(format!("stored torrent {what} is not valid: {value}"))
@@ -102,6 +102,7 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         move_to: row.opt_text("move_to")?,
         queue_position: row.i64("queue_position")?,
         pool_member: opt_u32(row, "pool_member")?,
+        private: row.bool("private")?,
     })
 }
 
@@ -133,13 +134,15 @@ pub(crate) struct CategoryIds {
 }
 
 /// Which torrents a list reads from the table: every one, or those a
-/// category match and named hashes keep.
+/// category match, named hashes and a privacy keep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TorrentListFilter {
     pub(crate) categories: Option<CategoryIds>,
     /// The torrents whose hash is one of these: the v1 hash, or the v2 hash
     /// cut to 20 bytes for a torrent with no v1 hash.
     pub(crate) hashes: Option<Vec<[u8; 20]>>,
+    /// The torrents whose metainfo marks them private, or those it does not.
+    pub(crate) private: Option<bool>,
 }
 
 impl TorrentListFilter {
@@ -194,6 +197,10 @@ impl TorrentListFilter {
                 _ => format!("({})", named.join(" OR ")),
             });
         }
+        if let Some(private) = self.private {
+            terms.push("private = {}".to_owned());
+            args.push(SqlArg::Bool(private));
+        }
         match terms.len() {
             0 => "1 = 1".to_owned(),
             _ => terms.join(" AND "),
@@ -204,7 +211,27 @@ impl TorrentListFilter {
     // binds: one per category id, which walks the index of that category
     // in the order of adding, and one for the torrents in no category.
     // Every torrent is one arm, `1 = 1`, and a match of nothing is none.
+    // With a privacy, each arm keeps that privacy's torrents alone, and
+    // walks the index of that privacy instead.
     fn arms(&self) -> Vec<(String, Vec<SqlArg>)> {
+        let arms = self.category_arms();
+        let Some(private) = self.private else {
+            return arms;
+        };
+        arms.into_iter()
+            .map(|(predicate, mut binds)| {
+                binds.push(SqlArg::Bool(private));
+                let predicate = match predicate.as_str() {
+                    "1 = 1" => "private = {}".to_owned(),
+                    _ => format!("{predicate} AND private = {{}}"),
+                };
+                (predicate, binds)
+            })
+            .collect()
+    }
+
+    // Its category match as `arms` gives it, with no privacy.
+    fn category_arms(&self) -> Vec<(String, Vec<SqlArg>)> {
         let Some(categories) = &self.categories else {
             return vec![("1 = 1".to_owned(), Vec::new())];
         };
@@ -238,16 +265,17 @@ impl TorrentListFilter {
         arms
     }
 
-    // The binds its category match takes in each statement.
+    // The binds its category match and privacy take in each statement.
     fn category_binds(&self) -> usize {
-        self.categories.as_ref().map_or(0, |categories| {
-            categories.ids.len()
-                + if categories.none {
-                    categories.known.len()
-                } else {
-                    0
-                }
-        })
+        usize::from(self.private.is_some())
+            + self.categories.as_ref().map_or(0, |categories| {
+                categories.ids.len()
+                    + if categories.none {
+                        categories.known.len()
+                    } else {
+                        0
+                    }
+            })
     }
 }
 
@@ -328,6 +356,35 @@ pub(crate) fn list_statements(
                 args.push(bound(0));
             }
             (sql, args)
+        })
+        .collect()
+}
+
+// The statements that count the torrents `filter`'s category match and
+// privacy keep, with no named hashes, each with its binds: one per group of
+// arms, whose counts add up, since no torrent is in two arms.
+pub(crate) fn count_statements(
+    engine: crate::persistence::sql_runtime::SqlEngine,
+    filter: &TorrentListFilter,
+) -> Vec<(String, Vec<SqlArg>)> {
+    arm_groups(engine, filter.arms())
+        .into_iter()
+        .map(|group| {
+            let mut args = Vec::new();
+            let predicate = group
+                .into_iter()
+                .map(|(predicate, binds)| {
+                    args.extend(binds);
+                    format!("({predicate})")
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            (
+                format!(
+                    "SELECT COUNT(*) AS kept FROM torrents WHERE retiring IS NULL AND ({predicate})"
+                ),
+                args,
+            )
         })
         .collect()
 }
@@ -553,24 +610,8 @@ impl Database {
             }
             // The arms keep no torrent twice, so their counts add up.
             let mut kept = 0;
-            for group in arm_groups(datastore.engine(), filter.arms()) {
-                let mut args = Vec::new();
-                let predicate = group
-                    .into_iter()
-                    .map(|(predicate, binds)| {
-                        args.extend(binds);
-                        predicate
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                let row = SqlRuntime::fetch_optional(
-                    datastore.read_exec(),
-                    &format!(
-                        "SELECT COUNT(*) AS kept FROM torrents WHERE retiring IS NULL AND ({predicate})"
-                    ),
-                    &args,
-                )
-                .await?;
+            for (sql, args) in count_statements(datastore.engine(), &filter) {
+                let row = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args).await?;
                 kept += row.map(|row| count(&row, "kept")).transpose()?.unwrap_or(0) as usize;
             }
             Ok(kept)

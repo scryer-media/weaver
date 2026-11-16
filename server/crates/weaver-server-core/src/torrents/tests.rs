@@ -38,6 +38,7 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         move_to: None,
         queue_position: job_id as i64,
         pool_member: None,
+        private: false,
     }
 }
 
@@ -332,6 +333,7 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             None,
             "torrent 5",
             b"d4:infodee",
+            false,
             "/data/t5",
             None,
             &more,
@@ -352,6 +354,41 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             "xn--bcher-kva.invalid"
         ]
     );
+}
+
+// A magnet is public in the table until its metainfo arrives; the metainfo
+// writes its privacy with it, and a list of private torrents then keeps it.
+#[test]
+fn a_magnets_privacy_is_written_with_its_metainfo() {
+    use crate::torrents::queries::TorrentListFilter;
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(5, Some([5; 20]), None), &[])
+        .unwrap();
+    let private = TorrentListFilter {
+        private: Some(true),
+        ..TorrentListFilter::default()
+    };
+    assert!(!db.get_torrent(JobId(5)).unwrap().unwrap().private);
+    assert_eq!(db.count_torrent_list(&private).unwrap(), 0);
+    assert!(
+        db.set_torrent_metainfo(
+            JobId(5),
+            Some([5; 20]),
+            None,
+            "torrent 5",
+            b"d4:infodee",
+            true,
+            "/data/t5",
+            None,
+            &[],
+            &[],
+            &crate::torrents::model::Adopted::default()
+        )
+        .unwrap()
+    );
+    assert!(db.get_torrent(JobId(5)).unwrap().unwrap().private);
+    assert_eq!(db.count_torrent_list(&private).unwrap(), 1);
+    assert_eq!(db.torrent_list_ids(&private, 0, None).unwrap(), [JobId(5)]);
 }
 
 #[test]

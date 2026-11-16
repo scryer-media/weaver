@@ -4,8 +4,8 @@
 //! Which torrents a list shows, picked before any view is built: a page, a
 //! category or a few hashes cost the views they show, not one view per
 //! torrent. The table picks them, a page at a time, through the index of
-//! the order they were added in; only privacy, which only a torrent's
-//! metainfo holds, is read from the torrents themselves.
+//! the order they were added in, of a privacy through the index of that
+//! privacy.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
@@ -145,7 +145,7 @@ pub enum CategoryPick<'a> {
 }
 
 impl CategoryPick<'_> {
-    fn keeps(self, category: Option<&str>) -> bool {
+    pub(super) fn keeps(self, category: Option<&str>) -> bool {
         match self {
             Self::Named(name) => {
                 category.is_some_and(|category| category.eq_ignore_ascii_case(name))
@@ -186,8 +186,8 @@ fn parsed(hashes: &[&str]) -> HashSet<Id20> {
 impl Pick<'_> {
     // What the table is asked for it: the ids of the categories it keeps,
     // as `CategoryPick::keeps` reads a torrent's category through
-    // `TorrentSettings::category`, and the hashes it names.
-    fn filter(&self, settings: &TorrentSettings) -> TorrentListFilter {
+    // `TorrentSettings::category`, the hashes it names and its privacy.
+    pub(super) fn filter(&self, settings: &TorrentSettings) -> TorrentListFilter {
         TorrentListFilter {
             categories: self.category.map(|pick| {
                 let mut seen = HashSet::new();
@@ -211,11 +211,13 @@ impl Pick<'_> {
                 parsed.sort_unstable();
                 parsed
             }),
+            private: self.private,
         }
     }
 
-    // The torrents of `live` it keeps, in the order they were added: the
-    // order `TorrentService::torrents` lists them in.
+    // The torrents of `live` its hashes and category keep, in the order they
+    // were added: the order `TorrentService::torrents` lists them in. Its
+    // privacy is kept by the table alone, never here.
     pub(super) fn ids(
         &self,
         settings: &TorrentSettings,
@@ -240,9 +242,6 @@ impl Pick<'_> {
                 hashes
                     .as_ref()
                     .is_none_or(|hashes| hashes.contains(&hashes_of(record).best()))
-                    && self
-                        .private
-                        .is_none_or(|private| torrent.private == private)
                     && self.category.is_none_or(|category| {
                         category.keeps(
                             settings
@@ -267,17 +266,24 @@ impl Pick<'_> {
         live: &BTreeMap<JobId, Live>,
         window: Window,
     ) -> Vec<JobId> {
-        let ids = self.ids(settings, live);
+        // The privacy the in-memory filter kept before the table did: the
+        // one a restore read from each torrent's metainfo.
+        let ids: Vec<JobId> = self
+            .ids(settings, live)
+            .into_iter()
+            .filter(|job_id| {
+                self.private
+                    .is_none_or(|private| live[job_id].private == private)
+            })
+            .collect();
         let places = window.places(ids.len());
         ids[places].to_vec()
     }
 
     // The ids of the torrents it keeps at `window`'s places, in the order
     // they were added, read from the table with no torrent's lock held: the
-    // page itself, or with a privacy to keep, every torrent the table
-    // keeps, for `Picked::under` to keep those of that privacy and take the
-    // page from them. A pick of every torrent, or of every one of a
-    // privacy, reads no table: `Picked::under` takes them from the live
+    // page itself, its privacy kept in the table too. A pick of every
+    // torrent reads no table: `Picked::under` takes them from the live
     // torrents it walks anyway.
     pub(super) fn picked(
         &self,
@@ -285,20 +291,14 @@ impl Pick<'_> {
         db: &crate::persistence::Database,
         window: Window,
     ) -> Result<Picked, crate::StateError> {
-        if self.hashes.is_none() && self.category.is_none() && matches!(window, Window::Every) {
-            return Ok(Picked::Live {
-                private: self.private,
-            });
+        if self.hashes.is_none()
+            && self.category.is_none()
+            && self.private.is_none()
+            && matches!(window, Window::Every)
+        {
+            return Ok(Picked::Live);
         }
         let filter = self.filter(settings);
-        if let Some(private) = self.private {
-            let kept = db.torrent_list_ids(&filter, 0, None)?;
-            return Ok(Picked::Private {
-                kept,
-                private,
-                window,
-            });
-        }
         let (offset, limit) = match window {
             Window::Every => (0, None),
             Window::Page { offset, first } => (offset, Some(first)),
@@ -318,16 +318,8 @@ impl Pick<'_> {
 pub(super) enum Picked {
     /// The page.
     Page(Vec<JobId>),
-    /// Every torrent the table keeps, of which those of `private`'s privacy
-    /// give the page at `window`'s places.
-    Private {
-        kept: Vec<JobId>,
-        private: bool,
-        window: Window,
-    },
-    /// Every live torrent, or every one of `private`'s privacy: the table
-    /// was not read.
-    Live { private: Option<bool> },
+    /// Every live torrent: the table was not read.
+    Live,
 }
 
 impl Picked {
@@ -336,25 +328,9 @@ impl Picked {
     pub(super) fn under(self, live: &BTreeMap<JobId, Live>) -> Vec<JobId> {
         match self {
             Self::Page(page) => page,
-            Self::Private {
-                kept,
-                private,
-                window,
-            } => {
-                let kept: Vec<JobId> = kept
-                    .into_iter()
-                    .filter(|job_id| {
-                        live.get(job_id)
-                            .is_some_and(|torrent| torrent.private == private)
-                    })
-                    .collect();
-                let places = window.places(kept.len());
-                kept[places].to_vec()
-            }
-            Self::Live { private } => {
+            Self::Live => {
                 let mut kept: Vec<(i64, JobId)> = live
                     .values()
-                    .filter(|torrent| private.is_none_or(|private| torrent.private == private))
                     .map(|torrent| (torrent.record.added_at_ms, torrent.record.job_id))
                     .collect();
                 kept.sort_unstable();
