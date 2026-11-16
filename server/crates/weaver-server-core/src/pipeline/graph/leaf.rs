@@ -1578,12 +1578,12 @@ mod tests {
     }
 
     fn through() -> Through {
-        let writers = crate::operations::disk::writer::VolumeWriters::new(|_| {});
+        let writers = crate::operations::disk::writer::VolumeWriters::reporting(|_| {});
         let volume = Arc::new(crate::operations::disk::volume::Volume::new(
             None,
             "test".to_owned(),
         ));
-        let to = writers.submitter(&volume, 1);
+        let to = writers.test_submitter(&volume, 1);
         Through {
             writers,
             volume,

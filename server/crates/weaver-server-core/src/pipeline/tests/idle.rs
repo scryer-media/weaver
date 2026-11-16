@@ -95,6 +95,7 @@ async fn idle_pipeline(
         db,
         config,
         crate::runtime::StartupDiskGate::opened(),
+        crate::pipeline::graph::disk::threads::writers(),
     )
     .await
     .unwrap();

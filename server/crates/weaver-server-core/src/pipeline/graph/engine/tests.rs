@@ -1348,7 +1348,7 @@ async fn a_volume_whose_file_takes_no_second_name_is_written_afresh() {
     SECOND_NAMES.store(true, std::sync::atomic::Ordering::SeqCst);
     let writers = VolumeWriters::inline(|_| {});
     let volume = Arc::new(Volume::new(None, "test".to_owned()));
-    let disk = || JobDisk::new(writers.submitter(&volume, 1), None);
+    let disk = || JobDisk::new(writers.test_submitter(&volume, 1), None);
     let mut echoing = echoing_through(
         1,
         Echoes {

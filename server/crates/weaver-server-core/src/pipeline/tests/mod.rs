@@ -229,6 +229,7 @@ impl TestHarness {
             db.clone(),
             config.clone(),
             crate::runtime::StartupDiskGate::opened(),
+            crate::pipeline::graph::disk::threads::writers(),
         )
         .await
         .unwrap();
@@ -714,6 +715,7 @@ async fn new_direct_pipeline_on_machine(
         db,
         config,
         crate::runtime::StartupDiskGate::opened(),
+        crate::pipeline::graph::disk::threads::writers(),
     )
     .await
     .unwrap();

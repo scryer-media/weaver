@@ -145,6 +145,7 @@ pub(crate) async fn run(
         db.clone(),
         standalone_config,
         weaver_server_core::runtime::StartupDiskGate::opened(),
+        std::sync::Arc::new(weaver_server_core::operations::VolumeWriters::new()),
     )
     .await?;
     let _late_classification_task = wiring::settle_late_classification(

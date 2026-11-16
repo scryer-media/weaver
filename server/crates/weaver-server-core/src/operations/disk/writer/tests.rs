@@ -35,7 +35,7 @@ fn create(path: &Path) -> Option<Create> {
 fn writers() -> (VolumeWriters, mpsc::Receiver<Report>) {
     let (send, reports) = mpsc::channel();
     let send = Mutex::new(send);
-    let writers = VolumeWriters::new(move |report| {
+    let writers = VolumeWriters::reporting(move |report| {
         let _ = send.lock().unwrap().send(report);
     });
     (writers, reports)
@@ -56,7 +56,7 @@ fn a_barrier_passes_once_every_write_before_it_returned() {
     let (writers, reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 7);
+    let job = writers.test_submitter(&volume, 7);
     job.write(1, 0, Bytes::from_static(b"lan"), create(&path));
     job.write(1, 3, Bytes::from_static(b"tern"), None);
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 7);
@@ -88,7 +88,7 @@ fn a_written_buffer_is_let_go_on_the_writer() {
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 7);
+    let job = writers.test_submitter(&volume, 7);
     let bytes = Bytes::from(b"lantern".to_vec());
     job.write(1, 0, bytes.clone(), create(&path));
     job.barrier().wait();
@@ -113,7 +113,7 @@ fn a_batch_counts_only_the_time_inside_its_write_calls() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     let slow = |path: &Path| {
@@ -149,7 +149,7 @@ fn a_callers_code_between_two_writes_is_not_write_time() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     // The open starts the stepped clock.
@@ -190,7 +190,7 @@ fn a_batch_writes_each_file_by_offset_and_keeps_overlaps_in_order() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     // One operation is taken and held; the rest queue behind it as a batch.
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
@@ -229,7 +229,7 @@ fn a_close_and_a_move_follow_the_writes_before_them() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     job.write(1, 4, Bytes::from_static(b"tail"), create(&from));
@@ -269,7 +269,7 @@ fn a_reader_does_not_wait_behind_the_drop_of_a_closed_files_handle() {
     let hold = writers.hold(&volume);
     hold.hold_drops(true);
     hold.open();
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"head"), create(&path));
     job.close(
         1,
@@ -318,8 +318,8 @@ fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let closing = writers.submitter(&volume, 1);
-    let other = writers.submitter(&volume, 2);
+    let closing = writers.test_submitter(&volume, 1);
+    let other = writers.test_submitter(&volume, 2);
     // The thread stands in a batch of its own before what follows comes.
     other.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
@@ -373,8 +373,8 @@ fn a_stopped_keys_code_is_dropped_after_the_handles_the_key_let_go() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     hold.hold_drops(true);
-    let job = writers.submitter(&volume, 1);
-    let plug = writers.submitter(&volume, 2);
+    let job = writers.test_submitter(&volume, 1);
+    let plug = writers.test_submitter(&volume, 2);
     plug.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     job.write(1, 0, Bytes::from_static(b"head"), create(&closed_path));
@@ -430,8 +430,8 @@ fn a_failed_write_comes_back_with_its_batch_and_stops_its_key_only() {
     let (writers, reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let failing = writers.submitter(&volume, 1);
-    let healthy = writers.submitter(&volume, 2);
+    let failing = writers.test_submitter(&volume, 1);
+    let healthy = writers.test_submitter(&volume, 2);
     failing.write(1, 0, Bytes::from_static(b"lost"), create(&bad));
     failing.write(2, 0, Bytes::from_static(b"never"), create(&good));
     healthy.write(3, 0, Bytes::from_static(b"kept"), create(&other));
@@ -464,7 +464,7 @@ fn a_forced_failure_of_a_later_write_names_the_open_file() {
     let (writers, reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 4);
+    let job = writers.test_submitter(&volume, 4);
     job.write(1, 0, Bytes::from_static(b"head"), create(&path));
     job.write(1, 4, Bytes::from_static(b"tail"), None);
     let barrier = job.barrier();
@@ -491,7 +491,7 @@ fn nothing_of_an_abandoned_key_is_written_after() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"one"), create(&path));
     job.write(1, 3, Bytes::from_static(b"two"), None);
     let (moved_from, moved_to) = (path.clone(), dir.path().join("b"));
@@ -516,8 +516,8 @@ fn a_held_volume_does_not_hold_another() {
     let (writers, _reports) = writers();
     let (slow, fast) = (volume("slow"), volume("fast"));
     let hold = writers.hold(&slow);
-    let on_slow = writers.submitter(&slow, 1);
-    let on_fast = writers.submitter(&fast, 1);
+    let on_slow = writers.test_submitter(&slow, 1);
+    let on_fast = writers.test_submitter(&fast, 1);
     on_slow.write(1, 0, Bytes::from_static(b"stuck"), create(&stuck));
     on_fast.write(2, 0, Bytes::from_static(b"free"), create(&free));
     on_fast.barrier().wait();
@@ -537,7 +537,7 @@ fn a_read_follows_the_writes_submitted_before_it() {
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
     assert_eq!(job.read(path, 3, 4).unwrap(), b"tern");
 }
@@ -549,8 +549,8 @@ fn a_keys_barrier_and_read_pass_while_another_keys_operation_is_held() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let slow = writers.submitter(&volume, 1);
-    let quick = writers.submitter(&volume, 2);
+    let slow = writers.test_submitter(&volume, 1);
+    let quick = writers.test_submitter(&volume, 2);
     quick.write(0, 0, Bytes::from_static(b"lantern"), create(&free));
     let passed = quick.barrier();
     hold.wait_held();
@@ -581,7 +581,7 @@ fn a_read_after_a_files_own_writes_passes_while_its_keys_write_of_another_file_i
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     let wrote = job.write(1, 0, Bytes::from_static(b"lantern"), create(&read));
     hold.wait_held();
     hold.release(1);
@@ -603,7 +603,7 @@ fn writes_queued_behind_a_held_volume_run_as_one_batch_by_offset() {
     let (writers, reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     // Each file is opened by its first four bytes; the rest are submitted
@@ -641,13 +641,13 @@ fn a_wake_asked_for_comes_once_when_the_line_is_crossed() {
     let (writers, reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"four"), create(&path));
     job.write(1, 4, Bytes::from_static(b"more"), None);
     job.write(1, 8, Bytes::from_static(b"last"), None);
-    assert!(!writers.wake_below(&volume, 12), "already there: no wake");
-    assert!(writers.wake_below(&volume, 4));
-    assert!(writers.wake_below(&volume, 4), "asked twice, woken once");
+    assert!(!job.wake_below(12), "already there: no wake");
+    assert!(job.wake_below(4));
+    assert!(job.wake_below(4), "asked twice, woken once");
     hold.wait_held();
     hold.release(1);
     hold.wait_held();
@@ -677,8 +677,8 @@ fn a_settle_span_too_long_for_the_clock_ends_centuries_on() {
     let end = bound.end();
     assert!(end >= clock.instant(CENTURY), "{end:?}");
     let (writers, _reports) = writers();
-    writers.end_loop_waits_at(Arc::clone(&bound.clock), end);
-    let (more, runs) = writers.registry.loop_end.more().unwrap();
+    writers.end_waits_at(Arc::clone(&bound.clock), end);
+    let (more, runs) = writers.registry.wait_end.more().unwrap();
     assert!(more >= CENTURY, "{more:?}");
     assert!(!runs);
     // Nothing is out, so a settle to that end returns at once.
@@ -696,7 +696,7 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let gone = writers.submitter(&volume, 1);
+    let gone = writers.test_submitter(&volume, 1);
     gone.write(1, 0, Bytes::from_static(b"old"), create(&old));
     drop(gone);
     hold.wait_held();
@@ -716,7 +716,7 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
             bytes: 3,
         }]
     );
-    let next = writers.submitter(&volume, 2);
+    let next = writers.test_submitter(&volume, 2);
     next.write(1, 0, Bytes::from_static(b"new"), create(&new));
     hold.open();
     writers.settle();
@@ -726,7 +726,7 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
     writers.wait_ended(&volume);
     assert_eq!(count(&volume.writer.threads), 1);
     // Only a volume whose thread has ended is given another.
-    let after = writers.submitter(&volume, 3);
+    let after = writers.test_submitter(&volume, 3);
     after.write(1, 0, Bytes::from_static(b"later"), create(&later));
     after.barrier().wait();
     assert_eq!(std::fs::read(&later).unwrap(), b"later");
@@ -740,7 +740,10 @@ fn two_keys_number_their_files_apart() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let (six, seven) = (writers.submitter(&volume, 6), writers.submitter(&volume, 7));
+    let (six, seven) = (
+        writers.test_submitter(&volume, 6),
+        writers.test_submitter(&volume, 7),
+    );
     six.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     // One batch holds both keys' file 0.
@@ -764,7 +767,7 @@ fn a_panicking_operation_fails_its_key_and_the_thread_goes_on() {
     let (writers, reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let broken = writers.submitter(&volume, 1);
+    let broken = writers.test_submitter(&volume, 1);
     broken.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     broken.write(1, 0, Bytes::from_static(b"first"), create(&lost));
@@ -781,7 +784,7 @@ fn a_panicking_operation_fails_its_key_and_the_thread_goes_on() {
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].key, 1);
     assert_eq!(count(&volume.writer.failed_operations), 1);
-    let healthy = writers.submitter(&volume, 2);
+    let healthy = writers.test_submitter(&volume, 2);
     healthy.write(1, 0, Bytes::from_static(b"kept"), create(&kept));
     let kept_barrier = healthy.barrier();
     kept_barrier.wait();
@@ -797,7 +800,7 @@ fn a_bounded_settle_gives_up_on_a_volume_that_holds_writes_at_its_end() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"stuck"), create(&path));
     hold.wait_held();
     let clock = ManualClock::default();
@@ -842,7 +845,7 @@ fn settles_that_share_an_end_give_up_at_it_whatever_returned_meanwhile() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"first"), create(&a));
     job.write(2, 0, Bytes::from_static(b"stuck"), create(&b));
     hold.wait_held();
@@ -883,10 +886,10 @@ fn the_counters_hold_what_a_scripted_run_did() {
     let (writers, reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let failing = writers.submitter(&volume, 0);
-    let ordered = writers.submitter(&volume, 1);
-    let seeking = writers.submitter(&volume, 2);
-    let given_up = writers.submitter(&volume, 3);
+    let failing = writers.test_submitter(&volume, 0);
+    let ordered = writers.test_submitter(&volume, 1);
+    let seeking = writers.test_submitter(&volume, 2);
+    let given_up = writers.test_submitter(&volume, 3);
     failing.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     hold.fail_next(io::Error::other("no room"));
@@ -944,9 +947,9 @@ fn a_volume_with_no_thread_is_asked_for_one_again_only_once_it_was_let_go() {
     let volume = volume("one");
     let starts = || count(&writers.registry.starts);
 
-    let first = writers.submitter(&volume, 1);
-    let second = writers.submitter(&volume, 2);
-    let own = writers.volume_submitter(&volume);
+    let first = writers.test_submitter(&volume, 1);
+    let second = writers.test_submitter(&volume, 2);
+    let own = writers.test_volume_submitter(&volume);
     assert_eq!(starts(), 1, "one ask for the three of them");
 
     first.write(1, 0, Bytes::from_static(b"lost"), create(&first_path));
@@ -988,14 +991,14 @@ fn a_volume_with_no_thread_is_asked_for_one_again_only_once_it_was_let_go() {
 
     // One caller lets go and another comes: the volume is still held.
     drop(first);
-    let third = writers.submitter(&volume, 3);
+    let third = writers.test_submitter(&volume, 3);
     assert_eq!(starts(), 1);
 
     // All let go: the next caller asks again, once.
     drop((second, own, third));
     writers.wait_ended(&volume);
-    let fourth = writers.submitter(&volume, 4);
-    let fifth = writers.submitter(&volume, 5);
+    let fourth = writers.test_submitter(&volume, 4);
+    let fifth = writers.test_submitter(&volume, 5);
     assert_eq!(starts(), 2);
     drop((fourth, fifth));
 }
@@ -1010,7 +1013,7 @@ fn a_producer_waits_until_the_bytes_waiting_fall_to_its_line() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"four"), create(&path));
     job.write(1, 4, Bytes::from_static(b"more"), None);
     job.write(1, 8, Bytes::from_static(b"last"), None);
@@ -1059,7 +1062,7 @@ fn a_wait_off_the_loop_is_not_counted_as_a_loop_wait() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
     let barrier = job.barrier();
     hold.wait_held();
@@ -1096,7 +1099,7 @@ fn the_loops_wait_and_read_are_each_counted_once() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
     let barrier = job.barrier();
     hold.wait_held();
@@ -1136,9 +1139,9 @@ fn a_producers_wait_ends_when_its_key_fails_or_is_given_up() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let failing = writers.submitter(&volume, 1);
-    let given_up = writers.submitter(&volume, 2);
-    let other = writers.submitter(&volume, 3);
+    let failing = writers.test_submitter(&volume, 1);
+    let given_up = writers.test_submitter(&volume, 2);
+    let other = writers.test_submitter(&volume, 3);
     failing.write(1, 0, Bytes::from_static(b"lost"), create(&failing_path));
     hold.wait_held();
     given_up.write(1, 0, Bytes::from_static(b"gone"), create(&given_path));
@@ -1177,7 +1180,7 @@ fn a_stop_ends_the_waits_of_producers_and_readers_on_a_volume_that_stands_still(
     let (writers, _reports) = writers();
     let (volume, later) = (volume("one"), volume("two"));
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"held"), create(&path));
     hold.wait_held();
     let barrier = job.barrier();
@@ -1199,7 +1202,7 @@ fn a_stop_ends_the_waits_of_producers_and_readers_on_a_volume_that_stands_still(
     job.wait_below(0);
     barrier.wait_aside();
     let later_hold = writers.hold(&later);
-    let other = writers.submitter(&later, 2);
+    let other = writers.test_submitter(&later, 2);
     other.write(
         1,
         0,
@@ -1229,17 +1232,17 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"held"), create(&path));
     hold.wait_held();
     // The four bytes held fill the volume: one more does not fit.
     volume.set_buffer_limits(4, 4);
     let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
+    writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     std::thread::scope(|scope| {
         let producer = scope.spawn(|| job.wait_below(0));
-        let looped = scope.spawn(|| job.loop_wait_room(1));
+        let looped = scope.spawn(|| job.wait_room(1));
         hold.wait_below_waiters(2);
         // The loop's wait read the clock once before it stood still.
         clock.wait_looks(1);
@@ -1248,20 +1251,20 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
         // Woken by the stop, the loop's wait read the clock again and
         // stands: it did not go on as the producer did.
         clock.wait_looks(2);
-        assert!(!job.left());
+        assert!(!job.gave_up());
         clock.move_to(end);
         writers.look_again();
         assert!(!looped.join().unwrap(), "the wait was given up at the end");
     });
-    assert!(job.left());
+    assert!(job.gave_up());
     assert_eq!(count(&volume.buffered_bytes), 4);
     // Past the end the loop does not stand still again, and queues nothing.
-    assert!(!job.loop_wait_room(1));
+    assert!(!job.wait_room(1));
     hold.open();
     writers.settle();
     assert_eq!(std::fs::read(&path).unwrap(), b"held");
     // With room the loop's wait says so, whatever the clock reads.
-    assert!(job.loop_wait_room(1));
+    assert!(job.wait_room(1));
 }
 
 // The loop's read of a file whose writes sit on a stuck volume does not
@@ -1277,13 +1280,13 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     let wrote = job.write(1, 0, Bytes::from_static(b"held"), create(&path));
     hold.wait_held();
     let barrier = job.barrier_at(wrote);
     let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
+    writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     std::thread::scope(|scope| {
         let read = scope.spawn(|| job.read_after(wrote, path.clone(), 0, 4));
         // The read looked at the clock once, short of the end, and stands
@@ -1306,7 +1309,7 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
         ),
         (1, 0, 0)
     );
-    assert!(job.left());
+    assert!(job.gave_up());
     assert!(!barrier.failed(), "nothing of the key failed");
     // Past the end the loop does not stand again.
     barrier.wait();
@@ -1324,7 +1327,7 @@ fn a_producer_does_not_wait_on_a_volume_with_no_thread() {
     let dir = tempfile::tempdir().unwrap();
     let writers = VolumeWriters::threadless(|_| {});
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     // Bytes counted as waiting by something else do not hold it either.
     volume.buffered_bytes.store(64, Ordering::SeqCst);
     job.wait_below(0);
@@ -1349,7 +1352,7 @@ fn an_operation_its_caller_makes_itself_is_no_failure_on_a_volume_with_no_thread
         count_reports.fetch_add(report.failures.len() as u64, Ordering::SeqCst);
     });
     let volume = volume("one");
-    let job = writers.submitter(&volume, 7);
+    let job = writers.test_submitter(&volume, 7);
     let (answer, answered) = mpsc::sync_channel(1);
     job.ask(PathBuf::from("delivered"), move || {
         let _ = answer.send(());
@@ -1376,7 +1379,7 @@ fn a_refused_name_is_not_a_failed_barrier() {
     let path = dir.path().join("a");
     let (writers, reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(
         1,
         0,
@@ -1408,7 +1411,7 @@ fn a_write_to_a_file_that_is_not_open_fails_its_key() {
     let (path, after) = (dir.path().join("a"), dir.path().join("after"));
     let (writers, reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"head"), create(&path));
     job.release(1);
     // The handle is closed, and this write brings no way to open it again.
@@ -1456,10 +1459,10 @@ fn reporting_what_is_outstanding(
 #[test]
 fn a_batchs_failures_are_reported_before_a_settle_of_it_can_end() {
     let dir = tempfile::tempdir().unwrap();
-    let (writers, lane, seen) = reporting_what_is_outstanding(VolumeWriters::new);
+    let (writers, lane, seen) = reporting_what_is_outstanding(VolumeWriters::reporting);
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     *lane.lock().unwrap() = Some(Arc::clone(&job.lane));
     job.write(
         1,
@@ -1487,7 +1490,7 @@ fn a_failure_on_a_volume_with_no_thread_is_reported_before_a_settle_can_end() {
     let dir = tempfile::tempdir().unwrap();
     let (writers, lane, seen) = reporting_what_is_outstanding(VolumeWriters::threadless);
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     *lane.lock().unwrap() = Some(Arc::clone(&job.lane));
 
     job.write(
@@ -1517,7 +1520,7 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
     // Watches the volume's thread and holds nothing of it back.
     let watch = writers.hold(&volume);
     watch.open();
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     let (began, begun) = mpsc::channel();
     let (go, gone) = mpsc::channel::<()>();
     let (ended, end) = mpsc::channel();
@@ -1532,7 +1535,7 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
 
     // Left with a volume that is held and has written nothing. The thread
     // has taken the work and the forgetting, and stands: not run.
-    writers.volume_submitter(&volume).when_idle(own);
+    writers.test_volume_submitter(&volume).when_idle(own);
     watch.wait_parked();
     assert!(
         begun.try_recv().is_err(),
@@ -1551,7 +1554,7 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
     // waits for the next one.
     let (again, ran_again) = mpsc::channel();
     writers
-        .volume_submitter(&volume)
+        .test_volume_submitter(&volume)
         .when_idle(move || again.send(()).unwrap());
     job.release(1);
     watch.wait_parked();
@@ -1564,7 +1567,7 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
     // On a volume no caller holds it runs at once.
     let (ran, run) = mpsc::channel();
     writers
-        .volume_submitter(&other)
+        .test_volume_submitter(&other)
         .when_idle(move || ran.send(()).unwrap());
     run.recv().unwrap();
 }
@@ -1578,7 +1581,7 @@ fn the_volumes_own_work_is_dropped_at_a_stop() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(
         1,
         0,
@@ -1590,7 +1593,7 @@ fn the_volumes_own_work_is_dropped_at_a_stop() {
     hold.wait_held();
     let (ran, run) = mpsc::channel::<()>();
     writers
-        .volume_submitter(&volume)
+        .test_volume_submitter(&volume)
         .when_idle(move || ran.send(()).unwrap());
     writers.stop_waits();
     hold.open();
@@ -1612,7 +1615,7 @@ fn a_write_is_counted_as_its_call_returns_not_at_the_end_of_its_batch() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     job.write(1, 0, Bytes::from_static(b"lan"), create(&path));
@@ -1645,7 +1648,7 @@ fn a_batch_stops_taking_writes_at_its_byte_cap() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     let big = BATCH_BYTES as usize;
@@ -1663,21 +1666,21 @@ fn a_batch_stops_taking_writes_at_its_byte_cap() {
     writers.wait_ended(&volume);
 }
 
-// The loop's writes count against the volume's hard limit before they are
-// queued, in pieces of at most its share (100 of 1600 here). With the volume
+// Writes count against the volume's hard limit before they are queued, in
+// pieces of at most its write piece (100 of 1600 here). With the volume
 // full the next write stands still for the writer, queues nothing
 // meanwhile, and goes once the writer has written one piece of what it
 // holds; the count never passes the limit.
 #[test]
-fn a_loop_write_on_a_full_volume_waits_for_room_and_never_counts_past_the_limit() {
+fn a_write_on_a_full_volume_waits_for_room_and_never_counts_past_the_limit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
     volume.set_buffer_limits(1600, 1600);
-    assert_eq!(volume.loop_share(), 100);
+    assert_eq!(volume.write_piece(), 100);
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from(vec![1u8; 1000]), create(&path));
     hold.wait_held();
     job.write(1, 1000, Bytes::from(vec![2u8; 600]), None);
@@ -1703,30 +1706,33 @@ fn a_loop_write_on_a_full_volume_waits_for_room_and_never_counts_past_the_limit(
     assert!(written[1600..].iter().all(|byte| *byte == 3));
 }
 
-// What the loop holds as credit, the arrived article it hands on, is
-// already counted: a write within it adds nothing to the count. Past it a
-// write longer than the loop's share goes in pieces of that share, each
-// counted as it fits.
+// What an owner prepaid out of its reservation is already counted: a write
+// within it adds nothing to the count. Past it a write longer than the
+// volume's write piece goes in pieces of that size, each counted as it
+// fits.
 #[test]
-fn a_loop_write_takes_its_credit_first_and_goes_in_pieces_past_its_share() {
+fn a_write_takes_what_was_prepaid_first_and_goes_in_pieces_past_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
     volume.set_buffer_limits(64, 64);
-    assert_eq!(volume.loop_share(), 4);
+    assert_eq!(volume.write_piece(), 4);
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
-    volume.charge(10);
-    volume.loop_credit.store(10, Ordering::Relaxed);
+    let job = writers.test_submitter(&volume, 1);
+    let mut held = Reservation::none(Arc::clone(&volume));
+    held.count(10);
+    let prepaid = writers.test_owner().prepay(&mut held, 10);
+    assert_eq!(held.bytes(), 0, "the reservation handed its bytes on");
     job.write(1, 0, Bytes::from(vec![1u8; 10]), create(&path));
-    assert_eq!(volume.unwritten_bytes(), 10, "the credit paid for it");
-    assert_eq!(count(&volume.loop_credit), 0);
+    assert_eq!(volume.unwritten_bytes(), 10, "what was prepaid paid for it");
+    assert_eq!(prepaid.settle(), 0, "the write took all of it");
     hold.wait_held();
-    // Two of credit, then eighteen past it: pieces of 6, 4, 4, 4 and 2.
-    volume.charge(2);
-    volume.loop_credit.store(2, Ordering::Relaxed);
+    // Two prepaid, then eighteen past it: pieces of 6, 4, 4, 4 and 2.
+    held.count(2);
+    let prepaid = writers.test_owner().prepay(&mut held, 2);
     job.write(1, 10, Bytes::from(vec![2u8; 20]), None);
+    assert_eq!(prepaid.settle(), 0);
     assert_eq!(volume.unwritten_bytes(), 30);
     assert_eq!(count(&volume.writer.operations), 0);
     hold.open();
@@ -1744,37 +1750,39 @@ fn a_loop_write_takes_its_credit_first_and_goes_in_pieces_past_its_share() {
     assert!(written[10..].iter().all(|byte| *byte == 2));
 }
 
-// A loop write whose wait for room is given up at the end of a stop queues
-// nothing more, and what of it the loop's credit paid for no longer counts:
-// once the writer has written what it holds, the volume counts nothing.
+// A write whose wait for room is given up at the end of a stop queues
+// nothing more, and what of it was prepaid no longer counts: once the
+// writer has written what it holds, the volume counts nothing.
 #[test]
-fn a_loop_write_given_up_at_the_stops_end_leaves_nothing_counted() {
+fn a_write_given_up_at_the_stops_end_leaves_nothing_counted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
     volume.set_buffer_limits(64, 64);
-    assert_eq!(volume.loop_share(), 4);
+    assert_eq!(volume.write_piece(), 4);
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from(vec![1u8; 60]), create(&path));
     assert_eq!(volume.unwritten_bytes(), 60);
     hold.wait_held();
     let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
-    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
+    writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     writers.stop_waits();
     clock.move_to(end);
-    // An arrived article of two, then eight past it: the first piece is
-    // two of credit and four charged, and four more do not fit.
-    volume.charge(2);
-    volume.loop_credit.store(2, Ordering::Relaxed);
+    // Two prepaid, then eight past it: the first piece is two prepaid and
+    // four counted, and four more do not fit.
+    let mut held = Reservation::none(Arc::clone(&volume));
+    held.count(2);
+    let prepaid = writers.test_owner().prepay(&mut held, 2);
     job.write(1, 60, Bytes::from(vec![2u8; 10]), None);
-    assert!(job.left());
+    assert!(job.gave_up());
+    assert_eq!(prepaid.settle(), 0, "the write took what was prepaid");
     assert_eq!(
         volume.unwritten_bytes(),
         60,
-        "the credit's two are given back"
+        "the two prepaid are given back"
     );
     hold.open();
     writers.settle();
@@ -1821,7 +1829,7 @@ fn a_close_sets_the_length_only_where_the_file_is_not_at_it() {
     let dir = tempfile::tempdir().unwrap();
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     // File, opener, declared length, bytes written from the start, close.
     let files: [(&str, OpenFn, u64, &'static [u8], u64); 5] = [
         ("sized-whole", open_sized, 8, b"lanterns", 8),
@@ -1898,7 +1906,7 @@ fn close_through_the_graphs_opener() -> (u64, u64) {
     let (whole, short) = (dir.path().join("whole"), dir.path().join("short"));
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(
         1,
         0,
@@ -1932,7 +1940,7 @@ fn a_truncated_file_is_known_to_be_empty() {
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
     job.truncate(1, made_by(&path, 0, open));
     job.close(1, 0, made_by(&path, 0, open));
@@ -1954,7 +1962,7 @@ fn opens_length_sets_and_drops_are_timed() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     job.write(
@@ -2003,8 +2011,8 @@ fn a_closed_file_is_placed_before_another_files_open() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let closing = writers.submitter(&volume, 1);
-    let other = writers.submitter(&volume, 2);
+    let closing = writers.test_submitter(&volume, 1);
+    let other = writers.test_submitter(&volume, 2);
     // The thread stands in a batch of its own before what follows comes.
     other.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
@@ -2042,8 +2050,8 @@ fn an_open_files_write_is_placed_before_another_files_make() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
-    let writing = writers.submitter(&volume, 1);
-    let making = writers.submitter(&volume, 2);
+    let writing = writers.test_submitter(&volume, 1);
+    let making = writers.test_submitter(&volume, 2);
     // The file is opened in a batch of its own.
     writing.write(1, 0, Bytes::from_static(b"head"), create(&open_path));
     hold.wait_held();
@@ -2077,7 +2085,7 @@ fn a_closed_file_written_and_closed_again_is_opened_once() {
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"head"), create(&path));
     job.close(1, 8, made_by(&path, 8, open));
     job.close(1, 8, made_by(&path, 8, open));
@@ -2105,7 +2113,7 @@ fn a_move_and_a_removal_drop_a_closed_files_handle_before_they_run() {
     let (from, to) = (dir.path().join("from"), dir.path().join("to"));
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"head"), create(&from));
     job.close(1, 4, made_by(&from, 4, open));
     let (seen, moved_from, moved_to) = (Arc::clone(&volume), from.clone(), to.clone());
@@ -2147,7 +2155,7 @@ fn a_keys_end_drops_its_closed_files_handles() {
     let dir = tempfile::tempdir().unwrap();
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     for file in 1..=3u64 {
         let path = dir.path().join(file.to_string());
         job.write(file, 0, Bytes::from_static(b"head"), create(&path));
@@ -2168,7 +2176,7 @@ fn a_key_keeps_a_bounded_number_of_closed_files_handles() {
     let dir = tempfile::tempdir().unwrap();
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     let kept = super::KEPT_CLOSED as u64;
     let path = |file: u64| dir.path().join(file.to_string());
     for file in 1..=kept + 1 {
@@ -2211,7 +2219,7 @@ fn a_closed_file_written_again_leaves_the_closed_files() {
     let dir = tempfile::tempdir().unwrap();
     let (writers, _reports) = writers();
     let volume = volume("one");
-    let job = writers.submitter(&volume, 1);
+    let job = writers.test_submitter(&volume, 1);
     let kept = super::KEPT_CLOSED as u64;
     let path = |file: u64| dir.path().join(file.to_string());
     let close = |file: u64| {
