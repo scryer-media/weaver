@@ -258,6 +258,9 @@ impl RssService {
                 Err(error) => {
                     let now = self.now();
                     let message = error.to_string();
+                    // One line per failed poll of a feed: a feed is polled
+                    // again only at its next interval, so this is bounded.
+                    warn!(feed_id = feed.id, feed = %feed.name, error = %message, "RSS feed poll failed");
                     let _ = self
                         .inner
                         .db
