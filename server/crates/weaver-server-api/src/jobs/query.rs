@@ -467,23 +467,22 @@ fn list_output_files(
         });
     }
 
-    let listing = weaver_server_core::history::output_files::list_output_files_after(
+    let page = weaver_server_core::history::output_files::list_output_files_after(
         dir,
         cursor.after.as_ref(),
         limit,
     )
     .map_err(|e| async_graphql::Error::new(format!("failed to read directory: {e}")))?;
+    // A next page exists when the walk found a file after this page's last,
+    // whatever moved before it since the first page.
+    let listing = page.listing;
     let next = offset.saturating_add(listing.files.len());
-    let next_cursor = listing
-        .files
-        .last()
-        .filter(|_| (next as u64) < listing.total_count)
-        .map(|last| {
-            encode_output_files_cursor(&OutputFilesCursor {
-                offset: next,
-                after: Some(last.listing_key()),
-            })
-        });
+    let next_cursor = page.last.filter(|_| page.more).map(|last| {
+        encode_output_files_cursor(&OutputFilesCursor {
+            offset: next,
+            after: Some(last),
+        })
+    });
     let files = listing
         .files
         .into_iter()

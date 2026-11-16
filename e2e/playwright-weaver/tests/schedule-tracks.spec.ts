@@ -13,7 +13,7 @@ import {
   DAY_MS, Rules, SCHEDULE_FIELDS, type RuleInput, type ScheduleRow, addCountedFeed, at, cancelledJob, clockWhileStoppedPending,
   completedJob, deleteFeed, egressSpeed, feedCount, freshDay, generalSettings, historyItem, hhmm, note, postPaused,
   profileState, queueState, restoreServer, resumeAll, schedules, serverRow, setClockWhileStopped, token, updateSettings,
-  releaseLast, waitPaused, waitProfile, waitQueue, watchFolderPaused, withRules, witnessTick,
+  releaseLast, waitFeedRead, waitPaused, waitProfile, waitQueue, watchFolderPaused, withRules, witnessTick,
 } from "./support/schedules";
 
 /**
@@ -963,18 +963,20 @@ test("R01 pause_rss and resume_rss hold the feed poller", async ({ request }) =>
       const pause = await rules.create({ actionType: "pause_rss", time: "10:00" });
       expect([resume.track, pause.track]).toEqual(["RSS", "RSS"]);
       const control = `r01-control-${token}`;
-      feeds.push(await addCountedFeed(request, control));
-      await expect.poll(() => feedCount(control), { message: "R01 a new feed is read while RSS runs", timeout: 0 }).toBe(1);
+      const controlFeed = await addCountedFeed(request, control);
+      feeds.push(controlFeed);
+      await waitFeedRead(request, controlFeed, control, "R01 a new feed is read while RSS runs");
 
       setClock(at(day, 10, 0));
       await witnessTick(request);
       const held = `r01-held-${token}`;
-      feeds.push(await addCountedFeed(request, held));
+      const heldFeed = await addCountedFeed(request, held);
+      feeds.push(heldFeed);
       await witnessTick(request);
-      expect(await feedCount(held), "a new feed is not read while RSS is paused").toBe(0);
+      expect(await feedCount(request, held), "a new feed is not read while RSS is paused").toBe(0);
 
       setClock(at(day, 10, 30));
-      await expect.poll(() => feedCount(held), { message: "R01 the resume reads the waiting feed", timeout: 0 }).toBe(1);
+      await waitFeedRead(request, heldFeed, held, "R01 the resume reads the waiting feed");
     } finally {
       for (const id of feeds) await deleteFeed(request, id);
       // Deleting the 10:30 resume first would put the 10:00 pause back in force.
@@ -999,14 +1001,15 @@ test("R02 pause_all holds downloads, watch intake and RSS, and resume releases a
       await waitPaused(request, true, "R02 downloads paused at 10:00");
       await expect.poll(() => watchFolderPaused(request), { message: "R02 watch intake paused", timeout: 0 }).toBe(true);
       const held = `r02-held-${token}`;
-      feeds.push(await addCountedFeed(request, held));
+      const heldFeed = await addCountedFeed(request, held);
+      feeds.push(heldFeed);
       await witnessTick(request);
-      expect(await feedCount(held), "a new feed is not read while pause_all holds RSS").toBe(0);
+      expect(await feedCount(request, held), "a new feed is not read while pause_all holds RSS").toBe(0);
 
       setClock(at(day, 10, 30));
       await waitPaused(request, false, "R02 downloads resumed");
       await expect.poll(() => watchFolderPaused(request), { message: "R02 watch intake resumed", timeout: 0 }).toBe(false);
-      await expect.poll(() => feedCount(held), { message: "R02 RSS resumed", timeout: 0 }).toBe(1);
+      await waitFeedRead(request, heldFeed, held, "R02 RSS resumed");
     } finally {
       for (const id of feeds) await deleteFeed(request, id);
       // Deleting the 10:30 resume first would put the pause_all back in force.

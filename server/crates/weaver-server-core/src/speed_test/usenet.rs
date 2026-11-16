@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use weaver_nntp::blocking::BlockingBodyLane;
@@ -97,6 +97,9 @@ pub(crate) async fn run(
     // Every worker holds a sender; the channel closes once the last one has
     // dropped its connection.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Set at the stop, so an article still arriving is cut at its next read
+    // rather than read to its end: a slow article must not hold the run open.
+    let halt = Arc::new(AtomicBool::new(false));
     for leg in plan.legs {
         if leg.connections == 0 {
             continue;
@@ -137,6 +140,7 @@ pub(crate) async fn run(
                 egress_control: leg.egress_control.clone(),
                 server_name: server.host.clone(),
                 stop: stop.clone(),
+                halt: halt.clone(),
                 runtime: runtime.clone(),
                 _done: done_tx.clone(),
             };
@@ -162,8 +166,9 @@ pub(crate) async fn run(
         _ = done_rx.recv() => {}
         _ = stop.stopped() => {
             // The clock stops at the stop. An article still on the wire is
-            // read to its end off the clock and not booked; waiting for it
+            // cut at its next read and not booked; waiting for its worker
             // keeps the run's sockets inside the connections it was lent.
+            halt.store(true, Ordering::Release);
             progress.finish();
             done_rx.recv().await;
         }
@@ -183,6 +188,7 @@ struct Worker {
     egress_control: Option<Arc<ServerTransferControl>>,
     server_name: String,
     stop: Stop,
+    halt: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
     _done: tokio::sync::mpsc::Sender<()>,
 }
@@ -291,7 +297,10 @@ impl Worker {
         let open = match lane {
             Some(open) => open,
             None => match self.dial(&article.groups) {
-                Ok(dialled) => lane.insert(dialled),
+                Ok(mut dialled) => {
+                    dialled.set_stop(self.halt.clone());
+                    lane.insert(dialled)
+                }
                 Err(error) => return Err(DecodedBodyError::Nntp(dial_error(error))),
             },
         };

@@ -2258,6 +2258,31 @@ async fn output_files_on_disk_refuse_a_position_only_cursor() {
     assert!(second["nextCursor"].is_null());
 }
 
+// Files listed on earlier pages that have since moved out leave the files
+// after them still to come: the page before the last says there is more.
+#[tokio::test]
+async fn output_files_on_disk_page_on_after_earlier_files_move_out() {
+    let h = TestHarness::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a", "b", "c", "d", "e"] {
+        std::fs::write(dir.path().join(format!("{name}.bin")), [0u8]).unwrap();
+    }
+    let mut row = sample_history_row(7_105, "Moved", "complete", 1_700_000_000);
+    row.output_dir = Some(dir.path().to_string_lossy().into_owned());
+    h.insert_history_row(&row);
+    let first = output_files_page(&h, 7_105, ", first: 2").await;
+    std::fs::remove_file(dir.path().join("a.bin")).unwrap();
+    std::fs::remove_file(dir.path().join("b.bin")).unwrap();
+    let mut seen = Vec::new();
+    let mut cursor = first["nextCursor"].as_str().map(str::to_string);
+    while let Some(after) = cursor {
+        let page = output_files_page(&h, 7_105, &format!(", first: 2, after: \"{after}\"")).await;
+        seen.extend(page_files(&page).into_iter().map(|f| f.0));
+        cursor = page["nextCursor"].as_str().map(str::to_string);
+    }
+    assert_eq!(seen, ["c.bin", "d.bin", "e.bin"]);
+}
+
 // The folder on disk lists no link and walks no linked folder, as the record
 // an archive keeps does not.
 #[cfg(unix)]
