@@ -255,6 +255,17 @@ impl RssService {
                     report.errors.extend(feed_report.errors.iter().cloned());
                     report.feed_results.push(feed_report);
                 }
+                // The routes were mid-reload: the feed is left due, with no
+                // error recorded, and the reload's end wakes the poller.
+                Err(RssServiceError::RoutesChanging) => {
+                    if !due_only {
+                        report.errors.push(format!(
+                            "{}: {}",
+                            feed.name,
+                            RssServiceError::RoutesChanging
+                        ));
+                    }
+                }
                 Err(error) => {
                     let now = self.now();
                     let message = error.to_string();
@@ -358,12 +369,13 @@ impl RssService {
     // Between the row insert and the proxy runtime reload that installs its
     // route, a new feed has none, so a sweep leaves it for the wake the
     // reload sends instead of polling it unrouted or recording a failure.
+    // A feed is left the same way while any reload is in progress.
     // Without a runtime no feed has a route.
     fn has_route(&self, feed_id: u32) -> bool {
         self.inner
             .handle
             .proxy_runtime()
-            .is_some_and(|runtime| runtime.routes_consumer(crate::proxies::Consumer::Rss(feed_id)))
+            .is_some_and(|runtime| runtime.feed_routable(crate::proxies::Consumer::Rss(feed_id)))
     }
 
     async fn sync_feed(
