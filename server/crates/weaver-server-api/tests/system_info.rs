@@ -268,11 +268,22 @@ async fn storage_queries_answer_configured_folders_from_the_cache() {
     };
     std::fs::create_dir_all(&category_dir).unwrap();
     wait_for_storage_readings(&h, &data_dir, &intermediate_dir, &complete_dir).await;
-    // The roots' readings stay current however slowly the test runs.
-    h.shared_state
+    let storage = h
+        .shared_state
         .storage_capacity()
-        .expect("the pipeline's samplers")
-        .stop_clock_for_test();
+        .expect("the pipeline's samplers");
+    // A pipeline turn tells the disk owner the new category's folder, and
+    // its device is read on a thread of the owner's: a count of looks taken
+    // before that read ends could take it.
+    {
+        let storage = std::sync::Arc::clone(&storage);
+        let folder = category_dir.clone();
+        tokio::task::spawn_blocking(move || storage.wait_for_folder_read_for_test(&folder))
+            .await
+            .unwrap();
+    }
+    // The roots' readings stay current however slowly the test runs.
+    storage.stop_clock_for_test();
 
     let mut variables = async_graphql::Variables::default();
     variables.insert(

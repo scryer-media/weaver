@@ -334,6 +334,32 @@ async fn delete_owned_output_dir(dir: &std::path::Path, job_id: JobId, legacy_ok
 // Which of the recorded output folders more than one job records: a folder
 // whose marker predates job-named markers is removed only when no other
 // job records it. One read for the whole request.
+// The jobs among `job_ids` with a script queued, running or waiting to be
+// admitted, in one read per bind-safe chunk: only those wait at the
+// script-stop barrier. A read that fails counts every job live, so each
+// keeps its own barrier.
+async fn jobs_with_live_scripts(
+    db: &crate::Database,
+    job_ids: Vec<u64>,
+) -> std::collections::HashSet<u64> {
+    if job_ids.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let read_db = db.clone();
+    let ids = job_ids.clone();
+    match tokio::task::spawn_blocking(move || read_db.jobs_with_live_script_events(&ids)).await {
+        Ok(Ok(live)) => live,
+        Ok(Err(error)) => {
+            warn!(%error, "could not list jobs with live scripts; each job waits at its own script-stop barrier");
+            job_ids.into_iter().collect()
+        }
+        Err(error) => {
+            warn!(%error, "the live-script listing task failed; each job waits at its own script-stop barrier");
+            job_ids.into_iter().collect()
+        }
+    }
+}
+
 async fn shared_output_dirs(
     db: &crate::Database,
     dirs: Vec<String>,
@@ -521,11 +547,14 @@ pub(crate) async fn delete_history_rows(
     // row. No pipeline state participates in a history deletion.
     let removed = delete_ids.iter().copied().collect::<BTreeSet<_>>();
     let mut deleted = BTreeMap::new();
+    let scripted =
+        jobs_with_live_scripts(db, cleanup.keys().map(|id: &JobId| id.0).collect()).await;
     for (job_id, dirs) in cleanup {
-        if let Err(error) = retry_script_stop_wait(job_id, || {
-            crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
-        })
-        .await
+        if scripted.contains(&job_id.0)
+            && let Err(error) = retry_script_stop_wait(job_id, || {
+                crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
+            })
+            .await
         {
             deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
             continue;
@@ -736,11 +765,14 @@ pub(crate) async fn archive_history(
     // Proven and listed before anything of any job goes.
     let mut proven = Vec::with_capacity(planned.len());
     let mut records = Vec::new();
+    let scripted =
+        jobs_with_live_scripts(db, planned.iter().map(|(id, _, _)| id.0).collect()).await;
     for (job_id, recorded, dirs) in planned {
-        if let Err(error) = retry_script_stop_wait(job_id, || {
-            crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
-        })
-        .await
+        if scripted.contains(&job_id.0)
+            && let Err(error) = retry_script_stop_wait(job_id, || {
+                crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
+            })
+            .await
         {
             outcomes.insert(
                 job_id,
