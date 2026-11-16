@@ -15,7 +15,7 @@ use crate::torrents::service::disk_room::DiskHeld;
 use crate::torrents::service::settings::WindDown;
 
 // A seeding goal met as soon as the download is done, then `action`.
-fn done_then(action: SeedingAction) -> Option<SeedingPolicy> {
+pub(super) fn done_then(action: SeedingAction) -> Option<SeedingPolicy> {
     Some(SeedingPolicy {
         seed_time_counting: Default::default(),
         ratio_goal: Leaf::Set(0.0),
@@ -29,7 +29,7 @@ fn done_then(action: SeedingAction) -> Option<SeedingPolicy> {
 // The script events raised so far, of every kind, by kind, once each is
 // admitted. The marker that waits for them is a URL's, which no torrent
 // raises, and is left out.
-async fn events(db: &Database) -> Vec<(QueueEvent, Vec<EventContext>)> {
+pub(super) async fn events(db: &Database) -> Vec<(QueueEvent, Vec<EventContext>)> {
     db.admitted_so_far().await;
     QueueEvent::ALL
         .iter()
@@ -42,7 +42,7 @@ async fn events(db: &Database) -> Vec<(QueueEvent, Vec<EventContext>)> {
 // limits, the row kept, the view published and what the pass holds in
 // memory; and the script events queued since `before`. The rig's folder
 // reads as `<dir>`.
-async fn written(
+pub(super) async fn written(
     rig: &Rig,
     jobs: &[(&str, JobId)],
     before: &[(QueueEvent, Vec<EventContext>)],
@@ -124,7 +124,7 @@ async fn written(
 }
 
 // A torrent added and in its session.
-async fn add(rig: &Rig, name: &str, seed: u8, request: AddRequest) -> JobId {
+pub(super) async fn add(rig: &Rig, name: &str, seed: u8, request: AddRequest) -> JobId {
     rig.service
         .add_opened(AddRequest {
             source: AddSource::Metainfo(plain(name, seed)),
@@ -341,17 +341,20 @@ async fn an_idle_tick_takes_the_lock_once_and_writes_nothing() {
 
     let mut changes = handle.state().subscribe_job_changes();
     changes.borrow_and_update();
+    // Counted by the tick's pass alone: the settle loop `open` started
+    // takes `live` and walks the torrents on its own, and is not counted.
     let counts = *rig.service.inner.pass_counts.borrow();
     let taken = rig.db.writes_taken();
     rig.service.tick().await;
     let after = *rig.service.inner.pass_counts.borrow();
     assert_eq!(
         (
+            after.passes - counts.passes,
             after.locks - counts.locks,
             after.walks - counts.walks,
             after.writes - counts.writes,
         ),
-        (1, 2, 0)
+        (1, 1, 2, 0)
     );
     assert_eq!(rig.db.writes_taken(), taken);
     assert!(!changes.has_changed().unwrap());

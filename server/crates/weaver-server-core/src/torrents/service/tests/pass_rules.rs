@@ -95,27 +95,46 @@ fn reading_a_torrent_with_no_session_only_takes_its_reading() {
 }
 
 // Seed mode: none kept, nothing; ended in the session, left; still in it,
-// the pieces checked since they were last kept, read only then.
+// the pieces checked since they were last kept, read only then, and copied
+// only when more passed than were kept.
 #[test]
 fn seed_mode_is_left_once_the_session_leaves_it_and_its_checks_are_kept() {
-    let unread = || -> Option<(usize, Vec<u8>)> { panic!("read with no seed mode kept") };
-    assert_eq!(policy::seed_mode_step(false, true, unread, 0), None);
-    assert_eq!(policy::seed_mode_step(false, false, unread, 0), None);
-    let unread = || -> Option<(usize, Vec<u8>)> { panic!("read once seed mode ended") };
+    type Bits = (usize, Vec<u8>);
+    let count = |bits: &Bits| bits.0;
+    let copy = |bits: &Bits| bits.1.clone();
+    let uncopied = |_: &Bits| -> Vec<u8> { panic!("copied with no more pieces passed") };
+    let unread = || -> Option<Bits> { panic!("read with no seed mode kept") };
     assert_eq!(
-        policy::seed_mode_step(true, false, unread, 3),
+        policy::seed_mode_step(false, true, unread, count, copy, 0),
+        None
+    );
+    assert_eq!(
+        policy::seed_mode_step(false, false, unread, count, copy, 0),
+        None
+    );
+    let unread = || -> Option<Bits> { panic!("read once seed mode ended") };
+    assert_eq!(
+        policy::seed_mode_step(true, false, unread, count, copy, 3),
         Some(Intent::LeaveSeedMode)
     );
-    assert_eq!(policy::seed_mode_step(true, true, || None, 0), None);
     assert_eq!(
-        policy::seed_mode_step(true, true, || Some((2, vec![0b1100_0000])), 1),
+        policy::seed_mode_step(true, true, || None, count, copy, 0),
+        None
+    );
+    let bits = || Some((2, vec![0b1100_0000]));
+    assert_eq!(
+        policy::seed_mode_step(true, true, bits, count, copy, 1),
         Some(Intent::KeepVerified {
             pieces: vec![0b1100_0000],
             count: 2
         })
     );
     assert_eq!(
-        policy::seed_mode_step(true, true, || Some((2, vec![0b1100_0000])), 2),
+        policy::seed_mode_step(true, true, bits, count, uncopied, 2),
+        None
+    );
+    assert_eq!(
+        policy::seed_mode_step(true, true, bits, count, uncopied, 3),
         None
     );
 }

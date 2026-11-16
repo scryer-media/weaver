@@ -7,27 +7,31 @@
 // the torrent and the pass's context, and returns intents. The pass takes
 // `live` once, asks each policy in its list in turn for each torrent,
 // applies one policy's intents before it asks the next, and gathers what
-// goes out after: the database writes, as one, the ledgers and checkpoints
-// queued on the torrents' lanes, and the removals.
+// goes out after: the seed-mode rows as one write, queued ahead of the
+// ledgers and checkpoints queued on the torrents' lanes, the stops as one
+// write, and the removals.
 
-use super::checkpoints::{CheckpointSave, Landing};
+use super::checkpoints::{CheckpointSave, CheckpointTaken, Landing, Resume, take_checkpoint};
 use super::disk_room::{DiskHeld, StartHold};
 use super::live::Live;
 use super::queue::QueueEnd;
 use super::scripts::Ending;
 use super::settings::{TorrentSettings, WindDown};
 use super::{TorrentService, queued, ratelimits_of, take_turn};
+use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::handle::HoldSet;
 use crate::post_processing::events::EventContext;
 use crate::post_processing::model::{QueueEvent, vars};
-use crate::settings::model::TrackerRule;
+use crate::settings::model::{TorrentConfig, TrackerRule};
 use crate::settings::{Seeding, SeedingAction};
-use crate::torrents::persistence::TorrentPassWrites as PassWrites;
+use crate::torrents::persistence::TorrentSeedWrites;
 use crate::torrents::status::{self, Queued, Turn};
 use crate::torrents::{FilePriority, KeptIntent, TorrentIntent};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::PoisonError;
+use std::path::PathBuf;
+use std::sync::{LazyLock, PoisonError};
+use tokio::sync::oneshot;
 use weaver_torrent::limits::LimitsConfig;
 
 /// What a pass looks at besides the torrent: the settings, rules and holds
@@ -103,11 +107,9 @@ impl Policy for Reading {
             out.extend(seed_mode_step(
                 torrent.record.seed_mode,
                 handle.seed_mode(),
-                || {
-                    handle
-                        .seed_verified()
-                        .map(|verified| (verified.count_ones(), verified.as_raw_slice().to_vec()))
-                },
+                || handle.seed_verified(),
+                |verified| verified.count_ones(),
+                |verified| verified.as_raw_slice().to_vec(),
                 torrent.seed_verified,
             ));
         }
@@ -117,12 +119,16 @@ impl Policy for Reading {
 
 // What seed mode asks of a torrent the record keeps `stored` in seed mode,
 // whose session is `running` in it, which kept `kept` pieces as checked:
-// left once the session left it; else the pieces checked since kept, read
-// from `verified` only then.
-pub(super) fn seed_mode_step(
+// left once the session left it; else the pieces checked since kept. The
+// session's checked pieces are read from `verified` only while it is in
+// seed mode, counted by `count`, and copied by `pieces` only when more
+// passed than were kept.
+pub(super) fn seed_mode_step<V>(
     stored: bool,
     running: bool,
-    verified: impl FnOnce() -> Option<(usize, Vec<u8>)>,
+    verified: impl FnOnce() -> Option<V>,
+    count: impl FnOnce(&V) -> usize,
+    pieces: impl FnOnce(&V) -> Vec<u8>,
     kept: usize,
 ) -> Option<Intent> {
     if !stored {
@@ -131,8 +137,12 @@ pub(super) fn seed_mode_step(
     if !running {
         return Some(Intent::LeaveSeedMode);
     }
-    let (count, pieces) = verified()?;
-    (count > kept).then_some(Intent::KeepVerified { pieces, count })
+    let verified = verified()?;
+    let count = count(&verified);
+    (count > kept).then(|| Intent::KeepVerified {
+        pieces: pieces(&verified),
+        count,
+    })
 }
 
 /// A torrent whose checkpoint is behind has it written, after its reading.
@@ -400,34 +410,72 @@ pub(super) fn seat(
     (Seats(seats), QueueEnd { slots, last })
 }
 
+/// A write a walk took from a torrent, queued on the torrent's lane once
+/// the walk is over and the seed-mode rows are queued, in the order taken.
+enum Taken {
+    Resume(JobId, Resume),
+    Checkpoint(CheckpointTaken),
+}
+
+/// What a walk undoes in memory of seed mode when its rows are not kept:
+/// the torrent left it, or kept `count` pieces; it had `prior` kept.
+struct SeedUndo {
+    job_id: JobId,
+    left: bool,
+    count: usize,
+    prior: usize,
+}
+
+/// A pass's seed-mode rows, queued, and what to undo should they fail.
+pub(super) struct SeedLanding {
+    landed: oneshot::Receiver<Result<(), StateError>>,
+    undo: Vec<SeedUndo>,
+}
+
 /// What a pass gathers to do once its walks are over.
 #[derive(Default)]
 pub(super) struct Gathered {
-    // The ledgers queued on their torrents' lanes, and the checkpoints.
+    // The seed-mode rows, and what memory undoes should they fail.
+    seed: TorrentSeedWrites,
+    undo: Vec<SeedUndo>,
+    // The ledgers and checkpoints taken, in the order taken.
+    taken: Vec<Taken>,
+    // Stopped by a wind-down to the downloads alone, and by their goals.
+    wound_down: Vec<JobId>,
+    met: Vec<JobId>,
+    // Once queued: the seed-mode rows, the ledgers and the checkpoints.
+    seed_landing: Option<SeedLanding>,
     landings: Vec<Landing>,
     saves: Vec<CheckpointSave>,
-    // The pass's database writes, made together.
-    pub(super) writes: PassWrites,
     // Each torrent's standing, by job, with its place in the queue.
     standings: Vec<(i64, Queued)>,
     // The torrents whose goal removes them, with their data or not, and
     // the event raised once each is in history.
     removals: Vec<(JobId, bool, Option<EventContext>)>,
+    // The walks made, and the writes queued or made, counted in tests.
+    walks: u64,
+    writes: u64,
+}
+
+/// What a session is told for an intent, awaited by the walk.
+enum Command {
+    Run(RunCommand),
+    Levels(Vec<(usize, FilePriority)>),
 }
 
 type LiveMap = BTreeMap<JobId, Live>;
 
-impl TorrentService {
-    // `live`, taken for a pass: counted in tests.
-    async fn pass_lock(&self) -> tokio::sync::MutexGuard<'_, LiveMap> {
-        let live = self.inner.live.lock().await;
-        #[cfg(test)]
-        self.inner
-            .pass_counts
-            .send_modify(|counts| counts.locks += 1);
-        live
-    }
+// Settings for the passes whose policies read none (reading, picking): the
+// settings are not cloned for them.
+static NO_SETTINGS: LazyLock<TorrentSettings> = LazyLock::new(|| TorrentSettings {
+    complete_dir: PathBuf::new(),
+    categories: Vec::new(),
+    seeding: None,
+    upload_cap: None,
+    torrent: TorrentConfig::default(),
+});
 
+impl TorrentService {
     // A pass's context with nothing of the reading, goals, checkpoint or
     // turn steps set.
     fn context<'a>(
@@ -457,11 +505,14 @@ impl TorrentService {
 
     /// The tick's pass: every torrent read, its checkpoint written when it
     /// is behind, its goals applied, then its turn, picking and limits, in
-    /// that order for each torrent, under one take of `live`. The database
-    /// writes go as one, off the runtime, with `live` held across them as
-    /// every intent write holds it. A goal that removes a torrent removes it
-    /// before any turn is taken, as the passes one after another did: the
-    /// turns are then taken after the removals, under a second take.
+    /// that order for each torrent, under one take of `live`. Once the
+    /// first walk is over, still under `live`: the seed-mode rows are
+    /// queued as one write ahead of every ledger and checkpoint the walk
+    /// took, those are queued in the order taken, and the stops are written
+    /// with `live` held, as every intent write holds it. A goal that
+    /// removes a torrent removes it before any turn is taken, as the passes
+    /// one after another did: the turns are then taken after the removals,
+    /// under a second take.
     pub(super) async fn policy_pass(&self, now: i64) {
         let settings = self.settings();
         let rules = self.rules();
@@ -473,11 +524,15 @@ impl TorrentService {
             ..Self::context(&settings, &rules, &holds, now)
         };
         let mut gathered = Gathered::default();
+        #[cfg(test)]
+        let mut locks = 1;
         {
-            let mut live = self.pass_lock().await;
+            let mut live = self.inner.live.lock().await;
+            gathered.standings.reserve(live.len());
             self.walk(&mut live, None, UP_TO_GOALS, &cx, &mut gathered)
                 .await;
-            self.write_pass(&mut live, &mut gathered.writes).await;
+            self.queue_taken(&mut live, &mut gathered);
+            self.write_stops(&mut gathered).await;
             if gathered.removals.is_empty() {
                 let standings = std::mem::take(&mut gathered.standings);
                 let seats = self.seat_queue(&settings, &holds, standings);
@@ -490,24 +545,44 @@ impl TorrentService {
             }
         }
         let removals = std::mem::take(&mut gathered.removals);
-        self.land(gathered).await;
-        if removals.is_empty() {
-            return;
+        #[cfg(test)]
+        let (mut walks, writes) = (gathered.walks, gathered.writes);
+        #[cfg(test)]
+        {
+            locks += u64::from(self.land(gathered).await);
         }
-        self.remove_met(removals).await;
-        self.apply_turns(ON_TURNS).await;
+        #[cfg(not(test))]
+        self.land(gathered).await;
+        if !removals.is_empty() {
+            self.remove_met(removals).await;
+            let _turn_walks = self.apply_turns(ON_TURNS).await;
+            #[cfg(test)]
+            {
+                locks += 1;
+                walks += _turn_walks;
+            }
+        }
+        #[cfg(test)]
+        self.inner.pass_counts.send_modify(|counts| {
+            counts.passes += 1;
+            counts.locks += locks;
+            counts.walks += walks;
+            counts.writes += writes;
+        });
     }
 
     // Each torrent's turn, and what `then` says once it is known: the
-    // standings walked, the turns worked out, then `then` walked.
-    pub(super) async fn apply_turns(&self, then: &[&dyn Policy]) {
+    // standings walked, the turns worked out, then `then` walked. Returns
+    // the walks made.
+    pub(super) async fn apply_turns(&self, then: &[&dyn Policy]) -> u64 {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.now_ms();
         let holds = self.holds();
         let cx = Self::context(&settings, &rules, &holds, now);
         let mut gathered = Gathered::default();
-        let mut live = self.pass_lock().await;
+        let mut live = self.inner.live.lock().await;
+        gathered.standings.reserve(live.len());
         self.walk(&mut live, None, &[&Standing], &cx, &mut gathered)
             .await;
         let standings = std::mem::take(&mut gathered.standings);
@@ -517,7 +592,8 @@ impl TorrentService {
             ..cx
         };
         self.walk(&mut live, None, then, &cx, &mut gathered).await;
-        debug_assert!(gathered.landings.is_empty() && gathered.writes.is_empty());
+        debug_assert!(gathered.taken.is_empty() && gathered.seed.is_empty());
+        gathered.walks
     }
 
     // The queue's seats from `standings`, and its end kept for the adds
@@ -560,10 +636,7 @@ impl TorrentService {
         cx: &Context<'_>,
         gathered: &mut Gathered,
     ) {
-        #[cfg(test)]
-        self.inner
-            .pass_counts
-            .send_modify(|counts| counts.walks += 1);
+        gathered.walks += 1;
         let mut intents = Vec::new();
         match only {
             None => {
@@ -594,32 +667,50 @@ impl TorrentService {
         for policy in policies {
             policy.decide(torrent, cx, intents);
             for intent in intents.drain(..) {
-                self.apply(torrent, intent, cx, gathered).await;
+                if let Some(command) = self.apply(torrent, intent, cx, gathered) {
+                    // Boxed: the walk's own future stays small for the
+                    // torrents no session is told anything of.
+                    Box::pin(self.command(torrent, command)).await;
+                }
             }
         }
     }
 
-    // One intent taken: in memory now, a session told now, or gathered for
-    // after the walk. Only a session's pause, unpause and file levels are
-    // awaited, as the passes before awaited them.
-    async fn apply(
+    // One intent taken: in memory now, or gathered for after the walk. What
+    // a session is told and awaited is returned: a pause, an unpause or the
+    // file levels, as the passes before awaited them.
+    fn apply(
         &self,
         torrent: &mut Live,
         intent: Intent,
         cx: &Context<'_>,
         gathered: &mut Gathered,
-    ) {
+    ) -> Option<Command> {
         let job_id = torrent.record.job_id;
         match intent {
             Intent::LeaveSeedMode => {
+                gathered.undo.push(SeedUndo {
+                    job_id,
+                    left: true,
+                    count: 0,
+                    prior: torrent.seed_verified,
+                });
                 torrent.record.seed_mode = false;
                 torrent.seed_verified = 0;
                 // Seeding no more, it may be queued again.
                 self.inner.signal.want_pass();
-                gathered.writes.left_seed_mode.push(job_id);
+                gathered.seed.left.push(job_id);
             }
             Intent::KeepVerified { pieces, count } => {
-                gathered.writes.verified.push((job_id, pieces, count));
+                gathered.undo.push(SeedUndo {
+                    job_id,
+                    left: false,
+                    count,
+                    prior: torrent.seed_verified,
+                });
+                // Kept now, and undone should the row not be.
+                torrent.seed_verified = count;
+                gathered.seed.verified.push((job_id, pieces));
             }
             Intent::TakeReading => {
                 let reading = torrent.reading(cx.now);
@@ -627,26 +718,24 @@ impl TorrentService {
                 torrent.speeds = reading.speeds;
                 torrent.peers = reading.peers;
                 torrent.keep(reading);
-                // Queued in the step that took it, so ledgers land in the
-                // order they were read.
-                gathered
-                    .landings
-                    .extend(self.queue_resume(torrent, cx.now, cx.at_once));
+                if let Some(resume) = torrent.take_resume(cx.now, cx.at_once) {
+                    gathered.taken.push(Taken::Resume(job_id, resume));
+                }
             }
             Intent::Checkpoint => {
-                gathered
-                    .saves
-                    .extend(self.queue_checkpoint(torrent, cx.now));
+                if let Some(taken) = take_checkpoint(torrent, cx.now) {
+                    gathered.taken.push(Taken::Checkpoint(taken));
+                }
             }
             Intent::WindDown => {
                 torrent.settle(cx.now);
                 // Not the operator's stop: it resumes when torrents are
                 // turned on again.
                 torrent.record.kept = KeptIntent::WoundDown;
-                gathered.writes.wound_down.push(job_id);
-                gathered
-                    .landings
-                    .extend(self.queue_resume(torrent, cx.now, true));
+                gathered.wound_down.push(job_id);
+                if let Some(resume) = torrent.take_resume(cx.now, true) {
+                    gathered.taken.push(Taken::Resume(job_id, resume));
+                }
             }
             Intent::GoalMet(action) => {
                 let finished = self.script_event(
@@ -658,10 +747,10 @@ impl TorrentService {
                     SeedingAction::Stop => {
                         torrent.settle(cx.now);
                         torrent.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
-                        gathered.writes.met.push(job_id);
-                        gathered
-                            .landings
-                            .extend(self.queue_resume(torrent, cx.now, true));
+                        gathered.met.push(job_id);
+                        if let Some(resume) = torrent.take_resume(cx.now, true) {
+                            gathered.taken.push(Taken::Resume(job_id, resume));
+                        }
                         self.queue_script_event(finished);
                     }
                     SeedingAction::Remove => gathered.removals.push((job_id, false, finished)),
@@ -697,18 +786,8 @@ impl TorrentService {
                 } else if !run && torrent.disk_held == Some(DiskHeld::Starting) {
                     torrent.disk_held = None;
                 }
-                let Some(attached) = &torrent.attached else {
-                    return;
-                };
-                let result = match run_command(run, attached.handle.is_paused()) {
-                    Some(RunCommand::Unpause) => attached.session.unpause(&attached.handle).await,
-                    Some(RunCommand::Pause) => attached.session.pause(&attached.handle).await,
-                    None => return,
-                };
-                // A run that ends or begins is not in upload mode: a wait for
-                // room on it, and what a wake handed it, end.
-                self.end_disk_room(torrent);
-                torrent.ran(result);
+                let attached = torrent.attached.as_ref()?;
+                return run_command(run, attached.handle.is_paused()).map(Command::Run);
             }
             Intent::Sequential(on) => {
                 if let Some(attached) = &torrent.attached {
@@ -723,14 +802,8 @@ impl TorrentService {
                 }
             }
             Intent::Levels(changes) => {
-                if let Some(attached) = &torrent.attached
-                    && let Err(error) = attached
-                        .session
-                        .set_file_priorities(&attached.handle, &changes)
-                        .await
-                {
-                    tracing::debug!(job_id = job_id.0, error = %error, "a torrent's file levels did not change");
-                }
+                torrent.attached.as_ref()?;
+                return Some(Command::Levels(changes));
             }
             Intent::Limits(limits) => {
                 if let Some(attached) = &torrent.attached {
@@ -738,62 +811,135 @@ impl TorrentService {
                 }
             }
         }
+        None
     }
 
-    // The pass's rows, written in one transaction off the runtime, `live`
-    // held across it as for every intent write: a resume taken between the
-    // two would otherwise be written over. The pieces a torrent checked in
-    // seed mode count as kept once they are.
-    pub(super) async fn write_pass(&self, live: &mut LiveMap, writes: &mut PassWrites) {
-        if writes.is_empty() {
+    // What `apply` returned, told the torrent's session and awaited.
+    async fn command(&self, torrent: &mut Live, command: Command) {
+        let job_id = torrent.record.job_id;
+        let Some(attached) = &torrent.attached else {
             return;
-        }
-        let writes = std::mem::take(writes);
-        #[cfg(test)]
-        self.inner
-            .pass_counts
-            .send_modify(|counts| counts.writes += 1);
-        let db = self.inner.db.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            let result = db.write_torrent_pass(&writes);
-            (writes, result)
-        })
-        .await;
-        let (writes, error) = match written {
-            Ok((writes, Ok(()))) => (writes, None),
-            Ok((writes, Err(error))) => (writes, Some(error.to_string())),
-            Err(error) => {
-                tracing::warn!(error = %error, "could not keep what a pass over the torrents changed");
-                return;
-            }
         };
-        let Some(error) = error else {
-            for (job_id, _, count) in &writes.verified {
-                if let Some(torrent) = live.get_mut(job_id) {
-                    torrent.seed_verified = *count;
+        match command {
+            Command::Run(command) => {
+                let result = match command {
+                    RunCommand::Unpause => attached.session.unpause(&attached.handle).await,
+                    RunCommand::Pause => attached.session.pause(&attached.handle).await,
+                };
+                // A run that ends or begins is not in upload mode: a wait for
+                // room on it, and what a wake handed it, end.
+                self.end_disk_room(torrent);
+                torrent.ran(result);
+            }
+            Command::Levels(changes) => {
+                if let Err(error) = attached
+                    .session
+                    .set_file_priorities(&attached.handle, &changes)
+                    .await
+                {
+                    tracing::debug!(job_id = job_id.0, error = %error, "a torrent's file levels did not change");
                 }
             }
-            return;
-        };
-        for job_id in &writes.left_seed_mode {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not record that a torrent left seed mode");
-        }
-        for (job_id, _, _) in &writes.verified {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not keep the pieces a torrent checked in seed mode");
-        }
-        if !writes.wound_down.is_empty() || !writes.met.is_empty() {
-            tracing::warn!(error = %error, "could not keep the stops of torrents done");
         }
     }
 
-    // What a pass queued, landed: its ledgers, then its checkpoints.
-    async fn land(&self, gathered: Gathered) {
+    // What a walk took, queued before `live` is let go: the seed-mode rows
+    // first, as one write that waits out every write queued before it, so
+    // they land ahead of each torrent's ledger and checkpoint, as they did
+    // when written before those were queued; then each ledger and
+    // checkpoint on its torrent's lane, in the order taken. No await: no
+    // other taking of a torrent's state comes between.
+    fn queue_taken(&self, live: &mut LiveMap, gathered: &mut Gathered) {
+        if !gathered.seed.is_empty() {
+            let writes = std::mem::take(&mut gathered.seed);
+            let undo = std::mem::take(&mut gathered.undo);
+            gathered.writes += 1;
+            let (landed, receiver) = oneshot::channel();
+            match self
+                .inner
+                .db
+                .try_queue_write("torrent_seed_modes", move |db| {
+                    let _ = landed.send(db.write_torrent_seed_modes(writes));
+                    Ok(())
+                }) {
+                Ok(()) => {
+                    gathered.seed_landing = Some(SeedLanding {
+                        landed: receiver,
+                        undo,
+                    });
+                }
+                Err(error) => {
+                    undo_seed(live, &undo, &error.to_string());
+                }
+            }
+        }
+        for taken in gathered.taken.drain(..) {
+            match taken {
+                Taken::Resume(job_id, resume) => {
+                    gathered
+                        .landings
+                        .push(self.queue_taken_resume(job_id, resume));
+                }
+                Taken::Checkpoint(taken) => {
+                    gathered.saves.push(self.queue_taken_checkpoint(taken));
+                }
+            }
+        }
+    }
+
+    // The kept intents of the torrents a walk stopped, in one transaction
+    // off the runtime, `live` held across it as for every intent write: a
+    // resume taken between the two would otherwise be written over.
+    async fn write_stops(&self, gathered: &mut Gathered) {
+        if gathered.wound_down.is_empty() && gathered.met.is_empty() {
+            return;
+        }
+        gathered.writes += 1;
+        let wound_down = std::mem::take(&mut gathered.wound_down);
+        let met = std::mem::take(&mut gathered.met);
+        let db = self.inner.db.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.update_torrent_intents(&[
+                (KeptIntent::WoundDown, &wound_down),
+                (KeptIntent::Intent(TorrentIntent::Stopped), &met),
+            ])
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not keep the stops of torrents done");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "could not keep the stops of torrents done");
+            }
+        }
+    }
+
+    // What a pass queued, landed: its seed-mode rows, its ledgers, then its
+    // checkpoints. Seed-mode rows that were not kept are undone in memory,
+    // under `live` taken again; returns whether it was.
+    async fn land(&self, gathered: Gathered) -> bool {
+        let mut relocked = false;
+        if let Some(SeedLanding { landed, undo }) = gathered.seed_landing {
+            let failed = match landed.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = failed {
+                let mut live = self.inner.live.lock().await;
+                relocked = true;
+                undo_seed(&mut live, &undo, &error);
+            }
+        }
         for landing in gathered.landings {
             let _ = self.landed(Some(landing)).await;
         }
         for save in gathered.saves {
             self.checkpoint_landed(save).await;
         }
+        relocked
     }
 
     // A removed torrent's event is queued once its job is in history, where
@@ -827,10 +973,11 @@ impl TorrentService {
         };
         let mut gathered = Gathered::default();
         {
-            let mut live = self.pass_lock().await;
+            let mut live = self.inner.live.lock().await;
             self.walk(&mut live, None, &[&Goals], &cx, &mut gathered)
                 .await;
-            self.write_pass(&mut live, &mut gathered.writes).await;
+            self.queue_taken(&mut live, &mut gathered);
+            self.write_stops(&mut gathered).await;
         }
         let removals = std::mem::take(&mut gathered.removals);
         self.land(gathered).await;
@@ -840,21 +987,19 @@ impl TorrentService {
     // The session's figures for each torrent, and the ledger kept from
     // them: written whenever it changed, with its peers once a minute while
     // they change, or now when `at_once`. The reading policy over every
-    // torrent.
+    // torrent, which reads no settings.
     pub(super) async fn read(&self, now: i64, at_once: bool) {
-        let settings = self.settings();
-        let rules = self.rules();
         let holds = HoldSet::default();
         let cx = Context {
             at_once,
-            ..Self::context(&settings, &rules, &holds, now)
+            ..Self::context(&NO_SETTINGS, &[], &holds, now)
         };
         let mut gathered = Gathered::default();
         {
-            let mut live = self.pass_lock().await;
+            let mut live = self.inner.live.lock().await;
             self.walk(&mut live, None, &[&Reading], &cx, &mut gathered)
                 .await;
-            self.write_pass(&mut live, &mut gathered.writes).await;
+            self.queue_taken(&mut live, &mut gathered);
         }
         self.land(gathered).await;
     }
@@ -878,36 +1023,70 @@ impl TorrentService {
         self.pick(None).await;
     }
 
-    // Picking for the torrents in `only`, or for every one.
+    // Picking for the torrents in `only`, or for every one. Picking reads
+    // no settings.
     pub(super) async fn pick(&self, only: Option<&BTreeSet<JobId>>) {
-        self.only(only, &[&Picking]).await;
+        let holds = HoldSet::default();
+        let cx = Self::context(&NO_SETTINGS, &[], &holds, self.inner.clock.now_ms());
+        self.walk_alone(only, &[&Picking], &cx).await;
     }
 
     // The limits each torrent's session holds it to.
     pub(super) async fn apply_limits(&self) {
-        self.only(None, &[&Limits]).await;
-    }
-
-    // `policies`, which gather nothing, over the torrents of `only`, or
-    // every one.
-    async fn only(&self, only: Option<&BTreeSet<JobId>>, policies: &[&dyn Policy]) {
         let settings = self.settings();
         let rules = self.rules();
         let holds = HoldSet::default();
         let cx = Self::context(&settings, &rules, &holds, self.inner.clock.now_ms());
+        self.walk_alone(None, &[&Limits], &cx).await;
+    }
+
+    // `policies`, which gather nothing, over the torrents of `only`, or
+    // every one, under one take of `live`.
+    async fn walk_alone(
+        &self,
+        only: Option<&BTreeSet<JobId>>,
+        policies: &[&dyn Policy],
+        cx: &Context<'_>,
+    ) {
         let mut gathered = Gathered::default();
-        let mut live = self.pass_lock().await;
-        self.walk(&mut live, only, policies, &cx, &mut gathered)
+        let mut live = self.inner.live.lock().await;
+        self.walk(&mut live, only, policies, cx, &mut gathered)
             .await;
-        debug_assert!(gathered.landings.is_empty() && gathered.writes.is_empty());
+        debug_assert!(gathered.taken.is_empty() && gathered.seed.is_empty());
     }
 }
 
-/// What the passes did, counted in tests: each take of `live`, each walk
-/// over the torrents and each write of a pass's rows.
+// Seed-mode rows not kept, undone in memory so that it agrees with the
+// database and the next pass writes them again: a torrent that left seed
+// mode is in it again, with the pieces it had kept; one that kept more
+// pieces has what it had kept. A torrent changed since, or gone, is left.
+fn undo_seed(live: &mut LiveMap, undo: &[SeedUndo], error: &str) {
+    for undo in undo {
+        let Some(torrent) = live.get_mut(&undo.job_id) else {
+            continue;
+        };
+        if undo.left {
+            tracing::warn!(job_id = undo.job_id.0, error = %error, "could not record that a torrent left seed mode");
+            if !torrent.record.seed_mode {
+                torrent.record.seed_mode = true;
+                torrent.seed_verified = undo.prior;
+            }
+        } else {
+            tracing::warn!(job_id = undo.job_id.0, error = %error, "could not keep the pieces a torrent checked in seed mode");
+            if torrent.record.seed_mode && torrent.seed_verified == undo.count {
+                torrent.seed_verified = undo.prior;
+            }
+        }
+    }
+}
+
+/// What the tick's passes did, counted in tests: each pass, each take of
+/// `live` and each walk over the torrents it made, and each write it queued
+/// or made of its rows.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct PassCounts {
+    pub(super) passes: u64,
     pub(super) locks: u64,
     pub(super) walks: u64,
     pub(super) writes: u64,
