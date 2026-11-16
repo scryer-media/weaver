@@ -392,31 +392,38 @@ async fn torrent_from_url(
     clients: &dyn HttpClients,
     url: &str,
 ) -> anyhow::Result<ParsedTorrentFile> {
+    // A `.torrent` link can carry a credential in its user, path or query,
+    // as a private tracker's download link does: errors name it by scheme,
+    // host and port, and client errors lose their URL (SECURITY.md,
+    // "Credentials stay with their scope").
+    let shown = crate::tracker::redacted_tracker_url(url);
     let mut response = clients
         .client(None, &ClientShape::FETCH)
         .context("error building HTTP(S) client")?
         .get(url)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("error downloading torrent metadata")?;
     if !response.status().is_success() {
-        bail!("GET {} returned {}", url, response.status())
+        bail!("GET {shown} returned {}", response.status())
     }
     let limit = crate::core::torrent_metainfo::MAX_TORRENT_FILE_BYTES;
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        bail!("torrent at {url} is larger than {limit} bytes");
+        bail!("torrent at {shown} is larger than {limit} bytes");
     }
     let mut b = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .with_context(|| format!("error reading response body from {url}"))?
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("error reading response body from {shown}"))?
     {
         if b.len() + chunk.len() > limit {
-            bail!("torrent at {url} is larger than {limit} bytes");
+            bail!("torrent at {shown} is larger than {limit} bytes");
         }
         b.extend_from_slice(&chunk);
     }

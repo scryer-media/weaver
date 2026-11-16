@@ -1737,6 +1737,194 @@ async fn a_torrent_downloads_from_its_web_seed_alone() -> anyhow::Result<()> {
     Ok(())
 }
 
+// A magnet link's `ws` web seed, its peer and the session that fetches
+// its metadata. The peer has the metainfo and none of the content: once
+// the metadata is in, the web seed is the content's only source. The seed
+// is named by the link, so its host is a public name (`seed.test`, at
+// 8.8.8.8) that the session's clients reach the server at.
+struct MagnetWithSeed {
+    t: crate::tests::embedder_util::TestTorrent,
+    server: Server,
+    seed: WebSeed,
+    magnet: String,
+    _peer: Arc<crate::Session>,
+    _peer_dir: tempfile::TempDir,
+    out: tempfile::TempDir,
+    session: Arc<crate::Session>,
+}
+
+impl MagnetWithSeed {
+    async fn new(name: &str) -> anyhow::Result<Self> {
+        use crate::{
+            AddTorrent, AddTorrentOptions, Session,
+            core::{magnet::Magnet, torrent_metainfo::torrent_from_bytes},
+            tests::embedder_util::{TestTorrent, isolated_session_opts},
+        };
+
+        let t = TestTorrent::new(name, 3 * 16384 + 100, 16384).await?;
+        let content = t.content.clone();
+        let server = Server::start(move |head| {
+            if head.target.ends_with("/0.data") {
+                Reply::ranged(&content, head)
+            } else {
+                Reply::status(404)
+            }
+        });
+        let peer_dir = tempfile::TempDir::with_prefix("magnet_ws_peer")?;
+        let peer =
+            Session::new_with_opts(peer_dir.path().into(), isolated_session_opts(true)).await?;
+        peer.add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                output_folder: Some(peer_dir.path().to_str().unwrap().to_owned()),
+                overwrite: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+        let peer_addr = peer.listen_addr().context("the peer is not listening")?;
+
+        let seed = WebSeed {
+            url: format!("http://seed.test:{}/seed/", server.addr.port()),
+            kind: WebSeedKind::Url,
+            named_by: NamedBy::Torrent,
+        };
+        let mut magnet = Magnet::of(
+            torrent_from_bytes(&t.torrent)?.info_hashes,
+            None,
+            Vec::new(),
+        );
+        magnet.peers.push(peer_addr);
+        magnet.web_seeds.push(seed.url.clone());
+        let magnet = magnet.to_string();
+        assert!(magnet.contains("&ws="), "{magnet}");
+
+        let out = tempfile::TempDir::with_prefix("magnet_ws_out")?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            crate::SessionOptions {
+                http_client: Some(Wired::new(server.addr)),
+                resolver: Some(names(&[("seed.test", "8.8.8.8")])),
+                ..isolated_session_opts(false)
+            },
+        )
+        .await?;
+        Ok(Self {
+            t,
+            server,
+            seed,
+            magnet,
+            _peer: peer,
+            _peer_dir: peer_dir,
+            out,
+            session,
+        })
+    }
+
+    // Adds the torrent with `add` and `opts` and waits for it to complete;
+    // checks that the web seed alone served the content.
+    async fn downloads(
+        &self,
+        add: crate::AddTorrent<'static>,
+        opts: crate::AddTorrentOptions,
+    ) -> anyhow::Result<crate::torrent_state::ManagedTorrentHandle> {
+        use crate::{
+            AddTorrentOptions, storage::StorageFactory, tests::embedder_util::MemoryStorageFactory,
+        };
+        let storage = MemoryStorageFactory::default();
+        let handle = self
+            .session
+            .add_torrent(
+                add,
+                Some(AddTorrentOptions {
+                    storage_factory: Some(storage.clone_box()),
+                    output_folder: Some(self.out.path().to_str().unwrap().to_owned()),
+                    ..opts
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        handle.wait_until_completed().await?;
+        assert!(
+            storage.log.file_contents(0) == self.t.content,
+            "content differs"
+        );
+        let total = self.t.content.len() as u64;
+        let live = handle.stats().live.context("expected a live torrent")?;
+        assert_eq!(live.snapshot.fetched_bytes, total);
+        let seen = self.server.seen();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter()
+                .all(|h| h.target.starts_with("/seed/") && h.target.ends_with("/0.data")),
+            "{seen:?}"
+        );
+        Ok(handle)
+    }
+}
+
+// A magnet link's `ws` seed is the torrent's once its metadata is in, and
+// is asked for the content (libtorrent `torrent::torrent` puts
+// `add_torrent_params::url_seeds` in `m_web_seeds`, which
+// `torrent::set_metadata` keeps).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_magnets_web_seed_serves_the_torrent_once_its_metadata_is_in() -> anyhow::Result<()> {
+    let m = MagnetWithSeed::new("magnet_ws_run").await?;
+    let handle = m
+        .downloads(
+            crate::AddTorrent::from_url(m.magnet.clone()),
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(handle.web_seeds(), std::slice::from_ref(&m.seed));
+    m.session.stop().await;
+    Ok(())
+}
+
+// A list-only add of a magnet names the link's `ws` seeds beside the
+// metainfo, which does not hold them; the torrent added from that
+// metainfo and those seeds asks the seed for its content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_list_only_magnet_names_its_web_seeds() -> anyhow::Result<()> {
+    use crate::{AddTorrent, AddTorrentOptions, AddTorrentResponse};
+
+    let m = MagnetWithSeed::new("magnet_ws_list").await?;
+    let listed = match m
+        .session
+        .add_torrent(
+            AddTorrent::from_url(m.magnet.clone()),
+            Some(AddTorrentOptions {
+                list_only: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+    {
+        AddTorrentResponse::ListOnly(listed) => listed,
+        _ => anyhow::bail!("expected a list-only response"),
+    };
+    assert_eq!(listed.web_seeds, std::slice::from_ref(&m.seed));
+    let meta = crate::core::torrent_metainfo::torrent_from_bytes(&listed.torrent_bytes)?;
+    assert!(meta.url_list.is_none(), "the metainfo is not rewritten");
+    assert!(m.server.seen().is_empty());
+
+    let handle = m
+        .downloads(
+            AddTorrent::from_bytes(listed.torrent_bytes),
+            AddTorrentOptions {
+                web_seeds: listed.web_seeds,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(handle.web_seeds(), std::slice::from_ref(&m.seed));
+    m.session.stop().await;
+    Ok(())
+}
+
 // A seed added or removed is found by its URL and kind in one lookup: the
 // seeds kept, in their order, and what each add and remove returns, are
 // what passing over the list says, over seeded adds and removes.

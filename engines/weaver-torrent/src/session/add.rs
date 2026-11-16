@@ -293,8 +293,8 @@ impl Session {
                         }
                         AddTorrent::Url(url) => {
                             bail!(
-                                "unsupported URL {:?}. Supporting magnet:, http:, and https",
-                                url
+                                "unsupported URL {}. Supporting magnet:, http:, and https",
+                                crate::tracker::redacted_tracker_url(&url)
                             )
                         }
                         AddTorrent::TorrentFileBytes(bytes) => {
@@ -673,6 +673,7 @@ impl Session {
                 first_last_piece_first: opts.first_last_piece_first,
                 output_folder,
                 seen_peers,
+                web_seeds: opts.web_seeds,
                 trackers: handover,
             }));
         }
