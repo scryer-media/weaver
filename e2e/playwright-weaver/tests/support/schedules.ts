@@ -434,8 +434,25 @@ export async function deleteFeed(request: APIRequestContext, id: number): Promis
   await graphql(request, "mutation($id: Int!) { deleteRssFeed(id: $id) }", { id });
 }
 
-export async function feedCount(key: string): Promise<number> {
-  const response = await fetch(`${RSS_FIXTURE}/count/${key}`);
-  expect(response.ok, `count for ${key}`).toBe(true);
+// Through the test's request context, so each read lands in the trace.
+export async function feedCount(request: APIRequestContext, key: string): Promise<number> {
+  const response = await request.get(`${RSS_FIXTURE}/count/${key}`);
+  expect(response.ok(), `count for ${key}`).toBe(true);
   return ((await response.json()) as { count: number }).count;
+}
+
+/**
+ * Waits for the poller's own record that it read feed `id`, then fails on
+ * the error that poll recorded. A failed fetch counts as the poll, and the
+ * feed is not due again for an hour, so a wait on the fixture's count alone
+ * would never end. Secondary evidence: the feed row, through the API, and
+ * the fixture's count of reads of `key`.
+ */
+export async function waitFeedRead(request: APIRequestContext, id: number, key: string, message: string): Promise<void> {
+  const poll = async () => (await graphql<{ rssFeed: { lastPolledAt: number | null; lastError: string | null } | null }>(request,
+    "query($id: Int!) { rssFeed(id: $id) { lastPolledAt lastError } }", { id })).rssFeed;
+  await expect.poll(async () => (await poll())?.lastPolledAt ?? null,
+    { message: `${message}: feed ${id} polled`, timeout: 0 }).not.toBeNull();
+  expect((await poll())?.lastError ?? null, `${message}: feed ${id} fetched without error`).toBeNull();
+  expect(await feedCount(request, key), `${message}: the fixture served feed ${id} once`).toBe(1);
 }
