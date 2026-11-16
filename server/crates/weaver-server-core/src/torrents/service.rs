@@ -53,6 +53,7 @@ pub mod fingerprint;
 pub mod listing;
 mod scripts;
 pub use scripts::ScriptDirs;
+mod batch;
 mod checkpoints;
 mod completion;
 mod disk_room;
@@ -354,10 +355,10 @@ impl TorrentService {
             JobEnv::of_pipeline(pipeline),
             Arc::new(SystemClock),
         );
-        service.publish_to(queue);
+        service.wire_to(queue);
         service.park_crashed(crashed);
         service.turn_at_start(config.torrent.enabled).await;
-        service.start().await?;
+        service.start_seated().await?;
         Ok(service)
     }
 }
@@ -1066,17 +1067,23 @@ impl TorrentService {
                     .db
                     .update_torrent_intent(job_id, intent)
                     .map_err(|error| ActionError::State(state_error(error)))?;
-                torrent.settle(now);
-                // The operator's word ends a wind-down's hold on it.
-                torrent.record.kept = KeptIntent::Intent(intent);
-                if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
-                    tee.hold_own_clock(intent == TorrentIntent::Paused);
-                }
-                Ok(self.queue_resume(torrent, now, true))
+                Ok(self.intend(torrent, intent, now))
             })
             .await?;
         let _ = self.landed(landing).await;
         Ok(())
+    }
+
+    // The intent written for the torrent, taken in memory: its ledger
+    // settled and queued to be kept beside it.
+    fn intend(&self, torrent: &mut Live, intent: TorrentIntent, now: i64) -> Option<Landing> {
+        torrent.settle(now);
+        // The operator's word ends a wind-down's hold on it.
+        torrent.record.kept = KeptIntent::Intent(intent);
+        if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
+            tee.hold_own_clock(intent == TorrentIntent::Paused);
+        }
+        self.queue_resume(torrent, now, true)
     }
 
     // Stop the torrent for good, as its goal or a refusal does: its intent

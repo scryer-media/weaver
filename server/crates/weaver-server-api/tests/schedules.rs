@@ -763,13 +763,13 @@ async fn a_split_rule_holds_the_split_track_and_lifts_without_a_percentage() {
 }
 
 #[tokio::test]
-async fn torrent_pause_actions_round_trip_on_their_own_track() {
+async fn class_pause_actions_round_trip_on_their_own_track() {
     use weaver_server_core::bandwidth::ScheduleAction;
     let h = TestHarness::new().await;
-    for (time, action) in [("22:00", "pause_torrents"), ("06:00", "resume_torrents")] {
+    for (time, action) in [("22:00", "pause_class"), ("06:00", "resume_class")] {
         let resp = h
             .execute(&format!(
-                r#"mutation {{ createSchedule(input: {{ time: "{time}", actionType: "{action}" }}) {{ actionType track }} }}"#
+                r#"mutation {{ createSchedule(input: {{ time: "{time}", actionType: "{action}", class: TORRENT }}) {{ actionType class track }} }}"#
             ))
             .await;
         assert_no_errors(&resp);
@@ -777,8 +777,11 @@ async fn torrent_pause_actions_round_trip_on_their_own_track() {
         let rules = data["createSchedule"].as_array().unwrap();
         assert!(rules.iter().any(|rule| rule["actionType"] == action));
         assert!(rules.iter().all(|rule| rule["track"] == "TORRENTS"));
+        assert!(rules.iter().all(|rule| rule["class"] == "TORRENT"));
     }
-    let resp = h.execute("{ schedules { time actionType track } }").await;
+    let resp = h
+        .execute("{ schedules { time actionType class track } }")
+        .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let mut listed: Vec<(String, String)> = data["schedules"]
@@ -787,6 +790,7 @@ async fn torrent_pause_actions_round_trip_on_their_own_track() {
         .iter()
         .map(|rule| {
             assert_eq!(rule["track"], "TORRENTS");
+            assert_eq!(rule["class"], "TORRENT");
             (
                 rule["time"].as_str().unwrap().to_owned(),
                 rule["actionType"].as_str().unwrap().to_owned(),
@@ -797,8 +801,8 @@ async fn torrent_pause_actions_round_trip_on_their_own_track() {
     assert_eq!(
         listed,
         [
-            ("06:00".to_owned(), "resume_torrents".to_owned()),
-            ("22:00".to_owned(), "pause_torrents".to_owned()),
+            ("06:00".to_owned(), "resume_class".to_owned()),
+            ("22:00".to_owned(), "pause_class".to_owned()),
         ]
     );
     let mut persisted: Vec<ScheduleAction> =
@@ -811,8 +815,27 @@ async fn torrent_pause_actions_round_trip_on_their_own_track() {
     assert_eq!(
         persisted,
         [
-            ScheduleAction::PauseTorrents,
-            ScheduleAction::ResumeTorrents
+            ScheduleAction::PauseClass {
+                class: weaver_server_core::torrents::CLASS,
+            },
+            ScheduleAction::ResumeClass {
+                class: weaver_server_core::torrents::CLASS,
+            },
         ]
     );
+    // A class with no hold of its own, a class action with no class, and a
+    // class on any other action are refused.
+    for input in [
+        r#"{ time: "08:00", actionType: "pause_class", class: NZB }"#,
+        r#"{ time: "08:00", actionType: "resume_class" }"#,
+        r#"{ time: "08:00", actionType: "pause", class: TORRENT }"#,
+        r#"{ time: "08:00", actionType: "pause_torrent" }"#,
+    ] {
+        common::assert_has_errors(
+            &h.execute(&format!(
+                "mutation {{ createSchedule(input: {input}) {{ id }} }}"
+            ))
+            .await,
+        );
+    }
 }

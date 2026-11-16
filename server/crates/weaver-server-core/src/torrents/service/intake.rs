@@ -55,6 +55,19 @@ pub enum AddSource {
     Magnet(String),
 }
 
+impl AddSource {
+    /// The torrent `bytes` hold, as `kind` classified them, when they are
+    /// one; the bytes back otherwise.
+    pub fn of(kind: crate::ingest::Kind, bytes: Vec<u8>) -> Result<Self, Vec<u8>> {
+        use crate::ingest::Kind;
+        match kind {
+            Kind::Metainfo => Ok(Self::Metainfo(bytes)),
+            Kind::Magnet(uri) => Ok(Self::Magnet(uri)),
+            Kind::Nzb | Kind::Url(_) => Err(bytes),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AddRequest {
     pub source: AddSource,
@@ -73,6 +86,29 @@ pub struct AddRequest {
     pub placement: Placement,
     // The tags its job is added with.
     pub tags: Vec<String>,
+}
+
+impl AddRequest {
+    /// The add an intake's class-neutral submission asks for: the torrent
+    /// it holds, with its own placement and no limits of its own. The one
+    /// place a submission becomes a torrent's add.
+    pub fn of(submission: crate::jobs::class::Submission) -> Result<Self, AddError> {
+        let source = AddSource::of(submission.kind, submission.bytes)
+            .map_err(|_| AddError::Invalid("not a torrent".into()))?;
+        Ok(Self {
+            source,
+            category: submission.category,
+            policy_override: submission.policy_override,
+            paused: submission.paused,
+            forced: submission.forced,
+            unpack: submission.unpack,
+            metadata: submission.metadata,
+            upload_limit: None,
+            download_limit: None,
+            placement: Placement::default(),
+            tags: submission.tags,
+        })
+    }
 }
 
 /// Where a torrent's files go, as a client adding it asks (qBittorrent

@@ -346,11 +346,7 @@ pub(crate) async fn run(
         )
         .await
         {
-            Ok(torrents) => {
-                watch_folder.use_torrents(torrents.clone());
-                rss.use_torrents(torrents.clone());
-                Some(torrents)
-            }
+            Ok(torrents) => Some(torrents),
             Err(error) => {
                 error!(%error, "the torrent client did not start");
                 None

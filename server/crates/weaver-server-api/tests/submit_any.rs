@@ -87,6 +87,11 @@ struct Rig {
 }
 
 async fn rig() -> Rig {
+    rig_seated(true).await
+}
+
+// `rig`, with the torrent client seated as the queue's torrent class or not.
+async fn rig_seated(seated: bool) -> Rig {
     let harness = TestHarness::new().await;
     let dir = tempfile::tempdir().unwrap();
     let db = harness.db.clone();
@@ -114,6 +119,10 @@ async fn rig() -> Rig {
         Arc::new(SystemClock),
     );
     torrents.start().await.unwrap();
+    // As the server does: the torrents are the queue's torrent class.
+    if seated {
+        torrents.publish_to(harness.handle.clone());
+    }
     Rig {
         harness,
         torrents,
@@ -392,6 +401,54 @@ async fn staging_refuses_a_torrent_while_torrents_are_off() {
             STAGE,
             json!({ "input": { "nzbUpload": null } }),
             Some(("a.nzb", &nzb("staged-off"))),
+        )
+        .await;
+    assert_no_errors(&staged);
+    let data = response_data(&staged)["stageNzbUpload"].clone();
+    assert_eq!(data["kind"], "NZB");
+    assert_eq!(data["accepted"], true);
+}
+
+// With no torrent class seated, a torrent submitted as text or as a file,
+// and one staged, are refused with the registry's refusal, the class's code
+// beside it; an NZB stages as ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_torrent_class_seated_a_torrent_is_refused_by_the_registry() {
+    use weaver_server_core::jobs::Protocol;
+    use weaver_server_core::jobs::class::AddRefusal;
+    let rig = rig_seated(false).await;
+    let refusal = AddRefusal::not_running(Protocol::Torrent).text;
+    let disabled = Protocol::Torrent.names().disabled_code;
+
+    let hash = "0123456789abcdef0123456789abcdef01234567";
+    for response in [
+        rig.submit_text(&format!("magnet:?xt=urn:btih:{hash}"))
+            .await,
+        rig.submit_file("a.bin", &metainfo("one.mkv"), false).await,
+    ] {
+        assert_eq!(code(&response).as_deref(), Some(disabled), "{response:?}");
+        assert_eq!(response.errors[0].message, refusal);
+    }
+    assert!(rig.harness.db.list_torrents().unwrap().is_empty());
+
+    let staged = rig
+        .run(
+            STAGE,
+            json!({ "input": { "nzbUpload": null } }),
+            Some(("a.torrent", &metainfo("one.mkv"))),
+        )
+        .await;
+    assert_no_errors(&staged);
+    let data = response_data(&staged)["stageNzbUpload"].clone();
+    assert_eq!(data["kind"], "TORRENT");
+    assert_eq!(data["accepted"], false);
+    assert_eq!(data["error"], refusal.as_str());
+
+    let staged = rig
+        .run(
+            STAGE,
+            json!({ "input": { "nzbUpload": null } }),
+            Some(("a.nzb", &nzb("staged-unseated"))),
         )
         .await;
     assert_no_errors(&staged);

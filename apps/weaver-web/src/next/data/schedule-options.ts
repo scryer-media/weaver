@@ -13,8 +13,8 @@ export const SCHEDULE_ACTIONS = [
   { value: "pause", label: "next.schedules.pause" },
   { value: "resume", label: "next.schedules.resume" },
   { value: "pause_all", label: "next.schedules.pauseAll" },
-  { value: "pause_torrents", label: "next.schedules.pauseTorrents", torrentOnly: true },
-  { value: "resume_torrents", label: "next.schedules.resumeTorrents", torrentOnly: true },
+  { value: "pause_class:TORRENT", label: "next.schedules.pauseTorrents", torrentOnly: true },
+  { value: "resume_class:TORRENT", label: "next.schedules.resumeTorrents", torrentOnly: true },
   { value: "pause_post_processing", label: "next.schedules.pausePost" },
   { value: "resume_post_processing", label: "next.schedules.resumePost" },
   { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
@@ -29,7 +29,24 @@ export const SCHEDULE_ACTIONS = [
   { value: "set_quota_metering", label: "next.schedules.quotaMetering" },
 ] as const;
 
-/** Whether a rule taking `actionType` acts on torrents alone. */
+/** A class of job a `pause_class` or `resume_class` rule holds. */
+export type ScheduleClass = "NZB" | "TORRENT";
+
+/**
+ * The picker's key for a rule: its action, and for a class's pause or resume
+ * the class it holds, as `pause_class:TORRENT`.
+ */
+export function scheduleActionKey(rule: { actionType: string; class?: ScheduleClass | null }): string {
+  return rule.class ? `${rule.actionType}:${rule.class}` : rule.actionType;
+}
+
+/** The action and class a picker key stands for, as a rule's input takes them. */
+export function scheduleActionOfKey(key: string): { actionType: string; class: ScheduleClass | null } {
+  const [actionType, held] = key.split(":");
+  return { actionType, class: (held as ScheduleClass | undefined) ?? null };
+}
+
+/** Whether a rule taking `actionType` (a picker key) acts on torrents alone. */
 export function torrentOnlyAction(actionType: string): boolean {
   return SCHEDULE_ACTIONS.some((option) => option.value === actionType && "torrentOnly" in option);
 }

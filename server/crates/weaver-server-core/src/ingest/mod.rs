@@ -13,7 +13,7 @@ mod submission;
 mod torrent_fetch;
 mod xz;
 
-pub use classify::{Kind, classify};
+pub use classify::{Kind, classify, declared_protocol};
 pub use import::{
     ImportError, dnzb_header_passwords, header_archive_password_candidates, import_nzb,
     integration_archive_password_candidates, normalize_archive_password_candidate,

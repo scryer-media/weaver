@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use weaver_torrent::Session;
 use weaver_torrent::limits::LimitKind;
 
-use crate::bandwidth::TorrentRates;
+use crate::bandwidth::ClassRates;
 
 /// The download and upload rates torrents may move at, each shared between
 /// the open sessions by the same work-conserving predicate that shares the
@@ -29,9 +29,9 @@ pub struct SessionRates {
 
 #[derive(Default)]
 struct State {
-    rates: TorrentRates,
+    rates: ClassRates,
     // What each egress a session runs on allows now.
-    egresses: HashMap<u32, TorrentRates>,
+    egresses: HashMap<u32, ClassRates>,
     sessions: Vec<Held>,
 }
 
@@ -48,15 +48,15 @@ struct Held {
     used: (u64, u64),
     // The lowest rates it was held to between them, the lowest since, and
     // the rates it is held to now.
-    given: TorrentRates,
-    held: TorrentRates,
-    applied: TorrentRates,
+    given: ClassRates,
+    held: ClassRates,
+    applied: ClassRates,
 }
 
 impl SessionRates {
     /// Put the torrents' rates in force on a session that just opened on
     /// egress `egress_id`, which allows `egress` now.
-    pub fn add(&self, session: &Arc<Session>, egress_id: u32, egress: TorrentRates) {
+    pub fn add(&self, session: &Arc<Session>, egress_id: u32, egress: ClassRates) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.egresses.insert(egress_id, egress);
         state.sessions.push(Held {
@@ -65,9 +65,9 @@ impl SessionRates {
             seen_at: Instant::now(),
             seen: session.transferred(),
             used: (0, 0),
-            given: TorrentRates::default(),
-            held: TorrentRates::default(),
-            applied: TorrentRates::default(),
+            given: ClassRates::default(),
+            held: ClassRates::default(),
+            applied: ClassRates::default(),
         });
         state.lay_over();
     }
@@ -100,7 +100,7 @@ impl SessionRates {
     }
 
     /// Put `rates` in force across the open sessions. `None` is no limit.
-    pub fn set(&self, rates: TorrentRates) {
+    pub fn set(&self, rates: ClassRates) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.rates = rates;
         state.lay_over();
@@ -109,7 +109,7 @@ impl SessionRates {
     /// Read again what each egress an open session runs on allows, from
     /// `allows`, and put it in force. The work is one read per egress and
     /// one pass over the open sessions, however many torrents they run.
-    pub fn set_egresses(&self, allows: impl Fn(u32) -> TorrentRates) {
+    pub fn set_egresses(&self, allows: impl Fn(u32) -> ClassRates) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.retain_open();
         let mut egresses = HashMap::new();
@@ -154,7 +154,7 @@ impl State {
         }
         for (held, rates) in self.sessions.iter_mut().zip(rates) {
             held.applied = rates;
-            held.held = TorrentRates {
+            held.held = ClassRates {
                 download: crate::bandwidth::lower(held.held.download, rates.download),
                 upload: crate::bandwidth::lower(held.held.upload, rates.upload),
             };
@@ -165,7 +165,7 @@ impl State {
     }
 
     // Each of the sessions at `indices`' share of `rates`, in that order.
-    fn shares(&self, rates: TorrentRates, indices: &[usize]) -> Vec<TorrentRates> {
+    fn shares(&self, rates: ClassRates, indices: &[usize]) -> Vec<ClassRates> {
         let held = indices.iter().map(|&index| &self.sessions[index]);
         let download = session_rates(
             rates.download,
@@ -186,7 +186,7 @@ impl State {
         download
             .into_iter()
             .zip(upload)
-            .map(|(download, upload)| TorrentRates { download, upload })
+            .map(|(download, upload)| ClassRates { download, upload })
             .collect()
     }
 }
@@ -219,7 +219,7 @@ pub fn session_rates(rate: Option<u64>, given: &[Option<u64>], used: &[u64]) -> 
 /// socket, so a rate is live on the session as it is: nothing is rebuilt or
 /// reattached, and a limit is set only when its rate changes; a change
 /// applies to the peers already waiting on it.
-pub fn apply_torrent_rates(session: &Session, rates: TorrentRates) {
+pub fn apply_torrent_rates(session: &Session, rates: ClassRates) {
     let limits = &session.ratelimits;
     let download = limit_kind(rates.download);
     if limits.get_download_bps() != download {
@@ -295,8 +295,8 @@ mod tests {
         )
     }
 
-    fn both(download: Option<u64>, upload: Option<u64>) -> TorrentRates {
-        TorrentRates { download, upload }
+    fn both(download: Option<u64>, upload: Option<u64>) -> ClassRates {
+        ClassRates { download, upload }
     }
 
     #[tokio::test]
@@ -304,14 +304,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rates = SessionRates::default();
         let one = session(&dir.path().join("one")).await;
-        rates.add(&one, 1, TorrentRates::default());
+        rates.add(&one, 1, ClassRates::default());
         assert_eq!(limits(&one), (None, None));
 
         rates.set(both(Some(1_000_000), Some(400_000)));
         assert_eq!(limits(&one), (Some(1_000_000), Some(400_000)));
 
         let two = session(&dir.path().join("two")).await;
-        rates.add(&two, 1, TorrentRates::default());
+        rates.add(&two, 1, ClassRates::default());
         assert_eq!(limits(&one), (Some(500_000), Some(200_000)));
         assert_eq!(limits(&two), (Some(500_000), Some(200_000)));
 
@@ -333,8 +333,8 @@ mod tests {
         let rates = SessionRates::default();
         let one = session(&dir.path().join("one")).await;
         let two = session(&dir.path().join("two")).await;
-        rates.add(&one, 1, TorrentRates::default());
-        rates.add(&two, 1, TorrentRates::default());
+        rates.add(&one, 1, ClassRates::default());
+        rates.add(&two, 1, ClassRates::default());
         rates.set(both(Some(1_000_000), Some(400_000)));
         assert_eq!(limits(&one), (Some(500_000), Some(200_000)));
 
@@ -361,7 +361,7 @@ mod tests {
         let other = session(&dir.path().join("other")).await;
         rates.add(&one, 1, both(None, Some(2_048)));
         rates.add(&two, 1, both(None, Some(2_048)));
-        rates.add(&other, 2, TorrentRates::default());
+        rates.add(&other, 2, ClassRates::default());
         rates.set(both(Some(900_000), Some(300_000)));
         assert_eq!(limits(&one), (Some(300_000), Some(1_024)));
         assert_eq!(limits(&two), (Some(300_000), Some(1_024)));
@@ -371,7 +371,7 @@ mod tests {
         // egress is untouched.
         let allows = |egress_id| match egress_id {
             1 => both(Some(100_000), Some(0)),
-            _ => TorrentRates::default(),
+            _ => ClassRates::default(),
         };
         rates.set_egresses(allows);
         assert_eq!(limits(&one), (Some(50_000), Some(0)));
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(limits(&other), (Some(300_000), Some(100_000)));
 
         // Lifted, the global shares come back.
-        rates.set_egresses(|_| TorrentRates::default());
+        rates.set_egresses(|_| ClassRates::default());
         assert_eq!(limits(&one), (Some(300_000), Some(100_000)));
         assert_eq!(limits(&other), (Some(300_000), Some(100_000)));
 

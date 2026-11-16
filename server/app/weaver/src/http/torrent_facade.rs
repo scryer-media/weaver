@@ -49,7 +49,8 @@ use weaver_server_core::torrents::service::listing::{
     CategoryPick, FileTotals, Pick, Shown, Window,
 };
 use weaver_server_core::torrents::service::{
-    ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
+    ActionError, AddError, AddRequest, AddSource, Placement, TorrentService, TorrentSettings,
+    TorrentView,
 };
 use weaver_server_core::torrents::{
     ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
@@ -1153,8 +1154,18 @@ async fn torrents(
         "delete" => delete(ctx, params).await,
         // Every torrent at once is one hold, which leaves each torrent's
         // own stop or start standing; named torrents are each stopped.
-        "stop" if names_all(params) => held(ctx.inner.handle.pause_torrents().await),
-        "start" if names_all(params) => held(ctx.inner.handle.resume_torrents().await),
+        "stop" if names_all(params) => held(
+            ctx.inner
+                .handle
+                .pause_class(weaver_server_core::torrents::CLASS)
+                .await,
+        ),
+        "start" if names_all(params) => held(
+            ctx.inner
+                .handle
+                .resume_class(weaver_server_core::torrents::CLASS)
+                .await,
+        ),
         "stop" => {
             each(ctx, params, |torrents, view| async move {
                 torrents.pause(view.job_id).await
@@ -1323,12 +1334,18 @@ async fn transfer_action(ctx: &TorrentFacadeContext, action: &str, params: &Para
         }
         "toggleSpeedLimitsMode" => unavailable("Alternative speed limits"),
         "banPeers" => ban_peers(ctx, params).await,
-        "pauseSession" => ctx
-            .api()
-            .without_result(held(ctx.inner.handle.pause_torrents().await)),
-        "resumeSession" => ctx
-            .api()
-            .without_result(held(ctx.inner.handle.resume_torrents().await)),
+        "pauseSession" => ctx.api().without_result(held(
+            ctx.inner
+                .handle
+                .pause_class(weaver_server_core::torrents::CLASS)
+                .await,
+        )),
+        "resumeSession" => ctx.api().without_result(held(
+            ctx.inner
+                .handle
+                .resume_class(weaver_server_core::torrents::CLASS)
+                .await,
+        )),
         _ => no_endpoint(ctx.api(), "transfer"),
     }
 }
@@ -2587,7 +2604,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         };
     let mut sources = Vec::with_capacity(params.files.len() + urls.len());
     for (name, body) in &params.files {
-        match classify(body).torrent(body.clone()) {
+        match AddSource::of(classify(body), body.clone()) {
             Ok(source) => sources.push(Ok(source)),
             Err(_) => {
                 return text(
@@ -2609,9 +2626,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
             _ => Ok(line.as_bytes().to_vec()),
         };
         sources.push(body.and_then(|body| {
-            classify(&body)
-                .torrent(body)
-                .map_err(|_| format!("{line} is not a torrent"))
+            AddSource::of(classify(&body), body).map_err(|_| format!("{line} is not a torrent"))
         }));
     }
     let stopped = params
@@ -3706,7 +3721,12 @@ async fn maindata(
     let holds = ctx.inner.handle.state().holds();
     let session_paused = [HoldOrigin::Manual, HoldOrigin::Scheduled]
         .into_iter()
-        .any(|origin| holds.held_by(origin, HoldOwner::Torrents));
+        .any(|origin| {
+            holds.held_by(
+                origin,
+                HoldOwner::Class(weaver_server_core::torrents::CLASS),
+            )
+        });
     if let Some(state) = server_state.as_object_mut() {
         state.extend(
             [

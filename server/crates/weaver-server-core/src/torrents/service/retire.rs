@@ -311,7 +311,7 @@ impl TorrentService {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(job.job_id, job.clone());
         if let Some(queue) = self.queue() {
-            queue.publish_owned_job(job);
+            queue.publish_owned_job(crate::jobs::Protocol::Torrent, job);
         }
     }
 
@@ -418,22 +418,7 @@ impl TorrentService {
         {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
-            if torrent.private && !confirm_unmet_goal {
-                let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
-                if let Some(left) =
-                    status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now)
-                {
-                    return Err(ActionError::UnmetGoal(left));
-                }
-            }
-            // A move of its files and its removal never overlap: one under
-            // way refuses the other, each seen under this lock.
-            if torrent.moving.is_some() {
-                return Err(ActionError::Invalid(
-                    "the torrent's files are moving; remove it once the move ends".to_owned(),
-                ));
-            }
-            torrent.removing = true;
+            self.begin_removal(torrent, &settings, now, confirm_unmet_goal)?;
         }
         // Its row is marked retiring, with whether its files go, while it is
         // still live and before anything of it goes: a stop from here on
@@ -447,27 +432,70 @@ impl TorrentService {
             Err(StateError::OutOfSpace(error)) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "no room to mark a torrent's removal; it goes on unmarked");
             }
-            Err(error) => {
-                // A failure that came while it was being removed was the
-                // removal's to retire: with no removal, it fails now.
-                let failed = self
-                    .inner
-                    .live
-                    .lock()
-                    .await
-                    .get_mut(&job_id)
-                    .and_then(|torrent| {
-                        torrent.removing = false;
-                        torrent.failed_removing.take()
-                    });
-                if let Some(failed) = failed {
-                    self.fail(job_id, failed).await;
-                }
-                return Err(ActionError::State(format!(
-                    "the torrent was not removed: its removal could not be recorded ({error})"
-                )));
+            Err(error) => return Err(self.mark_refused(job_id, &error).await),
+        }
+        self.remove_marked(job_id, delete_files, ending).await
+    }
+
+    // Whether the torrent may be removed now, and if so its removal begun:
+    // a private one whose goal is unmet stays unless the removal knows, and
+    // one whose files are moving stays until the move ends.
+    pub(super) fn begin_removal(
+        &self,
+        torrent: &mut Live,
+        settings: &super::settings::TorrentSettings,
+        now: i64,
+        confirm_unmet_goal: bool,
+    ) -> Result<(), ActionError> {
+        if torrent.private && !confirm_unmet_goal {
+            let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
+            if let Some(left) =
+                status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now)
+            {
+                return Err(ActionError::UnmetGoal(left));
             }
         }
+        // A move of its files and its removal never overlap: one under way
+        // refuses the other, each seen under the live lock.
+        if torrent.moving.is_some() {
+            return Err(ActionError::Invalid(
+                "the torrent's files are moving; remove it once the move ends".to_owned(),
+            ));
+        }
+        torrent.removing = true;
+        Ok(())
+    }
+
+    // A removal whose mark was refused ends: the torrent is live again, and
+    // a failure that came while it was being removed, the removal's to
+    // retire, fails it now.
+    pub(super) async fn mark_refused(&self, job_id: JobId, error: &StateError) -> ActionError {
+        let failed = self
+            .inner
+            .live
+            .lock()
+            .await
+            .get_mut(&job_id)
+            .and_then(|torrent| {
+                torrent.removing = false;
+                torrent.failed_removing.take()
+            });
+        if let Some(failed) = failed {
+            self.fail(job_id, failed).await;
+        }
+        ActionError::State(format!(
+            "the torrent was not removed: its removal could not be recorded ({error})"
+        ))
+    }
+
+    // The rest of a removal once its mark is written: out of the live
+    // torrents, its files gone when they go, and into history.
+    pub(super) async fn remove_marked(
+        &self,
+        job_id: JobId,
+        delete_files: bool,
+        ending: Ending,
+    ) -> Result<(), ActionError> {
         let mut torrent = self
             .inner
             .live
@@ -541,13 +569,7 @@ impl TorrentService {
 
     // A removal's mark on the torrent's row, written off the runtime.
     async fn mark_retiring(&self, job_id: JobId, delete_files: bool) -> Result<(), StateError> {
-        #[cfg(test)]
-        let held = locked(&MARK_HOLD).take();
-        #[cfg(test)]
-        if let Some((reached, release)) = held {
-            let _ = reached.send(());
-            let _ = release.await;
-        }
+        mark_hold().await;
         let db = self.inner.db.clone();
         tokio::task::spawn_blocking(move || db.mark_torrent_retiring(job_id, delete_files))
             .await
@@ -1289,5 +1311,16 @@ pub(in crate::torrents) fn delete_written(deletion: &Deletion) {
                 let _ = std::fs::remove_dir(folder);
             }
         }
+    }
+}
+
+// A test's hold on a removal just before its mark is written.
+pub(super) async fn mark_hold() {
+    #[cfg(test)]
+    let held = locked(&MARK_HOLD).take();
+    #[cfg(test)]
+    if let Some((reached, release)) = held {
+        let _ = reached.send(());
+        let _ = release.await;
     }
 }

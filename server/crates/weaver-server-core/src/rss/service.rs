@@ -13,6 +13,7 @@ use tracing::warn;
 use crate::RssRuleAction;
 use crate::SchedulerHandle;
 use crate::ingest::{Kind, SubmissionOptions, classify, submit_nzb_bytes_with_options};
+use crate::jobs::class::{AddRefusal, ClassIntake, RefusalReason, Route, Submission};
 use crate::jobs::{CallerScopedIdempotency, SubmissionOrigin};
 use crate::proxies::{Consumer, FetchOptions, read_body, routed_fetch};
 use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata, unix_now_secs};
@@ -20,7 +21,6 @@ use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata, u
 use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items};
 use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
-use crate::torrents::service::{AddError, AddRequest, AddSource, TorrentService};
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenDecision, RssSeenItemRow};
 
 const MAX_RSS_REDIRECTS: usize = 10;
@@ -67,14 +67,30 @@ pub enum RssServiceError {
     Http(String),
 }
 
-// Why an accepted item made no job: one already holds it, it is a torrent
-// while torrents are off, or it failed.
+// Why an accepted item made no job: one already holds it, its class takes
+// no new jobs now, or it failed.
 #[derive(Debug)]
 pub(super) enum NotAdded {
     Ignored(String),
-    // Held, not seen: judged anew once torrents are on.
-    Waiting,
+    // Held, not seen, with the class's word on why: judged anew once its
+    // class takes new jobs.
+    Waiting(String),
     Failed(String),
+}
+
+impl From<AddRefusal> for NotAdded {
+    fn from(refusal: AddRefusal) -> Self {
+        match refusal.reason {
+            RefusalReason::Duplicate(_) | RefusalReason::Removing => Self::Ignored(refusal.text),
+            RefusalReason::Off => Self::Waiting(refusal.text),
+            RefusalReason::NotRunning
+            | RefusalReason::NoIntake
+            | RefusalReason::Invalid
+            | RefusalReason::Refused
+            | RefusalReason::NoNetwork
+            | RefusalReason::State => Self::Failed(refusal.text),
+        }
+    }
 }
 
 impl From<String> for NotAdded {
@@ -95,8 +111,6 @@ pub(super) struct RssServiceInner {
     pub(super) security: RuntimeSecurityConfig,
     pub(super) sync_lock: Mutex<()>,
     pub(super) scheduled_paused: tokio::sync::watch::Sender<bool>,
-    // The torrent client the feeds' torrents go to, once it runs.
-    torrents: std::sync::OnceLock<TorrentService>,
     #[cfg(test)]
     clock_origin: tokio::time::Instant,
     #[cfg(test)]
@@ -117,17 +131,15 @@ impl RssService {
         });
     }
 
-    /// Send the torrents the feeds accept from now on to `torrents`.
-    pub fn use_torrents(&self, torrents: TorrentService) {
-        let _ = self.inner.torrents.set(torrents);
-    }
-
-    // Whether the torrent client takes a new torrent now.
-    pub(super) fn torrents_take_new(&self) -> bool {
+    // Whether any class the feeds' items go to takes new jobs now.
+    pub(super) fn classes_take_new(&self) -> bool {
         self.inner
-            .torrents
-            .get()
-            .is_some_and(TorrentService::takes_new)
+            .handle
+            .state()
+            .classes()
+            .iter()
+            .filter_map(|class| class.intake())
+            .any(|intake| intake.takes_new().is_ok())
     }
 
     pub fn is_scheduled_paused(&self) -> bool {
@@ -176,7 +188,6 @@ impl RssService {
                 security,
                 sync_lock: Mutex::new(()),
                 scheduled_paused: tokio::sync::watch::channel(false).0,
-                torrents: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 clock_origin: tokio::time::Instant::now(),
                 #[cfg(test)]
@@ -187,9 +198,9 @@ impl RssService {
         }
     }
 
-    // An accepted item's job. A magnet goes to the torrent client as it is;
-    // anything else is fetched on the feed's route, and its bytes say whether
-    // it is a torrent or an NZB.
+    // An accepted item's job. A magnet goes to its class as it is; anything
+    // else is fetched on the feed's route, and its bytes say which class it
+    // goes to, or that it is an NZB.
     pub(super) async fn accept_item_cancellable(
         &self,
         feed: &RssFeedRow,
@@ -203,20 +214,24 @@ impl RssService {
         let category = self.category(feed, rule).await;
         let metadata = build_submission_metadata(feed, rule, item);
 
-        let fetched = match classify(download_url.as_bytes()) {
-            Kind::Magnet(uri) => Ok(AddSource::Magnet(uri)),
-            // A link the feed says is a torrent waits unfetched while
-            // torrents take no new ones; it is fetched once they do.
-            _ if item.declared_torrent
-                && self
-                    .inner
-                    .torrents
-                    .get()
-                    .is_some_and(|torrents| !torrents.takes_new()) =>
-            {
-                return Err(NotAdded::Waiting);
-            }
+        let classes = self.inner.handle.state().classes();
+        let (kind, body, supplied_password_candidates) = match classify(download_url.as_bytes()) {
+            kind @ Kind::Magnet(_) => (kind, Vec::new(), Vec::new()),
             _ => {
+                // A link whose declared type names a class is not fetched
+                // while that class would refuse it: it waits unfetched while
+                // the class takes no new jobs, and is fetched once it does;
+                // with no such class running it fails as its bytes would.
+                if let Some(declared) = item.declared {
+                    let refused = match classes.route_to(Some(declared)) {
+                        Ok(Route::Class(intake)) => intake.takes_new().err(),
+                        Ok(Route::Pipeline) => None,
+                        Err(refusal) => Some(refusal),
+                    };
+                    if let Some(refusal) = refused {
+                        return Err(refusal.into());
+                    }
+                }
                 let response = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".to_string().into()),
@@ -236,17 +251,21 @@ impl RssService {
                     _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".to_string().into()),
                     result = read_body(response, self.inner.security.nzb_decompressed_limit_bytes) => result.map_err(|e| format!("failed to read item body: {e}"))?,
                 };
-                classify(&body)
-                    .torrent(body)
-                    .map_err(|nzb| (nzb, supplied_password_candidates))
+                (classify(&body), body, supplied_password_candidates)
             }
         };
         if cancellation.is_cancelled() {
             return Err("scheduled RSS sync cancelled".to_string().into());
         }
-        match fetched {
-            Ok(source) => self.add_torrent(source, category, metadata).await,
-            Err((nzb, supplied_password_candidates)) => {
+        match classes.route(&kind)? {
+            Route::Class(intake) => {
+                let mut submission = Submission::of(kind, body);
+                submission.category = category;
+                submission.metadata = metadata;
+                self.add_to_class(intake, submission).await
+            }
+            Route::Pipeline => {
+                let nzb = body;
                 weaver_nzb::parse_nzb(&nzb).map_err(|e| format!("invalid NZB: {e}"))?;
                 // Submission owns durable writes. Once started it must finish before shutdown.
                 let idempotency = CallerScopedIdempotency::new(
@@ -297,39 +316,14 @@ impl RssService {
         canonical
     }
 
-    // A torrent goes to the torrent client with the item's category, whose
-    // route it takes. One the client already holds is left to it.
-    async fn add_torrent(
+    // An item another class takes goes to it with the item's category,
+    // whose route it takes. One the class already holds is left to it.
+    async fn add_to_class(
         &self,
-        source: AddSource,
-        category: Option<String>,
-        metadata: Vec<(String, String)>,
+        intake: &dyn ClassIntake,
+        submission: Submission,
     ) -> Result<u64, NotAdded> {
-        let Some(torrents) = self.inner.torrents.get() else {
-            return Err("the torrent client is not running".to_string().into());
-        };
-        let request = AddRequest {
-            source,
-            category,
-            policy_override: None,
-            paused: false,
-            forced: false,
-            unpack: None,
-            metadata,
-            upload_limit: None,
-            download_limit: None,
-            placement: Default::default(),
-            tags: Vec::new(),
-        };
-        match torrents.add(request).await {
-            Ok(job_id) => Ok(job_id.0),
-            Err(AddError::Duplicate(_)) => Err(NotAdded::Ignored("already added".into())),
-            Err(AddError::Off) => Err(NotAdded::Waiting),
-            Err(AddError::Refused(crate::torrents::admission::Refusal::Removing(_))) => Err(
-                NotAdded::Ignored("the torrent is still being removed".into()),
-            ),
-            Err(error) => Err(error.to_string().into()),
-        }
+        Ok(intake.add(submission).await?.0)
     }
 
     pub(super) async fn fetch_feed_response(

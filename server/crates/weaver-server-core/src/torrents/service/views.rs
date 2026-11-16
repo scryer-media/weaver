@@ -377,7 +377,10 @@ impl TorrentService {
             .published
             .send_replace(Arc::new(Published { torrents, sessions }));
         if let Some(queue) = self.queue() {
-            queue.publish_owned_jobs(self.with_retiring(job_infos(views, now)));
+            queue.publish_owned_jobs(
+                crate::jobs::Protocol::Torrent,
+                self.with_retiring(job_infos(views, now)),
+            );
         }
     }
 
@@ -393,7 +396,10 @@ impl TorrentService {
         let now = self.inner.clock.now_ms();
         if let Some(view) = self.torrent(job_id).await {
             let status = job_status(&view);
-            queue.publish_owned_job(report(view, status, now).job_info());
+            queue.publish_owned_job(
+                crate::jobs::Protocol::Torrent,
+                report(view, status, now).job_info(),
+            );
         }
     }
 

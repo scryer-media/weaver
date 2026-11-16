@@ -5,26 +5,14 @@ use std::net::{IpAddr, SocketAddr};
 
 use async_graphql::{Context, MaybeUndefined, Object, Result};
 use base64::Engine;
-use weaver_server_core::SchedulerHandle;
+use weaver_server_core::jobs::class::AddRefusal;
 use weaver_server_core::jobs::ids::JobId;
-use weaver_server_core::torrents::service::{ActionError, AddError, AddRequest, AddSource};
+use weaver_server_core::torrents::service::{ActionError, AddRequest, AddSource};
 
 use super::service;
 use super::types::{SubmitTorrentInput, Torrent, TorrentFilePriorityInput, TorrentTrackerInput};
 use crate::auth::{ControlGuard, graphql_error};
 use crate::settings::types::SeedingPolicyInput;
-
-fn add_error(error: AddError) -> async_graphql::Error {
-    let code = match &error {
-        AddError::Invalid(_) => "INVALID_INPUT",
-        AddError::Refused(_) => "REFUSED",
-        AddError::Duplicate(_) => "DUPLICATE",
-        AddError::NoNetwork(_) => "NO_NETWORK",
-        AddError::State(_) => "INTERNAL",
-        AddError::Off => "TORRENTS_DISABLED",
-    };
-    graphql_error(code, error.to_string())
-}
 
 pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
     let code = match &error {
@@ -42,7 +30,12 @@ pub struct TorrentsMutation;
 impl TorrentsMutation {
     /// Add a torrent, with the client's refusal in its own words.
     pub(crate) async fn add(ctx: &Context<'_>, request: AddRequest) -> Result<JobId> {
-        service(ctx)?.add(request).await.map_err(add_error)
+        service(ctx)?.add(request).await.map_err(|error| {
+            crate::jobs::mutation::add_refusal_error(
+                weaver_server_core::jobs::Protocol::Torrent,
+                AddRefusal::from(error),
+            )
+        })
     }
 }
 
@@ -124,27 +117,6 @@ impl TorrentsMutation {
             .resume(JobId(id))
             .await
             .map_err(action_error)?;
-        Ok(true)
-    }
-
-    /// Pause every torrent, seeding too, as one hold. Each torrent's own
-    /// pause or resume stands under it.
-    #[graphql(guard = "ControlGuard")]
-    async fn pause_torrents(&self, ctx: &Context<'_>) -> Result<bool> {
-        ctx.data::<SchedulerHandle>()?
-            .pause_torrents()
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
-        Ok(true)
-    }
-
-    /// Lift the operator's pause of every torrent.
-    #[graphql(guard = "ControlGuard")]
-    async fn resume_torrents(&self, ctx: &Context<'_>) -> Result<bool> {
-        ctx.data::<SchedulerHandle>()?
-            .resume_torrents()
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
         Ok(true)
     }
 

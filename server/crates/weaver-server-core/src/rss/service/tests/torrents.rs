@@ -39,6 +39,16 @@ impl Drop for Rig {
 // rule that takes every Silver Horizon item of `sizes`, and a torrent client
 // that is on or off.
 async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
+    rig_seated(items, sizes, torrents_on, true).await
+}
+
+// `rig`, with the torrent client seated as the queue's torrent class or not.
+async fn rig_seated(
+    items: &str,
+    sizes: Option<(u64, u64)>,
+    torrents_on: bool,
+    seated: bool,
+) -> Rig {
     let dir = TempDir::new().unwrap();
     let db = Database::open(&dir.path().join("rss.sqlite")).unwrap();
     let feed = format!(
@@ -141,7 +151,9 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
     torrents.open().await.unwrap();
 
     let service = build_service(dir.path(), db.clone());
-    service.use_torrents(torrents.clone());
+    if seated {
+        torrents.publish_to(service.inner.handle.clone());
+    }
     Rig {
         service,
         db,
@@ -496,6 +508,46 @@ async fn a_declared_torrent_enclosure_is_not_fetched_while_torrents_are_off() {
     assert_eq!(rig.seen()[0].1, "submitted");
 }
 
+// With no torrent class seated, an item the feed declares a torrent fails
+// unfetched, a magnet and a torrent whose bytes say so fail, each with the
+// registry's refusal, and an NZB beside them is submitted as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_torrent_class_seated_torrent_items_fail_with_its_refusal() {
+    let rig = rig_seated(
+        &format!(
+            "{}{}{}{}",
+            item(
+                "a",
+                r#"<enclosure url="http://localhost/set.torrent" length="3000" type="application/x-bittorrent"/>"#,
+            ),
+            item("b", &format!(r#"<enclosure url="{}" length="3000"/>"#, magnet())),
+            item("c", r#"<enclosure url="http://localhost/set.torrent" length="3000"/>"#),
+            item("d", r#"<enclosure url="http://localhost/download.nzb" length="3000"/>"#),
+        ),
+        None,
+        true,
+        false,
+    )
+    .await;
+
+    rig.service.run_all_sync().await.unwrap();
+
+    let refusal = crate::jobs::class::AddRefusal::not_running(crate::jobs::Protocol::Torrent).text;
+    // Only the undeclared torrent is fetched, its bytes telling what it is.
+    assert_eq!(rig.torrent_fetches.load(Ordering::SeqCst), 1);
+    assert!(rig.torrent_jobs().is_empty());
+    let seen = rig.seen();
+    for row in &seen[..3] {
+        assert_eq!(
+            (row.1.as_str(), row.3.as_deref()),
+            ("error", Some(refusal.as_str())),
+            "{seen:?}"
+        );
+    }
+    assert_eq!(seen[3].1, "submitted", "{seen:?}");
+    assert_eq!(rig.nzb_jobs().len(), 1);
+}
+
 // A torrent the client already holds, from this feed or any other origin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_the_client_already_holds_is_ignored_as_already_added() {
@@ -520,7 +572,7 @@ async fn a_torrent_the_client_already_holds_is_ignored_as_already_added() {
                 "b".into(),
                 "ignored".into(),
                 None,
-                Some("already added".into())
+                Some(format!("already added as job {}", jobs[0]))
             ),
         ]
     );
@@ -578,7 +630,7 @@ async fn a_poll_records_its_items_together_with_the_rows_one_by_one_gave() {
                 "b".into(),
                 "ignored".into(),
                 None,
-                Some("already added".into())
+                Some(format!("already added as job {}", jobs[0]))
             ),
             ("old".into(), "submitted".into(), Some(77), None),
             ("x".into(), "ignored".into(), None, None),

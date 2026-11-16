@@ -93,7 +93,7 @@ pub(crate) struct FakeRoutes {
     pub(crate) egress_of: Mutex<BTreeMap<String, u32>>,
     // What each egress allows its sessions, unlimited when unset, and the
     // signals rung as it changes.
-    pub(crate) egress_rates: Mutex<BTreeMap<u32, crate::bandwidth::TorrentRates>>,
+    pub(crate) egress_rates: Mutex<BTreeMap<u32, crate::bandwidth::ClassRates>>,
     pub(crate) egress_policy: tokio::sync::watch::Sender<u64>,
     pub(crate) egress_capacity: tokio::sync::watch::Sender<u64>,
     // The legs it opens run no local service discovery, so a session on
@@ -206,7 +206,7 @@ impl FakeRoutes {
     }
 
     // Egress `egress_id` allows `rates` from now, and says so.
-    pub(crate) fn set_egress_rates(&self, egress_id: u32, rates: crate::bandwidth::TorrentRates) {
+    pub(crate) fn set_egress_rates(&self, egress_id: u32, rates: crate::bandwidth::ClassRates) {
         self.egress_rates.lock().unwrap().insert(egress_id, rates);
         self.egress_policy.send_modify(|revision| *revision += 1);
     }
@@ -372,7 +372,7 @@ impl Routes for FakeRoutes {
         ))
     }
 
-    fn egress_rates(&self, egress_id: u32) -> crate::bandwidth::TorrentRates {
+    fn egress_rates(&self, egress_id: u32) -> crate::bandwidth::ClassRates {
         self.egress_rates
             .lock()
             .unwrap()
@@ -2642,7 +2642,7 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
         .await
         .unwrap();
     assert_eq!(rate(&one), None);
-    sessions.rates().set(crate::bandwidth::TorrentRates {
+    sessions.rates().set(crate::bandwidth::ClassRates {
         download: Some(1_000_000),
         upload: None,
     });
@@ -2659,12 +2659,12 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
     assert_eq!(sessions.rates().sample(), 0);
 
     // Nothing closes the sessions.
-    sessions.rates().set(crate::bandwidth::TorrentRates {
+    sessions.rates().set(crate::bandwidth::ClassRates {
         download: Some(0),
         upload: None,
     });
     assert_eq!((rate(&one), rate(&two)), (Some(0), Some(0)));
-    sessions.rates().set(crate::bandwidth::TorrentRates {
+    sessions.rates().set(crate::bandwidth::ClassRates {
         download: None,
         upload: None,
     });

@@ -27,7 +27,7 @@ import {
 } from "../../../data/hardware-profiles";
 import { SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
 import { scheduleActionFields, scheduleActionHelp, scheduleSpeedSections, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, speedTarget, torrentOnlyAction, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, scheduleActionKey, scheduleActionOfKey, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, speedTarget, torrentOnlyAction, type ScheduleClass, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -45,6 +45,7 @@ interface Schedule extends ScheduleOptions {
   days: string[];
   time: string;
   actionType: string;
+  class: ScheduleClass | null;
   track: ScheduleTrack;
   hardwareProfile: HardwareProfileName | null;
 }
@@ -55,6 +56,7 @@ interface ScheduleForm {
   label: string;
   days: string[];
   time: string;
+  /** The picker's key: the action, and the class a class's pause holds. */
   actionType: string;
   /** Null until one is picked; the editor then offers the recommendation. */
   hardwareProfile: HardwareProfileName | null;
@@ -76,7 +78,7 @@ function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets
   if (schedule.actionType === "hardware_profile" && schedule.hardwareProfile) {
     return t("next.schedules.profileTo", { profile: profileName(t, schedule.hardwareProfile) });
   }
-  const action = SCHEDULE_ACTIONS.find((option) => option.value === schedule.actionType);
+  const action = SCHEDULE_ACTIONS.find((option) => option.value === scheduleActionKey(schedule));
   return action ? t(action.label) : schedule.actionType;
 }
 
@@ -124,7 +126,7 @@ export function SchedulesPanel() {
             label: schedule.label ?? "",
             days: schedule.days,
             time: schedule.time,
-            actionType: schedule.actionType,
+            actionType: scheduleActionKey(schedule),
             hardwareProfile: schedule.hardwareProfile,
             options: optionsFromSchedule(schedule),
           }
@@ -149,7 +151,7 @@ export function SchedulesPanel() {
     setBusy(true);
     const input: Record<string, unknown> = {
       time: form.time,
-      actionType: form.actionType,
+      ...scheduleActionOfKey(form.actionType),
       days: form.days.length > 0 ? form.days : null,
       label: form.label.trim() || null,
       enabled: form.enabled,
@@ -259,7 +261,7 @@ export function SchedulesPanel() {
         rows: withoutTorrentOnly(
           schedules.filter((schedule) => schedule.track === track.value),
           torrentsOn,
-          (schedule) => torrentOnlyAction(schedule.actionType),
+          (schedule) => torrentOnlyAction(scheduleActionKey(schedule)),
         ).map((schedule) => row(schedule)),
       })),
     },

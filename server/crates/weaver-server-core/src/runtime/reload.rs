@@ -9,9 +9,9 @@ use crate::{NntpRuntimeActivation, SchedulerError, SchedulerHandle};
 // The operator's holds, as last kept.
 pub async fn load_holds_from_db(db: &Database) -> Result<HoldSet, String> {
     let mut holds = HoldSet::default();
-    for owner in [HoldOwner::All, HoldOwner::Torrents] {
+    for (owner, setting) in HoldOwner::kept() {
         let db = db.clone();
-        let value = tokio::task::spawn_blocking(move || db.get_setting(owner.setting()))
+        let value = tokio::task::spawn_blocking(move || db.get_setting(setting))
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
@@ -218,7 +218,7 @@ pub async fn reload_runtime_from_db(
         .await
         .map_err(|error| error.to_string())?;
     let holds = load_holds_from_db(db).await?;
-    for owner in [HoldOwner::All, HoldOwner::Torrents] {
+    for (owner, _) in HoldOwner::kept() {
         if holds.held_by(HoldOrigin::Manual, owner) {
             handle.pause(Hold::manual(owner)).await
         } else {

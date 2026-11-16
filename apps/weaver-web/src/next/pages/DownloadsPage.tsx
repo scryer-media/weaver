@@ -10,11 +10,11 @@ import {
   PAUSE_ALL_MUTATION,
   PAUSE_JOB_MUTATION,
   PAUSE_QUEUE_ITEMS_MUTATION,
-  PAUSE_TORRENTS_MUTATION,
+  PAUSE_CLASS_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
   RESUME_QUEUE_ITEMS_MUTATION,
-  RESUME_TORRENTS_MUTATION,
+  RESUME_CLASS_MUTATION,
   SET_QUEUE_ITEMS_CATEGORY_MUTATION,
   SET_QUEUE_ITEMS_PRIORITY_MUTATION,
   SYSTEM_INFO_QUERY,
@@ -247,7 +247,7 @@ function TimedResumeButton({ resumeAt, onResume }: { resumeAt: number; onResume:
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, torrentsPaused, resumeAt, downloadBlock } = useNextData();
+  const { queue, categories: configured, speed, isPaused, pausedClasses, resumeAt, downloadBlock } = useNextData();
   // The ETA's cap; 0 is none.
   const speedLimit = useSpeedLimitInForce().inForce ?? 0;
   const statusLabel = useStatusLabel();
@@ -294,8 +294,9 @@ export function DownloadsPage() {
 
   const client = useClient();
 
-  const [, pauseTorrents] = useMutation(PAUSE_TORRENTS_MUTATION);
-  const [, resumeTorrents] = useMutation(RESUME_TORRENTS_MUTATION);
+  const [, pauseClass] = useMutation(PAUSE_CLASS_MUTATION);
+  const [, resumeClass] = useMutation(RESUME_CLASS_MUTATION);
+  const torrentsPaused = pausedClasses.includes("TORRENT");
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
@@ -721,7 +722,7 @@ export function DownloadsPage() {
               <SecondaryButton
                 icon={torrentsPaused ? "resume" : "pause"}
                 onClick={() => {
-                  void (torrentsPaused ? resumeTorrents({}) : pauseTorrents({}));
+                  void (torrentsPaused ? resumeClass({ class: "TORRENT" }) : pauseClass({ class: "TORRENT" }));
                 }}
               >
                 {torrentsPaused ? t("next.downloads.resumeTorrents") : t("next.downloads.pauseTorrents")}

@@ -101,7 +101,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
 
 // What the rail reads while the metered egress has spent its allowance.
 const blockedBy = (windowEndsAtEpochMs: number | null): NextData => ({
-  version: "fixture", update: undefined, speed: 0, peakSpeed: 0, isPaused: false, torrentsPaused: false, resumeAt: null, speedLimit: 0,
+  version: "fixture", update: undefined, speed: 0, peakSpeed: 0, isPaused: false, pausedClasses: [], resumeAt: null, speedLimit: 0,
   downloadBlock: {
     kind: "EGRESS_QUOTA", egressId: 2, egressName: "LTE standby", usedBytes: 20 * GIB, limitBytes: 20 * GIB, remainingBytes: 0,
     windowStartsAtEpochMs: windowStart, windowEndsAtEpochMs, timezoneName: "UTC", scheduledSpeedLimit: null, speedLimitInForce: null, speedLimitBySchedule: false,

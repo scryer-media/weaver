@@ -454,7 +454,7 @@ async fn an_operator_resume_leaves_a_running_test_held() {
     // The test holds everything, seeding included, through the one pause.
     let holds = rig.handle.state().holds();
     assert_eq!(
-        holds.reason(HoldOwner::Torrents, true),
+        holds.reason(HoldOwner::Class(crate::torrents::CLASS), true),
         Some(HoldOrigin::SpeedTest)
     );
     rig.handle.resume_all().await.unwrap();

@@ -1969,11 +1969,12 @@ pub(crate) fn render_script_runs(out: &mut Encoder, metrics: &ScriptRunMetricsSn
 
 pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnapshot) {
     out.sample(&f::SCHEDULE_EVALUATIONS, &[], metrics.evaluations);
-    for &(action, track, outcome, count) in &metrics.actions {
+    for &(action, class, track, outcome, count) in &metrics.actions {
         out.sample(
             &f::SCHEDULE_ACTIONS,
             &[
                 ("action", action.as_str()),
+                ("class", class.map_or("", |class| class.protocol().as_str())),
                 ("track", track.as_str()),
                 ("outcome", outcome.as_str()),
             ],

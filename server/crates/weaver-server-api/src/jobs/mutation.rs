@@ -16,14 +16,13 @@ use crate::jobs::batch::{QueueBatchOp, batch_result};
 use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
 use crate::jobs::types::{
     CancelJobResult, DuplicateDecisionInfo, DuplicateModeGql, PRIORITY_ATTRIBUTE_KEY,
-    PersistedQueueEvent, QueueBatchResult, QueueBatchTarget, QueueCommandResult, QueueEventKind,
-    QueueMoveKind, QueuePriority, SemanticDuplicateAdmissionInfo, SemanticPromotionResult,
-    StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult, SubmissionKind,
-    SubmissionResult, SubmissionStatus, SubmitInput, SubmitNzbInput, SubmitStagedNzbsInput,
-    SubmitStagedNzbsResult, global_queue_state, normalize_priority_value, queue_item_from_job,
-    queue_item_from_submission, submit_metadata,
+    PersistedQueueEvent, ProtocolGql, QueueBatchResult, QueueBatchTarget, QueueCommandResult,
+    QueueEventKind, QueueMoveKind, QueuePriority, SemanticDuplicateAdmissionInfo,
+    SemanticPromotionResult, StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult,
+    SubmissionKind, SubmissionResult, SubmissionStatus, SubmitInput, SubmitNzbInput,
+    SubmitStagedNzbsInput, SubmitStagedNzbsResult, global_queue_state, normalize_priority_value,
+    queue_item_from_job, queue_item_from_submission, submit_metadata,
 };
-use crate::torrents::TorrentsMutation;
 use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
     FetchedNzb, Kind, ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions,
@@ -32,13 +31,15 @@ use weaver_server_core::ingest::{
     submit_staged_nzb_zstd_with_options, submit_staged_prepared_nzb_with_options,
     submit_uploaded_nzb_reader_with_options,
 };
+use weaver_server_core::jobs::Protocol;
+use weaver_server_core::jobs::class::{AddRefusal, RefusalReason, Submission};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{
     CallerScopedIdempotency, DuplicateAction, DuplicateMode, SemanticDuplicate, SubmissionOrigin,
 };
+use weaver_server_core::jobs::{HeldClass, Route};
 use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::settings::SharedConfig;
-use weaver_server_core::torrents::service::{AddRequest, AddSource, TorrentService};
 use weaver_server_core::{
     Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
 };
@@ -121,35 +122,30 @@ impl JobsMutation {
                     filename = fetched.filename;
                     source_url = Some(url.to_string());
                 }
-                match kind.torrent(bytes) {
-                    Ok(source) => {
-                        let added = add_torrent(
-                            ctx,
-                            source,
-                            category.clone(),
-                            input.paused,
-                            input.unpack,
-                            tags,
+                if goes_to_class(ctx, &kind)? {
+                    let mut submission = Submission::of(kind, bytes);
+                    submission.category = category.clone();
+                    submission.paused = input.paused;
+                    submission.unpack = input.unpack;
+                    submission.tags = tags;
+                    let added = add_to_class(ctx, submission).await;
+                    if let Some(url) = source_url {
+                        let status = if added.is_ok() {
+                            UrlStatus::Success
+                        } else {
+                            UrlStatus::ScanFailure
+                        };
+                        raise_url_completed(
+                            ctx.data::<Database>()?,
+                            &url,
+                            category.as_deref(),
+                            status,
                         )
                         .await;
-                        if let Some(url) = source_url {
-                            let status = if added.is_ok() {
-                                UrlStatus::Success
-                            } else {
-                                UrlStatus::ScanFailure
-                            };
-                            raise_url_completed(
-                                ctx.data::<Database>()?,
-                                &url,
-                                category.as_deref(),
-                                status,
-                            )
-                            .await;
-                        }
-                        return added;
                     }
-                    Err(bytes) => (NzbSource::Bytes(bytes), filename, source_url),
+                    return added;
                 }
+                (NzbSource::Bytes(bytes), filename, source_url)
             }
             (None, Some(upload)) => {
                 let upload = upload
@@ -157,20 +153,16 @@ impl JobsMutation {
                     .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
                 let filename =
                     (!upload.filename.trim().is_empty()).then_some(upload.filename.clone());
-                match torrent_upload(upload) {
-                    Ok(source) => {
-                        return add_torrent(
-                            ctx,
-                            source,
-                            category,
-                            input.paused,
-                            input.unpack,
-                            tags,
-                        )
-                        .await;
-                    }
-                    Err(upload) => (NzbSource::Upload(upload), filename, None),
+                let kind = classify(&upload.content);
+                if goes_to_class(ctx, &kind)? {
+                    let mut submission = Submission::of(kind, upload.content.to_vec());
+                    submission.category = category;
+                    submission.paused = input.paused;
+                    submission.unpack = input.unpack;
+                    submission.tags = tags;
+                    return add_to_class(ctx, submission).await;
                 }
+                (NzbSource::Upload(upload), filename, None)
             }
             _ => {
                 return Err(graphql_error(
@@ -215,14 +207,18 @@ impl JobsMutation {
         // A torrent is not staged: it is added whole, through `submit`. While
         // torrents take no new ones it is refused here, for every client, so
         // its row says so before anything is submitted.
-        if classify(&upload.content).is_torrent() {
-            let refusal = match ctx.data_opt::<TorrentService>() {
-                None => Some("the torrent client is not running".to_string()),
-                Some(torrents) if !torrents.takes_new() => {
-                    Some(weaver_server_core::torrents::status::TORRENTS_OFF.to_string())
-                }
-                Some(_) => None,
-            };
+        let kind = classify(&upload.content);
+        let refusal = match ctx
+            .data::<SchedulerHandle>()?
+            .state()
+            .classes()
+            .route(&kind)
+        {
+            Ok(Route::Pipeline) => None,
+            Ok(Route::Class(intake)) => Some(intake.takes_new().err().map(|refusal| refusal.text)),
+            Err(refusal) => Some(Some(refusal.text)),
+        };
+        if let Some(refusal) = refusal {
             return Ok(StagedNzbUploadResult {
                 kind: SubmissionKind::Torrent,
                 error: refusal,
@@ -920,6 +916,30 @@ impl JobsMutation {
         map_scheduler_result(handle.reorder_job(JobId(id), target).await)?;
         Ok(true)
     }
+    /// Pause every job of a class, as one hold, its jobs' own pauses and
+    /// resumes standing under it. A class with no hold of its own is
+    /// refused.
+    #[graphql(guard = "ControlGuard")]
+    async fn pause_class(&self, ctx: &Context<'_>, class: ProtocolGql) -> Result<bool> {
+        let class = held_class(class)?;
+        ctx.data::<SchedulerHandle>()?
+            .pause_class(class)
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        Ok(true)
+    }
+
+    /// Lift the operator's pause of every job of a class.
+    #[graphql(guard = "ControlGuard")]
+    async fn resume_class(&self, ctx: &Context<'_>, class: ProtocolGql) -> Result<bool> {
+        let class = held_class(class)?;
+        ctx.data::<SchedulerHandle>()?
+            .resume_class(class)
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        Ok(true)
+    }
+
     /// Pause all download dispatch globally. With `resumeAfterSecs`, downloads
     /// resume on their own after that many seconds (1 to 30 days).
     #[graphql(guard = "ControlGuard")]
@@ -1677,31 +1697,27 @@ async fn fetch_url(ctx: &Context<'_>, url: &str, category: Option<&str>) -> Resu
     fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))
 }
 
-async fn add_torrent(
-    ctx: &Context<'_>,
-    source: AddSource,
-    category: Option<String>,
-    paused: bool,
-    unpack: Option<bool>,
-    tags: Vec<String>,
-) -> Result<SubmissionResult> {
-    let job_id = TorrentsMutation::add(
-        ctx,
-        AddRequest {
-            source,
-            category,
-            policy_override: None,
-            paused,
-            forced: false,
-            unpack,
-            metadata: Vec::new(),
-            upload_limit: None,
-            download_limit: None,
-            placement: Default::default(),
-            tags,
-        },
-    )
-    .await?;
+// A submission another class takes goes to it, with its refusal in its own
+// words.
+async fn add_to_class(ctx: &Context<'_>, submission: Submission) -> Result<SubmissionResult> {
+    let Some(protocol) = submission.kind.protocol() else {
+        return Err(graphql_error(
+            "INVALID_INPUT",
+            "nothing takes this submission",
+        ));
+    };
+    let handle = ctx.data::<SchedulerHandle>()?;
+    let added = match handle.state().classes().route(&submission.kind) {
+        Ok(Route::Class(intake)) => intake.add(submission).await,
+        Ok(Route::Pipeline) => {
+            return Err(graphql_error(
+                "INVALID_INPUT",
+                "the pipeline takes this submission, not a class",
+            ));
+        }
+        Err(refusal) => Err(refusal),
+    };
+    let job_id = added.map_err(|refusal| add_refusal_error(protocol, refusal))?;
     Ok(SubmissionResult {
         accepted: true,
         status: SubmissionStatus::Accepted,
@@ -1715,12 +1731,39 @@ async fn add_torrent(
     })
 }
 
-// A torrent or magnet upload as the torrent client takes it; any other
-// upload comes back.
-fn torrent_upload(upload: UploadValue) -> Result<AddSource, UploadValue> {
-    classify(&upload.content)
-        .torrent(upload.content.to_vec())
-        .map_err(|_| upload)
+// The class a pause of a whole class is over, refused when the class has no
+// hold of its own.
+fn held_class(class: ProtocolGql) -> Result<HeldClass> {
+    let protocol = Protocol::from(class);
+    HeldClass::of(protocol).ok_or_else(|| {
+        graphql_error(
+            "INVALID_INPUT",
+            format!("the {} class has no pause of its own", protocol.as_str()),
+        )
+    })
+}
+
+// Whether the registry hands a submission of `kind` to a class, not the
+// pipeline: a refusal is the class's to give, in `add_to_class`.
+fn goes_to_class(ctx: &Context<'_>, kind: &Kind) -> Result<bool> {
+    Ok(!matches!(
+        ctx.data::<SchedulerHandle>()?.state().classes().route(kind),
+        Ok(Route::Pipeline)
+    ))
+}
+
+/// The GraphQL error of an add a class refused: the one mapping of every
+/// refusal to its code.
+pub(crate) fn add_refusal_error(protocol: Protocol, refusal: AddRefusal) -> async_graphql::Error {
+    let code = match refusal.reason {
+        RefusalReason::Invalid => "INVALID_INPUT",
+        RefusalReason::Refused | RefusalReason::Removing | RefusalReason::NoIntake => "REFUSED",
+        RefusalReason::Duplicate(_) => "DUPLICATE",
+        RefusalReason::NoNetwork => "NO_NETWORK",
+        RefusalReason::State => "INTERNAL",
+        RefusalReason::Off | RefusalReason::NotRunning => protocol.names().disabled_code,
+    };
+    graphql_error(code, refusal.text)
 }
 
 async fn raise_url_completed(db: &Database, url: &str, category: Option<&str>, status: UrlStatus) {

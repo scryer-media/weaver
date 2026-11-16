@@ -420,9 +420,15 @@ async fn the_global_pause_reaches_the_torrents() {
             vec![scheduled(HoldScope::Everything, HoldOwner::All)],
             (true, true),
         ),
-        (vec![Hold::manual(HoldOwner::Torrents)], (true, true)),
         (
-            vec![scheduled(HoldScope::Everything, HoldOwner::Torrents)],
+            vec![Hold::manual(HoldOwner::Class(crate::torrents::CLASS))],
+            (true, true),
+        ),
+        (
+            vec![scheduled(
+                HoldScope::Everything,
+                HoldOwner::Class(crate::torrents::CLASS),
+            )],
             (true, true),
         ),
         (vec![], (false, false)),
@@ -536,7 +542,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
     let schedule = Hold {
         origin: HoldOrigin::Scheduled,
         scope: HoldScope::Everything,
-        owner: HoldOwner::Torrents,
+        owner: HoldOwner::Class(crate::torrents::CLASS),
     };
     // Subscribed before the first look, so the publish that follows the
     // change wakes it.
@@ -550,7 +556,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         }
     };
 
-    for owner in [HoldOwner::Torrents, HoldOwner::All] {
+    for owner in [HoldOwner::Class(crate::torrents::CLASS), HoldOwner::All] {
         hold(Hold { owner, ..schedule });
         wait(plain, Some(HoldOrigin::Scheduled)).await;
         assert_eq!(paused_by(&rig.service, kept).await, None);
@@ -588,7 +594,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
     wait(plain, None).await;
     complete(kept, Some(EPOCH_MS)).await;
 
-    hold(Hold::manual(HoldOwner::Torrents));
+    hold(Hold::manual(HoldOwner::Class(crate::torrents::CLASS)));
     wait(kept, Some(HoldOrigin::Manual)).await;
     assert_eq!(
         paused_by(&rig.service, plain).await,
@@ -1036,4 +1042,227 @@ async fn a_pause_racing_completion_keeps_the_completion() {
     let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
     assert_eq!(stored.intent(), TorrentIntent::Resumed);
     assert_eq!(stored.completed_at_ms, Some(EPOCH_MS));
+}
+
+// A client that failed to start is never seated: every torrent intake is
+// refused as the registry's "not running", as though no client were there,
+// and one that starts is seated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_fails_to_start_is_not_seated_as_the_torrent_class() {
+    use crate::ingest::Kind;
+    use crate::jobs::{AddRefusal, RefusalReason};
+    use crate::persistence::sql_runtime::SqlRuntime;
+
+    let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_owned();
+    let kinds = [Kind::Metainfo, Kind::Magnet(magnet)];
+
+    let rig = rig(set_clock());
+    let queue = queue();
+    let state = queue.state().clone();
+    let store = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&store, "missing_tracker_rules_fixture", |tx| {
+                Box::pin(async move {
+                    tx.execute("DROP TABLE tracker_rules", &[]).await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .unwrap();
+    rig.service.wire_to(queue);
+    assert!(rig.service.start_seated().await.is_err());
+    assert!(state.classes().get(Protocol::Torrent).is_none());
+    for kind in &kinds {
+        let refusal = match state.classes().route(kind) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("{kind:?} was taken by a client that did not start"),
+        };
+        assert_eq!(refusal, AddRefusal::not_running(Protocol::Torrent));
+        assert_eq!(refusal.reason, RefusalReason::NotRunning);
+    }
+
+    let started = super::rig(set_clock());
+    let queue = super::queue();
+    let state = queue.state().clone();
+    started.service.wire_to(queue);
+    started.service.start_seated().await.unwrap();
+    assert!(state.classes().get(Protocol::Torrent).is_some());
+    for kind in &kinds {
+        assert!(
+            matches!(
+                state.classes().route(kind),
+                Ok(crate::jobs::Route::Class(_))
+            ),
+            "{kind:?}"
+        );
+    }
+}
+
+// A batch of actions on torrents is one unit: one change to the published
+// queue for a run of pauses or resumes where one at a time made one each,
+// and the same results and the same rows as those one at a time. A move
+// changes no published job, so its one publish is not counted here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_of_torrent_actions_ends_as_the_same_actions_one_at_a_time() {
+    use crate::jobs::handle::{CancellationOrigin, QueueAction, QueueMoveTarget};
+
+    async fn seeded() -> (Rig, SchedulerHandle, Vec<JobId>) {
+        let rig = rig(set_clock());
+        // No session is built while the route is down.
+        rig.routes.set_down(Some("down"));
+        let queue = queue();
+        rig.service.publish_to(queue.clone());
+        rig.service.open().await.unwrap();
+        let mut ids = Vec::new();
+        for seed in 1..=5 {
+            ids.push(
+                rig.service
+                    .add_opened(request(AddSource::Metainfo(plain(
+                        &format!("set{seed}"),
+                        seed,
+                    ))))
+                    .await
+                    .unwrap(),
+            );
+        }
+        (rig, queue, ids)
+    }
+    let rows = |rig: &Rig, ids: &[JobId]| {
+        ids.iter()
+            .map(|id| {
+                rig.db.get_torrent(*id).unwrap().map(|record| {
+                    (
+                        record.intent(),
+                        record.category_id,
+                        record.forced,
+                        record.queue_position,
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let (batched, batched_queue, ids) = seeded().await;
+    let (single, single_queue, single_ids) = seeded().await;
+    assert_eq!(ids, single_ids);
+    let [a, b, c, d, e] = ids[..] else {
+        unreachable!()
+    };
+    let missing = JobId(9_999);
+    let update = |category: FieldUpdate<String>, priority: &str| {
+        QueueAction::Update(JobUpdate {
+            category,
+            metadata: FieldUpdate::Set(vec![("priority".into(), priority.into())]),
+            ..JobUpdate::default()
+        })
+    };
+    // Each step's actions, and how many changes one at a time makes to the
+    // published queue when it is counted.
+    type Step = (Vec<(JobId, QueueAction)>, Option<u64>);
+    let steps: Vec<Step> = vec![
+        (
+            vec![
+                (a, QueueAction::Pause),
+                (b, QueueAction::Pause),
+                (missing, QueueAction::Pause),
+                (c, QueueAction::Pause),
+            ],
+            Some(3),
+        ),
+        (
+            vec![
+                (a, QueueAction::Resume),
+                (missing, QueueAction::Resume),
+                (b, QueueAction::Resume),
+            ],
+            Some(2),
+        ),
+        (
+            vec![
+                (a, update(FieldUpdate::Set("tv".into()), "HIGH")),
+                (
+                    b,
+                    QueueAction::Update(JobUpdate {
+                        name: Some("other".into()),
+                        ..JobUpdate::default()
+                    }),
+                ),
+                (c, update(FieldUpdate::Set("nope".into()), "HIGH")),
+                (d, update(FieldUpdate::Clear, "HIGH")),
+                (missing, update(FieldUpdate::Unchanged, "HIGH")),
+            ],
+            None,
+        ),
+        (
+            vec![
+                (c, QueueAction::Move(QueueMoveTarget::Top)),
+                (a, QueueAction::Move(QueueMoveTarget::Offset(1))),
+                (e, QueueAction::Move(QueueMoveTarget::Bottom)),
+                (b, QueueAction::Move(QueueMoveTarget::Offset(-1))),
+            ],
+            None,
+        ),
+        // A move of a torrent not found ends the moves after it.
+        (
+            vec![
+                (d, QueueAction::Move(QueueMoveTarget::Top)),
+                (missing, QueueAction::Move(QueueMoveTarget::Top)),
+                (a, QueueAction::Move(QueueMoveTarget::Top)),
+            ],
+            None,
+        ),
+        (
+            vec![
+                (a, QueueAction::Cancel(CancellationOrigin::User)),
+                (missing, QueueAction::Cancel(CancellationOrigin::User)),
+                (b, QueueAction::Cancel(CancellationOrigin::UserKeepingFiles)),
+            ],
+            None,
+        ),
+    ];
+    let class = batched.service.class();
+    for (actions, singles_published) in steps {
+        let before = (batched_queue.job_revision(), single_queue.job_revision());
+        let together: Vec<(JobId, String)> = class
+            .act(actions.clone())
+            .await
+            .into_iter()
+            .map(|(job_id, result)| (job_id, format!("{result:?}")))
+            .collect();
+        let mut alone = BTreeMap::new();
+        let mut moves_failed = false;
+        for (job_id, action) in actions {
+            let moving = matches!(action, QueueAction::Move(_));
+            if moving && moves_failed {
+                continue;
+            }
+            let result = single
+                .service
+                .act(job_id, action)
+                .await
+                .map_err(super::super::queue::scheduler_error);
+            moves_failed |= moving && result.is_err();
+            alone.insert(job_id, format!("{result:?}"));
+        }
+        let alone: Vec<(JobId, String)> = alone.into_iter().collect();
+        assert_eq!(together, alone);
+        assert_eq!(rows(&batched, &ids), rows(&single, &ids));
+        if let Some(published) = singles_published {
+            assert_eq!(
+                (
+                    batched_queue.job_revision() - before.0,
+                    single_queue.job_revision() - before.1
+                ),
+                (1, published),
+                "{together:?}"
+            );
+        }
+    }
+    // What the steps leave, read apart from either path.
+    let left = rows(&batched, &ids);
+    assert_eq!(left[0], None);
+    assert_eq!(left[1], None);
+    assert_eq!(left[2].map(|row| row.0), Some(TorrentIntent::Paused));
+    assert_eq!(left[3].map(|row| (row.1, row.2)), Some((None, true)));
 }

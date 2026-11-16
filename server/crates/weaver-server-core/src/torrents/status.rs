@@ -476,7 +476,7 @@ impl Queued {
     /// The torrent as the holds are asked about it.
     pub fn target(&self) -> HoldTarget {
         HoldTarget {
-            owner: HoldOwner::Torrents,
+            owner: HoldOwner::Class(crate::torrents::CLASS),
             complete: self.seeding,
             runs_through_schedule: self.runs_through_schedule,
         }
@@ -1443,7 +1443,13 @@ mod tests {
         // hold over the torrents alone stops them as one over the queue does.
         assert_eq!(ids(hold(HoldScope::Downloads, HoldOwner::All)), [1]);
         assert!(ids(hold(HoldScope::Everything, HoldOwner::All)).is_empty());
-        assert!(ids(hold(HoldScope::Everything, HoldOwner::Torrents)).is_empty());
+        assert!(
+            ids(hold(
+                HoldScope::Everything,
+                HoldOwner::Class(crate::torrents::CLASS)
+            ))
+            .is_empty()
+        );
         assert_eq!(eta_seconds(1000, 300), Some(4));
         assert_eq!(eta_seconds(1000, 0), None);
     }
@@ -1511,7 +1517,7 @@ mod tests {
         let window = held(
             HoldOrigin::Scheduled,
             HoldScope::Everything,
-            HoldOwner::Torrents,
+            HoldOwner::Class(crate::torrents::CLASS),
         );
         assert_eq!(
             active(&[through, plain], 3, &window),
@@ -1530,7 +1536,7 @@ mod tests {
             held(
                 HoldOrigin::Manual,
                 HoldScope::Everything,
-                HoldOwner::Torrents,
+                HoldOwner::Class(crate::torrents::CLASS),
             ),
             held(HoldOrigin::SpeedTest, HoldScope::Everything, HoldOwner::All),
         ] {

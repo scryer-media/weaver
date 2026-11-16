@@ -6,7 +6,7 @@
 // metainfo, or else an NZB. Every intake asks this one question: the Add
 // dialog, the torrent client API and the watch folder.
 
-use crate::torrents::service::AddSource;
+use crate::jobs::model::Protocol;
 
 // The longest a magnet, infohash or URL given as text can be. Anything longer
 // is a document.
@@ -27,18 +27,22 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Whether these bytes go to the torrent client.
-    pub fn is_torrent(&self) -> bool {
-        matches!(self, Self::Metainfo | Self::Magnet(_))
+    /// The class of job these bytes belong to; `None` for a URL whose bytes
+    /// are not fetched yet.
+    pub const fn protocol(&self) -> Option<Protocol> {
+        Protocol::of_kind(self)
     }
+}
 
-    /// The torrent `bytes` hold, when this is one; the bytes back otherwise.
-    pub fn torrent(self, bytes: Vec<u8>) -> Result<AddSource, Vec<u8>> {
-        match self {
-            Self::Metainfo => Ok(AddSource::Metainfo(bytes)),
-            Self::Magnet(uri) => Ok(AddSource::Magnet(uri)),
-            Self::Nzb | Self::Url(_) => Err(bytes),
-        }
+/// The class of job a link's declared media type says it fetches, before
+/// its bytes are read: a torrent file's type is a metainfo's class. `None`
+/// for any other type, whose bytes say what they are once fetched.
+pub fn declared_protocol(media_type: &str) -> Option<Protocol> {
+    let essence = media_type.split(';').next().unwrap_or_default().trim();
+    if essence.eq_ignore_ascii_case("application/x-bittorrent") {
+        Kind::Metainfo.protocol()
+    } else {
+        None
     }
 }
 
@@ -134,10 +138,10 @@ mod tests {
             classify(b"d8:announce3:url4:infod4:name1:aee"),
             Kind::Metainfo
         );
-        assert!(matches!(
-            Kind::Metainfo.torrent(b"d4:infodee".to_vec()),
-            Ok(AddSource::Metainfo(bytes)) if bytes == b"d4:infodee"
-        ));
+        assert_eq!(
+            Kind::Metainfo.protocol(),
+            Some(crate::jobs::model::Protocol::Torrent)
+        );
     }
 
     #[test]
@@ -159,9 +163,14 @@ mod tests {
 
     #[test]
     fn only_a_torrent_leaves_its_bytes() {
-        assert!(matches!(
-            Kind::Nzb.torrent(b"<nzb/>".to_vec()),
-            Err(bytes) if bytes == b"<nzb/>"
-        ));
+        // Each kind names its class; a URL names none until it is fetched.
+        use crate::jobs::model::Protocol;
+        assert_eq!(Kind::Nzb.protocol(), Some(Protocol::Nzb));
+        assert_eq!(
+            Kind::Magnet("magnet:?xt=urn:btih:a".into()).protocol(),
+            Some(Protocol::Torrent)
+        );
+        let url = reqwest::Url::parse("https://indexer.invalid/a").unwrap();
+        assert_eq!(Kind::Url(url).protocol(), None);
     }
 }

@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 
+use crate::jobs::class::{ByProtocol, OwnedRows, PIPELINE};
 use crate::jobs::handle::{CancellationOrigin, JobInfo};
-use crate::jobs::{JobId, JobUpdate};
+use crate::jobs::{JobId, JobUpdate, Protocol};
 
 mod admission;
 mod counters;
@@ -87,14 +88,10 @@ pub struct QueueInner {
     // Every change to a row goes through `RowMut` (`job_mut`, `row_mut_at`),
     // never `iter_mut`, so the count of jobs with work waiting stays right.
     pub jobs: Vec<JobRow>,
-    // The jobs another owner publishes beside the pipeline's, in its order.
-    // Changed only through `replace_torrents`, `insert_torrent`,
-    // `set_torrent` and `remove_torrent`, which keep `torrent_positions` in
-    // step.
-    torrents: Vec<JobInfo>,
-    // Each of `torrents`' position, so asking whose a job is, or reading
-    // one, costs no walk of them.
-    torrent_positions: HashMap<JobId, usize>,
+    // The jobs each other class publishes beside the pipeline's, in that
+    // class's order, each with its position, so asking whose a job is, or
+    // reading one, costs one probe per class and no walk.
+    owned: ByProtocol<OwnedRows>,
     // Each row's position in `jobs`, so a lookup by id is one probe.
     job_positions: HashMap<JobId, usize>,
     // The rows in a phase, the only ones the metrics tick samples.
@@ -552,63 +549,56 @@ impl QueueInner {
         self.reindex_jobs();
     }
 
-    /// The jobs another owner publishes beside the pipeline's, in its
+    /// The jobs `protocol`'s class publishes beside the pipeline's, in its
     /// order.
-    pub fn torrents(&self) -> &[JobInfo] {
-        &self.torrents
+    pub fn owned(&self, protocol: Protocol) -> &[JobInfo] {
+        self.owned[protocol].rows()
     }
 
-    /// Replaces the other owner's jobs whole, and the position of each.
-    pub(crate) fn replace_torrents(&mut self, torrents: Vec<JobInfo>) {
-        self.torrents = torrents;
-        self.torrent_positions = self
-            .torrents
+    /// The rows `protocol`'s class publishes, to change through their own
+    /// methods.
+    pub(crate) fn owned_mut(&mut self, protocol: Protocol) -> &mut OwnedRows {
+        &mut self.owned[protocol]
+    }
+
+    /// The job `job_id` another class published, if it is one: one probe per
+    /// class.
+    pub fn owned_job(&self, job_id: JobId) -> Option<&JobInfo> {
+        self.owned.iter().find_map(|(_, owned)| owned.get(job_id))
+    }
+
+    /// The class that answers for `job_id`: the one that published it, or
+    /// else the pipeline. One probe per class.
+    pub fn class_of(&self, job_id: JobId) -> Protocol {
+        self.owned
             .iter()
-            .enumerate()
-            .map(|(position, job)| (job.job_id, position))
-            .collect();
+            .find(|(_, owned)| owned.position(job_id).is_some())
+            .map_or(PIPELINE, |(protocol, _)| protocol)
     }
 
-    /// Puts `job`, new among the other owner's, at its place in their
-    /// order, by when it was added; only the positions after it move.
-    pub(crate) fn insert_torrent(&mut self, job: JobInfo) {
-        let key = (job.created_at_epoch_ms, job.job_id);
-        let at = self
-            .torrents
-            .partition_point(|was| (was.created_at_epoch_ms, was.job_id) <= key);
-        self.torrent_positions.insert(job.job_id, at);
-        self.torrents.insert(at, job);
-        for (position, later) in self.torrents.iter().enumerate().skip(at + 1) {
-            self.torrent_positions.insert(later.job_id, position);
-        }
-    }
-
-    /// Puts `job` in place of the other owner's job at `at`, which has its
-    /// id.
-    pub(crate) fn set_torrent(&mut self, at: usize, job: JobInfo) {
-        debug_assert_eq!(self.torrents[at].job_id, job.job_id);
-        self.torrents[at] = job;
-    }
-
-    /// Takes the other owner's job `job_id` out, if it is one; only the
-    /// positions after it move.
-    pub(crate) fn remove_torrent(&mut self, job_id: JobId) -> Option<JobInfo> {
-        let at = self.torrent_positions.remove(&job_id)?;
-        let job = self.torrents.remove(at);
-        for (position, later) in self.torrents.iter().enumerate().skip(at) {
-            self.torrent_positions.insert(later.job_id, position);
-        }
-        Some(job)
-    }
-
-    /// Where `job_id` sits among the other owner's `torrents`, if it is one.
-    pub(crate) fn torrent_position(&self, job_id: JobId) -> Option<usize> {
-        self.torrent_positions.get(&job_id).copied()
-    }
-
-    /// The other owner's job `job_id`, if it is one: one probe.
-    pub fn torrent(&self, job_id: JobId) -> Option<&JobInfo> {
-        self.torrent_position(job_id).map(|at| &self.torrents[at])
+    /// Every class's published jobs in one order, by when each was added,
+    /// each class's own order kept; a tie goes to the class first in the
+    /// protocol table. Each class's place in its rows is given with the row.
+    pub fn owned_rows(&self) -> impl Iterator<Item = (Protocol, usize, &JobInfo)> {
+        let mut next: ByProtocol<usize> = ByProtocol::default();
+        std::iter::from_fn(move || {
+            let (protocol, at, job) = self
+                .owned
+                .iter()
+                .filter_map(|(protocol, owned)| {
+                    let at = next[protocol];
+                    owned.rows().get(at).map(|job| (protocol, at, job))
+                })
+                .reduce(|first, other| {
+                    if other.2.created_at_epoch_ms < first.2.created_at_epoch_ms {
+                        other
+                    } else {
+                        first
+                    }
+                })?;
+            next[protocol] += 1;
+            Some((protocol, at, job))
+        })
     }
 
     // Rebuilds the position index after `jobs` was replaced or reordered.

@@ -130,7 +130,7 @@ fn first_matching_rule_wins() {
         categories: vec!["tv".to_string()],
         download_url: Some("https://example.com/download.nzb".to_string()),
         display_url: None,
-        declared_torrent: false,
+        declared: None,
     };
     let rules = compile_rules(vec![
         RssRuleRow {

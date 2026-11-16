@@ -1017,10 +1017,19 @@ fn sample_schedules() -> weaver_server_core::bandwidth::schedule_metrics::Schedu
         actions: ActionKind::ALL
             .into_iter()
             .flat_map(|action| {
-                action.tracks().iter().flat_map(move |track| {
-                    ActionOutcome::ALL
-                        .into_iter()
-                        .map(move |outcome| (action, *track, outcome, 1))
+                let classes: Vec<_> = if action.over_class() {
+                    weaver_server_core::jobs::HeldClass::all()
+                        .map(Some)
+                        .collect()
+                } else {
+                    vec![None]
+                };
+                classes.into_iter().flat_map(move |class| {
+                    action.tracks().iter().flat_map(move |track| {
+                        ActionOutcome::ALL
+                            .into_iter()
+                            .map(move |outcome| (action, class, *track, outcome, 1))
+                    })
                 })
             })
             .collect(),

@@ -557,11 +557,11 @@ impl NetworkRuntime {
     /// trickle, and past the hard cap move nothing; downloads move nothing
     /// once the download quota is used. The global limits are not in it.
     /// An egress with no policy adds no limit.
-    pub fn torrent_egress_rates(&self, egress_id: u32) -> crate::bandwidth::TorrentRates {
+    pub fn torrent_egress_rates(&self, egress_id: u32) -> crate::bandwidth::ClassRates {
         let Some(policy) = &self.quota_policy else {
-            return crate::bandwidth::TorrentRates::default();
+            return crate::bandwidth::ClassRates::default();
         };
-        crate::bandwidth::TorrentRates {
+        crate::bandwidth::ClassRates {
             download: policy.egress_rate(
                 egress_id,
                 crate::bandwidth::Direction::Download,

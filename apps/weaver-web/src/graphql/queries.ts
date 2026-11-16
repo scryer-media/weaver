@@ -1049,7 +1049,7 @@ export const LIVE_METRICS_QUERY = gql`
     }
     globalState: globalQueueState {
       isPaused
-      torrentsPaused
+      pausedClasses
       speedLimitBytesPerSec
       resumeAtEpochMs
       downloadBlock {
@@ -1363,15 +1363,15 @@ export const RESUME_ALL_MUTATION = gql`
   }
 `;
 
-export const PAUSE_TORRENTS_MUTATION = gql`
-  mutation PauseTorrents {
-    pauseTorrents
+export const PAUSE_CLASS_MUTATION = gql`
+  mutation PauseClass($class: Protocol!) {
+    pauseClass(class: $class)
   }
 `;
 
-export const RESUME_TORRENTS_MUTATION = gql`
-  mutation ResumeTorrents {
-    resumeTorrents
+export const RESUME_CLASS_MUTATION = gql`
+  mutation ResumeClass($class: Protocol!) {
+    resumeClass(class: $class)
   }
 `;
 
@@ -1423,7 +1423,7 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       }
       globalState {
         isPaused
-        torrentsPaused
+        pausedClasses
         speedLimitBytesPerSec
         resumeAtEpochMs
         downloadBlock {
@@ -2597,6 +2597,7 @@ export const SCHEDULES_QUERY = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -2623,6 +2624,7 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -2649,6 +2651,7 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -2675,6 +2678,7 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -2701,6 +2705,7 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute

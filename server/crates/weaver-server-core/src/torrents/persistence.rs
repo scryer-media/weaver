@@ -168,6 +168,43 @@ impl Database {
         })
     }
 
+    // The removal marks of a batch of torrents (`mark_torrent_retiring`),
+    // in one transaction: one statement per row.
+    pub(crate) fn mark_torrents_retiring(&self, marks: &[(JobId, bool)]) -> Result<(), StateError> {
+        #[cfg(test)]
+        match MARK_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return Err(StateError::OutOfSpace("database or disk is full".into())),
+            2 => return Err(StateError::Database("the mark was refused".into())),
+            _ => {}
+        }
+        if marks.is_empty() {
+            return Ok(());
+        }
+        let rows = marks
+            .iter()
+            .map(|&(job_id, delete_files)| {
+                Ok(vec![
+                    SqlArg::Text(RetiringMark::of(delete_files).as_str().to_owned()),
+                    SqlArg::I64(stored(job_id.0)?),
+                ])
+            })
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "mark_torrents_retiring", |tx| {
+                let rows = rows.clone();
+                Box::pin(async move {
+                    for args in &rows {
+                        tx.execute("UPDATE torrents SET retiring = {} WHERE job_id = {}", args)
+                            .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
     // Whether a removal has marked the torrent of `job_id` (`retiring`): an
     // add of the same torrent is refused as still being removed, not as a
     // duplicate. One read by key, only when an add finds the torrent.
@@ -1850,6 +1887,52 @@ impl Database {
                             args,
                         )
                         .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // The categories and the forced flags of a batch of torrents, each its
+    // one column and no other, in one transaction: one statement per row.
+    pub(crate) fn set_torrent_categories_and_forced(
+        &self,
+        categories: &[(JobId, Option<u32>)],
+        forced: &[(JobId, bool)],
+    ) -> Result<(), StateError> {
+        if categories.is_empty() && forced.is_empty() {
+            return Ok(());
+        }
+        let categories = categories
+            .iter()
+            .map(|&(job_id, category_id)| {
+                Ok(vec![
+                    SqlArg::OptI64(category_id.map(i64::from)),
+                    SqlArg::I64(stored(job_id.0)?),
+                ])
+            })
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let forced = forced
+            .iter()
+            .map(|&(job_id, forced)| Ok(vec![SqlArg::Bool(forced), SqlArg::I64(stored(job_id.0)?)]))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_categories_and_forced", |tx| {
+                let (categories, forced) = (categories.clone(), forced.clone());
+                Box::pin(async move {
+                    for args in &categories {
+                        tx.execute(
+                            "UPDATE torrents SET category_id = {} WHERE job_id = {}",
+                            args,
+                        )
+                        .await?;
+                    }
+                    for args in &forced {
+                        tx.execute("UPDATE torrents SET forced = {} WHERE job_id = {}", args)
+                            .await?;
                     }
                     Ok(())
                 })

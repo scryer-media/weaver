@@ -1819,9 +1819,10 @@ async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
     rig.add_file(&metainfo("two.mkv", 4000, false), &[]).await;
     let queue = rig.context.inner.handle.state().clone();
     let held = || {
-        queue
-            .holds()
-            .held_by(HoldOrigin::Manual, HoldOwner::Torrents)
+        queue.holds().held_by(
+            HoldOrigin::Manual,
+            HoldOwner::Class(weaver_server_core::torrents::CLASS),
+        )
     };
     let named = |torrents: &[Value], name: &str, field: &str| {
         torrents
