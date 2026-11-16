@@ -453,8 +453,7 @@ impl SocketSlot {
         let entry = state.entries.get_mut(&self.id).expect("live socket slot");
         entry.phase = phase;
         entry.recall = recall;
-        let recalled = if entry.retiring.load(Ordering::Acquire)
-            && phase == SocketPhase::OwnedIdle
+        let recalled = if entry.retiring.load(Ordering::Acquire) && phase == SocketPhase::OwnedIdle
         {
             entry.phase = SocketPhase::Closing;
             entry.recall.take()

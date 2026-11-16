@@ -1376,8 +1376,7 @@ impl BlockingNntpConnection {
         };
 
         // The route's setup evidence is whether the server answered over this
-        // connection, as on the asynchronous path: a greeting that arrived is
-        // a reached server, whatever the session makes of it afterwards. A
+        // connection: a greeting that arrived is a reached server, whatever the session makes of it afterwards. A
         // session that the server drops after greeting it is not an address,
         // proxy, or pool member that fails to answer.
         let greeting = match conn.read_response() {
@@ -1497,8 +1496,8 @@ impl BlockingNntpConnection {
         self.capabilities_round_trip
     }
 
-    // Name of the negotiated TLS cipher suite, as the backend reports it, the
-    // same as the asynchronous transport's; `None` on plaintext.
+    // Name of the negotiated TLS cipher suite, as the backend reports it;
+    // `None` on plaintext.
     pub fn negotiated_cipher_suite(&self) -> Option<String> {
         match &self.transport {
             BlockingTransport::Plain(_) => None,

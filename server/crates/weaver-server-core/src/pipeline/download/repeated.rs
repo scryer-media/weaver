@@ -795,7 +795,10 @@ mod tests {
         };
         // The second reference found the claim held and waits on it.
         cache.wait_for_waiters(1);
-        assert!(!waiting.is_finished(), "a waiter is answered only by the settle");
+        assert!(
+            !waiting.is_finished(),
+            "a waiter is answered only by the settle"
+        );
         let bytes = [42u8; 1024];
         let mut data = Ok(DownloadPayload::Decoded(decoded(work.segment_id, &bytes)));
         first.settle(&mut data, Some(0), 1);
@@ -869,12 +872,7 @@ mod tests {
                 ..
             }))
         ));
-        let reply = replay(cache.ask(
-            &reference(&work, 1),
-            0,
-            weaver_nntp::ServerSet::EMPTY,
-            7,
-        ));
+        let reply = replay(cache.ask(&reference(&work, 1), 0, weaver_nntp::ServerSet::EMPTY, 7));
         assert!(matches!(
             reply.data,
             Err(DownloadError::Fetch(DownloadFailure {
@@ -889,12 +887,7 @@ mod tests {
         );
         // Another server, another ledger or another generation is another
         // request: it fetches, and its claim replaces the evidence.
-        drop(claim(cache.ask(
-            &work,
-            1,
-            weaver_nntp::ServerSet::EMPTY,
-            7,
-        )));
+        drop(claim(cache.ask(&work, 1, weaver_nntp::ServerSet::EMPTY, 7)));
         let fetch = claim(cache.ask(&work, 0, weaver_nntp::ServerSet::EMPTY, 7));
         let mut data = Err(DownloadError::from_nntp(
             weaver_nntp::NntpError::ArticleNotFound,
@@ -911,12 +904,7 @@ mod tests {
             weaver_nntp::NntpError::ArticleNotFound,
         ));
         fetch.settle(&mut data, Some(0), 1);
-        drop(claim(cache.ask(
-            &work,
-            0,
-            weaver_nntp::ServerSet::EMPTY,
-            8,
-        )));
+        drop(claim(cache.ask(&work, 0, weaver_nntp::ServerSet::EMPTY, 8)));
     }
 
     fn entry_is_empty(cache: &RepeatedArticles, work: &DownloadWork) -> bool {
@@ -980,14 +968,13 @@ mod tests {
             // its body serves the rest.
             let second = reference(&work, 1);
             let fetch = claim(cache.ask(&second, 0, weaver_nntp::ServerSet::EMPTY, 7));
-            let mut data = Ok(DownloadPayload::Decoded(decoded(second.segment_id, b"body")));
+            let mut data = Ok(DownloadPayload::Decoded(decoded(
+                second.segment_id,
+                b"body",
+            )));
             fetch.settle(&mut data, Some(0), 1);
-            let reply = replay(cache.ask(
-                &reference(&work, 2),
-                0,
-                weaver_nntp::ServerSet::EMPTY,
-                7,
-            ));
+            let reply =
+                replay(cache.ask(&reference(&work, 2), 0, weaver_nntp::ServerSet::EMPTY, 7));
             assert!(reply.data.is_ok(), "{fault:?}");
         }
         // A 412 the work cannot answer by selecting a group is the server's
@@ -999,9 +986,11 @@ mod tests {
         refusal.settle_group_refusal(false, true);
         let mut data = Err(DownloadError::Fetch(refusal));
         fetch.settle(&mut data, Some(0), 1);
-        assert!(replay(cache.ask(&reference(&work, 1), 0, weaver_nntp::ServerSet::EMPTY, 7))
-            .data
-            .is_err());
+        assert!(
+            replay(cache.ask(&reference(&work, 1), 0, weaver_nntp::ServerSet::EMPTY, 7))
+                .data
+                .is_err()
+        );
     }
 
     // A refused login is the account's answer on that server: it is kept,

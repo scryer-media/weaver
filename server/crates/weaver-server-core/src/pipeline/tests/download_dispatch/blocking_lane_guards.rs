@@ -88,11 +88,7 @@ async fn pipeline_on_fixture(
     ));
     pipeline.tuner.set_connection_limit(1);
     pipeline.owned_download_lane_pool.resize(1);
-    let spec = segmented_job_spec(
-        "lane-guards",
-        "payload.bin",
-        &vec![512; segments as usize],
-    );
+    let spec = segmented_job_spec("lane-guards", "payload.bin", &vec![512; segments as usize]);
     pipeline
         .add_job(
             job_id,
@@ -197,7 +193,11 @@ async fn obsolete_work_on_a_lane_leaves_no_attempt_and_no_health_mark() {
     }
 
     let commands = close_lane_and_collect(&pipeline, &mut observed, Vec::new()).await;
-    assert_eq!(bodies(&commands), 0, "no article was asked for: {commands:?}");
+    assert_eq!(
+        bodies(&commands),
+        0,
+        "no article was asked for: {commands:?}"
+    );
     {
         let health = pipeline.nntp.pool().health().lock().await;
         assert_eq!(health.server(0).failure_count, 0);
@@ -238,7 +238,9 @@ async fn a_lane_carrying_the_recovery_probe_sends_one_article_until_the_probe_is
                 .map(|work| work.segment_id.segment_number)
                 .collect();
             assert_eq!(returned, vec![1, 2], "every article but the probe's");
-            ack.expect("the hand-back is acknowledged").send(()).unwrap();
+            ack.expect("the hand-back is acknowledged")
+                .send(())
+                .unwrap();
         }
         OwnedDownloadLaneEvent::LeaseObsolete { .. } => {
             panic!("the probe's own lane must carry its lease")
@@ -263,8 +265,14 @@ async fn a_lane_carrying_the_recovery_probe_sends_one_article_until_the_probe_is
             Seen::Closed => panic!("the fixture closed before any BODY"),
         }
     }
-    assert!(commands.last().unwrap().contains("guard-0@"), "{commands:?}");
-    assert!(pipeline.nntp.pool().requires_recovery(0), "the probe is out");
+    assert!(
+        commands.last().unwrap().contains("guard-0@"),
+        "{commands:?}"
+    );
+    assert!(
+        pipeline.nntp.pool().requires_recovery(0),
+        "the probe is out"
+    );
     answer.send(true).unwrap();
 
     // The answer comes back, the lane asks for more and is told there is
@@ -298,6 +306,10 @@ async fn a_lane_carrying_the_recovery_probe_sends_one_article_until_the_probe_is
     );
 
     let commands = close_lane_and_collect(&pipeline, &mut observed, commands).await;
-    assert_eq!(bodies(&commands), 1, "one article while the probe was out: {commands:?}");
+    assert_eq!(
+        bodies(&commands),
+        1,
+        "one article while the probe was out: {commands:?}"
+    );
     server.await.unwrap();
 }

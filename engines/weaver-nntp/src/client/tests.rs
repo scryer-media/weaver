@@ -290,7 +290,12 @@ fn infrastructure_admission_failures_do_not_poison_server_health() {
         );
     }
     assert_eq!(
-        client.pool().health().blocking_lock().server(0).failure_count,
+        client
+            .pool()
+            .health()
+            .blocking_lock()
+            .server(0)
+            .failure_count,
         0
     );
 
@@ -301,7 +306,12 @@ fn infrastructure_admission_failures_do_not_poison_server_health() {
         ticket,
     );
     assert_eq!(
-        client.pool().health().blocking_lock().server(0).failure_count,
+        client
+            .pool()
+            .health()
+            .blocking_lock()
+            .server(0)
+            .failure_count,
         1
     );
 }
@@ -555,7 +565,15 @@ fn blocking_provider_rejection_parks_fresh_lanes_for_that_server_only() {
         assert_eq!(bytes, b"A");
     }
     assert_eq!(accepted.load(Ordering::SeqCst), accepted_after_rejection);
-    assert_eq!(client.pool().health().blocking_lock().server(0).failure_count, 0);
+    assert_eq!(
+        client
+            .pool()
+            .health()
+            .blocking_lock()
+            .server(0)
+            .failure_count,
+        0
+    );
 
     // A peer server that never rejected anything is unaffected.
     assert!(!client.pool().is_over_limit(ServerId(1)));
@@ -1214,10 +1232,12 @@ async fn blocking_soft_timeout_on_the_primary_does_not_unlock_a_healthy_lower_gr
         assert_eq!(order.first(), Some(&ServerId(0)), "reauth={reauth}");
         assert!(
             matches!(
-                client
-                    .pool()
-                    .provider_policy()
-                    .eligibility(1, ServerSet::EMPTY, ServerSet::EMPTY, 1),
+                client.pool().provider_policy().eligibility(
+                    1,
+                    ServerSet::EMPTY,
+                    ServerSet::EMPTY,
+                    1
+                ),
                 crate::provider_policy::ArticleEligibility::HigherPriority(_)
             ),
             "reauth={reauth}"
@@ -1871,4 +1891,3 @@ fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
     assert!(client.server_quota_rejection(ServerId(0), 41).is_some());
     assert!(limited.snapshot().quota_blocked);
 }
-

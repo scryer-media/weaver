@@ -60,8 +60,7 @@ pub use address_plan::{
 };
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{
-    BodyLaneMode, BodyServerSelection, DecodedBody,
-    DecodedBodyError, DecodedBodyTrace, NntpClient,
+    BodyLaneMode, BodyServerSelection, DecodedBody, DecodedBodyError, DecodedBodyTrace, NntpClient,
 };
 pub use codec::StreamChunk;
 pub use connection::{PipeliningCapability, ServerConfig};

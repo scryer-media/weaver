@@ -563,9 +563,9 @@ impl OwnedDownloadLanePool {
         stopped
     }
 
-    // The Err variant hands the lease back to the caller for the async
-    // fallback path; it only occurs when the pool is stopped, so the size
-    // of the returned lease is irrelevant.
+    // The Err variant hands the lease back to the caller; it only occurs
+    // when the pool is stopped, so the size of the returned lease is
+    // irrelevant.
     #[allow(clippy::result_large_err)]
     pub(crate) fn submit(
         &self,
@@ -1825,7 +1825,15 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     work_context.runtime_generation,
                     lane.ring_outstanding() == 0,
                     // A lookup may wait out another lane's fetch.
-                    || issue_is_current(&state, &nntp, HeldConnection::of(lane), work, work_context),
+                    || {
+                        issue_is_current(
+                            &state,
+                            &nntp,
+                            HeldConnection::of(lane),
+                            work,
+                            work_context,
+                        )
+                    },
                 );
                 match lookup {
                     Some(super::repeated::SharedLookup::Replay(reply)) => {

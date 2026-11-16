@@ -821,9 +821,8 @@ impl Pipeline {
                     return;
                 }
                 // Capacity admission and health-mutex contention are both
-                // "ask again shortly": the work goes back to the scheduler on
-                // the owned fast path instead of being demoted to an async
-                // lane on what is not a verdict about the servers at all.
+                // "ask again shortly": the work goes back to the scheduler,
+                // since neither is a verdict about the servers at all.
                 self.note_owned_lane_acquire_failure(&lease, &error);
                 if error.should_requeue_owned_work() {
                     let DownloadBatchLease {
@@ -1022,7 +1021,7 @@ impl Pipeline {
     // Counts one owned-lane acquire failure by kind, and warns about it at
     // most once a minute per job.
     //
-    // Both arms of the caller — requeue and async fallback — keep the download
+    // Both arms of the caller, requeue and failing the lease, keep the download
     // running, so nothing above debug said that a lane had failed to open. A
     // job whose owned lanes all fail this way still finishes, on a fraction of
     // the connections it was given, with no line in the log to explain it.

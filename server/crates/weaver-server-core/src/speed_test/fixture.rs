@@ -199,9 +199,7 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
             "MODE" => stream.write_all(b"200 reader\r\n").await?,
             "AUTHINFO" => match words.next().map(str::to_ascii_uppercase).as_deref() {
                 Some("USER") => stream.write_all(b"381 password\r\n").await?,
-                _ if shared.behaviour.refuse_login => {
-                    stream.write_all(b"481 rejected\r\n").await?
-                }
+                _ if shared.behaviour.refuse_login => stream.write_all(b"481 rejected\r\n").await?,
                 _ => stream.write_all(b"281 welcome\r\n").await?,
             },
             "GROUP" => {

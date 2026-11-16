@@ -164,7 +164,11 @@ async fn unexpected_nntp_eof_fails_only_that_connection_and_retries() {
         let mut truncated = BlockingNntpConnection::connect(&cfg).unwrap();
         assert!(truncated.stream_yenc_article("fixture").is_err());
         let mut retry = BlockingNntpConnection::connect(&cfg).unwrap();
-        let body = retry.stream_yenc_article("fixture").unwrap().chunks.concat();
+        let body = retry
+            .stream_yenc_article("fixture")
+            .unwrap()
+            .chunks
+            .concat();
         retry.quit().unwrap();
         body
     })
@@ -182,23 +186,21 @@ async fn blocking_nntp_reports_unexpected_eof_but_not_quit_or_auth_rejection() {
             cfg.username = Some("fixture".into());
             cfg.password = Some("fixture".into());
         }
-        tokio::task::spawn_blocking(move || {
-            match BlockingNntpConnection::connect(&cfg) {
-                Ok(mut connection) => {
-                    if matches!(mode, Mode::NoResponse) {
-                        assert!(
-                            connection
-                                .send_command(&weaver_nntp::commands::Command::Stat(
-                                    weaver_nntp::ArticleId::MessageId("fixture".into()),
-                                ))
-                                .is_err()
-                        );
-                    } else {
-                        connection.quit().unwrap();
-                    }
+        tokio::task::spawn_blocking(move || match BlockingNntpConnection::connect(&cfg) {
+            Ok(mut connection) => {
+                if matches!(mode, Mode::NoResponse) {
+                    assert!(
+                        connection
+                            .send_command(&weaver_nntp::commands::Command::Stat(
+                                weaver_nntp::ArticleId::MessageId("fixture".into()),
+                            ))
+                            .is_err()
+                    );
+                } else {
+                    connection.quit().unwrap();
                 }
-                Err(error) => assert!(matches!(mode, Mode::AuthRejected), "{error}"),
             }
+            Err(error) => assert!(matches!(mode, Mode::AuthRejected), "{error}"),
         })
         .await
         .unwrap();

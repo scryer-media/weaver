@@ -17,8 +17,7 @@ use crate::error::NntpError;
 use crate::fused_yenc::FusedArticleBody;
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{
-    BodyServerAvailability, FreshConnectAdmission, NntpPool, PoolConfig, ServerId,
-    ServerPoolConfig,
+    BodyServerAvailability, FreshConnectAdmission, NntpPool, PoolConfig, ServerId, ServerPoolConfig,
 };
 use crate::tls::TransportReadStats;
 use crate::transfer::QuotaRejection;
@@ -206,8 +205,7 @@ enum QuotaCheck {
 pub enum BlockingBodyLaneCandidacy {
     // At least one eligible server can carry an owned blocking lane.
     Candidate,
-    // No eligible server can. This is the only answer that justifies the
-    // asynchronous path.
+    // No eligible server can.
     None,
     // The shared server health state was busy, so the candidates could not be
     // ranked. Says nothing about the servers: ask again in a moment, on the
@@ -407,10 +405,7 @@ impl NntpClient {
     fn around(pool: NntpPool, soft_timeout: Duration) -> Self {
         let pool = Arc::new(pool);
         pool.start_route_probes();
-        NntpClient {
-            pool,
-            soft_timeout,
-        }
+        NntpClient { pool, soft_timeout }
     }
 
     // Create a client wrapping an existing pool.
@@ -809,9 +804,7 @@ impl NntpClient {
     // [`BlockingBodyLaneCandidacy::Contended`] is the reason this is not a
     // `bool`: the shared health state was busy for the length of the spin, so
     // nothing is known about the servers. Treating that as "no candidate"
-    // sends the work to the asynchronous lanes, which then queue for the very
-    // connection permits the idle owned lanes are holding and wait out the
-    // whole acquire deadline for it.
+    // fails work the servers were never asked about.
     // The servers a new owned lane would try, in the order the pool ranks
     // them right now. A question, not a dispatch: it reserves nothing and
     // clears no quota latch. `None` while the health state is contended.
