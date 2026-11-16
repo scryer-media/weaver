@@ -13,12 +13,13 @@ use std::sync::Arc;
 use crate::JobId;
 use crate::jobs::model::JobStatus;
 use crate::operations::StorageCapacity;
+use crate::operations::VolumeBuffers;
 use crate::operations::disk::volume::{Reservation, Volume};
 use crate::operations::disk::writer::{
     Barrier, DiskOwner, Failure, Owner, Prepaid, Submitter, VolumeWriters,
 };
 use crate::pipeline::Pipeline;
-use crate::pipeline::download::volume_pace::{VolumeBuffers, VolumeIntake, intake_of};
+use crate::pipeline::download::volume_pace::{VolumeIntake, intake_of};
 use crate::pipeline::graph::job::GraphError;
 use crate::pipeline::graph::job::GraphJob;
 use crate::pipeline::graph::leaf::LeafError;
@@ -43,11 +44,6 @@ impl PipelineWriters {
     ) -> Self {
         let owner = writers.owner(Arc::new(PipelineOwner { mail, rooms }));
         Self { writers, owner }
-    }
-
-    // The writers the process shares, for another owner to write through.
-    pub(crate) fn writers(&self) -> &Arc<VolumeWriters> {
-        &self.writers
     }
 
     // The way to write to `volume` for the job `key`.

@@ -248,10 +248,14 @@ pub struct JobEnv {
 
 impl JobEnv {
     /// The pipeline's own budget: its holds, slots, extraction limits and
-    /// the complete root's free space.
-    pub fn of_pipeline(pipeline: &crate::pipeline::Pipeline) -> Self {
+    /// the complete root's free space; written through the volumes' writers
+    /// the process shares, `writers`, on the limits `buffers` sizes.
+    pub fn of_pipeline(
+        pipeline: &crate::pipeline::Pipeline,
+        writers: Arc<crate::operations::VolumeWriters>,
+        buffers: Arc<crate::operations::VolumeBuffers>,
+    ) -> Self {
         let budget = pipeline.graph_budget();
-        let (writers, buffers) = pipeline.volume_writing();
         let capacity = pipeline.storage_capacity();
         Self {
             accountant: budget.accountant,
@@ -334,12 +338,17 @@ const ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 impl TorrentService {
     /// The server's torrent client, started: sessions on the proxy
     /// runtime's routes while the settings turn torrents on, jobs on the
-    /// pipeline's budget, and its torrents in the pipeline's queue.
+    /// pipeline's budget, and its torrents in the pipeline's queue. Its
+    /// pieces are written by the volumes' writers the process shares,
+    /// `writers`, on the limits `buffers` sizes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn for_server(
         config: &Config,
         db: Database,
         proxies: &Arc<crate::proxies::ProxyRuntime>,
         pipeline: &crate::pipeline::Pipeline,
+        writers: Arc<crate::operations::VolumeWriters>,
+        buffers: Arc<crate::operations::VolumeBuffers>,
         queue: SchedulerHandle,
         crashed: crate::runtime::panic_trap::CrashMarks,
     ) -> Result<Self, String> {
@@ -349,7 +358,7 @@ impl TorrentService {
             db,
             sessions,
             TorrentSettings::of(config),
-            JobEnv::of_pipeline(pipeline),
+            JobEnv::of_pipeline(pipeline, writers, buffers),
             Arc::new(SystemClock),
         );
         service.wire_to(queue);

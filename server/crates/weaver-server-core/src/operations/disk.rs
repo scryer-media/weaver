@@ -17,6 +17,7 @@ use crate::runtime::system_profile::{FilesystemType, StorageClass};
 pub(crate) mod holes;
 mod storage_kind;
 pub(crate) mod volume;
+pub(crate) mod volume_buffers;
 pub(crate) mod volume_label;
 mod volume_probe;
 pub(crate) mod volume_rate;
@@ -27,6 +28,7 @@ pub(crate) mod writer;
 #[cfg(target_vendor = "apple")]
 pub(crate) use storage_kind::filesystem_name;
 pub(crate) use storage_kind::{StorageKind, storage_kind};
+pub use volume_buffers::VolumeBuffers;
 #[allow(unused_imports)]
 pub(crate) use volume_probe::{ProbeStore, probe_once};
 pub use writer::VolumeWriters;

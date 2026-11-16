@@ -28,11 +28,11 @@ use bytes::Bytes;
 use tokio::sync::Notify;
 
 use crate::operations::StorageCapacity;
+use crate::operations::VolumeBuffers;
 use crate::operations::disk::volume::{Reservation, Volume};
 use crate::operations::disk::writer::{
     Barrier, Create, DiskOwner, Failure, OpenSteps, Opened, Owner, Submitter, VolumeWriters,
 };
-use crate::pipeline::VolumeBuffers;
 
 // What a piece handed to be written came to, told once on whatever thread
 // it ended on. Dropped untold when the writes were given up.
@@ -669,7 +669,7 @@ impl Batch<'_> {
     // is dropped.
     pub(crate) fn then(&mut self, done: Done, land: impl FnOnce(Done) + Send + 'static) {
         let landing = Landing {
-            land: Some(Box::new(land)),
+            land: Some(land),
             done: Some(done),
             lost: Arc::clone(&self.generation.lost),
         };
@@ -684,14 +684,15 @@ impl Batch<'_> {
     }
 }
 
-// What follows a piece's writes, run on the writer after them.
-struct Landing {
-    land: Option<Box<dyn FnOnce(Done) + Send>>,
+// What follows a piece's writes, run on the writer after them. `land` is
+// held as it is: the step the writer runs is boxed once, with it inside.
+struct Landing<L: FnOnce(Done)> {
+    land: Option<L>,
     done: Option<Done>,
     lost: Arc<Lost>,
 }
 
-impl Landing {
+impl<L: FnOnce(Done)> Landing<L> {
     fn run(mut self) {
         if let (Some(land), Some(done)) = (self.land.take(), self.done.take()) {
             land(done);
@@ -699,7 +700,7 @@ impl Landing {
     }
 }
 
-impl Drop for Landing {
+impl<L: FnOnce(Done)> Drop for Landing<L> {
     // Dropped unrun: the writes before it failed or were given up.
     fn drop(&mut self) {
         if let Some(done) = self.done.take() {

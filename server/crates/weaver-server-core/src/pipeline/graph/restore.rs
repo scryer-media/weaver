@@ -129,7 +129,7 @@ pub(crate) struct RestoreSeat {
         Arc<super::disk::PipelineWriters>,
         Arc<crate::operations::StorageCapacity>,
         Arc<super::disk::VolumeProbes>,
-        Arc<crate::pipeline::download::volume_pace::VolumeBuffers>,
+        Arc<crate::operations::VolumeBuffers>,
     ),
 }
 
