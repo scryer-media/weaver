@@ -778,7 +778,9 @@ async fn a_naming_holds_validated_answers_apart_and_never_asks_the_host() {
 // HTTP/1.1 asks each family's chain in turn on a connection of the family's
 // own: the first connection's handshake says the server speaks HTTP/1.1,
 // and the other family's connection opens once the first is busy, so it
-// costs a dial and a handshake of its own, two connections per lookup.
+// costs a dial and a handshake of its own, two connections per lookup. A
+// query asked ahead waits there until a family waits on it, which costs the
+// cold lookup one round trip more than sending it ahead would.
 // DNS over TLS and HTTP/2 make one connection, so one TLS handshake, per
 // lookup.
 #[tokio::test(start_paused = true)]
@@ -791,7 +793,7 @@ async fn a_validated_lookup_takes_these_round_trips_on_each_wire() {
     let expected = [
         ("plain", [(7, 7, 14, 6), (2, 2, 4, 3)]),
         ("tls", [(7, 1, 5, 5), (2, 1, 3, 3)]),
-        ("https/1.1", [(7, 2, 11, 7), (2, 2, 6, 5)]),
+        ("https/1.1", [(7, 2, 11, 8), (2, 2, 6, 5)]),
         ("https/2", [(7, 1, 5, 5), (2, 1, 4, 3)]),
     ];
     for ((servers, wires, listed), (wire, lookups)) in every_wire(serving(&resolver, &[]))
