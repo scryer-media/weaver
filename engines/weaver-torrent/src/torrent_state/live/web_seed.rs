@@ -10,7 +10,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     num::IntErrorKind,
     sync::Arc,
     time::Duration,
@@ -88,22 +88,6 @@ const MAX_REDIRECTS: usize = 5;
 /// How often the torrent tries its web seeds (libtorrent
 /// `torrent::second_tick` calls `maybe_connect_web_seeds`).
 pub(crate) const WEB_SEED_TICK: Duration = Duration::from_secs(1);
-
-/// The peer table address of web seed `id`: in the IPv6 discard prefix
-/// (RFC 6666), at port 0, which no peer we may connect to has
-/// (`TorrentStateLive::may_connect_to`). Its own address, so a ban for bad
-/// data bans the one seed.
-fn handle_of(id: u32) -> PeerHandle {
-    #[allow(clippy::cast_possible_truncation)]
-    let ip = Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, (id >> 16) as u16, id as u16);
-    SocketAddr::new(IpAddr::V6(ip), 0)
-}
-
-/// Whether `handle` is a web seed's.
-pub(crate) fn is_web_seed(handle: PeerHandle) -> bool {
-    handle.port() == 0
-        && matches!(handle.ip(), IpAddr::V6(ip) if ip.segments()[..4] == [0x100, 0, 0, 0])
-}
 
 /// A torrent's web seeds, kept for its whole life (libtorrent
 /// `torrent::m_web_seeds`).
@@ -263,13 +247,13 @@ impl WebSeeds {
     /// seeds count, connected ones among them: those not disabled, not
     /// waiting to retry and with a piece to give, which `interesting` tells
     /// from what a seed lacks. Of those, a seed whose URL can never be
-    /// fetched is removed or disabled, as is one `banned` names (libtorrent
+    /// fetched is removed or disabled, as is one banned for bad data
+    /// ([`Self::ban`]) (libtorrent
     /// `torrent::maybe_connect_web_seeds`, `connect_to_url_seed`,
     /// `connect_web_seed`).
     pub fn due(
         &self,
         now: Instant,
-        banned: impl Fn(PeerHandle) -> bool,
         interesting: impl Fn(&Lacks) -> bool,
         allow_idna: bool,
     ) -> Vec<Due> {
@@ -288,9 +272,6 @@ impl WebSeeds {
             if entry.connection.is_some() {
                 at += 1;
                 continue;
-            }
-            if banned(handle_of(entry.id)) {
-                entry.banned = true;
             }
             // A seed's URL can carry a passkey: a log names only its
             // scheme, host and port.
@@ -350,7 +331,10 @@ impl WebSeeds {
         layout: &Layout,
     ) -> Option<BF> {
         let mut g = self.inner.lock();
-        let entry = g.seeds.iter_mut().find(|e| handle_of(e.id) == handle)?;
+        let entry = g
+            .seeds
+            .iter_mut()
+            .find(|e| PeerHandle::WebSeed(e.id) == handle)?;
         layout.failed(piece, &mut entry.lacks);
         debug!(
             url = redacted_tracker_url(&entry.seed.url),
@@ -358,6 +342,32 @@ impl WebSeeds {
             "web seed sent a bad piece"
         );
         Some(layout.bitfield(&entry.lacks))
+    }
+
+    /// Seed `handle` is banned for sending bad data: it is not listed and
+    /// not connected to again (libtorrent `peer_info.banned`, which
+    /// `torrent::maybe_connect_web_seeds` reads). Returns whether `handle` is
+    /// a seed's that was not banned before.
+    pub fn ban(&self, handle: PeerHandle) -> bool {
+        let mut g = self.inner.lock();
+        let Some(entry) = g
+            .seeds
+            .iter_mut()
+            .find(|e| PeerHandle::WebSeed(e.id) == handle)
+        else {
+            return false;
+        };
+        !std::mem::replace(&mut entry.banned, true)
+    }
+
+    /// Seed `handle` is banned for sending bad data.
+    #[cfg(test)]
+    pub fn is_banned(&self, handle: PeerHandle) -> bool {
+        self.inner
+            .lock()
+            .seeds
+            .iter()
+            .any(|e| e.banned && PeerHandle::WebSeed(e.id) == handle)
     }
 
     fn with_entry<R>(&self, id: u32, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
@@ -465,9 +475,9 @@ impl Drop for SeedLink {
 }
 
 impl SeedLink {
-    /// The seed's address in the peer table.
+    /// The seed's entry in the peer table.
     pub fn handle(&self) -> PeerHandle {
-        handle_of(self.id)
+        PeerHandle::WebSeed(self.id)
     }
 
     fn lacks(&self) -> Lacks {

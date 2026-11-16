@@ -42,7 +42,6 @@ use self::{
 };
 
 use super::smart_ban::{SentBlock, SmartBan};
-use super::web_seed::is_web_seed;
 
 use super::peer::{
     IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx, listen_address,
@@ -92,6 +91,12 @@ impl SessionBans {
         self.0.read().banned.contains(&ip)
     }
 
+    /// Whether no address is banned.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.read().banned.is_empty()
+    }
+
     /// Bans `ip`; true when it was not banned before.
     pub(crate) fn insert(&self, ip: IpAddr) -> bool {
         let mut list = self.0.write();
@@ -127,7 +132,7 @@ fn erase_rank(peer: &Peer) -> EraseRank {
         !erase_candidate,
         Reverse(failcount),
         !resume_data_only,
-        peer.outgoing_address == Some(peer.addr),
+        peer.listens_where_listed(),
         peer.trust().points(),
     )
 }
@@ -283,7 +288,7 @@ impl PeerList {
 
     /// The peers and bans a restart is to begin with; see [`ResumePeers`].
     pub fn resume_peers(&self) -> ResumePeers {
-        ResumePeers::of(self.peers.iter().map(resume_entry), &self.banned)
+        ResumePeers::of(self.peers.iter().filter_map(resume_entry), &self.banned)
     }
 
     /// Bans `ip` on a list no run holds: a peer at it rejoins the next run
@@ -325,7 +330,10 @@ impl PeerList {
     /// The addresses of the peers on the list.
     #[cfg(test)]
     pub(crate) fn addrs(&self) -> Vec<SocketAddr> {
-        self.peers.iter().map(|peer| peer.addr).collect()
+        self.peers
+            .iter()
+            .filter_map(|peer| peer.addr.addr())
+            .collect()
     }
 }
 
@@ -350,14 +358,14 @@ pub struct ResumePeers {
 // it when we can, and whether we were ever connected to it, or None when it
 // is not to be saved: we cannot connect to it (not `connectable`), its last
 // connection failed (`failcount`), or it sent bad data (`trust_points`
-// below zero).
-fn resume_entry(peer: &Peer) -> (IpAddr, Option<(SocketAddr, bool)>) {
+// below zero). None for a peer at no address, which is on no list.
+fn resume_entry(peer: &Peer) -> Option<(IpAddr, Option<(SocketAddr, bool)>)> {
     let failcount = peer.failcount();
     let saved = peer
         .outgoing_address
         .filter(|_| failcount == 0 && peer.trust().points() >= 0)
         .map(|addr| (addr, peer.ever_closed() || peer.connected_out().is_some()));
-    (peer.addr.ip(), saved)
+    Some((peer.addr.ip()?, saved))
 }
 
 impl ResumePeers {
@@ -480,10 +488,13 @@ fn lowest<T: Ord>(mut ranked: Vec<T>, n: usize) -> Vec<T> {
     ranked
 }
 
-// Whether a peer at `addr` in `state` counts among the connected
-// addresses: it has a connection, open or opening, and is no web seed.
-fn has_connection(addr: PeerHandle, state: &PeerState) -> bool {
-    !is_web_seed(addr) && matches!(state, PeerState::Connecting(_) | PeerState::Live(_))
+// The address a peer at `handle` in `state` counts at among the connected
+// addresses: it has a connection, open or opening, and is at an address
+// (a web seed is at none).
+fn connected_addr(handle: PeerHandle, state: &PeerState) -> Option<SocketAddr> {
+    handle
+        .addr()
+        .filter(|_| matches!(state, PeerState::Connecting(_) | PeerState::Live(_)))
 }
 
 impl Drop for PeerStates {
@@ -618,7 +629,7 @@ impl PeerStates {
         let leaving = self.untracked_leaving.lock().clone();
         let mut ranked = Vec::new();
         for e in self.states.iter() {
-            if is_web_seed(*e.key()) || self.leaves_untracked(&leaving, *e.key(), e.value()) {
+            if !e.key().is_listed() || self.leaves_untracked(&leaving, *e.key(), e.value()) {
                 smart_ban.forget(*e.key());
             } else {
                 ranked.push(((erase_rank(e.value()), *e.key()), e.value().idle()));
@@ -668,7 +679,7 @@ impl PeerStates {
         let named: Vec<PeerHandle> = self
             .states
             .iter()
-            .filter(|e| !is_web_seed(*e.key()) && !tracker_or_operator_named(e.value().sources()))
+            .filter(|e| e.key().is_listed() && !tracker_or_operator_named(e.value().sources()))
             .map(|e| *e.key())
             .collect();
         for handle in named {
@@ -708,9 +719,9 @@ impl PeerStates {
             .states
             .iter()
             .filter(|e| {
-                !is_web_seed(*e.key()) && !self.leaves_untracked(&leaving, *e.key(), e.value())
+                e.key().is_listed() && !self.leaves_untracked(&leaving, *e.key(), e.value())
             })
-            .map(|e| resume_entry(e.value()))
+            .filter_map(|e| resume_entry(e.value()))
             .collect();
         ResumePeers::of(entries.into_iter(), &self.banned.read())
     }
@@ -736,7 +747,7 @@ impl PeerStates {
     pub fn close_session_banned(&self, ip: IpAddr) {
         let _admission = self.admission.lock();
         for mut peer in self.states.iter_mut() {
-            if peer.key().ip() == ip {
+            if peer.key().ip() == Some(ip) {
                 peer.value_mut().ban(self);
             }
         }
@@ -752,7 +763,7 @@ impl PeerStates {
         }
         warn!(%ip, "banning the peer's address");
         for mut peer in self.states.iter_mut() {
-            if peer.key().ip() == ip {
+            if peer.key().ip() == Some(ip) {
                 peer.value_mut().ban(self);
             }
         }
@@ -769,7 +780,7 @@ impl PeerStates {
             .states
             .iter()
             .map(|e| *e.key())
-            .filter(|handle| !is_web_seed(*handle) && refused(*handle))
+            .filter(|handle| handle.addr().is_some_and(&refused))
             .collect();
         for handle in named {
             self.leave(handle);
@@ -780,7 +791,7 @@ impl PeerStates {
     /// closed.
     pub fn refuse_at(&self, handle: PeerHandle, refused: impl Fn(SocketAddr) -> bool) {
         let _admission = self.admission.lock();
-        if !is_web_seed(handle) && refused(handle) {
+        if handle.addr().is_some_and(refused) {
             self.leave(handle);
         }
     }
@@ -819,20 +830,20 @@ impl PeerStates {
     /// A PEX message named the peer at `addr` with `flags`; see
     /// [`Peer::pex_flags`].
     pub fn pex_flags(&self, addr: SocketAddr, flags: u8) {
-        self.with_peer_mut(addr, "pex_flags", |peer| peer.pex_flags(flags, self));
+        self.with_peer_mut(addr.into(), "pex_flags", |peer| peer.pex_flags(flags, self));
     }
 
     /// Whether the connection being made to the peer at `addr` tries the
     /// encrypted handshake; see [`Peer::encrypt_outgoing`]. Every connection
     /// to the peer asks here, whether it fetches metadata or pieces.
-    pub fn encrypt_outgoing(&self, addr: SocketAddr) -> bool {
+    pub fn encrypt_outgoing(&self, addr: PeerHandle) -> bool {
         self.with_peer_mut(addr, "encrypt_outgoing", |peer| peer.encrypt_outgoing())
             .unwrap_or(true)
     }
 
     /// The connection of the peer at `addr` completed its handshake; see
     /// [`Peer::handshake_encryption`].
-    pub fn handshake_encryption(&self, addr: SocketAddr, encryption: Encryption) {
+    pub fn handshake_encryption(&self, addr: PeerHandle, encryption: Encryption) {
         self.with_peer_mut(addr, "handshake_encryption", |peer| {
             peer.handshake_encryption(encryption, self)
         });
@@ -920,12 +931,13 @@ impl PeerStates {
         if self.is_banned(addr.ip()) {
             return Admitted::Banned;
         }
+        let handle = PeerHandle::from(addr);
         if let Some(our_port) = our_port
             && !self.keeps_incoming(addr, our_port)
         {
             return Admitted::Duplicate;
         }
-        if let Some(r) = self.with_peer_mut(addr, "admit", known) {
+        if let Some(r) = self.with_peer_mut(handle, "admit", known) {
             return Admitted::Known(r);
         }
         let Some(mut peer) = newcomer() else {
@@ -934,13 +946,13 @@ impl PeerStates {
         if !self.erase_to(displace, MAX_PEERLIST_SIZE) {
             return Admitted::Refused;
         }
-        self.count_in(addr, peer.get_state());
+        self.count_in(handle, peer.get_state());
         self.reindex(&mut peer);
         for counter in [&*self.session_stats, &*self.stats] {
             atomic_inc(&counter.seen);
         }
         let counters = peer.stats.counters.clone();
-        self.states.insert(addr, peer);
+        self.states.insert(handle, peer);
         Admitted::New(counters)
     }
 
@@ -968,7 +980,7 @@ impl PeerStates {
             .collect::<Vec<_>>();
         let Some((other, outgoing)) = others
             .into_iter()
-            .find_map(|other| Some((other, self.with_peer(other, Peer::connected_out)??)))
+            .find_map(|other| Some((other, self.with_peer(other.into(), Peer::connected_out)??)))
         else {
             return true;
         };
@@ -979,7 +991,7 @@ impl PeerStates {
                 std::cmp::Ordering::Equal => rand::random(),
             };
         if keep {
-            self.with_peer(other, Peer::disconnect);
+            self.with_peer(other.into(), Peer::disconnect);
         }
         keep
     }
@@ -1001,8 +1013,7 @@ impl PeerStates {
         }
         self.states
             .iter()
-            .filter(|e| !is_web_seed(*e.key()))
-            .filter_map(|e| e.value().connected_out().map(|_| e.key().ip()))
+            .filter_map(|e| e.value().connected_out().and(e.key().ip()))
             .collect()
     }
 
@@ -1029,7 +1040,10 @@ impl PeerStates {
         let connected = self.connected_ips_walked();
         self.states
             .iter()
-            .filter(|e| e.value().is_connect_candidate() && !connected.contains(&e.key().ip()))
+            .filter(|e| {
+                e.value().is_connect_candidate()
+                    && e.key().ip().is_some_and(|ip| !connected.contains(&ip))
+            })
             .count()
     }
 
@@ -1074,8 +1088,11 @@ impl PeerStates {
     /// held or the peer not yet on the list. A change that moves nothing
     /// takes no lock unless the peer is a connect candidate.
     pub(super) fn reindex(&self, peer: &mut Peer) {
-        let erase =
-            (!is_web_seed(peer.addr) && peer.connected_out().is_none()).then(|| erase_rank(peer));
+        // The index holds the peers on the list, by address.
+        let Some(addr) = peer.addr.addr().filter(|_| peer.addr.is_listed()) else {
+            return;
+        };
+        let erase = peer.connected_out().is_none().then(|| erase_rank(peer));
         let candidate = peer.is_connect_candidate();
         let filed = peer.indexed();
         if !candidate && !filed.candidate && erase == filed.erase {
@@ -1083,14 +1100,14 @@ impl PeerStates {
         }
         let mut index = self.index.lock();
         if erase != filed.erase {
-            index.file_erase(peer.addr, filed.erase, erase);
+            index.file_erase(addr, filed.erase, erase);
         }
         if candidate || filed.candidate {
             let key = candidate.then(|| ConnectKey {
                 rank: peer.connect_rank(&index.basis.ranking, index.basis.finished),
                 due: peer.reconnect_at(),
             });
-            index.file(peer.addr, key);
+            index.file(addr, key);
         }
         peer.set_indexed(Indexed { candidate, erase });
     }
@@ -1099,8 +1116,10 @@ impl PeerStates {
     // even when the index holds one it thinks current.
     fn refile(&self, peer: &mut Peer) {
         let filed = peer.indexed();
-        if filed.candidate {
-            self.index.lock().file(peer.addr, None);
+        if filed.candidate
+            && let Some(addr) = peer.addr.addr()
+        {
+            self.index.lock().file(addr, None);
             peer.set_indexed(Indexed {
                 candidate: false,
                 ..filed
@@ -1112,13 +1131,17 @@ impl PeerStates {
     // `peer`, at `handle`, left the table: it leaves the index.
     fn unindex(&self, handle: PeerHandle, peer: &Peer) {
         let filed = peer.indexed();
+        // Only a peer at an address is filed.
+        let Some(addr) = handle.addr() else {
+            return;
+        };
         if !filed.candidate && filed.erase.is_none() {
             return;
         }
         let mut index = self.index.lock();
-        index.file_erase(handle, filed.erase, None);
+        index.file_erase(addr, filed.erase, None);
         if filed.candidate {
-            index.file(handle, None);
+            index.file(addr, None);
         }
     }
 
@@ -1142,13 +1165,13 @@ impl PeerStates {
     }
 
     /// A connection to web seed `handle` begins: the seed joins the table,
-    /// off the peer list, and is connecting. None while its address is
-    /// banned or a connection to it is open.
+    /// off the peer list, and is connecting. None while a connection to it
+    /// is open. A seed banned for bad data is banned in [`WebSeeds`], and
+    /// is not connected to again.
+    ///
+    /// [`WebSeeds`]: super::web_seed::WebSeeds
     pub fn admit_web_seed(&self, handle: PeerHandle) -> Option<(PeerRx, PeerTx)> {
         let _admission = self.admission.lock();
-        if self.is_banned(handle.ip()) {
-            return None;
-        }
         let (tx, rx) = unbounded_channel();
         let connecting = PeerState::Connecting(tx.clone());
         if let Some(known) = self.with_peer_mut(handle, "admit_web_seed", |peer| {
@@ -1163,9 +1186,7 @@ impl PeerStates {
         }) {
             return known.then_some((rx, tx));
         }
-        // Not where it listens: a web seed is never a connect candidate.
-        let mut peer = Peer::new_with_outgoing_address(handle, Default::default());
-        peer.outgoing_address = None;
+        let mut peer = Peer::new_web_seed(handle);
         self.count_in(handle, peer.get_state());
         peer.set_state(PeerState::Connecting(tx.clone()), self);
         self.web_seeds.fetch_add(1, Ordering::Relaxed);
@@ -1184,7 +1205,7 @@ impl PeerStates {
             return true;
         }
         let victims = self.index.lock().erase_victims(displace, excess);
-        for addr in victims {
+        for addr in victims.into_iter().map(PeerHandle::from) {
             if let Some((_, peer)) = self
                 .states
                 .remove_if(&addr, |_, peer| peer.connected_out().is_none())
@@ -1198,7 +1219,7 @@ impl PeerStates {
     /// The `n` peers [`Self::erase_to`] forgets first of those `displace`
     /// allows, as the index holds them.
     #[cfg(test)]
-    fn erase_victims(&self, displace: Displace, n: usize) -> BTreeSet<PeerHandle> {
+    fn erase_victims(&self, displace: Displace, n: usize) -> BTreeSet<SocketAddr> {
         self.index
             .lock()
             .erase_victims(displace, n)
@@ -1208,12 +1229,12 @@ impl PeerStates {
 
     /// [`Self::erase_victims`] read off the whole list.
     #[cfg(test)]
-    fn erase_victims_walked(&self, displace: Displace, n: usize) -> BTreeSet<PeerHandle> {
+    fn erase_victims_walked(&self, displace: Displace, n: usize) -> BTreeSet<SocketAddr> {
         let ranked = self
             .states
             .iter()
-            .filter(|e| !is_web_seed(*e.key()) && e.value().connected_out().is_none())
-            .map(|e| (erase_rank(e.value()), *e.key()))
+            .filter(|e| e.key().is_listed() && e.value().connected_out().is_none())
+            .filter_map(|e| Some((erase_rank(e.value()), e.key().addr()?)))
             .filter(|(rank, _)| displace.allows(rank))
             .collect::<Vec<_>>();
         lowest(ranked, n)
@@ -1225,7 +1246,7 @@ impl PeerStates {
     // `peer`, at `handle`, left the table: what was counted of it, its
     // place in the index, and the records of what it sent, go with it.
     fn erased(&self, handle: PeerHandle, peer: &Peer) {
-        if is_web_seed(handle) {
+        if !handle.is_listed() {
             self.web_seeds.fetch_sub(1, Ordering::Relaxed);
         }
         self.count_out(handle, peer.get_state());
@@ -1271,7 +1292,8 @@ impl PeerStates {
         let mut next = NextCandidate::None;
         for e in self.states.iter() {
             let peer = e.value();
-            if !peer.is_connect_candidate() || connected.contains(&e.key().ip()) {
+            if !peer.is_connect_candidate() || e.key().ip().is_none_or(|ip| connected.contains(&ip))
+            {
                 continue;
             }
             match peer.reconnect_at() {
@@ -1313,7 +1335,7 @@ impl PeerStates {
     /// grown to its low watermark first forgets erase candidates,
     /// lowest-ranked first, until it is under it (libtorrent
     /// `peer_list::find_connect_candidates`).
-    pub fn connect_next(&self, now: Instant) -> Option<(PeerHandle, PeerRx, PeerTx)> {
+    pub fn connect_next(&self, now: Instant) -> Option<(SocketAddr, PeerRx, PeerTx)> {
         let _admission = self.admission.lock();
         self.erase_to(Displace::EraseCandidates, PEERLIST_LOW_WATERMARK);
         loop {
@@ -1321,7 +1343,7 @@ impl PeerStates {
             // The index is let go before the entry is taken. A peer it holds
             // that is not due after all, or is gone, is filed again from
             // what it is, so the next pick does not choose it again.
-            match self.with_peer_mut(addr, "connect_next", |peer| {
+            match self.with_peer_mut(addr.into(), "connect_next", |peer| {
                 let connecting = peer.connect_if_due(now, self);
                 if connecting.is_none() {
                     self.refile(peer);
@@ -1337,7 +1359,7 @@ impl PeerStates {
 
     // The candidate [`Self::connect_next`] connects to at `now`, as the
     // index holds it.
-    fn connect_pick(&self, now: Instant) -> Option<PeerHandle> {
+    fn connect_pick(&self, now: Instant) -> Option<SocketAddr> {
         self.rebase();
         self.index.lock().first_due(now)
     }
@@ -1345,21 +1367,24 @@ impl PeerStates {
     /// The candidate [`Self::connect_next`] connects to at `now`, without
     /// connecting.
     #[cfg(test)]
-    pub(crate) fn connect_pick_indexed(&self, now: Instant) -> Option<PeerHandle> {
+    pub(crate) fn connect_pick_indexed(&self, now: Instant) -> Option<SocketAddr> {
         self.connect_pick(now)
     }
 
     /// [`Self::connect_pick_indexed`] read off the whole list: the due
     /// candidate at an address no connection is at that ranks first.
     #[cfg(test)]
-    pub(crate) fn connect_pick_walked(&self, now: Instant) -> Option<PeerHandle> {
+    pub(crate) fn connect_pick_walked(&self, now: Instant) -> Option<SocketAddr> {
         let connected = self.connected_ips_walked();
         let finished = self.is_finished();
         let order = self.connect_order.now();
         self.states
             .iter()
-            .filter(|e| e.value().is_due(now) && !connected.contains(&e.key().ip()))
-            .map(|e| (e.value().connect_rank(&order, finished), *e.key()))
+            .filter_map(|e| {
+                let addr = e.key().addr()?;
+                (e.value().is_due(now) && !connected.contains(&addr.ip()))
+                    .then(|| (e.value().connect_rank(&order, finished), addr))
+            })
             .min()
             .map(|(_, addr)| addr)
     }
@@ -1396,9 +1421,9 @@ impl PeerStates {
     /// reconnect after leaving upload mode). One walk of the list per leave.
     pub fn reconnect_after_upload_mode(&self) {
         for mut e in self.states.iter_mut() {
-            let ip = e.key().ip();
+            let banned = e.key().ip().is_some_and(|ip| self.is_banned(ip));
             let peer = e.value_mut();
-            if !self.is_banned(ip) && peer.forget_last_close() {
+            if !banned && peer.forget_last_close() {
                 self.reindex(peer);
             }
         }
@@ -1555,8 +1580,8 @@ impl PeerStates {
         for counter in [&*self.session_stats, &*self.stats] {
             counter.inc(state);
         }
-        if has_connection(addr, state) {
-            self.index.lock().connection_opened(addr);
+        if let Some(at) = connected_addr(addr, state) {
+            self.index.lock().connection_opened(at);
         }
         if let PeerState::Live(live) = state {
             self.live.lock().insert(addr);
@@ -1573,8 +1598,8 @@ impl PeerStates {
         for counter in [&*self.session_stats, &*self.stats] {
             counter.dec(state);
         }
-        if has_connection(addr, state) {
-            self.index.lock().connection_closed(addr);
+        if let Some(at) = connected_addr(addr, state) {
+            self.index.lock().connection_closed(at);
         }
         if let PeerState::Live(live) = state {
             self.live.lock().swap_remove(&addr);
@@ -1687,8 +1712,8 @@ impl PeerStates {
 
     pub(crate) fn on_steal(
         &self,
-        from_peer: SocketAddr,
-        to_peer: SocketAddr,
+        from_peer: PeerHandle,
+        to_peer: PeerHandle,
         stolen_idx: ValidPieceIndex,
     ) {
         self.with_peer(to_peer, |p| {

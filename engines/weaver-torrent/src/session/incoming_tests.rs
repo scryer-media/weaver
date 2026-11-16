@@ -621,11 +621,11 @@ async fn an_incoming_connection_in_the_slack_replaces_one_of_the_fullest_torrent
     let newcomer = checked.addr;
     let added = other_live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
-    session.settle_over_limit(&other_live, newcomer);
+    session.settle_over_limit(&other_live, newcomer.into());
 
     // It holds a place under the cap, the fullest torrent one connection
     // fewer, and the slack's place is free again.
-    assert!(!other_live.exceeds_limit(newcomer, slots));
+    assert!(!other_live.exceeds_limit(newcomer.into(), slots));
     assert_eq!(fullest_live.connections().0, 1);
     assert_eq!(slots.in_use(), 2);
     assert!(slots.exceeds_limit(&slots.try_accept().unwrap()));

@@ -752,7 +752,12 @@ async fn an_address_banned_for_bad_data_on_one_torrent_is_banned_on_every_torren
     );
     assert_eq!(state(&b, "127.0.0.7:6881"), Some("queued"));
 
-    a.ban_for_bad_data("127.0.0.7".parse().unwrap());
+    a.ban_for_bad_data(
+        "127.0.0.7:6881"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into(),
+    );
 
     // Nothing below awaits, so no connection is attempted meanwhile.
     // On B the peer it knew is no connect candidate, and the address at

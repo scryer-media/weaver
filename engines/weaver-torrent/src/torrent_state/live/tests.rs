@@ -275,10 +275,10 @@ impl Harness {
         let upload = self
             .live
             .peers
-            .with_live(addr, peer::LivePeerState::upload_ledger)
+            .with_live(addr.into(), peer::LivePeerState::upload_ledger)
             .unwrap();
         let handler = PeerHandler {
-            addr,
+            addr: addr.into(),
             incoming: true,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
@@ -530,8 +530,13 @@ impl Harness {
             .await
     }
 
+    // A swarm peer is banned by address; a web seed on its torrent's seed
+    // list.
     fn banned(&self, peer: &PeerHandler) -> bool {
-        self.peers.is_banned(peer.addr.ip())
+        match peer.addr.ip() {
+            Some(ip) => self.peers.is_banned(ip),
+            None => self.shared.web_seeds.is_banned(peer.addr),
+        }
     }
 
     /// Whether a peer connecting from `addr` is turned away.
@@ -589,7 +594,7 @@ impl Harness {
     /// Whether the peer at `addr` is in the torrent's peer list.
     fn knows(&self, addr: &str) -> bool {
         self.peers
-            .with_peer(addr.parse().unwrap(), |_| ())
+            .with_peer(addr.parse::<SocketAddr>().unwrap().into(), |_| ())
             .is_some()
     }
 
@@ -795,7 +800,7 @@ fn client_id(addr: SocketAddr) -> Id20 {
 impl Harness {
     /// The place the connection at `addr`, whose writer queue is `tx`, holds
     /// under the torrent's cap and the session's, as its task would.
-    fn hold(&self, addr: SocketAddr, tx: &PeerTx) -> Held {
+    fn hold(&self, addr: PeerHandle, tx: &PeerTx) -> Held {
         let permit = self.peer_semaphore.clone().try_acquire_owned().unwrap();
         let slot = self._session.connection_slots.try_open().unwrap();
         self.live.hold_place(addr, tx, permit, slot)
@@ -842,7 +847,9 @@ impl Harness {
     }
 
     fn holds_place(&self, addr: &str) -> bool {
-        self.places.lock().contains_key(&sock(addr))
+        self.places
+            .lock()
+            .contains_key(&PeerHandle::from(sock(addr)))
     }
 }
 

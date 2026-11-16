@@ -5,7 +5,6 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use super::web_seed;
 use std::{sync::atomic::Ordering, time::Duration};
 
 use crate::session_stats::swarm::{self};
@@ -144,7 +143,7 @@ impl TorrentStateLive {
 
     /// The torrent's connections to peers, by address (libtorrent
     /// `torrent::get_peer_info`). A web seed is no peer of the swarm, and
-    /// is not listed.
+    /// is not listed ([`PeerInfo::of`]).
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
         // The choker's lock goes before the peer table's.
         let optimistic = self
@@ -158,7 +157,6 @@ impl TorrentStateLive {
             .peers
             .states
             .iter()
-            .filter(|e| !web_seed::is_web_seed(*e.key()))
             .filter_map(|e| PeerInfo::of(e.value(), total_pieces, optimistic.contains(e.key())))
             .collect();
         infos.sort_by_key(|info| info.addr);

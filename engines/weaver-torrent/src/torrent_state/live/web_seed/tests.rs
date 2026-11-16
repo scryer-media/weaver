@@ -536,7 +536,7 @@ async fn an_error_status_loses_the_file_and_the_seed_waits_retry_after() {
 
     let interesting = |l: &Lacks| layout.bitfield(l).any();
     assert_eq!(has(&layout, &lacking(&[2], &[])), [true, true, false]);
-    let due = |at| seeds.due(at, |_| false, interesting, false).len();
+    let due = |at| seeds.due(at, interesting, false).len();
     assert_eq!(due(now + Duration::from_secs(119)), 0);
     assert_eq!(due(now + Duration::from_secs(120)), 1);
 
@@ -1367,25 +1367,22 @@ fn a_bad_piece_loses_the_seed_its_file_or_itself() {
     ]);
     let piece = |i| padded.lengths.validate_piece_index(i).unwrap();
     let seeds = WebSeeds::new([url()]);
-    let have = seeds.piece_failed(handle_of(0), piece(1), &padded).unwrap();
+    let have = seeds
+        .piece_failed(PeerHandle::WebSeed(0), piece(1), &padded)
+        .unwrap();
     assert_eq!(bits(have, 3), [false, false, true]);
     assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[0], &[]));
     assert_eq!(has(&padded, &lacking(&[0], &[])), [false, false, true]);
     assert_eq!(
         seeds
-            .due(
-                Instant::now(),
-                |_| false,
-                |l| padded.bitfield(l).any(),
-                false
-            )
+            .due(Instant::now(), |l| padded.bitfield(l).any(), false)
             .len(),
         1
     );
     // A handle no seed has.
     assert!(
         seeds
-            .piece_failed(handle_of(1), piece(2), &padded)
+            .piece_failed(PeerHandle::WebSeed(1), piece(2), &padded)
             .is_none()
     );
 
@@ -1397,20 +1394,19 @@ fn a_bad_piece_loses_the_seed_its_file_or_itself() {
     ]);
     let piece = |i| spans.lengths.validate_piece_index(i).unwrap();
     let seeds = WebSeeds::new([url()]);
-    let have = seeds.piece_failed(handle_of(0), piece(0), &spans).unwrap();
+    let have = seeds
+        .piece_failed(PeerHandle::WebSeed(0), piece(0), &spans)
+        .unwrap();
     assert_eq!(bits(have, 3), [false, true, true]);
     assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[], &[0]));
-    let have = seeds.piece_failed(handle_of(0), piece(2), &spans).unwrap();
+    let have = seeds
+        .piece_failed(PeerHandle::WebSeed(0), piece(2), &spans)
+        .unwrap();
     assert_eq!(bits(have, 3), [false, false, false]);
     assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[2], &[0]));
     assert!(
         seeds
-            .due(
-                Instant::now(),
-                |_| false,
-                |l| spans.bitfield(l).any(),
-                false
-            )
+            .due(Instant::now(), |l| spans.bitfield(l).any(), false)
             .is_empty()
     );
 
@@ -1418,7 +1414,9 @@ fn a_bad_piece_loses_the_seed_its_file_or_itself() {
     let single = layout(&[("f", 70000, false)]);
     let seeds = WebSeeds::new([url()]);
     let piece = single.lengths.validate_piece_index(1).unwrap();
-    let have = seeds.piece_failed(handle_of(0), piece, &single).unwrap();
+    let have = seeds
+        .piece_failed(PeerHandle::WebSeed(0), piece, &single)
+        .unwrap();
     assert!(!have.any());
 }
 
@@ -1436,17 +1434,17 @@ fn which_seeds_are_due() {
     let seeds = Arc::new(WebSeeds::new(
         (0..5).map(|i| seed(&format!("http://h{i}.example/"))),
     ));
-    let due = seeds.due(now, |_| false, any, false);
+    let due = seeds.due(now, any, false);
     assert_eq!(due.len(), MAX_WEB_SEED_CONNECTIONS);
     assert!(due.iter().all(|d| d.endpoint.is_none()));
     let _link = seeds.link(due[0].id).unwrap();
     assert!(seeds.link(due[0].id).is_none());
     assert_eq!(
-        seeds.due(now, |_| false, any, false).len(),
+        seeds.due(now, any, false).len(),
         MAX_WEB_SEED_CONNECTIONS - 1
     );
     // A seed with no piece to give is not counted.
-    assert_eq!(seeds.due(now, |_| false, |_| false, false).len(), 0);
+    assert_eq!(seeds.due(now, |_| false, false).len(), 0);
 
     // (url, banned, listed afterwards, disabled afterwards, endpoint)
     let cases = [
@@ -1483,7 +1481,10 @@ fn which_seeds_are_due() {
     ];
     for (url, banned, listed, disabled, endpoint) in cases {
         let seeds = WebSeeds::new([seed(url)]);
-        let due = seeds.due(now, |h| banned && h == handle_of(0), any, false);
+        if banned {
+            assert!(seeds.ban(PeerHandle::WebSeed(0)));
+        }
+        let due = seeds.due(now, any, false);
         assert_eq!(seeds.list().len(), usize::from(listed), "{url}");
         let present = seeds.with_entry(0, |e| e.disabled);
         assert_eq!(present.unwrap_or(false), disabled, "{url}");
@@ -1498,7 +1499,7 @@ fn which_seeds_are_due() {
         "http://b\u{fc}cher.example/f",
     ] {
         let seeds = WebSeeds::new([seed(url)]);
-        assert_eq!(seeds.due(now, |_| false, any, true).len(), 1, "{url}");
+        assert_eq!(seeds.due(now, any, true).len(), 1, "{url}");
         assert_eq!(seeds.with_entry(0, |e| e.disabled), Some(false), "{url}");
     }
 
@@ -1508,13 +1509,14 @@ fn which_seeds_are_due() {
     {
         let _capture = lines.capture();
         let disabled = WebSeeds::new([seed("ftp://h.example/0123passkey/f?pk=s3cret")]);
-        disabled.due(now, |_| false, any, false);
+        disabled.due(now, any, false);
         let removed = WebSeeds::new([seed("http://h.example:0/0123passkey/f?pk=s3cret")]);
-        removed.due(now, |_| false, any, false);
+        removed.due(now, any, false);
         let bad = WebSeeds::new([seed("https://u:pw@h.example:8443/0123passkey/?pk=s3cret")]);
         let single = layout(&[("f", 70000, false)]);
         let piece = single.lengths.validate_piece_index(0).unwrap();
-        bad.piece_failed(handle_of(0), piece, &single).unwrap();
+        bad.piece_failed(PeerHandle::WebSeed(0), piece, &single)
+            .unwrap();
     }
     let text = lines.text();
     for (url, message) in [
@@ -1620,13 +1622,4 @@ async fn a_torrent_downloads_from_its_web_seed_alone() -> anyhow::Result<()> {
     assert_eq!(handle.web_seeds(), [http_seed]);
     assert!(handle.magnet().web_seeds.is_empty());
     Ok(())
-}
-
-#[test]
-fn a_web_seed_handle_is_no_peers() {
-    assert!(is_web_seed(handle_of(0)));
-    assert!(is_web_seed(handle_of(u32::MAX)));
-    assert_ne!(handle_of(1), handle_of(65536));
-    assert!(!is_web_seed("[100::1]:6881".parse().unwrap()));
-    assert!(!is_web_seed("1.2.3.4:0".parse().unwrap()));
 }

@@ -825,7 +825,7 @@ async fn a_connection_that_failed_its_handshake_asks_for_no_introduction() {
     assert!(h.knows(&target.to_string()));
 
     // The connect loop dials the target; its connection fails once open.
-    while h.peers.with_peer(target, |p| p.failcount()).unwrap() == 0 {
+    while h.peers.with_peer(target.into(), |p| p.failcount()).unwrap() == 0 {
         tokio::task::yield_now().await;
     }
     assert_eq!(holepunch_sent(&mut rx), []);

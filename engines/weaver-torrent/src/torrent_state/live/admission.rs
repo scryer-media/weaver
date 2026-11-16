@@ -58,13 +58,14 @@ impl TorrentStateLive {
             debug!(addr = %checked_peer.addr, "finished with upload closed, refusing incoming peer");
             return Ok(AddIncomingPeerResult::NotWanted);
         }
+        let handle = PeerHandle::from(checked_peer.addr);
         let (tx, rx) = unbounded_channel();
         // Held until the newcomer holds its place, so the connection it
         // displaces keeps its own until then.
         let mut places = self.places.lock();
         let room = match self.peer_semaphore.clone().try_acquire_owned() {
             Ok(permit) => Room::Free(permit),
-            Err(_) => match self.displaced_by(&places, checked_peer.addr) {
+            Err(_) => match self.displaced_by(&places, handle) {
                 Some(displaced) => Room::Displacing(displaced),
                 None => {
                     drop(places);
@@ -125,13 +126,13 @@ impl TorrentStateLive {
                 (place.permit, place.slot)
             }
         };
-        let held = self.hold_place_in(&mut places, checked_peer.addr, &tx, permit, slot);
+        let held = self.hold_place_in(&mut places, handle, &tx, permit, slot);
         drop(places);
 
         // Incoming peers are live before their task is polled, so its
         // lifetime must already be owned when the task is scheduled.
         let handler = PeerLifetime(Some(PeerHandler {
-            addr: checked_peer.addr,
+            addr: handle,
             incoming: true,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
@@ -217,9 +218,10 @@ impl TorrentStateLive {
         let state = self;
         let options = state.shared.options.peer_opts;
         let base_timeout = options.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let handle = PeerHandle::from(addr);
         let (counters, transports, connect_timeout) = state
             .peers
-            .with_peer(addr, |p| {
+            .with_peer(handle, |p| {
                 (
                     p.stats.counters.clone(),
                     p.transports(),
@@ -229,7 +231,7 @@ impl TorrentStateLive {
             .ok_or(Error::BugPeerNotFound)?;
 
         let handler = PeerHandler {
-            addr,
+            addr: handle,
             incoming: false,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
@@ -443,7 +445,7 @@ impl TorrentStateLive {
                 continue;
             };
             slots.begin_connect().await;
-            let held = state.hold_place(addr, &tx, permit, slot);
+            let held = state.hold_place(addr.into(), &tx, permit, slot);
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),

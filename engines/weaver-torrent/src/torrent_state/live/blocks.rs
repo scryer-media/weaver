@@ -507,7 +507,7 @@ pub(super) fn settle_landed_piece(
             // Before the storage takes the piece, while the good bytes
             // are still there to read back.
             for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
-                state.ban_for_bad_data(sender.ip());
+                state.ban_for_bad_data(sender);
             }
             // The piece is ours only once the storage has taken it
             // (libtorrent: the write completes before the hash job,
@@ -597,7 +597,7 @@ pub(super) fn settle_landed_piece(
             // Before the storage lets go of the failed bytes.
             let blocks = smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
             for liar in state.peers.piece_failed(piece_index, blocks) {
-                state.ban_for_bad_data(liar.ip());
+                state.ban_for_bad_data(liar);
             }
             // Checked by v2, a piece of more than one sender has its
             // block hashes fetched, which name the senders of its bad

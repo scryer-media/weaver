@@ -83,7 +83,6 @@ impl TorrentStateLive {
         let registry = &self.shared.web_seeds;
         let due = registry.due(
             tokio::time::Instant::now(),
-            |handle| self.peers.is_banned(handle.ip()),
             |lacks| self.web_layout.bitfield(lacks).any(),
             session.allow_idna,
         );

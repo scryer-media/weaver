@@ -55,14 +55,14 @@ async fn explicit_mapped_block_ranges_refuse_both_peer_representations_before_ad
         for peer in peers() {
             harness.add_peer(peer, PeerSourceFlag::Tracker);
             assert!(
-                harness.peers.with_peer(peer, |_| ()).is_none(),
+                harness.peers.with_peer(peer.into(), |_| ()).is_none(),
                 "{peer}, parsed={parsed}"
             );
         }
         assert!(dialed.try_recv().is_err());
         let allowed = (Ipv4Addr::new(127, 0, 0, 2), 6881).into();
         harness.add_peer(allowed, PeerSourceFlag::Tracker);
-        assert!(harness.peers.with_peer(allowed, |_| ()).is_some());
+        assert!(harness.peers.with_peer(allowed.into(), |_| ()).is_some());
         harness._session.stop().await;
     }
 }
@@ -86,11 +86,14 @@ async fn a_parsed_mapped_allowlist_admits_both_representations_and_refuses_other
     .await;
     let refused = (Ipv4Addr::new(127, 0, 0, 2), 6881).into();
     harness.add_peer(refused, PeerSourceFlag::Tracker);
-    assert!(harness.peers.with_peer(refused, |_| ()).is_none());
+    assert!(harness.peers.with_peer(refused.into(), |_| ()).is_none());
     for peer in peers() {
         harness.add_peer(peer, PeerSourceFlag::Tracker);
         let key = crate::network::canonical_socket_addr(peer);
-        assert!(harness.peers.with_peer(key, |_| ()).is_some(), "{peer}");
+        assert!(
+            harness.peers.with_peer(key.into(), |_| ()).is_some(),
+            "{peer}"
+        );
     }
     assert_eq!(harness.peers.states.len(), 1);
     harness._session.stop().await;

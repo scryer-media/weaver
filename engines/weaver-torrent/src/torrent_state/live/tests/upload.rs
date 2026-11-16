@@ -705,7 +705,7 @@ async fn the_peers_listing_shows_encryption_unchoke_and_the_optimistic_slot() {
     assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
 
     let [info] = h.live.peer_infos().try_into().unwrap();
-    assert_eq!(info.addr, peer.addr);
+    assert_eq!(Some(info.addr), peer.addr.addr());
     assert_eq!(info.encryption, crate::mse::Encryption::HeaderOnly);
     assert!(!info.outgoing);
     assert!(!info.flags.remote_choked && info.flags.remote_interested);

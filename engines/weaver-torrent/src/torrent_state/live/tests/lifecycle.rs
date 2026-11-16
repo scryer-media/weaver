@@ -181,10 +181,14 @@ async fn the_web_seed_of_a_single_file_torrent_that_fails_a_piece_is_banned() {
     assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
     assert!(h.banned(&seed));
     assert!(told_to_disconnect(&mut rx));
+    // The ban is the seed's, on this torrent alone: no address is banned
+    // for the session, and none is saved for a restart.
+    assert!(h._session.bad_data_bans.is_empty());
+    assert!(h.peers.resume_peers().banned.is_empty());
+    assert!(h.shared.web_seeds.list().is_empty());
     drop(link);
     let due = h.shared.web_seeds.due(
         tokio::time::Instant::now(),
-        |handle| h.peers.is_banned(handle.ip()),
         |lacks| h.web_layout.bitfield(lacks).any(),
         false,
     );
