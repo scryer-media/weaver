@@ -4502,12 +4502,12 @@ fn the_server_state_reads_the_open_sessions_network() {
         session("02", true, None, &["203.0.113.7", "2001:db8::8"]),
         session("03", true, Some((30, 0, 1)), &["203.0.113.8"]),
     ];
-    let state = transfer(&[], &sessions, None, None);
+    let state = transfer(&RowSums::default(), &sessions, None, None);
     assert_eq!(state["dht_nodes"], 200);
     assert_eq!(state["last_external_address_v4"], "203.0.113.7");
     assert_eq!(state["last_external_address_v6"], "2001:db8::7");
 
-    let state = transfer(&[], &sessions[..1], None, None);
+    let state = transfer(&RowSums::default(), &sessions[..1], None, None);
     assert_eq!(state["dht_nodes"], 0);
     assert_eq!(state["last_external_address_v4"], "");
     assert_eq!(state["last_external_address_v6"], "");
@@ -4955,20 +4955,19 @@ async fn torrents_info_filters_and_pages_as_the_whole_list() {
     // Each torrent past checking what was saved of it, so that no read
     // below sees one torrent checking that another read saw stopped.
     let service = rig.context.inner.torrents.as_ref().unwrap();
-    let mut updates = service.follow(
-        weaver_server_core::torrents::service::updates::Follow::Every,
-        std::time::Duration::from_millis(10),
-    );
-    let mut states = std::collections::HashMap::new();
-    while states.len() != 45
-        || states
-            .values()
-            .any(|state| *state == TorrentState::CheckingResumeData)
-    {
-        let changes = updates.next().await;
-        for view in changes.torrents {
-            states.insert(view.job_id, view.state);
+    let snapshot = service.snapshot();
+    let mut revision = snapshot.subscribe();
+    loop {
+        revision.borrow_and_update();
+        let (_, rows) = snapshot.every();
+        if rows.len() == 45
+            && rows
+                .iter()
+                .all(|row| row.view.state != TorrentState::CheckingResumeData)
+        {
+            break;
         }
+        revision.changed().await.unwrap();
     }
     let all = steady(rig.get("/api/v2/torrents/info").await.json());
     assert_eq!(all.len(), 45);

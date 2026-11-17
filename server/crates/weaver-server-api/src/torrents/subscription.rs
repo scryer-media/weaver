@@ -1,33 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::time::Duration;
-
 use async_graphql::{Context, Result, Subscription};
 use tokio_stream::Stream;
 use weaver_server_core::jobs::ids::JobId;
-use weaver_server_core::torrents::service::updates::Follow;
+use weaver_server_core::torrents::service::updates::{Follow, FollowError, MAX_FOLLOWED};
 
-use super::query::MAX_TORRENT_PAGE;
 use super::service;
 use super::types::TorrentChangesGql;
 use crate::auth::ReadGuard;
-
-/// How often the torrents are read again between pushes, for their rates.
-const BEAT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 pub struct TorrentsSubscription;
 
 #[Subscription]
 impl TorrentsSubscription {
-    /// The torrents as they move: the one `id` names, the ones `ids` names
-    /// (at most 500), or every torrent. The first push is the torrents as
-    /// they are, with `fullUpdate`; each later one comes when one of them
-    /// changes, a tracker's answer as soon as it lands, and carries only the
-    /// torrents that changed or came and the ids of the ones gone. Every
-    /// torrent is followed only once the stored torrents are all read at
-    /// start: asked before, it is an error with code `TORRENTS_LOADING`.
+    /// The torrents as they move: the one `id` names, whole, or the ones
+    /// `ids` names (at most 500), as a list shows them. Give one of the two.
+    /// The first push is the torrents as they are, with `fullUpdate`; each
+    /// later one comes when one of them changes and carries only the
+    /// torrents that changed or came and the ids of the ones gone.
+    ///
+    /// `ids` reads each torrent's row as the service last published it: no
+    /// files and no trackers, and a change in the fields that move with the
+    /// clock alone is told with the next other change. Those torrents are
+    /// followed only once the stored torrents are all read at start: asked
+    /// before, it is an error with code `TORRENTS_LOADING`. `id` reads its
+    /// torrent whole, files and trackers with it, each time it moves.
     #[graphql(guard = "ReadGuard")]
     async fn torrent_updates(
         &self,
@@ -38,17 +37,19 @@ impl TorrentsSubscription {
         let follow = match (id, ids) {
             (Some(_), Some(_)) => return Err("give id or ids, not both".into()),
             (Some(id), None) => Follow::One(JobId(id)),
-            (None, Some(ids)) if ids.len() > MAX_TORRENT_PAGE => {
-                return Err(format!("at most {MAX_TORRENT_PAGE} ids").into());
+            (None, Some(ids)) if ids.len() > MAX_FOLLOWED => {
+                return Err(format!("at most {MAX_FOLLOWED} ids").into());
             }
             (None, Some(ids)) => Follow::Some(ids.into_iter().map(JobId).collect()),
-            (None, None) => Follow::Every,
+            (None, None) => {
+                return Err("give id, or ids (at most 500): every torrent is not followed".into());
+            }
         };
         let service = service(ctx)?;
-        if follow == Follow::Every {
-            service.whole().map_err(super::not_ready)?;
-        }
-        let mut updates = service.follow(follow, BEAT);
+        let mut updates = service.follow(follow).map_err(|error| match error {
+            FollowError::NotReady(why) => super::not_ready(why),
+            FollowError::TooMany(_) => error.to_string().into(),
+        })?;
         Ok(async_stream::stream! {
             loop {
                 yield updates.next().await.into();

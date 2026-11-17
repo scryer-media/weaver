@@ -46,26 +46,35 @@ async fn seeded(rig: &Rig, clock: &ManualClock) -> Vec<JobId> {
 }
 
 // Once each of `count` torrents is past checking what was saved of it, as
-// a follower of every torrent hears it: a view read before then can say
-// it is checking, and one read after says it is paused.
+// the snapshot of their rows holds them: a view read before then can say it
+// is checking, and one read after says it is paused.
 pub(super) async fn settled(service: &TorrentService, count: usize) {
-    let mut updates = service.follow(Follow::Every, std::time::Duration::from_millis(10));
-    let mut states = std::collections::HashMap::new();
+    let mut revision = service.snapshot().subscribe();
     loop {
-        let changes = updates.next().await;
-        for view in changes.torrents {
-            states.insert(view.job_id, view.state);
-        }
-        for job_id in changes.removed {
-            states.remove(&job_id);
-        }
-        if states.len() == count
-            && states
-                .values()
-                .all(|state| *state != TorrentState::CheckingResumeData)
+        revision.borrow_and_update();
+        let (_, rows) = service.snapshot().every();
+        if rows.len() == count
+            && rows
+                .iter()
+                .all(|row| row.view.state != TorrentState::CheckingResumeData)
         {
             return;
         }
+        revision
+            .changed()
+            .await
+            .expect("the service keeps its snapshot");
+    }
+}
+
+// `view` as a row of the snapshot carries it: no files, no bytes of each
+// file and no trackers.
+pub(super) fn as_row(view: TorrentView) -> TorrentView {
+    TorrentView {
+        files: Vec::new(),
+        file_have: Vec::new(),
+        trackers: Vec::new(),
+        ..view
     }
 }
 
@@ -280,12 +289,12 @@ async fn a_list_that_cannot_read_the_table_fails() {
     rig.service.stop().await;
 }
 
-// A follower of a few torrents is given what every torrent's follower is
-// given of those, and hears nothing of the others.
+// A follower of a few torrents is given their rows as the snapshot holds
+// them, which are their views without files or trackers, and hears nothing
+// of the others.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_followed_set_is_given_its_torrents_of_every_torrent() {
+async fn a_followed_set_is_given_its_rows() {
     use std::collections::BTreeSet;
-    use std::time::Duration;
 
     let clock = set_clock();
     let rig = rig(clock.clone());
@@ -296,19 +305,19 @@ async fn a_followed_set_is_given_its_torrents_of_every_torrent() {
         .copied()
         .chain([JobId(999_999)])
         .collect();
-    let beat = Duration::from_millis(10);
-    let every = rig.service.follow(Follow::Every, beat).next().await;
-    let mut some = rig.service.follow(Follow::Some(followed.clone()), beat);
+    rig.service.publish().await;
+    let mut some = rig.service.follow(Follow::Some(followed.clone())).unwrap();
     let first = some.next().await;
     assert!(first.full_update);
-    let old: Vec<TorrentView> = every
-        .torrents
+    let old: Vec<TorrentView> = rig
+        .service
+        .torrents_of(&followed)
+        .await
         .into_iter()
-        .filter(|view| followed.contains(&view.job_id))
+        .map(as_row)
         .collect();
     assert_eq!(old.len(), TORRENTS / 4);
     assert_eq!(first.torrents, old);
-    assert_eq!(first.torrents, rig.service.torrents_of(&followed).await);
 
     // A torrent it does not follow goes unheard; one it follows goes as
     // gone. What a removal moves in the others is told of those it follows.
@@ -330,6 +339,37 @@ async fn a_followed_set_is_given_its_torrents_of_every_torrent() {
     let now = rig.service.torrents_of(&followed).await;
     assert_eq!(now.len(), TORRENTS / 4 - 1);
     assert!(now.iter().all(|view| view.job_id != jobs[4]));
+    rig.service.stop().await;
+}
+
+// More than `MAX_FOLLOWED` torrents are not followed, and a few are not
+// followed while the stored torrents are still being read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_followed_set_is_bounded_and_waits_for_the_load() {
+    use crate::torrents::service::updates::{FollowError, MAX_FOLLOWED};
+    use std::collections::BTreeSet;
+
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let many: BTreeSet<JobId> = (0..=MAX_FOLLOWED as u64).map(JobId).collect();
+    assert!(matches!(
+        rig.service.follow(Follow::Some(many)),
+        Err(FollowError::TooMany(count)) if count == MAX_FOLLOWED + 1
+    ));
+    rig.service.inner.snapshot.unready();
+    assert!(matches!(
+        rig.service.follow(Follow::Some(BTreeSet::from([JobId(1)]))),
+        Err(FollowError::NotReady(NotReady::Loading))
+    ));
+    // One torrent is followed all the same, read on demand.
+    let mut one = rig.service.updates(JobId(1));
+    assert_eq!(one.next().await.torrents, Vec::new());
+    rig.service.publish().await;
+    assert!(
+        rig.service
+            .follow(Follow::Some(BTreeSet::from([JobId(1)])))
+            .is_ok()
+    );
     rig.service.stop().await;
 }
 

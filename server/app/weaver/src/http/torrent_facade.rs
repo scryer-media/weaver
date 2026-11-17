@@ -45,9 +45,11 @@ use weaver_server_core::settings::{
 use weaver_server_core::tags::split_tags;
 use weaver_server_core::torrents::metrics::{Published, SessionSeries};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
-use weaver_server_core::torrents::service::fingerprint::ViewParts;
 use weaver_server_core::torrents::service::listing::{
     CategoryPick, FileTotals, Pick, Shown, Window,
+};
+use weaver_server_core::torrents::service::snapshot::{
+    RowSums, Snapshot, TorrentRow, TrackerSummary,
 };
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, AddSource, ListError, NotReady, Placement, TorrentService,
@@ -55,13 +57,13 @@ use weaver_server_core::torrents::service::{
 };
 use weaver_server_core::torrents::{
     ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TrackerStatus, redacted_tracker_url, status,
+    TorrentTracker, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, RssFeedRow, SchedulerHandle};
 // The tests build peers of each kind; the facade reads a kind's names only.
 #[cfg(test)]
-use weaver_server_core::torrents::ConnectionKind;
+use weaver_server_core::torrents::{ConnectionKind, TrackerStatus};
 
 use super::auth::{LoginRateLimiter, login_client_id, same_origin_request};
 
@@ -71,7 +73,7 @@ mod sync;
 mod tests;
 
 pub(super) use api::Api;
-use sync::{CLOCK_KEYS, Fields, Poll, Row, SyncClient, SyncTable};
+use sync::{CLOCK_KEYS, ClientSync, Fields, Others, Row, Start, SyncClient, SyncTable};
 
 const BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_CAP: usize = 1024;
@@ -241,6 +243,16 @@ impl TorrentFacadeContext {
         };
         torrents.whole().map_err(not_ready)?;
         Ok(torrents.torrents_with_files().await)
+    }
+
+    // What every torrent adds up to, as the service last published them:
+    // not ready until every stored torrent is read.
+    fn sums(&self) -> Result<RowSums, NotReady> {
+        let Some(torrents) = &self.inner.torrents else {
+            return Ok(RowSums::default());
+        };
+        torrents.listing_ready()?;
+        Ok(torrents.snapshot().sums())
     }
 
     // The torrent of `hash`; a failure to read the table is the answer to
@@ -1339,9 +1351,12 @@ async fn transfer_action(ctx: &TorrentFacadeContext, action: &str, params: &Para
     };
     match action {
         "info" => {
-            let views = found!(ctx.bare(Pick::default()).await);
+            let sums = match ctx.sums() {
+                Ok(sums) => sums,
+                Err(why) => return not_ready(why),
+            };
             axum::Json(transfer(
-                &views.iter().collect::<Vec<_>>(),
+                &sums,
                 &ctx.published_sessions().sessions,
                 ctx.torrent_download_limit(),
                 bandwidth.upload_bps,
@@ -1618,7 +1633,7 @@ fn info(view: &TorrentView, scope: CallerScope) -> Value {
 // `info` of a view read without its files, from their totals.
 fn info_row(view: &TorrentView, totals: FileTotals, scope: CallerScope) -> Value {
     Value::Object(
-        steady_row(view, totals, scope)
+        steady_row(view, totals, &TrackerSummary::of(view), scope)
             .into_iter()
             .chain(clock_fields(view, now_secs()))
             .map(|(name, value)| (name.to_owned(), value))
@@ -1645,13 +1660,15 @@ fn clock_fields(view: &TorrentView, now: i64) -> [(&'static str, Value); CLOCK_K
 // Every other field of a torrent's row, which moves only when the view does.
 #[cfg(test)]
 fn steady_fields(view: &TorrentView, scope: CallerScope) -> Vec<(&'static str, Value)> {
-    steady_row(view, FileTotals::of(view), scope)
+    steady_row(view, FileTotals::of(view), &TrackerSummary::of(view), scope)
 }
 
-// `steady_fields` of a view read without its files, from their totals.
+// `steady_fields` of a view read without its files or trackers, from their
+// totals and what its trackers come to.
 fn steady_row(
     view: &TorrentView,
     totals: FileTotals,
+    trackers: &TrackerSummary,
     scope: CallerScope,
 ) -> Vec<(&'static str, Value)> {
     let (save_path, content_path) = view.paths_as(totals.one_file);
@@ -1728,8 +1745,11 @@ fn steady_row(
         ("root_path", json!(root_path(view, totals))),
         ("added_on", json!(secs(view.added_at_ms))),
         ("completion_on", json!(when(view.completed_at_ms))),
-        ("tracker", json!(current_tracker(view, scope))),
-        ("trackers_count", json!(view.trackers.len())),
+        (
+            "tracker",
+            json!(current_tracker(trackers.current.as_ref(), scope)),
+        ),
+        ("trackers_count", json!(trackers.count)),
         // All time, and this run alone, which a pause resets (qBittorrent
         // `serialize_torrent.cpp`: `all_time_download` and
         // `total_payload_download`).
@@ -1764,32 +1784,11 @@ fn steady_row(
 // What `sync/maindata` adds to a torrent's row: whether a tracker answered
 // with a warning, failed, or could not be reached (qBittorrent
 // `addAnnounceStats`).
-fn announce_stats(view: &TorrentView) -> [(&'static str, Value); 3] {
-    let any = |pick: fn(&TorrentTracker) -> bool| json!(view.trackers.iter().any(pick));
+fn announce_stats(trackers: &TrackerSummary) -> [(&'static str, Value); 3] {
     [
-        (
-            "has_tracker_warning",
-            any(|tracker| {
-                tracker.status == TrackerStatus::Working
-                    && tracker
-                        .message
-                        .as_deref()
-                        .is_some_and(|message| !message.is_empty())
-            }),
-        ),
-        (
-            "has_tracker_error",
-            any(|tracker| tracker.status == TrackerStatus::TrackerError),
-        ),
-        (
-            "has_other_announce_error",
-            any(|tracker| {
-                matches!(
-                    tracker.status,
-                    TrackerStatus::NotWorking | TrackerStatus::Unreachable
-                )
-            }),
-        ),
+        ("has_tracker_warning", json!(trackers.warning)),
+        ("has_tracker_error", json!(trackers.error)),
+        ("has_other_announce_error", json!(trackers.other_error)),
     ]
 }
 
@@ -2307,8 +2306,8 @@ async fn file_prio(ctx: &TorrentFacadeContext, params: &Params) -> Response {
 // qBittorrent `TorrentImpl::currentTracker`, as `TorrentView::current_tracker`
 // says it. The URL is redacted for a caller that only reads, as in
 // `torrents/trackers`.
-fn current_tracker(view: &TorrentView, scope: CallerScope) -> String {
-    match view.current_tracker() {
+fn current_tracker(current: Option<&TorrentTracker>, scope: CallerScope) -> String {
+    match current {
         None => String::new(),
         Some(tracker) if scope.can_control() => tracker.url.clone(),
         Some(tracker) => redacted_tracker_url(&tracker.url),
@@ -3676,7 +3675,7 @@ async fn edit_category(
 // vote settled on for that family, in route order, "" for none
 // (qBittorrent `SessionImpl::lastExternalIPv4Address`).
 fn transfer(
-    views: &[&TorrentView],
+    sums: &RowSums,
     sessions: &[SessionSeries],
     download: Option<u64>,
     upload: Option<u64>,
@@ -3693,10 +3692,10 @@ fn transfer(
             .map_or_else(String::new, ToString::to_string)
     };
     let fields = json!({
-        "dl_info_speed": views.iter().map(|view| view.download_bps).sum::<u64>(),
-        "dl_info_data": views.iter().map(|view| view.downloaded_bytes).sum::<u64>(),
-        "up_info_speed": views.iter().map(|view| view.upload_bps).sum::<u64>(),
-        "up_info_data": views.iter().map(|view| view.uploaded_bytes).sum::<u64>(),
+        "dl_info_speed": sums.download_bps,
+        "dl_info_data": sums.downloaded_bytes,
+        "up_info_speed": sums.upload_bps,
+        "up_info_data": sums.uploaded_bytes,
         "last_external_address_v4": external(true),
         "last_external_address_v6": external(false),
         "dht_nodes": dht_nodes,
@@ -3711,48 +3710,39 @@ fn transfer(
     )
 }
 
-// A torrent as a `sync/maindata` poll reads it. Its fingerprint leaves out
-// the fields that move with the clock alone, which `clock_fields` reads, and
-// takes in its files' totals, which its row reads in place of its files;
-// whether the caller may control torrents shapes the row too
-// (`current_tracker`).
-fn maindata_row(
-    row: &(TorrentView, FileTotals),
-    scope: CallerScope,
-) -> Row<'_, (TorrentView, FileTotals)> {
-    let (view, totals) = row;
+// A torrent's row as a `sync/maindata` poll reads it. Its fingerprint
+// leaves out the fields that move with the clock alone, which
+// `clock_fields` reads, and takes in its files' totals, which its row reads
+// in place of its files; whether the caller may control torrents shapes the
+// row too (`current_tracker`).
+fn maindata_row(row: &Arc<TorrentRow>, scope: CallerScope) -> Row<'_, Arc<TorrentRow>> {
+    let view = &row.view;
     Row {
         hash: view.infohash.to_ascii_lowercase(),
         fingerprint: {
             let mut hasher = DefaultHasher::new();
-            (
-                view.fingerprint(ViewParts::Steady),
-                totals,
-                scope.can_control(),
-            )
-                .hash(&mut hasher);
+            (row.print(), scope.can_control()).hash(&mut hasher);
             hasher.finish()
         },
         closed: u8::from(view.download_limit == Some(0))
             | u8::from(view.upload_limit == Some(0)) << 1,
+        place: (view.added_at_ms, view.job_id.0),
         view: row,
     }
 }
 
 // `torrents/info`'s row with the announce flags, keyed by its hash.
-fn maindata_steady(
-    view: &TorrentView,
-    totals: FileTotals,
-    scope: CallerScope,
-) -> Vec<(&'static str, Value)> {
-    let mut row = steady_row(view, totals, scope);
-    row.retain(|(name, _)| *name != "hash");
-    row.extend(announce_stats(view));
-    row
+fn maindata_steady(row: &TorrentRow, scope: CallerScope) -> Vec<(&'static str, Value)> {
+    let mut fields = steady_row(&row.view, row.totals, &row.trackers, scope);
+    fields.retain(|(name, _)| *name != "hash");
+    fields.extend(announce_stats(&row.trackers));
+    fields
 }
 
 // `sync/maindata`: the whole state, or what changed since the response
-// `rid` names (qBittorrent `SyncController::maindataAction`).
+// `rid` names (qBittorrent `SyncController::maindataAction`). The torrents
+// are read from the service's snapshot: a full update reads every row, and
+// changes read only the rows that moved since the client's last response.
 async fn maindata(
     ctx: &TorrentFacadeContext,
     scope: CallerScope,
@@ -3764,24 +3754,20 @@ async fn maindata(
         .get("rid")
         .and_then(|rid| rid.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    // Each row reads its files' totals alone, not its files.
-    let rows = found!(ctx.rows(Pick::default(), Window::Every, false).await);
+    let sums = found!(ctx.sums().map_err(not_ready));
     let tags = match made_tags(ctx).await {
         Ok(tags) => tags,
         Err(error) => return internal(error),
     };
     let config = ctx.inner.config.read().await;
-    let torrents = rows.iter().map(|row| maindata_row(row, scope)).collect();
-    let views: Vec<&TorrentView> = rows.iter().map(|(view, _)| view).collect();
     let (download, upload) = (ctx.torrent_download_limit(), config.bandwidth.upload_bps);
     let server_closed = u8::from(download == Some(0)) | u8::from(upload == Some(0)) << 1;
-    let mut server_state = transfer(&views, &ctx.published_sessions().sessions, download, upload);
+    let mut server_state = transfer(&sums, &ctx.published_sessions().sessions, download, upload);
     let save_path = PathBuf::from(config.complete_dir());
     let free = ctx.free_bytes(save_path).await;
     // Weaver keeps no totals past its torrents: the all-time figures are
     // those of the torrents it has.
-    let downloaded = views.iter().map(|view| view.downloaded_bytes).sum::<u64>();
-    let uploaded = views.iter().map(|view| view.uploaded_bytes).sum::<u64>();
+    let (downloaded, uploaded) = (sums.downloaded_bytes, sums.uploaded_bytes);
     let ratio = if downloaded > 0 && uploaded > 0 {
         format!("{:.2}", uploaded as f64 / downloaded as f64)
     } else {
@@ -3802,15 +3788,9 @@ async fn maindata(
                 ("free_space_on_disk", json!(free)),
                 ("alltime_dl", json!(downloaded)),
                 ("alltime_ul", json!(uploaded)),
-                (
-                    "total_wasted_session",
-                    json!(views.iter().map(|view| view.wasted_bytes).sum::<u64>()),
-                ),
+                ("total_wasted_session", json!(sums.wasted_bytes)),
                 ("global_ratio", json!(ratio)),
-                (
-                    "total_peer_connections",
-                    json!(views.iter().map(|view| u64::from(view.peers)).sum::<u64>()),
-                ),
+                ("total_peer_connections", json!(sums.peers)),
                 // Weaver has no disk cache or announce queue to report.
                 ("read_cache_hits", json!("0")),
                 ("read_cache_overload", json!("0")),
@@ -3831,8 +3811,7 @@ async fn maindata(
             .map(|(key, value)| (key.to_owned(), value)),
         );
     }
-    let now = Poll {
-        torrents,
+    let others = Others {
         categories: match categories(&config) {
             Value::Object(categories) => categories
                 .into_iter()
@@ -3853,19 +3832,61 @@ async fn maindata(
     drop(config);
     let at = now_secs();
     let fields = Fields {
-        steady: |(view, totals): &(TorrentView, FileTotals)| {
+        steady: |row: &Arc<TorrentRow>| {
             #[cfg(test)]
             ctx.inner.maindata_rows.fetch_add(1, Ordering::Relaxed);
-            maindata_steady(view, *totals, scope)
+            maindata_steady(row, scope)
         },
-        clock: |(view, _): &(TorrentView, FileTotals)| clock_fields(view, at),
+        clock: |row: &Arc<TorrentRow>| clock_fields(&row.view, at),
     };
-    // The lock is held for the bookkeeping alone, not while the response is
-    // built.
-    let start = ctx.sync().begin(&client, rid);
-    let (body, kept) = sync::answer(&start, now, &fields);
-    ctx.sync().finish(&client, start.id(), kept);
+    let snapshot = ctx.inner.torrents.as_ref().map(TorrentService::snapshot);
+    // The client's requests are answered one at a time, under its own lock;
+    // the table's lock is held to find it alone.
+    let sync = ctx.sync().client(&client);
+    let mut sync = sync.lock().unwrap_or_else(PoisonError::into_inner);
+    let start = sync.begin(rid, u8::from(scope.can_control()));
+    let body = maindata_answer(&mut sync, &start, snapshot, scope, others, &fields);
+    drop(sync);
     axum::Json(body).into_response()
+}
+
+// The response `start` begins, from the snapshot's rows: the changes, from
+// the rows that moved or went since the revision the client's state stands
+// at, else a full update from every row.
+fn maindata_answer<Steady, Clock>(
+    sync: &mut ClientSync,
+    start: &Start,
+    snapshot: Option<&Snapshot>,
+    scope: CallerScope,
+    others: Others,
+    fields: &Fields<Steady, Clock>,
+) -> Value
+where
+    Steady: Fn(&Arc<TorrentRow>) -> Vec<(&'static str, Value)>,
+    Clock: Fn(&Arc<TorrentRow>) -> [(&'static str, Value); CLOCK_KEYS],
+{
+    let since = start.since().and_then(|since| {
+        let since = snapshot.map_or_else(Default::default, |snapshot| snapshot.since(since));
+        since
+            .removed
+            .map(|removed| (since.revision, since.moved, removed))
+    });
+    let answer = match &since {
+        Some((revision, moved, removed)) => sync.changes(
+            start,
+            *revision,
+            moved.iter().map(|row| maindata_row(row, scope)).collect(),
+            removed.iter().map(|(_, hash)| hash.clone()).collect(),
+            others,
+            fields,
+        ),
+        None => Err(Box::new(others)),
+    };
+    answer.unwrap_or_else(|others| {
+        let (revision, rows) = snapshot.map(Snapshot::every).unwrap_or_default();
+        let rows = rows.iter().map(|row| maindata_row(row, scope)).collect();
+        sync.whole(start, revision, rows, *others, fields)
+    })
 }
 
 // The client's name for a peer from the first eight bytes of its peer id
@@ -4300,6 +4321,11 @@ async fn export(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScope)
 // `httpseeds`) user names, passwords, queries and fragments taken out, and
 // a URL that does not parse left out. Every other byte is as added, so its
 // info hash is the torrent's. None when the metainfo does not parse.
+//
+// The web seed's path stays in this export for every caller, on purpose:
+// the operator ruled on 2026-11-17 that user name, password, query and
+// fragment are stripped and the path is kept. Do not strip the path or
+// raise this again.
 fn without_web_seed_secrets(metainfo: &[u8]) -> Option<Vec<u8>> {
     if metainfo.first() != Some(&b'd') {
         return None;
