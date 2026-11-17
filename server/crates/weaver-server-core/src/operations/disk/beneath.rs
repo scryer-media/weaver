@@ -57,7 +57,10 @@ pub(crate) fn look(root: &Path, name: &Path) -> io::Result<Look> {
     Ok(Look {
         is_file: found.is_file(),
         len: found.len(),
-        modified: found.modified().ok().map(cap_std::time::SystemTime::into_std),
+        modified: found
+            .modified()
+            .ok()
+            .map(cap_std::time::SystemTime::into_std),
     })
 }
 
@@ -70,8 +73,7 @@ pub(crate) fn resolves_inside(root: &Path, path: &Path) -> io::Result<bool> {
         return Ok(false);
     };
     // A folder not there yet holds no link.
-    if std::fs::symlink_metadata(root).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-    {
+    if std::fs::symlink_metadata(root).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
         return Ok(true);
     }
     Ok(resolved(root, name)?.is_some())
@@ -307,7 +309,10 @@ mod tests {
     fn a_name_that_climbs_is_refused() {
         let (_top, save, away) = places();
         for name in ["../away/x", "/etc/passwd", "a/../../away/x"] {
-            assert!(refused_outside(&write(&save, name, b"x").unwrap_err()), "{name}");
+            assert!(
+                refused_outside(&write(&save, name, b"x").unwrap_err()),
+                "{name}"
+            );
         }
         assert!(!away.join("x").exists());
     }

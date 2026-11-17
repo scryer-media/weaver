@@ -363,7 +363,11 @@ mod tests {
         let volume = Arc::new(Volume::new(None, "test".to_owned()));
         let submitter = writers.test_submitter(&volume, 1);
         let reads = VolumeReads::of(StorageKind::Rotational);
-        fn open(path: &std::path::Path, _length: Option<u64>, _: Option<&std::path::Path>) -> std::io::Result<Opened> {
+        fn open(
+            path: &std::path::Path,
+            _length: Option<u64>,
+            _: Option<&std::path::Path>,
+        ) -> std::io::Result<Opened> {
             Ok(Opened {
                 file: std::fs::OpenOptions::new()
                     .read(true)

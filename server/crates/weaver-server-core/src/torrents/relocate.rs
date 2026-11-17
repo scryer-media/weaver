@@ -934,14 +934,14 @@ mod tests {
         for existing in [Existing::Keep, Existing::Replace] {
             // A file of the torrent's that is a link to one outside.
             symlink(away.join("secret"), from.join("linked.bin")).unwrap();
-            let failed = move_files(&from, &moves_of(&["a.bin", "linked.bin"]), existing)
-                .unwrap_err();
+            let failed =
+                move_files(&from, &moves_of(&["a.bin", "linked.bin"]), existing).unwrap_err();
             assert!(leads_outside(&failed.error), "{}", failed.error);
             std::fs::remove_file(from.join("linked.bin")).unwrap();
             // A folder of the torrent's linked outside.
             symlink(&away, from.join("out")).unwrap();
-            let failed = move_files(&from, &moves_of(&["a.bin", "out/secret"]), existing)
-                .unwrap_err();
+            let failed =
+                move_files(&from, &moves_of(&["a.bin", "out/secret"]), existing).unwrap_err();
             assert!(leads_outside(&failed.error), "{}", failed.error);
             std::fs::remove_file(from.join("out")).unwrap();
             // A folder at the new place linked outside.
@@ -952,7 +952,10 @@ mod tests {
             std::fs::remove_file(to.join("sub")).unwrap();
             assert_eq!(contents(&from), expected);
             assert!(contents(&to).is_empty());
-            assert_eq!(contents(&away), vec![(PathBuf::from("secret"), b"theirs".to_vec())]);
+            assert_eq!(
+                contents(&away),
+                vec![(PathBuf::from("secret"), b"theirs".to_vec())]
+            );
         }
         // A folder at the new place linked to another inside it moves.
         std::fs::create_dir_all(to.join("real")).unwrap();

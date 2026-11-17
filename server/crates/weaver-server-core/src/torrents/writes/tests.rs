@@ -234,7 +234,10 @@ fn a_write_through_a_link_that_leads_outside_is_refused() {
     let writes = TorrentDisk::alone().writes(1, &save);
     for name in ["file.bin", "dir/payload.bin", "mid/link/deep/payload.bin"] {
         let refused = write_under(&writes, &save, name).unwrap_err();
-        assert!(format!("{refused:#}").contains("leads outside"), "{name}: {refused:#}");
+        assert!(
+            format!("{refused:#}").contains("leads outside"),
+            "{name}: {refused:#}"
+        );
         let grown = writes
             .grow(
                 Place {
@@ -244,7 +247,10 @@ fn a_write_through_a_link_that_leads_outside_is_refused() {
                 4,
             )
             .unwrap_err();
-        assert!(grown.to_string().contains("leads outside"), "{name}: {grown}");
+        assert!(
+            grown.to_string().contains("leads outside"),
+            "{name}: {grown}"
+        );
     }
     assert_eq!(std::fs::read(away.join("secret")).unwrap(), b"theirs");
     assert!(!away.join("payload.bin").exists());
@@ -253,5 +259,8 @@ fn a_write_through_a_link_that_leads_outside_is_refused() {
     std::fs::create_dir_all(save.join("real")).unwrap();
     symlink("real", save.join("in")).unwrap();
     write_under(&writes, &save, "in/inside.bin").unwrap();
-    assert_eq!(std::fs::read(save.join("real/inside.bin")).unwrap(), b"ours");
+    assert_eq!(
+        std::fs::read(save.join("real/inside.bin")).unwrap(),
+        b"ours"
+    );
 }
