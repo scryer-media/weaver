@@ -125,6 +125,10 @@ pub enum RefusalReason {
     NotRunning,
     /// The class runs and takes no new jobs now; one may be added later.
     Off,
+    /// This run of the server has no such class at all, and gains none
+    /// until it is started anew with it. Held as `Off` is: nothing about
+    /// the payload is wrong.
+    Unavailable,
     /// The payload cannot be read as the class's.
     Invalid,
     /// The class's admission refused it.
@@ -176,6 +180,7 @@ impl AddRefusal {
         match self.reason {
             RefusalReason::NotRunning
             | RefusalReason::Off
+            | RefusalReason::Unavailable
             | RefusalReason::NoNetwork
             | RefusalReason::State => true,
             RefusalReason::Invalid

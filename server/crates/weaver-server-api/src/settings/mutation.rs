@@ -207,6 +207,15 @@ impl SettingsMutation {
         let mut wind_down = None;
         let torrent_update = match &input.torrent {
             Some(update) => {
+                // Torrents this run of the server does not have cannot be
+                // turned on; the rest of their settings still save.
+                if update.enabled == Some(true) {
+                    ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?
+                        .may_turn_on()
+                        .map_err(|refusal| {
+                            crate::auth::graphql_error("TORRENTS_UNAVAILABLE", refusal)
+                        })?;
+                }
                 let mut torrent = config.read().await.torrent.clone();
                 if update.enabled == Some(false)
                     && (torrent.enabled || update.when_disabled.is_some())

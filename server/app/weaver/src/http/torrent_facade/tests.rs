@@ -32,7 +32,9 @@ use weaver_server_core::torrents::service::{JobEnv, TorrentService, TorrentSetti
 use weaver_server_core::torrents::sessions::{
     IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };
-use weaver_server_core::torrents::{TorrentFile, TorrentSource, TorrentState, status};
+use weaver_server_core::torrents::{
+    TorrentAvailability, TorrentFile, TorrentSource, TorrentState, status,
+};
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle, SharedPipelineState};
 
@@ -249,7 +251,7 @@ async fn rig_on(
         None,
     );
     Rig {
-        app: build_torrent_facade_routes(context.clone())
+        app: build_torrent_facade_routes(TorrentAvailability::AVAILABLE, context.clone())
             .layer(Extension(LoginRateLimiter::default())),
         context,
         db,
@@ -2506,14 +2508,73 @@ async fn a_limit_closed_or_opened_sends_the_whole_state() {
 
 #[tokio::test]
 async fn without_a_torrent_client_the_lists_are_empty_and_adds_conflict() {
+    // A server that has torrents whose client did not start: the settings
+    // say on, the facade is mounted, and no client was built.
     let rig = rig_with(false).await;
+    assert!(rig.config.read().await.torrent.enabled);
     assert!(rig.torrents().await.is_empty());
     let added = rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
     assert_eq!(added.status, StatusCode::CONFLICT);
+    assert_eq!(added.body, "torrents are not enabled");
     assert_eq!(
         rig.post("/api/v2/torrents/stop", "hashes=all").await.status,
         StatusCode::OK
     );
+}
+
+// A server without torrents mounts no facade: every `/api/v2` request is
+// answered as one to an unknown path, so no client logs in, passes its
+// connection test or adds, and nothing is written.
+#[tokio::test]
+async fn a_server_without_torrents_mounts_no_facade_and_writes_nothing() {
+    let mut rig = rig_with(false).await;
+    rig.app = build_torrent_facade_routes(TorrentAvailability::UNAVAILABLE, rig.context.clone())
+        .layer(Extension(LoginRateLimiter::default()));
+    let unknown = rig.get("/no/such/path").await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    let before = rig.config.read().await.clone();
+    let holds = rig.context.inner.handle.state().holds();
+
+    for path in ["/api/v2/app/version", "/api/v2/torrents/info"] {
+        let reply = rig.get(path).await;
+        assert_eq!(
+            (reply.status, reply.body.as_str()),
+            (unknown.status, unknown.body.as_str()),
+            "{path}"
+        );
+    }
+    let login = rig
+        .send(
+            Request::post("/api/v2/auth/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("username=admin&password=secret"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(login.status, unknown.status);
+    assert_eq!(login.cookie, None);
+    let added = rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    assert_eq!(
+        (added.status, added.body.as_str()),
+        (unknown.status, unknown.body.as_str())
+    );
+    // What the mounted facade would write: a setting, the hold, a category.
+    assert_eq!(
+        rig.set_preferences(r#"{"listen_port":51413,"max_connec":7}"#)
+            .await,
+        unknown.status
+    );
+    for (path, form) in [
+        ("/api/v2/torrents/stop", "hashes=all"),
+        ("/api/v2/torrents/createCategory", "category=tv"),
+    ] {
+        assert_eq!(rig.post(path, form).await.status, unknown.status, "{path}");
+    }
+    let after = rig.config.read().await.clone();
+    assert_eq!(after.torrent, before.torrent);
+    assert_eq!(after.categories.len(), before.categories.len());
+    assert!(rig.db.list_categories().unwrap().is_empty());
+    assert_eq!(rig.context.inner.handle.state().holds(), holds);
 }
 
 // A body that counts every read of it.

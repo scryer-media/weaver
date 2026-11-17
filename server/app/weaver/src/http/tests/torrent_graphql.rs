@@ -201,6 +201,7 @@ async fn endpoint(dir: &std::path::Path, db: Database, torrents: TorrentService)
         spawn_history_delete_worker: false,
         post_processing_executor: None,
         torrents: Some(torrents),
+        torrent_availability: weaver_server_core::torrents::TorrentAvailability::AVAILABLE,
         usage_recorder: None,
     });
     Router::new()

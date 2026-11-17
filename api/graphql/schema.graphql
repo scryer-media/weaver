@@ -6748,7 +6748,15 @@ Whether torrents are on, and the torrents there are.
 """
 type TorrentPresence {
 	"""
-	The settings turn torrents on.
+	This run of the server has torrents at all: it was started with the
+	environment variable `WEAVER_TORRENTS` set to `1` or `true`. While
+	false no torrent runs, none is listed, turning torrents on is
+	refused, and every other field here is false or null whatever the
+	settings say.
+	"""
+	available: Boolean!
+	"""
+	Torrents are available and the settings turn them on.
 	"""
 	enabled: Boolean!
 	"""

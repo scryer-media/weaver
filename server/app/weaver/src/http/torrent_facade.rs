@@ -415,7 +415,17 @@ impl Caller {
     }
 }
 
-pub(super) fn build_torrent_facade_routes(context: TorrentFacadeContext) -> Router {
+// The qBittorrent facade's routes: none at all on a server without torrents,
+// where a request to `/api/v2` is answered as one to any unknown path. No
+// client then logs in, passes a connection test, or changes a setting, a
+// hold or a category through it.
+pub(super) fn build_torrent_facade_routes(
+    availability: weaver_server_core::torrents::TorrentAvailability,
+    context: TorrentFacadeContext,
+) -> Router {
+    if !availability.available() {
+        return Router::new();
+    }
     Router::new()
         .route("/api/v2/{group}/{action}", any(handle))
         .route_layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT_BYTES))

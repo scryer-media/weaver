@@ -431,7 +431,13 @@ pub struct SystemMetricsSnapshot {
 /// Whether torrents are on, and the torrents there are.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
 pub struct TorrentPresence {
-    /// The settings turn torrents on.
+    /// This run of the server has torrents at all: it was started with the
+    /// environment variable `WEAVER_TORRENTS` set to `1` or `true`. While
+    /// false no torrent runs, none is listed, turning torrents on is
+    /// refused, and every other field here is false or null whatever the
+    /// settings say.
+    pub available: bool,
+    /// Torrents are available and the settings turn them on.
     pub enabled: bool,
     /// There is a torrent job, in any state.
     pub jobs: bool,
@@ -446,9 +452,11 @@ pub struct TorrentPresence {
 
 impl TorrentPresence {
     pub(crate) fn of(
+        availability: weaver_server_core::torrents::TorrentAvailability,
         enabled: bool,
         torrents: Option<&weaver_server_core::torrents::service::TorrentService>,
     ) -> Self {
+        let enabled = availability.on(enabled);
         let presence = torrents
             .map(|torrents| torrents.presence())
             .unwrap_or_default();
@@ -458,6 +466,7 @@ impl TorrentPresence {
             .filter(|_| !enabled)
             .map(crate::settings::types::TorrentDisableModeGql::of_wind_down);
         Self {
+            available: availability.available(),
             enabled,
             jobs: presence.jobs,
             running: presence.running,

@@ -25,6 +25,7 @@ import {
   formFromInstance,
   inputFromForm,
   inputNameProblem,
+  isTorrentQueueEvent,
   jobSchedule,
   newInstanceForm,
   triggerTitle,
@@ -41,6 +42,8 @@ import {
   type ScriptKind,
 } from "../../../data/script-instances";
 import { SCHEDULE_DAYS } from "../../../data/schedule-options";
+import { withoutTorrentOnly } from "../../../data/torrents-shown";
+import { useTorrentsAvailable } from "../../../data/use-torrents-shown";
 import { sortedSecrets, type Secret, type SecretRef } from "../../../data/secrets";
 import { FieldControlView, type FieldSpec } from "../framework";
 import { SecretEditor } from "./SecretEditor";
@@ -102,6 +105,7 @@ export function ScriptInstanceEditor({
   onSetUp: (script: DiscoveredScript) => Promise<string | null>;
 }) {
   const t = useTranslate();
+  const torrentsAvailable = useTorrentsAvailable();
   const [, createInstance] = useMutation(CREATE_SCRIPT_INSTANCE_MUTATION);
   const [, updateInstance] = useMutation(UPDATE_SCRIPT_INSTANCE_MUTATION);
 
@@ -199,9 +203,10 @@ export function ScriptInstanceEditor({
       : []),
   ];
 
-  const queueEvents: string[] = QUEUE_EVENTS.includes(form.queueEvent)
-    ? [...QUEUE_EVENTS]
-    : [...QUEUE_EVENTS, form.queueEvent];
+  // The events offered: without the torrents' own on a server that has no
+  // torrents. The one a saved instance runs on stays listed either way.
+  const events: string[] = withoutTorrentOnly(QUEUE_EVENTS, torrentsAvailable, isTorrentQueueEvent);
+  const queueEvents: string[] = events.includes(form.queueEvent) ? events : [...events, form.queueEvent];
 
   const scriptFields: FieldSpec[] = [
     {

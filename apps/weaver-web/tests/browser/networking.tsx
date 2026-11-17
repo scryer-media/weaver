@@ -82,7 +82,7 @@ function Fixture(){
  <RouteEditor value={route} onChange={setRoute} egresses={egresses} profiles={profiles} pools={pools} cap={50} status={flow.legs.filter(leg=>leg.consumer==="server:1")}/><output aria-label="Route weights">{route.legs.map(l=>l.weight).join(",")}</output></main></MemoryRouter>;
 }
 // Torrents on: the editors show their torrent parts, as they did before those parts asked.
-const torrentsOn={torrents:"on",torrentPresence:{enabled:true,jobs:false,running:false,windingDown:false,windDown:null}} as NextData;
+const torrentsOn={torrents:"on",torrentPresence:{available:true,enabled:true,jobs:false,running:false,windingDown:false,windDown:null}} as NextData;
 createRoot(document.getElementById("root")!).render(<TranslateContext.Provider value={{t:(key,values)=>translateDictionary(en,key,values),uiLanguage:"eng",selectedLanguage:{code:"eng",label:"English"},setLanguagePreference:()=>{}}}><Provider value={client}><DnsReads><Fixture/></DnsReads></Provider></TranslateContext.Provider>);
 
 /* Holds the DNS profile reads as NextDataProvider does, for the editors that offer them, with torrents on. */

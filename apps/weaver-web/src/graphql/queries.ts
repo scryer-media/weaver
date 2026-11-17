@@ -1034,6 +1034,7 @@ export const METRICS_PAGE_QUERY = gql`
 /** Whether torrents are on and whether there are torrents: what torrent things show by. */
 const TORRENT_PRESENCE_FIELDS = `
   fragment TorrentPresenceFields on TorrentPresence {
+    available
     enabled
     jobs
     running

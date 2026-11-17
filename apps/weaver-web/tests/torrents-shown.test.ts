@@ -10,6 +10,8 @@ import {
   torrentAddsOffered,
   torrentSettingsDisclosed,
   torrentSwitchWaits,
+  torrentsAvailable,
+  torrentsAvailableView,
   torrentsShown,
   torrentsStateFrom,
   torrentsView,
@@ -19,9 +21,10 @@ import {
   type TorrentsState,
 } from "../src/next/data/torrents-shown.ts";
 
-const STATES: readonly TorrentsState[] = ["on", "off", "unknown"];
+const STATES: readonly TorrentsState[] = ["on", "off", "unavailable", "unknown"];
 
 const presence = (enabled: boolean, jobs: boolean, running = jobs): TorrentPresence => ({
+  available: true,
   enabled,
   jobs,
   running,
@@ -105,9 +108,57 @@ test("torrent-only things show only once torrents are known to be on", () => {
     [
       ["on", true],
       ["off", false],
+      ["unavailable", false],
       ["unknown", false],
     ],
   );
+});
+
+// A server started without WEAVER_TORRENTS: the third state, apart from off.
+const unavailable = (enabled: boolean, jobs: boolean): TorrentPresence => ({
+  ...presence(enabled, jobs),
+  available: false,
+});
+
+test("a server without torrents is unavailable whatever else it says, and shows and offers nothing", () => {
+  for (const answer of [unavailable(false, false), unavailable(true, false), unavailable(false, true), unavailable(true, true)]) {
+    assert.equal(torrentsStateFrom(answer), "unavailable");
+    assert.equal(torrentsShown(torrentsStateFrom(answer)), false);
+    assert.equal(torrentAddsOffered(answer), false);
+  }
+  // A torrent-only screen leaves as it does while torrents are off.
+  assert.equal(torrentsView("unavailable", "page", "redirect", "loading"), "redirect");
+});
+
+test("the server has torrents while they are on or off, and not while unavailable or unsaid", () => {
+  assert.deepEqual(
+    STATES.map((state) => [state, torrentsAvailable(state)]),
+    [
+      ["on", true],
+      ["off", true],
+      ["unavailable", false],
+      ["unknown", false],
+    ],
+  );
+  // What a direct visit to the Torrents settings draws: the panel, no such panel, or nothing yet.
+  assert.deepEqual(
+    STATES.map((state) => torrentsAvailableView(state, "panel", "none", "wait")),
+    ["panel", "panel", "none", "wait"],
+  );
+});
+
+test("the settings rail and search hold the Torrents panel only while the server has torrents", () => {
+  // The same shape as the settings panels list, in rail order.
+  const panels = [{ slug: "general" }, { slug: "torrents", torrentOnly: true as const }, { slug: "rss" }];
+  const slugs = (state: TorrentsState) =>
+    withoutTorrentOnly(panels, torrentsAvailable(state), (panel) => panel.torrentOnly === true).map(
+      (panel) => panel.slug,
+    );
+  assert.deepEqual(slugs("on"), ["general", "torrents", "rss"]);
+  // Off in the settings: the panel stays, since its switch turns them on.
+  assert.deepEqual(slugs("off"), ["general", "torrents", "rss"]);
+  assert.deepEqual(slugs("unavailable"), ["general", "rss"]);
+  assert.deepEqual(slugs("unknown"), ["general", "rss"]);
 });
 
 test("a filter list keeps every item while on and drops only the torrent-only ones otherwise", () => {
@@ -126,6 +177,7 @@ test("a filter list keeps every item while on and drops only the torrent-only on
     );
   assert.deepEqual(keys("on"), consumers.map((consumer) => consumer.key));
   assert.deepEqual(keys("off"), ["outbound", "server:1", "rss:2"]);
+  assert.deepEqual(keys("unavailable"), ["outbound", "server:1", "rss:2"]);
   assert.deepEqual(keys("unknown"), ["outbound", "server:1", "rss:2"]);
 });
 

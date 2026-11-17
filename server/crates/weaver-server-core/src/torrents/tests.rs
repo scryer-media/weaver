@@ -9,7 +9,7 @@ use crate::torrents::{
     TorrentRecord, TorrentSource, TrackerEntry,
 };
 
-fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
+pub(crate) fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
     TorrentRecord {
         unpack_in_force: None,
         job_id: JobId(job_id),
