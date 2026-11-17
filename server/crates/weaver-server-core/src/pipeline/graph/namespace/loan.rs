@@ -31,6 +31,9 @@ use weaver_graph::{
     VolumeIndex,
 };
 
+use crate::operations::disk::reader::Reading;
+use crate::operations::disk::volume::Volume;
+
 use super::super::envelope::Shelf;
 use super::super::hardware::Shutdown;
 use super::super::leaf::{Leaf, LeafError, read_exact_at};
@@ -148,6 +151,7 @@ impl Loan {
             .recovery_mut()
             .filter(|_| given)
             .map(|recovery| recovery.repair(&mut self.access, budget));
+        self.access.let_go();
         let stopped = self.access.stopped();
         let access = self.access;
         if let Some(dir) = &access.scratch {
@@ -210,6 +214,8 @@ struct Taken {
     spill_later: Option<PathBuf>,
     spill_revision: Option<(u64, u64)>,
     bound: Option<(NodeId, VolumeIndex)>,
+    // The volume the member's file lies on.
+    volume: Option<Arc<Volume>>,
 }
 
 #[derive(Default)]
@@ -326,6 +332,28 @@ struct Lent {
     shutdown: Shutdown,
     // The members the disk has no room for the repair to rebuild.
     withheld: BTreeSet<MemberId>,
+    // The volume of the job's working directory, where its scratch and
+    // spill files lie, and the read turn the loan holds (`Reading`): every
+    // read of a file is made in a turn of the file's volume.
+    working: Option<Arc<Volume>>,
+    reading: RefCell<Reading>,
+}
+
+impl Lent {
+    // `read` in a turn of `volume`, when the file read is written through
+    // one.
+    fn in_turn<R>(&self, volume: Option<&Arc<Volume>>, read: impl FnOnce() -> R) -> R {
+        match volume {
+            Some(volume) => self.reading.borrow_mut().read(volume.read_turns(), read),
+            None => read(),
+        }
+    }
+
+    // The loan waits on something other than the disk, or is done reading:
+    // its turn goes back.
+    pub(super) fn let_go(&self) {
+        self.reading.borrow_mut().let_go();
+    }
 }
 
 // What a repair rewrote: runs of members in the order written, each one's
@@ -548,6 +576,8 @@ impl NamespaceWriter {
             scratch: None,
             shutdown: Shutdown::default(),
             withheld: BTreeSet::new(),
+            working: self.working_volume(),
+            reading: RefCell::default(),
         };
         let mut seen = BTreeSet::new();
         self.take_namespace(tree, namespace, &mut access, &mut seen);
@@ -742,6 +772,10 @@ impl NamespaceWriter {
                     .filter(|_| access.settled.is_some())
                     .map(|leaf| leaf.path().to_path_buf()),
                 bound,
+                volume: files
+                    .and_then(|files| files.leaves.get(&member))
+                    .and_then(Leaf::volume)
+                    .cloned(),
             },
         );
         let Some((child, _)) = bound else {
@@ -799,6 +833,20 @@ impl Lent {
 
 impl Lent {
     fn read_file(
+        &self,
+        at: (NodeId, MemberId),
+        path: &std::path::Path,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let volume = self
+            .members
+            .get(&at)
+            .and_then(|taken| taken.volume.as_ref());
+        self.in_turn(volume, || self.read_file_here(at, path, range, into))
+    }
+
+    fn read_file_here(
         &self,
         at: (NodeId, MemberId),
         path: &std::path::Path,
@@ -869,7 +917,11 @@ impl Source for Lent {
             self.usage.borrow_mut().shelves.insert(child);
         }
         match self.shelves.get(&child) {
-            Some((shelf, _)) => shelf.read_aside(envelope, range, into),
+            // The turn is taken before the shelf's lock, which the read
+            // holds: nothing waits for a turn under it.
+            Some((shelf, _)) => {
+                self.in_turn(shelf.volume(), || shelf.read_aside(envelope, range, into))
+            }
             None => range.is_empty(),
         }
     }
@@ -938,7 +990,10 @@ impl Source for Lent {
         super::tests::SCRATCH_READ_MOST.with(|most| most.set(most.get().max(len)));
         let start = into.len();
         into.resize(start + index(len), 0);
-        if read_exact_at(file, offset, &mut into[start..]).is_err() {
+        let read = self.in_turn(self.working.as_ref(), || {
+            read_exact_at(file, offset, &mut into[start..])
+        });
+        if read.is_err() {
             into.truncate(start);
             return false;
         }
@@ -961,7 +1016,10 @@ impl Source for Lent {
         };
         let start = into.len();
         into.resize(start + index(range.len()), 0);
-        if read_exact_at(file, range.start, &mut into[start..]).is_err() {
+        let read = self.in_turn(self.working.as_ref(), || {
+            read_exact_at(file, range.start, &mut into[start..])
+        });
+        if read.is_err() {
             into.truncate(start);
             return false;
         }

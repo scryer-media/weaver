@@ -499,6 +499,14 @@ impl NamespaceWriter {
         self.disk.as_ref().map(|disk| Arc::clone(disk.under(root)))
     }
 
+    // The volume of the working directory, whose read turns a loan's reads
+    // of the job's scratch and spill files take.
+    pub(super) fn working_volume(&self) -> Option<Arc<crate::operations::disk::volume::Volume>> {
+        self.disk
+            .as_ref()
+            .map(|disk| Arc::clone(disk.working().volume()))
+    }
+
     // Everything the job has submitted for its files, when some of it has
     // yet to return: what a thread of its own waits for before it reads or
     // opens them where they lie. `None` when the files already lie as said.

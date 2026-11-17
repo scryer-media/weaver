@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use super::StorageKind;
+use super::reader::VolumeReads;
 
 // The most of a volume's hard limit one write counts at once
 // (`Volume::write_piece`).
@@ -74,6 +77,9 @@ pub(crate) struct Volume {
     pub(crate) throughput: AtomicU64,
     // What its writer did and what waiting on it cost, for the metrics.
     pub(crate) writer: WriterCounts,
+    // Its read turns, made with its kind when first asked for
+    // (`Volume::reads`).
+    reads: OnceLock<VolumeReads>,
 }
 
 // A volume writer's own counts. Each is one relaxed add per event.
@@ -202,6 +208,15 @@ impl WriterCounts {
     }
 }
 
+impl std::fmt::Debug for Volume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Volume")
+            .field("device", &self.device)
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Volume {
     pub(crate) fn new(device: Option<u64>, label: String) -> Self {
         Self {
@@ -224,7 +239,24 @@ impl Volume {
             write_rate: AtomicU64::new(0),
             throughput: AtomicU64::new(0),
             writer: WriterCounts::default(),
+            reads: OnceLock::new(),
         }
+    }
+
+    // The volume's read turns, shared by everything that reads files on it.
+    // Made once, the first time they are asked for, for the volume's kind
+    // as `kind` says then (`StorageCapacity::volume_reads`); the turns stay
+    // what they were made, as callers hold them.
+    pub(crate) fn reads(&self, kind: impl FnOnce() -> StorageKind) -> &VolumeReads {
+        self.reads.get_or_init(|| VolumeReads::of(kind()))
+    }
+
+    // The volume's read turns for a usenet reader. They were made for the
+    // volume's kind when a job was given its writer (`job_disk`), or by a
+    // torrent before it; a volume no one asked of yet reads as one whose
+    // kind is not known.
+    pub(crate) fn read_turns(&self) -> &VolumeReads {
+        self.reads(|| StorageKind::Unknown)
     }
 
     // The bytes counted against the volume's hard limit: reserved ahead of

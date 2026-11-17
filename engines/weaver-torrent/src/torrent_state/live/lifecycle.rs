@@ -80,6 +80,7 @@ impl TorrentStateLive {
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
             }),
+            reads: arc_swap::ArcSwap::from_pointee(paused.files.read_turns()),
             files: DropOffShard::new(paused.files, &paused.shared.spawner),
             stats: AtomicStats {
                 have_bytes: AtomicU64::new(have_bytes),
@@ -304,10 +305,12 @@ impl TorrentStateLive {
             }
             match seed.claim(piece) {
                 Claim::Check(checking) => {
-                    // The check holds one of the session's blocking
-                    // permits, as a peer's does, and only while it runs.
-                    let _permit =
-                        crate::torrent_state::seed_mode::blocking_permit(&self.shared.spawner);
+                    // The check holds one read turn of the torrent's
+                    // volume, as a peer's does, and only while it runs.
+                    let _turn = crate::torrent_state::seed_mode::read_turn(
+                        &self.shared.spawner,
+                        &self.reads.load(),
+                    );
                     return self.check_claimed(piece, checking);
                 }
                 Claim::Wait(mut found) => {
@@ -324,13 +327,11 @@ impl TorrentStateLive {
 
     // A peer's request for a block of `piece` waits here while the torrent
     // is in seed mode and the piece is not yet checked. The check runs on a
-    // blocking thread of the session and holds one of the session's
-    // blocking permits, as a TCP peer's upload read, an initial check, an
-    // add and a stream do: as many seed-mode pieces are read at once as the
-    // session has permits (`SessionOptions::runtime_worker_threads`, 8 by
-    // default), however many peers ask. A downloaded piece's check runs on
-    // the session's hashing thread and a uTP peer's upload read on the
-    // read threads, neither with a permit. libtorrent hashes a seed-mode
+    // blocking thread of the session and holds one read turn of the
+    // torrent's volume, as every upload read and initial check of it does:
+    // as many seed-mode pieces are read at once as the volume has turns
+    // (eight, one on a spinning disk), however many peers ask. A downloaded
+    // piece's check runs on the session's hashing thread. libtorrent hashes a seed-mode
     // piece with a hash job that has no `sequential_access` flag
     // (peer_connection.cpp:5329-5337, v2.0.15), which goes to its generic
     // disk threads, `aio_threads` (10), not to its hashing thread
@@ -350,12 +351,15 @@ impl TorrentStateLive {
             match seed.claim(piece) {
                 Claim::Check(checking) => {
                     let state = Arc::clone(self);
+                    let turns = self.reads.load_full();
                     // On the session's pool: a uTP thread's runtime has a
                     // pool of its own, which nothing bounds.
                     return self
                         .shared
                         .spawner
-                        .spawn_blocking_with_permit(move || state.check_claimed(piece, checking))
+                        .spawn_blocking_in_turn(&turns, move || {
+                            state.check_claimed(piece, checking)
+                        })
                         .await
                         .context("a seed-mode check did not run to its end")?;
                 }

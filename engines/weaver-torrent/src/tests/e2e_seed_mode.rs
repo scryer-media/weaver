@@ -215,11 +215,13 @@ async fn test_seed_mode_piece_that_fails_its_check_ends_seed_mode_and_checks_eve
 // One file's bytes, read only. Every read waits at a gate until the test
 // opens it, and the gate counts the reads: how many were asked for, how
 // many wait at it now, and the most that waited at once. It also tells
-// whether the storage was handed on while a read was under way.
-#[derive(Default)]
+// whether the storage was handed on while a read was under way. Its
+// storage's reads take `turns`, the read turns of the volume its files are
+// on in a test, which a move changes.
 struct Gate {
     state: std::sync::Mutex<Gated>,
     changed: std::sync::Condvar,
+    turns: std::sync::Mutex<crate::storage::ReadTurns>,
 }
 
 #[derive(Default)]
@@ -232,6 +234,30 @@ struct Gated {
 }
 
 impl Gate {
+    fn new(turns: usize) -> Self {
+        Self {
+            state: Default::default(),
+            changed: Default::default(),
+            turns: std::sync::Mutex::new(crate::storage::ReadTurns::new(
+                std::sync::Arc::new(tokio::sync::Semaphore::new(turns)),
+                false,
+            )),
+        }
+    }
+
+    fn turns(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        std::sync::Arc::clone(self.turns.lock().unwrap().semaphore())
+    }
+
+    // The files are on a volume of `turns` read turns from now on: its
+    // turns, which the storage hands over from here.
+    fn moved(&self, turns: usize) -> std::sync::Arc<tokio::sync::Semaphore> {
+        let now = std::sync::Arc::new(tokio::sync::Semaphore::new(turns));
+        *self.turns.lock().unwrap() =
+            crate::storage::ReadTurns::new(std::sync::Arc::clone(&now), false);
+        now
+    }
+
     fn open(&self) {
         self.state.lock().unwrap().open = true;
         self.changed.notify_all();
@@ -312,6 +338,10 @@ impl crate::storage::TorrentStorage for GatedFactory {
         Ok(())
     }
 
+    fn read_turns(&self) -> crate::storage::ReadTurns {
+        self.gate.turns.lock().unwrap().clone()
+    }
+
     fn take(&self) -> anyhow::Result<Box<dyn crate::storage::TorrentStorage>> {
         let mut state = self.gate.state.lock().unwrap();
         state.taken_while_reading |= state.reading > 0;
@@ -327,7 +357,7 @@ fn piece_of(index: u32) -> anyhow::Result<crate::core::lengths::ValidPieceIndex>
 }
 
 // A session of `permits` blocking permits seeding `t` in seed mode from a
-// gated storage, the torrent running.
+// gated storage on a volume of as many read turns, the torrent running.
 async fn seeding_gated(
     t: &TestTorrent,
     dir: &TempDir,
@@ -339,7 +369,7 @@ async fn seeding_gated(
     tokio::sync::mpsc::UnboundedReceiver<()>,
 )> {
     let (reached, reaches) = tokio::sync::mpsc::unbounded_channel();
-    let gate = std::sync::Arc::new(Gate::default());
+    let gate = std::sync::Arc::new(Gate::new(permits));
     let storage = GatedFactory {
         content: std::sync::Arc::new(t.content.clone()),
         gate: gate.clone(),
@@ -419,10 +449,10 @@ async fn test_seed_mode_piece_asked_for_while_it_is_checked_is_read_once() -> an
 }
 
 // The checks of seed-mode pieces that run at once are as many as the
-// session's blocking permits, each holding one, however many peers ask:
-// six pieces asked for at once on two permits are read two at a time.
+// volume's read turns, each holding one, however many peers ask: six
+// pieces asked for at once on two turns are read two at a time.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_seed_mode_checks_at_once_are_bounded_by_the_blocking_permits() -> anyhow::Result<()> {
+async fn test_seed_mode_checks_at_once_are_bounded_by_the_read_turns() -> anyhow::Result<()> {
     setup_test_logging();
     const PERMITS: usize = 2;
     const ASKED: u32 = 6;
@@ -435,7 +465,7 @@ async fn test_seed_mode_checks_at_once_are_bounded_by_the_blocking_permits() -> 
     let dir = TempDir::with_prefix("test_seed_mode_bounded_out")?;
     let (_session, seed, gate, mut reaches) = seeding_gated(&t, &dir, PERMITS).await?;
     let live = seed.live().context("the seed is not live")?;
-    let permits = live.shared.spawner.semaphore();
+    let permits = gate.turns().clone();
     assert_eq!(permits.available_permits(), PERMITS);
 
     let asked: Vec<_> = (0..ASKED)
@@ -463,12 +493,48 @@ async fn test_seed_mode_checks_at_once_are_bounded_by_the_blocking_permits() -> 
     Ok(())
 }
 
-// A check of a seed-mode piece that no peer's request runs, as the one a
-// server makes of a torrent it placed, holds a blocking permit too: with
-// the session's permits all held, the piece is claimed and not read until
-// one is free.
+// A torrent whose files moved while it runs checks a seed-mode piece in a
+// read turn of the volume they moved to, from the move on: no turn of the
+// volume they left is taken.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_seed_mode_check_off_the_runtime_waits_for_a_blocking_permit() -> anyhow::Result<()> {
+async fn test_a_seed_check_after_the_files_moved_takes_a_turn_of_their_new_volume()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_seed_mode_moved",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_seed_mode_moved_out")?;
+    let (_session, seed, gate, mut reaches) = seeding_gated(&t, &dir, 1).await?;
+    let live = seed.live().context("the seed is not live")?;
+    let left = gate.turns();
+    let now = gate.moved(1);
+    seed.files_moved();
+
+    let asked = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece_of(2)?).await }
+    });
+    reaches.recv().await.context("no read came")?;
+    assert_eq!(
+        (left.available_permits(), now.available_permits()),
+        (1, 0),
+        "the check reads in a turn of the volume the files are on now"
+    );
+    gate.open();
+    assert!(asked.await??);
+    assert_eq!((left.available_permits(), now.available_permits()), (1, 1));
+    Ok(())
+}
+
+// A check of a seed-mode piece that no peer's request runs, as the one a
+// server makes of a torrent it placed, holds a read turn too: with the
+// volume's turns all held, the piece is claimed and not read until one is
+// free.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_seed_mode_check_off_the_runtime_waits_for_a_read_turn() -> anyhow::Result<()> {
     setup_test_logging();
     let t = TestTorrent::new(
         "test_seed_mode_permit",
@@ -480,7 +546,7 @@ async fn test_seed_mode_check_off_the_runtime_waits_for_a_blocking_permit() -> a
     let (_session, seed, gate, mut reaches) = seeding_gated(&t, &dir, 1).await?;
     let live = seed.live().context("the seed is not live")?;
     let piece = piece_of(5)?;
-    let held = live.shared.spawner.semaphore().acquire_owned().await?;
+    let held = gate.turns().clone().acquire_owned().await?;
 
     let checked = tokio::task::spawn_blocking({
         let seed = seed.clone();
@@ -528,7 +594,7 @@ async fn adversary_seed_mode_first_asker_cancelled_before_its_permit() -> anyhow
     let live = seed.live().context("the seed is not live")?;
     let piece = piece_of(5)?;
     let seed_mode = &seed.shared().options.seed;
-    let permits = live.shared.spawner.semaphore();
+    let permits = gate.turns().clone();
     let all = u32::try_from(permits.available_permits())?;
     let taken = permits.clone().acquire_many_owned(all).await?;
 
@@ -599,9 +665,8 @@ async fn adversary_seed_mode_first_asker_cancelled_while_its_check_reads() -> an
     assert!(second.await??);
     assert!(!seed_mode.unchecked(piece));
     assert_eq!(gate.counts().0, 1, "the piece is read once");
-    // The permit the cancelled check held came back.
-    let permits = live.shared.spawner.semaphore();
-    let _all = permits.acquire_many_owned(2).await?;
+    // The turn the cancelled check held came back.
+    let _all = gate.turns().clone().acquire_many_owned(2).await?;
     Ok(())
 }
 
@@ -625,7 +690,7 @@ async fn test_paused_seed_check_waits_for_its_permit_without_the_state_lock() ->
     gate.open();
     seed.pause()?;
     assert!(seed.live().is_none());
-    let permits = seed.shared().spawner.semaphore();
+    let permits = gate.turns().clone();
     let all = u32::try_from(permits.available_permits())?;
     let taken = permits.clone().acquire_many_owned(all).await?;
 
@@ -811,7 +876,7 @@ async fn test_a_seed_mode_check_queued_when_its_run_ends_reads_nothing() -> anyh
     let live = seed.live().context("the seed is not live")?;
     let piece = piece_of(5)?;
     let seed_mode = &seed.shared().options.seed;
-    let held = live.shared.spawner.semaphore().acquire_owned().await?;
+    let held = gate.turns().clone().acquire_owned().await?;
     let asked = tokio::spawn({
         let live = live.clone();
         async move { live.serve_seeded(piece).await }
@@ -887,10 +952,10 @@ async fn test_a_torrents_seed_check_across_a_pause_checks_the_paused_torrent() -
     let dir = TempDir::with_prefix("test_seed_check_across_pause_out")?;
     let (_session, seed, gate, _reaches) = seeding_gated(&t, &dir, 1).await?;
     gate.open();
-    let live = seed.live().context("the seed is not live")?;
+    seed.live().context("the seed is not live")?;
     let piece = piece_of(6)?;
     let seed_mode = &seed.shared().options.seed;
-    let held = live.shared.spawner.semaphore().acquire_owned().await?;
+    let held = gate.turns().clone().acquire_owned().await?;
     let checked = tokio::task::spawn_blocking({
         let seed = seed.clone();
         move || seed.check_seeded(piece.get())
