@@ -461,6 +461,22 @@ enum Proxying {
     Alerts,
     // Holds it until the test lets it go, then carries it to the address.
     Held(SocketAddr),
+    // Carries it to a destination that reads the request and never answers.
+    Stalls,
+}
+
+// The requests a stalled destination read, shared by every stand-in that
+// carries to it.
+#[derive(Default)]
+struct Stall {
+    asked: std::sync::atomic::AtomicUsize,
+    heard: tokio::sync::Notify,
+}
+
+impl Stall {
+    fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 // A proxy session in place of an HTTP/3 proxy's: what it does with a dial
@@ -471,16 +487,26 @@ struct StandIn {
     dials: Mutex<Vec<(String, u16)>>,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    stall: Arc<Stall>,
 }
 
 impl StandIn {
     fn new(default: Proxying, hosts: &[(&'static str, Proxying)]) -> Arc<Self> {
+        Self::stalling(default, hosts, &Arc::default())
+    }
+    // One whose stalled destination is `stall`.
+    fn stalling(
+        default: Proxying,
+        hosts: &[(&'static str, Proxying)],
+        stall: &Arc<Stall>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             default,
             hosts: hosts.iter().copied().collect(),
             dials: Mutex::default(),
             reached: Default::default(),
             release: Default::default(),
+            stall: stall.clone(),
         })
     }
     fn dials(&self) -> Vec<(String, u16)> {
@@ -533,6 +559,28 @@ impl TunnelProvider for StandIn {
                 self.reached.notify_one();
                 self.release.notified().await;
                 connect(addr).await
+            }
+            Proxying::Stalls => {
+                use tokio::io::AsyncReadExt;
+                let (near, mut far) = tokio::io::duplex(64 * 1024);
+                let stall = self.stall.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        let Ok(byte) = far.read_u8().await else {
+                            return;
+                        };
+                        head.push(byte);
+                    }
+                    stall
+                        .asked
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    stall.heard.notify_one();
+                    // Held open, unanswered, until the client lets it go.
+                    let mut rest = Vec::new();
+                    let _ = far.read_to_end(&mut rest).await;
+                });
+                Ok(Box::new(near))
             }
         }
     }
@@ -1064,14 +1112,25 @@ async fn a_routed_client_dials_no_more_of_a_leg_changed_under_it() {
     .await;
 }
 
-// What the walk makes of an attempt's own time running out: the path's,
-// though its dial went through.
-#[tokio::test(start_paused = true)]
-async fn running_out_of_time_is_the_paths() {
-    let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
-        .await
-        .unwrap_err();
-    let verdict = judge(Err(elapsed), None, true, "TEST");
+// What the walk makes of an attempt's own time running out: the
+// destination's once the attempt's dial went through, so nothing is
+// charged and the next attempt is tried; the path's, as a timeout, while it
+// had not.
+#[test]
+fn running_out_of_time_is_the_paths_until_its_dial_went_through() {
+    let timed_out = || {
+        Err(AttemptError::TimedOut {
+            destination: "http://stalled.test:80".into(),
+        })
+    };
+    let verdict = judge(timed_out(), None, true, "TEST");
+    assert!(verdict.end.is_none());
+    assert!(
+        matches!(&verdict.report, Report::Carried(error) if error == "TEST request timed out after its route connected"),
+        "{:?}",
+        verdict.report
+    );
+    let verdict = judge(timed_out(), None, false, "TEST");
     assert!(verdict.end.is_none());
     assert!(
         matches!(&verdict.report, Report::Failed(error) if matches!(error.as_ref(), DialError::Timeout { .. })),
@@ -1086,10 +1145,10 @@ async fn running_out_of_time_is_the_paths() {
 #[test]
 fn a_request_sent_without_a_dial_through_is_the_paths() {
     let sent = || {
-        Ok(Err(AttemptError::Sent {
+        Err(AttemptError::Sent {
             destination: "http://dropping.test:80".into(),
             cause: "connection reset".into(),
-        }))
+        })
     };
     let verdict = judge(sent(), None, false, "TEST");
     assert!(verdict.end.is_none());
@@ -1105,6 +1164,162 @@ fn a_request_sent_without_a_dial_through_is_the_paths() {
         "{:?}",
         verdict.report
     );
+}
+
+// Holds a paused clock still while a loopback read or write is in flight:
+// tokio does not move it on its own while a blocking task runs, so time
+// moves only when the test advances it. Dropping the hold ends the task.
+struct ClockHold(#[allow(dead_code)] std::sync::mpsc::Sender<()>);
+
+fn hold_the_clock() -> ClockHold {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let _ = rx.recv();
+    });
+    ClockHold(tx)
+}
+
+// Once `stall` has read a request, the attempt's time runs out.
+async fn run_out_once_asked(stall: &Stall, options: &FetchOptions) {
+    stall.heard.notified().await;
+    tokio::time::advance(options.timeout).await;
+}
+
+// The proxy carries the request to a destination that never answers: the
+// attempt's time runs out, the fetch goes on to the next rung, which
+// carries it, and neither rung is charged.
+#[tokio::test(start_paused = true)]
+async fn a_destination_that_never_answers_on_one_rung_is_carried_by_the_next() {
+    let clock = hold_the_clock();
+    let (addr, log, task) = origin().await;
+    let first = StandIn::new(Proxying::Stalls, &[]);
+    let second = StandIn::new(Proxying::To(addr), &[]);
+    let db = with_proxies(&[1, 2]);
+    let runtime = standing_in(
+        &db,
+        vec![ladder(100, vec![proxy(1), proxy(2)])],
+        &[(1, &first), (2, &second)],
+    );
+    let options = options(true);
+    let (response, ()) = tokio::join!(
+        outbound_fetch(&runtime, "http://origin.test/start", &options),
+        run_out_once_asked(&first.stall, &options),
+    );
+    assert_eq!(
+        read_body(response.unwrap(), 1024).await.unwrap(),
+        b"fetched"
+    );
+    assert_eq!(first.stall.asked(), 1);
+    assert_eq!(first.hosts(), ["origin.test"]);
+    assert_eq!(second.hosts(), ["origin.test"]);
+    assert_eq!(
+        outbound_health(&runtime),
+        (vec!["STANDBY", "STANDBY"], LegHealthState::Up)
+    );
+    assert_eq!(requests(&log), [pair("/start", "origin.test")]);
+    runtime.stop_all().await;
+    task.abort();
+    drop(clock);
+}
+
+// One rung, and a destination that never answers: that request times out
+// as the destination's, the rung stays on standby and the leg up, and the
+// next fetch, to another host, dials at once and is answered.
+#[tokio::test(start_paused = true)]
+async fn a_destination_that_never_answers_fails_that_request_only() {
+    let clock = hold_the_clock();
+    let (addr, log, task) = origin().await;
+    let only = StandIn::new(Proxying::To(addr), &[("stalled.test", Proxying::Stalls)]);
+    let db = with_proxies(&[1]);
+    let runtime = standing_in(&db, vec![ladder(100, vec![proxy(1)])], &[(1, &only)]);
+    let options = options(true);
+    let (result, ()) = tokio::join!(
+        outbound_fetch(&runtime, "http://stalled.test/start", &options),
+        run_out_once_asked(&only.stall, &options),
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "TEST request timed out after its route connected"
+    );
+    assert_eq!(
+        outbound_health(&runtime),
+        (vec!["STANDBY"], LegHealthState::Up)
+    );
+    let response = outbound_fetch(&runtime, "http://origin.test/start", &options)
+        .await
+        .unwrap();
+    assert_eq!(read_body(response, 1024).await.unwrap(), b"fetched");
+    assert_eq!(only.stall.asked(), 1);
+    assert_eq!(only.hosts(), ["stalled.test", "origin.test"]);
+    assert_eq!(requests(&log), [pair("/start", "origin.test")]);
+    runtime.stop_all().await;
+    task.abort();
+    drop(clock);
+}
+
+// A pool rung of three members before a destination that never answers:
+// the destination is asked once on that rung, not once by each member, and
+// no member is charged.
+#[tokio::test(start_paused = true)]
+async fn a_destination_that_never_answers_is_asked_once_per_rung() {
+    let clock = hold_the_clock();
+    let stall = Arc::<Stall>::default();
+    let members: Vec<_> = (0..3)
+        .map(|_| StandIn::stalling(Proxying::Stalls, &[], &stall))
+        .collect();
+    let db = with_proxies(&[1, 2, 3]);
+    let pool = pool_of(&db, &[1, 2, 3]);
+    let runtime = standing_in(
+        &db,
+        vec![ladder(100, vec![pool])],
+        &[(1, &members[0]), (2, &members[1]), (3, &members[2])],
+    );
+    let options = options(true);
+    let (result, ()) = tokio::join!(
+        outbound_fetch(&runtime, "http://stalled.test/start", &options),
+        run_out_once_asked(&stall, &options),
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "TEST request timed out after its route connected"
+    );
+    assert_eq!(stall.asked(), 1);
+    let dials: usize = members.iter().map(|member| member.dials().len()).sum();
+    assert_eq!(dials, 1);
+    assert_pool_uncharged(&runtime);
+    assert_eq!(
+        outbound_health(&runtime),
+        (vec!["STANDBY"], LegHealthState::Up)
+    );
+    runtime.stop_all().await;
+    drop(clock);
+}
+
+// A dial the proxy never completes: the attempt's time runs out before the
+// path carried anything, so the rung cools as the path's.
+#[tokio::test(start_paused = true)]
+async fn a_dial_that_never_completes_cools_its_rung() {
+    let clock = hold_the_clock();
+    let (addr, _log, task) = origin().await;
+    let held = StandIn::new(Proxying::Held(addr), &[]);
+    let db = with_proxies(&[1]);
+    let runtime = standing_in(&db, vec![ladder(100, vec![proxy(1)])], &[(1, &held)]);
+    let options = options(true);
+    let (result, ()) = tokio::join!(
+        outbound_fetch(&runtime, "http://origin.test/start", &options),
+        async {
+            held.reached.notified().await;
+            tokio::time::advance(options.timeout).await;
+        },
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "TEST request failed on all permitted routes"
+    );
+    assert_eq!(outbound_health(&runtime).0, ["COOLDOWN"]);
+    runtime.stop_all().await;
+    task.abort();
+    drop(clock);
 }
 
 // Every WARN event on this thread, as its fields.

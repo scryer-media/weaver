@@ -368,6 +368,10 @@ pub(crate) enum AttemptError {
     // response came: the path's failure unless the attempt's dial went
     // through it. `destination` is the hop's scheme, host and port.
     Sent { destination: String, cause: String },
+    // The attempt's own time ran out on a hop to `destination`, its scheme,
+    // host and port: the path's unless the attempt's dial went through it,
+    // as for a request that fails once handed over.
+    TimedOut { destination: String },
     // The destination is refused whichever path it is reached over.
     Destination(String),
     // The path carried a response, but the fetch cannot go on from it.
@@ -408,13 +412,12 @@ where
             continue;
         }
         let path: Arc<dyn FetchPath> = attempt.clone();
+        // Each attempt has the whole of the fetch's timeout: one that runs
+        // out on a rung leaves the next rung its own.
         let result = tokio::select! {
             biased;
             _ = attempt.cancelled() => continue,
-            result = tokio::time::timeout(
-                options.timeout,
-                fetch_on(&path, url, options, &request),
-            ) => result,
+            result = fetch_on(&path, url, options, &request) => result,
         };
         let verdict = judge(
             result,
@@ -463,7 +466,7 @@ pub(crate) struct Verdict {
 // failure of the attempt's own dial or lookup, if one failed; `carried`
 // says whether its latest dial went through the path.
 pub(crate) fn judge(
-    result: Result<Result<reqwest::Response, AttemptError>, tokio::time::error::Elapsed>,
+    result: Result<reqwest::Response, AttemptError>,
     transport: Option<Arc<DialError>>,
     carried: bool,
     label: &'static str,
@@ -476,23 +479,23 @@ pub(crate) fn judge(
         return failed(error);
     }
     match result {
-        Ok(Ok(response)) => Verdict {
+        Ok(response) => Verdict {
             report: Report::Answered,
             end: Some(Ok(response)),
         },
-        Ok(Err(AttemptError::Answered(message))) => Verdict {
+        Err(AttemptError::Answered(message)) => Verdict {
             report: Report::Answered,
             end: Some(Err(message)),
         },
-        Ok(Err(AttemptError::Destination(message))) => Verdict {
+        Err(AttemptError::Destination(message)) => Verdict {
             report: Report::Nothing,
             end: Some(Err(message)),
         },
-        Ok(Err(AttemptError::Routed(error))) => failed(error),
+        Err(AttemptError::Routed(error)) => failed(error),
         // The path carried the connection, and the destination failed the
         // request on it, as when a body breaks off: no evidence about the
         // path, so the next path is tried.
-        Ok(Err(AttemptError::Sent { destination, cause })) if carried => {
+        Err(AttemptError::Sent { destination, cause }) if carried => {
             tracing::warn!(
                 fetch = label,
                 %destination,
@@ -506,13 +509,30 @@ pub(crate) fn judge(
                 end: None,
             }
         }
-        Ok(Err(AttemptError::Route | AttemptError::Sent { .. })) => {
+        // The path carried the connection, and the destination did not
+        // answer in the attempt's time: the destination's, as above.
+        Err(AttemptError::TimedOut { destination }) if carried => {
+            tracing::warn!(
+                fetch = label,
+                %destination,
+                "request timed out after its route connected"
+            );
+            Verdict {
+                report: Report::Carried(format!(
+                    "{label} request timed out after its route connected"
+                )),
+                end: None,
+            }
+        }
+        Err(AttemptError::Route | AttemptError::Sent { .. }) => {
             failed(Arc::new(DialError::Egress(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 format!("{label} transport or routed DNS failed"),
             ))))
         }
-        Err(_) => failed(Arc::new(DialError::Timeout {
+        // The time ran out before the attempt's dial went through: in the
+        // lookup, the proxy, the tunnel or the connect.
+        Err(AttemptError::TimedOut { .. }) => failed(Arc::new(DialError::Timeout {
             stage: format!("{label} route"),
         })),
     }
@@ -520,8 +540,9 @@ pub(crate) fn judge(
 
 const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
 
-// One attempt: every hop of the fetch on `path`. Each redirect is resolved
-// and checked through the same path before it is followed.
+// One attempt: every hop of the fetch on `path`, within the options'
+// timeout. Each redirect is resolved and checked through the same path
+// before it is followed.
 pub(crate) async fn fetch_on<F>(
     path: &Arc<dyn FetchPath>,
     url: &reqwest::Url,
@@ -531,10 +552,32 @@ pub(crate) async fn fetch_on<F>(
 where
     F: Fn(reqwest::RequestBuilder, &reqwest::Url, usize) -> reqwest::RequestBuilder + Sync,
 {
+    // The hop under way, as scheme, host and port, for when time runs out.
+    let at = std::sync::Mutex::new(scheme_host_port(url));
+    tokio::time::timeout(options.timeout, hops(path, url, options, request, &at))
+        .await
+        .unwrap_or_else(|_| {
+            Err(AttemptError::TimedOut {
+                destination: std::mem::take(&mut *at.lock().expect("fetch hop")),
+            })
+        })
+}
+
+async fn hops<F>(
+    path: &Arc<dyn FetchPath>,
+    url: &reqwest::Url,
+    options: &FetchOptions,
+    request: &F,
+    at: &std::sync::Mutex<String>,
+) -> Result<reqwest::Response, AttemptError>
+where
+    F: Fn(reqwest::RequestBuilder, &reqwest::Url, usize) -> reqwest::RequestBuilder + Sync,
+{
     let label = options.label;
     let bridge = start_bridge(path.clone()).map_err(|_| AttemptError::Route)?;
     let mut current = url.clone();
     for hop in 0..=options.redirects {
+        *at.lock().expect("fetch hop") = scheme_host_port(&current);
         if options.https_only && current.scheme() != "https" {
             return Err(AttemptError::Destination(format!(
                 "{label} URL must use https"
@@ -574,9 +617,10 @@ where
                 if weaver_nntp::tls::is_certificate_error(&error) {
                     AttemptError::Destination(format!("{label} TLS verification failed"))
                 } else if error.is_timeout() {
-                    // The attempt's own time ran out: the path's, as the
-                    // attempt's timeout is.
-                    AttemptError::Route
+                    // The client's timeout is the attempt's: its time ran out.
+                    AttemptError::TimedOut {
+                        destination: scheme_host_port(&current),
+                    }
                 } else {
                     AttemptError::Sent {
                         destination: scheme_host_port(&current),
