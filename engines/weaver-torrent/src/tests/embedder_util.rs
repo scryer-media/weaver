@@ -142,6 +142,12 @@ impl StorageLog {
         self.files.read()[file_id].read().clone()
     }
 
+    /// Every byte of file `file_id` becomes `byte`: another file's bytes
+    /// under the torrent's name.
+    pub fn overwrite_file(&self, file_id: usize, byte: u8) {
+        self.files.read()[file_id].write().fill(byte);
+    }
+
     /// Holds the next `ensure_file_length` until the returned sender sends
     /// or is dropped.
     pub fn hold_file_lengths(&self) -> std::sync::mpsc::Sender<()> {

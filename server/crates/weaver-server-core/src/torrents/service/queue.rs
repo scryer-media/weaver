@@ -488,6 +488,7 @@ fn refusal(error: AddError) -> AddRefusal {
         AddError::NoNetwork(_) => RefusalReason::NoNetwork,
         AddError::Off => RefusalReason::Off,
         AddError::State(_) => RefusalReason::State,
+        AddError::Forbidden(_) => RefusalReason::Invalid,
     };
     AddRefusal {
         reason,
@@ -499,7 +500,9 @@ pub(super) fn scheduler_error(error: ActionError) -> SchedulerError {
     match error {
         ActionError::NotFound(job_id) => SchedulerError::JobNotFound(job_id),
         ActionError::UnmetGoal(_) => SchedulerError::Conflict(error.to_string()),
-        ActionError::Invalid(reason) => SchedulerError::InvalidInput(reason),
+        ActionError::Invalid(reason) | ActionError::Forbidden(reason) => {
+            SchedulerError::InvalidInput(reason)
+        }
         ActionError::State(reason) => SchedulerError::Internal(reason),
     }
 }

@@ -33,12 +33,53 @@ pub(crate) struct DirectoryFingerprint {
 // wherever the mount takes the exclusive rename; see `rename_exclusive_with`
 // for the mounts that refuse it.
 pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
+    rename_path_exclusive_or(src, dst, Unlinkable::Copied)
+}
+
+// `rename_path_exclusive` that never copies: a move of names alone, however
+// large the file. The same exclusive rename, then the same link and unlink.
+// A symbolic link that neither took is made again at the target, which
+// never replaces, and removed at the source.
+//
+// Anything else is looked for at the target and then renamed, as
+// libtorrent moves a torrent's files (`storage_utils.cpp` `move_storage`:
+// `exists`, then `move_file`; `path.cpp` `rename` is a plain rename(2)),
+// whenever neither the exclusive rename nor the link moved it. Only two
+// answers of those end the move: the target exists (`AlreadyExists`, for
+// the caller to number or refuse), and another device (`CrossesDevices`,
+// for the caller to copy). Any other, as network and FUSE mounts give
+// (EINVAL, ENOTSUP, EPERM, EACCES, EMLINK and more), passes to the next
+// step, and the plain rename's own answer is the move's.
+//
+// An entry made at the target between that look and that rename is
+// replaced by a file: no move left there refuses it.
+pub(crate) fn rename_path_exclusive_in_place(src: &Path, dst: &Path) -> io::Result<()> {
+    rename_path_exclusive_or(src, dst, Unlinkable::Renamed)
+}
+
+// What becomes of a file on a mount with neither an exclusive rename nor
+// hard links.
+#[derive(Clone, Copy)]
+enum Unlinkable {
+    // Copied into a file made new, and its source removed.
+    Copied,
+    // Renamed after a look at the target.
+    Renamed,
+}
+
+fn rename_path_exclusive_or(src: &Path, dst: &Path, unlinkable: Unlinkable) -> io::Result<()> {
     if src == dst {
         return Ok(());
     }
+    // `MoveFileExW` below, without `MOVEFILE_COPY_ALLOWED` or
+    // `MOVEFILE_REPLACE_EXISTING`, never copies and never replaces.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = unlinkable;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        rename_exclusive_with(src, dst, exclusive_rename_native)
+        rename_exclusive_with_link(src, dst, exclusive_rename_native, unlinkable, |src, dst| {
+            std::fs::hard_link(src, dst)
+        })
     }
     #[cfg(windows)]
     {
@@ -79,6 +120,117 @@ pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
+// One job's file moves that never replace what is there, in one run of
+// placing or moving its files.
+//
+// `rename_path_exclusive_in_place` is the move: an entry at the target,
+// whenever it came, is answered `AlreadyExists` and stays as it was (but on
+// a mount with no move that refuses, where it is looked for first). A file
+// is copied only across devices, never on its own. Across devices,
+// where no rename goes, the file is copied to a new hidden name in the
+// target's folder and moved from there by the same never-replacing move, so
+// the target is never a file half written. The copy is removed whenever the
+// move does not end at the target.
+//
+// The hidden copy is named for the job (`move_copy_name`), one of
+// `MOVE_COPY_TRIES` names. A run that died mid-copy leaves one behind; the
+// job's next move into that folder removes it first (`sweep_move_copies`),
+// and so does a removal of the torrent with its files.
+pub(crate) struct JobMoves {
+    job: u64,
+    // The folders swept of the job's left copies in this run.
+    swept: std::cell::RefCell<std::collections::HashSet<PathBuf>>,
+}
+
+// How many names a job's hidden copy may take in one folder. A move that
+// finds every one taken, or cannot make any, fails with that error.
+pub(crate) const MOVE_COPY_TRIES: u32 = 16;
+
+// The `n`th name of `job`'s hidden copy.
+pub(crate) fn move_copy_name(job: u64, n: u32) -> String {
+    format!(".wvr-{job}-{n:x}")
+}
+
+// Removes from `folder` the hidden copies `job`'s moves left there: only a
+// regular file under one of that job's own names, never another job's and
+// never a folder or a link.
+pub(crate) fn sweep_move_copies(job: u64, folder: &Path) {
+    for n in 0..MOVE_COPY_TRIES {
+        let copy = folder.join(move_copy_name(job, n));
+        if std::fs::symlink_metadata(&copy).is_ok_and(|found| found.file_type().is_file())
+            && let Err(error) = std::fs::remove_file(&copy)
+        {
+            tracing::warn!(path = %copy.display(), error = %error, "a left copy of a moved file could not be removed");
+        }
+    }
+}
+
+impl JobMoves {
+    pub(crate) fn of(job: u64) -> Self {
+        Self {
+            job,
+            swept: Default::default(),
+        }
+    }
+
+    // Moves the file `src` to `dst`, never over what is there.
+    pub(crate) fn move_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        self.move_file_using(src, dst, rename_path_exclusive_in_place)
+    }
+
+    pub(crate) fn move_file_using(
+        &self,
+        src: &Path,
+        dst: &Path,
+        rename: impl Fn(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let folder = dst.parent().unwrap_or_else(|| Path::new("."));
+        if self.swept.borrow_mut().insert(folder.to_path_buf()) {
+            sweep_move_copies(self.job, folder);
+        }
+        match rename(src, dst) {
+            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
+            moved => return moved,
+        }
+        // No copy is made for a name that is taken already.
+        if std::fs::symlink_metadata(dst).is_ok() {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        let mut made = None;
+        for n in 0..MOVE_COPY_TRIES {
+            let copy = folder.join(move_copy_name(self.job, n));
+            // Made new, so it is this move's own; a name something else
+            // holds is passed over. The copy that failed removed what it
+            // made.
+            match file_cache::copy_large_file(src, &copy) {
+                Ok(_) => {
+                    made = Some(Ok(copy));
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    made = Some(Err(error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Every name was taken, or the folder itself cannot be made (a file
+        // holds its name): the last answer, never another try.
+        let copy = made.unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::AlreadyExists)))?;
+        if let Err(error) = rename(&copy, dst) {
+            let _ = std::fs::remove_file(&copy);
+            return Err(error);
+        }
+        // The file is at `dst`, whole: a source that will not go is only
+        // left behind.
+        if let Err(error) = std::fs::remove_file(src)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %src.display(), error = %error, "a moved file was copied but could not be removed from where it was");
+        }
+        Ok(())
+    }
+}
+
 // The one call that both moves and refuses an existing target, atomically.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 type ExclusiveRename = fn(&std::ffi::CStr, &std::ffi::CStr) -> io::Result<()>;
@@ -115,9 +267,11 @@ fn exclusive_rename_native(src: &std::ffi::CStr, dst: &std::ffi::CStr) -> io::Re
 // a file created between the two. Directories retain their inode for the
 // working-directory ownership journal; plain rename cannot replace a file
 // or a nonempty directory with a directory.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn rename_exclusive_with(src: &Path, dst: &Path, exclusive: ExclusiveRename) -> io::Result<()> {
-    rename_exclusive_with_link(src, dst, exclusive, |src, dst| std::fs::hard_link(src, dst))
+    rename_exclusive_with_link(src, dst, exclusive, Unlinkable::Copied, |src, dst| {
+        std::fs::hard_link(src, dst)
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -125,6 +279,7 @@ fn rename_exclusive_with_link(
     src: &Path,
     dst: &Path,
     exclusive: ExclusiveRename,
+    unlinkable: Unlinkable,
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -132,8 +287,19 @@ fn rename_exclusive_with_link(
         std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
     };
+    // Whether an answer of the first two rungs passes to the next one. In
+    // place, only "the target exists" and "another device" end the move
+    // there: network and FUSE mounts answer these calls with many codes
+    // where a plain rename still works, and the last rung's rename says
+    // what is wrong when nothing works. A move that copies when no name
+    // move goes passes on "not supported" alone, so a refusal never turns
+    // into a copy on the same device.
+    let passes = |error: &io::Error, also: &[i32]| match unlinkable {
+        Unlinkable::Renamed => !matches!(error.raw_os_error(), Some(libc::EEXIST | libc::EXDEV)),
+        Unlinkable::Copied => refused(error, also),
+    };
     match exclusive(&path(src)?, &path(dst)?) {
-        Err(error) if refused(&error, &[]) => {}
+        Err(error) if passes(&error, &[]) => {}
         moved => return moved,
     }
     // A directory has no hard links: link(2) answers it EPERM.
@@ -146,18 +312,33 @@ fn rename_exclusive_with_link(
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             return finish_or_refuse(src, dst);
         }
-        Err(error) if refused(&error, &[libc::EPERM, libc::EXDEV]) => {}
+        // Another device: no move of names goes there, and the caller that
+        // never copies in place is told so.
+        Err(error)
+            if matches!(unlinkable, Unlinkable::Renamed)
+                && error.kind() == io::ErrorKind::CrossesDevices =>
+        {
+            return Err(error);
+        }
+        Err(error) if passes(&error, &[libc::EPERM, libc::EXDEV]) => {}
         Err(error) => return Err(error),
     }
     let source = std::fs::symlink_metadata(src)?;
     if let Some(settled) = settled_before_copy(src, dst) {
         return settled;
     }
-    if source.is_file() {
-        return copy_file_no_overwrite_then_remove_source(src, dst);
-    }
+    // A symbolic link is made again at the target, which never replaces:
+    // neither a copy nor a rename that cannot refuse.
     if source.file_type().is_symlink() {
         return move_symlink_no_overwrite(src, dst);
+    }
+    if matches!(unlinkable, Unlinkable::Renamed) {
+        // The limit `rename_path_exclusive_in_place` names: the look
+        // above, then a rename that cannot refuse.
+        return std::fs::rename(src, dst);
+    }
+    if source.is_file() {
+        return copy_file_no_overwrite_then_remove_source(src, dst);
     }
     if !source.is_dir() {
         return Err(io::Error::new(
@@ -822,16 +1003,169 @@ mod tests {
         let dst = dir.path().join("destination.bin");
         std::fs::write(&src, b"source").unwrap();
         let no_links = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-        rename_exclusive_with_link(&src, &dst, refuse::<{ libc::EINVAL }>, no_links).unwrap();
+        rename_exclusive_with_link(
+            &src,
+            &dst,
+            refuse::<{ libc::EINVAL }>,
+            Unlinkable::Copied,
+            no_links,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
         assert!(!src.exists());
 
         std::fs::write(&src, b"second").unwrap();
-        let error = rename_exclusive_with_link(&src, &dst, refuse::<{ libc::EINVAL }>, no_links)
-            .unwrap_err();
+        let error = rename_exclusive_with_link(
+            &src,
+            &dst,
+            refuse::<{ libc::EINVAL }>,
+            Unlinkable::Copied,
+            no_links,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&src).unwrap(), b"second");
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    // A link refused the way `refuses` says, on a mount that refuses the
+    // exclusive rename too, by the move that never copies.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn in_place_without_links(src: &Path, dst: &Path, refuses: i32) -> io::Result<()> {
+        rename_exclusive_with_link(
+            src,
+            dst,
+            refuse::<{ libc::EINVAL }>,
+            Unlinkable::Renamed,
+            |_, _| Err(io::Error::from_raw_os_error(refuses)),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_mount_without_exclusive_rename_or_links_renames_and_never_copies() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("destination.bin");
+        std::fs::write(&src, b"source").unwrap();
+        let inode = std::fs::metadata(&src).unwrap().ino();
+        in_place_without_links(&src, &dst, libc::EOPNOTSUPP).unwrap();
+        // The very file under its new name: a copy would be another.
+        assert_eq!(std::fs::metadata(&dst).unwrap().ino(), inode);
+        assert!(!src.exists());
+
+        // A name that is taken when it is looked at is still refused.
+        std::fs::write(&src, b"second").unwrap();
+        let error = in_place_without_links(&src, &dst, libc::EOPNOTSUPP).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"second");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    // A symbolic link that no exclusive rename and no link took is made
+    // again at the target, by a call that never replaces: it is not
+    // renamed after a look.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_symlink_moved_in_place_without_links_is_made_again_not_renamed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.link");
+        let dst = dir.path().join("destination.link");
+        std::os::unix::fs::symlink("pointed/at", &src).unwrap();
+        let inode = std::fs::symlink_metadata(&src).unwrap().ino();
+        in_place_without_links(&src, &dst, libc::EPERM).unwrap();
+        let made = std::fs::symlink_metadata(&dst).unwrap();
+        assert!(made.file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&dst).unwrap(), Path::new("pointed/at"));
+        // Made while the source was still there: a rename would have kept
+        // the source's own entry.
+        assert_ne!(made.ino(), inode);
+        assert!(std::fs::symlink_metadata(&src).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_link_across_devices_is_told_and_nothing_is_copied_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("destination.bin");
+        std::fs::write(&src, b"source").unwrap();
+        let error = in_place_without_links(&src, &dst, libc::EXDEV).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::CrossesDevices);
+        assert_eq!(std::fs::read(&src).unwrap(), b"source");
+        assert!(!dst.exists());
+    }
+
+    // A move in place whose exclusive rename answers `exclusive` and whose
+    // link answers `link`: the file is the very one, under its new name, so
+    // the plain rename moved it and nothing copied it. The link was asked
+    // once.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn renamed_in_place_after(exclusive: ExclusiveRename, link: i32) {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("destination.bin");
+        std::fs::write(&src, b"source").unwrap();
+        let inode = std::fs::metadata(&src).unwrap().ino();
+        let asked = std::cell::Cell::new(0);
+        rename_exclusive_with_link(&src, &dst, exclusive, Unlinkable::Renamed, |_, _| {
+            asked.set(asked.get() + 1);
+            Err(io::Error::from_raw_os_error(link))
+        })
+        .unwrap();
+        assert_eq!(asked.get(), 1);
+        assert_eq!(std::fs::metadata(&dst).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+        assert!(!src.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_link_answered_eacces_in_place_still_moves_the_file_by_rename() {
+        renamed_in_place_after(refuse::<{ libc::EINVAL }>, libc::EACCES);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_exclusive_rename_answered_eperm_in_place_still_moves_the_file_by_rename() {
+        renamed_in_place_after(refuse::<{ libc::EPERM }>, libc::EOPNOTSUPP);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_link_answered_emlink_in_place_still_moves_the_file_by_rename() {
+        renamed_in_place_after(refuse::<{ libc::EINVAL }>, libc::EMLINK);
+    }
+
+    // In place, the exclusive rename's "another device" and "the target
+    // exists" still end the move there, the target untouched.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn in_place_only_another_device_or_a_taken_target_end_the_exclusive_rename() {
+        for (errno, kind) in [
+            (libc::EXDEV, io::ErrorKind::CrossesDevices),
+            (libc::EEXIST, io::ErrorKind::AlreadyExists),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("source.bin");
+            let dst = dir.path().join("destination.bin");
+            std::fs::write(&src, b"source").unwrap();
+            let exclusive: ExclusiveRename = match errno {
+                libc::EXDEV => refuse::<{ libc::EXDEV }>,
+                _ => refuse::<{ libc::EEXIST }>,
+            };
+            let error =
+                rename_exclusive_with_link(&src, &dst, exclusive, Unlinkable::Renamed, |_, _| {
+                    panic!("no link is asked after {errno}")
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(std::fs::read(&src).unwrap(), b"source");
+            assert!(!dst.exists());
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -844,7 +1178,14 @@ mod tests {
         let dst = parent.join("../source.bin");
         std::fs::write(&src, b"source").unwrap();
         let no_links = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-        rename_exclusive_with_link(&src, &dst, refuse::<{ libc::EINVAL }>, no_links).unwrap();
+        rename_exclusive_with_link(
+            &src,
+            &dst,
+            refuse::<{ libc::EINVAL }>,
+            Unlinkable::Copied,
+            no_links,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&src).unwrap(), b"source");
     }
 
@@ -856,6 +1197,158 @@ mod tests {
         std::fs::write(&dst, b"another owner").unwrap();
         assert!(copy_file_no_overwrite_then_remove_source(&src, &dst).is_err());
         assert_eq!(std::fs::read(&dst).unwrap(), b"another owner");
+    }
+
+    // Every entry of `dir`, by name, in order.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    // A rename that will not cross from one folder to another, as one
+    // across devices will not.
+    fn across(src: &Path, dst: &Path) -> io::Result<()> {
+        if src.parent() == dst.parent() {
+            rename_path_exclusive(src, dst)
+        } else {
+            Err(io::Error::from(io::ErrorKind::CrossesDevices))
+        }
+    }
+
+    #[test]
+    fn a_file_moved_across_devices_arrives_whole_and_leaves_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::create_dir(&from).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        std::fs::write(from.join("a.bin"), b"moved").unwrap();
+        JobMoves::of(7)
+            .move_file_using(&from.join("a.bin"), &to.join("a.bin"), across)
+            .unwrap();
+        assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"moved");
+        assert_eq!(entries(&to), ["a.bin"]);
+        assert!(entries(&from).is_empty());
+    }
+
+    // The name is taken while the copy is made: the file there stays as it
+    // was, the source stays, and the hidden copy is gone.
+    #[test]
+    fn a_move_across_devices_never_replaces_and_leaves_no_copy_when_it_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::create_dir(&from).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        let (src, dst) = (from.join("a.bin"), to.join("a.bin"));
+        std::fs::write(&src, b"moved").unwrap();
+        let meets = |src: &Path, dst: &Path| {
+            if src.parent() == dst.parent() {
+                std::fs::write(dst, b"another's").unwrap();
+            }
+            across(src, dst)
+        };
+        let error = JobMoves::of(7)
+            .move_file_using(&src, &dst, meets)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"another's");
+        assert_eq!(entries(&to), ["a.bin"]);
+        assert_eq!(std::fs::read(&src).unwrap(), b"moved");
+
+        // A name taken before the move makes no copy at all.
+        let error = JobMoves::of(7)
+            .move_file_using(&src, &dst, across)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(entries(&to), ["a.bin"]);
+
+        // Any other failure of the last move removes the copy too.
+        std::fs::remove_file(&dst).unwrap();
+        let refused = |src: &Path, dst: &Path| {
+            if src.parent() == dst.parent() {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                across(src, dst)
+            }
+        };
+        let error = JobMoves::of(7)
+            .move_file_using(&src, &dst, refused)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(entries(&to).is_empty());
+        assert_eq!(std::fs::read(&src).unwrap(), b"moved");
+    }
+
+    // A move across devices tries a bounded number of hidden names and then
+    // answers. Where a file holds the name of the target's folder no copy
+    // can ever be made: the move ends with that error, and the source stays.
+    #[test]
+    fn a_move_across_devices_gives_up_when_no_copy_can_be_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        std::fs::create_dir(&from).unwrap();
+        let src = from.join("a.bin");
+        std::fs::write(&src, b"moved").unwrap();
+        std::fs::write(dir.path().join("to"), b"a file, not a folder").unwrap();
+        let error = JobMoves::of(7)
+            .move_file_using(&src, &dir.path().join("to/a.bin"), across)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"moved");
+        assert_eq!(
+            std::fs::read(dir.path().join("to")).unwrap(),
+            b"a file, not a folder"
+        );
+
+        // Every hidden name held by something that is not the job's to
+        // sweep: the move ends, and each of them stays.
+        let to = dir.path().join("full");
+        std::fs::create_dir(&to).unwrap();
+        for n in 0..MOVE_COPY_TRIES {
+            std::fs::create_dir(to.join(move_copy_name(7, n))).unwrap();
+        }
+        let error = JobMoves::of(7)
+            .move_file_using(&src, &to.join("a.bin"), across)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(entries(&to).len(), MOVE_COPY_TRIES as usize);
+        assert_eq!(std::fs::read(&src).unwrap(), b"moved");
+    }
+
+    // A copy a dead run left is the job's own, by its exact name: the job's
+    // next move into the folder removes it, and nothing else. Another job's
+    // copy, a name that only starts like one, and a folder under the job's
+    // name all stay.
+    #[test]
+    fn a_jobs_left_copies_are_swept_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::create_dir(&from).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        std::fs::write(from.join("a.bin"), b"moved").unwrap();
+        std::fs::write(to.join(move_copy_name(7, 0)), b"left").unwrap();
+        std::fs::write(to.join(move_copy_name(7, 3)), b"left").unwrap();
+        std::fs::write(to.join(move_copy_name(70, 0)), b"another job's").unwrap();
+        std::fs::write(to.join(".wvr-7-0.txt"), b"not a copy").unwrap();
+        std::fs::write(to.join(".wvr-7-10"), b"past the names").unwrap();
+        std::fs::create_dir(to.join(move_copy_name(7, 1))).unwrap();
+        JobMoves::of(7)
+            .move_file_using(&from.join("a.bin"), &to.join("a.bin"), across)
+            .unwrap();
+        assert_eq!(
+            entries(&to),
+            [
+                ".wvr-7-0.txt",
+                ".wvr-7-1",
+                ".wvr-7-10",
+                ".wvr-70-0",
+                "a.bin"
+            ]
+        );
+        assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"moved");
     }
 
     #[test]

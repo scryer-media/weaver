@@ -131,6 +131,33 @@ impl Session {
         handle: &ManagedTorrentHandle,
     ) -> anyhow::Result<()> {
         handle.recheck()?;
+        self.start_check(handle)
+    }
+
+    /// The first half of [`Self::restart_check`]: every piece of the
+    /// torrent forgotten and its peers gone, with no check begun
+    /// ([`crate::ManagedTorrent::forget_for_recheck`]). For files about to
+    /// change under it: nothing of them is served until
+    /// [`Self::restart_check`] has checked them.
+    pub async fn forget_for_recheck(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        handle.forget_for_recheck().await
+    }
+
+    /// [`Self::force_recheck`] for files that changed under the torrent: a
+    /// check under way is stopped and begun again, so no piece it passed
+    /// from the files as they were stays had.
+    pub async fn restart_check(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+    ) -> anyhow::Result<()> {
+        handle.forget_for_recheck().await?;
+        self.start_check(handle)
+    }
+
+    /// The check a torrent that forgot its pieces
+    /// ([`Self::forget_for_recheck`]) is left to make, begun: a running
+    /// torrent runs again once checked, a paused one stays paused.
+    pub fn start_check(self: &Arc<Self>, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
         let paused = handle.is_paused();
         let peer_rx = if paused {
             None

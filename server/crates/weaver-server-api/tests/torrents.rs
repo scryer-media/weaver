@@ -2133,3 +2133,81 @@ async fn torrent_updates_follow_the_torrents_named() {
         assert!(!refused.errors.is_empty(), "{arguments}");
     }
 }
+
+// Operator ruling, 2026-11-16 (PR 129 question 2): a control key moves a
+// torrent only to a folder at or under the default save folder or a
+// category's folder; elsewhere it is forbidden and nothing moves. An admin
+// key moves it anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_key_moves_a_torrent_only_under_the_save_folders() {
+    let rig = rig().await;
+    let complete = rig._dir.path().join("complete");
+    let tv = rig._dir.path().join("media").join("tv");
+    rig.torrents
+        .set_settings(TorrentSettings {
+            upload_cap: None,
+            complete_dir: complete.clone(),
+            categories: vec![CategoryConfig {
+                upload_cap: Default::default(),
+                id: 1,
+                name: "tv".into(),
+                dest_dir: Some(tv.to_string_lossy().into_owned()),
+                aliases: String::new(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
+            }],
+            seeding: None,
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
+        })
+        .await;
+    let added = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(added.errors.is_empty(), "{:?}", added.errors);
+    let id = added.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let rig = &rig;
+    let dir = || async move {
+        let view = rig
+            .torrents
+            .torrent(weaver_server_core::jobs::ids::JobId(id))
+            .await
+            .unwrap();
+        std::path::PathBuf::from(view.storage_dir.unwrap())
+    };
+    let move_to = |path: std::path::PathBuf, scope: CallerScope| async move {
+        let path = path.to_string_lossy().replace('\\', "\\\\");
+        rig.execute_as_key(
+            &format!(r#"mutation {{ setTorrentLocation(id: {id}, path: "{path}") }}"#),
+            scope,
+        )
+        .await
+    };
+
+    let under_default = complete.join("moved");
+    let moved = move_to(under_default.clone(), CallerScope::Control).await;
+    assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+    assert_eq!(dir().await.parent(), Some(under_default.as_path()));
+    let under_category = tv.join("Show");
+    let moved = move_to(under_category.clone(), CallerScope::Control).await;
+    assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+    let there = dir().await;
+    assert_eq!(there.parent(), Some(under_category.as_path()));
+
+    let elsewhere = rig._dir.path().join("elsewhere");
+    for path in [elsewhere.clone(), tv.join("..").join("elsewhere")] {
+        let refused = move_to(path, CallerScope::Control).await;
+        assert_eq!(code(&refused).as_deref(), Some("FORBIDDEN"));
+    }
+    assert_eq!(dir().await, there);
+    assert!(!elsewhere.exists());
+
+    let moved = move_to(elsewhere.clone(), CallerScope::Admin).await;
+    assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+    assert_eq!(dir().await.parent(), Some(elsewhere.as_path()));
+}

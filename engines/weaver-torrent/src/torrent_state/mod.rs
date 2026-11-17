@@ -978,7 +978,15 @@ impl ManagedTorrent {
                                     // torrent.cpp:9739-9746 and :2371, v2.0.15,
                                     // gate every step on `m_paused` as it is
                                     // now).
-                                    let start_paused = g.paused;
+                                    //
+                                    // A pause asked of the check itself
+                                    // that it had no place left to stop at
+                                    // (`forget_for_recheck`, come as the
+                                    // check was past its saved state) is
+                                    // one too: the torrent stays paused
+                                    // for the one that asked, and says
+                                    // nothing to a tracker or a peer.
+                                    let start_paused = g.paused || init.is_pause_requested();
                                     _start(&t, peer_rx, start_paused, session, Some(g), token)
                                 }
                                 Err(err) => {
@@ -991,6 +999,36 @@ impl ManagedTorrent {
                                         // reader sees it end early.
                                         init.finish_check();
                                         debug!("initial check paused");
+                                        t.state_change_notify.notify_waiters();
+                                        return Ok(());
+                                    }
+
+                                    // The files shut under the check
+                                    // (`FilesShut`): what it could not
+                                    // read is not missing, so it passes
+                                    // nothing and starts nothing. Every
+                                    // piece is forgotten, which opens the
+                                    // files, and the torrent waits to be
+                                    // checked by whoever changed them, or
+                                    // by the next start: no tracker and no
+                                    // peer hears of a torrent that has
+                                    // none of its pieces.
+                                    if crate::storage::FilesShut::refused_in(&err) {
+                                        let mut g = t.locked.write();
+                                        if let ManagedTorrentState::Initializing(now) = &g.state
+                                            && Arc::ptr_eq(now, &init)
+                                        {
+                                            g.state = match t
+                                                .checking_everything(&g, init.take_peers())
+                                            {
+                                                Ok(again) => {
+                                                    ManagedTorrentState::Initializing(again)
+                                                }
+                                                Err(error) => ManagedTorrentState::Error(error),
+                                            };
+                                        }
+                                        drop(g);
+                                        debug!("check ended: the files were shut under it");
                                         t.state_change_notify.notify_waiters();
                                         return Ok(());
                                     }
@@ -1229,16 +1267,83 @@ impl ManagedTorrent {
     /// already. The check runs on the next [`Self::start`].
     pub(crate) fn recheck(&self) -> anyhow::Result<()> {
         let mut g = self.locked.write();
+        if matches!(g.state, ManagedTorrentState::Initializing(_)) {
+            return Ok(());
+        }
+        self.forget(&mut g)
+    }
+
+    // Every piece forgotten, the connections closed, and the torrent left
+    // to check them all on its next start. Not for a check under way: its
+    // reads would be had after this forgot them.
+    fn forget(&self, g: &mut ManagedTorrentLocked) -> anyhow::Result<()> {
         let peers = match &g.state {
-            ManagedTorrentState::Initializing(_) => return Ok(()),
+            ManagedTorrentState::Initializing(init) => init.take_peers(),
             ManagedTorrentState::Live(live) => live.pause()?.peers,
             ManagedTorrentState::Paused(_) => g.state.take().assert_paused().peers,
             ManagedTorrentState::Error(_) => Default::default(),
             ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
         };
-        g.state = ManagedTorrentState::Initializing(self.checking_everything(&g, peers)?);
+        // A storage that could not forget its pieces leaves the torrent
+        // in error, with the reason, for whoever reads its state: its
+        // next start checks every piece (`start`). Never paused with
+        // nothing to say so, and nobody to start it.
+        let forgotten = match self.checking_everything(g, peers) {
+            Ok(init) => {
+                g.state = ManagedTorrentState::Initializing(init);
+                Ok(())
+            }
+            Err(error) => {
+                let reason = anyhow::anyhow!("{error:#}");
+                g.state = ManagedTorrentState::Error(error);
+                Err(reason)
+            }
+        };
         self.state_change_notify.notify_waiters();
-        Ok(())
+        forgotten
+    }
+
+    /// [`Self::recheck`] for files that changed under the torrent, as a
+    /// move that kept a file already at the new place changes them
+    /// (libtorrent `torrent::on_storage_moved` on `need_full_check`): no
+    /// piece stays had, whatever the torrent was doing. A check under way
+    /// read the files as they were, so it is stopped first, and what it
+    /// found is forgotten with the rest; one that waited its turn or had
+    /// not begun is replaced by a check of every piece. No peer stays
+    /// connected, and none is served, until the check that the next
+    /// [`Self::start`] runs has passed a piece.
+    ///
+    /// It waits only for a check that is reading to stop at its next piece,
+    /// and holds no lock while it waits. A session that stops meanwhile
+    /// drops the check with no word to those who wait on it: the wait ends
+    /// with an error then, and nothing is forgotten.
+    pub async fn forget_for_recheck(&self) -> anyhow::Result<()> {
+        let stopping = self
+            .shared
+            .session
+            .upgrade()
+            .context("session is dead, cannot check the torrent again")?
+            .cancellation_token()
+            .clone();
+        loop {
+            let stopped = self.next_state_change();
+            {
+                let mut g = self.locked.write();
+                match &g.state {
+                    ManagedTorrentState::Initializing(init) if init.is_checking() => {
+                        init.request_pause();
+                    }
+                    _ => return self.forget(&mut g),
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = stopped => {}
+                _ = stopping.cancelled() => {
+                    bail!("the session stopped while the torrent's check was being stopped")
+                }
+            }
+        }
     }
 
     /// Whether the torrent is in seed mode (see

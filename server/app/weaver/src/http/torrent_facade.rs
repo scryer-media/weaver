@@ -26,7 +26,8 @@ use weaver_server_core::auth::{
     ApiKeyCache, CallerScope, LoginAuthCache, generate_api_key, hash_api_key,
 };
 use weaver_server_core::categories::{
-    CategoryConfig, completion_parent, validate_category_path_component,
+    CategoryConfig, Made, category_writes, completion_parent, make_category,
+    validate_category_path_component,
 };
 use weaver_server_core::ingest::{Kind, classify};
 use weaver_server_core::jobs::ids::JobId;
@@ -107,7 +108,6 @@ struct Inner {
     maindata_rows: AtomicU64,
     // `sync/torrentPeers` ids.
     rid: AtomicU64,
-    categories: tokio::sync::Mutex<()>,
     rss: RssService,
     // The API version the facade answers as.
     api: Api,
@@ -174,7 +174,6 @@ impl TorrentFacadeContext {
                 #[cfg(test)]
                 maindata_rows: AtomicU64::new(0),
                 rid: AtomicU64::new(0),
-                categories: tokio::sync::Mutex::new(()),
                 launched: now_secs(),
             }),
         }
@@ -1146,7 +1145,7 @@ async fn torrents(
         return *response;
     }
     if action == "add" {
-        return add(ctx, params).await;
+        return add(ctx, params, scope).await;
     }
     let params = &params;
     match action {
@@ -1245,8 +1244,8 @@ async fn torrents(
         "decreasePrio" => move_in_queue(ctx, params, QueueMoveTarget::Offset(1)).await,
         "topPrio" => move_in_queue(ctx, params, QueueMoveTarget::Top).await,
         "bottomPrio" => move_in_queue(ctx, params, QueueMoveTarget::Bottom).await,
-        "setLocation" => set_location(ctx, params, "hashes", "location").await,
-        "setSavePath" => set_location(ctx, params, "id", "path").await,
+        "setLocation" => set_location(ctx, params, "hashes", "location", scope).await,
+        "setSavePath" => set_location(ctx, params, "id", "path", scope).await,
         // A torrent is written where it is saved: no download path is
         // all a client can ask.
         "setDownloadPath" if params.get("path").unwrap_or_default().is_empty() => ok(),
@@ -2564,7 +2563,7 @@ async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
 // A url is fetched when it is added, over the one leg of the route its
 // torrent takes, with the client's cookie; one that cannot be fetched, or
 // a torrent already added, is a failure.
-async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
+async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> Response {
     let Some(torrents) = &ctx.inner.torrents else {
         return text(StatusCode::CONFLICT, "torrents are not enabled");
     };
@@ -2621,6 +2620,23 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
             }
         }
     }
+    // An add the service would refuse before it reads the torrent is
+    // refused before any URL is fetched, by the owner the add itself asks
+    // (`TorrentService::may_add_at`): a refused add reaches no host. It is
+    // answered as the add answers it: a place the caller may not save at is
+    // forbidden, and any other refusal fails every torrent of the request.
+    let placement = placement(&params);
+    match torrents.may_add_at(scope, category.as_deref(), &placement) {
+        Ok(()) => {}
+        Err(AddError::Forbidden(_)) => return forbidden(),
+        Err(AddError::State(error)) => return internal(error),
+        Err(refused) => {
+            let failed = sources.len() + urls.len();
+            if failed > 0 {
+                return ctx.api().added(&[], failed, Some(refused.to_string()));
+            }
+        }
+    }
     for line in urls {
         let body = match classify(line.as_bytes()) {
             Kind::Url(url) => match ctx.inner.handle.proxy_runtime() {
@@ -2644,7 +2660,6 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
     let first_last = params.flag("firstLastPiecePrio").unwrap_or(false);
     // Off unless asked, as qBittorrent's `isAddTorrentToQueueTop` is.
     let to_top = params.flag_value("addToTopOfQueue").unwrap_or(false);
-    let placement = placement(&params);
     // A comma list; empty parts are skipped (qBittorrent `torrents/add`).
     let tags = params.get("tags").map(split_tags).unwrap_or_default();
     let mut ids = Vec::new();
@@ -2652,25 +2667,33 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
     let mut refusal: Option<String> = None;
     for source in sources {
         let added = match source {
-            Ok(source) => torrents
-                .add(AddRequest {
-                    source,
-                    category: category.clone(),
-                    policy_override,
-                    paused: stopped,
-                    forced: params.flag("forced").unwrap_or(false),
-                    unpack: None,
-                    metadata: Vec::new(),
-                    upload_limit,
-                    download_limit,
-                    placement: placement.clone(),
-                    tags: tags.clone(),
-                })
+            Ok(source) => match torrents
+                .add_as(
+                    scope,
+                    AddRequest {
+                        source,
+                        category: category.clone(),
+                        policy_override,
+                        paused: stopped,
+                        forced: params.flag("forced").unwrap_or(false),
+                        unpack: None,
+                        metadata: Vec::new(),
+                        upload_limit,
+                        download_limit,
+                        placement: placement.clone(),
+                        tags: tags.clone(),
+                    },
+                )
                 .await
-                .map_err(|error| match error {
+            {
+                // Every source shares the one placement, so the first one
+                // refused is the first tried: nothing was added.
+                Err(AddError::Forbidden(_)) => return forbidden(),
+                added => added.map_err(|error| match error {
                     AddError::State(error) => Err(error),
                     refused => Ok(refused.to_string()),
                 }),
+            },
             Err(error) => Err(Ok(error)),
         };
         match added {
@@ -3042,6 +3065,7 @@ where
             Err(error @ ActionError::Invalid(_)) => {
                 return text(StatusCode::CONFLICT, error.to_string());
             }
+            Err(ActionError::Forbidden(_)) => return forbidden(),
             Err(error) => return internal(error),
         }
     }
@@ -3513,7 +3537,7 @@ async fn create_category(
         return text(StatusCode::CONFLICT, "Incorrect category name");
     };
     let inner = &ctx.inner;
-    let _guard = inner.categories.lock().await;
+    let held = category_writes().await;
     let (dest_dir, seeding) = {
         let config = inner.config.read().await;
         if config
@@ -3528,28 +3552,17 @@ async fn create_category(
             Err(response) => return *response,
         }
     };
-    let db = inner.db.clone();
-    let candidate = name.clone();
-    let created = tokio::task::spawn_blocking(move || {
-        let category = CategoryConfig {
-            upload_cap: Default::default(),
-            id: db.next_category_id()?,
-            name: candidate,
-            dest_dir,
-            aliases: String::new(),
-            seeding,
-            torrent_route: false,
-            unpack: None,
-        };
-        db.insert_category(&category).map(|()| category)
-    })
-    .await;
-    let category = match created {
-        Ok(Ok(category)) => category,
-        Ok(Err(error)) => return internal(error),
-        Err(error) => return internal(error),
+    let category = CategoryConfig {
+        dest_dir,
+        seeding,
+        ..CategoryConfig::named(name)
     };
-    inner.config.write().await.categories.push(category);
+    match make_category(&held, &inner.config, &inner.db, category).await {
+        Ok(Made::New(_)) => {}
+        Ok(Made::There(_)) => return text(StatusCode::CONFLICT, "Unable to create category"),
+        Err(error) => return internal(error),
+    }
+    drop(held);
     ctx.categories_changed().await;
     ok()
 }
@@ -3565,7 +3578,7 @@ async fn edit_category(
         return text(StatusCode::BAD_REQUEST, "Category cannot be empty");
     }
     let inner = &ctx.inner;
-    let _guard = inner.categories.lock().await;
+    let _held = category_writes().await;
     let edited = {
         let config = inner.config.read().await;
         let Some(current) = config
@@ -4142,6 +4155,7 @@ async fn set_location(
     params: &Params,
     ids: &str,
     path: &str,
+    scope: CallerScope,
 ) -> Response {
     let Some(location) = params
         .get(path)
@@ -4151,10 +4165,16 @@ async fn set_location(
     else {
         return text(StatusCode::BAD_REQUEST, "Save path cannot be empty");
     };
+    // Refused before any torrent moves (`TorrentService::may_place`).
+    if let Some(torrents) = &ctx.inner.torrents
+        && !torrents.may_place(scope, Path::new(&location))
+    {
+        return forbidden();
+    }
     let views = found!(ctx.named(params.get(ids).unwrap_or_default()).await);
     each_of(ctx, views, move |torrents, view| {
         let location = location.clone();
-        async move { torrents.set_location(view.job_id, location).await }
+        async move { torrents.set_location_as(scope, view.job_id, location).await }
     })
     .await
 }

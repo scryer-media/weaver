@@ -111,6 +111,10 @@ pub(super) struct Live {
     pub(super) peers: (u32, u32, u32),
     // Where a move goes, while it is under way.
     pub(super) moving: Option<Moving>,
+    // A start of its run was left for the end of that move
+    // (`start_waits_on_move`): the move's end makes one pass over the
+    // queue for it, and none otherwise.
+    pub(super) start_held: bool,
     // A removal has begun writing its mark: no move starts, and a failure
     // leaves the torrent to the removal (`remove_as`).
     pub(super) removing: bool,
@@ -219,6 +223,7 @@ impl Live {
             speeds: (0, 0),
             peers: (0, 0, 0),
             moving: None,
+            start_held: false,
             removing: false,
             failed_removing: None,
             leveling: None,
@@ -341,6 +346,25 @@ impl Live {
 
     pub(super) fn resumed(&self) -> bool {
         self.record.intent() == TorrentIntent::Resumed
+    }
+
+    // Whether a start of the torrent's run now would wait on a move of its
+    // files. The start after an error forgets every piece to check them
+    // all (`ManagedTorrent::start`), which opens the files to reads
+    // (`TorrentStore::check_every_piece`), and a move holds the files
+    // until it ends, a copy to another disk included. The move owns the
+    // check of them until then, as it does for a recheck asked for
+    // meanwhile: the start is left, and marked held, for the pass the
+    // move ends with (`end_moving`).
+    pub(super) fn start_waits_on_move(&mut self) -> bool {
+        let waits = matches!(self.moving, Some(Moving::Dir(_) | Moving::Files))
+            && self.attached.as_ref().is_some_and(|attached| {
+                attached.handle.with_state(|state| {
+                    matches!(state, weaver_torrent::ManagedTorrentState::Error(_))
+                })
+            });
+        self.start_held |= waits;
+        waits
     }
 
     // The session took a change to the torrent's run, or refused it.

@@ -791,6 +791,9 @@ impl TorrentService {
                 } else if !run && torrent.disk_held == Some(DiskHeld::Starting) {
                     torrent.disk_held = None;
                 }
+                if run && torrent.start_waits_on_move() {
+                    return None;
+                }
                 let attached = torrent.attached.as_ref()?;
                 return run_command(run, attached.handle.is_paused()).map(Command::Run);
             }

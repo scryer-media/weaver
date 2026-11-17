@@ -232,6 +232,7 @@ async fn rig_on(
         );
         torrents.start().await.unwrap();
         torrents.publish_to(handle.clone());
+        torrents.make_categories_in(config.clone());
         Some(torrents)
     } else {
         None
@@ -329,6 +330,10 @@ impl Rig {
     }
 
     async fn add_file(&self, metainfo: &[u8], fields: &[(&str, &str)]) -> Reply {
+        self.add_file_as(metainfo, fields, ADMIN).await
+    }
+
+    async fn add_file_as(&self, metainfo: &[u8], fields: &[(&str, &str)], key: &str) -> Reply {
         let boundary = "facade-boundary";
         let mut body = Vec::new();
         for (name, value) in fields {
@@ -349,7 +354,7 @@ impl Rig {
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         self.send(
             Request::post("/api/v2/torrents/add")
-                .header("x-api-key", ADMIN)
+                .header("x-api-key", key)
                 .header(
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={boundary}"),
@@ -1989,6 +1994,97 @@ async fn categories_are_created_listed_and_assigned() {
     assert_eq!(unknown.status, StatusCode::CONFLICT);
 }
 
+// qBittorrent `SessionImpl::addTorrent_impl` (sessionimpl.cpp:2853-2857): an
+// add that names a category there is none of makes it, with no folder of its
+// own, and the torrent is in it; a name that cannot be a category adds the
+// torrent with none. A torrent file and a magnet alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_in_a_category_there_is_none_of_makes_it() {
+    let rig = rig().await;
+    let added = rig
+        .add_file(&metainfo("one.mkv", 3000, false), &[("category", "films")])
+        .await;
+    assert_eq!(added.status, StatusCode::OK, "{}", added.body);
+    let magnet = rig
+        .post(
+            "/api/v2/torrents/add",
+            "urls=magnet%3A%3Fxt%3Durn%3Abtih%3A0123456789abcdef0123456789abcdef01234567\
+             &category=docs",
+        )
+        .await;
+    assert_eq!(magnet.json()["success_count"], 1, "{}", magnet.body);
+    // The same name in another letter case is the category made, not a
+    // second one.
+    let again = rig
+        .add_file(&metainfo("two.mkv", 3000, false), &[("category", "FILMS")])
+        .await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    let invalid = rig
+        .add_file(&metainfo("three.mkv", 3000, false), &[("category", "a/b")])
+        .await;
+    assert_eq!(invalid.status, StatusCode::OK, "{}", invalid.body);
+
+    let categories = rig.get("/api/v2/torrents/categories").await.json();
+    let mut names: Vec<&String> = categories.as_object().unwrap().keys().collect();
+    names.sort();
+    assert_eq!(names, ["docs", "films"]);
+    let complete = rig.config.read().await.complete_dir();
+    assert_eq!(
+        categories["films"]["savePath"],
+        PathBuf::from(&complete)
+            .join("films")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let stored = rig.db.list_categories().unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|category| category.dest_dir.is_none()));
+
+    let mut held: Vec<(String, String)> = rig
+        .torrents()
+        .await
+        .iter()
+        .map(|torrent| {
+            (
+                torrent["name"].as_str().unwrap().to_owned(),
+                torrent["category"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    held.sort();
+    assert_eq!(
+        held,
+        [
+            (
+                "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                "docs".to_owned()
+            ),
+            ("one.mkv".to_owned(), "films".to_owned()),
+            ("three.mkv".to_owned(), String::new()),
+            ("two.mkv".to_owned(), "films".to_owned()),
+        ]
+    );
+}
+
+// A control key's add in a category there is none of makes it as an admin
+// key's does, at the default save folder, which the key may save at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_keys_add_makes_its_new_category_too() {
+    let (rig, complete, _tv) = rig_with_a_control_key().await;
+    let added = rig
+        .add_file_as(
+            &metainfo("one.mkv", 3000, false),
+            &[("category", "films")],
+            CONTROLLER,
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK, "{}", added.body);
+    let listed = rig.torrents().await;
+    assert_eq!(listed[0]["category"], "films");
+    let saved = PathBuf::from(listed[0]["save_path"].as_str().unwrap());
+    assert!(saved.starts_with(complete.join("films")), "{saved:?}");
+}
+
 // qBittorrent `TorrentsController::setLocationAction`: the torrent moves
 // under the location and is listed there; an empty location is a bad
 // request, and one no directory can be made under is a conflict.
@@ -2030,6 +2126,306 @@ async fn set_location_moves_the_torrent_under_the_location() {
         PathBuf::from(listed[0]["content_path"].as_str().unwrap()),
         content
     );
+}
+
+// A key that only controls, as a qBittorrent client such as Sonarr holds.
+const CONTROLLER: &str = "facade-control-key";
+
+// The rig with a control key, and a category `tv` whose folder is outside
+// the default save folder.
+async fn rig_with_a_control_key() -> (Rig, PathBuf, PathBuf) {
+    let rig = rig().await;
+    rig.keys.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key(CONTROLLER),
+        id: 3,
+        scope: "control".to_owned(),
+    });
+    let complete = PathBuf::from(rig.config.read().await.complete_dir());
+    let tv = rig._dir.path().join("media").join("tv");
+    let created = rig
+        .post(
+            "/api/v2/torrents/createCategory",
+            &format!("category=tv&savePath={}", url_encode(&tv.to_string_lossy())),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::OK);
+    (rig, complete, tv)
+}
+
+// An add a control key may not save where it names is refused before any
+// of its URLs is fetched: the host is never reached. An add that may be
+// saved fetches as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_refused_for_its_save_folder_fetches_no_url() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let handle = scheduler();
+    handle.set_proxy_runtime(
+        weaver_server_core::proxies::ProxyRuntime::new(
+            Database::open_in_memory().unwrap(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+    let rig = rig_on(
+        true,
+        RuntimeSecurityConfig::default(),
+        handle,
+        Offline {
+            up: true,
+            ..Default::default()
+        },
+        Api::LATEST,
+    )
+    .await;
+    rig.keys.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key(CONTROLLER),
+        id: 3,
+        scope: "control".to_owned(),
+    });
+    let complete = PathBuf::from(rig.config.read().await.complete_dir());
+    let elsewhere = rig._dir.path().join("elsewhere");
+    let path = |path: &Path| url_encode(&path.to_string_lossy());
+
+    // A server that counts each connection made to it, and answers every
+    // request with a torrent.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http%3A%2F%2F{}%2Fa.torrent",
+        listener.local_addr().unwrap()
+    );
+    let reached = Arc::new(AtomicUsize::new(0));
+    let server = tokio::spawn({
+        let reached = reached.clone();
+        async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                reached.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+                let body = metainfo("fetched.mkv", 4096, false);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        }
+    });
+
+    for form in [
+        format!("urls={url}&savepath={}", path(&elsewhere)),
+        // Not absolute, and out of the save folder by `..`.
+        format!("urls={url}&savepath=..%2Felsewhere"),
+        format!("urls={url}&savepath=shows&downloadPath=..%2F..%2Felsewhere"),
+        // A category that is not there does not let the path by.
+        format!("urls={url}&category=nosuch&savepath={}", path(&elsewhere)),
+        format!(
+            "urls={url}&savepath={}&downloadPath={}",
+            path(&complete.join("shows")),
+            path(&elsewhere)
+        ),
+    ] {
+        let refused = rig.post_as("/api/v2/torrents/add", &form, CONTROLLER).await;
+        assert_eq!(
+            (refused.status, refused.body.as_str()),
+            (StatusCode::FORBIDDEN, "Forbidden"),
+            "{form}"
+        );
+        assert_eq!(reached.load(Ordering::SeqCst), 0, "{form}");
+    }
+    // An add refused for its place makes none of the category it names.
+    assert!(rig.torrents().await.is_empty());
+    assert!(
+        !rig.config
+            .read()
+            .await
+            .categories
+            .iter()
+            .any(|category| category.name == "nosuch")
+    );
+
+    let added = rig
+        .post_as(
+            "/api/v2/torrents/add",
+            &format!("urls={url}&savepath={}", path(&complete.join("shows"))),
+            CONTROLLER,
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    assert_eq!(reached.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.torrents().await[0]["name"], "fetched.mkv");
+    server.abort();
+}
+
+// Operator ruling, 2026-11-16 (PR 129 question 2): a control key saves a
+// torrent it adds only at or under the default save folder or a category's
+// folder; elsewhere, or by `..` out of one, it is forbidden and nothing is
+// added. An admin key saves anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_key_adds_only_under_the_save_folders() {
+    let (rig, complete, tv) = rig_with_a_control_key().await;
+    let elsewhere = rig._dir.path().join("elsewhere");
+    let path = |path: &Path| path.to_string_lossy().into_owned();
+    let saved = |hash_name: &'static str| {
+        let rig = &rig;
+        async move {
+            let listed = rig.torrents().await;
+            let torrent = listed
+                .iter()
+                .find(|torrent| torrent["name"] == hash_name)
+                .unwrap();
+            PathBuf::from(torrent["save_path"].as_str().unwrap())
+        }
+    };
+
+    let under_default = complete.join("shows");
+    let added = rig
+        .add_file_as(
+            &metainfo("default.mkv", 3000, false),
+            &[("savepath", &path(&under_default))],
+            CONTROLLER,
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    assert_eq!(saved("default.mkv").await, under_default);
+
+    let relative = rig
+        .add_file_as(
+            &metainfo("relative.mkv", 3000, false),
+            &[("savepath", "shows")],
+            CONTROLLER,
+        )
+        .await;
+    assert_eq!(relative.status, StatusCode::OK);
+    assert_eq!(saved("relative.mkv").await, complete.join("shows"));
+
+    let under_category = tv.join("Show");
+    let added = rig
+        .add_file_as(
+            &metainfo("category.mkv", 3000, false),
+            &[("savepath", &path(&under_category))],
+            CONTROLLER,
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    assert_eq!(saved("category.mkv").await, under_category);
+
+    let escape = complete.join("..").join("elsewhere");
+    for fields in [
+        vec![("savepath", path(&elsewhere))],
+        vec![("savepath", path(&escape))],
+        vec![
+            ("savepath", path(&under_default)),
+            ("downloadPath", path(&elsewhere)),
+        ],
+    ] {
+        let fields: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let refused = rig
+            .add_file_as(&metainfo("refused.mkv", 3000, false), &fields, CONTROLLER)
+            .await;
+        assert_eq!(
+            (refused.status, refused.body.as_str()),
+            (StatusCode::FORBIDDEN, "Forbidden"),
+            "{fields:?}"
+        );
+    }
+    assert_eq!(rig.torrents().await.len(), 3);
+    assert!(!elsewhere.exists());
+
+    let added = rig
+        .add_file(
+            &metainfo("admin.mkv", 3000, false),
+            &[("savepath", &path(&elsewhere))],
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    assert_eq!(saved("admin.mkv").await, elsewhere);
+}
+
+// Operator ruling, 2026-11-16 (PR 129 question 2): a control key moves a
+// torrent only to a folder at or under the default save folder or a
+// category's folder, by `setLocation` or `setSavePath`; elsewhere it is
+// forbidden and nothing moves. An admin key moves it anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_key_moves_only_under_the_save_folders() {
+    let (rig, complete, tv) = rig_with_a_control_key().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let content =
+        || async { PathBuf::from(rig.torrents().await[0]["content_path"].as_str().unwrap()) };
+    let set_location = |location: PathBuf, key: &'static str| {
+        let (rig, hash) = (&rig, &hash);
+        async move {
+            rig.post_as(
+                "/api/v2/torrents/setLocation",
+                &format!(
+                    "hashes={hash}&location={}",
+                    url_encode(&location.to_string_lossy())
+                ),
+                key,
+            )
+            .await
+        }
+    };
+    let set_save_path = |path: PathBuf, key: &'static str| {
+        let (rig, hash) = (&rig, &hash);
+        async move {
+            rig.post_as(
+                "/api/v2/torrents/setSavePath",
+                &format!("id={hash}&path={}", url_encode(&path.to_string_lossy())),
+                key,
+            )
+            .await
+        }
+    };
+
+    let under_default = complete.join("moved");
+    assert_eq!(
+        set_location(under_default.clone(), CONTROLLER).await.status,
+        StatusCode::OK
+    );
+    assert!(content().await.starts_with(&under_default));
+    let under_category = tv.join("Show");
+    assert_eq!(
+        set_save_path(under_category.clone(), CONTROLLER)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let there = content().await;
+    assert!(there.starts_with(&under_category));
+
+    let elsewhere = rig._dir.path().join("elsewhere");
+    for refused in [
+        set_location(elsewhere.clone(), CONTROLLER).await,
+        set_save_path(elsewhere.clone(), CONTROLLER).await,
+        set_location(tv.join("..").join("elsewhere"), CONTROLLER).await,
+    ] {
+        assert_eq!(
+            (refused.status, refused.body.as_str()),
+            (StatusCode::FORBIDDEN, "Forbidden")
+        );
+    }
+    assert_eq!(content().await, there);
+    assert!(!elsewhere.exists());
+
+    assert_eq!(
+        set_location(elsewhere.clone(), ADMIN).await.status,
+        StatusCode::OK
+    );
+    assert!(content().await.starts_with(&elsewhere));
 }
 
 #[tokio::test]
@@ -3655,8 +4051,6 @@ async fn a_read_key_sees_no_trackers_passkey() {
     assert_eq!(urls(READER).await, ["https://tracker.invalid:8443/…"]);
     assert_eq!(urls(ADMIN).await, [PRIVATE]);
 }
-
-const CONTROLLER: &str = "facade-control-key";
 
 // Adds a key that controls but is not an Admin.
 fn with_control_key(rig: &Rig) {

@@ -138,6 +138,7 @@ fn profile() -> SystemProfile {
 async fn endpoint(dir: &std::path::Path, db: Database, torrents: TorrentService) -> Router {
     let handle = test_scheduler_handle();
     let config = test_config();
+    torrents.make_categories_in(config.clone());
     let server_transfer_policy = Arc::new(
         weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry::new(
             db.clone(),
@@ -291,6 +292,38 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
     assert_eq!(listed.get("errors"), None, "{listed}");
     assert_eq!(listed["data"]["torrents"][0]["id"], id);
     assert_eq!(listed["data"]["torrents"][0]["name"], "one.mkv");
+    torrents.stop().await;
+}
+
+// A torrent submitted in a category there is none of makes it, with no folder
+// of its own, as qBittorrent's add does (`SessionImpl::addTorrent_impl`); a
+// second submit in it, by a name in another letter case, makes no second one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_submitted_in_a_category_there_is_none_of_makes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let torrents = started(dir.path(), &db, None).await;
+    let app = endpoint(dir.path(), db.clone(), torrents.clone()).await;
+
+    for (name, category) in [("one.mkv", "films"), ("two.mkv", "Films")] {
+        let submitted = graphql(
+            &app,
+            &format!(
+                r#"mutation {{ submitTorrent(input: {{ metainfoBase64: "{}", category: "{category}" }}) {{ name category }} }}"#,
+                metainfo(name, 3000)
+            ),
+        )
+        .await;
+        assert_eq!(submitted.get("errors"), None, "{submitted}");
+        assert_eq!(submitted["data"]["submitTorrent"]["category"], "films");
+    }
+    let listed = graphql(&app, "{ categories { name destDir } }").await;
+    assert_eq!(listed.get("errors"), None, "{listed}");
+    assert_eq!(
+        listed["data"]["categories"],
+        serde_json::json!([{ "name": "films", "destDir": null }])
+    );
+    assert_eq!(db.list_categories().unwrap().len(), 1);
     torrents.stop().await;
 }
 

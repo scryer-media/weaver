@@ -1602,6 +1602,44 @@ fn a_recorded_folder_that_is_a_link_is_not_managed() {
     assert!(real.join("a.bin").exists());
 }
 
+// A removal of a history entry's files takes the hidden copies a move of
+// its job left beside them, as a live removal does: a regular file under
+// one of that job's own names, never another job's and never a folder of
+// such a name. With them gone the folders empty and go.
+#[test]
+fn a_history_removal_sweeps_the_copies_its_jobs_moves_left() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("torrent");
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::write(dir.join("a/own.bin"), b"o").unwrap();
+    std::fs::write(dir.join("top.bin"), b"t").unwrap();
+    let copy = |job, n| crate::runtime::fs::move_copy_name(job, n);
+    std::fs::write(dir.join("a").join(copy(1, 0)), b"left").unwrap();
+    std::fs::write(dir.join(copy(1, 3)), b"left").unwrap();
+    std::fs::write(dir.join(copy(2, 0)), b"another job's").unwrap();
+    std::fs::create_dir_all(dir.join(copy(1, 1))).unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_output_dir(&dir, JobId(1)).unwrap();
+    let listed = |name: &str| HistoryFile {
+        path: dir.join(name).to_string_lossy().into_owned(),
+        whole: false,
+    };
+    let removal = remove_history_files(
+        JobId(1),
+        &root.path().join("work"),
+        &dir,
+        &[listed("a/own.bin"), listed("top.bin")],
+        &LiveHeld::default(),
+    );
+    assert_eq!(removal.removed, 2);
+    assert!(!dir.join("a").exists(), "emptied, it went");
+    assert!(!dir.join(copy(1, 3)).exists());
+    assert_eq!(
+        std::fs::read(dir.join(copy(2, 0))).unwrap(),
+        b"another job's"
+    );
+    assert!(dir.join(copy(1, 1)).is_dir());
+}
+
 // What `held_of` writes for a torrent whose files' top-level folder is
 // `top`, over a folder already there as `on_disk`, as the history side
 // reads it.
@@ -2323,6 +2361,707 @@ async fn a_removal_with_what_was_there_unknown_keeps_every_file() {
     rig.service.remove(job_id, true, true).await.unwrap();
     assert!(rig.service.torrent(job_id).await.is_none(), "removed");
     assert_eq!(files_under(&dir), files, "not known: every file stays");
+    rig.service.stop().await;
+}
+
+const SMALL_TXT: &[u8] = include_bytes!(concat!(
+    std::env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/originals/small.txt"
+));
+
+// Adds a torrent of `set.rar`, which holds `small.txt`, and `sample.mkv`,
+// downloads it whole with a file at each of `taken` already in its folder,
+// each holding its own name, and waits for it to complete: its unpacked
+// file is placed by then.
+async fn unpacked_beside(taken: &[&str]) -> (Rig, JobId, PathBuf) {
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let sample = vec![0x5a_u8; 300];
+    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("sample.mkv", &sample)];
+    let bytes = metainfo("set", &files, 128, false);
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let mut published = rig.service.inner.published.subscribe();
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    let mut dir = PathBuf::new();
+    fetch_pieces(&rig.service, job_id, &whole, None, |torrent| {
+        dir = torrent.store.as_ref().unwrap().files().dir();
+        for name in taken {
+            std::fs::write(dir.join(name), name.as_bytes()).unwrap();
+        }
+    })
+    .await;
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    (rig, job_id, dir)
+}
+
+// Operator ruling, 2026-11-16 (PR 129 question 10): an unpacked file whose
+// name is taken is placed under a numbered name, kept on the torrent's row,
+// and the file that held the name stays as it was. A removal with the
+// torrent's files takes the numbered file and leaves the one it never wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacked_file_whose_name_is_taken_lands_under_a_numbered_name() {
+    let (rig, job_id, dir) = unpacked_beside(&["small.txt"]).await;
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
+    assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        ["small (1).txt".to_owned()]
+    );
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert!(!dir.join("small (1).txt").exists());
+    assert!(!dir.join("set.rar").exists());
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
+    rig.service.stop().await;
+}
+
+// A second collision takes the next number: "small.txt" and
+// "small (1).txt" both held, the unpacked file lands as "small (2).txt".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_collision_takes_the_next_number() {
+    let (rig, job_id, dir) = unpacked_beside(&["small.txt", "small (1).txt"]).await;
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
+    assert_eq!(
+        std::fs::read(dir.join("small (1).txt")).unwrap(),
+        b"small (1).txt"
+    );
+    assert_eq!(std::fs::read(dir.join("small (2).txt")).unwrap(), SMALL_TXT);
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        ["small (2).txt".to_owned()]
+    );
+    rig.service.stop().await;
+}
+
+// A torrent `name` of `<name>.rar`, which holds `small.txt`, and
+// `<name>.mkv`, laid flat in `save`: its job and its bytes.
+async fn added_flat(rig: &Rig, name: &str, save: &Path) -> (JobId, Vec<u8>) {
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let sample = vec![name.as_bytes()[0]; 300];
+    let (rar, mkv) = (format!("{name}.rar"), format!("{name}.mkv"));
+    let files: [(&str, &[u8]); 2] = [(&rar, archive), (&mkv, &sample)];
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            placement: Placement {
+                save_path: Some(save.to_string_lossy().into_owned()),
+                layout: Some(ContentLayout::NoSubfolder),
+                ..Placement::default()
+            },
+            ..request(AddSource::Metainfo(metainfo(name, &files, 128, false)))
+        })
+        .await
+        .unwrap();
+    let whole = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    (job_id, whole)
+}
+
+// Fetches every piece of `job_id` and waits for it to complete.
+async fn fetched_and_completed(rig: &Rig, job_id: JobId, whole: &[u8]) {
+    let mut published = rig.service.inner.published.subscribe();
+    fetch_pieces(&rig.service, job_id, whole, None, |_| {}).await;
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+}
+
+// What `job_id` holds, as its rows say.
+fn held_by(rig: &Rig, job_id: JobId) -> std::collections::HashSet<PathBuf> {
+    rig.db
+        .held_rows(Some(job_id))
+        .unwrap()
+        .into_iter()
+        .map(|(_, path)| PathBuf::from(path))
+        .collect()
+}
+
+// Two torrents unpack the same name into one folder: each ends with its
+// own file, the one name on its row and among what it holds, and never the
+// other's. A removal of either with its files takes its own and leaves the
+// other's as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_torrents_unpacking_one_name_into_one_folder_each_own_their_file() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    let (first, first_bytes) = added_flat(&rig, "first", &save).await;
+    let (second, second_bytes) = added_flat(&rig, "second", &save).await;
+    fetched_and_completed(&rig, first, &first_bytes).await;
+    fetched_and_completed(&rig, second, &second_bytes).await;
+    assert_eq!(rig.db.torrent_outputs(first).unwrap(), ["small.txt"]);
+    assert_eq!(rig.db.torrent_outputs(second).unwrap(), ["small (1).txt"]);
+    let base = resolved(&save);
+    let (firsts, seconds) = (base.join("small.txt"), base.join("small (1).txt"));
+    assert_eq!(std::fs::read(&firsts).unwrap(), SMALL_TXT);
+    assert_eq!(std::fs::read(&seconds).unwrap(), SMALL_TXT);
+    let (held_first, held_second) = (held_by(&rig, first), held_by(&rig, second));
+    assert!(held_first.contains(&firsts) && !held_first.contains(&seconds));
+    assert!(held_second.contains(&seconds) && !held_second.contains(&firsts));
+
+    rig.service.remove(second, true, false).await.unwrap();
+    assert!(!seconds.exists(), "its own file goes");
+    assert!(!save.join("second.rar").exists());
+    assert_eq!(
+        std::fs::read(&firsts).unwrap(),
+        SMALL_TXT,
+        "the other's stays"
+    );
+    assert!(save.join("first.rar").exists());
+    rig.service.remove(first, true, false).await.unwrap();
+    assert!(!firsts.exists());
+    rig.service.stop().await;
+}
+
+// Another writer's file, put at `name` the one time an output of the next
+// placing is about to move there: after the look found the name free, and
+// before the move.
+fn another_takes(name: &'static str) {
+    let mut taken = false;
+    *locked(&OUTPUT_MEETS) = Some(Box::new(move |to: &Path| {
+        if !taken && to.ends_with(name) {
+            taken = true;
+            std::fs::write(to, b"another's").unwrap();
+        }
+    }));
+}
+
+// Another writer takes the output's name between the look and the move.
+// The file is theirs: the output is placed under the next name, the row and
+// what the torrent holds name that one only, and a removal with its files
+// leaves the other writer's file as they wrote it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_another_writer_takes_before_the_move_is_never_on_the_torrents_row() {
+    another_takes("small.txt");
+    let (rig, job_id, dir) = unpacked_beside(&[]).await;
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), ["small (1).txt"]);
+    assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
+    let base = resolved(&dir);
+    let held = held_by(&rig, job_id);
+    assert!(held.contains(&base.join("small (1).txt")), "{held:?}");
+    assert!(!held.contains(&base.join("small.txt")), "{held:?}");
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert!(!dir.join("small (1).txt").exists());
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
+    rig.service.stop().await;
+}
+
+// A row that will not be written keeps no output: the file that moved goes
+// back to the torrent's unpacking folder, the row names none, the torrent
+// holds none, and the file that held the name is as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outputs_the_row_did_not_keep_go_back_where_unpacking_made_them() {
+    KEEP_FAILS.store(true, Ordering::Release);
+    let (rig, job_id, dir) = unpacked_beside(&["small.txt"]).await;
+    assert!(rig.db.torrent_outputs(job_id).unwrap().is_empty());
+    assert!(!dir.join("small (1).txt").exists(), "it went back");
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
+    let work = rig.service.unpacking_dir(job_id);
+    assert_eq!(std::fs::read(work.join("small.txt")).unwrap(), SMALL_TXT);
+    let held = held_by(&rig, job_id);
+    assert!(
+        !held.contains(&resolved(&dir).join("small (1).txt")),
+        "{held:?}"
+    );
+    rig.service.stop().await;
+}
+
+// The same, with another writer's file met on the way: the row that was
+// not written names neither file, the output is back in the unpacking
+// folder, and a removal with the torrent's files leaves theirs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_another_writer_took_is_not_the_torrents_after_a_failed_row_write() {
+    another_takes("small.txt");
+    KEEP_FAILS.store(true, Ordering::Release);
+    let (rig, job_id, dir) = unpacked_beside(&[]).await;
+    assert!(rig.db.torrent_outputs(job_id).unwrap().is_empty());
+    assert!(!dir.join("small (1).txt").exists());
+    let work = rig.service.unpacking_dir(job_id);
+    assert_eq!(std::fs::read(work.join("small.txt")).unwrap(), SMALL_TXT);
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
+    rig.service.stop().await;
+}
+
+// A placing that ends unheard after its moves, as a panic ends it, wrote
+// no row: the row names no file, the torrent holds none of them, and the
+// file it moved stays beside the torrent's on no row. A removal with the
+// torrent's files takes neither it nor the other writer's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_placing_that_panicked_names_no_file_on_the_row() {
+    another_takes("small.txt");
+    PLACE_PANICS.store(true, Ordering::Release);
+    let (rig, job_id, dir) = unpacked_beside(&[]).await;
+    assert!(rig.db.torrent_outputs(job_id).unwrap().is_empty());
+    let base = resolved(&dir);
+    let held = held_by(&rig, job_id);
+    assert!(!held.contains(&base.join("small.txt")), "{held:?}");
+    assert!(!held.contains(&base.join("small (1).txt")), "{held:?}");
+    assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
+    assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
+    rig.service.stop().await;
+}
+
+// A name the row kept from an earlier placing with no file at it goes from
+// the row as the next placing is recorded; one with a file at it stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_name_with_no_file_goes_from_the_row() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    let (job_id, whole) = added_flat(&rig, "first", &save).await;
+    std::fs::write(save.join("kept.txt"), b"delivered before").unwrap();
+    rig.db
+        .finish_torrent_unpack(
+            job_id,
+            &["kept.txt".to_owned(), "gone.txt".to_owned()],
+            &[],
+            &[],
+        )
+        .unwrap();
+    fetched_and_completed(&rig, job_id, &whole).await;
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        ["kept.txt", "small.txt"]
+    );
+    assert_eq!(
+        std::fs::read(save.join("kept.txt")).unwrap(),
+        b"delivered before"
+    );
+    rig.service.stop().await;
+}
+
+// A torrent of `first.rar` and `first.mkv` laid flat in a folder, complete,
+// with `small.txt` unpacked beside them and on its row; and another folder
+// that holds someone else's file at each of `theirs`, each holding its own
+// name.
+async fn unpacked_flat_and_a_taken_folder(theirs: &[&str]) -> (Rig, JobId, PathBuf, PathBuf) {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    let (job_id, whole) = added_flat(&rig, "first", &save).await;
+    fetched_and_completed(&rig, job_id, &whole).await;
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), ["small.txt"]);
+    let there = rig.dir.path().join("there");
+    std::fs::create_dir_all(&there).unwrap();
+    for name in theirs {
+        std::fs::write(there.join(name), name.as_bytes()).unwrap();
+    }
+    (rig, job_id, save, there)
+}
+
+// Operator ruling, 2026-11-16 (PR 129 question 10), for a move: an
+// unpacked file is never dropped and never replaces the file there. A move
+// of the torrent to a folder where someone else has a file of an unpacked
+// file's name leaves their file as it was; the unpacked file lands beside
+// it under the next number, the row and what the torrent holds name that
+// one only, and a removal with the torrent's files leaves theirs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_torrents_unpacked_file_never_takes_a_name_someone_else_holds() {
+    let (rig, job_id, save, there) = unpacked_flat_and_a_taken_folder(&["small.txt"]).await;
+    rig.service
+        .set_location(job_id, there.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(there.join("small.txt")).unwrap(),
+        b"small.txt"
+    );
+    assert_eq!(
+        std::fs::read(there.join("small (1).txt")).unwrap(),
+        SMALL_TXT
+    );
+    assert!(!save.join("small.txt").exists(), "it moved");
+    assert!(there.join("first.rar").exists());
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), ["small (1).txt"]);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        stored.files_dir.as_deref(),
+        Some(there.to_string_lossy().as_ref())
+    );
+    let base = resolved(&there);
+    let held = held_by(&rig, job_id);
+    assert!(held.contains(&base.join("small (1).txt")), "{held:?}");
+    assert!(!held.contains(&base.join("small.txt")), "{held:?}");
+    assert!(
+        !held.contains(&resolved(&save).join("small.txt")),
+        "{held:?}"
+    );
+
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert!(!there.join("small (1).txt").exists(), "its own file goes");
+    assert!(!there.join("first.rar").exists());
+    assert_eq!(
+        std::fs::read(there.join("small.txt")).unwrap(),
+        b"small.txt"
+    );
+    rig.service.stop().await;
+}
+
+// The same for the move a complete torrent makes from its download path to
+// its save path, which replaces a file of the torrent's own name there
+// (`Existing::Replace`): what it unpacked replaces nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_complete_torrents_move_never_puts_an_unpacked_file_over_another() {
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (incoming, done) = (rig.dir.path().join("incoming"), rig.dir.path().join("done"));
+    std::fs::create_dir_all(&incoming).unwrap();
+    std::fs::create_dir_all(&done).unwrap();
+    std::fs::write(done.join("small.txt"), b"theirs").unwrap();
+    std::fs::write(done.join("first.mkv"), b"older").unwrap();
+    let done_text = done.to_string_lossy().into_owned();
+    let sample = vec![b'f'; 300];
+    let files: [(&str, &[u8]); 2] = [("first.rar", archive), ("first.mkv", &sample)];
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            placement: Placement {
+                save_path: Some(done_text.clone()),
+                download_path: Some(incoming.to_string_lossy().into_owned()),
+                layout: Some(ContentLayout::NoSubfolder),
+                ..Placement::default()
+            },
+            ..request(AddSource::Metainfo(metainfo("first", &files, 128, false)))
+        })
+        .await
+        .unwrap();
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    let mut published = rig.service.inner.published.subscribe();
+    fetch_pieces(&rig.service, job_id, &whole, None, |_| {}).await;
+    published
+        .wait_for(|_| {
+            let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+            stored.files_dir.as_deref() == Some(done_text.as_str())
+        })
+        .await
+        .unwrap();
+    // The torrent's own file took the place of the one there, as its move
+    // does; its unpacked file did not.
+    assert_eq!(std::fs::read(done.join("first.mkv")).unwrap(), sample);
+    assert_eq!(std::fs::read(done.join("small.txt")).unwrap(), b"theirs");
+    assert_eq!(
+        std::fs::read(done.join("small (1).txt")).unwrap(),
+        SMALL_TXT
+    );
+    assert!(!incoming.join("small.txt").exists());
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), ["small (1).txt"]);
+
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert!(!done.join("small (1).txt").exists());
+    assert_eq!(std::fs::read(done.join("small.txt")).unwrap(), b"theirs");
+    rig.service.stop().await;
+}
+
+// A move whose row will not be written did not happen: the unpacked file
+// and the torrent's own files are back where they were, the row names
+// them there, and the folder they went to holds what it held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_that_is_not_recorded_puts_every_file_back() {
+    let (rig, job_id, save, there) = unpacked_flat_and_a_taken_folder(&["small.txt"]).await;
+    crate::torrents::service::MOVE_RECORD_FAILS.store(true, Ordering::Release);
+    rig.service
+        .set_location(job_id, there.to_string_lossy().into_owned())
+        .await
+        .unwrap_err();
+    assert_eq!(std::fs::read(save.join("small.txt")).unwrap(), SMALL_TXT);
+    assert!(save.join("first.rar").exists());
+    assert!(save.join("first.mkv").exists());
+    assert_eq!(files_under(&there), [there.join("small.txt")]);
+    assert_eq!(
+        std::fs::read(there.join("small.txt")).unwrap(),
+        b"small.txt"
+    );
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), ["small.txt"]);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        stored.files_dir.as_deref(),
+        Some(save.to_string_lossy().as_ref())
+    );
+    let dir = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .as_ref()
+        .unwrap()
+        .files()
+        .dir();
+    assert_eq!(dir, save, "read where it was");
+    rig.service.stop().await;
+}
+
+// A move that ends unrecorded while someone else's files took the names two
+// of the torrent's files left: neither is replaced by the put-back, and
+// neither is the torrent's afterwards. The unpacked file's name leaves the
+// row, the torrent's own file's name is on the row as there before it, the
+// torrent's pieces are checked against what is at the old place (so the
+// file there is not served as the torrent's), and a removal with the
+// torrent's files leaves both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_move_gives_up_the_names_someone_took_meanwhile() {
+    let (rig, job_id, save, there) = unpacked_flat_and_a_taken_folder(&[]).await;
+    let whole = handle_of(&rig.service, job_id).await.stats().total_bytes;
+    let taken = save.clone();
+    *locked(&crate::torrents::service::MOVE_RECORD_MEETS) = Some(Box::new(move || {
+        std::fs::write(taken.join("small.txt"), b"theirs").unwrap();
+        std::fs::write(taken.join("first.mkv"), b"theirs too").unwrap();
+    }));
+    crate::torrents::service::MOVE_RECORD_FAILS.store(true, Ordering::Release);
+    rig.service
+        .set_location(job_id, there.to_string_lossy().into_owned())
+        .await
+        .unwrap_err();
+    assert_eq!(std::fs::read(save.join("small.txt")).unwrap(), b"theirs");
+    assert_eq!(
+        std::fs::read(save.join("first.mkv")).unwrap(),
+        b"theirs too"
+    );
+    assert!(save.join("first.rar").exists(), "it went back");
+    assert_eq!(std::fs::read(there.join("small.txt")).unwrap(), SMALL_TXT);
+    let mut stayed = files_under(&there);
+    stayed.sort();
+    assert_eq!(
+        stayed,
+        [there.join("first.mkv"), there.join("small.txt")],
+        "what could not go back stays where the move put it"
+    );
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        Vec::<String>::new()
+    );
+    let adopted = rig.db.torrent_adopted(job_id).unwrap().unwrap();
+    assert_eq!(adopted.files, ["first.mkv"]);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        stored.files_dir.as_deref(),
+        Some(save.to_string_lossy().as_ref())
+    );
+    let held = held_by(&rig, job_id);
+    assert!(
+        !held.contains(&resolved(&save).join("small.txt")),
+        "{held:?}"
+    );
+    // The check after the failed move reads the old place: the pieces of
+    // the file someone put there do not pass.
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert!(handle.stats().progress_bytes < whole);
+
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert_eq!(std::fs::read(save.join("small.txt")).unwrap(), b"theirs");
+    assert_eq!(
+        std::fs::read(save.join("first.mkv")).unwrap(),
+        b"theirs too"
+    );
+    assert!(!save.join("first.rar").exists(), "its own file goes");
+    rig.service.stop().await;
+}
+
+// A failed move whose row could not take back what the torrent made: the
+// files are back, and the row names none of them as the torrent's, so a
+// removal with the torrent's files deletes nothing. It errs to leaving a
+// file, never to deleting one that may not be the torrent's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_move_whose_row_stays_set_aside_deletes_no_file() {
+    let (rig, job_id, save, there) = unpacked_flat_and_a_taken_folder(&[]).await;
+    crate::torrents::service::MOVE_RECORD_FAILS.store(true, Ordering::Release);
+    crate::torrents::service::MOVE_UNDO_FAILS.store(true, Ordering::Release);
+    rig.service
+        .set_location(job_id, there.to_string_lossy().into_owned())
+        .await
+        .unwrap_err();
+    assert_eq!(std::fs::read(save.join("small.txt")).unwrap(), SMALL_TXT);
+    assert_eq!(files_under(&there), Vec::<PathBuf>::new());
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        Vec::<String>::new()
+    );
+    let adopted = rig.db.torrent_adopted(job_id).unwrap().unwrap();
+    assert!(adopted.all_files);
+    assert!(adopted.dirs.contains(&String::new()), "{:?}", adopted.dirs);
+
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert_eq!(std::fs::read(save.join("small.txt")).unwrap(), SMALL_TXT);
+    assert!(save.join("first.rar").exists());
+    assert!(save.join("first.mkv").exists());
+    rig.service.stop().await;
+}
+
+// A crash between the write that sets the row aside and the write that
+// records the move, the files moved by then. Nothing undoes it at the next
+// start, and nothing of the torrent's is deleted by Weaver afterwards: what
+// it unpacked is off the row, the row still says the old place, so its
+// files show as missing, and a removal with its files deletes none at
+// either place. The operator sets the location to where the files went: the
+// move keeps them there, the torrent is checked and has every piece again,
+// and a removal with its files still deletes none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_cut_off_by_a_crash_deletes_nothing_and_is_set_right_by_a_new_location() {
+    for set_right in [false, true] {
+        let (rig, job_id, save, there) = unpacked_flat_and_a_taken_folder(&[]).await;
+        let whole = handle_of(&rig.service, job_id).await.stats().total_bytes;
+        let there_text = there.to_string_lossy().into_owned();
+        crate::torrents::service::MOVE_RECORD_DIES.store(true, Ordering::Release);
+        rig.service
+            .set_location(job_id, there_text.clone())
+            .await
+            .unwrap_err();
+        rig.service.stop().await;
+        rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+
+        let all = [
+            there.join("first.mkv"),
+            there.join("first.rar"),
+            there.join("small.txt"),
+        ];
+        let at = |dir: &Path| {
+            let mut files = files_under(dir);
+            files.sort();
+            files
+        };
+        assert_eq!(at(&there), all, "the files had moved");
+        assert_eq!(at(&save), Vec::<PathBuf>::new());
+        assert_eq!(
+            rig.db.torrent_outputs(job_id).unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(rig.db.torrent_adopted(job_id).unwrap().unwrap().all_files);
+        assert_eq!(
+            rig.db.get_torrent(job_id).unwrap().unwrap().files_dir,
+            Some(save.to_string_lossy().into_owned())
+        );
+
+        let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+        reopen(&again).await;
+        assert_eq!(
+            again.torrent(job_id).await.unwrap().state,
+            TorrentState::FilesMissing
+        );
+        if set_right {
+            again.set_location(job_id, there_text).await.unwrap();
+            again.opened(job_id).await;
+            let handle = handle_of(&again, job_id).await;
+            handle.wait_until_initialized().await.unwrap();
+            assert_eq!(handle.stats().progress_bytes, whole);
+            assert_ne!(
+                again.torrent(job_id).await.unwrap().state,
+                TorrentState::FilesMissing
+            );
+            assert_eq!(
+                rig.db.get_torrent(job_id).unwrap().unwrap().files_dir,
+                Some(there.to_string_lossy().into_owned())
+            );
+            assert_eq!(
+                rig.db.torrent_outputs(job_id).unwrap(),
+                Vec::<String>::new()
+            );
+        }
+        again.remove(job_id, true, false).await.unwrap();
+        assert_eq!(at(&there), all, "a removal with its files deletes none");
+        again.stop().await;
+    }
+}
+
+// What was there before the torrent where its files were says nothing of
+// where a move put them: the row after a move to a folder the move made
+// names no folder as there before the torrent, though the folder it was
+// added in was. (The place itself stays at a removal either way, as the
+// shared folder the torrent's files were set in: `written_of`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_torrents_row_names_no_folder_of_its_old_place() {
+    let (rig, job_id, _, _) = unpacked_flat_and_a_taken_folder(&[]).await;
+    let before = rig.db.torrent_adopted(job_id).unwrap().unwrap();
+    assert!(before.dirs.contains(&String::new()), "{:?}", before.dirs);
+    let made = rig.dir.path().join("made");
+    rig.service
+        .set_location(job_id, made.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    assert!(made.join("first.rar").exists());
+    let adopted = rig.db.torrent_adopted(job_id).unwrap().unwrap();
+    assert_eq!(adopted.dirs, Vec::<String>::new());
+    rig.service.stop().await;
+}
+
+// A move onto a folder that already holds the torrent's file keeps that
+// file, checks it, and seeds from it; the file is the torrent's from then
+// on, and a removal with the torrent's files deletes it (libtorrent
+// `dont_replace` with `need_full_check`, src/storage_utils.cpp and
+// `torrent::on_storage_moved`; qBittorrent `SessionImpl::removeTorrent`
+// deletes every file the torrent lists). A file there under a name the
+// torrent does not list stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_a_move_kept_is_deleted_with_the_torrents_files() {
+    let (rig, job_id, data, save, taken) = super::moves::seeding_beside_a_taken_name().await;
+    // Its file is one it made, as one it downloaded is: the rig seeds it
+    // from bytes put there before the add, which the add adopts.
+    let made = crate::torrents::model::Adopted {
+        all_files: false,
+        files: Vec::new(),
+        dirs: vec![String::new()],
+    };
+    rig.db.set_torrent_adopted(job_id, &made).unwrap();
+    // The file at the new place is the torrent's own, as when the operator
+    // points the torrent at a folder its files are already in.
+    std::fs::write(taken.join("a.bin"), &data).unwrap();
+    std::fs::write(taken.join("notes.txt"), b"notes").unwrap();
+    rig.service
+        .set_location(job_id, taken.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.stats().progress_bytes, data.len() as u64);
+    let adopted = rig.db.torrent_adopted(job_id).unwrap().unwrap();
+    assert!(!adopted.all_files);
+    assert!(adopted.files.is_empty(), "{:?}", adopted.files);
+
+    // It seeds with no goal met: the removal is confirmed.
+    rig.service.remove(job_id, true, true).await.unwrap();
+    assert!(
+        !taken.join("a.bin").exists(),
+        "the kept file is the torrent's"
+    );
+    assert_eq!(std::fs::read(taken.join("notes.txt")).unwrap(), b"notes");
+    // The copy the move left behind is no longer the torrent's.
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
     rig.service.stop().await;
 }
 

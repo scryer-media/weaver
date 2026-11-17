@@ -244,6 +244,21 @@ fn info_bytes(pieces: usize) -> Bytes {
     Bytes::from(info)
 }
 
+/// Something we told a [`MockPeer`] of the pieces we have, or a block we
+/// sent it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Offered {
+    Bitfield(Vec<u8>),
+    Have(u32),
+    HaveAll,
+    HaveNone,
+    Block {
+        piece: u32,
+        begin: u32,
+        data: Vec<u8>,
+    },
+}
+
 /// The far end of a metadata fetch.
 pub(crate) struct MockPeer {
     read: BoxAsyncReadVectored,
@@ -285,6 +300,38 @@ impl MockPeer {
         self.sent += bytes.len();
     }
 
+    /// `msg` written to us, unless we hung up already.
+    pub(crate) async fn send_if_open(&mut self, msg: Message<'_>) {
+        let mut out = vec![0u8; 1 << 15];
+        let len = msg
+            .serialize(&mut out, &PeerExtendedMessageIds::my)
+            .unwrap();
+        if self.write.write_all(&out[..len]).await.is_ok() {
+            self.sent += len;
+        }
+    }
+
+    /// The next block we send, its piece, where it begins and its bytes;
+    /// other messages pass. None once we hang up.
+    pub(crate) async fn next_block(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        loop {
+            let msg = self
+                .buf
+                .read_message(
+                    &mut self.read,
+                    NO_TIMEOUT,
+                    None,
+                    &mut crate::read_buf::Unlimited,
+                )
+                .await
+                .ok()?;
+            if let Message::Piece(piece) = msg {
+                let (head, tail) = piece.data();
+                return Some((piece.index, piece.begin, [head, tail].concat()));
+            }
+        }
+    }
+
     /// The next block we ask for; other messages pass. None once we hang
     /// up.
     pub(crate) async fn next_block_request(&mut self) -> Option<crate::peer_protocol::Request> {
@@ -301,6 +348,44 @@ impl MockPeer {
                 .ok()?;
             if let Message::Request(request) = msg {
                 return Some(request);
+            }
+        }
+    }
+
+    /// What we say we have, and each block we send, up to the next block we
+    /// ask for; that is None once we hang up.
+    pub(crate) async fn offered_until_request(
+        &mut self,
+    ) -> (Vec<Offered>, Option<crate::peer_protocol::Request>) {
+        let mut offered = Vec::new();
+        loop {
+            let Ok(msg) = self
+                .buf
+                .read_message(
+                    &mut self.read,
+                    NO_TIMEOUT,
+                    None,
+                    &mut crate::read_buf::Unlimited,
+                )
+                .await
+            else {
+                return (offered, None);
+            };
+            match msg {
+                Message::Request(request) => return (offered, Some(request)),
+                Message::Bitfield(bits) => offered.push(Offered::Bitfield(bits.as_ref().to_vec())),
+                Message::Have(piece) => offered.push(Offered::Have(piece)),
+                Message::HaveAll => offered.push(Offered::HaveAll),
+                Message::HaveNone => offered.push(Offered::HaveNone),
+                Message::Piece(piece) => {
+                    let (head, tail) = piece.data();
+                    offered.push(Offered::Block {
+                        piece: piece.index,
+                        begin: piece.begin,
+                        data: [head, tail].concat(),
+                    });
+                }
+                _ => {}
             }
         }
     }

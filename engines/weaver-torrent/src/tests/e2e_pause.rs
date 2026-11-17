@@ -29,22 +29,22 @@ use crate::{
 };
 
 /// A request the tracker heard: its path and its `event`.
-type Heard = (String, Option<String>);
+pub(crate) type Heard = (String, Option<String>);
 
 /// An HTTP tracker on loopback that hands out `peer`, if any, and hears
 /// every request.
 /// Its accept loop runs on the blocking pool, which holds the paused clock
 /// still: time moves only when the test moves it.
-struct Tracker {
+pub(crate) struct Tracker {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     // The query of every request heard, in order, each recorded before it
     // is heard.
-    queries: Arc<parking_lot::Mutex<Vec<String>>>,
+    pub(crate) queries: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl Tracker {
-    fn start(peer: Option<SocketAddr>) -> (Self, mpsc::UnboundedReceiver<Heard>) {
+    pub(crate) fn start(peer: Option<SocketAddr>) -> (Self, mpsc::UnboundedReceiver<Heard>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -75,7 +75,7 @@ impl Tracker {
         )
     }
 
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         format!("http://{}/announce", self.addr)
     }
 }
@@ -128,17 +128,17 @@ fn serve(
 }
 
 /// The next request `heard` hears.
-async fn next(heard: &mut mpsc::UnboundedReceiver<Heard>) -> anyhow::Result<Heard> {
+pub(crate) async fn next(heard: &mut mpsc::UnboundedReceiver<Heard>) -> anyhow::Result<Heard> {
     heard.recv().await.context("the tracker stopped")
 }
 
-fn announce(event: Option<&str>) -> Heard {
+pub(crate) fn announce(event: Option<&str>) -> Heard {
     ("/announce".into(), event.map(str::to_owned))
 }
 
 /// Waits until the announce `torrent`'s tracker heard is answered and
 /// recorded, its next one scheduled.
-async fn answered(torrent: &crate::ManagedTorrent) -> anyhow::Result<()> {
+pub(crate) async fn answered(torrent: &crate::ManagedTorrent) -> anyhow::Result<()> {
     let status = torrent
         .tracker_status()
         .context("the torrent has no trackers")?;
@@ -360,6 +360,190 @@ async fn test_a_pause_reports_the_block_it_cut_in_the_stopped_announce() -> anyh
         Some(RECEIVED.to_string().as_str())
     );
     assert!(torrent.shared().ending_run.lock().is_none());
+    drop(tracker);
+    session.stop().await;
+    Ok(())
+}
+
+// Files that change under a seeding torrent, as a move that keeps a file
+// already at the new place changes them: the torrent forgets every piece
+// before they change, as libtorrent's `torrent::force_recheck` does
+// (`disconnect_all`, then `set_have_all(false)`). Its peer, served a block a
+// moment before, is let go, and the block it asks for once the files have
+// changed is not sent it: no block of the other file's bytes is. The peer
+// dialed after the check is told of no piece: the check passed none.
+#[tokio::test(start_paused = true)]
+async fn test_a_torrent_whose_files_changed_serves_none_of_them_unchecked() -> anyhow::Result<()> {
+    use crate::buffers::ByteBuf;
+    use crate::peer_info_reader::tests::Offered;
+    use crate::peer_protocol::{Message, Request};
+    const FOREIGN: u8 = 0xa5;
+
+    let peer_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 6881));
+    let (tracker, mut heard) = Tracker::start(Some(peer_addr));
+    let (tx, mut dials) = mpsc::unbounded_channel();
+    let out = TempDir::with_prefix("changed_files_out")?;
+    let session = Session::new_with_opts(
+        out.path().into(),
+        SessionOptions {
+            socket_factory: Arc::new(Dialed(tx)),
+            connect: Some(ConnectionOptions {
+                enable_tcp: true,
+                enable_utp: None,
+                peer_opts: None,
+            }),
+            ..tracker_session_opts()?
+        },
+    )
+    .await?;
+    let t = TestTorrent::new("changed_files", 4096, 1024).await?;
+    let storage = MemoryStorageFactory::holding(vec![t.content.clone()]);
+    let torrent = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(storage.clone_box()),
+                trackers: Some(vec![tracker.url()]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    assert_eq!(next(&mut heard).await?, announce(Some("started")));
+    let (dialed, stream) = dials.recv().await.context("no dial")?;
+    assert_eq!(dialed, peer_addr);
+    let mut peer = MockPeer::greet(stream, torrent.shared().info_hashes).await;
+    let run = torrent.live().context("the torrent is not live")?;
+    while run.stats_snapshot().peer_stats.live != 1 {
+        tokio::task::yield_now().await;
+    }
+    assert!(torrent.stats().finished, "the torrent does not seed");
+    // The peer wants the first block, and is sent it: its requests reach
+    // the torrent and are served while the files are the torrent's own.
+    peer.send(Message::Interested).await;
+    peer.send(Message::Request(Request::new(0, 0, 1024))).await;
+    let (piece, begin, data) = peer.next_block().await.context("the seed sent no block")?;
+    assert_eq!((piece, begin), (0, 0));
+    assert_eq!(data[..], t.content[..1024]);
+
+    session.forget_for_recheck(&torrent).await?;
+    storage.log.overwrite_file(0, FOREIGN);
+
+    // It asks for the next block, of the files as they are now. The
+    // connection ends, and no block is sent on it: were the pieces still
+    // had, this one would go out with the other file's bytes.
+    peer.send_if_open(Message::Request(Request::new(1, 0, 1024)))
+        .await;
+    assert_eq!(
+        peer.next_block().await,
+        None,
+        "a block was served unchecked"
+    );
+
+    // Checked, the torrent has no piece and says so to the peer it dials:
+    // nothing it has, and no block, before it asks that peer for one.
+    session.restart_check(&torrent).await?;
+    torrent.wait_until_initialized().await?;
+    let (dialed, stream) = dials.recv().await.context("no dial after the check")?;
+    assert_eq!(dialed, peer_addr);
+    let mut peer = MockPeer::greet(stream, torrent.shared().info_hashes).await;
+    peer.send(Message::Bitfield(ByteBuf(&[0xf0]))).await;
+    peer.send(Message::Unchoke).await;
+    let (offered, request) = peer.offered_until_request().await;
+    assert!(request.is_some(), "the torrent asked for nothing");
+    assert!(
+        offered.iter().all(|said| match said {
+            Offered::HaveNone => true,
+            Offered::Bitfield(bits) => bits.iter().all(|byte| *byte == 0),
+            _ => false,
+        }),
+        "{offered:?}"
+    );
+    drop(tracker);
+    session.stop().await;
+    Ok(())
+}
+
+// A recheck of a running torrent says `stopped` for the run it ends, with
+// that run's counters, and `started` for the run after the check, counted
+// from zero, as libtorrent does: `torrent::force_recheck` calls
+// `stop_announcing` (torrent.cpp:2407), which announces `stopped`
+// (torrent.cpp:10384), and `files_checked` calls `start_announcing`
+// (torrent.cpp:8884), which resets every tracker's `start_sent`
+// (torrent.cpp:10346) and the session's counters (torrent.cpp:10351-10353,
+// v2.0.15). Neither waits for the other, there or here: the tracker may
+// read the two in either order, so each is told apart by its event.
+#[tokio::test(start_paused = true)]
+async fn test_a_recheck_says_stopped_with_the_runs_counters_then_started_from_zero()
+-> anyhow::Result<()> {
+    use super::e2e_tracker_announces::param;
+    use crate::peer_protocol::{Message, Request};
+
+    let peer_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 6881));
+    let (tracker, mut heard) = Tracker::start(Some(peer_addr));
+    let (tx, mut dials) = mpsc::unbounded_channel();
+    let out = TempDir::with_prefix("recheck_events_out")?;
+    let session = Session::new_with_opts(
+        out.path().into(),
+        SessionOptions {
+            socket_factory: Arc::new(Dialed(tx)),
+            connect: Some(ConnectionOptions {
+                enable_tcp: true,
+                enable_utp: None,
+                peer_opts: None,
+            }),
+            ..tracker_session_opts()?
+        },
+    )
+    .await?;
+    let t = TestTorrent::new("recheck_events", 4096, 1024).await?;
+    let torrent = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(
+                    MemoryStorageFactory::holding(vec![t.content.clone()]).clone_box(),
+                ),
+                trackers: Some(vec![tracker.url()]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    assert_eq!(next(&mut heard).await?, announce(Some("started")));
+    answered(&torrent).await?;
+
+    // The run uploads one block before the recheck ends it.
+    let (dialed, stream) = dials.recv().await.context("no dial")?;
+    assert_eq!(dialed, peer_addr);
+    let mut peer = MockPeer::greet(stream, torrent.shared().info_hashes).await;
+    peer.send(Message::Interested).await;
+    peer.send(Message::Request(Request::new(0, 0, 1024))).await;
+    peer.next_block().await.context("the seed sent no block")?;
+
+    session.force_recheck(&torrent).await?;
+    let mut events = [next(&mut heard).await?, next(&mut heard).await?];
+    events.sort();
+    assert_eq!(
+        events,
+        [announce(Some("started")), announce(Some("stopped"))]
+    );
+    let queries = tracker.queries.lock().clone();
+    assert_eq!(queries.len(), 3, "{queries:?}");
+    let of = |event: &str| {
+        queries[1..]
+            .iter()
+            .find(|query| param(query, "event") == Some(event))
+            .context("no such announce")
+    };
+    let stopped = of("stopped")?;
+    assert_eq!(param(stopped, "uploaded"), Some("1024"), "{stopped}");
+    let started = of("started")?;
+    assert_eq!(param(started, "uploaded"), Some("0"), "{started}");
+    assert_eq!(param(started, "downloaded"), Some("0"), "{started}");
+    assert_eq!(param(started, "left"), Some("0"), "{started}");
     drop(tracker);
     session.stop().await;
     Ok(())

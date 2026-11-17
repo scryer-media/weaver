@@ -7,6 +7,7 @@
 // handle on the files is let go first, so the move happens whole and no
 // write or read sees a path under the old place beside one under the new.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,27 @@ pub(crate) struct MoveError {
     pub(crate) source: io::Error,
 }
 
+// A move of files that failed, with what it had moved put back.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub(crate) struct Failed {
+    #[source]
+    pub(crate) error: MoveError,
+    // The files, by their place in the list moved, that would not go back:
+    // something took each one's old name since it left. Each stays where
+    // the move put it, and the file at its old name is not the mover's.
+    pub(crate) stranded: Vec<usize>,
+}
+
+impl From<MoveError> for Failed {
+    fn from(error: MoveError) -> Self {
+        Self {
+            error,
+            stranded: Vec::new(),
+        }
+    }
+}
+
 impl MoveError {
     fn at(path: &Path) -> impl FnOnce(io::Error) -> Self + '_ {
         move |source| Self {
@@ -49,13 +71,157 @@ impl MoveError {
 // every file is in, and a move that fails partway puts back what it moved.
 // A file it replaced stays replaced, and a file it kept stays kept, as
 // libtorrent's do. The directories under `from` the move leaves empty go.
-// True when a file already at a destination was kept.
+//
+// Keeping is by a move that never replaces
+// (`rename_path_exclusive_in_place`, and across devices a copy made new),
+// not by a look before one that does: a file that takes the name after the
+// look is kept as one found by it is. So is every move back (`put_back`).
+// A file is copied only across devices; on one device a mount with no move
+// that refuses is looked at and then renamed, which is that mount's limit.
+//
+// A destination that is itself a file of the batch still to move (a move
+// into a folder of the torrent's own, or out of one) is not a file already
+// there: the batch is ordered (`ordered`) so that file moves first, and
+// each ends at its own name with none taking another's place. A batch that
+// cannot be ordered so moves nothing.
+//
+// What it moved and what it kept, by their place in `moves`.
 pub(crate) fn move_files(
     from: &Path,
     moves: &[(PathBuf, PathBuf)],
     existing: Existing,
-) -> Result<bool, MoveError> {
-    move_files_using(from, moves, existing, |from, to| std::fs::rename(from, to))
+) -> Result<Moved, Failed> {
+    match existing {
+        Existing::Keep => move_files_using(
+            from,
+            moves,
+            existing,
+            crate::runtime::fs::rename_path_exclusive_in_place,
+        ),
+        Existing::Replace => {
+            move_files_using(from, moves, existing, |from, to| std::fs::rename(from, to))
+        }
+    }
+}
+
+// What a move of files did, each file by its place in the list moved.
+#[derive(Debug, Default)]
+pub(crate) struct Moved {
+    // The files whose destination held a file already, which was kept.
+    pub(crate) kept: Vec<usize>,
+    // The files that moved, in the order they did.
+    pub(crate) moved: Vec<usize>,
+}
+
+impl Moved {
+    // The files that moved go back where they were, the last first, over
+    // nothing: a move ended whole that what came after it could not keep.
+    // The folders under `to` that leaves empty go, but for `there`, the
+    // ones that were there before the move. The files that would not go
+    // back, by their place in `moves`: see `Failed::stranded`.
+    pub(crate) fn put_back(
+        &self,
+        to: &Path,
+        moves: &[(PathBuf, PathBuf)],
+        there: &HashSet<PathBuf>,
+    ) -> Vec<usize> {
+        let stranded = put_back(moves, self.moved.iter().rev().copied());
+        remove_emptied_but(to, moves.iter().map(|(_, target)| target.as_path()), there);
+        stranded
+    }
+}
+
+// Each of `moved`, files of `moves` now at their destinations, back at its
+// source by a move that never replaces: a name something took since the
+// file left it is theirs, and the file stays where it is. Those that stay.
+fn put_back(moves: &[(PathBuf, PathBuf)], moved: impl Iterator<Item = usize>) -> Vec<usize> {
+    let mut stranded = Vec::new();
+    for at in moved {
+        let (source, target) = &moves[at];
+        if let Err(error) = move_exclusive(target, source) {
+            tracing::warn!(from = %target.display(), to = %source.display(), error = %error, "a moved file could not be put back where it was; it stays where the move put it");
+            stranded.push(at);
+        }
+    }
+    stranded
+}
+
+// The file at `from` moved to `to`, never over what is there, its folder
+// made when it is not there: renamed, or across devices copied into a file
+// made new and then removed.
+fn move_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match crate::runtime::fs::rename_path_exclusive_in_place(from, to) {
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
+        moved => return moved,
+    }
+    crate::runtime::file_cache::copy_large_file(from, to)?;
+    left_behind(from, std::fs::remove_file(from));
+    Ok(())
+}
+
+// The order `moves` are made in: each file after the file of the batch that
+// sits at its destination, so no file lands on one still to move. One
+// lookup per file. An error when files would each take another's place in
+// a ring, which no order moves without setting one aside. With it, which
+// files another of the batch waits on to move out of its way.
+//
+// The file at a destination is the one of that very path, else one whose
+// path differs from it only as a volume that folds names would not tell
+// apart (`tee::key_of`, the key unpacked files are named by): on such a
+// volume they are one name. On a volume that tells them apart the second
+// only orders two files that never meet.
+fn ordered(moves: &[(PathBuf, PathBuf)]) -> Result<(Vec<usize>, Vec<bool>), MoveError> {
+    let by_source: HashMap<&Path, usize> = moves
+        .iter()
+        .enumerate()
+        .map(|(at, (source, _))| (source.as_path(), at))
+        .collect();
+    let by_key: HashMap<String, usize> = moves
+        .iter()
+        .enumerate()
+        .map(|(at, (source, _))| (super::tee::key_of(source), at))
+        .collect();
+    let at_destination = |target: &Path| {
+        by_source
+            .get(target)
+            .or_else(|| by_key.get(&super::tee::key_of(target)))
+            .copied()
+    };
+    // 0 not looked at, 1 waiting on the file at its destination, 2 in.
+    let mut state = vec![0_u8; moves.len()];
+    let mut order = Vec::with_capacity(moves.len());
+    let mut waiting = Vec::new();
+    let mut awaited = vec![false; moves.len()];
+    for first in 0..moves.len() {
+        let mut at = first;
+        while state[at] == 0 {
+            state[at] = 1;
+            waiting.push(at);
+            match at_destination(&moves[at].1) {
+                Some(next) if next != at => {
+                    awaited[next] = true;
+                    at = next;
+                }
+                _ => break,
+            }
+        }
+        if state[at] == 1 && waiting.last() != Some(&at) {
+            return Err(MoveError {
+                path: moves[at].0.clone(),
+                source: io::Error::other(
+                    "files of the torrent would each move onto another still to move",
+                ),
+            });
+        }
+        while let Some(done) = waiting.pop() {
+            state[done] = 2;
+            order.push(done);
+        }
+    }
+    Ok((order, awaited))
 }
 
 fn move_files_using(
@@ -63,16 +229,18 @@ fn move_files_using(
     moves: &[(PathBuf, PathBuf)],
     existing: Existing,
     rename: impl Fn(&Path, &Path) -> io::Result<()>,
-) -> Result<bool, MoveError> {
-    let mut kept = false;
+) -> Result<Moved, Failed> {
+    let mut kept = Vec::new();
     let mut renamed = Vec::new();
     let mut copied = Vec::new();
     let mut failed = None;
-    for (source, target) in moves {
+    let (order, awaited) = ordered(moves)?;
+    for at in order {
+        let (source, target) = &moves[at];
         // A dangling link there still counts as a file there, as in
         // libtorrent.
         if existing == Existing::Keep && std::fs::symlink_metadata(target).is_ok() {
-            kept = true;
+            kept.push(at);
             continue;
         }
         if std::fs::symlink_metadata(source).is_err() {
@@ -85,12 +253,51 @@ fn move_files_using(
             break;
         }
         match rename(source, target) {
-            Ok(()) => renamed.push((source, target)),
+            Ok(()) => renamed.push(at),
+            // Taken since the look: kept, as one the look found is.
+            Err(error)
+                if existing == Existing::Keep && error.kind() == io::ErrorKind::AlreadyExists =>
+            {
+                kept.push(at);
+            }
+            // A copy leaves its source in place until every file is in, so
+            // a file another waits on cannot go by one: the move fails
+            // whole rather than land that other on a source still there.
+            Err(error) if error.kind() == io::ErrorKind::CrossesDevices && awaited[at] => {
+                failed = Some(MoveError::at(source)(error));
+                break;
+            }
             Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-                match std::fs::copy(source, target) {
-                    Ok(_) => copied.push((source, target)),
+                let made = match existing {
+                    // Into a file made new: a copy that fails removes what
+                    // it made, and nothing else.
+                    Existing::Keep => {
+                        crate::runtime::file_cache::copy_large_file(source, target).map(drop)
+                    }
+                    // Over what is there. A copy that fails removes only a
+                    // file it made: one that was there is not this move's
+                    // to remove, whether or not the copy could open it.
+                    // The copy writes into that file in place, so one that
+                    // fails partway leaves it cut short or part written
+                    // over: what it held before is not kept.
+                    Existing::Replace => {
+                        let made_new = std::fs::symlink_metadata(target).is_err();
+                        std::fs::copy(source, target).map(drop).inspect_err(|_| {
+                            if made_new {
+                                let _ = std::fs::remove_file(target);
+                            }
+                        })
+                    }
+                };
+                match made {
+                    Ok(()) => copied.push(at),
+                    Err(error)
+                        if existing == Existing::Keep
+                            && error.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        kept.push(at);
+                    }
                     Err(error) => {
-                        let _ = std::fs::remove_file(target);
                         failed = Some(MoveError::at(source)(error));
                         break;
                     }
@@ -103,29 +310,47 @@ fn move_files_using(
         }
     }
     if let Some(error) = failed {
-        for (source, target) in renamed {
-            let _ = std::fs::rename(target, source);
+        // A copy's source never left: the copy goes. Then the last moved
+        // first: a file goes back before the one that moved out of its way.
+        for at in copied {
+            let _ = std::fs::remove_file(&moves[at].1);
         }
-        for (_, target) in copied {
-            let _ = std::fs::remove_file(target);
-        }
-        return Err(error);
+        let stranded = put_back(moves, renamed.into_iter().rev());
+        return Err(Failed { error, stranded });
     }
     // Every file is in: the move is done, and a source that will not go is
     // only left behind (libtorrent `storage_utils.cpp:314-320`).
-    for (source, _) in copied {
+    for at in &copied {
+        let source = &moves[*at].0;
         left_behind(source, std::fs::remove_file(source));
     }
-    for (source, _) in moves {
-        let mut dir = source.parent();
+    remove_emptied(from, moves.iter().map(|(source, _)| source.as_path()));
+    let mut moved = renamed;
+    moved.extend(copied);
+    Ok(Moved { kept, moved })
+}
+
+// The folders above each of `paths`, under `from`, that hold nothing now.
+pub(crate) fn remove_emptied<'a>(from: &Path, paths: impl Iterator<Item = &'a Path>) {
+    remove_emptied_but(from, paths, &HashSet::new());
+}
+
+// `remove_emptied`, but for the folders of `there` and those above them:
+// the ones that were there before what emptied them came.
+pub(crate) fn remove_emptied_but<'a>(
+    from: &Path,
+    paths: impl Iterator<Item = &'a Path>,
+    there: &HashSet<PathBuf>,
+) {
+    for path in paths {
+        let mut dir = path.parent();
         while let Some(at) = dir.filter(|at| *at != from && at.starts_with(from)) {
-            if std::fs::remove_dir(at).is_err() {
+            if there.contains(at) || std::fs::remove_dir(at).is_err() {
                 break;
             }
             dir = at.parent();
         }
     }
-    Ok(kept)
 }
 
 // Move the directory at `from` to `to`, an empty directory that exists:
@@ -282,7 +507,8 @@ mod tests {
             }
         })
         .unwrap_err();
-        assert!(matches!(error, MoveError { ref path, .. } if path.ends_with("c.bin")));
+        assert!(matches!(error.error, MoveError { ref path, .. } if path.ends_with("c.bin")));
+        assert!(error.stranded.is_empty());
         let mut expected = expected;
         expected.push((PathBuf::from("c.bin"), b"cc".to_vec()));
         expected.sort();
@@ -306,7 +532,9 @@ mod tests {
             .iter()
             .map(|(name, _)| (from.join(name), to.join(name)))
             .collect();
-        assert!(move_files(&from, &moves, Existing::Keep).unwrap());
+        let kept = move_files(&from, &moves, Existing::Keep).unwrap().kept;
+        assert_eq!(kept.len(), 1);
+        assert!(moves[kept[0]].0.ends_with("sub/b.bin"));
         let moved = |name: &str, bytes: &[u8]| (PathBuf::from(name), bytes.to_vec());
         assert_eq!(
             contents(&to),
@@ -321,7 +549,9 @@ mod tests {
         // Nothing there, nothing kept.
         let again = root.path().join("again");
         let moves: Vec<(PathBuf, PathBuf)> = vec![(to.join("a.bin"), again.join("a.bin"))];
-        assert!(!move_files(&to, &moves, Existing::Keep).unwrap());
+        let moved = move_files(&to, &moves, Existing::Keep).unwrap();
+        assert!(moved.kept.is_empty());
+        assert_eq!(moved.moved, [0]);
         assert_eq!(std::fs::read(again.join("a.bin")).unwrap(), b"aaa");
     }
 
@@ -340,9 +570,200 @@ mod tests {
             .iter()
             .map(|(name, _)| (from.join(name), to.join(name)))
             .collect();
-        assert!(!move_files(&from, &moves, Existing::Replace).unwrap());
+        assert!(
+            move_files(&from, &moves, Existing::Replace)
+                .unwrap()
+                .kept
+                .is_empty()
+        );
         assert_eq!(contents(&to), expected);
         assert!(contents(&from).is_empty());
+    }
+
+    // A move into a folder of the torrent's own, or out of one: a file's
+    // destination is then another file of the batch still to move. Each
+    // ends at its own name with its own bytes, in either mode, whatever
+    // order the batch lists them in; none is replaced by another, and none
+    // is taken for a file already there.
+    #[test]
+    fn a_file_never_moves_onto_one_of_the_batch_still_to_move() {
+        for existing in [Existing::Replace, Existing::Keep] {
+            for reversed in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let from = root.path().join("from");
+                let to = from.join("sub");
+                std::fs::create_dir_all(from.join("sub/sub")).unwrap();
+                std::fs::write(from.join("a.bin"), b"top").unwrap();
+                std::fs::write(from.join("sub/a.bin"), b"middle").unwrap();
+                std::fs::write(from.join("sub/sub/a.bin"), b"deep").unwrap();
+                let mut moves: Vec<(PathBuf, PathBuf)> = ["a.bin", "sub/a.bin", "sub/sub/a.bin"]
+                    .iter()
+                    .map(|name| (from.join(name), to.join(name)))
+                    .collect();
+                if reversed {
+                    moves.reverse();
+                }
+                let moved = move_files(&from, &moves, existing).unwrap();
+                assert!(moved.kept.is_empty(), "{existing:?} {reversed}");
+                assert_eq!(moved.moved.len(), 3);
+                let at = |name: &str| std::fs::read(to.join(name)).unwrap();
+                assert_eq!(at("a.bin"), b"top", "{existing:?} {reversed}");
+                assert_eq!(at("sub/a.bin"), b"middle", "{existing:?} {reversed}");
+                assert_eq!(at("sub/sub/a.bin"), b"deep", "{existing:?} {reversed}");
+
+                // And back out again, by the move that puts a move back.
+                assert!(moved.put_back(&to, &moves, &HashSet::new()).is_empty());
+                let at = |name: &str| std::fs::read(from.join(name)).unwrap();
+                assert_eq!(at("a.bin"), b"top");
+                assert_eq!(at("sub/a.bin"), b"middle");
+                assert_eq!(at("sub/sub/a.bin"), b"deep");
+                assert!(!from.join("sub/sub/sub").exists());
+            }
+        }
+    }
+
+    // A file that takes a destination's name after the look that found it
+    // free is kept as one the look found is: the move never replaces it,
+    // and the file that would have taken its place stays at its source.
+    #[test]
+    fn a_file_that_appears_after_the_look_is_kept_not_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let (from, to) = (root.path().join("from"), root.path().join("to"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("a.bin"), b"ours").unwrap();
+        std::fs::write(from.join("b.bin"), b"ours too").unwrap();
+        let moves: Vec<(PathBuf, PathBuf)> = ["a.bin", "b.bin"]
+            .iter()
+            .map(|name| (from.join(name), to.join(name)))
+            .collect();
+        let moved = move_files_using(&from, &moves, Existing::Keep, |source, target| {
+            if source.ends_with("b.bin") {
+                std::fs::write(target, b"theirs").unwrap();
+            }
+            crate::runtime::fs::rename_path_exclusive(source, target)
+        })
+        .unwrap();
+        assert_eq!((moved.kept, moved.moved), (vec![1], vec![0]));
+        assert_eq!(std::fs::read(to.join("b.bin")).unwrap(), b"theirs");
+        assert_eq!(std::fs::read(from.join("b.bin")).unwrap(), b"ours too");
+        assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"ours");
+    }
+
+    // Putting files back never replaces: a file whose old name was taken
+    // since it left stays where the move put it, the file at its old name
+    // is as it was put there, and the put-back names it. So does the undo
+    // of a batch that failed partway.
+    #[test]
+    fn a_file_put_back_never_replaces_what_took_its_name() {
+        let root = tempfile::tempdir().unwrap();
+        let (from, to) = (root.path().join("from"), root.path().join("to"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("a.bin"), b"ours").unwrap();
+        std::fs::write(from.join("b.bin"), b"ours too").unwrap();
+        let moves: Vec<(PathBuf, PathBuf)> = ["a.bin", "b.bin"]
+            .iter()
+            .map(|name| (from.join(name), to.join(name)))
+            .collect();
+        let moved = move_files(&from, &moves, Existing::Replace).unwrap();
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("a.bin"), b"theirs").unwrap();
+        assert_eq!(moved.put_back(&to, &moves, &HashSet::new()), [0]);
+        assert_eq!(std::fs::read(from.join("a.bin")).unwrap(), b"theirs");
+        assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"ours");
+        assert_eq!(std::fs::read(from.join("b.bin")).unwrap(), b"ours too");
+        assert!(!to.join("b.bin").exists());
+
+        // A batch that fails at its second file, the first one's old name
+        // taken by then.
+        let (from, to) = (root.path().join("from2"), root.path().join("to2"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("a.bin"), b"ours").unwrap();
+        std::fs::write(from.join("b.bin"), b"ours too").unwrap();
+        let moves: Vec<(PathBuf, PathBuf)> = ["a.bin", "b.bin"]
+            .iter()
+            .map(|name| (from.join(name), to.join(name)))
+            .collect();
+        let failed = move_files_using(&from, &moves, Existing::Replace, |source, target| {
+            if source.ends_with("b.bin") {
+                std::fs::write(from.join("a.bin"), b"theirs").unwrap();
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            std::fs::rename(source, target)
+        })
+        .unwrap_err();
+        assert_eq!(failed.stranded, [0]);
+        assert_eq!(std::fs::read(from.join("a.bin")).unwrap(), b"theirs");
+        assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"ours");
+        assert_eq!(std::fs::read(from.join("b.bin")).unwrap(), b"ours too");
+    }
+
+    // A replacing copy across devices that fails leaves the file that was
+    // at the destination: it is not one this move made.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_copy_over_a_file_there_does_not_remove_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (from, to) = (root.path().join("from"), root.path().join("to"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        // A source the copy cannot open.
+        std::os::unix::fs::symlink(from.join("gone"), from.join("a.bin")).unwrap();
+        std::fs::write(to.join("a.bin"), b"theirs").unwrap();
+        let moves = vec![(from.join("a.bin"), to.join("a.bin"))];
+        move_files_using(&from, &moves, Existing::Replace, |_, _| {
+            Err(io::Error::from(io::ErrorKind::CrossesDevices))
+        })
+        .unwrap_err();
+        assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"theirs");
+    }
+
+    // A file's destination that differs from a file of the batch still to
+    // move only as a volume that folds names would not tell apart: that
+    // file moves first, as one at the very path does, so on such a volume
+    // neither lands on the other. On a volume that tells them apart the
+    // two never meet, and each ends at its own name all the same.
+    #[test]
+    fn a_file_waits_for_one_at_its_destination_under_another_case() {
+        for reversed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let from = root.path().join("from");
+            let to = from.join("sub");
+            std::fs::create_dir_all(&to).unwrap();
+            std::fs::write(from.join("a.bin"), b"top").unwrap();
+            std::fs::write(from.join("sub/A.BIN"), b"middle").unwrap();
+            let mut moves: Vec<(PathBuf, PathBuf)> = ["a.bin", "sub/A.BIN"]
+                .iter()
+                .map(|name| (from.join(name), to.join(name)))
+                .collect();
+            if reversed {
+                moves.reverse();
+            }
+            let moved = move_files(&from, &moves, Existing::Replace).unwrap();
+            assert_eq!(moved.moved.len(), 2, "{reversed}");
+            assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"top");
+            assert_eq!(std::fs::read(to.join("sub/A.BIN")).unwrap(), b"middle");
+        }
+    }
+
+    // Files that would each take another's place in a ring move not at
+    // all, and neither do the rest of the batch.
+    #[test]
+    fn files_that_would_swap_places_do_not_move() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().to_path_buf();
+        std::fs::write(from.join("a.bin"), b"a").unwrap();
+        std::fs::write(from.join("b.bin"), b"b").unwrap();
+        std::fs::write(from.join("c.bin"), b"c").unwrap();
+        let moves = vec![
+            (from.join("c.bin"), from.join("moved/c.bin")),
+            (from.join("a.bin"), from.join("b.bin")),
+            (from.join("b.bin"), from.join("a.bin")),
+        ];
+        move_files(&from, &moves, Existing::Replace).unwrap_err();
+        assert_eq!(std::fs::read(from.join("a.bin")).unwrap(), b"a");
+        assert_eq!(std::fs::read(from.join("b.bin")).unwrap(), b"b");
+        assert_eq!(std::fs::read(from.join("c.bin")).unwrap(), b"c");
+        assert!(!from.join("moved").exists());
     }
 
     // libtorrent `storage_utils::move_storage` (`storage_utils.cpp:295-335`):
@@ -378,7 +799,7 @@ mod tests {
         locked(&from.join("sub"), 0o555);
         let moved = move_files_using(&from, &moves, Existing::Replace, across);
         locked(&from.join("sub"), 0o755);
-        assert!(!moved.unwrap());
+        assert!(moved.unwrap().kept.is_empty());
         assert_eq!(contents(&to), expected);
         assert!(from.join("sub/b.bin").exists());
         assert!(!from.join("a.bin").exists());

@@ -161,11 +161,22 @@ impl PeerHandler {
             self.count_holepunch(HolepunchEvent::Unoffered);
             return;
         }
+        // A private torrent takes no peer from any source but its trackers
+        // (AGENTS.md, "Private trackers"): it neither dials the address a
+        // Connect names nor introduces two peers to each other. A Connect is
+        // ignored, and a Rendezvous is refused "no support", the BEP 55 code
+        // that says no holepunch can happen through us whatever we are
+        // connected to (`on_rendezvous`). This departs from libtorrent by the
+        // operator's ruling of 2026-11-16: `bt_peer_connection::on_holepunch`
+        // adds a Connect's address and introduces with no private check
+        // (src/bt_peer_connection.cpp:1593-1629, v2.0.15). The extension is
+        // still advertised in the handshake.
+        let private = self.state.metadata.info.info().private;
         match msg {
-            UtHolepunch::Rendezvous(target) => self.on_rendezvous(me, target),
+            UtHolepunch::Rendezvous(target) => self.on_rendezvous(me, target, private),
             // A local address is taken only from a local peer.
             UtHolepunch::Connect(addr) => {
-                if !is_local(addr.ip()) || is_local(me.ip()) {
+                if !private && (!is_local(addr.ip()) || is_local(me.ip())) {
                     self.count_holepunch(HolepunchEvent::Connect);
                     self.state.holepunch(addr);
                 } else {
@@ -179,16 +190,17 @@ impl PeerHandler {
         }
     }
 
-    /// The peer asks us to introduce it to the peer at `target`: when we are
-    /// connected to that peer and it speaks the extension, each is told to
-    /// connect to the other; else the peer is told why not. A local peer and
-    /// one that is not are never introduced (libtorrent
-    /// `bt_peer_connection::on_holepunch`, `rendezvous`).
     fn count_holepunch(&self, event: HolepunchEvent) {
         self.state.session_stats.network.holepunch(event);
     }
 
-    fn on_rendezvous(&self, me: SocketAddr, target: SocketAddr) {
+    /// The peer asks us to introduce it to the peer at `target`: when we are
+    /// connected to that peer and it speaks the extension, each is told to
+    /// connect to the other; else the peer is told why not. A local peer and
+    /// one that is not are never introduced (libtorrent
+    /// `bt_peer_connection::on_holepunch`, `rendezvous`). A private torrent
+    /// introduces no one: the peer is told "no support".
+    fn on_rendezvous(&self, me: SocketAddr, target: SocketAddr, private: bool) {
         let send = |tx: &PeerTx, msg: UtHolepunch| {
             let _ = tx.send(WriterRequest::Message(Message::Extended(
                 ExtendedMessage::UtHolepunch(msg),
@@ -198,6 +210,7 @@ impl PeerHandler {
             (live.supports_holepunch, live.tx.clone())
         });
         let refused = match &found {
+            _ if private => Some(ut_holepunch::error::NO_SUPPORT),
             None => Some(ut_holepunch::error::NOT_CONNECTED),
             Some((false, _)) => Some(ut_holepunch::error::NO_SUPPORT),
             Some(_) if target == me => Some(ut_holepunch::error::NO_SELF),

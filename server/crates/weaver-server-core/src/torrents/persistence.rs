@@ -1482,30 +1482,35 @@ impl Database {
         })
     }
 
-    // Unpacking is over: the files it placed beside the torrent's own are
-    // kept on its row, with those an earlier unpacking that a crash cut
-    // short kept there, those kept for it that it did not place go from it,
-    // and its job's checkpoint goes, in one transaction. Run on the
+    // Unpacking is over, and its outputs are where they stay: the files it
+    // placed beside the torrent's own are kept on its row, with those an
+    // earlier unpacking kept there; `dropped`, the names kept that hold no
+    // file, go from it; `held` joins what the torrent holds, so a history
+    // archive leaves them; and its job's checkpoint goes. One transaction:
+    // a restart finds the placing recorded whole or not at all. Run on the
     // torrent's own lane, so no write of the job's checkpoint queued before
     // it lands after.
     pub(crate) fn finish_torrent_unpack(
         &self,
         job_id: JobId,
         outputs: &[String],
-        unplaced: &[String],
+        dropped: &[String],
+        held: &[String],
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
-        let outputs = self.outputs_with(job_id, outputs, unplaced)?;
+        let outputs = self.outputs_with(job_id, outputs, dropped)?;
+        let held = held.to_vec();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "finish_torrent_unpack", |tx| {
-                let outputs = outputs.clone();
+                let (outputs, held) = (outputs.clone(), held.clone());
                 Box::pin(async move {
                     tx.execute(
                         "UPDATE torrents SET outputs = {} WHERE job_id = {}",
                         &[SqlArg::OptText(outputs), SqlArg::I64(id)],
                     )
                     .await?;
+                    insert_held_tx(tx, id, &held).await?;
                     for table in crate::jobs::graph_checkpoint::TABLES {
                         tx.execute(
                             &format!("DELETE FROM {table} WHERE job_id = {{}}"),
@@ -1520,28 +1525,114 @@ impl Database {
         })
     }
 
-    // The files unpacking is about to place beside the torrent's own, kept
-    // on its row with those it kept before: a crash before
-    // [`Self::finish_torrent_unpack`] leaves none its delete does not know.
-    // `held` joins what the torrent holds in the same transaction, so a
-    // history archive leaves them from the moment they are placed.
-    pub(crate) fn keep_torrent_outputs(
+    // What a torrent's row says the torrent made, written whole in one
+    // statement: `outputs`, the files unpacking placed, and `adopted`, what
+    // was there before the torrent (None for not known). A move of its
+    // placed files writes it before any file moves, to no output and every
+    // file adopted, so a move that stops midway leaves a row that names no
+    // file as the torrent's to delete; and again when a move fails, with
+    // what the move left as it was. False when the torrent has no row.
+    //
+    // `checking` is written with it, in the same transaction, as the mark
+    // the saved pieces carry (`Kept::checking`): while it is set the next
+    // start trusts none of them and checks every piece. The write before a
+    // move sets it, so a run that ends mid-move never vouches, at its next
+    // start, for a file the move left at one of the torrent's names; the
+    // write after a failed move says what the store vouches for then.
+    pub(crate) fn set_torrent_made(
         &self,
         job_id: JobId,
         outputs: &[String],
+        adopted: Option<&super::model::Adopted>,
+        checking: bool,
+    ) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let outputs = stored_list(outputs)?;
+        let adopted = adopted.map(adopted_text).transpose()?.flatten();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_made", |tx| {
+                let (outputs, adopted) = (outputs.clone(), adopted.clone());
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE torrents SET outputs = {}, adopted = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(outputs),
+                                SqlArg::OptText(adopted),
+                                SqlArg::I64(id),
+                            ],
+                        )
+                        .await?;
+                    tx.execute(
+                        "UPDATE torrent_counters SET pieces_checking = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(checking), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
+        })
+    }
+
+    // A move of a torrent's placed files, recorded whole: the folder its
+    // files are in and its save path are `to`; `outputs` are the files
+    // unpacking placed, under the names the move left them at; `adopted`
+    // is what was there before the torrent with the files the move found
+    // at `to` and kept, None when it is not known; and `held` is what the
+    // torrent holds from now on, in place of what it held. One transaction,
+    // so a restart never finds the new folder beside the names of the old
+    // one. `checking` is the mark the saved pieces carry from then
+    // (`set_torrent_made`): set when the move kept a file at `to`, so a
+    // start that comes before those pieces are forgotten checks them all.
+    pub(crate) fn record_torrent_files_move(
+        &self,
+        job_id: JobId,
+        to: &str,
+        outputs: &[String],
+        adopted: Option<&super::model::Adopted>,
         held: &[String],
+        checking: bool,
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
-        let outputs = self.outputs_with(job_id, outputs, &[])?;
+        let to = to.to_owned();
+        let outputs = stored_list(outputs)?;
+        let adopted = adopted.map(adopted_text).transpose()?.flatten();
         let held = held.to_vec();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "keep_torrent_outputs", |tx| {
-                let (outputs, held) = (outputs.clone(), held.clone());
+            SqlRuntime::run_in_transaction(&datastore, "record_torrent_files_move", |tx| {
+                let (to, outputs, adopted, held) =
+                    (to.clone(), outputs.clone(), adopted.clone(), held.clone());
                 Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE torrents SET files_dir = {}, save_path = {}, outputs = {}, \
+                             adopted = {}, held_set = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(Some(to.clone())),
+                                SqlArg::OptText(Some(to)),
+                                SqlArg::OptText(outputs),
+                                SqlArg::OptText(adopted),
+                                SqlArg::Bool(true),
+                                SqlArg::I64(id),
+                            ],
+                        )
+                        .await?;
+                    if changed == 0 {
+                        return Err(StateError::Database(
+                            "the torrent has no row to record its move on".to_owned(),
+                        ));
+                    }
                     tx.execute(
-                        "UPDATE torrents SET outputs = {} WHERE job_id = {}",
-                        &[SqlArg::OptText(outputs), SqlArg::I64(id)],
+                        "UPDATE torrent_counters SET pieces_checking = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(checking), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM torrent_held_paths WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
                     )
                     .await?;
                     insert_held_tx(tx, id, &held).await?;
