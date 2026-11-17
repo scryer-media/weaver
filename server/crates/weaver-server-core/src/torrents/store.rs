@@ -63,6 +63,20 @@ struct Have {
     // Each file's bytes in the pieces had.
     file_have: Vec<u64>,
     count: u32,
+    // A move of placed files is between the write that set its row aside
+    // and the write that ends it (`TorrentStore::mid_move`): the pieces
+    // kept meanwhile are to be checked, as that row says.
+    mid_move: bool,
+}
+
+// A move of a torrent's placed files is under way until this is dropped
+// (`TorrentStore::mid_move`).
+pub(crate) struct MidMove<'a>(&'a TorrentStore);
+
+impl Drop for MidMove<'_> {
+    fn drop(&mut self) {
+        self.0.have().mid_move = false;
+    }
 }
 
 impl Have {
@@ -73,6 +87,7 @@ impl Have {
             unchecked: BitVec::repeat(false, count),
             file_have: vec![0; layout.file_count()],
             count: 0,
+            mid_move: false,
         }
     }
 
@@ -513,8 +528,20 @@ impl TorrentStore {
         let have = self.have();
         Kept {
             bits: have.pieces.as_raw_slice().to_vec(),
-            checking: have.unchecked.any(),
+            checking: have.unchecked.any() || have.mid_move,
         }
+    }
+
+    // A move of the torrent's placed files begins: until what is returned
+    // is dropped, after the write that ends the move, the pieces kept for
+    // the next run are to be checked (`kept`), as the row the move set
+    // aside says. A run that ends while files are copied then trusts none
+    // of them, whatever checkpoint was written meanwhile. It forgets no
+    // piece and marks none unchecked: a move that keeps nothing leaves the
+    // pieces vouched for as they were.
+    pub(crate) fn mid_move(&self) -> MidMove<'_> {
+        self.have().mid_move = true;
+        MidMove(self)
     }
 
     // The pieces the session starts from, so it does not check the files:

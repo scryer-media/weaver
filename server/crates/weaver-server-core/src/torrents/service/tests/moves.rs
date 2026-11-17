@@ -1203,10 +1203,14 @@ async fn a_checkpoint_as_a_move_that_kept_a_file_is_recorded_still_says_checking
     // What the row holds after the checkpoint: whether its pieces are to
     // be checked, and whether it has any.
     let saved = Arc::new(Mutex::new(None));
+    let store = store_of(&rig, job_id).await;
     {
         let (service, db, saved) = (rig.service.clone(), rig.db.clone(), Arc::clone(&saved));
         let runtime = tokio::runtime::Handle::current();
         *locked(&crate::torrents::service::MOVE_RECORDED_MEETS) = Some(Box::new(move || {
+            // Whatever was written before, this checkpoint writes the
+            // pieces.
+            store.lost_saved();
             runtime.block_on(service.save_checkpoints([job_id].into()));
             let pieces = db.torrent_pieces(job_id).unwrap().unwrap();
             let had = pieces.bits.iter().any(|byte| *byte != 0);
@@ -1278,6 +1282,90 @@ async fn a_torrent_in_error_resumed_mid_move_starts_once_the_move_ends() {
     assert!(!errored(&handle), "the end of the move did not start it");
     handle.wait_until_initialized().await.unwrap();
     assert!(!handle.is_paused());
+    assert_eq!(handle.stats().progress_bytes, data.len() as u64);
+    rig.service.stop().await;
+}
+
+async fn store_of(rig: &Rig, job_id: JobId) -> Arc<crate::torrents::store::TorrentStore> {
+    rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap()
+}
+
+// A move that kept someone else's file marked the torrent's pieces to be
+// checked before it wrote its row; that write refused, the torrent's own
+// files went back where they were. They are checked there at once, every
+// piece found, so the store vouches for them again: no checkpoint of the
+// rest of the run says to check them all at the next start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_that_kept_a_file_and_was_not_recorded_checks_the_files_put_back() {
+    let (rig, job_id, data, save, _) = seeding_beside_a_taken_name().await;
+    let free = rig.dir.path().join("free");
+    std::fs::create_dir_all(&free).unwrap();
+    {
+        let (at, theirs) = (free.join("a.bin"), strangers(&data));
+        *locked(&crate::torrents::service::MOVE_BEGIN_MEETS) =
+            Some(Box::new(move || std::fs::write(at, theirs).unwrap()));
+    }
+    crate::torrents::service::MOVE_RECORD_FAILS.store(true, Ordering::Release);
+    rig.service
+        .set_location(job_id, free.to_string_lossy().into_owned())
+        .await
+        .unwrap_err();
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    assert_eq!(std::fs::read(free.join("a.bin")).unwrap(), strangers(&data));
+
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.stats().progress_bytes, data.len() as u64);
+    let store = store_of(&rig, job_id).await;
+    assert!(!store.files().is_shut());
+    assert!(!store.kept().checking, "nothing vouches for its own files");
+    store.lost_saved();
+    rig.service.save_checkpoints([job_id].into()).await;
+    let saved = rig.db.torrent_pieces(job_id).unwrap().unwrap();
+    assert!(!saved.checking, "the next start would check every piece");
+    rig.service.stop().await;
+}
+
+// The row of a torrent whose placed files are moving says its pieces are
+// to be checked, from the write that begins the move to the one that ends
+// it. A checkpoint written while the files move says the same, so a run
+// that ends there trusts none of them. A move that kept nothing ends with
+// the pieces vouched for as they were, on the row and in every checkpoint
+// after, and checks nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_while_placed_files_move_says_checking_and_not_after() {
+    let (rig, job_id, data, _, _) = seeding_beside_a_taken_name().await;
+    let store = store_of(&rig, job_id).await;
+    let checking = move |db: &Database| db.torrent_pieces(job_id).unwrap().unwrap().checking;
+    let during = Arc::new(Mutex::new(None));
+    {
+        let (service, db, during) = (rig.service.clone(), rig.db.clone(), Arc::clone(&during));
+        let store = Arc::clone(&store);
+        let runtime = tokio::runtime::Handle::current();
+        *locked(&crate::torrents::service::MOVE_RECORD_MEETS) = Some(Box::new(move || {
+            store.lost_saved();
+            runtime.block_on(service.save_checkpoints([job_id].into()));
+            *locked(&during) = Some(checking(&db));
+        }));
+    }
+    let plain = rig.dir.path().join("plain");
+    rig.service
+        .set_location(job_id, plain.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    assert_eq!(*locked(&during), Some(true), "as written mid-move");
+    assert!(!checking(&rig.db), "the row after a move that kept nothing");
+    assert!(!store.kept().checking);
+    rig.service.save_checkpoints([job_id].into()).await;
+    assert!(!checking(&rig.db), "a checkpoint after the move");
+    let handle = handle_of(&rig.service, job_id).await;
+    assert!(
+        handle.live().is_some(),
+        "the move checked the torrent again"
+    );
     assert_eq!(handle.stats().progress_bytes, data.len() as u64);
     rig.service.stop().await;
 }

@@ -1298,9 +1298,10 @@ impl TorrentService {
                     torrent,
                     self.inner.clock.unix_ms(),
                 );
+                let waits = !paused_now && torrent.start_waits_on_move();
                 if let Some(attached) = &torrent.attached
                     && attached.handle.is_paused() != paused_now
-                    && (paused_now || !torrent.start_waits_on_move())
+                    && !waits
                 {
                     let result = if paused_now {
                         attached.session.pause(&attached.handle).await

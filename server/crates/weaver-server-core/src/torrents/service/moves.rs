@@ -396,6 +396,11 @@ impl TorrentService {
             // file left at one of the torrent's names that is not its own
             // is checked before any of it is had. The write that ends the
             // move says what holds from then.
+            //
+            // The store says the same for as long as the move lasts, so a
+            // checkpoint written while files are copied says it too, and
+            // does not write the pieces as vouched for over this mark.
+            let _mid_move = store.mid_move();
             db.set_torrent_made(job_id, &[], Some(&aside), true)
                 .map_err(not_begun)?;
             #[cfg(test)]
@@ -411,6 +416,15 @@ impl TorrentService {
                 forgot,
             };
             let moved = move_listed(&store, moving, to, |moved| {
+                // A file kept there is not the torrent's own: a start
+                // before its pieces are forgotten checks them all. The
+                // store says so before the row does, so a checkpoint taken
+                // from here on writes the same, and none between the row's
+                // write and the end of the move vouches for every piece at
+                // the new place.
+                if !moved.kept.is_empty() {
+                    store.unvouch();
+                }
                 #[cfg(test)]
                 if let Some(meets) = super::locked(&super::MOVE_RECORD_MEETS).take() {
                     meets();
@@ -438,15 +452,6 @@ impl TorrentService {
                     // were says nothing of where they are now.
                     dirs: moved.dirs.clone(),
                 });
-                // A file kept there is not the torrent's own: a start
-                // before its pieces are forgotten checks them all. The
-                // store says so before the row does, so a checkpoint taken
-                // from here on writes the same, and none between the row's
-                // write and the end of the move vouches for every piece at
-                // the new place.
-                if !moved.kept.is_empty() {
-                    store.unvouch();
-                }
                 let recorded = db.record_torrent_files_move(
                     job_id,
                     &moved.to.to_string_lossy(),
@@ -590,16 +595,30 @@ impl TorrentService {
     // A move refused before any file moved: the torrent is as it was, and
     // an unpacking that waited on the move goes on.
     async fn move_refused(&self, job_id: JobId) {
-        let _ = self
-            .with_torrent(job_id, |torrent| {
-                torrent.settle(self.inner.clock.unix_ms());
-                torrent.moving = None;
-                Ok(())
-            })
-            .await;
-        self.inner.signal.mark(job_id);
+        self.end_moving(job_id, true).await;
         // It no longer shows moving.
         self.publish_job(job_id).await;
+    }
+
+    // The torrent is no longer moving, its times settled first when
+    // `settle`. A start of its run left for the end of the move
+    // (`Live::start_waits_on_move`) is made now, by one pass over the
+    // queue; a move that held none makes no pass.
+    async fn end_moving(&self, job_id: JobId, settle: bool) {
+        let held = self
+            .with_torrent(job_id, |torrent| {
+                if settle {
+                    torrent.settle(self.inner.clock.unix_ms());
+                }
+                torrent.moving = None;
+                Ok(std::mem::take(&mut torrent.start_held))
+            })
+            .await
+            .unwrap_or(false);
+        self.inner.signal.mark(job_id);
+        if held {
+            self.apply_queue().await;
+        }
     }
 
     // The torrent's files moved, or could not: the record follows a move,
@@ -707,8 +726,14 @@ impl TorrentService {
                 // of its names is not its own now: they are checked where
                 // its files stayed, every one forgotten first, so nothing
                 // of a file that is not its own is served as had.
-                if (forgot || !stranded.is_empty())
-                    && let Some(store) = &store
+                //
+                // So are those of a store that vouches for none: a move
+                // that kept a file there said so before its row's write
+                // was refused, and its own files went back. Checked now,
+                // once, it vouches again; left, every checkpoint of the
+                // run would say to check them all at the next start.
+                if let Some(store) = &store
+                    && (forgot || !stranded.is_empty() || store.unvouched())
                 {
                     self.check_kept(job_id, store).await;
                 }
@@ -722,17 +747,9 @@ impl TorrentService {
 
     // The move ended, its check begun where it owed one: the torrent is no
     // longer moving, and an unpacking that waited on the move places its
-    // files now. A start that waited on the move (`start_waits_on_move`)
-    // is made by the pass over the queue this ends with.
+    // files now.
     async fn move_over(&self, job_id: JobId) {
-        let _ = self
-            .with_torrent(job_id, |torrent| {
-                torrent.moving = None;
-                Ok(())
-            })
-            .await;
-        self.inner.signal.mark(job_id);
-        self.apply_queue().await;
+        self.end_moving(job_id, false).await;
     }
 
     // A move kept a file already at the torrent's new place, so its files
