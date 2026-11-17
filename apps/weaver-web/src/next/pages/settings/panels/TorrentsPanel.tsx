@@ -81,8 +81,11 @@ interface TrackerRule {
   lsd: boolean | null;
   /** Null inherits the global encryption. */
   encryption: TorrentEncryption | null;
-  /** Null inherits the global peer protocol. */
-  peerProtocol: TorrentPeerProtocol | null;
+  /** Each null inherits the global value; the rule governs its torrents' dials only. */
+  peerTcp: boolean | null;
+  peerUtp: boolean | null;
+  preferDownloading: PeerTransport | null;
+  preferSeeding: PeerTransport | null;
   /** The upload cap its torrents take in place of their category's and the global one. */
   uploadCap: Leaf<number>;
   forced: boolean;
@@ -102,7 +105,10 @@ interface TrackerBinding {
   revision: string;
   /** Milliseconds since the epoch. */
   importedAt: number;
-  /** The fields the file locked: dht, pex, lsd, encryption, ssl. */
+  /**
+   * The fields the file locked: dht, pex, lsd, encryption, peer_tcp, peer_utp,
+   * prefer_downloading, prefer_seeding, ssl.
+   */
   locked: string[];
 }
 
@@ -140,7 +146,10 @@ interface TrackerRuleForm {
   pex: boolean | null;
   lsd: boolean | null;
   encryption: TorrentEncryption | null;
-  peerProtocol: TorrentPeerProtocol | null;
+  peerTcp: boolean | null;
+  peerUtp: boolean | null;
+  preferDownloading: PeerTransport | null;
+  preferSeeding: PeerTransport | null;
   uploadCap: Leaf<number>;
   forced: boolean;
   /** A certificate and key pasted to replace the rule's; both blank keeps it. */
@@ -163,7 +172,10 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   pex: null,
   lsd: null,
   encryption: null,
-  peerProtocol: null,
+  peerTcp: null,
+  peerUtp: null,
+  preferDownloading: null,
+  preferSeeding: null,
   uploadCap: INHERIT,
   forced: false,
   certificatePem: "",
@@ -330,6 +342,10 @@ const CHANGE_LABELS: Record<string, string> = {
   pex: "next.torrents.trackerRulePex",
   lsd: "next.torrents.trackerRuleLsd",
   encryption: "next.torrents.encryption",
+  peer_tcp: "next.torrents.peerTcp",
+  peer_utp: "next.torrents.peerUtp",
+  prefer_downloading: "next.torrents.preferDownloading",
+  prefer_seeding: "next.torrents.preferSeeding",
   "seeding.ratio_goal": "next.seeding.ratioGoal",
   "seeding.seed_time_goal_minutes": "next.seeding.seedTimeGoal",
   "seeding.inactive_goal_minutes": "next.seeding.inactiveGoal",
@@ -356,6 +372,9 @@ function changeValue(t: Translate, field: string, value: string | null): string 
   }
   if (field.endsWith("_minutes")) {
     return durationText(t, Number(value));
+  }
+  if (field.startsWith("prefer_")) {
+    return value === "utp" ? "uTP" : "TCP";
   }
   const key = CHANGE_VALUES[value];
   return key ? t(key) : value;
@@ -656,7 +675,11 @@ function useTorrentRoutes(t: Translate): SettingsBlock {
 }
 
 /** The tracker rules' table, and the editor and confirmation it opens. */
-function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactNode } {
+/**
+ * The tracker rules table and editor. `global` is the saved connection
+ * settings, which a rule's transports resolve over.
+ */
+function useTrackerRules(t: Translate, global: TorrentConnection): { block: SettingsBlock; overlays: ReactNode } {
   const [{ data }, reexecute] = useQuery<{ trackerRules: TrackerRule[] }>({ query: TRACKER_RULES_QUERY });
   const [, saveRule] = useMutation(SAVE_TRACKER_RULE_MUTATION);
   const [, deleteRule] = useMutation(DELETE_TRACKER_RULE_MUTATION);
@@ -698,7 +721,10 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           pex: rule.pex,
           lsd: rule.lsd,
           encryption: rule.encryption,
-          peerProtocol: rule.peerProtocol,
+          peerTcp: rule.peerTcp,
+          peerUtp: rule.peerUtp,
+          preferDownloading: rule.preferDownloading,
+          preferSeeding: rule.preferSeeding,
           uploadCap: leafFrom(rule.uploadCap),
           forced: rule.forced,
           certificatePem: "",
@@ -727,7 +753,10 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         pex: form.pex,
         lsd: form.lsd,
         encryption: form.encryption,
-        peerProtocol: form.peerProtocol,
+        peerTcp: form.peerTcp,
+        peerUtp: form.peerUtp,
+        preferDownloading: form.preferDownloading,
+        preferSeeding: form.preferSeeding,
         uploadCap: leafInput(form.uploadCap),
         forced: form.forced,
         ...sslInput(form),
@@ -988,27 +1017,42 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                 { value: "inherit", label: t("next.torrents.unpackInherit") },
                 ...ENCRYPTIONS.map((option) => ({ ...option, label: t(option.label) })),
               ]),
-              {
-                id: "peerProtocol",
-                label: t("next.torrents.peerProtocol"),
-                keywords: "peer protocol tcp utp transport",
-                help: form.peerProtocol
-                  ? t((PEER_PROTOCOLS.find((option) => option.value === form.peerProtocol) ?? PEER_PROTOCOLS[0]).help)
-                  : undefined,
-                control: {
-                  kind: "select",
-                  value: form.peerProtocol ?? "inherit",
-                  options: [
-                    { value: "inherit", label: t("next.torrents.unpackInherit") },
-                    ...PEER_PROTOCOLS.map((option) => ({ value: option.value, label: t(option.label) })),
-                  ],
-                  onChange: (peerProtocol) =>
-                    setForm((current) => ({
-                      ...current,
-                      peerProtocol: peerProtocol === "inherit" ? null : (peerProtocol as TorrentPeerProtocol),
-                    })),
-                },
-              },
+              // Each transport field inherits the global one while unset. A
+              // preference is kept as set; while the resolved transports leave
+              // one off, it shows locked to the one left on.
+              ...TRANSPORT_SWITCHES.map(({ key, field, label, keywords }) => {
+                const options = UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) }));
+                return lockable(field, unpackChoice(form[key]), options, {
+                  id: key,
+                  label: t(label),
+                  keywords,
+                  control: {
+                    kind: "segmented" as const,
+                    value: unpackChoice(form[key]),
+                    options,
+                    onChange: (choice: string) => setForm((current) => ({ ...current, [key]: unpackOf(choice) })),
+                  },
+                });
+              }),
+              ...TRANSPORT_PREFERENCES.map(({ key, field, label, keywords }) => {
+                const only = onlyTransport(form.peerTcp ?? global.peerTcp, form.peerUtp ?? global.peerUtp);
+                const options = [{ value: "inherit", label: t("next.torrents.unpackInherit") }, ...PEER_TRANSPORTS].map(
+                  (option) => ({ ...option, disabled: only !== null }),
+                );
+                const value = only ?? form[key] ?? "inherit";
+                return lockable(field, value, options, {
+                  id: key,
+                  label: t(label),
+                  keywords,
+                  control: {
+                    kind: "segmented" as const,
+                    value,
+                    options,
+                    onChange: (prefer: string) =>
+                      setForm((current) => ({ ...current, [key]: prefer === "inherit" ? null : (prefer as PeerTransport) })),
+                  },
+                });
+              }),
               uploadCapField(t, form.uploadCap, (uploadCap) => setForm((current) => ({ ...current, uploadCap })), "trackerRule"),
               {
                 id: "forced",
@@ -1156,7 +1200,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
 }
 
 type TorrentEncryption = "PREFER" | "REQUIRE" | "DISABLED";
-type TorrentPeerProtocol = "TCP_FIRST" | "UTP_FIRST" | "UTP_ONLY";
+type PeerTransport = "TCP" | "UTP";
 
 interface TorrentConnection {
   enabled: boolean;
@@ -1171,7 +1215,11 @@ interface TorrentConnection {
   unchokeSlotsLimit: number | null;
   connectionSpeed: number;
   allowMultipleConnectionsPerIp: boolean;
-  peerProtocol: TorrentPeerProtocol;
+  peerTcp: boolean;
+  peerUtp: boolean;
+  /** Each kept as set; used as the transport left on while the other is off. */
+  preferDownloading: PeerTransport;
+  preferSeeding: PeerTransport;
   dhtBootstrapNodes: string;
   blocklistEnabled: boolean;
   blocklist: string | null;
@@ -1204,7 +1252,10 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   unchokeSlotsLimit: 8,
   connectionSpeed: 30,
   allowMultipleConnectionsPerIp: false,
-  peerProtocol: "TCP_FIRST",
+  peerTcp: true,
+  peerUtp: true,
+  preferDownloading: "TCP",
+  preferSeeding: "UTP",
   dhtBootstrapNodes: "dht.transmissionbt.com:6881,dht.libtorrent.org:25401",
   blocklistEnabled: false,
   blocklist: null,
@@ -1219,12 +1270,40 @@ const DEFAULT_CONNECTION: TorrentConnection = {
 /** The SSL port an operator's own starts from. */
 const DEFAULT_SSL_PORT = 4433;
 
-/** Each order's label and the help line shown while it is chosen. */
-const PEER_PROTOCOLS: { value: TorrentPeerProtocol; label: string; help: string }[] = [
-  { value: "TCP_FIRST", label: "next.torrents.peerProtocolTcpFirst", help: "next.torrents.peerProtocolTcpFirstHelp" },
-  { value: "UTP_FIRST", label: "next.torrents.peerProtocolUtpFirst", help: "next.torrents.peerProtocolUtpFirstHelp" },
-  { value: "UTP_ONLY", label: "next.torrents.peerProtocolUtpOnly", help: "next.torrents.peerProtocolUtpOnlyHelp" },
+/** The transport switches; one off locks both preferences to the other. */
+const TRANSPORT_SWITCHES = [
+  { key: "peerTcp", field: "peer_tcp", label: "next.torrents.peerTcp", keywords: "tcp transport peers" },
+  { key: "peerUtp", field: "peer_utp", label: "next.torrents.peerUtp", keywords: "utp transport peers udp" },
+] as const;
+
+const TRANSPORT_PREFERENCES = [
+  {
+    key: "preferDownloading",
+    field: "prefer_downloading",
+    label: "next.torrents.preferDownloading",
+    help: "next.torrents.preferDownloadingHelp",
+    keywords: "tcp utp transport order dial downloading",
+  },
+  {
+    key: "preferSeeding",
+    field: "prefer_seeding",
+    label: "next.torrents.preferSeeding",
+    help: "next.torrents.preferSeedingHelp",
+    keywords: "tcp utp transport order dial seeding",
+  },
+] as const;
+
+const PEER_TRANSPORTS: { value: PeerTransport; label: string }[] = [
+  { value: "TCP", label: "TCP" },
+  { value: "UTP", label: "uTP" },
 ];
+
+/**
+ * The one transport on, which both preferences are used as while the other
+ * is off; null while both are on and the preferences are used as kept.
+ */
+const onlyTransport = (tcp: boolean, utp: boolean): PeerTransport | null =>
+  tcp && !utp ? "TCP" : utp && !tcp ? "UTP" : null;
 
 /** Option labels are translation keys, resolved when the panel renders. */
 const ENCRYPTIONS: { value: TorrentEncryption; label: string }[] = [
@@ -1256,7 +1335,11 @@ export function TorrentsPanel() {
   const [asking, setAsking] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const trackerRules = useTrackerRules(t);
+  const savedConnection = useMemo<TorrentConnection>(
+    () => ({ ...DEFAULT_CONNECTION, ...(data?.settings?.torrent ?? {}) }),
+    [data?.settings?.torrent],
+  );
+  const trackerRules = useTrackerRules(t, savedConnection);
   const torrentRoutes = useTorrentRoutes(t);
 
   const source = useMemo<TorrentForm | null>(() => {
@@ -1413,21 +1496,38 @@ export function TorrentsPanel() {
           id: "connection",
           title: t("next.torrents.connection"),
           fields: [
-            {
-              id: "peerProtocol",
-              label: t("next.torrents.peerProtocol"),
-              keywords: "tcp utp protocol order",
-              help: t(
-                (PEER_PROTOCOLS.find((option) => option.value === values.torrent.peerProtocol) ?? PEER_PROTOCOLS[0])
-                  .help,
-              ),
-              control: {
-                kind: "select",
-                value: values.torrent.peerProtocol,
-                options: PEER_PROTOCOLS.map((option) => ({ value: option.value, label: t(option.label) })),
-                onChange: (peerProtocol) => patchTorrent({ peerProtocol: peerProtocol as TorrentPeerProtocol }),
-              },
-            },
+            // One transport stays on. The preferences are kept as set; while
+            // one is off they show locked to the other, as the dials use them.
+            ...TRANSPORT_SWITCHES.map(({ key, label, keywords }) => {
+              const otherOn = key === "peerTcp" ? values.torrent.peerUtp : values.torrent.peerTcp;
+              return {
+                id: key,
+                label: t(label),
+                keywords,
+                help: t(`${label}Help`),
+                control: {
+                  kind: "toggle" as const,
+                  value: values.torrent[key],
+                  disabled: values.torrent[key] && !otherOn,
+                  onChange: (on: boolean) => patchTorrent({ [key]: on }),
+                },
+              };
+            }),
+            ...TRANSPORT_PREFERENCES.map(({ key, label, help, keywords }) => {
+              const only = onlyTransport(values.torrent.peerTcp, values.torrent.peerUtp);
+              return {
+                id: key,
+                label: t(label),
+                keywords,
+                help: t(help),
+                control: {
+                  kind: "segmented" as const,
+                  value: only ?? values.torrent[key],
+                  options: PEER_TRANSPORTS.map((option) => ({ ...option, disabled: only !== null })),
+                  onChange: (prefer: string) => patchTorrent({ [key]: prefer as PeerTransport }),
+                },
+              };
+            }),
             {
               id: "basePort",
               label: t("next.torrents.basePort"),

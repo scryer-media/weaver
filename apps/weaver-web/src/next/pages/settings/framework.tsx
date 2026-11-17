@@ -56,6 +56,8 @@ import { filterBlocks, type SearchRegistry } from "./search";
 export interface SelectOption {
   value: string;
   label: string;
+  /** Shown and not offered; a segmented control greys it out. */
+  disabled?: boolean;
 }
 
 export type FieldControl =
