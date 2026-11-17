@@ -1023,6 +1023,7 @@ async fn an_incoming_peer_that_sends_no_handshake_ends_at_the_handshake_timeout(
                 connect: Some(super::ConnectionOptions {
                     enable_tcp: true,
                     enable_utp: None,
+                    utp_on_demand: false,
                     peer_opts: Some(PeerConnectionOptions {
                         read_write_timeout: Some(std::time::Duration::from_secs(120)),
                         ..Default::default()
@@ -1080,6 +1081,7 @@ async fn memory_a_metadata_connection_leaves_is_read_by_the_torrents_connector_a
             connect: Some(super::ConnectionOptions {
                 enable_tcp: true,
                 enable_utp: None,
+                utp_on_demand: false,
                 peer_opts: None,
             }),
             ..isolated_session_opts(false)
@@ -1162,6 +1164,7 @@ async fn a_new_peer_is_sent_the_plain_handshake_first_unless_encryption_is_requi
                 connect: Some(super::ConnectionOptions {
                     enable_tcp: true,
                     enable_utp: None,
+                    utp_on_demand: false,
                     peer_opts: None,
                 }),
                 ..isolated_session_opts(false)

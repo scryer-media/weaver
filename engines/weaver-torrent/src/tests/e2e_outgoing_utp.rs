@@ -309,3 +309,92 @@ async fn legacy_and_enabled_outgoing_utp_reuse_the_incoming_socket() -> anyhow::
     }
     Ok(())
 }
+
+/// The kernel's sockets, with the uTP sockets bound and TCP connects made
+/// through it counted.
+#[derive(Default)]
+struct Counted {
+    utp_binds: AtomicUsize,
+    tcp_connects: AtomicUsize,
+}
+
+impl SocketFactory for Counted {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        self.tcp_connects.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { crate::test_support::sockets().connect_tcp(addr).await })
+    }
+    fn listen_tcp<'a>(
+        &'a self,
+        _: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+    }
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move { crate::test_support::sockets().bind_udp(addr).await })
+    }
+    fn bind_utp<'a>(
+        &'a self,
+        _: SocketAddr,
+        receive_buffer: usize,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        self.utp_binds.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            crate::test_support::sockets()
+                .bind_utp((Ipv4Addr::LOCALHOST, 0).into(), receive_buffer)
+                .await
+        })
+    }
+}
+
+// An outgoing uTP socket asked for on demand is not bound with the
+// session, and the first dial over uTP binds it through the factory and
+// sends its SYN.
+#[tokio::test]
+async fn an_on_demand_outgoing_utp_socket_is_bound_by_the_first_utp_dial() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let factory = Arc::new(Counted::default());
+    let session = Session::new_with_opts(
+        directory.path().into(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            ipv4_only: true,
+            connections_limit: 4,
+            listen: None,
+            connect: Some(ConnectionOptions {
+                enable_tcp: true,
+                enable_utp: Some(true),
+                utp_on_demand: true,
+                ..Default::default()
+            }),
+            socket_factory: factory.clone(),
+            ..crate::test_support::session_options()
+        },
+    )
+    .await?;
+    assert_eq!(factory.utp_binds.load(Ordering::Relaxed), 0);
+    assert!(!session.uses_utp());
+    let peer = crate::test_support::loopback_udp().await;
+    let mut connect = Box::pin(session.connector.connect(peer.bind_addr(), Transports::Utp));
+    let mut datagram = [0u8; 1500];
+    let (len, _) = tokio::select! {
+        received = peer.recv_from(&mut datagram) => received?,
+        connected = &mut connect => panic!("the dial ended before its SYN: {:?}", connected.err()),
+    };
+    assert!(len >= 20);
+    assert_eq!(datagram[0] >> 4, 4, "a uTP SYN");
+    assert_eq!(factory.utp_binds.load(Ordering::Relaxed), 1);
+    assert!(session.uses_utp());
+    assert_eq!(factory.tcp_connects.load(Ordering::Relaxed), 0);
+    drop(connect);
+    session.stop().await;
+    Ok(())
+}

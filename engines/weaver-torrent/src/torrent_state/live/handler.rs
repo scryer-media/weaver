@@ -48,6 +48,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.peers.encrypt_outgoing(self.addr)
     }
 
+    fn seeding(&self) -> bool {
+        self.state.peers.is_finished()
+    }
+
     fn tcp_wants(&self) -> Option<&crate::stream_connect::TcpWants> {
         Some(&self.state.tcp_wants)
     }

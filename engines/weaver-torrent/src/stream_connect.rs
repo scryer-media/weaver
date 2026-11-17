@@ -123,6 +123,36 @@ pub enum DialOrder {
     UtpFirst,
     /// uTP alone, never TCP.
     UtpOnly,
+    /// TCP alone, never uTP.
+    TcpOnly,
+}
+
+/// The order a torrent's outgoing connections dial in while it downloads,
+/// and while it seeds: once it holds every piece it wants. A dial takes the
+/// one for the torrent's state when it starts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DialOrders {
+    pub downloading: DialOrder,
+    pub seeding: DialOrder,
+}
+
+impl DialOrders {
+    /// `order` in both states.
+    pub const fn both(order: DialOrder) -> Self {
+        Self {
+            downloading: order,
+            seeding: order,
+        }
+    }
+
+    /// The order a dial starting now takes, the torrent `seeding` or not.
+    pub const fn pick(self, seeding: bool) -> DialOrder {
+        if seeding {
+            self.seeding
+        } else {
+            self.downloading
+        }
+    }
 }
 
 impl DialOrder {
@@ -131,6 +161,7 @@ impl DialOrder {
             Self::TcpFirst => 0,
             Self::UtpFirst => 1,
             Self::UtpOnly => 2,
+            Self::TcpOnly => 3,
         }
     }
 
@@ -138,6 +169,7 @@ impl DialOrder {
         match code {
             1 => Self::UtpFirst,
             2 => Self::UtpOnly,
+            3 => Self::TcpOnly,
             _ => Self::TcpFirst,
         }
     }
@@ -182,6 +214,10 @@ pub struct ConnectionOptions {
     /// and fails the session on a bind failure only when TCP is disabled;
     /// `Some(false)` disables outgoing uTP without changing its listener.
     pub enable_utp: Option<bool>,
+    /// With `enable_utp` `Some(true)` and no listening uTP socket, the
+    /// outgoing socket is bound by the first dial that goes over uTP, and
+    /// not at all while no torrent's dial order lets one.
+    pub utp_on_demand: bool,
     pub peer_opts: Option<PeerConnectionOptions>,
 }
 
@@ -190,6 +226,7 @@ impl Default for ConnectionOptions {
         Self {
             enable_tcp: true,
             enable_utp: None,
+            utp_on_demand: false,
             peer_opts: None,
         }
     }
@@ -346,9 +383,11 @@ pub(crate) struct StreamConnector {
     // The session's encryption, as `policy_code` writes it: a change of the
     // settings moves it while the session runs.
     encryption: AtomicU8,
-    // The session's dial order, as `DialOrder::code` writes it: a change of
-    // the settings moves it for the dials that start after.
+    // The session's dial orders, downloading and seeding, as
+    // `DialOrder::code` writes each: a change of the settings moves them for
+    // the dials that start after.
     dial_order: AtomicU8,
+    seeding_order: AtomicU8,
 }
 
 // An encryption policy as one byte, and back.
@@ -370,7 +409,7 @@ const fn policy_of(code: u8) -> EncryptionPolicy {
 
 impl StreamConnector {
     pub async fn new(config: StreamConnectorArgs) -> anyhow::Result<Self> {
-        if !config.enable_tcp && config.utp_socket.is_none() {
+        if !config.enable_tcp && config.utp_socket.is_none() && config.utp_rebind.is_none() {
             bail!("no way to connect to peers, enable TCP or uTP")
         }
 
@@ -388,18 +427,25 @@ impl StreamConnector {
             ipv4_only: config.ipv4_only,
             encryption: AtomicU8::new(policy_code(config.encryption)),
             dial_order: AtomicU8::new(DialOrder::TcpFirst.code()),
+            seeding_order: AtomicU8::new(DialOrder::TcpFirst.code()),
         })
     }
 
-    /// The order the session's dials try TCP and uTP in now.
-    pub fn dial_order(&self) -> DialOrder {
-        DialOrder::of(self.dial_order.load(Ordering::Relaxed))
+    /// The orders the session's dials try TCP and uTP in now.
+    pub fn dial_orders(&self) -> DialOrders {
+        DialOrders {
+            downloading: DialOrder::of(self.dial_order.load(Ordering::Relaxed)),
+            seeding: DialOrder::of(self.seeding_order.load(Ordering::Relaxed)),
+        }
     }
 
-    /// Dial in `order` from the next dial on: a dial under way keeps its
+    /// Dial in `orders` from the next dial on: a dial under way keeps its
     /// plan.
-    pub fn set_dial_order(&self, order: DialOrder) {
-        self.dial_order.store(order.code(), Ordering::Relaxed);
+    pub fn set_dial_orders(&self, orders: DialOrders) {
+        self.dial_order
+            .store(orders.downloading.code(), Ordering::Relaxed);
+        self.seeding_order
+            .store(orders.seeding.code(), Ordering::Relaxed);
     }
 
     /// The session's encryption, which a connection is made under unless
@@ -634,7 +680,7 @@ impl StreamConnector {
             ConnectionKind::Utp => &utp,
         };
         match plan_of(
-            order.unwrap_or(self.dial_order()),
+            order.unwrap_or(self.dial_orders().downloading),
             transports,
             self.tcp.enabled,
         ) {
@@ -677,6 +723,7 @@ const fn plan_of(order: DialOrder, transports: Transports, tcp: bool) -> Plan {
     match (order, transports) {
         (DialOrder::TcpFirst, _) => Plan::TcpFirst,
         (DialOrder::UtpOnly, _) => Plan::Utp,
+        (DialOrder::TcpOnly, _) => Plan::Tcp,
         (DialOrder::UtpFirst, Transports::Any) => Plan::UtpFirst,
         (DialOrder::UtpFirst, Transports::UtpFailed) if tcp => Plan::Tcp,
         (DialOrder::UtpFirst, Transports::UtpFailed) => Plan::UtpFirst,
@@ -1172,6 +1219,8 @@ mod tests {
         for transports in [Any, UtpFailed, UtpConfirmed, Utp] {
             for tcp in [true, false] {
                 assert_eq!(plan_of(UtpOnly, transports, tcp), Plan::Utp);
+                // TCP only: TCP alone, whatever the record says.
+                assert_eq!(plan_of(TcpOnly, transports, tcp), Plan::Tcp);
             }
         }
     }
@@ -1259,7 +1308,7 @@ mod tests {
         })
         .await
         .unwrap();
-        connector.set_dial_order(order);
+        connector.set_dial_orders(DialOrders::both(order));
         (connector, made, through)
     }
 
@@ -1420,7 +1469,7 @@ mod tests {
             Transports::UtpConfirmed,
         ] {
             let (connector, mut made, through) = watched(DialOrder::TcpFirst, true).await;
-            assert_eq!(connector.dial_order(), DialOrder::TcpFirst);
+            assert_eq!(connector.dial_orders().downloading, DialOrder::TcpFirst);
             let (listener, theirs) = peer(true).await;
             let addr = listener.local_addr().unwrap();
             through.add_permits(1);
@@ -1431,6 +1480,111 @@ mod tests {
             assert_eq!(made.try_recv().unwrap(), addr);
             drop(theirs);
         }
+    }
+
+    // TCP only: a peer that listens on both sees TCP's connect, and no uTP
+    // SYN is sent, whatever its record says of uTP.
+    #[tokio::test]
+    async fn tcp_only_never_dials_utp() {
+        for transports in [
+            Transports::Any,
+            Transports::UtpFailed,
+            Transports::UtpConfirmed,
+        ] {
+            let (connector, mut made, through) = watched(DialOrder::TcpOnly, true).await;
+            let (listener, theirs) = peer(true).await;
+            let addr = listener.local_addr().unwrap();
+            through.add_permits(1);
+            let (accepted, connected) =
+                tokio::join!(listener.accept(), connector.connect(addr, transports));
+            accepted.unwrap();
+            assert_eq!(connected.unwrap().0, ConnectionKind::Tcp);
+            assert_eq!(made.try_recv().unwrap(), addr);
+            assert_eq!(utp_stat(&connector).attempts, 0);
+            let theirs = theirs.unwrap();
+            assert!(futures::poll!(std::pin::pin!(theirs.accept())).is_pending());
+        }
+    }
+
+    // A session that dials uTP only on its own still dials TCP first for a
+    // torrent whose order says so, and a dial in the session's order never
+    // sends a TCP connect.
+    #[tokio::test]
+    async fn a_dials_own_tcp_first_order_broadens_a_utp_only_session() {
+        let (connector, mut made, through) = watched(DialOrder::UtpOnly, true).await;
+        let (listener, theirs) = peer(true).await;
+        let addr = listener.local_addr().unwrap();
+        through.add_permits(1);
+        let (seen, expired, started) = (
+            UtpSeen::default(),
+            AtomicBool::new(false),
+            tokio::sync::Notify::new(),
+        );
+        let (accepted, dialed) = tokio::join!(
+            listener.accept(),
+            connector.dial_noting(
+                addr,
+                Transports::Any,
+                &expired,
+                None,
+                &seen,
+                &started,
+                Some(DialOrder::TcpFirst),
+            )
+        );
+        accepted.unwrap();
+        assert_eq!(dialed.unwrap().kind, ConnectionKind::Tcp);
+        assert_eq!(made.try_recv().unwrap(), addr);
+        drop(theirs);
+
+        let (listener, _) = peer(false).await;
+        let addr = listener.local_addr().unwrap();
+        let error = connector
+            .connect(addr, Transports::Any)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::UtpConnect(_)), "{error:?}");
+        assert!(made.try_recv().is_err());
+        assert!(futures::poll!(std::pin::pin!(listener.accept())).is_pending());
+    }
+
+    // An outgoing uTP socket left to be bound on demand stays unbound while
+    // every dial goes over TCP alone.
+    #[tokio::test]
+    async fn an_on_demand_utp_socket_is_not_bound_by_tcp_only_dials() {
+        let (tx, made) = tokio::sync::mpsc::unbounded_channel();
+        let through = Arc::new(tokio::sync::Semaphore::new(1));
+        let sockets: Arc<dyn SocketFactory> = Arc::new(Watched {
+            sockets: crate::test_support::socket_factory(),
+            tcp: tx,
+            through,
+        });
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            utp_rebind: Some(UtpRebind {
+                address: (Ipv4Addr::LOCALHOST, 0).into(),
+                opts: Default::default(),
+                receive_buffer: crate::udp_options::STREAM_WINDOW,
+                connection_slots: Arc::new(crate::connection_slots::ConnectionSlots::new(
+                    8,
+                    0,
+                    std::num::NonZeroU32::new(10).unwrap(),
+                )),
+            }),
+            ..StreamConnectorArgs::over(sockets)
+        })
+        .await
+        .unwrap();
+        connector.set_dial_orders(DialOrders::both(DialOrder::TcpOnly));
+        let (listener, _) = peer(false).await;
+        let addr = listener.local_addr().unwrap();
+        let (accepted, connected) =
+            tokio::join!(listener.accept(), connector.connect(addr, Transports::Any));
+        accepted.unwrap();
+        assert_eq!(connected.unwrap().0, ConnectionKind::Tcp);
+        drop(made);
+        assert!(!connector.has_utp());
+        assert!(connector.rebound_utp().is_none());
     }
 
     // The connector's TCP dialer hands over a link to the peer dialed, with

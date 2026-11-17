@@ -111,7 +111,7 @@ pub use session::{
 };
 pub use ssl::SslIdentity;
 pub use stream_connect::{
-    ByKind, Capabilities, ConnectionKind, ConnectionOptions, DialOrder, Names,
+    ByKind, Capabilities, ConnectionKind, ConnectionOptions, DialOrder, DialOrders, Names,
 };
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,

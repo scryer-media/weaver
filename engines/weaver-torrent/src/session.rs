@@ -543,15 +543,16 @@ impl Session {
         self.connector.set_encryption(policy);
     }
 
-    /// The order the session's outgoing connections try TCP and uTP in now.
-    pub fn dial_order(&self) -> crate::DialOrder {
-        self.connector.dial_order()
+    /// The orders the session's outgoing connections try TCP and uTP in
+    /// now, while a torrent downloads and while it seeds.
+    pub fn dial_orders(&self) -> crate::DialOrders {
+        self.connector.dial_orders()
     }
 
-    /// Dial peers in `order` from the next dial on: a dial under way keeps
+    /// Dial peers in `orders` from the next dial on: a dial under way keeps
     /// its plan, and a connection made keeps its transport.
-    pub fn set_dial_order(&self, order: crate::DialOrder) {
-        self.connector.set_dial_order(order);
+    pub fn set_dial_orders(&self, orders: crate::DialOrders) {
+        self.connector.set_dial_orders(orders);
     }
 
     /// Whether peers at one address may each hold a connection to a torrent
@@ -634,7 +635,7 @@ impl Session {
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
             encryption: other.encryption.or(self.peer_opts.encryption),
-            dial_order: other.dial_order.or(self.peer_opts.dial_order),
+            dial_orders: other.dial_orders.or(self.peer_opts.dial_orders),
         }
     }
 

@@ -71,9 +71,16 @@ pub trait PeerConnectionHandler {
     /// encrypted handshake where encryption is preferred; asked once per
     /// connection (libtorrent `bt_peer_connection::on_connected`, by
     /// `torrent_peer::pe_support`). A handler that remembers nothing of the
-    /// peer tries it.
+    /// peer does not, as a peer with no record starts plain
+    /// (`torrent_peer::pe_support` starts false).
     fn encrypt_outgoing(&self) -> bool {
-        true
+        false
+    }
+    /// Whether the torrent holds every piece it wants, so that a dial
+    /// starting now takes the seeding dial order. A handler that holds no
+    /// pieces of a torrent is downloading.
+    fn seeding(&self) -> bool {
+        false
     }
     /// Where the torrent holds its want for a TCP socket its route held for
     /// others; a handler with none has its dials hold nothing.
@@ -391,10 +398,10 @@ pub struct PeerConnectionOptions {
     #[serde(default)]
     pub encryption: Option<EncryptionPolicy>,
 
-    /// The order every outgoing connection of the torrent tries TCP and uTP
-    /// in, over the session's.
+    /// The orders every outgoing connection of the torrent tries TCP and
+    /// uTP in, while it downloads and while it seeds, over the session's.
     #[serde(default)]
-    pub dial_order: Option<crate::DialOrder>,
+    pub dial_orders: Option<crate::DialOrders>,
 }
 
 /// libtorrent `settings_pack::handshake_timeout`: a peer that has not
@@ -943,7 +950,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 handshake_timeout,
                 self.handler.tcp_wants(),
                 &seen,
-                self.options.dial_order,
+                Some(
+                    self.options
+                        .dial_orders
+                        .unwrap_or_else(|| self.connector.dial_orders())
+                        .pick(self.handler.seeding()),
+                ),
             )
             .await;
         if let Some(opened) = seen.get() {
@@ -1787,6 +1799,115 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(start.elapsed(), DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    /// A handler that holds every piece it wants when `0` holds.
+    struct Holding(bool);
+
+    impl PeerConnectionHandler for Holding {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, _: Message<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn seeding(&self) -> bool {
+            self.0
+        }
+    }
+
+    // The dial order is picked from the torrent's state when the dial
+    // starts: under TCP first while downloading and uTP first while
+    // seeding, a peer that listens on both gets a uTP SYN first from a
+    // seeding torrent, and TCP's connect once that is not answered; from a
+    // downloading one it gets TCP's connect and no datagram.
+    #[tokio::test]
+    async fn a_dial_takes_the_order_of_the_torrents_state() {
+        for seeding in [true, false] {
+            let opts = weaver_utp::SocketOpts {
+                syn_resends: std::num::NonZeroUsize::new(1),
+                connect_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            };
+            let ours = crate::listen::bind_utp(
+                &crate::test_support::sockets(),
+                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                opts,
+                crate::udp_options::STREAM_WINDOW,
+                None,
+            )
+            .await
+            .unwrap();
+            let connector = StreamConnector::new(StreamConnectorArgs {
+                enable_tcp: true,
+                utp_socket: Some(ours),
+                encryption: EncryptionPolicy::Disabled,
+                ..StreamConnectorArgs::over(crate::test_support::socket_factory())
+            })
+            .await
+            .unwrap();
+            connector.set_dial_orders(crate::DialOrders {
+                downloading: crate::DialOrder::TcpFirst,
+                seeding: crate::DialOrder::UtpFirst,
+            });
+            let (theirs, listener) = loop {
+                let theirs = crate::test_support::loopback_udp().await;
+                let port = theirs.bind_addr().port();
+                // The port is free for UDP; another test may hold it for TCP.
+                if let Ok(listener) =
+                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+                {
+                    break (theirs, listener);
+                }
+            };
+            let connection = PeerConnection::new(
+                theirs.bind_addr(),
+                InfoHashes {
+                    v1: Some(Id20::new(HASH)),
+                    v2: None,
+                },
+                Id20::new([1; 20]),
+                Holding(seeding),
+                Some(PeerConnectionOptions {
+                    read_write_timeout: Some(Duration::from_secs(120)),
+                    ..Default::default()
+                }),
+                BlockingSpawner::new(1),
+                Arc::new(connector),
+            );
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(async move { connection.manage_peer_outgoing(rx).await });
+            let mut datagram = [0u8; 1500];
+            if seeding {
+                let (len, _) = theirs.recv_from(&mut datagram).await.unwrap();
+                // uTP's packet type is the high nibble of its first byte;
+                // ST_SYN is 4 (BEP 29).
+                assert!(len >= 20);
+                assert_eq!(datagram[0] >> 4, 4, "a uTP SYN first");
+                assert!(futures::poll!(std::pin::pin!(listener.accept())).is_pending());
+                listener.accept().await.unwrap();
+            } else {
+                listener.accept().await.unwrap();
+                assert!(
+                    futures::poll!(std::pin::pin!(theirs.recv_from(&mut datagram))).is_pending(),
+                    "no uTP SYN behind a TCP connect that opened"
+                );
+            }
+            task.abort();
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2635,7 +2756,10 @@ mod tests {
             handshake_timeout: Some(Duration::from_millis(2500)),
             max_request_window: None,
             encryption: None,
-            dial_order: Some(crate::DialOrder::UtpOnly),
+            dial_orders: Some(crate::DialOrders {
+                downloading: crate::DialOrder::UtpOnly,
+                seeding: crate::DialOrder::UtpFirst,
+            }),
         };
         assert_eq!(
             serde_json::to_value(options).unwrap(),
@@ -2646,7 +2770,7 @@ mod tests {
                 "handshake_timeout": 3,
                 "max_request_window": null,
                 "encryption": null,
-                "dial_order": "utp_only",
+                "dial_orders": {"downloading": "utp_only", "seeding": "utp_first"},
             })
         );
         let parsed: PeerConnectionOptions =
