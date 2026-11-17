@@ -308,6 +308,7 @@ impl Session {
                 .await
                 .context("error creating stream connector")?,
             );
+            stream_connector.set_dial_order(opts.dial_order);
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");

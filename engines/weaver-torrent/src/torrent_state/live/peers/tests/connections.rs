@@ -1010,6 +1010,50 @@ fn a_holepunched_peer_is_connected_to_next_whatever_its_failures() {
     assert_eq!(state_of(&peers, banned), None);
 }
 
+// libtorrent `torrent_peer::supports_utp`, `confirmed_supports_utp`: a
+// peer is assumed to speak uTP; a failed uTP connect ends that, unless a
+// holepunch asked for the connection (peer_connection.cpp:4204-4212); a
+// uTP connection confirms it (6363-6367); a PEX uTP flag or a holepunch
+// sets the assumption again (peer_list.cpp `update_peer`,
+// bt_peer_connection.cpp `on_holepunch`).
+#[test]
+fn a_peers_utp_record_follows_its_utp_dials_pex_and_holepunch() {
+    use crate::peer_protocol::extended::ut_pex::PEX_UTP;
+    use crate::stream_connect::Transports;
+    let peers = make_peer_states();
+    let addr = peer_addr(1);
+    peers.add_peer(addr, PeerSourceFlag::Tracker);
+    let transports = || {
+        peers
+            .with_peer_mut(addr.into(), "test", |peer| peer.transports())
+            .unwrap()
+    };
+    assert_eq!(transports(), Transports::Any);
+
+    peers.utp_dialed(addr.into(), false);
+    assert_eq!(transports(), Transports::UtpFailed);
+    peers.pex_flags(addr, PEX_UTP);
+    assert_eq!(transports(), Transports::Any);
+
+    peers.utp_dialed(addr.into(), true);
+    assert_eq!(transports(), Transports::UtpConfirmed);
+    // A later failure leaves a confirmed peer confirmed.
+    peers.utp_dialed(addr.into(), false);
+    assert_eq!(transports(), Transports::UtpConfirmed);
+
+    // A holepunched connection's uTP failure keeps the assumption.
+    let punched = peer_addr(2);
+    peers.holepunch(punched);
+    peers.utp_dialed(punched.into(), false);
+    peers
+        .with_peer_mut(punched.into(), "test", |peer| {
+            assert_eq!(peer.transports(), Transports::Utp);
+            peers.connection_closed(peer, Instant::now(), true, false);
+            assert_eq!(peer.transports(), Transports::Any);
+        })
+        .unwrap();
+}
+
 // libtorrent `ut_pex_plugin` keeps what a connection's PEX named, the
 // added less the dropped, at most `max_pex_peers` of each family;
 // `torrent::find_introducer` asks a connected holepunch peer whose PEX

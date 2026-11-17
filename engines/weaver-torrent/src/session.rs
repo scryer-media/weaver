@@ -540,6 +540,17 @@ impl Session {
         self.connector.set_encryption(policy);
     }
 
+    /// The order the session's outgoing connections try TCP and uTP in now.
+    pub fn dial_order(&self) -> crate::DialOrder {
+        self.connector.dial_order()
+    }
+
+    /// Dial peers in `order` from the next dial on: a dial under way keeps
+    /// its plan, and a connection made keeps its transport.
+    pub fn set_dial_order(&self, order: crate::DialOrder) {
+        self.connector.set_dial_order(order);
+    }
+
     /// Whether peers at one address may each hold a connection to a torrent
     /// now.
     pub fn allows_multiple_connections_per_ip(&self) -> bool {

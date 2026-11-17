@@ -50,7 +50,7 @@ use crate::{
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
     ssl::SslTorrent,
-    stream_connect::{Guard, Link, StreamConnector, Transports},
+    stream_connect::{Guard, Link, StreamConnector, Transports, UtpSeen},
     type_aliases::BoxAsyncReadVectored,
 };
 
@@ -80,6 +80,10 @@ pub trait PeerConnectionHandler {
     fn tcp_wants(&self) -> Option<&crate::stream_connect::TcpWants> {
         None
     }
+    /// The outgoing connection's dial tried uTP: it `opened` a uTP
+    /// connection, or a uTP attempt failed and none opened. Told once per
+    /// outgoing connection that tried uTP, before it goes on or ends.
+    fn on_utp_dialed(&self, _opened: bool) {}
     /// The connection, whichever side opened it, completed its handshake,
     /// as `encryption` says; told right after
     /// [`Self::on_handshake`].
@@ -897,7 +901,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
         let now = Instant::now();
-        let (link, meter, encryption) = self
+        let seen = UtpSeen::default();
+        let connected = self
             .connector
             .connect_link(
                 self.addr,
@@ -912,8 +917,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 connect_timeout,
                 handshake_timeout,
                 self.handler.tcp_wants(),
+                &seen,
             )
-            .await?;
+            .await;
+        if let Some(opened) = seen.get() {
+            self.handler.on_utp_dialed(opened);
+        }
+        let (link, meter, encryption) = connected?;
         self.handler.on_connected(now.elapsed());
         Ok(Connected {
             link,

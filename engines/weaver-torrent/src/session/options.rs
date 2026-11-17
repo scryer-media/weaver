@@ -638,6 +638,10 @@ pub struct SessionOptions {
     /// Defaults to [`EncryptionPolicy::Disabled`](crate::EncryptionPolicy::Disabled).
     pub encryption: crate::mse::EncryptionPolicy,
 
+    /// The order outgoing peer connections try TCP and uTP in. Defaults to
+    /// [`DialOrder::TcpFirst`](crate::DialOrder::TcpFirst).
+    pub dial_order: crate::DialOrder,
+
     /// Whether peers at one address may each hold a connection to a torrent
     /// (libtorrent `allow_multiple_connections_per_ip`). Off by default: one
     /// connection per address.
@@ -699,6 +703,7 @@ impl SessionOptions {
             resolver: None,
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
+            dial_order: crate::DialOrder::TcpFirst,
             allow_multiple_connections_per_ip: false,
             allow_idna: false,
             port_map_events: None,

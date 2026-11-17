@@ -913,6 +913,11 @@ impl PeerStates {
             .unwrap_or(true)
     }
 
+    /// A dial to the peer at `addr` tried uTP; see [`Peer::utp_dialed`].
+    pub fn utp_dialed(&self, addr: PeerHandle, opened: bool) {
+        self.with_peer_mut(addr, "utp_dialed", |peer| peer.utp_dialed(opened));
+    }
+
     /// The connection of the peer at `addr` completed its handshake; see
     /// [`Peer::handshake_encryption`].
     pub fn handshake_encryption(&self, addr: PeerHandle, encryption: Encryption) {

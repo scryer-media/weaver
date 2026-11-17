@@ -52,6 +52,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Some(&self.state.tcp_wants)
     }
 
+    fn on_utp_dialed(&self, opened: bool) {
+        self.state.peers.utp_dialed(self.addr, opened);
+    }
+
     fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
         if let Some(transport) = self.transport() {
             let direction = if self.incoming {
