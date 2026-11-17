@@ -279,6 +279,14 @@ impl RssService {
             Route::Pipeline => {
                 let nzb = body;
                 weaver_nzb::parse_nzb(&nzb).map_err(|e| format!("invalid NZB: {e}"))?;
+                // A usenet job keeps the item's link and id sealed: only an
+                // admin reads them back, through `rss_link_attributes`.
+                let mut metadata = metadata;
+                crate::torrents::sealed::seal_rss_link_metadata(
+                    self.inner.db.sealing_key(),
+                    &mut metadata,
+                )
+                .map_err(|e| e.to_string())?;
                 // Submission owns durable writes. Once started it must finish before shutdown.
                 let idempotency = CallerScopedIdempotency::new(
                     format!("rss:feed:{}", feed.id),

@@ -406,6 +406,77 @@ async fn an_nzb_beside_a_torrent_client_is_submitted_as_before() {
     assert!(seen[0].2.is_some());
 }
 
+// A usenet job keeps the item's link and id sealed, in the queue and as
+// stored, beside the feed's other attributes kept as they were. An admin
+// reads them back opened; any other caller reads neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_usenet_jobs_rss_link_and_id_are_stored_sealed_and_shown_to_an_admin_only() {
+    use crate::auth::CallerScope;
+    use crate::persistence::encryption::is_encrypted;
+
+    let rig = rig(
+        &item(
+            "a",
+            r#"<enclosure url="http://localhost/download.nzb" length="321" type="application/x-nzb"/>"#,
+        ),
+        None,
+        true,
+    )
+    .await;
+
+    let report = rig.service.run_all_sync().await.unwrap();
+    assert_eq!(report.items_submitted, 1, "{report:?}");
+    let job = rig.nzb_jobs().remove(0);
+    let datastore = rig.db.datastore();
+    let job_id = job.job_id.0 as i64;
+    let stored = rig
+        .db
+        .run_sql_blocking_read(async move {
+            crate::persistence::sql_runtime::SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT metadata FROM active_jobs WHERE job_id = {}",
+                &[crate::persistence::sql_runtime::SqlArg::I64(job_id)],
+            )
+            .await?[0]
+                .opt_text("metadata")
+        })
+        .unwrap();
+    let stored = crate::history::parse_history_metadata(stored.as_deref());
+    for metadata in [&job.metadata, &stored] {
+        let keys: Vec<&str> = metadata
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .filter(|key| !key.starts_with("weaver.") && !key.starts_with("__weaver_"))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "rss.feed_id",
+                "rss.feed_name",
+                "rss.item_id",
+                "rss.item_title",
+                "rss.item_url",
+                "tier"
+            ]
+        );
+        for (key, value) in metadata {
+            assert_eq!(
+                is_encrypted(value),
+                key == "rss.item_id" || key == "rss.item_url",
+                "{key}"
+            );
+        }
+        let link = crate::history::attributes::rss_link_pairs(metadata);
+        let opened = rig.db.rss_link_attributes(&link, CallerScope::Admin);
+        assert_eq!(opened[0], ("rss.item_id".to_owned(), "a".to_owned()));
+        assert_eq!(opened[1].0, "rss.item_url");
+        assert!(opened[1].1.ends_with("/download.nzb"), "{opened:?}");
+        for scope in [CallerScope::Read, CallerScope::Control] {
+            assert!(rig.db.rss_link_attributes(&link, scope).is_empty());
+        }
+    }
+}
+
 // A torrent while torrents are off is held, once: later polls neither read
 // the unchanged feed nor write its row again. Once torrents are on, the
 // feed is read whole and the item is added.

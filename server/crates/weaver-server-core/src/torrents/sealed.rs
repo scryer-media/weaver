@@ -106,11 +106,55 @@ pub(crate) const SEALED_MARK: &str = "secrets_sealed_at_rest";
 const SEAL_BEGUN: &str = "begun";
 const SEAL_DONE: &str = "done";
 
-// The keys an RSS item's link was once kept under in a torrent's metadata.
-pub(crate) const RSS_LINK_KEYS: [&str; 2] = ["rss.item_url", "rss.item_id"];
+// The keys an RSS item's link and id are kept under in a job's metadata. A
+// torrent keeps neither; a usenet job keeps both sealed.
+pub(crate) const RSS_LINK_KEYS: [&str; 2] = crate::history::attributes::RSS_LINK_ATTRIBUTE_KEYS;
 
 // What selects, in SQL, a metadata that may name an RSS item's link or id.
 const RSS_LINK_LIKE: &str = "%\"rss.item_%";
+
+// A usenet RSS job's metadata as it is stored: the item's link and id
+// sealed with the instance key. A write always seals, whatever a value
+// starts with. Under a key held in memory only they stay plain, as a seen
+// item's link does: a key gone at the next start would lose them.
+pub(crate) fn seal_rss_link_metadata(
+    key: Option<&EncryptionKey>,
+    metadata: &mut [(String, String)],
+) -> Result<(), StateError> {
+    let Some(key) = key.filter(|key| !key.is_ephemeral()) else {
+        return Ok(());
+    };
+    for (name, value) in metadata.iter_mut() {
+        if RSS_LINK_KEYS.contains(&name.as_str()) {
+            *value = encrypt_value(key, value).map_err(StateError::Database)?;
+        }
+    }
+    Ok(())
+}
+
+// A job's stored RSS link or id, opened: a plain one as it is, a sealed one
+// decrypted, and one that does not decrypt, under a lost key, none.
+fn open_rss_link(key: Option<&EncryptionKey>, stored: &str) -> Option<String> {
+    if !is_encrypted(stored) {
+        return Some(stored.to_string());
+    }
+    decrypt_value(key?, stored).ok()
+}
+
+// A metadata list with its RSS link and id sealed, or none when it holds
+// none still to seal. A value already sealed stays as it is: one another
+// key sealed reads as absent.
+fn with_sealed_rss_link(key: &EncryptionKey, metadata: &str) -> Option<String> {
+    let mut pairs: Vec<(String, String)> = serde_json::from_str(metadata).ok()?;
+    let mut changed = false;
+    for (name, value) in &mut pairs {
+        if RSS_LINK_KEYS.contains(&name.as_str()) && !is_encrypted(value) {
+            *value = encrypt_value(key, value).ok()?;
+            changed = true;
+        }
+    }
+    changed.then(|| serde_json::to_string(&pairs).ok())?
+}
 
 // A metadata list without an RSS item's link or id, or none when it holds
 // neither.
@@ -121,6 +165,31 @@ fn without_rss_link(metadata: &str) -> Option<String> {
     (pairs.len() != before).then(|| serde_json::to_string(&pairs).ok())?
 }
 
+// Take a page of history rows' RSS link and id out of the attributes the
+// history is filtered by: they were listed there plain before they were
+// kept apart. One statement a page, by the attributes' key.
+async fn drop_rss_link_attributes_tx(
+    tx: &mut crate::persistence::sql_runtime::SqlTx<'_>,
+    page: &[(i64, String)],
+) -> Result<(), StateError> {
+    use crate::persistence::sql_runtime::SqlArg;
+    let sql = format!(
+        "DELETE FROM job_history_attributes WHERE job_id IN ({}) AND key IN ({{}}, {{}})",
+        vec!["{}"; page.len()].join(", ")
+    );
+    let mut args: Vec<SqlArg> = page
+        .iter()
+        .map(|(job_id, _)| SqlArg::I64(*job_id))
+        .collect();
+    args.extend(
+        RSS_LINK_KEYS
+            .iter()
+            .map(|key| SqlArg::Text((*key).to_string())),
+    );
+    tx.execute(&sql, &args).await?;
+    Ok(())
+}
+
 impl crate::Database {
     // The key new secrets are sealed with: the instance key when a store
     // keeps it, none while it is held in memory only.
@@ -128,10 +197,33 @@ impl crate::Database {
         self.encryption_key().filter(|key| !key.is_ephemeral())
     }
 
+    // What a caller is shown of an RSS job's link and id: the opened values
+    // to an admin, nothing to anyone else, and nothing for a value that does
+    // not open. `link` is a job's stored pairs under those keys (from
+    // `rss_link_pairs`); every surface that shows a job's metadata adds
+    // these and only these.
+    pub fn rss_link_attributes(
+        &self,
+        link: &[(String, String)],
+        scope: crate::auth::CallerScope,
+    ) -> Vec<(String, String)> {
+        if !scope.is_admin() {
+            return Vec::new();
+        }
+        link.iter()
+            .filter(|(name, _)| RSS_LINK_KEYS.contains(&name.as_str()))
+            .filter_map(|(name, stored)| {
+                open_rss_link(self.encryption_key(), stored).map(|value| (name.clone(), value))
+            })
+            .collect()
+    }
+
     // Seal, once, every secret stored before sealing: each torrent's
     // metainfo and tracker URLs, each RSS feed's URL and each seen item's
-    // link and id, and take an RSS item's link out of the torrents' kept
-    // metadata. Each step selects in SQL only the rows it has yet to seal,
+    // link and id, take an RSS item's link and id out of the torrents' kept
+    // metadata and the history's attribute rows, and seal them in each
+    // usenet job's, queued or in history. Each step selects in SQL only the
+    // rows it has yet to seal,
     // a page at a time, each page in one write transaction, so a pass a
     // crash cut short goes on from where it stood. The pass is marked begun
     // before its first write and done after its last: a start that finds it
@@ -413,10 +505,73 @@ impl crate::Database {
                         }
                         args.extend(had.iter().map(|(job_id, _)| SqlArg::I64(*job_id)));
                         tx.execute(&sql, &args).await?;
-                        Ok(())
+                        drop_rss_link_attributes_tx(tx, &had).await
                     })
                 })
                 .await?;
+            }
+
+            // Each usenet job's metadata that names an RSS item's link or id
+            // still plain: the queue's, then the history's, with them sealed.
+            // A torrent's history row is never selected: it keeps neither.
+            for (table, usenet_only) in [("active_jobs", ""), ("job_history", " AND protocol <> {}")]
+            {
+                let select = format!(
+                    "SELECT job_id, metadata FROM {table} \
+                      WHERE job_id > {{}}{usenet_only} AND metadata LIKE {{}} \
+                      ORDER BY job_id LIMIT {{}}"
+                );
+                let mut after = i64::MIN;
+                loop {
+                    let mut args = vec![SqlArg::I64(after)];
+                    if !usenet_only.is_empty() {
+                        args.push(SqlArg::Text(
+                            crate::jobs::Protocol::Torrent.as_str().to_string(),
+                        ));
+                    }
+                    args.extend([
+                        SqlArg::Text(RSS_LINK_LIKE.to_string()),
+                        SqlArg::I64(SEAL_PAGE),
+                    ]);
+                    let rows = SqlRuntime::fetch_all(datastore.read_exec(), &select, &args).await?;
+                    let Some(last) = rows.last() else { break };
+                    after = last.i64("job_id")?;
+                    let mut had = Vec::new();
+                    for row in &rows {
+                        if let Some(sealed) = row
+                            .opt_text("metadata")?
+                            .as_deref()
+                            .and_then(|metadata| with_sealed_rss_link(&key, metadata))
+                        {
+                            had.push((row.i64("job_id")?, sealed));
+                        }
+                    }
+                    if had.is_empty() {
+                        continue;
+                    }
+                    SqlRuntime::run_in_transaction(&datastore, "seal_job_rss_links", |tx| {
+                        let had = had.clone();
+                        Box::pin(async move {
+                            let sql = format!(
+                                "UPDATE {table} SET metadata = CASE job_id {}END \
+                                  WHERE job_id IN ({})",
+                                "WHEN {} THEN {} ".repeat(had.len()),
+                                vec!["{}"; had.len()].join(", ")
+                            );
+                            let mut args = Vec::with_capacity(had.len() * 3);
+                            for (job_id, sealed) in &had {
+                                args.extend([SqlArg::I64(*job_id), SqlArg::Text(sealed.clone())]);
+                            }
+                            args.extend(had.iter().map(|(job_id, _)| SqlArg::I64(*job_id)));
+                            tx.execute(&sql, &args).await?;
+                            if table == "job_history" {
+                                drop_rss_link_attributes_tx(tx, &had).await?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .await?;
+                }
             }
             Ok(())
         })?;

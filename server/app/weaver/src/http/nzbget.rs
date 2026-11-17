@@ -231,9 +231,9 @@ async fn run_jsonrpc(
     }
 
     if method == "listgroups" {
-        return listgroups_response(ctx, id).await;
+        return listgroups_response(ctx, id, scope).await;
     }
-    match dispatch_method(ctx, &method, params).await {
+    match dispatch_method(ctx, scope, &method, params).await {
         Ok(result) => rpc_success_response(id, result),
         Err(error) => rpc_error_response(StatusCode::OK, id, error),
     }
@@ -376,6 +376,7 @@ fn facade_method_allowed(scope: CallerScope, method: &str, required: RequiredSco
 
 async fn dispatch_method(
     ctx: &NzbgetFacadeContext,
+    scope: CallerScope,
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, RpcError> {
@@ -386,9 +387,9 @@ async fn dispatch_method(
         "append" => append(ctx, params).await,
         "appendurl" => append_url(ctx, params).await,
         "status" => status(ctx).await,
-        "listgroups" => listgroups(ctx).await,
+        "listgroups" => listgroups(ctx, scope).await,
         "listfiles" => listfiles(ctx, params).await,
-        "history" => history(ctx, params).await,
+        "history" => history(ctx, params, scope).await,
         // NZBGet distinguishes current values (`config`) from on-disk values
         // (`loadconfig`); weaver has a single live config. nzb360 reads its
         // category list from `loadconfig`.
@@ -559,7 +560,7 @@ pub(super) async fn xmlrpc_handler(
     } else {
         Some(Value::Array(call.params))
     };
-    match dispatch_method(&ctx, &method, params).await {
+    match dispatch_method(&ctx, scope, &method, params).await {
         Ok(result) => xmlrpc_success_response(&result),
         Err(error) => xmlrpc_fault_response(StatusCode::OK, error),
     }
@@ -1702,6 +1703,7 @@ fn group_chunk(
     ctx: &NzbgetFacadeContext,
     ids: &[JobId],
     post_started: &HashMap<u64, i64>,
+    scope: CallerScope,
 ) -> Vec<Value> {
     let jobs = ctx.queue.read_queue(|inner| {
         ids.iter()
@@ -1711,7 +1713,9 @@ fn group_chunk(
     });
     jobs.iter()
         .filter_map(|job| {
-            let item = queue_table_item_from_job(job);
+            let mut item = queue_table_item_from_job(job);
+            item.attributes
+                .extend(rss_link_parameters(ctx, scope, &item.rss_link));
             (!matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
@@ -1728,21 +1732,39 @@ fn group_chunk(
         .collect()
 }
 
-async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
+async fn listgroups(ctx: &NzbgetFacadeContext, scope: CallerScope) -> Result<Value, RpcError> {
     let listing = group_listing(ctx).await;
     Ok(Value::Array(
         listing
             .ids
             .chunks(GROUP_CHUNK)
-            .flat_map(|ids| group_chunk(ctx, ids, &listing.post_started))
+            .flat_map(|ids| group_chunk(ctx, ids, &listing.post_started, scope))
             .collect(),
     ))
+}
+
+// The Parameters an RSS job's item link and id add for this caller: the
+// opened values for an admin, none for anyone else. The core owner
+// decides; a job with neither costs nothing.
+fn rss_link_parameters(
+    ctx: &NzbgetFacadeContext,
+    scope: CallerScope,
+    link: &[(String, String)],
+) -> Vec<Attribute> {
+    if link.is_empty() {
+        return Vec::new();
+    }
+    ctx.db
+        .rss_link_attributes(link, scope)
+        .into_iter()
+        .map(|(key, value)| Attribute { key, value })
+        .collect()
 }
 
 // `listgroups` over JSON-RPC: NZBGet has no paging for it, so the answer is
 // every group, written a chunk at a time as the client reads it. No chunk
 // holds the queue lock while it is serialised or sent.
-async fn listgroups_response(ctx: &NzbgetFacadeContext, id: Value) -> Response {
+async fn listgroups_response(ctx: &NzbgetFacadeContext, id: Value, scope: CallerScope) -> Response {
     use tokio::io::AsyncWriteExt as _;
 
     let listing = group_listing(ctx).await;
@@ -1755,7 +1777,7 @@ async fn listgroups_response(ctx: &NzbgetFacadeContext, id: Value) -> Response {
         buf.extend_from_slice(br#","result":["#);
         let mut first = true;
         for ids in listing.ids.chunks(GROUP_CHUNK) {
-            for group in group_chunk(&ctx, ids, &listing.post_started) {
+            for group in group_chunk(&ctx, ids, &listing.post_started, scope) {
                 if !first {
                     buf.push(b',');
                 }
@@ -2109,7 +2131,11 @@ fn attribute_value(attributes: &[Attribute], key: &str) -> Option<String> {
         .map(|attribute| attribute.value.clone())
 }
 
-async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
+async fn history(
+    ctx: &NzbgetFacadeContext,
+    params: Option<Value>,
+    scope: CallerScope,
+) -> Result<Value, RpcError> {
     // history(Hidden): rows a client removed with HistoryDelete are listed
     // only when the first parameter is true.
     let include_hidden = optional_bool_param(&positional_params(params)?, 0)?.unwrap_or(false);
@@ -2208,6 +2234,16 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
             !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id)
         })
         .map(|(item, category, kept)| {
+            let link = rss_link_parameters(ctx, scope, &item.rss_link);
+            let shown;
+            let item = if link.is_empty() {
+                item
+            } else {
+                let mut with_link = item.clone();
+                with_link.attributes.extend(link);
+                shown = with_link;
+                &shown
+            };
             nzbget_history_queue_item(
                 item,
                 category,
@@ -2239,11 +2275,15 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
                 .get(&row.job_id)
                 .filter(|(completed_at, _)| *completed_at == row.completed_at)
                 .map(|(_, item)| item.clone());
-            let item = cached.unwrap_or_else(|| {
+            let mut item = cached.unwrap_or_else(|| {
                 let item = history_item_from_row(row, None);
                 cache.insert(row.job_id, (row.completed_at, item.clone()));
                 item
             });
+            // The cache keeps the link sealed; this caller's view is added
+            // to this answer alone.
+            item.attributes
+                .extend(rss_link_parameters(ctx, scope, &item.rss_link));
             let category = reported_category(
                 row.category.as_deref(),
                 &weaver_server_core::history::parse_history_metadata(row.metadata.as_deref()),

@@ -1493,6 +1493,112 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     assert_eq!(failed["Message"], "article failures");
 }
 
+// An RSS job's item link and id are Parameters for an admin key only,
+// opened; a read key's history lists neither, and no caller is given the
+// sealed text.
+#[tokio::test]
+async fn nzbget_history_gives_an_rss_link_to_an_admin_key_only() {
+    use weaver_server_core::persistence::encryption::{EncryptionKey, encrypt_value};
+
+    const LINK: &str = "https://tracker.invalid/dl/1?passkey=f00d";
+    let key = EncryptionKey::generate();
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(key.clone());
+    let metadata = serde_json::to_string(&[
+        (
+            weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+            "drone-rss".to_string(),
+        ),
+        (
+            "rss.item_id".to_string(),
+            encrypt_value(&key, LINK).unwrap(),
+        ),
+        (
+            "rss.item_url".to_string(),
+            encrypt_value(&key, LINK).unwrap(),
+        ),
+        ("rss.feed_name".to_string(), "feed".to_string()),
+    ])
+    .unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
+        job_id: 100,
+        job_hash: None,
+        name: "Linked.Release".into(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(metadata),
+        server_attribution: None,
+        archived_at: None,
+    })
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("read-key", "read"),
+    );
+    let parameters = |payload: serde_json::Value| {
+        let text = payload.to_string();
+        assert!(!text.contains("enc:v1:"), "{text}");
+        payload["result"][0]["Parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter["Name"].as_str().unwrap().to_owned(),
+                    parameter["Value"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let history = serde_json::json!({ "method": "history", "params": [], "id": "history" });
+    // Twice as an admin: the second answer comes from the facade's cache.
+    for _ in 0..2 {
+        let (status, payload) =
+            post_nzbget(app.clone(), history.clone(), "Bearer session-token").await;
+        assert_eq!(status, StatusCode::OK);
+        let shown = parameters(payload);
+        assert!(
+            shown.contains(&("rss.item_id".to_owned(), LINK.to_owned())),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&("rss.item_url".to_owned(), LINK.to_owned())),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&("drone".to_owned(), "drone-rss".to_owned())),
+            "{shown:?}"
+        );
+    }
+    let (status, payload) = post_nzbget(app, history, "Bearer read-key").await;
+    assert_eq!(status, StatusCode::OK);
+    let shown = parameters(payload);
+    assert!(
+        shown
+            .iter()
+            .all(|(name, _)| !name.starts_with("rss.item_") || name == "rss.item_title"),
+        "{shown:?}"
+    );
+    assert!(
+        shown.contains(&("rss.feed_name".to_owned(), "feed".to_owned())),
+        "{shown:?}"
+    );
+}
+
 #[tokio::test]
 async fn nzbget_history_reports_the_folder_named_after_the_original_title() {
     let original = "Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP";
