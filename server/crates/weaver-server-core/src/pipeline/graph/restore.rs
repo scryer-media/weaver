@@ -121,8 +121,8 @@ pub(crate) struct RestoreSeat {
     metrics: Arc<PipelineMetrics>,
     extraction_limits: Arc<ExtractionLimits>,
     spec_password: Option<String>,
-    data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
-    window_ledger: super::window::ScratchLedger,
+    data_dir: Option<(PathBuf, CapacityReader, crate::scratch::ScratchLedger)>,
+    window_ledger: crate::scratch::ScratchLedger,
     // The volume writers and the disk owner the restored job's files are
     // written through.
     volumes: (

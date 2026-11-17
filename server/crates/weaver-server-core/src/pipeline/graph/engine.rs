@@ -707,7 +707,7 @@ impl Runs {
     // run was widened to above it is dropped: the run is held to the
     // ceiling, and its decoder refuses with the sizes.
     //
-    // Where no window can be mapped (`window::MAPS`), no run is lent: one
+    // Where no window can be mapped (`crate::scratch::MAPS`), no run is lent: one
     // whose window is over the ceiling is placed in RAM from the start where
     // the policy lets it go above, and is refused where it does not.
     pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
@@ -721,7 +721,7 @@ impl Runs {
         }
         let ceiling = grant.ceiling();
         let above = grant.over_limit == OverLimit::ScratchThenRam;
-        run.lends = lends && !run.in_ram && self.windows.is_some() && super::window::MAPS;
+        run.lends = lends && !run.in_ram && self.windows.is_some() && crate::scratch::MAPS;
         if above && !run.lends && window > ceiling {
             run.wide = run.wide.max(Some(window));
         }

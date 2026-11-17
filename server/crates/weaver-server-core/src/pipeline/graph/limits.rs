@@ -1344,13 +1344,13 @@ pub(crate) struct GraphBudget {
     // The decode pool every job shares.
     pub(crate) decode: Arc<super::engine::DecodePool>,
     // What decode windows took from the disk `work` is on.
-    pub(crate) window_ledger: super::window::ScratchLedger,
+    pub(crate) window_ledger: crate::scratch::ScratchLedger,
     // Weaver's data folder, the free space of its disk, and what decode
     // windows took from it.
     pub(crate) data_dir: (
         std::path::PathBuf,
         crate::operations::disk::CapacityReader,
-        super::window::ScratchLedger,
+        crate::scratch::ScratchLedger,
     ),
 }
 

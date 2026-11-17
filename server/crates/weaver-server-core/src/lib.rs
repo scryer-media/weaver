@@ -38,6 +38,7 @@ pub mod rss;
 pub mod runtime;
 pub mod schema_migrations;
 pub mod schema_upgrade;
+pub(crate) mod scratch;
 pub mod security;
 pub mod servers;
 pub mod settings;

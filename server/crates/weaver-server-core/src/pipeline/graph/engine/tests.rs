@@ -2259,13 +2259,15 @@ fn an_inner_run_reserved_first_never_holds_back_the_outer_run_it_waits_on() {
 // not known: nothing but the platform refuses a window.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scratch(dir: &Path) -> Arc<crate::pipeline::graph::window::Windows> {
-    Arc::new(crate::pipeline::graph::window::Windows::new(
-        dir.to_path_buf(),
-        CapacityReader::unknown(),
-        Default::default(),
-        holds(u64::MAX),
-        64 << 20,
-    ))
+    Arc::new(crate::pipeline::graph::window::Windows::new(Arc::new(
+        crate::scratch::Scratch::new(
+            dir.to_path_buf(),
+            CapacityReader::unknown(),
+            Default::default(),
+            holds(u64::MAX),
+            64 << 20,
+        ),
+    )))
 }
 
 // Scratch on a disk with room for `room` bytes over a one-byte reserve.
@@ -2295,13 +2297,15 @@ fn scratch_up_to(
         scratch_ceiling: u64::MAX,
         disk_reserve: 1,
     }));
-    Arc::new(crate::pipeline::graph::window::Windows::new(
-        dir.to_path_buf(),
-        free,
-        Default::default(),
-        accountant,
-        ceiling,
-    ))
+    Arc::new(crate::pipeline::graph::window::Windows::new(Arc::new(
+        crate::scratch::Scratch::new(
+            dir.to_path_buf(),
+            free,
+            Default::default(),
+            accountant,
+            ceiling,
+        ),
+    )))
 }
 
 // A decoder that borrows windows over its grant.
@@ -2960,11 +2964,7 @@ async fn a_7z_run_reserves_its_overhead_and_shares_the_pool_on_every_profile() {
         let found = saw.recv().unwrap();
         assert_eq!(found.memory_bytes, Some(memory), "{name}");
         assert_eq!(found.window_bytes, Some(window), "{name}");
-        assert_eq!(
-            found.lent.is_some(),
-            crate::pipeline::graph::window::MAPS,
-            "{name}"
-        );
+        assert_eq!(found.lent.is_some(), crate::scratch::MAPS, "{name}");
         runs.ended(first, said.generation, 3);
         runs.ended(second, 0, 3);
         runs.ended(rar, 0, 3);
