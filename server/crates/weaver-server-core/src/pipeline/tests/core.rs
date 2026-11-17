@@ -1017,6 +1017,7 @@ async fn delayed_retry_carries_exclusions_across_a_pool_rebuild() {
     pipeline.receive_retry_work(super::RetryWork {
         scheduled_pool_generation: 0,
         infrastructure_retry: false,
+        hold: crate::pipeline::RetryHold::Ordinary,
         work: make_work(),
     });
     let queued = pipeline
@@ -1042,6 +1043,7 @@ async fn delayed_retry_carries_exclusions_across_a_pool_rebuild() {
     pipeline.receive_retry_work(super::RetryWork {
         scheduled_pool_generation: 77,
         infrastructure_retry: false,
+        hold: crate::pipeline::RetryHold::Ordinary,
         work: make_work(),
     });
     let queued = pipeline
@@ -1061,6 +1063,7 @@ async fn delayed_retry_carries_exclusions_across_a_pool_rebuild() {
     pipeline.receive_retry_work(super::RetryWork {
         scheduled_pool_generation: 1,
         infrastructure_retry: false,
+        hold: crate::pipeline::RetryHold::Ordinary,
         work: make_work(),
     });
     let queued = pipeline

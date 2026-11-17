@@ -63,6 +63,8 @@ pub struct TorrentStateInitializing {
     pub(crate) only_files: Option<Vec<usize>>,
     pub(crate) checked_bytes: AtomicU64,
     pause_requested: AtomicBool,
+    // Rung by a pause request, for a check that waits its turn.
+    pause_wake: tokio::sync::Notify,
     // Where the last check that read every piece back was paused, and the
     // bytes it had read: the next check goes on from there. Kept for this
     // run only.
@@ -195,6 +197,7 @@ impl TorrentStateInitializing {
             files,
             checked_bytes: AtomicU64::new(0),
             pause_requested: AtomicBool::new(false),
+            pause_wake: tokio::sync::Notify::new(),
             paused_at: parking_lot::Mutex::new(None),
             check: AtomicU8::new(CHECK_IDLE),
             full_check,
@@ -229,6 +232,7 @@ impl TorrentStateInitializing {
 
     pub(crate) fn request_pause(&self) {
         self.pause_requested.store(true, Ordering::Relaxed);
+        self.pause_wake.notify_waiters();
     }
 
     pub(crate) fn clear_pause_request(&self) {
@@ -475,14 +479,35 @@ impl TorrentStateInitializing {
         self.check.store(CHECK_WAITING, Ordering::Release);
         waiting();
         let session = self.shared.session.upgrade();
+        // A check paused while it waits its turn gives the turn up at once,
+        // with what a paused check before it had read: it has read nothing,
+        // and one asked to pause does not wait out another torrent's check.
+        // A pause taken back before the wait is woken (the torrent resumed)
+        // is no pause: the wake finds the request gone, and the check goes
+        // on waiting its turn.
         let _turn = match &session {
-            Some(session) => Some(
-                session
-                    .concurrent_initialize_semaphore
-                    .acquire()
-                    .await
-                    .context("bug: concurrent check semaphore was closed")?,
-            ),
+            Some(session) => {
+                let turn = loop {
+                    let paused = self.pause_wake.notified();
+                    tokio::pin!(paused);
+                    paused.as_mut().enable();
+                    if self.is_pause_requested() {
+                        break None;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = &mut paused => {}
+                        turn = session.concurrent_initialize_semaphore.acquire() => break Some(
+                            turn.context("bug: concurrent check semaphore was closed")?,
+                        ),
+                    }
+                };
+                let Some(turn) = turn else {
+                    *self.paused_at.lock() = from;
+                    anyhow::bail!("initial check paused");
+                };
+                Some(turn)
+            }
             None => None,
         };
         info!("Doing initial checksum validation, this might take a while...");
@@ -945,7 +970,7 @@ mod tests {
     mod checking_in_the_stats {
         use std::path::Path;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         use anyhow::Context;
         use parking_lot::Mutex;
@@ -1129,6 +1154,13 @@ mod tests {
             reading: Mutex<Option<UnboundedSender<()>>>,
             // The bytes read through the door.
             read: AtomicU64,
+            // Every read is refused as of files shut (`FilesShut`), until
+            // every piece is forgotten.
+            refusing: AtomicBool,
+            // The storage cannot forget its pieces.
+            forgets_fail: AtomicBool,
+            // How many times every piece was forgotten.
+            forgotten: AtomicU64,
         }
 
         impl Door {
@@ -1138,6 +1170,9 @@ mod tests {
                     opened: parking_lot::Condvar::new(),
                     reading: Mutex::new(Some(reading)),
                     read: AtomicU64::new(0),
+                    refusing: AtomicBool::new(false),
+                    forgets_fail: AtomicBool::new(false),
+                    forgotten: AtomicU64::new(0),
                 })
             }
 
@@ -1197,10 +1232,24 @@ mod tests {
                 buf: &mut [u8],
             ) -> anyhow::Result<()> {
                 self.door.pass();
+                if self.door.refusing.load(Ordering::Acquire) {
+                    return Err(crate::storage::FilesShut::refused().into());
+                }
                 self.door
                     .read
                     .fetch_add(buf.len() as u64, Ordering::Relaxed);
                 self.inner.pread_exact(file_id, offset, buf)
+            }
+
+            fn on_check_everything(&self) -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    !self.door.forgets_fail.load(Ordering::Acquire),
+                    "the pieces are not forgotten"
+                );
+                self.inner.on_check_everything()?;
+                self.door.refusing.store(false, Ordering::Release);
+                self.door.forgotten.fetch_add(1, Ordering::AcqRel);
+                Ok(())
             }
 
             fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
@@ -1337,6 +1386,477 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_recheck_stopped_by_a_pause_reads_as_paused() -> anyhow::Result<()> {
             a_check_stopped_by_a_pause_reads_as_paused("recheck_paused", true).await
+        }
+
+        // Files that change under a torrent while a check of them is under
+        // way are checked from the first piece again: nothing the stopped
+        // check read from the files as they were stays had. `paused` leaves
+        // the check paused part way, with pieces it passed, before the
+        // files change; else the check is reading when it is told.
+        async fn a_check_of_files_that_changed_starts_over(
+            name: &str,
+            paused: bool,
+        ) -> anyhow::Result<()> {
+            let t = TestTorrent::new(name, PIECES * 1024, 1024).await?;
+            let out = TempDir::with_prefix(name)?;
+            let session =
+                Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+            let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
+            let door = Door::shut(reading_tx);
+            let storage = ShutStorageFactory {
+                inner: MemoryStorageFactory::holding(vec![t.content.clone()]),
+                door: door.clone(),
+            };
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(storage.clone_box()),
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            reading.recv().await.context("the check read nothing")?;
+            let checking = |handle: &crate::ManagedTorrent| {
+                handle.with_state(|state| {
+                    matches!(state, crate::ManagedTorrentState::Initializing(init) if init.is_checking())
+                })
+            };
+            if paused {
+                session.pause(&handle).await?;
+                door.open();
+                loop {
+                    let changed = handle.next_state_change();
+                    if !checking(&handle) {
+                        break;
+                    }
+                    changed.await;
+                }
+                let passed = handle
+                    .with_state(|state| match state {
+                        crate::ManagedTorrentState::Initializing(init) => {
+                            init.paused_at.lock().as_ref().map(|(at, _)| at.next)
+                        }
+                        _ => None,
+                    })
+                    .context("the paused check kept no place")?;
+                assert!(0 < passed && passed < PIECES, "{passed}");
+                session.forget_for_recheck(&handle).await?;
+            } else {
+                // The check is told while its reads wait at the door; it
+                // stops at its next piece once they are let through.
+                let forgetting = {
+                    let session = session.clone();
+                    let handle = handle.clone();
+                    tokio::spawn(async move { session.forget_for_recheck(&handle).await })
+                };
+                while !handle.with_state(|state| {
+                    matches!(state, crate::ManagedTorrentState::Initializing(init) if init.is_pause_requested())
+                }) {
+                    tokio::task::yield_now().await;
+                }
+                door.open();
+                forgetting.await??;
+            }
+            assert!(!checking(&handle), "the old check still runs");
+            assert!(
+                handle.with_state(|state| match state {
+                    crate::ManagedTorrentState::Initializing(init) =>
+                        init.is_full_check() && init.paused_at.lock().is_none(),
+                    _ => false,
+                }),
+                "the torrent kept the old check's place"
+            );
+            assert_eq!(handle.is_paused(), paused, "forgetting changed the pause");
+
+            // Another file's bytes are under the torrent now.
+            storage.inner.log.overwrite_file(0, 0xa5);
+            door.read.store(0, Ordering::Relaxed);
+            session.restart_check(&handle).await?;
+            handle.wait_until_initialized().await?;
+            assert_eq!(
+                door.read.load(Ordering::Relaxed),
+                PIECES as u64 * 1024,
+                "the check did not read every piece again"
+            );
+            let have =
+                handle.with_chunk_tracker(|ct| ct.get_have_pieces().as_slice().count_ones())?;
+            assert_eq!(have, 0, "a piece of the old files stayed had");
+            assert_eq!(handle.is_paused(), paused);
+            session.stop().await;
+            Ok(())
+        }
+
+        // A session that stops while a torrent waits for its check to stop
+        // drops the check with no word: the wait ends with an error, and
+        // does not hang on a change of state that never comes. The check's
+        // reads are still held at the door when it does.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_wait_for_a_check_to_stop_ends_when_the_session_stops() -> anyhow::Result<()> {
+            let name = "stopped_under_a_forget";
+            let t = TestTorrent::new(name, PIECES * 1024, 1024).await?;
+            let out = TempDir::with_prefix(name)?;
+            let session =
+                Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+            let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
+            let door = Door::shut(reading_tx);
+            let storage = ShutStorageFactory {
+                inner: MemoryStorageFactory::holding(vec![t.content.clone()]),
+                door: door.clone(),
+            };
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(storage.clone_box()),
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            reading.recv().await.context("the check read nothing")?;
+            let forgetting = {
+                let session = session.clone();
+                let handle = handle.clone();
+                tokio::spawn(async move { session.forget_for_recheck(&handle).await })
+            };
+            while !handle.with_state(|state| {
+                matches!(state, crate::ManagedTorrentState::Initializing(init) if init.is_pause_requested())
+            }) {
+                tokio::task::yield_now().await;
+            }
+            session.cancellation_token().cancel();
+            let ended = forgetting.await?;
+            assert!(
+                ended.is_err(),
+                "the pieces were forgotten under a stopped session"
+            );
+            door.open();
+            session.stop().await;
+            Ok(())
+        }
+
+        // A pause taken back before the check that waits its turn has woken
+        // to it (the torrent paused and resumed at once) is no pause: the
+        // check goes on waiting, takes its turn when one is free, and the
+        // torrent runs. It does not end in an error.
+        #[tokio::test]
+        async fn a_pause_taken_back_while_a_check_waits_its_turn_is_no_pause() -> anyhow::Result<()>
+        {
+            let name = "pause_taken_back";
+            let t = TestTorrent::new(name, 8 * 1024, 1024).await?;
+            let out = TempDir::with_prefix(name)?;
+            let session =
+                Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+            let checks = session.concurrent_initialize_semaphore.clone();
+            let held = checks
+                .clone()
+                .acquire_many_owned(u32::try_from(checks.available_permits()).unwrap())
+                .await?;
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(
+                            MemoryStorageFactory::holding(vec![t.content.clone()]).clone_box(),
+                        ),
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            loop {
+                let changed = handle.next_state_change();
+                if matches!(
+                    handle.stats().state,
+                    TorrentStatsState::Initializing { checking: true, .. }
+                ) {
+                    break;
+                }
+                changed.await;
+            }
+            // Asked and taken back with the check's task not run between.
+            handle.with_state(|state| match state {
+                crate::ManagedTorrentState::Initializing(init) => {
+                    init.request_pause();
+                    init.clear_pause_request();
+                }
+                _ => panic!("the torrent is not being checked"),
+            });
+            drop(held);
+            handle.wait_until_initialized().await?;
+            assert!(handle.live().is_some(), "the torrent does not run");
+            session.stop().await;
+            Ok(())
+        }
+
+        // A check told to stop once it is past its last place to stop (it
+        // reads the one piece its checkpoint left to verify, and hashes no
+        // other) ends as it would have. The torrent it leaves does not run
+        // for the moment before its pieces are forgotten: its tracker hears
+        // no `started` followed by a `stopped`, only the `started` of the
+        // run after the check that the forgetting was for.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_check_told_to_stop_past_its_last_stop_says_nothing_to_a_tracker()
+        -> anyhow::Result<()> {
+            use crate::tests::e2e_pause::{Tracker, announce, answered, next};
+            let name = "stopped_past_the_stop";
+            let t = TestTorrent::new(name, 8 * 1024, 1024).await?;
+            let out = TempDir::with_prefix(name)?;
+            let (tracker, mut heard) = Tracker::start(None);
+            let session = Session::new_with_opts(
+                out.path().into(),
+                crate::tests::e2e_tracker_announces::tracker_session_opts()?,
+            )
+            .await?;
+            let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
+            let door = Door::shut(reading_tx);
+            let storage = ShutStorageFactory {
+                inner: MemoryStorageFactory::holding(vec![t.content.clone()]),
+                door: door.clone(),
+            };
+            // Every piece had but the fourth, every block of which is
+            // written: the check reads that one back, and no other.
+            let mut have = crate::BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+            have.set(3, false);
+            let checkpoint = crate::Checkpoint {
+                have,
+                blocks: Some(crate::BF::from_boxed_slice(vec![0xff].into_boxed_slice())),
+                files: None,
+            };
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(storage.clone_box()),
+                        trackers: Some(vec![tracker.url()]),
+                        checkpoint: Some(checkpoint),
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            reading.recv().await.context("the check read nothing")?;
+            let forgetting = {
+                let session = session.clone();
+                let handle = handle.clone();
+                tokio::spawn(async move { session.forget_for_recheck(&handle).await })
+            };
+            while !handle.with_state(|state| {
+                matches!(state, crate::ManagedTorrentState::Initializing(init) if init.is_pause_requested())
+            }) {
+                tokio::task::yield_now().await;
+            }
+            door.open();
+            forgetting.await??;
+            assert!(
+                handle.tracker_status().is_none(),
+                "the torrent ran before its pieces were forgotten"
+            );
+
+            session.start_check(&handle)?;
+            handle.wait_until_initialized().await?;
+            assert_eq!(next(&mut heard).await?, announce(Some("started")));
+            answered(&handle).await?;
+            let queries = tracker.queries.lock().clone();
+            assert_eq!(queries.len(), 1, "{queries:?}");
+            drop(tracker);
+            session.stop().await;
+            Ok(())
+        }
+
+        // The torrent of `a_check_told_to_stop_past_its_last_stop_says_nothing_to_a_tracker`
+        // added to a session with a tracker, its check waiting on its
+        // first read: the session, the torrent, the tracker with what it
+        // heard, and the door.
+        struct Tracked {
+            session: Arc<Session>,
+            handle: Arc<crate::ManagedTorrent>,
+            tracker: crate::tests::e2e_pause::Tracker,
+            heard: tokio::sync::mpsc::UnboundedReceiver<crate::tests::e2e_pause::Heard>,
+            door: Arc<Door>,
+            total: u64,
+            _out: TempDir,
+        }
+
+        async fn checking_with_a_tracker(
+            name: &str,
+            checkpoint: Option<crate::Checkpoint>,
+        ) -> anyhow::Result<Tracked> {
+            let t = TestTorrent::new(name, 8 * 1024, 1024).await?;
+            let out = TempDir::with_prefix(name)?;
+            let (tracker, heard) = crate::tests::e2e_pause::Tracker::start(None);
+            let session = Session::new_with_opts(
+                out.path().into(),
+                crate::tests::e2e_tracker_announces::tracker_session_opts()?,
+            )
+            .await?;
+            let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
+            let door = Door::shut(reading_tx);
+            let storage = ShutStorageFactory {
+                inner: MemoryStorageFactory::holding(vec![t.content.clone()]),
+                door: door.clone(),
+            };
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(storage.clone_box()),
+                        trackers: Some(vec![tracker.url()]),
+                        checkpoint,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            reading.recv().await.context("the check read nothing")?;
+            Ok(Tracked {
+                session,
+                handle,
+                tracker,
+                heard,
+                door,
+                total: 8 * 1024,
+                _out: out,
+            })
+        }
+
+        // A check under way when the torrent's files are shut to reads
+        // (`FilesShut`, as a move that left a file among them that is not
+        // the torrent's own shuts them) does not take the reads it is
+        // refused for pieces that are missing: it ends, every piece is
+        // forgotten, and the torrent does not run with none of them. Its
+        // tracker hears nothing of it. The check that whoever changed the
+        // files then begins reads them, finds every piece, and the tracker
+        // hears the one `started` of the run after it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_check_that_meets_shut_files_ends_and_says_nothing_to_a_tracker()
+        -> anyhow::Result<()> {
+            use crate::tests::e2e_pause::{announce, answered, next};
+            let Tracked {
+                session,
+                handle,
+                tracker,
+                mut heard,
+                door,
+                total,
+                _out,
+            } = checking_with_a_tracker("shut_under_check", None).await?;
+            door.refusing.store(true, Ordering::Release);
+            door.open();
+            loop {
+                let changed = handle.next_state_change();
+                if door.forgotten.load(Ordering::Acquire) > 0
+                    && handle.with_state(|state| {
+                        matches!(state, crate::ManagedTorrentState::Initializing(init) if !init.is_checking())
+                    })
+                {
+                    break;
+                }
+                changed.await;
+            }
+            assert!(
+                handle.tracker_status().is_none(),
+                "the torrent ran on a check that read nothing"
+            );
+            assert!(tracker.queries.lock().is_empty());
+            assert_eq!(door.read.load(Ordering::Relaxed), 0);
+
+            session.forget_for_recheck(&handle).await?;
+            session.start_check(&handle)?;
+            handle.wait_until_initialized().await?;
+            assert_eq!(
+                handle.stats().progress_bytes,
+                total,
+                "a piece was not found"
+            );
+            assert_eq!(next(&mut heard).await?, announce(Some("started")));
+            answered(&handle).await?;
+            let queries = tracker.queries.lock().clone();
+            assert_eq!(queries.len(), 1, "{queries:?}");
+            drop(tracker);
+            session.stop().await;
+            Ok(())
+        }
+
+        // A check ended paused on a stop asked of it past its last place
+        // to stop, for pieces that are then forgotten, and the storage
+        // cannot forget them: the torrent is not left paused with nothing
+        // saying so and nobody to start it. It is in error, with the
+        // reason, and the one who asked is told. Its next start checks
+        // every piece and runs; its tracker hears that run's `started` and
+        // nothing before it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn pieces_that_cannot_be_forgotten_leave_the_torrent_in_error_not_paused()
+        -> anyhow::Result<()> {
+            use crate::tests::e2e_pause::{announce, answered, next};
+            let mut have = crate::BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+            have.set(3, false);
+            let checkpoint = crate::Checkpoint {
+                have,
+                blocks: Some(crate::BF::from_boxed_slice(vec![0xff].into_boxed_slice())),
+                files: None,
+            };
+            let Tracked {
+                session,
+                handle,
+                tracker,
+                mut heard,
+                door,
+                total,
+                _out,
+            } = checking_with_a_tracker("forget_fails", Some(checkpoint)).await?;
+            let forgetting = {
+                let session = session.clone();
+                let handle = handle.clone();
+                tokio::spawn(async move { session.forget_for_recheck(&handle).await })
+            };
+            while !handle.with_state(|state| {
+                matches!(state, crate::ManagedTorrentState::Initializing(init) if init.is_pause_requested())
+            }) {
+                tokio::task::yield_now().await;
+            }
+            door.forgets_fail.store(true, Ordering::Release);
+            door.open();
+            let refused = forgetting.await?.unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("the pieces are not forgotten"),
+                "{refused:#}"
+            );
+            assert!(
+                handle.with_state(|state| matches!(state, crate::ManagedTorrentState::Error(_))),
+                "the torrent is not in error"
+            );
+            assert!(matches!(handle.stats().state, TorrentStatsState::Error));
+            assert!(handle.tracker_status().is_none());
+
+            door.forgets_fail.store(false, Ordering::Release);
+            session.start_check(&handle)?;
+            handle.wait_until_initialized().await?;
+            assert_eq!(handle.stats().progress_bytes, total);
+            assert_eq!(next(&mut heard).await?, announce(Some("started")));
+            answered(&handle).await?;
+            let queries = tracker.queries.lock().clone();
+            assert_eq!(queries.len(), 1, "{queries:?}");
+            drop(tracker);
+            session.stop().await;
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_running_check_of_files_that_changed_starts_over() -> anyhow::Result<()> {
+            a_check_of_files_that_changed_starts_over("changed_under_check", false).await
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_paused_check_of_files_that_changed_starts_over() -> anyhow::Result<()> {
+            a_check_of_files_that_changed_starts_over("changed_under_paused_check", true).await
         }
     }
 

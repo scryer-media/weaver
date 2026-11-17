@@ -722,6 +722,78 @@ async fn a_connect_admits_the_peer_only_over_utp_and_a_local_one_only_from_a_loc
     assert_eq!(holepunches(&with, HolepunchEvent::Connect), 1);
 }
 
+/// A private torrent on a session that speaks uTP only, so a holepunch
+/// connect would be dialled were it taken.
+async fn private_utp_harness(name: &str) -> Harness {
+    let opts = SessionOptions {
+        listen: Some(crate::ListenerOptions {
+            mode: crate::ListenerMode::UtpOnly,
+            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            ..Default::default()
+        }),
+        ..isolated_session_opts(false)
+    };
+    let out = TempDir::with_prefix(name).unwrap();
+    let session = Session::new_with_opts(out.path().into(), opts)
+        .await
+        .unwrap();
+    let mut torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
+        .await
+        .unwrap();
+    torrent.torrent = crate::tests::e2e_tracker_announces::made_private(&torrent.torrent).unwrap();
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        ..Default::default()
+    };
+    let have = BF::from_boxed_slice(vec![0x00].into());
+    let h = Harness::adding(session, out, torrent, crate::Checkpoint::pieces(have), add).await;
+    assert!(h.live.metadata.info.info().private);
+    h
+}
+
+// Operator ruling 2026-11-16, departing from libtorrent
+// `bt_peer_connection::on_holepunch`, `connect` (bt_peer_connection.cpp:1629,
+// v2.0.15): a private torrent takes no peer a holepunch names. A connect that
+// a public torrent on the same session would dial, from a local peer naming
+// a local address over uTP, is ignored: the address joins no peer list, so
+// it is never dialled.
+#[tokio::test]
+async fn a_private_torrent_dials_no_address_a_holepunch_connect_names() {
+    let target = closed_port();
+    let h = private_utp_harness("holepunch_private_connect").await;
+    let (from, _rx) = h.holepunch_peer("127.0.0.1:6881", true);
+    // Still advertised, as on every connection.
+    assert_eq!(
+        h.advertised(&from).ut_holepunch,
+        Some(MY_EXTENDED_UT_HOLEPUNCH)
+    );
+    send_holepunch(&from, UtHolepunch::Connect(target)).await;
+    assert!(!h.knows(&target.to_string()));
+    assert_eq!(holepunches(&h, HolepunchEvent::ConnectIgnored), 1);
+    assert_eq!(holepunches(&h, HolepunchEvent::Connect), 0);
+}
+
+// Operator ruling 2026-11-16, departing from libtorrent
+// `bt_peer_connection::on_holepunch`, `rendezvous`
+// (bt_peer_connection.cpp:1593-1622, v2.0.15): a private torrent introduces
+// no peer to another. The asker is told "no support", and the peer it named
+// is told nothing, though both are connected and speak the extension.
+#[tokio::test]
+async fn a_private_torrent_refuses_a_rendezvous() {
+    use ut_holepunch::error::NO_SUPPORT;
+    let h = private_utp_harness("holepunch_private_rendezvous").await;
+    let (a, mut a_rx) = h.holepunch_peer("203.0.113.1:6881", true);
+    let (_b, mut b_rx) = h.holepunch_peer("203.0.113.2:6881", true);
+    send_holepunch(&a, UtHolepunch::Rendezvous(sock("203.0.113.2:6881"))).await;
+    assert_eq!(
+        holepunch_sent(&mut a_rx),
+        [UtHolepunch::Error(sock("203.0.113.2:6881"), NO_SUPPORT)]
+    );
+    assert_eq!(holepunch_sent(&mut b_rx), []);
+    assert_eq!(holepunches(&h, HolepunchEvent::Refused), 1);
+    assert_eq!(holepunches(&h, HolepunchEvent::Introduced), 0);
+}
+
 /// A PEX message naming `addr` with `flags`.
 fn pex_flagged(addr: SocketAddr, flags: u8) -> Vec<u8> {
     let SocketAddr::V4(v4) = addr else {

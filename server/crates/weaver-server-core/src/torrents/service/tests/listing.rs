@@ -488,29 +488,11 @@ fn the_tables_pick_is_the_walk_of_every_record() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tables_pick_is_the_walk_of_every_record_on_postgres() {
     use crate::persistence::database_target::DatabaseTarget;
-    let Some(base_url) = std::env::var("WEAVER_TEST_POSTGRES_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
+    let Some((admin, schema, url)) =
+        crate::persistence::connection::tests::create_postgres_test_schema("torrent_list").await
     else {
-        eprintln!("skipping the torrent list on PostgreSQL; WEAVER_TEST_POSTGRES_URL is not set");
         return;
     };
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let schema = format!("weaver_torrent_list_{}_{suffix}", std::process::id());
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&base_url)
-        .await
-        .unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let separator = if base_url.contains('?') { '&' } else { '?' };
-    let url = format!("{base_url}{separator}options=-csearch_path%3D{schema}");
     tokio::task::spawn_blocking(move || {
         let db = Database::open_target(DatabaseTarget::PostgresUrl(url)).unwrap();
         picks_are_the_walk_of_every_record(&db);
@@ -526,7 +508,7 @@ async fn the_tables_pick_is_the_walk_of_every_record_on_postgres() {
 }
 
 fn picks_are_the_walk_of_every_record(db: &Database) {
-    use crate::schema_migrations::torrent_private_v125::tiny_metainfo;
+    use crate::schema_migrations::torrent_private_v126::tiny_metainfo;
     use crate::torrents::service::metainfo_is_private;
     const SEEDED: u64 = 3000;
     let category = |id: u32, name: &str| CategoryConfig {

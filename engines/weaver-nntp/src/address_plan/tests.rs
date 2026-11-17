@@ -366,6 +366,57 @@ fn a_resolve_that_answers_nothing_keeps_the_last_candidates() {
     assert_eq!(candidates, vec![pinned, other]);
 }
 
+// Runs `work` as a dial under the DNS setting `choice` would.
+fn under<R>(choice: weaver_tunnel::pipe::DnsChoice, work: impl FnOnce() -> R) -> R {
+    weaver_tunnel::pipe::Names::sync_scope(
+        Some(weaver_tunnel::pipe::Names::new(choice, None)),
+        work,
+    )
+}
+
+fn proxy_naming() -> weaver_tunnel::pipe::DnsChoice {
+    weaver_tunnel::pipe::DnsChoice::Proxy {
+        trust: weaver_tunnel::dns::Trust::AsSent,
+        system_fallback: true,
+    }
+}
+
+#[test]
+fn a_resolve_that_answers_nothing_under_the_same_dns_setting_keeps_the_last_candidates() {
+    let (pinned, other) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, other]);
+    let plan = plan();
+    under(proxy_naming(), || pin(&plan, &dialer, pinned, &[other]));
+    plan.age_pin_by(ADDRESS_REPLAN_INTERVAL);
+    dialer.resolve_to_nothing();
+
+    let hold_pinned = dialer.gate(pinned);
+    let (_, raced) = under(proxy_naming(), || plan.connect(&dialer)).unwrap();
+    drop(hold_pinned);
+
+    assert_eq!(raced, other);
+}
+
+#[test]
+fn a_resolve_that_answers_nothing_under_a_new_dns_setting_dials_nothing() {
+    let (pinned, other) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, other]);
+    let plan = plan();
+    under(weaver_tunnel::pipe::DnsChoice::System, || {
+        pin(&plan, &dialer, pinned, &[other])
+    });
+    dialer.resolve_to_nothing();
+
+    let error = under(proxy_naming(), || plan.connect(&dialer)).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(dialer.take_dialled().is_empty());
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.pinned, None);
+    assert!(snapshot.addresses.is_empty());
+    assert_eq!(snapshot.races_won, 1);
+}
+
 #[test]
 fn a_first_race_with_nothing_resolved_fails_the_connect() {
     let dialer = ScriptedDialer::new(&[]);

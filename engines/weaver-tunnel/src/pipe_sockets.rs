@@ -43,14 +43,25 @@
 // as a dialer that tries another transport when there is none, presses for
 // that look once it uses what it was given, as the bandwidth rule counts a
 // side pressing, and for that division only.
+//
+// Connections kept between lookups (`Keeper`) hold bytes nothing is using,
+// each the bytes its socket reserved when it was dialled. A claim that does
+// not fit closes as many of them as it needs, the oldest first, and no more:
+// bytes already closing count as on their way back, so a second claim closes
+// nothing for bytes the first freed. A kept connection's tunnel socket is
+// reset, so the tunnel frees the socket and its bytes are back before the
+// claim looks again: nothing kept makes a claim fail or wait. A look at room
+// closes nothing, and counts what closing the
+// kept connections would give. A connection newly kept rings its class's
+// slot, so a waiter refused while it was in use comes back to close it.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::Notify;
 
-use super::{LISTEN_BACKLOG, Purpose};
-use crate::wireguard::{TcpBuffers, WgTcpStream};
+use super::{Held, Keeper, LISTEN_BACKLOG, Purpose};
+use crate::wireguard::{TcpBuffers, WgTcpAborter, WgTcpStream};
 use proxy_tunnels::SlotFreed;
 
 const KIB: u64 = 1024;
@@ -247,6 +258,7 @@ impl SocketBudget {
     }
 }
 
+#[derive(Clone)]
 struct Ledger {
     budget: SocketBudget,
     // Bytes and sockets held by each side, then the reserve, and the bytes
@@ -553,16 +565,30 @@ impl SocketPermit {
     // the permit gives them back. Whichever goes first, the bytes come back
     // exactly once, when the permit goes.
     pub fn for_stream(self) -> (SocketPermit, StreamOpen) {
-        let stream = Arc::new(StreamEnd::default());
+        let mut permit = self;
+        // The stream's side, made already when the permit was marked
+        // reclaimable.
+        let stream = permit.stream.take().unwrap_or_default();
         let open = StreamOpen {
-            shares: Arc::clone(&self.shares),
-            kind: self.kind,
-            bytes: self.bytes,
+            shares: Arc::clone(&permit.shares),
+            kind: permit.kind,
+            bytes: permit.bytes,
             stream: Arc::clone(&stream),
         };
-        let mut permit = self;
         permit.stream = Some(stream);
         (permit, open)
+    }
+
+    // What a connection kept on this socket of `class` registers with its
+    // keeper: the bytes, and the stream's side, which resets its socket.
+    pub(crate) fn reclaimable(&mut self, class: SocketClass) -> Reclaimable {
+        let stream = self.stream.get_or_insert_with(Arc::default);
+        Reclaimable {
+            shares: Arc::downgrade(&self.shares),
+            class,
+            bytes: self.bytes,
+            stream: Arc::clone(stream),
+        }
     }
 }
 
@@ -573,13 +599,59 @@ impl Drop for SocketPermit {
     }
 }
 
-// What a split stream's two sides know of each other, read and written only
-// under the ledger's lock: whether the stream was dropped and counted
-// closing, and whether the tunnel freed the socket.
+// What a split stream's two sides know of each other, the flags read and
+// written only under the ledger's lock: whether the stream was dropped and
+// counted closing, and whether the tunnel freed the socket.
 #[derive(Default)]
 struct StreamEnd {
     closed: AtomicBool,
     freed: AtomicBool,
+    // What resets the stream's tunnel socket, for a stream a kept connection
+    // may ride: set once the tunnel holds the socket.
+    aborter: OnceLock<WgTcpAborter>,
+}
+
+// The socket a kept connection holds, as its keeper's share reads and
+// reclaims it: the class and bytes it reserved, and the stream's side.
+// Holds the tunnel's bytes weakly.
+#[derive(Clone)]
+pub(crate) struct Reclaimable {
+    shares: std::sync::Weak<Shares>,
+    class: SocketClass,
+    bytes: u64,
+    stream: Arc<StreamEnd>,
+}
+
+impl Reclaimable {
+    pub(crate) fn held(&self) -> Held {
+        (self.class, self.bytes)
+    }
+
+    // The connection was closed to make room. Its tunnel socket is reset:
+    // the tunnel frees the socket at once, without waiting on the far side,
+    // and the bytes are back before this returns. A stream on no tunnel
+    // socket gave its bytes back as the connection was dropped. Called with
+    // no lock of the ledger's or a keeper's held: the reset hands the bytes
+    // back, which takes the ledger's lock.
+    pub(crate) fn reclaimed(&self) {
+        if let Some(aborter) = self.stream.aborter.get() {
+            aborter.abort();
+        }
+    }
+
+    // Whether the stream can be reset to free its socket at once.
+    #[cfg(test)]
+    pub(crate) fn aborts(&self) -> bool {
+        self.stream.aborter.get().is_some()
+    }
+
+    // The connection is now kept, its bytes reclaimable: a claim of its
+    // class waiting for bytes looks again.
+    pub(crate) fn kept(&self) {
+        if let Some(shares) = self.shares.upgrade() {
+            shares.freed[self.class.index()].notify().notify_waiters();
+        }
+    }
 }
 
 // The stream's side of a TCP stream's bytes, held by the stream while it is
@@ -616,14 +688,33 @@ impl StreamSocket {
     }
 
     // `stream`'s socket holds these bytes: its tunnel holds the permit
-    // until it frees the socket. Taking the tunnel's stack lock here, this
-    // holds no lock of the ledger's.
+    // until it frees the socket. A stream a kept connection may ride, marked
+    // reclaimable, keeps what resets the socket; no other makes one. Taking
+    // the tunnel's stack lock here, this holds no lock of the ledger's.
     pub fn hold_in(&mut self, stream: &WgTcpStream) {
         if let Some(permit) = self.permit.take() {
+            if let Some(end) = &permit.stream {
+                end.aborter.get_or_init(|| stream.aborter());
+            }
             let (permit, open) = permit.for_stream();
             stream.hold_until_freed(permit);
             self.open = Some(open);
         }
+    }
+
+    // What a connection kept on this stream of `class` registers with its
+    // keeper, while the dial still holds the stream's bytes: none for a
+    // stream that holds none.
+    pub(crate) fn reclaimable(&mut self, class: SocketClass) -> Option<Reclaimable> {
+        Some(self.permit.as_mut()?.reclaimable(class))
+    }
+
+    // Whether the stream's tunnel socket can be reset to free it at once.
+    #[cfg(test)]
+    pub(crate) fn aborts(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.stream.aborter.get().is_some())
     }
 
     // `SocketPermit::connected_signal`, while this stream holds bytes.
@@ -713,10 +804,12 @@ impl Drop for Want {
 }
 
 // A session's bytes. A session without them, any but a WireGuard one, holds
-// its sockets to no budget at all.
+// its sockets to no budget at all. Its keeper holds the connections kept
+// between lookups that hold its reserve bytes.
 #[derive(Default)]
 pub struct SessionSockets {
     shares: Option<Arc<Shares>>,
+    keeper: Keeper,
 }
 
 impl SessionSockets {
@@ -744,6 +837,55 @@ impl SessionSockets {
         shares.publish(&shares.ledger());
         Self {
             shares: Some(shares),
+            keeper: Keeper::default(),
+        }
+    }
+
+    // What keeps connections between lookups on this session's bytes.
+    pub fn keeper(&self) -> &Keeper {
+        &self.keeper
+    }
+
+    // How many kept connections a claim of `bytes` of `class` needs closed
+    // to fit, counting the bytes of streams already closing as back: none
+    // when it fits without, when those bytes suffice, or when closing every
+    // kept connection would not make it fit. A claim fitting as the ledger
+    // stands reads nothing more. Kept connections help a claim of the class
+    // their bytes are held in, and another class's only while the reserve
+    // holds past its bytes: within them, the reserve's bytes are off the
+    // sides' and below the tunnel's, so closing one never fits another. Reads
+    // the ledger alone, then the keeper alone, then the ledger again, and
+    // closes nothing.
+    fn kept_needed(&self, inner: &Shares, class: SocketClass, bytes: u64) -> usize {
+        let over = {
+            let ledger = inner.ledger();
+            if fits(&ledger, &*inner.divider, class, bytes) {
+                return 0;
+            }
+            ledger.held[RESERVE] > ledger.budget.reserve
+        };
+        let kept = self.keeper.held();
+        if !kept.iter().any(|(holds, _)| *holds == class || over) {
+            return 0;
+        }
+        let mut ledger = inner.ledger().clone();
+        reclaim_count(&mut ledger, &*inner.divider, class, bytes, &kept)
+    }
+
+    // Close the kept connections a claim of `bytes` of `class` needs, the
+    // oldest first. Each one's bytes are back before this returns: its
+    // tunnel socket is reset.
+    // A reclaim that found its connection already taken for a
+    // lookup closed nothing and is not counted. Runs with no lock of the
+    // ledger's held: closing takes it.
+    fn make_room(&self, class: SocketClass, bytes: u64) {
+        let Some(inner) = &self.shares else {
+            return;
+        };
+        for _ in 0..self.kept_needed(inner, class, bytes) {
+            if !self.keeper.reclaim() {
+                break;
+            }
         }
     }
 
@@ -782,16 +924,27 @@ impl SessionSockets {
     // A side refused that uses what it was given looks with its want: what
     // each side is given is shared out again with it. A look alone asks no
     // side to give anything back, and leaves no demand.
+    //
+    // Closing kept connections would make room counts as room: the claim
+    // that follows closes them. The look itself closes nothing.
     pub fn room(&self, class: SocketClass, bytes: u64) -> Result<(), SlotFreed> {
-        self.look(class, bytes, false)
-            .map_err(|refused| refused.freed)
+        match self.look(class, bytes, false) {
+            Ok(()) => Ok(()),
+            Err(refused) => match &self.shares {
+                Some(inner) if self.kept_needed(inner, class, bytes) > 0 => Ok(()),
+                _ => Err(refused.freed),
+            },
+        }
     }
 
     // As `room`, but a side refused only because another holds past its
     // share is handed a `Demand`, as a refused hand-out is: while the caller
     // holds it the side presses and the other owes what it holds past its
-    // share. A side at or past its own share is handed none.
+    // share. A side at or past its own share is handed none. First closes
+    // the kept connections whose bytes the caller needs, so it waits for
+    // them to come back rather than behind a connection nobody closes.
     pub fn wait_room(&self, class: SocketClass, bytes: u64) -> Result<(), Refused> {
+        self.make_room(class, bytes);
         self.look(class, bytes, true)
     }
 
@@ -842,14 +995,22 @@ impl SessionSockets {
     // the sockets of `class` open now, the signal that bytes come back and,
     // for a side, the `Demand` the refusal leaves. A refusal divides the
     // sides again with the side refused pressing. A session without a
-    // budget hands out no permits.
+    // budget hands out no permits. First closes the kept connections whose
+    // bytes it needs; their bytes are back before it looks again.
     pub fn take(&self, class: SocketClass, bytes: u64) -> Result<Option<SocketPermit>, Refused> {
         let Some(inner) = &self.shares else {
             return Ok(None);
         };
-        let mut ledger = inner.ledger();
         let kind = class.index();
+        let mut ledger = inner.ledger();
         let mut fit = fits(&ledger, &*inner.divider, class, bytes);
+        if !fit {
+            // Only a claim that does not fit reads what is kept.
+            drop(ledger);
+            self.make_room(class, bytes);
+            ledger = inner.ledger();
+            fit = fits(&ledger, &*inner.divider, class, bytes);
+        }
         let mut pressed = None;
         if !fit && let Some(side) = class.side() {
             // The refusal presses for the division that may yet fit it.
@@ -1033,6 +1194,98 @@ fn fits(ledger: &Ledger, divider: &dyn SocketDivider, class: SocketClass, bytes:
                     && ledger.sides_held() + bytes <= ledger.sides()
             }
         }
+}
+
+// Whether `bytes` of `class` fit in `ledger`, a copy, as `take` would divide
+// for it: as it stands, or for a side, divided again with it pressing.
+fn fits_divided(
+    ledger: &mut Ledger,
+    divider: &dyn SocketDivider,
+    class: SocketClass,
+    bytes: u64,
+) -> bool {
+    if fits(ledger, divider, class, bytes) {
+        return true;
+    }
+    let Some(side) = class.side() else {
+        return false;
+    };
+    ledger.press(side, bytes);
+    ledger.divide(divider, [0; SIDES]);
+    let fit = fits(ledger, divider, class, bytes);
+    ledger.unpress(side, bytes);
+    fit
+}
+
+// How many of the `kept` connections, oldest first, each at the class and
+// bytes its socket reserved, `ledger`, a copy, must close for `bytes` of
+// `class` to fit, as `take` would divide for it: none when it fits as it
+// is, or once the bytes of streams already closing are back, and none when
+// closing all of them would not make it fit.
+fn reclaim_count(
+    ledger: &mut Ledger,
+    divider: &dyn SocketDivider,
+    class: SocketClass,
+    bytes: u64,
+    kept: &[Held],
+) -> usize {
+    let fit = |ledger: &mut Ledger| fits_divided(ledger, divider, class, bytes);
+    if fit(ledger) {
+        return 0;
+    }
+    for kind in 0..KINDS {
+        ledger.held[kind] -= ledger.closing[kind];
+        ledger.closing[kind] = 0;
+    }
+    if fit(ledger) {
+        return 0;
+    }
+    for (needed, (holds, each)) in (1..).zip(kept) {
+        let kind = holds.index();
+        let Some(held) = ledger.held[kind].checked_sub(*each) else {
+            return 0;
+        };
+        ledger.held[kind] = held;
+        if fit(ledger) {
+            return needed;
+        }
+    }
+    0
+}
+
+// A session whose reserve holds `streams` DNS streams, and nothing else: no
+// side, and nothing kept for torrent sessions.
+#[cfg(test)]
+pub(crate) fn reserve_of(streams: u64) -> SessionSockets {
+    struct NoSides;
+    impl SocketDivider for NoSides {
+        fn shares(&self, _: u64) -> [u64; SIDES] {
+            [0; SIDES]
+        }
+        fn share_out(&self, _: u64, _: &[u64], _: &[Option<u64>], _: &[u64]) -> Vec<u64> {
+            vec![0; SIDES]
+        }
+        fn presses(&self, _: u64, _: u64) -> bool {
+            false
+        }
+    }
+    const MTU: u16 = 1420;
+    let reserve = streams * dns_stream_bytes();
+    SessionSockets::new(
+        SocketBudget {
+            bytes: overhead_bytes(MTU) + reserve,
+            reserve,
+            torrent_kept: 0,
+            mtu: MTU,
+        },
+        Arc::new(NoSides),
+    )
+}
+
+// What one DNS stream holds.
+#[cfg(test)]
+pub(crate) fn dns_stream_bytes() -> u64 {
+    stream_bytes(super::socket_buffers(&Purpose::Dns))
 }
 
 #[cfg(test)]

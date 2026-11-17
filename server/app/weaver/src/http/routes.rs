@@ -124,6 +124,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         http_metrics,
         restart,
         torrents,
+        torrent_availability,
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
@@ -206,6 +207,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .route("/readyz", get(super::health::readyz_handler))
         .merge(nzbget_rpc_routes)
         .merge(super::torrent_facade::build_torrent_facade_routes(
+            torrent_availability,
             torrent_facade,
         ))
         .route("/graphql", post(super::graphql::graphql_handler))

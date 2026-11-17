@@ -24,7 +24,7 @@ use crate::buffers::ByteBuf;
 use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
-    net::{ClientShape, HttpClients, Resolver},
+    net::{ClientShape, HttpClients, Resolver, TorrentNaming},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::TorrentMetaV1Owned,
 };
@@ -474,6 +474,15 @@ impl Session {
 
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    /// How a torrent added with no naming of its own looks names up and
+    /// asks over HTTP: the session's resolver and clients.
+    pub fn naming(&self) -> TorrentNaming {
+        TorrentNaming {
+            resolver: self.resolver.clone(),
+            http_clients: self.http_clients.clone(),
+        }
     }
 
     pub fn get_dht(&self) -> Option<&Dht> {

@@ -94,19 +94,28 @@ pub struct RouteInput {
     pub legs: Vec<RouteLegInput>,
     #[graphql(default)]
     pub failover: RouteFailover,
+    /// The DNS profile the route's names follow. Null or absent keeps a
+    /// saved route's profile, and is the built-in System profile, 0, for a
+    /// new one.
+    pub dns_profile_id: Option<u32>,
 }
 #[derive(Clone, PartialEq, SimpleObject)]
 #[graphql(name = "Route")]
 pub struct RouteGql {
     pub legs: Vec<RouteLegGql>,
     pub failover: RouteFailover,
+    /// The DNS profile the route's names follow; 0 is the built-in System
+    /// profile.
+    pub dns_profile_id: u32,
 }
 impl From<core::RoutingPolicy> for RouteGql {
     fn from(policy: core::RoutingPolicy) -> Self {
+        let dns_profile_id = policy.dns_profile();
         let route = policy.route();
         Self {
             legs: route.legs.into_iter().map(Into::into).collect(),
             failover: route.failover.into(),
+            dns_profile_id,
         }
     }
 }
@@ -118,10 +127,12 @@ pub(crate) fn selected_policy(
         (Some(_), Some(_)) => Err(refusal_error(NetworkRefusal::RouteAndRoutingBoth)),
         (Some(legacy), None) => Ok(Some(legacy.into())),
         (None, Some(input)) => {
+            let dns_profile_id = input.dns_profile_id;
             let route = input.route()?;
             Ok(Some(core::RoutingPolicy {
                 legs: route.legs,
                 failover: route.failover,
+                dns_profile_id,
                 ..Default::default()
             }))
         }
@@ -758,6 +769,11 @@ pub enum LookupErrorCode {
     TimedOut,
     ServerFailure,
     NoReply,
+    // The answer failed DNSSEC validation.
+    Bogus,
+    // The server returns no DNSSEC records, so nothing could be validated.
+    DnssecUnavailable,
+    TlsFailed,
     Other,
 }
 impl From<core::LookupFailure> for LookupErrorCode {
@@ -768,7 +784,31 @@ impl From<core::LookupFailure> for LookupErrorCode {
             core::LookupFailure::TimedOut => Self::TimedOut,
             core::LookupFailure::ServerFailure => Self::ServerFailure,
             core::LookupFailure::NoReply => Self::NoReply,
+            core::LookupFailure::Bogus => Self::Bogus,
+            core::LookupFailure::DnssecUnavailable => Self::DnssecUnavailable,
+            core::LookupFailure::TlsFailed => Self::TlsFailed,
             core::LookupFailure::Other => Self::Other,
+        }
+    }
+}
+// What a lookup's answer from listed servers was taken as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum LookupTrust {
+    AsSent,
+    // Weaver checked its DNSSEC signatures and they held.
+    Validated,
+    // The zone is not signed, so there was nothing to check.
+    Unsigned,
+    // Refused, as its DNSSEC signatures failed Weaver's check.
+    Bogus,
+}
+impl From<core::TrustOutcome> for LookupTrust {
+    fn from(value: core::TrustOutcome) -> Self {
+        match value {
+            core::TrustOutcome::AsSent => Self::AsSent,
+            core::TrustOutcome::Validated => Self::Validated,
+            core::TrustOutcome::Unsigned => Self::Unsigned,
+            core::TrustOutcome::Bogus => Self::Bogus,
         }
     }
 }
@@ -785,6 +825,12 @@ pub struct HostResolution {
     // The proxy that resolved it, or that Weaver asked through.
     pub proxy_id: Option<u32>,
     pub dns_servers: Vec<String>,
+    // The wire the servers were asked over, when servers were asked.
+    pub wire: Option<crate::dns::DnsWire>,
+    // The listed server whose answer was used, when one answered.
+    pub answered_by: Option<String>,
+    // What the servers' answer was taken as, when one came to judge.
+    pub trust: Option<LookupTrust>,
     pub addresses: Vec<String>,
     // The answer was held from an earlier lookup.
     pub cached: bool,
@@ -798,6 +844,9 @@ impl From<core::HostResolution> for HostResolution {
             resolved_by: value.by.into(),
             proxy_id: value.proxy,
             dns_servers: value.servers.iter().map(ToString::to_string).collect(),
+            wire: value.wire.map(Into::into),
+            answered_by: value.answered_by.map(|ip| ip.to_string()),
+            trust: value.trust.map(Into::into),
             addresses: value.addresses.iter().map(ToString::to_string).collect(),
             cached: value.cached,
             connected_address: value.connected.map(|ip| ip.to_string()),
@@ -851,6 +900,7 @@ fn direct_on(egress_id: u32) -> core::Route {
 async fn test_via(
     runtime: &ProxyRuntime,
     route: &core::Route,
+    dns_profile: u32,
     subject: core::TestSubject,
     target: Option<(String, u16)>,
 ) -> Result<Vec<core::PathTest>> {
@@ -862,7 +912,11 @@ async fn test_via(
                 > + Send
                 + '_,
         >,
-    > = Box::pin(runtime.network.test_via(route, subject, target));
+    > = Box::pin(
+        runtime
+            .network
+            .test_via(route, dns_profile, subject, target),
+    );
     test.await.map_err(refusal_error)
 }
 // The test torrent over every path through a route of one torrent leg.
@@ -870,9 +924,15 @@ async fn test_via_torrent(
     ctx: &Context<'_>,
     runtime: &ProxyRuntime,
     route: &core::Route,
+    dns_profile: u32,
     subject: core::TestSubject,
     target: Option<(String, u16)>,
 ) -> Result<Vec<core::PathTest>> {
+    // A server without torrents runs no test torrent: nothing is fetched,
+    // announced or dialled.
+    ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?
+        .may_test()
+        .map_err(refusal_error)?;
     route.legs.first().ok_or("the route has no leg")?;
     // Tests point the test torrent at a loopback source.
     let source = ctx
@@ -900,6 +960,7 @@ async fn test_via_torrent(
             >,
         > = Box::pin(runtime.network.test_via_torrent(
             route,
+            dns_profile,
             subject,
             target,
             core::P2pTest {
@@ -984,6 +1045,9 @@ pub struct NetworkRoute {
     pub consumer: String,
     pub legs: Vec<RouteLegGql>,
     pub failover: RouteFailover,
+    /// The DNS profile the route's names follow; 0 is the built-in System
+    /// profile.
+    pub dns_profile_id: u32,
 }
 #[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkLegFlow {
@@ -1420,7 +1484,7 @@ impl NetworkingQuery {
             && matches!(visible.as_slice(), [interface]
             if interface.name == "eth0" && interface.addresses.iter().any(|address|
                 matches!(address.address, std::net::IpAddr::V4(ip) if ip.is_private())));
-        let mut notes = vec!["Direct destinations and proxy endpoints use the system DNS resolver; selecting an egress does not bind those DNS lookups.".into()];
+        let mut notes = vec!["Every name a route dials is looked up as its DNS profile says. The built-in System profile uses the system DNS resolver, and selecting an egress does not bind those lookups.".into()];
         if bridge_network_suspected {
             notes.push("Only container interfaces are visible. Use host networking for host-link selection, or attach multiple container networks.".into());
         }
@@ -1448,11 +1512,13 @@ impl NetworkingQuery {
                 .await?
                 .into_iter()
                 .map(|(consumer, p)| {
+                    let dns_profile_id = p.dns_profile();
                     let r = p.route();
                     NetworkRoute {
                         consumer,
                         legs: r.legs.into_iter().map(Into::into).collect(),
                         failover: r.failover.into(),
+                        dns_profile_id,
                     }
                 })
                 .collect(),
@@ -1682,14 +1748,16 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
+        let dns_profile_id = input.dns_profile_id;
         let route = input.route()?;
         let consumer = kind.consumer(id);
         let policy = core::RoutingPolicy {
             legs: route.legs.clone(),
             failover: route.failover,
+            dns_profile_id,
             ..Default::default()
         };
-        spawn_blocking_db("network.save_route", move || {
+        let saved = spawn_blocking_db("network.save_route", move || {
             let exists = match consumer {
                 core::Consumer::Server(id) => {
                     db.list_servers()?.iter().any(|server| server.id == id)
@@ -1709,7 +1777,8 @@ impl NetworkingMutation {
             if !exists {
                 return Err(NetworkRefusal::RouteConsumerGone.into());
             }
-            db.save_proxy_routing_policy(consumer, &policy)
+            db.save_proxy_routing_policy(consumer, &policy)?;
+            db.proxy_routing_policy(consumer)
         })
         .await?;
         runtime.reload().await.map_err(async_graphql::Error::new)?;
@@ -1717,6 +1786,7 @@ impl NetworkingMutation {
             consumer: consumer.key(),
             legs: route.legs.into_iter().map(Into::into).collect(),
             failover: route.failover.into(),
+            dns_profile_id: saved.dns_profile(),
         })
     }
     // Tests every path through a drafted route, with a proxy or a pool on
@@ -1736,6 +1806,7 @@ impl NetworkingMutation {
         #[graphql(default = false)] torrent: bool,
     ) -> Result<Vec<PathTestResult>> {
         let runtime = runtime(ctx)?;
+        let dns_profile = route.dns_profile_id.unwrap_or(core::SYSTEM_DNS_PROFILE_ID);
         let route = route.route()?;
         let subject = match subject {
             None => core::TestSubject::Route,
@@ -1744,9 +1815,9 @@ impl NetworkingMutation {
         };
         let target = target.map(|target| (target.host, target.port));
         let tests = if torrent {
-            test_via_torrent(ctx, &runtime, &route, subject, target).await?
+            test_via_torrent(ctx, &runtime, &route, dns_profile, subject, target).await?
         } else {
-            test_via(&runtime, &route, subject, target).await?
+            test_via(&runtime, &route, dns_profile, subject, target).await?
         };
         Ok(tests.into_iter().map(Into::into).collect())
     }
@@ -1764,12 +1835,18 @@ impl NetworkingMutation {
     ) -> Result<EgressTestResult> {
         let runtime = runtime(ctx)?;
         let subject = proxy_id.map_or(core::TestSubject::Route, core::TestSubject::Proxy);
-        test_via(&runtime, &direct_on(id), subject, Some((host, port)))
-            .await?
-            .into_iter()
-            .next()
-            .map(Into::into)
-            .ok_or_else(|| "the test tried no path".into())
+        test_via(
+            &runtime,
+            &direct_on(id),
+            core::SYSTEM_DNS_PROFILE_ID,
+            subject,
+            Some((host, port)),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .map(Into::into)
+        .ok_or_else(|| "the test tried no path".into())
     }
     #[graphql(
         guard = "AdminGuard",
@@ -1801,6 +1878,7 @@ impl NetworkingMutation {
         Ok(test_via(
             &runtime,
             &direct_on(egress_id),
+            core::SYSTEM_DNS_PROFILE_ID,
             core::TestSubject::Members(id),
             target,
         )

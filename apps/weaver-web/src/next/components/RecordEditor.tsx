@@ -35,6 +35,7 @@ export function RecordEditor({
   note,
   sections,
   error,
+  errorCode,
   busy = false,
   saveLabel,
   saveDisabled = false,
@@ -53,6 +54,8 @@ export function RecordEditor({
   note?: ReactNode;
   sections: readonly EditorSection[];
   error?: string | null;
+  /** The code of the problem the error line shows, when the editor found it itself. */
+  errorCode?: string | null;
   busy?: boolean;
   saveLabel?: string;
   saveDisabled?: boolean;
@@ -103,7 +106,7 @@ export function RecordEditor({
       ))}
       {children}
       {error ? (
-        <div data-testid={testIds.editorError} className="flex-none border-t border-wv-hairline px-4 sm:px-6 py-4 text-[12.5px] leading-[1.5] text-wv-error-text">
+        <div data-testid={testIds.editorError} data-problem={errorCode ?? undefined} className="flex-none border-t border-wv-hairline px-4 sm:px-6 py-4 text-[12.5px] leading-[1.5] text-wv-error-text">
           {error}
         </div>
       ) : null}

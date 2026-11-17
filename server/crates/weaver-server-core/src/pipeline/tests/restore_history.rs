@@ -2640,3 +2640,44 @@ async fn a_retired_job_joins_the_finished_jobs() {
     let listed = pipeline.shared_state.get_job(job_id).unwrap();
     assert_eq!(listed.protocol, crate::jobs::model::Protocol::Torrent);
 }
+
+// A torrent's unpacking folder carries its job's marker, and its job is a
+// torrent row, in neither the queue's rows nor history. Housekeeping leaves
+// it however old the marker is, live or left retiring, and whether or not
+// the server runs torrents: the sweep goes by the rows alone. A marked
+// folder no row accounts for still goes.
+#[tokio::test]
+async fn housekeeping_leaves_a_torrent_s_marked_folder_however_old() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let (live, retiring, rowless) = (JobId(30201), JobId(30202), JobId(30203));
+    let live_dir = marked_working_dir(&intermediate_dir, "torrent-30201", live).await;
+    let retiring_dir = marked_working_dir(&intermediate_dir, "torrent-30202", retiring).await;
+    let rowless_dir = marked_working_dir(&intermediate_dir, "torrent-30203", rowless).await;
+    for (job_id, byte) in [(live, 1_u8), (retiring, 2)] {
+        pipeline
+            .db
+            .insert_torrent(
+                &crate::torrents::tests::torrent(job_id.0, Some([byte; 20]), None),
+                &[],
+            )
+            .unwrap();
+    }
+    pipeline
+        .db
+        .mark_torrents_retiring(&[(retiring, false)])
+        .unwrap();
+    pipeline.report_all_for_test();
+
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(None, after_every_marker())
+        .await;
+
+    assert!(live_dir.join("lantern.part01.rar").exists());
+    assert!(retiring_dir.join("lantern.part01.rar").exists());
+    assert!(!rowless_dir.exists());
+    retire_pipeline_database(pipeline).await;
+}

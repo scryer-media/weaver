@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Migration 125, upgrade step: each torrent already kept takes the privacy
+// Migration 126, upgrade step: each torrent already kept takes the privacy
 // its metainfo gives it.
 //
-// A torrent list keeps a privacy in the table, through an index, so 125
+// A torrent list keeps a privacy in the table, through an index, so 126
 // stores it beside the metainfo, which SQL cannot read. This step reads it
 // from the metainfo of each torrent written before, as a restore reads it,
 // a page of rows at a time by job id: a metainfo can be megabytes, so a page
@@ -15,7 +15,7 @@ use crate::StateError;
 use crate::persistence::sql_runtime::{SqlArg, SqlConn};
 use crate::torrents::service::metainfo_is_private;
 
-pub(crate) const HOOK_ID: &str = "fill_torrent_private_v125";
+pub(crate) const HOOK_ID: &str = "fill_torrent_private_v126";
 
 // The rows a page reads, each with its metainfo, and the most ids one
 // update binds.

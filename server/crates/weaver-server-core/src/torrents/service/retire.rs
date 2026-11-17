@@ -743,7 +743,9 @@ pub(in crate::torrents) struct Deletion {
     pub(in crate::torrents) owner: Option<JobId>,
     // The torrent's own files Weaver made, each removed only as a file.
     pub(in crate::torrents) paths: Vec<PathBuf>,
-    // What its job made of them, files or folders, removed whole.
+    // What its job made of them: unpacked files, each removed only while
+    // its name holds a regular file. A folder or a link found there is not
+    // what the job placed, and stays.
     pub(in crate::torrents) made: Vec<PathBuf>,
     // The directory the files are in.
     pub(in crate::torrents) dir: PathBuf,
@@ -790,9 +792,9 @@ pub(in crate::torrents) fn deletion(
     }
 }
 
-// What a history row lists of a deletion: the torrent's own files, each to
-// go only as a file, what its job made, to go whole, and its unpacking
-// directory while it carries the job's marker, as an NZB job's row records
+// What a history row lists of a deletion: the torrent's own files and what
+// its job made, each to go only as a file, and its unpacking directory, to
+// go whole, while it carries the job's marker, as an NZB job's row records
 // the working directory it kept. Only what is on disk as the row is written:
 // never a path a removal of the torrent with its files just took. Read off
 // the runtime.
@@ -806,10 +808,16 @@ async fn history_files(deletion: Deletion) -> Vec<HistoryFile> {
 }
 
 // [`history_files`], on the calling thread.
-fn listed_files(deletion: &Deletion) -> Vec<HistoryFile> {
+pub(in crate::torrents) fn listed_files(deletion: &Deletion) -> Vec<HistoryFile> {
     {
         let listed = deletion.paths.iter().map(|path| (path.clone(), false));
-        let made = deletion.made.iter().map(|path| (path.clone(), true));
+        // An unpacked file is listed only while its name holds a regular
+        // file: a folder or a link there is someone else's.
+        let made = deletion
+            .made
+            .iter()
+            .filter(|path| is_file(path))
+            .map(|path| (path.clone(), false));
         let work = deletion.work.as_ref().and_then(|(root, work, job_id)| {
             let owned = crate::jobs::working_dir::working_dir_owner(root, work)
                 .is_ok_and(|owner| owner == Some(*job_id));
@@ -934,19 +942,51 @@ fn spare_held(deletion: &mut Deletion, held: &LiveHeld, job_id: JobId) {
         deletion.own = false;
         return;
     }
-    let spared = |path: &Path, whole: bool| {
-        held.holds(path, whole)
-            || path
-                .ancestors()
-                .skip(1)
-                .take_while(|folder| *folder != dir && folder.starts_with(&dir))
-                .any(|folder| {
-                    std::fs::symlink_metadata(folder)
-                        .is_ok_and(|found| found.file_type().is_symlink())
-                })
-    };
-    deletion.paths.retain(|path| !spared(path, false));
-    deletion.made.retain(|path| !spared(path, true));
+    let mut links = Links::under(&dir);
+    let mut spared = |path: &Path| held.holds(path, false) || links.above(path);
+    deletion.paths.retain(|path| !spared(path));
+    deletion.made.retain(|path| !spared(path));
+}
+
+// The one check that a removal under a torrent's folder does not leave it
+// through a link (`SECURITY.md`, "Deletes are narrow"): whether a folder
+// between `dir` and a path is a link. Each folder is read once, never
+// followed. `dir` itself is not judged here.
+pub(in crate::torrents) struct Links<'a> {
+    dir: &'a Path,
+    seen: HashMap<PathBuf, bool>,
+}
+
+impl<'a> Links<'a> {
+    pub(in crate::torrents) fn under(dir: &'a Path) -> Self {
+        Self {
+            dir,
+            seen: HashMap::new(),
+        }
+    }
+
+    // Whether a folder above `path`, inside the folder, is a link.
+    pub(in crate::torrents) fn above(&mut self, path: &Path) -> bool {
+        let dir = self.dir;
+        let seen = &mut self.seen;
+        path.ancestors()
+            .skip(1)
+            .take_while(|folder| *folder != dir && folder.starts_with(dir))
+            .any(|folder| {
+                if let Some(linked) = seen.get(folder) {
+                    return *linked;
+                }
+                let linked = std::fs::symlink_metadata(folder)
+                    .is_ok_and(|found| found.file_type().is_symlink());
+                seen.insert(folder.to_path_buf(), linked);
+                linked
+            })
+    }
+}
+
+// Whether `path` holds a regular file, never following a link.
+fn is_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|found| found.file_type().is_file())
 }
 
 // [`held_of`] for `record` as placed, off the runtime; its whole folder, as
@@ -1171,26 +1211,26 @@ pub(crate) fn remove_history_files(
         return removal;
     }
     // A link between the folder and a file would take the removal out of
-    // it: each folder on the way is read once, never followed.
-    let mut linked: HashMap<PathBuf, bool> = HashMap::new();
-    let mut through_link = |path: &Path| {
-        path.ancestors()
-            .skip(1)
-            .take_while(|at| *at != dir)
-            .any(|at| {
-                *linked.entry(at.to_path_buf()).or_insert_with(|| {
-                    std::fs::symlink_metadata(at).is_ok_and(|found| found.file_type().is_symlink())
-                })
-            })
-    };
+    // it.
+    let mut links = Links::under(dir);
     let mut folders = BTreeSet::new();
+    // The folders its listed files are in, each swept once of the hidden
+    // copies its job's moves left there (`JobMoves`), as a live removal
+    // sweeps them (`delete_written`).
+    let mut swept: HashSet<PathBuf> = HashSet::new();
     for (path, whole) in inside {
         if held.holds(&path, whole) {
             continue;
         }
-        if through_link(&path) {
+        if links.above(&path) {
             tracing::warn!(file = %path.display(), "a torrent's listed file is under a link, and stays");
             continue;
+        }
+        if let Some(folder) = path.parent()
+            && !swept.contains(folder)
+        {
+            swept.insert(folder.to_path_buf());
+            crate::runtime::fs::sweep_move_copies(job_id.0, folder);
         }
         let found = match std::fs::symlink_metadata(&path) {
             Ok(found) => found,
@@ -1238,7 +1278,10 @@ pub(crate) fn remove_history_files(
 // its directory, that this leaves empty and that was not there before the
 // torrent. Whatever else is in its directory stays, and so does a folder
 // found where one of the torrent's files was (`delete_one_file` removes a
-// file, never a folder's contents).
+// file, never a folder's contents). What its job made is an unpacked file:
+// it goes only while its name holds a regular file, so a folder or a link
+// someone put there stays, whole. Nothing goes through a link inside the
+// directory (`Links`), on a live removal as at a start.
 pub(in crate::torrents) fn delete_written(deletion: &Deletion) {
     if let Some((root, work, job_id)) = &deletion.work {
         match crate::jobs::working_dir::remove_job_working_dir(root, work, *job_id) {
@@ -1250,13 +1293,29 @@ pub(in crate::torrents) fn delete_written(deletion: &Deletion) {
         }
     }
     let mut folders = BTreeSet::new();
+    let mut links = Links::under(&deletion.dir);
+    // The folders its unpacked files were moved into, each swept once of
+    // the hidden copies its job's moves left there (`JobMoves`).
+    let mut swept: HashSet<&Path> = HashSet::new();
     let listed = deletion.paths.iter().map(|path| (path, false));
     let made = deletion.made.iter().map(|path| (path, true));
-    for (path, whole) in listed.chain(made) {
+    for (path, made) in listed.chain(made) {
+        if links.above(path) {
+            tracing::warn!(file = %path.display(), "a torrent's file is under a link, and stays");
+            continue;
+        }
+        if let (true, Some(owner), Some(folder)) = (made, deletion.owner, path.parent())
+            && swept.insert(folder)
+        {
+            crate::runtime::fs::sweep_move_copies(owner.0, folder);
+        }
         let removed = match std::fs::symlink_metadata(path) {
-            Ok(found) if found.is_dir() && whole => std::fs::remove_dir_all(path),
             Ok(found) if found.is_dir() => {
                 tracing::warn!(file = %path.display(), "a folder is where a torrent's file was, and stays");
+                Ok(())
+            }
+            Ok(found) if made && !found.file_type().is_file() => {
+                tracing::warn!(file = %path.display(), "an unpacked file's name does not hold a file, and is left");
                 Ok(())
             }
             Ok(_) => std::fs::remove_file(path),

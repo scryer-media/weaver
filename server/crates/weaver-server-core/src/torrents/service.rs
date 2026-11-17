@@ -80,11 +80,11 @@ pub(crate) use intake::metainfo_is_private;
 pub use intake::{AddError, AddRequest, AddSource, Placement};
 use live::{Live, Timed};
 #[cfg(test)]
-pub(in crate::torrents) use moves::move_listed;
+pub(in crate::torrents) use moves::{Listed, Moved, NotMoved, move_listed};
 use queue::QueueEnd;
 pub(crate) use retire::{ListedRemoval, LiveHeld, finish_retiring, remove_history_files};
 #[cfg(test)]
-pub(in crate::torrents) use retire::{delete_written, deletion};
+pub(in crate::torrents) use retire::{delete_written, deletion, listed_files};
 pub use settings::{
     DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEX, Presence, RATIO_GOAL, SCOPE,
     SEED_TIME_COUNTING, SEED_TIME_GOAL, SEEDING_ACTION, SEEDING_MODE, ScheduleSeeding,
@@ -380,6 +380,9 @@ pub enum ActionError {
     Invalid(String),
     #[error("{0}")]
     State(String),
+    // The caller may not use that location (`may_place`).
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 fn state_error(error: StateError) -> String {
@@ -919,6 +922,10 @@ struct Inner {
     entering: Mutex<BTreeMap<JobId, (RunMark, NoRoom)>>,
     // The service stops: a look its stop ended waits for no reading.
     stopping: AtomicBool,
+    // The settings an add makes a category it names in, when it names one
+    // Weaver does not have (`categories::make_category`). Unset, such an
+    // add is refused.
+    categories: std::sync::OnceLock<crate::settings::SharedConfig>,
     // How many settles ran: what a test waits on to know one consumed
     // what the intakes said before it.
     #[cfg(test)]
@@ -997,8 +1004,16 @@ impl TorrentService {
                 relook: Mutex::default(),
                 entering: Mutex::default(),
                 stopping: AtomicBool::new(false),
+                categories: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// The settings an add that names a category Weaver does not have makes
+    /// that category in, as qBittorrent's add does. Set once; a later call
+    /// changes nothing.
+    pub fn make_categories_in(&self, config: crate::settings::SharedConfig) {
+        let _ = self.inner.categories.set(config);
     }
 
     // The torrents that crashed the daemon on its last run, read at start
@@ -1434,6 +1449,92 @@ pub(crate) static MOVE_HOLD: Mutex<
         tokio::sync::oneshot::Receiver<()>,
     )>,
 > = Mutex::new(None);
+
+// Test seam: the write that ends a failed move of placed files, of what the
+// torrent made as the move left it, is refused once.
+#[cfg(test)]
+pub(crate) static MOVE_UNDO_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: holds a move of placed files that forgot the torrent's pieces,
+// before any file moves, until the test lets it go, saying first that it has
+// reached that point.
+#[cfg(test)]
+pub(crate) static MOVE_FORGOT_HOLD: Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = Mutex::new(None);
+
+// Test seam: run with the name each of a torrent's unpacked files is about
+// to move to, the look having found it free, right before the move.
+#[cfg(test)]
+pub(crate) static OUTPUT_MEETS: Mutex<Option<OutputMeets>> = Mutex::new(None);
+#[cfg(test)]
+pub(crate) type OutputMeets = Box<dyn FnMut(&Path) + Send>;
+
+// Test seam: the next placing of a torrent's unpacked files panics once
+// its files have moved, before its row is written.
+#[cfg(test)]
+pub(crate) static PLACE_PANICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: the next write of a torrent's unpacked names to its row is
+// refused.
+#[cfg(test)]
+pub(crate) static KEEP_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: run once a move of a torrent's placed files has moved them,
+// right before the write of the move to its row.
+#[cfg(test)]
+pub(crate) static MOVE_RECORD_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+// Test seam: the next time a torrent's session asks its store to forget
+// every piece for a check, the store refuses.
+#[cfg(test)]
+pub(crate) static CHECK_EVERYTHING_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: run once a move of a torrent's placed files has written the
+// move to its row, the files still held by the move.
+#[cfg(test)]
+pub(crate) static MOVE_RECORDED_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+// Test seam: run as a move of a torrent's placed files begins, after its
+// look at the new place and before any file moves.
+#[cfg(test)]
+pub(crate) static MOVE_BEGIN_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+// Test seam: the next move of a torrent's placed files ends as a crash
+// would end it, its files moved and its row not written.
+#[cfg(test)]
+pub(crate) static MOVE_RECORD_DIES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: holds a move of placed files that will check the torrent
+// again, once the move is over and before any piece is forgotten, until the
+// test lets it go, saying first that it has reached that point.
+#[cfg(test)]
+pub(crate) static MOVE_CHECK_HOLD: Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = Mutex::new(None);
+
+// Test seam: the next check a move owes the torrent once it is over is not
+// begun, as when its pieces could not be forgotten.
+#[cfg(test)]
+pub(crate) static MOVE_CHECK_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: the next write of a move of a torrent's placed files to its
+// row is refused.
+#[cfg(test)]
+pub(crate) static MOVE_RECORD_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: a write of what a torrent holds is refused, 1 once its files
 // moved (`sync_held`), 2 before they move (`hold_destination`).

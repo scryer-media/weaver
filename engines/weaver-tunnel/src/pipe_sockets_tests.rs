@@ -6,6 +6,7 @@
 // split's own rule, in the server's `socket_ledger_tests`.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::*;
 
@@ -242,4 +243,291 @@ async fn nothing_is_handed_out_past_the_tunnels_bytes() {
     assert!(take(&sockets, SocketClass::TorrentSession, peer()).is_none());
     assert_eq!(sockets.owed(SocketClass::Nntp), 7 * peer());
     assert_eq!(sockets.woken(), [true, false]);
+}
+
+// `count` connections kept between lookups, each holding a reserve stream's
+// bytes as a tunnel stream does: the switch each one's closer turns, and the
+// tunnel's half of each stream's bytes, which the test drops as the tunnel
+// would free the socket.
+struct Kept {
+    _registered: Vec<crate::pipe::KeptRegistration>,
+    closed: Vec<Arc<AtomicBool>>,
+    tunnel: Vec<Option<SocketPermit>>,
+}
+
+impl Kept {
+    fn closed(&self, at: usize) -> bool {
+        self.closed[at].load(Ordering::Relaxed)
+    }
+
+    // The tunnel frees the socket of kept connection `at`.
+    fn free(&mut self, at: usize) {
+        self.tunnel[at] = None;
+    }
+}
+
+fn kept(sockets: &SessionSockets, count: usize) -> Kept {
+    kept_of(sockets, count, peer())
+}
+
+// As `kept`, each holding `bytes`.
+fn kept_of(sockets: &SessionSockets, count: usize, bytes: u64) -> Kept {
+    let handle = sockets.keeper().handle();
+    let mut kept = Kept {
+        _registered: Vec::new(),
+        closed: Vec::new(),
+        tunnel: Vec::new(),
+    };
+    for _ in 0..count {
+        let mut permit = take(sockets, SocketClass::Reserve, bytes).expect("room");
+        let socket = permit.reclaimable(SocketClass::Reserve);
+        let (tunnel, open) = permit.for_stream();
+        let closed = Arc::new(AtomicBool::new(false));
+        let switch = closed.clone();
+        kept._registered.push(
+            handle
+                .hold(
+                    Some(socket),
+                    Box::new(move || {
+                        drop(open);
+                        switch.store(true, Ordering::Relaxed);
+                        true
+                    }),
+                )
+                .expect("a live keeper"),
+        );
+        kept.closed.push(closed);
+        kept.tunnel.push(Some(tunnel));
+    }
+    kept
+}
+
+// Kept connections fill the reserve: a claim of it closes the oldest, and
+// is refused while its bytes are closing, as for any closing socket. Asked
+// again before they are back, it closes nothing more: the bytes closing
+// count as on their way. Once the tunnel frees the socket the claim takes
+// the bytes, and the next claim closes the next kept connection.
+#[test]
+fn a_claim_on_a_full_reserve_closes_a_kept_connection_and_takes_its_bytes_once_back() {
+    let sockets = sockets(2, 4);
+    let mut kept = kept(&sockets, 2);
+    assert_eq!(sockets.held(SocketClass::Reserve), 2 * peer());
+
+    assert!(sockets.take(SocketClass::Reserve, peer()).is_err());
+    assert!(kept.closed(0));
+    assert!(!kept.closed(1));
+    assert_eq!(sockets.keeper().holding(), 1);
+    assert_eq!(sockets.closing(SocketClass::Reserve), peer());
+    assert_eq!(sockets.held(SocketClass::Reserve), 2 * peer());
+
+    // Closing bytes are not counted twice: nothing more closes.
+    assert!(sockets.take(SocketClass::Reserve, peer()).is_err());
+    assert!(sockets.wait_room(SocketClass::Reserve, peer()).is_err());
+    assert!(!kept.closed(1));
+    assert_eq!(sockets.keeper().holding(), 1);
+
+    kept.free(0);
+    let claim = take(&sockets, SocketClass::Reserve, peer()).expect("the kept bytes are back");
+    assert!(!kept.closed(1));
+    assert_eq!(sockets.held(SocketClass::Reserve), 2 * peer());
+
+    assert!(sockets.take(SocketClass::Reserve, peer()).is_err());
+    assert!(kept.closed(1));
+    assert_eq!(sockets.keeper().holding(), 0);
+    kept.free(1);
+    let second = take(&sockets, SocketClass::Reserve, peer()).expect("back");
+    assert!(sockets.take(SocketClass::Reserve, peer()).is_err());
+    drop((claim, second));
+}
+
+// A look at room counts what closing a kept connection would give, and
+// closes nothing. Once a claim closed it, its bytes are on their way and no
+// longer room until they are back.
+#[test]
+fn room_closes_nothing() {
+    let sockets = sockets(1, 2);
+    let mut kept = kept(&sockets, 1);
+    assert!(sockets.has_room(SocketClass::Reserve, peer()));
+    assert!(sockets.room(SocketClass::Reserve, peer()).is_ok());
+    assert!(!kept.closed(0));
+    assert_eq!(sockets.keeper().holding(), 1);
+    assert_eq!(sockets.closing(SocketClass::Reserve), 0);
+
+    assert!(sockets.take(SocketClass::Reserve, peer()).is_err());
+    assert!(kept.closed(0));
+    assert!(!sockets.has_room(SocketClass::Reserve, peer()));
+    kept.free(0);
+    assert!(sockets.has_room(SocketClass::Reserve, peer()));
+}
+
+// A side's bytes are its own: a claim of a full side, or a look at it,
+// closes no kept connection of the reserve, whose bytes it could not use.
+#[test]
+fn a_claim_closes_nothing_it_cannot_use() {
+    let sockets = sockets(2, 2);
+    let kept = kept(&sockets, 2);
+    let usenet = fill(&sockets, SocketClass::Nntp);
+    assert_eq!(usenet.len(), 1);
+    assert!(!sockets.has_room(SocketClass::Nntp, peer()));
+    assert!(sockets.take(SocketClass::Nntp, peer()).is_err());
+    assert!(sockets.wait_room(SocketClass::Nntp, peer()).is_err());
+    assert!(!kept.closed(0) && !kept.closed(1));
+    assert_eq!(sockets.keeper().holding(), 2);
+    // Bigger than the reserve holds: closing every kept one would not fit.
+    assert!(sockets.take(SocketClass::Reserve, 3 * peer()).is_err());
+    assert!(!sockets.has_room(SocketClass::Reserve, 3 * peer()));
+    assert!(!kept.closed(0) && !kept.closed(1));
+}
+
+// A reserve lowered below what its kept connections hold leaves them holding
+// bytes the sides now divide: a side's claim the tunnel's bytes refuse
+// closes one kept connection, as many as it needs, and takes the bytes once
+// back. A claim past the side's own share closes none.
+#[test]
+fn a_claim_closes_a_kept_connection_of_a_reserve_over_its_bytes() {
+    let sockets = sockets(2, 2);
+    let mut kept = kept(&sockets, 2);
+    sockets.set_budget(budget(0, 0, 4));
+    let usenet = fill(&sockets, SocketClass::Nntp);
+    assert_eq!(usenet.len(), 2);
+    assert!(!kept.closed(0));
+    // Usenet holds its share: its claim closes nothing.
+    assert!(sockets.take(SocketClass::Nntp, peer()).is_err());
+    assert!(!kept.closed(0));
+
+    assert!(sockets.has_room(SocketClass::Torrent, peer()));
+    assert!(!kept.closed(0));
+    assert!(sockets.take(SocketClass::Torrent, peer()).is_err());
+    assert!(kept.closed(0));
+    assert!(!kept.closed(1));
+    kept.free(0);
+    let first = take(&sockets, SocketClass::Torrent, peer()).expect("back");
+    assert!(sockets.take(SocketClass::Torrent, peer()).is_err());
+    assert!(kept.closed(1));
+    kept.free(1);
+    let second = take(&sockets, SocketClass::Torrent, peer()).expect("back");
+    assert!(sockets.take(SocketClass::Torrent, peer()).is_err());
+    drop((usenet, first, second));
+}
+
+// A keeper cut closes everything it keeps; the bytes come back as the
+// tunnel frees each socket.
+#[test]
+fn a_cut_closes_what_is_kept() {
+    let sockets = sockets(2, 2);
+    let mut kept = kept(&sockets, 2);
+    sockets.keeper().cut();
+    assert!(kept.closed(0) && kept.closed(1));
+    assert_eq!(sockets.keeper().holding(), 0);
+    assert_eq!(sockets.closing(SocketClass::Reserve), 2 * peer());
+    kept.free(0);
+    kept.free(1);
+    assert_eq!(sockets.held(SocketClass::Reserve), 0);
+}
+
+// A waiter for room is not parked behind a kept connection nobody closes:
+// its wait closes the kept connection, and it is woken as the tunnel frees
+// the socket.
+#[tokio::test]
+async fn a_waiter_is_woken_when_a_kept_connections_bytes_come_back() {
+    let sockets = sockets(1, 2);
+    let mut kept = kept(&sockets, 1);
+    let Err(Refused { freed, demand, .. }) = sockets.wait_room(SocketClass::Reserve, peer()) else {
+        panic!("room while the kept connection's bytes are closing");
+    };
+    assert!(demand.is_none());
+    assert!(kept.closed(0));
+    let notify = freed.notify();
+    let woken = notify.notified();
+    tokio::pin!(woken);
+    woken.as_mut().enable();
+    kept.free(0);
+    woken.await;
+    assert!(sockets.wait_room(SocketClass::Reserve, peer()).is_ok());
+}
+
+// Each kept connection is reclaimed at the bytes its socket reserved: one
+// holding two peer sockets' bytes is enough for a claim of two, and closing
+// it alone makes room.
+#[test]
+fn a_kept_connection_is_reclaimed_at_the_bytes_it_reserved() {
+    let sockets = sockets(4, 2);
+    let mut kept = kept_of(&sockets, 1, 2 * peer());
+    let others: Vec<_> = (0..2)
+        .map(|_| take(&sockets, SocketClass::Reserve, peer()).expect("room"))
+        .collect();
+    assert!(!kept.closed(0));
+    assert_eq!(
+        sockets.keeper().held(),
+        [(SocketClass::Reserve, 2 * peer())]
+    );
+    assert!(sockets.has_room(SocketClass::Reserve, 2 * peer()));
+    assert!(!sockets.has_room(SocketClass::Reserve, 3 * peer()));
+    assert!(sockets.take(SocketClass::Reserve, 2 * peer()).is_err());
+    assert!(kept.closed(0));
+    assert_eq!(sockets.closing(SocketClass::Reserve), 2 * peer());
+    kept.free(0);
+    assert!(take(&sockets, SocketClass::Reserve, 2 * peer()).is_some());
+    drop(others);
+}
+
+// A reserve full of connections in use has nothing to reclaim: a claim is
+// refused at once, as before. So is one past what closing every kept
+// connection would give.
+#[test]
+fn a_claim_on_a_reserve_full_of_connections_in_use_is_refused_at_once() {
+    let sockets = sockets(1, 2);
+    let in_use = take(&sockets, SocketClass::Reserve, peer()).expect("room");
+    assert!(sockets.take(SocketClass::Reserve, peer()).is_err());
+    drop(in_use);
+
+    let kept = kept(&sockets, 1);
+    assert!(sockets.take(SocketClass::Reserve, 2 * peer()).is_err());
+    assert!(!kept.closed(0));
+}
+
+// A waiter refused while the reserve's connections are in use is woken when
+// one of them becomes kept: it looks again, closes it, and gets its bytes
+// once the tunnel frees the socket.
+#[tokio::test]
+async fn a_waiter_refused_while_connections_are_in_use_is_woken_when_they_are_kept() {
+    let sockets = sockets(1, 2);
+    let mut permit = take(&sockets, SocketClass::Reserve, peer()).expect("room");
+    let socket = permit.reclaimable(SocketClass::Reserve);
+    let (tunnel, open) = permit.for_stream();
+
+    let Err(Refused { freed, .. }) = sockets.wait_room(SocketClass::Reserve, peer()) else {
+        panic!("room in a full reserve");
+    };
+    let notify = freed.notify();
+    let woken = notify.notified();
+    tokio::pin!(woken);
+    woken.as_mut().enable();
+
+    // The lookup ends and keeps its connection.
+    let closed = Arc::new(AtomicBool::new(false));
+    let switch = closed.clone();
+    let _kept = sockets
+        .keeper()
+        .handle()
+        .hold(
+            Some(socket),
+            Box::new(move || {
+                drop(open);
+                switch.store(true, Ordering::Relaxed);
+                true
+            }),
+        )
+        .expect("a live keeper");
+    woken.await;
+
+    let woken = notify.notified();
+    tokio::pin!(woken);
+    woken.as_mut().enable();
+    assert!(sockets.wait_room(SocketClass::Reserve, peer()).is_err());
+    assert!(closed.load(Ordering::Relaxed));
+    drop(tunnel);
+    woken.await;
+    assert!(sockets.wait_room(SocketClass::Reserve, peer()).is_ok());
+    assert!(take(&sockets, SocketClass::Reserve, peer()).is_some());
 }

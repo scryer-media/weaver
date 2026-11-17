@@ -2,20 +2,15 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use async_graphql::{Context, Object, Result};
-use std::sync::LazyLock;
 use tracing::info;
 
 use crate::auth::{AdminGuard, graphql_error};
 use crate::categories::types::{Category, CategoryInput};
-use crate::observability::{
-    persist_then_update_config, spawn_blocking_db, with_timed_config_read, with_timed_config_write,
-};
+use crate::observability::{spawn_blocking_db, with_timed_config_read, with_timed_config_write};
 use weaver_server_core::Database;
+use weaver_server_core::categories::{CategoryConfig, Made, category_writes, make_category};
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::watch_folder::WatchFolderService;
-
-static CATEGORY_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Default)]
 pub(crate) struct CategoriesMutation;
@@ -35,7 +30,7 @@ impl CategoriesMutation {
     async fn add_category(&self, ctx: &Context<'_>, input: CategoryInput) -> Result<Category> {
         let config = ctx.data::<SharedConfig>()?;
         let db = ctx.data::<Database>()?;
-        let _mutation_guard = CATEGORY_MUTATION_GUARD.lock().await;
+        let held = category_writes().await;
 
         let name = input.name.trim().to_string();
         if name.is_empty() {
@@ -45,69 +40,31 @@ impl CategoriesMutation {
         validate_category_name(&name, dest_dir.as_deref())?;
         let fields = input.torrent_fields(None)?;
 
-        with_timed_config_read(config, "categories.mutation.add_category.validate", |cfg| {
-            if cfg
-                .categories
-                .iter()
-                .any(|category| category.name.eq_ignore_ascii_case(&name))
-            {
-                Err(async_graphql::Error::new(format!(
-                    "category '{name}' already exists"
-                )))
-            } else {
-                Ok(())
-            }
-        })
-        .await?;
-
-        let id = {
-            let db = db.clone();
-            spawn_blocking_db("categories.mutation.add_category.next_id", move || {
-                db.next_category_id()
-            })
-            .await?
-        };
-
-        let cat = weaver_server_core::categories::CategoryConfig {
-            id,
-            name: name.clone(),
+        // Made by the one owner of making a category, which a torrent add
+        // that names a new one makes it through too.
+        let category = CategoryConfig {
             dest_dir,
             aliases: input.aliases,
             seeding: fields.seeding,
             torrent_route: fields.torrent_route,
             unpack: fields.unpack,
             upload_cap: fields.upload_cap,
+            ..CategoryConfig::named(name.clone())
         };
-
-        let added = {
-            let persisted_category = cat.clone();
-            let db = db.clone();
-            let persist = async move {
-                spawn_blocking_db("categories.mutation.add_category.persist", move || {
-                    db.insert_category(&persisted_category)
-                })
-                .await
-            };
-            persist_then_update_config(
-                config,
-                "categories.mutation.add_category.apply",
-                persist,
-                move |cfg| {
-                    if let Some(existing) = cfg
-                        .categories
-                        .iter_mut()
-                        .find(|category| category.id == cat.id)
-                    {
-                        *existing = cat.clone();
-                        Category::from(&*existing)
-                    } else {
-                        cfg.categories.push(cat.clone());
-                        Category::from(&cat)
-                    }
-                },
-            )
-            .await?
+        let added = match make_category(&held, config, db, category)
+            .await
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        {
+            Made::New(category) => category,
+            Made::There(_) => {
+                return Err(async_graphql::Error::new(format!(
+                    "category '{name}' already exists"
+                )));
+            }
         };
+        drop(held);
+        let id = added.id;
+        let added = Category::from(&added);
 
         info!(id, name = %name, "category added");
         reconcile_watch_folder(ctx).await?;
@@ -126,7 +83,7 @@ impl CategoriesMutation {
     ) -> Result<Category> {
         let config = ctx.data::<SharedConfig>()?;
         let db = ctx.data::<Database>()?;
-        let _mutation_guard = CATEGORY_MUTATION_GUARD.lock().await;
+        let _held = category_writes().await;
 
         let name = input.name.trim().to_string();
         if name.is_empty() {
@@ -208,7 +165,7 @@ impl CategoriesMutation {
     async fn remove_category(&self, ctx: &Context<'_>, id: u32) -> Result<Vec<Category>> {
         let config = ctx.data::<SharedConfig>()?;
         let db = ctx.data::<Database>()?;
-        let _mutation_guard = CATEGORY_MUTATION_GUARD.lock().await;
+        let _held = category_writes().await;
 
         with_timed_config_read(
             config,

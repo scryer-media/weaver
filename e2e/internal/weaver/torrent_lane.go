@@ -159,6 +159,8 @@ type torrentLane struct {
 	results      []torrentScenarioResult
 	defaultRoute string
 	trackerSeen  map[string]bool
+	// The lane's one DNS profile for proxied routes, made on first use.
+	proxyDNSProfileID int
 }
 
 func newTorrentLane(artifacts string) (*torrentLane, error) {

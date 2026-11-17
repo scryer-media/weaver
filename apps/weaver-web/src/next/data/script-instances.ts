@@ -53,6 +53,11 @@ export const QUEUE_EVENTS = [
 
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];
 
+/** Whether only a torrent raises `event`: one a server without torrents never raises. */
+export function isTorrentQueueEvent(event: string): boolean {
+  return event.startsWith("TORRENT_") || event.startsWith("SEEDING_");
+}
+
 export type ScriptOptionType = "STRING" | "INTEGER" | "NUMBER" | "BOOLEAN" | "SECRET";
 
 /** What a script's header says about one input, for drawing its field. */

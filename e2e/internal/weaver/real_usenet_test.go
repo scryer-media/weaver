@@ -183,7 +183,8 @@ func TestRealUsenetEveryCaseUsesProductionRouteContractAndCleansUp(t *testing.T)
 			var profiles []map[string]any
 			var removed []int
 			var poolSize, selected int
-			var consumerRemoved, poolRemoved bool
+			var consumerRemoved, poolRemoved, dnsRemoved bool
+			var dnsWho string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var payload struct {
 					Query     string
@@ -220,6 +221,13 @@ func TestRealUsenetEveryCaseUsesProductionRouteContractAndCleansUp(t *testing.T)
 					leg := input["legs"].([]any)[0].(map[string]any)
 					if input["failover"] != "HOLD" || leg["egressId"] != float64(0) || leg["weight"] != float64(100) {
 						t.Error("invalid production route contract")
+					}
+					wantDNS := float64(70)
+					if testCase.Kind == "direct" {
+						wantDNS = 0
+					}
+					if input["dnsProfileId"] != wantDNS {
+						t.Error("route does not resolve with the case's DNS profile")
 					}
 					path := leg["path"].(map[string]any)
 					if testCase.Kind != "direct" && path["ladder"].(map[string]any)["directFallback"] != false {
@@ -261,6 +269,25 @@ func TestRealUsenetEveryCaseUsesProductionRouteContractAndCleansUp(t *testing.T)
 				case strings.Contains(query, "deleteProxyProfile("):
 					removed = append(removed, int(vars["id"].(float64)))
 					data = map[string]any{"deleteProxyProfile": true}
+				case strings.Contains(query, "saveDnsServerList("):
+					data = map[string]any{"saveDnsServerList": map[string]int{"id": 60}}
+				case strings.Contains(query, "saveDnsProfile("):
+					dnsInput := vars["input"].(map[string]any)
+					dnsWho = dnsInput["who"].(string)
+					// A route follows a route profile; a proxy name profile is never offered to one.
+					if dnsInput["kind"] != "ROUTE" {
+						t.Error("route DNS profile must be made as a route profile")
+					}
+					// No case has a leg without a proxy, so none asks the host.
+					if fallback, ok := dnsInput["systemFallback"]; !ok || fallback != false {
+						t.Error("DNS profile must state systemFallback false")
+					}
+					data = map[string]any{"saveDnsProfile": map[string]int{"id": 70}}
+				case strings.Contains(query, "deleteDnsProfile("):
+					dnsRemoved = true
+					data = map[string]any{"deleteDnsProfile": true}
+				case strings.Contains(query, "deleteDnsServerList("):
+					data = map[string]any{"deleteDnsServerList": true}
 				default:
 					t.Error("unexpected flow API operation")
 					data = map[string]any{}
@@ -280,6 +307,13 @@ func TestRealUsenetEveryCaseUsesProductionRouteContractAndCleansUp(t *testing.T)
 			}
 			if !consumerRemoved || len(removed) != len(profiles) {
 				t.Fatal("case left a consumer or tunnel session behind")
+			}
+			wantWho := map[string]string{"direct": "", "chain": "PROXY", "pool": "PROXY"}[testCase.Kind]
+			if testCase.Kind != "direct" && wantWho == "" {
+				wantWho = "WEAVER"
+			}
+			if dnsWho != wantWho || dnsRemoved != (testCase.Kind != "direct") {
+				t.Fatalf("DNS profile who %q removed %v", dnsWho, dnsRemoved)
 			}
 			if testCase.Kind == "chain" {
 				if len(profiles) != testCase.Depth {

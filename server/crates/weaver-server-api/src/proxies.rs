@@ -48,29 +48,6 @@ impl From<proxies::ProxyKind> for ProxyKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
-#[graphql(name = "ProxyResolver")]
-pub enum ProxyResolver {
-    Weaver,
-    Proxy,
-}
-impl From<ProxyResolver> for proxies::Resolver {
-    fn from(v: ProxyResolver) -> Self {
-        match v {
-            ProxyResolver::Weaver => Self::Weaver,
-            ProxyResolver::Proxy => Self::Proxy,
-        }
-    }
-}
-impl From<proxies::Resolver> for ProxyResolver {
-    fn from(v: proxies::Resolver) -> Self {
-        match v {
-            proxies::Resolver::Weaver => Self::Weaver,
-            proxies::Resolver::Proxy => Self::Proxy,
-        }
-    }
-}
-
 #[derive(Clone, Debug, InputObject)]
 pub struct RoutingPolicyInput {
     pub proxy_ids: Vec<u32>,
@@ -143,7 +120,8 @@ pub struct ProxyProfileGql {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
-    pub resolver: ProxyResolver,
+    /// WireGuard: the tunnel's own DNS servers, asked in plain through the
+    /// tunnel when a route's DNS profile has the proxy answer.
     pub dns_servers: Vec<String>,
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
@@ -161,6 +139,9 @@ pub struct ProxyProfileGql {
     pub has_private_key: bool,
     pub has_passphrase: bool,
     pub has_preshared_key: bool,
+    /// The DNS profile that finds this proxy's own address when it is a
+    /// name: 0, the built-in System profile, or a PROXY_NAME profile.
+    pub dns_profile_id: u32,
 }
 impl From<ProxyProfile> for ProxyProfileGql {
     fn from(p: ProxyProfile) -> Self {
@@ -176,7 +157,6 @@ impl From<ProxyProfile> for ProxyProfileGql {
             enabled: p.enabled,
             host: p.host,
             port: p.port,
-            resolver: p.resolver.into(),
             dns_servers: p.dns_servers.iter().map(ToString::to_string).collect(),
             tunnel_addresses: p.tunnel_addresses,
             peer_public_key: p.peer_public_key,
@@ -192,6 +172,7 @@ impl From<ProxyProfile> for ProxyProfileGql {
             has_private_key: p.secrets.private_key.is_some(),
             has_passphrase: p.secrets.passphrase.is_some(),
             has_preshared_key: p.secrets.preshared_key.is_some(),
+            dns_profile_id: p.dns_profile_id,
         }
     }
 }
@@ -203,11 +184,9 @@ pub struct ProxyProfileInput {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
-    // Omitted by a client written before a proxy named its resolver: a saved
-    // proxy keeps its own, and a new one resolves as every proxy did then.
-    pub resolver: Option<ProxyResolver>,
-    #[graphql(default)]
-    pub dns_servers: Vec<String>,
+    /// WireGuard only: the tunnel's own DNS servers, as IPs. Omitted keeps
+    /// the saved list; a new proxy starts with none.
+    pub dns_servers: Option<Vec<String>>,
     #[graphql(default)]
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
@@ -224,6 +203,10 @@ pub struct ProxyProfileInput {
     pub private_key: MaybeUndefined<String>,
     pub passphrase: MaybeUndefined<String>,
     pub preshared_key: MaybeUndefined<String>,
+    /// The DNS profile that finds the proxy's own address: 0, System, or a
+    /// PROXY_NAME profile. Absent is 0 on create and keeps the saved one on
+    /// update.
+    pub dns_profile_id: Option<u32>,
 }
 fn secret_update(target: &mut Option<String>, value: MaybeUndefined<String>) {
     match value {
@@ -248,22 +231,14 @@ impl ProxyProfileInput {
         secret_update(&mut secrets.private_key, self.private_key);
         secret_update(&mut secrets.passphrase, self.passphrase);
         secret_update(&mut secrets.preshared_key, self.preshared_key);
-        let dns_servers: Vec<std::net::IpAddr> = self
-            .dns_servers
-            .iter()
-            .map(|s| s.trim().parse())
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|_| refusal_error(NetworkRefusal::ProxyDnsServerInvalid))?;
-        let resolver = match (self.resolver, existing) {
-            (Some(resolver), _) => resolver.into(),
-            (None, Some(existing)) => existing.resolver,
-            // A WireGuard tunnel cannot take a name, so without servers of
-            // its own Weaver resolved for it; every other proxy resolved for
-            // itself, through its servers when it had them.
-            (None, None) if self.kind == ProxyKind::WireGuard && dns_servers.is_empty() => {
-                proxies::Resolver::Weaver
-            }
-            (None, None) => proxies::Resolver::Proxy,
+        let dns_servers = match (self.dns_servers, existing) {
+            (Some(servers), _) => servers
+                .iter()
+                .map(|server| server.trim().parse::<std::net::IpAddr>())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| refusal_error(NetworkRefusal::ProxyDnsServerInvalid))?,
+            (None, Some(existing)) => existing.dns_servers.clone(),
+            (None, None) => Vec::new(),
         };
         let mut profile = ProxyProfile {
             id,
@@ -272,7 +247,6 @@ impl ProxyProfileInput {
             enabled: self.enabled,
             host: self.host.trim().trim_matches(['[', ']']).into(),
             port: self.port,
-            resolver,
             dns_servers,
             tunnel_addresses: self.tunnel_addresses,
             peer_public_key: self.peer_public_key,
@@ -287,6 +261,10 @@ impl ProxyProfileInput {
                 .forwarded_port
                 .filter(|port| *port != 0 && self.kind == ProxyKind::WireGuard && !self.natpmp),
             revision: 0,
+            dns_profile_id: self
+                .dns_profile_id
+                .or(existing.map(|p| p.dns_profile_id))
+                .unwrap_or(proxies::SYSTEM_DNS_PROFILE_ID),
             secrets,
         };
         profile.revision = profile
@@ -419,13 +397,20 @@ impl ProxiesMutation {
         );
         let profile = input.profile(id, existing)?;
         // A save that changes nothing keeps the revision, and everything
-        // built from the profile is keyed by it: nothing is rebuilt.
+        // built from the profile is keyed by it: nothing is rebuilt. The DNS
+        // profile the proxy selects is no part of the revision: a change of
+        // it alone reloads the names, and every session and connection
+        // stays.
         let unchanged = existing.is_some_and(|existing| existing.revision == profile.revision);
+        let renamed =
+            existing.is_some_and(|existing| existing.dns_profile_id != profile.dns_profile_id);
         let saved = profile.clone();
         let profile =
             spawn_blocking_db("proxies.save", move || db.save_proxy_profile(&saved)).await?;
         if !unchanged {
             refresh_profile(ctx, id).await?;
+        } else if renamed {
+            refresh(ctx).await?;
         }
         Ok(profile.into())
     }

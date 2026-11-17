@@ -5,7 +5,8 @@ import type { ProxyKind } from "./proxies";
 
 export type Rung = { kind: "PROXY" | "POOL" | "CHAIN"; proxyId: number | null; poolId: number | null; chainIds: number[] };
 export type Leg = { egressId: number; weight: number; path: { kind: "DIRECT" | "LADDER"; rungs: Rung[]; directFallback: boolean } };
-export type NetworkRoute = { legs: Leg[]; failover: "REDISTRIBUTE" | "HOLD" };
+/** `dnsProfileId` is the DNS profile the route's names follow; 0 is System. A route read without it keeps the saved one. */
+export type NetworkRoute = { legs: Leg[]; failover: "REDISTRIBUTE" | "HOLD"; dnsProfileId?: number };
 export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; downloadBps: number | null; uploadBps: number | null; quota?: EgressQuota; quotaUsage?: EgressQuotaUsage | null; health: string; reason: string | null };
 export type QuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
 export type Weekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
@@ -59,7 +60,7 @@ export const directLeg = (): Leg => ({ egressId: 0, weight: 100, path: { kind: "
 /** A path nothing can take: a ladder with no rung on it and no going direct. It is how a kill switch is stored. */
 export const closedPath = (path: Leg["path"]) => path.kind === "LADDER" && !path.rungs.length && !path.directFallback;
 export function routeInput(route: NetworkRoute) {
-  return { failover: route.failover, legs: route.legs.map(leg => ({ egressId: leg.egressId, weight: leg.weight,
+  return { failover: route.failover, ...(route.dnsProfileId === undefined ? {} : { dnsProfileId: route.dnsProfileId }), legs: route.legs.map(leg => ({ egressId: leg.egressId, weight: leg.weight,
     path: leg.path.kind === "DIRECT" ? { direct: true } : { ladder: { directFallback: leg.path.directFallback, rungs: leg.path.rungs.map(r => r.kind === "PROXY" ? { proxy: r.proxyId } : r.kind === "POOL" ? { pool: r.poolId } : { chain: r.chainIds }) } },
   })) };
 }
@@ -88,7 +89,7 @@ export function rungProxyIds(rung: Rung, pools: ProxyPool[]): number[] {
   if (rung.kind === "POOL") return pools.find(pool => pool.id === rung.poolId)?.memberIds ?? [];
   return rung.chainIds;
 }
-export function routeProblem(route: NetworkRoute, known: { egresses?: Egress[]; pools?: ProxyPool[]; kind?: ConsumerKind } = {}): RouteProblem | null {
+export function routeProblem(route: NetworkRoute, known: { egresses?: Pick<Egress, "id" | "enabled">[]; pools?: ProxyPool[]; kind?: ConsumerKind } = {}): RouteProblem | null {
   if (!route.legs.length || route.legs.length > 8) return "legCount";
   const fault = known.kind !== undefined && isTorrentConsumer(known.kind) ? torrentRouteFault(route) : null;
   if (fault) return fault;

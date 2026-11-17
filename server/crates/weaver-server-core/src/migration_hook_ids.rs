@@ -21,7 +21,8 @@ pub(crate) fn is_known_migration_hook_id(hook_id: &str) -> bool {
             | "trim_servers_to_limit_v92"
             | "move_bandwidth_to_networking_v94"
             | "fill_tracker_hosts_v105"
-            | "fill_torrent_private_v125"
+            | "dns_profiles_from_proxies_v125"
+            | "fill_torrent_private_v126"
     )
 }
 

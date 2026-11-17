@@ -246,6 +246,7 @@ impl TestHarness {
             spawn_history_delete_worker,
             post_processing_executor: None,
             torrents: None,
+            torrent_availability: weaver_server_core::torrents::TorrentAvailability::AVAILABLE,
             usage_recorder: None,
         });
 

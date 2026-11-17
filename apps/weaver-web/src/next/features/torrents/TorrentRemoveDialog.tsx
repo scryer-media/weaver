@@ -8,6 +8,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { removeOutcome } from "@/lib/torrents";
 import { ConfirmDialog } from "@/next/components/ConfirmDialog";
 import { CheckRow } from "@/next/features/networking/presentation";
+import { testIds, torrentIds } from "@/next/testids";
 
 /**
  * Removing a torrent: first whether its files go too, then, only when the
@@ -60,11 +61,17 @@ export function TorrentRemoveDialog({
     <>
       <ConfirmDialog
         open={id !== null && unmet === null}
+        testId={testIds.dialog("torrent-remove")}
         title={t("next.torrent.removeTitle")}
         note={name}
         busy={state.fetching}
         body={
-          <CheckRow checked={deleteFiles} onChange={setDeleteFiles} label={t("next.torrent.deleteFiles")} />
+          <CheckRow
+            checked={deleteFiles}
+            onChange={setDeleteFiles}
+            label={t("next.torrent.deleteFiles")}
+            testId={torrentIds.removeDeleteFiles}
+          />
         }
         confirmLabel={t("next.common.remove")}
         onConfirm={() => void remove(false)}
@@ -72,6 +79,7 @@ export function TorrentRemoveDialog({
       />
       <ConfirmDialog
         open={id !== null && unmet !== null}
+        testId={testIds.dialog("torrent-unmet-goal")}
         title={t("next.torrent.unmetGoalTitle")}
         note={name}
         busy={state.fetching}

@@ -22,11 +22,13 @@ const query = new URLSearchParams(location.search);
 const screen = query.get("screen") ?? "downloads";
 // What the server says of torrents: off with none left, off with some still seeding, or on with some running or none.
 const PRESENCES: Record<string, TorrentPresence> = {
-  off: { enabled: false, jobs: false, running: false, windingDown: false, windDown: null },
-  offJobs: { enabled: false, jobs: true, running: true, windingDown: true, windDown: "FINISH_ALL" },
-  offFinishDownloads: { enabled: false, jobs: true, running: true, windingDown: true, windDown: "FINISH_DOWNLOADS" },
-  onRunning: { enabled: true, jobs: true, running: true, windingDown: false, windDown: null },
-  onIdle: { enabled: true, jobs: true, running: false, windingDown: false, windDown: null },
+  off: { available: true, enabled: false, jobs: false, running: false, windingDown: false, windDown: null },
+  offJobs: { available: true, enabled: false, jobs: true, running: true, windingDown: true, windDown: "FINISH_ALL" },
+  offFinishDownloads: { available: true, enabled: false, jobs: true, running: true, windingDown: true, windDown: "FINISH_DOWNLOADS" },
+  onRunning: { available: true, enabled: true, jobs: true, running: true, windingDown: false, windDown: null },
+  // A server started without torrents, whatever its saved setting and rows say.
+  unavailable: { available: false, enabled: true, jobs: true, running: false, windingDown: false, windDown: null },
+  onIdle: { available: true, enabled: true, jobs: true, running: false, windingDown: false, windDown: null },
 };
 // "unknown" is the server not having said yet: torrents on, as the settings read.
 const unknown = query.get("presence") === "unknown";

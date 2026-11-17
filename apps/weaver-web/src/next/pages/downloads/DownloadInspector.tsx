@@ -27,6 +27,7 @@ import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 import { SupportReportActions } from "@/next/features/SupportReportActions";
 import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
+import { torrentIds } from "@/next/testids";
 
 interface OutputFile {
   name: string;
@@ -201,6 +202,7 @@ export function DownloadInspector({
           {/* The inspector is a summary; the whole story lives on the job's own screen. */}
           <Link
             to={`/jobs/${job.id}`}
+            data-testid={torrentIds.inspectorOpenDetail}
             className="flex items-center gap-[3px] font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
           >
             {t("next.inspector.openDetail")}
@@ -351,6 +353,7 @@ export function DownloadInspector({
           icon="cancelDownload"
           className="w-full justify-center"
           disabled={cancelState.fetching}
+          testId={torrentIds.inspectorRemove}
           onClick={() => {
             setFailure(null);
             if (isTorrent) {

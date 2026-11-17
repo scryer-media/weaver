@@ -218,6 +218,26 @@ pub async fn recover_server_state(
     data_dir: &Path,
     intermediate_dir: &Path,
 ) -> Result<RecoveredServerState, Box<dyn std::error::Error>> {
+    recover_server_state_with(
+        db,
+        data_dir,
+        intermediate_dir,
+        crate::torrents::TorrentAvailability::AVAILABLE,
+    )
+    .await
+}
+
+/// [`recover_server_state`] for a server whose torrents are as `torrents`
+/// says. Unavailable, the stored torrents are left as they are: a removal a
+/// stop cut short is not finished, so none of its files or rows goes, and
+/// their folders are still kept as theirs.
+pub async fn recover_server_state_with(
+    db: &Database,
+    data_dir: &Path,
+    intermediate_dir: &Path,
+    torrents: crate::torrents::TorrentAvailability,
+) -> Result<RecoveredServerState, Box<dyn std::error::Error>> {
+    let torrents_available = torrents.available();
     // One-time migration: convert binary journal to SQLite if it exists.
     let journal_path = data_dir.join(".weaver-journal");
     match db.migrate_from_journal(&journal_path) {
@@ -333,10 +353,13 @@ pub async fn recover_server_state(
     // One that cannot be written, or all of them when they do not read,
     // stays retiring: never live, its folders kept, finished and written by
     // the torrent service through the kept archives.
-    let finishing = {
+    let finishing = if torrents_available {
         let (db, work) = (db.clone(), intermediate_dir.to_path_buf());
         tokio::task::spawn_blocking(move || crate::torrents::service::finish_retiring(&db, &work))
             .await
+    } else {
+        // Torrents are unavailable: every stored torrent stays as it is.
+        Ok(Ok(Vec::new()))
     };
     match finishing {
         Ok(Ok(rows)) => {

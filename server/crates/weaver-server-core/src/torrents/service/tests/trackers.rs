@@ -1095,6 +1095,62 @@ async fn started_accepted(service: &TorrentService, job_id: JobId) {
     .await;
 }
 
+// What a tracker hears of a seed whose move kept someone else's file at the
+// new place, its pieces not forgotten for the move. The torrent stays
+// moving until the check the move owes has forgotten them: a recheck asked
+// for in between is refused, so none ends early on files not read and
+// tells the tracker of a start the move's check then stops. The tracker
+// hears one `stopped`, of the run that ended when the pieces were
+// forgotten, and one `started`, of the run after the check; then the
+// `stopped` of the shutdown, and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_that_kept_a_file_is_one_stopped_and_one_started_to_a_tracker() {
+    use super::moves::{move_held_before_its_check, seeding_beside_a_taken_name, strangers};
+    let (url, mut announces) = heard_tracker(&[]).await;
+    let (rig, job_id, data, _, _) = seeding_beside_a_taken_name().await;
+    tracked(&rig.service, job_id, &url).await;
+    assert_eq!(
+        next_event(&mut announces).await.event.as_deref(),
+        Some("started")
+    );
+    announces_answered(&rig.service, job_id).await;
+
+    let free = rig.dir.path().join("free");
+    std::fs::create_dir_all(&free).unwrap();
+    {
+        let (at, theirs) = (free.join("a.bin"), strangers(&data));
+        *locked(&crate::torrents::service::MOVE_BEGIN_MEETS) =
+            Some(Box::new(move || std::fs::write(at, theirs).unwrap()));
+    }
+    let held = move_held_before_its_check(&rig, job_id, &free).await;
+    let refused = rig.service.recheck(job_id).await.unwrap_err();
+    assert!(
+        matches!(&refused, ActionError::Invalid(why) if why.contains("moving")),
+        "{refused:?}"
+    );
+    held.release.send(()).unwrap();
+    held.moving.await.unwrap().unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.stats().progress_bytes, 0);
+
+    // The run that ended and the run that began each tell the tracker on
+    // their own, so it may read the two in either order.
+    let mut between = [
+        next_event(&mut announces).await.event.unwrap(),
+        next_event(&mut announces).await.event.unwrap(),
+    ];
+    between.sort();
+    assert_eq!(between, ["started", "stopped"]);
+    announces_answered(&rig.service, job_id).await;
+    rig.service.stop().await;
+    let mut after = Vec::new();
+    while let Ok(heard) = announces.try_recv() {
+        after.extend(heard.event);
+    }
+    assert_eq!(after, ["stopped"], "only the shutdown's");
+}
+
 // Once no announce of the torrent's session waits for its answer and a
 // tracker has answered one. Asked after an announce was heard, it says that
 // announce's answer is taken: a tracker is sent no `stopped` while its last

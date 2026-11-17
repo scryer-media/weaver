@@ -24,12 +24,13 @@ pub(crate) mod history_search_key_v88;
 mod history_swept_v91;
 pub(crate) mod networking_bandwidth_v94;
 pub(crate) mod nzb_tables_v85;
+pub(crate) mod proxy_dns_v125;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
 pub(crate) mod script_instances_v55;
 pub(crate) mod server_limit_v92;
-pub(crate) mod torrent_private_v125;
+pub(crate) mod torrent_private_v126;
 pub(crate) mod tracker_hosts_v105;
 pub(crate) mod unwanted_extensions_v56;
 
@@ -42,7 +43,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 126;
+const CURRENT_SCHEMA_VERSION: i64 = 127;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -915,8 +916,11 @@ async fn run_rust_hook(
         tracker_hosts_v105::HOOK_ID => {
             tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
         }
-        torrent_private_v125::HOOK_ID => {
-            torrent_private_v125::fill_torrent_private(&mut SqlConn::Sqlite(tx)).await
+        proxy_dns_v125::HOOK_ID => {
+            proxy_dns_v125::dns_profiles_from_proxies(&mut SqlConn::Sqlite(tx)).await
+        }
+        torrent_private_v126::HOOK_ID => {
+            torrent_private_v126::fill_torrent_private(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
@@ -1492,7 +1496,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 126);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 127);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -1877,7 +1881,7 @@ mod tests {
         replay_catalog_into_fresh_db(&fresh, &catalog, &payload, None, true)
             .await
             .unwrap();
-        // Of the three, only the privacy is back, from 125, as a column the
+        // Of the three, only the privacy is back, from 126, as a column the
         // add writes.
         assert_eq!(
             pragma_column_count(&fresh, "torrents", &gone_torrents).await,
@@ -2165,16 +2169,16 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 125 keeps a torrent's privacy in the table: each torrent
+    // Migration 126 keeps a torrent's privacy in the table: each torrent
     // kept before it takes the privacy its metainfo reads as, a page of rows
     // at a time across more than one page, a magnet with none and a
     // metainfo that does not read stay public, and the list's own
     // statements for a privacy, alone or in a category, walk the privacy's
     // indexes in the order of adding, unsorted.
     #[tokio::test]
-    async fn sqlite_migration_125_fills_each_torrents_privacy_from_its_metainfo() {
+    async fn sqlite_migration_126_fills_each_torrents_privacy_from_its_metainfo() {
         use crate::persistence::sql_runtime::{SqlArg, SqlEngine};
-        use crate::schema_migrations::torrent_private_v125::tiny_metainfo;
+        use crate::schema_migrations::torrent_private_v126::tiny_metainfo;
         use crate::torrents::queries::{
             CategoryIds, TorrentListFilter, count_statements, list_statements,
         };
@@ -2183,7 +2187,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(124), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(125), true)
             .await
             .unwrap();
         // 200 torrents, more than three pages of the step's 64: by job id,

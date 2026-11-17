@@ -1677,13 +1677,14 @@ async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
         .await
         .unwrap();
     rig.db
-        .finish_torrent_unpack(job_id, &["small.txt".to_owned()], &[])
+        .finish_torrent_unpack(job_id, &["small.txt".to_owned()], &[], &[])
         .unwrap();
-    rig.db.finish_torrent_unpack(job_id, &[], &[]).unwrap();
+    rig.db.finish_torrent_unpack(job_id, &[], &[], &[]).unwrap();
     rig.db
         .finish_torrent_unpack(
             job_id,
             &["small.txt".to_owned(), "notes.txt".to_owned()],
+            &[],
             &[],
         )
         .unwrap();

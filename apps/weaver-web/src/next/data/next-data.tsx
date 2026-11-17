@@ -15,7 +15,10 @@ import {
   type ReactNode,
 } from "react";
 import { useQuery, useSubscription } from "urql";
+import type { DocumentNode } from "graphql";
 import { useGraphqlConnectionState, type GraphqlConnectionStatus } from "@/graphql/client";
+import { DNS_PROFILE_CHOICES_QUERY, DNS_PROFILE_NAMES_QUERY } from "@/graphql/dns";
+import type { DnsProfileChoice, DnsProfileName } from "@/lib/dns";
 import {
   CATEGORIES_QUERY,
   HISTORY_JOBS_COUNT_QUERY,
@@ -163,6 +166,14 @@ export interface NextData {
   categories: ConfiguredCategory[];
   /** Re-read the categories after a change made elsewhere in the interface. */
   refreshCategories: () => void;
+  /** The saved DNS profiles a route can follow, and the System profile; undefined until read. */
+  dnsRouteProfiles: DnsProfileChoice[] | undefined;
+  /** The saved DNS profiles' names, for finding proxies; undefined until read. */
+  dnsProfileNames: DnsProfileName[] | undefined;
+  /** An editor shows the profiles: read them once, or again if the last read failed. */
+  wantDnsProfiles: (read: DnsProfileRead) => void;
+  /** Re-read the DNS profiles after one is saved or deleted. */
+  refreshDnsProfiles: () => void;
   historyCount: number;
   /** Re-read the history count after a change made elsewhere in the interface. */
   refreshHistoryCount: () => void;
@@ -314,6 +325,59 @@ function pick<K extends keyof NextData>(data: NextData, keys: readonly K[]): Pic
   return picked;
 }
 
+/** The two reads of the saved DNS profiles: what a route editor offers, and the names a proxy editor offers. */
+export type DnsProfileRead = "ROUTE" | "PROXY_NAME";
+
+/**
+ * One read of the saved DNS profiles, shared by every editor that offers them.
+ * Like the categories it is read once and again after a change made here, but
+ * only from the first editor that asks, so a screen without one sends nothing.
+ * A failed read is not kept: the next editor that opens asks again.
+ */
+function useWantedProfiles<T>(query: DocumentNode) {
+  const [wanted, setWanted] = useState(false);
+  const [{ data, fetching }, reexecute] = useQuery<{ dnsProfiles: T[] }>({ query, pause: !wanted });
+  const state = useRef({ wanted, failed: false });
+  useLayoutEffect(() => {
+    state.current = { wanted, failed: wanted && !fetching && data === undefined };
+  }, [data, fetching, wanted]);
+  const want = useCallback(() => {
+    if (!state.current.wanted) {
+      state.current = { wanted: true, failed: false };
+      setWanted(true);
+    } else if (state.current.failed) {
+      state.current = { wanted: true, failed: false };
+      reexecute({ requestPolicy: "network-only" });
+    }
+  }, [reexecute]);
+  const refresh = useCallback(() => {
+    if (state.current.wanted) {
+      reexecute({ requestPolicy: "network-only" });
+    }
+  }, [reexecute]);
+  return { profiles: data?.dnsProfiles, want, refresh };
+}
+
+/**
+ * The DNS profile reads the provider holds. Exported so a fixture that renders
+ * an editor without the whole provider holds them the same way.
+ */
+export function useDnsProfileReads(): Pick<NextData, "dnsRouteProfiles" | "dnsProfileNames" | "wantDnsProfiles" | "refreshDnsProfiles"> {
+  const route = useWantedProfiles<DnsProfileChoice>(DNS_PROFILE_CHOICES_QUERY);
+  const names = useWantedProfiles<DnsProfileName>(DNS_PROFILE_NAMES_QUERY);
+  const { want: wantRoute, refresh: refreshRoute } = route;
+  const { want: wantNames, refresh: refreshNames } = names;
+  const wantDnsProfiles = useCallback(
+    (read: DnsProfileRead) => (read === "ROUTE" ? wantRoute() : wantNames()),
+    [wantNames, wantRoute],
+  );
+  const refreshDnsProfiles = useCallback(() => {
+    refreshRoute();
+    refreshNames();
+  }, [refreshNames, refreshRoute]);
+  return { dnsRouteProfiles: route.profiles, dnsProfileNames: names.profiles, wantDnsProfiles, refreshDnsProfiles };
+}
+
 export function NextDataProvider({ children }: { children: ReactNode }) {
   const connectionState = useGraphqlConnectionState();
   const queue = useLiveQueue();
@@ -332,6 +396,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const [{ data: categoryData }, reexecuteCategories] = useQuery<{ categories: ConfiguredCategory[] }>({
     query: CATEGORIES_QUERY,
   });
+  const { dnsRouteProfiles, dnsProfileNames, wantDnsProfiles, refreshDnsProfiles } = useDnsProfileReads();
   const [{ data: providerData }, reexecuteProviders] = useQuery<{
     serverHealth: ProviderHealth[];
   }>({ query: SERVER_HEALTH_QUERY });
@@ -470,6 +535,10 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       queue,
       categories,
       refreshCategories,
+      dnsRouteProfiles,
+      dnsProfileNames,
+      wantDnsProfiles,
+      refreshDnsProfiles,
       historyCount,
       refreshHistoryCount,
       providers,
@@ -480,6 +549,8 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     [
       categories,
       connection,
+      dnsProfileNames,
+      dnsRouteProfiles,
       downloadBlock,
       historyCount,
       holdoffs,
@@ -489,6 +560,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providersLoaded,
       queue,
       refreshCategories,
+      refreshDnsProfiles,
       resumeAt,
       refreshHistoryCount,
       speed,
@@ -498,6 +570,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       pausedClasses,
       update,
       version,
+      wantDnsProfiles,
     ],
   );
 

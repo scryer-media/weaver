@@ -238,6 +238,23 @@ test("the egress editor saves its limits and caps, and refuses a cap switched on
   await page.close();
 });
 
+test("an egress's editor has no DNS of its own: a route's DNS profile says who answers", async () => {
+  const { page, errors } = await open("egress");
+  await page.getByText("WAN Fiber", { exact: true }).click();
+  const editor = page.getByRole("dialog", { name: "WAN Fiber", exact: true });
+  await editor.getByRole("button", { name: "Save egress", exact: true }).waitFor();
+  for (const id of ["field-dnsWho", "field-dnsTrust", "field-dnsServer-0-address", "field-dnsServerAdd"]) {
+    assert.equal(await editor.getByTestId(id).count(), 0, id);
+  }
+  await editor.getByRole("button", { name: "Save egress", exact: true }).click();
+  await editor.waitFor({ state: "detached" });
+  const [update] = await saved(page);
+  assert.equal(update.name, "UpdateEgress");
+  assert.equal("dns" in update.variables.input, false);
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
 test("the block banner names the egress whose quota is spent and when its window ends", async () => {
   const { page, errors } = await open("banner");
   await page.getByText("Download quota reached on LTE standby", { exact: true }).waitFor();

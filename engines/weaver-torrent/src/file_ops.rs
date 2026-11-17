@@ -27,7 +27,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     file_info::FileInfo,
-    storage::TorrentStorage,
+    storage::{FilesShut, TorrentStorage},
     type_aliases::{BF, FileInfos, PeerHandle},
 };
 
@@ -233,7 +233,9 @@ impl<'o, 'a> PieceReader<'o, 'a> {
     /// from there and not read there again: every piece of it from there
     /// on is needed. Any other miss fails that piece alone (libtorrent
     /// `torrent::on_piece_hashed` skips the rest of a file only on eof, a
-    /// missing file or a file too short).
+    /// missing file or a file too short), but for a read refused because
+    /// the files are shut ([`FilesShut`]), which is an error: it ends the
+    /// check.
     pub(crate) fn read(
         &mut self,
         piece: ValidPieceIndex,
@@ -254,6 +256,12 @@ impl<'o, 'a> PieceReader<'o, 'a> {
                     "error reading from file {} ({:?}) at {}: {err:#}",
                     span.file, span.info.relative_filename, span.at
                 );
+                // Files shut to reads say nothing of the piece: the check
+                // ends here, and finds no piece missing on a read it was
+                // refused.
+                if FilesShut::refused_in(&err) {
+                    return Err(err);
+                }
                 if ends_the_file(&err) {
                     self.broken[span.file] = self.broken[span.file].min(span.at);
                 }

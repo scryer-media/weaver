@@ -4,17 +4,20 @@
 use super::moves::Moving;
 use super::policy::goal_met;
 use super::retire::{held_tops, resolved};
+#[cfg(test)]
+use super::{KEEP_FAILS, OUTPUT_MEETS, PLACE_PANICS, locked};
 use super::{TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced};
 use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::model::JobStatus;
 use crate::post_processing::model::QueueEvent;
+use crate::runtime::fs::JobMoves;
 use crate::runtime::panic_trap::JobScope;
 use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::model::HistoryEnd;
 use crate::torrents::relocate::Existing;
 use crate::torrents::store::TorrentStore;
-use crate::torrents::tee::{Tee, plan_outputs};
+use crate::torrents::tee::{Tee, place_outputs};
 use crate::torrents::{KeptIntent, TorrentIntent};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -78,8 +81,10 @@ impl TorrentService {
     }
 
     // Unpacking is over: what it made goes beside the torrent's files,
-    // never over one, and is kept on the torrent's row as its job's
-    // checkpoint goes. Its directory goes last, with what it spent. The
+    // never over one, each by a move that never replaces, and the names of
+    // the files that moved go on the torrent's row after, in the one write
+    // its job's checkpoint goes in. Its directory goes last, with what it
+    // spent. The
     // torrent's files are claimed as a move claims them, so its directory
     // stays where it is with no lock its reads and writes wait on; while a
     // move has them, this waits for the move to end, which marks the
@@ -129,82 +134,84 @@ impl TorrentService {
         tee.stop_checkpoints();
         tee.forget();
         let work = tee.work().to_path_buf();
-        let (planned, tee) = (Arc::clone(store), Arc::clone(tee));
-        let planned = tokio::task::spawn_blocking(move || {
-            let _job = JobScope::enter(job_id);
-            let files = planned.files();
-            let listed: Vec<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
-            let dir = files.dir();
-            let outputs = plan_outputs(tee.work(), &dir, &listed, &spent);
-            // Held before they move, as the row keeps them.
-            let held = held_tops(outputs.names.iter().map(String::as_str)).map_or_else(
-                || vec![resolved(&dir).to_string_lossy().into_owned()],
-                |tops| {
-                    let base = resolved(&dir);
-                    tops.iter()
-                        .map(|top| base.join(top).to_string_lossy().into_owned())
-                        .collect()
-                },
-            );
-            (outputs, held)
-        })
-        .await;
-        let (outputs, held) = match planned {
-            Ok((outputs, held)) => (Arc::new(outputs), held),
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
-                let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
-                    db.finish_torrent_unpack(job_id, &[], &[])
-                });
-                self.recorded(job_id, recorded.await);
-                self.unclaim_outputs(job_id).await;
-                return Placing::Short {
-                    why: unplaced(&work, &error),
-                    placed: Vec::new(),
-                };
-            }
-        };
-        // Kept on the row before they move, so a crash between leaves no
-        // file of the torrent's that its delete does not know of.
-        let names = outputs.names.clone();
-        let kept = self.queue_save(job_id, "keep_torrent_outputs", move |db| {
-            db.keep_torrent_outputs(job_id, &names, &held)
-        });
-        self.recorded(job_id, kept.await);
-        let (from, moving) = (work.clone(), Arc::clone(&outputs));
+        let (placing, tee, db) = (Arc::clone(store), Arc::clone(tee), self.inner.db.clone());
         let placed = tokio::task::spawn_blocking(move || {
             let _job = JobScope::enter(job_id);
-            moving
-                .place(&from)
-                .map_err(|error| (error.to_string(), Some(moving.there())))
+            let files = placing.files();
+            let listed: HashSet<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
+            let spent: HashSet<PathBuf> = spent.into_iter().collect();
+            let dir = files.dir();
+            // The names an earlier placing of this torrent's kept on its row.
+            let kept = db.torrent_outputs(job_id).unwrap_or_else(|error| {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not read the files a torrent placed before");
+                Vec::new()
+            });
+            let moves = JobMoves::of(job_id.0);
+            let placed = place_outputs(tee.work(), &dir, &listed, &spent, &kept, |from, to| {
+                move_output(&moves, from, to)
+            });
+            #[cfg(test)]
+            assert!(
+                !PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
+                "placing a torrent's unpacked files"
+            );
+            let held = match placed.names.is_empty() {
+                true => Vec::new(),
+                false => held_of(&dir, &placed.names),
+            };
+            (placed, held)
         })
-        .await
-        .unwrap_or_else(|error| Err((error.to_string(), None)));
-        // A move that failed takes off the row the files it put back; one
-        // whose end is not known leaves every one on it, for its delete.
-        let (names, unplaced_names) = match &placed {
-            Ok(()) | Err((_, None)) => (outputs.names.clone(), Vec::new()),
-            Err((_, Some(there))) => {
-                let there: HashSet<&String> = there.iter().collect();
-                let left = outputs
-                    .names
-                    .iter()
-                    .filter(|name| !there.contains(name))
-                    .cloned()
-                    .collect();
-                (Vec::new(), left)
+        .await;
+        let (placed, held) = match placed {
+            Ok(placed) => placed,
+            // Its end is not known, as a panic leaves it. The row was not
+            // written for this placing and names none of its files: any it
+            // moved stay beside the torrent's, on no row.
+            Err(error) => {
+                return self
+                    .not_placed(job_id, &work, &error.to_string(), Vec::new(), Vec::new())
+                    .await;
             }
         };
+        // The one write of this placing, after its moves: the row keeps
+        // exactly the names of the files it moved, what the torrent holds
+        // gains them, and the job's checkpoint goes.
+        let (names, gone) = (placed.names.clone(), placed.gone.clone());
+        let failed = placed.failed.as_ref().map(ToString::to_string);
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
-            db.finish_torrent_unpack(job_id, &names, &unplaced_names)
+            #[cfg(test)]
+            if KEEP_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                return Err(StateError::Database("refused".to_owned()));
+            }
+            db.finish_torrent_unpack(job_id, &names, &gone, &held)
         });
-        self.recorded(job_id, recorded.await);
+        let recorded = match recorded.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("the torrent's row was not written".to_owned()),
+        };
+        // A row that does not name them keeps no output: each goes back
+        // where unpacking made it, by the move that placed it.
+        if let Err(error) = recorded {
+            let gone = placed.gone.clone();
+            let there = tokio::task::spawn_blocking(move || {
+                let moves = JobMoves::of(job_id.0);
+                placed
+                    .put_back(|from, to| moves.move_file(from, to))
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .collect()
+            })
+            .await
+            .unwrap_or_default();
+            return self.not_placed(job_id, &work, &error, gone, there).await;
+        }
         self.unclaim_outputs(job_id).await;
-        if let Err((error, there)) = placed {
-            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not move beside it");
+        if let Some(error) = failed {
+            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not all move beside it");
             return Placing::Short {
                 why: unplaced(&work, &error),
-                placed: there.unwrap_or_default(),
+                placed: placed.names,
             };
         }
         let root = self.inner.env.work.clone();
@@ -218,6 +225,30 @@ impl TorrentService {
             tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent's unpacking directory");
         }
         Placing::Placed
+    }
+
+    // No output is on the row for this placing: the row lets go of
+    // `dropped`, the names it kept that hold no file, and the torrent ends
+    // short with its outputs in its unpacking folder, but for `there`, the
+    // ones that are beside its files and would not go back.
+    async fn not_placed(
+        &self,
+        job_id: JobId,
+        work: &Path,
+        error: &str,
+        dropped: Vec<String>,
+        there: Vec<String>,
+    ) -> Placing {
+        tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
+        let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
+            db.finish_torrent_unpack(job_id, &[], &dropped, &[])
+        });
+        self.recorded(job_id, recorded.await);
+        self.unclaim_outputs(job_id).await;
+        Placing::Short {
+            why: unplaced(work, &error),
+            placed: there,
+        }
     }
 
     fn recorded(
@@ -400,4 +431,28 @@ pub(super) enum Placing {
     // Some or all stay where unpacking made them, for `why`; `placed` are
     // the ones beside the torrent's files.
     Short { why: String, placed: Vec<String> },
+}
+
+// The move every output is placed by: never over what is there.
+pub(super) fn move_output(moves: &JobMoves, from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(meets) = locked(&OUTPUT_MEETS).as_mut() {
+        meets(to);
+    }
+    moves.move_file(from, to)
+}
+
+// What a torrent holds for the outputs `names` under `dir`: each one's top
+// part there, or the folder itself when one of them has no part of its own.
+// It reads the disk, so it runs off the runtime.
+fn held_of(dir: &Path, names: &[String]) -> Vec<String> {
+    let base = resolved(dir);
+    held_tops(names.iter().map(String::as_str)).map_or_else(
+        || vec![base.to_string_lossy().into_owned()],
+        |tops| {
+            tops.iter()
+                .map(|top| base.join(top).to_string_lossy().into_owned())
+                .collect()
+        },
+    )
 }

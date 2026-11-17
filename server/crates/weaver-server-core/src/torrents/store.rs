@@ -63,6 +63,20 @@ struct Have {
     // Each file's bytes in the pieces had.
     file_have: Vec<u64>,
     count: u32,
+    // A move of placed files is between the write that set its row aside
+    // and the write that ends it (`TorrentStore::mid_move`): the pieces
+    // kept meanwhile are to be checked, as that row says.
+    mid_move: bool,
+}
+
+// A move of a torrent's placed files is under way until this is dropped
+// (`TorrentStore::mid_move`).
+pub(crate) struct MidMove<'a>(&'a TorrentStore);
+
+impl Drop for MidMove<'_> {
+    fn drop(&mut self) {
+        self.0.have().mid_move = false;
+    }
 }
 
 impl Have {
@@ -73,6 +87,7 @@ impl Have {
             unchecked: BitVec::repeat(false, count),
             file_have: vec![0; layout.file_count()],
             count: 0,
+            mid_move: false,
         }
     }
 
@@ -473,14 +488,24 @@ impl TorrentStore {
 
     // A check of every piece begun: none is had until it finds it. True
     // when any was had.
+    //
+    // Files a move shut to reads (`Files::relocate`) are read again from
+    // here, once no piece is had: this is the one place every piece is
+    // forgotten, so whatever begins the check (the move itself, a recheck
+    // the operator asks for, the start after an error, a session joined)
+    // reads them, and none is left with files it can never check.
     fn check_every_piece(&self) -> bool {
-        let mut have = self.have();
-        let had = have.pieces.clone();
-        have.unchecked.fill(true);
-        for piece in had.iter_ones() {
-            have.set(&self.layout, piece as u32, false);
-        }
-        had.any()
+        let had = {
+            let mut have = self.have();
+            let had = have.pieces.clone();
+            have.unchecked.fill(true);
+            for piece in had.iter_ones() {
+                have.set(&self.layout, piece as u32, false);
+            }
+            had.any()
+        };
+        self.files.let_read();
+        had
     }
 
     // Why the side store found at open was not trusted and was removed,
@@ -503,8 +528,20 @@ impl TorrentStore {
         let have = self.have();
         Kept {
             bits: have.pieces.as_raw_slice().to_vec(),
-            checking: have.unchecked.any(),
+            checking: have.unchecked.any() || have.mid_move,
         }
+    }
+
+    // A move of the torrent's placed files begins: until what is returned
+    // is dropped, after the write that ends the move, the pieces kept for
+    // the next run are to be checked (`kept`), as the row the move set
+    // aside says. A run that ends while files are copied then trusts none
+    // of them, whatever checkpoint was written meanwhile. It forgets no
+    // piece and marks none unchecked: a move that keeps nothing leaves the
+    // pieces vouched for as they were.
+    pub(crate) fn mid_move(&self) -> MidMove<'_> {
+        self.have().mid_move = true;
+        MidMove(self)
     }
 
     // The pieces the session starts from, so it does not check the files:
@@ -516,7 +553,13 @@ impl TorrentStore {
     // that were `placed` where its client asked: they may be there already,
     // and the check finds them (libtorrent checks the files of a torrent
     // added with no resume data).
+    //
+    // Files still shut to reads have their pieces forgotten here first: a
+    // session joined with them holds none as had and checks them all.
     pub(crate) fn initial_have(&self, placed: bool) -> Option<BitBox<u8, Msb0>> {
+        if self.files.is_shut() {
+            self.check_every_piece();
+        }
         let have = self.have();
         if have.unchecked.any() || (placed && have.count == 0) {
             return None;
@@ -739,21 +782,55 @@ impl TorrentStore {
     // for them where they are has been written: those after go where they
     // went. For a thread that may wait on a disk.
     // Pieces handed over while it lasts are kept, and queued as it ends.
+    // `shut` says whether the files come out of it shut to reads
+    // (`Files::relocate`).
     pub(crate) fn relocate<T, E>(
         &self,
         relocate: impl FnOnce(&Path) -> Result<(PathBuf, T), E>,
+        shut: impl FnOnce(Result<&T, &E>) -> bool,
     ) -> Result<T, E> {
         self.begin_move();
-        let moved = self.files.relocate(|dir| {
-            if !self.writes.drain() {
-                tracing::warn!(dir = %dir.display(), "a torrent's files moved with pieces queued for them unwritten");
-            }
-            let (to, outcome) = relocate(dir)?;
-            self.writes.moved(&to);
-            Ok((to, outcome))
-        });
+        let moved = self.files.relocate(
+            |dir| {
+                if !self.writes.drain() {
+                    tracing::warn!(dir = %dir.display(), "a torrent's files moved with pieces queued for them unwritten");
+                }
+                let (to, outcome) = relocate(dir)?;
+                self.writes.moved(&to);
+                Ok((to, outcome))
+            },
+            // Files that come out shut are vouched for by nothing saved:
+            // the pieces kept for the next run say so (`kept`), and that
+            // run checks them all, until a check of every piece has found
+            // them. Said while the move still holds the files, so no
+            // checkpoint finds them moved and the pieces vouched for.
+            |ended| {
+                let shut = shut(ended);
+                if shut {
+                    self.unvouch();
+                }
+                shut
+            },
+        );
+        // And files shut by a move before this one stay unvouched for.
+        if self.files.is_shut() {
+            self.unvouch();
+        }
         self.end_move();
         moved
+    }
+
+    // Whether the store vouches for none of its pieces: a check of every
+    // piece has yet to find them.
+    pub(crate) fn unvouched(&self) -> bool {
+        self.have().unchecked.any()
+    }
+
+    // The store vouches for none of its pieces from here, until a check of
+    // every piece has found them: the pieces kept for the next run say so
+    // (`kept`). It forgets none; that is `check_every_piece`.
+    pub(crate) fn unvouch(&self) {
+        self.have().unchecked.fill(true);
     }
 
     // The files are under `to` from now on, moved by no one: a torrent held
@@ -762,10 +839,13 @@ impl TorrentStore {
     pub(crate) fn place(&self, to: PathBuf) {
         self.begin_move();
         self.files
-            .relocate(|_| {
-                self.writes.placed(&to);
-                Ok::<_, std::convert::Infallible>((to.clone(), ()))
-            })
+            .relocate(
+                |_| {
+                    self.writes.placed(&to);
+                    Ok::<_, std::convert::Infallible>((to.clone(), ()))
+                },
+                |_| false,
+            )
             .unwrap_or_else(|never| match never {});
         self.end_move();
     }

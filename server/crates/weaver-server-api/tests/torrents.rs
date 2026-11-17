@@ -1622,7 +1622,8 @@ fn announcing(name: &str, announce: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_routes_and_trackers_say_who_resolves_their_names() {
     use weaver_server_core::proxies::{
-        Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, Resolver, RouteLeg, Rung,
+        Consumer, DnsProfile, DnsProfileKind, DnsTrust, DnsWho, ProxyKind, ProxyProfile,
+        ProxyRuntime, ProxySecrets, RouteLeg, Rung,
     };
     use weaver_server_core::torrents::sessions::NetworkRoutes;
 
@@ -1637,7 +1638,6 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
             enabled: true,
             host: "127.0.0.1".into(),
             port: 1,
-            resolver: Resolver::Proxy,
             dns_servers: vec![],
             tunnel_addresses: vec![],
             peer_public_key: None,
@@ -1649,6 +1649,7 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
             forwarded_port: None,
             revision: 1,
             secrets: ProxySecrets::default(),
+            dns_profile_id: 0,
         })
         .unwrap();
         let proxies = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
@@ -1670,11 +1671,30 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
     let rule = response.data.into_json().unwrap()["saveTrackerRule"][0]["id"]
         .as_u64()
         .unwrap();
+    // The ladder's route has its exit proxy answer names.
+    let by_proxy = rig
+        .harness
+        .db
+        .save_dns_profile(
+            DnsProfile {
+                id: 0,
+                name: "by proxy".into(),
+                kind: DnsProfileKind::Route,
+                who: DnsWho::Proxy,
+                transit: None,
+                trust: DnsTrust::AsSent,
+                server_list_id: None,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
     rig.harness
         .db
         .save_proxy_routing_policy(
             Consumer::Torrent(TorrentScope::TrackerRule(rule as u32)),
             &RoutingPolicy {
+                dns_profile_id: Some(by_proxy.id),
                 legs: vec![RouteLeg {
                     egress_id: SYSTEM_EGRESS_ID,
                     weight: 100,
@@ -2206,4 +2226,82 @@ async fn the_updates_of_every_torrent_wait_for_the_load() {
             .len(),
         3
     );
+}
+
+// Operator ruling, 2026-11-16 (PR 129 question 2): a control key moves a
+// torrent only to a folder at or under the default save folder or a
+// category's folder; elsewhere it is forbidden and nothing moves. An admin
+// key moves it anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_key_moves_a_torrent_only_under_the_save_folders() {
+    let rig = rig().await;
+    let complete = rig._dir.path().join("complete");
+    let tv = rig._dir.path().join("media").join("tv");
+    rig.torrents
+        .set_settings(TorrentSettings {
+            upload_cap: None,
+            complete_dir: complete.clone(),
+            categories: vec![CategoryConfig {
+                upload_cap: Default::default(),
+                id: 1,
+                name: "tv".into(),
+                dest_dir: Some(tv.to_string_lossy().into_owned()),
+                aliases: String::new(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
+            }],
+            seeding: None,
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
+        })
+        .await;
+    let added = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(added.errors.is_empty(), "{:?}", added.errors);
+    let id = added.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let rig = &rig;
+    let dir = || async move {
+        let view = rig
+            .torrents
+            .torrent(weaver_server_core::jobs::ids::JobId(id))
+            .await
+            .unwrap();
+        std::path::PathBuf::from(view.storage_dir.unwrap())
+    };
+    let move_to = |path: std::path::PathBuf, scope: CallerScope| async move {
+        let path = path.to_string_lossy().replace('\\', "\\\\");
+        rig.execute_as_key(
+            &format!(r#"mutation {{ setTorrentLocation(id: {id}, path: "{path}") }}"#),
+            scope,
+        )
+        .await
+    };
+
+    let under_default = complete.join("moved");
+    let moved = move_to(under_default.clone(), CallerScope::Control).await;
+    assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+    assert_eq!(dir().await.parent(), Some(under_default.as_path()));
+    let under_category = tv.join("Show");
+    let moved = move_to(under_category.clone(), CallerScope::Control).await;
+    assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+    let there = dir().await;
+    assert_eq!(there.parent(), Some(under_category.as_path()));
+
+    let elsewhere = rig._dir.path().join("elsewhere");
+    for path in [elsewhere.clone(), tv.join("..").join("elsewhere")] {
+        let refused = move_to(path, CallerScope::Control).await;
+        assert_eq!(code(&refused).as_deref(), Some("FORBIDDEN"));
+    }
+    assert_eq!(dir().await, there);
+    assert!(!elsewhere.exists());
+
+    let moved = move_to(elsewhere.clone(), CallerScope::Admin).await;
+    assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+    assert_eq!(dir().await.parent(), Some(elsewhere.as_path()));
 }

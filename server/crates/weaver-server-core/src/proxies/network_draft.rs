@@ -9,6 +9,7 @@ use weaver_tunnel::{
 };
 
 pub struct DraftNetworkRoute {
+    consumer: Consumer,
     pub policy: RoutingPolicy,
     legs: Vec<LiveLeg>,
     handle: tokio::runtime::Handle,
@@ -54,7 +55,7 @@ impl DraftNetworkRoute {
         Ok((
             leg_kind(&self.isolated, leg.egress_id, &leg.path),
             leg_unavailable(&self.isolated, leg.egress_id),
-            names_on(&self.isolated, &leg.path),
+            names_on(&self.isolated, self.consumer, &leg.path),
         ))
     }
     pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
@@ -223,15 +224,15 @@ impl TunnelProvider for ProbeProvider {
 }
 impl NetworkRuntime {
     pub(super) fn isolated_probe_runtime(&self) -> Arc<Self> {
+        let configuration = self
+            .configuration
+            .read()
+            .expect("network configuration")
+            .clone();
         Arc::new(Self {
             db: self.db.clone(),
             handle: self.handle.clone(),
-            configuration: RwLock::new(
-                self.configuration
-                    .read()
-                    .expect("network configuration")
-                    .clone(),
-            ),
+            configuration: RwLock::new(configuration),
             sessions: Mutex::new(HashMap::new()),
             session_sockets: Arc::default(),
             borrowed_sessions: self.sessions.lock().expect("network sessions").clone(),
@@ -248,6 +249,9 @@ impl NetworkRuntime {
             route_health: None,
             probing: true,
             reloads: tokio::sync::watch::Sender::new(0),
+            // A probe asks its DNS itself rather than taking what the live
+            // routes were already told.
+            route_names: Arc::default(),
             egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
                 weaver_nntp::transfer::TransferScope::Egress,
             )),
@@ -264,6 +268,10 @@ impl NetworkRuntime {
     pub fn validate_policy(&self, policy: &RoutingPolicy) -> Result<(), NetworkRefusal> {
         policy.validate()?;
         let config = self.configuration.read().expect("network configuration");
+        // A route names only by a route profile, as its save requires.
+        if let Some(id) = policy.dns_profile_id {
+            config.route_profile(id)?;
+        }
         if policy.legs.is_empty() && policy.proxy_ids.is_empty() && !policy.allow_direct {
             return Ok(());
         }
@@ -292,7 +300,7 @@ impl NetworkRuntime {
         // Drafts share unchanged live carriers. Carried tunnels are sized
         // by the provider in the same way before and after saving the route.
         let isolated = self.isolated_probe_runtime();
-        if !removed.is_empty() {
+        let profile = {
             let mut config = isolated
                 .configuration
                 .write()
@@ -300,7 +308,18 @@ impl NetworkRuntime {
             for pool in config.pools.values_mut() {
                 pool.member_ids.retain(|id| !removed.contains(id));
             }
-        }
+            // A draft names by the DNS profile it gives, else by its
+            // route's, and says so wherever the probe asks.
+            let profile = policy
+                .dns_profile_id
+                .unwrap_or_else(|| config.dns_profile_of(&consumer.key()));
+            config
+                .policies
+                .entry(consumer.key())
+                .or_default()
+                .dns_profile_id = Some(profile);
+            profile
+        };
         let config = isolated
             .configuration
             .read()
@@ -310,10 +329,11 @@ impl NetworkRuntime {
             .legs
             .iter()
             .enumerate()
-            .map(|(i, l)| isolated.leg(&config, consumer, i, l, timeout))
+            .map(|(i, l)| isolated.leg(&config, consumer, i, l, timeout, Some(profile)))
             .collect::<Result<Vec<_>, _>>()?;
         drop(config);
         Ok(Arc::new(DraftNetworkRoute {
+            consumer,
             policy,
             legs,
             handle: self.handle.clone(),

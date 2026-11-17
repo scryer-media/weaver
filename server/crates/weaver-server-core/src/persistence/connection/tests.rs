@@ -3034,7 +3034,12 @@ async fn postgres_post_processing_roundtrip_when_configured() {
     admin_pool.close().await;
 }
 
-async fn create_postgres_test_schema(test_name: &str) -> Option<(sqlx::PgPool, String, String)> {
+// A schema of its own for `test_name` on the server WEAVER_TEST_POSTGRES_URL
+// names, as (admin pool, schema, URL of the schema); none when it names none.
+// The one place a test outside this module opens a PostgreSQL connection.
+pub(crate) async fn create_postgres_test_schema(
+    test_name: &str,
+) -> Option<(sqlx::PgPool, String, String)> {
     let Ok(base_url) = std::env::var("WEAVER_TEST_POSTGRES_URL") else {
         eprintln!("skipping {test_name}; WEAVER_TEST_POSTGRES_URL is not set");
         return None;

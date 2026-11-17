@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useClient, useQuery, useSubscription, type Client } from "urql";
 import type { DocumentNode } from "graphql";
 import { NETWORK_FLOW_QUERY, NETWORK_FLOW_SUBSCRIPTION, NETWORKING_QUERY } from "@/graphql/networking";
@@ -20,7 +20,7 @@ import {
   type ProxyPool,
 } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
-import { refusalMessage } from "@/lib/refusal";
+import { refusalMessage, type RefusalNames } from "@/lib/refusal";
 import { withoutTorrentOnly } from "../../data/torrents-shown";
 import { useTorrentsShown } from "../../data/use-torrents-shown";
 
@@ -52,7 +52,7 @@ export type Consumer = {
   route: NetworkRoute | null;
 };
 
-export const NETWORKING_PAGES = ["overview", "egress", "proxies", "routes", "speed"] as const;
+export const NETWORKING_PAGES = ["overview", "egress", "proxies", "routes", "dns", "speed"] as const;
 export type NetworkingPage = (typeof NETWORKING_PAGES)[number];
 
 /** The speed test page with a route selected. */
@@ -172,11 +172,12 @@ async function runNetworkingAction(
   variables: Record<string, unknown>,
   refresh: () => void,
   report: (failure: string | null) => void,
+  names: RefusalNames,
   onData?: (data: unknown) => void,
 ): Promise<string | null> {
   try {
     const result = await client.mutation(document, variables).toPromise();
-    const failure = result.error ? refusalMessage(t, result.error) : null;
+    const failure = result.error ? refusalMessage(t, result.error, names) : null;
     report(failure);
     if (failure === null) {
       onData?.(result.data);
@@ -199,10 +200,12 @@ async function runNetworkingAction(
 export function useNetworkingWorkspace(page: string) {
   const t = useTranslate();
   const client = useClient();
-  const live = page !== "proxies";
+  // The DNS page reads its own lists and profiles, and draws no flow.
+  const live = page !== "proxies" && page !== "dns";
   const [{ data, error, fetching }, refresh] = useQuery<NetworkingData>({
     query: NETWORKING_QUERY,
     requestPolicy: "cache-and-network",
+    pause: page === "dns",
   });
   const [initial] = useQuery<{ networkFlow: NetworkFlow }>({
     query: NETWORK_FLOW_QUERY,
@@ -216,6 +219,9 @@ export function useNetworkingWorkspace(page: string) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  // The routes' and proxies' names as last drawn, for a refusal that names them by key and id.
+  const consumersRef = useRef<Consumer[]>([]);
+  const profilesRef = useRef<ProxyProfile[]>([]);
 
   // Kept the same across renders, as is everything derived below, so a page
   // drawn again for some other reason hands its rows the same props.
@@ -231,6 +237,10 @@ export function useNetworkingWorkspace(page: string) {
       (outcome) => {
         setFailed(outcome !== null);
         setMessage(outcome ?? t("next.networking.saved"));
+      },
+      {
+        route: (key) => consumersRef.current.find((consumer) => consumer.key === key)?.name ?? key,
+        proxy: (id) => profilesRef.current.find((profile) => profile.id === id)?.name,
       },
       onData,
     );
@@ -248,9 +258,15 @@ export function useNetworkingWorkspace(page: string) {
   const consumers = useSameWhileUnchanged(
     withoutTorrentOnly(flowConsumers(measured, data, t), torrentsOn, (consumer) => isTorrentConsumer(consumer.kind)),
   );
+  useEffect(() => {
+    consumersRef.current = consumers;
+  }, [consumers]);
   const flow = useMemo(() => plannedFlow(measured, consumers), [consumers, measured]);
   const egresses = useSameWhileUnchanged(measured.egresses ?? data?.egressInterfaces ?? NO_EGRESSES);
   const profiles = useSameWhileUnchanged(measured.proxies ?? data?.proxyProfiles ?? NO_PROFILES);
+  useEffect(() => {
+    profilesRef.current = profiles;
+  }, [profiles]);
   const pools = useSameWhileUnchanged(measured.proxyPools ?? data?.proxyPools ?? NO_POOLS);
 
   return {
@@ -297,6 +313,7 @@ export function liveAddresses(egress: Egress, data: NetworkingData): string[] {
   );
 }
 
+/** An egress as its save sends it. */
 export function egressInput(egress: Egress) {
   return {
     name: egress.name,

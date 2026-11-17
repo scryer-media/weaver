@@ -5,6 +5,8 @@ import { readFileSync } from "node:fs";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
 import { expectGraphqlErrors } from "./support/graphql-errors";
+import { byTestIdPrefix, saveSettings, tableRow } from "./support/settings-locators";
+import { jobIds, testIds, torrentIds } from "./support/testids";
 
 /**
  * Torrents as an operator drives them in the browser: the settings panel and
@@ -35,201 +37,195 @@ const magnetFixture = fixture("ui-magnet");
 const fileFixture = fixture("ui-file");
 const category = "e2e-torrent-category";
 
-/** A settings table row, found by the exact text of one of its cells. */
-function tableRow(page: Page, table: string, cellText: string): Locator {
-  return page
-    .getByRole("region", { name: table, exact: true })
-    .getByRole("button")
-    .filter({ has: page.getByText(cellText, { exact: true }) });
-}
-
 /**
- * The queue row of a download, by the name the row carries as its title: the
- * queue shows a release name with its dots read as spaces.
+ * The queue row of a download, by the name it shows: the queue shows a
+ * release name with its dots read as spaces.
  */
 function queueRow(page: Page, name: string): Locator {
   const shown = name.replaceAll(".", " ").replace(/\s+/g, " ").trim();
-  return page.getByRole("main").getByTitle(shown, { exact: true });
+  return byTestIdPrefix(page, torrentIds.queueRowPrefix).filter({
+    has: page.getByTestId(torrentIds.queueRowName).and(page.getByText(shown, { exact: true })),
+  });
 }
 
-async function setNumber(scope: Locator, label: string, value: string) {
-  const field = scope.getByRole("spinbutton", { name: label, exact: true });
+/** Type a number into the field whose test ID is `fieldId`, inside `scope`. */
+async function setNumber(scope: Locator, fieldId: string, value: string) {
+  const field = scope.getByTestId(fieldId);
   await field.fill(value);
   await field.press("Enter");
   await expect(field).toHaveValue(value);
-}
-
-async function saveSettings(page: Page) {
-  await page.getByRole("button", { name: "Save changes", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
 }
 
 /** Open a torrent's own screen from its queue row and the inspector's link. */
 async function openJob(page: Page, torrent: Fixture) {
   await page.goto("/");
   await queueRow(page, torrent.name).click();
-  await page.getByRole("link", { name: "Open job detail" }).click();
+  await page.getByTestId(torrentIds.inspectorOpenDetail).click();
   await expect(page).toHaveURL(/\/jobs\/\d+$/);
-  await expect(page.locator("#torrent").getByText(torrent.infohash, { exact: true })).toBeVisible();
+  await expect(page.getByTestId(torrentIds.field("infoHashV1"))).toContainText(torrent.infohash);
 }
 
 test("Settings → Torrents saves the connection and the global seeding policy", async ({ cleanPage: page }) => {
   await page.goto("/settings/torrents");
-  const connection = page.getByRole("region", { name: "Connection", exact: true });
-  const seeding = page.getByRole("region", { name: "Seeding", exact: true });
-  await expect(connection.getByRole("switch", { name: "Enabled", exact: true })).toHaveAttribute("aria-checked", "true");
+  const connection = page.getByTestId(testIds.section("connection"));
+  const bittorrent = page.getByTestId(testIds.section("bittorrent"));
+  const seeding = page.getByTestId(testIds.section("seeding"));
+  await expect(connection.getByTestId(testIds.field("enabled"))).toHaveAttribute("aria-checked", "true");
 
-  await setNumber(connection, "Max active downloads", "4");
-  await setNumber(connection, "Max peers", "150");
-  await seeding.getByRole("switch", { name: "Seed time goal", exact: true }).click();
-  await setNumber(seeding, "Seed time goal", "2880");
+  await setNumber(bittorrent, testIds.field("maxActiveDownloads"), "4");
+  await setNumber(connection, testIds.field("maxPeersTotal"), "150");
+  await seeding.getByTestId(testIds.field("seeding-seedTimeGoalMinutes")).click();
+  // The goal starts in days, the unit its one-day fallback divides into: 2 days is 2880 minutes.
+  await setNumber(seeding, testIds.fieldValue("seeding-seedTimeGoalMinutes"), "2");
   await saveSettings(page);
 
   await page.reload();
-  const reloadedConnection = page.getByRole("region", { name: "Connection", exact: true });
-  const reloadedSeeding = page.getByRole("region", { name: "Seeding", exact: true });
-  await expect(reloadedConnection.getByRole("spinbutton", { name: "Max active downloads", exact: true })).toHaveValue("4");
-  await expect(reloadedConnection.getByRole("spinbutton", { name: "Max peers", exact: true })).toHaveValue("150");
-  await expect(reloadedConnection.getByRole("switch", { name: "Enabled", exact: true })).toHaveAttribute("aria-checked", "true");
-  await expect(reloadedSeeding.getByRole("switch", { name: "Seed time goal", exact: true })).toHaveAttribute("aria-checked", "true");
-  await expect(reloadedSeeding.getByRole("spinbutton", { name: "Seed time goal", exact: true })).toHaveValue("2880");
-  await expect(reloadedSeeding.getByRole("switch", { name: "Ratio goal", exact: true })).toHaveAttribute("aria-checked", "false");
+  const reloadedConnection = page.getByTestId(testIds.section("connection"));
+  const reloadedBittorrent = page.getByTestId(testIds.section("bittorrent"));
+  const reloadedSeeding = page.getByTestId(testIds.section("seeding"));
+  await expect(reloadedBittorrent.getByTestId(testIds.field("maxActiveDownloads"))).toHaveValue("4");
+  await expect(reloadedConnection.getByTestId(testIds.field("maxPeersTotal"))).toHaveValue("150");
+  await expect(reloadedConnection.getByTestId(testIds.field("enabled"))).toHaveAttribute("aria-checked", "true");
+  await expect(reloadedSeeding.getByTestId(testIds.field("seeding-seedTimeGoalMinutes"))).toHaveAttribute("aria-checked", "true");
+  await expect(reloadedSeeding.getByTestId(testIds.fieldValue("seeding-seedTimeGoalMinutes"))).toHaveValue("2");
+  await expect(reloadedSeeding.getByTestId(testIds.field("seeding-ratioGoal"))).toHaveAttribute("aria-checked", "false");
 });
 
 test("a category's Torrents section saves its own route and seeding policy", async ({ cleanPage: page }) => {
   await page.goto("/settings/categories");
-  await page.getByRole("main").getByRole("button", { name: "Add category", exact: true }).click();
-  const form = page.getByRole("dialog", { name: "Add category", exact: true });
-  await form.getByRole("textbox", { name: "Name", exact: true }).fill(category);
-  // The editor's Torrents section: its fields are the only ones by these names in the dialog.
-  const torrents = form;
-  await torrents.getByRole("switch", { name: "Own torrent route", exact: true }).click();
-  await torrents.getByRole("switch", { name: "Own seeding policy", exact: true }).click();
-  await torrents.getByRole("switch", { name: "Ratio goal", exact: true }).click();
-  await setNumber(torrents, "Ratio goal", "2.5");
-  await form.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByTestId(testIds.tableAdd("categories")).click();
+  const form = page.getByTestId(testIds.dialog("category"));
+  await form.getByTestId(testIds.field("name")).fill(category);
+  const ratioGoal = testIds.field("categorySeeding-ratioGoal");
+  await form.getByTestId(testIds.field("torrentRoute")).click();
+  // A category's goal is set on its own once its state is Set; nothing else turns its policy on.
+  await form.getByTestId(testIds.option(ratioGoal, "SET")).click();
+  await setNumber(form, testIds.fieldValue("categorySeeding-ratioGoal"), "2.5");
+  await form.getByTestId(testIds.editorSave).click();
   await expect(form).toBeHidden();
 
   await page.reload();
-  await tableRow(page, "Categories", category).click();
-  const editor = page.getByRole("dialog", { name: category, exact: true });
-  const saved = editor;
-  await expect(saved.getByRole("switch", { name: "Own torrent route", exact: true })).toHaveAttribute("aria-checked", "true");
-  await expect(saved.getByRole("switch", { name: "Own seeding policy", exact: true })).toHaveAttribute("aria-checked", "true");
-  await expect(saved.getByRole("spinbutton", { name: "Ratio goal", exact: true })).toHaveValue("2.5");
+  await tableRow(page, "categories", category).click();
+  const editor = page.getByTestId(testIds.dialog("category"));
+  await expect(editor.getByTestId(testIds.field("torrentRoute"))).toHaveAttribute("aria-checked", "true");
+  await expect(editor.getByTestId(testIds.option(ratioGoal, "SET"))).toHaveAttribute("aria-checked", "true");
+  await expect(editor.getByTestId(testIds.fieldValue("categorySeeding-ratioGoal"))).toHaveValue("2.5");
 
-  await editor.getByRole("button", { name: "Remove category", exact: true }).click();
-  const confirm = page.getByRole("dialog", { name: "Remove category", exact: true });
-  await confirm.getByRole("button", { name: "Remove category", exact: true }).click();
+  await editor.getByTestId(testIds.editorDelete).click();
+  const confirm = page.getByTestId(testIds.dialog("category-remove"));
+  await confirm.getByTestId(testIds.confirmAccept).click();
   await expect(confirm).toBeHidden();
-  await expect(tableRow(page, "Categories", category)).toHaveCount(0);
+  await expect(tableRow(page, "categories", category)).toHaveCount(0);
 });
 
 test("the Add dialog takes a magnet and a .torrent, and the queue tags and seeds them", async ({ cleanPage: page }) => {
   await page.goto("/");
-  await page.getByRole("banner").getByRole("button", { name: "Add", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Add", exact: true });
-  await dialog
-    .getByRole("textbox", { name: "Magnet link", exact: true })
-    .fill(readFileSync(`${fixturesRoot}/ui-magnet.magnet`, "utf8").trim());
+  await page.getByTestId(torrentIds.addOpen).click();
+  const dialog = page.getByTestId(testIds.dialog("add"));
+  await dialog.getByTestId(torrentIds.addLink).fill(readFileSync(`${fixturesRoot}/ui-magnet.magnet`, "utf8").trim());
   const chooser = page.waitForEvent("filechooser");
-  await dialog.getByRole("button", { name: /Drop NZB or torrent files here, or click to choose/ }).click();
+  await dialog.getByTestId(torrentIds.addDrop).click();
   await (await chooser).setFiles(`${fixturesRoot}/ui-file.torrent`);
-  await expect(dialog.getByRole("switch", { name: "Add paused", exact: true })).toHaveAttribute("aria-checked", "false");
-  await expect(dialog.getByRole("switch", { name: "Force", exact: true })).toHaveAttribute("aria-checked", "false");
-  await dialog.getByRole("button", { name: "Add 2 downloads", exact: true }).click();
+  await expect(dialog.getByTestId(torrentIds.addPaused)).toHaveAttribute("aria-checked", "false");
+  const submit = dialog.getByTestId(torrentIds.addSubmit);
+  // The button counts what it adds: the magnet and the file.
+  await expect(submit).toContainText("2");
+  await submit.click();
   await expect(dialog).toBeHidden();
 
   for (const name of [magnetFixture.name, fileFixture.name]) {
     const row = queueRow(page, name);
-    await expect(row.getByTitle("Torrent", { exact: true })).toHaveText("BT");
+    await expect(row.getByTestId(torrentIds.queueRowProtocol("TORRENT"))).toBeVisible();
     // Seeding shows once the download is whole: the ratio and the upload rate.
-    await expect(row.getByTitle("Ratio · upload", { exact: true })).toHaveText(/^\d+\.\d{2} · ↑ /);
+    await expect(row.getByTestId(torrentIds.queueRowSeeding)).toHaveText(/^\d+\.\d{2} · ↑ /);
   }
 });
 
 test("a torrent job shows its swarm, trackers, files and policy, and takes a seeding override", async ({ cleanPage: page }) => {
   await openJob(page, fileFixture);
-  const swarm = page.locator("#torrent");
-  await expect(swarm.getByText(fileFixture.infohash, { exact: true })).toBeVisible();
-  await expect(swarm.getByText("100.0%", { exact: true })).toBeVisible();
-  await expect(swarm.getByText("Seeds / leechers", { exact: true })).toBeVisible();
-  await expect(swarm.getByText(/^\d+ \/ \d+$/)).toBeVisible();
-  await expect(swarm.getByText("Ratio", { exact: true })).toBeVisible();
+  await expect(page.getByTestId(torrentIds.field("infoHashV1"))).toContainText(fileFixture.infohash);
+  // The swarm: seeds and peers each read as a count over the swarm's total, and the share ratio as a number.
+  await expect(page.getByTestId(torrentIds.field("seeds"))).toContainText(/\d+ \((\d+|—) total\)/);
+  await expect(page.getByTestId(torrentIds.field("peers"))).toContainText(/\d+ \((\d+|—) total\)/);
+  await expect(page.getByTestId(torrentIds.field("shareRatio"))).toContainText(/\d+\.\d{2}/);
 
-  const trackers = page.locator("#trackers");
-  await expect(trackers.getByText(fileFixture.tracker, { exact: true })).toBeVisible();
-  await expect(trackers.getByText("Working", { exact: true })).toBeVisible();
+  const tracker = page.getByTestId(torrentIds.tracker(fileFixture.tracker));
+  await expect(tracker).toBeVisible();
+  await expect(tracker.getByTestId(torrentIds.trackerStatus("WORKING"))).toBeVisible();
 
-  const files = page.locator("#torrent-files");
-  await expect(files.getByText(/beryl\.bin$/)).toBeVisible();
-  await expect(files.getByText(/notes\/beryl\.txt$/)).toBeVisible();
+  const filePaths = page.getByTestId(torrentIds.filePath);
+  await expect(filePaths.filter({ hasText: /beryl\.bin$/ })).toBeVisible();
+  await expect(filePaths.filter({ hasText: /notes\/beryl\.txt$/ })).toBeVisible();
+  // The whole download arrived: the torrent reads complete, and so does each of its files.
+  await expect(byTestIdPrefix(page, jobIds.jobProgressPrefix)).toHaveText(["100.0%"]);
+  for (const name of [/beryl\.bin$/, /notes\/beryl\.txt$/]) {
+    const file = page.getByTestId(torrentIds.file).filter({ has: filePaths.filter({ hasText: name }) });
+    await expect(file.getByTestId(torrentIds.fileProgress)).toHaveText("100.0%");
+  }
 
-  const seeding = page.locator("#seeding");
-  await expect(seeding.getByText("Global", { exact: true })).toBeVisible();
-  await expect(seeding.getByText("2880 min", { exact: true })).toBeVisible();
+  await expect(page.getByTestId(torrentIds.seedingLevel("seedTimeGoalMinutes", "GLOBAL"))).toBeVisible();
+  // 2880 minutes reads in the largest unit it divides into whole.
+  await expect(page.getByTestId(torrentIds.seedingTerm("seedTimeGoalMinutes"))).toHaveText("2 d");
 
-  await seeding.getByRole("button", { name: "Override seeding", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Override seeding", exact: true });
-  await dialog.getByRole("switch", { name: "Ratio goal", exact: true }).click();
-  await setNumber(dialog, "Ratio goal", "3");
-  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByTestId(torrentIds.seedingOverride).click();
+  const dialog = page.getByTestId(testIds.dialog("torrent-seeding"));
+  await dialog.getByTestId(testIds.option(testIds.field("torrent-seeding-ratioGoal"), "SET")).click();
+  await setNumber(dialog, testIds.fieldValue("torrent-seeding-ratioGoal"), "3");
+  await dialog.getByTestId(testIds.editorSave).click();
   await expect(dialog).toBeHidden();
-  await expect(seeding.getByText("Override", { exact: true })).toBeVisible();
-  await expect(seeding.getByText("3.00", { exact: true })).toBeVisible();
+  await expect(page.getByTestId(torrentIds.seedingLevel("ratioGoal", "TORRENT"))).toBeVisible();
+  await expect(page.getByTestId(torrentIds.seedingTerm("ratioGoal"))).toHaveText("3.00");
 });
 
 test("a torrent job pauses, resumes, forces and unforces from its header", async ({ cleanPage: page }) => {
   await openJob(page, fileFixture);
-  const header = page.getByRole("banner");
-  await header.getByRole("button", { name: "Pause", exact: true }).click();
-  await expect(header.getByRole("button", { name: "Resume", exact: true })).toBeVisible();
-  await header.getByRole("button", { name: "Resume", exact: true }).click();
-  await expect(header.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
+  await page.getByTestId(torrentIds.jobPause).click();
+  await expect(page.getByTestId(torrentIds.jobResume)).toBeVisible();
+  await page.getByTestId(torrentIds.jobResume).click();
+  await expect(page.getByTestId(torrentIds.jobPause)).toBeVisible();
 
-  await header.getByRole("button", { name: "Force", exact: true }).click();
-  await expect(header.getByRole("button", { name: "Unforce", exact: true })).toBeVisible();
-  await header.getByRole("button", { name: "Unforce", exact: true }).click();
-  await expect(header.getByRole("button", { name: "Force", exact: true })).toBeVisible();
+  await page.getByTestId(torrentIds.jobForce).click();
+  await expect(page.getByTestId(torrentIds.jobUnforce)).toBeVisible();
+  await page.getByTestId(torrentIds.jobUnforce).click();
+  await expect(page.getByTestId(torrentIds.jobForce)).toBeVisible();
 });
 
 test("Pause torrents on the Downloads page holds every torrent and leaves the queue's pause alone", async ({ cleanPage: page }) => {
   await page.goto("/");
-  const header = page.getByRole("banner");
   const rows = [queueRow(page, magnetFixture.name), queueRow(page, fileFixture.name)];
-  for (const row of rows) await expect(row.getByText("Seeding", { exact: true })).toBeVisible();
-  await expect(header.getByRole("button", { name: "Pause all", exact: true })).toBeVisible();
+  for (const row of rows) await expect(row.getByTestId(torrentIds.queueRowStatus("SEEDING"))).toBeVisible();
+  await expect(page.getByTestId(testIds.queuePauseAll)).toBeVisible();
 
-  await header.getByRole("button", { name: "Pause torrents", exact: true }).click();
-  await expect(header.getByRole("button", { name: "Resume torrents", exact: true })).toBeVisible();
+  await page.getByTestId(torrentIds.pauseTorrents).click();
+  await expect(page.getByTestId(torrentIds.resumeTorrents)).toBeVisible();
   for (const row of rows) {
-    await expect(row.getByText("Paused", { exact: true })).toBeVisible();
-    await expect(row.getByRole("button", { name: "Resume", exact: true })).toBeVisible();
+    await expect(row.getByTestId(torrentIds.queueRowStatus("PAUSED"))).toBeVisible();
+    await expect(row.getByTestId(torrentIds.queueRowResume)).toBeVisible();
   }
   // The torrents' hold is its own: the queue's pause still reads unpaused.
-  await expect(header.getByRole("button", { name: "Pause all", exact: true })).toBeVisible();
-  await expect(header.getByRole("button", { name: "Resume all", exact: true })).toHaveCount(0);
+  await expect(page.getByTestId(testIds.queuePauseAll)).toBeVisible();
+  await expect(page.getByTestId(testIds.queueResumeAll)).toHaveCount(0);
 
-  await header.getByRole("button", { name: "Resume torrents", exact: true }).click();
-  await expect(header.getByRole("button", { name: "Pause torrents", exact: true })).toBeVisible();
+  await page.getByTestId(torrentIds.resumeTorrents).click();
+  await expect(page.getByTestId(torrentIds.pauseTorrents)).toBeVisible();
   for (const row of rows) {
-    await expect(row.getByText("Seeding", { exact: true })).toBeVisible();
-    await expect(row.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
+    await expect(row.getByTestId(torrentIds.queueRowStatus("SEEDING"))).toBeVisible();
+    await expect(row.getByTestId(torrentIds.queueRowPause)).toBeVisible();
   }
-  await expect(header.getByRole("button", { name: "Pause all", exact: true })).toBeVisible();
+  await expect(page.getByTestId(testIds.queuePauseAll)).toBeVisible();
 });
 
 test("removing a private torrent short of its goal asks about its files and then the goal", async ({ cleanPage: page }) => {
   // The daemon refuses the first remove with the goal it is short of; the dialog turns that into its second confirm.
   expectGraphqlErrors(page, /seeding goal is not met/);
   await openJob(page, fileFixture);
-  await page.getByRole("banner").getByRole("button", { name: "Remove", exact: true }).click();
-  const first = page.getByRole("dialog", { name: "Remove torrent", exact: true });
-  await first.getByRole("checkbox", { name: "Also delete files", exact: true }).check();
-  await first.getByRole("button", { name: "Remove", exact: true }).click();
-  const second = page.getByRole("dialog", { name: "Seeding goal not met", exact: true });
+  await page.getByTestId(torrentIds.jobRemove).click();
+  const first = page.getByTestId(testIds.dialog("torrent-remove"));
+  await first.getByTestId(torrentIds.removeDeleteFiles).check();
+  await first.getByTestId(testIds.confirmAccept).click();
+  const second = page.getByTestId(testIds.dialog("torrent-unmet-goal"));
   await expect(second).toBeVisible();
-  await second.getByRole("button", { name: "Remove anyway", exact: true }).click();
+  await second.getByTestId(testIds.confirmAccept).click();
   await expect(second).toBeHidden();
   await expect(page).toHaveURL(/\/$/);
   await expect(queueRow(page, fileFixture.name)).toHaveCount(0);
@@ -239,11 +235,11 @@ test("removing a private torrent short of its goal asks about its files and then
 test("removing a public torrent from the queue inspector takes one confirm", async ({ cleanPage: page }) => {
   await page.goto("/");
   await queueRow(page, magnetFixture.name).click();
-  await page.getByRole("button", { name: "Remove download", exact: true }).click();
-  const confirm = page.getByRole("dialog", { name: "Remove torrent", exact: true });
-  await expect(confirm.getByRole("checkbox", { name: "Also delete files", exact: true })).not.toBeChecked();
-  await confirm.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.getByTestId(torrentIds.inspectorRemove).click();
+  const confirm = page.getByTestId(testIds.dialog("torrent-remove"));
+  await expect(confirm.getByTestId(torrentIds.removeDeleteFiles)).not.toBeChecked();
+  await confirm.getByTestId(testIds.confirmAccept).click();
   await expect(confirm).toBeHidden();
-  await expect(page.getByRole("dialog", { name: "Seeding goal not met", exact: true })).toHaveCount(0);
+  await expect(page.getByTestId(testIds.dialog("torrent-unmet-goal"))).toHaveCount(0);
   await expect(queueRow(page, magnetFixture.name)).toHaveCount(0);
 });

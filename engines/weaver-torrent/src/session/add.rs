@@ -289,7 +289,13 @@ impl Session {
                         AddTorrent::Url(url)
                             if url.starts_with("http://") || url.starts_with("https://") =>
                         {
-                            torrent_from_url(self.http_clients.as_ref(), &url).await?
+                            // Fetched as the torrent names, when it names
+                            // its own way.
+                            let clients = opts
+                                .naming
+                                .as_ref()
+                                .map_or(&self.http_clients, |naming| &naming.http_clients);
+                            torrent_from_url(clients.as_ref(), &url).await?
                         }
                         AddTorrent::Url(url) => {
                             bail!(
@@ -388,6 +394,7 @@ impl Session {
             .identity
             .take()
             .unwrap_or_else(|| self.identity.clone());
+        let naming = opts.naming.take().unwrap_or_else(|| self.naming());
         let dht_announce = tokio::sync::watch::channel(()).0;
 
         let make_peer_rx = |info_hashes: InfoHashes,
@@ -404,6 +411,7 @@ impl Session {
                     initial_peers: own_peers(&opts.initial_peers, &opts.found_peers, private),
                     trackers: TrackerAsk {
                         identity,
+                        naming: naming.clone(),
                         tiers: tracker_tiers.clone(),
                         force_interval: opts.force_tracker_interval,
                         private,
@@ -453,6 +461,7 @@ impl Session {
                 handover = handover.or_else(|| {
                     let mut trackers = TrackerAsk {
                         identity: &identity,
+                        naming: naming.clone(),
                         tiers: tracker_tiers.clone(),
                         force_interval: opts.force_tracker_interval,
                         private: true,
@@ -771,6 +780,7 @@ impl Session {
                 announced_from: parking_lot::Mutex::new(handed_from.unwrap_or(opts.totals)),
                 handed_over: handed_from.is_some().into(),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
+                naming: naming.clone(),
                 ssl,
                 run: Default::default(),
             });

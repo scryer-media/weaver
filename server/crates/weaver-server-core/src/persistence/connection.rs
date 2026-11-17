@@ -3042,7 +3042,7 @@ pub(crate) static JOB_WRITE_WAITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // Every blocking database call made on the thread that armed it, by the
 // caller's location: a test proves an actor turn reads nothing by arming the

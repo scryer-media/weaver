@@ -607,3 +607,491 @@ async fn a_torrent_unpack_held_for_room_is_woken_when_room_returns() {
     assert!(!outside.waits_for_disk());
     tee.forget();
 }
+
+// Operator ruling, 2026-11-16 (PR 129 question 10): an unpacked file whose
+// name is taken is placed under a numbered name, never dropped and never
+// over the file there.
+mod numbered_outputs {
+    use std::collections::HashSet;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::super::{GOES, Placed, place_outputs, walk};
+
+    // The product's move, as one job's.
+    fn move_file_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+        crate::runtime::fs::JobMoves::of(1).move_file(from, to)
+    }
+
+    fn place(work: &Path, dir: &Path, kept: &[&str]) -> Placed {
+        place_using(work, dir, kept, &[], move_file_exclusive)
+    }
+
+    // `place`, for a torrent that lists `listed` as files of its own, each
+    // output moved by `moved`.
+    fn place_using(
+        work: &Path,
+        dir: &Path,
+        kept: &[&str],
+        listed: &[&str],
+        moved: impl Fn(&Path, &Path) -> io::Result<()>,
+    ) -> Placed {
+        let kept: Vec<String> = kept.iter().map(|name| (*name).to_owned()).collect();
+        place_outputs(
+            work,
+            dir,
+            &listed.iter().map(PathBuf::from).collect(),
+            &HashSet::new(),
+            &kept,
+            moved,
+        )
+    }
+
+    fn names(placed: &Placed) -> Vec<&str> {
+        let mut names: Vec<&str> = placed.names.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    fn folders() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let (work, dir) = (root.path().join("work"), root.path().join("dir"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, work, dir)
+    }
+
+    // Every file under `dir`, by its path under it, in order.
+    fn on_disk(dir: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        walk(dir, Path::new(""), &mut found);
+        let mut found: Vec<String> = found
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    // An output's own name and a numbered form of another's never meet:
+    // "movie (1).mkv" made by the archive keeps its name, and "movie.mkv",
+    // whose name a file holds, is placed past it.
+    #[test]
+    fn a_numbered_form_is_never_placed_over_another_outputs_name() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("movie.mkv"), b"there").unwrap();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::write(work.join("movie (1).mkv"), b"also unpacked").unwrap();
+        let placed = place(&work, &dir, &[]);
+        assert!(placed.failed.is_none());
+        assert_eq!(names(&placed), ["movie (1).mkv", "movie (2).mkv"]);
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), b"there");
+        assert_eq!(
+            std::fs::read(dir.join("movie (1).mkv")).unwrap(),
+            b"also unpacked"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("movie (2).mkv")).unwrap(),
+            b"unpacked"
+        );
+        assert!(on_disk(&work).is_empty());
+    }
+
+    // Two torrents unpack the same name into one folder: each is given the
+    // name of the file it moved there itself, and neither the other's.
+    #[test]
+    fn two_torrents_placing_one_name_each_get_a_file_of_their_own() {
+        let (root, first_work, dir) = folders();
+        let second_work = root.path().join("second");
+        std::fs::create_dir_all(&second_work).unwrap();
+        std::fs::write(first_work.join("movie.mkv"), b"the first's").unwrap();
+        std::fs::write(second_work.join("movie.mkv"), b"the second's").unwrap();
+        assert_eq!(place(&first_work, &dir, &[]).names, ["movie.mkv"]);
+        assert_eq!(place(&second_work, &dir, &[]).names, ["movie (1).mkv"]);
+        assert_eq!(
+            std::fs::read(dir.join("movie.mkv")).unwrap(),
+            b"the first's"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("movie (1).mkv")).unwrap(),
+            b"the second's"
+        );
+    }
+
+    // Another writer's file appears at an output's name after the look
+    // found it free and before the move: it is theirs, as they wrote it,
+    // and the output goes to the next form at once. The names for the row
+    // are those of the files this placing moved, and no other.
+    #[test]
+    fn a_name_another_writer_takes_before_the_move_is_theirs() {
+        let (_root, work, dir) = folders();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::write(work.join("subs.srt"), b"subs").unwrap();
+        let placed = place_using(&work, &dir, &[], &[], |from, to| {
+            if to.ends_with("movie.mkv") {
+                std::fs::write(to, b"another's").unwrap();
+            }
+            move_file_exclusive(from, to)
+        });
+        assert!(placed.failed.is_none());
+        assert_eq!(names(&placed), ["movie (1).mkv", "subs.srt"]);
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), b"another's");
+        assert_eq!(
+            std::fs::read(dir.join("movie (1).mkv")).unwrap(),
+            b"unpacked"
+        );
+        assert_eq!(std::fs::read(dir.join("subs.srt")).unwrap(), b"subs");
+        assert!(on_disk(&work).is_empty());
+    }
+
+    // An output that keeps finding its names taken between the look and the
+    // move goes for `GOES` of them and no more: it stays where unpacking
+    // made it, the placing says so, and the others are placed.
+    #[test]
+    fn an_output_goes_for_a_bounded_number_of_names() {
+        let (_root, work, dir) = folders();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::write(work.join("subs.srt"), b"subs").unwrap();
+        let goes = AtomicUsize::new(0);
+        let placed = place_using(&work, &dir, &[], &[], |from, to| {
+            if from.ends_with("movie.mkv") {
+                goes.fetch_add(1, Ordering::Relaxed);
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            move_file_exclusive(from, to)
+        });
+        assert_eq!(goes.load(Ordering::Relaxed), GOES);
+        let failed = placed.failed.as_ref().unwrap();
+        assert_eq!(failed.path, work.join("movie.mkv"));
+        assert_eq!(failed.source.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(placed.names, ["subs.srt"]);
+        assert_eq!(on_disk(&dir), ["subs.srt"]);
+        assert_eq!(std::fs::read(work.join("movie.mkv")).unwrap(), b"unpacked");
+    }
+
+    // A move that fails for any other reason ends the placing where it is:
+    // nothing is named that did not move, and the file stays in the job's
+    // folder.
+    #[test]
+    fn a_move_that_fails_names_nothing_it_did_not_move() {
+        let (_root, work, dir) = folders();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        let placed = place_using(&work, &dir, &[], &[], |_, _| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(placed.failed.unwrap().path, work.join("movie.mkv"));
+        assert!(placed.names.is_empty());
+        assert!(on_disk(&dir).is_empty());
+        assert_eq!(std::fs::read(work.join("movie.mkv")).unwrap(), b"unpacked");
+    }
+
+    // A folder that cannot be written keeps its output in the job's folder:
+    // every name given is a file that moved, and every other output is
+    // where unpacking made it.
+    #[cfg(unix)]
+    #[test]
+    fn a_placing_that_fails_partway_names_only_what_moved() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, work, dir) = folders();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::create_dir_all(work.join("shut")).unwrap();
+        std::fs::write(work.join("shut/extra.mkv"), b"unpacked").unwrap();
+        std::fs::create_dir_all(dir.join("shut")).unwrap();
+        std::fs::set_permissions(dir.join("shut"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let placed = place(&work, &dir, &[]);
+        std::fs::set_permissions(dir.join("shut"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(placed.failed.unwrap().path, work.join("shut/extra.mkv"));
+        assert_eq!(on_disk(&dir), placed.names);
+        assert!(!placed.names.contains(&"shut/extra.mkv".to_owned()));
+        let moved = placed.names.len();
+        assert_eq!(on_disk(&work).len(), 2 - moved);
+    }
+
+    // Outputs go back where unpacking made them by the move that placed
+    // them: one whose place there is taken stays where it is, and is told.
+    #[test]
+    fn outputs_put_back_never_replace_and_tell_what_stayed() {
+        let (_root, work, dir) = folders();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::write(work.join("subs.srt"), b"subs").unwrap();
+        let placed = place(&work, &dir, &[]);
+        assert_eq!(names(&placed), ["movie.mkv", "subs.srt"]);
+        std::fs::write(work.join("subs.srt"), b"made since").unwrap();
+        let stayed = placed.put_back(move_file_exclusive);
+        assert_eq!(stayed.len(), 1);
+        assert_eq!(stayed[0].1, "subs.srt");
+        assert_eq!(std::fs::read(work.join("movie.mkv")).unwrap(), b"unpacked");
+        assert_eq!(std::fs::read(work.join("subs.srt")).unwrap(), b"made since");
+        assert_eq!(on_disk(&dir), ["subs.srt"]);
+        assert_eq!(std::fs::read(dir.join("subs.srt")).unwrap(), b"subs");
+    }
+
+    // A name the row kept from an earlier placing stays when a file is at
+    // it, on disk and on the row, and goes from the row when none is.
+    // Nothing at a kept name is touched.
+    #[test]
+    fn a_kept_name_stays_with_a_file_at_it_and_goes_with_none() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("delivered.mkv"), b"delivered").unwrap();
+        std::fs::write(dir.join("empty.mkv"), b"").unwrap();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        let placed = place(&work, &dir, &["delivered.mkv", "empty.mkv", "gone.mkv"]);
+        assert_eq!(placed.gone, ["gone.mkv"]);
+        assert_eq!(placed.names, ["movie.mkv"]);
+        assert_eq!(on_disk(&dir), ["delivered.mkv", "empty.mkv", "movie.mkv"]);
+        assert_eq!(
+            std::fs::read(dir.join("delivered.mkv")).unwrap(),
+            b"delivered"
+        );
+    }
+
+    // A placing cut off after its moves and before its row was written
+    // left a whole file on no row. The placing run again does not take it
+    // for its own and does not replace it: its output goes beside it.
+    #[test]
+    fn a_placing_run_again_goes_beside_the_files_the_first_left_on_no_row() {
+        let (_root, work, dir) = folders();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        assert_eq!(place(&work, &dir, &[]).names, ["movie.mkv"]);
+        // The restart: nothing on the row, and the job unpacks again.
+        std::fs::write(work.join("movie.mkv"), b"unpacked again").unwrap();
+        let again = place(&work, &dir, &[]);
+        assert_eq!(again.names, ["movie (1).mkv"]);
+        assert!(again.gone.is_empty());
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), b"unpacked");
+        assert_eq!(
+            std::fs::read(dir.join("movie (1).mkv")).unwrap(),
+            b"unpacked again"
+        );
+    }
+
+    // Thousands of outputs whose names are all taken each take their own
+    // first number: no output walks past another's forms.
+    #[test]
+    fn thousands_of_taken_names_each_take_their_first_number() {
+        let (_root, work, dir) = folders();
+        let count = 2_000;
+        for i in 0..count {
+            std::fs::write(dir.join(format!("e{i}.mkv")), b"there").unwrap();
+            std::fs::write(work.join(format!("e{i}.mkv")), b"unpacked").unwrap();
+        }
+        let moves = AtomicUsize::new(0);
+        let placed = place_using(&work, &dir, &[], &[], |from, to| {
+            moves.fetch_add(1, Ordering::Relaxed);
+            move_file_exclusive(from, to)
+        });
+        let names: HashSet<String> = placed.names.iter().cloned().collect();
+        let wanted: HashSet<String> = (0..count).map(|i| format!("e{i} (1).mkv")).collect();
+        assert_eq!(names, wanted);
+        assert_eq!(moves.load(Ordering::Relaxed), count, "one move for each");
+    }
+
+    // A folder of an output's path whose name a file holds is numbered, once
+    // for every output under it, and nothing is dropped: the file stays as
+    // it was, and the outputs go under the numbered folder, on the row.
+    #[test]
+    fn a_folder_whose_name_a_file_holds_is_numbered_for_every_output_under_it() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("Extras"), b"there").unwrap();
+        std::fs::create_dir_all(work.join("Extras/deep")).unwrap();
+        for name in ["Extras/a.mkv", "Extras/b.mkv", "Extras/deep/c.mkv"] {
+            std::fs::write(work.join(name), name.as_bytes()).unwrap();
+        }
+        let placed = place(&work, &dir, &[]);
+        assert!(placed.failed.is_none());
+        assert_eq!(
+            names(&placed),
+            [
+                "Extras (1)/a.mkv",
+                "Extras (1)/b.mkv",
+                "Extras (1)/deep/c.mkv"
+            ]
+        );
+        assert_eq!(std::fs::read(dir.join("Extras")).unwrap(), b"there");
+        for name in ["a.mkv", "b.mkv", "deep/c.mkv"] {
+            assert_eq!(
+                std::fs::read(dir.join("Extras (1)").join(name)).unwrap(),
+                format!("Extras/{name}").as_bytes()
+            );
+        }
+    }
+
+    // A folder numbered past a file never takes the folder another output
+    // keeps as its own.
+    #[test]
+    fn a_numbered_folder_is_not_another_outputs() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("Extras"), b"there").unwrap();
+        std::fs::create_dir_all(work.join("Extras")).unwrap();
+        std::fs::create_dir_all(work.join("Extras (1)")).unwrap();
+        std::fs::write(work.join("Extras/a.mkv"), b"one").unwrap();
+        std::fs::write(work.join("Extras (1)/a.mkv"), b"two").unwrap();
+        let placed = place(&work, &dir, &[]);
+        assert_eq!(names(&placed), ["Extras (1)/a.mkv", "Extras (2)/a.mkv"]);
+        assert_eq!(std::fs::read(dir.join("Extras (1)/a.mkv")).unwrap(), b"two");
+        assert_eq!(std::fs::read(dir.join("Extras (2)/a.mkv")).unwrap(), b"one");
+        assert!(!dir.join("Extras (3)").exists());
+    }
+
+    // Only the file's own name is numbered: a dot in a folder above it does
+    // not draw the number there.
+    #[test]
+    fn the_number_goes_in_the_files_own_name() {
+        let (_root, work, dir) = folders();
+        for folder in [&work, &dir] {
+            std::fs::create_dir_all(folder.join("v1.0")).unwrap();
+            std::fs::write(folder.join("v1.0/noext"), b"x").unwrap();
+            std::fs::write(folder.join("v1.0/a.tar.gz"), b"x").unwrap();
+        }
+        let placed = place(&work, &dir, &[]);
+        assert_eq!(names(&placed), ["v1.0/a.tar (1).gz", "v1.0/noext (1)"]);
+    }
+
+    // A name the torrent lists for a file of its own, not there yet, is no
+    // output's: a numbered form passes over it, and so does a folder.
+    #[test]
+    fn a_name_the_torrent_lists_is_passed_over_though_nothing_holds_it() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("movie.mkv"), b"there").unwrap();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::create_dir_all(work.join("Extras")).unwrap();
+        std::fs::write(work.join("Extras/a.mkv"), b"unpacked").unwrap();
+        let placed = place_using(
+            &work,
+            &dir,
+            &[],
+            &["movie (1).mkv", "Extras"],
+            move_file_exclusive,
+        );
+        assert_eq!(names(&placed), ["Extras (1)/a.mkv", "movie (2).mkv"]);
+        assert!(!dir.join("movie (1).mkv").exists());
+        assert!(!dir.join("Extras").exists());
+    }
+
+    // A name that is not text is placed under the text it reads as, numbered
+    // as any other: the name on the row is the name on disk, so a removal
+    // by the row finds exactly the torrent's file, and the file another
+    // writer has under that text is neither replaced nor taken for it.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn a_name_that_is_not_text_is_on_disk_as_the_row_names_it() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("mov\u{fffd}ie.mkv"), b"another's").unwrap();
+        std::fs::write(work.join(OsStr::from_bytes(b"mov\xffie.mkv")), b"unpacked").unwrap();
+        std::fs::write(work.join(OsStr::from_bytes(b"sub\xffs.srt")), b"subs").unwrap();
+        let placed = place(&work, &dir, &[]);
+        assert!(placed.failed.is_none());
+        assert_eq!(
+            names(&placed),
+            ["mov\u{fffd}ie (1).mkv", "sub\u{fffd}s.srt"]
+        );
+        assert_eq!(on_disk(&dir).len(), 3);
+        assert_eq!(
+            std::fs::read(dir.join("mov\u{fffd}ie (1).mkv")).unwrap(),
+            b"unpacked"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("sub\u{fffd}s.srt")).unwrap(),
+            b"subs"
+        );
+        // As a removal with its files does: each name on the row, joined to
+        // the folder.
+        for name in &placed.names {
+            std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        assert_eq!(on_disk(&dir), ["mov\u{fffd}ie.mkv"]);
+        assert_eq!(
+            std::fs::read(dir.join("mov\u{fffd}ie.mkv")).unwrap(),
+            b"another's"
+        );
+    }
+
+    // Every name on the row is a file on disk under that very name, and
+    // the folder holds no file of the torrent's under any other.
+    #[test]
+    fn every_name_on_the_row_is_the_name_on_disk() {
+        let (_root, work, dir) = folders();
+        std::fs::write(dir.join("Extras"), b"there").unwrap();
+        std::fs::write(dir.join("movie.mkv"), b"there").unwrap();
+        std::fs::create_dir_all(work.join("Extras")).unwrap();
+        for name in ["movie.mkv", "Extras/a.mkv", "caf\u{e9}.srt"] {
+            std::fs::write(work.join(name), b"unpacked").unwrap();
+        }
+        let placed = place(&work, &dir, &[]);
+        assert!(placed.failed.is_none());
+        let mut expected: Vec<String> = placed.names.clone();
+        expected.extend(["Extras".to_owned(), "movie.mkv".to_owned()]);
+        expected.sort_unstable();
+        assert_eq!(on_disk(&dir), expected);
+    }
+
+    // An output whose file is gone from the job's folder before its move is
+    // not placed and not among the names. The others are placed.
+    #[test]
+    fn an_output_gone_before_the_move_is_not_placed() {
+        let (_root, work, dir) = folders();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::write(work.join("subs.srt"), b"subs").unwrap();
+        let placed = place_using(&work, &dir, &[], &[], |from, to| {
+            if from.ends_with("subs.srt") {
+                std::fs::remove_file(from).unwrap();
+            }
+            move_file_exclusive(from, to)
+        });
+        assert!(placed.failed.is_none());
+        assert_eq!(placed.names, ["movie.mkv"]);
+        assert_eq!(on_disk(&dir), ["movie.mkv"]);
+    }
+
+    // A name at the filesystem's length limit that needs a number gives up
+    // the end of its stem for it, and is placed.
+    #[test]
+    fn a_name_at_the_length_limit_is_shortened_for_its_number() {
+        let (_root, work, dir) = folders();
+        let long = format!("{}.mkv", "a".repeat(251));
+        std::fs::write(dir.join(&long), b"there").unwrap();
+        std::fs::write(work.join(&long), b"unpacked").unwrap();
+        let placed = place(&work, &dir, &[]);
+        assert!(placed.failed.is_none());
+        let numbered = format!("{} (1).mkv", "a".repeat(247));
+        assert_eq!(placed.names, std::slice::from_ref(&numbered));
+        assert_eq!(std::fs::read(dir.join(&numbered)).unwrap(), b"unpacked");
+        assert_eq!(std::fs::read(dir.join(&long)).unwrap(), b"there");
+    }
+
+    // Operator ruling, 2026-11-16 (PR 129 question 1): a folder name held
+    // by a link out of the save folder is not written through; it is passed
+    // over as a file's is. A link that stays inside is a folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_link_is_written_through_only_inside_the_save_folder() {
+        let (root, work, dir) = folders();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("Out")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("In")).unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("Dangling")).unwrap();
+        for folder in ["Out", "In", "Dangling"] {
+            std::fs::create_dir_all(work.join(folder)).unwrap();
+            std::fs::write(work.join(folder).join("a.mkv"), folder.as_bytes()).unwrap();
+        }
+        let placed = place(&work, &dir, &[]);
+        assert!(placed.failed.is_none());
+        assert_eq!(
+            names(&placed),
+            ["Dangling (1)/a.mkv", "In/a.mkv", "Out (1)/a.mkv"]
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!dir.join("nowhere").exists());
+        assert_eq!(std::fs::read(dir.join("real/a.mkv")).unwrap(), b"In");
+        assert_eq!(std::fs::read(dir.join("Out (1)/a.mkv")).unwrap(), b"Out");
+        assert_eq!(
+            std::fs::read(dir.join("Dangling (1)/a.mkv")).unwrap(),
+            b"Dangling"
+        );
+    }
+}

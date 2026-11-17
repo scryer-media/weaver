@@ -6,7 +6,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::dns::WireKind;
 use crate::pipe::DialError;
+use crate::resolution::record::TrustOutcome;
 
 // The kind of proxy a tunnel hop speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +168,10 @@ static CACHE: [[AtomicU64; CacheOutcome::ALL.len()]; Resolver::ALL.len()] =
 static RUNG_COOLDOWNS: [AtomicU64; RUNGS] = [const { AtomicU64::new(0) }; RUNGS];
 static RUNG_FALLBACKS: [AtomicU64; RUNGS] = [const { AtomicU64::new(0) }; RUNGS];
 static REVOCATIONS: AtomicU64 = AtomicU64::new(0);
+static DNS_WIRES: [AtomicU64; WireKind::ALL.len()] =
+    [const { AtomicU64::new(0) }; WireKind::ALL.len()];
+static DNS_TRUST: [AtomicU64; TrustOutcome::ALL.len()] =
+    [const { AtomicU64::new(0) }; TrustOutcome::ALL.len()];
 // Give-backs a tunnel asked of a side over its share, and their bytes; the
 // peers dropped and idle usenet connections retired to answer them.
 static SOCKET_GIVE_BACKS: AtomicU64 = AtomicU64::new(0);
@@ -196,6 +202,43 @@ pub fn record_resolution(resolver: Resolver, ok: bool) {
 
 pub fn record_cache(resolver: Resolver, outcome: CacheOutcome) {
     CACHE[resolver as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+// A lookup of routed DNS came to an answer from a server on `wire`.
+pub fn record_dns_wire(wire: WireKind) {
+    DNS_WIRES[wire as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+// How a lookup of routed DNS was judged: an answer taken as sent,
+// validated or unsigned, or one refused for failing the DNSSEC check. Once per lookup; and bogus once more
+// for each address family that failed the check in a lookup the other
+// family answered.
+pub fn record_dns_trust(outcome: TrustOutcome) {
+    DNS_TRUST[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    TRUST_HERE.with_borrow_mut(|judged| judged.push(outcome));
+}
+
+#[cfg(test)]
+thread_local! {
+    // Every outcome counted on this thread, in order. A test on a runtime of
+    // one thread reads the outcomes of its own lookups here, whatever other
+    // tests count at the same time.
+    pub(crate) static TRUST_HERE: std::cell::RefCell<Vec<TrustOutcome>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// Queries sent to listed servers to check DNSSEC signatures, the address
+// queries among them: each counted as it goes out, whether or not a reply
+// comes, and again when it is sent again.
+static DNSSEC_QUERIES: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_dnssec_queries(sent: u64) {
+    DNSSEC_QUERIES.fetch_add(sent, Ordering::Relaxed);
+}
+
+pub fn dnssec_queries() -> u64 {
+    DNSSEC_QUERIES.load(Ordering::Relaxed)
 }
 
 // A rung of a ladder was set aside after its path failed.
@@ -296,6 +339,33 @@ pub fn snapshot() -> TunnelMetricsSnapshot {
         socket_give_back_bytes: load(&SOCKET_GIVE_BACK_BYTES),
         socket_peers_dropped: load(&SOCKET_PEERS_DROPPED),
         socket_idle_retired: load(&SOCKET_IDLE_RETIRED),
+    }
+}
+
+// The routed DNS counters, apart from the tunnel snapshot so its shape
+// stays as consumers build it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DnsMetricsSnapshot {
+    // Answered lookups by the wire of the server that answered.
+    pub wires: Vec<(WireKind, u64)>,
+    // Lookups by how their answer was judged.
+    pub trust: Vec<(TrustOutcome, u64)>,
+    // Queries sent to check DNSSEC signatures.
+    pub dnssec_queries: u64,
+}
+
+pub fn dns_snapshot() -> DnsMetricsSnapshot {
+    let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    DnsMetricsSnapshot {
+        wires: WireKind::ALL
+            .into_iter()
+            .map(|wire| (wire, load(&DNS_WIRES[wire as usize])))
+            .collect(),
+        trust: TrustOutcome::ALL
+            .into_iter()
+            .map(|outcome| (outcome, load(&DNS_TRUST[outcome as usize])))
+            .collect(),
+        dnssec_queries: dnssec_queries(),
     }
 }
 

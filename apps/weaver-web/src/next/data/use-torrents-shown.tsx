@@ -3,7 +3,13 @@
 
 import type { ReactNode } from "react";
 import { useNextDataSelector } from "./next-data";
-import { torrentAddsOffered, torrentsShown, torrentsView } from "./torrents-shown";
+import {
+  torrentAddsOffered,
+  torrentsAvailable,
+  torrentsShown,
+  torrentsView,
+  type TorrentsState,
+} from "./torrents-shown";
 
 /**
  * Whether torrent things show: while torrents are on or any torrent job is
@@ -15,6 +21,20 @@ import { torrentAddsOffered, torrentsShown, torrentsView } from "./torrents-show
  */
 export function useTorrentsShown(): boolean {
   return useNextDataSelector((data) => torrentsShown(data.torrents));
+}
+
+/**
+ * Whether the server has torrents, turned on or not, and only once it has
+ * said so. What is there even while torrents are off asks this: the Torrents
+ * settings and the torrent events a script can run on.
+ */
+export function useTorrentsAvailable(): boolean {
+  return useNextDataSelector((data) => torrentsAvailable(data.torrents));
+}
+
+/** The state itself, for a screen that draws each of its answers apart. */
+export function useTorrentsState(): TorrentsState {
+  return useNextDataSelector((data) => data.torrents);
 }
 
 /**

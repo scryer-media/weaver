@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -17,12 +17,13 @@ use weaver_torrent::{
 };
 
 use super::{PieceStorage, PieceStorageFactory, Pieces};
+use crate::jobs::JobId;
 use crate::torrents::files::{self, Files};
 use crate::torrents::intake::Holds;
 use crate::torrents::layout::{PieceFile, PieceLayout, layout_of};
 use crate::torrents::model::Adopted;
 use crate::torrents::relocate::Existing;
-use crate::torrents::service::{delete_written, deletion, move_listed};
+use crate::torrents::service::{Listed, delete_written, deletion, move_listed};
 use crate::torrents::store::{Kept, TorrentStore};
 use weaver_torrent::storage::{
     BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
@@ -633,7 +634,8 @@ fn deleting_a_torrents_files_leaves_what_was_there_before_it() {
 
 // libtorrent `storage_utils::delete_one_file`: a torrent's file is removed
 // as a file. A folder now where one of its files was is not the torrent's,
-// and stays with all it holds; what unpacking made is still removed whole.
+// and stays with all it holds; what unpacking placed goes as a file, and
+// the folders that leaves empty go after it.
 #[test]
 fn deleting_a_torrents_files_leaves_a_folder_where_a_file_was() {
     let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 500)]);
@@ -652,7 +654,7 @@ fn deleting_a_torrents_files_leaves_a_folder_where_a_file_was() {
     delete_written(&deletion(
         shim.store.files(),
         &Adopted::default(),
-        &["out".to_owned()],
+        &["out/inner/member.txt".to_owned()],
         None,
     ));
     let mut left = walkdir(&dir);
@@ -662,6 +664,96 @@ fn deleting_a_torrents_files_leaves_a_folder_where_a_file_was() {
         std::fs::read(dir.join("a.bin/deep/photo.jpg")).unwrap(),
         b"the operator's"
     );
+}
+
+// What unpacking placed is a file, and goes only as one (`SECURITY.md`,
+// "Deletes are narrow"). A folder someone put where the row names an
+// unpacked file stays with all it holds, and so does a link there and what
+// it points at; the history row lists neither.
+#[test]
+fn deleting_a_torrents_files_leaves_a_folder_or_link_where_an_output_was() {
+    let shim = shim(1024, vec![file("a.bin", 1000)]);
+    let torrent = noise(1000, 7);
+    shim.complete(0, &torrent);
+    let dir = shim.dir.path().to_path_buf();
+    shim.store.forget_now();
+    std::fs::create_dir_all(dir.join("movie.mkv/deep")).unwrap();
+    std::fs::write(dir.join("movie.mkv/deep/photo.jpg"), b"the operator's").unwrap();
+    std::fs::write(dir.join("real.txt"), b"unpacked").unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("x.bin"), b"x").unwrap();
+    let outputs = vec![
+        "movie.mkv".to_owned(),
+        "real.txt".to_owned(),
+        #[cfg(unix)]
+        "linked".to_owned(),
+    ];
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(elsewhere.path(), dir.join("linked")).unwrap();
+
+    let written = deletion(shim.store.files(), &Adopted::default(), &outputs, None);
+    let listed: Vec<String> = crate::torrents::service::listed_files(&written)
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            dir.join("a.bin").to_string_lossy().into_owned(),
+            dir.join("real.txt").to_string_lossy().into_owned()
+        ],
+        "only the files are listed, each to go as a file"
+    );
+    delete_written(&written);
+    assert!(!dir.join("a.bin").exists());
+    assert!(!dir.join("real.txt").exists());
+    assert_eq!(
+        std::fs::read(dir.join("movie.mkv/deep/photo.jpg")).unwrap(),
+        b"the operator's"
+    );
+    #[cfg(unix)]
+    {
+        assert!(dir.join("linked").exists(), "the link stays");
+        assert!(elsewhere.path().join("x.bin").exists());
+    }
+}
+
+// A live removal with files never leaves the torrent's folder through a
+// link inside it: a listed file and an unpacked one under a folder that has
+// become a link stay, with what the link points at, as they do when a start
+// finishes the removal (`spare_held`).
+#[cfg(unix)]
+#[test]
+fn deleting_a_torrents_files_follows_no_link_inside_its_folder() {
+    let shim = shim(1024, vec![file("sub/a.bin", 1000), file("b.bin", 500)]);
+    let torrent = noise(1500, 8);
+    for piece in 0..2 {
+        shim.complete(piece, &torrent);
+    }
+    let dir = shim.dir.path().to_path_buf();
+    shim.store.forget_now();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("a.bin"), b"someone's").unwrap();
+    std::fs::write(elsewhere.path().join("member.txt"), b"someone's").unwrap();
+    std::fs::remove_dir_all(dir.join("sub")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), dir.join("sub")).unwrap();
+
+    delete_written(&deletion(
+        shim.store.files(),
+        &Adopted::default(),
+        &["sub/member.txt".to_owned()],
+        None,
+    ));
+    assert!(!dir.join("b.bin").exists(), "its own file goes");
+    assert_eq!(
+        std::fs::read(elsewhere.path().join("a.bin")).unwrap(),
+        b"someone's"
+    );
+    assert_eq!(
+        std::fs::read(elsewhere.path().join("member.txt")).unwrap(),
+        b"someone's"
+    );
+    assert!(dir.join("sub").exists(), "the link stays");
 }
 
 // Every path under the directory, relative to it.
@@ -735,8 +827,8 @@ fn files_move_part_written_and_the_torrent_goes_on_from_there() {
     assert!(!placed.join("c.bin").exists());
     std::fs::create_dir_all(&moved).unwrap();
 
-    let (to, kept) = move_listed(&shim.store, &[], moved.clone(), Existing::Keep).unwrap();
-    assert_eq!((to, kept), (moved.clone(), false));
+    let went = move_plain(&shim.store, moved.clone());
+    assert_eq!((went.to, went.kept.len()), (moved.clone(), 0));
     assert!(!placed.join("a.bin").exists());
     assert!(!placed.join("sub").exists());
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
@@ -755,6 +847,20 @@ fn files_move_part_written_and_the_torrent_goes_on_from_there() {
     assert_eq!(std::fs::read_dir(&placed).unwrap().count(), 0);
 }
 
+// A move of the torrent's placed files that keeps a file already there, for
+// a torrent with nothing unpacked beside them, its row written by no one.
+fn move_plain(store: &TorrentStore, to: PathBuf) -> crate::torrents::service::Moved {
+    let moving = Listed {
+        job_id: JobId(1),
+        storage: None,
+        outputs: &[],
+        existing: Existing::Keep,
+        to_made: false,
+        forgot: false,
+    };
+    move_listed(store, moving, to, |_| Ok(())).unwrap()
+}
+
 // libtorrent `move_flags_t::dont_replace`: a file already at the new place
 // stays, the torrent's own copy of it stays where it was, the other files
 // move, and the store reads every file from the new place; the move tells
@@ -770,8 +876,11 @@ fn a_file_already_where_the_files_go_is_kept() {
     let moved = moved_dir.path().to_path_buf();
     std::fs::write(moved.join("b.bin"), b"theirs").unwrap();
 
-    let (to, kept) = move_listed(&shim.store, &[], moved.clone(), Existing::Keep).unwrap();
-    assert_eq!((to, kept), (moved.clone(), true));
+    let went = move_plain(&shim.store, moved.clone());
+    assert_eq!(
+        (went.to, went.kept),
+        (moved.clone(), vec!["b.bin".to_owned()])
+    );
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
     assert!(!placed.join("a.bin").exists());
     assert_eq!(std::fs::read(moved.join("b.bin")).unwrap(), b"theirs");
@@ -782,6 +891,275 @@ fn a_file_already_where_the_files_go_is_kept() {
     assert_eq!(
         [0, 1].map(|file| shim.store.files().path(file)),
         [Some(moved.join("a.bin")), Some(moved.join("b.bin"))]
+    );
+}
+
+// The move of `store`'s placed files to `to` with `outputs` beside them,
+// its row written by `record`.
+fn move_with(
+    store: &TorrentStore,
+    to: &Path,
+    outputs: &[&str],
+    existing: Existing,
+    record: impl FnOnce(&crate::torrents::service::Moved) -> Result<(), crate::StateError>,
+) -> Result<crate::torrents::service::Moved, crate::torrents::service::NotMoved> {
+    let outputs: Vec<String> = outputs.iter().map(|name| (*name).to_owned()).collect();
+    let moving = Listed {
+        job_id: JobId(1),
+        storage: None,
+        outputs: &outputs,
+        existing,
+        to_made: std::fs::symlink_metadata(to).is_err(),
+        forgot: false,
+    };
+    std::fs::create_dir_all(to).unwrap();
+    move_listed(store, moving, to.to_path_buf(), record)
+}
+
+// A move into a folder of the torrent's own where an unpacked file sits at
+// the very name one of the torrent's files moves to: the unpacked file
+// moves out of the way first, to its own name under the new place, and the
+// torrent's file then takes the name. Neither replaces the other, in either
+// mode, and none is taken for a file kept there. `output` names the
+// unpacked file; on a volume that folds names `b/X.BIN` is the name
+// `b/x.bin`, and is moved out of the way as that one is.
+#[test]
+fn an_unpacked_file_where_a_listed_file_goes_moves_out_of_its_way() {
+    for existing in [Existing::Replace, Existing::Keep] {
+        for output in ["b/x.bin", "b/X.BIN"] {
+            let shim = shim(1024, vec![file("x.bin", 1000)]);
+            let torrent = noise(1000, 21);
+            shim.complete(0, &torrent);
+            let placed = shim.dir.path().to_path_buf();
+            let to = placed.join("b");
+            std::fs::create_dir_all(&to).unwrap();
+            std::fs::write(placed.join(output), b"unpacked").unwrap();
+
+            let went = move_with(&shim.store, &to, &[output], existing, |_| Ok(())).unwrap();
+            assert!(went.kept.is_empty(), "{existing:?} {output}");
+            assert_eq!(went.outputs, [output], "{existing:?} {output}");
+            assert_eq!(std::fs::read(to.join("x.bin")).unwrap(), torrent);
+            assert_eq!(std::fs::read(to.join(output)).unwrap(), b"unpacked");
+            assert!(!placed.join("x.bin").exists());
+            assert_eq!(shim.read(0), torrent[..1000]);
+        }
+    }
+}
+
+// A move that ends unrecorded puts back what it moved by moves that never
+// replace. A file of the torrent's and an unpacked file whose old names
+// someone took meanwhile stay at the new place; the files now at the old
+// names are as they were put there, and the failure names both, so the row
+// drops the output and adopts the listed name.
+#[test]
+fn a_put_back_never_replaces_and_names_what_stayed() {
+    let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
+    let torrent = noise(2000, 22);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let placed = shim.dir.path().to_path_buf();
+    std::fs::write(placed.join("o.mkv"), b"unpacked").unwrap();
+    std::fs::write(placed.join("p.mkv"), b"also unpacked").unwrap();
+    let moved_dir = tempfile::tempdir().unwrap();
+    let to = moved_dir.path().join("new");
+
+    let taken = placed.clone();
+    let not_moved = move_with(
+        &shim.store,
+        &to,
+        &["o.mkv", "p.mkv"],
+        Existing::Keep,
+        |moved| {
+            assert_eq!(moved.outputs, ["o.mkv", "p.mkv"]);
+            std::fs::write(taken.join("o.mkv"), b"theirs").unwrap();
+            std::fs::write(taken.join("b.bin"), b"theirs too").unwrap();
+            Err(crate::StateError::Database("refused".to_owned()))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(not_moved.stranded, ["b.bin"]);
+    assert_eq!(not_moved.outputs, ["p.mkv"]);
+    assert_eq!(std::fs::read(placed.join("o.mkv")).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(placed.join("b.bin")).unwrap(), b"theirs too");
+    assert_eq!(std::fs::read(to.join("o.mkv")).unwrap(), b"unpacked");
+    assert_eq!(std::fs::read(to.join("b.bin")).unwrap(), torrent[1000..]);
+    assert_eq!(
+        std::fs::read(placed.join("p.mkv")).unwrap(),
+        b"also unpacked"
+    );
+    assert_eq!(
+        std::fs::read(placed.join("a.bin")).unwrap(),
+        torrent[..1000]
+    );
+    assert_eq!(shim.store.files().dir(), placed, "read where it was");
+    // A file there is not the torrent's now, and its pieces were not
+    // forgotten for the move: no read is made of its files, of the upload
+    // of a piece to a peer as of any other, until they are.
+    assert!(shim.store.files().is_shut());
+    let mut buf = [0; 16];
+    let refused = shim.storage.pread_exact(1, 0, &mut buf).unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("not read until"),
+        "{refused:#}"
+    );
+    assert!(shim.storage.pread_exact(0, 0, &mut buf).is_err());
+    assert!(
+        weaver_torrent::storage::FilesShut::refused_in(&refused),
+        "a check is told the files are shut, not that a piece is missing"
+    );
+    // Whatever has every piece forgotten opens them.
+    shim.storage.on_check_everything().unwrap();
+    shim.storage.pread_exact(0, 0, &mut buf).unwrap();
+    assert_eq!(buf, torrent[..16]);
+}
+
+// A move that kept a file it had not seen at the new place before it began,
+// so with the torrent's pieces not forgotten for it, ends with the store's
+// files shut to every read: what is at that name is someone else's, and
+// the store would read it as the torrent's. They open once the pieces are
+// forgotten. A move whose pieces were forgotten before it leaves them open,
+// with nothing had to read.
+#[test]
+fn a_move_that_kept_a_file_unseen_shuts_the_files_until_the_pieces_are_forgotten() {
+    for forgot in [false, true] {
+        let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
+        let torrent = noise(2000, 8);
+        shim.complete(0, &torrent);
+        shim.complete(1, &torrent);
+        let moved_dir = tempfile::tempdir().unwrap();
+        let moved = moved_dir.path().to_path_buf();
+        // As long as the torrent's own, so only the fence stands between
+        // it and a read.
+        let theirs = noise(1000, 99);
+        std::fs::write(moved.join("b.bin"), &theirs).unwrap();
+        let moving = Listed {
+            job_id: JobId(1),
+            storage: None,
+            outputs: &[],
+            existing: Existing::Keep,
+            to_made: false,
+            forgot,
+        };
+        let went = move_listed(&shim.store, moving, moved.clone(), |_| Ok(())).unwrap();
+        assert_eq!(went.kept, ["b.bin"]);
+        assert_eq!(shim.store.files().dir(), moved);
+        assert_eq!(shim.store.files().is_shut(), !forgot);
+        let mut buf = [0; 16];
+        for file in [0, 1] {
+            let read = shim.storage.pread_exact(file, 0, &mut buf);
+            assert_eq!(read.is_err(), !forgot, "file {file}: {read:?}");
+        }
+        // Shut files are vouched for by nothing kept for the next run.
+        assert_eq!(shim.store.kept().checking, !forgot);
+        if forgot {
+            continue;
+        }
+        // The one place every piece is forgotten opens them: a recheck,
+        // the start after an error and the move's own check all pass it.
+        assert_eq!(shim.store.count(), 2);
+        shim.storage.on_check_everything().unwrap();
+        assert_eq!(shim.store.count(), 0);
+        assert!(!shim.store.files().is_shut());
+        shim.storage.pread_exact(1, 24, &mut buf).unwrap();
+        assert_eq!(buf, theirs[24..40], "what is there, read only now");
+    }
+}
+
+// A torrent whose files a move left shut joins a session before anything
+// forgot its pieces: it hands that session no piece as had, so the session
+// checks them all, and its files are read by that check.
+#[test]
+fn files_left_shut_join_a_session_with_every_piece_to_check() {
+    let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
+    let torrent = noise(2000, 8);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let moved_dir = tempfile::tempdir().unwrap();
+    let moved = moved_dir.path().to_path_buf();
+    std::fs::write(moved.join("b.bin"), noise(1000, 99)).unwrap();
+    let moving = Listed {
+        job_id: JobId(1),
+        storage: None,
+        outputs: &[],
+        existing: Existing::Keep,
+        to_made: false,
+        forgot: false,
+    };
+    move_listed(&shim.store, moving, moved, |_| Ok(())).unwrap();
+    assert!(shim.store.files().is_shut());
+    assert_eq!(shim.store.count(), 2);
+
+    assert!(shim.store.initial_have(false).is_none());
+    assert_eq!(shim.store.count(), 0, "no piece is had unchecked");
+    assert!(!shim.store.files().is_shut());
+    let mut buf = [0; 16];
+    shim.storage.pread_exact(0, 0, &mut buf).unwrap();
+    assert_eq!(buf, torrent[..16]);
+}
+
+// What was at the new place before a move is told by the move and outlives
+// it: the place itself only when it was there, a folder there that only
+// unpacked files go in, and a folder of the torrent's own files that was
+// there. A move that ends unrecorded removes the folders it made and none
+// that was there.
+#[test]
+fn folders_at_the_new_place_before_a_move_are_told_and_stay() {
+    let files = || vec![file("in/a.bin", 1000), file("made/b.bin", 1000)];
+    let unpacked = |placed: &Path| {
+        std::fs::create_dir_all(placed.join("subs")).unwrap();
+        std::fs::create_dir_all(placed.join("extras")).unwrap();
+        std::fs::write(placed.join("subs/a.srt"), b"subs").unwrap();
+        std::fs::write(placed.join("extras/e.txt"), b"extra").unwrap();
+    };
+    let outputs = ["subs/a.srt", "extras/e.txt"];
+    let torrent = noise(2000, 23);
+
+    // A place the move makes, with nothing in it before.
+    let shim_new = shim(1024, files());
+    shim_new.complete(0, &torrent);
+    shim_new.complete(1, &torrent);
+    unpacked(shim_new.dir.path());
+    let root = tempfile::tempdir().unwrap();
+    let to = root.path().join("new");
+    let went = move_with(&shim_new.store, &to, &outputs, Existing::Keep, |_| Ok(())).unwrap();
+    assert!(went.dirs.is_empty(), "{:?}", went.dirs);
+
+    // A place that was there, with a folder of the torrent's files and one
+    // only an unpacked file goes in.
+    let shim_there = shim(1024, files());
+    shim_there.complete(0, &torrent);
+    shim_there.complete(1, &torrent);
+    unpacked(shim_there.dir.path());
+    let to = root.path().join("there");
+    std::fs::create_dir_all(to.join("in")).unwrap();
+    std::fs::create_dir_all(to.join("subs")).unwrap();
+    let went = move_with(&shim_there.store, &to, &outputs, Existing::Keep, |_| Ok(())).unwrap();
+    assert_eq!(went.dirs, ["", "in", "subs"]);
+
+    // The same place, the move unrecorded: what it made there goes, and
+    // the folders that were there stay, empty as they were.
+    let shim_back = shim(1024, files());
+    shim_back.complete(0, &torrent);
+    shim_back.complete(1, &torrent);
+    unpacked(shim_back.dir.path());
+    let to = root.path().join("back");
+    std::fs::create_dir_all(to.join("in")).unwrap();
+    std::fs::create_dir_all(to.join("subs")).unwrap();
+    let not_moved = move_with(&shim_back.store, &to, &outputs, Existing::Keep, |_| {
+        Err(crate::StateError::Database("refused".to_owned()))
+    })
+    .unwrap_err();
+    assert!(not_moved.stranded.is_empty());
+    assert_eq!(not_moved.outputs, outputs);
+    assert!(to.join("in").is_dir() && to.join("subs").is_dir());
+    assert!(!to.join("made").exists() && !to.join("extras").exists());
+    assert_eq!(std::fs::read_dir(to.join("in")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(to.join("subs")).unwrap().count(), 0);
+    let placed = shim_back.dir.path();
+    assert_eq!(std::fs::read(placed.join("subs/a.srt")).unwrap(), b"subs");
+    assert_eq!(
+        std::fs::read(placed.join("in/a.bin")).unwrap(),
+        torrent[..1000]
     );
 }
 
@@ -803,7 +1181,7 @@ fn a_file_is_read_through_one_handle_that_does_not_follow_a_move() {
 
     let moved_dir = tempfile::tempdir().unwrap();
     let moved = moved_dir.path().to_path_buf();
-    move_listed(&shim.store, &[], moved.clone(), Existing::Keep).unwrap();
+    move_plain(&shim.store, moved.clone());
     // Another file now stands where a.bin went: a handle kept from before
     // the move would still read the old one.
     std::fs::remove_file(moved.join("a.bin")).unwrap();
@@ -1285,16 +1663,19 @@ async fn a_torrent_moving_holds_up_no_other_torrent_of_its_session() {
                 .flatten()
                 .map(Path::to_path_buf)
                 .collect();
-            store.relocate(|dir| {
-                entered.send(()).unwrap();
-                ended.recv().unwrap();
-                let moves: Vec<_> = names
-                    .iter()
-                    .map(|name| (dir.join(name), moved.join(name)))
-                    .collect();
-                crate::torrents::relocate::move_files(dir, &moves, Existing::Keep)?;
-                Ok::<_, anyhow::Error>((moved, ()))
-            })
+            store.relocate(
+                |dir| {
+                    entered.send(()).unwrap();
+                    ended.recv().unwrap();
+                    let moves: Vec<_> = names
+                        .iter()
+                        .map(|name| (dir.join(name), moved.join(name)))
+                        .collect();
+                    crate::torrents::relocate::move_files(dir, &moves, Existing::Keep)?;
+                    Ok::<_, anyhow::Error>((moved, ()))
+                },
+                |_| false,
+            )
         })
     };
     in_move.recv().unwrap();
@@ -2021,7 +2402,7 @@ fn a_move_keeps_the_side_store() {
     let moved_dir = tempfile::tempdir().unwrap();
     let moved = moved_dir.path().join("moved");
     std::fs::create_dir_all(&moved).unwrap();
-    move_listed(&shim.store, &[], moved.clone(), Existing::Keep).unwrap();
+    move_plain(&shim.store, moved.clone());
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1536]);
     assert!(!moved.join("sub").exists());
     assert_eq!(shim.read(1), torrent[1024..2048]);
