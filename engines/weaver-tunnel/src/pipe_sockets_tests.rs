@@ -471,59 +471,18 @@ fn a_kept_connection_is_reclaimed_at_the_bytes_it_reserved() {
     drop(others);
 }
 
-// A claim refused only for the bytes of kept connections closed to make room
-// waits for them rather than fail: refused once by a claim that closed the
-// kept connection, the next claim waits too, and takes the bytes as the
-// tunnel frees the socket. Kept, the connection made nothing fail.
-#[tokio::test]
-async fn a_claim_on_a_reserve_full_of_kept_connections_waits_for_their_bytes() {
-    let sockets = sockets(1, 2);
-    let mut kept = kept(&sockets, 1);
-    // A claim closes the kept connection; its bytes are closing.
-    let Err(refused) = sockets.take(SocketClass::Reserve, peer()) else {
-        panic!("room while the kept connection's bytes are closing");
-    };
-    assert!(refused.reclaiming);
-    assert!(kept.closed(0));
-    let (claim, ()) = tokio::join!(sockets.claim(SocketClass::Reserve, peer()), async {
-        // The claim, polled first, is waiting: the tunnel frees the socket.
-        assert_eq!(sockets.closing(SocketClass::Reserve), peer());
-        kept.free(0);
-    });
-    let claim = claim.expect("the kept bytes are back").expect("a budget");
-    assert_eq!(sockets.held(SocketClass::Reserve), peer());
-    drop(claim);
-
-    // With nothing refused, a claim on a reserve kept full closes the kept
-    // connection itself and waits for its bytes.
-    let mut kept = kept_of(&sockets, 1, peer());
-    let (claim, ()) = tokio::join!(sockets.claim(SocketClass::Reserve, peer()), async {
-        assert!(kept.closed(0));
-        kept.free(0);
-    });
-    assert!(claim.expect("the kept bytes are back").is_some());
-}
-
 // A reserve full of connections in use has nothing to reclaim: a claim is
 // refused at once, as before. So is one past what closing every kept
 // connection would give.
-#[tokio::test]
-async fn a_claim_on_a_reserve_full_of_connections_in_use_is_refused_at_once() {
+#[test]
+fn a_claim_on_a_reserve_full_of_connections_in_use_is_refused_at_once() {
     let sockets = sockets(1, 2);
     let in_use = take(&sockets, SocketClass::Reserve, peer()).expect("room");
-    let Err(refused) = sockets.claim(SocketClass::Reserve, peer()).await else {
-        panic!("room in a full reserve");
-    };
-    assert!(!refused.reclaiming);
+    assert!(sockets.take(SocketClass::Reserve, peer()).is_err());
     drop(in_use);
 
     let kept = kept(&sockets, 1);
-    assert!(
-        sockets
-            .claim(SocketClass::Reserve, 2 * peer())
-            .await
-            .is_err()
-    );
+    assert!(sockets.take(SocketClass::Reserve, 2 * peer()).is_err());
     assert!(!kept.closed(0));
 }
 

@@ -48,13 +48,10 @@
 // each the bytes its socket reserved when it was dialled. A claim that does
 // not fit closes as many of them as it needs, the oldest first, and no more:
 // bytes already closing count as on their way back, so a second claim closes
-// nothing for bytes the first freed. One on a tunnel socket is reset, so the
-// tunnel frees the socket and its bytes are back before the claim looks
-// again; any other comes back as a closing stream does, when its socket is
-// freed. A claim refused only for the bytes of kept connections closed for
-// a claim, its own or an earlier one's, waits for them (`claim`): without
-// those connections kept the bytes would have been there, so nothing kept
-// makes it fail. A look at room closes nothing, and counts what closing the
+// nothing for bytes the first freed. A kept connection's tunnel socket is
+// reset, so the tunnel frees the socket and its bytes are back before the
+// claim looks again: nothing kept makes a claim fail or wait. A look at room
+// closes nothing, and counts what closing the
 // kept connections would give. A connection newly kept rings its class's
 // slot, so a waiter refused while it was in use comes back to close it.
 use std::collections::BTreeMap;
@@ -269,9 +266,6 @@ struct Ledger {
     held: [u64; KINDS],
     open: [usize; KINDS],
     closing: [u64; KINDS],
-    // The bytes among them of kept connections closed to make room, whose
-    // sockets the tunnel still holds.
-    reclaimed: [u64; KINDS],
     // What each side was given at the last division; none before the first.
     given: [Option<u64>; SIDES],
     // Each side's live demands: how many ask each size of socket. A side
@@ -494,9 +488,6 @@ impl Shares {
         let mut ledger = self.ledger();
         let closed = stream.is_some_and(|stream| {
             stream.freed.store(true, Ordering::Relaxed);
-            if stream.reclaimed.load(Ordering::Relaxed) {
-                ledger.reclaimed[kind] -= bytes;
-            }
             stream.closed.load(Ordering::Relaxed)
         });
         let asked = self.give(&mut ledger, kind, bytes, closed);
@@ -518,18 +509,6 @@ impl Shares {
         ledger.moved(kind);
         // Closing, the bytes are owed no more: nothing grows, so none wakes.
         ledger.settle(&*self.divider);
-    }
-
-    // The kept connection holding `bytes` of `kind` on `stream` was closed to
-    // make room: a claim refused for those bytes alone waits for them.
-    // Nothing, when the tunnel already freed the socket.
-    fn reclaimed(&self, kind: usize, bytes: u64, stream: &StreamEnd) {
-        let mut ledger = self.ledger();
-        if stream.freed.load(Ordering::Relaxed) || stream.reclaimed.load(Ordering::Relaxed) {
-            return;
-        }
-        stream.reclaimed.store(true, Ordering::Relaxed);
-        ledger.reclaimed[kind] += bytes;
     }
 
     // A socket of `kind` connected: no bytes move, so only the side woken
@@ -601,7 +580,7 @@ impl SocketPermit {
     }
 
     // What a connection kept on this socket of `class` registers with its
-    // keeper: the bytes, and the stream's side to mark as reclaimed.
+    // keeper: the bytes, and the stream's side, which resets its socket.
     pub(crate) fn reclaimable(&mut self, class: SocketClass) -> Reclaimable {
         let stream = self.stream.get_or_insert_with(Arc::default);
         Reclaimable {
@@ -627,8 +606,6 @@ impl Drop for SocketPermit {
 struct StreamEnd {
     closed: AtomicBool,
     freed: AtomicBool,
-    // Whether a kept connection on the stream was closed to make room.
-    reclaimed: AtomicBool,
     // What resets the stream's tunnel socket, for a stream a kept connection
     // may ride: set once the tunnel holds the socket.
     aborter: OnceLock<WgTcpAborter>,
@@ -650,18 +627,15 @@ impl Reclaimable {
         (self.class, self.bytes)
     }
 
-    // The connection was closed to make room. On a tunnel socket it is reset
-    // first: the tunnel frees the socket at once, without waiting on the far
-    // side, and the bytes are back before this returns, never counted as
-    // reclaimed. Otherwise a claim refused for its bytes alone waits for
-    // them. Called with no lock of the ledger's or a keeper's held: the
-    // reset hands the bytes back, which takes the ledger's lock.
+    // The connection was closed to make room. Its tunnel socket is reset:
+    // the tunnel frees the socket at once, without waiting on the far side,
+    // and the bytes are back before this returns. A stream on no tunnel
+    // socket gave its bytes back as the connection was dropped. Called with
+    // no lock of the ledger's or a keeper's held: the reset hands the bytes
+    // back, which takes the ledger's lock.
     pub(crate) fn reclaimed(&self) {
         if let Some(aborter) = self.stream.aborter.get() {
             aborter.abort();
-        }
-        if let Some(shares) = self.shares.upgrade() {
-            shares.reclaimed(self.class.index(), self.bytes, &self.stream);
         }
     }
 
@@ -766,9 +740,6 @@ pub struct Refused {
     pub open: usize,
     pub freed: SlotFreed,
     pub demand: Option<Demand>,
-    // Whether it fits once the bytes of kept connections closed to make
-    // room are back, which they are once the tunnel frees their sockets.
-    pub reclaiming: bool,
 }
 
 // A side's want for a socket it was refused. The side presses exactly while
@@ -849,7 +820,6 @@ impl SessionSockets {
                 held: [0; KINDS],
                 open: [0; KINDS],
                 closing: [0; KINDS],
-                reclaimed: [0; KINDS],
                 given: [None; SIDES],
                 demand: Default::default(),
                 level: [0; SIDES],
@@ -903,8 +873,8 @@ impl SessionSockets {
     }
 
     // Close the kept connections a claim of `bytes` of `class` needs, the
-    // oldest first. One on a tunnel socket is reset and its bytes are back
-    // before this returns; any other's come back when its socket is freed.
+    // oldest first. Each one's bytes are back before this returns: its
+    // tunnel socket is reset.
     // A reclaim that found its connection already taken for a
     // lookup closed nothing and is not counted. Runs with no lock of the
     // ledger's held: closing takes it.
@@ -915,37 +885,6 @@ impl SessionSockets {
         for _ in 0..self.kept_needed(inner, class, bytes) {
             if !self.keeper.reclaim() {
                 break;
-            }
-        }
-    }
-
-    // As `take`, but a claim refused only for the bytes of kept connections
-    // closed to make room, by it or an earlier claim, waits for them: the
-    // tunnel gives them back as it frees their sockets, and without those
-    // connections kept the bytes would have been there. Any other refusal
-    // is returned at once, as `take`'s. Never past the budget: each look is
-    // a `take`.
-    pub async fn claim(
-        &self,
-        class: SocketClass,
-        bytes: u64,
-    ) -> Result<Option<SocketPermit>, Refused> {
-        let Some(inner) = &self.shares else {
-            return Ok(None);
-        };
-        let freed = inner.freed[class.index()].notify();
-        loop {
-            // Armed before the look, so bytes that come back between the
-            // refusal and the wait are not missed.
-            let notified = freed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match self.take(class, bytes) {
-                Err(refused) if refused.reclaiming => {
-                    drop(refused);
-                    notified.await;
-                }
-                taken => return taken,
             }
         }
     }
@@ -1048,7 +987,6 @@ impl SessionSockets {
                 open,
                 freed: inner.freed[class.index()].clone(),
                 demand,
-                reclaiming: false,
             })
         }
     }
@@ -1058,8 +996,7 @@ impl SessionSockets {
     // for a side, the `Demand` the refusal leaves. A refusal divides the
     // sides again with the side refused pressing. A session without a
     // budget hands out no permits. First closes the kept connections whose
-    // bytes it needs: refused while their bytes are closing, the caller
-    // waits for them as for any other closing socket.
+    // bytes it needs; their bytes are back before it looks again.
     pub fn take(&self, class: SocketClass, bytes: u64) -> Result<Option<SocketPermit>, Refused> {
         let Some(inner) = &self.shares else {
             return Ok(None);
@@ -1083,17 +1020,6 @@ impl SessionSockets {
             pressed = Some(side);
         }
         if !fit {
-            let reclaiming = ledger.reclaimed.iter().any(|&bytes| bytes > 0) && {
-                let mut back = ledger.clone();
-                if let Some(side) = pressed {
-                    back.unpress(side, bytes);
-                }
-                for kind in 0..KINDS {
-                    back.held[kind] -= back.reclaimed[kind];
-                    back.closing[kind] = back.closing[kind].saturating_sub(back.reclaimed[kind]);
-                }
-                fits_divided(&mut back, &*inner.divider, class, bytes)
-            };
             let asked = ledger.settle(&*inner.divider);
             let open = ledger.open[kind];
             drop(ledger);
@@ -1104,7 +1030,6 @@ impl SessionSockets {
                 open,
                 freed: inner.freed[kind].clone(),
                 demand: pressed.map(|side| Demand::pressed(inner, side, bytes)),
-                reclaiming,
             });
         }
         // Divided again, it fits: the refusal it nearly was wants nothing.
@@ -1140,15 +1065,6 @@ impl SessionSockets {
         self.shares
             .as_ref()
             .map_or(0, |inner| inner.ledger().held[class.index()])
-    }
-
-    // Bytes of `class` of kept connections closed to make room, whose
-    // sockets are not yet freed.
-    #[cfg(test)]
-    pub(crate) fn reclaimed(&self, class: SocketClass) -> u64 {
-        self.shares
-            .as_ref()
-            .map_or(0, |inner| inner.ledger().reclaimed[class.index()])
     }
 
     // Bytes of `class` whose streams were dropped and whose sockets the

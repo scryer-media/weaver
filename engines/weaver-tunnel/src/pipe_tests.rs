@@ -2874,15 +2874,6 @@ async fn a_dial_on_a_reserve_held_by_a_kept_connection_takes_its_bytes() {
     drop(next);
 }
 
-// Poll `future` once, with nothing to wake it: ready only when it never
-// waits.
-fn once<F: std::future::Future>(future: F) -> std::task::Poll<F::Output> {
-    let mut future = std::pin::pin!(future);
-    future
-        .as_mut()
-        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-}
-
 // Keep `dialed` as a lookup that ends keeps its connection: with the keeper
 // of each stage in `rides`, and reclaimable in the share whose keeper its
 // socket reserved bytes with. Closing it drops it, unless `in_use` says a
@@ -2946,23 +2937,21 @@ async fn a_kept_dns_connection_reclaimed_gives_its_bytes_back_at_once() {
     drop(near);
     tokio::time::pause();
     let asked = tokio::time::Instant::now();
-    let std::task::Poll::Ready(claimed) = once(sockets.claim(SocketClass::Reserve, one)) else {
-        panic!("the claim waited for the kept connection's bytes");
-    };
-    let permit = claimed.expect("room").expect("a budget");
+    let permit = sockets
+        .take(SocketClass::Reserve, one)
+        .expect("room: the kept connection's bytes are back")
+        .expect("a budget");
     assert_eq!(tokio::time::Instant::now(), asked);
     assert!(link.lock().unwrap().is_none());
     assert_eq!(sockets.keeper().holding(), 0);
     within();
     assert_eq!(sockets.held(SocketClass::Reserve), one);
     assert_eq!(sockets.closing(SocketClass::Reserve), 0);
-    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
 
     drop(permit);
     assert_eq!(sockets.reserved(), before);
     assert_eq!(sockets.held(SocketClass::Reserve), 0);
     assert_eq!(sockets.closing(SocketClass::Reserve), 0);
-    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
 }
 
 // A kept DNS connection a lookup takes back as the share reclaims it is in
@@ -2985,14 +2974,13 @@ async fn a_kept_connection_taken_back_is_never_reset_and_the_next_is_closed() {
     let (_older, older) = keep_dialed(older, &rides, &taken);
     let (_newer, newer) = keep_dialed(newer, &rides, &Default::default());
 
-    let std::task::Poll::Ready(claimed) = once(sockets.claim(SocketClass::Reserve, one)) else {
-        panic!("the claim waited for the next kept connection's bytes");
-    };
-    let permit = claimed.expect("room").expect("a budget");
+    let permit = sockets
+        .take(SocketClass::Reserve, one)
+        .expect("room: the kept connection's bytes are back")
+        .expect("a budget");
     assert!(newer.lock().unwrap().is_none());
     assert_eq!(sockets.held(SocketClass::Reserve), 2 * one);
     assert_eq!(sockets.closing(SocketClass::Reserve), 0);
-    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
 
     // The connection the lookup took back still works.
     let mut in_use = older.lock().unwrap().take().expect("never closed");
@@ -3061,7 +3049,6 @@ async fn closes_gracefully(
     assert!(link.lock().unwrap().is_none());
     assert_eq!(sockets.held(SocketClass::Reserve), one);
     assert_eq!(sockets.closing(SocketClass::Reserve), one);
-    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
     let mut rest = Vec::new();
     far.read_to_end(&mut rest)
         .await
@@ -3105,7 +3092,6 @@ async fn only_a_kept_connection_closed_for_room_is_reset() {
     assert!(link.lock().unwrap().is_none());
     assert_eq!(sockets.held(SocketClass::Reserve), one);
     assert_eq!(sockets.closing(SocketClass::Reserve), 0);
-    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
     drop(permit);
     assert_eq!(sockets.held(SocketClass::Reserve), 0);
     drop(far);
@@ -3254,7 +3240,6 @@ async fn a_kept_connection_through_two_tunnels_resets_only_its_own_socket() {
     assert!(link.lock().unwrap().is_none());
     assert_eq!(upper.sockets.held(SocketClass::Reserve), one);
     assert_eq!(upper.sockets.closing(SocketClass::Reserve), 0);
-    assert_eq!(upper.sockets.reclaimed(SocketClass::Reserve), 0);
     assert_eq!(lower.sockets.held(SocketClass::Reserve), carried);
     assert_eq!(lower.sockets.closing(SocketClass::Reserve), 0);
     drop(permit);

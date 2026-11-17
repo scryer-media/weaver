@@ -116,7 +116,7 @@ impl Keeper {
     }
 
     // Closes the oldest thing kept that holds a socket in this stage's
-    // share, resets its socket or marks its bytes reclaimed, and says
+    // share, resets its socket so its bytes are back, and says
     // whether there was one. One taken back for use as it was found closes
     // nothing, is never reset, and is not counted: the next is closed in its
     // place. The reset runs outside the holders' lock, after the close.

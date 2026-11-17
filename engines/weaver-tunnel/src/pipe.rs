@@ -1715,15 +1715,15 @@ impl SessionHop {
     }
 
     // `bytes` of `class` in `sockets`, this session's or a lender's. No
-    // room says the session is at capacity until bytes come back; bytes of
-    // kept connections closed to make room are waited for (`claim`).
-    async fn take_socket(
+    // room says the session is at capacity until bytes come back; kept
+    // connections are closed to make room first.
+    fn take_socket(
         &self,
         sockets: &SessionSockets,
         class: SocketClass,
         bytes: u64,
     ) -> Result<Option<SocketPermit>, DialError> {
-        sockets.claim(class, bytes).await.map_err(|refused| {
+        sockets.take(class, bytes).map_err(|refused| {
             tracing::debug!(
                 proxy = self.id,
                 share = class.as_str(),
@@ -1836,10 +1836,8 @@ impl Dialer for SessionHop {
         // when it frees it. A dial that fails or is cancelled has its socket
         // discarded before it returns, and these bytes come back after.
         let class = SocketClass::of(&target.purpose);
-        let mut socket = StreamSocket::new(
-            self.take_socket(&sockets, class, stream_bytes(buffers))
-                .await?,
-        );
+        let mut socket =
+            StreamSocket::new(self.take_socket(&sockets, class, stream_bytes(buffers))?);
         let outcome = Arc::new(ConnectionOutcome::default());
         // What a DNS dial's socket reserved, and in whose share: a connection
         // kept after it is reclaimed at exactly these bytes. Only a DNS
