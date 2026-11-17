@@ -150,6 +150,7 @@ pub(super) struct Live {
     // What the boot read of its rows for its first store and its first
     // attach, each taken by the one it is for; a later one reads its row.
     pub(super) kept_at_boot: Option<Option<Kept>>,
+    pub(super) stamps_at_boot: Option<Vec<(u32, i64)>>,
     pub(super) verified_at_boot: Option<Option<Vec<u8>>>,
     // Held while a session takes it and while it is removed, so the two
     // never cross: a torrent removed is never put in a session after, and
@@ -236,6 +237,7 @@ impl Live {
             kept_pieces: 0,
             failed: None,
             kept_at_boot: None,
+            stamps_at_boot: None,
             verified_at_boot: None,
             gate: Arc::default(),
         }
