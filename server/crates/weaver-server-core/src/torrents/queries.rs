@@ -760,41 +760,6 @@ impl Database {
         })
     }
 
-    /// Every torrent's trackers, by torrent, each in the order
-    /// [`Self::list_torrent_trackers`] gives.
-    /// A torrent one of whose URLs does not open has why in place of its
-    /// list.
-    pub fn torrent_trackers_by_job(&self) -> Result<TrackersByJob, StateError> {
-        self.torrent_read();
-        let key = self.encryption_key().cloned();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, tier, url, named_by FROM torrent_trackers ORDER BY job_id, tier",
-                &[],
-            )
-            .await?;
-            let mut trackers = TrackersByJob::new();
-            for row in &rows {
-                let job_id = count(row, "job_id")?;
-                let entry = tracker_entry(row, key.as_ref())?;
-                match (
-                    trackers.entry(JobId(job_id)).or_insert(Ok(Vec::new())),
-                    entry,
-                ) {
-                    (Ok(list), Ok(entry)) => list.push(entry),
-                    (list @ Ok(_), Err(error)) => *list = Err(error),
-                    (Err(_), _) => {}
-                }
-            }
-            for list in trackers.values_mut().filter_map(|list| list.as_mut().ok()) {
-                list.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
-            }
-            Ok(trackers)
-        })
-    }
-
     // Every host a torrent has announced to, in order.
     pub fn list_tracker_hosts(&self) -> Result<Vec<String>, StateError> {
         let datastore = self.datastore();
@@ -831,74 +796,207 @@ impl Database {
         })
     }
 
-    // Every torrent a start brings back, never one a removal left
-    // retiring, in the order they were added, each with its files'
-    // levels and the pieces it checked in seed mode: what a boot reads of
-    // the torrents' rows, in one read. A row that does not read fails the
-    // read, as [`Self::list_torrents`] does; a level or seed-mode column
-    // that does not read is that torrent's alone.
-    pub(crate) fn restored_torrents(&self) -> Result<Vec<RestoredTorrent>, StateError> {
+    // The torrents a start brings back, never one a removal left retiring,
+    // by job id: a page of them, or those of the jobs named. Each comes
+    // with its files' levels, the pieces it checked in seed mode, its
+    // trackers, its ledger, saved peers and kept pieces, and why unpacking
+    // left it short: what a boot reads of a torrent, four statements a
+    // page, each by its table's key. A row that does not read fails the
+    // read, as [`Self::list_torrents`] does; a level, a seed-mode column, a
+    // tracker URL or a part of the ledger that does not read is that
+    // torrent's alone.
+    pub(crate) fn restored_torrents(
+        &self,
+        which: Restoring<'_>,
+    ) -> Result<Vec<RestoredTorrent>, StateError> {
         self.torrent_read();
         let key = self.encryption_key().cloned();
         let datastore = self.datastore();
+        let (page, named) = match which {
+            Restoring::Page {
+                after,
+                through,
+                limit,
+            } => (
+                Some([
+                    SqlArg::I64(after.map_or(-1, |job_id| job_id.0 as i64)),
+                    SqlArg::I64(through.0 as i64),
+                    SqlArg::I64(i64::try_from(limit).unwrap_or(i64::MAX)),
+                ]),
+                Vec::new(),
+            ),
+            Restoring::Of(jobs) => (None, jobs.iter().map(|job_id| job_id.0 as i64).collect()),
+        };
+        #[cfg(test)]
+        let reads = self.torrent_reads.clone();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                &format!(
-                    "SELECT {TORRENT_COLUMNS}, file_priorities, seed_verified, held_set, \
-                            CASE WHEN held_set THEN NULL ELSE outputs END AS unheld_outputs \
-                       FROM torrents WHERE retiring IS NULL ORDER BY added_at_ms, job_id"
+            let select = format!(
+                "SELECT {TORRENT_COLUMNS}, file_priorities, seed_verified, held_set, \
+                        CASE WHEN held_set THEN NULL ELSE outputs END AS unheld_outputs \
+                   FROM torrents WHERE retiring IS NULL"
+            );
+            let per = max_rows_for_engine(datastore.engine(), 1);
+            let mut rows = Vec::new();
+            match &page {
+                Some(page) => rows.extend(
+                    SqlRuntime::fetch_all(
+                        datastore.read_exec(),
+                        &format!(
+                            "{select} AND job_id > {{}} AND job_id <= {{}} \
+                             ORDER BY job_id LIMIT {{}}"
+                        ),
+                        page,
+                    )
+                    .await?,
                 ),
-                &[],
-            )
-            .await?;
-            rows.iter()
+                None => {
+                    for chunk in named.chunks(per) {
+                        let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
+                        rows.extend(
+                            SqlRuntime::fetch_all(
+                                datastore.read_exec(),
+                                &format!(
+                                    "{select} AND job_id IN ({}) ORDER BY job_id",
+                                    binds(chunk.len())
+                                ),
+                                &args,
+                            )
+                            .await?,
+                        );
+                    }
+                }
+            }
+            let mut restored = rows
+                .into_iter()
                 .map(|row| {
-                    let (record, sealed) = torrent_and_seal(row, key.as_ref())?;
+                    // The stored metainfo is given up as it is opened: no
+                    // page holds its torrents' sealed and opened bytes both.
+                    let (record, sealed) = torrent_and_seal(&row, key.as_ref())?;
                     Ok(RestoredTorrent {
                         record,
                         sealed,
-                        levels: file_priorities_from_row(row),
+                        levels: file_priorities_from_row(&row),
                         seed_verified: row.opt_bytes("seed_verified"),
                         held_set: row.bool("held_set")?,
                         unheld_outputs: row
                             .opt_text("unheld_outputs")?
                             .map_or(Some(Vec::new()), |text| serde_json::from_str(&text).ok()),
+                        trackers: Ok(Vec::new()),
+                        counters: None,
+                        failure: None,
                     })
                 })
-                .collect()
+                .collect::<Result<Vec<_>, StateError>>()?;
+            if restored.is_empty() {
+                return Ok(restored);
+            }
+            let at: std::collections::HashMap<u64, usize> = restored
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.record.job_id.0, index))
+                .collect();
+            let jobs: Vec<i64> = restored
+                .iter()
+                .map(|row| row.record.job_id.0 as i64)
+                .collect();
+            for chunk in jobs.chunks(per) {
+                let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
+                let among = binds(chunk.len());
+                #[cfg(test)]
+                reads.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, tier, url, named_by FROM torrent_trackers \
+                          WHERE job_id IN ({among})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in &rows {
+                    let Some(&index) = at.get(&count(row, "job_id")?) else {
+                        continue;
+                    };
+                    match (
+                        &mut restored[index].trackers,
+                        tracker_entry(row, key.as_ref())?,
+                    ) {
+                        (Ok(list), Ok(entry)) => list.push(entry),
+                        (list @ Ok(_), Err(error)) => *list = Err(error),
+                        (Err(_), _) => {}
+                    }
+                }
+                for (job_id, row) in
+                    crate::torrents::persistence::counters_among(&datastore, &among, &args).await?
+                {
+                    if let Some(&index) = at.get(&job_id.0) {
+                        restored[index].counters = Some(row);
+                    }
+                }
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, error_message FROM job_history \
+                          WHERE job_id IN ({among}) AND status IN ('failed', 'partial') \
+                            AND error_message IS NOT NULL"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in &rows {
+                    if let Some(&index) = at.get(&count(row, "job_id")?) {
+                        restored[index].failure = Some(row.text("error_message")?);
+                    }
+                }
+            }
+            for list in restored
+                .iter_mut()
+                .filter_map(|row| row.trackers.as_mut().ok())
+            {
+                list.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+            }
+            Ok(restored)
         })
     }
 
-    // Why unpacking left each torrent short, as its history keeps it failed or partial, by
-    // torrent, in one read: what [`Self::get_job_history`] gives a torrent's
-    // restore, for all of them.
-    pub(crate) fn failed_torrent_histories(
-        &self,
-    ) -> Result<std::collections::BTreeMap<JobId, String>, StateError> {
+    // The last job a torrent row has: a start reads the torrents as far as
+    // it, by the table's key. None with no torrent.
+    pub(crate) fn last_torrent_job(&self) -> Result<Option<JobId>, StateError> {
         self.torrent_read();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
+            let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT h.job_id, h.error_message FROM job_history h \
-                   JOIN torrents t ON t.job_id = h.job_id \
-                  WHERE h.status IN ('failed', 'partial') AND h.error_message IS NOT NULL",
+                "SELECT MAX(job_id) AS last FROM torrents",
                 &[],
             )
             .await?;
-            rows.iter()
-                .map(|row| Ok((JobId(count(row, "job_id")?), row.text("error_message")?)))
-                .collect()
+            row.map(|row| row.opt_i64("last"))
+                .transpose()?
+                .flatten()
+                .map(|last| {
+                    u64::try_from(last)
+                        .map(JobId)
+                        .map_err(|_| corrupt("job", last))
+                })
+                .transpose()
         })
     }
 }
 
-// One torrent's row as a boot reads it.
-/// Every torrent's trackers, by torrent, or why one of its URLs did not
-/// decrypt.
-pub type TrackersByJob = std::collections::BTreeMap<JobId, Result<Vec<TrackerEntry>, String>>;
+/// Which torrents a start's read brings back.
+pub(crate) enum Restoring<'a> {
+    /// The next `limit` after `after`, by job id, none past `through`.
+    Page {
+        after: Option<JobId>,
+        through: JobId,
+        limit: usize,
+    },
+    /// Those of these jobs.
+    Of(&'a [JobId]),
+}
 
+// One torrent's rows as a boot reads them.
 pub(crate) struct RestoredTorrent {
     pub(crate) record: TorrentRecord,
     // Why its stored metainfo did not decrypt, when it did not.
@@ -910,6 +1008,14 @@ pub(crate) struct RestoredTorrent {
     // that list does not read.
     pub(crate) held_set: bool,
     pub(crate) unheld_outputs: Option<Vec<String>>,
+    // Its trackers, in the order [`Database::list_torrent_trackers`] gives,
+    // or why one of its URLs did not decrypt.
+    pub(crate) trackers: Result<Vec<TrackerEntry>, String>,
+    // Its ledger, saved peers and kept pieces; None with no row of them.
+    pub(crate) counters: Option<crate::torrents::persistence::CountersRow>,
+    // Why unpacking left it short, as its history keeps it failed or
+    // partial: what [`Database::get_job_history`] gives a torrent's restore.
+    pub(crate) failure: Option<String>,
 }
 
 pub(crate) fn counters_from_row(row: &SqlRow) -> Result<TorrentCounters, StateError> {

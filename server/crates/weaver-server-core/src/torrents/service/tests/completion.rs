@@ -1792,11 +1792,9 @@ async fn a_crash_after_the_mark_leaves_what_a_live_torrent_holds() {
 // Whether the torrents row of `job_id` says its held paths are its own.
 fn held_set(rig: &Rig, job_id: JobId) -> bool {
     rig.db
-        .restored_torrents()
+        .restored_torrents(crate::torrents::queries::Restoring::Of(&[job_id]))
         .unwrap()
-        .into_iter()
-        .find(|torrent| torrent.record.job_id == job_id)
-        .unwrap()
+        .remove(0)
         .held_set
 }
 
@@ -2176,10 +2174,7 @@ async fn what_a_torrent_holds_is_spelled_as_the_folder_its_files_went_into() {
         .join(spelled)
         .to_string_lossy()
         .into_owned();
-    assert_eq!(
-        rig.db.held_rows(Some(job_id)).unwrap(),
-        [(job_id, expected)]
-    );
+    assert_eq!(rig.db.held_rows(&[job_id]).unwrap(), [(job_id, expected)]);
     restarted.stop().await;
 }
 

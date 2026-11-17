@@ -1882,3 +1882,261 @@ fn a_torrents_password_list_is_its_rules_then_the_global_list_once_each() {
         ]
     );
 }
+
+// The stored torrents load behind the start: with the load held before its
+// first page, the start has ended and the service answers. The whole list
+// shows the torrents in so far; one named by its key, or on a page of the
+// list, is read then and there; an
+// add of a torrent stored but not yet in is refused from its row; a remove
+// of one not yet in removes it, and the load does not bring it back; a new
+// torrent is kept at once. Once the load goes on, every stored torrent is
+// in, once, and the one added under it is last in the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_service_answers_while_its_stored_torrents_load() {
+    use crate::torrents::service::listing::{Pick, Shown, page};
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let mut stored = Vec::new();
+    for (name, seed) in [("one", 1), ("two", 2), ("three", 3)] {
+        stored.push(
+            rig.service
+                .add_opened(request(AddSource::Metainfo(plain(name, seed))))
+                .await
+                .unwrap(),
+        );
+    }
+    let [one, two, three] = stored[..] else {
+        unreachable!()
+    };
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.inner.load_held.send_replace(true);
+    again.start_seated().await.unwrap();
+    assert!(again.loading());
+    assert_eq!(again.torrents(None).await.len(), 0);
+
+    assert_eq!(again.torrent(one).await.unwrap().name, "one");
+    let listed: Vec<JobId> = again
+        .torrents(None)
+        .await
+        .iter()
+        .map(|view| view.job_id)
+        .collect();
+    assert_eq!(listed, [one]);
+    // A page of the list brings in the torrents it shows.
+    let paged: Vec<JobId> = again
+        .picked(Pick::default(), page(0, 2), Shown::LISTED)
+        .await
+        .unwrap()
+        .iter()
+        .map(|view| view.job_id)
+        .collect();
+    assert_eq!(paged, [one, two]);
+    assert_eq!(
+        again
+            .add(request(AddSource::Metainfo(plain("two", 2))))
+            .await,
+        Err(AddError::Duplicate(two))
+    );
+    again.remove(three, false, true).await.unwrap();
+    assert_eq!(rig.db.get_torrent(three).unwrap(), None);
+    let four = again
+        .add(request(AddSource::Metainfo(plain("four", 4))))
+        .await
+        .unwrap();
+    assert!(rig.db.get_torrent(four).unwrap().is_some());
+
+    again.inner.load_held.send_replace(false);
+    again
+        .inner
+        .load
+        .subscribe()
+        .wait_for(|load| matches!(load, Load::Done))
+        .await
+        .unwrap();
+    let listed: Vec<JobId> = again
+        .torrents(None)
+        .await
+        .iter()
+        .map(|view| view.job_id)
+        .collect();
+    assert_eq!(listed, [one, two, four]);
+    let place = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().queue_position;
+    assert!(place(one) < place(two) && place(two) < place(four));
+    again.stop().await;
+}
+
+// A tick that finds no torrent waiting for its job begins no restore pass:
+// the pass's state never changes. A restart leaves one waiting, the next
+// tick begins the pass, and the tick after it begins none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_tick_begins_no_restore_pass() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let mut passes = rig.service.inner.restores.subscribe();
+    passes.borrow_and_update();
+    rig.service.tick().await;
+    rig.service.tick().await;
+    assert!(!passes.has_changed().unwrap());
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let mut passes = again.inner.restores.subscribe();
+    passes.borrow_and_update();
+    again.tick().await;
+    again.restored().await;
+    assert!(passes.has_changed().unwrap());
+    assert!(again.inner.live.lock().await[&job_id].store.is_some());
+    passes.borrow_and_update();
+    again.tick().await;
+    again.tick().await;
+    assert!(!passes.has_changed().unwrap());
+    again.stop().await;
+}
+
+// A recheck and a move of a torrent that still waits for its job restore
+// the job first, as a remove does, and then act.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recheck_and_a_move_restore_the_job_they_need() {
+    for moved in [false, true] {
+        let rig = rig(set_clock());
+        on_loopback(&rig.routes);
+        rig.service.open().await.unwrap();
+        let job_id = rig
+            .service
+            .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+            .await
+            .unwrap();
+        rig.service.stop().await;
+
+        let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+        let written = again.written();
+        again.open().await.unwrap();
+        assert!(again.inner.live.lock().await[&job_id].store.is_none());
+        if moved {
+            let elsewhere = rig.dir.path().join("elsewhere");
+            again
+                .set_location(job_id, elsewhere.to_str().unwrap().to_owned())
+                .await
+                .unwrap();
+            let stored = rig.db.get_torrent(job_id).unwrap().unwrap().storage_dir;
+            assert_eq!(
+                stored.as_deref().map(Path::new),
+                Some(&*elsewhere.join("set"))
+            );
+        } else {
+            again.recheck(job_id).await.unwrap();
+        }
+        assert_eq!(written.borrow().checkpoints_read, 1);
+        assert!(again.inner.live.lock().await[&job_id].store.is_some());
+        again.stop().await;
+    }
+}
+
+// The restore pass and the tick's look at the routes may both come to put
+// one torrent in a session, each having read it before the other put it
+// there, and on two routes when its route changed between them. One does:
+// the torrent is in one session, and its tracker hears it start once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_torrent_joins_one_session_though_its_route_changed() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    let (url, mut answered) = answering_tracker("127.0.0.1:1".parse().unwrap()).await;
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    answered
+        .wait_for(|events| events.iter().any(|(event, _)| event == "started"))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    let before = answered.borrow().len();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let gate = Arc::clone(&again.inner.live.lock().await[&job_id].gate);
+    let held = gate.lock().await;
+    let mut asked = rig.routes.asked.subscribe();
+    let opens = *asked.borrow_and_update();
+    // The pass: the job back, then its route's session opened for it.
+    let pass = {
+        let again = again.clone();
+        tokio::spawn(async move {
+            if again.restore_job(job_id).await {
+                again.attach(job_id, None).await;
+            }
+        })
+    };
+    asked.wait_for(|asked| *asked > opens).await.unwrap();
+    // The tick: its route is another now, whose session opens for it too.
+    rig.routes.route(TorrentScope::Default, 2);
+    let tick = {
+        let again = again.clone();
+        tokio::spawn(async move { again.follow_routes().await })
+    };
+    asked.wait_for(|asked| *asked > opens + 1).await.unwrap();
+    drop(held);
+    pass.await.unwrap();
+    tick.await.unwrap();
+
+    let running = again.inner.sessions.running().await;
+    let taken: usize = running
+        .values()
+        .map(|session| session.with_torrents(|torrents| torrents.count()))
+        .sum();
+    assert_eq!(taken, 1);
+    answered
+        .wait_for(|events| events.len() > before)
+        .await
+        .unwrap();
+    again.pause(job_id).await.unwrap();
+    let heard = answered
+        .wait_for(|events| events.len() > before + 1)
+        .await
+        .unwrap()[before..]
+        .iter()
+        .map(|(event, _)| event.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(heard, ["started", "stopped"]);
+    // Each session numbers the torrents it takes from 0: the one that took
+    // the torrent gives the next 1, and the other, which never took it, 0.
+    assert_eq!(running.len(), 2);
+    let mut next = Vec::new();
+    for (at, session) in running.values().enumerate() {
+        let options = AddTorrentOptions {
+            paused: true,
+            output_folder: Some(
+                rig.dir
+                    .path()
+                    .join(format!("probe-{at}"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        };
+        let probe = session
+            .add_torrent(
+                weaver_torrent::AddTorrent::from_bytes(plain("probe", 9)),
+                Some(options),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        next.push(probe.id());
+    }
+    next.sort_unstable();
+    assert_eq!(next, [0, 1], "the torrent was put in both sessions");
+    again.stop().await;
+}

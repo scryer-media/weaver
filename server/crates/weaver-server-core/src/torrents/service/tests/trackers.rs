@@ -439,20 +439,22 @@ async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, S
         .collect()
 }
 
-// Each torrent's trackers are held with it, and a boot reads each torrent
-// table a restore and an attach read once, for every torrent: the
-// torrents' rows, their trackers', their counters' and their history's. From then on
+// Each torrent's trackers are held with it, and a boot reads the last
+// torrent's key, then each torrent table a restore and an attach read once
+// a page of torrents: the torrents' rows, their trackers', their counters'
+// and their history's. A boot of no torrent reads the key alone. From then on
 // publishing, listing, viewing and matching the tracker rules again read
 // none, whether one torrent is live or fifty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
-    const BOOT_READS: usize = 4;
+    // Fewer torrents than a page holds, so one page.
+    const BOOT_READS: usize = 5;
     let a = "http://a.invalid/announce";
     let reads = |db: &Database| db.torrent_reads.load(std::sync::atomic::Ordering::Relaxed);
     for count in [1, 50] {
         let rig = rig(set_clock());
         rig.service.open().await.unwrap();
-        assert_eq!(reads(&rig.db), BOOT_READS, "the boot of no torrent");
+        assert_eq!(reads(&rig.db), 1, "the boot of no torrent");
         let mut jobs = Vec::new();
         for seed in 0..count {
             let name = format!("listed-{seed}");

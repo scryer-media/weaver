@@ -357,6 +357,21 @@ impl TorrentService {
         pick.picked(&self.settings(), &self.inner.db, window)
     }
 
+    // `picked_ids`, each torrent of the page here to be shown: one the
+    // start's load has not reached is read now, so a page lists what the
+    // table holds however far the load is.
+    async fn picked_here(
+        &self,
+        pick: Pick<'_>,
+        window: Window,
+    ) -> Result<Picked, crate::StateError> {
+        let picked = self.picked_ids(pick, window)?;
+        if let Picked::Page(page) = &picked {
+            self.ensure(page).await;
+        }
+        Ok(picked)
+    }
+
     /// The torrents `pick` keeps, in the order they were added, and of
     /// those the ones at `window`'s places. Only their views are built. An
     /// error when the table cannot be read, never an empty list.
@@ -366,7 +381,7 @@ impl TorrentService {
         window: Window,
         shown: Shown,
     ) -> Result<Vec<TorrentView>, crate::StateError> {
-        let picked = self.picked_ids(pick, window)?;
+        let picked = self.picked_here(pick, window).await?;
         let now = self.inner.clock.unix_ms();
         Ok(self
             .listed_by(shown, false, false, now, move |_, live| picked.under(live))
@@ -384,7 +399,7 @@ impl TorrentService {
         window: Window,
         shown: Shown,
     ) -> Result<Vec<(TorrentView, FileTotals)>, crate::StateError> {
-        let picked = self.picked_ids(pick, window)?;
+        let picked = self.picked_here(pick, window).await?;
         let now = self.inner.clock.unix_ms();
         Ok(self
             .listed_by(shown, false, true, now, move |_, live| picked.under(live))

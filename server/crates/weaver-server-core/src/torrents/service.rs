@@ -711,6 +711,28 @@ enum Restores {
     Again,
 }
 
+// Where the read of the stored torrents at start stands: not begun, under
+// way as far as the last job a torrent row had when it began, ended, or
+// ended on a read that failed, with why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Load {
+    Idle,
+    Running(Option<JobId>),
+    Done,
+    Failed(String),
+}
+
+// What moved under a load of the stored torrents, kept only while it runs.
+#[derive(Default)]
+struct LoadMarks {
+    // The torrents taken out of the live ones: a page read before one went
+    // does not bring it back.
+    gone: BTreeSet<JobId>,
+    // The torrents added: each takes its place past every stored torrent
+    // once the last of them is read.
+    added: Vec<JobId>,
+}
+
 struct Inner {
     db: Database,
     sessions: Sessions,
@@ -730,6 +752,16 @@ struct Inner {
     // their records alone, run off the tick: none, one running, or one
     // running with another asked to follow it.
     restores: watch::Sender<Restores>,
+    // Set where a torrent comes to wait for its job: a page of the load, a
+    // restore held, a resume of one that crashed the daemon. The tick
+    // begins a restore pass only when it is set, and takes it.
+    restore_wanted: AtomicBool,
+    // The load of the stored torrents at start, and what moved under it.
+    load: watch::Sender<Load>,
+    load_marks: Mutex<LoadMarks>,
+    // Held, the load reads no page: a test's hold on it.
+    #[cfg(test)]
+    load_held: watch::Sender<bool>,
     // The torrents whose work crashed the daemon on its last run: each is
     // kept paused, its job not restored, until a resume takes its marker.
     crash_marks: Mutex<crate::runtime::panic_trap::CrashMarks>,
@@ -841,6 +873,11 @@ impl TorrentService {
                 restoring: std::sync::Mutex::new(HashMap::new()),
                 restore_permits: Arc::new(tokio::sync::Semaphore::new(RESTORES_AT_ONCE)),
                 restores: watch::channel(Restores::Idle).0,
+                restore_wanted: AtomicBool::new(false),
+                load: watch::channel(Load::Idle).0,
+                load_marks: Mutex::default(),
+                #[cfg(test)]
+                load_held: watch::channel(false).0,
                 crash_marks: Mutex::default(),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
@@ -1079,11 +1116,27 @@ impl TorrentService {
         Ok(())
     }
 
+    // Whether the stored torrents are still being read at start.
+    fn loading(&self) -> bool {
+        matches!(*self.inner.load.borrow(), Load::Running(_))
+    }
+
+    // `job_id` taken out of the live torrents. Under a load, a page read
+    // before it went does not bring it back.
+    fn unlive(&self, live: &mut BTreeMap<JobId, Live>, job_id: JobId) -> Option<Live> {
+        let torrent = live.remove(&job_id)?;
+        if self.loading() {
+            locked(&self.inner.load_marks).gone.insert(job_id);
+        }
+        Some(torrent)
+    }
+
     async fn with_torrent<T>(
         &self,
         job_id: JobId,
         change: impl FnOnce(&mut Live) -> Result<T, ActionError>,
     ) -> Result<T, ActionError> {
+        self.ensure(&[job_id]).await;
         let mut live = self.inner.live.lock().await;
         let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
         change(torrent)

@@ -577,7 +577,13 @@ impl TorrentService {
     // session, held off.
     pub(super) async fn run(&self, on: bool) {
         if on {
-            self.spawn_tick();
+            // While the stored torrents are still being read no tick runs:
+            // the load starts it once the last is in, as the sessions
+            // stand then, so no torrent takes a queue turn among only some
+            // of them.
+            if !self.loading() {
+                self.spawn_tick();
+            }
         } else {
             self.stop_tick();
             let mut live = self.inner.live.lock().await;

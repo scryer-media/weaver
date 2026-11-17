@@ -643,6 +643,13 @@ async fn a_restart_keeps_the_whole_and_starts_the_seeding_run_again() {
         Arc::clone(&seeded.clock) as Arc<dyn Clock>,
     );
     reopen(&again).await;
+    // The restored torrent's session has checked it: the tick below reads
+    // it seeding, not still at its check.
+    handle_of(&again, seeded.job_id)
+        .await
+        .wait_until_initialized()
+        .await
+        .unwrap();
     let view = again.torrent(seeded.job_id).await.unwrap();
     assert_eq!(
         (view.seeding_seconds, view.consecutive_seeding_seconds),

@@ -337,6 +337,7 @@ impl TorrentService {
             None => None,
         };
         let rules = self.rules();
+        self.ensure(&[job_id]).await;
         let moved = {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;

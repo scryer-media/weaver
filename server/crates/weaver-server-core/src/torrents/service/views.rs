@@ -566,6 +566,7 @@ impl TorrentService {
 
     /// One torrent, with its files and trackers.
     pub async fn torrent(&self, job_id: JobId) -> Option<TorrentView> {
+        self.ensure(&[job_id]).await;
         let settings = self.settings();
         let now = self.inner.clock.unix_ms();
         let (mut view, announces, pinned, listed) = {
@@ -590,6 +591,7 @@ impl TorrentService {
     /// torrent under the lock its view takes; its peers are read after,
     /// from its session.
     pub async fn support(&self, job_id: JobId) -> Option<TorrentSupport> {
+        self.ensure(&[job_id]).await;
         let settings = self.settings();
         let now = self.inner.clock.unix_ms();
         let (mut support, announces, handle, pinned, listed) = {

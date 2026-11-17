@@ -539,8 +539,13 @@ fn a_mark_that_does_not_read_keeps_the_peers_and_bans() {
         ..saved
     };
     assert_eq!(db.torrent_peers(JobId(1)).unwrap(), unmarked);
-    let boot = db.torrent_counters_by_job().unwrap();
-    assert_eq!(boot[&JobId(1)].peers.as_ref().unwrap(), &unmarked);
+    let boot = db
+        .restored_torrents(crate::torrents::queries::Restoring::Of(&[JobId(1)]))
+        .unwrap();
+    assert_eq!(
+        boot[0].counters.as_ref().unwrap().peers.as_ref().unwrap(),
+        &unmarked
+    );
 }
 
 #[test]

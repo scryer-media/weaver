@@ -19,6 +19,7 @@ use crate::torrents::admission::Refusal;
 use crate::torrents::metrics::FetchOutcome;
 use crate::torrents::{TorrentIntent, status};
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, Weak};
 
 // A snapshot of the download queue's end from the last pass, extended by
@@ -49,14 +50,32 @@ impl TorrentService {
         queue.state().classes().seat(self.class());
     }
 
-    /// Start the client, and only once it runs seat it as the torrent class
-    /// of the queue it was wired to: a client that failed to start is never
-    /// the class the job layer hands torrents to.
+    /// Start the client without waiting on its torrents, and seat it as
+    /// the torrent class of the queue it was wired to. What a start reads
+    /// before any torrent, its tracker rules and the last torrent's key,
+    /// fails the start: a client that failed to start is never the class
+    /// the job layer hands torrents to. The stored torrents are then read
+    /// on a task the service keeps, a page at a time, and the tick starts
+    /// once the last is in; the caller goes on at once. A load the database
+    /// fails is said: the torrents read so far stay, no tick runs, and an
+    /// add is refused with why.
     pub(super) async fn start_seated(&self) -> Result<(), String> {
-        self.start().await?;
+        let through = self.begin()?;
         if let Some(queue) = self.queue() {
             queue.state().classes().seat(self.class());
         }
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            match service.load(through).await {
+                Ok(()) => {
+                    service.after_load().await;
+                    service.run(service.inner.sessions.on()).await;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "the stored torrents did not load; the torrent client does not run");
+                }
+            }
+        }));
         Ok(())
     }
 
@@ -147,6 +166,8 @@ impl TorrentService {
                 Ok(())
             })
             .await?;
+            // Its job is restored at the next tick.
+            self.inner.restore_wanted.store(true, Ordering::Release);
         }
         self.set_intent(job_id, TorrentIntent::Resumed).await?;
         self.with_torrent(job_id, |torrent| {
@@ -236,6 +257,7 @@ impl TorrentService {
         job_ids: &[JobId],
         target: QueueMoveTarget,
     ) -> Result<(), ActionError> {
+        self.ensure(job_ids).await;
         {
             let mut live = self.inner.live.lock().await;
             if let Some(&missing) = job_ids.iter().find(|job_id| !live.contains_key(job_id)) {

@@ -20,6 +20,7 @@ use crate::torrents::{KeptIntent, TorrentIntent};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::PoisonError;
+use std::sync::atomic::Ordering;
 
 pub(super) type Outcome = BTreeMap<JobId, Result<(), ActionError>>;
 
@@ -91,6 +92,7 @@ impl TorrentService {
     // `pause` for each torrent: one write of their intents, then one pass
     // of the queue and one publish.
     pub(super) async fn pause_many(&self, job_ids: &[JobId]) -> Outcome {
+        self.ensure(job_ids).await;
         let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         let mut stopped = Vec::new();
@@ -138,6 +140,7 @@ impl TorrentService {
     // `resume` for each torrent: one write of their intents, then one pass
     // of the queue and one publish.
     pub(super) async fn resume_many(&self, job_ids: &[JobId]) -> Outcome {
+        self.ensure(job_ids).await;
         let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         // A resume is the go-ahead to restore a torrent that crashed the
@@ -169,6 +172,8 @@ impl TorrentService {
             for job_id in present.iter().filter(|job_id| marked.contains(job_id)) {
                 if let Some(torrent) = live.get_mut(job_id) {
                     torrent.restore_held = None;
+                    // Its job is restored at the next tick.
+                    self.inner.restore_wanted.store(true, Ordering::Release);
                 }
             }
             if let Err(error) = self.inner.db.update_torrent_intents(&[(
@@ -231,6 +236,13 @@ impl TorrentService {
     // `update` for each torrent: one write of the categories and forced
     // flags, then a pass of the queue when a flag changed, and one publish.
     pub(super) async fn update_many(&self, updates: Vec<(JobId, JobUpdate)>) -> Outcome {
+        self.ensure(
+            &updates
+                .iter()
+                .map(|(job_id, _)| *job_id)
+                .collect::<Vec<_>>(),
+        )
+        .await;
         let settings = self.settings();
         let mut outcome = Outcome::new();
         // What each update asks, checked before anything is changed: a
@@ -352,6 +364,13 @@ impl TorrentService {
     // `remove` for each torrent: their gates held, one write of their
     // removal marks, then each removed as `remove_gated` removes one.
     pub(super) async fn remove_many(&self, removals: &[(JobId, bool)]) -> Outcome {
+        self.ensure(
+            &removals
+                .iter()
+                .map(|(job_id, _)| *job_id)
+                .collect::<Vec<_>>(),
+        )
+        .await;
         let mut outcome = Outcome::new();
         // Their outcome is their job's: a job still waiting for the tick
         // is restored first.
@@ -462,6 +481,8 @@ impl TorrentService {
     // came, with one write of the places that changed, one pass of the
     // queue and one publish. A move of a torrent not found ends the moves.
     pub(super) async fn move_many(&self, moves: &[(JobId, QueueMoveTarget)]) -> Outcome {
+        self.ensure(&moves.iter().map(|(job_id, _)| *job_id).collect::<Vec<_>>())
+            .await;
         let mut outcome = Outcome::new();
         {
             let mut live = self.inner.live.lock().await;

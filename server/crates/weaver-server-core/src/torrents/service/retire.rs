@@ -67,7 +67,7 @@ impl TorrentService {
                 torrent.failed_removing.get_or_insert(error);
                 return;
             }
-            live.remove(&job_id)
+            self.unlive(&mut live, job_id)
         };
         let Some(mut torrent) = torrent else { return };
         let stopped = self.seeding_stopped(&torrent, StoppedSeeding::Failed);
@@ -497,11 +497,7 @@ impl TorrentService {
         ending: Ending,
     ) -> Result<(), ActionError> {
         let mut torrent = self
-            .inner
-            .live
-            .lock()
-            .await
-            .remove(&job_id)
+            .unlive(&mut *self.inner.live.lock().await, job_id)
             .ok_or(ActionError::NotFound(job_id))?;
         let written = read_written(self.written_of(&torrent)).await;
         // The job's outcome: complete, short of what unpacking would
