@@ -3156,23 +3156,35 @@ async fn rate_limits(
             .filter_map(|view| Some((view.infohash.to_ascii_lowercase(), reading(view)?)))
             .collect()
     } else {
-        params
-            .get("hashes")
-            .unwrap_or_default()
-            .split('|')
-            .filter_map(|hash| {
-                let reading = match views
-                    .iter()
-                    .find(|view| view.infohash.eq_ignore_ascii_case(hash.trim()))
-                {
-                    Some(view) => reading(view)?,
-                    None => json!(-1),
-                };
-                Some((hash.to_owned(), reading))
-            })
-            .collect()
+        limits_by_sent_hash(params.get("hashes").unwrap_or_default(), &views, reading)
     };
     axum::Json(map).into_response()
+}
+
+// The reading of each hash in `sent` (`|`-separated), keyed by the hash as
+// it was sent: -1 for a hash no view has, and no entry for a closed limit.
+// The views are indexed once by lowercase infohash; the first view of an
+// infohash answers for it.
+fn limits_by_sent_hash(
+    sent: &str,
+    views: &[TorrentView],
+    reading: impl Fn(&TorrentView) -> Option<Value>,
+) -> Map<String, Value> {
+    let mut by_hash: HashMap<String, &TorrentView> = HashMap::with_capacity(views.len());
+    for view in views {
+        by_hash
+            .entry(view.infohash.to_ascii_lowercase())
+            .or_insert(view);
+    }
+    sent.split('|')
+        .filter_map(|hash| {
+            let reading = match by_hash.get(&hash.trim().to_ascii_lowercase()) {
+                Some(view) => reading(view)?,
+                None => json!(-1),
+            };
+            Some((hash.to_owned(), reading))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
