@@ -208,6 +208,15 @@ impl WriterCounts {
     }
 }
 
+impl std::fmt::Debug for Volume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Volume")
+            .field("device", &self.device)
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Volume {
     pub(crate) fn new(device: Option<u64>, label: String) -> Self {
         Self {
@@ -240,6 +249,14 @@ impl Volume {
     // what they were made, as callers hold them.
     pub(crate) fn reads(&self, kind: impl FnOnce() -> StorageKind) -> &VolumeReads {
         self.reads.get_or_init(|| VolumeReads::of(kind()))
+    }
+
+    // The volume's read turns for a usenet reader. They were made for the
+    // volume's kind when a job was given its writer (`job_disk`), or by a
+    // torrent before it; a volume no one asked of yet reads as one whose
+    // kind is not known.
+    pub(crate) fn read_turns(&self) -> &VolumeReads {
+        self.reads(|| StorageKind::Unknown)
     }
 
     // The bytes counted against the volume's hard limit: reserved ahead of

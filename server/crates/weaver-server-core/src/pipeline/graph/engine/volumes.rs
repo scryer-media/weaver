@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
 
+use crate::operations::disk::reader::VolumeReads;
+use crate::operations::disk::volume::Volume;
 use crate::operations::disk::writer::Barrier;
 use crate::pipeline::graph::decoding::Decoding;
 use crate::pipeline::graph::envelope::{ReadFiles, Shelf, Shelved};
@@ -57,6 +59,9 @@ pub(crate) struct RunVolumes {
     // The run's handles are registered with the storage owner for draining.
     // A read never holds the shelf's state lock while it touches the disk.
     files: Arc<ReadFiles>,
+    // The volume the envelopes are written to: the run reads them in its
+    // turns, holding one across its reads on a volume with more than one.
+    volume: Option<Arc<Volume>>,
     // The lost spans reads failed on that the run has not read on past.
     lost: Mutex<BTreeSet<(u32, u64, u64)>>,
     stopped: AtomicBool,
@@ -84,6 +89,7 @@ impl RunVolumes {
     pub(crate) fn new(shelf: Arc<Shelf>, generation: u64) -> Self {
         Self {
             files: shelf.reader_files(),
+            volume: shelf.volume().cloned(),
             shelf,
             generation,
             lost: Mutex::default(),
@@ -99,7 +105,27 @@ impl RunVolumes {
         *self.decoding.lock().unwrap_or_else(PoisonError::into_inner) = decoding;
     }
 
+    // The run gives back the read turn it holds: it waits on something
+    // other than the disk, or it ended.
+    pub(crate) fn let_go(&self) {
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reading
+            .let_go();
+    }
+
     fn wait<'a>(&self, state: MutexGuard<'a, Shelved>) -> MutexGuard<'a, Shelved> {
+        // A run waiting for bytes to come reads nothing: its turn goes back.
+        // The shelf's lock is held here, and a read takes the files' lock
+        // before the shelf's, so it is only tried: when it is held, a drain
+        // holds it and lets the turn go itself, or the run's other thread
+        // reads in it.
+        match self.files.try_lock() {
+            Ok(mut files) => files.reading.let_go(),
+            Err(std::sync::TryLockError::Poisoned(files)) => files.into_inner().reading.let_go(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
         let decoding = self
             .decoding
             .lock()
@@ -155,7 +181,18 @@ impl RunVolumes {
         self.files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .open
             .len()
+    }
+
+    // Whether the run holds a read turn.
+    #[cfg(test)]
+    pub(super) fn holds_turn(&self) -> bool {
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reading
+            .held()
     }
 
     // Whether a read failed because nothing will bring its bytes, and the
@@ -346,14 +383,33 @@ impl Volumes for RunVolumes {
             }
         }
         let len = usize::try_from(len).expect("a read fits the buffer it fills");
+        // The read is made in a turn of the envelopes' volume. A spinning
+        // one's single turn is taken for this read alone, before the
+        // files' lock; any other's is the one the run holds.
+        let reads = self.volume.as_deref().map(Volume::read_turns);
+        let _one = reads
+            .filter(|reads| reads.whole_pieces())
+            .map(VolumeReads::one_here);
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(reads) = reads.filter(|reads| !reads.whole_pieces())
+            && !files.reading.holds(reads)
+        {
+            // Waited for holding nothing: a drain takes the files' lock,
+            // and the turn may be another reader's for a while.
+            files.reading.let_go();
+            drop(files);
+            let turn = reads.owned_here();
+            files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+            files.reading.keep(turn);
+        }
         // The owner can revoke access after wait_for returns. Check again
         // while holding the cache lock, so draining it waits for this read
         // and a late reader cannot reopen a file after the drain.
         if !self.current() {
+            files.reading.let_go();
             return Err(Unreadable::Stopped.into());
         }
-        let file = match files.entry(volume.0) {
+        let file = match files.open.entry(volume.0) {
             std::collections::btree_map::Entry::Occupied(found) => found.into_mut(),
             std::collections::btree_map::Entry::Vacant(slot) => slot.insert(File::open(path)?),
         };

@@ -459,6 +459,16 @@ impl Drop for Ends {
     }
 }
 
+// A run's read turn, given back when the run's thread lets it go: before
+// its last word, which may wait for the job.
+struct LetGo(Arc<RunVolumes>);
+
+impl Drop for LetGo {
+    fn drop(&mut self) {
+        self.0.let_go();
+    }
+}
+
 // One job's runs, the slots they take, and the bytes they reserve in the
 // decode pool.
 #[derive(Debug)]
@@ -843,6 +853,9 @@ impl Runs {
             // waits on its volumes or on the job to hear it.
             let decoding = Arc::new(clock.decoding());
             volumes.decoding(Arc::downgrade(&decoding));
+            // The run's read turn goes back as it ends, a panic's unwinding
+            // included: the run's volumes outlive it.
+            let _turns = LetGo(Arc::clone(&volumes));
             let reader = Arc::clone(&volumes);
             let mut sink = |emit: Emit| {
                 if matches!(emit, Emit::Member { .. }) {
