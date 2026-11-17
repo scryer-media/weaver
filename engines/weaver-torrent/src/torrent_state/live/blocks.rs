@@ -451,16 +451,23 @@ fn write_failed(
 }
 
 // Hashes the piece whose last block was written: where the storage holds it
-// in memory, or read back from its files.
+// in memory, or read back from its files on one of their volume's read
+// turns, as a peer's read or a seed-mode check takes one (libtorrent hashes
+// a piece it does not hold by reading it on its disk threads,
+// `mmap_disk_io::do_hash`).
 pub(super) fn hash_landed_piece(
     state: &TorrentStateLive,
     piece_index: ValidPieceIndex,
 ) -> anyhow::Result<Verdict> {
     let stats = state.shared.spawner.stats();
-    let call = stats.call(if state.files.writes_to_memory() {
+    let from_memory = state.files.writes_to_memory();
+    let call = stats.call(if from_memory {
         DiskOp::HashMemory
     } else {
         DiskOp::HashFiles
+    });
+    let _turn = (!from_memory).then(|| {
+        crate::torrent_state::seed_mode::read_turn(&state.shared.spawner, &state.reads.load())
     });
     call.bytes(u64::from(state.lengths.piece_length(piece_index)));
     state

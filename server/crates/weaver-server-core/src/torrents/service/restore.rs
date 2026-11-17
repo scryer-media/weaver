@@ -32,7 +32,7 @@ use crate::torrents::sessions::{OPENING, RouteKey, RoutePlan};
 use crate::torrents::status::{Engine, Held};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
-use crate::torrents::tee::{Parts, Plan, Tee};
+use crate::torrents::tee::{Parts, Plan, Reading, Tee};
 use crate::torrents::{FilePriority, KeptIntent, TorrentCounters, TorrentIntent, TrackerEntry};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
@@ -140,11 +140,7 @@ struct Joining {
     dir: String,
     paused: bool,
     ratelimits: LimitsConfig,
-    have: (
-        Option<Checkpoint>,
-        bool,
-        Arc<TorrentStore>,
-    ),
+    have: (Option<Checkpoint>, bool, Arc<TorrentStore>),
     identity: Identity,
     totals: TorrentTotals,
     terms: PeerTerms,
@@ -348,7 +344,15 @@ impl TorrentService {
         let writes = self.inner.env.disk.writes(job_id.0, &files);
         let files = Files::new(&layout, files).map_err(|error| Unmade::Fails(error.to_string()))?;
         let mut notes = Vec::new();
-        let tee = match tee.then(|| Plan::of(&layout)).flatten() {
+        // Pieces too large for the resident budget are written block by
+        // block and read back to the tee from disk: chosen here as the
+        // storage chooses (`storage::writes_blocks`), at every restore.
+        let blocks =
+            crate::torrents::storage::writes_blocks(layout.piece_length(), &self.resident(job_id));
+        let tee = match tee
+            .then(|| Plan::of(&layout).map(|plan| plan.reading_back(blocks)))
+            .flatten()
+        {
             Some(plan) => {
                 let (tee, fresh) = self.tee(job_id, &layout, plan, passwords, hold)?;
                 notes.extend(fresh);
@@ -444,6 +448,15 @@ impl TorrentService {
             limit: env.slots,
             db: self.inner.db.clone(),
             mail: env.written.clone(),
+            reading: plan.reads_back().then(|| {
+                Reading::new(
+                    Arc::new(
+                        self.storage(work.clone(), layout, &plan, Vec::new())
+                            .scratch(job_id.0),
+                    ),
+                    self.resident(job_id),
+                )
+            }),
         };
         let storage = || self.storage(work.clone(), layout, &plan, passwords.clone());
         // The directory is claimed the job's before anything reads or writes
@@ -497,7 +510,7 @@ impl TorrentService {
     fn give_store(&self, torrent: &mut Live, store: TorrentStore) {
         let job_id = torrent.record.job_id;
         let env = &self.inner.env;
-        let store = Arc::new(store);
+        let store = store.shared();
         let signal = Arc::clone(&self.inner.signal);
         // With disks to read, the pieces book on the disk the torrent's
         // folder lies on. A store handed again over the same folder keeps

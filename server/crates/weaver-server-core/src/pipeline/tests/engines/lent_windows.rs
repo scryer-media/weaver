@@ -34,8 +34,8 @@ use crate::jobs::model::JobStatus;
 use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
 use crate::pipeline::Pipeline;
 use crate::pipeline::graph::engine::{DecodePool, Heard};
-use crate::pipeline::graph::window::{SPARE_DIR, Windows};
 use crate::runtime::{HardwareProfile, OverLimit};
+use crate::scratch::{SPARE_DIR, Scratch};
 
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
@@ -281,16 +281,16 @@ fn leftover(pipeline: &Pipeline, room: u64) -> Left {
     let spare_made = dir.is_dir();
     let spare_files = std::fs::read_dir(&dir).map_or(0, |entries| entries.count());
     let check = tempfile::tempdir().unwrap();
-    let fresh = Arc::new(Windows::new(
+    let fresh = Arc::new(Scratch::new(
         check.path().to_path_buf(),
         pipeline.storage_capacity.reader(StorageRoot::Data),
         pipeline.window_ledgers.data.clone(),
         Arc::clone(&pipeline.graph_holds),
         64 * GIB,
     ));
-    let over = fresh.allocate(NodeId(900), (room + 1) as usize).is_err();
+    let over = fresh.allocate(900, (room + 1) as usize).is_err();
     // An empty window is never lent: with no room there is nothing to take.
-    let whole = room == 0 || fresh.allocate(NodeId(901), room as usize).is_ok();
+    let whole = room == 0 || fresh.allocate(901, room as usize).is_ok();
     let room_left = pipeline.graph_decode.room();
     Left {
         spare_made,

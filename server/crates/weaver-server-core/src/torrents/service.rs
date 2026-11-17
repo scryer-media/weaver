@@ -32,7 +32,7 @@ use crate::pipeline::ExtractionLimits;
 use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::graph::status::{Delivery, Failure};
-use crate::pipeline::graph::window::ScratchLedger;
+use crate::scratch::ScratchLedger;
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{Config, TorrentEncryption, TransportRule};
 use crate::torrents::identity::TorrentIdentity;

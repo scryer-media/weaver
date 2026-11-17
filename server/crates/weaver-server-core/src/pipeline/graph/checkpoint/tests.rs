@@ -545,7 +545,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/graph-recovery-0-3.repaired"),
         format!("{INTERNAL_DIR}/graph-recovery-0-3/set.par2"),
         format!("{INTERNAL_DIR}/graph-waiting-0-2"),
-        crate::pipeline::graph::window::window_name(NodeId(1), 0),
+        crate::scratch::file_name(1, 0),
         "inner/stray.bin".to_owned(),
         "set.par2".to_owned(),
         "set.part1.rar".to_owned(),
@@ -592,11 +592,11 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
 // the job's.
 #[test]
 fn a_restore_removes_leftover_decode_windows_only_in_its_own_folder() {
-    use crate::pipeline::graph::window::window_name;
+    use crate::scratch::file_name;
     let dir = tempfile::tempdir().unwrap();
     let job = dir.path().join("job");
     let other = dir.path().join("other");
-    let windows = [window_name(NodeId(0), 0), window_name(NodeId(2), 7)];
+    let windows = [file_name(0, 0), file_name(2, 7)];
     for root in [&job, &other] {
         for name in &windows {
             let path = root.join(name);

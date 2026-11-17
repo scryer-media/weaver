@@ -440,9 +440,9 @@ impl Files {
         let name = self.name(file)?;
         let at = self.at();
         at.read()?;
-        let handle = self
-            .pool
-            .open(at.reads[file], || beneath::open(&at.dir, name, Access::Read))?;
+        let handle = self.pool.open(at.reads[file], || {
+            beneath::open(&at.dir, name, Access::Read)
+        })?;
         counted(
             &self.ends[file].read,
             offset,
@@ -464,9 +464,9 @@ impl Files {
         if at.shut {
             return;
         }
-        if let Ok(handle) = self
-            .pool
-            .open(at.reads[file], || beneath::open(&at.dir, name, Access::Read)) {
+        if let Ok(handle) = self.pool.open(at.reads[file], || {
+            beneath::open(&at.dir, name, Access::Read)
+        }) {
             advise_will_need(&handle, offset, len);
         }
     }
@@ -477,9 +477,9 @@ impl Files {
         let name = self.name(file)?;
         let at = self.at();
         at.read()?;
-        let handle = self
-            .pool
-            .open(at.reads[file], || beneath::open(&at.dir, name, Access::Read))?;
+        let handle = self.pool.open(at.reads[file], || {
+            beneath::open(&at.dir, name, Access::Read)
+        })?;
         let len = outs.iter().map(|out| out.len()).sum();
         counted(
             &self.ends[file].read,
@@ -910,7 +910,10 @@ mod tests {
             assert!(read.to_string().contains("leads outside"), "{file}: {read}");
             let mut outs = [&mut out[..]];
             let readv = files.readv(file, 0, &mut outs).unwrap_err();
-            assert!(readv.to_string().contains("leads outside"), "{file}: {readv}");
+            assert!(
+                readv.to_string().contains("leads outside"),
+                "{file}: {readv}"
+            );
             assert_eq!(files.held(file), Some(0), "{file}");
             files.will_read(file, 0, 6);
             assert_eq!(out, [0; 6]);

@@ -51,6 +51,10 @@ pub(crate) struct Side {
     made: bool,
     // The slot each piece kept here is in.
     slots: HashMap<u32, u32>,
+    // The slot each piece still arriving block by block is written into,
+    // untagged until it verifies (`seal`). None is found at open: a piece
+    // still arriving when the process stopped is fetched again.
+    pending: HashMap<u32, u32>,
     // Slots no piece is in, in the file already.
     free: Vec<u32>,
     // How many slots the file has room for.
@@ -126,6 +130,7 @@ impl Side {
             scans: 0,
             made: false,
             slots: HashMap::new(),
+            pending: HashMap::new(),
             free: Vec::new(),
             count: 0,
             reset: None,
@@ -221,12 +226,14 @@ impl Side {
         self.path.as_deref()
     }
 
-    pub(crate) fn kept(&self, piece: u32) -> bool {
-        self.slots.contains_key(&piece)
+    // Whether the piece's bytes of the files set aside are here: kept, or
+    // still arriving.
+    pub(crate) fn holds(&self, piece: u32) -> bool {
+        self.slots.contains_key(&piece) || self.pending.contains_key(&piece)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.slots.is_empty() && self.pending.is_empty()
     }
 
     // The pieces kept here.
@@ -273,6 +280,72 @@ impl Side {
         held: &[u8],
         aside: &Arc<Vec<bool>>,
     ) -> io::Result<()> {
+        let (file, slot) = self.open_slot(piece, aside)?;
+        let at = self.at(slot);
+        write_all_at(&file, at + TAG, held)?;
+        write_all_at(&file, at, &tag(Some(piece)))?;
+        let arriving = self.pending.remove(&piece).is_some();
+        if self.slots.insert(piece, slot).is_none() && !arriving {
+            self.taken(slot);
+        }
+        Ok(())
+    }
+
+    // A block of a piece still arriving, its bytes from `at` of the piece
+    // in the piece's slot: the slot is the piece's from its first block,
+    // its tag cleared, and is tagged only once the piece verified
+    // (`seal`), so a slot whose tag is there still holds what it says.
+    pub(crate) fn keep_block(
+        &mut self,
+        piece: u32,
+        at: u64,
+        bytes: &[u8],
+        aside: &Arc<Vec<bool>>,
+    ) -> io::Result<()> {
+        let (file, slot) = self.open_slot(piece, aside)?;
+        let start = self.at(slot);
+        if let std::collections::hash_map::Entry::Vacant(pending) = self.pending.entry(piece) {
+            // A free slot may still carry the tag of a piece it held.
+            write_all_at(&file, start, &tag(None))?;
+            pending.insert(slot);
+            if !self.slots.contains_key(&piece) {
+                self.taken(slot);
+            }
+        }
+        write_all_at(&file, start + TAG + at, bytes)
+    }
+
+    // The piece still arriving verified: its slot is tagged, and it is
+    // kept here. A piece with no block here has nothing to tag.
+    pub(crate) fn seal(&mut self, piece: u32) -> io::Result<()> {
+        let Some(slot) = self.pending.get(&piece).copied() else {
+            return Ok(());
+        };
+        let file = OpenOptions::new().write(true).open(self.file_path()?)?;
+        write_all_at(&file, self.at(slot), &tag(Some(piece)))?;
+        self.pending.remove(&piece);
+        self.slots.insert(piece, slot);
+        Ok(())
+    }
+
+    // Where the slot starts.
+    fn at(&self, slot: u32) -> u64 {
+        self.base + u64::from(slot) * self.slot_len
+    }
+
+    // The slot taken from the free ones, or added past them.
+    fn taken(&mut self, slot: u32) {
+        if self.free.last() == Some(&slot) {
+            self.free.pop();
+        } else {
+            self.count += 1;
+        }
+    }
+
+    // The store's file open for writing, its head naming every file
+    // `aside` sets aside, and the slot the piece goes in: the one it is
+    // in, or the next free one. The files are scanned once per selection.
+    fn open_slot(&mut self, piece: u32, aside: &Arc<Vec<bool>>) -> io::Result<(File, u32)> {
         let file = open_for_write(self.file_path()?)?;
         let covered = self.made
             && self
@@ -305,34 +378,28 @@ impl Side {
             }
             self.covered = Some(Arc::clone(aside));
         }
-        let slot = match self.slots.get(&piece) {
+        let slot = match self.pending.get(&piece).or(self.slots.get(&piece)) {
             Some(slot) => *slot,
             None => match self.free.last() {
                 Some(slot) => *slot,
                 None => self.count,
             },
         };
-        let at = self.base + u64::from(slot) * self.slot_len;
-        write_all_at(&file, at + TAG, held)?;
-        write_all_at(&file, at, &tag(Some(piece)))?;
-        if self.slots.insert(piece, slot).is_none() {
-            if self.free.last() == Some(&slot) {
-                self.free.pop();
-            } else {
-                self.count += 1;
-            }
-        }
-        Ok(())
+        Ok((file, slot))
     }
 
-    // `out` from `at` inside the piece kept here.
+    // `out` from `at` inside the piece kept here, or still arriving here.
     pub(crate) fn read(&self, piece: u32, at: u64, out: &mut [u8]) -> io::Result<()> {
-        let slot = self.slots.get(&piece).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "the piece is not in the side store",
-            )
-        })?;
+        let slot = self
+            .pending
+            .get(&piece)
+            .or(self.slots.get(&piece))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the piece is not in the side store",
+                )
+            })?;
         let file = File::open(self.file_path()?)?;
         read_exact_at(
             &file,
@@ -342,8 +409,13 @@ impl Side {
     }
 
     // The piece kept here no longer: its slot's tag is cleared, and the slot
-    // is free for the next.
+    // is free for the next. A piece still arriving had no tag written.
     pub(crate) fn drop_piece(&mut self, piece: u32) -> io::Result<()> {
+        if let Some(slot) = self.pending.remove(&piece)
+            && self.slots.get(&piece) != Some(&slot)
+        {
+            self.free.push(slot);
+        }
         let Some(slot) = self.slots.get(&piece).copied() else {
             return Ok(());
         };
@@ -429,6 +501,49 @@ mod tests {
             &new[..head_len(FILES) as usize],
             head(&new_named).as_slice()
         );
+    }
+
+    // A piece written block by block is in its slot as it arrives, read
+    // there, and untagged until it verifies: opened again before that, the
+    // store holds nothing of it; sealed, it is found again by its tag. One
+    // that fails gives its slot to the next, and a slot that held a piece
+    // loses that piece's tag as a new one arrives in it.
+    #[test]
+    fn a_piece_arriving_block_by_block_is_tagged_only_once_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work").join("t.side");
+        let aside = sel(&[false, true]);
+        let mut side = Side::open(path.clone(), 4, 2).unwrap();
+        side.keep_block(5, 2, b"cd", &aside).unwrap();
+        side.keep_block(5, 0, b"ab", &aside).unwrap();
+        assert!(side.holds(5));
+        assert!(!side.is_empty());
+        let mut out = [0; 4];
+        side.read(5, 0, &mut out).unwrap();
+        assert_eq!(&out, b"abcd");
+        assert!(Side::open(path.clone(), 4, 2).unwrap().pieces().is_empty());
+
+        side.seal(5).unwrap();
+        let again = Side::open(path.clone(), 4, 2).unwrap();
+        assert_eq!(again.pieces(), [5]);
+        again.read(5, 0, &mut out).unwrap();
+        assert_eq!(&out, b"abcd");
+
+        // A piece that fails before it verified frees its slot.
+        side.keep_block(6, 0, b"wxyz", &aside).unwrap();
+        side.drop_piece(6).unwrap();
+        assert!(!side.holds(6));
+        side.keep_block(7, 0, b"ijkl", &aside).unwrap();
+        side.seal(7).unwrap();
+        assert_eq!(Side::open(path.clone(), 4, 2).unwrap().pieces(), [5, 7]);
+        assert_eq!(side.count, 2);
+
+        // Piece 5 dropped, its slot taken by 8 arriving: a restart before 8
+        // verifies finds neither.
+        side.drop_piece(5).unwrap();
+        side.keep_block(8, 0, b"mn", &aside).unwrap();
+        assert_eq!(Side::open(path.clone(), 4, 2).unwrap().pieces(), [7]);
+        assert_eq!(side.count, 2);
     }
 
     // A piece kept reads back from its slot, a dropped one's slot is taken

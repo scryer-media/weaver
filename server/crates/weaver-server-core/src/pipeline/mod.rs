@@ -2226,7 +2226,7 @@ pub struct Pipeline {
     pub(super) volume_reserved_by_job: HashMap<JobId, crate::operations::disk::volume::Reservation>,
     // What decode windows took from each disk they go on, for every graph
     // job together.
-    pub(super) window_ledgers: graph::window::WindowLedgers,
+    pub(super) window_ledgers: crate::scratch::ScratchLedgers,
     // Largest refused UU spill. Dispatch preserves cursor progress until
     // this many bytes can be parked in memory or admitted to the spool.
     pub(super) uu_spool_blocked_spill_bytes: Option<usize>,

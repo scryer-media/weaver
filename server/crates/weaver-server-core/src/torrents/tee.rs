@@ -21,8 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
+use weaver_graph::holds::Reserve;
 use weaver_graph::slots::AskerId;
 use weaver_graph::{Listed, VolumeIndex};
+use weaver_torrent::storage::HeldRoom;
 
 use super::layout::{PieceLayout, Span};
 use super::relocate::MoveError;
@@ -52,9 +54,91 @@ mod tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
     volumes: Vec<Option<VolumeIndex>>,
+    // The longest article a share is cut into: no cut, one article per
+    // share, unless the torrent writes its pieces block by block, when a
+    // share is read back from disk in articles of `READ_BACK_BYTES`. Chosen
+    // with the write path at add, and the same at every restart.
+    article: u64,
 }
 
+// The longest article of a torrent whose pieces are written block by block:
+// the most one read-back holds at once when scratch cannot be had.
+pub(crate) const READ_BACK_BYTES: u64 = 1 << 20;
+
 impl Plan {
+    // The plan of a torrent whose pieces are written block by block when
+    // `blocks`: its shares are read back from disk in articles of
+    // `READ_BACK_BYTES`.
+    pub(crate) fn reading_back(mut self, blocks: bool) -> Self {
+        if blocks {
+            self.article = READ_BACK_BYTES;
+        }
+        self
+    }
+
+    // Whether its pieces are written block by block, and read back.
+    pub(crate) fn reads_back(&self) -> bool {
+        self.article != u64::MAX
+    }
+
+    // The articles a share of `len` bytes is cut into.
+    fn articles(&self, len: u64) -> u32 {
+        if self.reads_back() {
+            len.div_ceil(self.article) as u32
+        } else {
+            1
+        }
+    }
+
+    // The ordinal of the first article of the file's share of `piece`: its
+    // piece's place in the file when shares are not cut, else the articles
+    // of the file's first share and of each whole piece before this one.
+    fn first_ordinal(&self, layout: &PieceLayout, file: usize, piece: u32) -> u32 {
+        let first = layout.file_pieces(file).start;
+        if !self.reads_back() || piece == first {
+            return piece - first;
+        }
+        let head = layout.share(file, first).map_or(0, |share| share.len());
+        self.articles(head) + (piece - first - 1) * self.articles(layout.piece_length())
+    }
+
+    // Every article the file is cut into.
+    fn ordinals(&self, layout: &PieceLayout, file: usize) -> u32 {
+        let pieces = layout.file_pieces(file);
+        if !self.reads_back() {
+            return pieces.end - pieces.start;
+        }
+        pieces
+            .filter_map(|piece| layout.share(file, piece))
+            .map(|share| self.articles(share.len()))
+            .sum()
+    }
+
+    // The span cut into its articles, each with its ordinal.
+    fn cut(&self, layout: &PieceLayout, piece: u32, span: Span) -> Vec<(u32, Span)> {
+        let first = self.first_ordinal(layout, span.file, piece);
+        if !self.reads_back() {
+            return vec![(first, span)];
+        }
+        let mut cut = Vec::new();
+        let mut start = span.range.start;
+        let mut ordinal = first;
+        while start < span.range.end {
+            let end = span.range.end.min(start + self.article);
+            cut.push((
+                ordinal,
+                Span {
+                    file: span.file,
+                    at: span.at + (start - span.range.start),
+                    range: weaver_graph::ByteRange::new(start, end),
+                },
+            ));
+            start = end;
+            ordinal += 1;
+        }
+        cut
+    }
+
     pub(crate) fn of(layout: &PieceLayout) -> Option<Self> {
         let names: Vec<&str> = layout.files().map(|file| file.name.as_str()).collect();
         let listed: Vec<Option<Listed>> = layout
@@ -75,7 +159,10 @@ impl Plan {
                 })
             })
             .collect();
-        Some(Self { volumes })
+        Some(Self {
+            volumes,
+            article: u64::MAX,
+        })
     }
 
     // The volume the file is, if it goes to the graph.
@@ -97,7 +184,21 @@ impl Plan {
                         .file_pieces(index)
                         .filter_map(|piece| {
                             let share = layout.share(index, piece)?;
-                            Some((piece - first, share.len() as u32))
+                            Some((piece, share))
+                        })
+                        .flat_map(|(piece, share)| {
+                            if !self.reads_back() {
+                                return vec![(piece - first, share.len() as u32)];
+                            }
+                            let span = Span {
+                                file: index,
+                                at: 0,
+                                range: share,
+                            };
+                            self.cut(layout, piece, span)
+                                .into_iter()
+                                .map(|(ordinal, span)| (ordinal, span.range.len() as u32))
+                                .collect()
                         })
                         .collect(),
                 }
@@ -127,6 +228,9 @@ pub(crate) struct Tee {
     signal: Arc<Signal>,
     outside: Arc<Outside>,
     limit: usize,
+    // What a torrent whose pieces are written block by block reads its
+    // shares back with; none for one whose pieces are held whole.
+    reading: Option<Reading>,
     // Where the job's checkpoints go, and where the database's word on
     // them, and the wake for one come due, come back.
     db: crate::Database,
@@ -175,6 +279,8 @@ enum Word {
     WakeDisk,
     // The job has room again: its runs and repairs go on.
     DiskWoke,
+    // Resident room returned: the read-backs waiting for it go again.
+    Room,
 }
 
 // The job waits for no room.
@@ -188,6 +294,189 @@ struct Share {
     span: Span,
     volume: VolumeIndex,
     ordinal: u32,
+}
+
+// What a torrent whose pieces are written block by block reads its shares
+// back from disk into: first a lease of scratch memory (`crate::scratch`)
+// for the piece's shares at once, charged to the disk ledgers every job
+// shares, as a decode window is; where scratch refuses, one share at a time
+// in resident memory, each charged to the holds' resident budget before it
+// is read. Either is held until the job lets the last of its bytes go.
+//
+// A share the budget has no room for waits, never over it: the piece is
+// kept on the bell, and read back again once room returns.
+pub(crate) struct Reading {
+    pub(crate) scratch: Arc<crate::scratch::Scratch>,
+    pub(crate) holds: super::intake::Holds,
+    bell: Arc<RoomBell>,
+    // The most resident and scratch memory read-backs held at once.
+    #[cfg(test)]
+    pub(crate) peaks: Arc<Peaks>,
+}
+
+impl Reading {
+    pub(crate) fn new(scratch: Arc<crate::scratch::Scratch>, holds: super::intake::Holds) -> Self {
+        Self {
+            scratch,
+            holds,
+            bell: Arc::default(),
+            #[cfg(test)]
+            peaks: Arc::default(),
+        }
+    }
+}
+
+// Who reads a waiting piece's shares back from its files: the torrent's
+// store.
+pub(crate) trait ReadsBack: Send + Sync {
+    // The piece's shares the tee still waits on, read back again.
+    fn read_back_again(&self, piece: u32);
+}
+
+// The pieces whose read-back waits for room, and the word that wakes them.
+// Room coming back rings it: the tee's own read-back room let go, a scratch
+// lease let go, or the torrent's storage giving back a piece's room. A ring
+// with nothing waiting costs one atomic load.
+#[derive(Default)]
+struct RoomBell {
+    // Some piece waits.
+    owed: std::sync::atomic::AtomicBool,
+    waiting: Mutex<std::collections::BTreeSet<u32>>,
+    // The job's words, where the wake goes: taken on the job's own task,
+    // off whatever let the room go.
+    words: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Word>>,
+    store: Mutex<Option<std::sync::Weak<dyn ReadsBack>>>,
+}
+
+impl RoomBell {
+    // The piece waits for room. Room let go before this rang no one, so the
+    // caller asks for room once more after it.
+    fn wait(&self, piece: u32) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(piece);
+        self.owed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    // `piece` waits no more: room was had on the second ask.
+    fn unwait(&self, piece: u32) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&piece);
+    }
+
+    fn ring(&self) {
+        if self.owed.swap(false, std::sync::atomic::Ordering::AcqRel)
+            && let Some(words) = self.words.get()
+        {
+            let _ = words.send(Word::Room);
+        }
+    }
+
+    // The pieces waiting, each taken off the bell.
+    fn take(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.waiting.lock().unwrap_or_else(PoisonError::into_inner))
+            .into_iter()
+            .collect()
+    }
+
+    fn store(&self) -> Option<Arc<dyn ReadsBack>> {
+        self.store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+}
+
+// The part of a job a read-back's scratch file is named for: no graph node
+// has this id.
+const READ_BACK_OWNER: u32 = u32::MAX;
+
+#[cfg(test)]
+#[derive(Default, Debug)]
+pub(crate) struct Peaks {
+    pub(crate) resident: std::sync::atomic::AtomicU64,
+    pub(crate) resident_peak: std::sync::atomic::AtomicU64,
+    pub(crate) scratch: std::sync::atomic::AtomicU64,
+    pub(crate) scratch_peak: std::sync::atomic::AtomicU64,
+    // Read-backs that took the smaller reads.
+    pub(crate) fallbacks: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl Peaks {
+    fn add(now: &std::sync::atomic::AtomicU64, peak: &std::sync::atomic::AtomicU64, bytes: u64) {
+        use std::sync::atomic::Ordering;
+        let at = now.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        peak.fetch_max(at, Ordering::AcqRel);
+    }
+}
+
+// Resident room the tee reserved for one read-back, given back to the holds
+// when the last holder of it lets go.
+struct Resident {
+    holds: super::intake::Holds,
+    bell: Arc<RoomBell>,
+    #[cfg(test)]
+    peaks: Arc<Peaks>,
+}
+
+impl weaver_torrent::storage::GivesRoomBack for Resident {
+    fn give_back(&self, bytes: u64) {
+        #[cfg(test)]
+        self.peaks
+            .resident
+            .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        self.holds
+            .accountant
+            .release_resident(self.holds.namespace, bytes);
+        self.bell.ring();
+    }
+}
+
+// A share read into resident memory, with the room charged for it: the room
+// goes back when the job lets the bytes go.
+struct Charged {
+    bytes: Vec<u8>,
+    _room: Arc<HeldRoom>,
+}
+
+impl AsRef<[u8]> for Charged {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+// A scratch lease with the bytes of a piece's shares, counted while the job
+// holds any of them. Let go, it rings the bell once the lease is gone.
+struct Leased {
+    // Always there until dropped.
+    lease: Option<crate::scratch::Lease>,
+    bell: Arc<RoomBell>,
+    #[cfg(test)]
+    peaks: Arc<Peaks>,
+}
+
+impl AsRef<[u8]> for Leased {
+    fn as_ref(&self) -> &[u8] {
+        self.lease.as_ref().map_or(&[], AsRef::as_ref)
+    }
+}
+
+impl Drop for Leased {
+    fn drop(&mut self) {
+        let lease = self.lease.take();
+        #[cfg(test)]
+        self.peaks.scratch.fetch_sub(
+            lease.as_ref().map_or(0, |lease| lease.len() as u64),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        drop(lease);
+        self.bell.ring();
+    }
 }
 
 // Why a tee's job could not be built again from its checkpoint.
@@ -233,6 +522,7 @@ pub(super) struct Parts {
     pub(super) limit: usize,
     pub(super) db: crate::Database,
     pub(super) mail: UnboundedSender<Said>,
+    pub(super) reading: Option<Reading>,
 }
 
 impl Tee {
@@ -265,6 +555,9 @@ impl Tee {
 
     fn joined(parts: Parts, job: GraphJob) -> Arc<Self> {
         let (words, heard_words) = tokio::sync::mpsc::unbounded_channel();
+        if let Some(reading) = &parts.reading {
+            let _ = reading.bell.words.set(words.clone());
+        }
         let tee = Arc::new(Self {
             job: Mutex::new(job),
             layout: parts.layout,
@@ -275,6 +568,7 @@ impl Tee {
             signal: parts.signal,
             outside: parts.outside,
             limit: parts.limit,
+            reading: parts.reading,
             db: parts.db,
             mail: parts.mail,
             broken: Mutex::new(None),
@@ -353,6 +647,10 @@ impl Tee {
             Word::DiskWoke => {
                 self.disk_woke();
                 self.heard.send_modify(|heard| *heard += 1);
+                (all, own)
+            }
+            Word::Room => {
+                self.read_back_waiting();
                 (all, own)
             }
         }
@@ -502,6 +800,12 @@ impl Tee {
             .is_some()
     }
 
+    // Whether the torrent's pieces are written block by block, as chosen
+    // with its plan.
+    pub(crate) fn writes_blocks(&self) -> bool {
+        self.plan.reads_back()
+    }
+
     pub(crate) fn work(&self) -> &Path {
         &self.work
     }
@@ -622,14 +926,17 @@ impl Tee {
         self.layout
             .spans(piece)
             .into_iter()
-            .filter_map(|span| {
-                let volume = self.plan.volume(span.file)?;
-                let ordinal = piece - self.layout.file_pieces(span.file).start;
-                (!job.article_settled(volume, ordinal)).then_some(Share {
-                    span,
-                    volume,
-                    ordinal,
-                })
+            .filter_map(|span| Some((self.plan.volume(span.file)?, span)))
+            .flat_map(|(volume, span)| {
+                self.plan
+                    .cut(&self.layout, piece, span)
+                    .into_iter()
+                    .filter(move |(ordinal, _)| !job.article_settled(volume, *ordinal))
+                    .map(move |(ordinal, span)| Share {
+                        span,
+                        volume,
+                        ordinal,
+                    })
             })
             .collect()
     }
@@ -652,16 +959,35 @@ impl Tee {
     // lend is left to the service's next settle, which this marks. One
     // torrent's commit never waits on another's.
     pub(crate) fn deliver(&self, piece: u32, held: &Bytes) -> bool {
+        self.take_shares(|job| {
+            self.unsettled(job, piece)
+                .into_iter()
+                .map(|share| {
+                    let at = share.span.at as usize;
+                    let bytes = held.slice(at..at + share.span.range.len() as usize);
+                    (share, bytes)
+                })
+                .collect()
+        })
+    }
+
+    // The shares `select` picks under the job's lock, each with its bytes,
+    // taken by the job; one it settled meanwhile is not taken twice. True
+    // when it took any.
+    fn take_shares(&self, select: impl FnOnce(&GraphJob) -> Vec<(Share, Bytes)>) -> bool {
         let _job = JobScope::enter(self.job_id);
         if self.is_broken() {
             return false;
         }
         let took = self.kept(self.with(|job| {
             let mut took = false;
-            for share in self.unsettled(job, piece) {
-                let bytes = share.span.range.end - share.span.range.start;
-                if job.take_in(self.decoded(&share, held), self.slots(self.limit))? {
-                    job.pending().delivered(bytes);
+            for (share, bytes) in select(job) {
+                if job.article_settled(share.volume, share.ordinal) {
+                    continue;
+                }
+                let len = share.span.range.end - share.span.range.start;
+                if job.take_in(self.decoded(&share, bytes), self.slots(self.limit))? {
+                    job.pending().delivered(len);
                     took = true;
                 }
             }
@@ -676,11 +1002,214 @@ impl Tee {
         }
     }
 
+    // The piece's shares the job waits on, of a torrent whose pieces are
+    // written block by block, read back from its files by `read` once the
+    // piece's hash from disk passed, or at a restart. They are read into
+    // one lease of scratch memory for them all when scratch can be had;
+    // otherwise one share at a time, each at most `READ_BACK_BYTES`, into
+    // resident memory: `room`, the piece's own room, while the job has let
+    // the last share in it go, else room reserved from the holds' resident
+    // budget first. When the budget has no room, the rest of the piece waits
+    // on the bell and is read back again once room returns. Each lease and
+    // room is held until the job lets the last byte in it go. True when the
+    // job took any share.
+    pub(crate) fn read_back(
+        &self,
+        piece: u32,
+        room: Option<HeldRoom>,
+        read: impl Fn(usize, u64, &mut [u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        let _job = JobScope::enter(self.job_id);
+        let Some(reading) = &self.reading else {
+            drop(room);
+            return self.replay_whole(piece, read);
+        };
+        if self.is_broken() {
+            return Ok(false);
+        }
+        let shares = self.unsettled(&self.locked(), piece);
+        if shares.is_empty() {
+            return Ok(false);
+        }
+        let total: u64 = shares.iter().map(|share| share.span.range.len()).sum();
+        if let Ok(mut lease) = reading.scratch.allocate(READ_BACK_OWNER, total as usize) {
+            // The lease holds the bytes: the piece's room is not needed.
+            drop(room);
+            #[cfg(test)]
+            Peaks::add(
+                &reading.peaks.scratch,
+                &reading.peaks.scratch_peak,
+                lease.len() as u64,
+            );
+            let mut placed = Vec::with_capacity(shares.len());
+            let out = lease.as_mut_slice();
+            let mut next = 0;
+            for share in &shares {
+                let len = share.span.range.len() as usize;
+                read(
+                    share.span.file,
+                    share.span.range.start,
+                    &mut out[next..next + len],
+                )?;
+                placed.push(next..next + len);
+                next += len;
+            }
+            let bytes = Bytes::from_owner(Leased {
+                lease: Some(lease),
+                bell: Arc::clone(&reading.bell),
+                #[cfg(test)]
+                peaks: Arc::clone(&reading.peaks),
+            });
+            return Ok(self.take_shares(|_| {
+                shares
+                    .into_iter()
+                    .zip(placed)
+                    .map(|(share, at)| (share, bytes.slice(at)))
+                    .collect()
+            }));
+        }
+        #[cfg(test)]
+        reading
+            .peaks
+            .fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut room = room.map(Arc::new);
+        let mut took = false;
+        for share in shares {
+            let len = share.span.range.len();
+            let charge = match room.take() {
+                Some(held) if Arc::strong_count(&held) == 1 && held.bytes() >= len => held,
+                held => {
+                    // Room the job still reads from is not this share's to
+                    // take; what the share asks for is had or waited on.
+                    drop(held);
+                    match self.reserve_or_wait(reading, piece, len) {
+                        Some(granted) => Arc::new(granted),
+                        // The rest of the piece's shares wait with it: the
+                        // job takes them once room returns.
+                        None => return Ok(took),
+                    }
+                }
+            };
+            let mut bytes = vec![0; len as usize];
+            read(share.span.file, share.span.range.start, &mut bytes)?;
+            room = Some(Arc::clone(&charge));
+            let bytes = Bytes::from_owner(Charged {
+                bytes,
+                _room: charge,
+            });
+            took |= self.take_shares(|_| vec![(share, bytes)]);
+        }
+        Ok(took)
+    }
+
+    // `bytes` of the holds' resident budget, for one share of `piece` read
+    // back; when the budget has no room for them, the piece waits on the
+    // bell and none is returned. Asked again once it waits, so room let go
+    // between the two asks is not missed.
+    fn reserve_or_wait(&self, reading: &Reading, piece: u32, bytes: u64) -> Option<HeldRoom> {
+        if let Some(room) = self.reserve(reading, bytes) {
+            return Some(room);
+        }
+        reading.bell.wait(piece);
+        let room = self.reserve(reading, bytes)?;
+        reading.bell.unwait(piece);
+        Some(room)
+    }
+
+    // `bytes` of the holds' resident budget, or none when it has no room
+    // for them: never over it.
+    fn reserve(&self, reading: &Reading, bytes: u64) -> Option<HeldRoom> {
+        let holds = &reading.holds;
+        match holds.accountant.reserve_resident(holds.namespace, bytes) {
+            Reserve::Granted => {}
+            Reserve::Breached(_) => return None,
+        }
+        #[cfg(test)]
+        Peaks::add(&reading.peaks.resident, &reading.peaks.resident_peak, bytes);
+        Some(HeldRoom::new(
+            bytes,
+            Arc::new(Resident {
+                holds: holds.clone(),
+                bell: Arc::clone(&reading.bell),
+                #[cfg(test)]
+                peaks: Arc::clone(&reading.peaks),
+            }),
+        ))
+    }
+
+    // Room returned to the torrent's budget: a read-back waiting for it
+    // goes again, on the job's own task.
+    pub(crate) fn room_returned(&self) {
+        if let Some(reading) = &self.reading {
+            reading.bell.ring();
+        }
+    }
+
+    // The store that reads the torrent's waiting pieces back again. A piece
+    // that began to wait before it was named, as a restart's replay may,
+    // goes again now.
+    pub(crate) fn reads_back_through(&self, store: std::sync::Weak<dyn ReadsBack>) {
+        if let Some(reading) = &self.reading {
+            *reading
+                .bell
+                .store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(store);
+            if self.waits_for_room() {
+                reading
+                    .bell
+                    .owed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                reading.bell.ring();
+            }
+        }
+    }
+
+    // Each piece waiting for room, read back again: what still finds no
+    // room waits again.
+    fn read_back_waiting(&self) {
+        let Some(reading) = &self.reading else {
+            return;
+        };
+        let Some(store) = reading.bell.store() else {
+            return;
+        };
+        for piece in reading.bell.take() {
+            store.read_back_again(piece);
+        }
+    }
+
+    // Whether any piece's read-back waits for room.
+    pub(crate) fn waits_for_room(&self) -> bool {
+        self.reading.as_ref().is_some_and(|reading| {
+            !reading
+                .bell
+                .waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        })
+    }
+
     // The piece's shares the job waits on, read from the torrent's files by
     // `read` into one buffer of the piece's length, then taken as a
     // verified piece's are: the one read a restart makes to bring the job
-    // back level with the pieces the torrent has. True when it took any.
+    // back level with the pieces the torrent has. True when it took any. A
+    // torrent whose pieces are written block by block reads them back as
+    // `read_back` does.
     pub(crate) fn replay(
+        &self,
+        piece: u32,
+        read: impl Fn(usize, u64, &mut [u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        if self.reading.is_some() {
+            return self.read_back(piece, None, read);
+        }
+        self.replay_whole(piece, read)
+    }
+
+    fn replay_whole(
         &self,
         piece: u32,
         read: impl Fn(usize, u64, &mut [u8]) -> std::io::Result<()>,
@@ -705,8 +1234,8 @@ impl Tee {
         Ok(self.deliver(piece, &Bytes::from(bytes)))
     }
 
-    fn decoded(&self, share: &Share, held: &Bytes) -> Decoded {
-        let at = share.span.at as usize;
+    // The share as the job takes an article: `bytes`, its own bytes.
+    fn decoded(&self, share: &Share, bytes: Bytes) -> Decoded {
         let length = self
             .layout
             .file(share.span.file)
@@ -715,7 +1244,7 @@ impl Tee {
             volume: share.volume,
             ordinal: share.ordinal,
             offset: share.span.range.start,
-            bytes: held.slice(at..at + share.span.range.len() as usize),
+            bytes,
             intact: true,
             positioned: true,
             length: Some(length),
@@ -736,8 +1265,7 @@ impl Tee {
                 if wanted(file) {
                     continue;
                 }
-                let pieces = self.layout.file_pieces(file);
-                for ordinal in 0..pieces.end - pieces.start {
+                for ordinal in 0..self.plan.ordinals(&self.layout, file) {
                     if !job.article_settled(volume, ordinal) {
                         job.lost(volume, ordinal, repairs, limit)?;
                     }

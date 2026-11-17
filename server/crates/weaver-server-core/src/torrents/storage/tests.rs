@@ -31,6 +31,7 @@ use weaver_torrent::storage::{
 
 #[cfg(unix)]
 mod bench;
+mod blocks;
 
 fn accountant(resident_limit: u64) -> Arc<HoldsAccountant> {
     Arc::new(HoldsAccountant::new(HoldBudgets {
@@ -920,7 +921,12 @@ fn deleting_a_torrents_files_never_follows_a_link_outside() {
     std::fs::create_dir_all(dir.join("mid")).unwrap();
     std::os::unix::fs::symlink(elsewhere.path().join("deep"), dir.join("mid/deep")).unwrap();
 
-    delete_written(&deletion(shim.store.files(), &Adopted::default(), &[], None));
+    delete_written(&deletion(
+        shim.store.files(),
+        &Adopted::default(),
+        &[],
+        None,
+    ));
     assert!(
         std::fs::symlink_metadata(dir.join("a.bin")).is_err(),
         "the link at a listed name goes, as a link"
@@ -934,7 +940,10 @@ fn deleting_a_torrents_files_never_follows_a_link_outside() {
         std::fs::read(elsewhere.path().join("deep/b.bin")).unwrap(),
         b"someone's"
     );
-    assert!(dir.join("mid/deep").exists(), "the link in the middle stays");
+    assert!(
+        dir.join("mid/deep").exists(),
+        "the link in the middle stays"
+    );
 }
 
 // Every path under the directory, relative to it.
@@ -1458,6 +1467,43 @@ impl Pieces for Watched {
     fn grow(&self, file: usize, length: u64) -> std::io::Result<()> {
         self.store.grow(file, length)
     }
+
+    fn write_block(
+        &self,
+        piece: u32,
+        file: usize,
+        offset: u64,
+        at: u64,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        self.store.write_block(piece, file, offset, at, bytes)
+    }
+
+    fn sealed(
+        self: Arc<Self>,
+        piece: u32,
+        room: weaver_torrent::storage::HeldRoom,
+    ) -> anyhow::Result<()> {
+        Arc::clone(&self.store).sealed(piece, room)?;
+        self.tell();
+        Ok(())
+    }
+
+    fn writes_blocks(&self) -> Option<bool> {
+        self.store.writes_blocks()
+    }
+
+    fn block_room(&self, piece_length: u64) -> u64 {
+        self.store.block_room(piece_length)
+    }
+
+    fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
+        self.store.read_turns()
+    }
+
+    fn room_returned(&self) {
+        self.store.room_returned();
+    }
 }
 
 // A session on loopback alone: no DHT, no trackers, no discovery, and
@@ -1502,13 +1548,19 @@ async fn seeded() -> Seeded {
 
 // The torrent `seeded` makes, of other bytes for each `seed`.
 async fn seeded_with(seed: u8) -> Seeded {
+    seeded_sized(seed, 1024, [1000, 2500, 700]).await
+}
+
+// A torrent of three files of `sizes`, in pieces of `piece_length`, seeded
+// by a session of its own.
+async fn seeded_sized(seed: u8, piece_length: u32, sizes: [usize; 3]) -> Seeded {
     let dir = tempfile::tempdir().unwrap();
     let set = dir.path().join("set");
     std::fs::create_dir(&set).unwrap();
     let originals = [
-        ("a.bin", noise(1000, 1 + 3 * seed)),
-        ("b.bin", noise(2500, 2 + 3 * seed)),
-        ("c.bin", noise(700, 3 + 3 * seed)),
+        ("a.bin", noise(sizes[0], 1 + 3 * seed)),
+        ("b.bin", noise(sizes[1], 2 + 3 * seed)),
+        ("c.bin", noise(sizes[2], 3 + 3 * seed)),
     ];
     for (name, bytes) in &originals {
         std::fs::write(set.join(name), bytes).unwrap();
@@ -1518,7 +1570,7 @@ async fn seeded_with(seed: u8) -> Seeded {
         CreateTorrentOptions {
             name: None,
             trackers: Vec::new(),
-            piece_length: Some(1024),
+            piece_length: Some(piece_length),
             ssl_cert: None,
         },
         &BlockingSpawner::new(1),

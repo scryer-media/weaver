@@ -25,6 +25,7 @@ use crate::pipeline::ExtractionLimits;
 use crate::torrents::storage::Pieces;
 use crate::torrents::writes::{Done, Paid, VolumeRoom};
 use tokio::sync::Notify;
+use weaver_torrent::storage::HeldRoom;
 
 // Where a torrent's pieces land: the disk the folder they are written to
 // lies on, by the choice a usenet job held for a full disk is placed by,
@@ -440,6 +441,52 @@ impl Pieces for Intake {
 
     fn stop_writes(&self) {
         self.inner.stop_writes();
+    }
+
+    // A block is booked on the disk's ledger as a piece is, and its write
+    // heard the same way when it fails. One that landed changes nothing
+    // the torrent has: the piece is had, and heard, once it is sealed.
+    fn write_block(
+        &self,
+        piece: u32,
+        file: usize,
+        offset: u64,
+        at: u64,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let len = bytes.len() as u64;
+        let booked = self.book(len)?;
+        match self.inner.write_block(piece, file, offset, at, bytes) {
+            Ok(()) => {
+                booked.landed();
+                if self.room.promised.swap(false, Ordering::AcqRel) {
+                    (self.hear)(Heard::Landed);
+                }
+                Ok(())
+            }
+            Err(error) => self.settled(booked, len, Err(error)),
+        }
+    }
+
+    fn sealed(self: Arc<Self>, piece: u32, room: HeldRoom) -> anyhow::Result<()> {
+        let sealed = Arc::clone(&self.inner).sealed(piece, room);
+        self.heard(sealed.map(|()| true)).map(|_| ())
+    }
+
+    fn writes_blocks(&self) -> Option<bool> {
+        self.inner.writes_blocks()
+    }
+
+    fn block_room(&self, piece_length: u64) -> u64 {
+        self.inner.block_room(piece_length)
+    }
+
+    fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
+        self.inner.read_turns()
+    }
+
+    fn room_returned(&self) {
+        self.inner.room_returned();
     }
 
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {

@@ -138,30 +138,36 @@ pub(crate) struct Storage {
     pub(crate) disk: Option<super::disk::JobDisk>,
     // Weaver's data folder and the free space of its disk: where a decode
     // window goes when the working directory cannot hold it.
-    pub(crate) data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
+    pub(crate) data_dir: Option<(PathBuf, CapacityReader, crate::scratch::ScratchLedger)>,
     // What decode windows took from the working directory's disk, for
     // every job that lends on it.
-    pub(crate) window_ledger: super::window::ScratchLedger,
+    pub(crate) window_ledger: crate::scratch::ScratchLedger,
 }
 
 impl Storage {
-    // The decode windows job `scope`'s runs may borrow: scratch files in
-    // its working directory, else in the data folder, out of the free space
-    // the holds keep.
-    pub(crate) fn windows(&self, scope: u64) -> Arc<super::window::Windows> {
-        let windows = super::window::Windows::new(
+    // The scratch memory job `scope` may borrow: scratch files in its
+    // working directory, else in the data folder, out of the free space the
+    // holds keep.
+    pub(crate) fn scratch(&self, scope: u64) -> crate::scratch::Scratch {
+        let scratch = crate::scratch::Scratch::new(
             self.working_dir.clone(),
             self.free_disk.clone(),
             self.window_ledger.clone(),
             Arc::clone(&self.accountant),
-            super::window::WINDOW_CEILING_BYTES,
+            crate::scratch::CEILING_BYTES,
         );
-        Arc::new(match &self.data_dir {
+        match &self.data_dir {
             Some((dir, free_disk, ledger)) => {
-                windows.or_spare(dir.clone(), scope, free_disk.clone(), ledger.clone())
+                scratch.or_spare(dir.clone(), scope, free_disk.clone(), ledger.clone())
             }
-            None => windows,
-        })
+            None => scratch,
+        }
+    }
+
+    // The decode windows job `scope`'s runs may borrow, lent from its
+    // scratch.
+    pub(crate) fn windows(&self, scope: u64) -> Arc<super::window::Windows> {
+        Arc::new(super::window::Windows::new(Arc::new(self.scratch(scope))))
     }
 }
 

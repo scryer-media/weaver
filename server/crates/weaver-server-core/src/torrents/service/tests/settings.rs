@@ -742,6 +742,8 @@ async fn a_wound_down_seed_whose_goal_is_met_stays_stopped_when_torrents_are_on(
     rig.service.set_settings(on).await;
 
     assert_eq!(kept(met), (TorrentIntent::Stopped, false));
+    // Each reads as checking what was saved of it until its session has it.
+    super::listing::settled(&rig.service, 2).await;
     assert_eq!(
         rig.service.torrent(met).await.unwrap().state,
         TorrentState::Stopped
