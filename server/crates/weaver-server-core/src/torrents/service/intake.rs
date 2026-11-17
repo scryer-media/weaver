@@ -10,7 +10,9 @@ use super::{
 };
 use crate::auth::CallerScope;
 use crate::categories::CategoryConfig;
-use crate::categories::model::{completion_parent, may_place, resolve_category_config};
+use crate::categories::model::{
+    completion_parent, may_place, resolve_category_config, validate_category_path_component,
+};
 use crate::jobs::JobId;
 use crate::persistence::Database;
 use crate::pipeline::claim_complete_destination_path;
@@ -160,6 +162,25 @@ pub(super) fn absolute_placement(placement: &Placement, default_save: &Path) -> 
         save_path,
         download_path,
         ..placement.clone()
+    }
+}
+
+// The category an add settled on before its source is read.
+enum Admitted {
+    // None named, or a name that cannot be a category.
+    None,
+    // One that is there.
+    There(CategoryConfig),
+    // One to make, at default settings, once the add goes ahead.
+    ToMake(CategoryConfig),
+}
+
+impl Admitted {
+    fn config(&self) -> Option<&CategoryConfig> {
+        match self {
+            Self::None => None,
+            Self::There(category) | Self::ToMake(category) => Some(category),
+        }
     }
 }
 
@@ -393,14 +414,22 @@ impl TorrentService {
 
     // What every add settles before its source is read: torrents take new
     // ones, its paths, made absolute, are ones `caller` may save at
-    // (`placement_as`), and its category is there. The one owner of those
-    // answers, for the add and for `may_add_at`.
+    // (`placement_as`), and its category is there or is one to make. The
+    // one owner of those answers, for the add and for `may_add_at`.
+    //
+    // A name no category matches (by name in any letter case, then by
+    // alias, `resolve_category_config`) is one to make, as qBittorrent's
+    // add makes it (`SessionImpl::addTorrent_impl`, sessionimpl.cpp:2853-
+    // 2857); a name that cannot be a category adds the torrent with none,
+    // as there. A category to make has no folder of its own: it saves
+    // under the default save folder, and so grants a key held to the save
+    // folders no place it did not have. Nothing is made here.
     fn admitted(
         &self,
         caller: CallerScope,
         category: Option<&str>,
         placement: &Placement,
-    ) -> Result<(TorrentSettings, Option<CategoryConfig>, Placement), AddError> {
+    ) -> Result<(TorrentSettings, Admitted, Placement), AddError> {
         // Off, a wind-down's sessions open included: no torrent is new.
         let settings = self.settings();
         if !self.takes_new() {
@@ -408,24 +437,70 @@ impl TorrentService {
         }
         let category = match category.filter(|name| !name.trim().is_empty()) {
             Some(name) => match resolve_category_config(&settings.categories, name) {
-                Some(category) => Some(category.clone()),
-                None => {
-                    // A place the caller may not save at is refused as that
-                    // first, as it is with a category that is there: the
-                    // answer to a caller held to the save folders does not
-                    // turn on whether the category exists.
-                    if let Err(refused @ AddError::Forbidden(_)) =
-                        placement_as(caller, &settings, None, placement)
-                    {
-                        return Err(refused);
+                Some(category) => Admitted::There(category.clone()),
+                None => match validate_category_path_component(name) {
+                    Ok(name) if self.inner.categories.get().is_some() => {
+                        Admitted::ToMake(CategoryConfig::named(name))
                     }
-                    return Err(AddError::Invalid(format!("no category {name}")));
-                }
+                    Ok(_) => {
+                        // A service with nowhere to make one in refuses
+                        // it, a place the caller may not save at first.
+                        if let Err(refused @ AddError::Forbidden(_)) =
+                            placement_as(caller, &settings, None, placement)
+                        {
+                            return Err(refused);
+                        }
+                        return Err(AddError::Invalid(format!("no category {name}")));
+                    }
+                    Err(_) => Admitted::None,
+                },
             },
-            None => None,
+            None => Admitted::None,
         };
-        let placement = placement_as(caller, &settings, category.as_ref(), placement)?;
+        let placement = placement_as(caller, &settings, category.config(), placement)?;
         Ok((settings, category, placement))
+    }
+
+    // The category `admitted` found for an add, made now when it is one to
+    // make, and the settings that hold it. Two adds that name one new
+    // category make one (`categories::make_category`).
+    async fn made(
+        &self,
+        settings: TorrentSettings,
+        category: Admitted,
+    ) -> Result<(TorrentSettings, Option<CategoryConfig>), AddError> {
+        let category = match category {
+            Admitted::None => return Ok((settings, None)),
+            Admitted::There(category) => return Ok((settings, Some(category))),
+            Admitted::ToMake(category) => category,
+        };
+        let Some(config) = self.inner.categories.get() else {
+            return Err(AddError::Invalid(format!("no category {}", category.name)));
+        };
+        let held = crate::categories::category_writes().await;
+        let made = crate::categories::make_category(&held, config, &self.inner.db, category)
+            .await
+            .map_err(|error| AddError::State(state_error(error)))?;
+        let category = made.category().clone();
+        drop(held);
+        tracing::info!(id = category.id, name = %category.name, "category made for a torrent added in it");
+        // The torrents' settings hold it from now on, as they would after
+        // the settings were handed on again.
+        let settings = {
+            let mut held = self
+                .inner
+                .settings
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !held.categories.iter().any(|there| there.id == category.id) {
+                held.categories.push(category.clone());
+            }
+            TorrentSettings {
+                categories: held.categories.clone(),
+                ..settings
+            }
+        };
+        Ok((settings, Some(category)))
     }
 
     /// Add the torrent `request` names for `caller`, who must be allowed
@@ -439,12 +514,16 @@ impl TorrentService {
         let (settings, category, placement) =
             self.admitted(caller, request.category.as_deref(), &request.placement)?;
         request.placement = placement;
+        // A category to make is made once the add is past every refusal of
+        // the caller's and of the torrent's, as qBittorrent's add makes it
+        // past its own (`SessionImpl::addTorrent_impl`).
         match request.source.clone() {
             AddSource::Metainfo(bytes) => {
                 let bytes = Bytes::from(bytes);
                 let parsed = parse(&bytes)?;
                 let left_out = self.admit(&parsed.manifest)?;
                 self.duplicate(parsed.hashes)?;
+                let (settings, category) = self.made(settings, category).await?;
                 let job_id = self.reserve()?;
                 let mut record = self.record(
                     job_id,
@@ -501,6 +580,7 @@ impl TorrentService {
                     .map_err(|error| AddError::Invalid(format!("not a magnet: {error}")))?;
                 let hashes = magnet.info_hashes();
                 self.duplicate(hashes)?;
+                let (settings, category) = self.made(settings, category).await?;
                 let trackers: Vec<TrackerEntry> = magnet
                     .trackers
                     .iter()

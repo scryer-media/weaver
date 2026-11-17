@@ -708,3 +708,196 @@ async fn a_magnets_selection_is_kept_with_its_metainfo() {
     rig.service.stop().await;
     seeding.stop().await;
 }
+
+// The server's settings over the rig's categories, stored as a server stores
+// them, for the service to make a category in.
+fn making_in(rig: &Rig) -> crate::settings::SharedConfig {
+    for category in rig.service.settings().categories {
+        rig.db.insert_category(&category).unwrap();
+    }
+    let config = Arc::new(tokio::sync::RwLock::new(crate::settings::Config {
+        seeding: None,
+        upload_cap: None,
+        torrent: Default::default(),
+        data_dir: rig.dir.path().to_string_lossy().into_owned(),
+        hardware_profile: None,
+        intermediate_dir: None,
+        complete_dir: Some(
+            rig.dir
+                .path()
+                .join("complete")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        servers: vec![],
+        categories: rig.service.settings().categories,
+        retry: None,
+        bandwidth: Default::default(),
+        cleanup_after_extract: None,
+        delete_failed_job_files: None,
+        history_retention_days: None,
+        propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
+        watch_folder: Default::default(),
+        duplicate_policy: Default::default(),
+        direct_store: None,
+        delivery_naming: None,
+        metrics: Default::default(),
+        config_path: None,
+    }));
+    rig.service.make_categories_in(config.clone());
+    config
+}
+
+fn in_category(source: AddSource, category: &str) -> AddRequest {
+    AddRequest {
+        category: Some(category.to_owned()),
+        ..request(source)
+    }
+}
+
+// qBittorrent `SessionImpl::addTorrent_impl` (sessionimpl.cpp:2853-2857):
+// a name no category goes by is made a category, stored and in the settings,
+// with no folder of its own, and the torrent is in it, saved under the
+// default save folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_in_a_category_there_is_none_of_makes_it() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let config = making_in(&rig);
+    let job_id = rig
+        .service
+        .add_opened(in_category(AddSource::Metainfo(plain("set", 1)), "films"))
+        .await
+        .unwrap();
+    let stored = rig.db.list_categories().unwrap();
+    let names: Vec<&str> = stored
+        .iter()
+        .map(|category| category.name.as_str())
+        .collect();
+    assert_eq!(names, ["films", "tv"]);
+    let films = &stored[0];
+    assert_eq!(films.dest_dir, None);
+    assert_ne!(films.id, stored[1].id);
+    assert!(
+        config
+            .read()
+            .await
+            .categories
+            .iter()
+            .any(|category| category.id == films.id && category.name == "films")
+    );
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.category.as_deref(), Some("films"));
+    assert_eq!(
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .storage_dir
+            .as_deref(),
+        Some(rig.dir.path().join("complete/films/set").to_str().unwrap())
+    );
+    rig.service.stop().await;
+}
+
+// A name that matches a category by its aliases is that category: nothing is
+// made. A name that cannot be a category adds the torrent with none, as
+// qBittorrent adds one whose category it cannot make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_alias_match_or_a_bad_name_makes_no_category() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let mut settings = rig.service.settings();
+    settings.categories[0].aliases = "series*".to_owned();
+    rig.service.set_settings(settings).await;
+    let config = making_in(&rig);
+    let by_alias = rig
+        .service
+        .add_opened(in_category(
+            AddSource::Metainfo(plain("one", 1)),
+            "series-hd",
+        ))
+        .await
+        .unwrap();
+    let bad = rig
+        .service
+        .add_opened(in_category(AddSource::Metainfo(plain("two", 2)), "a/b"))
+        .await
+        .unwrap();
+    assert_eq!(rig.db.list_categories().unwrap().len(), 1);
+    assert_eq!(config.read().await.categories.len(), 1);
+    assert_eq!(
+        rig.service
+            .torrent(by_alias)
+            .await
+            .unwrap()
+            .category
+            .as_deref(),
+        Some("tv")
+    );
+    assert_eq!(rig.service.torrent(bad).await.unwrap().category, None);
+    rig.service.stop().await;
+}
+
+// Two adds that name one new category at once make one, and both torrents
+// are in it; a refused add, here a duplicate, makes none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_adds_in_one_new_category_make_one() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let config = making_in(&rig);
+    let (one, two) = tokio::join!(
+        rig.service
+            .add_opened(in_category(AddSource::Metainfo(plain("one", 1)), "films")),
+        rig.service
+            .add_opened(in_category(AddSource::Metainfo(plain("two", 2)), "FILMS")),
+    );
+    let stored = rig.db.list_categories().unwrap();
+    assert_eq!(stored.len(), 2, "{stored:?}");
+    assert_eq!(
+        config
+            .read()
+            .await
+            .categories
+            .iter()
+            .filter(|category| category.name.eq_ignore_ascii_case("films"))
+            .count(),
+        1
+    );
+    for job_id in [one.unwrap(), two.unwrap()] {
+        let view = rig.service.torrent(job_id).await.unwrap();
+        assert!(
+            view.category
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("films")),
+            "{:?}",
+            view.category
+        );
+    }
+    assert!(matches!(
+        rig.service
+            .add_opened(in_category(AddSource::Metainfo(plain("one", 1)), "docs"))
+            .await,
+        Err(AddError::Duplicate(_))
+    ));
+    assert_eq!(rig.db.list_categories().unwrap().len(), 2);
+    rig.service.stop().await;
+}
+
+// A service with nowhere to make a category in, as one built without the
+// server's settings, refuses an add in a category there is none of, as it
+// did before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_with_nowhere_to_make_a_category_refuses_a_new_one() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    assert_eq!(
+        rig.service
+            .add_opened(in_category(AddSource::Metainfo(plain("one", 1)), "films"))
+            .await,
+        Err(AddError::Invalid("no category films".to_owned()))
+    );
+    assert!(rig.db.list_categories().unwrap().is_empty());
+    rig.service.stop().await;
+}

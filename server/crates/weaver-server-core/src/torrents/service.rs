@@ -797,6 +797,10 @@ struct Inner {
     entering: Mutex<BTreeMap<JobId, (RunMark, NoRoom)>>,
     // The service stops: a look its stop ended waits for no reading.
     stopping: AtomicBool,
+    // The settings an add makes a category it names in, when it names one
+    // Weaver does not have (`categories::make_category`). Unset, such an
+    // add is refused.
+    categories: std::sync::OnceLock<crate::settings::SharedConfig>,
     // How many settles ran: what a test waits on to know one consumed
     // what the intakes said before it.
     #[cfg(test)]
@@ -869,8 +873,16 @@ impl TorrentService {
                 relook: Mutex::default(),
                 entering: Mutex::default(),
                 stopping: AtomicBool::new(false),
+                categories: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// The settings an add that names a category Weaver does not have makes
+    /// that category in, as qBittorrent's add does. Set once; a later call
+    /// changes nothing.
+    pub fn make_categories_in(&self, config: crate::settings::SharedConfig) {
+        let _ = self.inner.categories.set(config);
     }
 
     // The torrents that crashed the daemon on its last run, read at start

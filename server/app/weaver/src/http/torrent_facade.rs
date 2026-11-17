@@ -26,7 +26,8 @@ use weaver_server_core::auth::{
     ApiKeyCache, CallerScope, LoginAuthCache, generate_api_key, hash_api_key,
 };
 use weaver_server_core::categories::{
-    CategoryConfig, completion_parent, validate_category_path_component,
+    CategoryConfig, Made, category_writes, completion_parent, make_category,
+    validate_category_path_component,
 };
 use weaver_server_core::ingest::{Kind, classify};
 use weaver_server_core::jobs::ids::JobId;
@@ -107,7 +108,6 @@ struct Inner {
     maindata_rows: AtomicU64,
     // `sync/torrentPeers` ids.
     rid: AtomicU64,
-    categories: tokio::sync::Mutex<()>,
     rss: RssService,
     // The API version the facade answers as.
     api: Api,
@@ -174,7 +174,6 @@ impl TorrentFacadeContext {
                 #[cfg(test)]
                 maindata_rows: AtomicU64::new(0),
                 rid: AtomicU64::new(0),
-                categories: tokio::sync::Mutex::new(()),
                 launched: now_secs(),
             }),
         }
@@ -3538,7 +3537,7 @@ async fn create_category(
         return text(StatusCode::CONFLICT, "Incorrect category name");
     };
     let inner = &ctx.inner;
-    let _guard = inner.categories.lock().await;
+    let held = category_writes().await;
     let (dest_dir, seeding) = {
         let config = inner.config.read().await;
         if config
@@ -3553,28 +3552,17 @@ async fn create_category(
             Err(response) => return *response,
         }
     };
-    let db = inner.db.clone();
-    let candidate = name.clone();
-    let created = tokio::task::spawn_blocking(move || {
-        let category = CategoryConfig {
-            upload_cap: Default::default(),
-            id: db.next_category_id()?,
-            name: candidate,
-            dest_dir,
-            aliases: String::new(),
-            seeding,
-            torrent_route: false,
-            unpack: None,
-        };
-        db.insert_category(&category).map(|()| category)
-    })
-    .await;
-    let category = match created {
-        Ok(Ok(category)) => category,
-        Ok(Err(error)) => return internal(error),
-        Err(error) => return internal(error),
+    let category = CategoryConfig {
+        dest_dir,
+        seeding,
+        ..CategoryConfig::named(name)
     };
-    inner.config.write().await.categories.push(category);
+    match make_category(&held, &inner.config, &inner.db, category).await {
+        Ok(Made::New(_)) => {}
+        Ok(Made::There(_)) => return text(StatusCode::CONFLICT, "Unable to create category"),
+        Err(error) => return internal(error),
+    }
+    drop(held);
     ctx.categories_changed().await;
     ok()
 }
@@ -3590,7 +3578,7 @@ async fn edit_category(
         return text(StatusCode::BAD_REQUEST, "Category cannot be empty");
     }
     let inner = &ctx.inner;
-    let _guard = inner.categories.lock().await;
+    let _held = category_writes().await;
     let edited = {
         let config = inner.config.read().await;
         let Some(current) = config

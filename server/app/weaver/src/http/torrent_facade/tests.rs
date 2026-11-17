@@ -232,6 +232,7 @@ async fn rig_on(
         );
         torrents.start().await.unwrap();
         torrents.publish_to(handle.clone());
+        torrents.make_categories_in(config.clone());
         Some(torrents)
     } else {
         None
@@ -1993,6 +1994,97 @@ async fn categories_are_created_listed_and_assigned() {
     assert_eq!(unknown.status, StatusCode::CONFLICT);
 }
 
+// qBittorrent `SessionImpl::addTorrent_impl` (sessionimpl.cpp:2853-2857): an
+// add that names a category there is none of makes it, with no folder of its
+// own, and the torrent is in it; a name that cannot be a category adds the
+// torrent with none. A torrent file and a magnet alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_in_a_category_there_is_none_of_makes_it() {
+    let rig = rig().await;
+    let added = rig
+        .add_file(&metainfo("one.mkv", 3000, false), &[("category", "films")])
+        .await;
+    assert_eq!(added.status, StatusCode::OK, "{}", added.body);
+    let magnet = rig
+        .post(
+            "/api/v2/torrents/add",
+            "urls=magnet%3A%3Fxt%3Durn%3Abtih%3A0123456789abcdef0123456789abcdef01234567\
+             &category=docs",
+        )
+        .await;
+    assert_eq!(magnet.json()["success_count"], 1, "{}", magnet.body);
+    // The same name in another letter case is the category made, not a
+    // second one.
+    let again = rig
+        .add_file(&metainfo("two.mkv", 3000, false), &[("category", "FILMS")])
+        .await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    let invalid = rig
+        .add_file(&metainfo("three.mkv", 3000, false), &[("category", "a/b")])
+        .await;
+    assert_eq!(invalid.status, StatusCode::OK, "{}", invalid.body);
+
+    let categories = rig.get("/api/v2/torrents/categories").await.json();
+    let mut names: Vec<&String> = categories.as_object().unwrap().keys().collect();
+    names.sort();
+    assert_eq!(names, ["docs", "films"]);
+    let complete = rig.config.read().await.complete_dir();
+    assert_eq!(
+        categories["films"]["savePath"],
+        PathBuf::from(&complete)
+            .join("films")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let stored = rig.db.list_categories().unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|category| category.dest_dir.is_none()));
+
+    let mut held: Vec<(String, String)> = rig
+        .torrents()
+        .await
+        .iter()
+        .map(|torrent| {
+            (
+                torrent["name"].as_str().unwrap().to_owned(),
+                torrent["category"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    held.sort();
+    assert_eq!(
+        held,
+        [
+            (
+                "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                "docs".to_owned()
+            ),
+            ("one.mkv".to_owned(), "films".to_owned()),
+            ("three.mkv".to_owned(), String::new()),
+            ("two.mkv".to_owned(), "films".to_owned()),
+        ]
+    );
+}
+
+// A control key's add in a category there is none of makes it as an admin
+// key's does, at the default save folder, which the key may save at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_keys_add_makes_its_new_category_too() {
+    let (rig, complete, _tv) = rig_with_a_control_key().await;
+    let added = rig
+        .add_file_as(
+            &metainfo("one.mkv", 3000, false),
+            &[("category", "films")],
+            CONTROLLER,
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK, "{}", added.body);
+    let listed = rig.torrents().await;
+    assert_eq!(listed[0]["category"], "films");
+    let saved = PathBuf::from(listed[0]["save_path"].as_str().unwrap());
+    assert!(saved.starts_with(complete.join("films")), "{saved:?}");
+}
+
 // qBittorrent `TorrentsController::setLocationAction`: the torrent moves
 // under the location and is listed there; an empty location is a bad
 // request, and one no directory can be made under is a conflict.
@@ -2150,26 +2242,16 @@ async fn an_add_refused_for_its_save_folder_fetches_no_url() {
         );
         assert_eq!(reached.load(Ordering::SeqCst), 0, "{form}");
     }
-    // An add the service refuses for anything else it settles before the
-    // torrent is read, here a category that is not there with a place the
-    // key may save at, is answered as the add answers it, and fetches
-    // nothing either.
-    for form in [
-        format!("urls={url}&category=nosuch"),
-        format!(
-            "urls={url}&category=nosuch&savepath={}",
-            path(&complete.join("shows"))
-        ),
-    ] {
-        let refused = rig.post_as("/api/v2/torrents/add", &form, CONTROLLER).await;
-        assert_eq!(
-            (refused.status, refused.body.as_str()),
-            (StatusCode::CONFLICT, "no category nosuch"),
-            "{form}"
-        );
-        assert_eq!(reached.load(Ordering::SeqCst), 0, "{form}");
-    }
+    // An add refused for its place makes none of the category it names.
     assert!(rig.torrents().await.is_empty());
+    assert!(
+        !rig.config
+            .read()
+            .await
+            .categories
+            .iter()
+            .any(|category| category.name == "nosuch")
+    );
 
     let added = rig
         .post_as(

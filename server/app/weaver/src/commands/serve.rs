@@ -383,7 +383,12 @@ pub(crate) async fn run(
             )
             .await
             {
-                Ok(torrents) => Some(torrents),
+                Ok(torrents) => {
+                    // An add that names a category Weaver does not have
+                    // makes it in the server's settings.
+                    torrents.make_categories_in(shared_config.clone());
+                    Some(torrents)
+                }
                 Err(error) => {
                     error!(%error, "the torrent client did not start");
                     None
