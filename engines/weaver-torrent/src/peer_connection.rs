@@ -84,6 +84,12 @@ pub trait PeerConnectionHandler {
     /// connection, or a uTP attempt failed and none opened. Told once per
     /// outgoing connection that tried uTP, before it goes on or ends.
     fn on_utp_dialed(&self, _opened: bool) {}
+    /// The outgoing connection, made where encryption is preferred,
+    /// completed the method it tried: the encryption handshake when
+    /// `encrypted`, told once it is done, else the plain BitTorrent
+    /// handshake, told once the peer answered it (libtorrent
+    /// `bt_peer_connection::on_receive_impl`, `on_receive_handshake`).
+    fn on_outgoing_method_worked(&self, _encrypted: bool) {}
     /// The connection, whichever side opened it, completed its handshake,
     /// as `encryption` says; told right after
     /// [`Self::on_handshake`].
@@ -384,6 +390,11 @@ pub struct PeerConnectionOptions {
     /// under, over the session's.
     #[serde(default)]
     pub encryption: Option<EncryptionPolicy>,
+
+    /// The order every outgoing connection of the torrent tries TCP and uTP
+    /// in, over the session's.
+    #[serde(default)]
+    pub dial_order: Option<crate::DialOrder>,
 }
 
 /// libtorrent `settings_pack::handshake_timeout`: a peer that has not
@@ -476,31 +487,41 @@ pub(crate) async fn with_timeout<T>(
     }
 }
 
-/// Connections run on a uTP thread so far, incoming and outgoing.
+/// Connections run on a session's uTP threads so far, by the name its
+/// threads share: incoming, outgoing, and those of either that ran on its
+/// first uTP thread, the one that reads and sends on its sockets. Kept by
+/// session, so tests that run at once each read their own.
 #[cfg(test)]
-pub(crate) static ON_UTP_THREADS: [std::sync::atomic::AtomicUsize; 2] = [
-    std::sync::atomic::AtomicUsize::new(0),
-    std::sync::atomic::AtomicUsize::new(0),
-];
+static ON_UTP_THREADS: std::sync::Mutex<std::collections::BTreeMap<String, [usize; 3]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Connections run so far on a session's first uTP thread, the one that
-/// reads and sends on its sockets.
+/// The connections [`ON_UTP_THREADS`] counted for the session whose uTP
+/// threads are named `name`.
 #[cfg(test)]
-pub(crate) static ON_UTP_IO_THREAD: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn on_utp_threads(name: &str) -> [usize; 3] {
+    ON_UTP_THREADS
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .unwrap_or_default()
+}
 
 #[cfg(test)]
 fn count_on_utp_thread(outgoing: bool) {
-    use std::sync::atomic::Ordering;
-    if weaver_utp::on_shard_thread() {
-        ON_UTP_THREADS[usize::from(outgoing)].fetch_add(1, Ordering::Relaxed);
-        // A session's uTP threads are named `utp{session}-{index}`.
-        if std::thread::current()
-            .name()
-            .is_some_and(|name| name.ends_with("-0"))
-        {
-            ON_UTP_IO_THREAD.fetch_add(1, Ordering::Relaxed);
-        }
+    if !weaver_utp::on_shard_thread() {
+        return;
+    }
+    // A session's uTP threads are named `utp{session}-{index}`.
+    let thread = std::thread::current();
+    let Some((session, index)) = thread.name().and_then(|name| name.rsplit_once('-')) else {
+        return;
+    };
+    let mut counts = ON_UTP_THREADS.lock().unwrap();
+    let counts = counts.entry(session.to_owned()).or_default();
+    counts[usize::from(outgoing)] += 1;
+    if index == "0" {
+        counts[2] += 1;
     }
 }
 
@@ -511,6 +532,8 @@ pub(crate) struct Connected {
     pub link: Link<crate::mse::Outbound>,
     meter: Meter,
     encryption: crate::mse::Encryption,
+    // The connection was made where encryption is preferred.
+    prefer: bool,
     write_buf: Box<[u8]>,
     greeting: Id20,
 }
@@ -902,6 +925,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // carries it inside the encryption handshake.
         let now = Instant::now();
         let seen = UtpSeen::default();
+        let policy = self.options.encryption_under(self.connector.encryption());
+        let prefer = policy == EncryptionPolicy::Prefer;
         let connected = self
             .connector
             .connect_link(
@@ -909,7 +934,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 self.transports,
                 match &self.ssl {
                     Some(ssl) => Guard::Tls(ssl),
-                    None => Guard::Mse(self.options.encryption_under(self.connector.encryption())),
+                    None => Guard::Mse(policy),
                 },
                 &greeting,
                 &write_buf[..hsz],
@@ -918,6 +943,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 handshake_timeout,
                 self.handler.tcp_wants(),
                 &seen,
+                self.options.dial_order,
             )
             .await;
         if let Some(opened) = seen.get() {
@@ -925,10 +951,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         }
         let (link, meter, encryption) = connected?;
         self.handler.on_connected(now.elapsed());
+        if prefer && encryption.is_encrypted() {
+            self.handler.on_outgoing_method_worked(true);
+        }
         Ok(Connected {
             link,
             meter,
             encryption,
+            prefer,
             write_buf,
             greeting,
         })
@@ -951,6 +981,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 },
             meter,
             encryption,
+            prefer,
             write_buf,
             greeting,
         } = connected;
@@ -983,8 +1014,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.handler
                 .on_handshake(h, ckind, speaks_v2)
                 .map_err(handler_error)?;
-            // The peer answered, so the method this connection tried works
-            // with it (libtorrent `bt_peer_connection::on_receive_impl`).
+            // The peer answered, so a plain handshake works with it; an
+            // encrypted one was told so when it was done (libtorrent
+            // `bt_peer_connection::on_receive_handshake`).
+            if prefer && !encryption.is_encrypted() {
+                self.handler.on_outgoing_method_worked(false);
+            }
             self.handler.on_handshake_encryption(encryption);
 
             self.manage_peer(ManagePeerArgs {
@@ -2600,6 +2635,7 @@ mod tests {
             handshake_timeout: Some(Duration::from_millis(2500)),
             max_request_window: None,
             encryption: None,
+            dial_order: Some(crate::DialOrder::UtpOnly),
         };
         assert_eq!(
             serde_json::to_value(options).unwrap(),
@@ -2610,6 +2646,7 @@ mod tests {
                 "handshake_timeout": 3,
                 "max_request_window": null,
                 "encryption": null,
+                "dial_order": "utp_only",
             })
         );
         let parsed: PeerConnectionOptions =

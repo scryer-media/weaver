@@ -29,7 +29,6 @@ use crate::{
         network::HolepunchEvent,
         swarm::{self, Direction},
     },
-    type_aliases::PeerSourceFlag,
 };
 
 use super::{
@@ -707,8 +706,7 @@ impl PeerHandler {
             .transpose()?
             .unwrap_or_default();
         for peer in news {
-            self.state.add_peer(peer.addr, PeerSourceFlag::Pex);
-            self.state.peers.pex_flags(peer.addr, peer.flags);
+            self.state.add_pex_peer(peer.addr, peer.flags);
         }
         Ok(())
     }

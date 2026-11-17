@@ -187,7 +187,9 @@ fn session_opts(
 }
 
 /// Seeds a torrent from a session whose sockets all come from `server_factory`,
-/// then downloads it into a second session using `client_factory`.
+/// then downloads it into a second session using `client_factory`. Returns
+/// the connections the two sessions ran on their uTP threads, as
+/// [`Session::on_utp_threads`] counts them.
 async fn transfer_through_factories(
     name: &str,
     server_listen: ListenerOptions,
@@ -195,7 +197,7 @@ async fn transfer_through_factories(
     client_connect: Option<ConnectionOptions>,
     server_factory: &Arc<CountingFactory>,
     client_factory: &Arc<CountingFactory>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<[usize; 3]> {
     setup_test_logging();
     let files = create_default_random_dir_with_torrents(1, 8192, Some(name));
     let torrent = create_torrent(
@@ -263,7 +265,8 @@ async fn transfer_through_factories(
 
     let downloaded = std::fs::read(client_dir.path().join("0.data"))?;
     assert!(downloaded == orig_content, "contents differ");
-    Ok(())
+    let [server, client] = [&server_session, &client_session].map(|s| s.on_utp_threads());
+    Ok(std::array::from_fn(|i| server[i] + client[i]))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -337,7 +340,6 @@ async fn test_e2e_socket_factory_utp() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_over_a_tunnel_socket_runs_on_the_thread_that_reads_and_sends() -> anyhow::Result<()>
 {
-    use crate::peer_connection::{ON_UTP_IO_THREAD, ON_UTP_THREADS};
     let tunnel = || {
         Arc::new(CountingFactory {
             tunnel: true,
@@ -350,7 +352,7 @@ async fn a_peer_over_a_tunnel_socket_runs_on_the_thread_that_reads_and_sends() -
         listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
         ..Default::default()
     };
-    transfer_through_factories(
+    let [incoming, outgoing, on_io] = transfer_through_factories(
         "a_peer_over_a_tunnel_socket",
         utp_only(),
         Some(utp_only()),
@@ -362,11 +364,10 @@ async fn a_peer_over_a_tunnel_socket_runs_on_the_thread_that_reads_and_sends() -
         &client,
     )
     .await?;
-    let [incoming, outgoing] = [0, 1].map(|way| ON_UTP_THREADS[way].load(Ordering::Relaxed));
     assert!(incoming > 0, "no incoming connection ran on a uTP thread");
     assert!(outgoing > 0, "no outgoing connection ran on a uTP thread");
     assert_eq!(
-        ON_UTP_IO_THREAD.load(Ordering::Relaxed),
+        on_io,
         incoming + outgoing,
         "a connection ran off the thread that reads and sends"
     );

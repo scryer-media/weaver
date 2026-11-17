@@ -28,6 +28,49 @@ async fn a_pex_message_adds_its_added_peers_and_not_its_dropped_ones() {
     assert!(!h.knows("10.0.0.2:6881"));
 }
 
+// A torrent whose connections are plain only does not take a peer PEX
+// names as reached encrypted, so never dials it, and counts it; the one
+// named without the flag is taken. Where encryption is preferred both are,
+// the flagged one to be tried encrypted first (libtorrent
+// `peer_list::insert_peer`).
+#[tokio::test]
+async fn a_plain_only_torrent_never_takes_a_peer_pex_flags_encrypted() {
+    use extended::ut_pex::PEX_ENCRYPTION;
+    let named = |flagged: &str, unflagged: &str| {
+        let added = [(flagged, PEX_ENCRYPTION), (unflagged, 0)].map(|(addr, flags)| PexPeerInfo {
+            flags,
+            addr: addr.parse().unwrap(),
+        });
+        UtPex::<ByteBufOwned>::from_peers(added.into_iter(), std::iter::empty())
+    };
+    let skipped = |h: &Harness| h.live.session_stats.swarm.snapshot().pex_encrypted_skipped;
+
+    let h = Harness::new("pex_encrypted_plain_only").await;
+    assert_eq!(h.live.encryption(), crate::EncryptionPolicy::Disabled);
+    let (peer, _rx) = h.peer("198.51.100.1:6881");
+    peer.send_pex(&named("203.0.113.1:6881", "203.0.113.2:6881"))
+        .await
+        .unwrap();
+    assert!(!h.knows("203.0.113.1:6881"));
+    assert!(h.knows("203.0.113.2:6881"));
+    assert_eq!(skipped(&h), 1);
+
+    let h = Harness::new("pex_encrypted_prefer").await;
+    h.live
+        .shared
+        .connector
+        .set_encryption(crate::EncryptionPolicy::Prefer);
+    let (peer, _rx) = h.peer("198.51.100.1:6881");
+    peer.send_pex(&named("203.0.113.1:6881", "203.0.113.2:6881"))
+        .await
+        .unwrap();
+    assert!(h.knows("203.0.113.1:6881"));
+    assert!(h.knows("203.0.113.2:6881"));
+    assert!(h.peers.encrypt_outgoing(sock("203.0.113.1:6881").into()));
+    assert!(!h.peers.encrypt_outgoing(sock("203.0.113.2:6881").into()));
+    assert_eq!(skipped(&h), 0);
+}
+
 impl PeerHandler {
     /// The peer sends us `msg`.
     async fn send_pex(&self, msg: &UtPex<ByteBufOwned>) -> anyhow::Result<()> {

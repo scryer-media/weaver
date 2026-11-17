@@ -381,8 +381,10 @@ pub(crate) struct Peer {
     // `torrent_peer::last_connected`, set in `peer_list::connection_closed`).
     last_connected: Option<Instant>,
     // Whether the next connection we make to the peer tries the encrypted
-    // handshake where encryption is preferred: the method the peer last
-    // completed one with, encrypted until it has (libtorrent
+    // handshake where encryption is preferred: plain at first, encrypted
+    // when the PEX message that first named it says its sender reached it
+    // so, then the method our last connection to it completed, or the
+    // other one after a connection that completed neither (libtorrent
     // `torrent_peer::pe_support`).
     encrypt: bool,
     // The connections to the peer that followed a failed encrypted
@@ -445,7 +447,7 @@ impl Peer {
             upload_only: false,
             maybe_upload_only: false,
             last_connected: None,
-            encrypt: true,
+            encrypt: false,
             fast_reconnects: 0,
             fast_reconnect: false,
             last_optimistic_unchoke: None,
@@ -483,7 +485,7 @@ impl Peer {
             upload_only: false,
             maybe_upload_only: false,
             last_connected: None,
-            encrypt: true,
+            encrypt: false,
             fast_reconnects: 0,
             fast_reconnect: false,
             last_optimistic_unchoke: None,
@@ -773,10 +775,9 @@ impl Peer {
 
     /// A PEX message named the peer with `flags`: one that speaks uTP or the
     /// holepunch extension is marked so (libtorrent `peer_list::insert_peer`,
-    /// `update_peer`), one flagged a seed may only upload unless we are
-    /// connected to it and know better (`update_peer`), and one the sender
-    /// is connected to encrypted is tried encrypted next (`insert_peer`; a
-    /// known peer too, as ours start at encrypted).
+    /// `update_peer`), and one flagged a seed may only upload unless we are
+    /// connected to it and know better (`update_peer`). The encryption flag
+    /// counts only for a peer the message added ([`Self::pex_named_new`]).
     pub(crate) fn pex_flags(&mut self, flags: u8, peers: &PeerStates) {
         if flags & PEX_SEED != 0 && self.connected_out().is_none() {
             self.maybe_upload_only = true;
@@ -787,21 +788,36 @@ impl Peer {
         if flags & PEX_HOLEPUNCH != 0 {
             self.supports_holepunch = true;
         }
+        peers.reindex(self);
+    }
+
+    /// A PEX message added the peer, new to the list, with `flags`: one its
+    /// sender reached encrypted is tried encrypted first (libtorrent
+    /// `peer_list::insert_peer` sets `pe_support` for a new peer only).
+    pub(crate) fn pex_named_new(&mut self, flags: u8) {
         if flags & PEX_ENCRYPTION != 0 {
             self.encrypt = true;
         }
-        peers.reindex(self);
+    }
+
+    /// The outgoing connection, made where encryption is preferred,
+    /// completed the method it tried: the encrypted handshake when
+    /// `encrypted`, which counts as soon as the encryption handshake is done
+    /// (libtorrent `bt_peer_connection::on_receive_impl`), else the plain
+    /// BitTorrent one once the peer answered it (`on_receive_handshake`).
+    /// The next connection tries it first again. libtorrent writes
+    /// `pe_support` there only under `pe_enabled`, and only outgoing.
+    pub(crate) fn outgoing_method_worked(&mut self, encrypted: bool) {
+        self.encrypt = encrypted;
     }
 
     /// The peer's connection completed its handshake as `encryption` says,
     /// and our PEX says whether it was encrypted (libtorrent
     /// `bt_peer_connection::init_bt_handshake` sets `m_encrypted` either
-    /// way round). One we made makes the next we make try that method again
-    /// (`init_bt_handshake` and `on_receive_impl` write `pe_support` only
-    /// when `is_outgoing()`).
+    /// way round). A connection we made that got this far is not followed
+    /// at once when it closes.
     pub(crate) fn handshake_encryption(&mut self, encryption: Encryption, peers: &PeerStates) {
         if self.connected_out() == Some(true) {
-            self.encrypt = encryption.is_encrypted();
             self.fast_reconnect = false;
         }
         if let Some(live) = self.get_live_mut() {

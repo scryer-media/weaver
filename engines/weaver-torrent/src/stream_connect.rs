@@ -111,7 +111,8 @@ pub(crate) enum Transports {
 }
 
 /// The order in which an outgoing connection to a peer tries TCP and uTP.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DialOrder {
     /// TCP first, and uTP once TCP has not connected within a second, or at
     /// once when it fails.
@@ -120,6 +121,8 @@ pub enum DialOrder {
     /// uTP first, and TCP once uTP fails, as libtorrent 2.0 dials; a peer
     /// whose uTP connect failed is dialed over TCP from then on.
     UtpFirst,
+    /// uTP alone, never TCP.
+    UtpOnly,
 }
 
 impl DialOrder {
@@ -127,12 +130,14 @@ impl DialOrder {
         match self {
             Self::TcpFirst => 0,
             Self::UtpFirst => 1,
+            Self::UtpOnly => 2,
         }
     }
 
     const fn of(code: u8) -> Self {
         match code {
             1 => Self::UtpFirst,
+            2 => Self::UtpOnly,
             _ => Self::TcpFirst,
         }
     }
@@ -436,6 +441,7 @@ impl StreamConnector {
         rw_timeout: Duration,
         wants: Option<&TcpWants>,
         seen: &UtpSeen,
+        order: Option<DialOrder>,
     ) -> Result<(Link<mse::Outbound>, Meter, Encryption)> {
         // The attempts still running when the time runs out end as timed
         // out: the flag is set before the dial, and with it its attempts, is
@@ -450,7 +456,7 @@ impl StreamConnector {
             home,
             caps,
         } = {
-            let dial = self.dial_noting(addr, transports, &expired, wants, seen, &started);
+            let dial = self.dial_noting(addr, transports, &expired, wants, seen, &started, order);
             tokio::pin!(dial);
             let deadline = tokio::time::sleep(connect_timeout);
             tokio::pin!(deadline);
@@ -573,13 +579,22 @@ impl StreamConnector {
         wants: Option<&TcpWants>,
     ) -> Result<Link> {
         let started = tokio::sync::Notify::new();
-        self.dial_noting(addr, transports, expired, wants, &UtpSeen::default(), &started)
-            .await
+        self.dial_noting(
+            addr,
+            transports,
+            expired,
+            wants,
+            &UtpSeen::default(),
+            &started,
+            None,
+        )
+        .await
     }
 
-    // `dial`, in the session's dial order, with a failed uTP attempt noted
-    // in `seen`, and `started` told as TCP starts behind a failed uTP
-    // attempt.
+    // `dial`, in `order` or else the session's dial order, with a failed
+    // uTP attempt noted in `seen`, and `started` told as TCP starts behind a
+    // failed uTP attempt.
+    #[allow(clippy::too_many_arguments)]
     async fn dial_noting(
         &self,
         addr: SocketAddr,
@@ -588,6 +603,7 @@ impl StreamConnector {
         wants: Option<&TcpWants>,
         seen: &UtpSeen,
         started: &tokio::sync::Notify,
+        order: Option<DialOrder>,
     ) -> Result<Link> {
         let addr = crate::network::canonical_socket_addr(addr);
         if addr.port() == 0 {
@@ -617,7 +633,11 @@ impl StreamConnector {
             ConnectionKind::Tcp => &self.tcp as &dyn PeerDialer,
             ConnectionKind::Utp => &utp,
         };
-        match plan_of(self.dial_order(), transports, self.tcp.enabled) {
+        match plan_of(
+            order.unwrap_or(self.dial_order()),
+            transports,
+            self.tcp.enabled,
+        ) {
             Plan::TcpFirst => {
                 dial::race(DialPlan::DEFAULT, noted, tally, addr, transports, wants).await
             }
@@ -656,6 +676,7 @@ enum Plan {
 const fn plan_of(order: DialOrder, transports: Transports, tcp: bool) -> Plan {
     match (order, transports) {
         (DialOrder::TcpFirst, _) => Plan::TcpFirst,
+        (DialOrder::UtpOnly, _) => Plan::Utp,
         (DialOrder::UtpFirst, Transports::Any) => Plan::UtpFirst,
         (DialOrder::UtpFirst, Transports::UtpFailed) if tcp => Plan::Tcp,
         (DialOrder::UtpFirst, Transports::UtpFailed) => Plan::UtpFirst,
@@ -722,6 +743,7 @@ mod tests {
                 rw_timeout,
                 None,
                 &UtpSeen::default(),
+                None,
             )
             .await
             .map(|(link, meter, encryption)| (link.kind, link.read, link.write, meter, encryption))
@@ -1146,6 +1168,12 @@ mod tests {
         assert_eq!(plan_of(UtpFirst, Any, false), Plan::UtpFirst);
         assert_eq!(plan_of(UtpFirst, UtpFailed, false), Plan::UtpFirst);
         assert_eq!(plan_of(UtpFirst, UtpConfirmed, false), Plan::Utp);
+        // uTP only: uTP alone, whatever the record says.
+        for transports in [Any, UtpFailed, UtpConfirmed, Utp] {
+            for tcp in [true, false] {
+                assert_eq!(plan_of(UtpOnly, transports, tcp), Plan::Utp);
+            }
+        }
     }
 
     /// The kernel's sockets, each TCP connect told to the test as it is
@@ -1269,7 +1297,7 @@ mod tests {
         );
         let (accepted, connected) = tokio::join!(
             theirs.accept(),
-            connector.dial_noting(addr, Transports::Any, &expired, None, &seen, &started)
+            connector.dial_noting(addr, Transports::Any, &expired, None, &seen, &started, None)
         );
         assert_eq!(seen.get(), None);
         accepted.unwrap();
@@ -1277,7 +1305,13 @@ mod tests {
         assert!(made.try_recv().is_err());
         assert!(futures::poll!(std::pin::pin!(listener.accept())).is_pending());
         assert_eq!(tcp_attempts(&connector), 0);
-        assert_eq!((utp_stat(&connector).attempts, utp_stat(&connector).successes), (1, 1));
+        assert_eq!(
+            (
+                utp_stat(&connector).attempts,
+                utp_stat(&connector).successes
+            ),
+            (1, 1)
+        );
     }
 
     // uTP first, to a peer that listens for TCP alone: the uTP connect
@@ -1294,7 +1328,8 @@ mod tests {
             AtomicBool::new(false),
             tokio::sync::Notify::new(),
         );
-        let dial = connector.dial_noting(addr, Transports::Any, &expired, None, &seen, &started);
+        let dial =
+            connector.dial_noting(addr, Transports::Any, &expired, None, &seen, &started, None);
         tokio::pin!(dial);
         let dialed = tokio::select! {
             dialed = made.recv() => dialed.unwrap(),
@@ -1341,11 +1376,49 @@ mod tests {
         assert_eq!(utp_stat(&connector).attempts, 2);
     }
 
+    // uTP only as a torrent's own order, over a session that dials TCP:
+    // the peer sees no TCP connect, whatever its record says.
+    #[tokio::test]
+    async fn a_dials_own_utp_only_order_never_dials_tcp() {
+        let (connector, mut made, through) = watched(DialOrder::TcpFirst, true).await;
+        through.add_permits(8);
+        let (listener, _) = peer(false).await;
+        let addr = listener.local_addr().unwrap();
+        for transports in [Transports::Any, Transports::UtpFailed] {
+            let (seen, expired, started) = (
+                UtpSeen::default(),
+                AtomicBool::new(false),
+                tokio::sync::Notify::new(),
+            );
+            let error = connector
+                .dial_noting(
+                    addr,
+                    transports,
+                    &expired,
+                    None,
+                    &seen,
+                    &started,
+                    Some(DialOrder::UtpOnly),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(error, Error::UtpConnect(_)), "{error:?}");
+        }
+        assert!(made.try_recv().is_err());
+        assert!(futures::poll!(std::pin::pin!(listener.accept())).is_pending());
+        assert_eq!(tcp_attempts(&connector), 0);
+    }
+
     // TCP first, the default: a peer that takes both sees TCP's connect
     // first, whatever its record says of uTP, as before the order existed.
     #[tokio::test]
     async fn tcp_first_dials_tcp_first_whatever_the_record_says() {
-        for transports in [Transports::Any, Transports::UtpFailed, Transports::UtpConfirmed] {
+        for transports in [
+            Transports::Any,
+            Transports::UtpFailed,
+            Transports::UtpConfirmed,
+        ] {
             let (connector, mut made, through) = watched(DialOrder::TcpFirst, true).await;
             assert_eq!(connector.dial_order(), DialOrder::TcpFirst);
             let (listener, theirs) = peer(true).await;

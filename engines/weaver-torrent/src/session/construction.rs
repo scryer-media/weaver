@@ -403,6 +403,8 @@ impl Session {
                 utp: listen_result
                     .as_ref()
                     .is_some_and(|l| l.utp_socket.is_some()),
+                #[cfg(test)]
+                utp_threads: utp_shards.as_ref().map(|shards| shards.name().to_owned()),
                 default_storage_factory: opts.default_storage_factory,
                 http_clients,
                 resolver,

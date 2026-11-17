@@ -1421,6 +1421,9 @@ fn attempt_at(peers: &PeerStates, addr: SocketAddr, at: Instant, ends: Ends) -> 
             peer.connect_if_due(at, peers).expect("a due candidate");
             let encrypted = peer.encrypt_outgoing();
             if let Ends::Completed = ends {
+                // As `PeerConnection` tells it: an encryption handshake once
+                // it is done, a plain one once the peer answered.
+                peer.outgoing_method_worked(encrypted);
                 peer.connecting_to_live(Id20::default(), peers, ConnectionKind::Tcp);
                 peer.handshake_encryption(handshake(encrypted), peers);
             }
@@ -1428,6 +1431,12 @@ fn attempt_at(peers: &PeerStates, addr: SocketAddr, at: Instant, ends: Ends) -> 
             encrypted
         })
         .unwrap()
+}
+
+// The peer at `addr` completed an encrypted handshake of ours before, so
+// the next connection to it tries one first.
+fn remembered_encrypted(peers: &PeerStates, addr: SocketAddr) {
+    peers.outgoing_method_worked(addr.into(), true);
 }
 
 // When the peer is due again after a connection closed at `at`.
@@ -1449,6 +1458,7 @@ async fn a_failed_encrypted_handshake_is_followed_at_once_by_a_plaintext_one() {
     let peers = make_peer_states();
     let a = peer_addr(1);
     peers.add_peer(a, PeerSourceFlag::Tracker);
+    remembered_encrypted(&peers, a);
     let t0 = Instant::now();
 
     assert!(attempt_at(&peers, a, t0, Ends::Failed));
@@ -1492,6 +1502,8 @@ async fn an_encrypted_handshake_the_peer_closed_is_retried_plain_before_failed_c
     for &addr in fresh.iter().chain([&closed, &unsynced]) {
         peers.add_peer(addr, PeerSourceFlag::Tracker);
     }
+    remembered_encrypted(&peers, closed);
+    remembered_encrypted(&peers, unsynced);
     let ended = |addr, error: crate::Error| {
         peers
             .with_peer_mut(addr, "test", |peer| {
@@ -1571,6 +1583,7 @@ fn retry_among_never_tried(
 ) -> (SocketAddr, Vec<(SocketAddr, PeerSourceFlag)>) {
     let retry = peer_addr(1);
     peers.add_peer(retry, PeerSourceFlag::Dht);
+    remembered_encrypted(peers, retry);
     assert!(attempt_at(peers, retry, closed_at, Ends::Closed));
     let never_tried: Vec<_> = (10..12)
         .map(|i| (peer_addr(i), PeerSourceFlag::Tracker))
@@ -1694,7 +1707,7 @@ async fn while_finished_a_peer_flagged_a_seed_goes_behind_one_not_flagged() {
     // again, both having closed at the same second.
     let (peers, higher, lower) = setup(true);
     for addr in [higher, lower] {
-        assert!(attempt_at(&peers, addr, t0, Ends::Completed));
+        assert!(!attempt_at(&peers, addr, t0, Ends::Completed));
     }
     let due = t0 + MIN_RECONNECT_TIME;
     assert_eq!(connect_order_at(&peers, due), [higher, lower]);
@@ -1731,30 +1744,68 @@ async fn a_seed_flag_for_a_connected_peer_is_ignored() {
     assert_eq!(connect_order_at(&peers, due), [higher, lower]);
 }
 
+// libtorrent `torrent_peer::pe_support` starts false: a peer no PEX
+// message flagged is tried plain first, and once that fails, encrypted
+// (`bt_peer_connection::on_connected` flips it on every try).
+#[tokio::test(start_paused = true)]
+async fn a_new_peer_is_tried_plain_first_then_encrypted() {
+    let peers = make_peer_states();
+    let a = peer_addr(1);
+    peers.add_peer(a, PeerSourceFlag::Tracker);
+    let t0 = Instant::now();
+
+    assert!(!attempt_at(&peers, a, t0, Ends::Failed));
+    let t1 = due_after(&peers, t0);
+    assert_eq!(t1, t0 + reconnect_wait(1), "a plain failure waits");
+    assert!(attempt_at(&peers, a, t1, Ends::Failed));
+    assert_eq!(due_after(&peers, t1), t1, "the plain retry follows at once");
+    assert!(!attempt_at(&peers, a, t1, Ends::Completed));
+}
+
 // libtorrent `bt_peer_connection::on_receive_impl` and
-// `init_bt_handshake` set `pe_support` to the method that completed:
+// `on_receive_handshake` set `pe_support` to the method that completed:
 // the next connection tries it again.
 #[tokio::test(start_paused = true)]
 async fn a_peer_is_tried_again_with_the_handshake_it_last_completed() {
     let peers = make_peer_states();
-    let (plain, encrypted) = (peer_addr(1), peer_addr(2));
+    let plain = peer_addr(1);
     let t0 = Instant::now();
-
     peers.add_peer(plain, PeerSourceFlag::Tracker);
-    assert!(attempt_at(&peers, plain, t0, Ends::Failed));
     assert!(!attempt_at(&peers, plain, t0, Ends::Completed));
     let t1 = due_after(&peers, t0);
     assert!(t1 > t0);
     assert!(!attempt_at(&peers, plain, t1, Ends::Completed));
 
+    let peers = make_peer_states();
+    let encrypted = peer_addr(2);
     peers.add_peer(encrypted, PeerSourceFlag::Tracker);
+    assert!(!attempt_at(&peers, encrypted, t0, Ends::Failed));
+    let t1 = due_after(&peers, t0);
     assert!(attempt_at(&peers, encrypted, t1, Ends::Completed));
-    assert!(attempt_at(
-        &peers,
-        encrypted,
-        t1 + MIN_RECONNECT_TIME,
-        Ends::Completed
-    ));
+    let t2 = due_after(&peers, t1);
+    assert!(attempt_at(&peers, encrypted, t2, Ends::Completed));
+}
+
+// libtorrent `bt_peer_connection::on_receive_impl` sets `pe_support`
+// back once the encryption handshake is done, before the peer answers
+// ours: a connection that ends between the two is tried encrypted again.
+#[tokio::test(start_paused = true)]
+async fn an_encryption_handshake_that_completed_points_the_peer_back_at_it() {
+    let peers = make_peer_states();
+    let a = peer_addr(1);
+    peers.add_peer(a, PeerSourceFlag::Tracker);
+    remembered_encrypted(&peers, a);
+    let t0 = Instant::now();
+    peers
+        .with_peer_mut(a.into(), "test", |peer| {
+            peer.connect_if_due(t0, &peers).expect("a due candidate");
+            assert!(peer.encrypt_outgoing());
+            peer.outgoing_method_worked(true);
+            peers.connection_closed(peer, t0, true, false);
+        })
+        .unwrap();
+    let t1 = due_after(&peers, t0);
+    assert!(attempt_at(&peers, a, t1, Ends::Completed));
 }
 
 // libtorrent `peer_connection::fast_reconnect` takes effect while
@@ -1765,6 +1816,7 @@ async fn only_two_connections_follow_an_encrypted_handshake_at_once() {
     let peers = make_peer_states();
     let a = peer_addr(1);
     peers.add_peer(a, PeerSourceFlag::Tracker);
+    remembered_encrypted(&peers, a);
     let mut at = Instant::now();
     for at_once in [true, true, false] {
         assert!(attempt_at(&peers, a, at, Ends::Closed));
@@ -1795,29 +1847,53 @@ async fn a_connection_that_asks_nothing_toggles_nothing() {
         NextCandidate::At(t0 + reconnect_wait(1) + reconnect_wait(2))
     );
     let tried = peers.with_peer_mut(a.into(), "test", |peer| peer.encrypt_outgoing());
-    assert_eq!(tried, Some(true));
+    assert_eq!(tried, Some(false), "still plain first, as a new peer");
 }
 
 // libtorrent `peer_list::insert_peer` sets `pe_support` on a PEX
-// `pex_encryption` flag, and never clears it on a naming without one:
-// a peer remembered as plaintext is tried encrypted again.
+// `pex_encryption` flag for a peer it inserts; `update_peer` leaves a
+// known peer's alone, so a peer a tracker named first stays plain first.
 #[tokio::test(start_paused = true)]
-async fn a_pex_naming_with_the_encryption_flag_points_a_peer_back_at_encryption() {
+async fn a_pex_encryption_flag_points_only_a_new_peer_at_encryption() {
     use crate::peer_protocol::extended::ut_pex::{PEX_ENCRYPTION, PEX_SEED};
     let peers = make_peer_states();
-    let (named, unflagged) = (peer_addr(1), peer_addr(2));
-    let t0 = Instant::now();
-    for addr in [named, unflagged] {
-        peers.add_peer(addr, PeerSourceFlag::Tracker);
-        assert!(attempt_at(&peers, addr, t0, Ends::Failed));
-        assert!(!attempt_at(&peers, addr, t0, Ends::Completed));
+    let (named, unflagged, known) = (peer_addr(1), peer_addr(2), peer_addr(3));
+    peers.add_peer(known, PeerSourceFlag::Tracker);
+    for (addr, flags) in [
+        (named, PEX_ENCRYPTION),
+        (unflagged, PEX_SEED),
+        (known, PEX_ENCRYPTION),
+    ] {
+        assert!(!peers.add_pex_peer(addr, flags, false));
     }
 
-    peers.pex_flags(named, PEX_ENCRYPTION);
-    peers.pex_flags(unflagged, PEX_SEED);
-    let t1 = due_after(&peers, t0);
-    assert!(attempt_at(&peers, named, t1, Ends::Completed));
-    assert!(!attempt_at(&peers, unflagged, t1, Ends::Completed));
+    let t0 = Instant::now();
+    assert!(attempt_at(&peers, named, t0, Ends::Completed));
+    assert!(!attempt_at(&peers, unflagged, t0, Ends::Completed));
+    assert!(!attempt_at(&peers, known, t0, Ends::Completed));
+}
+
+// Where the torrent's connections are plain only, a peer PEX names as
+// reached encrypted is not taken, so never dialled; one it names without
+// the flag is, and a peer already known stays, flag or not.
+#[tokio::test(start_paused = true)]
+async fn a_plain_only_torrent_takes_no_new_peer_pex_flags_encrypted() {
+    use crate::peer_protocol::extended::ut_pex::PEX_ENCRYPTION;
+    let peers = make_peer_states();
+    let (encrypted, plain, known) = (peer_addr(1), peer_addr(2), peer_addr(3));
+    peers.add_peer(known, PeerSourceFlag::Tracker);
+
+    assert!(peers.add_pex_peer(encrypted, PEX_ENCRYPTION, true));
+    assert!(!peers.add_pex_peer(plain, 0, true));
+    assert!(!peers.add_pex_peer(known, PEX_ENCRYPTION, true));
+
+    assert_eq!(state_of(&peers, encrypted), None);
+    let order = connect_order_at(&peers, Instant::now());
+    assert_eq!(order.len(), 2);
+    assert!(
+        order.contains(&plain) && order.contains(&known),
+        "{order:?}"
+    );
 }
 
 // libtorrent `ut_pex_plugin::tick` flags `pex_encryption` for a peer
@@ -1844,8 +1920,9 @@ async fn our_pex_flags_a_peer_whose_connection_is_encrypted() {
 
 // libtorrent `bt_peer_connection::init_bt_handshake` marks a connection
 // encrypted whichever side opened it; both writes of `pe_support`
-// (`init_bt_handshake`, `on_receive_impl`) are `is_outgoing()`, so a
-// handshake the peer opened leaves which one ours try alone.
+// (`on_receive_handshake`, `on_receive_impl`) are `is_outgoing()`, so a
+// handshake the peer opened leaves which one ours try alone: plain first,
+// as for any new peer.
 #[tokio::test(start_paused = true)]
 async fn a_handshake_the_peer_opened_leaves_which_one_ours_try_alone() {
     use crate::peer_protocol::extended::ut_pex::PEX_ENCRYPTION;
@@ -1864,7 +1941,7 @@ async fn a_handshake_the_peer_opened_leaves_which_one_ours_try_alone() {
         peers.with_peer_mut(addr.into(), "test", |peer| {
             peers.connection_closed(peer, Instant::now(), false, false)
         });
-        assert!(peers.encrypt_outgoing(addr.into()), "{addr}");
+        assert!(!peers.encrypt_outgoing(addr.into()), "{addr}");
     }
 }
 
