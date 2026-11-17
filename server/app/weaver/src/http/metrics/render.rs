@@ -3358,11 +3358,14 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
         }
     }
     for session in sessions() {
-        for (transport, family, [_, successes, refused, timeouts, errors]) in &session.connects {
+        for (transport, family, [_, successes, refused, timeouts, errors, unreachable]) in
+            &session.connects
+        {
             for (result, count) in [
                 ("succeeded", successes),
                 ("refused", refused),
                 ("timed_out", timeouts),
+                ("unreachable", unreachable),
                 ("failed", errors),
             ] {
                 out.sample(

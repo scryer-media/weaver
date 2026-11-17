@@ -1242,6 +1242,10 @@ impl Latch {
         }
     }
 
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
     async fn opened(&self) {
         loop {
             let mut opened = std::pin::pin!(self.opened.notified());
@@ -1466,6 +1470,14 @@ pub struct DhtState {
     // search that fell short waits on to search again.
     growth_v4: Growth,
     growth_v6: Growth,
+    // Open while the IPv6 node runs. Until it opens, the IPv6 node holds no
+    // table, sends nothing and reads nothing: its refreshes and searches
+    // wait, an IPv6 datagram is dropped unread, and an IPv6 node a peer
+    // names is not asked. libtorrent starts no IPv6 node until a listen
+    // socket on an IPv6 address the internet reaches is opened
+    // (session_impl.cpp:2206-2211, v2.0.15; see
+    // `route_interface::runs_ipv6_dht`).
+    ipv6: Latch,
     listen_addr: SocketAddr,
 
     // Sending requests to the worker.
@@ -1524,6 +1536,11 @@ impl DhtState {
             bootstrap_sent_v6: Latch::new(),
             growth_v4: Growth::new(),
             growth_v6: Growth::new(),
+            ipv6: {
+                let ipv6 = Latch::new();
+                ipv6.open();
+                ipv6
+            },
             worker_sender: sender,
             listen_addr,
             rate_limiter: make_rate_limiter(),
@@ -1905,6 +1922,12 @@ impl DhtState {
         slot: Option<SendSlot>,
     ) -> crate::dht::Result<()> {
         let ip = datagram.addr.ip();
+        if ip.is_ipv6() && !self.ipv6.is_open() {
+            return Err(Error::Send(std::io::Error::new(
+                std::io::ErrorKind::NetworkUnreachable,
+                "the IPv6 node has not started",
+            )));
+        }
         self.worker_sender
             .send(datagram)
             .map_err(|_| Error::DhtDead)?;
@@ -2617,6 +2640,10 @@ impl DhtWorker {
                 // IPv6; it is the IPv4 node it is, which our requests to it
                 // are keyed under.
                 let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+                // No IPv6 node, nothing read from IPv6.
+                if addr.is_ipv6() && !self.dht.ipv6.is_open() {
+                    continue;
+                }
                 if let Some(msg) = self.dht.read_datagram(&buf[..size], addr)
                     && output_tx.send((msg, addr)).await.is_err()
                 {
@@ -2674,22 +2701,29 @@ impl DhtWorker {
             .clone()
             .refresh_self(true)
             .instrument(debug_span!("refresh_self_v4"));
-        let refresh_self_v6 = self
-            .dht
-            .clone()
-            .refresh_self(false)
-            .instrument(debug_span!("refresh_self_v6"));
+        // The IPv6 node's work waits for it to start.
+        let refresh_self_v6 = {
+            let dht = self.dht.clone();
+            async move {
+                dht.ipv6.opened().await;
+                dht.refresh_self(false).await
+            }
+        }
+        .instrument(debug_span!("refresh_self_v6"));
 
         let refresh_table_v4 = self
             .dht
             .clone()
             .refresh_table(true)
             .instrument(debug_span!("refresh_table_v4"));
-        let refresh_table_v6 = self
-            .dht
-            .clone()
-            .refresh_table(false)
-            .instrument(debug_span!("refresh_table_v6"));
+        let refresh_table_v6 = {
+            let dht = self.dht.clone();
+            async move {
+                dht.ipv6.opened().await;
+                dht.refresh_table(false).await
+            }
+        }
+        .instrument(debug_span!("refresh_table_v6"));
 
         let send_windows_sweep = self.dht.send_guard.sweep();
 
@@ -2769,6 +2803,10 @@ pub struct DhtConfig {
     /// Track the DHT's worker in this tracker. The worker owns the socket, so once the
     /// tracker is empty after cancellation, the socket is gone.
     pub tasks: Option<TaskTracker>,
+    /// Start the IPv6 node only once [`DhtState::start_ipv6`] is called, for
+    /// a route with no IPv6 address the internet reaches yet. Until then it
+    /// holds no table, a saved one too, and sends and reads nothing.
+    pub ipv6_waits: bool,
 }
 
 // An entirely random node id.
@@ -2831,9 +2869,12 @@ impl DhtState {
                 .routing_table
                 .filter(|t| t.id() == peer_id)
                 .map(|t| t.of_family(true));
+            // An IPv6 node that waits keeps no saved table: libtorrent keeps
+            // the nodes of a family only in a node of it, and starts each
+            // node from the routers (dht_tracker.cpp:124-157, 184-197).
             let routing_table_v6 = config
                 .routing_table_v6
-                .filter(|t| t.id() == peer_id)
+                .filter(|t| t.id() == peer_id && !config.ipv6_waits)
                 .map(|t| t.of_family(false));
             let bootstrap_addrs = config.bootstrap_addrs.unwrap_or_else(|| {
                 crate::dht::DHT_BOOTSTRAP
@@ -2845,7 +2886,7 @@ impl DhtState {
             let token = config.cancellation_token.take().unwrap_or_default();
 
             let (in_tx, in_rx) = unbounded_channel();
-            let state = Arc::new(Self::new_internal(
+            let mut state = Self::new_internal(
                 peer_id,
                 in_tx,
                 routing_table,
@@ -2853,7 +2894,12 @@ impl DhtState {
                 listen_addr,
                 token,
                 config.client_version.map(ByteBufOwned::from),
-            ));
+            );
+            if config.ipv6_waits {
+                info!("no IPv6 address the internet reaches: the IPv6 DHT waits for one");
+                state.ipv6 = Latch::new();
+            }
+            let state = Arc::new(state);
 
             spawn_with_cancel(
                 debug_span!("dht"),
@@ -2901,12 +2947,32 @@ impl DhtState {
         self.listen_addr
     }
 
+    /// Whether the IPv6 node runs.
+    pub fn runs_ipv6(&self) -> bool {
+        self.ipv6.is_open()
+    }
+
+    /// Starts the IPv6 node of a DHT made with
+    /// [`DhtConfig::ipv6_waits`]: its table fills from the routers, as
+    /// libtorrent starts a node for a listen socket opened later
+    /// (`dht_tracker::new_socket`, dht_tracker.cpp:124-157, v2.0.15). A node
+    /// that runs is left alone.
+    pub fn start_ipv6(&self) {
+        if !self.ipv6.is_open() {
+            info!("an IPv6 address the internet reaches: the IPv6 DHT starts");
+        }
+        self.ipv6.open();
+    }
+
     /// Pings a node a peer named (BEP 5 PORT) and, when it answers, adds it
     /// to the routing table under the id it answered with (libtorrent
     /// `node::add_node`: "ping the node, and if we get a reply, it will be
     /// added to the routing table").
     pub fn add_node(self: &Arc<Self>, addr: SocketAddr) {
         let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        if addr.is_ipv6() && !self.ipv6.is_open() {
+            return;
+        }
         let dht = self.clone();
         spawn_with_cancel(
             debug_span!("dht_add_node", %addr),

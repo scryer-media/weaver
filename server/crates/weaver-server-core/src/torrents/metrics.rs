@@ -455,8 +455,8 @@ pub struct SessionSeries {
     pub peers: Vec<(&'static str, u32)>,
     /// Outgoing connections by transport and address family: attempted,
     /// then each attempt's end: connected, refused, timed out, failed
-    /// otherwise.
-    pub connects: Vec<(&'static str, &'static str, [u64; 5])>,
+    /// otherwise, unreachable.
+    pub connects: Vec<(&'static str, &'static str, [u64; 6])>,
     /// Its DHT, while it runs one: nodes in the v4 and v6 routing tables,
     /// and requests waiting for an answer.
     pub dht: Option<(usize, usize, usize)>,
@@ -593,7 +593,7 @@ impl SessionSeries {
 
 /// A session's outgoing connects, one row per transport and family, as
 /// `SessionSeries::connects` holds them.
-fn connects(stats: &SessionStatsSnapshot) -> Vec<(&'static str, &'static str, [u64; 5])> {
+fn connects(stats: &SessionStatsSnapshot) -> Vec<(&'static str, &'static str, [u64; 6])> {
     let connections = &stats.connections;
     macro_rules! family {
         ($single:expr) => {
@@ -603,6 +603,7 @@ fn connects(stats: &SessionStatsSnapshot) -> Vec<(&'static str, &'static str, [u
                 $single.refused,
                 $single.timeouts,
                 $single.errors,
+                $single.unreachable,
             ]
         };
     }
@@ -803,13 +804,15 @@ mod tests {
         seeded!(stats.connections.kinds[ConnectionKind::Tcp].v6);
         seeded!(stats.connections.kinds[ConnectionKind::Utp].v4);
         seeded!(stats.connections.kinds[ConnectionKind::Utp].v6);
+        stats.connections.kinds[ConnectionKind::Tcp].v6.unreachable = 41;
+        stats.connections.kinds[ConnectionKind::Utp].v6.unreachable = 7;
         assert_eq!(
             super::connects(&stats),
             [
-                ("tcp", "v4", [174, 191, 580, 879, 648]),
-                ("tcp", "v6", [787, 898, 350, 178, 127]),
-                ("utp", "v4", [887, 234, 421, 179, 778]),
-                ("utp", "v6", [819, 13, 993, 472, 331]),
+                ("tcp", "v4", [174, 191, 580, 879, 648, 0]),
+                ("tcp", "v6", [787, 898, 350, 178, 127, 41]),
+                ("utp", "v4", [887, 234, 421, 179, 778, 0]),
+                ("utp", "v6", [819, 13, 993, 472, 331, 7]),
             ]
         );
     }
