@@ -183,6 +183,13 @@ impl Dialer for Revocable {
         }
         self.inner.source_toward(to)
     }
+    // The leg's IPv6 sources, while it is not revoked.
+    fn ipv6_sources(&self) -> Option<std::io::Result<crate::egress::Ipv6Sources>> {
+        if self.is_revoked() {
+            return Some(Err(std::io::Error::other("the leg was revoked")));
+        }
+        self.inner.ipv6_sources()
+    }
     fn failing_hop(&self) -> Option<super::FailingHop> {
         self.inner.failing_hop()
     }
