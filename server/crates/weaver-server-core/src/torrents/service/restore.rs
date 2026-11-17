@@ -81,6 +81,9 @@ pub(super) struct Attached {
     pub(super) ssl: Option<TrackerCertificate>,
     // The leg the session runs it on, which counts what it moves.
     pub(super) leg: Option<OnLeg>,
+    // How it names, and the scope it names as.
+    pub(super) names: Arc<crate::torrents::naming::TorrentNames>,
+    pub(super) scope: TorrentScope,
 }
 
 // The leg of a scope's route a session runs on.
@@ -1141,7 +1144,11 @@ impl TorrentService {
             Arc::clone(&pieces),
             self.resident(job_id),
         );
+        // Its trackers and web seeds name by its route's profile, and follow
+        // it to another route on the same session.
+        let names = self.inner.sessions.torrent_names(&plan, &session).await;
         let mut options = AddTorrentOptions {
+            naming: Some(names.naming()),
             paused,
             // A write that finds no room waits for this service to see room
             // made, not for a timer.
@@ -1286,6 +1293,8 @@ impl TorrentService {
                     terms,
                     ssl,
                     leg,
+                    names,
+                    scope,
                 });
                 torrent.route = Some(plan.key);
                 torrent.held = None;

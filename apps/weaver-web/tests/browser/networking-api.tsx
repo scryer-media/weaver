@@ -18,7 +18,7 @@ import "@/next/theme.css";
 const ws=createWSClient({url:`ws://${window.location.host}/graphql`});
 const client=createClient({url:"/graphql",preferGetMethod:false,requestPolicy:"cache-and-network",exchanges:[cacheExchange,fetchExchange,subscriptionExchange({forwardSubscription(operation){return {subscribe(sink){return {unsubscribe:ws.subscribe({...operation,query:operation.query!},sink)};}};}})]});
 const actionsRef={current:null};
-const torrentsOn={torrents:"on",torrentPresence:{enabled:true,jobs:false,running:false,windingDown:false,windDown:null}} as NextData;
+const torrentsOn={torrents:"on",torrentPresence:{available:true,enabled:true,jobs:false,running:false,windingDown:false,windDown:null}} as NextData;
 const setFlags=()=>{};
 const registry=new SearchRegistry();
 function Fixture(){

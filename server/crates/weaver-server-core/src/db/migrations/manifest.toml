@@ -1755,3 +1755,25 @@ kind = "sql"
 file = "migrations/0124_torrent_found_peers/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 125
+description = "saved DNS server lists and profiles; a route names the profile its names follow, a proxy the profile that finds its own address, and each saved proxy's DNS setting becomes a list and profiles"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0125_dns_profiles/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0125_dns_profiles/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "dns_profiles_from_proxies_v125"
+scope = "upgrade_only"

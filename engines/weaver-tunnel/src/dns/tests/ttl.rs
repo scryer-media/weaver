@@ -4,28 +4,32 @@
 use super::*;
 use crate::resolution::record::{LookupError, Recording};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-type Answer = dyn Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync;
+pub(super) type Answer = dyn Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync;
 
 // Servers that answer each query as the test says.
-struct Zone(Arc<Answer>);
+pub(super) struct Zone(Arc<Answer>);
 
 impl Zone {
-    fn new(answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> Self {
+    pub(super) fn new(
+        answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static,
+    ) -> Self {
         Self(Arc::new(answer))
     }
 }
 
 #[async_trait::async_trait]
 impl Carrier for Zone {
-    async fn open(&self, server: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+    async fn open(&self, server: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         let (client, mut stream) = tokio::io::duplex(4096);
         let answer = self.0.clone();
+        let asked = server.address.ip();
         tokio::spawn(async move {
             let size = stream.read_u16().await.unwrap() as usize;
             let mut query = vec![0; size];
             stream.read_exact(&mut query).await.unwrap();
-            let reply = answer(server, u16_at(&query, size - 4).unwrap(), &query);
+            let reply = answer(asked, u16_at(&query, size - 4).unwrap(), &query);
             stream.write_u16(reply.len() as u16).await.unwrap();
             stream.write_all(&reply).await.unwrap();
         });
@@ -34,9 +38,9 @@ impl Carrier for Zone {
 }
 
 // The name asked, by pointer to the question.
-const ASKED: [u8; 2] = [0xc0, 0x0c];
+pub(super) const ASKED: [u8; 2] = [0xc0, 0x0c];
 
-fn wire(name: &str) -> Vec<u8> {
+pub(super) fn wire(name: &str) -> Vec<u8> {
     let mut wire = Vec::new();
     for label in name.split('.') {
         wire.push(label.len() as u8);
@@ -46,7 +50,7 @@ fn wire(name: &str) -> Vec<u8> {
     wire
 }
 
-fn rr(owner: &[u8], kind: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
+pub(super) fn rr(owner: &[u8], kind: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
     let mut record = owner.to_vec();
     record.extend_from_slice(&kind.to_be_bytes());
     record.extend_from_slice(&[0, 1]);
@@ -56,7 +60,7 @@ fn rr(owner: &[u8], kind: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
     record
 }
 
-fn soa(ttl: u32, minimum: u32) -> Vec<u8> {
+pub(super) fn soa(ttl: u32, minimum: u32) -> Vec<u8> {
     let mut data = wire("ns.test");
     data.extend(wire("hostmaster.test"));
     for field in [1u32, 7200, 900, 1_209_600, minimum] {
@@ -65,7 +69,12 @@ fn soa(ttl: u32, minimum: u32) -> Vec<u8> {
     rr(&wire("test"), 6, ttl, &data)
 }
 
-fn respond(query: &[u8], rcode: u8, answers: &[Vec<u8>], authority: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn respond(
+    query: &[u8],
+    rcode: u8,
+    answers: &[Vec<u8>],
+    authority: &[Vec<u8>],
+) -> Vec<u8> {
     let mut reply = query.to_vec();
     reply[2] = 0x81;
     reply[3] = 0x80 | rcode;
@@ -77,12 +86,12 @@ fn respond(query: &[u8], rcode: u8, answers: &[Vec<u8>], authority: &[Vec<u8>]) 
     reply
 }
 
-fn v4(query: &[u8], ttl: u32) -> Vec<u8> {
+pub(super) fn v4(query: &[u8], ttl: u32) -> Vec<u8> {
     respond(query, 0, &[rr(&ASKED, 1, ttl, &[192, 0, 2, 7])], &[])
 }
 
-fn server() -> IpAddr {
-    "192.0.2.53".parse().unwrap()
+pub(super) fn server() -> DnsServer {
+    DnsServer::plain("192.0.2.53".parse().unwrap())
 }
 
 #[tokio::test]
@@ -162,33 +171,83 @@ async fn an_alias_to_a_name_that_does_not_exist_is_a_negative_answer() {
     assert_eq!(lookup.ttl, Ttl::Seconds(30));
 }
 
+// As dnsmasq by default: a negative answer with no SOA is passed on but not
+// held (rfc1035.c, `if (have_soa || daemon->neg_ttl)` with `neg_ttl` 0).
 #[tokio::test]
-async fn no_address_without_an_soa_stays_unanswered() {
-    let zone = Zone::new(|_, _, query| respond(query, 3, &[], &[]));
-    let unanswered = resolve_name(&zone, &[server()], "missing.test")
-        .await
-        .unwrap_err();
-    assert!(unanswered.reached);
+async fn a_negative_answer_without_an_soa_is_given_and_held_for_no_time() {
+    for (rcode, nonexistent) in [(3, true), (0, false)] {
+        let zone = Zone::new(move |_, _, query| respond(query, rcode, &[], &[]));
+        let lookup = resolve_name(&zone, &[server()], "missing.test")
+            .await
+            .unwrap();
+        assert!(lookup.addresses.is_empty(), "{rcode}");
+        assert_eq!(lookup.nonexistent, nonexistent, "{rcode}");
+        assert_eq!(lookup.ttl, Ttl::Seconds(0), "{rcode}");
+    }
+}
+
+// An SOA in the authority section, owned by `owner`.
+fn soa_at(owner: &str, ttl: u32, minimum: u32) -> Vec<u8> {
+    let mut record = soa(ttl, minimum);
+    let test = wire("test");
+    record.splice(..test.len(), wire(owner));
+    record
+}
+
+// As dnsmasq's find_soa: only an SOA owned by the name or a zone above it
+// says how long the name's having no address holds, and the first such
+// wins. One for another zone, or below the name, is passed over.
+#[tokio::test]
+async fn only_the_first_soa_at_or_above_the_name_bounds_a_negative_answer() {
+    for (authority, held) in [
+        (vec![soa_at("elsewhere", 900, 300)], 0),
+        (vec![soa_at("deeper.missing.test", 900, 300)], 0),
+        (vec![soa_at("ng.test", 900, 300)], 0),
+        (vec![soa_at("elsewhere", 900, 30), soa(900, 120)], 120),
+        (vec![soa_at("missing.test", 900, 60), soa(900, 120)], 60),
+        (vec![soa(900, 120), soa_at("missing.test", 900, 60)], 120),
+    ] {
+        let zone = Zone::new({
+            let authority = authority.clone();
+            move |_, _, query| respond(query, 3, &[], &authority)
+        });
+        let lookup = resolve_name(&zone, &[server()], "missing.test")
+            .await
+            .unwrap();
+        assert_eq!(lookup.ttl, Ttl::Seconds(held), "{authority:?}");
+    }
 }
 
 #[tokio::test]
 async fn a_negative_answer_needs_every_server_asked_to_give_one() {
     let other: IpAddr = "192.0.2.54".parse().unwrap();
+    let both = [server(), DnsServer::plain(other)];
     let zone = Zone::new(move |asked, _, query| {
         if asked == other {
-            respond(query, 3, &[], &[])
+            respond(query, 2, &[], &[])
         } else {
             respond(query, 3, &[], &[soa(900, 120)])
         }
     });
-    let unanswered = resolve_name(&zone, &[server(), other], "missing.test")
+    let unanswered = resolve_name(&zone, &both, "missing.test")
         .await
         .unwrap_err();
     assert!(unanswered.reached);
     let zone = Zone::new(|_, _, query| respond(query, 3, &[], &[soa(900, 120)]));
-    let both = [server(), other];
     let lookup = resolve_name(&zone, &both, "missing.test").await.unwrap();
     assert_eq!(lookup.ttl, Ttl::Seconds(120));
+    // One server's negative answer with no SOA holds for no time, so
+    // neither does the lookup's.
+    let zone = Zone::new(move |asked, _, query| {
+        let authority = if asked == other {
+            vec![]
+        } else {
+            vec![soa(900, 120)]
+        };
+        respond(query, 3, &[], &authority)
+    });
+    let lookup = resolve_name(&zone, &both, "missing.test").await.unwrap();
+    assert_eq!(lookup.ttl, Ttl::Seconds(0));
 }
 
 #[test]
@@ -202,17 +261,21 @@ fn a_ttl_with_the_top_bit_set_is_read_as_zero() {
         &[rr(&ASKED, 1, 0x8000_0001, &[192, 0, 2, 7])],
         &[],
     );
-    let parsed = parse_response(&reply, 9, "fixture.test", 1).unwrap();
-    assert_eq!(parsed.ttl, 0);
+    let query = weaver_dnssec::Query::new(
+        weaver_dnssec::Name::from_text("fixture.test.").unwrap(),
+        weaver_dnssec::RecordType::A,
+    );
+    let parsed = weaver_dnssec::Reply::read(&query, &reply).unwrap();
+    assert_eq!(parsed.answer().ttl(), 0);
 }
 
 // What a test recording says of a lookup through `carrier` that found
 // nothing.
-async fn why(carrier: &dyn Carrier, servers: &[IpAddr], host: &str) -> LookupError {
+pub(super) async fn why(carrier: &dyn Carrier, servers: &[DnsServer], host: &str) -> LookupError {
     let recording = Arc::new(Recording::default());
     recording
         .scope(async {
-            record::asking(host, || record::Asker::servers(servers));
+            record::asking(host, || record::Asker::servers(servers, Trust::AsSent));
             let _ = resolve_name(carrier, servers, host).await;
         })
         .await;
@@ -222,7 +285,7 @@ async fn why(carrier: &dyn Carrier, servers: &[IpAddr], host: &str) -> LookupErr
         .expect("a failed lookup")
 }
 
-fn failure(failure: LookupFailure, detail: &str) -> LookupError {
+pub(super) fn failure(failure: LookupFailure, detail: &str) -> LookupError {
     LookupError {
         failure,
         detail: detail.into(),
@@ -253,18 +316,18 @@ async fn a_lookup_says_which_answer_told_it_most() {
         respond(query, if asked == other { 3 } else { 5 }, &[], &[])
     });
     assert_eq!(
-        why(&zone, &[server(), other], "missing.test").await,
+        why(&zone, &[server(), DnsServer::plain(other)], "missing.test").await,
         failure(LookupFailure::NoSuchName, "192.0.2.54: NXDOMAIN")
     );
 }
 
 // Servers that can be dialled and never answer.
 #[derive(Default)]
-struct Silent(std::sync::Mutex<Vec<tokio::io::DuplexStream>>);
+pub(super) struct Silent(std::sync::Mutex<Vec<tokio::io::DuplexStream>>);
 
 #[async_trait::async_trait]
 impl Carrier for Silent {
-    async fn open(&self, _: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+    async fn open(&self, _: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         let (client, server) = tokio::io::duplex(4096);
         self.0.lock().unwrap().push(server);
         Ok(Box::new(client))
@@ -276,7 +339,7 @@ struct Unreachable;
 
 #[async_trait::async_trait]
 impl Carrier for Unreachable {
-    async fn open(&self, _: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+    async fn open(&self, _: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         Err(TunnelError::Engine(
             "egress connection failed: no route".into(),
         ))
@@ -293,4 +356,65 @@ async fn a_server_that_never_answers_runs_out_of_time_and_one_never_reached_give
         why(&Unreachable, &[server()], "fixture.test").await,
         failure(LookupFailure::NoReply, "egress connection failed: no route")
     );
+}
+
+#[tokio::test]
+async fn a_plain_server_off_port_53_is_dialled_there_and_named_with_its_port() {
+    let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = ports.clone();
+    struct Port(Zone, Arc<std::sync::Mutex<Vec<u16>>>);
+    #[async_trait::async_trait]
+    impl Carrier for Port {
+        async fn open(
+            &self,
+            server: &DnsServer,
+        ) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+            self.1.lock().unwrap().push(server.address.port());
+            self.0.open(server).await
+        }
+    }
+    let zone = Port(Zone::new(|_, _, query| respond(query, 2, &[], &[])), seen);
+    let server = DnsServer {
+        address: "192.0.2.53:5353".parse().unwrap(),
+        wire: Wire::Plain,
+    };
+    assert_eq!(
+        why(&zone, &[server], "fixture.test").await,
+        failure(LookupFailure::ServerFailure, "192.0.2.53:5353: SERVFAIL")
+    );
+    assert_eq!(*ports.lock().unwrap(), [5353, 5353]);
+}
+
+// An SOA with `fixed` of the twenty bytes of its five numbers, then
+// `trailing`.
+fn soa_cut(fixed: usize, trailing: &[u8]) -> Vec<u8> {
+    let mut data = wire("ns.test");
+    data.extend(wire("hostmaster.test"));
+    let numbers: Vec<u8> = [1u32, 7200, 900, 1_209_600, 120]
+        .iter()
+        .flat_map(|number| number.to_be_bytes())
+        .collect();
+    data.extend_from_slice(&numbers[..fixed]);
+    data.extend_from_slice(trailing);
+    rr(&wire("test"), 6, 900, &data)
+}
+
+// An SOA is read for the negative answer's bound when its record holds its
+// five numbers whole, whatever follows them. One short of them bounds
+// nothing, as no SOA does.
+#[tokio::test]
+async fn an_soa_bounds_a_negative_answer_with_bytes_after_its_numbers_and_not_short_of_them() {
+    for (fixed, trailing, held) in [
+        (20, &[][..], 120),
+        (20, &[0, 0, 0][..], 120),
+        (19, &[][..], 0),
+    ] {
+        let soa = soa_cut(fixed, trailing);
+        let zone = Zone::new(move |_, _, query| respond(query, 3, &[], std::slice::from_ref(&soa)));
+        let lookup = resolve_name(&zone, &[server()], "missing.test")
+            .await
+            .unwrap();
+        assert!(lookup.addresses.is_empty(), "{fixed} {trailing:?}");
+        assert_eq!(lookup.ttl, Ttl::Seconds(held), "{fixed} {trailing:?}");
+    }
 }

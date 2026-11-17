@@ -123,6 +123,25 @@ const PROBE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 // probes again.
 const PROBE_KEPT_AFTER: Duration = Duration::from_millis(100);
 
+// `WEAVER_VOLUME_WRITE_PROBE=off` probes no volume and reads no stored
+// figure: each volume's rate comes from its own writes alone. For benchmark
+// runs, which start every download with an empty data directory and would
+// otherwise pay a probe that a real install pays once a week per volume.
+// Unset, or any other value, probes as usual.
+pub(crate) const ENV_VOLUME_WRITE_PROBE: &str = "WEAVER_VOLUME_WRITE_PROBE";
+
+pub(crate) fn volume_write_probe_disabled() -> bool {
+    probe_switched_off(std::env::var(ENV_VOLUME_WRITE_PROBE).ok().as_deref())
+}
+
+fn probe_switched_off(raw: Option<&str>) -> bool {
+    raw.map(str::trim).is_some_and(|value| {
+        ["off", "0", "false", "no"]
+            .iter()
+            .any(|off| value.eq_ignore_ascii_case(off))
+    })
+}
+
 // One volume's stored figure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct StoredRate {
@@ -406,6 +425,23 @@ mod tests {
 
     fn volume(device: Option<u64>, label: &str) -> Arc<Volume> {
         Arc::new(Volume::new(device, label.to_string()))
+    }
+
+    #[test]
+    fn only_an_off_value_switches_the_probe_off() {
+        for off in ["off", "OFF", " 0 ", "false", "No"] {
+            assert!(probe_switched_off(Some(off)), "{off:?}");
+        }
+        for on in [
+            None,
+            Some(""),
+            Some("on"),
+            Some("1"),
+            Some("true"),
+            Some("offline"),
+        ] {
+            assert!(!probe_switched_off(on), "{on:?}");
+        }
     }
 
     // A store whose clock stands at `now` and whose probe answers `rate`,

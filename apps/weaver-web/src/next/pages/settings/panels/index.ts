@@ -4,6 +4,7 @@
 import type { ComponentType } from "react";
 import type { IconName } from "../../../components/icons";
 import type { PanelListItem } from "../../../shell/rail-blocks";
+import { withoutTorrentOnly } from "../../../data/torrents-shown";
 import { BackupPanel } from "./BackupPanel";
 import { CategoriesPanel } from "./CategoriesPanel";
 import { GeneralPanel } from "./GeneralPanel";
@@ -45,6 +46,8 @@ export interface PanelDefinition {
   tag?: "beta" | "count:providers";
   /** The rail icon, from `ICONS`. */
   icon: IconName;
+  /** The torrents' own panel: there only while the server has torrents. */
+  torrentOnly?: true;
   Component: ComponentType;
 }
 
@@ -86,6 +89,7 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     label: "next.settings.panel.torrents",
     note: "next.settings.panel.torrentsNote",
     icon: "downloads",
+    torrentOnly: true,
     Component: TorrentsPanel,
   },
   {
@@ -114,6 +118,13 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     group: "networking",
     label: "settings.networkRoutes",
     icon: "routes",
+    Component: NetworkingPanel,
+  },
+  {
+    slug: "networking/dns",
+    group: "networking",
+    label: "next.dns.title",
+    icon: "dns",
     Component: NetworkingPanel,
   },
   {
@@ -175,8 +186,26 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
   },
 ];
 
-export function findPanel(slug: string | undefined): PanelDefinition | undefined {
-  return SETTINGS_PANELS.find((panel) => panel.slug === slug);
+/**
+ * The panels there are: every one while the server has torrents, and all but
+ * the torrents' own while it has none or has not said. The rail, the search
+ * and a direct visit all go by this list, so a panel left out of it is, to
+ * each of them, a panel that does not exist.
+ */
+export function settingsPanels(torrentsAvailable: boolean): PanelDefinition[] {
+  return withoutTorrentOnly(SETTINGS_PANELS, torrentsAvailable, (panel) => panel.torrentOnly === true);
+}
+
+/** Whether `slug` is a panel there only while the server has torrents. */
+export function isTorrentOnlyPanel(slug: string | undefined): boolean {
+  return SETTINGS_PANELS.some((panel) => panel.slug === slug && panel.torrentOnly === true);
+}
+
+export function findPanel(
+  slug: string | undefined,
+  panels: readonly PanelDefinition[] = SETTINGS_PANELS,
+): PanelDefinition | undefined {
+  return panels.find((panel) => panel.slug === slug);
 }
 
 /**
@@ -200,10 +229,11 @@ export function panelSearchTitle(
 export function settingsRail(
   t: (key: string) => string,
   providerCount: number,
+  panels: readonly PanelDefinition[] = SETTINGS_PANELS,
 ): PanelListItem[] {
   const items: PanelListItem[] = [];
   const nested = new Map<PanelGroup, PanelListItem[]>();
-  for (const entry of SETTINGS_PANELS) {
+  for (const entry of panels) {
     const row: PanelListItem = {
       to: `/settings/${entry.slug}`,
       label: t(entry.label),

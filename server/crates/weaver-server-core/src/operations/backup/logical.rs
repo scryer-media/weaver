@@ -18,11 +18,12 @@ use super::catalog::{
     BACKUP_TABLE_CATALOG, BackupTableClassification, catalog_tables, export_query,
     is_engine_internal_table, is_optional_catalog_table, quote_identifier,
 };
+use crate::persistence::encryption::{EncryptionKey, decrypt_value};
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
     egress_quotas_v53, history_retention_v89, history_search_key_v88, networking_bandwidth_v94,
-    proxy_resolver_v64, script_concurrency_v58, script_instances_v55, server_limit_v92,
-    unwanted_extensions_v56,
+    proxy_dns_v125, proxy_resolver_v64, script_concurrency_v58, script_instances_v55,
+    server_limit_v92, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
@@ -136,6 +137,9 @@ impl Database {
         source_schema_version: i64,
     ) -> Result<(), StateError> {
         let allow_older_catalog = source_schema_version < self.schema_version()?;
+        // The key the bundle's secrets are sealed with, when this database
+        // holds it: a restore sets it before it imports.
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         match datastore {
             StoreDatastore::Sqlite { pool, .. } => {
@@ -148,6 +152,7 @@ impl Database {
                         &expected,
                         allow_older_catalog,
                         source_schema_version,
+                        key.as_ref(),
                     )
                     .await
                 })
@@ -162,6 +167,7 @@ impl Database {
                         &expected,
                         allow_older_catalog,
                         source_schema_version,
+                        key.as_ref(),
                     )
                     .await
                 })
@@ -832,6 +838,7 @@ async fn import_sqlite(
     expected: &BTreeMap<String, TablePartMetadata>,
     allow_older_catalog: bool,
     source_schema_version: i64,
+    key: Option<&EncryptionKey>,
 ) -> Result<(), StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_sqlite_catalog(&mut conn).await?;
@@ -924,7 +931,9 @@ async fn import_sqlite(
         fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
             .await?;
         name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
-        refuse_unsaveable_proxies(&mut SqlConn::Sqlite(&mut conn)).await?;
+        spell_out_older_proxy_dns(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
+        store_proxies_as_saved(&mut SqlConn::Sqlite(&mut conn), key).await?;
+        store_dns_as_saved(&mut SqlConn::Sqlite(&mut conn)).await?;
         move_older_bandwidth_limits(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
         name_older_history_releases(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
         trim_older_server_list(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
@@ -953,6 +962,7 @@ async fn import_postgres(
     expected: &BTreeMap<String, TablePartMetadata>,
     allow_older_catalog: bool,
     source_schema_version: i64,
+    key: Option<&EncryptionKey>,
 ) -> Result<(), StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_postgres_catalog(&mut conn).await?;
@@ -1027,7 +1037,9 @@ async fn import_postgres(
     .await?;
     fill_older_unwanted_extensions(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     name_older_proxy_resolvers(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
-    refuse_unsaveable_proxies(&mut SqlConn::Postgres(&mut tx)).await?;
+    spell_out_older_proxy_dns(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
+    store_proxies_as_saved(&mut SqlConn::Postgres(&mut tx), key).await?;
+    store_dns_as_saved(&mut SqlConn::Postgres(&mut tx)).await?;
     move_older_bandwidth_limits(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     name_older_history_releases(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     trim_older_server_list(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
@@ -1099,22 +1111,72 @@ async fn name_older_proxy_resolvers(
     Ok(())
 }
 
-// A restored proxy is one a save would take. A restore checks no row the
-// way a save does, so a bundle holding a proxy no save would take, such as
-// a WireGuard proxy left to resolve names with no DNS server, is refused
-// whole, with what a save of that proxy says.
-async fn refuse_unsaveable_proxies(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
-    let rows = conn
-        .fetch_all("SELECT config FROM proxy_profiles ORDER BY id", &[])
-        .await?;
-    for row in rows {
-        let profile: crate::proxies::ProxyProfile = serde_json::from_str(&row.text("config")?)
-            .map_err(|error| {
-                StateError::Database(format!("a restored proxy cannot be read: {error}"))
-            })?;
-        profile.validate()?;
+// A bundle written before DNS profiles carries proxies that name a resolver
+// instead, and routes that name no profile. The step an upgrade runs turns
+// them into lists and profiles here too. It runs after the resolver is
+// named, so a bundle from before either gets both.
+async fn spell_out_older_proxy_dns(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+) -> Result<(), StateError> {
+    if source_schema_version < proxy_dns_v125::SCHEMA_VERSION {
+        proxy_dns_v125::dns_profiles_from_proxies(conn).await?;
     }
     Ok(())
+}
+
+// A restored proxy is one a save would take, stored as a save stores it. A
+// restore checks no row the way a save does, so a bundle holding a proxy no
+// save would take, such as a proxy other than WireGuard that lists DNS
+// servers, is refused whole, with what a save of that proxy says.
+//
+// A bundle seals each proxy's secrets with the key it carries, which a
+// restore sets on the database before it imports. With them in hand the
+// proxy is judged whole, keys included. A row whose secrets cannot be
+// opened is judged on its own settings only; the restore refuses a bundle
+// whose secrets do not match its key when it checks every sealed value.
+async fn store_proxies_as_saved(
+    conn: &mut SqlConn<'_>,
+    key: Option<&EncryptionKey>,
+) -> Result<(), StateError> {
+    let rows = conn
+        .fetch_all(
+            "SELECT id, config, password FROM proxy_profiles ORDER BY id",
+            &[],
+        )
+        .await?;
+    for row in rows {
+        let unreadable = |error: String| {
+            StateError::Database(format!("a restored proxy cannot be read: {error}"))
+        };
+        let mut profile: crate::proxies::ProxyProfile = serde_json::from_str(&row.text("config")?)
+            .map_err(|error| unreadable(error.to_string()))?;
+        let secrets = match (row.opt_text("password")?, key) {
+            (None, _) => Some(crate::proxies::ProxySecrets::default()),
+            (Some(sealed), Some(key)) => decrypt_value(key, &sealed)
+                .ok()
+                .and_then(|plain| serde_json::from_str(&plain).ok()),
+            (Some(_), None) => None,
+        };
+        match secrets {
+            Some(secrets) => {
+                profile.secrets = secrets;
+                profile.validate()?;
+            }
+            None => profile.validate_config()?,
+        }
+    }
+    Ok(())
+}
+
+// The DNS lists, profiles and route choices a bundle brings are ones saves
+// would take. A bundle holding a list no save would take, such as eleven
+// servers or a plain one after an encrypted one, a profile naming a list
+// that is not there, or a route on a profile that is not there or cannot
+// answer on it, is refused whole. A bundle from before profiles restores
+// every route on the System profile, unless its proxies named their DNS.
+async fn store_dns_as_saved(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
+    crate::proxies::validate_restored_dns(conn).await
 }
 
 // A bundle written before bandwidth limits were kept in networking carries
@@ -2111,46 +2173,52 @@ mod logical_reader_tests {
         assert_eq!(target.list_egress_interfaces().unwrap().len(), 1);
     }
 
-    // A bundle holding a WireGuard proxy left to resolve names with no DNS
-    // server, which no save takes, is refused whole with what a save says.
-    #[test]
-    fn a_bundle_with_a_proxy_no_save_would_take_is_refused() {
-        use crate::proxies::{ProxyKind, ProxyProfile, ProxySecrets, Resolver};
+    // A WireGuard proxy whose tunnel lists one DNS server.
+    fn wireguard_tunnel() -> crate::proxies::ProxyProfile {
+        use crate::proxies::{ProxyKind, ProxyProfile, ProxySecrets};
         use base64::Engine;
         let key = |seed: u8| base64::engine::general_purpose::STANDARD.encode([seed; 32]);
+        ProxyProfile {
+            dns_profile_id: 0,
+            id: 0,
+            name: "tunnel".into(),
+            kind: ProxyKind::WireGuard,
+            enabled: true,
+            host: "192.0.2.10".into(),
+            port: 51820,
+            dns_servers: vec!["10.63.0.1".parse().unwrap()],
+            tunnel_addresses: vec!["10.63.0.2/32".into()],
+            peer_public_key: Some(key(2)),
+            mtu: 1420,
+            keepalive_seconds: None,
+            timeout_seconds: 30,
+            host_key_fingerprint: None,
+            revision: 0,
+            natpmp: false,
+            forwarded_port: None,
+            secrets: ProxySecrets {
+                private_key: Some(key(1)),
+                ..Default::default()
+            },
+        }
+    }
+
+    // A bundle holding a proxy other than WireGuard that lists DNS servers,
+    // which no save takes, is refused whole with what a save says.
+    #[test]
+    fn a_bundle_with_a_proxy_no_save_would_take_is_refused() {
         let source = Database::open_in_memory().unwrap();
-        source
-            .save_proxy_profile(&ProxyProfile {
-                id: 0,
-                name: "tunnel".into(),
-                kind: ProxyKind::WireGuard,
-                enabled: true,
-                host: "192.0.2.10".into(),
-                port: 51820,
-                resolver: Resolver::Proxy,
-                dns_servers: vec!["10.63.0.1".parse().unwrap()],
-                tunnel_addresses: vec!["10.63.0.2/32".into()],
-                peer_public_key: Some(key(2)),
-                mtu: 1420,
-                keepalive_seconds: None,
-                timeout_seconds: 30,
-                host_key_fingerprint: None,
-                revision: 0,
-                natpmp: false,
-                forwarded_port: None,
-                secrets: ProxySecrets {
-                    private_key: Some(key(1)),
-                    ..Default::default()
-                },
-            })
-            .unwrap();
+        source.save_proxy_profile(&wireguard_tunnel()).unwrap();
         let mut archive = source.export_logical_backup().unwrap();
         let tables = archive.staging.path().join("tables");
         let metadata = rewrite_table_objects(archive.staging.path(), "proxy_profiles", |row| {
             let mut config: JsonValue =
                 serde_json::from_str(row["config"].as_str().unwrap()).unwrap();
-            config["dns_servers"] = JsonValue::Array(Vec::new());
+            config["kind"] = "Socks5".into();
+            config["tunnel_addresses"] = serde_json::json!([]);
+            config["peer_public_key"] = JsonValue::Null;
             row.insert("config".into(), JsonValue::from(config.to_string()));
+            row.insert("password".into(), JsonValue::Null);
             Ok(())
         })
         .unwrap();
@@ -2163,9 +2231,318 @@ mod logical_reader_tests {
             .unwrap_err();
         assert_eq!(
             error.refusal().map(|refusal| refusal.code),
-            Some(crate::proxies::NetworkRefusal::ProxyWireGuardNeedsDnsServers.code())
+            Some(crate::proxies::NetworkRefusal::ProxyDnsServerInvalid.code())
         );
         assert!(target.list_proxy_profiles().unwrap().is_empty());
+    }
+
+    // A bundle holding a proxy that lists one DNS server twice, which no
+    // save takes, is refused whole with what a save says.
+    #[test]
+    fn a_bundle_with_a_proxy_listing_a_server_twice_is_refused() {
+        let source = Database::open_in_memory().unwrap();
+        source.save_proxy_profile(&wireguard_tunnel()).unwrap();
+        let mut archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        let metadata = rewrite_table_objects(archive.staging.path(), "proxy_profiles", |row| {
+            let mut config: JsonValue =
+                serde_json::from_str(row["config"].as_str().unwrap()).unwrap();
+            let server = config["dns_servers"][0].clone();
+            config["dns_servers"].as_array_mut().unwrap().push(server);
+            row.insert("config".into(), JsonValue::from(config.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        archive.tables.insert("proxy_profiles".into(), metadata);
+
+        let target = Database::open_in_memory().unwrap();
+        let error = target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap_err();
+        assert_eq!(
+            error.refusal().map(|refusal| refusal.code),
+            Some(crate::proxies::NetworkRefusal::ProxyDnsServerDuplicate.code())
+        );
+        assert!(target.list_proxy_profiles().unwrap().is_empty());
+    }
+
+    // Ten listed servers, the most a save takes, over each wire.
+    fn ten_servers() -> crate::proxies::DnsServerList {
+        use crate::proxies::{DnsServerList, ListedServer, ListedWire};
+        DnsServerList {
+            id: 0,
+            name: "Ten".into(),
+            servers: (1..=10)
+                .map(|n| ListedServer {
+                    address: format!("192.0.2.{n}:853").parse().unwrap(),
+                    wire: if n % 2 == 0 {
+                        ListedWire::Https {
+                            path: "/dns-query".into(),
+                        }
+                    } else {
+                        ListedWire::Tls {
+                            name: Some(format!("dns{n}.example")),
+                        }
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    // A source whose Outbound route asks the ten servers from its egress,
+    // validating their answers here.
+    fn source_with_listed_dns() -> (
+        Database,
+        crate::proxies::DnsServerList,
+        crate::proxies::DnsProfile,
+    ) {
+        use crate::proxies::{Consumer, DnsProfile, DnsTransit, DnsTrust, DnsWho, RoutingPolicy};
+        let source = Database::open_in_memory().unwrap();
+        let list = source.save_dns_server_list(ten_servers(), true).unwrap();
+        let profile = source
+            .save_dns_profile(
+                DnsProfile {
+                    kind: crate::proxies::DnsProfileKind::Route,
+                    id: 0,
+                    name: "Listed".into(),
+                    who: DnsWho::Weaver,
+                    transit: Some(DnsTransit::Egress),
+                    trust: DnsTrust::Validate,
+                    server_list_id: Some(list.id),
+                    system_fallback: false,
+                },
+                true,
+            )
+            .unwrap();
+        source
+            .save_proxy_routing_policy(
+                Consumer::Outbound,
+                &RoutingPolicy {
+                    dns_profile_id: Some(profile.id),
+                    ..RoutingPolicy::default()
+                },
+            )
+            .unwrap();
+        (source, list, profile)
+    }
+
+    // A route's DNS profile and the server list it asks survive a backup
+    // and a restore as they were saved.
+    #[test]
+    fn a_dns_profile_and_its_list_round_trip_through_a_bundle() {
+        let (source, list, profile) = source_with_listed_dns();
+        let archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+
+        let target = Database::open_in_memory().unwrap();
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap();
+        assert_eq!(target.list_dns_server_lists().unwrap(), [list]);
+        assert_eq!(
+            target.load_dns().unwrap().profiles,
+            std::collections::HashMap::from([(profile.id, profile.clone())])
+        );
+        assert_eq!(
+            target
+                .proxy_routing_policy(crate::proxies::Consumer::Outbound)
+                .unwrap()
+                .dns_profile(),
+            profile.id
+        );
+    }
+
+    // A bundle holding a server list or a profile no save would take is
+    // refused whole, and nothing of it is restored.
+    #[test]
+    fn a_bundle_with_dns_no_save_would_take_is_refused() {
+        let restore = |table: &str, rewrite: &dyn Fn(&mut JsonMap<String, JsonValue>)| {
+            let (source, _, _) = source_with_listed_dns();
+            let mut archive = source.export_logical_backup().unwrap();
+            let tables = archive.staging.path().join("tables");
+            let metadata = rewrite_table_objects(archive.staging.path(), table, |row| {
+                rewrite(row);
+                Ok(())
+            })
+            .unwrap();
+            archive.tables.insert(table.into(), metadata);
+            let target = Database::open_in_memory().unwrap();
+            let error = target
+                .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+                .unwrap_err();
+            assert!(target.list_dns_server_lists().unwrap().is_empty());
+            assert!(target.load_dns().unwrap().profiles.is_empty());
+            error.to_string()
+        };
+        let servers = |row: &mut JsonMap<String, JsonValue>,
+                       change: &dyn Fn(&mut Vec<JsonValue>)| {
+            let mut stored: JsonValue =
+                serde_json::from_str(row["servers"].as_str().unwrap()).unwrap();
+            change(stored["servers"].as_array_mut().unwrap());
+            row.insert("servers".into(), JsonValue::from(stored.to_string()));
+        };
+        let eleven = restore("dns_server_lists", &|row| {
+            servers(row, &|list| {
+                list.push(serde_json::json!({
+                    "address": "192.0.2.11:53", "wire": "Plain",
+                }))
+            });
+        });
+        let count = crate::proxies::NetworkRefusal::ProxyDnsServerCount.to_string();
+        assert!(eleven.contains(&count), "{eleven}");
+        let repeated = restore("dns_server_lists", &|row| {
+            servers(row, &|list| list[9] = list[0].clone());
+        });
+        let duplicate = crate::proxies::NetworkRefusal::ProxyDnsServerDuplicate.to_string();
+        assert!(repeated.contains(&duplicate), "{repeated}");
+        // The host answering takes nothing only Weaver's servers use.
+        let loose = restore("dns_profiles", &|row| {
+            row.insert("who".into(), "system".into());
+        });
+        assert!(loose.contains("not in the form a save stores"), "{loose}");
+    }
+
+    // A bundle from before a proxy spelled out its DNS names a resolver and
+    // a server list. It is restored as a server list and a profile on the
+    // route through the proxy, resolving as it did: those servers asked
+    // through the proxy.
+    #[test]
+    fn a_bundle_from_before_spelled_out_dns_restores_it_spelled_out() {
+        use crate::proxies::{
+            Consumer, DnsTransit, DnsTrust, DnsWho, ListedServer, ListedWire, ProxyKind,
+            ProxyProfile, ProxySecrets, ResolvedBy, RoutingPolicy,
+        };
+        use crate::schema_migrations::proxy_dns_v125::SCHEMA_VERSION;
+        // A restore checks a proxy without its keys, which a bundle keeps
+        // apart, so the proxy here is one that needs none.
+        let socks = ProxyProfile {
+            kind: ProxyKind::Socks5,
+            dns_servers: vec![],
+            tunnel_addresses: vec![],
+            peer_public_key: None,
+            secrets: ProxySecrets::default(),
+            ..wireguard_tunnel()
+        };
+        let source = Database::open_in_memory().unwrap();
+        let saved = source.save_proxy_profile(&socks).unwrap();
+        source
+            .save_proxy_routing_policy(
+                Consumer::Outbound,
+                &RoutingPolicy {
+                    proxy_ids: vec![saved.id],
+                    allow_direct: false,
+                    ..RoutingPolicy::default()
+                },
+            )
+            .unwrap();
+        let mut archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        // The profile and route as the build before 125 saved them.
+        let metadata = rewrite_table_objects(archive.staging.path(), "proxy_profiles", |row| {
+            let mut config: JsonValue =
+                serde_json::from_str(row["config"].as_str().unwrap()).unwrap();
+            let object = config.as_object_mut().unwrap();
+            object.insert("resolver".into(), "Proxy".into());
+            object.insert("dns_servers".into(), serde_json::json!(["10.63.0.1"]));
+            row.insert("config".into(), JsonValue::from(config.to_string()));
+            // Sealed with the source's key, which the target does not hold.
+            row.insert("password".into(), JsonValue::Null);
+            Ok(())
+        })
+        .unwrap();
+        archive.tables.insert("proxy_profiles".into(), metadata);
+        let metadata = rewrite_table_objects(archive.staging.path(), "proxy_routes", |row| {
+            row.remove("dns_profile_id");
+            Ok(())
+        })
+        .unwrap();
+        archive.tables.insert("proxy_routes".into(), metadata);
+        archive.tables.remove("dns_server_lists");
+        archive.tables.remove("dns_profiles");
+
+        let target = Database::open_in_memory().unwrap();
+        target
+            .import_logical_backup(&tables, &archive.tables, SCHEMA_VERSION - 1)
+            .unwrap();
+        let [restored] = target.list_proxy_profiles().unwrap().try_into().unwrap();
+        assert!(restored.dns_servers.is_empty());
+        let [list] = target.list_dns_server_lists().unwrap().try_into().unwrap();
+        assert_eq!(
+            list.servers,
+            [ListedServer {
+                address: "10.63.0.1:53".parse().unwrap(),
+                wire: ListedWire::Plain,
+            }]
+        );
+        let [_, profile] = target.list_dns_profiles().unwrap().try_into().unwrap();
+        assert_eq!(
+            (
+                profile.who,
+                profile.transit,
+                profile.trust,
+                profile.server_list_id
+            ),
+            (
+                DnsWho::Weaver,
+                Some(DnsTransit::Proxy),
+                DnsTrust::AsSent,
+                Some(list.id)
+            )
+        );
+        assert_eq!(
+            target
+                .proxy_routing_policy(Consumer::Outbound)
+                .unwrap()
+                .dns_profile(),
+            profile.id
+        );
+        assert_eq!(
+            profile.resolved_by(Some(ProxyKind::Socks5), false),
+            Some(ResolvedBy::ProxyServers)
+        );
+    }
+
+    // A bundle carries each proxy's keys sealed with the key it also
+    // carries, so a restore that holds that key judges a WireGuard or SSH
+    // proxy with its keys and brings it back as it was.
+    #[test]
+    fn a_bundle_with_proxies_that_need_keys_restores_them() {
+        use crate::proxies::{ProxyKind, ProxyProfile, ProxySecrets};
+        let ssh = ProxyProfile {
+            id: 1,
+            name: "jump".into(),
+            kind: ProxyKind::Ssh,
+            port: 22,
+            dns_servers: vec![],
+            tunnel_addresses: vec![],
+            peer_public_key: None,
+            secrets: ProxySecrets {
+                username: Some("weaver".into()),
+                private_key: Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into()),
+                ..Default::default()
+            },
+            ..wireguard_tunnel()
+        };
+        let source = Database::open_in_memory().unwrap();
+        let saved = [
+            source.save_proxy_profile(&wireguard_tunnel()).unwrap(),
+            source.save_proxy_profile(&ssh).unwrap(),
+        ];
+        let archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+
+        let mut target = Database::open_in_memory().unwrap();
+        target.set_encryption_key(source.encryption_key().unwrap().clone());
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap();
+        let restored = target.list_proxy_profiles().unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(restored[0].secrets, saved[0].secrets);
+        assert_eq!(restored[1].secrets, saved[1].secrets);
     }
 
     #[test]

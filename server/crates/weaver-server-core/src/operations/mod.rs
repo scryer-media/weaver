@@ -54,7 +54,9 @@ pub use metrics_store::{
     ROLLUP_1H_RESOLUTION_SECS, ROLLUP_1H_RETENTION_SECS, ROLLUP_5M_RESOLUTION_SECS,
     ROLLUP_5M_RETENTION_SECS, RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
 };
-pub use recovery::{RecoveredServerState, RestoreCandidate, recover_server_state};
+pub use recovery::{
+    RecoveredServerState, RestoreCandidate, recover_server_state, recover_server_state_with,
+};
 pub(crate) use recovery::{apply_password_override, read_stored_files, restore_request};
 pub use usage_history::{
     FinishedJobCounts, JOBS_FINISHED, JOBS_REPAIRED, REMOVED_SERVER_ID_PREFIX, RecoveryBytes,

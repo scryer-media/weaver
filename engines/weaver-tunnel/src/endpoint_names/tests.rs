@@ -16,6 +16,14 @@ fn egress() -> Arc<Egress> {
     ))
 }
 
+// A slot holding the names of a System profile.
+fn system() -> Arc<crate::pipe::NamesSlot> {
+    Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        crate::pipe::DnsChoice::System,
+        None,
+    )))
+}
+
 fn host_lookups() -> u64 {
     let metrics = crate::metrics::snapshot();
     let resolved: u64 = metrics
@@ -44,7 +52,7 @@ async fn a_wireguard_endpoint_name_is_asked_of_the_egress_beneath() {
     let bottom = egress();
     let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver))
         .with_udp_factory(bottom.clone())
-        .with_endpoint_resolver(Arc::new(EndpointNames(bottom)));
+        .with_endpoint_resolver(Arc::new(EndpointNames(bottom, system())));
 
     let before = host_lookups();
     let recording = Arc::new(record::Recording::default());
@@ -90,7 +98,7 @@ async fn a_leg_that_resolves_no_names_refuses_an_endpoint_name() {
         }
     }
     let error = crate::endpoint::EndpointResolver::resolve(
-        &EndpointNames(Arc::new(HandsOn)),
+        &EndpointNames(Arc::new(HandsOn), system()),
         "vpn.example.test",
     )
     .await
@@ -154,4 +162,49 @@ async fn an_http3_tunnel_without_a_resolver_refuses_a_proxy_name() {
         recording.finish("proxy.example.test", 443, None).is_none(),
         "the proxy name reached a resolver"
     );
+}
+
+// A session's endpoint is asked with its own slot's names whichever route
+// dials, and from its own tasks alike; a reload swaps them in place. A slot
+// with no names refuses the lookup and never takes the dialling route's.
+#[tokio::test]
+async fn an_endpoint_name_is_asked_with_the_slots_names_whichever_route_dials() {
+    use crate::endpoint::EndpointResolver;
+    use crate::pipe::{DnsChoice, Names, NamesSlot};
+    let refused = |why: &str| Names::new(DnsChoice::Refused(why.into()), None);
+    let slot = Arc::new(NamesSlot::new(refused("the slot's profile")));
+    let names = EndpointNames(egress(), slot.clone());
+
+    let error = names.resolve("localhost").await.unwrap_err().to_string();
+    assert!(error.contains("the slot's profile"), "{error}");
+
+    let dialling = Names::scope(
+        Some(refused("the dialling route's profile")),
+        names.resolve("localhost"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(dialling.contains("the slot's profile"), "{dialling}");
+
+    // A profile edit swaps the slot's names; the next lookup uses them,
+    // whichever route dials.
+    slot.set(Names::new(DnsChoice::System, None));
+    let addresses = Names::scope(
+        Some(refused("the dialling route's profile")),
+        names.resolve("localhost"),
+    )
+    .await
+    .unwrap();
+    assert!(!addresses.is_empty());
+
+    let unowned = EndpointNames(egress(), Arc::new(NamesSlot::default()));
+    let dialling = Names::scope(
+        Some(refused("the dialling route's profile")),
+        unowned.resolve("localhost"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(dialling.contains("not set"), "{dialling}");
 }

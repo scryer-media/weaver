@@ -24,6 +24,7 @@ pub(crate) mod history_search_key_v88;
 mod history_swept_v91;
 pub(crate) mod networking_bandwidth_v94;
 pub(crate) mod nzb_tables_v85;
+pub(crate) mod proxy_dns_v125;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
@@ -41,7 +42,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 124;
+const CURRENT_SCHEMA_VERSION: i64 = 125;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -914,6 +915,9 @@ async fn run_rust_hook(
         tracker_hosts_v105::HOOK_ID => {
             tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
         }
+        proxy_dns_v125::HOOK_ID => {
+            proxy_dns_v125::dns_profiles_from_proxies(&mut SqlConn::Sqlite(tx)).await
+        }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
         ))),
@@ -1488,7 +1492,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 124);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 125);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)

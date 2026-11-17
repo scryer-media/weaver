@@ -3,7 +3,12 @@
 
 /** Whether torrents are on, and the torrents there are, as the server says. */
 export interface TorrentPresence {
-  /** The settings turn torrents on. */
+  /**
+   * The server has torrents at all: it was started with `WEAVER_TORRENTS`
+   * set. While false nothing else here is true, whatever the settings say.
+   */
+  available: boolean;
+  /** Torrents are available and the settings turn them on. */
   enabled: boolean;
   /** There is a torrent job, in any state. */
   jobs: boolean;
@@ -25,13 +30,36 @@ export interface TorrentPresence {
  * never hides the torrents still there. Until the answer comes, or while the
  * read fails, they stay hidden and torrent-only routes wait: nothing shows
  * and then goes, and a failed read is never taken for off.
+ *
+ * "unavailable" is a server started without torrents: it has none to show
+ * and no way to turn them on, so nothing of theirs shows at all, the
+ * Torrents settings and their switch included.
  */
-export type TorrentsState = "on" | "off" | "unknown";
+export type TorrentsState = "on" | "off" | "unavailable" | "unknown";
 
 /** The state from the server's answer: none yet, or a failed read, is unknown. */
 export function torrentsStateFrom(presence: TorrentPresence | null | undefined): TorrentsState {
   if (!presence) return "unknown";
+  if (!presence.available) return "unavailable";
   return presence.enabled || presence.jobs ? "on" : "off";
+}
+
+/**
+ * Whether the server has torrents, turned on or not: only once known to.
+ * What shows even while torrents are off shows by this: the Torrents
+ * settings, where they are turned on, and the names of the torrent events a
+ * script can run on.
+ */
+export function torrentsAvailable(state: TorrentsState): boolean {
+  return state === "on" || state === "off";
+}
+
+/**
+ * What a screen that is there whenever the server has torrents draws:
+ * `there` while it has them, `none` once known not to, `pending` until then.
+ */
+export function torrentsAvailableView<T>(state: TorrentsState, there: T, none: T, pending: T): T {
+  return torrentsAvailable(state) ? there : state === "unknown" ? pending : none;
 }
 
 /** Whether torrent things show: only once known to. */
@@ -43,15 +71,16 @@ export function torrentsShown(state: TorrentsState): boolean {
  * Whether a screen offers to start a torrent (a magnet link, a .torrent file):
  * only while the switch is on, as the server says. Torrent jobs left while
  * torrents are off, or winding down, still show, but no new one is offered,
- * since the server refuses it. Unknown offers none, as torrent things wait.
+ * since the server refuses it. Unknown offers none, as torrent things wait, and
+ * so does a server without torrents.
  */
 export function torrentAddsOffered(presence: TorrentPresence | null | undefined): boolean {
-  return presence?.enabled === true;
+  return presence?.available === true && presence.enabled === true;
 }
 
 /** What a torrent-only screen draws: `on` while torrent things show, `off` once known not to, `pending` until then. */
 export function torrentsView<T>(state: TorrentsState, on: T, off: T, pending: T): T {
-  return state === "on" ? on : state === "off" ? off : pending;
+  return state === "on" ? on : state === "unknown" ? pending : off;
 }
 
 /** `items` without the torrent-only ones while torrent things do not show. */

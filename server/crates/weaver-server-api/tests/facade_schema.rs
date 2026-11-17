@@ -38,8 +38,9 @@ fn exported_schema_has_no_trailing_whitespace() {
 // No field a client reads returns a password. Inputs may take one; every
 // field of an output type that names a password says only whether there is
 // one, except the settings' password-file path, the settings object
-// (which carries only `hasPasswords` and that path), and the closed enum
-// naming where an archive's password came from.
+// (which carries only `hasPasswords` and that path), the closed enum
+// naming where an archive's password came from, and a count of passwords,
+// which is a number and so can hold none.
 #[test]
 fn no_output_field_returns_a_password() {
     let sdl = export_schema_sdl();

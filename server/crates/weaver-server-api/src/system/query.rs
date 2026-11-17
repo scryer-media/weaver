@@ -179,6 +179,7 @@ impl SystemQuery {
     ) -> Result<crate::system::types::TorrentPresence> {
         let enabled = ctx.data::<SharedConfig>()?.read().await.torrent.enabled;
         Ok(crate::system::types::TorrentPresence::of(
+            *ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?,
             enabled,
             ctx.data_opt::<weaver_server_core::torrents::service::TorrentService>(),
         ))

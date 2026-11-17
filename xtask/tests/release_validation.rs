@@ -24,6 +24,11 @@ if [ "$1" = "${FAIL_VALIDATION_STAGE:-}" ]; then exit 51; fi
 "#,
             ),
             ("cargo-xwin", "exit 0\n"),
+            // The host name lookup lint's tools and toolchain are found, or
+            // "installed", here: nothing on the host is asked or changed.
+            ("cargo-dylint", "exit 0\n"),
+            ("dylint-link", "exit 0\n"),
+            ("rustup", "exit 0\n"),
             (
                 "docker",
                 "printf '%s\\n' \"$*\" >> \"$DOCKER_COMMAND_LOG\"\nexit 0\n",
@@ -92,10 +97,11 @@ fn clippy_runs_host_and_windows_without_a_container_engine() {
         .unwrap();
     assert_passed(&output);
     let calls = tools.cargo_calls();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 3);
     assert!(calls[0].starts_with("clippy --workspace --locked "));
-    assert!(calls[1].starts_with("xwin clippy --target x86_64-pc-windows-msvc "));
-    for call in calls {
+    assert!(calls[1].starts_with("dylint --path lints/host_name_lookup --workspace -- --locked "));
+    assert!(calls[2].starts_with("xwin clippy --target x86_64-pc-windows-msvc "));
+    for (at, call) in calls.iter().enumerate() {
         for flag in [
             "--workspace",
             "--locked",
@@ -107,7 +113,8 @@ fn clippy_runs_host_and_windows_without_a_container_engine() {
         ] {
             assert!(call.split_whitespace().any(|arg| arg == flag), "{call}");
         }
-        assert!(call.ends_with("-- -D warnings"), "{call}");
+        // The lint run takes the same targets and denies in its own crate.
+        assert_eq!(call.ends_with("-- -D warnings"), at != 1, "{call}");
     }
     tools.assert_no_docker();
 }
@@ -136,7 +143,7 @@ fn a_windows_clippy_failure_fails_validation() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert_eq!(tools.cargo_calls().len(), 2);
+    assert_eq!(tools.cargo_calls().len(), 3);
     tools.assert_no_docker();
 }
 

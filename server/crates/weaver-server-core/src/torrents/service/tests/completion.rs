@@ -3048,3 +3048,62 @@ async fn a_file_a_move_kept_is_not_deleted_with_the_torrents_files() {
     assert!(!there.join("small.txt").exists());
     rig.service.stop().await;
 }
+
+// A start without torrents leaves a torrent a stop left retiring as it is:
+// its row stays and nothing of it is archived. The next start with torrents
+// finishes the removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_without_torrents_leaves_a_retiring_torrent_as_it_is() {
+    use crate::persistence::ArchiveNews;
+    use crate::torrents::TorrentAvailability;
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (news, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    rig.db.hear_archive_news(move |said| {
+        let _ = news.send(said);
+    });
+    let bytes = [0x5a_u8; 300];
+    let files: [(&str, &[u8]); 1] = [("ember.mkv", &bytes)];
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "ember", &files, 128, false,
+        ))))
+        .await
+        .unwrap();
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    rig.service.remove(job_id, false, false).await.unwrap();
+    assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
+    rig.service.stop().await;
+
+    let data = rig.dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let work = rig.dir.path().join("work");
+    let before = rig.db.get_torrent(job_id).unwrap().expect("left retiring");
+    crate::operations::recover_server_state_with(
+        &rig.db,
+        &data,
+        &work,
+        TorrentAvailability::UNAVAILABLE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rig.db.get_torrent(job_id).unwrap(), Some(before));
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+
+    crate::operations::recover_server_state_with(
+        &rig.db,
+        &data,
+        &work,
+        TorrentAvailability::AVAILABLE,
+    )
+    .await
+    .unwrap();
+    assert!(rig.db.get_torrent(job_id).unwrap().is_none());
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_some());
+}

@@ -76,7 +76,7 @@ import { NextShell } from "../shell/NextShell";
 import { describeFailedArchive, describeArchiveHistory, rowOperationKind } from "../data/history-archive";
 import { useArchiveHistory } from "../data/use-archive-history";
 import { extendKept, LIST_PAGE_SIZE, prependOlder, showsMore } from "../data/list-pages";
-import { jobIds, testIds } from "@/next/testids";
+import { jobIds, testIds, torrentIds } from "@/next/testids";
 import { SupportReportActions } from "../features/SupportReportActions";
 import { TorrentDetail, useTorrent } from "../features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
@@ -663,6 +663,7 @@ function JobDetailContent() {
                   icon={token === "paused" ? "resume" : "pause"}
                   size="compact"
                   disabled={busy}
+                  testId={token === "paused" ? torrentIds.jobResume : torrentIds.jobPause}
                   onClick={() => {
                     void run(
                       token === "paused" ? t("next.job.report.resumed") : t("next.job.report.paused"),
@@ -675,6 +676,7 @@ function JobDetailContent() {
                 <SecondaryButton
                   size="compact"
                   disabled={busy || torrent === null}
+                  testId={torrent?.forced ? torrentIds.jobUnforce : torrentIds.jobForce}
                   onClick={() => {
                     const forced = !(torrent?.forced ?? false);
                     void run(t(forced ? "next.torrent.forced" : "next.torrent.unforced"), () =>
@@ -701,7 +703,13 @@ function JobDetailContent() {
                 >
                   {t("next.categories.category")}
                 </SecondaryButton>
-                <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setRemovingTorrent(true)}>
+                <DangerButton
+                  icon="remove"
+                  size="compact"
+                  disabled={busy}
+                  onClick={() => setRemovingTorrent(true)}
+                  testId={torrentIds.jobRemove}
+                >
                   {t("next.common.remove")}
                 </DangerButton>
               </>
@@ -855,6 +863,7 @@ function JobDetailContent() {
             decimals={1}
             barClassName="min-w-0 flex-1"
             percentClassName="text-[13px] font-medium text-wv-fg"
+            percentTestId={jobIds.jobProgress}
           />
           <div className="font-wv-mono text-[11.5px] text-wv-muted">{statusSentence}</div>
         </div>

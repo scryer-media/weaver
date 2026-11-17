@@ -4,7 +4,10 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use super::{ConnectionOutcome, DialError, Dialed, DialedStream, Dialer, Resolution, Target};
+use super::{
+    ConnectionOutcome, DialError, Dialed, DialedStream, Dialer, Names, NamesSlot, Resolution,
+    Target,
+};
 use crate::endpoint::DatagramTransport;
 
 // One leg's sockets and streams. Revocation also cancels in-flight opens.
@@ -14,6 +17,9 @@ pub struct Revocable {
     streams: Arc<crate::direct::Streams>,
     slots: Arc<tokio::sync::Semaphore>,
     outcomes: Mutex<Vec<Weak<ConnectionOutcome>>>,
+    // The names the leg dials and resolves with. A reload swaps the slot,
+    // or the names in it, without touching anything the leg holds.
+    names: Mutex<Option<Arc<NamesSlot>>>,
 }
 
 impl Revocable {
@@ -24,7 +30,35 @@ impl Revocable {
             streams: Default::default(),
             slots: Arc::new(tokio::sync::Semaphore::new(16384)),
             outcomes: Mutex::new(Vec::new()),
+            names: Mutex::new(None),
         }
+    }
+    // A leg that dials and resolves with the names in `slot`.
+    pub fn named(inner: Arc<dyn Dialer>, slot: Arc<NamesSlot>) -> Self {
+        let leg = Self::new(inner);
+        leg.set_names(slot);
+        leg
+    }
+    // Dial and resolve with the names in `slot` from now on. Nothing the
+    // leg holds is ended.
+    pub fn set_names(&self, slot: Arc<NamesSlot>) {
+        *self.names.lock().expect("leg names") = Some(slot);
+    }
+    // The slot this leg reads its names from, if it has one.
+    pub fn names_slot(&self) -> Option<Arc<NamesSlot>> {
+        self.names.lock().expect("leg names").clone()
+    }
+    // The names this leg dials with now: those of the dial in scope, which
+    // a caller dialling through a shared leg for a route of its own sets,
+    // else the leg's.
+    pub fn names(&self) -> Option<Names> {
+        Names::current().or_else(|| {
+            self.names
+                .lock()
+                .expect("leg names")
+                .as_ref()
+                .and_then(|slot| slot.get())
+        })
     }
     pub async fn cancelled(&self) {
         self.streams.cancelled().await;
@@ -44,7 +78,7 @@ impl Revocable {
         let mut dialed = tokio::select! {
             biased;
             _ = self.streams.cancelled() => return Err(DialError::Skipped("leg revoked".into())),
-            result = inner.dial(target) => result?,
+            result = Names::scope(self.names(), inner.dial(target)) => result?,
         };
         dialed.stream = match dialed.stream {
             DialedStream::Socket(socket) => {
@@ -110,7 +144,7 @@ impl Dialer for Revocable {
         self.sockets
             .check()
             .map_err(|e| DialError::Skipped(e.to_string()))?;
-        self.inner.resolve(host).await
+        Names::scope(self.names(), self.inner.resolve(host)).await
     }
     fn room(&self, purpose: &super::Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
         self.inner.room(purpose)

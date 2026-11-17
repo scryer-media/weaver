@@ -164,8 +164,8 @@ test("E09 egress tests report the source address, go through a proxy, and fail w
   const fixture = await fixtureState(request);
   const primary = await world.profile({
     name: "e09-primary", kind: "HTTP_CONNECT", enabled: true, host: hostAddress("proxy-fixture", "a"), port: fixture.ports.primary!,
-    username: "fixture", password: "fixture", dnsServers: [hostAddress("proxy-fixture", "a")], timeoutSeconds: 5,
-  });
+    username: "fixture", password: "fixture", timeoutSeconds: 5,
+  }, "fixture");
   const direct = await testEgress(request, egress.id, DIRECT_HOST, 119);
   expect(direct).toMatchObject({ success: true, proxyId: null });
   expect(direct.sourceAddress?.replace(/:\d+$/, "")).toBe(egressAddress("a"));

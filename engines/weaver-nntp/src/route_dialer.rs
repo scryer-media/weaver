@@ -46,10 +46,17 @@ impl Dialer for AddressPlanned {
             self.egress.clone(),
         ));
         let plan = self.plan.clone();
-        let (socket, peer) = tokio::task::spawn_blocking(move || plan.connect(&dialer))
-            .await
-            .map_err(|e| DialError::Egress(std::io::Error::other(e)))?
-            .map_err(|error| self.egress.connect_error(error))?;
+        // A blocking thread is outside the task, so the route's names go
+        // with the work.
+        let names = weaver_tunnel::pipe::Names::current();
+        let (socket, peer) = tokio::task::spawn_blocking(move || {
+            weaver_tunnel::pipe::Names::sync_scope(names, || {
+                weaver_tunnel::pipe::blocking(|| plan.connect(&dialer))
+            })
+        })
+        .await
+        .map_err(|e| DialError::Egress(std::io::Error::other(e)))?
+        .map_err(|error| self.egress.connect_error(error))?;
         socket.set_nonblocking(true).map_err(DialError::Egress)?;
         let source = socket.local_addr().ok();
         let stream = tokio::net::TcpStream::from_std(socket).map_err(DialError::Egress)?;

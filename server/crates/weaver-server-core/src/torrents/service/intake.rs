@@ -933,10 +933,13 @@ impl TorrentService {
             }
             return;
         }
+        // Its trackers name by its route's profile, on whichever session.
+        let naming = self.inner.sessions.torrent_names(&plan, &session).await;
         let mut options = AddTorrentOptions {
             list_only: true,
             tracker_tiers,
             identity: Some(identity.clone()),
+            naming: Some(naming.naming()),
             ..Default::default()
         };
         terms.apply(&mut options);

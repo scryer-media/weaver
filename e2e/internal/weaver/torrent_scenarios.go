@@ -710,7 +710,7 @@ func (lane *torrentLane) saveProxy(name, kind string, port int) (int, error) {
 		return 0, errors.New("the proxy fixture is not running")
 	}
 	// Every proxy listener of the fixture asks for the same credentials.
-	input := map[string]any{"name": name, "kind": kind, "enabled": true, "host": lane.proxyIP, "port": port, "resolver": "PROXY",
+	input := map[string]any{"name": name, "kind": kind, "enabled": true, "host": lane.proxyIP, "port": port,
 		"username": "fixture", "password": "fixture"}
 	var saved struct{ SaveProxyProfile struct{ ID int } }
 	err := lane.gql(`mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }`, map[string]any{"input": input}, &saved)
@@ -719,12 +719,35 @@ func (lane *torrentLane) saveProxy(name, kind string, port int) (int, error) {
 
 func (lane *torrentLane) saveTorrentRoute(kind string, id int, proxyID int) error {
 	path := map[string]any{"direct": true}
+	// Zero is the built-in System DNS profile: the host resolves.
+	dnsProfileID := 0
 	if proxyID > 0 {
 		path = map[string]any{"ladder": map[string]any{"rungs": []map[string]any{{"proxy": proxyID}}, "directFallback": false}}
+		profile, err := lane.proxyDNSProfile()
+		if err != nil {
+			return err
+		}
+		dnsProfileID = profile
 	}
-	route := map[string]any{"failover": "HOLD", "legs": []map[string]any{{"egressId": 0, "weight": 100, "path": path}}}
+	route := map[string]any{"failover": "HOLD", "dnsProfileId": dnsProfileID, "legs": []map[string]any{{"egressId": 0, "weight": 100, "path": path}}}
 	return lane.gql(`mutation($kind: NetworkConsumerKind!, $id: Int!, $input: RouteInput!) { saveNetworkRoute(kind: $kind, id: $id, input: $input) { consumer } }`,
 		map[string]any{"kind": kind, "id": id, "input": route}, nil)
+}
+
+// proxyDNSProfile is the lane's one profile for proxied routes, which hands
+// tracker and peer names to the proxy. Every proxied route shares it.
+func (lane *torrentLane) proxyDNSProfile() (int, error) {
+	if lane.proxyDNSProfileID != 0 {
+		return lane.proxyDNSProfileID, nil
+	}
+	var saved struct{ SaveDnsProfile struct{ ID int } }
+	if err := lane.gql(`mutation($input: DnsProfileInput!) { saveDnsProfile(input: $input) { id } }`, map[string]any{"input": map[string]any{
+		"name": "lane-proxy-dns", "kind": "ROUTE", "who": "PROXY", "transit": nil, "trust": "AS_SENT", "serverListId": nil, "systemFallback": false,
+	}}, &saved); err != nil {
+		return 0, err
+	}
+	lane.proxyDNSProfileID = saved.SaveDnsProfile.ID
+	return lane.proxyDNSProfileID, nil
 }
 
 type proxyEvent struct {

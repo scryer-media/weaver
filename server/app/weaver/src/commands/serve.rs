@@ -209,9 +209,21 @@ pub(crate) async fn run(
         handle.note_server_probe_latency(server_id, latency);
     }
 
-    let recovered_state =
-        weaver_server_core::operations::recover_server_state(&db, &data_dir, &intermediate_dir)
-            .await?;
+    // Whether this run has torrents at all: the first of their two opt-ins,
+    // read here once and handed down. Nothing below reads the environment
+    // for it.
+    let torrent_availability = weaver_server_core::torrents::TorrentAvailability::of_env_value(
+        std::env::var(weaver_server_core::torrents::TORRENTS_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let recovered_state = weaver_server_core::operations::recover_server_state_with(
+        &db,
+        &data_dir,
+        &intermediate_dir,
+        torrent_availability,
+    )
+    .await?;
     let initial_history = recovered_state.initial_history;
     let to_restore = recovered_state.to_restore;
     let initial_holds = recovered_state.initial_holds;
@@ -346,28 +358,39 @@ pub(crate) async fn run(
     let post_processing_executor = pipeline.post_processing_executor();
     // The torrent client starts with the server, on when the settings turn it
     // on, and runs on the pipeline's budget; one that cannot start leaves the
-    // rest of the server running.
-    let torrents = {
-        let config = shared_config.read().await.clone();
-        match weaver_server_core::torrents::service::TorrentService::for_server(
-            &config,
-            db.clone(),
-            &proxies,
-            &pipeline,
-            volume_writers,
-            volume_buffers,
-            handle.clone(),
-            crashed_torrents,
-        )
-        .await
-        {
-            Ok(torrents) => Some(torrents),
-            Err(error) => {
-                error!(%error, "the torrent client did not start");
-                None
+    // rest of the server running. A run without torrents builds no client:
+    // nothing of theirs opens, listens or loads, the stored torrents stay as
+    // they are, and an intake's torrent is refused as it is while the
+    // settings turn torrents off.
+    if !torrent_availability.available() {
+        info!(
+            variable = weaver_server_core::torrents::TORRENTS_ENV,
+            "torrents are not available in this run; set the variable to 1 to make them available"
+        );
+    }
+    let torrents = torrent_availability
+        .client(&handle, || async {
+            let config = shared_config.read().await.clone();
+            match weaver_server_core::torrents::service::TorrentService::for_server(
+                &config,
+                db.clone(),
+                &proxies,
+                &pipeline,
+                volume_writers,
+                volume_buffers,
+                handle.clone(),
+                crashed_torrents,
+            )
+            .await
+            {
+                Ok(torrents) => Some(torrents),
+                Err(error) => {
+                    error!(%error, "the torrent client did not start");
+                    None
+                }
             }
-        }
-    };
+        })
+        .await;
     let scheduled_resume =
         weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
 
@@ -507,6 +530,7 @@ pub(crate) async fn run(
             spawn_history_delete_worker: true,
             post_processing_executor: Some(post_processing_executor),
             torrents: torrents.clone(),
+            torrent_availability,
             usage_recorder: Some(Arc::clone(&usage_recorder)),
         },
         backup.clone(),
@@ -583,6 +607,7 @@ pub(crate) async fn run(
         disk_space: storage_capacity,
         restart: restart_controller.clone(),
         torrents: torrents.clone(),
+        torrent_availability,
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
     // Start-up housekeeping nothing serving a request waits on runs once the

@@ -722,7 +722,7 @@ async fn a_cancel_mid_run_ends_cancelled_with_the_bytes_moved_so_far() {
 #[tokio::test]
 async fn a_downed_rung_is_absent_from_every_connection_path() {
     let h = harness().await;
-    let response = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080}){id}}"#).await;
+    let response = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080}){id}}"#).await;
     assert_no_errors(&response);
     let proxy = response_data(&response)["saveProxyProfile"]["id"]
         .as_u64()
@@ -999,4 +999,23 @@ async fn a_torrent_run_on_a_feed_or_with_torrents_off_is_refused_by_code() {
         ))
         .await;
     assert_eq!(refusal(&response).1, "SPEED_TEST_TORRENTS_OFF");
+}
+
+// A path test of a torrent on a server without torrents is refused as a
+// torrent speed test is, before anything is fetched: the source it would
+// read is never asked.
+#[tokio::test]
+async fn a_torrent_path_test_is_refused_on_a_server_without_torrents() {
+    use weaver_server_core::speed_test::torrent_fixture::TorrentFixture;
+    let h = harness().await;
+    let fixture = TorrentFixture::start(true).await;
+    let request = common::local_request(format!(
+        "mutation{{testVia(route:{DIRECT},torrent:true){{success}}}}"
+    ))
+    .data(fixture.source.clone())
+    .data(weaver_server_core::torrents::TorrentAvailability::UNAVAILABLE);
+    let response = h.schema.execute(request).await;
+    assert_eq!(refusal(&response).1, "SPEED_TEST_TORRENTS_OFF");
+    assert!(fixture.announces().borrow().is_empty());
+    fixture.stop().await;
 }

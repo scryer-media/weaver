@@ -22,9 +22,9 @@ fn hop(
     credentials: Option<(&str, &str)>,
     inner: Arc<dyn Dialer>,
 ) -> Arc<TransportHop> {
-    Arc::new(TransportHop {
-        id: 7,
-        spec: TransportProxy {
+    Arc::new(TransportHop::new(
+        7,
+        TransportProxy {
             kind,
             host: endpoint.ip().to_string(),
             port: endpoint.port(),
@@ -32,10 +32,14 @@ fn hop(
             password: credentials.map(|(_, password)| password.into()),
         },
         inner,
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        failure: HopFailure::default(),
-    })
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
+        HopFailure::default(),
+    ))
 }
 
 // A pause the test ends. It records each pause asked for, and lasts until
