@@ -109,6 +109,7 @@ impl Replay {
                 }
             }
         }));
+        self.access.let_go();
         if staged.is_err() {
             self.access.repaired.failed = Some(LeafError::Io {
                 device: crate::pipeline::graph::limits::Device::Working,
@@ -228,6 +229,8 @@ impl NamespaceWriter {
                 scratch: None,
                 shutdown: Shutdown::default(),
                 withheld: std::collections::BTreeSet::new(),
+                working: self.working_volume(),
+                reading: RefCell::default(),
             };
             let mut seen = BTreeSet::new();
             for member in volumes.values() {

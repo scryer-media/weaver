@@ -259,6 +259,11 @@ pub struct TorrentStateLive {
     // Closed off the uTP threads: the last hold of the run may be a peer's
     // task on one.
     pub(crate) files: DropOffShard<FileStorage>,
+    // The read turns of the volume the files are on, asked of the storage
+    // when the run begins and again when the files move: every read of the
+    // files takes one of them. A connection takes its copy once, when it
+    // starts, and is handed the new one when the files move.
+    pub(crate) reads: arc_swap::ArcSwap<crate::storage::ReadTurns>,
 
     per_piece_locks: Vec<RwLock<()>>,
 
@@ -470,6 +475,23 @@ impl TorrentStateLive {
     /// Bans `ip`; see [`PeerStates::ban`].
     pub(crate) fn ban_peer(&self, ip: std::net::IpAddr) {
         self.peers.ban(ip);
+    }
+
+    /// The torrent's files moved: the reads of the run take the turns of
+    /// the volume they are on now, asked of the storage again. Each live
+    /// connection is handed them on its writer's queue, and takes them
+    /// between two of its batches; one that goes live after this reads
+    /// them when it starts.
+    pub(crate) fn files_moved(&self) {
+        let turns = self.files.read_turns();
+        self.reads.store(Arc::new(turns.clone()));
+        self.peers.for_each_live(|_, _, live| {
+            let _ = live
+                .tx
+                .send(crate::peer_connection::WriterRequest::ReadTurns(
+                    turns.clone(),
+                ));
+        });
     }
 
     /// Bans `peer` for the bad data it sent. A peer of the swarm is banned
@@ -809,8 +831,11 @@ impl crate::peer_connection::ChunkReader for UploadReader {
         &self,
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
+        held: Option<&mut crate::file_ops::HeldPiece>,
     ) -> std::result::Result<(), (usize, anyhow::Error)> {
-        self.state.file_ops().read_chunks(self.addr, chunks, bufs)
+        self.state
+            .file_ops()
+            .read_chunks(self.addr, chunks, bufs, held)
     }
 }
 

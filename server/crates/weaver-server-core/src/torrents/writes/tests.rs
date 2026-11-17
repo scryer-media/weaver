@@ -174,3 +174,24 @@ fn a_dropped_reservation_is_given_back() {
     drop(paid);
     assert_eq!(volume.unwritten_bytes(), 0);
 }
+
+// Every torrent on a volume reads in the one set of turns that volume
+// has, the turns its writes' volume holds: a read turn taken for one is
+// gone for the other. A volume whose kind is not known reads as a
+// solid-state one, eight at once, block by block.
+#[test]
+fn torrents_on_one_volume_share_its_read_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = TorrentDisk::alone();
+    let one = disk.writes(1, dir.path());
+    let two = disk.writes(2, dir.path());
+    let (a, b) = (one.read_turns(), two.read_turns());
+    assert!(!a.whole_pieces());
+    let held = Arc::clone(a.semaphore()).try_acquire_many_owned(8).unwrap();
+    assert_eq!(b.semaphore().available_permits(), 0);
+    drop(held);
+    assert_eq!(b.semaphore().available_permits(), 8);
+    let volume = one.volume();
+    let reads = volume.reads(|| unreachable!("the kind is decided once"));
+    assert!(Arc::ptr_eq(reads.turns(), a.semaphore()));
+}

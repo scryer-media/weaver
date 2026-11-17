@@ -15,6 +15,7 @@ use crate::runtime::StartupDiskGate;
 use crate::runtime::system_profile::{FilesystemType, StorageClass};
 
 pub(crate) mod holes;
+pub(crate) mod reader;
 mod storage_kind;
 pub(crate) mod volume;
 pub(crate) mod volume_buffers;

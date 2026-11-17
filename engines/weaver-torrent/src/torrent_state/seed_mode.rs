@@ -77,15 +77,17 @@ impl Drop for Checking {
     }
 }
 
-// One of the session's blocking permits, waited for on the calling thread:
-// for a check of a seed-mode piece that no peer's request runs, which is
-// called off the async runtime. The checks of seed-mode pieces that read
-// at once, whoever asked for them, are as many as the session has permits.
-// None once the session's permits are closed.
-pub(crate) fn blocking_permit(
+// One read turn of `turns`, the torrent's volume's, waited for on the
+// calling thread: for a check of a seed-mode piece that no peer's request
+// runs, which is called off the async runtime. The checks of seed-mode
+// pieces that read at once, whoever asked for them, are as many as the
+// volume has turns, shared with every other read of it.
+pub(crate) fn read_turn(
     spawner: &crate::spawn_utils::BlockingSpawner,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    futures::executor::block_on(spawner.owned_permit()).ok()
+    turns: &crate::storage::ReadTurns,
+) -> tokio::sync::OwnedSemaphorePermit {
+    crate::spawn_utils::no_block_on_utp_thread();
+    futures::executor::block_on(turns.owned_turn(spawner.stats()))
 }
 
 // The read of a seed-mode check, `read`, of a piece of `bytes`, counted

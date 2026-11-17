@@ -128,6 +128,8 @@ pub struct DiskStats {
     check_wait_nanos: AtomicU64,
     hash_busy_nanos: AtomicU64,
     hash_jobs_queued: AtomicU64,
+    // Reads handed off a thread that may not block and not begun yet.
+    read_jobs_queued: AtomicU64,
     read_buffer_growths: AtomicU64,
     // Writers holding a batch buffer.
     batch_buffers: AtomicU64,
@@ -294,6 +296,16 @@ impl DiskStats {
         self.hash_jobs_queued.fetch_sub(1, Relaxed);
     }
 
+    /// A read was handed off a thread that may not block.
+    pub fn read_queued(&self) {
+        self.read_jobs_queued.fetch_add(1, Relaxed);
+    }
+
+    /// A read handed off begun, or was dropped unrun.
+    pub fn read_taken(&self) {
+        self.read_jobs_queued.fetch_sub(1, Relaxed);
+    }
+
     pub fn read_buffers_grew(&self, times: u64) {
         self.read_buffer_growths.fetch_add(times, Relaxed);
     }
@@ -354,6 +366,7 @@ impl DiskStats {
             check_wait_nanos: self.check_wait_nanos.load(Relaxed),
             hash_busy_nanos: self.hash_busy_nanos.load(Relaxed),
             hash_jobs_queued: self.hash_jobs_queued.load(Relaxed),
+            read_jobs_queued: self.read_jobs_queued.load(Relaxed),
             read_buffer_growths: self.read_buffer_growths.load(Relaxed),
             batch_buffers: self.batch_buffers.load(Relaxed),
             read_seeks: self.read_seeks.load(Relaxed),

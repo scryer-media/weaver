@@ -77,13 +77,18 @@ impl RewalkLoan {
                 whole = false;
                 break;
             }
-            if let Some((volume, piece)) = self.rewalk.read(index, &mut placed)
+            let read = self.rewalk.read(index, &mut placed);
+            // Each piece waits for the loop to hear it, reading nothing:
+            // the loan's read turn goes back meanwhile.
+            access.let_go();
+            if let Some((volume, piece)) = read
                 && !said(volume, piece, access.scratch_read())
             {
                 whole = false;
                 break;
             }
         }
+        self.access.let_go();
         let _ = self.access.repaired.discard();
         whole
     }
@@ -141,6 +146,8 @@ impl NamespaceWriter {
             scratch: None,
             shutdown: Shutdown::default(),
             withheld: BTreeSet::new(),
+            working: self.working_volume(),
+            reading: RefCell::default(),
         };
         let mut seen = BTreeSet::new();
         for (volume, member) in volumes {
