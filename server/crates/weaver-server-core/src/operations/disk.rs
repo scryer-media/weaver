@@ -30,7 +30,7 @@ pub(crate) use storage_kind::filesystem_name;
 pub(crate) use storage_kind::{StorageKind, storage_kind};
 pub use volume_buffers::VolumeBuffers;
 #[allow(unused_imports)]
-pub(crate) use volume_probe::{ProbeStore, probe_once};
+pub(crate) use volume_probe::{ProbeStore, probe_once, volume_write_probe_disabled};
 pub use writer::VolumeWriters;
 
 // Capacity for the filesystem backing a path.

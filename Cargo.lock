@@ -3681,9 +3681,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c26ff4dc62c0d93420fe90d87c905c66da3bd13d2a1036a67004a48d00103c8a"
+checksum = "6c77c65675099cc57866d63a55cca3d8b28167c5bbf77315a1d04922049c4964"
 dependencies = [
  "bytes",
  "cap-std",
