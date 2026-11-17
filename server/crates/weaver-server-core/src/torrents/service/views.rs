@@ -350,15 +350,18 @@ impl Unviewed {
 }
 
 impl TorrentService {
-    // The torrents, as queue items, into the published queue, and with
-    // their sessions as the tick last read them, as the exporter reads
-    // them: one reading of each torrent.
+    // The torrents, as queue items, into the published queue, as rows into
+    // the snapshot, and with their sessions as the tick last read them, as
+    // the exporter reads them: one reading of each torrent.
     pub(super) async fn publish(&self) {
         let now = self.inner.clock.unix_ms();
+        // Whether every stored torrent is here, taken before they are read.
+        let every = self.whole().is_ok();
+        let stamp = self.inner.snapshot.stamp();
         // Presence is counted in the walk that picks the torrents.
         let mut presence = Presence::default();
         let listed = self
-            .listed_noting(None, false, now, |torrent| presence.note(torrent))
+            .listed_noting(None, false, true, now, |torrent| presence.note(torrent))
             .await;
         let sessions = self
             .inner
@@ -366,7 +369,13 @@ impl TorrentService {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let (views, torrents): (Vec<TorrentView>, Vec<TorrentSeries>) = listed.into_iter().unzip();
+        let mut torrents = Vec::with_capacity(listed.len());
+        let mut rows = Vec::with_capacity(listed.len());
+        for (view, series, totals) in listed {
+            torrents.push(series);
+            rows.push((view, totals));
+        }
+        self.inner.snapshot.replace(&rows, every, stamp);
         self.inner.presence.send_if_modified(|was| {
             let changed = *was != presence;
             *was = presence;
@@ -377,6 +386,7 @@ impl TorrentService {
             .published
             .send_replace(Arc::new(Published { torrents, sessions }));
         if let Some(queue) = self.queue() {
+            let views = rows.into_iter().map(|(view, _)| view).collect();
             queue.publish_owned_jobs(
                 crate::jobs::Protocol::Torrent,
                 self.with_retiring(job_infos(views, now)),
@@ -385,22 +395,49 @@ impl TorrentService {
     }
 
     // The job of `job_id`, which changed, into the published queue beside
-    // the others as they stand: a settle reads the torrents that spoke, not
-    // every one (libtorrent posts a state update for the torrents that
-    // changed). The exporter's reading takes it at the next publish of
-    // every torrent.
+    // the others as they stand, and its row into the snapshot: a settle
+    // reads the torrents that spoke, not every one (libtorrent posts a
+    // state update for the torrents that changed). The exporter's reading
+    // takes it at the next publish of every torrent.
     pub(super) async fn publish_job(&self, job_id: JobId) {
+        let now = self.inner.clock.unix_ms();
+        let stamp = self.inner.snapshot.stamp();
+        let view = self.torrent(job_id).await;
+        self.inner.snapshot.put_one(job_id, view.as_ref(), stamp);
         let Some(queue) = self.queue() else {
             return;
         };
-        let now = self.inner.clock.unix_ms();
-        if let Some(view) = self.torrent(job_id).await {
+        if let Some(view) = view {
             let status = job_status(&view);
             queue.publish_owned_job(
                 crate::jobs::Protocol::Torrent,
                 report(view, status, now).job_info(),
             );
         }
+    }
+
+    // Each row's tags as the tags now stand: the tags move a row with no
+    // publish of the torrents.
+    pub(super) fn retag(&self) {
+        let stamp = self.inner.snapshot.stamp();
+        match self.inner.db.tag_snapshot() {
+            Ok(tags) => self
+                .inner
+                .snapshot
+                .retag(|job_id| tags.of(job_id).to_vec(), stamp),
+            Err(error) => tracing::warn!(error = %error, "could not read the tags"),
+        }
+    }
+
+    // The rows follow the tags as they change.
+    pub(super) fn spawn_follow_tags(&self) {
+        let service = self.clone();
+        let mut changes = self.inner.db.subscribe_tag_changes();
+        self.keep(tokio::spawn(async move {
+            while changes.changed().await.is_ok() {
+                service.retag();
+            }
+        }));
     }
 
     /// Warnings that stand: the stored torrents not all loaded, and the
@@ -437,6 +474,10 @@ impl TorrentService {
         reading: Reading,
         now: i64,
     ) -> TorrentView {
+        #[cfg(any(test, feature = "test-support"))]
+        self.inner
+            .views_built
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (state, why) = status::project(&torrent.observed(reading.engine));
         let status::WhyParts {
             detail,
@@ -700,29 +741,37 @@ impl TorrentService {
         files: bool,
         now: i64,
     ) -> Vec<(TorrentView, TorrentSeries)> {
-        self.listed_noting(category, files, now, |_| {}).await
+        self.listed_noting(category, files, false, now, |_| {})
+            .await
+            .into_iter()
+            .map(|(view, series, _)| (view, series))
+            .collect()
     }
 
     // As `listed`, with `note` shown every live torrent in the walk that
-    // picks them.
+    // picks them, and with the totals of their files when `totals` asks for
+    // them (default ones otherwise).
     async fn listed_noting(
         &self,
         category: Option<&str>,
         files: bool,
+        totals: bool,
         now: i64,
         note: impl FnMut(&Live) + Send,
-    ) -> Vec<(TorrentView, TorrentSeries)> {
+    ) -> Vec<(TorrentView, TorrentSeries, FileTotals)> {
         let shown = if files { Shown::WHOLE } else { Shown::LISTED };
         let pick = Pick {
             category: category.map(CategoryPick::Named),
             ..Pick::default()
         };
-        self.listed_by(shown, true, false, now, |settings, live| {
+        self.listed_by(shown, true, totals, now, |settings, live| {
             pick.ids_noting(settings, live, note)
         })
         .await
         .into_iter()
-        .map(|(view, series, _)| (view, series.expect("asked for")))
+        .map(|(view, series, totals)| {
+            (view, series.expect("asked for"), totals.unwrap_or_default())
+        })
         .collect()
     }
 

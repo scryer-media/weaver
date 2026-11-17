@@ -2291,11 +2291,12 @@ async fn torrent_updates_follow_the_torrents_named() {
 }
 
 // While the stored torrents are still being read at start, a page of the
-// list is read and answered, and the updates of every torrent are refused
-// under their own code, never begun from some of them; the updates of one
-// torrent are given. Once the last is in, every torrent's are.
+// list is read and answered, and the updates of a page's torrents are
+// refused under their own code, never begun from some of them; the updates
+// of one torrent are given. Once the last is in, the page's are. Every
+// torrent is never followed: a follow names one torrent or a page of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_updates_of_every_torrent_wait_for_the_load() {
+async fn the_updates_of_a_page_wait_for_the_load() {
     use tokio_stream::StreamExt;
 
     let before = rig().await;
@@ -2359,8 +2360,12 @@ async fn the_updates_of_every_torrent_wait_for_the_load() {
         .data(rig.torrents.clone());
         rig.harness.schema.execute_stream(request)
     };
-    let refused = updates("").next().await.expect("an answer");
+    let page = format!("(ids: {ids:?})");
+    let refused = updates(&page).next().await.expect("an answer");
     assert_eq!(code(&refused).as_deref(), Some("TORRENTS_LOADING"));
+    let every = updates("").next().await.expect("an answer");
+    assert!(!every.errors.is_empty());
+    assert_ne!(code(&every).as_deref(), Some("TORRENTS_LOADING"));
     let one = updates(&format!("(id: {})", ids[2]))
         .next()
         .await
@@ -2373,7 +2378,7 @@ async fn the_updates_of_every_torrent_wait_for_the_load() {
 
     rig.torrents.hold_load(false);
     rig.torrents.loaded().await;
-    let every = updates("").next().await.expect("an answer");
+    let every = updates(&page).next().await.expect("an answer");
     assert!(every.errors.is_empty(), "{:?}", every.errors);
     assert_eq!(
         every.data.into_json().unwrap()["torrentUpdates"]["torrents"]

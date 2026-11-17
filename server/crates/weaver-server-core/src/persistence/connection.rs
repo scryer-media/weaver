@@ -1615,6 +1615,9 @@ pub struct Database {
     // How many times a consumer's routing policy was read from its row.
     #[cfg(test)]
     pub(crate) proxy_route_reads: Arc<AtomicUsize>,
+    // How many times the datastore was taken for a statement, read or write.
+    #[cfg(any(test, feature = "test-support"))]
+    datastore_takes: Arc<AtomicUsize>,
     pub(crate) rss_schedule_cache: Arc<crate::rss::ScheduleCache>,
     pub(crate) script_runtime: Arc<crate::post_processing::events::ScriptRuntime>,
     target: DatabaseTarget,
@@ -1707,6 +1710,8 @@ impl Database {
             torrent_reads: Arc::default(),
             #[cfg(test)]
             proxy_route_reads: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            datastore_takes: Arc::default(),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             target,
             sql_services,
@@ -1747,6 +1752,8 @@ impl Database {
             torrent_reads: Arc::default(),
             #[cfg(test)]
             proxy_route_reads: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            datastore_takes: Arc::default(),
             sql_services,
             sql_worker,
             writer_tx,
@@ -1770,7 +1777,18 @@ impl Database {
     }
 
     pub(crate) fn datastore(&self) -> StoreDatastore {
+        #[cfg(any(test, feature = "test-support"))]
+        self.datastore_takes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.sql_services.datastore()
+    }
+
+    /// How many times a statement took the datastore, to read or to write:
+    /// what a test reads to know a path touched the database not at all.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn datastore_takes(&self) -> usize {
+        self.datastore_takes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // Stable, non-sensitive name of the configured persistence engine.
@@ -1987,6 +2005,8 @@ impl Database {
             torrent_reads: self.torrent_reads.clone(),
             #[cfg(test)]
             proxy_route_reads: self.proxy_route_reads.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            datastore_takes: self.datastore_takes.clone(),
             sql_services: self.sql_services.clone(),
             sql_worker: self.sql_worker.clone(),
             writer_tx: detached_tx,

@@ -7,10 +7,19 @@
 
 //! The RC4 stream cipher, as the encrypted peer handshake uses it.
 
+/// One entry of the state. On x86-64 each entry has a 32-bit word of its
+/// own, so a read of one entry never shares a word with a recent store to a
+/// neighbour; AMD cores hold such a read back until the store is done.
+/// Elsewhere a byte.
+#[cfg(target_arch = "x86_64")]
+type Cell = u32;
+#[cfg(not(target_arch = "x86_64"))]
+type Cell = u8;
+
 /// RC4 state. Encryption and decryption are the same operation.
 #[derive(Clone)]
 pub(crate) struct Rc4 {
-    s: [u8; 256],
+    s: [Cell; 256],
     i: u8,
     j: u8,
     /// Keystream bytes produced, shared with every clone.
@@ -24,13 +33,13 @@ impl Rc4 {
             !key.is_empty() && key.len() <= 256,
             "RC4 key must be 1..=256 bytes"
         );
-        let mut s = [0u8; 256];
+        let mut s = [0; 256];
         for (v, i) in s.iter_mut().zip(0..=255u8) {
-            *v = i;
+            *v = Cell::from(i);
         }
         let mut j = 0u8;
         for (i, &k) in (0..256).zip(key.iter().cycle()) {
-            j = j.wrapping_add(s[i]).wrapping_add(k);
+            j = j.wrapping_add(low(s[i])).wrapping_add(k);
             s.swap(i, usize::from(j));
         }
         Self {
@@ -50,13 +59,22 @@ impl Rc4 {
     }
 
     /// XOR the keystream into `buf`.
-    ///
-    /// Eight keystream bytes are gathered into a word and XORed into the
-    /// buffer at once, so each byte costs the two state stores and no store
-    /// of its own (libtorrent `rc4_encrypt`, src/pe_crypto.cpp, RC_2_1).
     pub fn apply(&mut self, buf: &mut [u8]) {
         #[cfg(test)]
         self.count(buf.len());
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            // SAFETY: the CPU has SSE4.1, checked just above.
+            unsafe { self.apply_ahead(buf) };
+            return;
+        }
+        self.apply_words(buf);
+    }
+
+    /// Eight keystream bytes are gathered into a word and XORed into the
+    /// buffer at once, so each byte costs the two state stores and no store
+    /// of its own (libtorrent `rc4_encrypt`, src/pe_crypto.cpp, RC_2_1).
+    fn apply_words(&mut self, buf: &mut [u8]) {
         let (mut i, mut j) = (self.i, usize::from(self.j));
         let s = &mut self.s;
         let (words, tail) = buf.as_chunks_mut::<8>();
@@ -71,6 +89,108 @@ impl Rc4 {
             *b ^= step(s, &mut i, &mut j);
         }
         self.i = i;
+        self.j = j.to_le_bytes()[0];
+    }
+
+    /// Sixteen bytes a round, with the state entries for `i` read three steps
+    /// ahead of their use.
+    ///
+    /// The next `j` is the last one plus `s[i + 1]`. Read after the store to
+    /// `s[j]`, as the textbook loop has it, that entry may be the one just
+    /// stored, and Intel's larger cores then hold the read back until the
+    /// store's address is known: one load and one add per byte in a row,
+    /// about 8 cycles. Here `s[i + 3]` is read before the step's two stores,
+    /// so it never waits on them, and three steps leave the read time to land
+    /// on AMD's cores too; a store that lands on one of the three entries
+    /// read ahead (`j` is `i + 1` to `i + 3`, 3 times in 256) takes a cold
+    /// path that reads them again. That test runs on a counter of its own,
+    /// `j` less the round's first `i`, one add a step, so it never lengthens
+    /// the chain from one `j` to the next. The round starts where `i + 1` is
+    /// a multiple of 16, so every `i` offset is a constant, and the sixteen
+    /// keystream bytes are gathered in one SSE register and XORed in at once.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse4.1")]
+    fn apply_ahead(&mut self, buf: &mut [u8]) {
+        use core::arch::x86_64::{
+            _mm_cvtsi128_si64, _mm_extract_epi64, _mm_insert_epi8, _mm_setzero_si128,
+        };
+        let mut at = 0;
+        while at < buf.len() && !self.i.wrapping_add(1).is_multiple_of(16) {
+            let mut j = usize::from(self.j);
+            buf[at] ^= step(&mut self.s, &mut self.i, &mut j);
+            self.j = j.to_le_bytes()[0];
+            at += 1;
+        }
+        let (rounds, tail) = buf[at..].as_chunks_mut::<16>();
+        if !rounds.is_empty() {
+            let s = &mut self.s;
+            let mut j = self.j;
+            // The round's first i, and the entries for it and the next two.
+            let mut b = usize::from(self.i.wrapping_add(1)) & 0xf0;
+            let mut t1 = s[b];
+            let mut t2 = s[b + 1];
+            let mut t3 = s[b + 2];
+            // `j` less `b`; only its low byte is read.
+            let mut d = u32::from(j.wrapping_sub(b.to_le_bytes()[0]));
+            for round in rounds {
+                let nb = (b + 16) & 0xf0;
+                // Entry `n` of the round, which runs into the next.
+                let at = |n: usize| if n < 16 { b + n } else { nb + n - 16 };
+                let mut v = _mm_setzero_si128();
+                macro_rules! step {
+                    ($n:literal) => {
+                        let tx = t1;
+                        j = j.wrapping_add(low(tx));
+                        let jj = usize::from(j);
+                        let ty = s[jj];
+                        let ahead = s[at($n + 3)];
+                        s[jj] = tx;
+                        s[b + $n] = ty;
+                        t1 = t2;
+                        t2 = t3;
+                        t3 = ahead;
+                        d = d.wrapping_add(tx);
+                        if d.wrapping_sub($n + 1).to_le_bytes()[0] < 3 {
+                            std::hint::cold_path();
+                            t1 = s[at($n + 1)];
+                            t2 = s[at($n + 2)];
+                            t3 = s[at($n + 3)];
+                        }
+                        let k = low(s[(tx as usize + ty as usize) & 0xff]);
+                        v = _mm_insert_epi8::<$n>(v, i32::from(k));
+                    };
+                }
+                step!(0);
+                step!(1);
+                step!(2);
+                step!(3);
+                step!(4);
+                step!(5);
+                step!(6);
+                step!(7);
+                step!(8);
+                step!(9);
+                step!(10);
+                step!(11);
+                step!(12);
+                step!(13);
+                step!(14);
+                step!(15);
+                let (lo, hi) = round.split_at_mut(8);
+                let lo: &mut [u8; 8] = lo.try_into().unwrap();
+                let hi: &mut [u8; 8] = hi.try_into().unwrap();
+                *lo = (u64::from_le_bytes(*lo) ^ _mm_cvtsi128_si64(v) as u64).to_le_bytes();
+                *hi = (u64::from_le_bytes(*hi) ^ _mm_extract_epi64::<1>(v) as u64).to_le_bytes();
+                d = d.wrapping_sub(16);
+                b = nb;
+            }
+            self.i = b.to_le_bytes()[0].wrapping_sub(1);
+            self.j = j;
+        }
+        let mut j = usize::from(self.j);
+        for t in tail {
+            *t ^= step(&mut self.s, &mut self.i, &mut j);
+        }
         self.j = j.to_le_bytes()[0];
     }
 
@@ -91,16 +211,22 @@ impl Rc4 {
 /// unmasked so that the dependency from one byte to the next is a single add,
 /// with the mask taken off that chain where `j` indexes the state.
 #[inline(always)]
-fn step(s: &mut [u8; 256], i: &mut u8, j: &mut usize) -> u8 {
+fn step(s: &mut [Cell; 256], i: &mut u8, j: &mut usize) -> u8 {
     *i = i.wrapping_add(1);
     let ii = usize::from(*i);
     let ti = s[ii];
-    *j = j.wrapping_add(usize::from(ti));
+    *j = j.wrapping_add(ti as usize);
     let jj = *j & 0xff;
     let tj = s[jj];
     s[ii] = tj;
     s[jj] = ti;
-    s[usize::from(ti.wrapping_add(tj))]
+    low(s[(ti as usize + tj as usize) & 0xff])
+}
+
+/// An entry's value, which is always below 256.
+#[inline(always)]
+fn low(v: Cell) -> u8 {
+    v.to_le_bytes()[0]
 }
 
 #[cfg(test)]
@@ -292,7 +418,7 @@ mod tests {
     }
 
     fn assert_same_state(c: &Rc4, r: &Reference, what: &str) {
-        assert_eq!(c.s, r.s, "{what}: state");
+        assert_eq!(c.s.map(super::low), r.s, "{what}: state");
         assert_eq!((c.i, c.j), (r.i, r.j), "{what}: i, j");
     }
 
@@ -364,6 +490,46 @@ mod tests {
             // Applying it again restores the plaintext.
             Rc4::new_discard_1024(&key).apply(&mut cut);
             assert_eq!(cut, plain);
+        }
+    }
+
+    /// Both x86-64 loops, the read-ahead one and the fallback for a CPU
+    /// without SSE4.1, against the reference, with the loop changed from
+    /// one call to the next so each picks up where the other left off.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn rc4_read_ahead_and_fallback_loops_match_the_reference_from_any_point() {
+        let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
+        let mut rng = Seeded(0x00a4_eaad);
+        for round in 0..48 {
+            let key_len = 1 + rng.below(256);
+            let key = rng.bytes(key_len);
+            let mut c = Rc4::new(&key);
+            let mut r = Reference::new(&key);
+            let mut calls = 0;
+            let mut total = 0;
+            while total < 70_000 {
+                let len = match rng.below(4) {
+                    0 => rng.below(17),
+                    1 => rng.below(300),
+                    2 => 1448 + rng.below(3),
+                    _ => 16_397 + rng.below(16_400),
+                };
+                let plain = rng.bytes(len);
+                let mut got = plain.clone();
+                let mut want = plain;
+                if sse41 && rng.below(2) == 0 {
+                    // SAFETY: the CPU has SSE4.1, checked above.
+                    unsafe { c.apply_ahead(&mut got) };
+                } else {
+                    c.apply_words(&mut got);
+                }
+                r.apply(&mut want);
+                assert_eq!(got, want, "round {round}, call {calls}, len {len}");
+                assert_same_state(&c, &r, "after the call");
+                calls += 1;
+                total += len;
+            }
         }
     }
 

@@ -395,9 +395,9 @@ async fn a_magnets_trackers_read_as_announced_while_its_metainfo_is_fetched() {
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
     let job_id = fetching_from(&rig.service, &"fe".repeat(20), port).await;
-    // A fetch's table is followed like a run's; the beat covers the view
-    // changes nothing pushes.
-    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+    // A fetch's table is followed like a run's: its tracker's answers move
+    // the torrent's row, which wakes its follower.
+    let mut updates = rig.service.updates(job_id);
 
     let mut started = heard_announce(&listener).await;
     let updating = loop {
@@ -464,7 +464,7 @@ async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_t
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
     let job_id = fetching_from(&rig.service, &"fd".repeat(20), port).await;
-    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+    let mut updates = rig.service.updates(job_id);
 
     started_and_answered(&listener, &mut updates).await;
     let table = rig.service.inner.live.lock().await[&job_id]
@@ -513,7 +513,7 @@ async fn a_magnet_removed_before_its_metainfo_leaves_no_directory() {
             .unwrap_or(0)
     };
     let job_id = fetching_from(&rig.service, &"fc".repeat(20), port).await;
-    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+    let mut updates = rig.service.updates(job_id);
     started_and_answered(&listener, &mut updates).await;
     assert_eq!(left(), 0);
 
@@ -538,7 +538,7 @@ async fn a_magnet_fetching_when_its_route_changes_fetches_again_on_the_new_route
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
     let job_id = fetching_from(&rig.service, &"fc".repeat(20), port).await;
-    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+    let mut updates = rig.service.updates(job_id);
     started_and_answered(&listener, &mut updates).await;
     let old = rig.service.inner.live.lock().await[&job_id]
         .route
@@ -603,7 +603,7 @@ async fn a_magnet_added_paused_announces_only_once_resumed() {
         &format!("http://127.0.0.1:{port}/announce"),
     )
     .await;
-    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+    let mut updates = rig.service.updates(job_id);
 
     rig.service.resume(job_id).await.unwrap();
     started_and_answered(&listener, &mut updates).await;

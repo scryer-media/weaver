@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use weaver_server_core::torrents::service::TorrentPieces;
+use weaver_server_core::torrents::service::fingerprint::ViewParts;
 use weaver_server_core::torrents::service::listing::FileTotals;
 use weaver_server_core::torrents::{FilePriority, NamedBy, TorrentTracker, TrackerStatus};
 
@@ -310,71 +311,31 @@ async fn torrents_info_answers_the_same_without_the_files() {
     }));
 }
 
-// One `sync/maindata` client's answers, built from the rows given.
-struct Client<V> {
-    table: SyncTable,
+// One `sync/maindata` client's answers as the facade gave them before the
+// snapshot: every torrent's view, with its files, read on every poll.
+struct OldClient {
+    table: sync::old::SyncTable,
     rid: u64,
     built: usize,
-    _rows: std::marker::PhantomData<V>,
 }
 
-impl<V> Client<V> {
-    fn new() -> Self {
-        Self {
-            table: SyncTable::default(),
-            rid: 0,
-            built: 0,
-            _rows: std::marker::PhantomData,
-        }
-    }
-
-    fn poll(
-        &mut self,
-        rid: u64,
-        rows: Vec<Row<'_, V>>,
-        steady: impl Fn(&V) -> Vec<(&'static str, Value)>,
-        clock: impl Fn(&V) -> [(&'static str, Value); CLOCK_KEYS],
-    ) -> String {
+impl OldClient {
+    fn poll(&mut self, rid: u64, views: &[&TorrentView], scope: CallerScope, at: i64) -> String {
         let built = std::cell::Cell::new(0);
-        let fields = Fields {
-            steady: |row: &V| {
+        let fields = sync::old::Fields {
+            steady: |view: &TorrentView| {
                 built.set(built.get() + 1);
-                steady(row)
+                let mut row = steady_fields(view, scope);
+                row.retain(|(name, _)| *name != "hash");
+                row.extend(announce_stats(&TrackerSummary::of(view)));
+                row
             },
-            clock,
+            clock: |view: &TorrentView| clock_fields(view, at),
         };
-        let now = Poll {
-            torrents: rows,
-            categories: Vec::new(),
-            tags: Vec::new(),
-            server_state: Map::new(),
-            server_closed: 0,
-        };
-        let start = self.table.begin(&SyncClient::Anonymous, rid);
-        let (body, kept) = sync::answer(&start, now, &fields);
-        self.table.finish(&SyncClient::Anonymous, start.id(), kept);
-        self.rid = start.id();
-        self.built += built.get();
-        serde_json::to_string(&body).unwrap()
-    }
-}
-
-// `sync/maindata` over 10,000 torrents answers the same, byte for byte,
-// whether its rows carry their files or only their totals, across a run of
-// ids: unchanged polls, changed levels, bytes in hand and states, torrents
-// added and removed, a file renamed, and an id the client never held.
-#[test]
-fn maindata_answers_the_same_without_the_files() {
-    const AT: i64 = 1_700_000_500;
-    for scope in [CallerScope::Admin, CallerScope::Read] {
-        let mut views: Vec<TorrentView> = (0..TORRENTS).map(seeded_view).collect();
-        let mut old: Client<TorrentView> = Client::new();
-        let mut new: Client<(TorrentView, FileTotals)> = Client::new();
-        let mut steps = 0;
-        let mut poll = |views: &[TorrentView], rid: Option<u64>| {
-            let old_rows: Vec<Row<'_, TorrentView>> = views
+        let now = sync::old::Poll {
+            torrents: views
                 .iter()
-                .map(|view| Row {
+                .map(|&view| sync::old::Row {
                     hash: view.infohash.to_ascii_lowercase(),
                     fingerprint: {
                         let mut hasher = DefaultHasher::new();
@@ -386,37 +347,110 @@ fn maindata_answers_the_same_without_the_files() {
                         | u8::from(view.upload_limit == Some(0)) << 1,
                     view,
                 })
-                .collect();
-            let before = old.built;
-            let answer_old = old.poll(
-                rid.unwrap_or(old.rid),
-                old_rows,
-                |view| {
-                    let mut row = steady_fields(view, scope);
-                    row.retain(|(name, _)| *name != "hash");
-                    row.extend(announce_stats(view));
-                    row
-                },
-                |view| clock_fields(view, AT),
-            );
-            let rows = rows_of(views);
-            let answer_new = new.poll(
-                rid.unwrap_or(new.rid),
-                rows.iter().map(|row| maindata_row(row, scope)).collect(),
-                |(view, totals)| maindata_steady(view, *totals, scope),
-                |(view, _)| clock_fields(view, AT),
-            );
+                .collect(),
+            categories: Vec::new(),
+            tags: Vec::new(),
+            server_state: Map::new(),
+            server_closed: 0,
+        };
+        let start = self.table.begin(&SyncClient::Anonymous, rid);
+        let (body, kept) = sync::old::answer(&start, now, &fields);
+        self.table.finish(&SyncClient::Anonymous, start.id(), kept);
+        self.rid = start.id();
+        self.built += built.get();
+        serde_json::to_string(&body).unwrap()
+    }
+}
+
+// One `sync/maindata` client's answers as the facade gives them: from the
+// snapshot's rows, read only where they moved.
+#[derive(Default)]
+struct NewClient {
+    sync: ClientSync,
+    rid: u64,
+    built: usize,
+    read: usize,
+}
+
+impl NewClient {
+    fn poll(&mut self, rid: u64, snapshot: &Snapshot, scope: CallerScope, at: i64) -> String {
+        let built = std::cell::Cell::new(0);
+        let read = std::cell::Cell::new(0);
+        let fields = Fields {
+            steady: |row: &Arc<TorrentRow>| {
+                built.set(built.get() + 1);
+                maindata_steady(row, scope)
+            },
+            clock: |row: &Arc<TorrentRow>| {
+                read.set(read.get() + 1);
+                clock_fields(&row.view, at)
+            },
+        };
+        let others = Others {
+            categories: Vec::new(),
+            tags: Vec::new(),
+            server_state: Map::new(),
+            server_closed: 0,
+        };
+        let start = self.sync.begin(rid, u8::from(scope.can_control()));
+        let body = maindata_answer(
+            &mut self.sync,
+            &start,
+            Some(snapshot),
+            scope,
+            others,
+            &fields,
+        );
+        self.rid = start.id();
+        self.built += built.get();
+        self.read += read.get();
+        serde_json::to_string(&body).unwrap()
+    }
+}
+
+// `sync/maindata` over 10,000 torrents answers as it did before the
+// snapshot, byte for byte, across a run of ids: unchanged polls, changed
+// levels, bytes in hand and states, torrents added and removed, a file
+// renamed, and an id the client never held. The old answer read every view
+// with its files on every poll; the new one reads the snapshot's rows, which
+// carry no files or trackers, and only the rows that moved.
+#[test]
+fn maindata_answers_from_the_snapshot_as_from_every_view() {
+    const AT: i64 = 1_700_000_500;
+    for scope in [CallerScope::Admin, CallerScope::Read] {
+        let mut views: Vec<TorrentView> = (0..TORRENTS).map(seeded_view).collect();
+        let snapshot = Snapshot::default();
+        let mut old = OldClient {
+            table: sync::old::SyncTable::default(),
+            rid: 0,
+            built: 0,
+        };
+        let mut new = NewClient::default();
+        let mut steps = 0;
+        let mut poll = |views: &[TorrentView], rid: Option<u64>| {
+            let before = (old.built, new.read);
+            // The order the service lists them in.
+            let mut listed: Vec<&TorrentView> = views.iter().collect();
+            listed.sort_by_key(|view| (view.added_at_ms, view.job_id));
+            let answer_old = old.poll(rid.unwrap_or(old.rid), &listed, scope, AT);
+            snapshot.replace_every(&rows_of(views));
+            let answer_new = new.poll(rid.unwrap_or(new.rid), &snapshot, scope, AT);
             assert_eq!(answer_old, answer_new, "step {steps}");
             steps += 1;
-            (answer_new, old.built - before, new.rid)
+            (
+                answer_new,
+                old.built - before.0,
+                new.rid,
+                new.read - before.1,
+            )
         };
-        let (first, built, _) = poll(&views, Some(0));
+        let (first, built, _, read) = poll(&views, Some(0));
         assert!(first.contains("\"full_update\":true"));
-        assert_eq!(built, TORRENTS);
-        // Nothing moved.
-        let (same, built, rid) = poll(&views, None);
+        assert_eq!((built, read), (TORRENTS, TORRENTS));
+        // Nothing moved: the old answer read every row, the new one none.
+        let (same, built, rid, read) = poll(&views, None);
         assert_eq!(same, format!("{{\"rid\":{rid}}}"));
-        assert_eq!(built, 0);
+        assert_eq!((built, read), (0, 0));
         // Levels, bytes in hand and states move.
         for index in (0..TORRENTS).step_by(97) {
             let view = &mut views[index];
@@ -431,7 +465,9 @@ fn maindata_answers_the_same_without_the_files() {
             }
             view.state = STATES[(index / 97) % STATES.len()];
         }
-        poll(&views, None);
+        let (.., read) = poll(&views, None);
+        // The rows whose state moved, and none other.
+        assert!(read > 0 && read <= TORRENTS.div_ceil(97), "{read}");
         // A level that leaves the totals as they were.
         for index in (5..TORRENTS).step_by(6).take(40) {
             views[index].files[1].priority = FilePriority::Normal;
@@ -459,5 +495,6 @@ fn maindata_answers_the_same_without_the_files() {
         poll(&views, None);
         // The new path built no more rows than the old one.
         assert!(new.built <= old.built, "{} > {}", new.built, old.built);
+        assert!(new.read < old.built, "{} >= {}", new.read, old.built);
     }
 }
