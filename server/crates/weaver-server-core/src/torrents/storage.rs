@@ -27,7 +27,8 @@ use tokio::sync::Notify;
 use weaver_graph::holds::Reserve;
 use weaver_torrent::core::lengths::ValidPieceIndex;
 use weaver_torrent::storage::{
-    BoxStorageFactory, ReadTurns, StorageFactory, StorageFactoryExt, StoredPiece, TorrentStorage,
+    BoxStorageFactory, GivesRoomBack, HeldRoom, ReadTurns, StorageFactory, StorageFactoryExt,
+    StoredPiece, TorrentStorage,
 };
 use weaver_torrent::{ManagedTorrentShared, TorrentMetadata};
 
@@ -78,8 +79,8 @@ pub(crate) trait Pieces: Send + Sync {
     fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> std::io::Result<()>;
     // The file's `len` bytes from `offset` are about to be read in order.
     fn will_read(&self, _file: usize, _offset: u64, _len: u64) {}
-    // The read turns of the volume the files are on, asked once when a
-    // run of the torrent starts.
+    // The read turns of the volume the files are on, asked when a run of
+    // the torrent starts and when its files move.
     fn read_turns(&self) -> ReadTurns {
         ReadTurns::private()
     }
@@ -179,6 +180,12 @@ impl Inner {
         if let Some(room) = &*self.room.lock().unwrap_or_else(PoisonError::into_inner) {
             room.notify_waiters();
         }
+    }
+}
+
+impl GivesRoomBack for Inner {
+    fn give_back(&self, bytes: u64) {
+        self.release(bytes);
     }
 }
 
@@ -315,6 +322,17 @@ impl TorrentStorage for PieceStorage {
 
     fn read_turns(&self) -> ReadTurns {
         self.inner.pieces.read_turns()
+    }
+
+    // A piece an upload holds whole is held against the same resident
+    // budget as a piece in flight, before it is read; the session waiting
+    // for room is rung when it goes back.
+    fn hold_whole_piece(&self, bytes: u64) -> Option<HeldRoom> {
+        let holds = &self.inner.holds;
+        match holds.accountant.reserve_resident(holds.namespace, bytes) {
+            Reserve::Granted => Some(HeldRoom::new(bytes, Arc::clone(&self.inner) as _)),
+            Reserve::Breached(_) => None,
+        }
     }
 
     // A run of a file's bytes on disk is read in one go; one with any of

@@ -291,10 +291,15 @@ mod tests {
             let mut reads: Vec<_> = (0..8)
                 .map(|i| {
                     let gate = gate.clone();
-                    Box::pin(read_off_shard(session.handle(), &turns, &stats, move |_| {
-                        gate.lock().unwrap().recv().unwrap();
-                        i * 10
-                    }))
+                    Box::pin(read_off_shard(
+                        session.handle(),
+                        &turns,
+                        &stats,
+                        move |_| {
+                            gate.lock().unwrap().recv().unwrap();
+                            i * 10
+                        },
+                    ))
                 })
                 .collect();
             // Every reader waits before any read finishes.
@@ -384,19 +389,27 @@ mod tests {
         let first_ended = Arc::new(AtomicBool::new(false));
         let got = shard().block_on(async {
             let ended = first_ended.clone();
-            let mut first = Box::pin(read_off_shard(session.handle(), &turns, &stats, move |_| {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                ended.store(true, Ordering::Release);
-            }));
+            let mut first = Box::pin(read_off_shard(
+                session.handle(),
+                &turns,
+                &stats,
+                move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    ended.store(true, Ordering::Release);
+                },
+            ));
             assert!(futures::poll!(first.as_mut()).is_pending());
             started_rx.recv().unwrap();
             // The connection ends while its read runs.
             drop(first);
             let ended = first_ended.clone();
-            let mut next = Box::pin(read_off_shard(session.handle(), &turns, &stats, move |_| {
-                ended.load(Ordering::Acquire)
-            }));
+            let mut next = Box::pin(read_off_shard(
+                session.handle(),
+                &turns,
+                &stats,
+                move |_| ended.load(Ordering::Acquire),
+            ));
             assert!(futures::poll!(next.as_mut()).is_pending());
             assert_eq!(
                 turns.semaphore().available_permits(),

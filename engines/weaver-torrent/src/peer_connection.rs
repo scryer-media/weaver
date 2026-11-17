@@ -47,8 +47,8 @@ use tracing::{Instrument, debug, trace, trace_span};
 use crate::mse::{Encryption, EncryptionPolicy};
 use crate::session_stats::{Transport, disk::DiskOp};
 use crate::{
-    read_buf::ReadBuf,
     file_ops::HeldPiece,
+    read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
     ssl::SslTorrent,
     storage::ReadTurns,
@@ -363,6 +363,9 @@ pub enum WriterRequest {
     Answer(Answer),
     ReadChunkRequest(ChunkInfo),
     Disconnect(anyhow::Result<()>),
+    /// The torrent's files moved: the connection's upload reads take these
+    /// turns, of the volume they are on now, from here on.
+    ReadTurns(ReadTurns),
 }
 
 #[derive(Default, Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -1094,7 +1097,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // turn of the torrent's volume; on one that reads whole pieces the
         // connection holds the last piece it read, and serves the blocks
         // asked of it from there.
-        let turns = self.handler.read_turns();
+        // A move of the torrent's files hands the connection the turns of
+        // the volume they moved to (`WriterRequest::ReadTurns`), between
+        // two batches, the piece it held let go.
+        let mut turns = self.handler.read_turns();
         let mut held = turns.whole_pieces().then(HeldPiece::default);
         let on_utp = weaver_utp::on_shard_thread();
         let upload_reader = if on_utp {
@@ -1214,6 +1220,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             PIECE_MESSAGE_PREAMBLE_LEN + chunk.size as usize
                         }
                         WriterRequest::Disconnect(_) => 0,
+                        // New turns are taken between two batches: the
+                        // blocks framed before them read on the old ones.
+                        WriterRequest::ReadTurns(_) if batch.iter().any(|framed| framed.read) => {
+                            usize::MAX
+                        }
+                        WriterRequest::ReadTurns(_) => 0,
                         _ => longest_frame,
                     };
                     if filled > 0 && buf.len() - filled < needs {
@@ -1299,6 +1311,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                     kind: None,
                                 })
                             }
+                        }
+                        WriterRequest::ReadTurns(moved) => {
+                            held = moved.whole_pieces().then(HeldPiece::default);
+                            turns = moved;
+                            None
                         }
                         WriterRequest::Disconnect(res) => {
                             trace!("disconnect requested, closing writer");
@@ -1592,6 +1609,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::ReadTurns;
     use std::{
         io,
         net::SocketAddr,
@@ -2649,6 +2667,11 @@ mod tests {
         told: parking_lot::Mutex<Vec<Told>>,
         /// The piece whose block fails to read, if any.
         fails: Option<u32>,
+        /// The turns the connection starts with, the private ones if none.
+        turns: Option<ReadTurns>,
+        /// Turns watched: how many of each were free at each block read.
+        watched: Vec<Arc<tokio::sync::Semaphore>>,
+        free: parking_lot::Mutex<Vec<Vec<usize>>>,
     }
 
     impl PeerConnectionHandler for &Recorder {
@@ -2679,7 +2702,16 @@ mod tests {
         fn upload_done(&self, chunk: &ChunkInfo) {
             self.told.lock().push(Told::Done(chunk.piece_index.get()));
         }
+        fn read_turns(&self) -> ReadTurns {
+            self.turns.clone().unwrap_or_else(ReadTurns::private)
+        }
         fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
+            self.free.lock().push(
+                self.watched
+                    .iter()
+                    .map(|turns| turns.available_permits())
+                    .collect(),
+            );
             anyhow::ensure!(
                 self.fails != Some(chunk.piece_index.get()),
                 "piece {} cannot be read",
@@ -3187,6 +3219,32 @@ mod tests {
                 Told::Done(1)
             ]
         );
+    }
+
+    // The files moved while blocks were queued: the blocks queued before
+    // the move read in a turn of the volume they left, those after in one
+    // of the volume they are on now, and every turn comes back.
+    #[tokio::test(start_paused = true)]
+    async fn blocks_queued_after_the_files_moved_read_on_the_new_volumes_turns() {
+        let one = || Arc::new(tokio::sync::Semaphore::new(1));
+        let (left, now) = (one(), one());
+        let recorder = Recorder {
+            turns: Some(ReadTurns::new(Arc::clone(&left), false)),
+            watched: vec![Arc::clone(&left), Arc::clone(&now)],
+            ..Recorder::default()
+        };
+        let block = blocks_of(5);
+        let queued = vec![
+            WriterRequest::ReadChunkRequest(block(0)),
+            WriterRequest::ReadTurns(ReadTurns::new(Arc::clone(&now), false)),
+            WriterRequest::ReadChunkRequest(block(1)),
+            WriterRequest::Message(Message::Have(4)),
+        ];
+        let (result, wire, _) = serve_queued(&recorder, queued, &have_frame(4)).await;
+        assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
+        assert!(wire.ends_with(&[block_frame(0), block_frame(1), have_frame(4)].concat()));
+        assert_eq!(*recorder.free.lock(), [vec![0, 1], vec![1, 0]]);
+        assert_eq!((left.available_permits(), now.available_permits()), (1, 1));
     }
 
     // A request framed behind a block that fails to read is not written, and

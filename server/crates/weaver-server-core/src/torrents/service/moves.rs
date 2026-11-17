@@ -637,13 +637,20 @@ impl TorrentService {
         outcome: Result<Moved, NotMoved>,
         forgot: bool,
     ) -> Result<(), ActionError> {
-        let (moving, store) = self
+        let (moving, store, handle) = self
             .with_torrent(job_id, |torrent| {
                 torrent.settle(self.inner.clock.unix_ms());
-                Ok((torrent.moving.clone(), torrent.store.clone()))
+                Ok((
+                    torrent.moving.clone(),
+                    torrent.store.clone(),
+                    torrent
+                        .attached
+                        .as_ref()
+                        .map(|attached| Arc::clone(&attached.handle)),
+                ))
             })
             .await
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None));
         // The torrent stays moving until the check of what the move left
         // has forgotten its pieces (`move_over`): a recheck asked for
         // before then is refused, as during the move, so none runs on
@@ -651,6 +658,11 @@ impl TorrentService {
         // hears one `stopped` and one `started` of it, not two.
         match outcome {
             Ok(moved) => {
+                // A torrent running reads its files on the turns of the
+                // volume they moved to from now on, its connections too.
+                if let Some(handle) = &handle {
+                    handle.files_moved();
+                }
                 let kept_existing = !moved.kept.is_empty();
                 let to = moved.to.to_string_lossy().into_owned();
                 let files = matches!(moving, Some(Moving::Files));

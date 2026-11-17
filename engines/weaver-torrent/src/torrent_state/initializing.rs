@@ -511,33 +511,44 @@ impl TorrentStateInitializing {
             None => None,
         };
         info!("Doing initial checksum validation, this might take a while...");
-        // The check's reader takes a read turn of the torrent's volume for
-        // each read; its hashers read nothing and take none.
+        // The check runs in one read turn of the torrent's volume, taken
+        // once, as its blocking permits were; on a spinning volume its
+        // reader takes the one turn a piece at a time instead, so uploads
+        // read between two pieces. Its hashers read nothing.
         let threads = (self.metadata.lengths().total_pieces() as usize)
             .min(self.shared.spawner.check_threads());
-        let outcome = self.shared.spawner.block_in_place(|| {
-                    let stats = self.shared.spawner.stats();
-                    let call = stats.call(crate::session_stats::disk::DiskOp::InitialCheck);
-                    let before = self.checked_bytes.load(Ordering::Relaxed);
-                    self.check.store(CHECK_READING, Ordering::Release);
-                    let outcome = FileOps::new(
-                        &self.metadata,
-                        &self.files,
-                        self.shared.options.disable_v1_hashes,
-                    )
-                    .initial_check_from(
-                        threads,
-                        &self.checked_bytes,
-                        &self.pause_requested,
-                        from.map(|(at, _)| at),
-                    );
-                    call.bytes(
-                        self.checked_bytes
-                            .load(Ordering::Relaxed)
-                            .saturating_sub(before),
-                    );
-                    outcome
-        })?;
+        let turns = self.files.read_turns();
+        let check = || {
+            let stats = self.shared.spawner.stats();
+            let call = stats.call(crate::session_stats::disk::DiskOp::InitialCheck);
+            let before = self.checked_bytes.load(Ordering::Relaxed);
+            self.check.store(CHECK_READING, Ordering::Release);
+            let outcome = FileOps::new(
+                &self.metadata,
+                &self.files,
+                self.shared.options.disable_v1_hashes,
+            )
+            .initial_check_from(
+                threads,
+                &self.checked_bytes,
+                &self.pause_requested,
+                from.map(|(at, _)| at),
+            );
+            call.bytes(
+                self.checked_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(before),
+            );
+            outcome
+        };
+        let outcome = if turns.whole_pieces() {
+            self.shared.spawner.block_in_place(check)
+        } else {
+            self.shared
+                .spawner
+                .block_in_place_in_turn(&turns, check)
+                .await
+        }?;
         let have_pieces = match outcome {
             CheckOutcome::Done(have) => have,
             CheckOutcome::Paused(at) => {

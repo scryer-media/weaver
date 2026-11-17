@@ -852,6 +852,15 @@ impl ManagedTorrent {
         self.shared.run.load_full()
     }
 
+    /// The torrent's files moved while it runs: its reads take the turns of
+    /// the volume they are on now, from here on. Nothing to do for a
+    /// torrent not running; its next run asks for the turns when it starts.
+    pub fn files_moved(&self) {
+        if let Some(live) = self.live() {
+            live.files_moved();
+        }
+    }
+
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();
         match &g.state {

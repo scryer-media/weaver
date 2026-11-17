@@ -80,7 +80,7 @@ impl TorrentStateLive {
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
             }),
-            reads: paused.files.read_turns(),
+            reads: arc_swap::ArcSwap::from_pointee(paused.files.read_turns()),
             files: DropOffShard::new(paused.files, &paused.shared.spawner),
             stats: AtomicStats {
                 have_bytes: AtomicU64::new(have_bytes),
@@ -309,7 +309,7 @@ impl TorrentStateLive {
                     // volume, as a peer's does, and only while it runs.
                     let _turn = crate::torrent_state::seed_mode::read_turn(
                         &self.shared.spawner,
-                        &self.reads,
+                        &self.reads.load(),
                     );
                     return self.check_claimed(piece, checking);
                 }
@@ -351,12 +351,13 @@ impl TorrentStateLive {
             match seed.claim(piece) {
                 Claim::Check(checking) => {
                     let state = Arc::clone(self);
+                    let turns = self.reads.load_full();
                     // On the session's pool: a uTP thread's runtime has a
                     // pool of its own, which nothing bounds.
                     return self
                         .shared
                         .spawner
-                        .spawn_blocking_in_turn(&self.reads, move || {
+                        .spawn_blocking_in_turn(&turns, move || {
                             state.check_claimed(piece, checking)
                         })
                         .await

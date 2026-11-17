@@ -189,9 +189,9 @@ impl BlockingSpawner {
 
     /// The most threads the initial check of a torrent runs on, its reader
     /// and its hashers: half the blocking permits, at least one, as before
-    /// the check's reads took turns on their volume. The reader reads a
-    /// piece at a time in one read turn; the hashers read nothing and take
-    /// no turn. libtorrent hashes on its own `hashing_threads` pool
+    /// the check's reads took turns on their volume. The check holds one
+    /// read turn throughout, or on a spinning volume its reader takes one a
+    /// piece at a time; the hashers read nothing and take no turn. libtorrent hashes on its own `hashing_threads` pool
     /// (default 1) beside the disk threads; here the cap keeps the threads
     /// a check runs on bounded.
     pub fn check_threads(&self) -> usize {
@@ -362,9 +362,7 @@ mod tests {
         let spawner = BlockingSpawner::new(1);
         let turns = turns(1);
         let failed = spawner
-            .spawn_blocking_in_turn(&turns, || -> u32 {
-                panic!("the piece could not be read")
-            })
+            .spawn_blocking_in_turn(&turns, || -> u32 { panic!("the piece could not be read") })
             .await
             .unwrap_err();
         assert!(

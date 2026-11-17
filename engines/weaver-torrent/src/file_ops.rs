@@ -27,7 +27,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     file_info::FileInfo,
-    storage::{FilesShut, ReadTurns, TorrentStorage},
+    storage::{FilesShut, HeldRoom, ReadTurns, TorrentStorage},
     type_aliases::{BF, FileInfos, PeerHandle},
 };
 
@@ -204,9 +204,11 @@ pub(crate) struct PieceReader<'o, 'a> {
     // about to be read, and how far past a read it is told.
     told: u64,
     told_ahead: u64,
-    // The read turns of the volume the files are on: each read takes one
-    // for as long as it reads, never while it waits for a hasher.
-    turns: &'o ReadTurns,
+    // The read turns of a volume that reads a whole piece at a time (a
+    // spinning disk), whose one turn each read takes for as long as it
+    // reads, never while it waits for a hasher. None on any other volume:
+    // the check runs in one turn of it, taken once by its caller.
+    turns: Option<&'o ReadTurns>,
 }
 
 /// How far past the byte it reads a check tells the storage what it reads
@@ -219,9 +221,9 @@ pub(crate) const CHECK_TOLD_AHEAD: u64 = 8 << 20;
 
 impl<'o, 'a> PieceReader<'o, 'a> {
     /// A reader that tells the storage what it reads next `told_ahead`
-    /// bytes ahead, none when that is nothing, and reads in a turn of
-    /// `turns`.
-    pub(crate) fn new(ops: &'o FileOps<'a>, told_ahead: u64, turns: &'o ReadTurns) -> Self {
+    /// bytes ahead, none when that is nothing, and takes a turn of `turns`
+    /// for each read when given.
+    pub(crate) fn new(ops: &'o FileOps<'a>, told_ahead: u64, turns: Option<&'o ReadTurns>) -> Self {
         Self {
             ops,
             broken: vec![u64::MAX; ops.file_infos.len()],
@@ -248,8 +250,7 @@ impl<'o, 'a> PieceReader<'o, 'a> {
         into: &mut [u8],
     ) -> anyhow::Result<bool> {
         self.tell(piece, from);
-        let turns = self.turns;
-        let _turn = turns.wait_here();
+        let _turn = self.turns.map(ReadTurns::wait_here);
         let mut filled = 0;
         for span in self.ops.piece_spans(piece, from, into.len()) {
             if span.at >= self.broken[span.file] {
@@ -348,12 +349,73 @@ impl Stream {
 /// The whole piece a connection uploading from a volume that reads whole
 /// pieces (a spinning disk) read last: the blocks the peer asks of it are
 /// copied out of it, the piece read once, in one go, not a block at a time
-/// between other readers' reads. One piece of memory per such connection,
-/// kept for as long as it lasts and sized before each read.
+/// between other readers' reads. Its memory is charged to the budget the
+/// storage holds pieces against before it is read
+/// ([`TorrentStorage::hold_whole_piece`]), and given back, the memory
+/// freed, once every block of the piece was served, its read failed, or
+/// the connection ends. A piece the budget has no room for is not held:
+/// its blocks are read as they are asked for.
 #[derive(Default)]
 pub struct HeldPiece {
     piece: Option<ValidPieceIndex>,
     bytes: Vec<u8>,
+    // What `bytes` is charged to: some while it holds memory, never less
+    // than it holds.
+    room: Option<HeldRoom>,
+    // The blocks of `piece` served since it was read, a bit each, and how
+    // many are not yet.
+    served: Vec<u64>,
+    unserved: u32,
+}
+
+impl HeldPiece {
+    /// Whether it holds a piece, or room for one.
+    #[cfg(test)]
+    fn holds(&self) -> bool {
+        self.room.is_some() || self.bytes.capacity() > 0
+    }
+
+    // The piece let go: its memory freed and its room given back.
+    fn let_go(&mut self) {
+        self.piece = None;
+        self.bytes = Vec::new();
+        self.room = None;
+    }
+
+    // Room for a piece of `len` bytes: the room held, when that is enough,
+    // or else the room of `files`' budget, what was held given back first.
+    fn room_for(&mut self, files: &dyn TorrentStorage, len: usize) -> bool {
+        if self
+            .room
+            .as_ref()
+            .is_some_and(|room| room.bytes() >= len as u64)
+        {
+            return true;
+        }
+        self.let_go();
+        self.room = files.hold_whole_piece(len as u64);
+        self.room.is_some()
+    }
+
+    // `piece`, of `blocks` blocks, read into `bytes`: none of them served.
+    fn read(&mut self, piece: ValidPieceIndex, blocks: u32) {
+        self.piece = Some(piece);
+        self.served.clear();
+        self.served.resize((blocks as usize).div_ceil(64), 0);
+        self.unserved = blocks;
+    }
+
+    // The block served: true once every block of the piece was.
+    fn serve(&mut self, block: u32) -> bool {
+        let (word, bit) = ((block / 64) as usize, 1u64 << (block % 64));
+        if let Some(word) = self.served.get_mut(word)
+            && *word & bit == 0
+        {
+            *word |= bit;
+            self.unserved -= 1;
+        }
+        self.unserved == 0
+    }
 }
 
 /// The memory a check reads into.
@@ -830,8 +892,12 @@ impl<'a> FileOps<'a> {
         let _ended = Ended(ahead);
         let memory = ahead.memory;
         let lengths = self.torrent.lengths();
+        // On a spinning volume the reader takes its one turn a piece at a
+        // time, so uploads from it read between two pieces; on any other
+        // the check's caller holds a turn for the whole check.
         let turns = self.files.read_turns();
-        let mut reader = PieceReader::new(self, CHECK_TOLD_AHEAD, &turns);
+        let per_read = turns.whole_pieces().then_some(&turns);
+        let mut reader = PieceReader::new(self, CHECK_TOLD_AHEAD, per_read);
         let mut checked = Vec::new();
         for index in pieces {
             if pause_requested.load(Ordering::Relaxed) || ahead.failed.load(Ordering::Relaxed) {
@@ -1357,9 +1423,20 @@ impl<'a> FileOps<'a> {
         held: Option<&mut HeldPiece>,
     ) -> Result<(), (usize, anyhow::Error)> {
         self.on_disk();
-        if let Some(held) = held {
-            return self.read_chunks_held(chunks, bufs, held);
+        match held {
+            Some(held) => self.read_chunks_held(who_sent, chunks, bufs, held),
+            None => self.read_runs(who_sent, chunks, bufs),
         }
+    }
+
+    // `chunks` read a run of blocks one after another in one file at a
+    // time, as [`Self::read_chunks`] reads them without a held piece.
+    fn read_runs(
+        &self,
+        who_sent: PeerHandle,
+        chunks: &[ChunkInfo],
+        bufs: &mut [&mut [u8]],
+    ) -> Result<(), (usize, anyhow::Error)> {
         let lengths = self.torrent.lengths();
         let mut i = 0;
         while i < chunks.len() {
@@ -1413,31 +1490,54 @@ impl<'a> FileOps<'a> {
     /// [`Self::read_chunks`] out of whole pieces: a block of a piece other
     /// than the one `held` holds reads that piece whole first, its share of
     /// each file in one read, into the buffer `held` keeps, sized before
-    /// the read. A piece that fails to read is held no more.
+    /// the read and charged to the storage's budget before that. A piece
+    /// that fails to read, or whose every block was served, is held no
+    /// more. A piece the budget has no room for is not read whole: the
+    /// rest of the batch is read as runs, as without a held piece, and room
+    /// is asked for again at the next batch.
     fn read_chunks_held(
         &self,
+        who_sent: PeerHandle,
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
         held: &mut HeldPiece,
     ) -> Result<(), (usize, anyhow::Error)> {
         let lengths = self.torrent.lengths();
-        for (i, (chunk, buf)) in chunks.iter().zip(bufs.iter_mut()).enumerate() {
+        let mut i = 0;
+        while i < chunks.len() {
+            let chunk = chunks[i];
             if held.piece != Some(chunk.piece_index) {
-                held.piece = None;
                 let len = lengths.piece_length(chunk.piece_index) as usize;
+                if !held.room_for(self.files, len) {
+                    return self
+                        .read_runs(who_sent, &chunks[i..], &mut bufs[i..])
+                        .map_err(|(k, e)| (i + k, e));
+                }
+                held.piece = None;
+                held.bytes
+                    .reserve_exact(len.saturating_sub(held.bytes.len()));
                 held.bytes.resize(len, 0);
-                self.read_piece(chunk.piece_index, &mut held.bytes)
-                    .map_err(|e| (i, e))?;
-                held.piece = Some(chunk.piece_index);
+                if let Err(e) = self.read_piece(chunk.piece_index, &mut held.bytes) {
+                    held.let_go();
+                    return Err((i, e));
+                }
+                held.read(
+                    chunk.piece_index,
+                    lengths.chunks_per_piece(chunk.piece_index),
+                );
             }
             let from = chunk.offset as usize;
             let block = held
                 .bytes
                 .get(from..from + chunk.size as usize)
-                .filter(|block| block.len() == buf.len())
+                .filter(|block| block.len() == bufs[i].len())
                 .context("read_chunks(): the block is not in its piece")
                 .map_err(|e| (i, e))?;
-            buf.copy_from_slice(block);
+            bufs[i].copy_from_slice(block);
+            if held.serve(chunk.chunk_index) {
+                held.let_go();
+            }
+            i += 1;
         }
         Ok(())
     }
@@ -1727,6 +1827,43 @@ mod tests {
     struct Runs {
         files: Files,
         runs: std::sync::Mutex<Vec<(usize, u64, usize)>>,
+        budget: Arc<TestBudget>,
+    }
+
+    /// A memory budget: the bytes free in it, and those held against it.
+    struct TestBudget {
+        free: AtomicU64,
+        held: AtomicU64,
+    }
+
+    impl TestBudget {
+        fn of(bytes: u64) -> Arc<Self> {
+            Arc::new(Self {
+                free: AtomicU64::new(bytes),
+                held: AtomicU64::new(0),
+            })
+        }
+
+        fn hold(self: &Arc<Self>, bytes: u64) -> Option<HeldRoom> {
+            self.free
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |free| {
+                    free.checked_sub(bytes)
+                })
+                .ok()?;
+            self.held.fetch_add(bytes, Ordering::Relaxed);
+            Some(HeldRoom::new(bytes, Arc::clone(self) as _))
+        }
+
+        fn held(&self) -> u64 {
+            self.held.load(Ordering::Relaxed)
+        }
+    }
+
+    impl crate::storage::GivesRoomBack for TestBudget {
+        fn give_back(&self, bytes: u64) {
+            self.held.fetch_sub(bytes, Ordering::Relaxed);
+            self.free.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     impl TorrentStorage for Runs {
@@ -1778,25 +1915,36 @@ mod tests {
         fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
             self.files.take()
         }
+
+        fn hold_whole_piece(&self, bytes: u64) -> Option<HeldRoom> {
+            self.budget.hold(bytes)
+        }
     }
 
-    /// A storage over `Files` on a spinning volume: one read turn, whole
-    /// pieces at a read. It keeps each read it was asked for, in order, and
-    /// whether a read ran without the volume's one turn held.
+    /// A storage over `Files` on a volume of one read turn: a spinning one,
+    /// whole pieces at a read, or else one that reads blocks. It keeps each
+    /// read it was asked for, in order, and whether a read ran without the
+    /// volume's one turn held, and whether one ran with it held.
     struct Spinning {
         files: Files,
         turns: ReadTurns,
         reads: std::sync::Mutex<Vec<(usize, u64, usize)>>,
         unturned: AtomicBool,
+        turned: AtomicBool,
     }
 
     impl Spinning {
         fn new(files: Files) -> Self {
+            Self::reading_whole_pieces(files, true)
+        }
+
+        fn reading_whole_pieces(files: Files, whole: bool) -> Self {
             Self {
                 files,
-                turns: ReadTurns::new(Arc::new(tokio::sync::Semaphore::new(1)), true),
+                turns: ReadTurns::new(Arc::new(tokio::sync::Semaphore::new(1)), whole),
                 reads: Default::default(),
                 unturned: AtomicBool::new(false),
+                turned: AtomicBool::new(false),
             }
         }
     }
@@ -1813,8 +1961,13 @@ mod tests {
         fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
             if self.turns.semaphore().available_permits() != 0 {
                 self.unturned.store(true, Ordering::Relaxed);
+            } else {
+                self.turned.store(true, Ordering::Relaxed);
             }
-            self.reads.lock().unwrap().push((file_id, offset, buf.len()));
+            self.reads
+                .lock()
+                .unwrap()
+                .push((file_id, offset, buf.len()));
             self.files.pread_exact(file_id, offset, buf)
         }
 
@@ -1915,12 +2068,54 @@ mod tests {
                         .count()
                 })
                 .sum();
-            assert!(reads.len() <= shares, "{threads}: {} > {shares}", reads.len());
+            assert!(
+                reads.len() <= shares,
+                "{threads}: {} > {shares}",
+                reads.len()
+            );
             let mut ends = vec![0u64; metadata.file_infos.len()];
             for &(file, at, len) in reads.iter() {
                 assert_eq!(at, ends[file], "{threads}: file {file}");
                 ends[file] = at + len as u64;
             }
+        }
+    }
+
+    /// The check of a torrent on a volume that reads blocks takes no turn
+    /// for a read: its caller holds one for the whole check, as the check
+    /// held its blocking permits once before. Each read is a slice at most,
+    /// and the check finds what the check of the files alone finds.
+    #[test]
+    fn a_check_on_a_solid_volume_takes_no_turn_for_a_read() {
+        let t = checking_torrent();
+        let metadata = metadata(&t.torrent_bytes());
+        let mut payload = t.v1_payload();
+        let third = usize::try_from(metadata.lengths().default_piece_length()).unwrap() * 2 + 7;
+        payload[third] ^= 0xff;
+        for threads in [1, 4] {
+            let alone = Spinning::reading_whole_pieces(Files::new(&metadata, &payload), false);
+            let had_alone = FileOps::new(&metadata, &alone.files, false)
+                .initial_check(threads, &AtomicU64::new(0), &AtomicBool::new(false))
+                .unwrap();
+            let solid = Spinning::reading_whole_pieces(Files::new(&metadata, &payload), false);
+            let had_solid = FileOps::new(&metadata, &solid, false)
+                .initial_check(threads, &AtomicU64::new(0), &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(had_solid, had_alone, "{threads}");
+            assert!(!had_solid.iter().by_vals().all(|had| had), "{threads}");
+            assert!(!solid.turned.load(Ordering::Relaxed), "{threads}");
+            assert_eq!(solid.turns.semaphore().available_permits(), 1);
+            assert_eq!(
+                *solid.files.2.lock().unwrap(),
+                *alone.files.2.lock().unwrap(),
+                "{threads}"
+            );
+            let reads = solid.reads.lock().unwrap();
+            assert!(!reads.is_empty(), "{threads}");
+            assert!(
+                reads.iter().all(|&(_, _, len)| len <= CHECK_MEMORY.slice),
+                "{threads}"
+            );
         }
     }
 
@@ -2084,9 +2279,50 @@ mod tests {
         assert_eq!(read, expected);
     }
 
+    // The orders a peer asks for every block in: in order, backwards, and
+    // two blocks of a piece, then a block of another, then the first piece
+    // again.
+    fn orders(chunks: &[ChunkInfo]) -> Vec<Vec<ChunkInfo>> {
+        vec![
+            chunks.to_vec(),
+            chunks.iter().rev().copied().collect(),
+            chunks
+                .chunks(2)
+                .flat_map(|two| two.iter().rev())
+                .copied()
+                .collect(),
+        ]
+    }
+
+    // `order` read a batch of three at a time through `held`, kept between
+    // batches, as a connection uploading from a spinning disk reads.
+    fn read_held(ops: &FileOps<'_>, order: &[ChunkInfo], held: &mut HeldPiece) -> Vec<Vec<u8>> {
+        let mut read: Vec<Vec<u8>> = order.iter().map(|c| vec![0xee; c.size as usize]).collect();
+        for (batch, bufs) in order.chunks(3).zip(read.chunks_mut(3)) {
+            let mut bufs: Vec<&mut [u8]> = bufs.iter_mut().map(Vec::as_mut_slice).collect();
+            ops.read_chunks(peer(), batch, &mut bufs, Some(&mut *held))
+                .unwrap();
+        }
+        read
+    }
+
+    // `order` read a batch of three at a time without a held piece, as a
+    // connection uploading from a solid-state disk reads.
+    fn read_alone(ops: &FileOps<'_>, order: &[ChunkInfo]) -> Vec<Vec<u8>> {
+        let mut read: Vec<Vec<u8>> = order.iter().map(|c| vec![0xee; c.size as usize]).collect();
+        for (batch, bufs) in order.chunks(3).zip(read.chunks_mut(3)) {
+            let mut bufs: Vec<&mut [u8]> = bufs.iter_mut().map(Vec::as_mut_slice).collect();
+            ops.read_chunks(peer(), batch, &mut bufs, None).unwrap();
+        }
+        read
+    }
+
     /// Blocks read out of whole pieces, as a connection uploading from a
     /// spinning disk reads them, are the bytes the blocks read on their own
     /// are, in every order a peer asks for them, across files and padding.
+    /// Every piece is read whole, none a run of blocks, and once every
+    /// block of a piece was served it is held no more: its room is back in
+    /// the budget.
     #[test]
     fn blocks_read_out_of_whole_pieces_are_the_blocks_read_alone() {
         for t in [two_files(), checking_torrent()] {
@@ -2095,32 +2331,90 @@ mod tests {
             let storage = Runs {
                 files: Files::new(&metadata, &payload),
                 runs: Default::default(),
+                budget: TestBudget::of(u64::MAX),
+            };
+            let ops = FileOps::new(&metadata, &storage, false);
+            for order in orders(&every_block(&metadata)) {
+                let old = read_alone(&ops, &order);
+                storage.runs.lock().unwrap().clear();
+                let mut held = HeldPiece::default();
+                let new = read_held(&ops, &order, &mut held);
+                assert_eq!(new, old);
+                assert!(storage.runs.lock().unwrap().is_empty());
+                assert!(!held.holds());
+                assert_eq!(storage.budget.held(), 0);
+            }
+        }
+    }
+
+    /// A connection uploading from a spinning disk whose budget has no room
+    /// for a piece holds nothing, and reads the blocks asked for as one on
+    /// a solid-state disk does: the same bytes, in the same runs. Two
+    /// connections with room for one piece between them: the one that has
+    /// it reads whole pieces, the other blocks, both the same bytes, and
+    /// once both end the budget holds nothing.
+    #[test]
+    fn a_whole_piece_upload_with_the_budget_full_reads_blocks_and_holds_nothing() {
+        let mut pieces_of_blocks = 0;
+        for t in [two_files(), checking_torrent()] {
+            let metadata = metadata(&t.torrent_bytes());
+            let payload = t.v1_payload();
+            let piece = u64::from(metadata.lengths().default_piece_length());
+            let storage = Runs {
+                files: Files::new(&metadata, &payload),
+                runs: Default::default(),
+                budget: TestBudget::of(piece / 2),
+            };
+            let ops = FileOps::new(&metadata, &storage, false);
+            for order in orders(&every_block(&metadata)) {
+                storage.runs.lock().unwrap().clear();
+                let old = read_alone(&ops, &order);
+                let old_runs = std::mem::take(&mut *storage.runs.lock().unwrap());
+                let mut held = HeldPiece::default();
+                let new = read_held(&ops, &order, &mut held);
+                assert_eq!(new, old);
+                assert_eq!(*storage.runs.lock().unwrap(), old_runs);
+                assert!(!held.holds());
+                assert_eq!(storage.budget.held(), 0);
+            }
+
+            let storage = Runs {
+                files: Files::new(&metadata, &payload),
+                runs: Default::default(),
+                budget: TestBudget::of(piece),
             };
             let ops = FileOps::new(&metadata, &storage, false);
             let chunks = every_block(&metadata);
-            let mut orders = vec![chunks.clone()];
-            orders.push(chunks.iter().rev().copied().collect());
-            // Two blocks of a piece, then a block of another, then the
-            // first piece again.
-            orders.push(chunks.chunks(2).flat_map(|two| two.iter().rev()).copied().collect());
-            for order in orders {
-                let mut old: Vec<Vec<u8>> =
-                    order.iter().map(|c| vec![0xee; c.size as usize]).collect();
-                let mut bufs: Vec<&mut [u8]> = old.iter_mut().map(Vec::as_mut_slice).collect();
-                ops.read_chunks(peer(), &order, &mut bufs, None).unwrap();
-
-                let mut held = HeldPiece::default();
-                let mut new: Vec<Vec<u8>> =
-                    order.iter().map(|c| vec![0xee; c.size as usize]).collect();
-                // A batch at a time, the held piece kept between batches.
-                for (batch, bufs) in order.chunks(3).zip(new.chunks_mut(3)) {
-                    let mut bufs: Vec<&mut [u8]> = bufs.iter_mut().map(Vec::as_mut_slice).collect();
-                    ops.read_chunks(peer(), batch, &mut bufs, Some(&mut held))
-                        .unwrap();
-                }
-                assert_eq!(new, old);
-            }
+            let old = read_alone(&ops, &chunks);
+            // The first connection asks for a block alone of a piece of
+            // more than one, and keeps its piece: the second finds no room.
+            let lengths = metadata.lengths();
+            let Some(k) = chunks
+                .iter()
+                .position(|c| lengths.chunks_per_piece(c.piece_index) > 1)
+            else {
+                continue;
+            };
+            pieces_of_blocks += 1;
+            let mut first = HeldPiece::default();
+            let mut block = vec![0xee; chunks[k].size as usize];
+            ops.read_chunks(
+                peer(),
+                &chunks[k..=k],
+                &mut [&mut block[..]],
+                Some(&mut first),
+            )
+            .unwrap();
+            assert_eq!(block, old[k]);
+            assert!(first.holds());
+            let mut second = HeldPiece::default();
+            assert_eq!(read_held(&ops, &chunks, &mut second), old);
+            assert!(!second.holds());
+            assert_eq!(read_held(&ops, &chunks, &mut first), old);
+            drop((first, second));
+            assert_eq!(storage.budget.held(), 0);
         }
+        assert!(pieces_of_blocks > 0);
     }
 
     /// A block read out of a whole piece that fails to read names the first
@@ -2144,6 +2438,7 @@ mod tests {
         let storage = Runs {
             files,
             runs: Default::default(),
+            budget: TestBudget::of(u64::MAX),
         };
         let ops = FileOps::new(&metadata, &storage, false);
         let chunks = every_block(&metadata);
@@ -2162,6 +2457,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(first, first_bad);
         assert_eq!(held.piece, None);
+        assert!(!held.holds());
+        assert_eq!(storage.budget.held(), 0);
         for (chunk, got) in chunks[..first].iter().zip(&read) {
             let mut block = vec![0; chunk.size as usize];
             ops.read_chunk(peer(), chunk, &mut block).unwrap();
@@ -2169,7 +2466,9 @@ mod tests {
         }
         // The old way fails no later.
         let mut bufs: Vec<&mut [u8]> = read.iter_mut().map(Vec::as_mut_slice).collect();
-        let (old_first, _) = ops.read_chunks(peer(), &chunks, &mut bufs, None).unwrap_err();
+        let (old_first, _) = ops
+            .read_chunks(peer(), &chunks, &mut bufs, None)
+            .unwrap_err();
         assert!(old_first <= first, "{old_first} {first}");
     }
 
@@ -2184,6 +2483,7 @@ mod tests {
         let storage = Runs {
             files: Files::new(&metadata, &payload),
             runs: Default::default(),
+            budget: TestBudget::of(u64::MAX),
         };
         let ops = FileOps::new(&metadata, &storage, false);
         let chunks = every_block(&metadata);
@@ -2229,6 +2529,7 @@ mod tests {
         let storage = Runs {
             files,
             runs: Default::default(),
+            budget: TestBudget::of(u64::MAX),
         };
         let ops = FileOps::new(&metadata, &storage, false);
         let chunks = every_block(&metadata);
@@ -2237,7 +2538,9 @@ mod tests {
             .map(|chunk| vec![0xee; chunk.size as usize])
             .collect();
         let mut bufs: Vec<&mut [u8]> = read.iter_mut().map(Vec::as_mut_slice).collect();
-        let (first, _) = ops.read_chunks(peer(), &chunks, &mut bufs, None).unwrap_err();
+        let (first, _) = ops
+            .read_chunks(peer(), &chunks, &mut bufs, None)
+            .unwrap_err();
         assert_eq!(first, 2);
         let mut block = vec![0; chunks[0].size as usize];
         ops.read_chunk(peer(), &chunks[0], &mut block).unwrap();
@@ -3195,8 +3498,7 @@ mod tests {
 
         let storage = Recording::new(Files::new(&metadata, &payload));
         let ops = FileOps::new(&metadata, &storage, true);
-        let turns = ReadTurns::private();
-        let mut reader = PieceReader::new(&ops, AHEAD, &turns);
+        let mut reader = PieceReader::new(&ops, AHEAD, None);
         for piece in lengths.iter_piece_infos() {
             let start = lengths.piece_offset(piece.piece_index);
             let mut bytes = vec![0u8; piece.len as usize];
@@ -3224,7 +3526,7 @@ mod tests {
         // A reader set to tell nothing tells nothing.
         let storage = Recording::new(Files::new(&metadata, &payload));
         let ops = FileOps::new(&metadata, &storage, true);
-        let mut reader = PieceReader::new(&ops, 0, &turns);
+        let mut reader = PieceReader::new(&ops, 0, None);
         let first = lengths.iter_piece_infos().next().unwrap();
         let mut bytes = vec![0u8; first.len as usize];
         assert!(reader.read(first.piece_index, 0, &mut bytes).unwrap());
