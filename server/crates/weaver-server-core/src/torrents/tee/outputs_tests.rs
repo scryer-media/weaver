@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::{claim_outputs, walk};
+use super::{place_outputs, walk};
 
 // The outputs as a scan of `listed` and `spent` per file found gives them:
 // what the sets must give, file for file and in the same order.
@@ -25,10 +25,10 @@ fn found_by_scans(work: &Path, listed: &[PathBuf], spent: &[PathBuf]) -> Vec<Str
 
 // Of a job's work with thousands of files, the outputs are those that are
 // neither the torrent's own, nor spent, nor the job's records: the same
-// names, in the same order, as the scans gave, each claimed under its own
+// names, in the same order, as the scans gave, each placed under its own
 // name where nothing holds it.
 #[test]
-fn outputs_are_claimed_as_the_scans_found_them() {
+fn outputs_are_placed_as_the_scans_found_them() {
     let root = tempfile::tempdir().unwrap();
     let work = root.path().join("work");
     let dir = root.path().join("dir");
@@ -50,25 +50,23 @@ fn outputs_are_claimed_as_the_scans_found_them() {
     }
 
     let expected = found_by_scans(&work, &listed, &spent);
-    let claimed = claim_outputs(
+    let placed = place_outputs(
         &work,
         &dir,
         &listed.iter().cloned().collect(),
         &spent.iter().cloned().collect(),
-        &HashSet::new(),
-    )
-    .unwrap();
+        &[],
+        crate::runtime::fs::move_file_exclusive,
+    );
+    assert!(placed.failed.is_none());
     assert_eq!(expected.len(), 1_200);
-    assert_eq!(claimed.names, expected);
+    assert_eq!(placed.names, expected);
     let wanted: HashSet<String> = (0..3_000)
         .filter(|index| index % 5 > 2)
         .map(|index| format!("set/part{index:04}.bin"))
         .collect();
-    assert_eq!(
-        claimed.names.iter().cloned().collect::<HashSet<_>>(),
-        wanted
-    );
+    assert_eq!(placed.names.iter().cloned().collect::<HashSet<_>>(), wanted);
     let mut there = Vec::new();
     walk(&dir, Path::new(""), &mut there);
-    assert_eq!(there.len(), 1_200, "one claim for each, and no other file");
+    assert_eq!(there.len(), 1_200, "one file for each, and no other");
 }

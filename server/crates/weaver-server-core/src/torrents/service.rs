@@ -1241,21 +1241,23 @@ pub(crate) static MOVE_HOLD: Mutex<
     )>,
 > = Mutex::new(None);
 
-// Test seam: a placing of a torrent's unpacked files waits once, their
-// names claimed and not yet kept on its row, until the test lets it go,
-// saying first that it has reached that point.
+// Test seam: run with the name each of a torrent's unpacked files is about
+// to move to, the look having found it free, right before the move.
 #[cfg(test)]
-pub(crate) static OUTPUTS_HOLD: Mutex<
-    Option<(
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
-    )>,
-> = Mutex::new(None);
+pub(crate) static OUTPUT_MEETS: Mutex<Option<OutputMeets>> = Mutex::new(None);
+#[cfg(test)]
+pub(crate) type OutputMeets = Box<dyn FnMut(&Path) + Send>;
 
-// Test seam: the next placing of a torrent's unpacked files panics as its
-// move begins, its names claimed and kept.
+// Test seam: the next placing of a torrent's unpacked files panics once
+// its files have moved, before its row is written.
 #[cfg(test)]
 pub(crate) static PLACE_PANICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: the next write of a torrent's unpacked names to its row is
+// refused.
+#[cfg(test)]
+pub(crate) static KEEP_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: a write of what a torrent holds is refused, 1 once its files

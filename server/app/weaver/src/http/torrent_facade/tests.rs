@@ -2129,6 +2129,11 @@ async fn an_add_refused_for_its_save_folder_fetches_no_url() {
 
     for form in [
         format!("urls={url}&savepath={}", path(&elsewhere)),
+        // Not absolute, and out of the save folder by `..`.
+        format!("urls={url}&savepath=..%2Felsewhere"),
+        format!("urls={url}&savepath=shows&downloadPath=..%2F..%2Felsewhere"),
+        // A category that is not there does not let the path by.
+        format!("urls={url}&category=nosuch&savepath={}", path(&elsewhere)),
         format!(
             "urls={url}&savepath={}&downloadPath={}",
             path(&complete.join("shows")),

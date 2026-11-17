@@ -163,6 +163,52 @@ pub(super) fn absolute_placement(placement: &Placement, default_save: &Path) -> 
     }
 }
 
+// Where `placement` puts a torrent of `category` added by `caller`: a path
+// that is not absolute resolved under the folder the torrent would save in
+// (`absolute_placement`), and every path one the caller may save at
+// (`may_place`). The one owner of that answer, for the add and for a
+// caller that asks before it fetches anything for one.
+fn placement_as(
+    caller: CallerScope,
+    settings: &TorrentSettings,
+    category: Option<&CategoryConfig>,
+    placement: &Placement,
+) -> Result<Placement, AddError> {
+    let relative = |path: &Option<String>| {
+        path.as_deref()
+            .is_some_and(|path| !Path::new(path).is_absolute())
+    };
+    let placement = if relative(&placement.save_path)
+        || relative(&placement.download_path)
+        || (placement.download_path.is_some() && placement.save_path.is_none())
+    {
+        let parent = completion_parent(
+            &settings.complete_dir,
+            &settings.categories,
+            category.map(|category| category.name.as_str()),
+        )
+        .map_err(AddError::Invalid)?;
+        absolute_placement(placement, &parent)
+    } else {
+        placement.clone()
+    };
+    if [&placement.save_path, &placement.download_path]
+        .into_iter()
+        .flatten()
+        .any(|path| {
+            !may_place(
+                caller,
+                Path::new(path.trim()),
+                &settings.complete_dir,
+                &settings.categories,
+            )
+        })
+    {
+        return Err(AddError::Forbidden(OUTSIDE_SAVE_FOLDERS.to_owned()));
+    }
+    Ok(placement)
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum AddError {
     #[error("{0}")]
@@ -329,6 +375,24 @@ impl TorrentService {
         self.add_as(CallerScope::Local, request).await
     }
 
+    /// Whether `caller` may add a torrent of `category` at `placement`, as
+    /// [`Self::add_as`] decides it, a path that is not absolute resolved
+    /// first: asked before anything is fetched for the add. A category that
+    /// is not there is the add's to refuse, and its paths are checked here
+    /// as those of a torrent with no category.
+    pub fn may_add_at(
+        &self,
+        caller: CallerScope,
+        category: Option<&str>,
+        placement: &Placement,
+    ) -> Result<(), AddError> {
+        let settings = self.settings();
+        let category = category
+            .filter(|name| !name.trim().is_empty())
+            .and_then(|name| resolve_category_config(&settings.categories, name));
+        placement_as(caller, &settings, category, placement).map(|_| ())
+    }
+
     /// Add the torrent `request` names for `caller`, who must be allowed
     /// its save and download paths once they are absolute (`may_place`).
     pub async fn add_as(
@@ -354,38 +418,7 @@ impl TorrentService {
             None => None,
         };
         let mut request = request;
-        let relative = |path: &Option<String>| {
-            path.as_deref()
-                .is_some_and(|path| !Path::new(path).is_absolute())
-        };
-        let placement = &request.placement;
-        if relative(&placement.save_path)
-            || relative(&placement.download_path)
-            || (placement.download_path.is_some() && placement.save_path.is_none())
-        {
-            let parent = completion_parent(
-                &settings.complete_dir,
-                &settings.categories,
-                category.as_ref().map(|category| category.name.as_str()),
-            )
-            .map_err(AddError::Invalid)?;
-            request.placement = absolute_placement(&request.placement, &parent);
-        }
-        let placement = &request.placement;
-        if [&placement.save_path, &placement.download_path]
-            .into_iter()
-            .flatten()
-            .any(|path| {
-                !may_place(
-                    caller,
-                    Path::new(path.trim()),
-                    &settings.complete_dir,
-                    &settings.categories,
-                )
-            })
-        {
-            return Err(AddError::Forbidden(OUTSIDE_SAVE_FOLDERS.to_owned()));
-        }
+        request.placement = placement_as(caller, &settings, category.as_ref(), &request.placement)?;
         match request.source.clone() {
             AddSource::Metainfo(bytes) => {
                 let bytes = Bytes::from(bytes);

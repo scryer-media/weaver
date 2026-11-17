@@ -2505,123 +2505,124 @@ async fn two_torrents_unpacking_one_name_into_one_folder_each_own_their_file() {
     rig.service.stop().await;
 }
 
-// `unpacked_beside`, with the placing held once its outputs have their
-// names and before its row is written, while `meanwhile` runs on the
-// torrent's folder.
-async fn unpacked_while(taken: &[&str], meanwhile: impl FnOnce(&Path)) -> (Rig, JobId, PathBuf) {
-    let archive = include_bytes!(concat!(
-        std::env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/rar5/rar5_store.rar"
-    ));
-    let rig = rig(set_clock());
-    rig.service.open().await.unwrap();
-    let sample = vec![0x5a_u8; 300];
-    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("sample.mkv", &sample)];
-    let job_id = rig
-        .service
-        .add_opened(request(AddSource::Metainfo(metainfo(
-            "set", &files, 128, false,
-        ))))
-        .await
-        .unwrap();
-    let (reached, at) = tokio::sync::oneshot::channel();
-    let (release, released) = tokio::sync::oneshot::channel();
-    *locked(&OUTPUTS_HOLD) = Some((reached, released));
-    let mut published = rig.service.inner.published.subscribe();
-    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
-    let mut dir = PathBuf::new();
-    fetch_pieces(&rig.service, job_id, &whole, None, |torrent| {
-        dir = torrent.store.as_ref().unwrap().files().dir();
-        for name in taken {
-            std::fs::write(dir.join(name), name.as_bytes()).unwrap();
+// Another writer's file, put at `name` the one time an output of the next
+// placing is about to move there: after the look found the name free, and
+// before the move.
+fn another_takes(name: &'static str) {
+    let mut taken = false;
+    *locked(&OUTPUT_MEETS) = Some(Box::new(move |to: &Path| {
+        if !taken && to.ends_with(name) {
+            taken = true;
+            std::fs::write(to, b"another's").unwrap();
         }
-    })
-    .await;
-    at.await.unwrap();
-    meanwhile(&dir);
-    release.send(()).unwrap();
-    published
-        .wait_for(|_| {
-            rig.db
-                .get_torrent(job_id)
-                .unwrap()
-                .unwrap()
-                .completed_at_ms
-                .is_some()
-        })
-        .await
-        .unwrap();
-    (rig, job_id, dir)
+    }));
 }
 
-// Another writer making `name` new in `dir`, as another torrent's placing
-// claims a name: it writes only a file that was not there. Whether it did.
-fn another_claims(dir: &Path, name: &str) -> bool {
-    use std::io::Write;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dir.join(name))
-        .and_then(|mut file| file.write_all(b"another's"))
-        .is_ok()
-}
-
-// Another writer goes for the output's name just as the torrent's row is
-// about to be written. Whichever of them has the name, the torrent's row
-// and what it holds name the file the torrent placed and no other, and a
-// removal with its files leaves the other writer's file as it was.
+// Another writer takes the output's name between the look and the move.
+// The file is theirs: the output is placed under the next name, the row and
+// what the torrent holds name that one only, and a removal with its files
+// leaves the other writer's file as they wrote it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_name_another_writer_goes_for_is_on_the_row_only_if_the_torrent_has_it() {
-    let mut theirs = false;
-    let (rig, job_id, dir) = unpacked_while(&[], |dir| {
-        theirs = another_claims(dir, "small.txt");
-    })
-    .await;
-    let outputs = rig.db.torrent_outputs(job_id).unwrap();
-    assert_eq!(outputs.len(), 1, "{outputs:?}");
-    assert_eq!(std::fs::read(dir.join(&outputs[0])).unwrap(), SMALL_TXT);
+async fn a_name_another_writer_takes_before_the_move_is_never_on_the_torrents_row() {
+    another_takes("small.txt");
+    let (rig, job_id, dir) = unpacked_beside(&[]).await;
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), ["small (1).txt"]);
+    assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
     let base = resolved(&dir);
     let held = held_by(&rig, job_id);
-    for name in ["small.txt", "small (1).txt"] {
-        assert_eq!(
-            held.contains(&base.join(name)),
-            outputs[0] == name,
-            "{name}: {held:?}"
-        );
-    }
+    assert!(held.contains(&base.join("small (1).txt")), "{held:?}");
+    assert!(!held.contains(&base.join("small.txt")), "{held:?}");
     rig.service.remove(job_id, true, false).await.unwrap();
-    assert!(!dir.join(&outputs[0]).exists());
-    if theirs {
-        assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
-    }
+    assert!(!dir.join("small (1).txt").exists());
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
     rig.service.stop().await;
 }
 
-// A placing that ends with its move unheard, as a panic ends it, leaves on
-// the row only names the torrent claimed: never the file another writer
-// made at a name it went for, which a removal with its files leaves.
+// A row that will not be written keeps no output: the file that moved goes
+// back to the torrent's unpacking folder, the row names none, the torrent
+// holds none, and the file that held the name is as it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_placing_whose_end_is_not_known_keeps_only_the_names_it_claimed() {
-    let mut theirs = false;
-    PLACE_PANICS.store(true, Ordering::Release);
-    let (rig, job_id, dir) = unpacked_while(&["small.txt"], |dir| {
-        theirs = another_claims(dir, "small (1).txt");
-    })
-    .await;
-    let outputs = rig.db.torrent_outputs(job_id).unwrap();
-    assert_eq!(outputs.len(), 1, "{outputs:?}");
-    // Its claim, which no output filled.
-    assert_eq!(std::fs::read(dir.join(&outputs[0])).unwrap(), b"");
+async fn outputs_the_row_did_not_keep_go_back_where_unpacking_made_them() {
+    KEEP_FAILS.store(true, Ordering::Release);
+    let (rig, job_id, dir) = unpacked_beside(&["small.txt"]).await;
+    assert!(rig.db.torrent_outputs(job_id).unwrap().is_empty());
+    assert!(!dir.join("small (1).txt").exists(), "it went back");
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
+    let work = rig.service.unpacking_dir(job_id);
+    assert_eq!(std::fs::read(work.join("small.txt")).unwrap(), SMALL_TXT);
+    let held = held_by(&rig, job_id);
+    assert!(
+        !held.contains(&resolved(&dir).join("small (1).txt")),
+        "{held:?}"
+    );
+    rig.service.stop().await;
+}
+
+// The same, with another writer's file met on the way: the row that was
+// not written names neither file, the output is back in the unpacking
+// folder, and a removal with the torrent's files leaves theirs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_another_writer_took_is_not_the_torrents_after_a_failed_row_write() {
+    another_takes("small.txt");
+    KEEP_FAILS.store(true, Ordering::Release);
+    let (rig, job_id, dir) = unpacked_beside(&[]).await;
+    assert!(rig.db.torrent_outputs(job_id).unwrap().is_empty());
+    assert!(!dir.join("small (1).txt").exists());
     let work = rig.service.unpacking_dir(job_id);
     assert_eq!(std::fs::read(work.join("small.txt")).unwrap(), SMALL_TXT);
     rig.service.remove(job_id, true, false).await.unwrap();
-    assert!(!dir.join(&outputs[0]).exists());
-    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
-    if theirs {
-        assert_eq!(
-            std::fs::read(dir.join("small (1).txt")).unwrap(),
-            b"another's"
-        );
-    }
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
+    rig.service.stop().await;
+}
+
+// A placing that ends unheard after its moves, as a panic ends it, wrote
+// no row: the row names no file, the torrent holds none of them, and the
+// file it moved stays beside the torrent's on no row. A removal with the
+// torrent's files takes neither it nor the other writer's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_placing_that_panicked_names_no_file_on_the_row() {
+    another_takes("small.txt");
+    PLACE_PANICS.store(true, Ordering::Release);
+    let (rig, job_id, dir) = unpacked_beside(&[]).await;
+    assert!(rig.db.torrent_outputs(job_id).unwrap().is_empty());
+    let base = resolved(&dir);
+    let held = held_by(&rig, job_id);
+    assert!(!held.contains(&base.join("small.txt")), "{held:?}");
+    assert!(!held.contains(&base.join("small (1).txt")), "{held:?}");
+    assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
+    rig.service.remove(job_id, true, false).await.unwrap();
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
+    assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
+    rig.service.stop().await;
+}
+
+// A name the row kept from an earlier placing with no file at it goes from
+// the row as the next placing is recorded; one with a file at it stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_name_with_no_file_goes_from_the_row() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    let (job_id, whole) = added_flat(&rig, "first", &save).await;
+    std::fs::write(save.join("kept.txt"), b"delivered before").unwrap();
+    rig.db
+        .finish_torrent_unpack(
+            job_id,
+            &["kept.txt".to_owned(), "gone.txt".to_owned()],
+            &[],
+            &[],
+        )
+        .unwrap();
+    fetched_and_completed(&rig, job_id, &whole).await;
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        ["kept.txt", "small.txt"]
+    );
+    assert_eq!(
+        std::fs::read(save.join("kept.txt")).unwrap(),
+        b"delivered before"
+    );
     rig.service.stop().await;
 }

@@ -1214,28 +1214,35 @@ pub fn numbered(name: &str, n: usize) -> String {
     format!("{stem} ({n}){extension}")
 }
 
-// [`numbered`] for one part of a path on disk, as the operating system
-// holds it, which need not be text: a file's number goes before its
-// extension and a folder's after its whole name, as `numbered` puts them.
-// The part alone is numbered, so a separator or a dot in the folders above
-// it never moves the number. A torrent's unpacked file takes this form
-// beside a file already there.
-pub fn numbered_part(part: &std::ffi::OsStr, n: usize, folder: bool) -> std::ffi::OsString {
-    if n == 0 {
-        return part.to_owned();
-    }
-    let whole = std::path::Path::new(part);
-    let (stem, extension) = match (whole.file_stem(), whole.extension()) {
-        (Some(stem), Some(extension)) if !folder => (stem, Some(extension)),
-        _ => (part, None),
+// The most bytes one part of a path may hold on the filesystems Weaver
+// writes to.
+pub const PART_MAX_BYTES: usize = 255;
+
+// [`numbered`] for one part of a path on disk: a file's number goes before
+// its extension and a folder's after its whole name, as `numbered` puts
+// them. The part alone is numbered, so a separator or a dot in the folders
+// above it never moves the number. A form too long for a part
+// ([`PART_MAX_BYTES`]), the part's own name among them, loses the end of
+// its stem, whole characters of it, and keeps its number and its
+// extension; an extension that leaves the stem no room is cut as the stem
+// is. A torrent's unpacked file takes this form beside a file already
+// there.
+pub fn numbered_part(part: &str, n: usize, folder: bool) -> String {
+    let number = if n == 0 {
+        String::new()
+    } else {
+        format!(" ({n})")
     };
-    let mut numbered = stem.to_owned();
-    numbered.push(format!(" ({n})"));
-    if let Some(extension) = extension {
-        numbered.push(".");
-        numbered.push(extension);
+    let (stem, extension) = match split_extension(part) {
+        split if !folder && number.len() + split.1.len() < PART_MAX_BYTES => split,
+        _ => (part, ""),
+    };
+    let room = PART_MAX_BYTES.saturating_sub(number.len() + extension.len());
+    let mut end = stem.len().min(room);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
     }
-    numbered
+    format!("{}{number}{extension}", &stem[..end])
 }
 
 // "subs.srt" -> ("subs", ".srt"); "archive.tar.gz" -> ("archive.tar", ".gz");
@@ -1261,7 +1268,6 @@ mod tests {
     // form for every file name, and a folder's number after its whole name.
     #[test]
     fn a_part_of_a_path_is_numbered_as_a_name_is() {
-        use std::ffi::OsStr;
         for name in [
             "subs.srt",
             "archive.tar.gz",
@@ -1273,29 +1279,49 @@ mod tests {
             "movie (1).mkv",
         ] {
             for n in 0..3 {
-                assert_eq!(
-                    numbered_part(OsStr::new(name), n, false),
-                    OsStr::new(&numbered(name, n)),
-                    "{name} {n}"
-                );
+                assert_eq!(numbered_part(name, n, false), numbered(name, n), "{name}");
             }
         }
-        assert_eq!(numbered_part(OsStr::new("v1.0"), 2, true), "v1.0 (2)");
+        assert_eq!(numbered_part("v1.0", 2, true), "v1.0 (2)");
         assert_eq!(numbered("v1.0/", 2), "v1.0 (2)/");
-        assert_eq!(numbered_part(OsStr::new("v1.0"), 0, true), "v1.0");
+        assert_eq!(numbered_part("v1.0", 0, true), "v1.0");
     }
 
-    // A name that is not text keeps every byte of it: the number goes
-    // before its extension as it stands.
-    #[cfg(unix)]
+    // A numbered form that would be too long for a part of a path gives up
+    // the end of its stem, never half a character, and keeps its number and
+    // its extension.
     #[test]
-    fn a_part_that_is_not_text_is_numbered_as_it_stands() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
+    fn a_numbered_part_too_long_loses_the_end_of_its_stem() {
+        let long = format!("{}.mkv", "a".repeat(251));
+        let numbered = numbered_part(&long, 12, false);
+        assert_eq!(numbered.len(), PART_MAX_BYTES);
+        assert_eq!(numbered, format!("{} (12).mkv", "a".repeat(246)));
+
+        let wide = format!("{}.mkv", "\u{e9}".repeat(125));
+        let numbered = numbered_part(&wide, 1, false);
+        assert_eq!(numbered, format!("{} (1).mkv", "\u{e9}".repeat(123)));
+        assert!(numbered.len() <= PART_MAX_BYTES);
+
+        let folder = "b".repeat(255);
         assert_eq!(
-            numbered_part(OsStr::from_bytes(b"mov\xffie.mkv"), 1, false),
-            OsStr::from_bytes(b"mov\xffie (1).mkv")
+            numbered_part(&folder, 3, true),
+            format!("{} (3)", "b".repeat(251))
         );
+
+        // Its own name too, which text read from a name that is not text
+        // can make longer than the name was.
+        let own = format!("{}.mkv", "\u{fffd}".repeat(100));
+        assert_eq!(
+            numbered_part(&own, 0, false),
+            format!("{}.mkv", "\u{fffd}".repeat(83))
+        );
+        assert_eq!(numbered_part("short.mkv", 0, false), "short.mkv");
+
+        // An extension that leaves the stem no room is cut as the stem is.
+        let all_extension = format!("a.{}", "x".repeat(300));
+        let numbered = numbered_part(&all_extension, 2, false);
+        assert_eq!(numbered, format!("a.{} (2)", "x".repeat(249)));
+        assert_eq!(numbered.len(), PART_MAX_BYTES);
     }
 
     const ROOT: NodeId = NodeId::ROOT;

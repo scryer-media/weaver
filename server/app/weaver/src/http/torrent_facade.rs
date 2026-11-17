@@ -2612,15 +2612,10 @@ async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> 
         }
     }
     // A place the caller may not save at is refused before any URL is
-    // fetched (`TorrentService::may_place`): a refused add reaches no host.
-    // `add_as` checks again, once a path that is not absolute has its
-    // folder.
+    // fetched, by the owner the add itself asks
+    // (`TorrentService::may_add_at`): a refused add reaches no host.
     let placement = placement(&params);
-    if [&placement.save_path, &placement.download_path]
-        .into_iter()
-        .flatten()
-        .map(|path| Path::new(path.trim()))
-        .any(|path| path.is_absolute() && !torrents.may_place(scope, path))
+    if let Err(AddError::Forbidden(_)) = torrents.may_add_at(scope, category.as_deref(), &placement)
     {
         return forbidden();
     }

@@ -79,6 +79,60 @@ pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
+// Moves the file `src` to `dst` and never replaces what is there: an entry
+// at `dst`, whenever it came, is answered `AlreadyExists` and stays as it
+// was. `rename_path_exclusive` is the move; across devices, where no rename
+// goes, the file is copied to a new hidden name in `dst`'s folder and moved
+// from there by the same never-replacing move, so `dst` is never a file
+// half written. The copy is removed whenever the move does not end at
+// `dst`.
+pub(crate) fn move_file_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
+    move_file_exclusive_using(src, dst, rename_path_exclusive)
+}
+
+pub(crate) fn move_file_exclusive_using(
+    src: &Path,
+    dst: &Path,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match rename(src, dst) {
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
+        moved => return moved,
+    }
+    // No copy is made for a name that is taken already.
+    if std::fs::symlink_metadata(dst).is_ok() {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    let folder = dst.parent().unwrap_or_else(|| Path::new("."));
+    let copy = loop {
+        let n = MOVE_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let copy = folder.join(format!(".wvr-{:x}-{n:x}", std::process::id()));
+        // Made new, so it is this move's own; a name a dead run left is
+        // passed over.
+        match file_cache::copy_large_file(src, &copy) {
+            Ok(_) => break copy,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            // The copy that failed removed what it made.
+            Err(error) => return Err(error),
+        }
+    };
+    if let Err(error) = rename(&copy, dst) {
+        let _ = std::fs::remove_file(&copy);
+        return Err(error);
+    }
+    // The file is at `dst`, whole: a source that will not go is only left
+    // behind.
+    if let Err(error) = std::fs::remove_file(src)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %src.display(), error = %error, "a moved file was copied but could not be removed from where it was");
+    }
+    Ok(())
+}
+
+// Numbers the hidden copies `move_file_exclusive` makes in this run.
+static MOVE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // The one call that both moves and refuses an existing target, atomically.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 type ExclusiveRename = fn(&std::ffi::CStr, &std::ffi::CStr) -> io::Result<()>;
@@ -847,6 +901,81 @@ mod tests {
         std::fs::write(&dst, b"another owner").unwrap();
         assert!(copy_file_no_overwrite_then_remove_source(&src, &dst).is_err());
         assert_eq!(std::fs::read(&dst).unwrap(), b"another owner");
+    }
+
+    // Every entry of `dir`, by name, in order.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    // A rename that will not cross from one folder to another, as one
+    // across devices will not.
+    fn across(src: &Path, dst: &Path) -> io::Result<()> {
+        if src.parent() == dst.parent() {
+            rename_path_exclusive(src, dst)
+        } else {
+            Err(io::Error::from(io::ErrorKind::CrossesDevices))
+        }
+    }
+
+    #[test]
+    fn a_file_moved_across_devices_arrives_whole_and_leaves_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::create_dir(&from).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        std::fs::write(from.join("a.bin"), b"moved").unwrap();
+        move_file_exclusive_using(&from.join("a.bin"), &to.join("a.bin"), across).unwrap();
+        assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"moved");
+        assert_eq!(entries(&to), ["a.bin"]);
+        assert!(entries(&from).is_empty());
+    }
+
+    // The name is taken while the copy is made: the file there stays as it
+    // was, the source stays, and the hidden copy is gone.
+    #[test]
+    fn a_move_across_devices_never_replaces_and_leaves_no_copy_when_it_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::create_dir(&from).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        let (src, dst) = (from.join("a.bin"), to.join("a.bin"));
+        std::fs::write(&src, b"moved").unwrap();
+        let meets = |src: &Path, dst: &Path| {
+            if src.parent() == dst.parent() {
+                std::fs::write(dst, b"another's").unwrap();
+            }
+            across(src, dst)
+        };
+        let error = move_file_exclusive_using(&src, &dst, meets).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"another's");
+        assert_eq!(entries(&to), ["a.bin"]);
+        assert_eq!(std::fs::read(&src).unwrap(), b"moved");
+
+        // A name taken before the move makes no copy at all.
+        let error = move_file_exclusive_using(&src, &dst, across).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(entries(&to), ["a.bin"]);
+
+        // Any other failure of the last move removes the copy too.
+        std::fs::remove_file(&dst).unwrap();
+        let refused = |src: &Path, dst: &Path| {
+            if src.parent() == dst.parent() {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                across(src, dst)
+            }
+        };
+        let error = move_file_exclusive_using(&src, &dst, refused).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(entries(&to).is_empty());
+        assert_eq!(std::fs::read(&src).unwrap(), b"moved");
     }
 
     #[test]

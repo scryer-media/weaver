@@ -1482,61 +1482,27 @@ impl Database {
         })
     }
 
-    // Unpacking is over: the files it placed beside the torrent's own are
-    // kept on its row, with those an earlier unpacking that a crash cut
-    // short kept there, those kept for it that it did not place go from it,
-    // and its job's checkpoint goes, in one transaction. Run on the
+    // Unpacking is over, and its outputs are where they stay: the files it
+    // placed beside the torrent's own are kept on its row, with those an
+    // earlier unpacking kept there; `dropped`, the names kept that hold no
+    // file, go from it; `held` joins what the torrent holds, so a history
+    // archive leaves them; and its job's checkpoint goes. One transaction:
+    // a restart finds the placing recorded whole or not at all. Run on the
     // torrent's own lane, so no write of the job's checkpoint queued before
     // it lands after.
     pub(crate) fn finish_torrent_unpack(
         &self,
         job_id: JobId,
         outputs: &[String],
-        unplaced: &[String],
-    ) -> Result<(), StateError> {
-        let id = stored(job_id.0)?;
-        let outputs = self.outputs_with(job_id, outputs, unplaced)?;
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "finish_torrent_unpack", |tx| {
-                let outputs = outputs.clone();
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE torrents SET outputs = {} WHERE job_id = {}",
-                        &[SqlArg::OptText(outputs), SqlArg::I64(id)],
-                    )
-                    .await?;
-                    for table in crate::jobs::graph_checkpoint::TABLES {
-                        tx.execute(
-                            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
-                            &[SqlArg::I64(id)],
-                        )
-                        .await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await
-        })
-    }
-
-    // The files unpacking is about to place beside the torrent's own, kept
-    // on its row with those it kept before: a crash before
-    // [`Self::finish_torrent_unpack`] leaves none its delete does not know.
-    // `held` joins what the torrent holds in the same transaction, so a
-    // history archive leaves them from the moment they are placed.
-    pub(crate) fn keep_torrent_outputs(
-        &self,
-        job_id: JobId,
-        outputs: &[String],
+        dropped: &[String],
         held: &[String],
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
-        let outputs = self.outputs_with(job_id, outputs, &[])?;
+        let outputs = self.outputs_with(job_id, outputs, dropped)?;
         let held = held.to_vec();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "keep_torrent_outputs", |tx| {
+            SqlRuntime::run_in_transaction(&datastore, "finish_torrent_unpack", |tx| {
                 let (outputs, held) = (outputs.clone(), held.clone());
                 Box::pin(async move {
                     tx.execute(
@@ -1545,6 +1511,13 @@ impl Database {
                     )
                     .await?;
                     insert_held_tx(tx, id, &held).await?;
+                    for table in crate::jobs::graph_checkpoint::TABLES {
+                        tx.execute(
+                            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+                            &[SqlArg::I64(id)],
+                        )
+                        .await?;
+                    }
                     Ok(())
                 })
             })
