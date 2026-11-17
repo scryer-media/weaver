@@ -43,18 +43,16 @@ pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
 //
 // Anything else is looked for at the target and then renamed, as
 // libtorrent moves a torrent's files (`storage_utils.cpp` `move_storage`:
-// `exists`, then `move_file`), exactly when both of these hold:
-//
-// - the exclusive rename was answered as not supported by the mount, and
-// - the link was answered as not supported, or EPERM. link(2) answers
-//   EPERM for a directory, on a mount with no hard links (SMB and CIFS,
-//   exFAT, FAT, many FUSE mounts), and on Linux for a file this process
-//   may not link (`fs.protected_hardlinks`), on a mount that has them.
+// `exists`, then `move_file`; `path.cpp` `rename` is a plain rename(2)),
+// whenever neither the exclusive rename nor the link moved it. Only two
+// answers of those end the move: the target exists (`AlreadyExists`, for
+// the caller to number or refuse), and another device (`CrossesDevices`,
+// for the caller to copy). Any other, as network and FUSE mounts give
+// (EINVAL, ENOTSUP, EPERM, EACCES, EMLINK and more), passes to the next
+// step, and the plain rename's own answer is the move's.
 //
 // An entry made at the target between that look and that rename is
-// replaced by a file: no move left there refuses it. A link answered
-// EXDEV is another device: the caller is answered `CrossesDevices`, at
-// this step as at every other, and only then does a caller copy.
+// replaced by a file: no move left there refuses it.
 pub(crate) fn rename_path_exclusive_in_place(src: &Path, dst: &Path) -> io::Result<()> {
     rename_path_exclusive_or(src, dst, Unlinkable::Renamed)
 }
@@ -289,8 +287,19 @@ fn rename_exclusive_with_link(
         std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
     };
+    // Whether an answer of the first two rungs passes to the next one. In
+    // place, only "the target exists" and "another device" end the move
+    // there: network and FUSE mounts answer these calls with many codes
+    // where a plain rename still works, and the last rung's rename says
+    // what is wrong when nothing works. A move that copies when no name
+    // move goes passes on "not supported" alone, so a refusal never turns
+    // into a copy on the same device.
+    let passes = |error: &io::Error, also: &[i32]| match unlinkable {
+        Unlinkable::Renamed => !matches!(error.raw_os_error(), Some(libc::EEXIST | libc::EXDEV)),
+        Unlinkable::Copied => refused(error, also),
+    };
     match exclusive(&path(src)?, &path(dst)?) {
-        Err(error) if refused(&error, &[]) => {}
+        Err(error) if passes(&error, &[]) => {}
         moved => return moved,
     }
     // A directory has no hard links: link(2) answers it EPERM.
@@ -311,7 +320,7 @@ fn rename_exclusive_with_link(
         {
             return Err(error);
         }
-        Err(error) if refused(&error, &[libc::EPERM, libc::EXDEV]) => {}
+        Err(error) if passes(&error, &[libc::EPERM, libc::EXDEV]) => {}
         Err(error) => return Err(error),
     }
     let source = std::fs::symlink_metadata(src)?;
@@ -1087,6 +1096,76 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::CrossesDevices);
         assert_eq!(std::fs::read(&src).unwrap(), b"source");
         assert!(!dst.exists());
+    }
+
+    // A move in place whose exclusive rename answers `exclusive` and whose
+    // link answers `link`: the file is the very one, under its new name, so
+    // the plain rename moved it and nothing copied it. The link was asked
+    // once.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn renamed_in_place_after(exclusive: ExclusiveRename, link: i32) {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("destination.bin");
+        std::fs::write(&src, b"source").unwrap();
+        let inode = std::fs::metadata(&src).unwrap().ino();
+        let asked = std::cell::Cell::new(0);
+        rename_exclusive_with_link(&src, &dst, exclusive, Unlinkable::Renamed, |_, _| {
+            asked.set(asked.get() + 1);
+            Err(io::Error::from_raw_os_error(link))
+        })
+        .unwrap();
+        assert_eq!(asked.get(), 1);
+        assert_eq!(std::fs::metadata(&dst).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+        assert!(!src.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_link_answered_eacces_in_place_still_moves_the_file_by_rename() {
+        renamed_in_place_after(refuse::<{ libc::EINVAL }>, libc::EACCES);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_exclusive_rename_answered_eperm_in_place_still_moves_the_file_by_rename() {
+        renamed_in_place_after(refuse::<{ libc::EPERM }>, libc::EOPNOTSUPP);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_link_answered_emlink_in_place_still_moves_the_file_by_rename() {
+        renamed_in_place_after(refuse::<{ libc::EINVAL }>, libc::EMLINK);
+    }
+
+    // In place, the exclusive rename's "another device" and "the target
+    // exists" still end the move there, the target untouched.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn in_place_only_another_device_or_a_taken_target_end_the_exclusive_rename() {
+        for (errno, kind) in [
+            (libc::EXDEV, io::ErrorKind::CrossesDevices),
+            (libc::EEXIST, io::ErrorKind::AlreadyExists),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("source.bin");
+            let dst = dir.path().join("destination.bin");
+            std::fs::write(&src, b"source").unwrap();
+            let exclusive: ExclusiveRename = match errno {
+                libc::EXDEV => refuse::<{ libc::EXDEV }>,
+                _ => refuse::<{ libc::EEXIST }>,
+            };
+            let error =
+                rename_exclusive_with_link(&src, &dst, exclusive, Unlinkable::Renamed, |_, _| {
+                    panic!("no link is asked after {errno}")
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(std::fs::read(&src).unwrap(), b"source");
+            assert!(!dst.exists());
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

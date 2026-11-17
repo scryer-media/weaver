@@ -3020,32 +3020,48 @@ async fn a_moved_torrents_row_names_no_folder_of_its_old_place() {
     rig.service.stop().await;
 }
 
-// A move that keeps a file already at the new place has adopted it: the
-// torrent did not make it, so a removal with the torrent's files leaves it
-// as it was, and takes the files the torrent brought.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_file_a_move_kept_is_not_deleted_with_the_torrents_files() {
-    let (rig, job_id, save, there) = unpacked_flat_and_a_taken_folder(&["first.mkv"]).await;
+// A move onto a folder that already holds the torrent's file keeps that
+// file, checks it, and seeds from it; the file is the torrent's from then
+// on, and a removal with the torrent's files deletes it (libtorrent
+// `dont_replace` with `need_full_check`, src/storage_utils.cpp and
+// `torrent::on_storage_moved`; qBittorrent `SessionImpl::removeTorrent`
+// deletes every file the torrent lists). A file there under a name the
+// torrent does not list stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_a_move_kept_is_deleted_with_the_torrents_files() {
+    let (rig, job_id, data, save, taken) = super::moves::seeding_beside_a_taken_name().await;
+    // Its file is one it made, as one it downloaded is: the rig seeds it
+    // from bytes put there before the add, which the add adopts.
+    let made = crate::torrents::model::Adopted {
+        all_files: false,
+        files: Vec::new(),
+        dirs: vec![String::new()],
+    };
+    rig.db.set_torrent_adopted(job_id, &made).unwrap();
+    // The file at the new place is the torrent's own, as when the operator
+    // points the torrent at a folder its files are already in.
+    std::fs::write(taken.join("a.bin"), &data).unwrap();
+    std::fs::write(taken.join("notes.txt"), b"notes").unwrap();
     rig.service
-        .set_location(job_id, there.to_string_lossy().into_owned())
+        .set_location(job_id, taken.to_string_lossy().into_owned())
         .await
         .unwrap();
-    assert_eq!(
-        std::fs::read(there.join("first.mkv")).unwrap(),
-        b"first.mkv"
-    );
-    assert!(save.join("first.mkv").exists(), "its own copy stays behind");
-    assert!(there.join("first.rar").exists());
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.stats().progress_bytes, data.len() as u64);
     let adopted = rig.db.torrent_adopted(job_id).unwrap().unwrap();
-    assert_eq!(adopted.files, ["first.mkv"]);
+    assert!(!adopted.all_files);
+    assert!(adopted.files.is_empty(), "{:?}", adopted.files);
 
-    rig.service.remove(job_id, true, false).await.unwrap();
-    assert_eq!(
-        std::fs::read(there.join("first.mkv")).unwrap(),
-        b"first.mkv"
+    // It seeds with no goal met: the removal is confirmed.
+    rig.service.remove(job_id, true, true).await.unwrap();
+    assert!(
+        !taken.join("a.bin").exists(),
+        "the kept file is the torrent's"
     );
-    assert!(!there.join("first.rar").exists(), "what it brought goes");
-    assert!(!there.join("small.txt").exists());
+    assert_eq!(std::fs::read(taken.join("notes.txt")).unwrap(), b"notes");
+    // The copy the move left behind is no longer the torrent's.
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
     rig.service.stop().await;
 }
 

@@ -437,15 +437,19 @@ impl TorrentService {
                 if super::MOVE_RECORD_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
                     return Err(StateError::Database("refused".to_owned()));
                 }
-                // What was there before the torrent gains what this move
-                // found there and kept: a removal of the torrent with its
-                // files leaves those, as it leaves any file it did not
-                // make. Not known stays not known, and takes no file.
+                // A file this move found at one of the torrent's names and
+                // kept is the torrent's from here on: the check after the
+                // move reads it as the torrent's own, and a removal with its
+                // files deletes it, as libtorrent's `dont_replace` with
+                // `need_full_check` and qBittorrent's removal with files
+                // (`SessionImpl::removeTorrent`) treat it. What was there
+                // before the torrent is not widened by it. Not known stays
+                // not known, and takes no file.
                 let adopted = adopted.as_ref().map(|adopted| Adopted {
                     all_files: adopted.all_files,
                     files: match adopted.all_files {
                         true => Vec::new(),
-                        false => with(&adopted.files, moved.kept.iter().cloned()),
+                        false => adopted.files.clone(),
                     },
                     // The folders are those of the new place alone: one
                     // that was there before the torrent where its files
