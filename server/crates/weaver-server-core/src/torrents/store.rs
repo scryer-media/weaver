@@ -1109,6 +1109,10 @@ impl Pieces for TorrentStore {
         self.files.will_read(file, offset, len);
     }
 
+    fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
+        self.writes.read_turns()
+    }
+
     fn readv(&self, file: usize, mut offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
         let aside = self.aside();
         if !aside.get(file).copied().unwrap_or(false) {

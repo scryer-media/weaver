@@ -1954,6 +1954,45 @@ async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
 }
 
+// A piece an upload holds whole is held against the resident budget a piece
+// in flight is: room for it is refused when the budget is full, it holds
+// room a piece in flight then cannot have, and once it is let go the room
+// is back, the session waiting for it rung.
+#[tokio::test]
+async fn a_piece_an_upload_holds_whole_is_held_against_the_resident_budget() {
+    let layout = Arc::new(PieceLayout::new(8, vec![file("a", 16)]).unwrap());
+    let budget = accountant(8);
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        Arc::new(Recorder::default()) as Arc<dyn Pieces>,
+        holds(&budget),
+    );
+    let lengths = Lengths::new(16, 8).unwrap();
+    let first = lengths.try_validate_piece_index(0).unwrap();
+    let room = Arc::new(Notify::new());
+
+    let held = storage.hold_whole_piece(8).unwrap();
+    assert_eq!(held.bytes(), 8);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 8);
+    // The budget is full: neither another upload's piece nor a piece in
+    // flight has room.
+    assert!(storage.hold_whole_piece(8).is_none());
+    assert!(!storage.reserve_piece(first, &room));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 8);
+
+    let rung = room.notified();
+    drop(held);
+    rung.await;
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+    assert!(storage.reserve_piece(first, &room));
+    assert!(storage.hold_whole_piece(8).is_none());
+
+    // The storage going gives back the piece in flight; nothing else held
+    // any room.
+    drop(storage);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+}
+
 // A piece its volume has no room for is not started: the session's room
 // for it is not taken, and it starts once the volume has written enough.
 // A storage taken gives back what its volume counted for pieces not

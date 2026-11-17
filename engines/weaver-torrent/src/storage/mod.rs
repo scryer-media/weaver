@@ -110,6 +110,149 @@ pub fn wants_room(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Where a storage's reads take their turn: the volume its files lie on
+/// reads so many at once, for every reader of it in the process, and a
+/// spinning one reads a whole piece at a time. A storage hands its turns
+/// over when a torrent starts, and again when its files move
+/// ([`TorrentStorage::read_turns`]); every read of the torrent's files
+/// takes one of them for as long as it reads, on the thread it reads on.
+/// Cloning it is cheap.
+#[derive(Clone, Debug)]
+pub struct ReadTurns {
+    turns: Arc<tokio::sync::Semaphore>,
+    whole_pieces: bool,
+}
+
+/// Reads at once of a storage that names no volume: what one session read
+/// with before its reads took turns on their volume.
+const PRIVATE_READERS: usize = 8;
+
+impl ReadTurns {
+    /// Turns that are `turns`' permits, a whole piece read at a time when
+    /// `whole_pieces`.
+    pub fn new(turns: Arc<tokio::sync::Semaphore>, whole_pieces: bool) -> Self {
+        Self {
+            turns,
+            whole_pieces,
+        }
+    }
+
+    /// The one set of turns every storage that names no volume shares, as
+    /// one on a solid-state disk.
+    pub fn private() -> Self {
+        static PRIVATE: std::sync::LazyLock<ReadTurns> = std::sync::LazyLock::new(|| {
+            ReadTurns::new(
+                Arc::new(tokio::sync::Semaphore::new(PRIVATE_READERS)),
+                false,
+            )
+        });
+        PRIVATE.clone()
+    }
+
+    /// Whether a reader reads a whole piece at a time.
+    pub fn whole_pieces(&self) -> bool {
+        self.whole_pieces
+    }
+
+    /// A turn, waited for on the async runtime: taken without waiting when
+    /// one is free, and counted as a blocking permit is.
+    pub(crate) async fn turn(
+        &self,
+        stats: &crate::session_stats::disk::DiskStats,
+    ) -> tokio::sync::SemaphorePermit<'_> {
+        if let Ok(turn) = self.turns.try_acquire() {
+            stats.permit_taken();
+            return turn;
+        }
+        let since = std::time::Instant::now();
+        let turn = self
+            .turns
+            .acquire()
+            .await
+            .expect("read turns are never closed");
+        stats.permit_waited(since);
+        turn
+    }
+
+    /// The same turn, held apart from these turns, to hand to another
+    /// thread with the read.
+    pub(crate) async fn owned_turn(
+        &self,
+        stats: &crate::session_stats::disk::DiskStats,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        if let Ok(turn) = Arc::clone(&self.turns).try_acquire_owned() {
+            stats.permit_taken();
+            return turn;
+        }
+        let since = std::time::Instant::now();
+        let turn = Arc::clone(&self.turns)
+            .acquire_owned()
+            .await
+            .expect("read turns are never closed");
+        stats.permit_waited(since);
+        turn
+    }
+
+    /// A turn waited for on the calling thread, uncounted: a check's reader
+    /// takes one for each read, which the blocking permit counters, that
+    /// count a check once, never saw.
+    pub(crate) fn wait_here(&self) -> tokio::sync::SemaphorePermit<'_> {
+        crate::spawn_utils::no_block_on_utp_thread();
+        match self.turns.try_acquire() {
+            Ok(turn) => turn,
+            Err(_) => futures::executor::block_on(self.turns.acquire())
+                .expect("read turns are never closed"),
+        }
+    }
+
+    /// The turns themselves: whose they are, and how many are free.
+    pub fn semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.turns
+    }
+}
+
+/// Where room a [`HeldRoom`] held goes back to: the budget it was charged
+/// to.
+pub trait GivesRoomBack: Send + Sync {
+    /// `bytes` held no more.
+    fn give_back(&self, bytes: u64);
+}
+
+/// Room in a storage's memory budget for one piece an upload holds whole
+/// ([`TorrentStorage::hold_whole_piece`]): `bytes` charged before the piece
+/// is read, given back when this is dropped.
+pub struct HeldRoom {
+    bytes: u64,
+    budget: Arc<dyn GivesRoomBack>,
+}
+
+impl HeldRoom {
+    /// `bytes` the caller charged to `budget`, given back to it when this
+    /// is dropped.
+    pub fn new(bytes: u64, budget: Arc<dyn GivesRoomBack>) -> Self {
+        Self { bytes, budget }
+    }
+
+    /// The bytes held.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for HeldRoom {
+    fn drop(&mut self) {
+        self.budget.give_back(self.bytes);
+    }
+}
+
+impl std::fmt::Debug for HeldRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldRoom")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
 pub trait StorageFactory: Send + Sync + Any {
     type Storage: TorrentStorage;
 
@@ -368,6 +511,24 @@ pub trait TorrentStorage: Send + Sync {
     fn stamp(&self, _file_id: usize) -> anyhow::Result<Option<FileStamp>> {
         Ok(None)
     }
+
+    /// Where the torrent's reads take their turn: its files' volume's
+    /// turns. Asked when a torrent starts, when a check begins and when its
+    /// files move while it runs, never per read. Default implementation names no volume and shares
+    /// [`ReadTurns::private`].
+    fn read_turns(&self) -> ReadTurns {
+        ReadTurns::private()
+    }
+
+    /// Room for `bytes` of a piece an upload holds whole in memory, read
+    /// from a volume that reads whole pieces, charged to the budget the
+    /// storage holds pieces in memory against before the piece is read.
+    /// None when that budget has no room for it, or the storage keeps none:
+    /// the upload then reads the blocks asked for. Default implementation
+    /// keeps none.
+    fn hold_whole_piece(&self, _bytes: u64) -> Option<HeldRoom> {
+        None
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -471,6 +632,14 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn stamp(&self, file_id: usize) -> anyhow::Result<Option<FileStamp>> {
         (**self).stamp(file_id)
+    }
+
+    fn read_turns(&self) -> ReadTurns {
+        (**self).read_turns()
+    }
+
+    fn hold_whole_piece(&self, bytes: u64) -> Option<HeldRoom> {
+        (**self).hold_whole_piece(bytes)
     }
 }
 

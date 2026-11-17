@@ -711,17 +711,17 @@ metric_families! {
     TORRENT_DISK_UPLOAD_READ_BLOCKS = ("weaver_torrent_disk_upload_read_blocks_total", Counter, ["route", "transport"],
         "Blocks the session's upload reads read since it opened, by the peer's transport; divide by the upload read calls for blocks per read.");
     TORRENT_DISK_PERMIT_ACQUISITIONS = ("weaver_torrent_disk_permit_acquisitions_total", Counter, ["route"],
-        "Blocking permits the session's disk work took since it opened.");
+        "Blocking permits and volume read turns the session's disk work took since it opened.");
     TORRENT_DISK_PERMIT_WAITS = ("weaver_torrent_disk_permit_waits_total", Counter, ["route"],
-        "Blocking permits that were not free when asked for, since the session opened.");
+        "Blocking permits and volume read turns that were not free when asked for, since the session opened.");
     TORRENT_DISK_PERMIT_WAIT_SECONDS = ("weaver_torrent_disk_permit_wait_seconds_total", Counter, ["route"],
-        "Time the session's disk work waited for a blocking permit since it opened, summed.");
+        "Time the session's disk work waited for a blocking permit or a volume read turn since it opened, summed.");
     TORRENT_DISK_PERMITS_IN_USE = ("weaver_torrent_disk_permits_in_use", Gauge, ["route"],
         "Blocking permits of the session held now.");
     TORRENT_DISK_PERMITS = ("weaver_torrent_disk_permits", Gauge, ["route"],
         "Blocking permits the session has.");
     TORRENT_DISK_READ_JOBS_QUEUED = ("weaver_torrent_disk_read_jobs_queued", Gauge, ["route"],
-        "Upload reads waiting for a disk thread of the session now.");
+        "Upload reads holding a volume read turn and waiting for a blocking thread of the session now.");
     TORRENT_DISK_PIECE_CHECK_WAITS = ("weaver_torrent_disk_piece_check_waits_total", Counter, ["route"],
         "Times a peer connection waited for the session's hashing thread to check a piece it completed, since the session opened. A piece held in memory until it is checked is not waited for: it is handed to the hashing thread and counted among the pieces waiting.");
     TORRENT_DISK_PIECE_CHECK_WAIT_SECONDS = ("weaver_torrent_disk_piece_check_wait_seconds_total", Counter, ["route"],

@@ -8,6 +8,8 @@ use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
+use crate::operations::disk::reader::Reading;
+use crate::operations::disk::volume::Volume;
 use crate::pipeline::graph::hardware::Shutdown;
 use crate::pipeline::graph::leaf::read_exact_at;
 use weaver_graph::Digest;
@@ -25,6 +27,8 @@ pub(crate) struct Verification {
     // Everything submitted for the file when the check was lent: the
     // worker reads once it has returned.
     settled: Option<crate::operations::disk::writer::Barrier>,
+    // The volume the file lies on: the check reads in its turns.
+    volume: Option<Arc<Volume>>,
     pub(crate) stop: Arc<AtomicBool>,
     #[cfg(test)]
     barrier: Option<ReadBarrier>,
@@ -107,12 +111,22 @@ impl Verification {
             let mut bytes = vec![0; READ_BACK as usize];
             let mut at = 0;
             let mut crc = 0;
+            // Each read in a turn of the file's volume: on one with more
+            // than one turn, the one the check took first and keeps until
+            // it returns.
+            let reads = self.volume.as_deref().map(Volume::read_turns);
+            let mut reading = Reading::default();
             while at < self.length {
                 if stopped() {
                     return Ok(None);
                 }
                 let len = (self.length - at).min(READ_BACK) as usize;
-                read_exact_at(&file, at, &mut bytes[..len]).map_err(io)?;
+                let into = &mut bytes[..len];
+                match reads {
+                    Some(reads) => reading.read(reads, || read_exact_at(&file, at, into)),
+                    None => read_exact_at(&file, at, into),
+                }
+                .map_err(io)?;
                 read(len);
                 if stopped() {
                     return Ok(None);
@@ -220,6 +234,7 @@ impl NamespaceWriter {
                 .folded(length, Algorithm::Crc32)
                 .map(|folded| folded as u32),
             settled: leaf.settled(),
+            volume: leaf.volume().cloned(),
             stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             barrier: None,
@@ -277,6 +292,93 @@ impl NamespaceWriter {
             self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod turns {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use weaver_graph::{Coverage, MemberId, NodeId};
+
+    use super::{READ_BACK, Verification};
+    use crate::operations::disk::StorageKind;
+    use crate::operations::disk::reader::{SOLID_READERS, SPINNING_READERS};
+    use crate::operations::disk::volume::Volume;
+    use crate::pipeline::graph::hardware::Shutdown;
+
+    fn check(path: std::path::PathBuf, length: u64, volume: Option<Arc<Volume>>) -> Verification {
+        Verification {
+            node: NodeId(1),
+            member: MemberId(0),
+            path,
+            revision: (0, 0),
+            length,
+            stated: 0,
+            coverage: Coverage::default(),
+            folded: None,
+            settled: None,
+            volume,
+            stop: Arc::new(AtomicBool::new(false)),
+            barrier: None,
+        }
+    }
+
+    // A member's check made in turns of its file's volume reads what the
+    // check made without them reads, read for read, and comes to the same
+    // CRC, or the same error. On solid state it holds one turn across its
+    // reads; on a spinning volume each read takes the one turn and gives it
+    // back. Every turn is back once it returns.
+    #[test]
+    fn a_check_in_its_volumes_turns_reads_what_a_check_without_them_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.bin");
+        let length = 2 * READ_BACK + READ_BACK / 2 + 7;
+        let body: Vec<u8> = (0..length).map(|at| (at * 31 % 251) as u8).collect();
+        std::fs::write(&path, &body).unwrap();
+        let shutdown = Shutdown::default();
+        let run = |volume: Option<Arc<Volume>>, path: std::path::PathBuf| {
+            let mut reads = Vec::new();
+            let mut free = Vec::new();
+            let watched = volume.clone();
+            let verified = check(path, length, volume).run_with(&shutdown, |len| {
+                reads.push(len);
+                if let Some(volume) = &watched {
+                    free.push(volume.read_turns().turns().available_permits());
+                }
+            });
+            let actual = verified.actual.map_err(|error| {
+                matches!(
+                    error,
+                    crate::pipeline::graph::leaf::LeafError::Io { ref source, .. }
+                        if source.kind() == std::io::ErrorKind::NotFound
+                )
+            });
+            (actual, reads, free)
+        };
+        let (old, old_reads, _) = run(None, path.clone());
+        let crc = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &body) as u32;
+        assert_eq!(old, Ok(Some(crc)));
+        assert_eq!(old_reads.len(), 3);
+        let (old_missing, _, _) = run(None, dir.path().join("gone.bin"));
+        assert_eq!(old_missing, Err(true));
+        for (kind, during, all) in [
+            (StorageKind::Solid, SOLID_READERS - 1, SOLID_READERS),
+            (StorageKind::Unknown, SOLID_READERS - 1, SOLID_READERS),
+            (StorageKind::Rotational, SPINNING_READERS, SPINNING_READERS),
+        ] {
+            let volume = Arc::new(Volume::new(None, "test".to_owned()));
+            volume.reads(|| kind);
+            let (new, new_reads, free) = run(Some(Arc::clone(&volume)), path.clone());
+            assert_eq!(new, old, "{kind:?}");
+            assert_eq!(new_reads, old_reads, "{kind:?}");
+            assert_eq!(free, vec![during; old_reads.len()], "{kind:?}");
+            assert_eq!(volume.read_turns().turns().available_permits(), all);
+            let (missing, _, _) = run(Some(Arc::clone(&volume)), dir.path().join("gone.bin"));
+            assert_eq!(missing, old_missing, "{kind:?}");
+            assert_eq!(volume.read_turns().turns().available_permits(), all);
+        }
     }
 }
 

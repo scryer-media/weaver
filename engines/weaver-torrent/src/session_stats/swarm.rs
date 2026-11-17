@@ -143,7 +143,7 @@ impl WriterRequest {
             Self::Answer(Answer::HashReject(_)) => Some(MessageKind::HashReject),
             Self::Answer(Answer::Hashes(_)) => Some(MessageKind::Hashes),
             Self::Answer(Answer::Metadata(_)) => Some(MessageKind::Metadata),
-            Self::Disconnect(_) => None,
+            Self::Disconnect(_) | Self::ReadTurns(_) => None,
         }
     }
 }

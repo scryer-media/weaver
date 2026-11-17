@@ -417,8 +417,15 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         &self,
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
+        held: Option<&mut crate::file_ops::HeldPiece>,
     ) -> std::result::Result<(), (usize, anyhow::Error)> {
-        self.state.file_ops().read_chunks(self.addr, chunks, bufs)
+        self.state
+            .file_ops()
+            .read_chunks(self.addr, chunks, bufs, held)
+    }
+
+    fn read_turns(&self) -> crate::storage::ReadTurns {
+        crate::storage::ReadTurns::clone(&self.state.reads.load())
     }
 
     fn chunk_reader(&self) -> Option<Arc<dyn crate::peer_connection::ChunkReader>> {

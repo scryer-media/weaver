@@ -157,6 +157,10 @@ pub(crate) fn job_disk(
             .map_or_else(|| capacity.volume(dir), |(_, volume)| Arc::clone(volume))
     };
     let volume = volume_of(working_dir);
+    // The volume's read turns are made for the kind the owner holds for it,
+    // from memory, the first time anyone asks: the job's readers take them
+    // (`Volume::read_turns`).
+    capacity.volume_reads(&volume);
     let mut writing = Writing {
         buffers: Arc::clone(buffers),
         volumes: Vec::with_capacity(2),
@@ -170,6 +174,7 @@ pub(crate) fn job_disk(
         let other = volume_of(dir);
         (!Arc::ptr_eq(&other, &volume)).then(|| {
             writing.join(&other);
+            capacity.volume_reads(&other);
             let output = writers.submitter(&other, key);
             probes.first_seen(writers, &writers.owner, &other, dir);
             (dir.to_path_buf(), output)
