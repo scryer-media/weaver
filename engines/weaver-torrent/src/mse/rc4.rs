@@ -68,12 +68,17 @@ impl Rc4 {
             unsafe { self.apply_ahead(buf) };
             return;
         }
+        #[cfg(target_arch = "aarch64")]
+        self.apply_ahead(buf);
+        #[cfg(not(target_arch = "aarch64"))]
         self.apply_words(buf);
     }
 
     /// Eight keystream bytes are gathered into a word and XORed into the
     /// buffer at once, so each byte costs the two state stores and no store
-    /// of its own (libtorrent `rc4_encrypt`, src/pe_crypto.cpp, RC_2_1).
+    /// of its own. libtorrent's `rc4_encrypt` (src/pe_crypto.cpp) is a plain
+    /// loop of one byte a step; the gather is Weaver's own.
+    #[cfg(any(not(target_arch = "aarch64"), test))]
     fn apply_words(&mut self, buf: &mut [u8]) {
         let (mut i, mut j) = (self.i, usize::from(self.j));
         let s = &mut self.s;
@@ -194,6 +199,84 @@ impl Rc4 {
         self.j = j.to_le_bytes()[0];
     }
 
+    /// The same idea on aarch64, in plain Rust: sixteen bytes a round, each
+    /// entry for `i` read ahead of its use, before the stores of the step
+    /// that reads it.
+    ///
+    /// Arm's Neoverse cores run a read of `s[i + 1]` before an older store
+    /// whose address is not known yet, and start again when the two meet,
+    /// so the textbook loop throws work away. Here the entries are read in
+    /// pairs: the odd step of each pair reads the next two, `s[i + 1]` and
+    /// `s[i + 2]`, and the even step reads none. A store that lands on an
+    /// entry still to be used takes a cold path that reads it again; the
+    /// pair is aligned, so the odd step tests `j` against both entries with
+    /// one mask, and the even step has one entry left to test.
+    ///
+    /// Each of the sixteen rounds of the table is its own copy, so every `i`
+    /// in a test, a read or a store is a constant. Whole passes over the
+    /// table run the sixteen copies in order with no dispatch between them;
+    /// a call's first rounds up to entry 0, and its last after the final
+    /// whole pass, pick their copy by the round's first `i`. The state stays
+    /// a byte per entry, which every Arm core measured prefers, and the
+    /// sixteen keystream bytes are gathered into two words by shift and or.
+    #[cfg(target_arch = "aarch64")]
+    fn apply_ahead(&mut self, buf: &mut [u8]) {
+        let mut at = 0;
+        while at < buf.len() && !self.i.wrapping_add(1).is_multiple_of(16) {
+            let mut j = usize::from(self.j);
+            buf[at] ^= step(&mut self.s, &mut self.i, &mut j);
+            self.j = j.to_le_bytes()[0];
+            at += 1;
+        }
+        let (rounds, tail) = buf[at..].as_chunks_mut::<16>();
+        if !rounds.is_empty() {
+            let s = &mut self.s;
+            let mut j = self.j;
+            // The round's first i, and the entries for it and the next.
+            let mut b = usize::from(self.i.wrapping_add(1)) & 0xf0;
+            let mut t = (low(s[b]), low(s[b + 1]));
+            let mut rest = rounds;
+            while b != 0 {
+                let Some((r, more)) = std::mem::take(&mut rest).split_first_mut() else {
+                    break;
+                };
+                round_at(s, &mut j, &mut t, r, b);
+                b = (b + 16) & 0xf0;
+                rest = more;
+            }
+            let (passes, rest) = rest.as_chunks_mut::<16>();
+            for p in passes {
+                round::<0>(s, &mut j, &mut t, &mut p[0]);
+                round::<16>(s, &mut j, &mut t, &mut p[1]);
+                round::<32>(s, &mut j, &mut t, &mut p[2]);
+                round::<48>(s, &mut j, &mut t, &mut p[3]);
+                round::<64>(s, &mut j, &mut t, &mut p[4]);
+                round::<80>(s, &mut j, &mut t, &mut p[5]);
+                round::<96>(s, &mut j, &mut t, &mut p[6]);
+                round::<112>(s, &mut j, &mut t, &mut p[7]);
+                round::<128>(s, &mut j, &mut t, &mut p[8]);
+                round::<144>(s, &mut j, &mut t, &mut p[9]);
+                round::<160>(s, &mut j, &mut t, &mut p[10]);
+                round::<176>(s, &mut j, &mut t, &mut p[11]);
+                round::<192>(s, &mut j, &mut t, &mut p[12]);
+                round::<208>(s, &mut j, &mut t, &mut p[13]);
+                round::<224>(s, &mut j, &mut t, &mut p[14]);
+                round::<240>(s, &mut j, &mut t, &mut p[15]);
+            }
+            for r in rest {
+                round_at(s, &mut j, &mut t, r, b);
+                b = (b + 16) & 0xf0;
+            }
+            self.i = b.to_le_bytes()[0].wrapping_sub(1);
+            self.j = j;
+        }
+        let mut j = usize::from(self.j);
+        for t in tail {
+            *t ^= step(&mut self.s, &mut self.i, &mut j);
+        }
+        self.j = j.to_le_bytes()[0];
+    }
+
     /// Advance the keystream by `n` bytes.
     pub fn skip(&mut self, n: usize) {
         #[cfg(test)]
@@ -205,6 +288,91 @@ impl Rc4 {
         self.i = i;
         self.j = j.to_le_bytes()[0];
     }
+}
+
+/// The round whose first `i` is `b`, a multiple of 16.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn round_at(s: &mut [Cell; 256], j: &mut u8, t: &mut (u8, u8), r: &mut [u8; 16], b: usize) {
+    match b {
+        0 => round::<0>(s, j, t, r),
+        16 => round::<16>(s, j, t, r),
+        32 => round::<32>(s, j, t, r),
+        48 => round::<48>(s, j, t, r),
+        64 => round::<64>(s, j, t, r),
+        80 => round::<80>(s, j, t, r),
+        96 => round::<96>(s, j, t, r),
+        112 => round::<112>(s, j, t, r),
+        128 => round::<128>(s, j, t, r),
+        144 => round::<144>(s, j, t, r),
+        160 => round::<160>(s, j, t, r),
+        176 => round::<176>(s, j, t, r),
+        192 => round::<192>(s, j, t, r),
+        208 => round::<208>(s, j, t, r),
+        224 => round::<224>(s, j, t, r),
+        240 => round::<240>(s, j, t, r),
+        _ => unreachable!("a round starts at a multiple of 16"),
+    }
+}
+
+/// Sixteen keystream bytes from entry `B`, XORed into `r`. `t` holds the
+/// entries for `i` at `B` and `B + 1` on entry, and for the next round's
+/// first two on return.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn round<const B: usize>(s: &mut [Cell; 256], j: &mut u8, t: &mut (u8, u8), r: &mut [u8; 16]) {
+    let (mut t1, mut t2) = *t;
+    let mut jv = *j;
+    let mut k = [0u64; 2];
+    macro_rules! pair {
+        ($n:literal) => {
+            // Even step: the entry for the odd step is already held.
+            let tx = t1;
+            jv = jv.wrapping_add(tx);
+            let jj = usize::from(jv);
+            let ty = low(s[jj]);
+            s[B + $n] = ty;
+            s[jj] = tx;
+            if jj == B + $n + 1 {
+                std::hint::cold_path();
+                t2 = low(s[B + $n + 1]);
+            }
+            t1 = t2;
+            let byte = low(s[(usize::from(tx) + usize::from(ty)) & 0xff]);
+            k[$n / 8] |= u64::from(byte) << (8 * ($n % 8));
+            // Odd step: the next pair is read before this step's stores.
+            let tx = t1;
+            jv = jv.wrapping_add(tx);
+            let jj = usize::from(jv);
+            let ty = low(s[jj]);
+            t1 = low(s[(B + $n + 2) & 0xff]);
+            t2 = low(s[(B + $n + 3) & 0xff]);
+            s[B + $n + 1] = ty;
+            s[jj] = tx;
+            if jj & 0xfe == (B + $n + 2) & 0xff {
+                std::hint::cold_path();
+                t1 = low(s[(B + $n + 2) & 0xff]);
+                t2 = low(s[(B + $n + 3) & 0xff]);
+            }
+            let byte = low(s[(usize::from(tx) + usize::from(ty)) & 0xff]);
+            k[($n + 1) / 8] |= u64::from(byte) << (8 * (($n + 1) % 8));
+        };
+    }
+    pair!(0);
+    pair!(2);
+    pair!(4);
+    pair!(6);
+    pair!(8);
+    pair!(10);
+    pair!(12);
+    pair!(14);
+    let (lo, hi) = r.split_at_mut(8);
+    let lo: &mut [u8; 8] = lo.try_into().unwrap();
+    let hi: &mut [u8; 8] = hi.try_into().unwrap();
+    *lo = (u64::from_le_bytes(*lo) ^ k[0]).to_le_bytes();
+    *hi = (u64::from_le_bytes(*hi) ^ k[1]).to_le_bytes();
+    *t = (t1, t2);
+    *j = jv;
 }
 
 /// One keystream byte. Only the low byte of `j` is RC4's `j`: it is carried
@@ -493,13 +661,16 @@ mod tests {
         }
     }
 
-    /// Both x86-64 loops, the read-ahead one and the fallback for a CPU
-    /// without SSE4.1, against the reference, with the loop changed from
+    /// The read-ahead loop and the word loop (on x86-64 the fallback for a
+    /// CPU without SSE4.1) against the reference, with the loop changed from
     /// one call to the next so each picks up where the other left off.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn rc4_read_ahead_and_fallback_loops_match_the_reference_from_any_point() {
-        let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
+        #[cfg(target_arch = "x86_64")]
+        let ahead = std::arch::is_x86_feature_detected!("sse4.1");
+        #[cfg(target_arch = "aarch64")]
+        let ahead = true;
         let mut rng = Seeded(0x00a4_eaad);
         for round in 0..48 {
             let key_len = 1 + rng.below(256);
@@ -518,9 +689,14 @@ mod tests {
                 let plain = rng.bytes(len);
                 let mut got = plain.clone();
                 let mut want = plain;
-                if sse41 && rng.below(2) == 0 {
+                if ahead && rng.below(2) == 0 {
+                    #[cfg(target_arch = "x86_64")]
                     // SAFETY: the CPU has SSE4.1, checked above.
-                    unsafe { c.apply_ahead(&mut got) };
+                    unsafe {
+                        c.apply_ahead(&mut got)
+                    };
+                    #[cfg(target_arch = "aarch64")]
+                    c.apply_ahead(&mut got);
                 } else {
                     c.apply_words(&mut got);
                 }
