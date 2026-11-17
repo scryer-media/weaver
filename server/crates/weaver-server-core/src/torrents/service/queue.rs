@@ -6,7 +6,7 @@ use super::intake::Resolving;
 use super::intake::{AddError, AddRequest};
 use super::live::Live;
 use super::scripts::StoppedSeeding;
-use super::{ActionError, Inner, TorrentService, state_error};
+use super::{ActionError, Asked, Inner, TorrentService, locked, state_error};
 use crate::SchedulerError;
 use crate::jobs::JobId;
 use crate::jobs::class::{
@@ -19,6 +19,7 @@ use crate::torrents::admission::Refusal;
 use crate::torrents::metrics::FetchOutcome;
 use crate::torrents::{TorrentIntent, status};
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, Weak};
 
 // A snapshot of the download queue's end from the last pass, extended by
@@ -49,14 +50,28 @@ impl TorrentService {
         queue.state().classes().seat(self.class());
     }
 
-    /// Start the client, and only once it runs seat it as the torrent class
-    /// of the queue it was wired to: a client that failed to start is never
-    /// the class the job layer hands torrents to.
+    /// Start the client without waiting on its torrents, and seat it as
+    /// the torrent class of the queue it was wired to. What a start reads
+    /// before any torrent, its tracker rules and the last torrent's key,
+    /// fails the start: a client that failed to start is never the class
+    /// the job layer hands torrents to. The stored torrents are then read
+    /// on a task the service keeps, a page at a time, and the tick starts
+    /// once the last is in; the caller goes on at once. A page the database
+    /// fails to give is said, and shown with the service's warnings: the
+    /// tick starts then, the torrents read so far run, and each tick reads
+    /// that page again until the load ends.
     pub(super) async fn start_seated(&self) -> Result<(), String> {
-        self.start().await?;
+        let through = self.begin()?;
         if let Some(queue) = self.queue() {
             queue.state().classes().seat(self.class());
         }
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            if service.load(through).await.is_ok() {
+                service.after_load().await;
+            }
+            service.run(service.inner.sessions.on()).await;
+        }));
         Ok(())
     }
 
@@ -147,6 +162,8 @@ impl TorrentService {
                 Ok(())
             })
             .await?;
+            // Its job is restored at the next tick.
+            self.inner.restore_wanted.store(true, Ordering::Release);
         }
         self.set_intent(job_id, TorrentIntent::Resumed).await?;
         self.with_torrent(job_id, |torrent| {
@@ -231,11 +248,42 @@ impl TorrentService {
     /// starting with the first. A seed has no place to move (libtorrent
     /// `torrent::finished` takes it out of the queue). Nothing moves a
     /// torrent past the queue: forcing does that.
+    ///
+    /// Asked for while the stored torrents are still being read, the move
+    /// is kept and made once the last is in, among all of them, after the
+    /// moves asked before it: a place among only some of the queue is no
+    /// place.
     pub async fn reorder(
         &self,
         job_ids: &[JobId],
         target: QueueMoveTarget,
     ) -> Result<(), ActionError> {
+        self.ensure(job_ids).await;
+        {
+            let live = self.inner.live.lock().await;
+            if let Some(&missing) = job_ids.iter().find(|job_id| !live.contains_key(job_id)) {
+                return Err(ActionError::NotFound(missing));
+            }
+            // Under the lock the load ends under: kept, or made now.
+            let mut marks = locked(&self.inner.load_marks);
+            if self.loading() {
+                marks.asked.push(Asked::Reorder(job_ids.to_vec(), target));
+                return Ok(());
+            }
+        }
+        if self.reorder_now(job_ids, target).await? {
+            self.apply_queue().await;
+            self.publish().await;
+        }
+        Ok(())
+    }
+
+    // `reorder` among the torrents here now: whether any place changed.
+    pub(super) async fn reorder_now(
+        &self,
+        job_ids: &[JobId],
+        target: QueueMoveTarget,
+    ) -> Result<bool, ActionError> {
         {
             let mut live = self.inner.live.lock().await;
             if let Some(&missing) = job_ids.iter().find(|job_id| !live.contains_key(job_id)) {
@@ -261,7 +309,7 @@ impl TorrentService {
                 .map(|(job_id, place)| (*job_id, place))
                 .collect();
             if moved.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
             self.inner
                 .db
@@ -273,9 +321,7 @@ impl TorrentService {
                 }
             }
         }
-        self.apply_queue().await;
-        self.publish().await;
-        Ok(())
+        Ok(true)
     }
 
     async fn update(&self, job_id: JobId, update: JobUpdate) -> Result<(), ActionError> {

@@ -337,6 +337,7 @@ impl TorrentService {
             None => None,
         };
         let rules = self.rules();
+        self.ensure(&[job_id]).await;
         let moved = {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
@@ -366,7 +367,11 @@ impl TorrentService {
     /// Read every torrent, keep their ledgers, follow their routes, and
     /// apply what that changes.
     pub async fn tick(&self) {
-        self.restore_jobs().await;
+        // A load of the stored torrents whose page failed reads it again.
+        self.resume_load();
+        // The jobs still to restore are restored off the tick, which goes on
+        // at once: a torrent reads as kept until its job is back.
+        self.start_restores();
         self.follow_routes().await;
         // Taken after the routes are followed, whose readings take their
         // own: no reading in the tick runs from before one already kept.
@@ -445,6 +450,12 @@ impl TorrentService {
                     if moved || torrent.held.is_some() {
                         unresolved.push(torrent.record.job_id);
                     }
+                    continue;
+                }
+                // One whose job is still to come back is the restore pass's:
+                // it joins its route as its job is back, held there if the
+                // route is down.
+                if torrent.awaits_restore() {
                     continue;
                 }
                 let terms = PeerTerms::of(&settings, rule);

@@ -51,7 +51,8 @@ async fn rig_seated(
     seated: bool,
 ) -> Rig {
     let dir = TempDir::new().unwrap();
-    let db = Database::open(&dir.path().join("rss.sqlite")).unwrap();
+    let mut db = Database::open(&dir.path().join("rss.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = format!(
         r#"<?xml version="1.0"?>
         <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
@@ -208,9 +209,19 @@ impl Rig {
             .collect()
     }
 
-    // The feed's seen rows, oldest first, as (item, decision, job, error).
+    // The feed's seen rows in their ids' order, as (item, decision, job,
+    // error). A row is listed under its id's digest: each is named
+    // back as the id these tests' feeds give.
     fn seen(&self) -> Vec<(String, String, Option<u64>, Option<String>)> {
         let mut rows = self.db.list_rss_seen_items(Some(1), None).unwrap();
+        for row in &mut rows {
+            if let Some(id) = ["a", "b", "c", "d", "old", "x"]
+                .into_iter()
+                .find(|id| self.db.rss_seen_item_key(id) == row.item_id)
+            {
+                row.item_id = id.to_owned();
+            }
+        }
         rows.sort_by(|a, b| a.item_id.cmp(&b.item_id));
         rows.into_iter()
             .map(|row| {
@@ -310,16 +321,17 @@ async fn a_magnet_link_is_added_without_a_fetch() {
         rig.seen(),
         vec![("a".into(), "submitted".into(), Some(jobs[0]), None)]
     );
-    // The job carries the feed's attributes as an NZB job does.
+    // The job carries the feed's attributes as an NZB job does, but for
+    // the item's link and its id, which is often the link: a private
+    // tracker's carries the passkey, and the attributes are kept in the
+    // clear.
     let stored = rig.db.list_torrents().unwrap();
     assert_eq!(
         stored[0].metadata,
         [
             ("rss.feed_id", "1"),
             ("rss.feed_name", "Torrent Feed"),
-            ("rss.item_id", "a"),
             ("rss.item_title", "Silver Horizon a"),
-            ("rss.item_url", magnet().replace("&amp;", "&").as_str()),
             ("tier", "gold"),
         ]
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -392,6 +404,247 @@ async fn an_nzb_beside_a_torrent_client_is_submitted_as_before() {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].1, "submitted");
     assert!(seen[0].2.is_some());
+}
+
+// A usenet job keeps the item's link and id sealed, in the queue and as
+// stored, beside the feed's other attributes kept as they were. An admin
+// reads them back opened; any other caller reads neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_usenet_jobs_rss_link_and_id_are_stored_sealed_and_shown_to_an_admin_only() {
+    use crate::auth::CallerScope;
+    use crate::persistence::encryption::is_encrypted;
+
+    let rig = rig(
+        &item(
+            "a",
+            r#"<enclosure url="http://localhost/download.nzb" length="321" type="application/x-nzb"/>"#,
+        ),
+        None,
+        true,
+    )
+    .await;
+
+    let report = rig.service.run_all_sync().await.unwrap();
+    assert_eq!(report.items_submitted, 1, "{report:?}");
+    let job = rig.nzb_jobs().remove(0);
+    let datastore = rig.db.datastore();
+    let job_id = job.job_id.0 as i64;
+    let stored = rig
+        .db
+        .run_sql_blocking_read(async move {
+            crate::persistence::sql_runtime::SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT metadata FROM active_jobs WHERE job_id = {}",
+                &[crate::persistence::sql_runtime::SqlArg::I64(job_id)],
+            )
+            .await?[0]
+                .opt_text("metadata")
+        })
+        .unwrap();
+    let stored = crate::history::parse_history_metadata(stored.as_deref());
+    for metadata in [&job.metadata, &stored] {
+        let keys: Vec<&str> = metadata
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .filter(|key| !key.starts_with("weaver.") && !key.starts_with("__weaver_"))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "rss.feed_id",
+                "rss.feed_name",
+                "rss.item_id",
+                "rss.item_title",
+                "rss.item_url",
+                "tier"
+            ]
+        );
+        for (key, value) in metadata {
+            assert_eq!(
+                is_encrypted(value),
+                key == "rss.item_id" || key == "rss.item_url",
+                "{key}"
+            );
+        }
+        let link = crate::history::attributes::rss_link_pairs(metadata);
+        let opened = rig.db.rss_link_attributes(&link, CallerScope::Admin);
+        assert_eq!(opened[0], ("rss.item_id".to_owned(), "a".to_owned()));
+        assert_eq!(opened[1].0, "rss.item_url");
+        assert!(opened[1].1.ends_with("/download.nzb"), "{opened:?}");
+        for scope in [CallerScope::Read, CallerScope::Control] {
+            assert!(rig.db.rss_link_attributes(&link, scope).is_empty());
+        }
+    }
+}
+
+impl Rig {
+    // Every idempotency row as stored: (scope, key, job), in key order.
+    fn idempotency(&self) -> Vec<(String, String, i64)> {
+        use crate::persistence::sql_runtime::SqlRuntime;
+        let datastore = self.db.datastore();
+        self.db
+            .run_sql_blocking_read(async move {
+                SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    "SELECT caller_scope, idempotency_key, job_id FROM submission_idempotency \
+                      ORDER BY caller_scope, idempotency_key",
+                    &[],
+                )
+                .await?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.text("caller_scope")?,
+                        row.text("idempotency_key")?,
+                        row.i64("job_id")?,
+                    ))
+                })
+                .collect()
+            })
+            .unwrap()
+    }
+
+    // `sql` run as one write.
+    fn write(&self, sql: &str) {
+        use crate::persistence::sql_runtime::SqlRuntime;
+        let (datastore, sql) = (self.db.datastore(), sql.to_owned());
+        self.db
+            .run_sql_blocking(async move {
+                SqlRuntime::execute(datastore.write_exec(), &sql, &[]).await?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    // The feed polled again with `item` forgotten and read whole: the item
+    // is submitted again as the feed gives it.
+    async fn submit_again(&self, item: &str) {
+        assert!(self.db.delete_rss_seen_item(1, item).unwrap());
+        let mut feed = self.db.get_rss_feed(1).unwrap().unwrap();
+        feed.etag = None;
+        feed.last_modified = None;
+        self.db.update_rss_feed(&feed).unwrap();
+        self.service.run_all_sync().await.unwrap();
+    }
+}
+
+// An RSS submission is kept idempotent under the item's seen key, never its
+// id, which is often the link and its passkey: the same item submitted again
+// is the job it made the first time, and no second is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_rss_submission_is_kept_under_the_items_seen_key_and_not_made_twice() {
+    let rig = rig(
+        &item(
+            "a",
+            r#"<enclosure url="http://localhost/download.nzb" length="321" type="application/x-nzb"/>"#,
+        ),
+        None,
+        true,
+    )
+    .await;
+
+    let report = rig.service.run_all_sync().await.unwrap();
+    assert_eq!(report.items_submitted, 1, "{report:?}");
+    let job = rig.nzb_jobs().remove(0).job_id.0 as i64;
+    let kept = vec![("rss:feed:1".to_owned(), rig.db.rss_seen_item_key("a"), job)];
+    assert_eq!(rig.idempotency(), kept);
+
+    rig.submit_again("a").await;
+    assert_eq!(rig.nzb_jobs().len(), 1);
+    assert_eq!(rig.seen()[0].2, Some(job as u64));
+    assert_eq!(rig.idempotency(), kept);
+}
+
+// RSS idempotency rows kept under the item's id before are put back under
+// its seen key by the one pass, across more than one page and a job's rows
+// split between two pages. One whose seen key is there already leaves the
+// row there as it is; another caller's rows, and a row keyed already, stay
+// as they were. A legacy item submitted again is still the job it made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rss_idempotency_rows_kept_under_an_id_are_keyed_by_the_pass() {
+    let rig = rig(
+        &item(
+            "a",
+            r#"<enclosure url="http://localhost/download.nzb" length="321" type="application/x-nzb"/>"#,
+        ),
+        None,
+        true,
+    )
+    .await;
+    rig.service.run_all_sync().await.unwrap();
+    let job = rig.nzb_jobs().remove(0).job_id.0 as i64;
+    // The item's row as a build before keyed it.
+    rig.write(
+        "UPDATE submission_idempotency SET idempotency_key = 'a' WHERE caller_scope = 'rss:feed:1'",
+    );
+
+    const ROWS: i64 = 70;
+    let id = |n: i64| format!("https://indexer.invalid/get/{n}?apikey=SECRET");
+    // Two rows a job, the first page ending inside one.
+    let job_of = |n: i64| 5000 + (n + 1) / 2;
+    let snapshots = (job_of(0)..=job_of(ROWS + 2))
+        .map(|job| format!("({job}, 'completed', 'n', 'accept', 'rss', 1, 1)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    rig.write(&format!(
+        "INSERT INTO duplicate_job_snapshots
+            (job_id, lifecycle, normalized_name, admission_action, origin, created_at, updated_at)
+         VALUES {snapshots}"
+    ));
+    let mut rows: Vec<String> = (0..ROWS)
+        .map(|n| format!("('rss:feed:2', '{}', x'00', {}, 1)", id(n), job_of(n)))
+        .collect();
+    let dup = rig.db.rss_seen_item_key("dup");
+    let keyed = rig.db.rss_seen_item_key("keyed");
+    rows.extend([
+        format!("('rss:feed:2', 'dup', x'00', {}, 1)", job_of(0)),
+        format!("('rss:feed:2', '{dup}', x'00', {}, 1)", job_of(1)),
+        format!("('rss:feed:2', '{keyed}', x'00', {}, 1)", job_of(2)),
+        format!(
+            "('api:key:1', 'client-key', x'00', {}, 1)",
+            job_of(ROWS + 2)
+        ),
+    ]);
+    rig.write(&format!(
+        "INSERT INTO submission_idempotency
+            (caller_scope, idempotency_key, request_hash, job_id, created_at)
+         VALUES {}",
+        rows.join(", ")
+    ));
+
+    rig.db.seal_stored_secrets().unwrap();
+
+    let mut expected: Vec<(String, String, i64)> = (0..ROWS)
+        .map(|n| {
+            (
+                "rss:feed:2".to_owned(),
+                rig.db.rss_seen_item_key(&id(n)),
+                job_of(n),
+            )
+        })
+        .collect();
+    expected.extend([
+        (
+            "api:key:1".to_owned(),
+            "client-key".to_owned(),
+            job_of(ROWS + 2),
+        ),
+        ("rss:feed:1".to_owned(), rig.db.rss_seen_item_key("a"), job),
+        ("rss:feed:2".to_owned(), dup, job_of(1)),
+        ("rss:feed:2".to_owned(), keyed, job_of(2)),
+    ]);
+    expected.sort();
+    let stored = rig.idempotency();
+    assert_eq!(stored, expected);
+    assert!(stored.iter().all(|(_, key, _)| !key.contains("apikey")));
+
+    // Nothing is left: the step reads one empty page and writes nothing.
+    rig.db.key_rss_idempotency().unwrap();
+    assert_eq!(rig.idempotency(), expected);
+
+    rig.submit_again("a").await;
+    assert_eq!(rig.nzb_jobs().len(), 1);
+    assert_eq!(rig.seen()[0].2, Some(job as u64));
 }
 
 // A torrent while torrents are off is held, once: later polls neither read
@@ -638,12 +891,21 @@ async fn a_poll_records_its_items_together_with_the_rows_one_by_one_gave() {
         ]
     );
     let rows = rig.db.list_rss_seen_items(Some(1), None).unwrap();
-    let old = rows.iter().find(|row| row.item_id == "old").unwrap();
-    assert_eq!(old, &before);
-    let a = rows.iter().find(|row| row.item_id == "a").unwrap();
+    let row = |id: &str| {
+        let listed = rig.db.rss_seen_item_key(id);
+        rows.iter().find(|row| row.item_id == listed).unwrap()
+    };
+    assert_eq!(
+        row("old"),
+        &RssSeenItemRow {
+            item_id: rig.db.rss_seen_item_key("old"),
+            ..before
+        }
+    );
+    let a = row("a");
     assert_eq!(a.item_title, "Silver Horizon a");
     assert_eq!(a.item_url, Some(magnet().replace("&amp;", "&")));
-    let x = rows.iter().find(|row| row.item_id == "x").unwrap();
+    let x = row("x");
     assert_eq!((x.item_url.as_deref(), x.size_bytes), (None, None));
 }
 

@@ -131,7 +131,8 @@ const REBUILD_JOB_HISTORY_ATTRIBUTES_SQL: &str =
        AND json_array_length(attr.value) = 2
        AND json_type(attr.value, '$[0]') = 'text'
        AND json_type(attr.value, '$[1]') = 'text'
-       AND json_extract(attr.value, '$[0]') != '__weaver_client_request_id'";
+       AND json_extract(attr.value, '$[0]') != '__weaver_client_request_id'
+       AND json_extract(attr.value, '$[0]') NOT IN ('rss.item_url', 'rss.item_id')";
 
 #[derive(Debug, Clone)]
 pub struct StableStateExport {

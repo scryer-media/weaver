@@ -209,6 +209,7 @@ async fn a_tick_over_torrents_in_every_state_leaves_what_it_left() {
     jobs.extend([("held", held), ("seed_mode", seed_mode), ("picks", picks)]);
     let before = events(&rig.db).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     let written = written(&rig, &jobs, &before).await;
     println!("{written}");
     assert_eq!(written, IN_EVERY_STATE);
@@ -247,6 +248,7 @@ async fn a_tick_winding_down_to_the_downloads_leaves_what_it_left() {
     let jobs = [("downloading", downloading), ("done", done), ("met", met)];
     let before = events(&rig.db).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     let written = written(&rig, &jobs, &before).await;
     println!("{written}");
     assert_eq!(written, WINDING_DOWN);
@@ -337,7 +339,9 @@ async fn an_idle_tick_takes_the_lock_once_and_writes_nothing() {
     rig.service.set_settings(settings).await;
     // The first ticks write what the adds left.
     rig.service.tick().await;
+    rig.service.restored().await;
     rig.service.tick().await;
+    rig.service.restored().await;
 
     let mut changes = handle.state().subscribe_job_changes();
     changes.borrow_and_update();
@@ -346,6 +350,7 @@ async fn an_idle_tick_takes_the_lock_once_and_writes_nothing() {
     let counts = *rig.service.inner.pass_counts.borrow();
     let taken = rig.db.writes_taken();
     rig.service.tick().await;
+    rig.service.restored().await;
     let after = *rig.service.inner.pass_counts.borrow();
     assert_eq!(
         (

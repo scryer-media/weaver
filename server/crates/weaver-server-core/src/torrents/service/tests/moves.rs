@@ -97,6 +97,7 @@ async fn a_torrent_in_no_session_is_not_rechecked() {
         .unwrap();
     rig.routes.set_down(Some("tunnel gone"));
     rig.service.tick().await;
+    rig.service.restored().await;
     assert!(matches!(
         rig.service.recheck(job_id).await,
         Err(ActionError::Invalid(_))
@@ -1111,6 +1112,7 @@ async fn a_seed_mode_torrent_keeps_its_checked_pieces_through_a_restart() {
     let verified = handle.seed_verified().unwrap();
     assert_eq!(verified.iter_ones().collect::<Vec<_>>(), [0, 2]);
     restarted.tick().await;
+    restarted.restored().await;
     assert_eq!(
         rig.db.torrent_seed_verified(job_id).unwrap(),
         Some(passed.to_vec())

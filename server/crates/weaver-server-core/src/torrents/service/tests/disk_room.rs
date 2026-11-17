@@ -983,6 +983,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     torrent.live().unwrap().wait_for_upload_mode(true).await;
 
     rig.service.tick().await;
+    rig.service.restored().await;
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(

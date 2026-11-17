@@ -9,7 +9,7 @@ use super::disk_room::DiskHeld;
 use super::intake::Resolving;
 use super::retire::mark_hold;
 use super::scripts::{Ending, StoppedSeeding};
-use super::{ActionError, TorrentService, state_error};
+use super::{ActionError, Asked, TorrentService, locked, state_error};
 use crate::StateError;
 use crate::categories::model::resolve_category_config;
 use crate::jobs::JobId;
@@ -20,6 +20,7 @@ use crate::torrents::{KeptIntent, TorrentIntent};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::PoisonError;
+use std::sync::atomic::Ordering;
 
 pub(super) type Outcome = BTreeMap<JobId, Result<(), ActionError>>;
 
@@ -91,6 +92,7 @@ impl TorrentService {
     // `pause` for each torrent: one write of their intents, then one pass
     // of the queue and one publish.
     pub(super) async fn pause_many(&self, job_ids: &[JobId]) -> Outcome {
+        self.ensure(job_ids).await;
         let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         let mut stopped = Vec::new();
@@ -138,6 +140,7 @@ impl TorrentService {
     // `resume` for each torrent: one write of their intents, then one pass
     // of the queue and one publish.
     pub(super) async fn resume_many(&self, job_ids: &[JobId]) -> Outcome {
+        self.ensure(job_ids).await;
         let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         // A resume is the go-ahead to restore a torrent that crashed the
@@ -169,6 +172,8 @@ impl TorrentService {
             for job_id in present.iter().filter(|job_id| marked.contains(job_id)) {
                 if let Some(torrent) = live.get_mut(job_id) {
                     torrent.restore_held = None;
+                    // Its job is restored at the next tick.
+                    self.inner.restore_wanted.store(true, Ordering::Release);
                 }
             }
             if let Err(error) = self.inner.db.update_torrent_intents(&[(
@@ -231,6 +236,13 @@ impl TorrentService {
     // `update` for each torrent: one write of the categories and forced
     // flags, then a pass of the queue when a flag changed, and one publish.
     pub(super) async fn update_many(&self, updates: Vec<(JobId, JobUpdate)>) -> Outcome {
+        self.ensure(
+            &updates
+                .iter()
+                .map(|(job_id, _)| *job_id)
+                .collect::<Vec<_>>(),
+        )
+        .await;
         let settings = self.settings();
         let mut outcome = Outcome::new();
         // What each update asks, checked before anything is changed: a
@@ -352,6 +364,13 @@ impl TorrentService {
     // `remove` for each torrent: their gates held, one write of their
     // removal marks, then each removed as `remove_gated` removes one.
     pub(super) async fn remove_many(&self, removals: &[(JobId, bool)]) -> Outcome {
+        self.ensure(
+            &removals
+                .iter()
+                .map(|(job_id, _)| *job_id)
+                .collect::<Vec<_>>(),
+        )
+        .await;
         let mut outcome = Outcome::new();
         // Their outcome is their job's: a job still waiting for the tick
         // is restored first.
@@ -461,7 +480,44 @@ impl TorrentService {
     // `reorder` of each torrent in turn, one move after another as they
     // came, with one write of the places that changed, one pass of the
     // queue and one publish. A move of a torrent not found ends the moves.
+    //
+    // Asked for while the stored torrents are still being read, the moves
+    // are kept and made once the last is in, among all of them.
     pub(super) async fn move_many(&self, moves: &[(JobId, QueueMoveTarget)]) -> Outcome {
+        self.ensure(&moves.iter().map(|(job_id, _)| *job_id).collect::<Vec<_>>())
+            .await;
+        {
+            let live = self.inner.live.lock().await;
+            // Under the lock the load ends under: kept, or made now.
+            let mut marks = locked(&self.inner.load_marks);
+            if self.loading() {
+                let mut outcome = Outcome::new();
+                let mut kept = Vec::with_capacity(moves.len());
+                for &(job_id, target) in moves {
+                    if !live.contains_key(&job_id) {
+                        outcome.insert(job_id, Err(ActionError::NotFound(job_id)));
+                        break;
+                    }
+                    kept.push((job_id, target));
+                    outcome.insert(job_id, Ok(()));
+                }
+                if !kept.is_empty() {
+                    marks.asked.push(Asked::Moves(kept));
+                }
+                return outcome;
+            }
+        }
+        let (outcome, moved) = self.move_now(moves).await;
+        if moved {
+            self.apply_queue().await;
+            self.publish().await;
+        }
+        outcome
+    }
+
+    // `move_many` among the torrents here now, the queue not yet applied,
+    // and whether any place changed.
+    pub(super) async fn move_now(&self, moves: &[(JobId, QueueMoveTarget)]) -> (Outcome, bool) {
         let mut outcome = Outcome::new();
         {
             let mut live = self.inner.live.lock().await;
@@ -492,7 +548,7 @@ impl TorrentService {
                 outcome.insert(job_id, Ok(()));
             }
             let Some(first_change) = first_change else {
-                return outcome;
+                return (outcome, false);
             };
             let moved: Vec<(JobId, i64)> = order
                 .order
@@ -502,7 +558,7 @@ impl TorrentService {
                 .map(|(job_id, place)| (*job_id, place))
                 .collect();
             if moved.is_empty() {
-                return outcome;
+                return (outcome, false);
             }
             if let Err(error) = self.inner.db.set_torrent_queue_positions(&moved) {
                 // Nothing of the moves was kept: the first that changed
@@ -512,7 +568,7 @@ impl TorrentService {
                 }
                 let (job_id, _) = moves[first_change];
                 outcome.insert(job_id, Err(ActionError::State(state_error(error))));
-                return outcome;
+                return (outcome, false);
             }
             for (job_id, place) in moved {
                 if let Some(torrent) = live.get_mut(&job_id) {
@@ -520,9 +576,7 @@ impl TorrentService {
                 }
             }
         }
-        self.apply_queue().await;
-        self.publish().await;
-        outcome
+        (outcome, true)
     }
 }
 

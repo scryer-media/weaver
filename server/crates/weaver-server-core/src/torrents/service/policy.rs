@@ -613,12 +613,15 @@ impl TorrentService {
                 .queue_order
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            seat(
-                standings,
-                &mut order,
-                settings.torrent.max_active_downloads,
-                holds,
-            )
+            // While only some of the stored torrents are here, no
+            // torrent takes a download slot among them: the pass at the
+            // load's end gives the turns, among all of them.
+            let slots = if self.partial() {
+                0
+            } else {
+                settings.torrent.max_active_downloads
+            };
+            seat(standings, &mut order, slots, holds)
         };
         *self
             .inner

@@ -1642,6 +1642,28 @@ pub struct Database {
     _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
 }
 
+// Each column the sealing pass seals: what it holds, whether its table has
+// a row that holds one, and one stored value of it. A seen item does not
+// count: its id is a digest no key is needed for, and a link that does not
+// decrypt reads as none, so a key lost never refuses a start for one.
+const SEALED_COLUMNS: [(&str, &str, &str); 3] = [
+    (
+        "torrent metainfo",
+        "SELECT 1 AS held FROM torrents WHERE metainfo IS NOT NULL LIMIT 1",
+        "SELECT metainfo AS sample FROM torrents WHERE metainfo IS NOT NULL LIMIT 1",
+    ),
+    (
+        "torrent tracker URL",
+        "SELECT 1 AS held FROM torrent_trackers LIMIT 1",
+        "SELECT url AS sample FROM torrent_trackers LIMIT 1",
+    ),
+    (
+        "RSS feed URL",
+        "SELECT 1 AS held FROM rss_feeds WHERE url <> '' LIMIT 1",
+        "SELECT url AS sample FROM rss_feeds WHERE url <> '' LIMIT 1",
+    ),
+];
+
 impl Database {
     // Executor engine, saturation and operation-latency histogram for the
     // database runtime backing this handle.
@@ -2484,7 +2506,84 @@ impl Database {
         if encrypted_credentials_exist {
             return Ok(true);
         }
+        if self.has_sealed_secrets()? {
+            return Ok(true);
+        }
         self.has_encrypted_persisted_jwt_signing_secret()
+    }
+
+    // Whether any torrent or RSS secret is sealed under the instance key:
+    // a torrent's metainfo or tracker URL, or a feed's URL. The sealing pass marks itself before its first write, and
+    // with its mark set every such value is sealed or about to be, so each
+    // table is asked only whether it holds a row: one existence read a
+    // column, none of them reading a payload. Without the mark nothing was sealed,
+    // and no table is read.
+    fn has_sealed_secrets(&self) -> Result<bool, StateError> {
+        use crate::persistence::sql_runtime::SqlRuntime;
+
+        if self
+            .get_setting(crate::torrents::sealed::SEALED_MARK)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            for query in SEALED_COLUMNS.map(|(_, exists, _)| exists) {
+                if SqlRuntime::fetch_optional(datastore.read_exec(), query, &[])
+                    .await?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    // Prove the selected key opens the sealed torrent and RSS secrets: one
+    // stored value of each sealed column is decrypted, so a wrong key is
+    // refused at start rather than found torrent by torrent. A column whose
+    // sample is not sealed yet proves nothing and passes.
+    fn validate_sealed_secrets(
+        &self,
+        key: &crate::persistence::encryption::EncryptionKey,
+    ) -> Result<(), StateError> {
+        use crate::persistence::encryption::{decrypt_value, is_encrypted};
+        use crate::persistence::sql_runtime::SqlRuntime;
+
+        if self
+            .get_setting(crate::torrents::sealed::SEALED_MARK)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        let key = key.clone();
+        self.run_sql_blocking_read(async move {
+            for (kind, _, sample) in SEALED_COLUMNS {
+                let Some(row) =
+                    SqlRuntime::fetch_optional(datastore.read_exec(), sample, &[]).await?
+                else {
+                    continue;
+                };
+                let opened = if kind == "torrent metainfo" {
+                    let stored = row.bytes("sample")?;
+                    crate::torrents::sealed::is_sealed(&stored).then(|| {
+                        crate::torrents::sealed::open_metainfo(Some(&key), stored).map(drop)
+                    })
+                } else {
+                    let stored = row.text("sample")?;
+                    is_encrypted(&stored).then(|| decrypt_value(&key, &stored).map(drop))
+                };
+                if let Some(Err(error)) = opened {
+                    return Err(StateError::Conflict(format!(
+                        "cannot decrypt a stored {kind}: {error}"
+                    )));
+                }
+            }
+            Ok(())
+        })
     }
 
     // Prove that every encrypted persisted credential can be authenticated by
@@ -2518,6 +2617,7 @@ impl Database {
                 ))
             })?;
         }
+        self.validate_sealed_secrets(key)?;
         let datastore = self.datastore();
         let credential_key = key.clone();
         self.run_sql_blocking_read(async move {
@@ -2942,7 +3042,7 @@ pub(crate) static JOB_WRITE_WAITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // Every blocking database call made on the thread that armed it, by the
 // caller's location: a test proves an actor turn reads nothing by arming the

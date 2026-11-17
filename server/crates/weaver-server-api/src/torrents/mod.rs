@@ -11,7 +11,7 @@ pub use query::TorrentsQuery;
 pub use subscription::TorrentsSubscription;
 
 use async_graphql::{Context, Result};
-use weaver_server_core::torrents::service::{TorrentService, TorrentSettings};
+use weaver_server_core::torrents::service::{ListError, NotReady, TorrentService, TorrentSettings};
 
 use crate::auth::graphql_error;
 
@@ -24,6 +24,20 @@ fn service<'a>(ctx: &'a Context<'_>) -> Result<&'a TorrentService> {
 
 // After a tracker rule changes: the torrent client matches every torrent's
 // trackers against the rules as they are now.
+// An answer that needs every torrent, asked for while the stored torrents
+// are still being read at start: said under its own code, so a client asks
+// again rather than showing some of them as all.
+fn not_ready(why: NotReady) -> async_graphql::Error {
+    graphql_error("TORRENTS_LOADING", why.to_string())
+}
+
+fn list_error(error: ListError) -> async_graphql::Error {
+    match error {
+        ListError::NotReady(why) => not_ready(why),
+        ListError::State(error) => crate::observability::state_error(error),
+    }
+}
+
 pub(crate) async fn reload_tracker_rules(ctx: &Context<'_>) -> Result<()> {
     if let Some(torrents) = ctx.data_opt::<TorrentService>() {
         torrents

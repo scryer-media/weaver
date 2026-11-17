@@ -239,8 +239,15 @@ pub(super) async fn run_root_field(
     arguments: Option<&str>,
 ) -> Result<(serde_json::Value, Vec<String>), String> {
     let query = root_query(shape, field, arguments)?;
+    // A bundle is read by people other than the admin who made it: no
+    // job's RSS link or id goes into it.
     let response = schema
-        .execute(Request::new(query).data(scope).data(identity))
+        .execute(
+            Request::new(query)
+                .data(scope)
+                .data(identity)
+                .data(weaver_server_api::HideRssLinks),
+        )
         .await;
     let errors: Vec<String> = response.errors.iter().map(ToString::to_string).collect();
 
