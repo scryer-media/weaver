@@ -946,6 +946,13 @@ struct Inner {
     // what the intakes said before it.
     #[cfg(test)]
     settled: watch::Sender<u64>,
+    // A test's hold on the sweep of idle sessions, once it has read the
+    // routes the torrents use and before it reads the sessions, and how
+    // many sweeps reached that hold.
+    #[cfg(test)]
+    sweep_held: watch::Sender<bool>,
+    #[cfg(test)]
+    sweeps_held: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
@@ -1018,6 +1025,10 @@ impl TorrentService {
                 disk_waits_moved: watch::channel(0).0,
                 #[cfg(test)]
                 settled: watch::channel(0).0,
+                #[cfg(test)]
+                sweep_held: watch::channel(false).0,
+                #[cfg(test)]
+                sweeps_held: watch::channel(0).0,
                 start_held: Mutex::new([false; 3]),
                 relook: Mutex::default(),
                 entering: Mutex::default(),

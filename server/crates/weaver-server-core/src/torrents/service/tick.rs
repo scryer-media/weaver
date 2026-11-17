@@ -839,18 +839,25 @@ impl TorrentService {
         listed
     }
 
+    // A route's session no torrent reads as its route is closed. The
+    // torrents' routes are read, and the sessions swept, under the
+    // torrents' lock: a torrent reads as its route under that lock before it
+    // asks the route's session to open (`planned`), so a session opening
+    // or opened for a torrent is never taken for idle. The sessions' lock
+    // is only ever taken inside the torrents', never around it.
     pub(super) async fn drop_idle_sessions(&self) {
-        let used: BTreeSet<RouteKey> = self
-            .inner
-            .live
-            .lock()
-            .await
-            .values()
-            .filter_map(|torrent| torrent.route.clone())
-            .collect();
-        for view in self.inner.sessions.views().await {
-            if !used.contains(&view.key) {
-                self.inner.sessions.drop_route(&view.key).await;
+        {
+            let live = self.inner.live.lock().await;
+            let used: BTreeSet<&RouteKey> = live
+                .values()
+                .filter_map(|torrent| torrent.route.as_ref())
+                .collect();
+            #[cfg(test)]
+            self.sweep_seam().await;
+            for view in self.inner.sessions.views().await {
+                if !used.contains(&view.key) {
+                    self.inner.sessions.drop_route(&view.key).await;
+                }
             }
         }
         // The routes that exist are the ones a scope plans to.
@@ -862,6 +869,31 @@ impl TorrentService {
             .flat_map(|plan| plan.keys().cloned().collect::<Vec<_>>())
             .collect();
         self.inner.sessions.forget_routes(existing).await;
+    }
+
+    // While a test holds the sweep of idle sessions, it waits here, and
+    // says it reached the hold.
+    #[cfg(test)]
+    async fn sweep_seam(&self) {
+        let mut held = self.inner.sweep_held.subscribe();
+        if !*held.borrow_and_update() {
+            return;
+        }
+        self.inner.sweeps_held.send_modify(|reached| *reached += 1);
+        let _ = held.wait_for(|held| !held).await;
+    }
+
+    /// Hold the sweep of idle sessions once it has read the routes the
+    /// torrents use, before it reads the sessions, or let it go.
+    #[cfg(test)]
+    pub(crate) fn hold_sweep(&self, held: bool) {
+        self.inner.sweep_held.send_replace(held);
+    }
+
+    /// Counts the sweeps of idle sessions that reached a test's hold.
+    #[cfg(test)]
+    pub(crate) fn sweeps_held(&self) -> watch::Receiver<u64> {
+        self.inner.sweeps_held.subscribe()
     }
 }
 
