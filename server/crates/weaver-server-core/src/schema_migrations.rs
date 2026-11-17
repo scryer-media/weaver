@@ -43,7 +43,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 128;
+const CURRENT_SCHEMA_VERSION: i64 = 129;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1496,7 +1496,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 128);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 129);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -3666,5 +3666,45 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    // The batched held-path writes and the tag reads that replaced the
+    // per-torrent statements and the whole-table read each go through a
+    // key or index of the current schema, with no table walked and no sort.
+    #[tokio::test]
+    async fn held_path_batches_and_tag_reads_are_served_by_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("current.db");
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+        let pool = open_test_pool(&db_path).await;
+        for (query, step) in [
+            (
+                "DELETE FROM torrent_held_paths WHERE job_id IN (1, 2, 3)",
+                "SEARCH torrent_held_paths USING INDEX sqlite_autoindex_torrent_held_paths_1 (job_id=?)",
+            ),
+            (
+                "UPDATE torrents SET held_set = 1 WHERE job_id IN (1, 2, 3)",
+                "USING INTEGER PRIMARY KEY (rowid=?)",
+            ),
+            (
+                "SELECT tag FROM job_tags WHERE job_id = 7",
+                "USING COVERING INDEX sqlite_autoindex_job_tags_1 (job_id=?)",
+            ),
+            (
+                "SELECT tag, COUNT(*) AS jobs FROM job_tags GROUP BY tag",
+                "USING COVERING INDEX idx_job_tags_tag",
+            ),
+        ] {
+            let plan = explain(&pool, query).await;
+            assert!(
+                plan.iter().any(|detail| detail.contains(step)),
+                "{query}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.contains("TEMP B-TREE")),
+                "{query}: {plan:?}"
+            );
+        }
+        pool.close().await;
     }
 }

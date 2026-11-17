@@ -40,9 +40,9 @@ use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
     BlocklistSource, Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy,
-    TorrentConfig, TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
+    TorrentConfig, TorrentEncryption, TorrentLimit,
 };
-use weaver_server_core::tags::{TagSnapshot, split_tags};
+use weaver_server_core::tags::split_tags;
 use weaver_server_core::torrents::metrics::{Published, SessionSeries};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
@@ -1292,8 +1292,8 @@ async fn torrents(
         "removeTrackers" => ctx.api().without_result(remove_trackers(ctx, params).await),
         "addTags" | "setTags" | "removeTags" => tag_torrents(ctx, action, params).await,
         "createTags" | "deleteTags" => make_tags(ctx, action, params).await,
-        "tags" => match tag_snapshot(ctx).await {
-            Ok(tags) => axum::Json(json!(tags.made())).into_response(),
+        "tags" => match made_tags(ctx).await {
+            Ok(tags) => axum::Json(json!(tags)).into_response(),
             Err(error) => internal(error),
         },
         "addWebSeeds" | "editWebSeed" | "removeWebSeeds" => unavailable("Web seeds"),
@@ -2964,16 +2964,16 @@ async fn delete(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     ok()
 }
 
-// The tags as stored: from memory when nothing changed them since the last
-// read, else read off the async workers.
-async fn tag_snapshot(
+// Every tag made: from memory when nothing changed the tags since the last
+// read, else read from the made tags alone, off the async workers.
+async fn made_tags(
     ctx: &TorrentFacadeContext,
-) -> Result<Arc<TagSnapshot>, weaver_server_core::StateError> {
+) -> Result<Vec<String>, weaver_server_core::StateError> {
     if let Some(tags) = ctx.inner.db.cached_tag_snapshot() {
-        return Ok(tags);
+        return Ok(tags.made().to_vec());
     }
     let db = ctx.inner.db.clone();
-    tokio::task::spawn_blocking(move || db.tag_snapshot())
+    tokio::task::spawn_blocking(move || db.made_tags())
         .await
         .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
 }
@@ -3156,23 +3156,35 @@ async fn rate_limits(
             .filter_map(|view| Some((view.infohash.to_ascii_lowercase(), reading(view)?)))
             .collect()
     } else {
-        params
-            .get("hashes")
-            .unwrap_or_default()
-            .split('|')
-            .filter_map(|hash| {
-                let reading = match views
-                    .iter()
-                    .find(|view| view.infohash.eq_ignore_ascii_case(hash.trim()))
-                {
-                    Some(view) => reading(view)?,
-                    None => json!(-1),
-                };
-                Some((hash.to_owned(), reading))
-            })
-            .collect()
+        limits_by_sent_hash(params.get("hashes").unwrap_or_default(), &views, reading)
     };
     axum::Json(map).into_response()
+}
+
+// The reading of each hash in `sent` (`|`-separated), keyed by the hash as
+// it was sent: -1 for a hash no view has, and no entry for a closed limit.
+// The views are indexed once by lowercase infohash; the first view of an
+// infohash answers for it.
+fn limits_by_sent_hash(
+    sent: &str,
+    views: &[TorrentView],
+    reading: impl Fn(&TorrentView) -> Option<Value>,
+) -> Map<String, Value> {
+    let mut by_hash: HashMap<String, &TorrentView> = HashMap::with_capacity(views.len());
+    for view in views {
+        by_hash
+            .entry(view.infohash.to_ascii_lowercase())
+            .or_insert(view);
+    }
+    sent.split('|')
+        .filter_map(|hash| {
+            let reading = match by_hash.get(&hash.trim().to_ascii_lowercase()) {
+                Some(view) => reading(view)?,
+                None => json!(-1),
+            };
+            Some((hash.to_owned(), reading))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -3255,16 +3267,18 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "encryption": match torrent.encryption {
             TorrentEncryption::Prefer => 0,
             TorrentEncryption::Require => 1,
+            TorrentEncryption::Disabled => 2,
         },
         "max_connec_per_torrent": torrent.max_peers_total,
         "max_connec": limit(torrent.connections_limit),
         "max_uploads": limit(torrent.unchoke_slots_limit),
         "connection_speed": torrent.connection_speed,
         "enable_multi_connections_from_same_ip": torrent.allow_multiple_connections_per_ip,
-        "bittorrent_protocol": match torrent.peer_protocol {
-            TorrentPeerProtocol::Both => 0,
-            TorrentPeerProtocol::Tcp => 1,
-            TorrentPeerProtocol::Utp => 2,
+        // qBittorrent's `BTProtocol`: 0 both, 1 TCP alone, 2 uTP alone.
+        "bittorrent_protocol": match (torrent.transports.tcp, torrent.transports.utp) {
+            (true, false) => 1,
+            (false, true) => 2,
+            _ => 0,
         },
         "dht_bootstrap_nodes": torrent.dht_bootstrap_nodes,
         "ip_filter_enabled": torrent.blocklist_enabled,
@@ -3361,10 +3375,13 @@ fn torrent_preferences(
         torrent.allow_multiple_connections_per_ip = allow;
     }
     if let Some(protocol) = changes.get("bittorrent_protocol") {
-        torrent.peer_protocol = match protocol.as_i64() {
-            Some(0) => TorrentPeerProtocol::Both,
-            Some(1) => TorrentPeerProtocol::Tcp,
-            Some(2) => TorrentPeerProtocol::Utp,
+        // qBittorrent's `BTProtocol` sets the two switches; the preferred
+        // transports have no field there and are kept as set; while one
+        // transport is off, dials use the one left on.
+        (torrent.transports.tcp, torrent.transports.utp) = match protocol.as_i64() {
+            Some(0) => (true, true),
+            Some(1) => (true, false),
+            Some(2) => (false, true),
             _ => return Err(out_of_range("bittorrent_protocol")),
         };
     }
@@ -3749,8 +3766,8 @@ async fn maindata(
         .unwrap_or(0);
     // Each row reads its files' totals alone, not its files.
     let rows = found!(ctx.rows(Pick::default(), Window::Every, false).await);
-    let tags = match tag_snapshot(ctx).await {
-        Ok(tags) => tags.made().to_vec(),
+    let tags = match made_tags(ctx).await {
+        Ok(tags) => tags,
         Err(error) => return internal(error),
     };
     let config = ctx.inner.config.read().await;

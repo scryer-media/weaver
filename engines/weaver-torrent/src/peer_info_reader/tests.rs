@@ -271,7 +271,33 @@ pub(crate) struct MockPeer {
 impl MockPeer {
     /// Reads our handshake and answers it, speaking the extension protocol.
     pub(crate) async fn greet(stream: DuplexStream, hashes: InfoHashes) -> Self {
-        let (mut read, mut write) = halves(stream);
+        let (read, write) = halves(stream);
+        Self::greet_over(read, write, hashes).await
+    }
+
+    /// A peer that speaks only the encrypted handshake: refuses a plain one,
+    /// with an error, and answers an encrypted one under the plaintext
+    /// method, as [`Self::greet`] does.
+    pub(crate) async fn greet_encrypted(
+        stream: DuplexStream,
+        hashes: InfoHashes,
+    ) -> Result<Self, crate::mse::MseError> {
+        let (read, write) = halves(stream);
+        let info_hash = hashes.v1.unwrap();
+        let (established, _) = crate::mse::respond(read, write, false, |_| {
+            Some((info_hash, EncryptionPolicy::Prefer))
+        })
+        .await?;
+        assert_eq!(established.encryption, crate::mse::Encryption::HeaderOnly);
+        let write = established.writer.into_plain().unwrap();
+        Ok(Self::greet_over(established.reader, write, hashes).await)
+    }
+
+    async fn greet_over(
+        mut read: BoxAsyncReadVectored,
+        mut write: BoxAsyncWrite,
+        hashes: InfoHashes,
+    ) -> Self {
         let mut buf = ReadBuf::new();
         buf.read_handshake(&mut read, NO_TIMEOUT).await.unwrap();
         let mut out = [0u8; 68];
@@ -778,11 +804,11 @@ async fn two_peers_send_the_metadata_between_them() {
 // libtorrent: metadata comes over the torrent's ordinary connections, so
 // `torrent_peer::pe_support` decides their handshake too
 // (`bt_peer_connection::on_connected`). Where encryption is preferred, a
-// peer that speaks only plaintext refuses the encrypted handshake; the next
-// connection, made at once (`peer_connection::fast_reconnect`), sends the
-// plaintext one and gets the metadata.
+// peer nothing flagged encrypted is tried plain first (`pe_support` starts
+// false), so one that speaks only plaintext sends the metadata over the
+// first connection.
 #[tokio::test(start_paused = true)]
-async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_once() {
+async fn a_plaintext_only_peer_sends_the_metadata_over_the_first_connection() {
     let (metadata, hashes) = metadata(10);
     let (tx, mut dials) = mpsc::unbounded_channel();
     let connector = StreamConnector::new(StreamConnectorArgs {
@@ -795,17 +821,6 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
     let connector = Arc::new(connector);
     let peer = async {
         let (_, stream) = dials.recv().await.unwrap();
-        let refused = Instant::now();
-        let (mut read, write) = halves(stream);
-        let greeting = ReadBuf::new().read_handshake(&mut read, NO_TIMEOUT).await;
-        assert!(
-            greeting.is_err(),
-            "the encrypted handshake is no BitTorrent one"
-        );
-        drop((read, write));
-
-        let (_, stream) = dials.recv().await.unwrap();
-        assert_eq!(Instant::now(), refused);
         let mut peer = MockPeer::greet(stream, hashes).await;
         peer.send_extended_handshake(u32::try_from(metadata.len()).unwrap())
             .await;
@@ -836,7 +851,7 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
         ReadMetainfoResult::ChannelClosed { .. } => panic!("no metadata"),
     }
     let stats = connector.stats().encryption.snapshot();
-    assert_eq!((stats.failures, stats.plaintext), (1, 1));
+    assert_eq!((stats.attempts, stats.plaintext), (0, 1));
 }
 
 type Found = oneshot::Receiver<Result<TorrentAndInfoBytes, crate::bencode::DeserializeError>>;

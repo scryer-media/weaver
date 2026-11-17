@@ -674,6 +674,12 @@ impl SettingsMutation {
         let rule = input.into_rule(id.unwrap_or(0))?;
         let db = ctx.data::<Database>()?.clone();
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        // The rule's transports, resolved over the global ones, leave one
+        // on; its preferences are kept as set.
+        let global = ctx.data::<SharedConfig>()?.read().await.torrent.transports;
+        rule.transports
+            .checked(global)
+            .map_err(async_graphql::Error::new)?;
         let rules = tokio::task::spawn_blocking(move || {
             let now = chrono::Utc::now().timestamp_millis();
             db.save_tracker_rule(id, rule, keeps_ssl, keeps_passwords, now)

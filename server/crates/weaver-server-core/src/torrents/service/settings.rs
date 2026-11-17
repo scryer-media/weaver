@@ -39,10 +39,15 @@ pub struct TorrentSettings {
 /// | unpack                   | yes     | yes  | yes      | yes             |
 /// | DHT, PEX, LSD            | no      | yes  | no       | the session's   |
 /// | encryption               | no      | yes  | no       | the session's   |
+/// | transports (dials) (2)   | no      | yes  | no       | yes             |
 /// | route scope              | no      | yes  | yes      | the default     |
 ///
 /// (1) A torrent's own upload limit is not a level of the cap: the tighter
 /// of the two holds ([`ratelimits_of`]).
+///
+/// (2) Each of a rule's four transport fields over the global one, the four
+/// then locked as a global save locks them. They govern its torrents'
+/// outgoing dials; what a session listens on is the global setting's.
 ///
 /// A tracker rule alone names a client, an SSL identity, whether its
 /// torrents start forced, and whether the schedule may pause them; those
@@ -113,7 +118,6 @@ pub const ENCRYPTION: Field<TorrentEncryption> = Field {
     category: None,
     global: |_| Leaf::Inherit,
 };
-
 // A rule or category routes its torrents itself once it says so.
 pub const SCOPE: Field<TorrentScope> = Field {
     torrent: None,

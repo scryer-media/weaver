@@ -150,6 +150,12 @@ impl Outbound {
         self.inner.write_all(buf).await
     }
 
+    /// The writer under a connection that writes plain, none under RC4.
+    #[cfg(test)]
+    pub fn into_plain(self) -> Option<BoxAsyncWrite> {
+        self.cipher.is_none().then_some(self.inner)
+    }
+
     #[cfg(test)]
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;

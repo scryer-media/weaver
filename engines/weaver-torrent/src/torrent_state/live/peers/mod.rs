@@ -28,7 +28,10 @@ use tracing::warn;
 use crate::{
     mse::Encryption,
     peer_connection::WriterRequest,
-    peer_protocol::{Message, extended::ExtendedMessage},
+    peer_protocol::{
+        Message,
+        extended::{ExtendedMessage, ut_pex::PEX_ENCRYPTION},
+    },
     stream_connect::ConnectionKind,
     torrent_state::utils::{TimedExistence, atomic_inc},
     type_aliases::{BF, PeerHandle, PeerSourceFlag},
@@ -905,12 +908,59 @@ impl PeerStates {
         self.with_peer_mut(addr.into(), "pex_flags", |peer| peer.pex_flags(flags, self));
     }
 
+    /// A PEX message added the peer at `addr` with `flags`, as
+    /// [`Self::add_peer`] and [`Self::pex_flags`] take it; a newcomer starts
+    /// as [`Peer::pex_named_new`] says. When `plain_only`, the torrent's
+    /// connections are plain only and a newcomer its sender reached
+    /// encrypted is not taken; returns true when one was not.
+    pub fn add_pex_peer(&self, addr: SocketAddr, flags: u8, plain_only: bool) -> bool {
+        let encrypted = flags & PEX_ENCRYPTION != 0;
+        let skipped = std::cell::Cell::new(false);
+        let admitted = self.admit(
+            addr,
+            Displace::EraseCandidates,
+            None,
+            |peer| {
+                peer.rediscovered(PeerSourceFlag::Pex, self);
+                peer.pex_flags(flags, self);
+            },
+            || {
+                if plain_only && encrypted {
+                    skipped.set(true);
+                    return None;
+                }
+                let mut peer = Peer::new_with_outgoing_address(addr, PeerSourceFlag::Pex.into());
+                peer.pex_named_new(flags);
+                Some(peer)
+            },
+        );
+        if let Admitted::New(_) = admitted {
+            self.pex_flags(addr, flags);
+        }
+        self.candidates_changed.notify_one();
+        skipped.get()
+    }
+
+    /// The outgoing connection to the peer at `addr`, made where encryption
+    /// is preferred, completed the method it tried; see
+    /// [`Peer::outgoing_method_worked`].
+    pub fn outgoing_method_worked(&self, addr: PeerHandle, encrypted: bool) {
+        self.with_peer_mut(addr, "outgoing_method_worked", |peer| {
+            peer.outgoing_method_worked(encrypted);
+        });
+    }
+
     /// Whether the connection being made to the peer at `addr` tries the
     /// encrypted handshake; see [`Peer::encrypt_outgoing`]. Every connection
     /// to the peer asks here, whether it fetches metadata or pieces.
     pub fn encrypt_outgoing(&self, addr: PeerHandle) -> bool {
         self.with_peer_mut(addr, "encrypt_outgoing", |peer| peer.encrypt_outgoing())
-            .unwrap_or(true)
+            .unwrap_or(false)
+    }
+
+    /// A dial to the peer at `addr` tried uTP; see [`Peer::utp_dialed`].
+    pub fn utp_dialed(&self, addr: PeerHandle, opened: bool) {
+        self.with_peer_mut(addr, "utp_dialed", |peer| peer.utp_dialed(opened));
     }
 
     /// The connection of the peer at `addr` completed its handshake; see

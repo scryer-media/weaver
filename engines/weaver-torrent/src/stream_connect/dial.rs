@@ -148,6 +148,7 @@ impl Attempt<'_> {
             Err(e) => match e.failure() {
                 Failure::Refused => stat.refused(1),
                 Failure::TimedOut => stat.timeouts(1),
+                Failure::Unreachable => stat.unreachable(1),
                 Failure::Other => stat.errors(1),
             },
         }
@@ -209,7 +210,7 @@ pub(super) struct TcpDialer {
 
 impl PeerDialer for TcpDialer {
     fn may_dial(&self, _: SocketAddr, transports: Transports) -> bool {
-        self.enabled && transports == Transports::Any
+        self.enabled && transports != Transports::Utp
     }
 
     fn look(&self) -> TcpRoom {
@@ -336,7 +337,14 @@ pub(crate) struct DialStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Behind {
     pub kind: ConnectionKind,
+    /// [`Behind::ON_FAILURE`] waits for the other attempt's failure alone.
     pub wait: Duration,
+}
+
+impl Behind {
+    /// A wait no time ends: the attempt starts only once the one it waits
+    /// behind fails.
+    pub const ON_FAILURE: Duration = Duration::MAX;
 }
 
 /// The transports a connection to a peer is tried over, in order. The
@@ -367,6 +375,117 @@ impl DialPlan<2> {
             },
         ],
     };
+
+    /// uTP first, and TCP only once uTP fails, at once then, as libtorrent
+    /// 2.0 dials a peer it assumes supports uTP: through the uTP socket
+    /// manager alone (`torrent::connect_to_peer`, torrent.cpp:7691-7697),
+    /// and over TCP straight after that connect fails
+    /// (`peer_connection::on_connection_complete`'s failure path,
+    /// peer_connection.cpp:4204-4212, `fast_reconnect` then
+    /// `connect_to_peer`). A route with no uTP socket goes to TCP at once.
+    pub const UTP_FIRST: Self = Self {
+        steps: [
+            DialStep {
+                kind: ConnectionKind::Utp,
+                behind: None,
+            },
+            DialStep {
+                kind: ConnectionKind::Tcp,
+                behind: Some(Behind {
+                    kind: ConnectionKind::Utp,
+                    wait: Behind::ON_FAILURE,
+                }),
+            },
+        ],
+    };
+}
+
+impl DialPlan<1> {
+    /// TCP alone: under uTP first, a peer whose uTP connect failed and that
+    /// never connected over uTP (libtorrent `torrent_peer::supports_utp` and
+    /// `confirmed_supports_utp` both false).
+    pub const TCP: Self = Self {
+        steps: [DialStep {
+            kind: ConnectionKind::Tcp,
+            behind: None,
+        }],
+    };
+
+    /// uTP alone: under uTP first, a peer that connected over uTP before
+    /// and is not assumed to support it again (libtorrent
+    /// `confirmed_supports_utp` alone, whose failed connect falls to no TCP).
+    pub const UTP: Self = Self {
+        steps: [DialStep {
+            kind: ConnectionKind::Utp,
+            behind: None,
+        }],
+    };
+}
+
+/// A dialer whose failed dials are noted in `seen`: a uTP attempt that
+/// failed tells the peer's record so.
+pub(super) struct Noting<'a> {
+    pub inner: &'a dyn PeerDialer,
+    pub seen: &'a super::UtpSeen,
+}
+
+impl PeerDialer for Noting<'_> {
+    fn may_dial(&self, to: SocketAddr, transports: Transports) -> bool {
+        self.inner.may_dial(to, transports)
+    }
+
+    fn ready(&self) -> bool {
+        self.inner.ready()
+    }
+
+    fn room(&self) -> bool {
+        self.inner.room()
+    }
+
+    fn look(&self) -> TcpRoom {
+        self.inner.look()
+    }
+
+    fn dial<'a>(&'a self, to: SocketAddr, tally: Tally<'a>) -> BoxFuture<'a, Result<Option<Link>>> {
+        Box::pin(async move {
+            let dialed = self.inner.dial(to, tally).await;
+            if dialed.is_err() {
+                self.seen.failed();
+            }
+            dialed
+        })
+    }
+}
+
+/// A dialer whose dial starts the connect time again in `started`: TCP
+/// after a failed uTP connect has the whole time for its own, as
+/// libtorrent's new connection to the peer has.
+pub(super) struct Fresh<'a> {
+    pub inner: &'a dyn PeerDialer,
+    pub started: &'a tokio::sync::Notify,
+}
+
+impl PeerDialer for Fresh<'_> {
+    fn may_dial(&self, to: SocketAddr, transports: Transports) -> bool {
+        self.inner.may_dial(to, transports)
+    }
+
+    fn ready(&self) -> bool {
+        self.inner.ready()
+    }
+
+    fn room(&self) -> bool {
+        self.inner.room()
+    }
+
+    fn look(&self) -> TcpRoom {
+        self.inner.look()
+    }
+
+    fn dial<'a>(&'a self, to: SocketAddr, tally: Tally<'a>) -> BoxFuture<'a, Result<Option<Link>>> {
+        self.started.notify_one();
+        self.inner.dial(to, tally)
+    }
 }
 
 // Which steps of `plan` a connection over `transports` tries: each whose
@@ -469,7 +588,8 @@ pub(super) async fn race<'d, const N: usize>(
 }
 
 // One attempt of a dial over `dialer`, when it is tried: once `wait` has
-// passed, or at once when the attempt it waits behind fails first.
+// passed, or at once when the attempt it waits behind fails first; only
+// then when `wait` is `Behind::ON_FAILURE`, with no timer.
 async fn attempt<'a>(
     dialer: Option<&'a dyn PeerDialer>,
     tally: Tally<'a>,
@@ -480,9 +600,13 @@ async fn attempt<'a>(
         return Ok(None);
     };
     if let Some((wait, failed)) = wait {
-        tokio::select! {
-            _ = failed.notified() => {},
-            _ = tokio::time::sleep(wait) => {}
+        if wait == Behind::ON_FAILURE {
+            failed.notified().await;
+        } else {
+            tokio::select! {
+                _ = failed.notified() => {},
+                _ = tokio::time::sleep(wait) => {}
+            }
         }
     }
     dialer.dial(to, tally).await
@@ -855,6 +979,132 @@ mod tests {
             )
         );
         assert_eq!(rig.stat(ConnectionKind::Tcp), (2, 0, 2, 0, 0));
+    }
+
+    // uTP first: uTP is dialed at once and alone, and TCP not while uTP
+    // still connects, however long that is; TCP starts the moment uTP
+    // fails, with no wait of its own (libtorrent
+    // `peer_connection::on_connection_complete`, peer_connection.cpp:
+    // 4204-4212). Each attempt counts under its own transport.
+    #[tokio::test(start_paused = true)]
+    async fn utp_first_dials_tcp_only_once_utp_fails() {
+        let (rig, mut dials) = fakes();
+        let start = Instant::now();
+        let mut race = pin!(rig.race_by(DialPlan::UTP_FIRST, Transports::Any));
+        let (kind, at, utp) = began(race.as_mut(), &mut dials).await;
+        assert_eq!((kind, at), (ConnectionKind::Utp, start));
+        // An hour on, uTP still connecting, TCP is not dialed.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(futures::poll!(race.as_mut()).is_pending());
+        assert!(dials.try_recv().is_err());
+        let failed_at = Instant::now();
+        utp.send(Err(refused())).unwrap();
+        let (kind, at, tcp) = began(race.as_mut(), &mut dials).await;
+        assert_eq!((kind, at), (ConnectionKind::Tcp, failed_at));
+        tcp.send(Ok(())).unwrap();
+        let link = race.await.unwrap();
+        assert_eq!(link.kind, ConnectionKind::Tcp);
+        assert!(link.home.is_none());
+        assert_eq!(rig.stat(ConnectionKind::Utp), (1, 0, 1, 0, 0));
+        assert_eq!(rig.stat(ConnectionKind::Tcp), (1, 1, 0, 0, 0));
+
+        // uTP connecting wins, and TCP is never dialed.
+        let (rig, mut dials) = fakes();
+        let mut race = pin!(rig.race_by(DialPlan::UTP_FIRST, Transports::Any));
+        let (kind, _, utp) = began(race.as_mut(), &mut dials).await;
+        assert_eq!(kind, ConnectionKind::Utp);
+        utp.send(Ok(())).unwrap();
+        assert_eq!(race.await.unwrap().kind, ConnectionKind::Utp);
+        assert!(dials.try_recv().is_err());
+        assert_eq!(rig.stat(ConnectionKind::Tcp), (0, 0, 0, 0, 0));
+    }
+
+    // uTP first on a route with no uTP socket, or for a peer that may not
+    // go over TCP: the transport left is dialed at once, the other never.
+    #[tokio::test(start_paused = true)]
+    async fn utp_first_with_one_transport_dials_that_one_at_once() {
+        let (mut rig, mut dials) = fakes();
+        rig.utp.may = false;
+        let start = Instant::now();
+        let mut race = pin!(rig.race_by(DialPlan::UTP_FIRST, Transports::Any));
+        let (kind, at, tcp) = began(race.as_mut(), &mut dials).await;
+        assert_eq!((kind, at), (ConnectionKind::Tcp, start));
+        tcp.send(Ok(())).unwrap();
+        assert_eq!(race.await.unwrap().kind, ConnectionKind::Tcp);
+        assert_eq!(rig.stat(ConnectionKind::Utp), (0, 0, 0, 0, 0));
+
+        // TCP off, as uTP only sets it: uTP's failure is the dial's.
+        let (mut rig, mut dials) = fakes();
+        rig.tcp.may = false;
+        let mut race = pin!(rig.race_by(DialPlan::UTP_FIRST, Transports::Any));
+        let (kind, _, utp) = began(race.as_mut(), &mut dials).await;
+        assert_eq!(kind, ConnectionKind::Utp);
+        utp.send(Err(refused())).unwrap();
+        let error = race.await.err().unwrap();
+        assert!(matches!(error, Error::UtpConnect(_)), "{error:?}");
+        assert!(dials.try_recv().is_err());
+        assert_eq!(rig.stat(ConnectionKind::Tcp), (0, 0, 0, 0, 0));
+    }
+
+    // The one-step plans dial their one transport and nothing else, even
+    // when it fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_one_step_plan_dials_its_transport_alone() {
+        for (plan, kind) in [
+            (DialPlan::TCP, ConnectionKind::Tcp),
+            (DialPlan::UTP, ConnectionKind::Utp),
+        ] {
+            let (rig, mut dials) = fakes();
+            let mut race = pin!(rig.race_by(plan, Transports::Any));
+            let (began_kind, _, answer) = began(race.as_mut(), &mut dials).await;
+            assert_eq!(began_kind, kind);
+            answer.send(Err(refused())).unwrap();
+            assert!(race.await.is_err());
+            assert!(dials.try_recv().is_err());
+        }
+    }
+
+    // A dial noted by `Noting` marks the peer's uTP failed only when it
+    // fails, and `Fresh` tells the connect time to start again only as TCP
+    // starts, behind uTP's failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_utp_attempt_is_noted_and_tcp_behind_it_starts_the_time_again() {
+        let (rig, mut dials) = fakes();
+        let seen = super::super::UtpSeen::default();
+        let started = tokio::sync::Notify::new();
+        let utp = Noting {
+            inner: &rig.utp,
+            seen: &seen,
+        };
+        let tcp = Fresh {
+            inner: &rig.tcp,
+            started: &started,
+        };
+        let mut race = pin!(super::race(
+            DialPlan::UTP_FIRST,
+            |kind| match kind {
+                ConnectionKind::Tcp => &tcp as &dyn PeerDialer,
+                ConnectionKind::Utp => &utp,
+            },
+            |kind| Tally {
+                stat: &rig.stats[kind as usize],
+                expired: &rig.expired,
+            },
+            TO,
+            Transports::Any,
+            None,
+        ));
+        let (_, _, answer) = began(race.as_mut(), &mut dials).await;
+        assert_eq!(seen.get(), None);
+        let mut told = pin!(started.notified());
+        assert!(futures::poll!(told.as_mut()).is_pending());
+        answer.send(Err(refused())).unwrap();
+        let (kind, _, tcp_answer) = began(race.as_mut(), &mut dials).await;
+        assert_eq!(kind, ConnectionKind::Tcp);
+        assert_eq!(seen.get(), Some(false));
+        told.await;
+        tcp_answer.send(Ok(())).unwrap();
+        assert_eq!(race.await.unwrap().kind, ConnectionKind::Tcp);
     }
 
     // A dialed link carries its kind's capabilities.

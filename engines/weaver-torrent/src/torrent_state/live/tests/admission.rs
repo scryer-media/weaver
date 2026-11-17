@@ -687,6 +687,7 @@ async fn the_want_goes_once_the_last_dial_comes_live() {
         connect: Some(crate::stream_connect::ConnectionOptions {
             enable_tcp: true,
             enable_utp: None,
+            utp_on_demand: false,
             peer_opts: None,
         }),
         ..isolated_session_opts(false)
@@ -740,6 +741,7 @@ async fn dialing_with(
         connect: Some(crate::stream_connect::ConnectionOptions {
             enable_tcp: true,
             enable_utp: None,
+            utp_on_demand: false,
             peer_opts: Some(peer_opts),
         }),
         ..isolated_session_opts(false)
@@ -817,6 +819,7 @@ async fn quiet_peers_harness(name: &str) -> Harness {
         connect: Some(crate::stream_connect::ConnectionOptions {
             enable_tcp: true,
             enable_utp: None,
+            utp_on_demand: false,
             peer_opts: Some(crate::PeerConnectionOptions {
                 read_write_timeout: Some(Duration::from_secs(3600)),
                 keep_alive_interval: Some(Duration::from_secs(60)),
@@ -919,6 +922,7 @@ async fn a_connection_to_ourselves_is_closed_and_its_address_never_dialed_again(
         connect: Some(crate::stream_connect::ConnectionOptions {
             enable_tcp: true,
             enable_utp: None,
+            utp_on_demand: false,
             peer_opts: None,
         }),
         ..isolated_session_opts(false)

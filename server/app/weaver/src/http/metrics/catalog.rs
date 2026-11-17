@@ -805,6 +805,8 @@ metric_families! {
         ["route"], "Pieces taken from a slower peer and given to a faster one, since the session opened.");
     TORRENT_SESSION_PEERS_DROPPED_UNTRACKED = ("weaver_torrent_session_peers_dropped_untracked_total", Counter,
         ["route"], "Peers that left a torrent's list since the session opened because no tracker or the operator named them, while the torrent takes its peers from its trackers alone: a private torrent once a tracker answers.");
+    TORRENT_SESSION_PEX_ENCRYPTED_SKIPPED = ("weaver_torrent_session_pex_encrypted_peers_skipped_total", Counter,
+        ["route"], "Peers new to a torrent that a peer exchange message flagged as reached encrypted, not taken because the torrent's connections are plain only, since the session opened.");
     TORRENT_SESSION_OUTGOING_ENCRYPTION = ("weaver_torrent_session_outgoing_encryption_total", Counter,
         ["route", "outcome"],
         "Outgoing peer handshakes since the session opened, by how each ended: plaintext (sent plain), or sent encrypted and settled on rc4, on header_only, failed, or cancelled (dropped before it ended, as when its torrent is paused or removed). No outcome holds another, so the outcomes sum to the handshakes started but for those under way.");

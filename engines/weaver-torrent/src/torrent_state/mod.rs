@@ -550,6 +550,12 @@ impl ManagedTorrent {
         self.shared.options.peer_opts.encryption
     }
 
+    /// The transport order the torrent dials peers in, over the session's;
+    /// `None` is the session's.
+    pub fn dial_orders(&self) -> Option<crate::DialOrders> {
+        self.shared.options.peer_opts.dial_orders
+    }
+
     pub fn with_metadata<R>(
         &self,
         mut f: impl FnMut(&Arc<TorrentMetadata>) -> R,

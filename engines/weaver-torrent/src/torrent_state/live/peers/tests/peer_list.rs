@@ -278,7 +278,8 @@ fn index_matches_walk(seed: u64) {
                             // An encrypted handshake that did not
                             // complete: the retry is due at once.
                             2 => {
-                                peer.encrypt_outgoing();
+                                peer.outgoing_method_worked(true);
+                                assert!(peer.encrypt_outgoing());
                                 peers.connection_closed(peer, at, failed, false);
                             }
                             // A seed we no longer need, as we are done.

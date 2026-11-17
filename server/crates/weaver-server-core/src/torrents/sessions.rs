@@ -69,6 +69,8 @@ pub enum TorrentRouteReason {
     ListenPortBindFailed,
     SessionStateUnreadable,
     SessionBuildFailed,
+    /// TCP is turned off, and the route carries no uTP.
+    UtpUnavailable,
     BlocklistFailed,
     /// Every session there can be is in use by other routes.
     SessionLimit,
@@ -129,6 +131,9 @@ impl RouteFailure {
                 "the session's stored ports could not be read"
             }
             TorrentRouteReason::SessionBuildFailed => "the session could not be opened",
+            TorrentRouteReason::UtpUnavailable => {
+                "TCP is turned off, and this route does not carry uTP"
+            }
             TorrentRouteReason::BlocklistFailed => "the blocklist could not be loaded",
             TorrentRouteReason::SessionLimit => "every session is in use by other routes",
             TorrentRouteReason::Opening => "the route's session is opening",
@@ -745,24 +750,27 @@ pub(crate) const fn encryption_policy(
     match policy {
         TorrentEncryption::Prefer => weaver_torrent::EncryptionPolicy::Prefer,
         TorrentEncryption::Require => weaver_torrent::EncryptionPolicy::Require,
+        TorrentEncryption::Disabled => weaver_torrent::EncryptionPolicy::Disabled,
     }
 }
 
-/// How a session on a leg of `shape` takes and reaches peers: the
-/// transports `torrent` asks for that the leg carries, and whether it listens
-/// at all. Outgoing uTP uses the leg's datagram route even when it has no
-/// incoming listener. A session left with neither outgoing transport fails
-/// to build, and its route holds closed.
+/// How a session on a leg of `shape` takes and reaches peers under the
+/// global transports of `torrent`: the transports it turns on that the leg
+/// carries, as libtorrent's `enable_incoming_*` and `enable_outgoing_*` pair
+/// them, and the listener for those when the leg listens. A transport the
+/// global setting turns off is not listened on, and its torrents do not dial
+/// it. A session left with neither fails to build, and its route holds
+/// closed.
 fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, bool, bool) {
-    let protocol = torrent.peer_protocol;
-    let utp = protocol.utp() && shape.utp;
-    let mode = match (protocol.tcp(), utp) {
+    let tcp = torrent.transports.tcp;
+    let utp = torrent.transports.utp && shape.utp;
+    let mode = match (tcp, utp) {
         (true, true) => Some(ListenerMode::TcpAndUtp),
         (false, true) => Some(ListenerMode::UtpOnly),
         (true, false) => Some(ListenerMode::TcpOnly),
         (false, false) => None,
     };
-    (mode.filter(|_| shape.listen), protocol.tcp(), utp)
+    (mode.filter(|_| shape.listen), tcp, utp)
 }
 
 /// The peer transports a session uses, as its opening line names them: TCP
@@ -819,7 +827,7 @@ pub fn session_options(
 ) -> SessionOptions {
     let shape = leg.shape;
     let listen_ip = leg.kind.listen_ip().unwrap_or_else(|| unspecified(binds));
-    let (mode, enable_tcp, enable_utp) = transports(torrent, shape);
+    let (mode, _, _) = transports(torrent, shape);
     let limits = session_limits(torrent);
     let mut options = SessionOptions {
         dht: shape.dht.then(|| DhtSessionConfig {
@@ -843,10 +851,16 @@ pub fn session_options(
             ..ListenerOptions::default()
         }),
         // Peers are dialed by the session's own sockets or by the leg's
-        // factory, never by a proxy URL of the session's.
+        // factory, never by a proxy URL of the session's. A tracker rule may
+        // dial a transport the global setting turns off, so the session
+        // keeps a dialer for each the leg carries; each dial's order alone
+        // says which it uses. A uTP socket the global setting does not
+        // listen on is bound by the first dial that takes uTP, so a session
+        // no rule dials uTP from sends no datagram.
         connect: Some(ConnectionOptions {
-            enable_tcp,
-            enable_utp: Some(enable_utp),
+            enable_tcp: true,
+            enable_utp: Some(shape.utp),
+            utp_on_demand: !torrent.transports.utp,
             peer_opts: Some(PeerConnectionOptions {
                 read_write_timeout: Some(PEER_TIMEOUT),
                 ..PeerConnectionOptions::default()
@@ -856,6 +870,7 @@ pub fn session_options(
         connections_limit: limits.connections_limit,
         unchoke_slots_limit: limits.unchoke_slots_limit,
         connection_speed: limits.connection_speed,
+        dial_orders: torrent.transports.dial_orders(),
         allow_multiple_connections_per_ip: torrent.allow_multiple_connections_per_ip,
         tracker_stopped_timeout: Some(Duration::from_secs(
             torrent.stop_tracker_timeout_secs.into(),
@@ -1691,6 +1706,10 @@ impl Sessions {
         let port = slot_port(&torrent, slot)
             .ok_or_else(|| RouteFailure::from(TorrentRouteReason::ListenPortUnavailable))?;
         let opening = Opening::of(&self.env, &torrent, leg.shape);
+        // TCP off over a leg that carries no uTP has no way to a peer.
+        if !opening.tcp && !opening.utp {
+            return Err(TorrentRouteReason::UtpUnavailable.into());
+        }
         let ip_filter = self.ip_filter(&torrent).await.map_err(|detail| {
             RouteFailure::with_detail(TorrentRouteReason::BlocklistFailed, detail)
         })?;
@@ -1878,14 +1897,43 @@ impl Sessions {
         rejoin_local_discovery(open).await;
     }
 
-    /// Joins local service discovery again each time `changes` rings, until
-    /// its sender goes. Changes that ring while a rejoin runs are taken by
-    /// one more, on the interfaces up then.
+    /// Starts the IPv6 DHT of every running session whose route now has an
+    /// IPv6 address the internet reaches (see `Session::follow_ipv6_route`).
+    /// The routes are asked off the async threads.
+    pub async fn follow_ipv6_routes(&self) {
+        let open: Vec<_> = self.running().await.into_iter().collect();
+        if open.is_empty() {
+            return;
+        }
+        let asked = tokio::task::spawn_blocking(move || {
+            for (key, session) in open {
+                if session.follow_ipv6_route() {
+                    tracing::info!(
+                        route = key.as_str(),
+                        "the route has an IPv6 address the internet reaches: its IPv6 DHT starts"
+                    );
+                }
+            }
+        })
+        .await;
+        if let Err(error) = asked {
+            tracing::warn!(%error, "the IPv6 DHT check did not finish");
+        }
+    }
+
+    /// Joins local service discovery again, and starts an IPv6 DHT that
+    /// waits for an address, each time `changes` rings, until its sender
+    /// goes. Changes that ring while a run goes on are taken by one more,
+    /// on the interfaces up then.
     pub async fn follow_interfaces(
         &self,
         changes: tokio::sync::watch::Receiver<MulticastInterfaces>,
     ) {
-        each_change(changes, || self.rejoin_local_discovery()).await;
+        each_change(changes, || async {
+            self.rejoin_local_discovery().await;
+            self.follow_ipv6_routes().await;
+        })
+        .await;
     }
 
     /// Close `key`'s session and hold it closed for `reason`, its route
@@ -2029,8 +2077,8 @@ impl Configured {
         Some(filter_over(torrent, blocked))
     }
 
-    // Every open session holds to the settings' limits, encryption and
-    // connections per address and, once the blocklist they name is loaded,
+    // Every open session holds to the settings' limits, encryption,
+    // connections per address and dial order and, once the blocklist they name is loaded,
     // to their IP filter; whether it is.
     fn lay_over(&mut self) -> bool {
         let limits = session_limits(&self.torrent);
@@ -2048,6 +2096,7 @@ impl Configured {
                     session.set_allow_multiple_connections_per_ip(
                         torrent.allow_multiple_connections_per_ip,
                     );
+                    session.set_dial_orders(torrent.transports.dial_orders());
                 }
                 if let Some(filter) = filter.as_ref().filter(|_| open) {
                     session.set_ip_filter(filter.clone());

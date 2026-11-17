@@ -162,6 +162,7 @@ async fn a_torrent_waiting_out_a_reconnect_time_keeps_its_press_until_it_seats()
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 enable_utp: Some(false),
+                utp_on_demand: false,
                 peer_opts: None,
             }),
             ipv4_only: true,

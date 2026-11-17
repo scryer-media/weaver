@@ -1718,7 +1718,10 @@ const TORRENT_SETTINGS_FIELDS = `
       unchokeSlotsLimit
       connectionSpeed
       allowMultipleConnectionsPerIp
-      peerProtocol
+      peerTcp
+      peerUtp
+      preferDownloading
+      preferSeeding
       dhtBootstrapNodes
       blocklistEnabled
       blocklist
@@ -1766,6 +1769,10 @@ const TRACKER_RULE_FIELDS = `
     pex
     lsd
     encryption
+    peerTcp
+    peerUtp
+    preferDownloading
+    preferSeeding
     uploadCap {
       state
       value

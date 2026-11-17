@@ -146,10 +146,35 @@ async fn test_require_downloader_from_prefer_seeder_is_encrypted() -> anyhow::Re
     assert_downloads_encrypted(EncryptionPolicy::Require, EncryptionPolicy::Prefer).await
 }
 
+// libtorrent `torrent_peer::pe_support` starts false, so under `pe_enabled`
+// the first connection to a new peer sends the plain handshake
+// (`bt_peer_connection::on_connected`), which a seeder that requires
+// encryption refuses. The encrypted retry that follows, a reconnect wait
+// later, is shown in `session::incoming_tests` over a paused clock.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_prefer_downloader_from_require_seeder_is_encrypted() -> anyhow::Result<()> {
+async fn test_prefer_downloader_tries_a_require_seeder_plain_first() -> anyhow::Result<()> {
+    use crate::session_stats::incoming::IncomingEnd;
     setup_test_logging();
-    assert_downloads_encrypted(EncryptionPolicy::Prefer, EncryptionPolicy::Require).await
+    let t = TestTorrent::new("test_mse_prefer_vs_require", FILE_SIZE, PIECE_LENGTH).await?;
+    let (seeder, seeder_addr) = seed(&t, EncryptionPolicy::Require).await?;
+    let d = download_from(&t, seeder_addr, EncryptionPolicy::Prefer).await?;
+    let refused = || {
+        seeder
+            .stats
+            .incoming
+            .snapshot()
+            .ends
+            .iter()
+            .map(|ends| ends[IncomingEnd::Encryption as usize])
+            .sum::<u64>()
+    };
+    while refused() == 0 {
+        tokio::task::yield_now().await;
+    }
+    let stats = encryption_stats(&d.session);
+    assert!(stats.plaintext >= 1, "{stats:?}");
+    assert_eq!(stats.failures, 0, "{stats:?}");
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -195,12 +220,12 @@ async fn test_require_downloader_against_disabled_seeder_is_refused() -> anyhow:
     Ok(())
 }
 
-// libtorrent `bt_peer_connection::on_connected` and
-// `peer_connection::fast_reconnect`: the encrypted handshake the seeder
-// refuses ends that connection, and the next one, made at once, tries
-// plaintext.
+// libtorrent `bt_peer_connection::on_connected`: `pe_support` starts
+// false, so the first connection to a new peer is plain, and a plain one
+// that completes keeps it so: a seeder that speaks only plaintext is never
+// sent an encrypted handshake.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_prefer_downloader_tries_plaintext_against_disabled_seeder() -> anyhow::Result<()> {
+async fn test_prefer_downloader_sends_plaintext_first_to_disabled_seeder() -> anyhow::Result<()> {
     setup_test_logging();
     let t = TestTorrent::new("test_mse_prefer_vs_disabled", FILE_SIZE, PIECE_LENGTH).await?;
     let (_seeder, seeder_addr) = seed(&t, EncryptionPolicy::Disabled).await?;
@@ -212,8 +237,7 @@ async fn test_prefer_downloader_tries_plaintext_against_disabled_seeder() -> any
     );
 
     let stats = encryption_stats(&d.session);
-    assert_eq!(stats.rc4, 0, "{stats:?}");
-    assert!(stats.failures >= 1, "{stats:?}");
+    assert_eq!(stats.attempts, 0, "{stats:?}");
     assert!(stats.plaintext >= 1, "{stats:?}");
     Ok(())
 }

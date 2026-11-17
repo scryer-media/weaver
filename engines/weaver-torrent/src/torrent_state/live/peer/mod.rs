@@ -29,7 +29,7 @@ use tokio::time::Instant;
 use crate::mse::Encryption;
 use crate::peer_connection::WriterRequest;
 use crate::peer_protocol::extended::ut_pex::{
-    PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PexPeerInfo,
+    PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo,
 };
 use crate::stream_connect::{ConnectionKind, Transports};
 use crate::type_aliases::{BF, PeerHandle, PeerSourceFlag, PeerSources};
@@ -381,8 +381,10 @@ pub(crate) struct Peer {
     // `torrent_peer::last_connected`, set in `peer_list::connection_closed`).
     last_connected: Option<Instant>,
     // Whether the next connection we make to the peer tries the encrypted
-    // handshake where encryption is preferred: the method the peer last
-    // completed one with, encrypted until it has (libtorrent
+    // handshake where encryption is preferred: plain at first, encrypted
+    // when the PEX message that first named it says its sender reached it
+    // so, then the method our last connection to it completed, or the
+    // other one after a connection that completed neither (libtorrent
     // `torrent_peer::pe_support`).
     encrypt: bool,
     // The connections to the peer that followed a failed encrypted
@@ -404,6 +406,13 @@ pub(crate) struct Peer {
     // failures, until the connection closes (libtorrent
     // `peer_connection::set_holepunch_mode`, `torrent::connect_to_peer`).
     holepunch: bool,
+    // The peer is assumed to support uTP: true from the start, false once a
+    // uTP connect to it failed or opened, true again when a PEX message or a
+    // holepunch says it speaks uTP (libtorrent `torrent_peer::supports_utp`).
+    supports_utp: bool,
+    // A uTP connect to the peer opened (libtorrent
+    // `torrent_peer::confirmed_supports_utp`).
+    confirmed_utp: bool,
     // Every source that named the peer.
     sources: PeerSources,
     // A restart saved the peer as found elsewhere than its trackers and the
@@ -438,13 +447,15 @@ impl Peer {
             upload_only: false,
             maybe_upload_only: false,
             last_connected: None,
-            encrypt: true,
+            encrypt: false,
             fast_reconnects: 0,
             fast_reconnect: false,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
             supports_holepunch: false,
             holepunch: false,
+            supports_utp: true,
+            confirmed_utp: false,
             sources: PeerSourceFlag::Incoming.into(),
             resumed_found: false,
             indexed: Indexed::default(),
@@ -474,13 +485,15 @@ impl Peer {
             upload_only: false,
             maybe_upload_only: false,
             last_connected: None,
-            encrypt: true,
+            encrypt: false,
             fast_reconnects: 0,
             fast_reconnect: false,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
             supports_holepunch: false,
             holepunch: false,
+            supports_utp: true,
+            confirmed_utp: false,
             sources,
             resumed_found: false,
             indexed: Indexed::default(),
@@ -676,12 +689,31 @@ impl Peer {
     /// What a connection to the peer may go over: uTP alone while a
     /// holepunch introduced it (libtorrent `bt_peer_connection::on_holepunch`
     /// marks it `supports_utp`, so `torrent::connect_to_peer` dials it
-    /// through the uTP socket manager).
+    /// through the uTP socket manager), and else either, with what its
+    /// uTP connects showed.
     pub(crate) fn transports(&self) -> Transports {
         if self.holepunch {
             Transports::Utp
-        } else {
+        } else if self.supports_utp {
             Transports::Any
+        } else if self.confirmed_utp {
+            Transports::UtpConfirmed
+        } else {
+            Transports::UtpFailed
+        }
+    }
+
+    /// A dial to the peer tried uTP: a uTP connection `opened`, which
+    /// confirms it and ends the assumption, or a uTP attempt failed, which
+    /// ends the assumption unless a holepunch asked for the connection
+    /// (libtorrent `peer_connection::on_connection_complete`,
+    /// peer_connection.cpp:4204-4212 and 6363-6367).
+    pub(crate) fn utp_dialed(&mut self, opened: bool) {
+        if opened {
+            self.confirmed_utp = true;
+            self.supports_utp = false;
+        } else if !self.holepunch {
+            self.supports_utp = false;
         }
     }
 
@@ -694,6 +726,7 @@ impl Peer {
             return false;
         }
         self.holepunch = true;
+        self.supports_utp = true;
         self.outgoing_address = self.addr.addr();
         self.set_state(self.idle_state(peers), peers);
         self.is_connect_candidate()
@@ -740,34 +773,51 @@ impl Peer {
         encrypt
     }
 
-    /// A PEX message named the peer with `flags`: one that speaks the
+    /// A PEX message named the peer with `flags`: one that speaks uTP or the
     /// holepunch extension is marked so (libtorrent `peer_list::insert_peer`,
-    /// `update_peer`), one flagged a seed may only upload unless we are
-    /// connected to it and know better (`update_peer`), and one the sender
-    /// is connected to encrypted is tried encrypted next (`insert_peer`; a
-    /// known peer too, as ours start at encrypted).
+    /// `update_peer`), and one flagged a seed may only upload unless we are
+    /// connected to it and know better (`update_peer`). The encryption flag
+    /// counts only for a peer the message added ([`Self::pex_named_new`]).
     pub(crate) fn pex_flags(&mut self, flags: u8, peers: &PeerStates) {
         if flags & PEX_SEED != 0 && self.connected_out().is_none() {
             self.maybe_upload_only = true;
         }
+        if flags & PEX_UTP != 0 {
+            self.supports_utp = true;
+        }
         if flags & PEX_HOLEPUNCH != 0 {
             self.supports_holepunch = true;
         }
+        peers.reindex(self);
+    }
+
+    /// A PEX message added the peer, new to the list, with `flags`: one its
+    /// sender reached encrypted is tried encrypted first (libtorrent
+    /// `peer_list::insert_peer` sets `pe_support` for a new peer only).
+    pub(crate) fn pex_named_new(&mut self, flags: u8) {
         if flags & PEX_ENCRYPTION != 0 {
             self.encrypt = true;
         }
-        peers.reindex(self);
+    }
+
+    /// The outgoing connection, made where encryption is preferred,
+    /// completed the method it tried: the encrypted handshake when
+    /// `encrypted`, which counts as soon as the encryption handshake is done
+    /// (libtorrent `bt_peer_connection::on_receive_impl`), else the plain
+    /// BitTorrent one once the peer answered it (`on_receive_handshake`).
+    /// The next connection tries it first again. libtorrent writes
+    /// `pe_support` there only under `pe_enabled`, and only outgoing.
+    pub(crate) fn outgoing_method_worked(&mut self, encrypted: bool) {
+        self.encrypt = encrypted;
     }
 
     /// The peer's connection completed its handshake as `encryption` says,
     /// and our PEX says whether it was encrypted (libtorrent
     /// `bt_peer_connection::init_bt_handshake` sets `m_encrypted` either
-    /// way round). One we made makes the next we make try that method again
-    /// (`init_bt_handshake` and `on_receive_impl` write `pe_support` only
-    /// when `is_outgoing()`).
+    /// way round). A connection we made that got this far is not followed
+    /// at once when it closes.
     pub(crate) fn handshake_encryption(&mut self, encryption: Encryption, peers: &PeerStates) {
         if self.connected_out() == Some(true) {
-            self.encrypt = encryption.is_encrypted();
             self.fast_reconnect = false;
         }
         if let Some(live) = self.get_live_mut() {
@@ -899,7 +949,7 @@ impl Peer {
     }
 
     /// The peer as a new run takes it from the list: where it listens, its
-    /// failures, trust and holepunch support, without its connection or
+    /// failures, trust, holepunch and uTP support, without its connection or
     /// this run's counters. Taking the peer closes nothing: an event that
     /// closes the connection runs the one close rule first (see
     /// [`PeerStates::close_all`]); a connection that carries on into the
@@ -923,6 +973,8 @@ impl Peer {
             trust: self.trust,
             supports_holepunch: self.supports_holepunch,
             holepunch: false,
+            supports_utp: self.supports_utp,
+            confirmed_utp: self.confirmed_utp,
             sources: self.sources,
             resumed_found: self.resumed_found,
             indexed: Indexed::default(),

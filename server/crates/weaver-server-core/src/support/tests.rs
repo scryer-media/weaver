@@ -825,7 +825,7 @@ fn published_metrics() -> crate::torrents::metrics::TorrentMetrics {
                 utp: Default::default(),
                 disk: Default::default(),
                 peers: vec![("established", 3), ("connecting", 2)],
-                connects: vec![("tcp", "v4", [7, 3, 1, 1, 2])],
+                connects: vec![("tcp", "v4", [7, 3, 1, 1, 2, 0])],
                 dht: None,
                 ..SessionSeries::default()
             }],
@@ -899,7 +899,7 @@ fn a_held_torrent_reports_what_the_service_holds() {
     assert!(
         report
             .text
-            .contains("    connects tcp/v4 3/7 refused 1 timed out 1 x2"),
+            .contains("    connects tcp/v4 3/7 refused 1 timed out 1 unreachable 0 x2"),
         "{}",
         report.text
     );

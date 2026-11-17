@@ -169,6 +169,62 @@ fn a_tagged_id_is_never_handed_out_again() {
     assert!(db.reserve_next_job_id().unwrap().0 > first.0 + 50);
 }
 
+// After a change, one job's tags, the made tags and the counts are read
+// without every job's tags, and read the same as the tags read whole: the
+// same values, order and counts over many history jobs, a job with no tags
+// and a tag on no job among them.
+#[test]
+fn reads_after_a_change_match_the_tags_read_whole() {
+    let db = Database::open_in_memory().unwrap();
+    let ids: Vec<JobId> = (1..=1_500u64).map(|n| JobId(40_000 + n)).collect();
+    for id in &ids {
+        db.insert_job_history(&history_row(id.0)).unwrap();
+    }
+    let every_third: Vec<JobId> = ids.iter().copied().step_by(3).collect();
+    let every_fifth: Vec<JobId> = ids.iter().copied().step_by(5).collect();
+    db.add_job_tags(&ids[..1_200], ["tag10", "TV", "a"])
+        .unwrap();
+    db.add_job_tags(&every_third, ["tag2", "tv"]).unwrap();
+    db.remove_job_tags(&every_fifth, ["a"]).unwrap();
+    db.create_tags(["unused"]).unwrap();
+    let samples = [ids[0], ids[3], ids[5], ids[1_299], ids[1_499], JobId(9)];
+
+    // Read with nothing in memory: the change just dropped it.
+    assert!(db.cached_tag_snapshot().is_none());
+    let one: Vec<Vec<String>> = samples.iter().map(|id| db.job_tags(*id).unwrap()).collect();
+    let made = db.made_tags().unwrap();
+    let counts = db.tag_counts().unwrap();
+    assert!(db.cached_tag_snapshot().is_none());
+
+    let whole = db.tag_snapshot().unwrap();
+    let expected: Vec<Vec<String>> = samples.iter().map(|id| whole.of(*id).to_vec()).collect();
+    assert_eq!(one, expected);
+    assert_eq!(made, whole.made());
+    assert_eq!(counts, whole.counts());
+    assert_eq!(one[0], ["tag2", "tag10", "TV", "tv"]);
+    assert_eq!(one[1], ["a", "tag2", "tag10", "TV", "tv"]);
+    assert!(one[5].is_empty());
+    assert_eq!(
+        counts
+            .iter()
+            .map(|count| (count.name.as_str(), count.jobs))
+            .collect::<Vec<_>>(),
+        [
+            ("a", 960),
+            ("tag2", 500),
+            ("tag10", 1_200),
+            ("TV", 1_200),
+            ("tv", 500),
+            ("unused", 0)
+        ]
+    );
+    // From memory now, the same again.
+    assert!(db.cached_tag_snapshot().is_some());
+    assert_eq!(db.job_tags(samples[0]).unwrap(), one[0]);
+    assert_eq!(db.tag_counts().unwrap(), counts);
+    assert_eq!(db.made_tags().unwrap(), made);
+}
+
 #[test]
 fn a_script_is_given_its_jobs_tags() {
     let db = Database::open_in_memory().unwrap();

@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::files::{read_exact_at, write_all_at};
 
@@ -38,6 +39,14 @@ pub(crate) struct Side {
     base: u64,
     // The files the head names, those whose shares may be here alone.
     recorded: Vec<bool>,
+    // The selection of files set aside the head was last found to name in
+    // full: a piece kept under that same selection writes no head, and
+    // its files are not scanned again. Held, so its address is never
+    // another selection's while it is here.
+    covered: Option<Arc<Vec<bool>>>,
+    // How many times a piece kept scanned the files set aside.
+    #[cfg(test)]
+    scans: usize,
     // Whether the file is there, its head written.
     made: bool,
     // The slot each piece kept here is in.
@@ -112,6 +121,9 @@ impl Side {
             slot_len: 0,
             base: 0,
             recorded: Vec::new(),
+            covered: None,
+            #[cfg(test)]
+            scans: 0,
             made: false,
             slots: HashMap::new(),
             free: Vec::new(),
@@ -247,25 +259,51 @@ impl Side {
             write_all_at(&file, 0, &head(aside))?;
         }
         self.recorded = aside.to_vec();
+        self.covered = None;
         Ok(())
     }
 
     // The piece kept whole, with the files `aside` names set aside: the
-    // head naming them, its bytes in a slot, then the slot's tag.
-    pub(crate) fn keep(&mut self, piece: u32, held: &[u8], aside: &[bool]) -> io::Result<()> {
+    // head naming them, its bytes in a slot, then the slot's tag. The
+    // files are scanned once per selection: a piece kept under the
+    // selection the head already names in full goes straight to its slot.
+    pub(crate) fn keep(
+        &mut self,
+        piece: u32,
+        held: &[u8],
+        aside: &Arc<Vec<bool>>,
+    ) -> io::Result<()> {
         let file = open_for_write(self.file_path()?)?;
-        if !self.made || self.recorded.iter().zip(aside).any(|(was, is)| *is && !was) {
-            // Every file set aside is named; one named and no longer set
-            // aside stays named until its shares are copied out.
-            let named: Vec<bool> = self
-                .recorded
-                .iter()
-                .zip(aside)
-                .map(|(was, is)| *was || *is)
-                .collect();
-            write_all_at(&file, 0, &head(&named))?;
-            self.recorded = named;
-            self.made = true;
+        let covered = self.made
+            && self
+                .covered
+                .as_ref()
+                .is_some_and(|covered| Arc::ptr_eq(covered, aside));
+        if !covered {
+            #[cfg(test)]
+            {
+                self.scans += 1;
+            }
+            if !self.made
+                || self
+                    .recorded
+                    .iter()
+                    .zip(aside.iter())
+                    .any(|(was, is)| *is && !was)
+            {
+                // Every file set aside is named; one named and no longer
+                // set aside stays named until its shares are copied out.
+                let named: Vec<bool> = self
+                    .recorded
+                    .iter()
+                    .zip(aside.iter())
+                    .map(|(was, is)| *was || *is)
+                    .collect();
+                write_all_at(&file, 0, &head(&named))?;
+                self.recorded = named;
+                self.made = true;
+            }
+            self.covered = Some(Arc::clone(aside));
         }
         let slot = match self.slots.get(&piece) {
             Some(slot) => *slot,
@@ -333,6 +371,66 @@ impl Side {
 mod tests {
     use super::*;
 
+    fn sel(aside: &[bool]) -> Arc<Vec<bool>> {
+        Arc::new(aside.to_vec())
+    }
+
+    // Keeping pieces under one selection scans its files once, and writes
+    // the same file as a scan for every piece did: the same head, slots
+    // and names, through a change of selection and a record in between.
+    #[test]
+    fn a_piece_kept_under_the_same_selection_scans_no_file() {
+        const FILES: usize = 40_000;
+        let dir = tempfile::tempdir().unwrap();
+        let odd = sel(&(0..FILES).map(|file| file % 2 == 1).collect::<Vec<_>>());
+        let more = sel(&(0..FILES)
+            .map(|file| file % 2 == 1 || file % 3 == 0)
+            .collect::<Vec<_>>());
+        let fewer = (0..FILES).map(|file| file % 4 == 1).collect::<Vec<_>>();
+        // Each step keeps a piece per two files of a stretch, under one
+        // selection; `None` records `fewer` in between.
+        type Step<'a> = (Option<&'a Arc<Vec<bool>>>, std::ops::Range<u32>);
+        let steps: [Step<'_>; 4] = [
+            (Some(&odd), 0..1_000),
+            (Some(&more), 1_000..1_500),
+            (None, 0..0),
+            (Some(&more), 1_500..2_000),
+        ];
+        let run = |name: &str, fresh: bool| {
+            let path = dir.path().join(name);
+            let mut side = Side::open(path.clone(), 4, FILES).unwrap();
+            for (aside, pieces) in &steps {
+                let Some(aside) = aside else {
+                    side.record(&fewer).unwrap();
+                    continue;
+                };
+                for piece in pieces.clone() {
+                    let held = piece.to_le_bytes();
+                    // The old path: every piece scanned, as a selection
+                    // never seen before.
+                    let aside = if fresh { sel(aside) } else { Arc::clone(aside) };
+                    side.keep(piece, &held, &aside).unwrap();
+                }
+            }
+            (
+                std::fs::read(&path).unwrap(),
+                side.recorded.clone(),
+                side.scans,
+            )
+        };
+        let (old, old_named, old_scans) = run("old.side", true);
+        let (new, new_named, scans) = run("new.side", false);
+        assert_eq!(new, old);
+        assert_eq!(new_named, old_named);
+        assert_eq!(old_scans, 2_000);
+        // One scan per selection, and one after the record.
+        assert_eq!(scans, 3);
+        assert_eq!(
+            &new[..head_len(FILES) as usize],
+            head(&new_named).as_slice()
+        );
+    }
+
     // A piece kept reads back from its slot, a dropped one's slot is taken
     // by the next, and the store opened again finds what it holds by the
     // tags alone, and by its head which files' shares may be there alone.
@@ -342,11 +440,11 @@ mod tests {
         let path = dir.path().join("work").join("t.side");
         let mut side = Side::open(path.clone(), 4, 2).unwrap();
         assert!(!path.exists());
-        side.keep(7, b"abcd", &[false, true]).unwrap();
-        side.keep(2, b"efgh", &[false, true]).unwrap();
+        side.keep(7, b"abcd", &sel(&[false, true])).unwrap();
+        side.keep(2, b"efgh", &sel(&[false, true])).unwrap();
         side.drop_piece(7).unwrap();
         // A file no longer set aside stays named until it is recorded so.
-        side.keep(9, b"ijkl", &[true, false]).unwrap();
+        side.keep(9, b"ijkl", &sel(&[true, false])).unwrap();
         let mut again = Side::open(path.clone(), 4, 2).unwrap();
         assert_eq!(again.pieces(), [2, 9]);
         assert!(again.recorded(0) && again.recorded(1));
@@ -376,8 +474,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.side");
         let mut other = Side::open(path.clone(), 4, 3).unwrap();
-        other.keep(5, b"abcd", &[false, true, false]).unwrap();
-        other.keep(6, b"efgh", &[false, true, false]).unwrap();
+        other.keep(5, b"abcd", &sel(&[false, true, false])).unwrap();
+        other.keep(6, b"efgh", &sel(&[false, true, false])).unwrap();
         let three = std::fs::read(&path).unwrap();
         // The same slots under a two-file head, its magic broken.
         let mut magic = head(&[false, true]);
@@ -395,7 +493,7 @@ mod tests {
             assert!(side.is_empty());
             assert!(!side.recorded(0) && !side.recorded(1));
             assert!(!path.exists());
-            side.keep(6, b"ijkl", &[false, true]).unwrap();
+            side.keep(6, b"ijkl", &sel(&[false, true])).unwrap();
             let mut out = [0; 4];
             side.read(6, 0, &mut out).unwrap();
             assert_eq!(&out, b"ijkl");
