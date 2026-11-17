@@ -447,7 +447,10 @@ impl TorrentService {
             mail: env.written.clone(),
             reading: plan.reads_back().then(|| {
                 Reading::new(
-                    Arc::new(self.storage(work.clone(), layout, &plan, Vec::new()).scratch(job_id.0)),
+                    Arc::new(
+                        self.storage(work.clone(), layout, &plan, Vec::new())
+                            .scratch(job_id.0),
+                    ),
                     self.resident(job_id),
                 )
             }),
@@ -504,7 +507,7 @@ impl TorrentService {
     fn give_store(&self, torrent: &mut Live, store: TorrentStore) {
         let job_id = torrent.record.job_id;
         let env = &self.inner.env;
-        let store = Arc::new(store);
+        let store = store.shared();
         let signal = Arc::clone(&self.inner.signal);
         // With disks to read, the pieces book on the disk the torrent's
         // folder lies on. A store handed again over the same folder keeps

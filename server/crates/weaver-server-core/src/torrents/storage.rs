@@ -124,6 +124,8 @@ pub(crate) trait Pieces: Send + Sync {
     fn read_turns(&self) -> ReadTurns {
         ReadTurns::private()
     }
+    // Resident room the storage held was given back.
+    fn room_returned(&self) {}
     // `outs` filled one after the other from the file's bytes at `offset`
     // as it holds them on disk.
     fn readv(&self, file: usize, mut offset: u64, outs: &mut [&mut [u8]]) -> std::io::Result<()> {
@@ -266,11 +268,15 @@ impl Inner {
             .release_resident(self.holds.namespace, bytes);
     }
 
-    // Room given back: the session waiting on it asks again.
+    // Room given back: the session waiting on it asks again, and so do the
+    // torrent's read-backs waiting on it.
     fn release(&self, bytes: u64) {
         self.unreserve(bytes);
         if let Some(room) = &*self.room.lock().unwrap_or_else(PoisonError::into_inner) {
             room.notify_waiters();
+        }
+        if bytes > 0 {
+            self.pieces.room_returned();
         }
     }
 }
@@ -499,11 +505,8 @@ impl TorrentStorage for PieceStorage {
                 let first = start / layout.piece_length();
                 let last = (start + len as u64 - 1) / layout.piece_length();
                 let flight = self.flight();
-                !(first..=last).any(|piece| {
-                    flight
-                        .get(&(piece as u32))
-                        .is_some_and(Flight::in_memory)
-                })
+                !(first..=last)
+                    .any(|piece| flight.get(&(piece as u32)).is_some_and(Flight::in_memory))
             };
         if !on_disk {
             let mut at = offset;

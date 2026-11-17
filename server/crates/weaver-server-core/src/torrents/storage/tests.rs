@@ -1500,6 +1500,10 @@ impl Pieces for Watched {
     fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
         self.store.read_turns()
     }
+
+    fn room_returned(&self) {
+        self.store.room_returned();
+    }
 }
 
 // A session on loopback alone: no DHT, no trackers, no discovery, and

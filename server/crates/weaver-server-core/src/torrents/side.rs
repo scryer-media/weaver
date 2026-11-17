@@ -390,12 +390,16 @@ impl Side {
 
     // `out` from `at` inside the piece kept here, or still arriving here.
     pub(crate) fn read(&self, piece: u32, at: u64, out: &mut [u8]) -> io::Result<()> {
-        let slot = self.pending.get(&piece).or(self.slots.get(&piece)).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "the piece is not in the side store",
-            )
-        })?;
+        let slot = self
+            .pending
+            .get(&piece)
+            .or(self.slots.get(&piece))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the piece is not in the side store",
+                )
+            })?;
         let file = File::open(self.file_path()?)?;
         read_exact_at(
             &file,

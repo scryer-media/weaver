@@ -19,9 +19,7 @@ const BUDGET: u64 = 32 << 10;
 // a.bin is torrent bytes 0..100000 and b.bin 100000..160000: piece 1 is the
 // end of a.bin and the start of b.bin.
 fn two_files() -> Arc<PieceLayout> {
-    Arc::new(
-        PieceLayout::new(PIECE, vec![file("a.bin", 100_000), file("b.bin", 60_000)]).unwrap(),
-    )
+    Arc::new(PieceLayout::new(PIECE, vec![file("a.bin", 100_000), file("b.bin", 60_000)]).unwrap())
 }
 
 fn shim_over(dir: tempfile::TempDir, holds: Holds, kept: Option<&Kept>) -> Shim {
@@ -118,7 +116,10 @@ fn a_fitting_piece_is_held_whole_as_before_and_ends_as_a_block_written_one_does(
         if piece == 0 {
             assert!(!fitting.dir.path().join("a.bin").exists());
         }
-        fitting.storage.on_piece_completed(fitting.index(piece)).unwrap();
+        fitting
+            .storage
+            .on_piece_completed(fitting.index(piece))
+            .unwrap();
         oversized.write_blocks(piece, &torrent, u64::MAX, None);
         oversized
             .storage

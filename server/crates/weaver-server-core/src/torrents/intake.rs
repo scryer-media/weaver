@@ -485,6 +485,10 @@ impl Pieces for Intake {
         self.inner.read_turns()
     }
 
+    fn room_returned(&self) {
+        self.inner.room_returned();
+    }
+
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {
         self.heard(self.inner.failed(piece))
     }

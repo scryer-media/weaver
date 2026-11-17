@@ -27,7 +27,7 @@ use super::files::{Files, Placed, Stamping};
 use super::layout::PieceLayout;
 use super::side::Side;
 use super::storage::Pieces;
-use super::tee::Tee;
+use super::tee::{ReadsBack, Tee};
 use super::writes::{Done, Paid, Paying, Place, VolumeRoom, Writes};
 use tokio::sync::Notify;
 use weaver_torrent::Checkpoint;
@@ -268,6 +268,15 @@ struct BlockAt {
     at: u64,
 }
 
+// A block of a piece written as it arrives, as it goes to the writer:
+// its bytes, where they go, and who hears when they are written.
+struct Arrived {
+    piece: u32,
+    held: Bytes,
+    block: BlockAt,
+    done: Done,
+}
+
 #[derive(Default)]
 struct Moves {
     moving: bool,
@@ -299,6 +308,17 @@ impl TorrentStore {
             stamps: Mutex::default(),
         };
         *store.saved() = Some(store.kept());
+        store
+    }
+
+    // The store, shared, and named to its tee as what reads its pieces back
+    // again when a read-back waited for room.
+    pub(crate) fn shared(self) -> Arc<Self> {
+        let store = Arc::new(self);
+        if let Some(tee) = &store.tee {
+            let reads: Arc<dyn ReadsBack> = Arc::clone(&store) as Arc<dyn ReadsBack>;
+            tee.reads_back_through(Arc::downgrade(&reads));
+        }
         store
     }
 
@@ -1165,7 +1185,13 @@ impl TorrentStore {
         } = parked;
         let aside = self.aside();
         if let Some(block) = block {
-            return self.queue_block(placed, paying, piece, held, block, done, &aside);
+            let arrived = Arrived {
+                piece,
+                held,
+                block,
+                done,
+            };
+            return self.queue_block(placed, paying, arrived, &aside);
         }
         self.writes.queue_paying(paying, move |batch| {
             let mut kept: Option<Arc<Vec<bool>>> = None;
@@ -1233,17 +1259,19 @@ impl TorrentStore {
     // `placed` has it, or, when its file is set aside, for the piece's slot
     // in the side store, on the writer in the same turn. Nothing is had
     // yet: the piece is, once it verified (`sealed`).
-    #[allow(clippy::too_many_arguments)]
     fn queue_block(
         &self,
         placed: &Placed<'_>,
         paying: Paying,
-        piece: u32,
-        held: Bytes,
-        block: BlockAt,
-        done: Done,
+        arrived: Arrived,
         aside: &Arc<Vec<bool>>,
     ) {
+        let Arrived {
+            piece,
+            held,
+            block,
+            done,
+        } = arrived;
         let set_aside = aside.get(block.file).copied().unwrap_or(false);
         let aside = Arc::clone(aside);
         self.writes.queue_paying(paying, move |batch| {
@@ -1277,6 +1305,16 @@ impl TorrentStore {
             if let Err(error) = tee.read_back(piece, Some(room), read) {
                 tracing::warn!(piece, error = %error, "a verified piece could not be read back for unpacking");
             }
+        }
+    }
+}
+
+impl ReadsBack for TorrentStore {
+    // The piece's waiting shares read again from the files, on the tee's own
+    // task; still no room, and it waits again.
+    fn read_back_again(&self, piece: u32) {
+        if let Err(error) = self.replay(piece) {
+            tracing::warn!(piece, error = %error, "a verified piece could not be read back for unpacking");
         }
     }
 }
@@ -1429,7 +1467,9 @@ impl Pieces for TorrentStore {
     // written block by block is checked a slice at a time, never a whole
     // piece held: the tee reads such a piece back once it is found.
     fn wants_hashed(&self, piece: u32) -> bool {
-        self.tee.as_ref().is_some_and(|tee| !tee.writes_blocks() && tee.wants(piece))
+        self.tee
+            .as_ref()
+            .is_some_and(|tee| !tee.writes_blocks() && tee.wants(piece))
     }
 
     fn hashed(&self, piece: u32, held: &Bytes) {
@@ -1450,17 +1490,16 @@ impl Pieces for TorrentStore {
             have.rechecked(&self.layout, piece);
             have.set(&self.layout, piece, true)
         };
-        match self.replay(piece) {
-            // A read-back the resident budget has no room for leaves the
-            // piece had; the tee takes it at the next restart's replay.
-            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
-                tracing::warn!(piece, error = %error, "a checked piece was not read back to the tee");
-            }
-            replayed => {
-                replayed?;
-            }
-        }
+        self.replay(piece)?;
         Ok(found)
+    }
+
+    // Room returned to the torrent's budget: the tee's read-backs waiting
+    // for it go again.
+    fn room_returned(&self) {
+        if let Some(tee) = &self.tee {
+            tee.room_returned();
+        }
     }
 
     // The tee's plan chose with the torrent's write path, so its choice

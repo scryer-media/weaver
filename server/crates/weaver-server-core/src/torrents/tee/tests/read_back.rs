@@ -119,9 +119,8 @@ fn rig(refused: bool) -> Rig {
     let mail = RunMail::default();
     let member = noise((3 * MIB + 12_345) as usize, 7);
     let archive = tar_gz(&member);
-    let layout = Arc::new(
-        PieceLayout::new(PIECE, vec![file("set.tar.gz", archive.len() as u64)]).unwrap(),
-    );
+    let layout =
+        Arc::new(PieceLayout::new(PIECE, vec![file("set.tar.gz", archive.len() as u64)]).unwrap());
     assert!(layout.piece_count() >= 2);
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -158,13 +157,14 @@ impl Rig {
         let writes = std::thread::spawn(crate::torrents::writes::Writes::for_test)
             .join()
             .unwrap();
-        Arc::new(TorrentStore::new(
+        TorrentStore::new(
             Arc::clone(&self.layout),
             Files::new(&self.layout, self.files()).unwrap(),
             kept,
             Some(Arc::clone(&self.tee)),
             writes,
-        ))
+        )
+        .shared()
     }
 
     fn files(&self) -> PathBuf {
@@ -295,7 +295,13 @@ async fn an_oversized_archive_piece_reads_back_through_scratch_and_unpacks() {
     assert_eq!(rig.resident_peak(), 0);
     assert!(storage.resident_peak() <= BUDGET);
     assert_eq!(storage.resident_peak(), READ_BACK_BYTES);
-    assert_eq!(rig.holds.accountant.namespace_usage(rig.holds.namespace).resident, 0);
+    assert_eq!(
+        rig.holds
+            .accountant
+            .namespace_usage(rig.holds.namespace)
+            .resident,
+        0
+    );
     rig.tee.forget();
 }
 
@@ -312,7 +318,13 @@ async fn an_oversized_archive_piece_reads_back_in_smaller_reads_when_scratch_is_
     assert_eq!(rig.scratch_peak(), 0);
     assert!(rig.resident_peak() <= BUDGET);
     assert!(storage.resident_peak() <= BUDGET);
-    assert_eq!(rig.holds.accountant.namespace_usage(rig.holds.namespace).resident, 0);
+    assert_eq!(
+        rig.holds
+            .accountant
+            .namespace_usage(rig.holds.namespace)
+            .resident,
+        0
+    );
     rig.tee.forget();
 }
 
@@ -351,4 +363,68 @@ async fn a_restart_reads_a_lacking_piece_back_by_the_same_rule() {
         assert!(rig.scratch_peak() <= PIECE);
         rig.tee.forget();
     }
+}
+
+// A read-back the budget has no room for waits for room, not for a
+// restart: with scratch refused and the budget held by a piece in flight,
+// the lacking piece's read-back is refused and waits; the piece's room let
+// go rings it, and it is read back and the archive unpacks, in the same
+// run. The budget is never passed.
+#[tokio::test]
+async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
+    let mut rig = rig(true);
+    let lacked = rig.layout.piece_count() - 1;
+    std::fs::create_dir_all(rig.files()).unwrap();
+    std::fs::write(rig.files().join("set.tar.gz"), &rig.archive).unwrap();
+    let store = rig.store(None);
+    drop(rig.fetch(&store, Some(lacked)));
+    assert!(rig.tee.wants(lacked));
+
+    let pieces = rig.layout.piece_count() as usize;
+    let mut bits = bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::repeat(true, pieces);
+    bits.set_uninitialized(false);
+    let kept = Kept {
+        bits: bits.into_vec(),
+        checking: false,
+    };
+    let again = rig.store(Some(&kept));
+    // A piece in flight holds the room the read-back would need.
+    let storage = PieceStorage::new(
+        Arc::clone(&rig.layout),
+        Arc::clone(&again) as Arc<dyn Pieces>,
+        rig.holds.clone(),
+    );
+    let lengths = Lengths::new(rig.layout.total(), PIECE as u32).unwrap();
+    let flying = lengths.try_validate_piece_index(0).unwrap();
+    assert!(storage.reserve_piece(flying, &Arc::default()));
+    let held = rig
+        .holds
+        .accountant
+        .namespace_usage(rig.holds.namespace)
+        .resident;
+    assert!(held + READ_BACK_BYTES > BUDGET, "{held}");
+    let resident_before = rig.resident_peak();
+
+    let replayed = again.replay_had();
+    assert_eq!(replayed.taken, 0);
+    assert!(replayed.unread.is_none());
+    assert!(rig.tee.waits_for_room());
+    assert!(rig.tee.wants(lacked));
+    assert_eq!(rig.resident_peak(), resident_before);
+
+    // The piece fails its hash: its room goes back, and rings the wait.
+    storage.on_piece_hash_failed(flying).unwrap();
+    assert_eq!(rig.unpacked().await, rig.member);
+    assert!(!rig.tee.wants(lacked));
+    assert!(!rig.tee.waits_for_room());
+    assert!(rig.resident_peak() <= BUDGET);
+    assert!(storage.resident_peak() <= BUDGET);
+    assert_eq!(
+        rig.holds
+            .accountant
+            .namespace_usage(rig.holds.namespace)
+            .resident,
+        0
+    );
+    rig.tee.forget();
 }
