@@ -18,6 +18,7 @@ use crate::torrents::metrics::{
     Published, SeedingSeries, SessionSeries, TorrentMetrics, TorrentSeries,
 };
 use crate::torrents::sessions::TorrentRouteReason;
+use crate::torrents::status::Engine;
 use crate::torrents::{
     FilePriority, TorrentCounters, TorrentFile, TorrentSource, TorrentState, TorrentTracker,
     TrackerEntry, TrackerStatus, status,
@@ -155,6 +156,44 @@ pub struct TorrentView {
     pub metadata: Vec<(String, String)>,
     /// Its job's tags, in tag order.
     pub tags: Vec<String>,
+    /// The reading its clock fields were taken at.
+    pub clock: ViewClock,
+}
+
+/// The reading a view's clock fields were taken at: a reader that holds the
+/// view runs them on to the time it answers, as a reading then gives them
+/// while nothing else about the torrent changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ViewClock {
+    /// When it was read, in milliseconds since the epoch.
+    pub at_ms: i64,
+    /// When its soonest tracker announce is, in milliseconds since the epoch.
+    pub next_announce_ms: Option<i64>,
+    /// The milliseconds the time active, the time seeding and the current
+    /// seeding run had run past their whole seconds.
+    pub active_ms: u16,
+    pub finished_ms: u16,
+    pub consecutive_ms: u16,
+    /// Whether its session ran it: its time active runs on.
+    pub active: bool,
+}
+
+/// A view's clock fields at a given time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockFields {
+    pub active_seconds: u64,
+    pub seeding_seconds: u64,
+    pub consecutive_seeding_seconds: u64,
+    pub reannounce_seconds: Option<u64>,
+}
+
+/// What a list's row carries beside its own fields when asked for it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RowParts {
+    pub files: Vec<TorrentFile>,
+    /// Each file's bytes in hand, by its index in the torrent.
+    pub file_have: Vec<u64>,
+    pub trackers: Vec<TorrentTracker>,
 }
 
 /// What a support report reads of a torrent beyond its view.
@@ -288,6 +327,46 @@ impl TorrentView {
             .or_else(|| self.trackers.first())
     }
 
+    /// Its clock fields run on to `now_ms` from the reading it was taken
+    /// at, as a reading at `now_ms` gives them while nothing else about the
+    /// torrent changed: the time active while its session runs it, the time
+    /// seeding and the current seeding run while it seeds (the durations of
+    /// `Timed::advanced`), and the countdown to its next announce. A time
+    /// before the reading runs nothing on.
+    pub fn clock_at(&self, now_ms: i64) -> ClockFields {
+        let clock = &self.clock;
+        let elapsed = u64::try_from(now_ms - clock.at_ms).unwrap_or(0);
+        // Whole seconds and the part past them, run on while `running`.
+        let run = |whole: u64, part: u16, running: bool| {
+            if running {
+                let ms = u64::from(part).saturating_add(elapsed);
+                (whole.saturating_add(ms / 1000), ms % 1000)
+            } else {
+                (whole, u64::from(part))
+            }
+        };
+        // The time active counts a part of a second as a whole one.
+        let active_whole = self
+            .active_seconds
+            .saturating_sub(u64::from(clock.active_ms > 0));
+        let (active_whole, active_part) = run(active_whole, clock.active_ms, clock.active);
+        let seeding = self.state == TorrentState::Seeding;
+        ClockFields {
+            active_seconds: status::active_seconds(active_whole, active_part),
+            seeding_seconds: run(self.seeding_seconds, clock.finished_ms, seeding).0,
+            consecutive_seeding_seconds: run(
+                self.consecutive_seeding_seconds,
+                clock.consecutive_ms,
+                seeding,
+            )
+            .0,
+            reannounce_seconds: match clock.next_announce_ms {
+                Some(next) => Some(status::reannounce_seconds(next, now_ms)),
+                None => self.reannounce_seconds,
+            },
+        }
+    }
+
     /// How much of `file` is in hand, from 0 to 1.
     pub fn file_progress(&self, file: &TorrentFile) -> f64 {
         let have = self
@@ -416,9 +495,12 @@ impl TorrentService {
         }
     }
 
-    // Each row's tags as the tags now stand: the tags move a row with no
-    // publish of the torrents.
-    pub(super) fn retag(&self) {
+    /// Each row's tags as the tags now stand: the tags move a row with no
+    /// publish of the torrents. A change to the tags does this on its own
+    /// soon after; a caller that changed them and answers from the rows
+    /// does it at once. It reads the database: call it off the async
+    /// runtime.
+    pub fn retag(&self) {
         let stamp = self.inner.snapshot.stamp();
         match self.inner.db.tag_snapshot() {
             Ok(tags) => self
@@ -478,6 +560,8 @@ impl TorrentService {
         self.inner
             .views_built
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let [active_ms, finished_ms, consecutive_ms] = reading.timed.parts();
+        let clock_runs = matches!(reading.engine, Engine::Live { .. });
         let (state, why) = status::project(&torrent.observed(reading.engine));
         let status::WhyParts {
             detail,
@@ -595,6 +679,15 @@ impl TorrentService {
             trackers: Vec::new(),
             metadata: record.metadata.clone(),
             tags: Vec::new(),
+            clock: ViewClock {
+                at_ms: now,
+                next_announce_ms: swarm.next_announce_ms,
+                // Each under a second.
+                active_ms: u16::try_from(active_ms).unwrap_or_default(),
+                finished_ms: u16::try_from(finished_ms).unwrap_or_default(),
+                consecutive_ms: u16::try_from(consecutive_ms).unwrap_or_default(),
+                active: clock_runs,
+            },
         }
     }
 
@@ -910,14 +1003,98 @@ impl TorrentService {
         announces: &[TrackerAnnounce],
         names: &mut HashMap<(TorrentScope, Option<u32>), Option<ResolvedBy>>,
     ) {
-        let names = *names.entry((view.scope, pinned)).or_insert_with(|| {
-            self.inner
-                .sessions
-                .routes()
-                .plan(view.scope)
-                .names_for(pinned)
-        });
-        view.trackers = status::trackers(listed.to_vec(), announces, names);
+        view.trackers = self.trackers_of(view.scope, pinned, listed, announces, names);
+    }
+
+    // `track`'s trackers of a torrent whose route is `scope`'s.
+    fn trackers_of(
+        &self,
+        scope: TorrentScope,
+        pinned: Option<u32>,
+        listed: &[TrackerEntry],
+        announces: &[TrackerAnnounce],
+        names: &mut HashMap<(TorrentScope, Option<u32>), Option<ResolvedBy>>,
+    ) -> Vec<TorrentTracker> {
+        let names = *names
+            .entry((scope, pinned))
+            .or_insert_with(|| self.inner.sessions.routes().plan(scope).names_for(pinned));
+        status::trackers(listed.to_vec(), announces, names)
+    }
+
+    /// What a list's rows, read from the snapshot, carry beside their own
+    /// fields when asked: each torrent of `ids`' files with the bytes in
+    /// hand of each when `files` asks, and its trackers when `trackers`
+    /// does, read as [`TorrentService::torrent`] reads them. No view is
+    /// built: only these parts of the torrents named are read.
+    pub async fn row_parts(
+        &self,
+        ids: &[JobId],
+        files: bool,
+        trackers: bool,
+    ) -> HashMap<JobId, RowParts> {
+        let settings = self.settings();
+        let rules = self.rules();
+        // Under the lock, each torrent's files are only taken by reference
+        // with its levels, and its trackers' entries with its announces: the
+        // lists are built after the lock is let go.
+        type Read = (
+            JobId,
+            Option<(Option<Arc<PieceLayout>>, Vec<FilePriority>, Vec<u64>)>,
+            Option<(
+                TorrentScope,
+                Option<u32>,
+                Arc<[TrackerEntry]>,
+                Vec<TrackerAnnounce>,
+            )>,
+        );
+        let read: Vec<Read> = {
+            let live = self.inner.live.lock().await;
+            ids.iter()
+                .filter_map(|job_id| live.get(job_id))
+                .map(|torrent| {
+                    let record = &torrent.record;
+                    (
+                        record.job_id,
+                        files.then(|| {
+                            (
+                                torrent.layout.clone(),
+                                torrent.levels.clone(),
+                                torrent.file_have_now(),
+                            )
+                        }),
+                        trackers.then(|| {
+                            (
+                                settings.scope(record.category_id, torrent.rule(&rules)),
+                                record.pool_member,
+                                torrent.trackers.clone(),
+                                torrent.announces(),
+                            )
+                        }),
+                    )
+                })
+                .collect()
+        };
+        let mut names = HashMap::new();
+        read.into_iter()
+            .map(|(job_id, files, trackers)| {
+                let (files, file_have) = files
+                    .map_or_else(Default::default, |(layout, levels, have)| {
+                        (files_of(layout.as_deref(), &levels), have)
+                    });
+                let trackers =
+                    trackers.map_or_else(Vec::new, |(scope, pinned, listed, announces)| {
+                        self.trackers_of(scope, pinned, &listed, &announces, &mut names)
+                    });
+                (
+                    job_id,
+                    RowParts {
+                        files,
+                        file_have,
+                        trackers,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// The torrents as queue items.

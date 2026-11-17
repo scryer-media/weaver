@@ -78,6 +78,18 @@ pub(super) fn as_row(view: TorrentView) -> TorrentView {
     }
 }
 
+// `views` with the time each was read at left out.
+fn unstamped(views: &[TorrentView]) -> Vec<TorrentView> {
+    views
+        .iter()
+        .map(|view| {
+            let mut view = view.clone();
+            view.clock.at_ms = 0;
+            view
+        })
+        .collect()
+}
+
 fn ids(views: &[TorrentView]) -> Vec<JobId> {
     views.iter().map(|view| view.job_id).collect()
 }
@@ -317,7 +329,17 @@ async fn a_followed_set_is_given_its_rows() {
         .map(as_row)
         .collect();
     assert_eq!(old.len(), TORRENTS / 4);
-    assert_eq!(first.torrents, old);
+    // A row keeps the reading it last moved at: its clock fields read now
+    // as those of a view built now, and the rest is the same.
+    let now = rig.service.now_ms();
+    assert!(
+        first
+            .torrents
+            .iter()
+            .zip(&old)
+            .all(|(row, built)| row.clock_at(now) == built.clock_at(now))
+    );
+    assert_eq!(unstamped(&first.torrents), unstamped(&old));
 
     // A torrent it does not follow goes unheard; one it follows goes as
     // gone. What a removal moves in the others is told of those it follows.

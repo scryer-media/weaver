@@ -117,6 +117,9 @@ impl TorrentView {
             seeding_left,
             last_seen_complete_ms,
             last_activity_ms,
+            // When it was read moves with the clock alone; whether its time
+            // runs, and when its next announce is, with the reading.
+            clock,
         } = self;
         let mut hasher = DefaultHasher::new();
         let hasher = &mut hasher;
@@ -190,6 +193,7 @@ impl TorrentView {
             (download_avg_bps, upload_avg_bps, reannounce_seconds).hash(hasher);
             (eta_seconds, seeding_left, last_seen_complete_ms).hash(hasher);
             last_activity_ms.hash(hasher);
+            (clock.active, clock.next_announce_ms).hash(hasher);
         }
         hasher.finish()
     }

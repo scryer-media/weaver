@@ -218,6 +218,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         file_have: Vec::new(),
         metadata: Vec::new(),
         tags: Vec::new(),
+        clock: Default::default(),
         seeding_override: None,
         seeding_policy: Seeding::default(),
         seeding_levels: SeedingLevels::default(),

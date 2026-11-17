@@ -46,14 +46,14 @@ use weaver_server_core::tags::split_tags;
 use weaver_server_core::torrents::metrics::{Published, SessionSeries};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::listing::{
-    CategoryPick, FileTotals, Pick, Shown, Window,
+    CategoryPick, FileTotals, Pick, RowPick, Shown, Window,
 };
 use weaver_server_core::torrents::service::snapshot::{
     RowSums, Snapshot, TorrentRow, TrackerSummary,
 };
 use weaver_server_core::torrents::service::{
-    ActionError, AddError, AddRequest, AddSource, ListError, NotReady, Placement, TorrentService,
-    TorrentSettings, TorrentView,
+    ActionError, AddError, AddRequest, AddSource, ClockFields, ListError, NotReady, Placement,
+    RowParts, TorrentService, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{
     ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
@@ -270,17 +270,34 @@ impl TorrentFacadeContext {
     }
 
     // The torrents `wanted` names: `|`-separated hashes, or `all`
-    // (qBittorrent `applyToTorrents`).
+    // (qBittorrent `applyToTorrents`). Their rows' views, with no files or
+    // trackers, once the rows are every torrent's; until then, as the
+    // table and the torrents read them.
     async fn named(&self, wanted: &str) -> Result<Vec<TorrentView>, Response> {
-        if wanted.trim() == "all" {
+        let all = wanted.trim() == "all";
+        let hashes: Vec<&str> = wanted.split('|').map(str::trim).collect();
+        let pick = Pick {
+            hashes: (!all).then_some(hashes.as_slice()),
+            ..Pick::default()
+        };
+        if let Ok(rows) = self.every_row() {
+            return Ok(kept_views(&rows, &pick.of_rows()));
+        }
+        if all {
             return self.views().await;
         }
-        let wanted: Vec<&str> = wanted.split('|').map(str::trim).collect();
-        self.picked(Pick {
-            hashes: Some(&wanted),
-            ..Pick::default()
-        })
-        .await
+        self.picked(pick).await
+    }
+
+    // Every torrent's row, in the order they were added, as the service
+    // last published them; not ready until the rows are every stored
+    // torrent's.
+    fn every_row(&self) -> Result<Vec<Arc<TorrentRow>>, NotReady> {
+        let Some(torrents) = &self.inner.torrents else {
+            return Ok(Vec::new());
+        };
+        torrents.listing_ready()?;
+        Ok(torrents.snapshot().every().1)
     }
 
     // Every torrent `pick` keeps, with its files, which its paths follow.
@@ -313,8 +330,6 @@ impl TorrentFacadeContext {
             .map_err(unlisted)
     }
 
-    // Every torrent `pick` keeps, its own fields alone: no files, trackers
-    // or tags.
     // The route sessions as the service last published them: a read of
     // what the tick took, which waits on no session.
     fn published_sessions(&self) -> Arc<Published> {
@@ -325,10 +340,16 @@ impl TorrentFacadeContext {
             .unwrap_or_default()
     }
 
+    // Every torrent `pick` keeps, its own fields alone: its row's view once
+    // the rows are every torrent's, else one built without files, trackers
+    // or tags.
     async fn bare(&self, pick: Pick<'_>) -> Result<Vec<TorrentView>, Response> {
         let Some(torrents) = &self.inner.torrents else {
             return Ok(Vec::new());
         };
+        if let Ok(rows) = self.every_row() {
+            return Ok(kept_views(&rows, &pick.of_rows()));
+        }
         torrents
             .picked(pick, Window::Every, Shown::BARE)
             .await
@@ -1451,7 +1472,7 @@ fn secs(ms: i64) -> i64 {
 // the download speed; once complete, the time to its seeding goal, the
 // soonest goal under `MatchAny` and the last under `MatchAll`, each goal
 // counted as Weaver meets it. Unknown is `ETA_UNKNOWN` (`MAX_ETA`).
-fn eta(view: &TorrentView, now: i64) -> u64 {
+fn eta(view: &TorrentView, clock: ClockFields, now: i64) -> u64 {
     let stopped = view.paused_by.is_some()
         || matches!(view.state, TorrentState::Paused | TorrentState::Stopped);
     if stopped {
@@ -1475,7 +1496,7 @@ fn eta(view: &TorrentView, now: i64) -> u64 {
         });
     }
     if let Some(minutes) = policy.seed_time_goal_minutes {
-        etas.push((u64::from(minutes) * 60).saturating_sub(seeding_time(view)));
+        etas.push((u64::from(minutes) * 60).saturating_sub(seeding_time(view, clock)));
     }
     if let Some(minutes) = policy.inactive_goal_minutes {
         // Weaver counts no idle time for a torrent that never moved data.
@@ -1558,6 +1579,14 @@ fn limit_action_name(action: SeedingAction) -> &'static str {
     }
 }
 
+// The views of the rows `pick` keeps, in the rows' order.
+fn kept_views(rows: &[Arc<TorrentRow>], pick: &RowPick<'_>) -> Vec<TorrentView> {
+    rows.iter()
+        .filter(|row| pick.keeps(&row.view))
+        .map(|row| row.view.clone())
+        .collect()
+}
+
 // A time the torrent may not have, in seconds since the epoch, -1 without
 // one (qBittorrent `Utils::DateTime::toSecsSinceEpoch`).
 fn when(ms: Option<i64>) -> i64 {
@@ -1586,9 +1615,9 @@ fn wanted_and_left(view: &TorrentView, totals: FileTotals) -> (u64, u64) {
 }
 
 // The ratio per month active (qBittorrent `TorrentImpl::popularity`).
-fn popularity(view: &TorrentView) -> f64 {
+fn popularity(view: &TorrentView, clock: ClockFields) -> f64 {
     const MONTH_SECS: f64 = 2_629_746.0;
-    let months = view.active_seconds as f64 / MONTH_SECS;
+    let months = clock.active_seconds as f64 / MONTH_SECS;
     if months > 0.0 {
         view.ratio / months
     } else {
@@ -1600,10 +1629,21 @@ fn popularity(view: &TorrentView) -> f64 {
 // or those of the current unbroken run. qBittorrent sends libtorrent's
 // `finished_duration`, the time spent complete and not paused
 // (serialize_torrent.cpp:181, torrentimpl.cpp:1030-1033).
-fn seeding_time(view: &TorrentView) -> u64 {
+fn seeding_time(view: &TorrentView, clock: ClockFields) -> u64 {
     match view.seeding_policy.seed_time_counting {
-        SeedTimeCounting::Cumulative => view.seeding_seconds,
-        SeedTimeCounting::Consecutive => view.consecutive_seeding_seconds,
+        SeedTimeCounting::Cumulative => clock.seeding_seconds,
+        SeedTimeCounting::Consecutive => clock.consecutive_seeding_seconds,
+    }
+}
+
+// A view's clock fields as it was read, run on to no later time: what a
+// view built for the request gives.
+fn own_clock(view: &TorrentView) -> ClockFields {
+    ClockFields {
+        active_seconds: view.active_seconds,
+        seeding_seconds: view.seeding_seconds,
+        consecutive_seeding_seconds: view.consecutive_seeding_seconds,
+        reannounce_seconds: view.reannounce_seconds,
     }
 }
 
@@ -1627,15 +1667,16 @@ fn root_path(view: &TorrentView, totals: FileTotals) -> String {
 // A torrent as `torrents/info` lists it (qBittorrent `serialize`).
 #[cfg(test)]
 fn info(view: &TorrentView, scope: CallerScope) -> Value {
-    info_row(view, FileTotals::of(view), scope)
+    info_row(view, FileTotals::of(view), scope, now_secs())
 }
 
-// `info` of a view read without its files, from their totals.
-fn info_row(view: &TorrentView, totals: FileTotals, scope: CallerScope) -> Value {
+// `info` of a view read without its files, from their totals, its clock
+// fields read at `now`, in seconds.
+fn info_row(view: &TorrentView, totals: FileTotals, scope: CallerScope, now: i64) -> Value {
     Value::Object(
         steady_row(view, totals, &TrackerSummary::of(view), scope)
             .into_iter()
-            .chain(clock_fields(view, now_secs()))
+            .chain(clock_fields(view, now))
             .map(|(name, value)| (name.to_owned(), value))
             .collect(),
     )
@@ -1646,14 +1687,25 @@ fn info_row(view: &TorrentView, totals: FileTotals, scope: CallerScope) -> Value
 // it last moved data, the countdowns, the ratio per month active, and when
 // it was last seen complete.
 fn clock_fields(view: &TorrentView, now: i64) -> [(&'static str, Value); CLOCK_KEYS] {
+    clock_fields_at(view, own_clock(view), now)
+}
+
+// `clock_fields` with the time active and seeding and the countdown to the
+// next announce as `clock` gives them: a published row's run on to the
+// time it is read (`TorrentView::clock_at`).
+fn clock_fields_at(
+    view: &TorrentView,
+    clock: ClockFields,
+    now: i64,
+) -> [(&'static str, Value); CLOCK_KEYS] {
     [
-        ("eta", json!(eta(view, now))),
-        ("popularity", json!(popularity(view))),
+        ("eta", json!(eta(view, clock, now))),
+        ("popularity", json!(popularity(view, clock))),
         ("seen_complete", json!(when(view.last_seen_complete_ms))),
-        ("time_active", json!(view.active_seconds)),
-        ("seeding_time", json!(seeding_time(view))),
+        ("time_active", json!(clock.active_seconds)),
+        ("seeding_time", json!(seeding_time(view, clock))),
         ("last_activity", json!(last_activity(view))),
-        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
+        ("reannounce", json!(clock.reannounce_seconds.unwrap_or(0))),
     ]
 }
 
@@ -1846,35 +1898,199 @@ fn less(left: &Value, right: &Value) -> bool {
     }
 }
 
-// qBittorrent `infoAction`: the torrents the filters pass, sorted by a
-// column and paged when asked.
+// qBittorrent `infoAction` (torrentscontroller.cpp:666-760): the torrents
+// the filters pass, sorted by a column and paged when asked. Read from the
+// rows the service publishes, with no torrent's view built: a row's files
+// and trackers are read only for the page that lists them. Until the rows
+// are every torrent's, the table and the torrents answer as they did
+// before there were rows (`info_list`).
 async fn torrents_info(
     ctx: &TorrentFacadeContext,
     params: &Params,
     scope: CallerScope,
 ) -> Response {
-    let hashes: Vec<&str> = params
+    let hashes = info_hashes(params);
+    let ask = InfoAsk::of(params);
+    let pick = info_pick(params, &hashes);
+    let (Some(torrents), Ok(rows)) = (&ctx.inner.torrents, ctx.every_row()) else {
+        // A row's files are read only when the answer lists them.
+        let window = if ask.paged_first() {
+            info_window(ask.limit, ask.offset)
+        } else {
+            Window::Every
+        };
+        let rows = found!(ctx.rows(pick, window, ask.with_files).await);
+        return info_list(rows, &ask, scope, ctx.api(), now_secs());
+    };
+    let mut page = match info_rows(&rows, &pick.of_rows(), &ask, scope, torrents.now_ms()) {
+        Ok(page) => page,
+        Err(response) => return *response,
+    };
+    if ask.with_files || ask.with_trackers {
+        let ids: Vec<JobId> = page.iter().map(|(row, _)| row.view.job_id).collect();
+        let mut parts = torrents
+            .row_parts(&ids, ask.with_files, ask.with_trackers)
+            .await;
+        for (row, fields) in &mut page {
+            // A torrent removed since the rows were read has none.
+            let parts = parts.remove(&row.view.job_id).unwrap_or_default();
+            with_parts(fields, &row.view, parts, &ask, scope, ctx.api());
+        }
+    }
+    info_answer(page)
+}
+
+// The hashes a `torrents/info` request names, blank ones left out.
+fn info_hashes(params: &Params) -> Vec<&str> {
+    params
         .get("hashes")
         .unwrap_or_default()
         .split('|')
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
-        .collect();
-    let private = params.flag_value("private");
-    let ask = InfoAsk::of(params);
-    let pick = Pick {
-        hashes: (!hashes.is_empty()).then_some(hashes.as_slice()),
+        .collect()
+}
+
+// The torrents a `torrents/info` request keeps by their hashes, category
+// and privacy.
+fn info_pick<'a>(params: &'a Params, hashes: &'a [&'a str]) -> Pick<'a> {
+    Pick {
+        hashes: (!hashes.is_empty()).then_some(hashes),
         category: params.get("category").map(CategoryPick::WithSubcategories),
-        private,
+        private: params.flag_value("private"),
+    }
+}
+
+// The `torrents/info` answer of a page of rows' fields.
+fn info_answer(page: InfoPage<'_>) -> Response {
+    let list: Vec<Value> = page
+        .into_iter()
+        .map(|(_, fields)| Value::Object(fields))
+        .collect();
+    axum::Json(list).into_response()
+}
+
+// A page of published rows with their `torrents/info` fields.
+type InfoPage<'r> = Vec<(&'r TorrentRow, Map<String, Value>)>;
+
+// The `torrents/info` answer from the published rows, each with its fields
+// but its files and trackers: the rows `pick` and `ask` keep, in the order
+// the torrents were added or `ask` sorts them, of those the page `ask`
+// takes. Clock fields are run on to `now_ms` from the reading each row came
+// from. Only the rows a sort reads, or the page, are written out.
+fn info_rows<'r>(
+    rows: &'r [Arc<TorrentRow>],
+    pick: &RowPick<'_>,
+    ask: &InfoAsk<'_>,
+    scope: CallerScope,
+    now_ms: i64,
+) -> Result<InfoPage<'r>, Box<Response>> {
+    let kept: Vec<&TorrentRow> = rows
+        .iter()
+        .map(Arc::as_ref)
+        .filter(|row| pick.keeps(&row.view) && ask.passes(&row.view))
+        .collect();
+    let written = |row: &'r TorrentRow| (row, info_fields(row, scope, now_ms));
+    let Some(column) = ask.sort else {
+        let page = info_page(ask.limit, ask.offset, kept.len()).unwrap_or(0..kept.len());
+        return Ok(kept[page].iter().map(|row| written(row)).collect());
     };
-    // A row's files are read only when the answer lists them.
-    let window = if ask.paged_first() {
-        info_window(ask.limit, ask.offset)
+    let mut list: Vec<_> = kept.into_iter().map(written).collect();
+    // The files and trackers a row lists are columns too: every row's are
+    // lists, which order none before another.
+    let listed = match column {
+        "files" => list
+            .first()
+            .is_some_and(|(row, _)| ask.with_files && row.view.pieces.is_some()),
+        "trackers" => ask.with_trackers,
+        _ => false,
+    };
+    if !listed {
+        if list
+            .first()
+            .is_some_and(|(_, fields)| !fields.contains_key(column))
+        {
+            return Err(Box::new(text(
+                StatusCode::BAD_REQUEST,
+                "'sort' parameter is invalid",
+            )));
+        }
+        list.sort_by(|(_, left), (_, right)| {
+            let field =
+                |fields: &'_ Map<String, Value>| fields.get(column).unwrap_or(&Value::Null).clone();
+            info_order(&field(left), &field(right), ask.reverse)
+        });
+    }
+    if let Some(page) = info_page(ask.limit, ask.offset, list.len()) {
+        list = list.drain(page).collect();
+    }
+    Ok(list)
+}
+
+// A published row's `torrents/info` fields, its files and trackers aside,
+// its clock fields run on to `now_ms`.
+fn info_fields(row: &TorrentRow, scope: CallerScope, now_ms: i64) -> Map<String, Value> {
+    let view = &row.view;
+    steady_row(view, row.totals, &row.trackers, scope)
+        .into_iter()
+        .chain(clock_fields_at(
+            view,
+            view.clock_at(now_ms),
+            now_ms.div_euclid(1000),
+        ))
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect()
+}
+
+// A row's files and trackers, as `ask` lists them: a torrent's files only
+// once it has its metadata.
+fn with_parts(
+    fields: &mut Map<String, Value>,
+    row: &TorrentView,
+    parts: RowParts,
+    ask: &InfoAsk<'_>,
+    scope: CallerScope,
+    api: Api,
+) {
+    if ask.with_files && row.pieces.is_some() {
+        let view = TorrentView {
+            files: parts.files,
+            file_have: parts.file_have,
+            ..row.clone()
+        };
+        fields.insert(
+            "files".to_owned(),
+            json!(file_list(&view, 0..view.files.len())),
+        );
+    }
+    if ask.with_trackers {
+        fields.insert(
+            "trackers".to_owned(),
+            json!(
+                parts
+                    .trackers
+                    .iter()
+                    .map(|tracker| tracker_json(tracker, scope, api))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+}
+
+// The order of two rows' values of a sorted column, reversed when asked.
+fn info_order(left: &Value, right: &Value, reverse: bool) -> std::cmp::Ordering {
+    let (left, right) = if reverse {
+        (right, left)
     } else {
-        Window::Every
+        (left, right)
     };
-    let rows = found!(ctx.rows(pick, window, ask.with_files).await);
-    info_list(rows, &ask, scope, ctx.api())
+    if less(left, right) {
+        std::cmp::Ordering::Less
+    } else if less(right, left) {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Equal
+    }
 }
 
 // What a `torrents/info` request asks for beyond the torrents' records.
@@ -1917,19 +2133,32 @@ impl<'a> InfoAsk<'a> {
     fn paged_first(&self) -> bool {
         self.sort.is_none() && self.tag.is_none() && filters_none(self.filter)
     }
+
+    // Whether its tag and status filter pass the torrent `view` shows.
+    fn passes(&self, view: &TorrentView) -> bool {
+        self.tag.is_none_or(|tag| {
+            if tag.is_empty() {
+                view.tags.is_empty()
+            } else {
+                view.tags.iter().any(|carried| carried == tag)
+            }
+        }) && wanted(view, self.filter)
+    }
 }
 
 // The `torrents/info` answer from the rows the torrents' records kept: the
-// page alone when `ask` let the records take it.
+// page alone when `ask` let the records take it. Each row's view is built
+// for the request, its clock fields read at `now`, in seconds.
 fn info_list(
     rows: Vec<(TorrentView, FileTotals)>,
     ask: &InfoAsk<'_>,
     scope: CallerScope,
     api: Api,
+    now: i64,
 ) -> Response {
     let InfoAsk {
-        filter,
-        tag,
+        filter: _,
+        tag: _,
         with_files,
         with_trackers,
         limit,
@@ -1940,17 +2169,10 @@ fn info_list(
     let paged_first = ask.paged_first();
     let mut list: Vec<Value> = Vec::new();
     for (view, totals) in rows {
-        let passes = tag.is_none_or(|tag| {
-            if tag.is_empty() {
-                view.tags.is_empty()
-            } else {
-                view.tags.iter().any(|carried| carried == tag)
-            }
-        }) && wanted(&view, filter);
-        if !passes {
+        if !ask.passes(&view) {
             continue;
         }
-        let mut row = info_row(&view, totals, scope);
+        let mut row = info_row(&view, totals, scope, now);
         if with_files && view.pieces.is_some() {
             row["files"] = json!(file_list(&view, 0..view.files.len()));
         }
@@ -1968,21 +2190,7 @@ fn info_list(
         if list.first().is_some_and(|row| row.get(column).is_none()) {
             return text(StatusCode::BAD_REQUEST, "'sort' parameter is invalid");
         }
-        list.sort_by(|left, right| {
-            let (left, right) = (&left[column], &right[column]);
-            let (left, right) = if reverse {
-                (right, left)
-            } else {
-                (left, right)
-            };
-            if less(left, right) {
-                std::cmp::Ordering::Less
-            } else if less(right, left) {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
+        list.sort_by(|left, right| info_order(&left[column], &right[column], reverse));
     }
     if !paged_first && let Some(page) = info_page(limit, offset, list.len()) {
         list = list.drain(page).collect();
@@ -2098,8 +2306,8 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("name", json!(view.name)),
         ("hash", json!(view.infohash.to_ascii_lowercase())),
         ("time_elapsed", json!(view.active_seconds)),
-        ("seeding_time", json!(seeding_time(&view))),
-        ("eta", json!(eta(&view, now))),
+        ("seeding_time", json!(seeding_time(&view, own_clock(&view)))),
+        ("eta", json!(eta(&view, own_clock(&view), now))),
         ("nb_connections", json!(view.peers)),
         ("nb_connections_limit", json!(view.max_peers)),
         ("total_downloaded", json!(view.downloaded_bytes)),
@@ -2128,7 +2336,10 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
             json!(view.swarm_leechers.unwrap_or(view.leechers)),
         ),
         ("share_ratio", json!(capped(view.ratio))),
-        ("popularity", json!(capped(popularity(&view)))),
+        (
+            "popularity",
+            json!(capped(popularity(&view, own_clock(&view)))),
+        ),
         // Weaver does not count the copies the swarm holds.
         ("availability", json!(-1)),
         ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
@@ -2568,25 +2779,44 @@ async fn remove_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Respons
 // `urls` names, else every tracker and the DHT.
 async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let urls = url_list(params.get("urls").unwrap_or_default());
-    each_of(
-        ctx,
-        found!(ctx.targets(params).await),
-        move |torrents, view| {
-            let urls = urls.clone();
-            async move {
-                if urls.is_empty() {
-                    torrents.reannounce(view.job_id).await?;
-                    return torrents.dht_announce(view.job_id).await;
-                }
-                for tracker in view.trackers.iter().filter(|t| urls.contains(&t.url)) {
-                    torrents
-                        .reannounce_tracker(view.job_id, &tracker.url)
-                        .await?;
-                }
-                Ok(())
+    let views = found!(ctx.targets(params).await);
+    // Of each torrent's trackers, in its order, those `urls` names: read for
+    // these torrents alone, as they stand now.
+    let mut named: HashMap<JobId, Vec<String>> = HashMap::new();
+    if !urls.is_empty()
+        && let Some(torrents) = &ctx.inner.torrents
+    {
+        let ids: Vec<JobId> = views.iter().map(|view| view.job_id).collect();
+        named = torrents
+            .row_parts(&ids, false, true)
+            .await
+            .into_iter()
+            .map(|(job_id, parts)| {
+                let kept = parts
+                    .trackers
+                    .into_iter()
+                    .map(|tracker| tracker.url)
+                    .filter(|url| urls.contains(url))
+                    .collect();
+                (job_id, kept)
+            })
+            .collect();
+    }
+    let named = Arc::new(named);
+    each_of(ctx, views, move |torrents, view| {
+        let every = urls.is_empty();
+        let named = named.clone();
+        async move {
+            if every {
+                torrents.reannounce(view.job_id).await?;
+                return torrents.dht_announce(view.job_id).await;
             }
-        },
-    )
+            for url in named.get(&view.job_id).into_iter().flatten() {
+                torrents.reannounce_tracker(view.job_id, url).await?;
+            }
+            Ok(())
+        }
+    })
     .await
 }
 
@@ -2977,13 +3207,22 @@ async fn made_tags(
         .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
 }
 
-// One change to the tags, run off the async workers.
+// One change to the tags, run off the async workers. The torrents' rows
+// take it before the answer, so the next list reads it.
 async fn change_tags(
     ctx: &TorrentFacadeContext,
     change: impl FnOnce(&Database) -> Result<(), weaver_server_core::StateError> + Send + 'static,
 ) -> Result<(), Response> {
     let db = ctx.inner.db.clone();
-    match tokio::task::spawn_blocking(move || change(&db)).await {
+    let torrents = ctx.inner.torrents.clone();
+    let changed = move || -> Result<(), weaver_server_core::StateError> {
+        change(&db)?;
+        if let Some(torrents) = torrents {
+            torrents.retag();
+        }
+        Ok(())
+    };
+    match tokio::task::spawn_blocking(changed).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(internal(error)),
         Err(error) => Err(internal(error)),

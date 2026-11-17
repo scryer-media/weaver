@@ -92,7 +92,10 @@ pub use settings::{
     SeedingLevels, TorrentSettings, UNPACK, UPLOAD_CAP, WindDown,
 };
 pub use tick::TorrentRoute;
-pub use views::{PeerKinds, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView};
+pub use views::{
+    ClockFields, PeerKinds, RowParts, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
+    ViewClock,
+};
 
 // Why a magnet with no trackers is turned away on a route with no DHT.
 const NEEDS_DHT: &str = "a magnet with no trackers needs DHT, which this route does not carry";
@@ -1199,6 +1202,12 @@ impl TorrentService {
     /// Every torrent's row as a list shows it, as last published.
     pub fn snapshot(&self) -> &snapshot::Snapshot {
         &self.inner.snapshot
+    }
+
+    /// The time on the service's clock, in milliseconds since the epoch:
+    /// what its views' readings are stamped with.
+    pub fn now_ms(&self) -> i64 {
+        self.inner.clock.unix_ms()
     }
 
     /// Whether every torrent's row is in the snapshot: every stored torrent
