@@ -34,6 +34,42 @@ impl RouteInterface {
     }
 }
 
+/// Whether the route `clients` say a session's traffic takes gives the
+/// session an IPv6 DHT. libtorrent runs a DHT node on each listen socket
+/// that is not `local_network` (session_impl.cpp:2206-2211, 5936-5941,
+/// v2.0.15), and an unspecified listen address becomes one socket per
+/// interface address (`expand_unspecified_address`, 288-345): one on a
+/// loopback or link-local address, or on a loopback interface, is
+/// `local_network`; so is one that is not global (2000::/3,
+/// ip_helpers.cpp:50-62) on an interface with no internet route of its
+/// family, while some interface has one (330-338, enum_net.cpp:1005-1029).
+/// So libtorrent starts no IPv6 node on a host with only link-local IPv6
+/// addresses, nor with only a unique local one off the internet route.
+///
+/// The route is asked where traffic toward a public IPv6 address leaves
+/// from: there is an internet route of the family, and the address it
+/// leaves from is on that route's interface. The DHT runs when that address
+/// is not loopback or link-local (libtorrent `is_link_local`,
+/// ip_helpers.cpp:65-75): a global one, or one that is not global but sits
+/// on the interface holding the internet route. It runs on a route a proxy
+/// carries, which says nothing of its addresses.
+pub fn runs_ipv6_dht(clients: &dyn HttpClients) -> bool {
+    match clients.egress(PUBLIC_PROBE_V6) {
+        Egress::From(IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
+            Some(_) => false,
+            None => {
+                let multicast_link_local = ip.is_multicast() && ip.segments()[0] & 0x000f == 2;
+                !(ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_unicast_link_local()
+                    || multicast_link_local)
+            }
+        },
+        Egress::From(IpAddr::V4(_)) | Egress::NoRoute => false,
+        Egress::Proxied => true,
+    }
+}
+
 /// An address only the local network reaches: loopback or link-local, and
 /// for IPv6 a unique local one too (libtorrent marks a listen socket on a
 /// loopback or link-local address `local_network`, and maps no local IPv6
@@ -377,6 +413,44 @@ mod tests {
                 "{ip}"
             );
         }
+    }
+
+    // The IPv6 DHT runs from an address libtorrent gives a node: not
+    // loopback or link-local, global or on the interface of the internet
+    // route; not without an IPv6 internet route.
+    #[test]
+    fn an_ipv6_dht_runs_from_an_address_the_internet_reaches() {
+        for (from, runs) in [
+            ("2001:db8::5", true),
+            ("2a00:1450::1", true),
+            ("fd12:3456::1", true),
+            ("fe80::1", false),
+            ("ff02::1", false),
+            ("::1", false),
+            ("::", false),
+            ("::ffff:192.0.2.1", false),
+            ("192.0.2.1", false),
+        ] {
+            let route = LeavesFrom(from.parse().unwrap());
+            assert_eq!(super::runs_ipv6_dht(&route), runs, "{from}");
+        }
+
+        struct Says(Egress);
+        impl HttpClients for Says {
+            fn client(
+                &self,
+                _: Option<HttpTarget<'_>>,
+                _: &ClientShape,
+            ) -> anyhow::Result<reqwest::Client> {
+                anyhow::bail!("the route makes no requests")
+            }
+            fn egress(&self, _: SocketAddr) -> Egress {
+                self.0
+            }
+        }
+        assert!(!super::runs_ipv6_dht(&Says(Egress::NoRoute)));
+        // A proxy says nothing of the route's addresses.
+        assert!(super::runs_ipv6_dht(&Says(Egress::Proxied)));
     }
 
     #[test]

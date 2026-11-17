@@ -572,23 +572,38 @@ impl TorrentService {
 
     /// One torrent, with its files and trackers.
     pub async fn torrent(&self, job_id: JobId) -> Option<TorrentView> {
+        self.torrent_shown(job_id, Shown::WHOLE).await
+    }
+
+    /// One torrent, carrying beside its own fields only what `shown` names:
+    /// its files, its trackers and its tags are read only when asked for,
+    /// and are empty otherwise.
+    pub async fn torrent_shown(&self, job_id: JobId, shown: Shown) -> Option<TorrentView> {
         self.ensure(&[job_id]).await;
         let settings = self.settings();
         let now = self.inner.clock.unix_ms();
-        let (mut view, announces, pinned, listed) = {
+        let (mut view, tracked) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
             let mut view = self.view(&settings, torrent, now);
-            view.files = torrent.files();
-            (
-                view,
-                torrent.announces(),
-                torrent.record.pool_member,
-                torrent.trackers.clone(),
-            )
+            if shown.files {
+                view.files = torrent.files();
+            }
+            let tracked = shown.trackers.then(|| {
+                (
+                    torrent.announces(),
+                    torrent.record.pool_member,
+                    torrent.trackers.clone(),
+                )
+            });
+            (view, tracked)
         };
-        self.track(&mut view, pinned, &listed, &announces, &mut HashMap::new());
-        self.tag(&mut [&mut view]);
+        if let Some((announces, pinned, listed)) = tracked {
+            self.track(&mut view, pinned, &listed, &announces, &mut HashMap::new());
+        }
+        if shown.tags {
+            self.tag(&mut [&mut view]);
+        }
         Some(view)
     }
 

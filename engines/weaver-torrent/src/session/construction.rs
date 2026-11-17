@@ -195,8 +195,17 @@ impl Session {
             let dht_share = listen_result
                 .as_mut()
                 .and_then(|listen| listen.dht_share.take());
+            let http_clients: Arc<dyn HttpClients> = opts
+                .http_client
+                .take()
+                .unwrap_or_else(|| Arc::new(NoClients::over(Arc::clone(&opts.socket_factory))));
+
             let mut dht_on_listener = false;
             let dht = if let Some(dht_config) = opts.dht.take() {
+                // The IPv6 node waits for an IPv6 address the route's
+                // internet traffic leaves from (see `Session::follow_ipv6_route`).
+                let ipv6_waits = opts.ipv4_only
+                    || !crate::route_interface::runs_ipv6_dht(http_clients.as_ref());
                 // The DHT on the port uTP listens on, or asked for the port
                 // the listener was asked for, shares uTP's socket, as
                 // libtorrent runs uTP and its DHT on one socket per listen
@@ -230,6 +239,7 @@ impl Session {
                             resolver: Some(resolver.clone()),
                             client_version: Some(dht_client_version()),
                             tasks: Some(swarm_tasks.clone()),
+                            ipv6_waits,
                             ..Default::default()
                         },
                     )
@@ -246,6 +256,7 @@ impl Session {
                         resolver: Some(resolver.clone()),
                         client_version: Some(dht_client_version()),
                         tasks: Some(swarm_tasks.clone()),
+                        ipv6_waits,
                         ..Default::default()
                     })
                     .await
@@ -302,11 +313,6 @@ impl Session {
             let (persistence, bitv_factory) = persistence_factory(&opts, spawner.clone())
                 .await
                 .context("error initializing session persistence store")?;
-
-            let http_clients: Arc<dyn HttpClients> = opts
-                .http_client
-                .take()
-                .unwrap_or_else(|| Arc::new(NoClients::over(Arc::clone(&opts.socket_factory))));
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {

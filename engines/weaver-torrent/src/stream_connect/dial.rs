@@ -148,6 +148,7 @@ impl Attempt<'_> {
             Err(e) => match e.failure() {
                 Failure::Refused => stat.refused(1),
                 Failure::TimedOut => stat.timeouts(1),
+                Failure::Unreachable => stat.unreachable(1),
                 Failure::Other => stat.errors(1),
             },
         }

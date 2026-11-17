@@ -52,10 +52,20 @@ pub(crate) async fn tags_of(ctx: &Context<'_>, job_id: u64) -> Result<Vec<String
     Ok(snapshot.of(JobId(job_id)).to_vec())
 }
 
+// Every tag with its count: from memory when nothing changed the tags since
+// the last read, else counted in the database off the async workers.
 async fn job_tags(db: &Database) -> Result<Vec<JobTag>> {
-    Ok(tag_snapshot(db)
-        .await?
-        .counts()
+    let counts = match db.cached_tag_snapshot() {
+        Some(snapshot) => snapshot.counts(),
+        None => {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.tag_counts())
+                .await
+                .map_err(internal)?
+                .map_err(internal)?
+        }
+    };
+    Ok(counts
         .into_iter()
         .map(|count| JobTag {
             name: count.name,

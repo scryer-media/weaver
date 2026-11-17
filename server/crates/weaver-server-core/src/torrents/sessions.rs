@@ -1897,14 +1897,43 @@ impl Sessions {
         rejoin_local_discovery(open).await;
     }
 
-    /// Joins local service discovery again each time `changes` rings, until
-    /// its sender goes. Changes that ring while a rejoin runs are taken by
-    /// one more, on the interfaces up then.
+    /// Starts the IPv6 DHT of every running session whose route now has an
+    /// IPv6 address the internet reaches (see `Session::follow_ipv6_route`).
+    /// The routes are asked off the async threads.
+    pub async fn follow_ipv6_routes(&self) {
+        let open: Vec<_> = self.running().await.into_iter().collect();
+        if open.is_empty() {
+            return;
+        }
+        let asked = tokio::task::spawn_blocking(move || {
+            for (key, session) in open {
+                if session.follow_ipv6_route() {
+                    tracing::info!(
+                        route = key.as_str(),
+                        "the route has an IPv6 address the internet reaches: its IPv6 DHT starts"
+                    );
+                }
+            }
+        })
+        .await;
+        if let Err(error) = asked {
+            tracing::warn!(%error, "the IPv6 DHT check did not finish");
+        }
+    }
+
+    /// Joins local service discovery again, and starts an IPv6 DHT that
+    /// waits for an address, each time `changes` rings, until its sender
+    /// goes. Changes that ring while a run goes on are taken by one more,
+    /// on the interfaces up then.
     pub async fn follow_interfaces(
         &self,
         changes: tokio::sync::watch::Receiver<MulticastInterfaces>,
     ) {
-        each_change(changes, || self.rejoin_local_discovery()).await;
+        each_change(changes, || async {
+            self.rejoin_local_discovery().await;
+            self.follow_ipv6_routes().await;
+        })
+        .await;
     }
 
     /// Close `key`'s session and hold it closed for `reason`, its route

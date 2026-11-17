@@ -1624,3 +1624,125 @@ fn nothing_is_sealed_under_a_key_held_in_memory_only() {
         None
     );
 }
+
+// Setting what 2,000 torrents hold in one pass leaves the same rows and
+// flags as the per-torrent statements it replaced: each torrent's paths in
+// place of the ones it had, a torrent named twice holding its last entry,
+// an untouched torrent keeping its own, and every named torrent marked set.
+#[test]
+fn setting_what_many_torrents_hold_matches_the_per_torrent_statements() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    fn seeded() -> Database {
+        let db = Database::open_in_memory().unwrap();
+        for n in 1..=2_001u64 {
+            let mut v1 = [0u8; 20];
+            v1[..8].copy_from_slice(&n.to_be_bytes());
+            db.insert_torrent(&torrent(n, Some(v1), None), &[]).unwrap();
+            db.add_torrent_held(JobId(n), &[format!("/old/{n}/a"), format!("/old/{n}/b")])
+                .unwrap();
+        }
+        db
+    }
+
+    // The statements `set_torrents_held` ran before: per torrent, a DELETE,
+    // its rows, and an UPDATE.
+    fn per_torrent(db: &Database, torrents: &[(JobId, Vec<String>)]) {
+        let torrents: Vec<(i64, Vec<String>)> = torrents
+            .iter()
+            .map(|(id, held)| (id.0 as i64, held.clone()))
+            .collect();
+        let datastore = db.datastore();
+        db.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "old_set_torrents_held", |tx| {
+                let torrents = torrents.clone();
+                Box::pin(async move {
+                    for (id, held) in &torrents {
+                        tx.execute(
+                            "DELETE FROM torrent_held_paths WHERE job_id = {}",
+                            &[SqlArg::I64(*id)],
+                        )
+                        .await?;
+                        let held: std::collections::BTreeSet<&String> = held.iter().collect();
+                        for path in held {
+                            tx.execute(
+                                "INSERT INTO torrent_held_paths (job_id, path) VALUES ({}, {}) \
+                                 ON CONFLICT (job_id, path) DO NOTHING",
+                                &[SqlArg::I64(*id), SqlArg::Text(path.clone())],
+                            )
+                            .await?;
+                        }
+                        tx.execute(
+                            "UPDATE torrents SET held_set = {} WHERE job_id = {}",
+                            &[SqlArg::Bool(true), SqlArg::I64(*id)],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .unwrap();
+    }
+
+    type HeldRows = Vec<(i64, String)>;
+    type HeldFlags = Vec<(i64, bool)>;
+
+    fn state(db: &Database) -> (HeldRows, HeldFlags) {
+        let datastore = db.datastore();
+        db.run_sql_blocking_read(async move {
+            let held = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, path FROM torrent_held_paths ORDER BY job_id, path",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok((row.i64("job_id")?, row.text("path")?)))
+            .collect::<Result<Vec<_>, crate::StateError>>()?;
+            let flags = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, held_set FROM torrents ORDER BY job_id",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok((row.i64("job_id")?, row.bool("held_set")?)))
+            .collect::<Result<Vec<_>, crate::StateError>>()?;
+            Ok((held, flags))
+        })
+        .unwrap()
+    }
+
+    // Torrent 2,001 is left alone; 7 is named twice; every third holds
+    // nothing; the rest hold a duplicated path and a new one.
+    let mut torrents: Vec<(JobId, Vec<String>)> = (1..=2_000u64)
+        .map(|n| {
+            let held = if n % 3 == 0 {
+                Vec::new()
+            } else {
+                vec![
+                    format!("/new/{n}/z"),
+                    format!("/new/{n}/a"),
+                    format!("/new/{n}/a"),
+                ]
+            };
+            (JobId(n), held)
+        })
+        .collect();
+    torrents.push((JobId(7), vec!["/last/7".to_string()]));
+
+    let (old, new) = (seeded(), seeded());
+    per_torrent(&old, &torrents);
+    new.set_torrents_held(&torrents).unwrap();
+    let (held, flags) = state(&new);
+    assert_eq!((held.clone(), flags.clone()), state(&old));
+    assert!(held.contains(&(2_001, "/old/2001/a".to_string())));
+    assert!(
+        held.iter()
+            .filter(|(id, _)| *id == 7)
+            .eq([&(7, "/last/7".to_string())])
+    );
+    assert_eq!(flags.iter().filter(|(_, set)| *set).count(), 2_000);
+}

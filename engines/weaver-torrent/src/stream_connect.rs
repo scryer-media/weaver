@@ -260,13 +260,15 @@ impl StreamConnectorArgs {
 
 // Outgoing connection attempts over one transport and family, and how each
 // ended: every attempt ends in exactly one of connected (`successes`),
-// refused by the peer, timed out, or failed otherwise (`errors`), an
-// attempt dropped because the other transport connected first among them.
+// refused by the peer, timed out, unreachable (no route to the peer's
+// network or host), or failed otherwise (`errors`), an attempt dropped
+// because the other transport connected first among them.
 gen_stats!(SingleStatAtomic SingleStatSnapshot, [
     attempts u64,
     successes u64,
     refused u64,
     timeouts u64,
+    unreachable u64,
     errors u64
 ], []);
 
@@ -274,7 +276,19 @@ gen_stats!(SingleStatAtomic SingleStatSnapshot, [
 enum Failure {
     Refused,
     TimedOut,
+    Unreachable,
     Other,
+}
+
+// Whether `error` says no route reaches the peer's network or host:
+// ENETUNREACH and EHOSTUNREACH, or WSAENETUNREACH (10051) and
+// WSAEHOSTUNREACH (10065) on Windows, which the standard library maps to
+// the same kinds.
+fn is_unreachable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable
+    )
 }
 
 trait Failed {
@@ -286,6 +300,7 @@ impl Failed for std::io::Error {
         match self.kind() {
             std::io::ErrorKind::ConnectionRefused => Failure::Refused,
             std::io::ErrorKind::TimedOut => Failure::TimedOut,
+            _ if is_unreachable(self) => Failure::Unreachable,
             _ => Failure::Other,
         }
     }
@@ -297,6 +312,12 @@ impl Failed for weaver_utp::Error {
             // A peer with no uTP listener answers the SYN with a reset.
             weaver_utp::Error::StResetReceived => Failure::Refused,
             weaver_utp::Error::ConnectTimedOut | weaver_utp::Error::TimedOut => Failure::TimedOut,
+            // The SYN found no route out.
+            weaver_utp::Error::ErrorSendingSyn(error) | weaver_utp::Error::Send(error)
+                if is_unreachable(error) =>
+            {
+                Failure::Unreachable
+            }
             _ => Failure::Other,
         }
     }
@@ -736,7 +757,7 @@ mod mapped_endpoint_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
     use crate::network::BoxFuture;
@@ -1846,12 +1867,17 @@ mod tests {
     }
 
     impl SocketFactory for Answering {
+        // An IPv4 connect ends as `answer` says; this route has no IPv6
+        // route, so an IPv6 connect finds none, as the kernel's does.
         fn connect_tcp<'a>(
             &'a self,
-            _addr: SocketAddr,
+            addr: SocketAddr,
         ) -> BoxFuture<'a, std::io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
             let answer = self.answer;
             Box::pin(async move {
+                if addr.is_ipv6() {
+                    return Err(std::io::Error::from_raw_os_error(no_route_os_error()));
+                }
                 match answer {
                     Some(kind) => Err(std::io::Error::from(kind)),
                     None => std::future::pending().await,
@@ -1882,10 +1908,27 @@ mod tests {
         }
     }
 
-    // The TCP counts, as attempted, connected, refused, timed out and failed
-    // otherwise, after one handshake to a peer whose connect ends as
-    // `answer` says, under a connect timeout of a minute.
-    async fn tcp_ends(answer: Option<std::io::ErrorKind>) -> [u64; 5] {
+    // The error the kernel gives a connect with no route to the network:
+    // ENETUNREACH, or WSAENETUNREACH on Windows.
+    #[cfg(unix)]
+    fn no_route_os_error() -> i32 {
+        nix::errno::Errno::ENETUNREACH as i32
+    }
+    #[cfg(windows)]
+    fn no_route_os_error() -> i32 {
+        10051
+    }
+
+    // The TCP counts, as attempted, connected, refused, timed out,
+    // unreachable and failed otherwise, after one handshake to a peer whose
+    // connect ends as `answer` says, under a connect timeout of a minute.
+    async fn tcp_ends(answer: Option<std::io::ErrorKind>) -> [u64; 6] {
+        connect_ends((Ipv4Addr::LOCALHOST, 6881).into(), answer).await[0]
+    }
+
+    // The counts of each transport and family, TCP v4, TCP v6, uTP v4 and
+    // uTP v6, after one handshake to `to`.
+    async fn connect_ends(to: SocketAddr, answer: Option<std::io::ErrorKind>) -> [[u64; 6]; 4] {
         let connector = StreamConnector::new(StreamConnectorArgs::over(Arc::new(Answering {
             sockets: crate::test_support::socket_factory(),
             answer,
@@ -1894,7 +1937,7 @@ mod tests {
         .unwrap();
         let sent = connector
             .connect_and_send_handshake(
-                (Ipv4Addr::LOCALHOST, 6881).into(),
+                to,
                 Transports::Any,
                 Guard::Mse(EncryptionPolicy::Disabled),
                 &Id20::new([7; 20]),
@@ -1905,30 +1948,36 @@ mod tests {
             )
             .await;
         assert!(sent.is_err());
-        let v4 = connector.stats().kinds[crate::ConnectionKind::Tcp]
-            .snapshot()
-            .v4;
-        [
-            v4.attempts,
-            v4.successes,
-            v4.refused,
-            v4.timeouts,
-            v4.errors,
-        ]
+        let ends = |kind: crate::ConnectionKind| {
+            let s = connector.stats().kinds[kind].snapshot();
+            [s.v4, s.v6].map(|f| {
+                [
+                    f.attempts,
+                    f.successes,
+                    f.refused,
+                    f.timeouts,
+                    f.unreachable,
+                    f.errors,
+                ]
+            })
+        };
+        let [tcp_v4, tcp_v6] = ends(crate::ConnectionKind::Tcp);
+        let [utp_v4, utp_v6] = ends(crate::ConnectionKind::Utp);
+        [tcp_v4, tcp_v6, utp_v4, utp_v6]
     }
 
     // Every attempt ends in exactly one counted end: one whose connect
     // timeout runs out counts as timed out, not as nothing.
     #[tokio::test(start_paused = true)]
     async fn an_attempt_that_runs_out_of_time_counts_as_timed_out() {
-        assert_eq!(tcp_ends(None).await, [1, 0, 0, 1, 0]);
+        assert_eq!(tcp_ends(None).await, [1, 0, 0, 1, 0, 0]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_attempt_the_peer_refuses_counts_as_refused() {
         assert_eq!(
             tcp_ends(Some(std::io::ErrorKind::ConnectionRefused)).await,
-            [1, 0, 1, 0, 0]
+            [1, 0, 1, 0, 0, 0]
         );
     }
 
@@ -1936,8 +1985,45 @@ mod tests {
     async fn an_attempt_that_fails_otherwise_counts_as_failed() {
         assert_eq!(
             tcp_ends(Some(std::io::ErrorKind::ConnectionReset)).await,
-            [1, 0, 0, 0, 1]
+            [1, 0, 0, 0, 0, 1]
         );
+    }
+
+    // A dial to an IPv6 peer on a route with no IPv6 route counts once, as
+    // unreachable, and under no other end of any transport or family.
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_with_no_route_to_its_family_counts_as_unreachable() {
+        assert_eq!(
+            connect_ends(
+                (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 6881).into(),
+                Some(std::io::ErrorKind::ConnectionRefused),
+            )
+            .await,
+            [
+                [0, 0, 0, 0, 0, 0],
+                [1, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0],
+            ]
+        );
+    }
+
+    // A uTP SYN that finds no route out is unreachable too.
+    #[test]
+    fn a_utp_syn_with_no_route_out_is_unreachable() {
+        let no_route = || std::io::Error::from_raw_os_error(no_route_os_error());
+        assert!(matches!(
+            weaver_utp::Error::ErrorSendingSyn(no_route()).failure(),
+            Failure::Unreachable
+        ));
+        assert!(matches!(
+            weaver_utp::Error::Send(std::io::ErrorKind::HostUnreachable.into()).failure(),
+            Failure::Unreachable
+        ));
+        assert!(matches!(
+            weaver_utp::Error::ErrorSendingSyn(std::io::ErrorKind::BrokenPipe.into()).failure(),
+            Failure::Other
+        ));
     }
 
     // A fixed run of counts, each to a kind and a family a seed picks, gives
@@ -1975,10 +2061,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&connector.stats().snapshot()).unwrap(),
             concat!(
-                r#"{"tcp":{"v4":{"attempts":32,"successes":23,"refused":17,"timeouts":28,"errors":54},"#,
-                r#""v6":{"attempts":39,"successes":38,"refused":23,"timeouts":29,"errors":49}},"#,
-                r#""utp":{"v4":{"attempts":29,"successes":39,"refused":29,"timeouts":31,"errors":8},"#,
-                r#""v6":{"attempts":17,"successes":27,"refused":23,"timeouts":32,"errors":37}},"#,
+                r#"{"tcp":{"v4":{"attempts":32,"successes":23,"refused":17,"timeouts":28,"unreachable":0,"errors":54},"#,
+                r#""v6":{"attempts":39,"successes":38,"refused":23,"timeouts":29,"unreachable":0,"errors":49}},"#,
+                r#""utp":{"v4":{"attempts":29,"successes":39,"refused":29,"timeouts":31,"unreachable":0,"errors":8},"#,
+                r#""v6":{"attempts":17,"successes":27,"refused":23,"timeouts":32,"unreachable":0,"errors":37}},"#,
                 r#""encryption":{"attempts":6,"rc4":3,"header_only":1,"failures":1,"cancelled":1,"plaintext":2}}"#,
             )
         );

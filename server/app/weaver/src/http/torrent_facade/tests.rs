@@ -3503,6 +3503,64 @@ async fn a_closed_torrent_limit_is_never_read_as_no_limit() {
     assert_eq!(properties["dl_limit"], -1);
 }
 
+// The per-hash limit map reads the same as the scan it replaced: keyed by
+// each hash as sent, mixed case and padding matched, a duplicate kept once,
+// -1 for a missing hash, and a closed limit left out.
+#[test]
+fn the_limit_map_by_sent_hash_matches_the_scan_it_replaced() {
+    fn scan(
+        sent: &str,
+        views: &[TorrentView],
+        reading: impl Fn(&TorrentView) -> Option<Value>,
+    ) -> Map<String, Value> {
+        sent.split('|')
+            .filter_map(|hash| {
+                let reading = match views
+                    .iter()
+                    .find(|view| view.infohash.eq_ignore_ascii_case(hash.trim()))
+                {
+                    Some(view) => reading(view)?,
+                    None => json!(-1),
+                };
+                Some((hash.to_owned(), reading))
+            })
+            .collect()
+    }
+    let views: Vec<TorrentView> = (0..300u32)
+        .map(|n| {
+            let mut view = view(TorrentState::Queued);
+            view.job_id = JobId(u64::from(n) + 1);
+            view.infohash = format!("{n:040X}");
+            view.upload_limit = match n % 3 {
+                0 => None,
+                1 => Some(0),
+                _ => Some(u64::from(n) * 1024),
+            };
+            view
+        })
+        .collect();
+    let reading = |view: &TorrentView| client_limit(view.upload_limit, 0);
+    let mut sent: Vec<String> = (0..300u32)
+        .flat_map(|n| {
+            let hash = format!("{n:040X}");
+            [hash.to_ascii_lowercase(), format!(" {hash} ")]
+        })
+        .collect();
+    sent.push(format!("{:040X}", 2));
+    sent.push(format!("{:040X}", 2));
+    sent.push("cd".repeat(20));
+    sent.push(String::new());
+    let sent = sent.join("|");
+
+    let new = limits_by_sent_hash(&sent, &views, reading);
+    assert_eq!(new, scan(&sent, &views, reading));
+    assert_eq!(new[&format!("{:040x}", 2)], 2048);
+    assert_eq!(new[&"cd".repeat(20)], -1);
+    assert_eq!(new[""], -1);
+    assert!(!new.contains_key(&format!("{:040x}", 1)));
+    assert_eq!(new[&format!("{:040x}", 3)], 0);
+}
+
 // Tags as qBittorrent's `TorrentsController` keeps them: taken on `add`,
 // shown joined by ", ", filtered on by `tag` (the empty tag is untagged),
 // and changed by the tag actions. A tag put on no torrent is not made.
