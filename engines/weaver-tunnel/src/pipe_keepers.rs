@@ -12,11 +12,13 @@
 //   proxy edited, disabled or replaced takes what was kept through it with
 //   it, at once;
 // - when a session's bytes are short, as many as a claim needs, before the
-//   share refuses it or leaves it waiting (`SessionSockets`). A claim then
-//   refused only for their bytes waits for them (`SessionSockets::claim`),
-//   so nothing kept ever makes other work fail, or wait for longer than its
-//   bytes take to come back. Keeping one rings its class's slot, so a claim
-//   waiting while it was in use looks again and closes it.
+//   share refuses it or leaves it waiting (`SessionSockets`). One on a
+//   tunnel socket is reset, so its bytes are back at once. A claim then
+//   refused only for the bytes of any other waits for them
+//   (`SessionSockets::claim`), so nothing kept ever makes other work fail,
+//   or wait for longer than its bytes take to come back. Keeping one rings
+//   its class's slot, so a claim waiting while it was in use looks again
+//   and closes it. Every other close is a graceful one.
 //
 // A kept thing remembers the stage it was dialled through by its keeper, and
 // is handed back only to a dial through that same live stage.
@@ -114,9 +116,10 @@ impl Keeper {
     }
 
     // Closes the oldest thing kept that holds a socket in this stage's
-    // share, marks its bytes reclaimed, and says whether there was one. One
-    // taken back for use as it was found closes nothing and is not counted:
-    // the next is closed in its place.
+    // share, resets its socket or marks its bytes reclaimed, and says
+    // whether there was one. One taken back for use as it was found closes
+    // nothing, is never reset, and is not counted: the next is closed in its
+    // place. The reset runs outside the holders' lock, after the close.
     pub(crate) fn reclaim(&self) -> bool {
         let Some(holders) = self.holders.get() else {
             return false;

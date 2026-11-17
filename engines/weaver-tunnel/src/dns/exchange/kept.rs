@@ -9,7 +9,9 @@
 // stage built anew, by a proxy edited, disabled or replaced, never takes a
 // connection its predecessor dialled. A connection closes when no lookup
 // takes it for `IDLE`, with the naming, when a stage it rides retires or is
-// dropped, and when a socket share it holds a permit of runs short.
+// dropped, and when a socket share it holds a permit of runs short. Only
+// that last is a reset, so the share has its bytes back at once; every other
+// close ends the connection gracefully.
 use super::{Tls, doh::Connection};
 use crate::dns::DnsServer;
 use crate::pipe::{KeeperRef, KeptRegistration, Reservation};

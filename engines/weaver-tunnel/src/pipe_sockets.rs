@@ -45,11 +45,13 @@
 // side pressing, and for that division only.
 //
 // Connections kept between lookups (`Keeper`) hold bytes nothing is using,
-// each the bytes its socket reserved when it was dialled. A claim that does not fit closes as many of them as it needs, the
-// oldest first, and no more: bytes already closing count as on their way
-// back, so a second claim closes nothing for bytes the first freed. Their
-// bytes come back as any closing stream's do, when the tunnel frees the
-// socket. A claim refused only for the bytes of kept connections closed for
+// each the bytes its socket reserved when it was dialled. A claim that does
+// not fit closes as many of them as it needs, the oldest first, and no more:
+// bytes already closing count as on their way back, so a second claim closes
+// nothing for bytes the first freed. One on a tunnel socket is reset, so the
+// tunnel frees the socket and its bytes are back before the claim looks
+// again; any other comes back as a closing stream does, when its socket is
+// freed. A claim refused only for the bytes of kept connections closed for
 // a claim, its own or an earlier one's, waits for them (`claim`): without
 // those connections kept the bytes would have been there, so nothing kept
 // makes it fail. A look at room closes nothing, and counts what closing the
@@ -57,12 +59,12 @@
 // slot, so a waiter refused while it was in use comes back to close it.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::Notify;
 
 use super::{Held, Keeper, LISTEN_BACKLOG, Purpose};
-use crate::wireguard::{TcpBuffers, WgTcpStream};
+use crate::wireguard::{TcpBuffers, WgTcpAborter, WgTcpStream};
 use proxy_tunnels::SlotFreed;
 
 const KIB: u64 = 1024;
@@ -618,15 +620,18 @@ impl Drop for SocketPermit {
     }
 }
 
-// What a split stream's two sides know of each other, read and written only
-// under the ledger's lock: whether the stream was dropped and counted
-// closing, and whether the tunnel freed the socket.
+// What a split stream's two sides know of each other, the flags read and
+// written only under the ledger's lock: whether the stream was dropped and
+// counted closing, and whether the tunnel freed the socket.
 #[derive(Default)]
 struct StreamEnd {
     closed: AtomicBool,
     freed: AtomicBool,
     // Whether a kept connection on the stream was closed to make room.
     reclaimed: AtomicBool,
+    // What resets the stream's tunnel socket, for a stream a kept connection
+    // may ride: set once the tunnel holds the socket.
+    aborter: OnceLock<WgTcpAborter>,
 }
 
 // The socket a kept connection holds, as its keeper's share reads and
@@ -645,12 +650,25 @@ impl Reclaimable {
         (self.class, self.bytes)
     }
 
-    // The connection was closed to make room: a claim refused for its bytes
-    // alone waits for them.
+    // The connection was closed to make room. On a tunnel socket it is reset
+    // first: the tunnel frees the socket at once, without waiting on the far
+    // side, and the bytes are back before this returns, never counted as
+    // reclaimed. Otherwise a claim refused for its bytes alone waits for
+    // them. Called with no lock of the ledger's or a keeper's held: the
+    // reset hands the bytes back, which takes the ledger's lock.
     pub(crate) fn reclaimed(&self) {
+        if let Some(aborter) = self.stream.aborter.get() {
+            aborter.abort();
+        }
         if let Some(shares) = self.shares.upgrade() {
             shares.reclaimed(self.class.index(), self.bytes, &self.stream);
         }
+    }
+
+    // Whether the stream can be reset to free its socket at once.
+    #[cfg(test)]
+    pub(crate) fn aborts(&self) -> bool {
+        self.stream.aborter.get().is_some()
     }
 
     // The connection is now kept, its bytes reclaimable: a claim of its
@@ -696,10 +714,14 @@ impl StreamSocket {
     }
 
     // `stream`'s socket holds these bytes: its tunnel holds the permit
-    // until it frees the socket. Taking the tunnel's stack lock here, this
-    // holds no lock of the ledger's.
+    // until it frees the socket. A stream a kept connection may ride, marked
+    // reclaimable, keeps what resets the socket; no other makes one. Taking
+    // the tunnel's stack lock here, this holds no lock of the ledger's.
     pub fn hold_in(&mut self, stream: &WgTcpStream) {
         if let Some(permit) = self.permit.take() {
+            if let Some(end) = &permit.stream {
+                end.aborter.get_or_init(|| stream.aborter());
+            }
             let (permit, open) = permit.for_stream();
             stream.hold_until_freed(permit);
             self.open = Some(open);
@@ -711,6 +733,14 @@ impl StreamSocket {
     // stream that holds none.
     pub(crate) fn reclaimable(&mut self, class: SocketClass) -> Option<Reclaimable> {
         Some(self.permit.as_mut()?.reclaimable(class))
+    }
+
+    // Whether the stream's tunnel socket can be reset to free it at once.
+    #[cfg(test)]
+    pub(crate) fn aborts(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.stream.aborter.get().is_some())
     }
 
     // `SocketPermit::connected_signal`, while this stream holds bytes.
@@ -873,8 +903,9 @@ impl SessionSockets {
     }
 
     // Close the kept connections a claim of `bytes` of `class` needs, the
-    // oldest first. Their bytes come back when the tunnel frees their
-    // sockets. A reclaim that found its connection already taken for a
+    // oldest first. One on a tunnel socket is reset and its bytes are back
+    // before this returns; any other's come back when its socket is freed.
+    // A reclaim that found its connection already taken for a
     // lookup closed nothing and is not counted. Runs with no lock of the
     // ledger's held: closing takes it.
     fn make_room(&self, class: SocketClass, bytes: u64) {
@@ -1109,6 +1140,15 @@ impl SessionSockets {
         self.shares
             .as_ref()
             .map_or(0, |inner| inner.ledger().held[class.index()])
+    }
+
+    // Bytes of `class` of kept connections closed to make room, whose
+    // sockets are not yet freed.
+    #[cfg(test)]
+    pub(crate) fn reclaimed(&self, class: SocketClass) -> u64 {
+        self.shares
+            .as_ref()
+            .map_or(0, |inner| inner.ledger().reclaimed[class.index()])
     }
 
     // Bytes of `class` whose streams were dropped and whose sockets the

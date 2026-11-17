@@ -2771,6 +2771,11 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
 // A WireGuard session on `near` whose reserve holds one DNS stream and whose
 // torrent side holds one peer.
 fn dns_session(near: &crate::test_support::WireGuardTestPeer) -> Arc<SessionHop> {
+    dns_session_of(near, 1)
+}
+
+// As `dns_session`, its reserve holding `streams` DNS streams.
+fn dns_session_of(near: &crate::test_support::WireGuardTestPeer, streams: u64) -> Arc<SessionHop> {
     let provider = Arc::new(
         crate::WireGuardTunnelProvider::new(
             near.client_spec("1"),
@@ -2779,7 +2784,7 @@ fn dns_session(near: &crate::test_support::WireGuardTestPeer) -> Arc<SessionHop>
         .with_udp_factory(bottom()),
     );
     let mtu = near.client_spec("1").mtu;
-    let reserve = super::dns_stream_bytes();
+    let reserve = streams * super::dns_stream_bytes();
     Arc::new(SessionHop {
         sockets: Arc::new(SessionSockets::new(
             SocketBudget {
@@ -2825,15 +2830,17 @@ async fn only_a_dns_dial_records_what_its_socket_reserved() {
         (SocketClass::Reserve, super::dns_stream_bytes())
     );
     assert!(reserved[0].keeper.is(&session.sockets.keeper().handle()));
+    // Its tunnel socket can be reset, to free it at once when reclaimed.
+    assert!(reserved[0].socket.aborts());
     drop(peer);
 }
 
-// A DNS dial on a reserve held whole by a kept connection closes it and
-// waits for its bytes, rather than fail: kept, the connection makes nothing
-// fail. With the reserve held by a connection in use, the dial is refused at
-// once.
+// A DNS dial on a reserve held whole by a kept connection closes it, resets
+// its socket and takes its bytes, rather than fail: kept, the connection
+// makes nothing fail. With the reserve held by a connection in use, the dial
+// is refused at once.
 #[tokio::test]
-async fn a_dial_on_a_reserve_held_by_a_kept_connection_waits_for_its_bytes() {
+async fn a_dial_on_a_reserve_held_by_a_kept_connection_takes_its_bytes() {
     let near = crate::test_support::WireGuardTestPeer::start().await;
     let session = dns_session(&near);
     let target = Target {
@@ -2864,6 +2871,402 @@ async fn a_dial_on_a_reserve_held_by_a_kept_connection_waits_for_its_bytes() {
         session.sockets.held(SocketClass::Reserve),
         super::dns_stream_bytes()
     );
+    drop(next);
+}
+
+// Poll `future` once, with nothing to wake it: ready only when it never
+// waits.
+fn once<F: std::future::Future>(future: F) -> std::task::Poll<F::Output> {
+    let mut future = std::pin::pin!(future);
+    future
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
+// Keep `dialed` as a lookup that ends keeps its connection: with the keeper
+// of each stage in `rides`, and reclaimable in the share whose keeper its
+// socket reserved bytes with. Closing it drops it, unless `in_use` says a
+// lookup took it back first.
+fn keep_dialed(
+    dialed: Dialed,
+    rides: &[KeeperRef],
+    in_use: &Arc<std::sync::atomic::AtomicBool>,
+) -> (Vec<KeptRegistration>, Arc<Mutex<Option<Dialed>>>) {
+    let reserved = dialed.outcome.reservations();
+    let link = Arc::new(Mutex::new(Some(dialed)));
+    let registered = rides
+        .iter()
+        .map(|keeper| {
+            let socket = reserved
+                .iter()
+                .find(|reserved| reserved.keeper.is(keeper))
+                .map(|reserved| reserved.socket.clone());
+            let (closing, in_use) = (link.clone(), in_use.clone());
+            keeper
+                .hold(
+                    socket,
+                    Box::new(move || {
+                        !in_use.load(std::sync::atomic::Ordering::SeqCst)
+                            && closing.lock().unwrap().take().is_some()
+                    }),
+                )
+                .expect("a live keeper")
+        })
+        .collect();
+    (registered, link)
+}
+
+// A kept DNS connection whose far side has gone silent, closed to make room
+// for a claim that does not fit: its socket is reset, so the claim takes its
+// bytes at once, with no reply from the far side and no time passing. Closed
+// gracefully, the socket would linger until the far side answered its FIN or
+// the tunnel's linger ran out, and the claim would wait. The share never
+// holds past its budget, and ends where it began.
+#[tokio::test]
+async fn a_kept_dns_connection_reclaimed_gives_its_bytes_back_at_once() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let session = dns_session(&near);
+    let sockets = &session.sockets;
+    let one = super::dns_stream_bytes();
+    let before = sockets.reserved();
+    let within = || assert!(sockets.reserved() <= sockets.limit());
+    let dialed = session
+        .dial(&Target {
+            purpose: Purpose::Dns,
+            ..probe_target()
+        })
+        .await
+        .unwrap();
+    within();
+    let (_kept, link) = keep_dialed(dialed, &[sockets.keeper().handle()], &Default::default());
+    assert_eq!(sockets.held(SocketClass::Reserve), one);
+    within();
+
+    // The far side goes: nothing will answer the close.
+    drop(near);
+    tokio::time::pause();
+    let asked = tokio::time::Instant::now();
+    let std::task::Poll::Ready(claimed) = once(sockets.claim(SocketClass::Reserve, one)) else {
+        panic!("the claim waited for the kept connection's bytes");
+    };
+    let permit = claimed.expect("room").expect("a budget");
+    assert_eq!(tokio::time::Instant::now(), asked);
+    assert!(link.lock().unwrap().is_none());
+    assert_eq!(sockets.keeper().holding(), 0);
+    within();
+    assert_eq!(sockets.held(SocketClass::Reserve), one);
+    assert_eq!(sockets.closing(SocketClass::Reserve), 0);
+    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
+
+    drop(permit);
+    assert_eq!(sockets.reserved(), before);
+    assert_eq!(sockets.held(SocketClass::Reserve), 0);
+    assert_eq!(sockets.closing(SocketClass::Reserve), 0);
+    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
+}
+
+// A kept DNS connection a lookup takes back as the share reclaims it is in
+// use: it is not reset, and still carries its exchange. The next oldest is
+// closed in its place, reset, and its bytes are back at once.
+#[tokio::test]
+async fn a_kept_connection_taken_back_is_never_reset_and_the_next_is_closed() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let session = dns_session_of(&near, 2);
+    let sockets = &session.sockets;
+    let one = super::dns_stream_bytes();
+    let target = Target {
+        purpose: Purpose::Dns,
+        ..probe_target()
+    };
+    let older = session.dial(&target).await.unwrap();
+    let newer = session.dial(&target).await.unwrap();
+    let rides = [sockets.keeper().handle()];
+    let taken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (_older, older) = keep_dialed(older, &rides, &taken);
+    let (_newer, newer) = keep_dialed(newer, &rides, &Default::default());
+
+    let std::task::Poll::Ready(claimed) = once(sockets.claim(SocketClass::Reserve, one)) else {
+        panic!("the claim waited for the next kept connection's bytes");
+    };
+    let permit = claimed.expect("room").expect("a budget");
+    assert!(newer.lock().unwrap().is_none());
+    assert_eq!(sockets.held(SocketClass::Reserve), 2 * one);
+    assert_eq!(sockets.closing(SocketClass::Reserve), 0);
+    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
+
+    // The connection the lookup took back still works.
+    let mut in_use = older.lock().unwrap().take().expect("never closed");
+    in_use
+        .stream
+        .write_all(b"GET /kept HTTP/1.1\r\nHost: origin\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    in_use.stream.read_to_end(&mut answer).await.unwrap();
+    assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 200"));
+    assert_eq!(near.requests(), vec!["GET /kept HTTP/1.1"]);
+    drop((permit, in_use));
+}
+
+// A kept connection on a tunnel stream, held until it is closed.
+type FarLink = Arc<Mutex<Option<(crate::WgTcpStream, StreamSocket)>>>;
+
+// A connection `near` opens into `provider`'s tunnel, kept as a DNS
+// connection is, on bytes of `sockets`' reserve marked reclaimable: the far
+// side's end, its registration, and the kept connection.
+async fn kept_from_far(
+    near: &crate::test_support::WireGuardTestPeer,
+    provider: &crate::WireGuardTunnelProvider,
+    sockets: &SessionSockets,
+) -> (crate::WgTcpStream, KeptRegistration, FarLink) {
+    let mut listener = provider.listen(0, 1).await.unwrap();
+    let port = listener.local_addr().port();
+    let (accepted, far) = tokio::join!(listener.accept(), near.dial_client(port));
+    let (stream, far) = (accepted.unwrap(), far.unwrap());
+    let permit = sockets
+        .take(SocketClass::Reserve, super::dns_stream_bytes())
+        .expect("room")
+        .expect("a budget");
+    let mut socket = StreamSocket::new(Some(permit));
+    let reclaimable = socket
+        .reclaimable(SocketClass::Reserve)
+        .expect("bytes held");
+    socket.hold_in(&stream);
+    assert!(socket.aborts() && reclaimable.aborts());
+    let link = Arc::new(Mutex::new(Some((stream, socket))));
+    let closing = link.clone();
+    let kept = sockets
+        .keeper()
+        .handle()
+        .hold(
+            Some(reclaimable),
+            Box::new(move || closing.lock().unwrap().take().is_some()),
+        )
+        .expect("a live keeper");
+    (far, kept, link)
+}
+
+// A connection kept from `near` into `provider`'s tunnel, closed by `close`:
+// the far side reads a FIN, and the bytes stay held, closing, until the far
+// side ends its side too.
+async fn closes_gracefully(
+    near: &crate::test_support::WireGuardTestPeer,
+    provider: &crate::WireGuardTunnelProvider,
+    close: impl FnOnce(&SessionSockets, KeptRegistration, &FarLink),
+) {
+    let one = super::dns_stream_bytes();
+    let sockets = super::reserve_of(1);
+    let (mut far, kept, link) = kept_from_far(near, provider, &sockets).await;
+    close(&sockets, kept, &link);
+    assert!(link.lock().unwrap().is_none());
+    assert_eq!(sockets.held(SocketClass::Reserve), one);
+    assert_eq!(sockets.closing(SocketClass::Reserve), one);
+    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
+    let mut rest = Vec::new();
+    far.read_to_end(&mut rest)
+        .await
+        .expect("a FIN, not a reset");
+    assert!(rest.is_empty());
+    drop(far);
+    until_given_back(&sockets, SocketClass::Reserve).await;
+    assert_eq!(sockets.closing(SocketClass::Reserve), 0);
+}
+
+// A kept connection closed for anything but room ends gracefully: idle past
+// its time, as the sweep closes it, or cut, as when its stage retires. The
+// far side reads a FIN, not a reset, and the bytes stay held, closing, until
+// it ends its side too. One closed for room is reset, and its bytes are back
+// at once, though the far side has not closed.
+#[tokio::test]
+async fn only_a_kept_connection_closed_for_room_is_reset() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let provider = crate::WireGuardTunnelProvider::new(
+        near.client_spec("1"),
+        Arc::new(crate::NoopTunnelObserver),
+    )
+    .with_udp_factory(bottom());
+    let one = super::dns_stream_bytes();
+    // Idle: the sweep drops the connection, and with it the registration.
+    closes_gracefully(&near, &provider, |_, kept, link| {
+        let idle = link.lock().unwrap().take();
+        drop((idle, kept));
+    })
+    .await;
+    // Cut by its stage.
+    closes_gracefully(&near, &provider, |sockets, _kept, _| sockets.keeper().cut()).await;
+
+    // Closed for room.
+    let sockets = super::reserve_of(1);
+    let (far, _kept, link) = kept_from_far(&near, &provider, &sockets).await;
+    let permit = sockets
+        .take(SocketClass::Reserve, one)
+        .expect("room")
+        .expect("a budget");
+    assert!(link.lock().unwrap().is_none());
+    assert_eq!(sockets.held(SocketClass::Reserve), one);
+    assert_eq!(sockets.closing(SocketClass::Reserve), 0);
+    assert_eq!(sockets.reclaimed(SocketClass::Reserve), 0);
+    drop(permit);
+    assert_eq!(sockets.held(SocketClass::Reserve), 0);
+    drop(far);
+}
+
+// Only a stream marked reclaimable, as only a DNS dial marks its socket,
+// keeps what resets its tunnel socket: any other stream, an accepted one
+// among them, makes none.
+#[tokio::test]
+async fn only_a_stream_a_kept_connection_may_ride_can_be_reset() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let provider = crate::WireGuardTunnelProvider::new(
+        near.client_spec("1"),
+        Arc::new(crate::NoopTunnelObserver),
+    )
+    .with_udp_factory(bottom());
+    let sockets = super::reserve_of(1);
+    let mut listener = provider.listen(0, 1).await.unwrap();
+    let port = listener.local_addr().port();
+    let (accepted, far) = tokio::join!(listener.accept(), near.dial_client(port));
+    let stream = accepted.unwrap();
+    let mut socket = StreamSocket::new(Some(
+        sockets
+            .take(SocketClass::Reserve, super::dns_stream_bytes())
+            .expect("room")
+            .expect("a budget"),
+    ));
+    socket.hold_in(&stream);
+    assert!(!socket.aborts());
+    drop((stream, socket, far));
+}
+
+// A DNS connection through a WireGuard tunnel carried by another holds a
+// socket only in the top tunnel's share: the tunnel beneath carries its
+// packets on the one datagram socket the top tunnel rides, and records
+// nothing. Closed for room, the kept connection resets its own socket alone,
+// its bytes are back in the top share at once, and the tunnel beneath and
+// its carrier are untouched: the next dial through both reaches the far
+// peer.
+#[tokio::test]
+async fn a_kept_connection_through_two_tunnels_resets_only_its_own_socket() {
+    use crate::test_support::{
+        TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT, WireGuardTestPeer, WireGuardTestPeerOptions,
+        test_key,
+    };
+    const CARRIED_PORT: u16 = 51820;
+    let far = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        private_key: test_key(31),
+        body: "carried through two tunnels".into(),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+    let near = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        udp_forward: Some((CARRIED_PORT, far.endpoint())),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+    let lower_provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let mtu = near.client_spec("1").mtu;
+    let carrying = 2 * datagram_bytes(mtu);
+    let lower = Arc::new(SessionHop {
+        sockets: Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(mtu) + carrying,
+                reserve: carrying,
+                torrent_kept: 0,
+                mtu,
+            },
+            Arc::new(TorrentsOnly),
+        )),
+        ..Arc::into_inner(wireguard_session(
+            1,
+            lower_provider.clone(),
+            lower_provider,
+            bottom(),
+            vec![],
+            1,
+        ))
+        .unwrap()
+    });
+    let carrier = lower
+        .clone()
+        .carrier_datagrams()
+        .expect("a WireGuard session carries a tunnel");
+    let spec = crate::WireGuardSpec {
+        endpoint_host: TEST_PEER_ADDRESS.to_string(),
+        endpoint_port: CARRIED_PORT,
+        ..far.client_spec("2")
+    };
+    let upper_provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(spec.clone(), Arc::new(crate::NoopTunnelObserver))
+            .with_datagram_transport(carrier),
+    );
+    let one = super::dns_stream_bytes();
+    let upper = Arc::new(SessionHop {
+        sockets: Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(spec.mtu) + one,
+                reserve: one,
+                torrent_kept: 0,
+                mtu: spec.mtu,
+            },
+            Arc::new(TorrentsOnly),
+        )),
+        ..Arc::into_inner(wireguard_session(
+            2,
+            upper_provider.clone(),
+            upper_provider,
+            lower.clone(),
+            vec![1],
+            1,
+        ))
+        .unwrap()
+    });
+    let target = Target {
+        host: TEST_PEER_ADDRESS.to_string(),
+        port: TEST_PEER_HTTP_PORT,
+        purpose: Purpose::Dns,
+        addresses: Vec::new(),
+    };
+    let dialed = upper.dial(&target).await.unwrap();
+    let reserved = dialed.outcome.reservations();
+    assert_eq!(reserved.len(), 1);
+    assert!(reserved[0].keeper.is(&upper.sockets.keeper().handle()));
+    assert!(reserved[0].socket.aborts());
+    assert!(!lower.sockets.keeper().asked_for());
+    let carried = lower.sockets.held(SocketClass::Reserve);
+    assert!(carried > 0);
+
+    // Kept with both stages' keepers, as a naming keeps it.
+    let rides = upper.keepers();
+    assert!(rides[1].is(&lower.sockets.keeper().handle()));
+    let (_kept, link) = keep_dialed(dialed, &rides, &Default::default());
+    assert!(lower.sockets.keeper().held().is_empty());
+    let permit = upper
+        .sockets
+        .take(SocketClass::Reserve, one)
+        .expect("room")
+        .expect("a budget");
+    assert!(link.lock().unwrap().is_none());
+    assert_eq!(upper.sockets.held(SocketClass::Reserve), one);
+    assert_eq!(upper.sockets.closing(SocketClass::Reserve), 0);
+    assert_eq!(upper.sockets.reclaimed(SocketClass::Reserve), 0);
+    assert_eq!(lower.sockets.held(SocketClass::Reserve), carried);
+    assert_eq!(lower.sockets.closing(SocketClass::Reserve), 0);
+    drop(permit);
+
+    let mut next = upper.dial(&target).await.unwrap();
+    next.stream
+        .write_all(b"GET /carried HTTP/1.1\r\nHost: origin\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    next.stream.read_to_end(&mut answer).await.unwrap();
+    assert!(String::from_utf8_lossy(&answer).ends_with("carried through two tunnels"));
     drop(next);
 }
 
