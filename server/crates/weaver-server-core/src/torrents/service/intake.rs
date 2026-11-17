@@ -41,7 +41,7 @@ use weaver_torrent::core::InfoHashes;
 use weaver_torrent::tracker::Tracker;
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, FilePriority, Identity, Magnet, ResumePeers,
-    Session, TorrentVersion, torrent_from_bytes,
+    SeedUrls, Session, TorrentVersion, WebSeed, WebSeedKind, torrent_from_bytes,
 };
 
 // The client a torrent under `rule` claims to be on every surface that
@@ -357,6 +357,71 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
                 .and_then(|secs| secs.checked_mul(1000)),
             comment: text(metainfo.comment.as_ref().map(|comment| comment.as_ref())),
         },
+    })
+}
+
+// The metainfo a magnet's fetch gave, with the web seeds the link named
+// (`ws`, in `added`) written into its BEP 19 `url-list` beside the info
+// dict: it is stored, sealed, with them, and a restart reads them back from
+// it (libtorrent keeps a magnet's `url_seeds` with the torrent it makes).
+// The list holds the URLs it held, then each added one it lacks, in the
+// link's order, each once. The info dict is written back as read, so the
+// info hash is the torrent's; a fetch's metainfo holds only `announce`,
+// `announce-list` and `info`, which read the same written back (an empty
+// `announce-list` is left out). The metainfo comes back as fetched when the
+// link named no seed, or when with the seeds it would pass what any torrent
+// file may hold (`torrent_from_bytes`: `MAX_TORRENT_FILE_BYTES`,
+// `MAX_TORRENT_TOKENS`).
+pub(super) fn with_web_seeds(metainfo: Bytes, added: &[WebSeed]) -> Bytes {
+    use weaver_torrent::ByteBuf;
+    use weaver_torrent::bencode::{BencodeValue, bencode_serialize_to_writer, from_bytes};
+
+    let added: Vec<&[u8]> = added
+        .iter()
+        .filter(|seed| seed.kind == WebSeedKind::Url && !seed.url.is_empty())
+        .map(|seed| seed.url.as_bytes())
+        .collect();
+    if added.is_empty() {
+        return metainfo;
+    }
+    let mut list = Vec::new();
+    let merged = (|| {
+        let mut meta = torrent_from_bytes(&metainfo).ok()?;
+        let mut urls: Vec<&[u8]> = Vec::new();
+        if let Some(listed) = &meta.url_list {
+            match from_bytes::<BencodeValue<ByteBuf<'_>>>(listed.0.0) {
+                Ok(BencodeValue::Bytes(url)) => urls.push(url.0),
+                Ok(BencodeValue::List(listed)) => {
+                    urls.extend(listed.into_iter().filter_map(|url| match url {
+                        BencodeValue::Bytes(url) => Some(url.0),
+                        _ => None,
+                    }))
+                }
+                _ => {}
+            }
+        }
+        urls.extend(added.iter().copied());
+        let mut seen = HashSet::new();
+        list.push(b'l');
+        for url in urls {
+            if !url.is_empty() && seen.insert(url) {
+                list.extend_from_slice(format!("{}:", url.len()).as_bytes());
+                list.extend_from_slice(url);
+            }
+        }
+        list.push(b'e');
+        meta.url_list = Some(SeedUrls(ByteBuf(&list)));
+        let mut out = Vec::with_capacity(metainfo.len() + list.len() + 12);
+        bencode_serialize_to_writer(&meta, &mut out).ok()?;
+        torrent_from_bytes(&out).ok()?;
+        Some(Bytes::from(out))
+    })();
+    merged.unwrap_or_else(|| {
+        tracing::warn!(
+            seeds = added.len(),
+            "a magnet's web seeds were not kept: its metainfo would not hold them"
+        );
+        metainfo
     })
 }
 
@@ -1086,14 +1151,11 @@ impl TorrentService {
             identity,
             trackers,
         });
-        // The levels the link's `so=` gave its files go with the metainfo.
+        // The link's web seeds are stored in the metainfo, and the levels
+        // its `so=` gave its files go with it.
+        let bytes = with_web_seeds(listed.torrent_bytes, &listed.web_seeds);
         match self
-            .resolved(
-                job_id,
-                listed.torrent_bytes,
-                &listed.file_priorities,
-                fetched,
-            )
+            .resolved(job_id, bytes, &listed.file_priorities, fetched)
             .await
         {
             Ok(()) => self.inner.counters.fetch(FetchOutcome::Resolved),
