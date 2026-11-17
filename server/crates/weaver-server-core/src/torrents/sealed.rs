@@ -109,6 +109,9 @@ const SEAL_DONE: &str = "done";
 // The keys an RSS item's link was once kept under in a torrent's metadata.
 pub(crate) const RSS_LINK_KEYS: [&str; 2] = ["rss.item_url", "rss.item_id"];
 
+// What selects, in SQL, a metadata that may name an RSS item's link or id.
+const RSS_LINK_LIKE: &str = "%\"rss.item_%";
+
 // A metadata list without an RSS item's link or id, or none when it holds
 // neither.
 fn without_rss_link(metadata: &str) -> Option<String> {
@@ -328,7 +331,7 @@ impl crate::Database {
             }
 
             // Each torrent whose kept metadata names an RSS item's link or
-            // id, and its history row: both without them.
+            // id: without them.
             let mut after = i64::MIN;
             loop {
                 let rows = SqlRuntime::fetch_all(
@@ -337,7 +340,7 @@ impl crate::Database {
                       WHERE job_id > {} AND metadata LIKE {} ORDER BY job_id LIMIT {}",
                     &[
                         SqlArg::I64(after),
-                        SqlArg::Text("%\"rss.item_%".to_string()),
+                        SqlArg::Text(RSS_LINK_LIKE.to_string()),
                         SqlArg::I64(SEAL_PAGE),
                     ],
                 )
@@ -348,55 +351,68 @@ impl crate::Database {
                 for row in &rows {
                     if let Some(kept) = row.opt_text("metadata")?.as_deref().and_then(without_rss_link)
                     {
-                        page.push((row.i64("job_id")?, kept));
+                        page.push((row.i64("job_id")?, SqlArg::Text(kept)));
                     }
                 }
-                let jobs: Vec<SqlArg> = rows
-                    .iter()
-                    .map(|row| row.i64("job_id").map(SqlArg::I64))
-                    .collect::<Result<_, _>>()?;
-                let history = SqlRuntime::fetch_all(
+                if page.is_empty() {
+                    continue;
+                }
+                SqlRuntime::run_in_transaction(&datastore, "strip_torrent_rss_links", |tx| {
+                    let page = page.clone();
+                    Box::pin(async move {
+                        crate::torrents::persistence::update_column_tx(tx, "metadata", &page).await
+                    })
+                })
+                .await?;
+            }
+
+            // The same of every torrent's history row, read from the
+            // history itself by its key: a torrent removed since has no
+            // row among the torrents, and its history is kept. A usenet
+            // job's row is never selected. The walk is the history's key
+            // in order, once, in this one pass.
+            let mut after = i64::MIN;
+            loop {
+                let rows = SqlRuntime::fetch_all(
                     datastore.read_exec(),
-                    &format!(
-                        "SELECT job_id, metadata FROM job_history WHERE job_id IN ({})",
-                        vec!["{}"; jobs.len()].join(", ")
-                    ),
-                    &jobs,
+                    "SELECT job_id, metadata FROM job_history \
+                      WHERE job_id > {} AND protocol = {} AND metadata LIKE {} \
+                      ORDER BY job_id LIMIT {}",
+                    &[
+                        SqlArg::I64(after),
+                        SqlArg::Text(crate::jobs::Protocol::Torrent.as_str().to_string()),
+                        SqlArg::Text(RSS_LINK_LIKE.to_string()),
+                        SqlArg::I64(SEAL_PAGE),
+                    ],
                 )
                 .await?;
+                let Some(last) = rows.last() else { break };
+                after = last.i64("job_id")?;
                 let mut had = Vec::new();
-                for row in &history {
+                for row in &rows {
                     if let Some(kept) = row.opt_text("metadata")?.as_deref().and_then(without_rss_link)
                     {
                         had.push((row.i64("job_id")?, kept));
                     }
                 }
-                if page.is_empty() && had.is_empty() {
+                if had.is_empty() {
                     continue;
                 }
-                SqlRuntime::run_in_transaction(&datastore, "strip_torrent_rss_links", |tx| {
-                    let (page, had) = (page.clone(), had.clone());
+                SqlRuntime::run_in_transaction(&datastore, "strip_history_rss_links", |tx| {
+                    let had = had.clone();
                     Box::pin(async move {
-                        let page: Vec<(i64, SqlArg)> = page
-                            .into_iter()
-                            .map(|(job_id, kept)| (job_id, SqlArg::Text(kept)))
-                            .collect();
-                        crate::torrents::persistence::update_column_tx(tx, "metadata", &page)
-                            .await?;
-                        if !had.is_empty() {
-                            let sql = format!(
-                                "UPDATE job_history SET metadata = CASE job_id {}END \
-                                  WHERE job_id IN ({})",
-                                "WHEN {} THEN {} ".repeat(had.len()),
-                                vec!["{}"; had.len()].join(", ")
-                            );
-                            let mut args = Vec::with_capacity(had.len() * 3);
-                            for (job_id, kept) in &had {
-                                args.extend([SqlArg::I64(*job_id), SqlArg::Text(kept.clone())]);
-                            }
-                            args.extend(had.iter().map(|(job_id, _)| SqlArg::I64(*job_id)));
-                            tx.execute(&sql, &args).await?;
+                        let sql = format!(
+                            "UPDATE job_history SET metadata = CASE job_id {}END \
+                              WHERE job_id IN ({})",
+                            "WHEN {} THEN {} ".repeat(had.len()),
+                            vec!["{}"; had.len()].join(", ")
+                        );
+                        let mut args = Vec::with_capacity(had.len() * 3);
+                        for (job_id, kept) in &had {
+                            args.extend([SqlArg::I64(*job_id), SqlArg::Text(kept.clone())]);
                         }
+                        args.extend(had.iter().map(|(job_id, _)| SqlArg::I64(*job_id)));
+                        tx.execute(&sql, &args).await?;
                         Ok(())
                     })
                 })

@@ -6,7 +6,8 @@ use super::retire::{held_at, held_tops};
 use super::settings::TorrentSettings;
 use super::{
     Asked, NEEDS_DHT, PeerTerms, TorrentService, give_back, hashes_of, held_by, identity_of,
-    in_table_order, locked, queued, state_error, take_turn, tidy_trackers, tracker, tracker_tiers,
+    in_table_order, locked, once_a_tier, queued, state_error, take_turn, tidy_trackers, tracker,
+    tracker_tiers,
 };
 use crate::categories::CategoryConfig;
 use crate::categories::model::{completion_parent, resolve_category_config};
@@ -770,6 +771,9 @@ impl TorrentService {
         // its whole folder until its metainfo arrives.
         held: Option<Vec<String>>,
     ) -> Result<Live, AddError> {
+        // The table keeps a URL once in a tier, the first that names it:
+        // the same list is written and held, so the two never differ.
+        let trackers = &once_a_tier(trackers);
         let rules = self.rules();
         let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
         record.forced |= rule.is_some_and(|rule| rule.forced);

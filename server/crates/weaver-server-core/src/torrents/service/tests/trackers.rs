@@ -439,6 +439,71 @@ async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, S
         .collect()
 }
 
+// A torrent file that names one tracker twice in a tier is kept with it
+// once, in the table and in memory alike: the list held is the list
+// written, at the add and after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_a_torrent_names_twice_is_held_as_it_is_stored() {
+    use super::super::once_a_tier;
+    let (a, b) = ("http://a.invalid/announce", "http://b.invalid/announce");
+    let entry = |tier: u32, url: &str| TrackerEntry {
+        tier,
+        url: url.to_owned(),
+        named_by: NamedBy::Torrent,
+    };
+    // Once in a tier, the first kept; another tier is another row.
+    assert_eq!(
+        once_a_tier(&[entry(0, a), entry(0, b), entry(0, a), entry(1, a)]),
+        [entry(0, a), entry(0, b), entry(1, a)]
+    );
+
+    // d 8:announce <a> 13:announce-list l l <a> <b> <a> e e ...
+    let rest = plain("twice", 7);
+    let mut bytes = b"d".to_vec();
+    bstr(&mut bytes, b"announce");
+    bstr(&mut bytes, a.as_bytes());
+    bstr(&mut bytes, b"announce-list");
+    bytes.extend_from_slice(b"ll");
+    for url in [a, b, a] {
+        bstr(&mut bytes, url.as_bytes());
+    }
+    bytes.extend_from_slice(b"ee");
+    bytes.extend_from_slice(&rest[1..]);
+
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(bytes))
+        })
+        .await
+        .unwrap();
+    let held = |service: &TorrentService| {
+        let service = service.clone();
+        async move {
+            let live = service.inner.live.lock().await;
+            live.get(&job_id).unwrap().trackers.to_vec()
+        }
+    };
+    let stored = |db: &Database| {
+        let mut stored = db.list_torrent_trackers(job_id).unwrap();
+        stored.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+        stored
+    };
+    let at_add = held(&rig.service).await;
+    assert_eq!(at_add, [entry(0, a), entry(0, b)]);
+    assert_eq!(at_add, stored(&rig.db));
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(held(&again).await, at_add);
+    assert_eq!(stored(&rig.db), at_add);
+    again.stop().await;
+}
+
 // Each torrent's trackers are held with it, and a boot reads the last
 // torrent's key, then, once a page of torrents, the bytes each takes and
 // each torrent table a restore and an attach read: the torrents' rows,

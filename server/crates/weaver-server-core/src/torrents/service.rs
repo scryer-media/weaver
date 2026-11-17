@@ -420,6 +420,18 @@ fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
     tidy
 }
 
+// `trackers` with each URL once in a tier, the first that names it kept, in
+// the order given: what the table's key over a tier and a URL keeps.
+fn once_a_tier(trackers: &[TrackerEntry]) -> Vec<TrackerEntry> {
+    let mut seen: std::collections::HashSet<(u32, &str)> =
+        std::collections::HashSet::with_capacity(trackers.len());
+    trackers
+        .iter()
+        .filter(|entry| seen.insert((entry.tier, entry.url.as_str())))
+        .cloned()
+        .collect()
+}
+
 // `trackers` in the order a torrent keeps them: by tier, then by the URL's
 // bytes, whatever order a database read gave them in.
 fn in_table_order(mut trackers: Vec<TrackerEntry>) -> Arc<[TrackerEntry]> {

@@ -1212,6 +1212,99 @@ fn a_sealing_pass_cut_short_completes_at_the_next_start() {
     assert!(holds_passkey(&clear.0[0].1));
 }
 
+// The history of a torrent removed long ago has no row among the torrents:
+// the pass reads the history itself, a page at a time, and takes an RSS
+// item's link and id out of every torrent's row. A usenet job's row is
+// left as it is.
+#[test]
+fn the_history_of_a_removed_torrent_loses_its_rss_link() {
+    const REMOVED: u64 = 150;
+    let db = Database::open_in_memory().unwrap();
+    let kept = |job_id: u64| {
+        serde_json::to_string(&[
+            ("rss.feed_name", "feed".to_owned()),
+            ("rss.item_id", format!("guid-{job_id}")),
+            (
+                "rss.item_url",
+                format!("https://tracker.example/dl/{job_id}?passkey=0123abcd"),
+            ),
+            ("label", "kept".to_owned()),
+        ])
+        .unwrap()
+    };
+    let row = |job_id: u64, protocol, metadata: Option<String>| crate::JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: format!("job {job_id}"),
+        status: "complete".to_owned(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata,
+        server_attribution: None,
+        protocol,
+        archived_at: None,
+    };
+    // More than two pages of removed torrents, none with a torrent row.
+    for job_id in 1..=REMOVED {
+        db.insert_job_history(&row(
+            job_id,
+            crate::jobs::Protocol::Torrent,
+            Some(kept(job_id)),
+        ))
+        .unwrap();
+    }
+    let usenet = REMOVED + 1;
+    db.insert_job_history(&row(usenet, crate::jobs::Protocol::Nzb, Some(kept(usenet))))
+        .unwrap();
+    let plain = REMOVED + 2;
+    let none = serde_json::to_string(&[("label", "kept")]).unwrap();
+    db.insert_job_history(&row(
+        plain,
+        crate::jobs::Protocol::Torrent,
+        Some(none.clone()),
+    ))
+    .unwrap();
+
+    db.seal_stored_secrets().unwrap();
+    let after: std::collections::HashMap<u64, Option<String>> = {
+        use crate::persistence::sql_runtime::SqlRuntime;
+        let datastore = db.datastore();
+        db.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, metadata FROM job_history",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok((row.i64("job_id")? as u64, row.opt_text("metadata")?)))
+            .collect::<Result<_, crate::StateError>>()
+        })
+        .unwrap()
+    };
+    let stored = |job_id: u64| after[&job_id].clone();
+    let stripped = serde_json::to_string(&[("rss.feed_name", "feed"), ("label", "kept")]).unwrap();
+    for job_id in 1..=REMOVED {
+        assert_eq!(
+            stored(job_id).as_deref(),
+            Some(stripped.as_str()),
+            "{job_id}"
+        );
+    }
+    assert_eq!(stored(usenet), Some(kept(usenet)));
+    assert_eq!(stored(plain), Some(none));
+}
+
 // A tracker's URL is sealed, and its ciphertext differs each time it is
 // written: what keeps one URL from a tier twice is its keyed digest.
 #[test]
