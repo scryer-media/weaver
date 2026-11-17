@@ -179,10 +179,7 @@ async fn the_clock_alone_moves_only_one_torrents_follower() {
         .find(|(event, _)| event == "completed")
         .unwrap()
         .1;
-    let mut follow = seeded
-        .rig
-        .service
-        .updates(Some(seeded.job_id), Duration::from_millis(10));
+    let mut follow = seeded.rig.service.updates(seeded.job_id);
     loop {
         let view = &follow.next().await.torrents[0];
         let answered = view.trackers.iter().all(|tracker| {
@@ -214,7 +211,7 @@ async fn the_clock_alone_moves_only_one_torrents_follower() {
 }
 
 // A follower hears a tracker's answer as it lands, with nothing in the queue
-// to say so: the rig has no queue, and the beat is far past the test.
+// to say so: the rig has no queue, and the answer moves the torrent's row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_followed_torrent_pushes_its_trackers_answer() {
     use tokio::io::AsyncWriteExt;
@@ -230,9 +227,7 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
-    let mut updates = rig
-        .service
-        .updates(Some(job_id), Duration::from_secs(86_400));
+    let mut updates = rig.service.updates(job_id);
 
     let mut started = heard_announce(&listener).await;
     let first = updates.next().await.torrents;

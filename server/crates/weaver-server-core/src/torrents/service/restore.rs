@@ -175,10 +175,12 @@ impl TorrentService {
         self.spawn_settle();
         self.spawn_follow_disk_room();
         self.spawn_follow_trackers();
+        self.spawn_follow_tags();
         self.spawn_follow_egress_limits();
         self.spawn_follow_interfaces();
         self.load_rules()?;
         let through = self.inner.db.last_torrent_job().map_err(state_error)?;
+        self.inner.snapshot.unready();
         self.inner.load.send_replace(Load::Running(through));
         Ok(through)
     }
@@ -188,6 +190,7 @@ impl TorrentService {
     pub(super) async fn restore(&self) -> Result<(), String> {
         self.load_rules()?;
         let through = self.inner.db.last_torrent_job().map_err(state_error)?;
+        self.inner.snapshot.unready();
         self.inner.load.send_replace(Load::Running(through));
         self.load(through).await
     }

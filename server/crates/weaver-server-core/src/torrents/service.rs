@@ -53,6 +53,7 @@ use crate::torrents::{
 pub mod fingerprint;
 pub mod listing;
 mod scripts;
+pub mod snapshot;
 pub use scripts::ScriptDirs;
 mod batch;
 mod checkpoints;
@@ -901,8 +902,11 @@ struct Inner {
     // What the passes did: each take of `live`, walk and write.
     #[cfg(test)]
     pass_counts: watch::Sender<policy::PassCounts>,
-    // The readings of every torrent's views their followers share.
-    readings: updates::Readings,
+    // Every torrent's row as a list shows it, as last published.
+    snapshot: snapshot::Snapshot,
+    // How many views were built.
+    #[cfg(any(test, feature = "test-support"))]
+    views_built: std::sync::atomic::AtomicUsize,
     // The torrents waiting for room on their disks, each by the wait every
     // kind of job shares for its refusal, and how many times a wait began
     // or ended, or a torrent's disk became known.
@@ -995,7 +999,9 @@ impl TorrentService {
                 queue_order: Mutex::default(),
                 #[cfg(test)]
                 pass_counts: watch::channel(policy::PassCounts::default()).0,
-                readings: updates::Readings::default(),
+                snapshot: snapshot::Snapshot::default(),
+                #[cfg(any(test, feature = "test-support"))]
+                views_built: std::sync::atomic::AtomicUsize::new(0),
                 disk_waits: Mutex::default(),
                 disk_waits_moved: watch::channel(0).0,
                 #[cfg(test)]
@@ -1167,6 +1173,28 @@ impl TorrentService {
         tasks.push(task);
     }
 
+    /// Every torrent's row as a list shows it, as last published.
+    pub fn snapshot(&self) -> &snapshot::Snapshot {
+        &self.inner.snapshot
+    }
+
+    /// Whether every torrent's row is in the snapshot: every stored torrent
+    /// is here, and a publish since put them in.
+    pub fn listing_ready(&self) -> Result<(), NotReady> {
+        self.whole()?;
+        if self.inner.snapshot.ready() {
+            Ok(())
+        } else {
+            Err(NotReady::Loading)
+        }
+    }
+
+    /// How many torrent views were built so far.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn views_built(&self) -> usize {
+        self.inner.views_built.load(Ordering::Relaxed)
+    }
+
     /// Counts the ticks run so far.
     pub fn ticks(&self) -> watch::Receiver<u64> {
         self.inner.ticks.subscribe()
@@ -1264,15 +1292,21 @@ impl TorrentService {
         self.start_seated().await
     }
 
-    /// Once every stored torrent is read.
+    /// Once every stored torrent is read, and its row is in the snapshot.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn loaded(&self) {
+        let mut revision = self.inner.snapshot.subscribe();
         let _ = self
             .inner
             .load
             .subscribe()
             .wait_for(|load| matches!(load, Load::Done))
             .await;
+        while !self.inner.snapshot.ready() {
+            if revision.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     async fn with_torrent<T>(

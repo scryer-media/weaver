@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Every torrent's followers share their readings, and each is told from them
-// what `changes` tells a follower that reads for itself.
+// Followers read the snapshot of every torrent's row: each is told from it
+// what `changes` tells a follower that reads the views for itself, and an
+// idle one costs no view and no statement.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::time::Instant;
-
-use super::listing::settled;
+use super::listing::{as_row, settled};
 use super::*;
-use crate::torrents::service::updates::{Follow, Need, Reading};
+use crate::torrents::service::listing::FileTotals;
+use crate::torrents::service::snapshot::{Snapshot, TorrentRow};
+use crate::torrents::service::updates::{Follow, TorrentChanges};
 
 const TORRENTS: u64 = 10_000;
 
@@ -68,8 +69,7 @@ fn steps(view: &TorrentView) -> Vec<Vec<TorrentView>> {
                 for view in views.iter_mut().skip(step as usize).step_by(211) {
                     view.tags = vec![format!("tag{step}")];
                 }
-                // A clock field alone, which every torrent's follower leaves
-                // out.
+                // A clock field alone, which a list's follower leaves out.
                 for view in views.iter_mut().step_by(7) {
                     view.active_seconds += 1;
                 }
@@ -80,112 +80,93 @@ fn steps(view: &TorrentView) -> Vec<Vec<TorrentView>> {
     steps
 }
 
-// Followers on several schedules are told from the shared readings what
-// `changes` tells each of them over the same views: one at every step, one
-// at every other, one at every third, one from the fifth, and one that is
-// given the same reading twice. Some readings are made with the one before
-// them let go.
+// `changes` as a follower of `ids` reads it: its push, each torrent as a row
+// carries it.
+fn rows_told(changes: Option<TorrentChanges>) -> Option<TorrentChanges> {
+    changes.map(|changes| TorrentChanges {
+        torrents: changes.torrents.into_iter().map(as_row).collect(),
+        ..changes
+    })
+}
+
+// Followers of a few torrents on several schedules are told from the
+// snapshot what `changes` tells each of them over the same views, read for
+// itself (the path the snapshot replaces): one at every step, one at every
+// other, one at every third, one from the fifth, over sets of up to 500 that
+// lose torrents and name ones that come later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_shared_reading_tells_each_follower_what_its_own_reading_would() {
+async fn the_snapshot_tells_each_follower_what_its_own_reading_would() {
     use fingerprint::ViewParts::Steady;
 
     let view = one_view().await;
     let steps = steps(&view);
-    let at = Instant::now();
-    let mut readings: Vec<Arc<Reading>> = Vec::new();
-    for (step, views) in steps.iter().enumerate() {
-        let before = readings.last().filter(|_| step % 5 != 3).map(Arc::as_ref);
-        let reading = Reading::of(
-            step as u64 + 1,
-            at,
-            (None, None),
-            Vec::new(),
-            views.clone(),
-            before,
-        );
-        readings.push(Arc::new(reading));
-    }
+    let snapshot = Snapshot::default();
 
     struct Follower {
+        ids: BTreeSet<JobId>,
         from: usize,
         every: usize,
-        last: Option<HashMap<JobId, u64>>,
-        held: Option<Arc<Reading>>,
+        old: Option<HashMap<JobId, u64>>,
+        new: Option<HashMap<JobId, u64>>,
         told: usize,
     }
-    let mut followers: Vec<Follower> = [(0, 1), (0, 2), (0, 3), (5, 1)]
+    let sets: [BTreeSet<JobId>; 4] = [
+        (0..TORRENTS).step_by(20).map(JobId).collect(),
+        (0..500).map(|id| JobId(id * 13 % TORRENTS)).collect(),
+        (TORRENTS - 300..TORRENTS + 200).map(JobId).collect(),
+        (0..TORRENTS)
+            .skip(31)
+            .step_by(37)
+            .take(500)
+            .map(JobId)
+            .collect(),
+    ];
+    let mut followers: Vec<Follower> = sets
         .into_iter()
-        .map(|(from, every)| Follower {
+        .zip([(0, 1), (0, 2), (0, 3), (5, 1)])
+        .map(|(ids, (from, every))| Follower {
+            ids,
             from,
             every,
-            last: None,
-            held: None,
+            old: None,
+            new: None,
             told: 0,
         })
         .collect();
+    assert!(followers.iter().all(|follower| follower.ids.len() <= 500));
     let mut moved_told = 0;
     for (step, views) in steps.iter().enumerate() {
+        let rows: Vec<(TorrentView, FileTotals)> = views
+            .iter()
+            .map(|view| (view.clone(), FileTotals::default()))
+            .collect();
+        snapshot.replace_every(&rows);
         for follower in &mut followers {
             if step < follower.from || (step - follower.from) % follower.every != 0 {
                 continue;
             }
-            let own = updates::changes(&mut follower.last, views.clone(), Steady);
-            let shared = readings[step].changes_since(follower.held.as_deref());
-            assert_eq!(shared, own, "step {step}, every {}", follower.every);
-            if let Some(changes) = &shared {
+            let own: Vec<TorrentView> = views
+                .iter()
+                .filter(|view| follower.ids.contains(&view.job_id))
+                .cloned()
+                .collect();
+            let old = rows_told(updates::changes(&mut follower.old, own, Steady));
+            let new = updates::changes_of_rows(&mut follower.new, &snapshot.rows_of(&follower.ids));
+            assert_eq!(new, old, "step {step}, every {}", follower.every);
+            if let Some(changes) = &new {
                 follower.told += 1;
                 moved_told += usize::from(!changes.full_update);
             }
-            follower.held = Some(Arc::clone(&readings[step]));
         }
     }
     assert!(followers.iter().all(|follower| follower.told > 1));
     assert!(moved_told > 10);
-
-    // The same reading twice tells nothing the second time.
-    let reading = &readings[4];
-    assert!(reading.changes_since(None).unwrap().full_update);
-    assert_eq!(reading.changes_since(Some(reading)), None);
 }
 
-// A reading serves a follower at the revisions it has seen or after, begun
-// after the count it woke at, and younger than its beat.
-#[test]
-fn a_reading_serves_the_need_it_meets() {
-    let at = Instant::now();
-    let beat = Duration::from_secs(3);
-    let reading = Reading::of(7, at, (Some(5), Some(2)), Vec::new(), Vec::new(), None);
-    let need = |queue, tags, begun_after, younger_than| Need {
-        queue,
-        tags,
-        begun_after,
-        younger_than,
-    };
-    assert!(reading.serves(Need::default(), at + beat * 10));
-    assert!(reading.serves(need(Some(5), Some(2), None, None), at));
-    assert!(reading.serves(need(Some(4), None, None, None), at));
-    assert!(!reading.serves(need(Some(6), None, None, None), at));
-    assert!(!reading.serves(need(None, Some(3), None, None), at));
-    assert!(reading.serves(need(None, None, Some(6), None), at));
-    assert!(!reading.serves(need(None, None, Some(7), None), at));
-
-    let young = need(Some(5), Some(2), None, Some(beat));
-    assert!(reading.serves(young, at));
-    assert!(reading.serves(young, at + beat - Duration::from_millis(1)));
-    assert!(!reading.serves(young, at + beat));
-    assert!(!reading.serves(young, at + beat * 2));
-
-    // A reading taken with no queue serves no follower that has one.
-    let unqueued = Reading::of(8, at, (None, Some(2)), Vec::new(), Vec::new(), None);
-    assert!(!unqueued.serves(need(Some(0), None, None, None), at));
-    assert!(unqueued.serves(need(None, Some(2), None, None), at));
-}
-
-// Twenty followers of every torrent hear one tag change from one reading,
-// and the reading is let go once none of them is left. The rig has no
-// queue, and the beat is far past the test.
+// Twenty followers of a few torrents hear one tag change, read from the
+// snapshot: no view is built for any of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn twenty_followers_hear_a_change_from_one_reading() {
+async fn twenty_followers_hear_a_tag_change_with_no_view_built() {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let mut jobs = Vec::new();
@@ -201,39 +182,435 @@ async fn twenty_followers_hear_a_change_from_one_reading() {
         jobs.push(job_id);
     }
     settled(&rig.service, jobs.len()).await;
+    rig.service.publish().await;
 
-    let beat = Duration::from_secs(86_400);
+    let ids: BTreeSet<JobId> = jobs.iter().copied().collect();
     let mut followers: Vec<_> = (0..20)
-        .map(|_| rig.service.follow(Follow::Every, beat))
+        .map(|_| rig.service.follow(Follow::Some(ids.clone())).unwrap())
         .collect();
-    let every = rig.service.torrents(None).await;
+    let every: Vec<TorrentView> = rig
+        .service
+        .torrents(None)
+        .await
+        .into_iter()
+        .map(as_row)
+        .collect();
+    let built = rig.service.views_built();
     for follower in &mut followers {
         let first = follower.next().await;
         assert!(first.full_update);
         assert_eq!(first.torrents, every);
     }
 
-    let before = rig.service.readings_begun();
     rig.db.add_job_tags(&[jobs[1]], ["shared"]).unwrap();
-    let tagged = rig
-        .service
-        .torrents(None)
-        .await
-        .into_iter()
-        .find(|view| view.job_id == jobs[1])
-        .unwrap();
-    assert_eq!(tagged.tags, ["shared"]);
     for follower in &mut followers {
         let changes = follower.next().await;
         assert!(!changes.full_update);
-        assert_eq!(changes.torrents, std::slice::from_ref(&tagged));
+        assert_eq!(changes.torrents.len(), 1);
+        assert_eq!(changes.torrents[0].job_id, jobs[1]);
+        assert_eq!(changes.torrents[0].tags, ["shared"]);
         assert!(changes.removed.is_empty());
     }
-    assert_eq!(rig.service.readings_begun() - before, 1);
+    assert_eq!(rig.service.views_built(), built);
+    rig.service.stop().await;
+}
 
-    assert!(rig.service.holds_reading().await);
-    drop(followers);
-    assert!(!rig.service.holds_reading().await);
+// Whether `next` has nothing to give yet: polled once, it waits.
+fn idle(next: impl std::future::Future<Output = TorrentChanges>) -> bool {
+    let next = std::pin::pin!(next);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    next.poll(&mut context).is_pending()
+}
+
+// Stored paused magnets, `count` of them, written as the add writes them.
+fn stored_magnets(db: &Database, count: u64) -> Vec<JobId> {
+    (1..=count)
+        .map(|job_id| {
+            let record = TorrentRecord {
+                job_id: JobId(job_id),
+                infohash_v1: Some(Sha1::digest(job_id.to_le_bytes()).into()),
+                infohash_v2: None,
+                name: format!("t{job_id}"),
+                source: TorrentSource::Magnet,
+                metainfo: None,
+                category_id: None,
+                added_at_ms: EPOCH_MS + job_id as i64,
+                kept: KeptIntent::Intent(TorrentIntent::Paused),
+                forced: false,
+                completed_at_ms: None,
+                storage_dir: None,
+                policy_override: None,
+                unpack: None,
+                unpack_in_force: None,
+                metadata: Vec::new(),
+                upload_limit: None,
+                download_limit: None,
+                sequential: false,
+                first_last_piece_first: false,
+                save_path: None,
+                content_layout: None,
+                files_dir: None,
+                seed_mode: false,
+                move_to: None,
+                queue_position: job_id as i64,
+                pool_member: None,
+                private: false,
+            };
+            db.insert_torrent(&record, &[]).unwrap();
+            JobId(job_id)
+        })
+        .collect()
+}
+
+// With ten thousand torrents loaded and nothing changing, followers woken
+// fifty times each build no view and take the database for no statement,
+// and no row moves; one torrent changing builds its view alone, and is the
+// one torrent its follower is told of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_followers_build_no_view_and_read_nothing() {
+    let rig = rig(set_clock());
+    let jobs = stored_magnets(&rig.db, TORRENTS);
+    rig.service.restore().await.unwrap();
+    rig.service.publish().await;
+    assert_eq!(rig.service.snapshot().len(), TORRENTS as usize);
+    assert!(rig.service.listing_ready().is_ok());
+
+    let pages: Vec<BTreeSet<JobId>> = jobs
+        .chunks(500)
+        .take(3)
+        .map(|page| page.iter().copied().collect())
+        .collect();
+    let mut followers: Vec<_> = pages
+        .iter()
+        .map(|page| rig.service.follow(Follow::Some(page.clone())).unwrap())
+        .collect();
+    for follower in &mut followers {
+        assert_eq!(follower.next().await.torrents.len(), 500);
+    }
+
+    let (views, statements) = (rig.service.views_built(), rig.db.datastore_takes());
+    let revision = rig.service.snapshot().revision();
+    for _ in 0..50 {
+        for follower in &mut followers {
+            assert!(idle(follower.next()));
+        }
+    }
+    assert_eq!(rig.service.views_built(), views);
+    assert_eq!(rig.db.datastore_takes(), statements);
+    assert_eq!(rig.service.snapshot().revision(), revision);
+    assert!(rig.service.snapshot().since(revision).moved.is_empty());
+
+    // One torrent changes, and is published alone, as a settle publishes
+    // the torrents that spoke.
+    let changed = jobs[700];
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&changed)
+        .unwrap()
+        .record
+        .forced = true;
+    rig.service.publish_job(changed).await;
+    assert_eq!(rig.service.views_built(), views + 1);
+    let since = rig.service.snapshot().since(revision);
+    assert_eq!(since.moved.len(), 1);
+    assert_eq!(since.moved[0].view.job_id, changed);
+    let told = followers[1].next().await;
+    assert_eq!(
+        told.torrents
+            .iter()
+            .map(|view| view.job_id)
+            .collect::<Vec<_>>(),
+        [changed]
+    );
+    assert!(told.torrents[0].forced);
+    for (index, follower) in followers.iter_mut().enumerate() {
+        if index != 1 {
+            assert!(idle(follower.next()));
+        }
+    }
+    assert_eq!(rig.service.views_built(), views + 1);
+    rig.service.stop().await;
+}
+
+// The heap a row's view holds beyond its own size: its strings and lists.
+fn heap_of(view: &TorrentView) -> usize {
+    let text = |text: &String| text.capacity();
+    let some = |text: &Option<String>| text.as_ref().map_or(0, String::capacity);
+    text(&view.name)
+        + text(&view.infohash)
+        + text(&view.magnet)
+        + some(&view.detail)
+        + some(&view.category)
+        + some(&view.created_by)
+        + some(&view.comment)
+        + some(&view.storage_dir)
+        + some(&view.files_dir)
+        + some(&view.seeding_left)
+        + some(&view.tracker_rule)
+        + some(&view.route)
+        + view.files.capacity() * std::mem::size_of::<TorrentFile>()
+        + view.file_have.capacity() * std::mem::size_of::<u64>()
+        + view.trackers.capacity() * std::mem::size_of::<TorrentTracker>()
+        + view.metadata.capacity() * std::mem::size_of::<(String, String)>()
+        + view
+            .metadata
+            .iter()
+            .map(|(key, value)| key.capacity() + value.capacity())
+            .sum::<usize>()
+        + view.tags.capacity() * std::mem::size_of::<String>()
+        + view.tags.iter().map(String::capacity).sum::<usize>()
+}
+
+// A row holds the list fields alone: no files, no file bytes, no trackers,
+// whatever its torrent has. Measures a row, and the rows of ten thousand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_holds_the_list_fields_only() {
+    let view = one_view().await;
+    assert!(!view.files.is_empty());
+    let snapshot = Snapshot::default();
+    let views: Vec<(TorrentView, FileTotals)> = (0..TORRENTS)
+        .map(|id| (copy(&view, id), FileTotals::of(&view)))
+        .collect();
+    snapshot.replace_every(&views);
+    drop(views);
+    let (_, rows) = snapshot.every();
+    assert_eq!(rows.len(), TORRENTS as usize);
+    let mut heap = 0;
+    for row in &rows {
+        assert!(row.view.files.is_empty());
+        assert!(row.view.file_have.is_empty());
+        assert!(row.view.trackers.is_empty());
+        heap += heap_of(&row.view)
+            + row
+                .trackers
+                .current
+                .as_ref()
+                .map_or(0, |tracker| tracker.url.capacity());
+    }
+    let own = std::mem::size_of::<TorrentRow>();
+    // An entry of the id map, the place set and the moved set, each.
+    let index = std::mem::size_of::<(JobId, Arc<TorrentRow>)>()
+        + std::mem::size_of::<(i64, JobId)>()
+        + std::mem::size_of::<(u64, JobId)>();
+    let each = own + 2 * std::mem::size_of::<usize>() + index + heap / rows.len();
+    eprintln!(
+        "row: {own} bytes, index {index} bytes, heap {} bytes; {each} bytes a row, {} KiB at {TORRENTS}",
+        heap / rows.len(),
+        each * rows.len() / 1024,
+    );
+}
+
+// A publish of every torrent that read them before a newer reading of one
+// landed does not take that one back, nor bring back one a newer reading
+// found gone, nor drop one added after it began; tags read after it stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_reading_never_takes_a_row_back() {
+    let view = one_view().await;
+    let snapshot = Snapshot::default();
+    let row = |id: u64, state: TorrentState| {
+        (
+            TorrentView {
+                state,
+                ..copy(&view, id)
+            },
+            FileTotals::of(&view),
+        )
+    };
+    snapshot.replace_every(&[row(1, TorrentState::Paused), row(2, TorrentState::Paused)]);
+
+    // A publish of every torrent begins: it reads 1 checking and 2 there.
+    let old = snapshot.stamp();
+    // Newer readings land first: 1 is seeding, 2 is gone, 3 came, 1 tagged.
+    snapshot.put_one(
+        JobId(1),
+        Some(&row(1, TorrentState::Seeding).0),
+        snapshot.stamp(),
+    );
+    snapshot.put_one(JobId(2), None, snapshot.stamp());
+    snapshot.put_one(
+        JobId(3),
+        Some(&row(3, TorrentState::Paused).0),
+        snapshot.stamp(),
+    );
+    snapshot.retag(
+        |job_id| {
+            if job_id == JobId(1) {
+                vec!["late".to_owned()]
+            } else {
+                Vec::new()
+            }
+        },
+        snapshot.stamp(),
+    );
+    let revision = snapshot.revision();
+    snapshot.replace(
+        &[
+            row(1, TorrentState::CheckingResumeData),
+            row(2, TorrentState::Paused),
+        ],
+        true,
+        old,
+    );
+    assert_eq!(snapshot.revision(), revision);
+    let (_, rows) = snapshot.every();
+    let ids: Vec<JobId> = rows.iter().map(|row| row.view.job_id).collect();
+    assert_eq!(ids, [JobId(1), JobId(3)]);
+    assert_eq!(rows[0].view.state, TorrentState::Seeding);
+    assert_eq!(rows[0].view.tags, ["late"]);
+
+    // A newer publish sets every row, keeping the tags read after it began
+    // only when they are newer than it.
+    snapshot.replace(
+        &[row(1, TorrentState::Paused), row(3, TorrentState::Paused)],
+        true,
+        snapshot.stamp(),
+    );
+    let (_, rows) = snapshot.every();
+    assert_eq!(rows[0].view.state, TorrentState::Paused);
+    assert!(rows[0].view.tags.is_empty());
+}
+
+// A page of the queue under a state filter, and a follow of the page's
+// torrents, do not go stale as a torrent moves from downloading to seeding:
+// the settle that sees it complete publishes it, which moves both its queue
+// job (status Seeding, a new job revision, which wakes `queuePageUpdates`)
+// and its row in the snapshot (which wakes the page's follower). A torrent
+// gone and one come move them again, and a follow made for the page's new
+// ids starts from the rows as they stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_that_seeds_moves_its_page_and_its_row() {
+    use crate::jobs::model::JobStatus;
+
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("page/a.bin", data.as_slice())];
+    let bytes = metainfo("page", &files, 16_384, false);
+    let seeds = tempfile::tempdir().unwrap();
+    let seeder = seeder(seeds.path(), &bytes, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeder.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let (url, _answered) = answering_tracker(peer).await;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    let handle = queue();
+    let jobs = handle.state();
+    let mut job_changes = jobs.subscribe_job_changes();
+    rig.service.publish_to(handle.clone());
+    rig.service.open().await.unwrap();
+    let other = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("other", 7)))
+        })
+        .await
+        .unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(bytes.to_vec())))
+        .await
+        .unwrap();
+    let page: BTreeSet<JobId> = [job_id, other].into();
+    let mut follower = rig.service.follow(Follow::Some(page.clone())).unwrap();
+    assert!(follower.next().await.full_update);
+
+    let before = jobs.job_revision();
+    assert_ne!(jobs.get_job(job_id).unwrap().status, JobStatus::Seeding);
+    tracked(&rig.service, job_id, &url).await;
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_completed()
+        .await
+        .unwrap();
+    // The queue's job says seeding, after a revision a page waits on.
+    let seeding_at = loop {
+        job_changes.borrow_and_update();
+        if jobs.get_job(job_id).unwrap().status == JobStatus::Seeding {
+            break jobs.job_revision();
+        }
+        job_changes.changed().await.unwrap();
+    };
+    assert!(seeding_at > before);
+    // A page under a downloading filter loses it, one under a seeding
+    // filter gains it: both read the queue's jobs, whose revision moved.
+    let seeding: Vec<JobId> = jobs
+        .list_jobs()
+        .into_iter()
+        .filter(|job| job.status == JobStatus::Seeding)
+        .map(|job| job.job_id)
+        .collect();
+    assert_eq!(seeding, [job_id]);
+    // Its row says so, and its follower is told.
+    let row = rig.service.snapshot().row(job_id).unwrap();
+    assert_eq!(row.view.state, TorrentState::Seeding);
+    loop {
+        let changes = follower.next().await;
+        assert!(!changes.full_update);
+        if changes
+            .torrents
+            .iter()
+            .any(|view| view.job_id == job_id && view.state == TorrentState::Seeding)
+        {
+            break;
+        }
+    }
+
+    // One gone and one come: the queue moves, and the follower hears the
+    // one it names that went.
+    let revision = jobs.job_revision();
+    let added = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("added", 9)))
+        })
+        .await
+        .unwrap();
+    rig.service.remove(other, false, true).await.unwrap();
+    loop {
+        job_changes.borrow_and_update();
+        // A removed torrent's job retires as cancelled: a page of paused
+        // jobs loses it.
+        let listed = jobs.list_jobs();
+        let status = |job_id| {
+            listed
+                .iter()
+                .find(|job| job.job_id == job_id)
+                .map(|job| job.status.clone())
+        };
+        let cancelled = JobStatus::Failed {
+            error: "cancelled".into(),
+        };
+        if status(other) == Some(cancelled) && status(added) == Some(JobStatus::Paused) {
+            break;
+        }
+        job_changes.changed().await.unwrap();
+    }
+    assert!(jobs.job_revision() > revision);
+    loop {
+        let changes = follower.next().await;
+        if changes.removed.contains(&other) {
+            break;
+        }
+    }
+
+    // The page's new ids: a follow of them starts from their rows as they
+    // stand, the seed whole in hand.
+    let mut fresh = rig
+        .service
+        .follow(Follow::Some([job_id, added].into()))
+        .unwrap();
+    let first = fresh.next().await;
+    assert!(first.full_update);
+    let ids: Vec<JobId> = first.torrents.iter().map(|view| view.job_id).collect();
+    assert_eq!(ids, [job_id, added]);
+    assert_eq!(first.torrents[0].state, TorrentState::Seeding);
+    assert_eq!(first.torrents[0].have_bytes, first.torrents[0].total_bytes);
+    assert_eq!(first.torrents[1].state, TorrentState::Paused);
     rig.service.stop().await;
 }
 

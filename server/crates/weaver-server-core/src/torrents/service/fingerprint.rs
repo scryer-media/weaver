@@ -23,6 +23,20 @@ impl TorrentView {
     /// A hash of the fields `parts` covers: two views with the same
     /// fingerprint read the same in those fields.
     pub fn fingerprint(&self, parts: ViewParts) -> u64 {
+        self.print(parts, true)
+    }
+
+    /// `fingerprint` of a list's row: the tags and the files left out. A
+    /// reader that keeps the tags beside it moves the print with them
+    /// itself, and one that reads the files' totals in place of the files
+    /// hashes those; so a view read with its files and one read without
+    /// print the same.
+    pub fn row_fingerprint(&self, parts: ViewParts) -> u64 {
+        self.print(parts, false)
+    }
+
+    // The print, with the tags and files when `whole`.
+    fn print(&self, parts: ViewParts, whole: bool) -> u64 {
         // Every field is named, so a new one is a compile error here until
         // it is put on one side or the other.
         let TorrentView {
@@ -166,8 +180,11 @@ impl TorrentView {
             unpack_override,
         )
             .hash(hasher);
-        (route, files, sequential, first_last_piece_first, file_have).hash(hasher);
-        (trackers, metadata, tags).hash(hasher);
+        (route, sequential, first_last_piece_first).hash(hasher);
+        (trackers, metadata).hash(hasher);
+        if whole {
+            (files, file_have, tags).hash(hasher);
+        }
         if parts == ViewParts::Whole {
             (active_seconds, seeding_seconds, consecutive_seeding_seconds).hash(hasher);
             (download_avg_bps, upload_avg_bps, reannounce_seconds).hash(hasher);
