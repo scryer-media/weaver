@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::operations::disk::beneath;
+
 // What a move of placed files does with a file already at its destination
 // (libtorrent `move_flags_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,7 @@ pub(crate) fn move_files(
     moves: &[(PathBuf, PathBuf)],
     existing: Existing,
 ) -> Result<Moved, Failed> {
+    confined(from, moves)?;
     match existing {
         Existing::Keep => move_files_using(
             from,
@@ -102,6 +105,59 @@ pub(crate) fn move_files(
             move_files_using(from, moves, existing, |from, to| std::fs::rename(from, to))
         }
     }
+}
+
+// Every file of `moves` stays inside its folder through the links on its
+// way, or nothing moves: a source that leads outside `from` (a link to a
+// file outside, or a linked folder above it), or a destination whose folder
+// leads outside the one it moves to. A move goes by path, so a file moved
+// through a link would leave, or a copy across devices would take in, bytes
+// not the torrent's. The destination's own name may be a link: a rename
+// takes the place of the link, never what it points at, and one kept is
+// read through the save folder's checks afterwards.
+//
+// Each move is `(from/name, to/name)`, so the folder it moves to is the
+// destination less as many parts as the name has. Each folder is resolved
+// once. A link swapped in after the look is not seen: a rename holds no
+// folder open (`beneath::resolves_inside`).
+fn confined(from: &Path, moves: &[(PathBuf, PathBuf)]) -> Result<(), MoveError> {
+    let refused = |path: &Path, root: &Path| MoveError {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} leads outside {} through a link, so the torrent was not moved",
+                path.display(),
+                root.display()
+            ),
+        ),
+    };
+    let mut inside: HashMap<PathBuf, bool> = HashMap::new();
+    let mut folder_inside = |root: &Path, folder: &Path| -> Result<bool, MoveError> {
+        if let Some(known) = inside.get(folder) {
+            return Ok(*known);
+        }
+        let found = folder == root
+            || beneath::resolves_inside(root, folder).map_err(MoveError::at(folder))?;
+        inside.insert(folder.to_path_buf(), found);
+        Ok(found)
+    };
+    for (source, target) in moves {
+        let Ok(name) = source.strip_prefix(from) else {
+            return Err(refused(source, from));
+        };
+        if !beneath::resolves_inside(from, source).map_err(MoveError::at(source))? {
+            return Err(refused(source, from));
+        }
+        let parts = name.components().count();
+        let (Some(to), Some(folder)) = (target.ancestors().nth(parts), target.parent()) else {
+            return Err(refused(target, target));
+        };
+        if !folder_inside(to, folder)? {
+            return Err(refused(target, to));
+        }
+    }
+    Ok(())
 }
 
 // What a move of files did, each file by its place in the list moved.
@@ -380,7 +436,7 @@ fn move_directory_using(
             });
         }
     }
-    if let Err(error) = copy_tree(from, to) {
+    if let Err(error) = copy_tree(from, from, to) {
         let _ = std::fs::remove_dir_all(to);
         let _ = std::fs::create_dir(to);
         return Err(error);
@@ -400,16 +456,37 @@ fn left_behind(path: &Path, removed: io::Result<()>) {
     }
 }
 
-// Copy the directory at `from`, as it is, to `to`, which need not exist.
-fn copy_tree(from: &Path, to: &Path) -> Result<(), MoveError> {
+// Copy the directory at `from`, as it is, to `to`, which need not exist. A
+// link in it is copied as what it points at, which must be inside `root`,
+// the folder moved: one that leads outside fails the move, so no bytes from
+// outside are taken in as the torrent's.
+fn copy_tree(root: &Path, from: &Path, to: &Path) -> Result<(), MoveError> {
     std::fs::create_dir_all(to).map_err(MoveError::at(to))?;
     for entry in std::fs::read_dir(from).map_err(MoveError::at(from))? {
         let entry = entry.map_err(MoveError::at(from))?;
         let source = entry.path();
         let target = to.join(entry.file_name());
-        let kind = entry.file_type().map_err(MoveError::at(&source))?;
+        let mut kind = entry.file_type().map_err(MoveError::at(&source))?;
+        if kind.is_symlink() {
+            if !beneath::resolves_inside(root, &source).map_err(MoveError::at(&source))? {
+                return Err(MoveError {
+                    path: source.clone(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{} leads outside {} through a link, so the torrent was not moved",
+                            source.display(),
+                            root.display()
+                        ),
+                    ),
+                });
+            }
+            kind = std::fs::metadata(&source)
+                .map_err(MoveError::at(&source))?
+                .file_type();
+        }
         if kind.is_dir() {
-            copy_tree(&source, &target)?;
+            copy_tree(root, &source, &target)?;
         } else {
             std::fs::copy(&source, &target).map_err(MoveError::at(&source))?;
         }
@@ -822,5 +899,97 @@ mod tests {
         assert_eq!(contents(&from), expected);
         assert!(to.is_dir());
         assert!(contents(&to).is_empty());
+    }
+
+    fn leads_outside(error: &MoveError) -> bool {
+        error.source.kind() == io::ErrorKind::InvalidInput
+            && error.source.to_string().contains("leads outside")
+    }
+
+    // A move of files through a link that leads out of either folder moves
+    // nothing: a file that is a link to one outside, a linked folder above a
+    // file, and a destination folder linked outside. Links that stay inside
+    // move as they always did.
+    #[cfg(unix)]
+    #[test]
+    fn a_move_through_a_link_that_leads_outside_moves_nothing() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let (from, to, away) = (
+            root.path().join("from"),
+            root.path().join("to"),
+            root.path().join("away"),
+        );
+        tree(&from);
+        std::fs::create_dir_all(&away).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(away.join("secret"), b"theirs").unwrap();
+        let expected = contents(&from);
+        let moves_of = |names: &[&str]| -> Vec<(PathBuf, PathBuf)> {
+            names
+                .iter()
+                .map(|name| (from.join(name), to.join(name)))
+                .collect()
+        };
+        for existing in [Existing::Keep, Existing::Replace] {
+            // A file of the torrent's that is a link to one outside.
+            symlink(away.join("secret"), from.join("linked.bin")).unwrap();
+            let failed = move_files(&from, &moves_of(&["a.bin", "linked.bin"]), existing)
+                .unwrap_err();
+            assert!(leads_outside(&failed.error), "{}", failed.error);
+            std::fs::remove_file(from.join("linked.bin")).unwrap();
+            // A folder of the torrent's linked outside.
+            symlink(&away, from.join("out")).unwrap();
+            let failed = move_files(&from, &moves_of(&["a.bin", "out/secret"]), existing)
+                .unwrap_err();
+            assert!(leads_outside(&failed.error), "{}", failed.error);
+            std::fs::remove_file(from.join("out")).unwrap();
+            // A folder at the new place linked outside.
+            symlink(&away, to.join("sub")).unwrap();
+            let failed =
+                move_files(&from, &moves_of(&["a.bin", "sub/b.bin"]), existing).unwrap_err();
+            assert!(leads_outside(&failed.error), "{}", failed.error);
+            std::fs::remove_file(to.join("sub")).unwrap();
+            assert_eq!(contents(&from), expected);
+            assert!(contents(&to).is_empty());
+            assert_eq!(contents(&away), vec![(PathBuf::from("secret"), b"theirs".to_vec())]);
+        }
+        // A folder at the new place linked to another inside it moves.
+        std::fs::create_dir_all(to.join("real")).unwrap();
+        symlink(to.join("real"), to.join("sub")).unwrap();
+        move_files(&from, &moves_of(&["a.bin", "sub/b.bin"]), Existing::Keep).unwrap();
+        assert_eq!(std::fs::read(to.join("real/b.bin")).unwrap(), b"bbbb");
+        assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), b"aaa");
+    }
+
+    // A folder copied across devices with a link in it to a file outside
+    // fails whole, nothing left at the new place; one to a file inside is
+    // copied as the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_copy_refuses_a_link_that_leads_outside() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let (from, to, away) = (
+            root.path().join("from"),
+            root.path().join("to"),
+            root.path().join("away"),
+        );
+        tree(&from);
+        std::fs::create_dir_all(&away).unwrap();
+        std::fs::write(away.join("secret"), b"theirs").unwrap();
+        let across = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::CrossesDevices));
+        symlink(away.join("secret"), from.join("sub/linked.bin")).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        let error = move_directory_using(&from, &to, across).unwrap_err();
+        assert!(leads_outside(&error), "{error}");
+        assert!(to.is_dir());
+        assert!(contents(&to).is_empty());
+        assert!(from.join("a.bin").exists());
+        std::fs::remove_file(from.join("sub/linked.bin")).unwrap();
+        symlink("../a.bin", from.join("sub/inside.bin")).unwrap();
+        move_directory_using(&from, &to, across).unwrap();
+        assert_eq!(std::fs::read(to.join("sub/inside.bin")).unwrap(), b"aaa");
+        assert!(!from.exists());
     }
 }

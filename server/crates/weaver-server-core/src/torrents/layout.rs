@@ -83,6 +83,11 @@ impl PieceLayout {
         self.piece_length
     }
 
+    // Every byte of the torrent, padding with it.
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+
     pub(crate) fn piece_count(&self) -> u32 {
         self.total.div_ceil(self.piece_length) as u32
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::StateError;
@@ -1084,6 +1085,57 @@ async fn insert_held_tx(tx: &mut SqlTx<'_>, id: i64, held: &[String]) -> Result<
     Ok(())
 }
 
+// A checkpoint's file times, in the transaction that writes its pieces:
+// `timed` (file, time) written over what was there, a row for each file of
+// `untimed` removed. Chunked under the bind limit, a statement per chunk,
+// never per file. A torrent gone meanwhile takes no row.
+async fn save_file_stamps(
+    tx: &mut SqlTx<'_>,
+    id: i64,
+    timed: &[(i64, i64)],
+    untimed: &[i64],
+) -> Result<(), StateError> {
+    // The torrent's id takes one bind of each statement.
+    let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 2)
+        .saturating_sub(1)
+        .max(1);
+    for chunk in timed.chunks(rows) {
+        let values = vec!["({}, {})"; chunk.len()].join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 2 + 1);
+        for (file, time) in chunk {
+            args.extend([SqlArg::I64(*file), SqlArg::I64(*time)]);
+        }
+        args.push(SqlArg::I64(id));
+        tx.execute(
+            &format!(
+                "WITH v (file, modified_ns) AS (VALUES {values}) \
+                 INSERT INTO torrent_file_stamps (job_id, file, modified_ns) \
+                 SELECT t.job_id, v.file, v.modified_ns FROM v, torrents t \
+                 WHERE t.job_id = {{}} \
+                 ON CONFLICT (job_id, file) DO UPDATE SET modified_ns = excluded.modified_ns"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 1)
+        .saturating_sub(1)
+        .max(1);
+    for chunk in untimed.chunks(rows) {
+        let placeholders = vec!["{}"; chunk.len()].join(", ");
+        let mut args = vec![SqlArg::I64(id)];
+        args.extend(chunk.iter().copied().map(SqlArg::I64));
+        tx.execute(
+            &format!(
+                "DELETE FROM torrent_file_stamps WHERE job_id = {{}} AND file IN ({placeholders})"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn stored(value: u64) -> Result<i64, StateError> {
     i64::try_from(value)
         .map_err(|_| StateError::Database(format!("{value} exceeds the database range")))
@@ -1490,28 +1542,39 @@ impl Database {
         })
     }
 
-    // The pieces the torrent has in its files, and its ledger and the peers
-    // and bans it begins with as they stood with them, each written only
-    // when given, in one transaction: a crash recovers the pieces and the
-    // counters of one moment.
+    // The pieces the torrent has in its files, the times of the files
+    // `stamps` names as taken with them, and its ledger and the peers and
+    // bans it begins with as they stood with them, each written only when
+    // given, in one transaction: a crash recovers the pieces, the times and
+    // the counters of one moment. A file with no usable time has its row
+    // removed, so the next start judges it by its size alone.
     pub(crate) fn save_torrent_checkpoint(
         &self,
         job_id: JobId,
         pieces: Option<&Kept>,
+        stamps: &[(u32, Option<i64>)],
         counters: Option<&TorrentCounters>,
         peers: Option<&ResumePeers>,
     ) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
         let resume = resume_update(job_id, counters, peers)?;
-        let pieces = pieces
-            .map(|kept| -> Result<_, StateError> {
-                Ok(vec![
-                    SqlArg::OptBytes(Some(kept.bits.clone())),
-                    SqlArg::Bool(kept.checking),
-                    SqlArg::I64(stored(job_id.0)?),
-                ])
-            })
-            .transpose()?;
-        if pieces.is_none() && resume.is_none() {
+        let pieces = pieces.map(|kept| {
+            vec![
+                SqlArg::OptBytes(Some(kept.bits.clone())),
+                SqlArg::Bool(kept.checking),
+                SqlArg::I64(id),
+            ]
+        });
+        let timed: Vec<(i64, i64)> = stamps
+            .iter()
+            .filter_map(|(file, time)| Some((i64::from(*file), (*time)?)))
+            .collect();
+        let untimed: Vec<i64> = stamps
+            .iter()
+            .filter(|(_, time)| time.is_none())
+            .map(|(file, _)| i64::from(*file))
+            .collect();
+        if pieces.is_none() && resume.is_none() && stamps.is_empty() {
             return Ok(());
         }
         let datastore = self.datastore();
@@ -1519,6 +1582,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "save_torrent_checkpoint", |tx| {
                 let pieces = pieces.clone();
                 let resume = resume.clone();
+                let (timed, untimed) = (timed.clone(), untimed.clone());
                 Box::pin(async move {
                     if let Some(args) = &pieces {
                         tx.execute(
@@ -1528,6 +1592,7 @@ impl Database {
                         )
                         .await?;
                     }
+                    save_file_stamps(tx, id, &timed, &untimed).await?;
                     if let Some((sql, args)) = &resume {
                         tx.execute(sql, args).await?;
                     }
@@ -1535,6 +1600,35 @@ impl Database {
                 })
             })
             .await
+        })
+    }
+
+    // Each file's time as [`Self::save_torrent_checkpoint`] last took it,
+    // by file, in one read by the table's key. A torrent's restore reads it
+    // only when it kept pieces; it holds a row per file at most.
+    pub(crate) fn torrent_file_stamps(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<u32, i64>, StateError> {
+        self.torrent_read();
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT file, modified_ns FROM torrent_file_stamps WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            let mut stamps = HashMap::with_capacity(rows.len());
+            for row in &rows {
+                // A row this build cannot place is no record: that file is
+                // judged by its size.
+                if let Ok(file) = u32::try_from(row.i64("file")?) {
+                    stamps.insert(file, row.i64("modified_ns")?);
+                }
+            }
+            Ok(stamps)
         })
     }
 
@@ -2369,6 +2463,7 @@ pub(crate) async fn counters_among(
                     counters: counters_from_row(row),
                     peers,
                     kept,
+                    stamps: Vec::new(),
                 },
             ))
         })
@@ -2380,4 +2475,7 @@ pub(crate) struct CountersRow {
     pub(crate) counters: Result<TorrentCounters, StateError>,
     pub(crate) peers: Result<ResumePeers, StateError>,
     pub(crate) kept: Result<Option<Kept>, StateError>,
+    // Each file's time as taken with the pieces, read apart from the row
+    // (`torrent_file_stamps`); none read, or none kept.
+    pub(crate) stamps: Vec<(u32, i64)>,
 }

@@ -40,8 +40,9 @@ use super::volume::{LoopWait, OWNERS, Reservation, Volume, WriterCounts};
 use super::volume_rate::RateSignal;
 
 // How a file that is not open is opened, made when it is not there, at the
-// length it is declared to reach when one is given.
-pub(crate) type OpenFn = fn(&Path, Option<u64>) -> io::Result<Opened>;
+// length it is declared to reach when one is given, and under the folder it
+// must not leave when one is given (`Create::within`).
+pub(crate) type OpenFn = fn(&Path, Option<u64>, Option<&Path>) -> io::Result<Opened>;
 
 // A file an `OpenFn` opened, and the length it left the file at when the
 // opener knows it without another call to the file system; `None` when it
@@ -78,6 +79,10 @@ pub(crate) struct Create {
     pub(crate) path: PathBuf,
     pub(crate) length: Option<u64>,
     pub(crate) open: OpenFn,
+    // The folder `path` lies under and must resolve inside, links and all,
+    // for an opener that holds it there (`super::beneath`); None for one
+    // whose path is its own.
+    pub(crate) within: Option<Arc<Path>>,
 }
 
 // Whoever writes through the volumes' writers: a caller obtains its
@@ -1984,7 +1989,7 @@ impl Held {
             // Timed, failed or not: an open on some systems stands behind
             // what the file system is writing out.
             let began = now();
-            let opened = (create.open)(&create.path, create.length);
+            let opened = (create.open)(&create.path, create.length, create.within.as_deref());
             let took = nanos_since(began);
             counts.opened(took);
             break_span();

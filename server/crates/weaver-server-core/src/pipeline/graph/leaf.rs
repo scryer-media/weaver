@@ -284,7 +284,7 @@ fn owned(bytes: &[u8]) -> Bytes {
 
 // Open the file at `path` for a volume's writer, as a leaf opens its own,
 // with the length it was left at when that is known.
-fn open_sized(path: &Path, length: Option<u64>) -> io::Result<Opened> {
+fn open_sized(path: &Path, length: Option<u64>, _: Option<&Path>) -> io::Result<Opened> {
     let began = std::time::Instant::now();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -420,6 +420,7 @@ impl Leaf {
             path: self.path.clone(),
             length,
             open: open_sized,
+            within: None,
         }
     }
 

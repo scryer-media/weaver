@@ -2534,3 +2534,154 @@ async fn a_page_keeps_whether_its_older_torrents_unpack() {
     }
     again.stop().await;
 }
+
+// A seed of two files, `set/a.bin` and `set/b.bin`, of `PIECES` pieces each,
+// found where they were placed and stopped: its checkpoint holds every
+// piece, and each file's time as it took them.
+const PIECES: usize = 8;
+
+struct StampedSeed {
+    rig: Rig,
+    job_id: JobId,
+    files: [std::path::PathBuf; 2],
+}
+
+async fn stamped_seed() -> StampedSeed {
+    let piece = 16_384;
+    let a: Vec<u8> = (0..(PIECES * piece) as u32)
+        .map(|at| (at % 251) as u8)
+        .collect();
+    let b: Vec<u8> = (0..(PIECES * piece) as u32)
+        .map(|at| (at % 241) as u8 ^ 0x5a)
+        .collect();
+    let metainfo = metainfo("set", &[("a.bin", &a), ("b.bin", &b)], piece, true);
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("stamped");
+    std::fs::create_dir_all(save.join("set")).unwrap();
+    let files = [save.join("set/a.bin"), save.join("set/b.bin")];
+    std::fs::write(&files[0], &a).unwrap();
+    std::fs::write(&files[1], &b).unwrap();
+    let (job_id, _) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            ..Placement::default()
+        },
+    )
+    .await;
+    rig.service.stop().await;
+    let stamps = rig.db.torrent_file_stamps(job_id).unwrap();
+    assert_eq!(stamps.len(), 2, "each file's time went with the pieces");
+    StampedSeed { rig, job_id, files }
+}
+
+// The file's bytes of its `piece`th piece turned over, its size kept.
+fn corrupt(path: &std::path::Path, piece: usize) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start((piece * 16_384) as u64)).unwrap();
+    file.write_all(&[0xa5; 64]).unwrap();
+}
+
+fn modified(path: &std::path::Path) -> std::time::SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+fn set_modified(path: &std::path::Path, at: std::time::SystemTime) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+// The seed restarted and through its check: its store's pieces, and the
+// reads its files took from the restart on.
+async fn restarted(seed: &StampedSeed) -> (TorrentService, u32, u64) {
+    let reads = crate::torrents::files::STATS.snapshot().reads.calls;
+    let again = service_on(
+        &seed.rig.db,
+        seed.rig.dir.path(),
+        &seed.rig.routes,
+        job_env(),
+        set_clock(),
+    );
+    again.open().await.unwrap();
+    again.tick().await;
+    again.restored().await;
+    handle_of(&again, seed.job_id)
+        .await
+        .wait_until_initialized()
+        .await
+        .unwrap();
+    let have = again.inner.live.lock().await[&seed.job_id]
+        .store
+        .as_ref()
+        .unwrap()
+        .count();
+    let read = crate::torrents::files::STATS.snapshot().reads.calls - reads;
+    (again, have, read)
+}
+
+// A file changed between runs, its size the same and its time new, is
+// checked again, and the pieces it no longer holds are dropped. The other
+// file, its bytes changed too but its time put back, is not checked: only
+// the changed file's pieces are read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_changed_between_runs_is_checked_again_and_its_bad_pieces_dropped() {
+    let seed = stamped_seed().await;
+    let [a, b] = &seed.files;
+    let a_was = modified(a);
+    corrupt(a, 1);
+    set_modified(a, a_was);
+    let b_was = modified(b);
+    corrupt(b, 2);
+    corrupt(b, 5);
+    set_modified(b, b_was + std::time::Duration::from_secs(10));
+
+    let (again, have, read) = restarted(&seed).await;
+    // b's two changed pieces gone; a's, its time as it was, kept.
+    assert_eq!(have, 2 * PIECES as u32 - 2);
+    assert!(read > 0, "the changed file's pieces were read");
+    let store = again.inner.live.lock().await[&seed.job_id]
+        .store
+        .clone()
+        .unwrap();
+    assert!(store.has(1), "a file whose time held was not read");
+    assert!(!store.has((PIECES + 2) as u32) && !store.has((PIECES + 5) as u32));
+    assert!(store.has(PIECES as u32));
+    again.stop().await;
+    // The check took the new time: the next restart checks nothing.
+    let stamps = seed.rig.db.torrent_file_stamps(seed.job_id).unwrap();
+    assert_eq!(
+        stamps.get(&1).copied(),
+        crate::torrents::files::stamp(Some(modified(b)))
+    );
+}
+
+// A torrent whose files are as it left them checks nothing and reads no byte
+// of them as it starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_untouched_torrent_checks_nothing_and_reads_nothing_at_restart() {
+    let seed = stamped_seed().await;
+    let (again, have, read) = restarted(&seed).await;
+    assert_eq!((have, read), (2 * PIECES as u32, 0));
+    again.stop().await;
+}
+
+// A file with no usable time is judged by its size alone: its bytes changed
+// and its time at the epoch, nothing is checked, and nothing read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_with_no_usable_time_is_judged_by_its_size() {
+    let seed = stamped_seed().await;
+    let b = &seed.files[1];
+    corrupt(b, 2);
+    set_modified(b, std::time::UNIX_EPOCH);
+    let (again, have, read) = restarted(&seed).await;
+    assert_eq!((have, read), (2 * PIECES as u32, 0));
+    again.stop().await;
+}

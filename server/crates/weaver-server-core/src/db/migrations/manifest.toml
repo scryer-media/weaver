@@ -1833,3 +1833,20 @@ kind = "sql"
 file = "migrations/0128_tracker_rule_transports/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 129
+description = "a torrent's checkpoint keeps each file's modified time"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0129_torrent_file_stamps/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0129_torrent_file_stamps/postgres.sql"
+engine = "postgres"
+scope = "all"

@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use bytes::Bytes;
 use tokio::sync::Notify;
 
-use super::{Done, Paid, TorrentDisk, VolumeRoom, Writes};
+use super::{Done, Paid, Place, TorrentDisk, VolumeRoom, Writes};
 
 // A torrent's writes to files under `dir`, through writers of their own,
 // on a volume with room for two pieces of eight, less the share its
@@ -49,7 +49,10 @@ fn queue_piece(writes: &Writes, paid: Paid, path: &Path, done: Done) -> mpsc::Re
         panic!("paid on another volume");
     };
     writes.queue_paying(paying, move |batch| {
-        batch.write(0, 0, Bytes::from_static(b"abcdefgh"), || path);
+        batch.write(0, 0, Bytes::from_static(b"abcdefgh"), || Place {
+            within: path.parent().unwrap_or(Path::new("")).to_path_buf(),
+            path,
+        });
         batch.then(done, move |done| {
             let _ = seen.send(volume.unwritten_bytes());
             done(Ok(()));
@@ -194,4 +197,61 @@ fn torrents_on_one_volume_share_its_read_turns() {
     let volume = one.volume();
     let reads = volume.reads(|| unreachable!("the kind is decided once"));
     assert!(Arc::ptr_eq(reads.turns(), a.semaphore()));
+}
+
+// A piece's bytes written to `name` under the save folder `save`, and what
+// the write came to.
+fn write_under(writes: &Writes, save: &Path, name: &str) -> anyhow::Result<()> {
+    let (done, heard) = told();
+    let place = Place {
+        path: save.join(name),
+        within: save.to_path_buf(),
+    };
+    writes.queue(move |batch| {
+        batch.write(0, 0, Bytes::from_static(b"ours"), || place);
+        batch.then(done, |done| done(Ok(())));
+    });
+    heard.recv().unwrap()
+}
+
+// A torrent's file is never written through a link that leads out of its
+// save folder: a link to a file outside, a link to a folder outside, and a
+// link in the middle of the name. The write fails the piece, says why, and
+// nothing outside is made or changed; a file made whole is refused the
+// same. Links that stay inside are written through.
+#[cfg(unix)]
+#[test]
+fn a_write_through_a_link_that_leads_outside_is_refused() {
+    use std::os::unix::fs::symlink;
+    let top = tempfile::tempdir().unwrap();
+    let (save, away) = (top.path().join("save"), top.path().join("away"));
+    std::fs::create_dir_all(save.join("mid")).unwrap();
+    std::fs::create_dir_all(away.join("deep")).unwrap();
+    std::fs::write(away.join("secret"), b"theirs").unwrap();
+    symlink(away.join("secret"), save.join("file.bin")).unwrap();
+    symlink(&away, save.join("dir")).unwrap();
+    symlink(&away, save.join("mid/link")).unwrap();
+    let writes = TorrentDisk::alone().writes(1, &save);
+    for name in ["file.bin", "dir/payload.bin", "mid/link/deep/payload.bin"] {
+        let refused = write_under(&writes, &save, name).unwrap_err();
+        assert!(format!("{refused:#}").contains("leads outside"), "{name}: {refused:#}");
+        let grown = writes
+            .grow(
+                Place {
+                    path: save.join(name),
+                    within: save.clone(),
+                },
+                4,
+            )
+            .unwrap_err();
+        assert!(grown.to_string().contains("leads outside"), "{name}: {grown}");
+    }
+    assert_eq!(std::fs::read(away.join("secret")).unwrap(), b"theirs");
+    assert!(!away.join("payload.bin").exists());
+    assert!(!away.join("deep/payload.bin").exists());
+
+    std::fs::create_dir_all(save.join("real")).unwrap();
+    symlink("real", save.join("in")).unwrap();
+    write_under(&writes, &save, "in/inside.bin").unwrap();
+    assert_eq!(std::fs::read(save.join("real/inside.bin")).unwrap(), b"ours");
 }

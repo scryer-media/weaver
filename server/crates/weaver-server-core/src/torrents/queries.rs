@@ -932,7 +932,7 @@ impl Database {
                 let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
                 let among = binds(chunk.len());
                 #[cfg(test)]
-                reads.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+                reads.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
                 let rows = SqlRuntime::fetch_all(
                     datastore.read_exec(),
                     &format!(
@@ -960,6 +960,31 @@ impl Database {
                 {
                     if let Some(&index) = at.get(&job_id.0) {
                         restored[index].counters = Some(row);
+                    }
+                }
+                // Each file's time as taken with the pieces, in one read of
+                // the page by the table's key; a row that does not read is
+                // that file's alone, judged by its size.
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, file, modified_ns FROM torrent_file_stamps \
+                          WHERE job_id IN ({among})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in &rows {
+                    let Some(&index) = at.get(&count(row, "job_id")?) else {
+                        continue;
+                    };
+                    let (Ok(file), Ok(time)) = (row.i64("file"), row.i64("modified_ns")) else {
+                        continue;
+                    };
+                    if let (Ok(file), Some(counters)) =
+                        (u32::try_from(file), restored[index].counters.as_mut())
+                    {
+                        counters.stamps.push((file, time));
                     }
                 }
                 let rows = SqlRuntime::fetch_all(
