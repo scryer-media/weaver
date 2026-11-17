@@ -108,9 +108,9 @@ const blockedBy = (windowEndsAtEpochMs: number | null): NextData => ({
   },
   queue: {} as NextData["queue"], categories: [], refreshCategories: () => {}, historyCount: 0, refreshHistoryCount: () => {},
   providers: [], providersLoaded: true, holdoffs: [], connection: { status: "connected", isDisconnected: false, isPolling: false },
-  torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false, windDown: null },
+  torrents: "on", torrentPresence: { available: true, enabled: true, jobs: false, running: false, windingDown: false, windDown: null },
 });
-const torrentsOn = { torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false, windDown: null } } as NextData;
+const torrentsOn = { torrents: "on", torrentPresence: { available: true, enabled: true, jobs: false, running: false, windingDown: false, windDown: null } } as NextData;
 
 const query = new URLSearchParams(location.search);
 const screen = query.get("screen") ?? "egress";

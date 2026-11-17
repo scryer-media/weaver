@@ -28,8 +28,11 @@ const save = (page) => page.evaluate(() => window.torrentsOffFixture.actions.cur
 const sentCount = (page, name, count) =>
   page.waitForFunction(([name, count]) => window.torrentsOffFixture.sent.filter((entry) => entry.name === name).length >= count, [name, count]);
 
-test("with torrents off and none left, Downloads says nothing of torrents", async () => {
-  const { page, errors } = await open("downloads", "off");
+for (const [presence, title] of [
+  ["off", "with torrents off and none left"],
+  ["unavailable", "on a server without torrents, whatever is saved"],
+]) test(`${title}, Downloads says nothing of torrents`, async () => {
+  const { page, errors } = await open("downloads", presence);
   const empty = page.getByTestId("queue-empty");
   await empty.waitFor();
   await empty.getByText("Add an NZB, or drop one anywhere on this list.", { exact: true }).waitFor();

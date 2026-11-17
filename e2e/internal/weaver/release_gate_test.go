@@ -557,6 +557,19 @@ func TestWeaverComposeAllowsPrivateRSSByDefault(t *testing.T) {
 	}
 }
 
+// Torrents are off unless the server is started with WEAVER_TORRENTS; the
+// torrent lanes run on this Compose service, so it gives the variable.
+func TestWeaverComposeMakesTorrentsAvailable(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "docker-compose.yml"))
+	if err != nil {
+		t.Fatalf("read docker compose file: %v", err)
+	}
+	const mapping = `WEAVER_TORRENTS: "${E2E_WEAVER_TORRENTS:-1}"`
+	if !strings.Contains(string(body), mapping) {
+		t.Fatalf("Weaver Compose torrent opt-in is missing %q", mapping)
+	}
+}
+
 func TestWeaverComposeDeclaresIsolatedBrowserTrust(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "docker-compose.yml"))
 	if err != nil {

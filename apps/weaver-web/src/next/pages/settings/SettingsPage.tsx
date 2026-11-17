@@ -8,24 +8,39 @@ import { PasswordManagersKeptOut } from "@/lib/password-manager";
 import { NextShell } from "../../shell/NextShell";
 import { PanelListBlock } from "../../shell/rail-blocks";
 import { useNextDataSelector } from "../../data/next-data";
+import { torrentsAvailable, torrentsAvailableView } from "../../data/torrents-shown";
+import { useTorrentsState } from "../../data/use-torrents-shown";
 import { BetaTag, EmptyState } from "../../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
 import { SettingsPanelScope, SettingsShellProvider, type PanelFlags } from "./framework";
-import { findPanel, panelSearchTitle, SETTINGS_PANELS, settingsRail, type PanelDefinition } from "./panels";
+import {
+  findPanel,
+  isTorrentOnlyPanel,
+  panelSearchTitle,
+  settingsPanels,
+  settingsRail,
+  type PanelDefinition,
+} from "./panels";
 import { SearchRegistry, searchOutcome } from "./search";
 import { settingsIds } from "@/next/testids";
-
-const PANEL_SLUGS = SETTINGS_PANELS.map((entry) => entry.slug);
 
 /**
  * The search's answer when no panel has a match: still loading, or nothing.
  * The matches themselves draw under each panel's heading.
  */
-function SearchOutcomeState({ search, registry }: { search: string; registry: SearchRegistry }) {
+function SearchOutcomeState({
+  search,
+  registry,
+  slugs,
+}: {
+  search: string;
+  registry: SearchRegistry;
+  slugs: readonly string[];
+}) {
   const t = useTranslate();
   const state = useSyncExternalStore(
     registry.subscribe,
-    () => searchOutcome(PANEL_SLUGS, (slug) => registry.panel(slug)).state,
+    () => searchOutcome(slugs, (slug) => registry.panel(slug)).state,
   );
   if (state === "loading") {
     return <EmptyState loading title={t("next.common.loading")} body={t("next.settings.searchLoadingBody")} />;
@@ -97,7 +112,16 @@ export function SettingsPage() {
   const t = useTranslate();
   const { panel: root, "*": nested } = useParams();
   const slug = nested ? `${root}/${nested}` : root;
-  const panel = findPanel(slug);
+  // The panels there are: without the torrents' own on a server that has no
+  // torrents, where its address is one no panel answers.
+  const torrents = useTorrentsState();
+  const panels = useMemo(() => settingsPanels(torrentsAvailable(torrents)), [torrents]);
+  const slugs = useMemo(() => panels.map((entry) => entry.slug), [panels]);
+  const panel = findPanel(slug, panels);
+  // A direct visit to the torrents' own panel waits, drawing nothing, for the
+  // server's answer instead of saying there is no such panel and then
+  // drawing it.
+  const awaited = !panel && isTorrentOnlyPanel(slug) && torrentsAvailableView(torrents, false, false, true);
   const serverCount = useNextDataSelector((data) => data.providers.length);
 
   const [search, setSearch] = useState("");
@@ -119,7 +143,7 @@ export function SettingsPage() {
     );
   }, []);
 
-  const railItems = useMemo(() => settingsRail(t, serverCount), [serverCount, t]);
+  const railItems = useMemo(() => settingsRail(t, serverCount, panels), [panels, serverCount, t]);
 
   const statusRight =
     flags.status ?? (flags.dirty ? t("next.settings.unsaved") : t("next.settings.allSaved"));
@@ -132,7 +156,7 @@ export function SettingsPage() {
   // A query searches every panel, so every panel mounts to answer it; without
   // one only the open panel does.
   const searching = search.trim() !== "";
-  const mounted = searching ? SETTINGS_PANELS : panel ? [panel] : [];
+  const mounted = searching ? panels : panel ? [panel] : [];
 
   return (
     <NextShell
@@ -208,8 +232,8 @@ export function SettingsPage() {
               title={panelSearchTitle(t, entry)}
             />
           ))}
-          {searching ? <SearchOutcomeState search={search.trim()} registry={registry} /> : null}
-          {!searching && !panel ? (
+          {searching ? <SearchOutcomeState search={search.trim()} registry={registry} slugs={slugs} /> : null}
+          {!searching && !panel && !awaited ? (
             <EmptyState
               title={t("next.settings.noPanel")}
               body={t("next.settings.noPanelBody")}

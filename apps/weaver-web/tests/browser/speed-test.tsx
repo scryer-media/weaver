@@ -288,7 +288,7 @@ const live = {
   speed: query.has("gauge") ? 12 * 1024 * 1024 : 0,
   queue,
   torrents: "on",
-  torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false, windDown: null },
+  torrentPresence: { available: true, enabled: true, jobs: false, running: false, windingDown: false, windDown: null },
 } as NextData;
 const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"), registry: new SearchRegistry() };
 createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter initialEntries={[query.has("routes") ? "/settings/networking/routes" : "/settings/networking/speed?consumer=server:1"]}><SettingsShellProvider {...shell}><NextDataContext.Provider value={live}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

@@ -17,7 +17,7 @@ before(async () => {
     plugins: [{ name: "record-identity-fixture", enforce: "pre", load(id) {
       // Keep the actual pages and urql hooks; omit unrelated application chrome.
       // Torrents on, so the pages show their torrent parts as they did before those parts asked.
-      if (id.endsWith("/next/data/next-data.tsx")) return 'const data = { connection: { isDisconnected: false }, torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false, windDown: null } }; export const useNextData = () => data; export const useNextDataSelector = (select) => select(data);';
+      if (id.endsWith("/next/data/next-data.tsx")) return 'const data = { connection: { isDisconnected: false }, torrents: "on", torrentPresence: { available: true, enabled: true, jobs: false, running: false, windingDown: false, windDown: null } }; export const useNextData = () => data; export const useNextDataSelector = (select) => select(data);';
       if (id.endsWith("/next/shell/NextShell.tsx")) return 'export const NextShell = ({header, controls, children}) => <main>{header}{controls}{children}</main>; export const RailBlock = ({children}) => <aside>{children}</aside>;';
       if (process.env.RECORD_IDENTITY_BASELINE && id.includes("/src/")) {
         const relative = id.slice(id.indexOf("/src/") + 1);
