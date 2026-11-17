@@ -88,6 +88,7 @@ fn park_indefinite_infrastructure_retry(pipeline: &mut Pipeline, job_id: JobId) 
         crate::pipeline::RetryWork {
             scheduled_pool_generation,
             infrastructure_retry: true,
+            hold: crate::pipeline::RetryHold::Ordinary,
             work,
         },
     );
@@ -1975,4 +1976,256 @@ async fn a_stall_under_soft_byte_pressure_is_still_reported() {
     let heard = lines.take();
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(field(&heard[0], "job_id"), Some("40017"), "{}", heard[0]);
+}
+
+// A stalled job whose queued articles server 0 lacks, leaving server 1, which
+// is quarantined for transport, as the only server for them. Each minute,
+// as the pool's recovery backoff (60 s at most) allows, server 1's probe
+// comes due, takes the job's highest-priority article from the scheduler,
+// fails with `kind`, and the server is quarantined again. Server 0 stays
+// healthy, so a server is always there to dispatch to. Time is the paused
+// tokio clock, and a pass runs at each instant the loop would wake for: a
+// probe's failure handled, and each parked retry coming due. Stops at the
+// release or after twenty minutes, past both windows. Returns the job's
+// articles booked missing and a line per pass on what the watch did.
+async fn a_probe_fails_every_minute(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    kind: DownloadFailureKind,
+) -> (u64, Vec<String>) {
+    use crate::pipeline::download::scheduler::Handout;
+
+    insert_stalled_job(pipeline, job, 4).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    for work in &mut works {
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
+    }
+    for work in works {
+        queue.push(work);
+    }
+    let pool = Arc::clone(pipeline.nntp.pool());
+    pool.quarantine_for_transport_for_test(1);
+    let not_found_before = pipeline.metrics.articles_not_found.load(Ordering::Relaxed);
+
+    let t0 = tokio::time::Instant::now();
+    let rel = |at: Instant| -> String {
+        let t0 = t0.into_std();
+        if at >= t0 {
+            format!("{}s", (at - t0).as_secs_f64())
+        } else {
+            format!("-{}s", (t0 - at).as_secs_f64())
+        }
+    };
+    let end = t0 + Duration::from_secs(20 * 60);
+    let mut next_probe = t0;
+    let mut trace = Vec::new();
+    loop {
+        let next_retry = pipeline.infrastructure_retries.next_deadline();
+        let next = next_retry.map_or(next_probe, |retry| retry.min(next_probe));
+        if next > end {
+            break;
+        }
+        tokio::time::advance(next.saturating_duration_since(tokio::time::Instant::now())).await;
+        let now = tokio::time::Instant::now();
+        let mut event = Vec::new();
+        let due = pipeline.infrastructure_retries.take_due(now);
+        if !due.is_empty() {
+            event.push(format!("{} retries due", due.len()));
+        }
+        for retry in due {
+            pipeline.receive_retry_work(retry);
+        }
+        if now >= next_probe {
+            next_probe += Duration::from_secs(60);
+            pool.expire_quarantine_for_test(1);
+            let pressure = pipeline.refresh_download_pressure();
+            let works = match pipeline.next_works(1, 1, None, pressure) {
+                Handout::Works(works) => works,
+                _ => Vec::new(),
+            };
+            let probe = pool.take_recovery_probe_for_test(1);
+            for work in works {
+                event.push(format!("probe fails {}", work.segment_id.segment_number));
+                let (segment_id, retry_count, exclude_servers) =
+                    (work.segment_id, work.retry_count, work.exclude_servers);
+                pipeline.hold_test_lane_works(vec![work], false);
+                pipeline
+                    .handle_download_done(DownloadResult {
+                        lane_id: 0,
+                        job_id: job,
+                        runtime_generation: pipeline.pool_generation,
+                        segment_id,
+                        data: Err(DownloadError::fetch(kind, "probe failed")),
+                        attempts: Vec::new(),
+                        lane_observation: None,
+                        source_server_idx: Some(1),
+                        origin: DownloadResultOrigin::NormalPrimary,
+                        retry_count,
+                        exclude_servers,
+                        release_connection_slot: true,
+                    })
+                    .await;
+            }
+            drop(probe);
+            pool.quarantine_for_transport_for_test(1);
+        }
+        pipeline.dispatch_downloads_at(now.into_std());
+        let parked: Vec<String> = pipeline
+            .infrastructure_retries
+            .iter_with_deadlines()
+            .map(|(deadline, retry)| {
+                format!(
+                    "{}@{}",
+                    retry.work.segment_id.segment_number,
+                    deadline.map_or("none".into(), |at| rel(at.into_std()))
+                )
+            })
+            .collect();
+        let watch = pipeline.download_dispatch_stall.as_ref().map(|watch| {
+            format!(
+                "since {} kicked {:?}",
+                rel(watch.since),
+                watch.kick.as_ref().map(|(at, _)| rel(*at))
+            )
+        });
+        trace.push(format!(
+            "t={} [{}] watch={:?} explained={:?} parked={parked:?} servers={:?} kicks={} releases={}",
+            rel(now.into_std()),
+            event.join(", "),
+            watch,
+            pipeline
+                .earliest_explained_dispatch_wait(now.into_std())
+                .map(rel),
+            pipeline
+                .nntp
+                .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
+                .map(|order| order.len()),
+            kicks(pipeline),
+            releases(pipeline),
+        ));
+        if releases(pipeline) > 0 {
+            break;
+        }
+    }
+    (
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed) - not_found_before,
+        trace,
+    )
+}
+
+// The probe fails on an established connection, so an article whose probe
+// keeps failing has its retry held past the recovery backoff. The comment on
+// the watchdog's outage branch promises that a stalled job whose articles
+// only a cooled-down server holds still escalates while another server is
+// available: kicked, then released with its queued articles booked missing.
+#[tokio::test(start_paused = true)]
+async fn a_job_only_a_quarantined_server_could_serve_escalates_while_its_probe_fails_on_the_connection()
+ {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41940);
+    let (booked, trace) = a_probe_fails_every_minute(
+        &mut pipeline,
+        job,
+        DownloadFailureKind::EstablishedTransport,
+    )
+    .await;
+    let trace = trace.join("\n");
+    assert_eq!(kicks(&pipeline), 1, "kicked once:\n{trace}");
+    assert_eq!(releases(&pipeline), 1, "released:\n{trace}");
+    assert!(booked > 0, "queued articles booked missing:\n{trace}");
+    assert_eq!(
+        pipeline.jobs[&job]
+            .articles
+            .active()
+            .map_or(0, |active| active.download_queue.len()),
+        0,
+        "{trace}"
+    );
+}
+
+// As above, with the probe failing at the dial: its article's retry waits
+// one second.
+#[tokio::test(start_paused = true)]
+async fn a_job_only_a_quarantined_server_could_serve_escalates_while_its_probe_fails_to_dial() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41941);
+    let (booked, trace) = a_probe_fails_every_minute(
+        &mut pipeline,
+        job,
+        DownloadFailureKind::ConnectionEstablishment,
+    )
+    .await;
+    let trace = trace.join("\n");
+    assert_eq!(kicks(&pipeline), 1, "kicked once:\n{trace}");
+    assert_eq!(releases(&pipeline), 1, "released:\n{trace}");
+    assert!(booked > 0, "queued articles booked missing:\n{trace}");
+    assert_eq!(
+        pipeline.jobs[&job]
+            .articles
+            .active()
+            .map_or(0, |active| active.download_queue.len()),
+        0,
+        "{trace}"
+    );
+}
+
+// A timed infrastructure retry of one of a stalled job's articles explains
+// the job's stall until its deadline; the same retry held for a quarantined
+// server's probe explains nothing.
+#[tokio::test]
+async fn a_timed_retry_explains_its_jobs_stall_and_a_probe_hold_does_not() {
+    for (hold, explains) in [
+        (crate::pipeline::RetryHold::Ordinary, true),
+        (crate::pipeline::RetryHold::ProbeHold, false),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut pipeline = stalled_pipeline(&temp_dir).await;
+        let job_id = JobId(40020);
+        insert_stalled_job(&mut pipeline, job_id, 3).await;
+        let work = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .extract_matching(|work| work.segment_id.segment_number == 0)
+            .pop()
+            .expect("segment 0 is queued");
+        let work = pipeline.dispatched(work);
+        pipeline.note_retry_scheduled(work.segment_id);
+        let scheduled_pool_generation = pipeline.pool_generation;
+        pipeline.schedule_infrastructure_retry(
+            Some(Duration::from_secs(90)),
+            crate::pipeline::RetryWork {
+                scheduled_pool_generation,
+                infrastructure_retry: true,
+                hold,
+                work,
+            },
+        );
+        let deadline = pipeline
+            .infrastructure_retries
+            .next_deadline()
+            .expect("the retry is parked with a deadline")
+            .into_std();
+        let now = Instant::now();
+        assert!(deadline > now);
+        assert_eq!(
+            pipeline.earliest_explained_dispatch_wait(now),
+            explains.then_some(deadline),
+            "{hold:?}"
+        );
+    }
 }

@@ -372,6 +372,7 @@ impl Pipeline {
                         .send(crate::pipeline::RetryWork {
                             scheduled_pool_generation,
                             infrastructure_retry: false,
+                            hold: crate::pipeline::RetryHold::Ordinary,
                             work,
                         })
                         .await;

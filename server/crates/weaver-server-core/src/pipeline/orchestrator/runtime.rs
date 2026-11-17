@@ -1847,6 +1847,7 @@ impl Pipeline {
         let crate::pipeline::RetryWork {
             scheduled_pool_generation,
             infrastructure_retry,
+            hold: _,
             mut work,
         } = retry;
         let egress_parked = self.egress_quota_parked.remove(&work.segment_id).is_some();
