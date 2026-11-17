@@ -351,11 +351,8 @@ async fn a_forced_torrent_seeds_past_its_goal() {
     assert_eq!(intent(&rig), TorrentIntent::Stopped);
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(
-        (view.state, view.detail.as_deref()),
-        (
-            TorrentState::Stopped,
-            Some(status::Stated::GoalMet.as_str())
-        )
+        (view.state, view.stated, view.detail.as_deref()),
+        (TorrentState::Stopped, Some(status::Stated::GoalMet), None)
     );
 }
 
@@ -404,11 +401,15 @@ async fn the_global_pause_reaches_the_torrents() {
         let service = rig.service.clone();
         async move {
             let view = service.torrent(job_id).await.unwrap();
-            (view.state, view.detail)
+            (view.state, view.stated)
         }
     };
-    let held =
-        |job_id| async move { matches!(state(job_id).await, (TorrentState::Queued, Some(_))) };
+    let held = |job_id| async move {
+        matches!(
+            state(job_id).await,
+            (TorrentState::Queued, Some(status::Stated::Held(_)))
+        )
+    };
     let scheduled = |scope, owner| Hold {
         origin: HoldOrigin::Scheduled,
         scope,
@@ -420,9 +421,15 @@ async fn the_global_pause_reaches_the_torrents() {
             vec![scheduled(HoldScope::Everything, HoldOwner::All)],
             (true, true),
         ),
-        (vec![Hold::manual(HoldOwner::Torrents)], (true, true)),
         (
-            vec![scheduled(HoldScope::Everything, HoldOwner::Torrents)],
+            vec![Hold::manual(HoldOwner::Class(crate::torrents::CLASS))],
+            (true, true),
+        ),
+        (
+            vec![scheduled(
+                HoldScope::Everything,
+                HoldOwner::Class(crate::torrents::CLASS),
+            )],
             (true, true),
         ),
         (vec![], (false, false)),
@@ -536,7 +543,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
     let schedule = Hold {
         origin: HoldOrigin::Scheduled,
         scope: HoldScope::Everything,
-        owner: HoldOwner::Torrents,
+        owner: HoldOwner::Class(crate::torrents::CLASS),
     };
     // Subscribed before the first look, so the publish that follows the
     // change wakes it.
@@ -550,7 +557,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         }
     };
 
-    for owner in [HoldOwner::Torrents, HoldOwner::All] {
+    for owner in [HoldOwner::Class(crate::torrents::CLASS), HoldOwner::All] {
         hold(Hold { owner, ..schedule });
         wait(plain, Some(HoldOrigin::Scheduled)).await;
         assert_eq!(paused_by(&rig.service, kept).await, None);
@@ -588,7 +595,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
     wait(plain, None).await;
     complete(kept, Some(EPOCH_MS)).await;
 
-    hold(Hold::manual(HoldOwner::Torrents));
+    hold(Hold::manual(HoldOwner::Class(crate::torrents::CLASS)));
     wait(kept, Some(HoldOrigin::Manual)).await;
     assert_eq!(
         paused_by(&rig.service, plain).await,
@@ -1036,4 +1043,418 @@ async fn a_pause_racing_completion_keeps_the_completion() {
     let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
     assert_eq!(stored.intent(), TorrentIntent::Resumed);
     assert_eq!(stored.completed_at_ms, Some(EPOCH_MS));
+}
+
+// A client that failed to start is never seated: every torrent intake is
+// refused as the registry's "not running", as though no client were there,
+// and one that starts is seated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_fails_to_start_is_not_seated_as_the_torrent_class() {
+    use crate::ingest::Kind;
+    use crate::jobs::{AddRefusal, RefusalReason};
+    use crate::persistence::sql_runtime::SqlRuntime;
+
+    let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_owned();
+    let kinds = [Kind::Metainfo, Kind::Magnet(magnet)];
+
+    let rig = rig(set_clock());
+    let queue = queue();
+    let state = queue.state().clone();
+    let store = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&store, "missing_tracker_rules_fixture", |tx| {
+                Box::pin(async move {
+                    tx.execute("DROP TABLE tracker_rules", &[]).await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .unwrap();
+    rig.service.wire_to(queue);
+    assert!(rig.service.start_seated().await.is_err());
+    assert!(state.classes().get(Protocol::Torrent).is_none());
+    for kind in &kinds {
+        let refusal = match state.classes().route(kind) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("{kind:?} was taken by a client that did not start"),
+        };
+        assert_eq!(refusal, AddRefusal::not_running(Protocol::Torrent));
+        assert_eq!(refusal.reason, RefusalReason::NotRunning);
+    }
+
+    let started = super::rig(set_clock());
+    let queue = super::queue();
+    let state = queue.state().clone();
+    started.service.wire_to(queue);
+    started.service.start_seated().await.unwrap();
+    assert!(state.classes().get(Protocol::Torrent).is_some());
+    for kind in &kinds {
+        assert!(
+            matches!(
+                state.classes().route(kind),
+                Ok(crate::jobs::Route::Class(_))
+            ),
+            "{kind:?}"
+        );
+    }
+}
+
+// A batch of actions on torrents is one unit: one change to the published
+// queue for a run of pauses or resumes where one at a time made one each,
+// and the same results and the same rows as those one at a time. A move
+// changes no published job, so its one publish is not counted here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_of_torrent_actions_ends_as_the_same_actions_one_at_a_time() {
+    use crate::jobs::handle::{CancellationOrigin, QueueAction, QueueMoveTarget};
+
+    async fn seeded() -> (Rig, SchedulerHandle, Vec<JobId>) {
+        let rig = rig(set_clock());
+        // No session is built while the route is down.
+        rig.routes.set_down(Some("down"));
+        let queue = queue();
+        rig.service.publish_to(queue.clone());
+        rig.service.open().await.unwrap();
+        let mut ids = Vec::new();
+        for seed in 1..=5 {
+            ids.push(
+                rig.service
+                    .add_opened(request(AddSource::Metainfo(plain(
+                        &format!("set{seed}"),
+                        seed,
+                    ))))
+                    .await
+                    .unwrap(),
+            );
+        }
+        (rig, queue, ids)
+    }
+    let rows = |rig: &Rig, ids: &[JobId]| {
+        ids.iter()
+            .map(|id| {
+                rig.db.get_torrent(*id).unwrap().map(|record| {
+                    (
+                        record.intent(),
+                        record.category_id,
+                        record.forced,
+                        record.queue_position,
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let (batched, batched_queue, ids) = seeded().await;
+    let (single, single_queue, single_ids) = seeded().await;
+    assert_eq!(ids, single_ids);
+    let [a, b, c, d, e] = ids[..] else {
+        unreachable!()
+    };
+    let missing = JobId(9_999);
+    let update = |category: FieldUpdate<String>, priority: &str| {
+        QueueAction::Update(JobUpdate {
+            category,
+            metadata: FieldUpdate::Set(vec![("priority".into(), priority.into())]),
+            ..JobUpdate::default()
+        })
+    };
+    // Each step's actions, and how many changes one at a time makes to the
+    // published queue when it is counted.
+    type Step = (Vec<(JobId, QueueAction)>, Option<u64>);
+    let steps: Vec<Step> = vec![
+        (
+            vec![
+                (a, QueueAction::Pause),
+                (b, QueueAction::Pause),
+                (missing, QueueAction::Pause),
+                (c, QueueAction::Pause),
+            ],
+            Some(3),
+        ),
+        (
+            vec![
+                (a, QueueAction::Resume),
+                (missing, QueueAction::Resume),
+                (b, QueueAction::Resume),
+            ],
+            Some(2),
+        ),
+        (
+            vec![
+                (a, update(FieldUpdate::Set("tv".into()), "HIGH")),
+                (
+                    b,
+                    QueueAction::Update(JobUpdate {
+                        name: Some("other".into()),
+                        ..JobUpdate::default()
+                    }),
+                ),
+                (c, update(FieldUpdate::Set("nope".into()), "HIGH")),
+                (d, update(FieldUpdate::Clear, "HIGH")),
+                (missing, update(FieldUpdate::Unchanged, "HIGH")),
+            ],
+            None,
+        ),
+        (
+            vec![
+                (c, QueueAction::Move(QueueMoveTarget::Top)),
+                (a, QueueAction::Move(QueueMoveTarget::Offset(1))),
+                (e, QueueAction::Move(QueueMoveTarget::Bottom)),
+                (b, QueueAction::Move(QueueMoveTarget::Offset(-1))),
+            ],
+            None,
+        ),
+        // A move of a torrent not found ends the moves after it.
+        (
+            vec![
+                (d, QueueAction::Move(QueueMoveTarget::Top)),
+                (missing, QueueAction::Move(QueueMoveTarget::Top)),
+                (a, QueueAction::Move(QueueMoveTarget::Top)),
+            ],
+            None,
+        ),
+        (
+            vec![
+                (a, QueueAction::Cancel(CancellationOrigin::User)),
+                (missing, QueueAction::Cancel(CancellationOrigin::User)),
+                (b, QueueAction::Cancel(CancellationOrigin::UserKeepingFiles)),
+            ],
+            None,
+        ),
+    ];
+    let class = batched.service.class();
+    for (actions, singles_published) in steps {
+        let before = (batched_queue.job_revision(), single_queue.job_revision());
+        let together: Vec<(JobId, String)> = class
+            .act(actions.clone())
+            .await
+            .into_iter()
+            .map(|(job_id, result)| (job_id, format!("{result:?}")))
+            .collect();
+        let mut alone = BTreeMap::new();
+        let mut moves_failed = false;
+        for (job_id, action) in actions {
+            let moving = matches!(action, QueueAction::Move(_));
+            if moving && moves_failed {
+                continue;
+            }
+            let result = single
+                .service
+                .act(job_id, action)
+                .await
+                .map_err(super::super::queue::scheduler_error);
+            moves_failed |= moving && result.is_err();
+            alone.insert(job_id, format!("{result:?}"));
+        }
+        let alone: Vec<(JobId, String)> = alone.into_iter().collect();
+        assert_eq!(together, alone);
+        assert_eq!(rows(&batched, &ids), rows(&single, &ids));
+        if let Some(published) = singles_published {
+            assert_eq!(
+                (
+                    batched_queue.job_revision() - before.0,
+                    single_queue.job_revision() - before.1
+                ),
+                (1, published),
+                "{together:?}"
+            );
+        }
+    }
+    // What the steps leave, read apart from either path.
+    let left = rows(&batched, &ids);
+    assert_eq!(left[0], None);
+    assert_eq!(left[1], None);
+    assert_eq!(left[2].map(|row| row.0), Some(TorrentIntent::Paused));
+    assert_eq!(left[3].map(|row| (row.1, row.2)), Some((None, true)));
+}
+
+// An ask the tunnel withdraws before torrents act on it closes no peer, and
+// one withdrawn while they act closes none past the session it was read
+// before: it is read just before each session's peers close.
+#[test]
+fn a_give_back_withdrawn_before_torrents_act_closes_nothing() {
+    use crate::jobs::{Owed, TunnelGiveBack};
+    use crate::torrents::sessions::RouteKey;
+    use std::sync::atomic::AtomicBool;
+    let route = |egress| {
+        RouteKey::of(
+            egress,
+            &crate::proxies::EgressBinding::System,
+            &crate::proxies::LegPath::Direct,
+        )
+    };
+    let running = std::collections::BTreeMap::from([(route(1), 3usize), (route(2), 3)]);
+    let held = Arc::new(AtomicBool::new(false));
+    let ask = TunnelGiveBack {
+        egress: 1,
+        hops: vec![11],
+        torrent_routes: vec![route(1), route(2)],
+        owed: Owed::new(
+            {
+                let held = Arc::clone(&held);
+                move || u64::from(held.load(Ordering::Acquire))
+            },
+            || {},
+        ),
+    };
+    let closed = std::sync::Mutex::new(Vec::new());
+    let close = |open: &usize, peers: usize| {
+        closed.lock().unwrap().push(peers);
+        // The waiter is served as the first session closes its peers.
+        held.store(false, Ordering::Release);
+        peers.min(*open)
+    };
+
+    assert_eq!(
+        super::super::queue::give_back_through(&running, &ask, 4, close),
+        0
+    );
+    assert!(
+        closed.lock().unwrap().is_empty(),
+        "withdrawn before it acted"
+    );
+
+    held.store(true, Ordering::Release);
+    assert_eq!(
+        super::super::queue::give_back_through(&running, &ask, 4, close),
+        3
+    );
+    assert_eq!(
+        *closed.lock().unwrap(),
+        [4],
+        "withdrawn after the first session"
+    );
+}
+
+use crate::jobs::handle::QueueMoveTarget;
+
+// A fixed run of numbers for the seeded orders below.
+fn numbers(seed: u64) -> impl Iterator<Item = u64> {
+    let mut state = seed;
+    std::iter::repeat_with(move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    })
+}
+
+const TARGETS: [QueueMoveTarget; 11] = [
+    QueueMoveTarget::Top,
+    QueueMoveTarget::Bottom,
+    QueueMoveTarget::Offset(0),
+    QueueMoveTarget::Offset(-1),
+    QueueMoveTarget::Offset(1),
+    QueueMoveTarget::Offset(-3),
+    QueueMoveTarget::Offset(7),
+    QueueMoveTarget::Offset(-250),
+    QueueMoveTarget::Offset(400),
+    QueueMoveTarget::Offset(i64::MIN),
+    QueueMoveTarget::Offset(i64::MAX),
+];
+
+// A move of many torrents ends where one splice of each after another
+// ended: every target, over queues with few, some and most torrents named.
+#[test]
+fn a_move_of_many_ends_where_the_splices_ended() {
+    use crate::torrents::service::queue::moved_order;
+    use std::collections::HashSet;
+    for (seed, length, share) in [
+        (1, 600, 2),
+        (2, 600, 50),
+        (3, 600, 95),
+        (4, 3, 50),
+        (5, 1, 100),
+    ] {
+        let order: Vec<JobId> = (0..length).map(JobId).collect();
+        let named: Vec<JobId> = order
+            .iter()
+            .copied()
+            .zip(numbers(seed))
+            .filter(|(_, number)| number % 100 < share)
+            .map(|(job_id, _)| job_id)
+            .collect();
+        let set: HashSet<JobId> = named.iter().copied().collect();
+        for target in TARGETS {
+            let first_first = match target {
+                QueueMoveTarget::Top => false,
+                QueueMoveTarget::Bottom => true,
+                QueueMoveTarget::Offset(offset) => offset < 0,
+            };
+            let mut spliced = order.clone();
+            let moving: Box<dyn Iterator<Item = &JobId>> = if first_first {
+                Box::new(named.iter())
+            } else {
+                Box::new(named.iter().rev())
+            };
+            for &job_id in moving {
+                crate::jobs::handle::splice_job_order(&mut spliced, job_id, target).unwrap();
+            }
+            assert_eq!(
+                moved_order(order.clone(), &set, target),
+                spliced,
+                "{length} torrents, {} named, {target:?}",
+                named.len()
+            );
+        }
+    }
+}
+
+// A batch of moves, one torrent each, ends where each splice followed by
+// a fresh read's order of torrents that share a place ended.
+#[test]
+fn a_batch_of_moves_ends_where_the_splices_and_reads_ended() {
+    use crate::torrents::service::batch::Spliced;
+    fn ties_by_job(order: &mut [JobId], places: &[i64]) {
+        let mut start = 0;
+        while start < places.len() {
+            let mut end = start + 1;
+            while end < places.len() && places[end] == places[start] {
+                end += 1;
+            }
+            if end - start > 1 {
+                order[start..end].sort_unstable();
+            }
+            start = end;
+        }
+    }
+    for (seed, length, tie_share) in [(11, 500, 0), (12, 500, 30), (13, 500, 90), (14, 2, 100)] {
+        // Places that rise, some shared by a run of torrents.
+        let mut place = 0;
+        let mut rows: Vec<(i64, JobId)> = (0..length)
+            .zip(numbers(seed))
+            .map(|(job, number)| {
+                if number % 100 >= tie_share {
+                    place += 1;
+                }
+                (place, JobId(number % 100_000 * 1_000 + job))
+            })
+            .collect();
+        rows.sort_unstable();
+        let places: Vec<i64> = rows.iter().map(|(place, _)| *place).collect();
+        let order: Vec<JobId> = rows.iter().map(|(_, job_id)| *job_id).collect();
+        let moves: Vec<(JobId, QueueMoveTarget)> = numbers(seed + 100)
+            .take(800)
+            .map(|number| {
+                let job_id = order[(number as usize) % order.len()];
+                (job_id, TARGETS[(number as usize / 7) % TARGETS.len()])
+            })
+            .chain([(JobId(u64::MAX), QueueMoveTarget::Top)])
+            .collect();
+        let mut by_splices = order.clone();
+        let mut spliced_then = Vec::new();
+        for &(job_id, target) in &moves {
+            let spliced = crate::jobs::handle::splice_job_order(&mut by_splices, job_id, target)
+                .unwrap_or(false);
+            ties_by_job(&mut by_splices, &places);
+            spliced_then.push(spliced);
+        }
+        let mut batch = Spliced::new(order.clone(), &places);
+        let spliced_now: Vec<bool> = moves
+            .iter()
+            .map(|&(job_id, target)| batch.splice(job_id, target))
+            .collect();
+        assert_eq!(spliced_now, spliced_then, "seed {seed}");
+        assert_eq!(batch.order, by_splices, "seed {seed}");
+    }
 }

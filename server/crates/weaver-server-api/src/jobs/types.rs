@@ -256,6 +256,15 @@ impl From<weaver_server_core::Protocol> for ProtocolGql {
     }
 }
 
+impl From<ProtocolGql> for weaver_server_core::Protocol {
+    fn from(value: ProtocolGql) -> Self {
+        match value {
+            ProtocolGql::Nzb => Self::Nzb,
+            ProtocolGql::Torrent => Self::Torrent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 #[graphql(complex)]
 pub struct QueueItem {
@@ -352,10 +361,10 @@ pub struct QueueSummary {
 #[graphql(complex)]
 pub struct GlobalQueueState {
     pub is_paused: bool,
-    /// Whether the operator's or the schedule's pause of every torrent is in
-    /// force.
+    /// The classes of job the operator's or the schedule's pause of the
+    /// whole class holds.
     #[serde(default)]
-    pub torrents_paused: bool,
+    pub paused_classes: Vec<ProtocolGql>,
     pub speed_limit_bytes_per_sec: Option<u64>,
     pub download_block: DownloadBlock,
 }
@@ -1374,6 +1383,65 @@ pub fn encode_offset_cursor(offset: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("off:{offset}"))
 }
 
+/// Where the next page of a job's output files starts: its position, which
+/// an archived entry's record pages by, and the last file listed, which a
+/// folder on disk pages by so a deep page keeps only its own files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputFilesCursor {
+    pub offset: usize,
+    pub after: Option<weaver_server_core::history::output_files::ListingKey>,
+}
+
+pub fn decode_output_files_cursor(cursor: Option<&str>) -> Result<OutputFilesCursor, String> {
+    let Some(cursor) = cursor else {
+        return Ok(OutputFilesCursor::default());
+    };
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| "cursor is not valid base64".to_string())?;
+    let decoded =
+        String::from_utf8(decoded).map_err(|_| "cursor is not valid UTF-8".to_string())?;
+    if decoded.starts_with("off:") {
+        return Ok(OutputFilesCursor {
+            offset: decode_offset_cursor(Some(cursor))?,
+            after: None,
+        });
+    }
+    let Some(body) = decoded.strip_prefix("fil:") else {
+        return Err("cursor has an invalid prefix".to_string());
+    };
+    let (offset, name, rel_path, raw): (usize, String, String, String) =
+        serde_json::from_str(body).map_err(|_| "cursor does not name a file".to_string())?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| "cursor does not name a file".to_string())?;
+    Ok(OutputFilesCursor {
+        offset,
+        after: Some(weaver_server_core::history::output_files::ListingKey {
+            name,
+            rel_path,
+            raw,
+        }),
+    })
+}
+
+pub fn encode_output_files_cursor(cursor: &OutputFilesCursor) -> String {
+    let body = match &cursor.after {
+        Some(after) => format!(
+            "fil:{}",
+            serde_json::to_string(&(
+                cursor.offset,
+                &after.name,
+                &after.rel_path,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&after.raw),
+            ))
+            .expect("a tuple of a number and three strings serializes")
+        ),
+        None => format!("off:{}", cursor.offset),
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
+}
+
 pub use weaver_server_core::jobs::model::PRIORITY_ATTRIBUTE_KEY;
 
 pub fn normalize_priority_value(value: &str) -> std::result::Result<String, String> {
@@ -1744,9 +1812,14 @@ pub fn global_queue_state(
 ) -> GlobalQueueState {
     GlobalQueueState {
         is_paused: holds.stops(HoldOwner::All, false),
-        torrents_paused: [HoldOrigin::Manual, HoldOrigin::Scheduled]
-            .into_iter()
-            .any(|origin| holds.held_by(origin, HoldOwner::Torrents)),
+        paused_classes: weaver_server_core::jobs::HeldClass::all()
+            .filter(|class| {
+                [HoldOrigin::Manual, HoldOrigin::Scheduled]
+                    .into_iter()
+                    .any(|origin| holds.held_by(origin, HoldOwner::Class(*class)))
+            })
+            .map(|class| class.protocol().into())
+            .collect(),
         speed_limit_bytes_per_sec,
         download_block: DownloadBlock::from(download_block),
     }

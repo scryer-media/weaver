@@ -243,6 +243,7 @@ async fn the_last_server_refusing_credentials_fails_the_job(servers: &[u32], nam
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
     pipeline.active_download_connections = 1;
@@ -390,6 +391,7 @@ async fn refused_probe_for_first_article(
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
     pipeline.active_download_connections = 1;
@@ -723,6 +725,188 @@ async fn a_series_of_refused_probes_reaches_the_verdict_at_the_give_up_time() {
         failure_kind(&pipeline, job),
         Some(crate::history::HistoryFailureKind::Health)
     );
+}
+
+// A news server on this machine that asks for no login at the dial, takes
+// every connection, answers every BODY with 480 and refuses the empty
+// login that 480 asks for.
+fn anonymous_server_refusing_at_body() -> super::harness::Listener {
+    super::harness::Listener::serve(|socket| {
+        use std::io::{BufRead, Write};
+        let mut writer = socket.try_clone().unwrap();
+        if writer.write_all(b"200 ready\r\n").is_err() {
+            return;
+        }
+        for line in std::io::BufReader::new(socket).lines() {
+            let Ok(line) = line else { break };
+            let upper = line.to_ascii_uppercase();
+            let reply: &[u8] = if upper == "CAPABILITIES" {
+                b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+            } else if upper.starts_with("GROUP ") {
+                b"211 1 1 1 alt.binaries.test\r\n"
+            } else if upper.starts_with("BODY ") {
+                b"480 authentication required\r\n"
+            } else if upper.starts_with("AUTHINFO USER") {
+                b"381 password\r\n"
+            } else if upper.starts_with("AUTHINFO PASS") {
+                b"481 authentication failed\r\n"
+            } else if upper == "QUIT" {
+                let _ = writer.write_all(b"205 closing\r\n");
+                break;
+            } else {
+                b"500 command not recognized\r\n"
+            };
+            if writer.write_all(reply).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+// Runs the lanes the last dispatch seated as the runtime's loop runs them,
+// until every lane has parked and given its connection back.
+async fn run_seated_lanes(pipeline: &mut Pipeline) {
+    let mut completed = false;
+    while !completed || pipeline.active_download_connections > 0 {
+        tokio::select! {
+            Some(event) = pipeline.owned_download_lane_event_rx.recv() => {
+                completed |= matches!(event, OwnedDownloadLaneEvent::BatchComplete { .. });
+                let mut pending: VecDeque<DownloadResult> = VecDeque::new();
+                pipeline.handle_owned_download_lane_event(event, &mut pending);
+                for result in pending {
+                    pipeline.process_released_download_done(result).await;
+                }
+            }
+            Some(request) = pipeline.download_refill_rx.recv() => {
+                let _ = request.response_tx.send(crate::pipeline::DownloadLaneRefillResponse {
+                    lease: None,
+                    park_reason: crate::pipeline::download::LaneParkReason::NoWork,
+                });
+            }
+            Some(parked) = pipeline.download_lane_parked_rx.recv() => {
+                pipeline.handle_download_lane_parked(parked);
+            }
+        }
+    }
+}
+
+// The job's only server asks for no login at the dial, answers every BODY
+// with 480 and refuses the empty login the 480 asks for: it refuses the
+// account. A real lane meets the refusal, and the server is waited for as
+// through an outage:
+// nothing is booked and the job names the server. Past the give-up time the
+// articles only it could bring are booked missing, the job fails for health
+// naming the server, it holds no connection, and its duplicate is tried.
+#[tokio::test]
+async fn a_lone_anonymous_server_refusing_at_body_is_waited_for_then_fails_the_job() {
+    let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 13))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let server = anonymous_server_refusing_at_body();
+    let mut config = weaver_nntp::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+        host: "127.0.0.1".into(),
+        port: server.port,
+        tls: false,
+        ..Default::default()
+    });
+    config.max_connections = 1;
+    pipeline.nntp = std::sync::Arc::new(weaver_nntp::client::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig {
+            servers: vec![config],
+            max_idle_age: std::time::Duration::from_secs(300),
+            max_retries_per_server: 1,
+            soft_timeout: std::time::Duration::from_secs(3600),
+        },
+    ));
+    pipeline.tuner.set_connection_limit(1);
+    pipeline.owned_download_lane_pool.resize(1);
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    let duplicate = parked_duplicate(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    let pool = std::sync::Arc::clone(pipeline.nntp.pool());
+    let began = std::time::Instant::now();
+    let give_up = weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP;
+    pool.set_login_refusal_clock(0, began);
+
+    pipeline.dispatch_downloads();
+    assert!(pipeline.active_download_connections > 0, "a lane is seated");
+    run_seated_lanes(&mut pipeline).await;
+    assert_eq!(
+        pool.login_refusal_waits(),
+        weaver_nntp::ServerSet::from([0]),
+        "health hears the 480 as a refused login, waited for"
+    );
+    assert!(!pool.refuses_credentials(0));
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+    assert!(pipeline.segment_terminal_states.is_empty());
+    assert!(!ended(&pipeline, job));
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(login_refused_reason(&pipeline, 0).as_str())
+    );
+    pipeline.wake_all_infrastructure_retries();
+
+    // A minute short of the give-up time the refusal is still a wait.
+    pool.set_login_refusal_clock(0, began + give_up - std::time::Duration::from_secs(60));
+    pipeline.tell_login_refusal_verdicts();
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+    assert!(queued_len(&pipeline, job) > 0);
+
+    // At the give-up time the refusal is the verdict, and the articles only
+    // the server could bring are booked missing.
+    pool.set_login_refusal_clock(0, began + give_up);
+    assert!(pool.refuses_credentials(0));
+    pipeline.tell_login_refusal_verdicts();
+    assert!(pipeline.metrics.articles_not_found.load(Ordering::Relaxed) >= 1);
+    assert_eq!(queued_or_none(&pipeline, job), 0);
+    assert_eq!(pipeline.infrastructure_retries.len(), 0);
+
+    drive(&mut pipeline, &scenario, job, |_| false).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(pipeline.active_download_connections, 0);
+    assert!(
+        !pipeline
+            .active_download_connections_by_job
+            .contains_key(&job)
+    );
+    let row = history(&mut pipeline, job).await;
+    assert_eq!(row.status, "failed");
+    let error = row.error_message.unwrap_or_default();
+    assert_eq!(
+        failure_kind(&pipeline, job),
+        Some(crate::history::HistoryFailureKind::Health),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!(
+            "server 127.0.0.1:{} refuses the login",
+            server.port
+        )),
+        "{error}"
+    );
+    let claims = pipeline.db.reconcile_semantic_promotion_claims(8).unwrap();
+    assert_eq!(
+        claims
+            .iter()
+            .map(|claim| (claim.trigger_job_id, claim.job_id))
+            .collect::<Vec<_>>(),
+        [(job, duplicate)]
+    );
+    pipeline.nntp.shutdown().await;
+    drop(server);
 }
 
 // Two jobs whose only server is pool server 0, installed and downloading.

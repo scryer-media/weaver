@@ -125,7 +125,7 @@ async fn a_start_of_every_torrent_looks_again_at_those_held_for_their_files() {
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     let queue = queue();
-    queue.pause_torrents().await.unwrap();
+    queue.pause_class(crate::torrents::CLASS).await.unwrap();
     again.publish_to(queue.clone());
     reopen(&again).await;
     held_for_its_files(&again, back, &back_dir).await;
@@ -134,7 +134,7 @@ async fn a_start_of_every_torrent_looks_again_at_those_held_for_their_files() {
 
     std::fs::rename(&back_away, &back_dir).unwrap();
     let mut published = queue.state().subscribe_job_changes();
-    queue.resume_torrents().await.unwrap();
+    queue.resume_class(crate::torrents::CLASS).await.unwrap();
     // The torrents held for their files are all looked at before any of
     // them joins a session, so the one that runs says the other was looked
     // at too.
@@ -223,7 +223,7 @@ async fn a_start_of_every_torrent_is_not_held_by_a_route_whose_session_does_not_
     for (_, dir) in &held {
         std::fs::rename(dir.with_extension("away"), dir).unwrap();
     }
-    queue.resume_torrents().await.unwrap();
+    queue.resume_class(crate::torrents::CLASS).await.unwrap();
     asked.wait_for(|asked| *asked > before).await.unwrap();
     held_for_its_files(&again, late, &late_dir).await;
 
@@ -231,7 +231,7 @@ async fn a_start_of_every_torrent_is_not_held_by_a_route_whose_session_does_not_
     // it in the default route's session, which runs.
     std::fs::rename(&late_away, &late_dir).unwrap();
     let mut published = queue.state().subscribe_job_changes();
-    queue.resume_torrents().await.unwrap();
+    queue.resume_class(crate::torrents::CLASS).await.unwrap();
     loop {
         published.borrow_and_update();
         if again.inner.live.lock().await[&late].attached.is_some() {
@@ -654,7 +654,7 @@ const SPLIT_PIECE: usize = 16_384;
 
 struct PartlyFetched {
     rig: Rig,
-    clock: Arc<SetClock>,
+    clock: Arc<ManualClock>,
     job_id: JobId,
     seeding: Arc<Session>,
     _seeds: tempfile::TempDir,
@@ -966,10 +966,7 @@ fn lifetime(view: &TorrentView) -> (u64, u64, u64) {
 async fn ticked(fetched: &PartlyFetched) -> (u64, u64, u64) {
     let service = &fetched.rig.service;
     service.tick().await;
-    fetched
-        .clock
-        .0
-        .fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
+    fetched.clock.shift_unix_ms(TICK.as_millis() as i64);
     service.tick().await;
     let shown = lifetime(&service.torrent(fetched.job_id).await.unwrap());
     assert!(shown.0 >= 3 * SPLIT_PIECE as u64, "{shown:?}");

@@ -9,8 +9,9 @@ use super::*;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64 as StdAtomicU64;
 
-use crate::bandwidth::{BandwidthSplit, ScheduleAction, SplitRates, SplitState, TorrentRates};
-use crate::jobs::handle::TorrentRate;
+use crate::bandwidth::{BandwidthSplit, ClassRates, ScheduleAction, SplitRates, SplitState};
+use crate::jobs::Protocol;
+use crate::jobs::class::{ClassRate, JobClass};
 use crate::jobs::{HoldOwner, HoldSet};
 
 const MB: u64 = 1_000_000;
@@ -20,21 +21,43 @@ const MB: u64 = 1_000_000;
 #[derive(Default)]
 struct Torrents {
     used: StdAtomicU64,
-    given: StdMutex<Vec<TorrentRates>>,
+    given: StdMutex<Vec<ClassRates>>,
 }
 
-impl TorrentRate for Torrents {
+// Only the rate of the torrent class: no job of it is acted on here.
+#[async_trait::async_trait]
+impl JobClass for Torrents {
+    fn protocol(&self) -> Protocol {
+        Protocol::Torrent
+    }
+
+    async fn act(
+        &self,
+        actions: Vec<(crate::JobId, crate::jobs::handle::QueueAction)>,
+    ) -> std::collections::BTreeMap<crate::JobId, Result<(), crate::SchedulerError>> {
+        actions
+            .into_iter()
+            .map(|(id, _)| (id, Err(crate::SchedulerError::JobNotFound(id))))
+            .collect()
+    }
+
+    fn rate(&self) -> Option<&dyn ClassRate> {
+        Some(self)
+    }
+}
+
+impl ClassRate for Torrents {
     fn sample(&self) -> u64 {
         self.used.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn set_rates(&self, rates: TorrentRates) {
+    fn set_rates(&self, rates: ClassRates) {
         self.given.lock().unwrap().push(rates);
     }
 }
 
 impl Torrents {
-    fn rates(&self) -> TorrentRates {
+    fn rates(&self) -> ClassRates {
         *self.given.lock().unwrap().last().expect("rates were given")
     }
 
@@ -74,7 +97,8 @@ async fn seated(temp_dir: &tempfile::TempDir) -> (Pipeline, Arc<Torrents>) {
     let torrents = Arc::new(Torrents::default());
     pipeline
         .shared_state
-        .seat_torrent_rate(Arc::clone(&torrents) as Arc<dyn TorrentRate>);
+        .classes()
+        .seat(Arc::clone(&torrents) as Arc<dyn JobClass>);
     (pipeline, torrents)
 }
 
@@ -114,7 +138,8 @@ async fn the_split_shares_the_download_limit_between_usenet_and_torrents() {
     let torrents = Arc::new(Torrents::default());
     pipeline
         .shared_state
-        .seat_torrent_rate(Arc::clone(&torrents) as Arc<dyn TorrentRate>);
+        .classes()
+        .seat(Arc::clone(&torrents) as Arc<dyn JobClass>);
 
     // Nothing moves: each side is held to its share.
     set_bandwidth(&mut pipeline, bandwidth(Some(100 * MB), Some(80))).await;
@@ -199,7 +224,8 @@ async fn editing_the_limit_keeps_a_scheduled_split_and_setting_a_split_lifts_it(
     let torrents = Arc::new(Torrents::default());
     pipeline
         .shared_state
-        .seat_torrent_rate(Arc::clone(&torrents) as Arc<dyn TorrentRate>);
+        .classes()
+        .seat(Arc::clone(&torrents) as Arc<dyn JobClass>);
 
     set_bandwidth(&mut pipeline, bandwidth(Some(100 * MB), Some(80))).await;
     schedule(
@@ -234,7 +260,7 @@ async fn the_whole_upload_limit_is_the_torrents() {
     .await;
     assert_eq!(
         torrents.rates(),
-        TorrentRates {
+        ClassRates {
             download: Some(20 * MB),
             upload: Some(3 * MB),
         }
@@ -260,7 +286,7 @@ async fn the_whole_upload_limit_is_the_torrents() {
     schedule(&mut pipeline, speed_limit(Some(10 * MB), Some(2 * MB))).await;
     assert_eq!(
         torrents.rates(),
-        TorrentRates {
+        ClassRates {
             download: Some(2 * MB),
             upload: Some(2 * MB),
         }
@@ -363,8 +389,8 @@ async fn usenet_is_measured_off_the_wire_at_each_tick() {
 fn stopped(holds: &HoldSet) -> (bool, bool, bool) {
     (
         holds.stops(HoldOwner::All, false),
-        holds.stops(HoldOwner::Torrents, false),
-        holds.stops(HoldOwner::Torrents, true),
+        holds.stops(HoldOwner::Class(crate::torrents::CLASS), false),
+        holds.stops(HoldOwner::Class(crate::torrents::CLASS), true),
     )
 }
 
@@ -379,9 +405,19 @@ async fn pauses_publish_what_they_stop_to_the_torrents() {
         (ScheduleAction::Resume, (false, false, false)),
         (ScheduleAction::PauseAll, (true, true, true)),
         (ScheduleAction::Resume, (false, false, false)),
-        (ScheduleAction::PauseTorrents, (false, true, true)),
+        (
+            ScheduleAction::PauseClass {
+                class: crate::torrents::CLASS,
+            },
+            (false, true, true),
+        ),
         (ScheduleAction::Resume, (false, true, true)),
-        (ScheduleAction::ResumeTorrents, (false, false, false)),
+        (
+            ScheduleAction::ResumeClass {
+                class: crate::torrents::CLASS,
+            },
+            (false, false, false),
+        ),
     ] {
         schedule(&mut pipeline, action.clone()).await;
         assert_eq!(stopped(&holds.borrow_and_update()), expected, "{action:?}");

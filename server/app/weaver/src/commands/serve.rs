@@ -132,9 +132,9 @@ pub(crate) async fn run(
         base_url
     };
 
-    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(
-        weaver_server_core::runtime::detect_startup_profile(&data_dir),
-    );
+    let (profile, late_classification) =
+        weaver_server_core::runtime::detect_startup_profile(&data_dir).await;
+    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(profile);
     let system_profile = Arc::new(std::sync::RwLock::new(profile.clone()));
 
     // Build the NNTP client from capability values validated when servers were saved.
@@ -283,6 +283,11 @@ pub(crate) async fn run(
     // skipped. Database maintenance and the free-space samplers wait on it,
     // so their first disk work does not land on top of the probe's.
     let startup_disk_work = weaver_server_core::runtime::StartupDiskGate::closed();
+    // The volumes' writer threads, one set for the process, and the one
+    // keeper of their buffer limits: the pipeline and the torrent service
+    // both write through them.
+    let volume_writers = std::sync::Arc::new(weaver_server_core::operations::VolumeWriters::new());
+    let volume_buffers = std::sync::Arc::new(weaver_server_core::operations::VolumeBuffers::new());
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
@@ -299,6 +304,8 @@ pub(crate) async fn run(
         db.clone(),
         pipeline_config,
         startup_disk_work.clone(),
+        std::sync::Arc::clone(&volume_writers),
+        std::sync::Arc::clone(&volume_buffers),
     )
     .await?;
     pipeline.park_crashed_jobs(crashed);
@@ -330,6 +337,12 @@ pub(crate) async fn run(
     // The pipeline's own free-space samplers: metrics and the NZBGet status
     // read their cached readings and never stat a filesystem themselves.
     let storage_capacity = pipeline.storage_capacity();
+    let _late_classification_task = wiring::settle_late_classification(
+        late_classification,
+        Arc::clone(&storage_capacity),
+        handle.clone(),
+        Some(Arc::clone(&system_profile)),
+    );
     let post_processing_executor = pipeline.post_processing_executor();
     // The torrent client starts with the server, on when the settings turn it
     // on, and runs on the pipeline's budget; one that cannot start leaves the
@@ -341,16 +354,14 @@ pub(crate) async fn run(
             db.clone(),
             &proxies,
             &pipeline,
+            volume_writers,
+            volume_buffers,
             handle.clone(),
             crashed_torrents,
         )
         .await
         {
-            Ok(torrents) => {
-                watch_folder.use_torrents(torrents.clone());
-                rss.use_torrents(torrents.clone());
-                Some(torrents)
-            }
+            Ok(torrents) => Some(torrents),
             Err(error) => {
                 error!(%error, "the torrent client did not start");
                 None

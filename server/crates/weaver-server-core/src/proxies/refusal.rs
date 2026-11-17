@@ -73,13 +73,15 @@ pub enum NetworkRefusal {
         required: usize,
         limit: usize,
     },
+    // Usenet asks `nntp` connections, `nntp_bytes` of a tunnel that keeps
+    // `kept_bytes` for itself and its torrent sessions, past `limit_bytes`.
     WireGuardSocketBudget {
         proxy: u32,
         egress: u32,
         nntp: usize,
-        reserve: usize,
-        peers: usize,
-        cap: usize,
+        nntp_bytes: u64,
+        kept_bytes: u64,
+        limit_bytes: u64,
     },
 
     // Proxy profiles.
@@ -387,16 +389,16 @@ impl NetworkRefusal {
                 proxy,
                 egress,
                 nntp,
-                reserve,
-                peers,
-                cap,
+                nntp_bytes,
+                kept_bytes,
+                limit_bytes,
             } => serde_json::json!({
                 "proxyId": proxy,
                 "egressId": egress,
                 "nntp": nntp,
-                "reserve": reserve,
-                "peers": peers,
-                "cap": cap,
+                "nntpBytes": nntp_bytes,
+                "keptBytes": kept_bytes,
+                "limitBytes": limit_bytes,
             }),
             Self::WireGuardInstanceLimit { required, limit } => serde_json::json!({
                 "required": required,
@@ -551,18 +553,17 @@ impl std::fmt::Display for NetworkRefusal {
                 proxy,
                 egress,
                 nntp,
-                reserve,
-                peers,
-                cap,
+                nntp_bytes,
+                kept_bytes,
+                limit_bytes,
             } => {
-                let kept = if *peers > 0 {
-                    format!(", {reserve} are reserved and {peers} kept for torrent peers")
-                } else {
-                    format!(" and {reserve} are reserved")
-                };
+                const MIB: u64 = 1024 * 1024;
                 return write!(
                     f,
-                    "usenet servers ask {nntp} sockets of WireGuard proxy {proxy} on egress {egress}{kept}, over the {cap} it holds"
+                    "usenet servers ask {nntp} connections of WireGuard proxy {proxy} on egress {egress}, {} MiB, and the tunnel keeps {} MiB for itself, over the {} MiB it holds",
+                    nntp_bytes.div_ceil(MIB),
+                    kept_bytes.div_ceil(MIB),
+                    limit_bytes / MIB
                 );
             }
             Self::WireGuardInstanceLimit { required, limit } => {

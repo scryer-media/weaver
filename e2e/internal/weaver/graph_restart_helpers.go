@@ -82,6 +82,46 @@ func (ctx *restartCaseContext) pollJob(what, dbPath string, jobID int, check fun
 	})
 }
 
+// loginRefusalWait is what the queue says of a job while a fill server
+// refuses the login: its state, what it waits on, and the bytes it has booked
+// missing.
+type loginRefusalWait struct {
+	State       string `json:"state"`
+	WaitReason  string `json:"downloadWaitReason"`
+	FailedBytes uint64 `json:"failedBytes"`
+}
+
+// waitForLoginRefusalWait waits until the queue says the job waits on the
+// news server at `port` refusing the login, and returns what it said then. A
+// refusal is a wait for the server, not a verdict, until its give-up time.
+func (ctx *restartCaseContext) waitForLoginRefusalWait(jobID int, port string) (loginRefusalWait, error) {
+	var seen loginRefusalWait
+	err := ctx.pollJob("the job reports it waits on the refusing server", caseDBPath(ctx), jobID, func() (bool, error) {
+		var out struct {
+			QueueItem *loginRefusalWait `json:"queueItem"`
+		}
+		if err := graphQLMutate(ctx.weaverURL, `query($id: Int!) { queueItem(id: $id) { state downloadWaitReason failedBytes } }`,
+			map[string]any{"id": jobID}, &out); err != nil {
+			return false, err
+		}
+		if out.QueueItem == nil {
+			return false, nil
+		}
+		seen = *out.QueueItem
+		servers, ok := strings.CutPrefix(seen.WaitReason, "login_refused:")
+		if !ok {
+			return false, nil
+		}
+		for _, server := range strings.Split(servers, ", ") {
+			if strings.HasSuffix(server, ":"+port) {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	return seen, err
+}
+
 func endedFirst(dbPath string, jobID int) error {
 	status, ok := restartJobStatusFromDB(dbPath, jobID)
 	if status = normalizeDBStatus(status); ok && (dbStatusTerminal(status) || status == "cancelled") {
@@ -518,12 +558,12 @@ var rustStepReverses = map[string]rustStepReverse{
 	// Migration 112 deletes a torrent setting. Torrents came with migration
 	// 93, so a database from before it never held the key.
 	"forget_saved_mapped_ports_v112": {Plan: func(schemaShape) []string { return nil }},
-	// Migration 124 turns each proxy's DNS setting into server lists and
+	// Migration 125 turns each proxy's DNS setting into server lists and
 	// profiles, and takes it off the proxy. A proxy that kept the default
 	// gets no row, and only keys meaning that default leave its config. A
 	// list or profile is a setting the rewind cannot write back onto the
 	// proxies, so a database holding one is refused.
-	"dns_profiles_from_proxies_v124": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseDNSProfilesV124},
+	"dns_profiles_from_proxies_v125": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseDNSProfilesV125},
 }
 
 // migrationStatement is one SQL statement of one migration, its whitespace
@@ -760,7 +800,7 @@ func schedulesWithZeroLimits(raw string) (string, bool) {
 	return string(rewritten), true
 }
 
-func refuseDNSProfilesV124(db *stateConn) error {
+func refuseDNSProfilesV125(db *stateConn) error {
 	tables, err := existingTables(db)
 	if err != nil {
 		return err

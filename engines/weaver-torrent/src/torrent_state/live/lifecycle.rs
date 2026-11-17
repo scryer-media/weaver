@@ -90,6 +90,7 @@ impl TorrentStateLive {
             peer_semaphore: Arc::new(Semaphore::new(peer_limit)),
             peer_limit,
             places: Mutex::new(HashMap::new()),
+            tcp_wants: Default::default(),
             new_pieces_notify: Notify::new(),
             room_notify: Arc::new(Notify::new()),
             layer_fetch: hash_fetch::LayerFetch::new(paused.metadata.v2.as_ref()),
@@ -110,10 +111,7 @@ impl TorrentStateLive {
             upload_turns,
             pex: crate::session::speaks_pex(
                 !session.disable_pex,
-                crate::session::trackers_only(
-                    paused.metadata.info.info().private,
-                    paused.shared.options.trackers_only,
-                ),
+                paused.metadata.info.info().private,
                 paused.shared.options.disable_pex,
             ),
             super_seeding,
@@ -493,6 +491,9 @@ impl TorrentStateLive {
         self.tasks.close();
         *self.shared.ending_run.lock() = Some(self.tasks.clone());
         self.cancellation_token.cancel();
+        // A paused torrent dials no one: it wants no TCP socket, and a dial
+        // still under way leaves none.
+        self.tcp_wants.close();
         // The write and the check under way end before the storage is handed
         // on, and none queued begins after: at most one check and one batch
         // of writes are waited for, before the torrent's lock is taken, as

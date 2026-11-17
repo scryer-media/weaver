@@ -12,7 +12,7 @@
 // dropped, and when a socket share it holds a permit of runs short.
 use super::{Tls, doh::Connection};
 use crate::dns::DnsServer;
-use crate::pipe::{KeeperRef, KeptRegistration, Purpose, SocketClass};
+use crate::pipe::{KeeperRef, KeptRegistration, Reservation};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -30,6 +30,16 @@ pub(in crate::dns) const IDLE: Duration = Duration::from_secs(30);
 pub(super) enum Link {
     Dot(Box<Tls>),
     Doh(Box<Connection>),
+}
+
+impl Link {
+    // The bytes the connection's sockets reserved, by share.
+    fn reserved(&self) -> &[Reservation] {
+        match self {
+            Self::Dot(tls) => &tls.get_ref().0.reserved,
+            Self::Doh(connection) => connection.reserved(),
+        }
+    }
 }
 
 // The connections one naming keeps, by server. Each closes once `IDLE`
@@ -80,7 +90,8 @@ impl Kept {
     // Keeps `link` for the next lookup of `server` through the stage that
     // `rides` names first, in place of one kept before, which closes. The
     // connection registers with the keeper of every stage in `rides`, and
-    // closes when any of them cuts or reclaims it. With no stage to tie it
+    // closes when any of them cuts it, or when one whose share its socket
+    // reserved bytes in reclaims it, at the bytes it reserved there. With no stage to tie it
     // to, a stage already gone, or outside a runtime, where there is no
     // timer to close it, it closes now.
     //
@@ -94,14 +105,18 @@ impl Kept {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let class = SocketClass::of(&Purpose::Dns);
         let mut links = lock(&self.links);
         links.next += 1;
         let tag = links.next;
         let mut registered = Vec::with_capacity(rides.len());
         for keeper in rides {
             let closer = Box::new(close(Arc::downgrade(&self.links), server.clone(), tag));
-            match keeper.hold(class, closer) {
+            let socket = link
+                .reserved()
+                .iter()
+                .find(|reserved| reserved.keeper.is(keeper))
+                .map(|reserved| reserved.socket.clone());
+            match keeper.hold(socket, closer) {
                 Some(registration) => registered.push(registration),
                 None => {
                     drop(links);
@@ -185,12 +200,13 @@ impl Drop for Sweeping {
     }
 }
 
-// Closes the connection kept for `server` under `tag`, if it is still kept.
-// The connection is dropped outside the lock.
-fn close(links: Weak<Mutex<Links>>, server: DnsServer, tag: u64) -> impl FnOnce() + Send {
+// Closes the connection kept for `server` under `tag`, if it is still kept,
+// and says whether it was: one a lookup took first is in use, and closes
+// nothing. The connection is dropped outside the lock.
+fn close(links: Weak<Mutex<Links>>, server: DnsServer, tag: u64) -> impl FnOnce() -> bool + Send {
     move || {
         let Some(links) = links.upgrade() else {
-            return;
+            return false;
         };
         let mut held = lock(&links);
         if held
@@ -201,6 +217,9 @@ fn close(links: Weak<Mutex<Links>>, server: DnsServer, tag: u64) -> impl FnOnce(
             let closed = held.by_server.remove(&server);
             drop(held);
             drop(closed);
+            true
+        } else {
+            false
         }
     }
 }

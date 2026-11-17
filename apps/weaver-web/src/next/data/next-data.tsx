@@ -108,7 +108,7 @@ interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
   globalState: {
     isPaused: boolean;
-    torrentsPaused?: boolean;
+    pausedClasses?: string[];
     speedLimitBytesPerSec: number | null;
     resumeAtEpochMs?: number | null;
     downloadBlock: DownloadBlockState;
@@ -135,8 +135,8 @@ export interface NextData {
   /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
   peakSpeed: number;
   isPaused: boolean;
-  /** Whether every torrent is held paused. */
-  torrentsPaused: boolean;
+  /** The classes of job held paused as a whole, as `TORRENT`. */
+  pausedClasses: readonly string[];
   /**
    * Whether torrent things show. Read through `useTorrentsShown` or
    * `TorrentsOnly`, never here, so every screen hides the same things the
@@ -204,6 +204,9 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
 };
 
 const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
+const NO_CLASSES: readonly string[] = [];
+const sameClasses = (left: readonly string[], right: readonly string[]) =>
+  left.length === right.length && left.every((held, index) => held === right[index]);
 
 function sameTorrentPresence(left: TorrentPresence | undefined, right: TorrentPresence | undefined): boolean {
   return left === right || (left !== undefined && right !== undefined && shallowEqual(left, right));
@@ -475,7 +478,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const globalState = snapshot?.globalState;
   const downloadBlock = useSettled(globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK, shallowEqual);
   const isPaused = globalState?.isPaused ?? false;
-  const torrentsPaused = globalState?.torrentsPaused ?? false;
+  const pausedClasses = useSettled(globalState?.pausedClasses ?? NO_CLASSES, sameClasses);
   const resumeAt = globalState?.resumeAtEpochMs ?? null;
   const speedLimit = globalState?.speedLimitBytesPerSec ?? null;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
@@ -523,7 +526,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       speed,
       peakSpeed,
       isPaused,
-      torrentsPaused,
+      pausedClasses,
       torrents,
       torrentPresence,
       resumeAt,
@@ -564,7 +567,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       speedLimit,
       torrents,
       torrentPresence,
-      torrentsPaused,
+      pausedClasses,
       update,
       version,
       wantDnsProfiles,

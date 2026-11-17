@@ -27,7 +27,7 @@ use weaver_torrent::{
 use weaver_tunnel::pipe::{Dialer, NamesSlot};
 
 use crate::StateError;
-use crate::bandwidth::TorrentRates;
+use crate::bandwidth::ClassRates;
 use crate::persistence::Database;
 use crate::proxies::{
     Consumer, EgressBinding, EgressHealth, EgressInterface, EgressLimitChanges, FetchOptions,
@@ -38,7 +38,9 @@ use crate::proxies::{
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
 use crate::torrents::naming::{LegNaming, ScopeNaming, TorrentNames};
-use crate::torrents::net::{Exposure, LegKind, LegNames, LegSockets, Shape, tracker_client};
+use crate::torrents::net::{
+    Exposure, LegKind, LegNames, LegSockets, PeerTunnels, Shape, tracker_client,
+};
 use crate::torrents::rate::SessionRates;
 
 /// The most sessions that run at once.
@@ -345,6 +347,9 @@ pub struct OpenLeg {
     pub leg: Option<Arc<TorrentLeg>>,
     /// How each torrent on the session names: by its own route's profile.
     pub naming: Arc<LegNaming>,
+    /// The path each of the session's live TCP peer connections rides, on a
+    /// leg whose sockets are its dialer's.
+    pub tunnels: Option<Arc<PeerTunnels>>,
 }
 
 impl OpenLeg {
@@ -359,12 +364,28 @@ impl OpenLeg {
         bridge: Option<crate::proxies::PathBridge>,
         leg: Option<Arc<TorrentLeg>>,
     ) -> Result<Self, String> {
-        let factory: Arc<dyn SocketFactory> = if kind.own_sockets() {
-            Arc::new(KernelSockets::new(kind.bind_device()).map_err(|error| format!("{error:#}"))?)
+        let (factory, tunnels): (Arc<dyn SocketFactory>, _) = if kind.own_sockets() {
+            let kernel =
+                KernelSockets::new(kind.bind_device()).map_err(|error| format!("{error:#}"))?;
+            (Arc::new(kernel), None)
         } else {
-            Arc::new(LegSockets::new(Arc::clone(&dialer), &kind))
+            let sockets = LegSockets::new(Arc::clone(&dialer), &kind);
+            let tunnels = sockets.tunnels();
+            (Arc::new(sockets), Some(tunnels))
         };
-        let http = tracker_client(&kind, Arc::clone(&dialer), bridge)?;
+        // A leg's web seed transfers ride its own seed bridge, started the
+        // first time a web seed is asked. The clients hold the leg weakly, so
+        // its drop revokes both bridges without waiting on them; a web seed
+        // asked after it fails as a revoked route does.
+        let seeds = leg.as_ref().map(|leg| {
+            let leg = Arc::downgrade(leg);
+            Arc::new(move || {
+                leg.upgrade()
+                    .ok_or_else(|| "leg revoked".to_owned())?
+                    .seed_bridge()
+            }) as crate::torrents::net::SeedBridge
+        });
+        let http = tracker_client(&kind, Arc::clone(&dialer), bridge, seeds)?;
         let names: Arc<dyn Resolver> = Arc::new(LegNames(Arc::clone(&dialer)));
         Ok(Self {
             shape: kind.shape(Some(&dialer)),
@@ -380,6 +401,7 @@ impl OpenLeg {
             names,
             kind,
             leg,
+            tunnels,
         })
     }
 }
@@ -412,8 +434,8 @@ pub trait Routes: Send + Sync {
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String>;
     /// What egress `egress_id` lets its sessions move at now: its own caps
     /// under its quota state. No limit by default.
-    fn egress_rates(&self, _egress_id: u32) -> TorrentRates {
-        TorrentRates::default()
+    fn egress_rates(&self, _egress_id: u32) -> ClassRates {
+        ClassRates::default()
     }
     /// What rings as an egress's caps or quota state may change; none when
     /// no egress limits torrents.
@@ -582,7 +604,7 @@ impl Routes for NetworkRoutes {
         ))
     }
 
-    fn egress_rates(&self, egress_id: u32) -> TorrentRates {
+    fn egress_rates(&self, egress_id: u32) -> ClassRates {
         self.network().torrent_egress_rates(egress_id)
     }
 
@@ -946,6 +968,8 @@ enum Slot {
         plan: RoutePlan,
         mappings: PortMappings,
         opening: Box<Opening>,
+        // The path each of its live TCP peer connections rides.
+        tunnels: Option<Arc<PeerTunnels>>,
     },
     // `failed` when it holds closed because its session could not be built.
     Held {
@@ -1531,13 +1555,13 @@ impl Sessions {
             let now = self
                 .off()
                 .or_else(|| slots.get(&plan.key).and_then(Slot::held));
-            if let Ok((session, leg, _, maps, _, _)) = built {
+            if let Ok((session, leg, _, maps, _, _, _)) = built {
                 self.closing.close(&plan.key, session, leg, maps);
             }
             return Err(SessionError::RouteDown(now.unwrap_or(REVOKED)));
         }
         match built {
-            Ok((session, leg, port, maps, opening, naming)) => {
+            Ok((session, leg, port, maps, opening, naming, tunnels)) => {
                 self.rates.add(
                     &session,
                     plan.egress_id,
@@ -1570,6 +1594,7 @@ impl Sessions {
                         plan: plan.clone(),
                         mappings,
                         opening: Box::new(opening),
+                        tunnels,
                     },
                 );
                 Ok(session)
@@ -1637,6 +1662,7 @@ impl Sessions {
             Option<u16>,
             Opening,
             Arc<LegNaming>,
+            Option<Arc<PeerTunnels>>,
         ),
         RouteFailure,
     > {
@@ -1730,7 +1756,15 @@ impl Sessions {
                 if let Some(leg) = &leg.leg {
                     leg.opened(true);
                 }
-                Ok((session, leg.leg, port, maps, opening, leg.naming))
+                Ok((
+                    session,
+                    leg.leg,
+                    port,
+                    maps,
+                    opening,
+                    leg.naming,
+                    leg.tunnels,
+                ))
             }
             // A session that could not open on a leg whose path has a
             // failing hop could not open for that hop: a tunnel that never
@@ -1802,6 +1836,26 @@ impl Sessions {
         slots
             .iter()
             .filter_map(|(key, slot)| Some((key.clone(), Arc::clone(slot.running()?))))
+            .collect()
+    }
+
+    /// Every running session with the paths its live TCP peer connections
+    /// ride, on a leg whose sockets are its dialer's.
+    pub async fn running_on_tunnels(&self) -> BTreeMap<RouteKey, (Arc<Session>, Arc<PeerTunnels>)> {
+        let slots = self.slots.lock().await;
+        slots
+            .iter()
+            .filter_map(|(key, slot)| {
+                let session = slot.running()?;
+                let Slot::Open {
+                    tunnels: Some(tunnels),
+                    ..
+                } = slot
+                else {
+                    return None;
+                };
+                Some((key.clone(), (Arc::clone(session), Arc::clone(tunnels))))
+            })
             .collect()
     }
 

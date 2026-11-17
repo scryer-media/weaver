@@ -15,6 +15,7 @@ pub(crate) mod restore;
 mod runs;
 mod works;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -197,6 +198,12 @@ pub(crate) struct GraphJob {
     // Where root members were last asked whether the sets proved them;
     // `None` before the first.
     sealed_at: Option<repair::Sealed>,
+    // The give-up the job went quiet into, while it has volumes to read
+    // back, one a turn.
+    quieting: Option<repair::Quieting>,
+    // Every give-up is applied in the one turn it was raised in.
+    #[cfg(test)]
+    one_turn: bool,
     // Counts the mutable borrows of this job: nothing of it changes without
     // one, so what was derived from it at a count holds while the count does.
     moved: u64,
@@ -310,6 +317,9 @@ impl GraphJob {
             notes: Vec::new(),
             fed: runs::Fed::default(),
             sealed_at: None,
+            quieting: None,
+            #[cfg(test)]
+            one_turn: false,
             moved: 0,
             indexes_kept: None,
         }
@@ -402,11 +412,19 @@ impl GraphJob {
         self.loans.out()
     }
 
-    // Whether an object of the job is out for its work. No checkpoint is
-    // taken meanwhile: its facts as it left hold the work undone, which a
-    // restart could not always do without the tree.
+    // Whether an object of the job is out for its work, or a give-up has
+    // volumes left to read back. No checkpoint is taken meanwhile: its facts
+    // as it left hold the work undone, which a restart could not always do
+    // without the tree, and a tree half given up is no state to restore. A
+    // restart gives up again from the checkpoint before.
     pub(crate) fn working(&self) -> bool {
-        self.works.working()
+        self.works.working() || self.quieting.is_some()
+    }
+
+    // Every give-up from here on is applied in the turn it was raised in.
+    #[cfg(test)]
+    pub(crate) fn give_up_in_one_turn(&mut self) {
+        self.one_turn = true;
     }
 
     // Every work loan from here on stays in the test's hand.
@@ -600,8 +618,10 @@ impl GraphJob {
         Ok(true)
     }
 
-    // Keep ownership until stopped workers report that they ended.
-    pub(in crate::pipeline) fn request_stop(&self) {
+    // Keep ownership until stopped workers report that they ended. A
+    // give-up's volumes not yet read back are not: the job goes.
+    pub(in crate::pipeline) fn request_stop(&mut self) {
+        self.quieting = None;
         self.runs.request_stop();
         self.loans.request_stop();
         self.works.request_stop();
@@ -637,6 +657,7 @@ impl GraphJob {
     pub(crate) fn work_pending(&self) -> bool {
         self.loans.out()
             || self.works.out()
+            || self.quieting.is_some()
             || self.tree.rewalks_owed()
             || self.writer.rechecks_waiting()
             || self.verifications_due()
@@ -1447,6 +1468,7 @@ impl GraphJob {
                 }
             }
             if !offered {
+                self.fetch_unkept();
                 return Ok(());
             }
             self.writer.apply_all(
@@ -1456,6 +1478,42 @@ impl GraphJob {
                 effects,
                 &mut out,
             )?;
+        }
+    }
+
+    // What a give-back left of a root member not in hand comes again: the
+    // root waits on the articles under it again, the queue fetches them as
+    // first dispatched, and the member is open until they are in. Without
+    // them the member never closes, and a set covering it never rules.
+    fn fetch_unkept(&mut self) {
+        let mut unkept: BTreeMap<MemberId, Vec<weaver_graph::ByteRange>> = BTreeMap::new();
+        for (member, range) in self.writer.take_unkept() {
+            unkept.entry(member).or_default().push(range);
+        }
+        for (member, ranges) in unkept {
+            let volume = VolumeIndex(member.0);
+            let under: Vec<(u32, weaver_graph::ByteRange)> = self
+                .root
+                .map
+                .arrived_ranges(volume)
+                .into_iter()
+                .filter(|(_, placed)| {
+                    ranges
+                        .iter()
+                        .any(|range| placed.start < range.end && range.start < placed.end)
+                })
+                .collect();
+            if under.is_empty() {
+                continue;
+            }
+            for (ordinal, placed) in under {
+                self.root.map.unarrive(volume, ordinal);
+                self.tree.uncover(NodeId::ROOT, volume, placed);
+                self.notes.push(Note::Unread(volume, ordinal));
+            }
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(member);
+            }
         }
     }
 }

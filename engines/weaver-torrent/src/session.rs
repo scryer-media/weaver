@@ -32,11 +32,9 @@ use crate::dht::{Dht, Id20};
 use crate::lsd::LocalServiceDiscovery;
 use crate::meter::Meter;
 use crate::peer_protocol::Handshake;
-use crate::ssl::{SslIdentity, SslTorrent};
+use crate::ssl::SslIdentity;
 use crate::torrent_state::live::{RateTick, choker::Choker};
-use crate::tracker::{
-    HttpAnnounces, ListenPort, StoppedAnnounces, Tracker, TrackerTask, UdpTrackerClient,
-};
+use crate::tracker::{HttpAnnounces, ListenPort, StoppedAnnounces, UdpTrackerClient};
 use crate::{
     api::TorrentIdOrHash,
     bitv_factory::BitVFactory,
@@ -76,6 +74,7 @@ mod construction;
 pub(crate) mod external_ip;
 mod listeners;
 mod options;
+mod peer_finder;
 mod peer_sources;
 mod ports;
 mod turnover;
@@ -84,7 +83,7 @@ pub use options::{
     ListOnlyResponse, SessionLimits, SessionOptions, SessionPersistenceConfig, SharedLimits,
 };
 pub use peer_sources::{Discovery, FetchPhase, MetadataFetch};
-pub(crate) use peer_sources::{a_tracker_answered, speaks_pex, trackers_only};
+pub(crate) use peer_sources::{a_tracker_answered, speaks_pex};
 
 use external_ip::ExternalIps;
 
@@ -342,6 +341,12 @@ pub struct Session {
     /// yet (see [`Session::rejoin_local_discovery`]).
     pub(crate) lsd: Option<LocalServiceDiscovery>,
 
+    /// Each info hash a peer finder was asked for, with the finder's source,
+    /// at the moment it handed the torrent a stream: a test's record of
+    /// where each torrent looks.
+    #[cfg(test)]
+    pub(crate) handed_out: std::sync::Mutex<Vec<(Id20, crate::type_aliases::PeerSourceFlag)>>,
+
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub(crate) connection_slots: Arc<ConnectionSlots>,
@@ -387,31 +392,38 @@ async fn torrent_from_url(
     clients: &dyn HttpClients,
     url: &str,
 ) -> anyhow::Result<ParsedTorrentFile> {
+    // A `.torrent` link can carry a credential in its user, path or query,
+    // as a private tracker's download link does: errors name it by scheme,
+    // host and port, and client errors lose their URL (SECURITY.md,
+    // "Credentials stay with their scope").
+    let shown = crate::tracker::redacted_tracker_url(url);
     let mut response = clients
         .client(None, &ClientShape::FETCH)
         .context("error building HTTP(S) client")?
         .get(url)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("error downloading torrent metadata")?;
     if !response.status().is_success() {
-        bail!("GET {} returned {}", url, response.status())
+        bail!("GET {shown} returned {}", response.status())
     }
     let limit = crate::core::torrent_metainfo::MAX_TORRENT_FILE_BYTES;
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        bail!("torrent at {url} is larger than {limit} bytes");
+        bail!("torrent at {shown} is larger than {limit} bytes");
     }
     let mut b = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .with_context(|| format!("error reading response body from {url}"))?
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("error reading response body from {shown}"))?
     {
         if b.len() + chunk.len() > limit {
-            bail!("torrent at {url} is larger than {limit} bytes");
+            bail!("torrent at {shown} is larger than {limit} bytes");
         }
         b.extend_from_slice(&chunk);
     }
@@ -453,36 +465,6 @@ pub(crate) struct CheckedIncomingConnection {
     pub encryption: crate::mse::Encryption,
     /// What has crossed the socket so far, the handshakes included.
     pub meter: Meter,
-}
-
-/// What a torrent asks for peers with: the hashes and identity it goes by,
-/// the trackers and sources it asks, and whether it announces itself.
-struct PeerRequest<'a> {
-    info_hashes: InfoHashes,
-    identity: &'a Identity,
-    naming: &'a TorrentNaming,
-    tracker_tiers: Vec<Vec<Tracker>>,
-    announce: bool,
-    force_tracker_interval: Option<Duration>,
-    initial_peers: Vec<SocketAddr>,
-    trackers_only: bool,
-    discovery: Discovery,
-    dht_announce: tokio::sync::watch::Receiver<()>,
-    ssl: Option<&'a Arc<SslTorrent>>,
-    // A tracker task already running for the torrent, taken over in place
-    // of starting its own.
-    trackers: Option<TrackerTask>,
-}
-
-// What a torrent's tracker task starts from.
-struct TrackerStart<'a> {
-    info_hashes: InfoHashes,
-    identity: &'a Identity,
-    naming: &'a TorrentNaming,
-    tracker_tiers: Vec<Vec<Tracker>>,
-    force_tracker_interval: Option<Duration>,
-    trackers_only: bool,
-    ssl: Option<&'a Arc<SslTorrent>>,
 }
 
 impl Session {

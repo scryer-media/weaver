@@ -21,6 +21,7 @@ pub mod status;
 pub(crate) mod storage;
 pub(crate) mod store;
 pub(crate) mod tee;
+pub(crate) mod writes;
 
 pub use model::{
     ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentFile, TorrentInsert,
@@ -33,6 +34,19 @@ pub use weaver_torrent::{
     ConnectionKind, Encryption, FetchPhase, NamedBy, PeerFlags, PeerInfo, PeerSourceFlag,
     PeerSources, TorrentVersion,
 };
+
+/// The torrents as a class an operator holds apart: their own pause.
+pub const CLASS: crate::jobs::HeldClass =
+    crate::jobs::HeldClass::must(crate::jobs::Protocol::Torrent);
+
+// The torrents the database still keeps, among `job_ids`: theirs whether or
+// not the client runs, so a history row never takes their folders.
+pub(crate) fn live_among(
+    db: &crate::Database,
+    job_ids: &[crate::jobs::ids::JobId],
+) -> Result<std::collections::BTreeSet<crate::jobs::ids::JobId>, crate::StateError> {
+    db.torrent_job_ids_among(job_ids)
+}
 
 #[cfg(test)]
 mod tests;

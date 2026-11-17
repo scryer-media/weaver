@@ -8,7 +8,6 @@
 // lookup on a naming that keeps connections takes the one its last lookup
 // to the server left, and leaves its own healthy one for the next.
 use super::{Carrier, DnsServer, Exchanged, Wire, list::Keeping};
-use crate::TunnelStream;
 use crate::pipe::KeeperRef;
 use doh::Doh;
 use dot::Dot;
@@ -86,7 +85,7 @@ impl Wires {
     }
 }
 
-pub(super) type Tls = TlsStream<Box<dyn TunnelStream>>;
+pub(super) type Tls = TlsStream<super::model::Opened>;
 
 // One query's reply, or why it got none.
 pub(super) type Reply = Result<Vec<u8>, Exchanged>;
@@ -206,7 +205,10 @@ async fn handshake(
         }
         None => ServerName::IpAddress(server.address.ip().into()),
     };
-    let stream = provider.open(server).await.map_err(Exchanged::Unreached)?;
+    let stream = provider
+        .open_reserving(server)
+        .await
+        .map_err(Exchanged::Unreached)?;
     reached();
     // A failed handshake or certificate fails this server. It is never
     // asked in plain instead.

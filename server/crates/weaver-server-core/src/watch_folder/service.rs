@@ -62,11 +62,6 @@ impl WatchFolderService {
         }
     }
 
-    /// Send the torrents the folder finds to `torrents`.
-    pub fn use_torrents(&self, torrents: crate::torrents::service::TorrentService) {
-        self.inner.scanner.use_torrents(torrents);
-    }
-
     pub async fn reconcile_from_config(&self) -> Result<(), WatchFolderServiceError> {
         let settings = {
             let cfg = self.inner.config.read().await;

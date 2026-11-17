@@ -1466,8 +1466,8 @@ dependencies = [
 
 [[package]]
 name = "proxy-tunnels"
-version = "0.5.0"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?rev=cf43a74f2468168509a9ed018f9f819160a4fbe5#cf43a74f2468168509a9ed018f9f819160a4fbe5"
+version = "0.6.0"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?rev=37fac12610462469f36e7053329aa78aa6390022#37fac12610462469f36e7053329aa78aa6390022"
 dependencies = [
  "async-trait",
  "base64",

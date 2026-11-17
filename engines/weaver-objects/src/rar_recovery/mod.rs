@@ -261,10 +261,14 @@ impl RarRecovery {
     }
 
     // Every data volume of the set, by index: as many as the header counts,
-    // or as the names reach.
+    // or as the names reach. A RAR3 footer signs nothing, and any seven
+    // bytes may read as one, so it counts the set's volumes only once the
+    // set covers one; a RAR5 header is signed and checksummed, and counts
+    // them always.
     fn slots(&self) -> u32 {
         let named = self.bound.keys().next_back().map_or(0, |last| last + 1);
         self.header()
+            .filter(|header| header.last_described || !self.bound.is_empty())
             .map_or(named, |header| header.data_count.max(named))
     }
 
@@ -357,7 +361,12 @@ impl RarRecovery {
     // the set holds no checksum for counts against it, so a set short of
     // one waits on its recovery volumes like any; once none can come, it
     // rules on nothing rather than short.
+    // A set that covers no data volume rules on nothing: no member is whole
+    // or short by it, whatever its recovery volumes say of a set.
     fn rule(&self, access: &mut dyn MemberAccess) -> (RepairOutcome, BTreeMap<u32, bool>) {
+        if self.bound.is_empty() {
+            return (RepairOutcome::Unread, BTreeMap::new());
+        }
         let header = self.header();
         let mut judged = self
             .last

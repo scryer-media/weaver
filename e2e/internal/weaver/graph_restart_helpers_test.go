@@ -368,11 +368,11 @@ func TestServerTrimReverseRefusesAListPastTheLimit(t *testing.T) {
 	}
 }
 
-// The reverses of migrations 94 and 124 refuse what an older build cannot
+// The reverses of migrations 94 and 125 refuse what an older build cannot
 // hold before the rewind changes anything, and pass a database without it.
 func TestBandwidthAndDNSReversesRefuseWhatAnOlderBuildCannotHold(t *testing.T) {
 	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
-	rewind := schemaRewind{Reverses: []string{"move_bandwidth_to_networking_v94", "egress_bandwidth_columns_v94", "dns_profiles_from_proxies_v124"}, LedgerFrom: 94}
+	rewind := schemaRewind{Reverses: []string{"move_bandwidth_to_networking_v94", "egress_bandwidth_columns_v94", "dns_profiles_from_proxies_v125"}, LedgerFrom: 94}
 	for _, tc := range []struct {
 		name, plant, refusal string
 	}{
@@ -541,7 +541,7 @@ var testRustSteps = map[string][]string{
 	},
 	// These tests hold no torrents and no proxies.
 	"fill_tracker_hosts_v105":        nil,
-	"dns_profiles_from_proxies_v124": nil,
+	"dns_profiles_from_proxies_v125": nil,
 }
 
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {

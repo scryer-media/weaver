@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::disk_room::{DiskHeld, StartHold};
+use super::disk_room::DiskHeld;
 use super::intake::Resolving;
+use super::intake::{AddError, AddRequest};
 use super::live::Live;
 use super::scripts::StoppedSeeding;
-use super::{ActionError, Inner, TorrentService, queued, state_error, take_turn};
+use super::{ActionError, Inner, TorrentService, state_error};
 use crate::SchedulerError;
 use crate::jobs::JobId;
-use crate::jobs::handle::{
-    CancellationOrigin, QueueAction, QueueMoveTarget, QueueOwner, SchedulerHandle, TorrentRate,
+use crate::jobs::class::{
+    AddRefusal, ClassIntake, ClassRate, ClassRates, JobClass, RefusalReason, Submission,
 };
+use crate::jobs::handle::{CancellationOrigin, QueueAction, QueueMoveTarget, SchedulerHandle};
+use crate::jobs::model::Protocol;
 use crate::jobs::model::{FieldUpdate, JobUpdate, PRIORITY_ATTRIBUTE_KEY};
+use crate::torrents::admission::Refusal;
 use crate::torrents::metrics::FetchOutcome;
-use crate::torrents::status::Queued;
 use crate::torrents::{TorrentIntent, status};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, PoisonError, Weak};
 
 // A snapshot of the download queue's end from the last pass, extended by
@@ -36,10 +39,30 @@ impl TorrentService {
     ///
     /// The torrents also take their share of the global download limit from
     /// it, and follow its global pause.
+    ///
+    /// It also seats the torrents as the queue's torrent class, so tests and
+    /// callers that start the client themselves get the whole wiring; the
+    /// server wires first and seats only once [`Self::start_seated`] has
+    /// started the client.
     pub fn publish_to(&self, queue: SchedulerHandle) {
-        let seat = Arc::new(Seat(Arc::downgrade(&self.inner)));
-        queue.state().seat_owner(seat.clone());
-        queue.state().seat_torrent_rate(seat);
+        self.wire_to(queue.clone());
+        queue.state().classes().seat(self.class());
+    }
+
+    /// Start the client, and only once it runs seat it as the torrent class
+    /// of the queue it was wired to: a client that failed to start is never
+    /// the class the job layer hands torrents to.
+    pub(super) async fn start_seated(&self) -> Result<(), String> {
+        self.start().await?;
+        if let Some(queue) = self.queue() {
+            queue.state().classes().seat(self.class());
+        }
+        Ok(())
+    }
+
+    // The queue wiring without the seat: holds, starts and the queue the
+    // torrents are published to.
+    pub(super) fn wire_to(&self, queue: SchedulerHandle) {
         let mut hold = queue.state().subscribe_holds();
         let mut starts = queue.state().subscribe_starts();
         *self
@@ -63,6 +86,14 @@ impl TorrentService {
                 service.look_again_held().await;
             }
         }));
+    }
+
+    // The torrents as a job class: the job layer's way to them, which does
+    // not keep the service alive.
+    pub(crate) fn class(&self) -> Arc<dyn JobClass> {
+        Arc::new(TorrentClass {
+            inner: Arc::downgrade(&self.inner),
+        })
     }
 
     pub(super) fn queue(&self) -> Option<SchedulerHandle> {
@@ -213,26 +244,9 @@ impl TorrentService {
             let mut order: Vec<&Live> =
                 live.values().filter(|torrent| !torrent.seeding()).collect();
             order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
-            let mut order: Vec<JobId> = order.iter().map(|torrent| torrent.record.job_id).collect();
-            let named: Vec<JobId> = order
-                .iter()
-                .copied()
-                .filter(|job_id| job_ids.contains(job_id))
-                .collect();
-            let first_first = match target {
-                QueueMoveTarget::Top => false,
-                QueueMoveTarget::Bottom => true,
-                QueueMoveTarget::Offset(offset) => offset < 0,
-            };
-            let moving: Box<dyn Iterator<Item = &JobId>> = if first_first {
-                Box::new(named.iter())
-            } else {
-                Box::new(named.iter().rev())
-            };
-            for &job_id in moving {
-                // Named and still downloading, so in the order.
-                let _ = crate::jobs::handle::splice_job_order(&mut order, job_id, target);
-            }
+            let order: Vec<JobId> = order.iter().map(|torrent| torrent.record.job_id).collect();
+            let named: HashSet<JobId> = job_ids.iter().copied().collect();
+            let order = moved_order(order, &named, target);
             // The torrents still downloading take the places they held among
             // themselves, in their new order; a seed keeps its own.
             let mut places: Vec<i64> = order
@@ -287,115 +301,275 @@ impl TorrentService {
             None => Ok(()),
         }
     }
+}
 
-    // Which torrents the queue lets download, applied to their sessions.
-    pub(super) async fn apply_queue(&self) {
-        let settings = self.settings();
-        let rules = self.rules();
-        let now = self.inner.clock.now_ms();
-        let holds = self.holds();
-        let mut live = self.inner.live.lock().await;
-        let mut order: Vec<&Live> = live.values().collect();
-        order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
-        let queue: Vec<Queued> = order
-            .iter()
-            .map(|torrent| queued(&settings, &rules, torrent, now))
-            .collect();
-        let last = order
-            .last()
-            .map(|torrent| (torrent.record.queue_position, torrent.record.job_id));
-        let (turns, slots) = status::turns(&queue, settings.torrent.max_active_downloads, &holds);
-        let turns: BTreeMap<JobId, (&Queued, status::Turn)> = queue
-            .iter()
-            .zip(turns)
-            .map(|(queued, turn)| (queued.job_id, (queued, turn)))
-            .collect();
-        *self
-            .inner
-            .queue_end
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = QueueEnd { slots, last };
-        for torrent in live.values_mut() {
-            let (queued, turn) = turns[&torrent.record.job_id];
-            take_turn(torrent, queued, turn, &holds, now);
-            let mut run = turn.active && torrent.resumed();
-            // One not running yet whose turn lets it run is kept from
-            // starting while the disk is short; one let go starts.
-            let starting = torrent
-                .attached
-                .as_ref()
-                .is_none_or(|attached| attached.handle.is_paused());
-            if run && (starting || torrent.disk_held == Some(DiskHeld::Starting)) {
-                match self.start_hold(torrent) {
-                    StartHold::Short => {
-                        torrent.disk_held = Some(DiskHeld::Starting);
-                        run = false;
-                    }
-                    StartHold::Unplaced => run = false,
-                    StartHold::Free if torrent.disk_held == Some(DiskHeld::Starting) => {
-                        torrent.disk_held = None;
-                    }
-                    StartHold::Free => {}
-                }
-            } else if !run && torrent.disk_held == Some(DiskHeld::Starting) {
-                torrent.disk_held = None;
-            }
-            let Some(attached) = &torrent.attached else {
-                continue;
-            };
-            let result = if run && attached.handle.is_paused() {
-                attached.session.unpause(&attached.handle).await
-            } else if !run && !attached.handle.is_paused() {
-                attached.session.pause(&attached.handle).await
-            } else {
-                continue;
-            };
-            // A run that ends or begins is not in upload mode: a wait for
-            // room on it, and what a wake handed it, end.
-            self.end_disk_room(torrent);
-            torrent.ran(result);
-        }
+// The torrents as a class of job in the queue: the actions on them, their
+// side of the global limits and their intake.
+struct TorrentClass {
+    inner: Weak<Inner>,
+}
+
+impl TorrentClass {
+    fn service(&self) -> Option<TorrentService> {
+        self.inner.upgrade().map(|inner| TorrentService { inner })
     }
 }
 
-// The torrents' seat in the queue.
-struct Seat(Weak<Inner>);
-
-impl TorrentRate for Seat {
+impl ClassRate for TorrentClass {
     fn sample(&self) -> u64 {
-        self.0
+        self.inner
             .upgrade()
             .map_or(0, |inner| inner.sessions.rates().sample())
     }
 
-    fn set_rates(&self, rates: crate::bandwidth::TorrentRates) {
-        if let Some(inner) = self.0.upgrade() {
+    fn set_rates(&self, rates: ClassRates) {
+        if let Some(inner) = self.inner.upgrade() {
             inner.sessions.rates().set(rates);
         }
     }
 }
 
 #[async_trait::async_trait]
-impl QueueOwner for Seat {
-    async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError> {
-        let inner = self
-            .0
-            .upgrade()
-            .ok_or(SchedulerError::JobNotFound(job_id))?;
-        TorrentService { inner }
-            .act(job_id, action)
+impl JobClass for TorrentClass {
+    fn protocol(&self) -> Protocol {
+        Protocol::Torrent
+    }
+
+    // The actions of one request as one unit (`act_many`).
+    async fn act(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        let Some(service) = self.service() else {
+            return actions
+                .into_iter()
+                .map(|(job_id, _)| (job_id, Err(SchedulerError::JobNotFound(job_id))))
+                .collect();
+        };
+        service
+            .act_many(actions)
             .await
-            .map_err(|error| match error {
-                ActionError::NotFound(job_id) => SchedulerError::JobNotFound(job_id),
-                ActionError::UnmetGoal(_) => SchedulerError::Conflict(error.to_string()),
-                ActionError::Invalid(reason) => SchedulerError::InvalidInput(reason),
-                ActionError::State(reason) => SchedulerError::Internal(reason),
-            })
+            .into_iter()
+            .map(|(job_id, result)| (job_id, result.map_err(scheduler_error)))
+            .collect()
+    }
+
+    fn rate(&self) -> Option<&dyn ClassRate> {
+        Some(self)
+    }
+
+    fn intake(&self) -> Option<&dyn ClassIntake> {
+        Some(self)
+    }
+
+    // Close enough TCP peers on the tunnel's torrent sessions to cover the
+    // bytes, each at a peer socket's size, those the sessions would keep
+    // least first: the choice a connection past the cap already makes. A
+    // peer closed this way is no failure and stays a connect candidate.
+    // Listeners and datagram sockets are never closed for it.
+    fn give_back(&self, ask: crate::jobs::TunnelGiveBack) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let running = inner.sessions.running_on_tunnels().await;
+            let dropped = answer_give_back(&running, &ask);
+            weaver_tunnel::metrics::record_socket_peers_dropped(dropped as u64);
+        });
+    }
+}
+
+// Read what torrents owe the tunnel now, close that many TCP peers' worth,
+// and say how many closed. An answer that owed some and closed none tells
+// the tunnel, so it does not wake torrents again until their holdings there
+// change.
+fn answer_give_back(
+    running: &std::collections::BTreeMap<
+        crate::torrents::sessions::RouteKey,
+        (
+            Arc<weaver_torrent::Session>,
+            Arc<crate::torrents::net::PeerTunnels>,
+        ),
+    >,
+    ask: &crate::jobs::TunnelGiveBack,
+) -> usize {
+    let owed = ask.owed.bytes();
+    if owed == 0 {
+        return 0;
+    }
+    let peer = weaver_tunnel::pipe::stream_bytes(None);
+    let peers = usize::try_from(owed.div_ceil(peer)).unwrap_or(usize::MAX);
+    let dropped = give_back_peers(running, ask, peers);
+    if dropped == 0 {
+        ask.owed.dry();
+    }
+    dropped
+}
+
+// Close up to `peers` TCP peers of the asking tunnel's torrent sessions,
+// those each session would keep least first, and say how many. Only a peer
+// whose every live connection rides the asking tunnel is closed: one on
+// another rung, another tunnel or the kernel's sockets never is.
+fn give_back_peers(
+    running: &std::collections::BTreeMap<
+        crate::torrents::sessions::RouteKey,
+        (
+            Arc<weaver_torrent::Session>,
+            Arc<crate::torrents::net::PeerTunnels>,
+        ),
+    >,
+    ask: &crate::jobs::TunnelGiveBack,
+    peers: usize,
+) -> usize {
+    give_back_through(running, ask, peers, |(session, tunnels), peers| {
+        let on = |addr| tunnels.only_on(addr, |egress, proxies| ask.rides(egress, proxies));
+        session.give_back_tcp_peers(peers, &on)
+    })
+}
+
+// Hand up to `peers` to `close` of each running session the ask names, in
+// its order, and say how many it closed. Once nothing is owed, before
+// torrents act or while they do, nothing more closes: it is read just before
+// each session's peers close.
+pub(super) fn give_back_through<S>(
+    running: &std::collections::BTreeMap<crate::torrents::sessions::RouteKey, S>,
+    ask: &crate::jobs::TunnelGiveBack,
+    peers: usize,
+    mut close: impl FnMut(&S, usize) -> usize,
+) -> usize {
+    let mut dropped = 0;
+    for key in &ask.torrent_routes {
+        if dropped == peers || !ask.owed.stands() {
+            break;
+        }
+        let Some(session) = running.get(key) else {
+            continue;
+        };
+        dropped += close(session, peers - dropped);
+    }
+    dropped
+}
+
+#[async_trait::async_trait]
+impl ClassIntake for TorrentClass {
+    fn takes_new(&self) -> Result<(), AddRefusal> {
+        match self.service() {
+            Some(service) if service.takes_new() => Ok(()),
+            Some(_) => Err(refusal(AddError::Off)),
+            None => Err(AddRefusal::not_running(Protocol::Torrent)),
+        }
+    }
+
+    async fn add(&self, submission: Submission) -> Result<JobId, AddRefusal> {
+        let service = self
+            .service()
+            .ok_or_else(|| AddRefusal::not_running(Protocol::Torrent))?;
+        let request = AddRequest::of(submission).map_err(refusal)?;
+        service.add(request).await.map_err(refusal)
+    }
+}
+
+// A refused add, as the intakes tell refusals apart, in the client's words.
+impl From<AddError> for AddRefusal {
+    fn from(error: AddError) -> Self {
+        refusal(error)
+    }
+}
+
+fn refusal(error: AddError) -> AddRefusal {
+    let reason = match &error {
+        AddError::Invalid(_) => RefusalReason::Invalid,
+        AddError::Refused(Refusal::Removing(_)) => RefusalReason::Removing,
+        AddError::Refused(_) => RefusalReason::Refused,
+        AddError::Duplicate(job_id) => RefusalReason::Duplicate(*job_id),
+        AddError::NoNetwork(_) => RefusalReason::NoNetwork,
+        AddError::Off => RefusalReason::Off,
+        AddError::State(_) => RefusalReason::State,
+    };
+    AddRefusal {
+        reason,
+        text: error.to_string(),
+    }
+}
+
+pub(super) fn scheduler_error(error: ActionError) -> SchedulerError {
+    match error {
+        ActionError::NotFound(job_id) => SchedulerError::JobNotFound(job_id),
+        ActionError::UnmetGoal(_) => SchedulerError::Conflict(error.to_string()),
+        ActionError::Invalid(reason) => SchedulerError::InvalidInput(reason),
+        ActionError::State(reason) => SchedulerError::Internal(reason),
     }
 }
 
 // The top priority a job can be given.
-fn top_priority(value: &str) -> bool {
+pub(super) fn top_priority(value: &str) -> bool {
     use crate::post_processing::scan::numeric_priority;
     numeric_priority(value) >= numeric_priority("HIGH")
+}
+
+// `order` with each torrent `named` moved to `target`, as one splice of each
+// after another gives it: for an offset up, each named torrent in queue
+// order moves that many places up, past any named torrent already there;
+// for one down, each in reverse queue order moves that many places down;
+// to the top, the named torrents in queue order, then the rest; to the
+// bottom, the rest, then the named torrents in queue order. One pass over
+// the order whatever the offset.
+pub(super) fn moved_order(
+    order: Vec<JobId>,
+    named: &HashSet<JobId>,
+    target: QueueMoveTarget,
+) -> Vec<JobId> {
+    let (mut moved, rest): (Vec<JobId>, Vec<JobId>) =
+        order.iter().partition(|job_id| named.contains(*job_id));
+    let offset = match target {
+        QueueMoveTarget::Top => {
+            moved.extend(rest);
+            return moved;
+        }
+        QueueMoveTarget::Bottom => {
+            let mut rest = rest;
+            rest.extend(moved);
+            return rest;
+        }
+        QueueMoveTarget::Offset(offset) => offset,
+    };
+    let places = usize::try_from(offset.unsigned_abs()).unwrap_or(usize::MAX);
+    if offset < 0 {
+        moved_up(order.into_iter(), named, places)
+    } else {
+        let mut down = moved_up(order.into_iter().rev(), named, places);
+        down.reverse();
+        down
+    }
+}
+
+// Each of `order` that is `named`, in turn, `places` places up, clamped at
+// the top. A torrent moved up `places` places lands just before the last
+// `places` torrents of those before it, which no later move reaches over:
+// they stay in `window`, and what leaves it is placed for good.
+fn moved_up(
+    order: impl Iterator<Item = JobId>,
+    named: &HashSet<JobId>,
+    places: usize,
+) -> Vec<JobId> {
+    let mut placed = Vec::new();
+    let mut window = VecDeque::new();
+    for job_id in order {
+        if !named.contains(&job_id) {
+            window.push_back(job_id);
+            if window.len() > places {
+                placed.extend(window.pop_front());
+            }
+        } else if window.len() < places {
+            // Fewer than `places` before it: to the top.
+            window.push_front(job_id);
+        } else {
+            placed.push(job_id);
+        }
+    }
+    placed.extend(window);
+    placed
 }

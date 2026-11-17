@@ -30,7 +30,7 @@ use weaver_server_core::proxies::network_metrics::tunnel::{
 };
 use weaver_server_core::proxies::network_metrics::{
     EgressHealthLabel, EgressMetrics, LegMetrics, LegStateLabel, NetworkMetricsSnapshot,
-    PoolMetrics, RungStateLabel, proxy_kind_label,
+    PoolMetrics, RungStateLabel, TunnelBytesMetrics, proxy_kind_label,
 };
 use weaver_server_core::settings::PerJobSeries;
 use weaver_server_core::torrents::metrics::{
@@ -1161,10 +1161,8 @@ fn render_servers(out: &mut Encoder, server_health: &[ServerHealthInfo], runtime
         for (phase, count) in [
             ("physical", srv.sockets.physical),
             ("dialing", srv.sockets.dialing),
-            ("async_idle", srv.sockets.async_idle),
             ("owned_idle", srv.sockets.owned_idle),
             ("closing", srv.sockets.closing),
-            ("replacement", srv.sockets.replacement),
         ] {
             out.sample(
                 &f::SERVER_SOCKETS,
@@ -1977,11 +1975,12 @@ pub(crate) fn render_script_runs(out: &mut Encoder, metrics: &ScriptRunMetricsSn
 
 pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnapshot) {
     out.sample(&f::SCHEDULE_EVALUATIONS, &[], metrics.evaluations);
-    for &(action, track, outcome, count) in &metrics.actions {
+    for &(action, class, track, outcome, count) in &metrics.actions {
         out.sample(
             &f::SCHEDULE_ACTIONS,
             &[
                 ("action", action.as_str()),
+                ("class", class.map_or("", |class| class.protocol().as_str())),
                 ("track", track.as_str()),
                 ("outcome", outcome.as_str()),
             ],
@@ -2271,6 +2270,36 @@ pub(crate) fn render_network(
             count,
         );
     }
+    // Each tunnel by its egress, its WireGuard proxy, and the proxies beneath
+    // it in hop order, empty for one straight on the egress.
+    let tunnels: Vec<(String, String, String, &TunnelBytesMetrics)> = metrics
+        .tunnels
+        .iter()
+        .map(|tunnel| {
+            let via: Vec<String> = tunnel.via.iter().map(u32::to_string).collect();
+            (
+                tunnel.egress_id.to_string(),
+                tunnel.proxy_id.to_string(),
+                via.join(","),
+                tunnel,
+            )
+        })
+        .collect();
+    for (family, value) in [
+        (
+            &f::NETWORK_TUNNEL_SOCKET_BYTES,
+            (|t: &TunnelBytesMetrics| t.reserved_bytes) as fn(&TunnelBytesMetrics) -> u64,
+        ),
+        (&f::NETWORK_TUNNEL_SOCKET_LIMIT_BYTES, |t| t.limit_bytes),
+    ] {
+        for (egress, proxy, via, tunnel) in &tunnels {
+            out.sample(
+                family,
+                &[("egress_id", egress), ("proxy_id", proxy), ("via", via)],
+                value(tunnel),
+            );
+        }
+    }
 }
 
 // The egress rate limiter's counters, from the same registry the egress
@@ -2358,6 +2387,26 @@ pub(crate) fn render_tunnel(out: &mut Encoder, metrics: &TunnelMetricsSnapshot) 
         out.sample(&f::NETWORK_RUNG_FALLBACKS, &[("rung", &rung)], *count);
     }
     out.sample(&f::NETWORK_LEG_REVOCATIONS, &[], metrics.revocations);
+    out.sample(
+        &f::NETWORK_SOCKET_GIVE_BACKS,
+        &[],
+        metrics.socket_give_backs,
+    );
+    out.sample(
+        &f::NETWORK_SOCKET_GIVE_BACK_BYTES,
+        &[],
+        metrics.socket_give_back_bytes,
+    );
+    out.sample(
+        &f::NETWORK_SOCKET_PEERS_DROPPED,
+        &[],
+        metrics.socket_peers_dropped,
+    );
+    out.sample(
+        &f::NETWORK_SOCKET_IDLE_RETIRED,
+        &[],
+        metrics.socket_idle_retired,
+    );
 }
 
 // Listed DNS servers. Both label sets come from the engine's wire and trust

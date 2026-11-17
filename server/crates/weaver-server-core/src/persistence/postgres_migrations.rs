@@ -16,7 +16,7 @@ use crate::migration_assets::{
 use crate::persistence::sql_runtime::SqlConn;
 use crate::schema_migrations::{
     MigrationMode, egress_quotas_v53, history_release_name_v87, history_retention_v89,
-    history_search_key_v88, networking_bandwidth_v94, nzb_tables_v85, proxy_dns_v124,
+    history_search_key_v88, networking_bandwidth_v94, nzb_tables_v85, proxy_dns_v125,
     proxy_resolver_v64, script_concurrency_v58, script_instances_v55, server_limit_v92,
     tracker_hosts_v105, unwanted_extensions_v56,
 };
@@ -649,8 +649,8 @@ async fn run_postgres_rust_hook(
         tracker_hosts_v105::HOOK_ID => {
             tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Postgres(tx)).await
         }
-        proxy_dns_v124::HOOK_ID => {
-            proxy_dns_v124::dns_profiles_from_proxies(&mut SqlConn::Postgres(tx)).await
+        proxy_dns_v125::HOOK_ID => {
+            proxy_dns_v125::dns_profiles_from_proxies(&mut SqlConn::Postgres(tx)).await
         }
         other => Err(StateError::Database(format!(
             "PostgreSQL migration hook '{other}' is not implemented"
@@ -673,7 +673,7 @@ fn implemented_postgres_rust_hooks() -> &'static [&'static str] {
         server_limit_v92::HOOK_ID,
         networking_bandwidth_v94::HOOK_ID,
         tracker_hosts_v105::HOOK_ID,
-        proxy_dns_v124::HOOK_ID,
+        proxy_dns_v125::HOOK_ID,
     ]
 }
 

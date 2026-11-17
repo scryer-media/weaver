@@ -867,7 +867,7 @@ async fn saturated_fallback_reports_every_capacity_release_source() {
             self.available.load(Ordering::Acquire)
         }
         async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
-            Err(DialError::AtCapacity(vec![self.changed.clone()]))
+            Err(DialError::AtCapacity(vec![self.changed.clone()].into()))
         }
         fn budget(&self) -> Duration {
             Duration::ZERO
@@ -891,9 +891,9 @@ async fn saturated_fallback_reports_every_capacity_release_source() {
     else {
         panic!("all saturated rungs must report capacity");
     };
-    assert_eq!(changes.len(), 2);
-    assert!(Arc::ptr_eq(&changes[0], &first.changed));
-    assert!(Arc::ptr_eq(&changes[1], &second.changed));
+    assert_eq!(changes.waits.len(), 2);
+    assert!(Arc::ptr_eq(&changes.waits[0], &first.changed));
+    assert!(Arc::ptr_eq(&changes.waits[1], &second.changed));
     for rung in [&first, &second] {
         rung.available.store(true, Ordering::Release);
         assert!(ladder.has_capacity());
@@ -1115,15 +1115,42 @@ fn session_budget_counts_probes_and_keeps_live_stream_reservations() {
     let live = SessionCapacity::new(budget.clone());
     let probe = SessionCapacity::new(budget.clone());
     let stream = live.acquire().unwrap();
-    assert!(matches!(probe.acquire(), Err(DialError::Skipped(_))));
+    assert!(matches!(probe.acquire(), Err(DialError::SessionBudget)));
     live.release();
-    assert!(matches!(probe.acquire(), Err(DialError::Skipped(_))));
+    assert!(matches!(probe.acquire(), Err(DialError::SessionBudget)));
     drop(stream);
     let probe_stream = probe.acquire().unwrap();
     assert_eq!(budget.available_permits(), 0);
     drop(probe_stream);
     probe.release();
     assert_eq!(budget.available_permits(), 1);
+}
+
+// A full tunnel and an exhausted session budget are refusals for room; every
+// other refusal, skipped or not, is not.
+#[test]
+fn only_a_full_tunnel_or_session_budget_is_a_capacity_refusal() {
+    let budget = Arc::new(tokio::sync::Semaphore::new(0));
+    let exhausted = SessionCapacity::new(budget).acquire().unwrap_err();
+    assert!(
+        matches!(exhausted, DialError::SessionBudget),
+        "{exhausted:?}"
+    );
+    assert!(exhausted.is_capacity(), "{exhausted}");
+    assert!(DialError::AtCapacity(Default::default()).is_capacity());
+    for other in [
+        // Only the variant is capacity: the same words in a skip are not.
+        DialError::Skipped(SESSION_BUDGET_EXHAUSTED.into()),
+        DialError::Skipped("leg revoked".into()),
+        DialError::Skipped("all rungs are unavailable".into()),
+        DialError::Timeout {
+            stage: "network route".into(),
+        },
+        DialError::Egress(io::Error::other("down")),
+        DialError::Refused(io::Error::from(io::ErrorKind::ConnectionRefused)),
+    ] {
+        assert!(!other.is_capacity(), "{other}");
+    }
 }
 
 #[test]
@@ -1295,6 +1322,10 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
     // The lower session is busy for as long as the upper tunnel rides on it.
     assert!(!lower.retire_idle().await);
     assert!(upper.retire_idle().await);
+    // The upper tunnel's tasks are cancelled by its retire and let go of the
+    // socket they hold in the lower session as they end, which can be after
+    // the retire returns: wait for the last rider to leave.
+    drop(lower.activity.write().await);
     assert!(lower.retire_idle().await);
     assert_eq!(budget.available_permits(), 2);
 
@@ -1406,7 +1437,7 @@ async fn an_exhausted_budget_beneath_a_carried_hop_is_a_skip_not_its_failure() {
         Ok(_) => panic!("no budget beneath, no tunnel above"),
         Err(error) => error,
     };
-    assert!(matches!(error, DialError::Skipped(_)), "{error:?}");
+    assert!(matches!(error, DialError::SessionBudget), "{error:?}");
     assert!(!error.is_path_evidence());
     // The hop above never took a permit of its own for a tunnel it could
     // not bring up.
@@ -2205,7 +2236,7 @@ async fn a_full_tunnel_waits_for_room_without_cooling_its_rung() {
     let Err(DialError::AtCapacity(waits)) = ladder.dial(&target).await else {
         panic!("a full tunnel is at capacity");
     };
-    assert!(Arc::ptr_eq(&waits[0], &freed.notify()));
+    assert!(Arc::ptr_eq(&waits.waits[0], &freed.notify()));
     assert_eq!(ladder.rung_states(), ["STANDBY"]);
 }
 
@@ -2637,9 +2668,24 @@ fn a_revoked_leg_reports_no_route() {
     ));
 }
 
-// Each kind of traffic holds its own share of a WireGuard tunnel's sockets.
-// A full share is at capacity until one of its streams closes, and traffic
-// of another kind still dials or binds.
+// Gives torrents every byte of the sides and usenet none.
+struct TorrentsOnly;
+
+impl SocketDivider for TorrentsOnly {
+    fn shares(&self, cap: u64) -> [u64; SIDES] {
+        [0, cap]
+    }
+    fn share_out(&self, cap: u64, _: &[u64], _: &[Option<u64>], _: &[u64]) -> Vec<u64> {
+        vec![0, cap]
+    }
+    fn presses(&self, used: u64, given: u64) -> bool {
+        used >= given
+    }
+}
+
+// Each class holds its own part of a WireGuard tunnel's bytes. A full part
+// is at capacity, a dropped stream's bytes stay held while it closes, and
+// the reserve still dials.
 #[tokio::test]
 async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     let near = crate::test_support::WireGuardTestPeer::start().await;
@@ -2650,13 +2696,18 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
         )
         .with_udp_factory(bottom()),
     );
+    let stream = stream_bytes(None);
+    let mtu = near.client_spec("1").mtu;
     let session = Arc::new(SessionHop {
-        sockets: Arc::new(SessionSockets::new(SocketShares {
-            nntp: 0,
-            torrent: 1,
-            core: 1,
-            http: 1,
-        })),
+        sockets: Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(mtu) + 2 * stream,
+                reserve: stream,
+                torrent_kept: 0,
+                mtu,
+            },
+            Arc::new(TorrentsOnly),
+        )),
         ..Arc::into_inner(wireguard_session(
             1,
             provider.clone(),
@@ -2675,25 +2726,27 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     assert!(session.has_room(&Purpose::Torrent));
     let peer = session.dial(&target(Purpose::Torrent)).await.unwrap();
     assert!(!session.has_room(&Purpose::Torrent));
-    assert_eq!(session.sockets.held(SocketClass::Torrent), 1);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
     assert!(matches!(
         session.dial(&target(Purpose::Torrent)).await,
         Err(DialError::AtCapacity(_))
     ));
-    let tracker = session.dial(&target(Purpose::TorrentHttp)).await.unwrap();
-    assert_eq!(session.sockets.held(SocketClass::ReserveHttp), 1);
-    // A tracker storm fills the HTTP reserve and leaves the DHT and uTP
-    // their datagram sockets.
+    // A web seed transfer and the DHT are torrents' too.
     assert!(matches!(
-        session.dial(&target(Purpose::Feed { feed: 1 })).await,
+        session.dial(&target(Purpose::TorrentWebSeed)).await,
         Err(DialError::AtCapacity(_))
     ));
     let datagrams = Arc::clone(&session).datagrams().unwrap();
     let far: SocketAddr = "192.0.2.50:6881".parse().unwrap();
-    let utp = datagrams.bind(far).await.unwrap();
-    assert_eq!(session.sockets.held(SocketClass::ReserveCore), 1);
     assert!(datagrams.bind(far).await.is_err());
-    drop(utp);
+    // The reserve is off the split: with the torrent side full, an announce
+    // dials at once.
+    let announce = session.dial(&target(Purpose::TorrentHttp)).await.unwrap();
+    assert_eq!(session.sockets.held(SocketClass::Reserve), stream);
+    assert!(matches!(
+        session.dial(&target(Purpose::Feed { feed: 2 })).await,
+        Err(DialError::AtCapacity(_))
+    ));
     assert!(matches!(
         session
             .dial(&target(Purpose::Nntp {
@@ -2705,22 +2758,290 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
         Err(DialError::AtCapacity(_))
     ));
 
+    // A dropped stream's socket stays in the tunnel while it closes, and its
+    // bytes with it, counted closing.
     drop(peer);
-    assert!(session.has_room(&Purpose::Torrent));
-    let _again = session.dial(&target(Purpose::Torrent)).await.unwrap();
-    drop(tracker);
-    assert_eq!(session.sockets.held(SocketClass::ReserveHttp), 0);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), stream);
+    assert!(!session.has_room(&Purpose::Torrent));
+    drop(announce);
+    assert_eq!(session.sockets.closing(SocketClass::Reserve), stream);
+}
+
+// A WireGuard session on `near` whose reserve holds one DNS stream and whose
+// torrent side holds one peer.
+fn dns_session(near: &crate::test_support::WireGuardTestPeer) -> Arc<SessionHop> {
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let mtu = near.client_spec("1").mtu;
+    let reserve = super::dns_stream_bytes();
+    Arc::new(SessionHop {
+        sockets: Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(mtu) + reserve + stream_bytes(None),
+                reserve,
+                torrent_kept: 0,
+                mtu,
+            },
+            Arc::new(TorrentsOnly),
+        )),
+        ..Arc::into_inner(wireguard_session(
+            1,
+            provider.clone(),
+            provider,
+            bottom(),
+            vec![],
+            1,
+        ))
+        .unwrap()
+    })
+}
+
+// Only a DNS dial records the bytes its socket reserved: a connection is
+// kept only after one. A peer's dial records nothing and leaves the
+// session's keeper unmade.
+#[tokio::test]
+async fn only_a_dns_dial_records_what_its_socket_reserved() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let session = dns_session(&near);
+    let target = |purpose| Target {
+        purpose,
+        ..probe_target()
+    };
+    let peer = session.dial(&target(Purpose::Torrent)).await.unwrap();
+    assert!(peer.outcome.reservations().is_empty());
+    assert!(!session.sockets.keeper().asked_for());
+
+    let dns = session.dial(&target(Purpose::Dns)).await.unwrap();
+    let reserved = dns.outcome.reservations();
+    assert_eq!(reserved.len(), 1);
+    assert_eq!(
+        reserved[0].socket.held(),
+        (SocketClass::Reserve, super::dns_stream_bytes())
+    );
+    assert!(reserved[0].keeper.is(&session.sockets.keeper().handle()));
+    drop(peer);
+}
+
+// A DNS dial on a reserve held whole by a kept connection closes it and
+// waits for its bytes, rather than fail: kept, the connection makes nothing
+// fail. With the reserve held by a connection in use, the dial is refused at
+// once.
+#[tokio::test]
+async fn a_dial_on_a_reserve_held_by_a_kept_connection_waits_for_its_bytes() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let session = dns_session(&near);
+    let target = Target {
+        purpose: Purpose::Dns,
+        ..probe_target()
+    };
+    let in_use = session.dial(&target).await.unwrap();
+    assert!(matches!(
+        session.dial(&target).await,
+        Err(DialError::AtCapacity(_))
+    ));
+
+    // The lookup ends and keeps its connection.
+    let reserved = in_use.outcome.reservations().remove(0);
+    let link = Arc::new(Mutex::new(Some(in_use)));
+    let closing = link.clone();
+    let _kept = reserved
+        .keeper
+        .hold(
+            Some(reserved.socket),
+            Box::new(move || closing.lock().unwrap().take().is_some()),
+        )
+        .expect("a live keeper");
+    let next = session.dial(&target).await.unwrap();
+    assert!(link.lock().unwrap().is_none());
+    assert_eq!(session.sockets.keeper().holding(), 0);
+    assert_eq!(
+        session.sockets.held(SocketClass::Reserve),
+        super::dns_stream_bytes()
+    );
+    drop(next);
+}
+
+// A WireGuard session on `near` whose tunnel holds a reserve socket, a
+// listener's backlog and two torrent peers, and its tunnel.
+fn budgeted_session(
+    near: &crate::test_support::WireGuardTestPeer,
+) -> (Arc<SessionHop>, Arc<crate::WireGuardTunnelProvider>) {
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let stream = stream_bytes(None);
+    let mtu = near.client_spec("1").mtu;
+    let session = Arc::new(SessionHop {
+        sockets: Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(mtu) + 3 * stream + listener_bytes(),
+                reserve: stream,
+                torrent_kept: listener_bytes(),
+                mtu,
+            },
+            Arc::new(TorrentsOnly),
+        )),
+        ..Arc::into_inner(wireguard_session(
+            1,
+            provider.clone(),
+            provider.clone(),
+            bottom(),
+            vec![],
+            1,
+        ))
+        .unwrap()
+    });
+    (session, provider)
+}
+
+// Until the tunnel holds none of `class`'s bytes: woken as bytes come back,
+// on the slot every give-back rings.
+async fn until_given_back(sockets: &SessionSockets, class: SocketClass) {
+    let past = sockets.budget().expect("a budget").bytes + 1;
+    let freed = sockets
+        .room(SocketClass::Reserve, past)
+        .expect_err("no room past the tunnel's bytes")
+        .notify();
+    loop {
+        let back = freed.notified();
+        tokio::pin!(back);
+        back.as_mut().enable();
+        if sockets.held(class) == 0 {
+            return;
+        }
+        back.await;
+    }
+}
+
+// A dialled stream's bytes stay held after it is dropped, while its socket
+// closes in the tunnel, and come back when the tunnel frees the socket once
+// the far side finished the close.
+#[tokio::test]
+async fn a_dropped_streams_bytes_come_back_when_the_tunnel_frees_its_socket() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let (session, _provider) = budgeted_session(&near);
+    let stream = stream_bytes(None);
+    let peer = session
+        .dial(&Target {
+            purpose: Purpose::Torrent,
+            ..probe_target()
+        })
+        .await
+        .unwrap();
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), 0);
+
+    // Nothing runs the tunnel between the drop and the reads: the socket is
+    // retired, not freed.
+    drop(peer);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.owed(SocketClass::Torrent), 0);
+
+    until_given_back(&session.sockets, SocketClass::Torrent).await;
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), 0);
+}
+
+// A stream dropped while its far side answers nothing stays closing in the
+// tunnel, its bytes held; stopping the tunnel frees the socket and gives them
+// back.
+#[tokio::test]
+async fn a_closing_streams_bytes_come_back_when_its_tunnel_stops() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let (session, provider) = budgeted_session(&near);
+    let stream = stream_bytes(None);
+    let peer = session
+        .dial(&Target {
+            purpose: Purpose::Torrent,
+            ..probe_target()
+        })
+        .await
+        .unwrap();
+    // The far side goes: nothing will finish the close.
+    drop(near);
+    drop(peer);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), stream);
+
+    // Retiring the tunnel waits for its engine to end, which stops its
+    // stack and frees every socket still closing.
+    TunnelProvider::retire(&*provider).await;
+    assert_eq!(session.sockets.held(SocketClass::Torrent), 0);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), 0);
+}
+
+// A dial the far side refuses holds nothing: its socket was freed before the
+// dial returned, and its bytes with it.
+#[tokio::test]
+async fn a_failed_dial_holds_nothing() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let (session, _provider) = budgeted_session(&near);
+    let refused = session
+        .dial(&Target {
+            port: 9,
+            purpose: Purpose::Torrent,
+            ..probe_target()
+        })
+        .await;
+    assert!(refused.is_err(), "a closed port took a connection");
+    assert_eq!(session.sockets.held(SocketClass::Torrent), 0);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), 0);
+}
+
+// An accepted stream's bytes, taken before the accept, are the tunnel's once
+// it accepted: held after the stream is dropped, and back when the tunnel
+// frees the socket. The listener's backlog comes back as it is dropped.
+#[tokio::test]
+async fn an_accepted_streams_bytes_come_back_when_the_tunnel_frees_its_socket() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let (session, _provider) = budgeted_session(&near);
+    let stream = stream_bytes(None);
+    let listener = Arc::clone(&session)
+        .inbound()
+        .expect("a WireGuard session takes connections")
+        .listen(0, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.sockets.held(SocketClass::TorrentSession),
+        listener_bytes()
+    );
+    let port = listener.local_addr().port();
+    let (accepted, far) = tokio::join!(listener.accept(), near.dial_client(port));
+    let accepted = accepted.unwrap();
+    let far = far.unwrap();
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+
+    drop(accepted);
+    assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
+    assert_eq!(session.sockets.closing(SocketClass::Torrent), stream);
+    // The far side closes too, and the close finishes.
+    drop(far);
+    until_given_back(&session.sockets, SocketClass::Torrent).await;
+
+    drop(listener);
+    assert_eq!(session.sockets.held(SocketClass::TorrentSession), 0);
 }
 
 // A stage that records the purpose of every dial and fails it, with room in
-// every share but the HTTP reserve.
+// every class but the reserve.
 #[derive(Default)]
 struct RecordsPurpose(Mutex<Vec<Purpose>>);
 
 #[async_trait::async_trait]
 impl Dialer for RecordsPurpose {
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
-        if SocketClass::of(purpose) == SocketClass::ReserveHttp {
+        if SocketClass::of(purpose) == SocketClass::Reserve {
             Err(Vec::new())
         } else {
             Ok(())
@@ -2768,7 +3089,7 @@ async fn a_chained_dial_takes_its_own_share_of_the_tunnel_beneath() {
         .collect();
     assert_eq!(classes, [SocketClass::Nntp, SocketClass::Torrent]);
     assert!(chain.has_room(&Purpose::Torrent));
-    assert!(!chain.has_room(&Purpose::TorrentHttp));
+    assert!(!chain.has_room(&Purpose::Feed { feed: 1 }));
 }
 
 // A rung whose share has room, or is full and says what frees it.
@@ -3275,4 +3596,155 @@ async fn an_inner_proxys_name_goes_to_its_carrier_and_a_first_hops_to_the_host()
     let _ = origin.accept().await.unwrap();
     assert_eq!(dialed.path.proxies, vec![8]);
     assert!(host_lookups() > before);
+}
+
+// A tunnel that records the buffers each dial through it asked for.
+#[derive(Default)]
+struct SizedRecorder(std::sync::Mutex<Vec<Option<crate::wireguard::TcpBuffers>>>);
+
+#[async_trait::async_trait]
+impl TunnelProvider for SizedRecorder {
+    async fn dial(&self, _: &str, _: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        Ok(Box::new(tokio::io::duplex(64).0))
+    }
+    async fn dial_sized(
+        &self,
+        host: &str,
+        port: u16,
+        _outcome: Arc<ConnectionOutcome>,
+        buffers: Option<crate::wireguard::TcpBuffers>,
+        _socket: &mut StreamSocket,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        self.0.lock().unwrap().push(buffers);
+        self.dial(host, port).await
+    }
+    fn describe(&self) -> String {
+        "sized recorder".into()
+    }
+}
+
+fn recording_session(provider: Arc<SizedRecorder>) -> SessionHop {
+    SessionHop {
+        sockets: Default::default(),
+        capacity: Default::default(),
+        activity: Default::default(),
+        id: 3,
+        provider,
+        inner: bottom(),
+        transport: None,
+        path: DialPath::default(),
+        endpoint: Some("127.0.0.1:22".parse().unwrap()),
+        timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
+        tunnel_dns: Vec::new(),
+        resolver: None,
+        forwarding: Default::default(),
+        failure: Default::default(),
+    }
+}
+
+fn aimed(purpose: Purpose) -> Target {
+    Target {
+        purpose,
+        ..target("192.0.2.9:119".parse().unwrap())
+    }
+}
+
+// Every dial through a tunnel asks for the buffers its traffic needs: a
+// usenet connection or a test of a usenet server the receive buffer the
+// profile sets and the command-sized send buffer, everything else the
+// tunnel's own sizes. Each profile's receive buffer reaches the next usenet
+// dial; a stream dialled before a change keeps what it was dialled with, and
+// nothing is dialled again for it.
+//
+// The receive size is one value for the whole process, so this is the only
+// test in the crate that sets it.
+#[tokio::test]
+async fn a_dial_through_a_tunnel_asks_for_the_buffers_of_its_traffic() {
+    use crate::wireguard::TcpBuffers;
+    let provider = Arc::new(SizedRecorder::default());
+    let hop = recording_session(provider.clone());
+    let nntp = Purpose::Nntp {
+        server: 1,
+        leg: 0,
+        probing: false,
+    };
+    let probe = Purpose::NntpProbe { server: 1, leg: 0 };
+    let sized = |receive| Some(TcpBuffers::new(receive, 64 * 1024));
+
+    // Before any profile is in force, a usenet socket asks for 1 MiB.
+    let cases = [
+        (nntp.clone(), sized(1024 * 1024)),
+        (probe.clone(), sized(1024 * 1024)),
+        (
+            Purpose::ProxyEndpoint {
+                proxy: 4,
+                carrying: None,
+            },
+            None,
+        ),
+        (Purpose::Feed { feed: 2 }, None),
+        (Purpose::Outbound, None),
+        (Purpose::Torrent, None),
+        (Purpose::TorrentHttp, None),
+        (Purpose::Probe, None),
+        (Purpose::Dns, None),
+    ];
+    for (purpose, _) in &cases {
+        hop.dial(&aimed(purpose.clone())).await.unwrap();
+    }
+    let asked = std::mem::take(&mut *provider.0.lock().unwrap());
+    let expected: Vec<_> = cases.iter().map(|(_, buffers)| *buffers).collect();
+    assert_eq!(asked, expected);
+
+    let mut open = Vec::new();
+    for receive in [256 * 1024, 1024 * 1024, 4 * 1024 * 1024] {
+        set_usenet_receive_bytes(receive);
+        open.push(hop.dial(&aimed(nntp.clone())).await.unwrap());
+        hop.dial(&aimed(probe.clone())).await.unwrap();
+    }
+    let asked = provider.0.lock().unwrap().clone();
+    assert_eq!(
+        asked,
+        vec![
+            sized(256 * 1024),
+            sized(256 * 1024),
+            sized(1024 * 1024),
+            sized(1024 * 1024),
+            sized(4 * 1024 * 1024),
+            sized(4 * 1024 * 1024),
+        ]
+    );
+    assert_eq!(USENET_SEND_BYTES, 64 * 1024);
+    assert_eq!(open.len(), 3);
+}
+
+// A usenet dial on a direct route opens an ordinary socket, sized by the
+// system as any other direct dial is: a profile's tunnel sizes never reach
+// it.
+#[tokio::test]
+async fn a_direct_usenet_dial_is_not_sized_by_the_profile() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let egress = bottom();
+    let plain = egress.dial(&target(address)).await.unwrap();
+    let usenet = egress
+        .dial(&Target {
+            purpose: Purpose::Nntp {
+                server: 1,
+                leg: 0,
+                probing: false,
+            },
+            ..target(address)
+        })
+        .await
+        .unwrap();
+    let sizes = |dialed: &Dialed| {
+        let socket = socket2::SockRef::from(dialed.stream.tcp().expect("a real socket"));
+        (
+            socket.recv_buffer_size().unwrap(),
+            socket.send_buffer_size().unwrap(),
+        )
+    };
+    assert_eq!(sizes(&usenet), sizes(&plain));
 }

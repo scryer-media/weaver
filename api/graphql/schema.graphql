@@ -1406,10 +1406,10 @@ input GeneralSettingsInput {
 type GlobalQueueState {
 	isPaused: Boolean!
 	"""
-	Whether the operator's or the schedule's pause of every torrent is in
-	force.
+	The classes of job the operator's or the schedule's pause of the
+	whole class holds.
 	"""
-	torrentsPaused: Boolean!
+	pausedClasses: [Protocol!]!
 	speedLimitBytesPerSec: Int
 	downloadBlock: DownloadBlock!
 	"""
@@ -2709,6 +2709,16 @@ type MutationRoot {
 	"""
 	reorderQueueItem(id: Int!, kind: QueueMoveKind!, offset: Int): Boolean!
 	"""
+	Pause every job of a class, as one hold, its jobs' own pauses and
+	resumes standing under it. A class with no hold of its own is
+	refused.
+	"""
+	pauseClass(class: Protocol!): Boolean!
+	"""
+	Lift the operator's pause of every job of a class.
+	"""
+	resumeClass(class: Protocol!): Boolean!
+	"""
 	Pause all download dispatch globally. With `resumeAfterSecs`, downloads
 	resume on their own after that many seconds (1 to 30 days).
 	"""
@@ -2927,15 +2937,6 @@ type MutationRoot {
 	removeTorrent(id: Int!, deleteFiles: Boolean! = false, confirmUnmetGoal: Boolean! = false): Boolean!
 	pauseTorrent(id: Int!): Boolean!
 	resumeTorrent(id: Int!): Boolean!
-	"""
-	Pause every torrent, seeding too, as one hold. Each torrent's own
-	pause or resume stands under it.
-	"""
-	pauseTorrents: Boolean!
-	"""
-	Lift the operator's pause of every torrent.
-	"""
-	resumeTorrents: Boolean!
 	setTorrentForced(id: Int!, forced: Boolean!): Boolean!
 	"""
 	Move the torrent's directory under `path`; it goes on from there.
@@ -4649,6 +4650,11 @@ type Schedule {
 	pruneCancelled: SchedulePruneFiles
 	actionType: String!
 	"""
+	The class of job a `pause_class` or `resume_class` rule holds; null
+	for every other action.
+	"""
+	class: Protocol
+	"""
 	Rules on this track hold independently of every other track. A rule
 	touching several tracks reports the first.
 	"""
@@ -4694,6 +4700,11 @@ input ScheduleInput {
 	pruneCompleted: SchedulePruneFilesInput
 	pruneCancelled: SchedulePruneFilesInput
 	actionType: String!
+	"""
+	The class of job a `pause_class` or `resume_class` rule holds, one
+	with a hold of its own; refused for every other action.
+	"""
+	class: Protocol
 	"""
 	A global rate for a `speed_limit` rule, read only when `speedLimits`
 	is omitted. 0 is no limit.
@@ -6362,8 +6373,14 @@ type Torrent {
 	version: TorrentVersion
 	state: TorrentState!
 	"""
-	Why the torrent is in its state, when there is a reason to give. While
-	its route holds it, the cause behind `routeReason`, when one is known.
+	Why the torrent is in its state, when the server states the reason
+	itself.
+	"""
+	stated: TorrentStatedReason
+	"""
+	Why the torrent is in its state, in free words (an error, an
+	unpacking refusal), when that is the reason. While its route holds
+	it, the cause behind `routeReason`, when one is known.
 	"""
 	detail: String
 	"""
@@ -6939,6 +6956,48 @@ enum TorrentState {
 	NEEDS_CERTIFICATE
 	CHECKING_RESUME_DATA
 	FILES_MISSING
+}
+
+"""
+Why a torrent is in its state, as the server states it.
+"""
+enum TorrentStatedReason {
+	"""
+	Kept from starting for room on its disk, as a usenet job waits.
+	"""
+	DISK_SPACE
+	"""
+	A write found no room: it fetches nothing and keeps seeding.
+	"""
+	DISK_FULL
+	"""
+	Stopped once its seeding goal was met.
+	"""
+	GOAL_MET
+	"""
+	Held in the queue by the operator's pause.
+	"""
+	HELD_MANUAL
+	"""
+	Held in the queue by the schedule.
+	"""
+	HELD_SCHEDULED
+	"""
+	Held in the queue while a speed test runs.
+	"""
+	HELD_SPEED_TEST
+	"""
+	Fetching its metadata from its trackers.
+	"""
+	FETCH_TRACKERS
+	"""
+	Fetching its metadata from its trackers, the DHT and local discovery.
+	"""
+	FETCH_DISCOVERY
+	"""
+	Fetching its metadata, with no peers named that may serve it.
+	"""
+	FETCH_WAITING
 }
 
 input TorrentTestInput {

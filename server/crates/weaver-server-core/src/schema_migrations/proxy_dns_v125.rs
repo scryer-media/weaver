@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Migration 124, upgrade step: the DNS a saved proxy named becomes a saved
+// Migration 125, upgrade step: the DNS a saved proxy named becomes a saved
 // DNS profile, and each route takes the profile of the proxy on its first
 // leg.
 //
-// Before 124 a proxy named its resolver, Weaver or the proxy, and a list of
+// Before 125 a proxy named its resolver, Weaver or the proxy, and a list of
 // server addresses that resolver asked, plain on port 53, taking answers as
 // sent. Weaver with no servers is the host answering: the built-in System
 // profile, and nothing is written. Weaver with servers is those servers
@@ -36,7 +36,7 @@
 //
 // The resolver key is removed from every proxy, and the server list from
 // every proxy but a WireGuard one whose tunnel asks it. The fields and
-// values are spelled out here as they stood at schema 124, so later changes
+// values are spelled out here as they stood at schema 125, so later changes
 // to the types do not change what this step does.
 
 use std::collections::HashMap;
@@ -46,10 +46,10 @@ use serde_json::{Map, Value, json};
 use crate::StateError;
 use crate::persistence::sql_runtime::{SqlArg, SqlConn, SqlEngine, max_rows_for_engine};
 
-pub(crate) const HOOK_ID: &str = "dns_profiles_from_proxies_v124";
+pub(crate) const HOOK_ID: &str = "dns_profiles_from_proxies_v125";
 // The schema that first keeps DNS profiles. A backup taken below it carries
 // proxies that name a resolver instead.
-pub(crate) const SCHEMA_VERSION: i64 = 124;
+pub(crate) const SCHEMA_VERSION: i64 = 125;
 
 const RESOLVER: &str = "resolver";
 const DNS_SERVERS: &str = "dns_servers";
@@ -413,5 +413,5 @@ pub(crate) async fn dns_profiles_from_proxies(conn: &mut SqlConn<'_>) -> Result<
 }
 
 #[cfg(test)]
-#[path = "proxy_dns_v124_tests.rs"]
+#[path = "proxy_dns_v125_tests.rs"]
 mod tests;

@@ -14,13 +14,14 @@ use serde_json::Value;
 use weaver_server_api::auth::{CallerIdentity, CallerScope};
 use weaver_server_api::networking::ResolvedBy as ResolvedByGql;
 use weaver_server_core::categories::CategoryConfig;
+use weaver_server_core::clock::SystemClock;
 use weaver_server_core::post_processing::model::PostProcessingSettings;
 use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::{Leaf, SeedingPolicy, TorrentConfig};
 use weaver_server_core::torrents::net::LegKind;
-use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
+use weaver_server_core::torrents::service::{JobEnv, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
     IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };
@@ -216,6 +217,31 @@ async fn a_metainfo_is_added_and_read_back() {
     let listed = listed.data.into_json().unwrap();
     assert_eq!(listed["torrents"][0]["id"], id);
     assert_eq!(listed["torrent"]["infohash"].as_str().unwrap().len(), 40);
+}
+
+// A list that asks for each torrent's files gets them, as the torrent's own
+// read does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_list_carries_the_files_it_asks_for() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("listed.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let listed = rig
+        .execute(&format!(
+            "{{ torrents {{ id files {{ path length }} }} torrent(id: {id}) {{ files {{ path length }} }} }}"
+        ))
+        .await;
+    assert!(listed.errors.is_empty(), "{:?}", listed.errors);
+    let listed = listed.data.into_json().unwrap();
+    assert_eq!(listed["torrents"][0]["id"], id);
+    assert_eq!(listed["torrents"][0]["files"][0]["path"], "listed.mkv");
+    assert_eq!(listed["torrents"][0]["files"][0]["length"], 3000);
+    assert_eq!(listed["torrents"][0]["files"], listed["torrent"]["files"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -516,27 +542,24 @@ async fn the_queue_events_carry_a_torrent() {
 async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
     use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
     let harness = TestHarness::new().await;
-    let state = "{ globalQueueState { isPaused torrentsPaused } }";
+    let state = "{ globalQueueState { isPaused pausedClasses } }";
     let read = |response: Response| {
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         let data = response.data.into_json().unwrap();
         (
             data["globalQueueState"]["isPaused"].as_bool().unwrap(),
-            data["globalQueueState"]["torrentsPaused"]
-                .as_bool()
-                .unwrap(),
+            data["globalQueueState"]["pausedClasses"] == serde_json::json!(["TORRENT"]),
         )
     };
 
-    let response = harness.execute("mutation { pauseTorrents }").await;
+    let response = harness
+        .execute("mutation { pauseClass(class: TORRENT) }")
+        .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    assert!(
-        harness
-            .handle
-            .state()
-            .holds()
-            .held_by(HoldOrigin::Manual, HoldOwner::Torrents)
-    );
+    assert!(harness.handle.state().holds().held_by(
+        HoldOrigin::Manual,
+        HoldOwner::Class(weaver_server_core::torrents::CLASS)
+    ));
     assert_eq!(read(harness.execute(state).await), (false, true));
 
     let response = harness.execute("mutation { pauseQueue { success } }").await;
@@ -547,9 +570,15 @@ async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
     assert!(response.errors.is_empty(), "{:?}", response.errors);
     assert_eq!(read(harness.execute(state).await), (false, true));
 
-    let response = harness.execute("mutation { resumeTorrents }").await;
+    let response = harness
+        .execute("mutation { resumeClass(class: TORRENT) }")
+        .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
     assert_eq!(read(harness.execute(state).await), (false, false));
+
+    // The pipeline has no pause of its own apart from the queue's.
+    let response = harness.execute("mutation { pauseClass(class: NZB) }").await;
+    assert!(!response.errors.is_empty());
 }
 
 // A follower of the torrents gets them as they are, then each change the

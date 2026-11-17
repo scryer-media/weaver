@@ -242,6 +242,17 @@ pub struct PoolMetrics {
     pub members: Vec<PoolMemberMetrics>,
 }
 
+// One WireGuard tunnel's socket memory: its egress, its WireGuard proxy and
+// the hops beneath it, what it holds now (overhead included) and its limit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TunnelBytesMetrics {
+    pub egress_id: u32,
+    pub proxy_id: u32,
+    pub via: Vec<u32>,
+    pub reserved_bytes: u64,
+    pub limit_bytes: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NetworkMetricsSnapshot {
     pub legs: Vec<LegMetrics>,
@@ -249,6 +260,8 @@ pub struct NetworkMetricsSnapshot {
     pub pools: Vec<PoolMetrics>,
     // (kind, enabled, configured profiles) for every kind and both states.
     pub proxies: Vec<(ProxyKind, bool, u64)>,
+    // Every WireGuard tunnel open now, by egress and path.
+    pub tunnels: Vec<TunnelBytesMetrics>,
 }
 
 fn now_epoch_ms() -> u64 {
@@ -448,11 +461,29 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
         }
     }
 
+    let mut tunnels: Vec<TunnelBytesMetrics> = runtime
+        .tunnel_bytes()
+        .into_iter()
+        .map(|((egress_id, mut path), reserved_bytes, limit_bytes)| {
+            let proxy_id = path.pop().unwrap_or_default();
+            TunnelBytesMetrics {
+                egress_id,
+                proxy_id,
+                via: path,
+                reserved_bytes,
+                limit_bytes,
+            }
+        })
+        .collect();
+    tunnels
+        .sort_by(|a, b| (a.egress_id, a.proxy_id, &a.via).cmp(&(b.egress_id, b.proxy_id, &b.via)));
+
     NetworkMetricsSnapshot {
         legs,
         egresses,
         pools,
         proxies,
+        tunnels,
     }
 }
 

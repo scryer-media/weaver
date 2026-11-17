@@ -616,3 +616,95 @@ async fn a_magnet_added_paused_announces_only_once_resumed() {
     answer_no_peers(stream).await;
     rig.service.stop().await;
 }
+
+// The magnet added, and the figures published for it once its metainfo is
+// in hand. A magnet retired first, as a failed fetch retires it, fails.
+async fn resolved_magnet(service: &TorrentService, magnet: String) -> (JobId, TorrentSeries) {
+    let mut retired = service.retired();
+    let before = *retired.borrow_and_update();
+    let mut published = service.inner.published.subscribe();
+    let job_id = service
+        .add(request(AddSource::Magnet(magnet)))
+        .await
+        .unwrap();
+    tokio::select! {
+        published = published.wait_for(|published| {
+            published
+                .job(job_id)
+                .is_some_and(|job| job.torrent.total_bytes != 0)
+        }) => (job_id, published.unwrap().job(job_id).unwrap().torrent.clone()),
+        _ = retired.wait_for(|retired| *retired > before) => panic!(
+            "the magnet was retired: {:?}",
+            service.inner.db.get_job_history(job_id.0).unwrap().map(|job| job.error_message)
+        ),
+    }
+}
+
+// A magnet of `metainfo` naming the seeder at `peer` as its one source:
+// no trackers, and `more` after its peer.
+fn magnet_of_peer(metainfo: &[u8], peer: std::net::SocketAddr, more: &str) -> String {
+    let hash = parse(metainfo).unwrap().hashes.v1.unwrap().as_string();
+    format!("magnet:?xt=urn:btih:{hash}&x.pe={peer}{more}")
+}
+
+// A magnet with no trackers that names its peers (`x.pe`) finds them on a
+// route with no DHT: its fetch is not failed for the DHT it does not need,
+// and, once the route's session runs, neither is its add.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnet_that_names_its_peers_needs_no_dht() {
+    let data: Vec<u8> = (0..40_000u32).map(|at| (at % 241) as u8).collect();
+    let first = metainfo("first", &[("first/a.bin", &data)], 16_384, false);
+    let second = metainfo(
+        "second",
+        &[("second/b.bin", &data[..30_000])],
+        16_384,
+        false,
+    );
+    let seeds = tempfile::tempdir().unwrap();
+    let (one, _) = sharing(seeds.path(), &first, &[]).await;
+    let (two, _) = sharing(seeds.path(), &second, &[]).await;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    // The route's session is opened by this magnet's fetch.
+    let magnet = magnet_of_peer(&first, one.listen_addr().unwrap(), "");
+    let (_, resolved) = resolved_magnet(&rig.service, magnet).await;
+    assert_eq!(resolved.total_bytes, 40_000);
+    // The route's session runs now.
+    let magnet = magnet_of_peer(&second, two.listen_addr().unwrap(), "");
+    let (_, resolved) = resolved_magnet(&rig.service, magnet).await;
+    assert_eq!(resolved.total_bytes, 30_000);
+    rig.service.stop().await;
+    one.stop().await;
+    two.stop().await;
+}
+
+// A magnet that selects some of its files (`so=`) downloads those alone,
+// as libtorrent's `parse_magnet_uri` has it: the files it leaves out are
+// Ignored once its metainfo is in hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnets_selection_is_kept_with_its_metainfo() {
+    let data: Vec<u8> = (0..50_000u32).map(|at| (at % 239) as u8).collect();
+    let files = [
+        ("set/a.bin", &data[..20_000]),
+        ("set/b.bin", &data[20_000..]),
+    ];
+    let shared = metainfo("set", &files, 16_384, false);
+    let seeds = tempfile::tempdir().unwrap();
+    let (seeding, _) = sharing(seeds.path(), &shared, &[]).await;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let magnet = magnet_of_peer(&shared, seeding.listen_addr().unwrap(), "&so=0");
+    let (job_id, resolved) = resolved_magnet(&rig.service, magnet).await;
+    assert_eq!(resolved.total_bytes, 50_000);
+    assert_eq!(resolved.wanted_bytes, 20_000);
+    assert_eq!(
+        rig.db.torrent_file_priorities(job_id).unwrap(),
+        [FilePriority::Normal, FilePriority::Ignored]
+    );
+    rig.service.stop().await;
+    seeding.stop().await;
+}

@@ -57,6 +57,8 @@ const EXCHANGE_READ: usize = REPLY_CAP + HEAD_CAP * (INTERIM + 1) + READ;
 // connection is not kept.
 pub(in crate::dns::exchange) struct Connection {
     http: Http,
+    // The bytes the connection's sockets reserved, by share.
+    reserved: Vec<crate::pipe::Reservation>,
     read: Arc<AtomicUsize>,
     overran: bool,
 }
@@ -82,6 +84,7 @@ enum Http {
 impl Connection {
     pub(super) async fn new(stream: Tls) -> Result<Self, Exchanged> {
         let two = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        let reserved = stream.get_ref().0.reserved.clone();
         let read = Arc::new(AtomicUsize::new(0));
         let io = Io {
             stream,
@@ -120,6 +123,7 @@ impl Connection {
         };
         Ok(Self {
             http,
+            reserved,
             read,
             overran: false,
         })
@@ -221,6 +225,11 @@ impl Connection {
 
     // Whether several queries can share the connection at once: HTTP/2
     // streams, on the one connection, with no new one opened.
+    // The bytes the connection's sockets reserved, by share.
+    pub(in crate::dns::exchange) fn reserved(&self) -> &[crate::pipe::Reservation] {
+        &self.reserved
+    }
+
     pub(super) fn multiplexes(&self) -> bool {
         matches!(self.http, Http::Two { .. })
     }

@@ -32,7 +32,7 @@ use crate::peer_protocol::extended::ut_pex::{
     PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PexPeerInfo,
 };
 use crate::stream_connect::{ConnectionKind, Transports};
-use crate::type_aliases::{BF, PeerSourceFlag, PeerSources};
+use crate::type_aliases::{BF, PeerHandle, PeerSourceFlag, PeerSources};
 
 use super::PeerStates;
 use super::choker::Transfer;
@@ -360,7 +360,7 @@ pub(crate) fn opening_rank(trust: Trust) -> DisconnectRank {
 
 #[derive(Debug)]
 pub(crate) struct Peer {
-    pub addr: SocketAddr,
+    pub addr: PeerHandle,
     state: PeerState,
     pub stats: stats::atomic::PeerStats,
     // Where the peer listens, when we know. We can connect to the peer when it
@@ -406,6 +406,10 @@ pub(crate) struct Peer {
     holepunch: bool,
     // Every source that named the peer.
     sources: PeerSources,
+    // A restart saved the peer as found elsewhere than its trackers and the
+    // operator (`ResumePeers::found`), so its resume data is no tracker's or
+    // operator's word.
+    resumed_found: bool,
     // Where the peer list's index holds the peer (`PeerStates::reindex`).
     indexed: Indexed,
 }
@@ -420,7 +424,7 @@ impl Peer {
     ) -> Self {
         let stats = stats::atomic::PeerStats::default();
         Self {
-            addr,
+            addr: addr.into(),
             state: PeerState::Live(Box::new(LivePeerState::new(
                 peer_id,
                 tx,
@@ -442,6 +446,7 @@ impl Peer {
             supports_holepunch: false,
             holepunch: false,
             sources: PeerSourceFlag::Incoming.into(),
+            resumed_found: false,
             indexed: Indexed::default(),
         }
     }
@@ -449,9 +454,20 @@ impl Peer {
     /// A peer `sources` named, listening where it was named. The peer list
     /// counts it on admission.
     pub fn new_with_outgoing_address(addr: SocketAddr, sources: PeerSources) -> Self {
+        Self::not_connected(addr.into(), Some(addr), sources)
+    }
+
+    /// A peer under `addr` we are not connected to, dialled at
+    /// `outgoing_address` when it has one: the one place a peer's fields
+    /// begin, but for an incoming connection's.
+    fn not_connected(
+        addr: PeerHandle,
+        outgoing_address: Option<SocketAddr>,
+        sources: PeerSources,
+    ) -> Self {
         Self {
             addr,
-            outgoing_address: Some(addr),
+            outgoing_address,
             stats: Default::default(),
             state: Default::default(),
             failcount: 0,
@@ -466,6 +482,7 @@ impl Peer {
             supports_holepunch: false,
             holepunch: false,
             sources,
+            resumed_found: false,
             indexed: Indexed::default(),
         }
     }
@@ -480,15 +497,29 @@ impl Peer {
         }
     }
 
+    /// Web seed `handle`, which no source named and which listens nowhere
+    /// we can dial, so it is never a connect candidate. The peer list
+    /// counts it on admission.
+    pub fn new_web_seed(handle: PeerHandle) -> Self {
+        Self::not_connected(handle, None, PeerSources::default())
+    }
+
+    /// Whether the peer listens at the address it is listed under, so we
+    /// can connect to it there.
+    pub(crate) fn listens_where_listed(&self) -> bool {
+        self.outgoing_address
+            .is_some_and(|at| self.addr == PeerHandle::from(at))
+    }
+
     // The state of a peer we are not connected to. A banned peer is no
     // connect candidate (libtorrent `peer_list::is_connect_candidate`); a
     // holepunched one is, whatever its failures. Nor is one known to only
     // upload while the list says we are finished, however it came to be
     // idle: named again, let go, or brought into a new run.
     fn idle_state(&self, peers: &PeerStates) -> PeerState {
-        if self.outgoing_address == Some(self.addr)
+        if self.listens_where_listed()
             && (self.failcount < MAX_FAILCOUNT || self.holepunch)
-            && !peers.is_banned(self.addr.ip())
+            && !self.addr.ip().is_some_and(|ip| peers.is_banned(ip))
         {
             if self.holepunch || self.needed(peers.is_finished()) {
                 PeerState::Queued
@@ -584,14 +615,16 @@ impl Peer {
     /// (`bt_peer_connection::on_holepunch` calls `torrent::connect_to_peer`),
     /// not through the candidates, so here it goes before them.
     pub(crate) fn connect_rank(&self, order: &ConnectRanking, finished: bool) -> ConnectRank {
+        // Only a peer at an address is a connect candidate.
+        let addr = self.addr.addr();
         (
             !self.holepunch,
             self.failcount,
-            !is_local(self.addr.ip()),
+            !addr.is_some_and(|addr| is_local(addr.ip())),
             order.session_seconds(self.last_connected),
             finished && self.maybe_upload_only,
             Reverse(source_rank(self.sources)),
-            Reverse(order.peer_rank(self.addr)),
+            Reverse(addr.map_or(0, |addr| order.peer_rank(addr))),
         )
     }
 
@@ -615,6 +648,31 @@ impl Peer {
         self.sources
     }
 
+    /// A peer a restart saved, as its own list names it: resume data, and
+    /// `found` when the save had it found elsewhere than its trackers and
+    /// the operator (`ResumePeers::found`).
+    pub fn resumed(addr: SocketAddr, found: bool) -> Self {
+        Self {
+            resumed_found: found,
+            ..Self::new_with_outgoing_address(addr, PeerSourceFlag::ResumeData.into())
+        }
+    }
+
+    /// Whether a tracker named the peer, or the operator did: the peers the
+    /// torrent was added with, and those a restart saved that were not
+    /// [found elsewhere](Self::found_elsewhere). A private torrent keeps
+    /// these once its trackers answer.
+    pub(crate) fn tracker_or_operator_named(&self) -> bool {
+        self.sources.contains(PeerSourceFlag::Tracker)
+            || (self.sources.contains(PeerSourceFlag::ResumeData) && !self.resumed_found)
+    }
+
+    /// Whether only the DHT, local discovery or peer exchange named the
+    /// peer: no tracker, not the operator, and it never connected to us.
+    pub(crate) fn found_elsewhere(&self) -> bool {
+        !self.tracker_or_operator_named() && !self.sources.contains(PeerSourceFlag::Incoming)
+    }
+
     /// What a connection to the peer may go over: uTP alone while a
     /// holepunch introduced it (libtorrent `bt_peer_connection::on_holepunch`
     /// marks it `supports_utp`, so `torrent::connect_to_peer` dials it
@@ -636,7 +694,7 @@ impl Peer {
             return false;
         }
         self.holepunch = true;
-        self.outgoing_address = Some(self.addr);
+        self.outgoing_address = self.addr.addr();
         self.set_state(self.idle_state(peers), peers);
         self.is_connect_candidate()
     }
@@ -866,6 +924,7 @@ impl Peer {
             supports_holepunch: self.supports_holepunch,
             holepunch: false,
             sources: self.sources,
+            resumed_found: self.resumed_found,
             indexed: Indexed::default(),
         }
     }
@@ -894,6 +953,11 @@ impl Peer {
             }
             PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => return None,
         })
+    }
+
+    /// Whether the peer is connected over TCP now.
+    pub(crate) fn live_over_tcp(&self) -> bool {
+        matches!(&self.state, PeerState::Live(live) if live.connection_kind == ConnectionKind::Tcp)
     }
 
     /// Asks the peer's connection, if it has one, to close. The close is no

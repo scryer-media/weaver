@@ -20,6 +20,7 @@ use weaver_torrent::{
 };
 
 use crate::StateError;
+use crate::clock::{Clock, SystemClock};
 use crate::jobs::JobId;
 use crate::jobs::handle::{HoldSet, JobInfo, SchedulerHandle};
 use crate::jobs::model::{JobStatus, Protocol};
@@ -53,12 +54,14 @@ pub mod fingerprint;
 pub mod listing;
 mod scripts;
 pub use scripts::ScriptDirs;
+mod batch;
 mod checkpoints;
 mod completion;
 mod disk_room;
 mod intake;
 mod live;
 mod moves;
+mod policy;
 mod queue;
 mod restore;
 mod retire;
@@ -130,27 +133,13 @@ const RESTORES_AT_ONCE: usize = 8;
 /// takes everything verified meanwhile.
 pub const CHECKPOINT_PIECES: u32 = 16;
 
-/// The time torrents are stamped with.
-pub trait Clock: Send + Sync {
-    fn now_ms(&self) -> i64;
-}
-
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_ms(&self) -> i64 {
-        chrono::Utc::now().timestamp_millis()
-    }
-}
-
 // What a torrent's session holds its peers to under its tracker rule:
-// whether it takes them from its trackers alone, whether it looks for them
-// on the DHT, on the local network and by peer exchange, and the encryption
+// whether it looks for them on the DHT, on the local network and by peer
+// exchange, each switch on its own, and the encryption
 // its connections are made under over the session's. A change of any takes
 // the torrent through its session again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PeerTerms {
-    trackers_only: bool,
     disable_dht: bool,
     disable_pex: bool,
     disable_lsd: bool,
@@ -164,7 +153,6 @@ impl PeerTerms {
         let off =
             |field: &Field<bool>| settings.levels(field, None, None, rule).resolve() == Some(false);
         Self {
-            trackers_only: rule.is_some_and(TrackerRule::trackers_only),
             disable_dht: off(&DHT),
             disable_pex: off(&PEX),
             disable_lsd: off(&LSD),
@@ -174,7 +162,6 @@ impl PeerTerms {
 
     // `options` under these terms.
     fn apply(self, options: &mut AddTorrentOptions) {
-        options.trackers_only = self.trackers_only;
         options.disable_dht = self.disable_dht;
         options.disable_pex = self.disable_pex;
         options.disable_lsd = self.disable_lsd;
@@ -231,6 +218,9 @@ pub struct JobEnv {
     // job does. None with no pipeline, where a torrent in upload mode
     // tries again by itself.
     pub(crate) capacity: Option<Arc<StorageCapacity>>,
+    // Where every torrent's pieces are written: the volumes' writers the
+    // pipeline writes through too.
+    pub(crate) disk: Arc<crate::torrents::writes::TorrentDisk>,
     pub(crate) slots: usize,
     pub(crate) limits: Arc<ExtractionLimits>,
     // The decode pool the pipeline's jobs share, and where a decode window
@@ -258,13 +248,24 @@ pub struct JobEnv {
 
 impl JobEnv {
     /// The pipeline's own budget: its holds, slots, extraction limits and
-    /// the complete root's free space.
-    pub fn of_pipeline(pipeline: &crate::pipeline::Pipeline) -> Self {
+    /// the complete root's free space; written through the volumes' writers
+    /// the process shares, `writers`, on the limits `buffers` sizes.
+    pub fn of_pipeline(
+        pipeline: &crate::pipeline::Pipeline,
+        writers: Arc<crate::operations::VolumeWriters>,
+        buffers: Arc<crate::operations::VolumeBuffers>,
+    ) -> Self {
         let budget = pipeline.graph_budget();
+        let capacity = pipeline.storage_capacity();
         Self {
             accountant: budget.accountant,
             free_disk: budget.free_disk,
-            capacity: Some(pipeline.storage_capacity()),
+            disk: crate::torrents::writes::TorrentDisk::new(
+                writers,
+                Some(Arc::clone(&capacity)),
+                Some(buffers),
+            ),
+            capacity: Some(capacity),
             slots: budget.slots.max(1),
             limits: budget.limits,
             decode: budget.decode,
@@ -303,6 +304,7 @@ impl JobEnv {
             })),
             free_disk: CapacityReader::unknown(),
             capacity: None,
+            disk: crate::torrents::writes::TorrentDisk::alone(),
             slots: 1,
             limits: Arc::new(ExtractionLimits::unbounded()),
             decode: Arc::new(DecodePool::new(u64::MAX)),
@@ -336,12 +338,17 @@ const ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 impl TorrentService {
     /// The server's torrent client, started: sessions on the proxy
     /// runtime's routes while the settings turn torrents on, jobs on the
-    /// pipeline's budget, and its torrents in the pipeline's queue.
+    /// pipeline's budget, and its torrents in the pipeline's queue. Its
+    /// pieces are written by the volumes' writers the process shares,
+    /// `writers`, on the limits `buffers` sizes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn for_server(
         config: &Config,
         db: Database,
         proxies: &Arc<crate::proxies::ProxyRuntime>,
         pipeline: &crate::pipeline::Pipeline,
+        writers: Arc<crate::operations::VolumeWriters>,
+        buffers: Arc<crate::operations::VolumeBuffers>,
         queue: SchedulerHandle,
         crashed: crate::runtime::panic_trap::CrashMarks,
     ) -> Result<Self, String> {
@@ -351,13 +358,13 @@ impl TorrentService {
             db,
             sessions,
             TorrentSettings::of(config),
-            JobEnv::of_pipeline(pipeline),
+            JobEnv::of_pipeline(pipeline, writers, buffers),
             Arc::new(SystemClock),
         );
-        service.publish_to(queue);
+        service.wire_to(queue);
         service.park_crashed(crashed);
         service.turn_at_start(config.torrent.enabled).await;
-        service.start().await?;
+        service.start_seated().await?;
         Ok(service)
     }
 }
@@ -393,12 +400,14 @@ fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
 // is no URL is left out, as a session leaves it out.
 fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
     let mut tidy: Vec<TrackerEntry> = Vec::with_capacity(trackers.len());
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(trackers.len());
     for entry in trackers {
         let url = entry.url.trim();
         if weaver_torrent::Url::parse(url).is_err() {
             continue;
         }
-        if tidy.iter().all(|known| known.url != url) {
+        if seen.insert(url.to_owned()) {
             tidy.push(TrackerEntry {
                 tier: entry.tier,
                 url: url.to_owned(),
@@ -758,6 +767,12 @@ struct Inner {
     // What the last pass over the queue left at its end, written under
     // `live`'s lock: a torrent added goes there.
     queue_end: Mutex<QueueEnd>,
+    // The queue's order as the last pass worked it out, taken again while
+    // no torrent's place moved. Kept under `live`'s lock.
+    queue_order: Mutex<policy::QueueOrder>,
+    // What the passes did: each take of `live`, walk and write.
+    #[cfg(test)]
+    pass_counts: watch::Sender<policy::PassCounts>,
     // The readings of every torrent's views their followers share.
     readings: updates::Readings,
     // The torrents waiting for room on their disks, each by the wait every
@@ -839,6 +854,9 @@ impl TorrentService {
                     slots: status::Slots::new(max_active),
                     last: None,
                 }),
+                queue_order: Mutex::default(),
+                #[cfg(test)]
+                pass_counts: watch::channel(policy::PassCounts::default()).0,
                 readings: updates::Readings::default(),
                 disk_waits: Mutex::default(),
                 disk_waits_moved: watch::channel(0).0,
@@ -951,7 +969,7 @@ impl TorrentService {
         // peers changed since the last write, before the sessions close
         // (qBittorrent saves only what changed as it exits, libtorrent
         // `torrent::write_resume_data` reads the peers off the torrent).
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         self.read(now, true).await;
         self.inner.sessions.stop_all().await;
         // Every tee's checkpoint goes at once, whether or not it was due,
@@ -1059,24 +1077,30 @@ impl TorrentService {
     // What the operator asks of the torrent, written under its lock with
     // no other column, and the ledger and peers as they stand beside it.
     async fn set_intent(&self, job_id: JobId, intent: TorrentIntent) -> Result<(), ActionError> {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let landing = self
             .with_torrent(job_id, |torrent| {
                 self.inner
                     .db
                     .update_torrent_intent(job_id, intent)
                     .map_err(|error| ActionError::State(state_error(error)))?;
-                torrent.settle(now);
-                // The operator's word ends a wind-down's hold on it.
-                torrent.record.kept = KeptIntent::Intent(intent);
-                if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
-                    tee.hold_own_clock(intent == TorrentIntent::Paused);
-                }
-                Ok(self.queue_resume(torrent, now, true))
+                Ok(self.intend(torrent, intent, now))
             })
             .await?;
         let _ = self.landed(landing).await;
         Ok(())
+    }
+
+    // The intent written for the torrent, taken in memory: its ledger
+    // settled and queued to be kept beside it.
+    fn intend(&self, torrent: &mut Live, intent: TorrentIntent, now: i64) -> Option<Landing> {
+        torrent.settle(now);
+        // The operator's word ends a wind-down's hold on it.
+        torrent.record.kept = KeptIntent::Intent(intent);
+        if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
+            tee.hold_own_clock(intent == TorrentIntent::Paused);
+        }
+        self.queue_resume(torrent, now, true)
     }
 
     // Stop the torrent for good, as its goal or a refusal does: its intent
@@ -1298,7 +1322,12 @@ fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
         remaining_bytes: view.wanted_bytes.saturating_sub(view.wanted_have_bytes),
         category: view.category,
         output_dir: view.storage_dir,
-        wait_reason: view.detail,
+        // A reason the service states goes by its key, a code the
+        // downloads list puts in words; free words go as they are.
+        wait_reason: view
+            .stated
+            .map(|stated| stated.key().to_owned())
+            .or(view.detail),
         created_at_ms: view.added_at_ms,
         metadata: view.metadata,
         shortfall: None,

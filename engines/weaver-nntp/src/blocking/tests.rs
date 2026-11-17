@@ -18,6 +18,7 @@ use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 mod buffer_cap;
 mod group_discovery;
 mod idle;
+mod login_refusal;
 mod socket_use;
 
 enum TestArticle {
@@ -486,6 +487,26 @@ fn spawn_blocking_probe_server(
     stat_reply: &'static [u8],
     head_reply: &'static [u8],
 ) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    spawn_probe_server_asking_login(held, stat_reply, head_reply, ProbeLogin::NotAsked)
+}
+
+// When the probe server answers STAT and HEAD with 480.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeLogin {
+    // Never.
+    NotAsked,
+    // Until a login is taken.
+    UntilLoggedIn,
+    // Always, the login taken or not.
+    Always,
+}
+
+fn spawn_probe_server_asking_login(
+    held: &'static [&'static str],
+    stat_reply: &'static [u8],
+    head_reply: &'static [u8],
+    login: ProbeLogin,
+) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -497,6 +518,7 @@ fn spawn_blocking_probe_server(
             .unwrap();
         socket.write_all(b"200 ready\r\n").unwrap();
         let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut logged_in = false;
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
@@ -506,10 +528,18 @@ fn spawn_blocking_probe_server(
             let command = line.trim_end_matches(['\r', '\n']).to_string();
             recorder.lock().unwrap().push(command.clone());
             let upper = command.to_ascii_uppercase();
+            let asks_login = match login {
+                ProbeLogin::NotAsked => false,
+                ProbeLogin::UntilLoggedIn => !logged_in,
+                ProbeLogin::Always => true,
+            };
             let response: Vec<u8> = if upper.starts_with("AUTHINFO USER") {
                 b"381 password\r\n".to_vec()
             } else if upper.starts_with("AUTHINFO PASS") {
+                logged_in = true;
                 b"281 authenticated\r\n".to_vec()
+            } else if asks_login && (upper.starts_with("STAT ") || upper.starts_with("HEAD ")) {
+                b"480 authentication required\r\n".to_vec()
             } else if let Some(id) = upper.strip_prefix("STAT ") {
                 if held.contains(&id.trim()) {
                     format!("223 0 {} article exists\r\n", id.trim()).into_bytes()
@@ -748,6 +778,105 @@ fn a_server_without_head_settles_on_the_stat_verdict() {
         &config.host,
         config.port
     ));
+    crate::server_caps::forget(&config.host, config.port);
+}
+
+// 451 to STAT and HEAD is the article missing, as 430 is: the batch settles
+// with a verdict for every id instead of reporting itself unanswerable.
+#[test]
+fn a_451_to_the_probe_is_a_missing_article() {
+    const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
+    let (port, _seen, handle) = spawn_blocking_probe_server(
+        HELD,
+        b"451 article not found\r\n",
+        b"451 article not found\r\n",
+    );
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut lane = probe_server_lane(&config, &[]);
+    let result = lane.probe_exists(&[
+        "<held@silver.horizon>".to_string(),
+        "<gone@silver.horizon>".to_string(),
+    ]);
+    assert!(!result.inconclusive, "a 451 is an answer");
+    assert_eq!(result.exists, vec![true, false]);
+    assert!(lane.is_healthy());
+    lane.park();
+    handle.join().unwrap();
+    crate::server_caps::forget(&config.host, config.port);
+}
+
+// A 480 to STAT asks for a login, as at a BODY: every reply of the batch is
+// read, the connection logs in once on the same socket, and only the ids the
+// 480s answered are asked again.
+#[test]
+fn a_480_to_the_probe_logs_in_and_asks_again() {
+    const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
+    let (port, seen, handle) = spawn_probe_server_asking_login(
+        HELD,
+        b"430 no such article\r\n",
+        b"430 no such article\r\n",
+        ProbeLogin::UntilLoggedIn,
+    );
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut lane = probe_server_lane(&config, &[]);
+    let result = lane.probe_exists(&[
+        "<held@silver.horizon>".to_string(),
+        "<gone@silver.horizon>".to_string(),
+    ]);
+    assert!(!result.inconclusive, "the login settled the batch");
+    assert_eq!(result.exists, vec![true, false]);
+    assert!(lane.is_healthy());
+    lane.park();
+    handle.join().unwrap();
+
+    let seen = seen.lock().unwrap().clone();
+    let stats = positions(&seen, "STAT");
+    let users = positions(&seen, "AUTHINFO USER");
+    let passes = positions(&seen, "AUTHINFO PASS");
+    assert_eq!(users.len(), 1, "one login; saw {seen:?}");
+    assert_eq!(seen[users[0]], "AUTHINFO USER ", "the empty login");
+    assert_eq!(stats.len(), 4, "each id asked twice; saw {seen:?}");
+    assert!(
+        stats[1] < users[0] && passes[0] < stats[2],
+        "the login goes out after the batch and before it is asked again; saw {seen:?}"
+    );
+    crate::server_caps::forget(&config.host, config.port);
+}
+
+// A 480 to the probe asked again after the login it asked for is the server
+// refusing the account: the batch is inconclusive and nothing is booked
+// missing.
+#[test]
+fn a_480_to_the_probe_after_its_login_is_a_refusal() {
+    let (port, seen, handle) = spawn_probe_server_asking_login(
+        &[],
+        b"430 no such article\r\n",
+        b"430 no such article\r\n",
+        ProbeLogin::Always,
+    );
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut conn = BlockingNntpConnection::connect(&config).unwrap();
+    let error = conn
+        .probe_exists(&["<gone@silver.horizon>".to_string()])
+        .unwrap_err();
+    assert!(
+        matches!(error, NntpError::AuthenticationRequired),
+        "{error:?}"
+    );
+    drop(conn);
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        positions(&seen, "AUTHINFO PASS").len(),
+        1,
+        "one login, none after; saw {seen:?}"
+    );
     crate::server_caps::forget(&config.host, config.port);
 }
 
@@ -1220,6 +1349,72 @@ fn blocking_starttls_rustls_reads_a_body_after_the_upgrade() {
 fn blocking_starttls_s2n_reads_a_body_after_the_upgrade() {
     let _guard = s2n_test_guard();
     starttls_lane_reads_a_body_after_the_upgrade(NntpTlsBackend::S2n);
+}
+
+// The server test reads the suite the handshake settled on and how long the
+// setup's CAPABILITIES took to answer, off the connection downloads use.
+fn tls_connection_reports_its_cipher_suite_and_capabilities_round_trip(backend: NntpTlsBackend) {
+    let (config, handle, ca_path) = spawn_tls_nntp_server(Vec::new());
+    let mut conn = connect_with_backend(&config, backend);
+
+    let suite = conn
+        .negotiated_cipher_suite()
+        .expect("a TLS connection names its suite");
+    assert!(
+        suite.contains("GCM") || suite.contains("CHACHA20"),
+        "{suite}"
+    );
+    assert!(conn.capabilities_round_trip().is_some());
+    assert!(conn.capabilities().supports_pipelining());
+
+    conn.quit().unwrap();
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(ca_path);
+}
+
+#[test]
+fn blocking_rustls_reports_its_cipher_suite_and_capabilities_round_trip() {
+    tls_connection_reports_its_cipher_suite_and_capabilities_round_trip(
+        NntpTlsBackend::ManualRustls,
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn blocking_s2n_reports_its_cipher_suite_and_capabilities_round_trip() {
+    let _guard = s2n_test_guard();
+    tls_connection_reports_its_cipher_suite_and_capabilities_round_trip(NntpTlsBackend::S2n);
+}
+
+// A known capability skips CAPABILITIES, so there is no round trip to report,
+// and a plaintext connection has no suite.
+#[test]
+fn blocking_connection_without_a_capabilities_exchange_reports_no_round_trip() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(b"200 test server ready\r\n").unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), "QUIT");
+        socket.write_all(b"205 closing\r\n").unwrap();
+    });
+    let config = ServerConfig {
+        host: "127.0.0.1".into(),
+        port,
+        tls: false,
+        pipelining: crate::connection::PipeliningCapability::Known(true),
+        ..ServerConfig::default()
+    };
+    let mut conn = BlockingNntpConnection::connect(&config).unwrap();
+
+    assert_eq!(conn.capabilities_round_trip(), None);
+    assert_eq!(conn.negotiated_cipher_suite(), None);
+
+    conn.quit().unwrap();
+    handle.join().unwrap();
 }
 
 // A server that refuses the upgrade must fail the connect rather than carry
@@ -2357,8 +2552,9 @@ fn a_drop_after_a_pipelined_answer_reports_the_pipelined_answer() {
 }
 
 // A server that refuses the in-place login poisons the connection. The lane
-// says so through its window, the article stays merely unanswered, and the
-// refusal is classified exactly as a dial's login reply is.
+// says so through its window, the article the 480 asked the login for takes
+// the refusal, told as a refused login, and the refusal is classified
+// exactly as a dial's login reply is.
 #[test]
 fn a_refused_reauth_poisons_the_connection() {
     const REFUSAL: &[u8] = b"481 authentication failed\r\n";
@@ -2372,7 +2568,18 @@ fn a_refused_reauth_poisons_the_connection() {
     let (first, _) = lane.ring_read_next().unwrap();
     assert_eq!(ring_payload(&first), vec![0x41; 256]);
     let (second, meta) = lane.ring_read_next().unwrap();
-    assert!(is_session_expired(&second), "got {:?}", second.result);
+    assert!(
+        matches!(
+            second.result,
+            Err(DecodedBodyError::Nntp(NntpError::AuthenticationFailed))
+        ),
+        "got {:?}",
+        second.result
+    );
+    assert_eq!(
+        second.attempts[0].outcome,
+        crate::client::FetchAttemptOutcome::AuthenticationFailure
+    );
     assert!(meta.connection_discarded);
     assert!(!lane.is_healthy());
     assert!(lane.ring_is_closed());
@@ -2405,17 +2612,21 @@ fn a_refused_reauth_poisons_the_connection() {
     handle.join().unwrap();
 }
 
-// Without credentials there is nothing to log in again with: a 480 drops the
-// connection as it always has.
+// With no account configured the dial sends no login, and a 480 at a BODY
+// is the server asking for one. It is asked as for an expired session: once
+// the replies queued behind the 480 are read, the lane logs in on the same
+// socket with an empty name and password, and the server that takes them
+// serves the next BODY. The article the 480 answered spends no try.
 #[test]
-fn a_480_on_an_anonymous_connection_poisons_it() {
+fn a_480_on_an_anonymous_connection_is_the_server_asking_for_a_login() {
     let (port, seen, handle) = spawn_reauth_server(
         vec![
             Scripted::Body(vec![0x51; 256]),
             Scripted::Expire,
             Scripted::Body(vec![0x53; 256]),
+            Scripted::Body(vec![0x54; 256]),
         ],
-        Vec::new(),
+        vec![b"281 ok\r\n"],
     );
     let mut config = reauth_config(port);
     config.username = None;
@@ -2427,17 +2638,77 @@ fn a_480_on_an_anonymous_connection_poisons_it() {
     assert_eq!(ring_payload(&first), vec![0x51; 256]);
     let (second, meta) = lane.ring_read_next().unwrap();
     assert!(is_session_expired(&second), "got {:?}", second.result);
+    assert!(!meta.connection_discarded);
+    assert!(lane.holds_new_requests());
+    let (third, meta) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&third), vec![0x53; 256]);
+    assert!(!meta.connection_discarded);
+    assert!(!lane.holds_new_requests(), "logged in on the last read");
+    assert!(lane.is_healthy());
+
+    issue_all(&mut lane, &["<4@t>"]);
+    let (fourth, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&fourth), vec![0x54; 256]);
+
+    lane.park();
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    let bodies = positions(&seen, "BODY");
+    let users = positions(&seen, "AUTHINFO USER");
+    let passes = positions(&seen, "AUTHINFO PASS");
+    assert_eq!(
+        users.len(),
+        1,
+        "no login at the dial, one in place; saw {seen:?}"
+    );
+    assert_eq!(seen[users[0]], "AUTHINFO USER ", "an empty name");
+    assert_eq!(seen[passes[0]], "AUTHINFO PASS ", "an empty password");
+    assert!(
+        bodies[2] < users[0] && passes[0] < bodies[3],
+        "the login goes out after the last queued BODY and before the next; saw {seen:?}"
+    );
+}
+
+// The credentialed session the server expires asks for a login, takes it,
+// and answers the very next BODY with 480 again. That is the server refusing
+// the account it took, not another request to log in: the lane logs in once,
+// and the article takes the refusal.
+#[test]
+fn a_480_right_after_the_login_it_asked_for_is_a_refusal() {
+    let (port, seen, handle) = spawn_reauth_server(
+        vec![Scripted::Expire, Scripted::Expire],
+        vec![b"281 ok\r\n", b"281 ok\r\n"],
+    );
+    let mut lane = test_body_lane(&reauth_config(port));
+    issue_all(&mut lane, &["<1@t>"]);
+    let (first, _) = lane.ring_read_next().unwrap();
+    assert!(is_session_expired(&first), "got {:?}", first.result);
+    assert!(lane.is_healthy(), "the login was taken");
+
+    issue_all(&mut lane, &["<1@t>"]);
+    let (again, meta) = lane.ring_read_next().unwrap();
+    assert!(
+        matches!(
+            again.result,
+            Err(DecodedBodyError::Nntp(NntpError::AuthenticationRequired))
+        ),
+        "got {:?}",
+        again.result
+    );
+    assert_eq!(
+        again.attempts[0].outcome,
+        crate::client::FetchAttemptOutcome::AuthenticationFailure
+    );
     assert!(meta.connection_discarded);
-    assert!(!lane.is_healthy());
-    assert!(lane.ring_is_closed());
     assert!(!lane.holds_new_requests());
 
     lane.park();
     handle.join().unwrap();
     let seen = seen.lock().unwrap().clone();
-    assert!(
-        positions(&seen, "AUTHINFO").is_empty(),
-        "an anonymous session never logs in; saw {seen:?}"
+    assert_eq!(
+        positions(&seen, "AUTHINFO PASS").len(),
+        2,
+        "one login at the dial, one in place, none after; saw {seen:?}"
     );
 }
 

@@ -58,8 +58,6 @@ pub struct TrackerStats {
     announces: [[Tally<{ TrackerResult::COUNT }>; AnnounceEvent::COUNT]; TrackerKind::COUNT],
     announce_nanos: Tally<{ TrackerKind::COUNT }>,
     peers: Tally<{ TrackerKind::COUNT }>,
-    scrapes: [Tally<{ TrackerResult::COUNT }>; TrackerKind::COUNT],
-    scrape_nanos: Tally<{ TrackerKind::COUNT }>,
 }
 
 fn nanos(took: Duration) -> u64 {
@@ -85,19 +83,11 @@ impl TrackerStats {
         add(&self.peers, kind as usize, peers as u64);
     }
 
-    /// A scrape of one tracker under one hash ended after `took`.
-    pub fn scraped(&self, kind: TrackerKind, result: TrackerResult, took: Duration) {
-        add(&self.scrapes[kind as usize], result as usize, 1);
-        add(&self.scrape_nanos, kind as usize, nanos(took));
-    }
-
     pub fn snapshot(&self) -> TrackerSnapshot {
         TrackerSnapshot {
             announces: self.announces.each_ref().map(|by| by.each_ref().map(read)),
             announce_nanos: read(&self.announce_nanos),
             peers: read(&self.peers),
-            scrapes: self.scrapes.each_ref().map(read),
-            scrape_nanos: read(&self.scrape_nanos),
         }
     }
 }
@@ -112,10 +102,6 @@ pub struct TrackerSnapshot {
     pub announce_nanos: [u64; TrackerKind::COUNT],
     /// The peers accepted announces named, by [`TrackerKind`].
     pub peers: [u64; TrackerKind::COUNT],
-    /// By [`TrackerKind`], then [`TrackerResult`].
-    pub scrapes: [[u64; TrackerResult::COUNT]; TrackerKind::COUNT],
-    /// The time the scrapes that ended took, by [`TrackerKind`].
-    pub scrape_nanos: [u64; TrackerKind::COUNT],
 }
 
 #[cfg(test)]
@@ -139,11 +125,6 @@ mod tests {
             Duration::from_secs(30),
             0,
         );
-        stats.scraped(
-            TrackerKind::Http,
-            TrackerResult::BadReply,
-            Duration::from_millis(5),
-        );
 
         let read = stats.snapshot();
         let udp = TrackerKind::Udp as usize;
@@ -165,10 +146,5 @@ mod tests {
         );
         assert_eq!(read.announce_nanos[udp], 30_250_000_000);
         assert_eq!(read.peers, [0, 40]);
-        assert_eq!(
-            read.scrapes[TrackerKind::Http as usize][TrackerResult::BadReply as usize],
-            1
-        );
-        assert_eq!(read.scrape_nanos, [5_000_000, 0]);
     }
 }

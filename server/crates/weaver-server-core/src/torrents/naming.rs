@@ -18,11 +18,11 @@ use std::time::Duration;
 use weaver_torrent::network::{BoxFuture, DatagramSocket, Resolved, Resolver};
 use weaver_torrent::{ClientShape, Egress, HttpClients, HttpTarget, TorrentNaming};
 use weaver_tunnel::pipe::{
-    DialError, Dialed, Dialer, Names, NamesSlot, Purpose, Resolution, Target, Transports,
+    Capacity, DialError, Dialed, Dialer, Names, NamesSlot, Purpose, Resolution, Target, Transports,
 };
 
-use crate::proxies::{TorrentLeg, TorrentScope};
-use crate::torrents::net::{LegKind, LegNames, tracker_client};
+use crate::proxies::{PathBridge, TorrentLeg, TorrentScope};
+use crate::torrents::net::{LegKind, LegNames, SeedBridge, tracker_client};
 
 /// How the torrents of one route look names up and ask over HTTP on a
 /// session's leg: a resolver and HTTP clients of their own.
@@ -100,13 +100,16 @@ impl LegNaming {
             leg: self.dialer.clone(),
             names,
         });
-        let bridge = match (&self.kind, &self.leg) {
-            (LegKind::Ladder, Some(leg)) => Some(leg.bridge_on(dialer.clone())?),
-            _ => None,
+        let (bridge, seeds) = match (&self.kind, &self.leg) {
+            (LegKind::Ladder, Some(leg)) => (
+                Some(leg.bridge_on(dialer.clone(), Purpose::TorrentHttp)?),
+                Some(scoped_seeds(leg, &dialer)),
+            ),
+            _ => (None, None),
         };
         let naming = Arc::new(Naming {
             resolver: Arc::new(LegNames(dialer.clone())),
-            http: tracker_client(&self.kind, dialer, bridge)?,
+            http: tracker_client(&self.kind, dialer, bridge, seeds)?,
         });
         scopes.insert(scope, Arc::downgrade(&naming));
         Ok(ScopeNaming(naming))
@@ -122,6 +125,30 @@ impl LegNaming {
             .map(|(scope, _)| *scope)
             .collect()
     }
+}
+
+// A route's web seed transfers ride a bridge of their own onto `dialer`,
+// the leg's dialer under that route's names, apart from its trackers': it
+// dials for web seeds as the leg's own seed bridge does, on the torrent side
+// of the same tunnel, so a long transfer never holds what announces keep. It
+// starts the first time a web seed is asked and is held by the route's
+// clients; it holds the leg weakly, so the leg's drop revokes it with the
+// others, and a web seed asked after that fails as a revoked route does.
+fn scoped_seeds(leg: &Arc<TorrentLeg>, dialer: &Arc<dyn Dialer>) -> SeedBridge {
+    let leg = Arc::downgrade(leg);
+    let dialer = Arc::clone(dialer);
+    let started: Mutex<Option<PathBridge>> = Mutex::new(None);
+    Arc::new(move || {
+        let leg = leg.upgrade().ok_or_else(|| "leg revoked".to_owned())?;
+        // A panic while starting the bridge left it unstarted: start it.
+        let mut started = started.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(bridge) = started.as_ref() {
+            return Ok(bridge.clone());
+        }
+        let bridge = leg.bridge_on(Arc::clone(&dialer), Purpose::TorrentWebSeed)?;
+        *started = Some(bridge.clone());
+        Ok(bridge)
+    })
 }
 
 /// One torrent's naming, which follows it to another route on the same
@@ -212,6 +239,9 @@ impl Dialer for Scoped {
     }
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
         self.leg.room(purpose)
+    }
+    fn wait_room(&self, purpose: &Purpose) -> Result<(), Capacity> {
+        self.leg.wait_room(purpose)
     }
     fn bind_local_udp(&self, local: SocketAddr) -> Option<io::Result<std::net::UdpSocket>> {
         self.leg.bind_local_udp(local)

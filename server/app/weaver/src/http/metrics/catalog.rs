@@ -420,8 +420,8 @@ metric_families! {
     // ---- schedules ----------------------------------------------------------------
     SCHEDULE_EVALUATIONS = ("weaver_schedule_evaluations_total", Counter, [],
         "Schedule evaluator ticks.");
-    SCHEDULE_ACTIONS = ("weaver_schedule_actions_total", Counter, ["action", "track", "outcome"],
-        "Schedule actions applied, by action kind, the state track it drives, and outcome.");
+    SCHEDULE_ACTIONS = ("weaver_schedule_actions_total", Counter, ["action", "class", "track", "outcome"],
+        "Schedule actions applied, by action kind, the class of job a class action holds (empty for any other), the state track it drives, and outcome.");
     SCHEDULE_ONE_SHOT_FIRES = ("weaver_schedule_one_shot_fires_total", Counter, ["action"],
         "One-shot schedule rules that came due.");
     SCHEDULE_REPLAYS = ("weaver_schedule_replays_total", Counter, ["reason"],
@@ -511,6 +511,20 @@ metric_families! {
         "Connections a ladder made on a rung past the first, by the rung that connected.");
     NETWORK_LEG_REVOCATIONS = ("weaver_network_leg_revocations_total", Counter, [],
         "Route stages revoked, closing the connections that ran over them.");
+    NETWORK_SOCKET_GIVE_BACKS = ("weaver_network_socket_give_backs_total", Counter, [],
+        "Times a WireGuard tunnel asked a class holding more than its share of the tunnel's socket memory to give some back while another class waited.");
+    NETWORK_SOCKET_GIVE_BACK_BYTES = ("weaver_network_socket_give_back_bytes_total", Counter, [],
+        "Socket memory WireGuard tunnels asked classes over their share to give back, in bytes.");
+    NETWORK_SOCKET_PEERS_DROPPED = ("weaver_network_socket_peers_dropped_total", Counter, [],
+        "Torrent peers closed to give a WireGuard tunnel's socket memory back.");
+    NETWORK_SOCKET_IDLE_RETIRED = ("weaver_network_socket_idle_retired_total", Counter, [],
+        "Idle usenet connections closed early to give a WireGuard tunnel's socket memory back.");
+    NETWORK_TUNNEL_SOCKET_BYTES = ("weaver_network_tunnel_socket_bytes", Gauge,
+        ["egress_id", "proxy_id", "via"],
+        "Socket memory a WireGuard tunnel holds now, its own overhead included, by egress, WireGuard proxy and the proxies beneath it.");
+    NETWORK_TUNNEL_SOCKET_LIMIT_BYTES = ("weaver_network_tunnel_socket_limit_bytes", Gauge,
+        ["egress_id", "proxy_id", "via"],
+        "Socket memory a WireGuard tunnel may hold, by egress, WireGuard proxy and the proxies beneath it.");
 
     // ---- torrents ----------------------------------------------------------------
     // Each torrent's series carry its category (empty when it has none) and the
@@ -789,6 +803,8 @@ metric_families! {
         ["route"], "Connected peers of the session that have every piece of their torrent.");
     TORRENT_SESSION_PIECE_STEALS = ("weaver_torrent_session_piece_steals_total", Counter,
         ["route"], "Pieces taken from a slower peer and given to a faster one, since the session opened.");
+    TORRENT_SESSION_PEERS_DROPPED_UNTRACKED = ("weaver_torrent_session_peers_dropped_untracked_total", Counter,
+        ["route"], "Peers that left a torrent's list since the session opened because no tracker or the operator named them, while the torrent takes its peers from its trackers alone: a private torrent once a tracker answers.");
     TORRENT_SESSION_OUTGOING_ENCRYPTION = ("weaver_torrent_session_outgoing_encryption_total", Counter,
         ["route", "outcome"],
         "Outgoing peer handshakes since the session opened, by how each ended: plaintext (sent plain), or sent encrypted and settled on rc4, on header_only, failed, or cancelled (dropped before it ended, as when its torrent is paused or removed). No outcome holds another, so the outcomes sum to the handshakes started but for those under way.");
@@ -804,11 +820,6 @@ metric_families! {
         "Time the announces that ended took in all, since the session opened; divided by the announces it gives their mean. The wait for a turn among HTTP announces is not in it.");
     TORRENT_TRACKER_PEERS = ("weaver_torrent_session_tracker_peers_total", Counter,
         ["route", "kind"], "Peers the accepted announces named, since the session opened, known already or not.");
-    TORRENT_TRACKER_SCRAPES = ("weaver_torrent_session_tracker_scrapes_total", Counter,
-        ["route", "kind", "result"],
-        "Scrapes of a tracker that ended since the session opened, one per hash asked about, by how the tracker is spoken to and how it ended. A tracker that offers no scrape counts as error. Every combination is emitted, so the series pre-exist at zero.");
-    TORRENT_TRACKER_SCRAPE_SECONDS = ("weaver_torrent_session_tracker_scrape_seconds_total", Counter,
-        ["route", "kind"], "Time the scrapes that ended took in all, since the session opened.");
     TORRENT_DHT_QUERIES_SENT = ("weaver_torrent_dht_queries_sent_total", Counter,
         ["route", "type"], "DHT queries the session's node sent since it started, by what they ask. Absent while the session runs no DHT.");
     TORRENT_DHT_QUERY_RESULTS = ("weaver_torrent_dht_query_results_total", Counter,

@@ -97,6 +97,25 @@ impl TunnelProvider for WireGuardTunnelProvider {
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
         proxy_tunnels::TunnelProvider::dial(&self.0, host, port).await
     }
+    // Each stream is a TCP socket on the tunnel's own stack, so it takes the
+    // sizes it asks for, or the tunnel's own, and the tunnel holds its bytes
+    // until it frees the socket. A dial that fails frees its socket before
+    // it returns, and leaves the bytes with the caller.
+    async fn dial_sized(
+        &self,
+        host: &str,
+        port: u16,
+        _outcome: Arc<crate::bridge::ConnectionOutcome>,
+        buffers: Option<TcpBuffers>,
+        socket: &mut crate::pipe::StreamSocket,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        // The tunnel is built with download tuning, so its own sizes are the
+        // tuned ones.
+        let buffers = buffers.unwrap_or(crate::pipe::tuned_buffers());
+        let stream = self.0.dial_with(host, port, buffers).await?;
+        socket.hold_in(&stream);
+        Ok(Box::new(stream))
+    }
     fn describe(&self) -> String {
         proxy_tunnels::TunnelProvider::describe(&self.0)
     }

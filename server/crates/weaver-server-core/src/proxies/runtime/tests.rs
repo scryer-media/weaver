@@ -81,7 +81,7 @@ async fn one_recovery_probe_and_cancellation_releases_it() {
     assert!(route.begin(1).is_some());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
     let db = Database::open_in_memory().unwrap();
     db.insert_server(&server(1)).unwrap();
@@ -106,7 +106,12 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
         pipelining: weaver_nntp::PipeliningCapability::Known(false),
         ..Default::default()
     };
-    let _connection = weaver_nntp::NntpConnection::connect(&config).await.unwrap();
+    let connect = config.clone();
+    let _connection =
+        tokio::task::spawn_blocking(move || weaver_nntp::BlockingNntpConnection::connect(&connect))
+            .await
+            .unwrap()
+            .unwrap();
     db.save_proxy_routing_policy(
         Consumer::Server(1),
         &RoutingPolicy {
@@ -119,7 +124,13 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
     runtime.reload().await.unwrap();
     assert!(registry.check().is_err());
     assert_eq!(fixture.await.unwrap().unwrap(), 0);
-    assert!(weaver_nntp::NntpConnection::connect(&config).await.is_err());
+    assert!(
+        tokio::task::spawn_blocking(
+            move || weaver_nntp::BlockingNntpConnection::connect(&config).is_err()
+        )
+        .await
+        .unwrap()
+    );
     runtime.stop_all().await;
 }
 
@@ -564,5 +575,95 @@ async fn a_reload_asked_for_during_another_reads_the_rows_again() {
     second.await.unwrap().unwrap();
     assert_eq!(routes.plan(TorrentScope::Default).egress_id, absent.id);
     first.await.unwrap().unwrap();
+    runtime.network.shutdown().await;
+}
+
+// A hardware profile with larger usenet buffers, put in force where the
+// profile is applied, budgets the tunnels again at once: a leg whose tunnel
+// fit at the smaller buffers says it is over budget, and says nothing again
+// once the buffers are smaller once more. Nothing polls for it.
+#[tokio::test]
+async fn a_new_usenet_buffer_size_budgets_the_tunnels_again() {
+    use base64::Engine;
+    let key = |seed: u8| {
+        base64::engine::general_purpose::STANDARD
+            .encode(weaver_tunnel::test_support::test_key(seed))
+    };
+    let small = 256 * 1024;
+    let large = 4 * 1024 * 1024;
+    // Before the runtime loads, as the profile is applied at start-up.
+    crate::proxies::set_usenet_receive_bytes(small, None);
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&crate::servers::ServerConfig {
+        connections: 400,
+        ..server(1)
+    })
+    .unwrap();
+    db.save_proxy_profile(&ProxyProfile {
+        kind: ProxyKind::WireGuard,
+        host: "192.0.2.1".into(),
+        port: 51820,
+        dns_servers: vec!["10.64.0.1".parse().unwrap()],
+        tunnel_addresses: vec!["10.64.0.2/32".into()],
+        peer_public_key: Some(key(2)),
+        secrets: ProxySecrets {
+            private_key: Some(key(1)),
+            ..Default::default()
+        },
+        ..profile(1)
+    })
+    .unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Server(1),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: 0,
+                weight: 100,
+                path: LegPath::Ladder {
+                    rungs: vec![Rung::Proxy { id: 1 }],
+                    direct_fallback: false,
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let runtime = ProxyRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+    let warning = |runtime: &ProxyRuntime| {
+        runtime
+            .network
+            .route(Consumer::Server(1), 5, Duration::from_secs(1))
+            .unwrap()
+            .legs
+            .read()
+            .unwrap()[0]
+            .warning
+            .clone()
+    };
+    assert_eq!(warning(&runtime), None);
+
+    let mut reloads = runtime.network.reloads();
+    assert!(crate::proxies::set_usenet_receive_bytes(
+        large,
+        Some(Arc::clone(&runtime))
+    ));
+    reloads.changed().await.unwrap();
+    let over = warning(&runtime).expect("the tunnel is over budget");
+    assert!(
+        over.starts_with("Usenet servers ask 401 connections of WireGuard proxy 1"),
+        "{over}"
+    );
+
+    // The same size again budgets nothing.
+    assert!(!crate::proxies::set_usenet_receive_bytes(
+        large,
+        Some(Arc::clone(&runtime))
+    ));
+    assert!(crate::proxies::set_usenet_receive_bytes(
+        small,
+        Some(Arc::clone(&runtime))
+    ));
+    reloads.changed().await.unwrap();
+    assert_eq!(warning(&runtime), None);
     runtime.network.shutdown().await;
 }

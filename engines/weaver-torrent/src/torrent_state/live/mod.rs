@@ -280,6 +280,9 @@ pub struct TorrentStateLive {
     // no longer counts, as libtorrent drops a disconnecting connection from
     // `torrent::m_connections` at once. Taken before `peers`.
     places: Mutex<HashMap<PeerHandle, Place>>,
+    // The torrent's want for a TCP socket its route held for others, while
+    // it still has peers to dial: the route counts it pressing for as long.
+    pub(crate) tcp_wants: crate::stream_connect::TcpWants,
 
     finished_notify: Notify,
     // Rings when the torrent may want pieces again after it finished: more
@@ -452,6 +455,12 @@ impl TorrentStateLive {
             .checkpoint(&*self.files, self.metadata.file_infos.len()))
     }
 
+    /// The torrent's peer list, for tests outside the run's own module.
+    #[cfg(test)]
+    pub(crate) fn peer_states(&self) -> &PeerStates {
+        &self.peers
+    }
+
     /// The peers and bans a restart is to begin with; see
     /// [`peers::ResumePeers`].
     pub(crate) fn resume_peers(&self) -> peers::ResumePeers {
@@ -463,11 +472,24 @@ impl TorrentStateLive {
         self.peers.ban(ip);
     }
 
-    /// Bans `ip` for the bad data it sent: here, and on every torrent of
-    /// the session while it runs, each closing its connections to it (see
+    /// Bans `peer` for the bad data it sent. A peer of the swarm is banned
+    /// by its host: here, and on every torrent of the session while it
+    /// runs, each closing its connections to it (see
     /// [`PeerStates::ban_for_bad_data`]). libtorrent bans a peer on the one
-    /// torrent it sent the data to (`torrent::ban_peer`).
-    pub(crate) fn ban_for_bad_data(&self, ip: std::net::IpAddr) {
+    /// torrent it sent the data to (`torrent::ban_peer`). A web seed, at no
+    /// address, is banned on this torrent alone and not connected to again
+    /// ([`web_seed::WebSeeds::ban`]).
+    pub(crate) fn ban_for_bad_data(&self, peer: PeerHandle) {
+        let Some(ip) = peer.ip() else {
+            if self.shared.web_seeds.ban(peer) {
+                // A seed's URL can carry a credential: the line names the
+                // seed by its entry alone.
+                warn!(id = ?self.shared.id, %peer, "banning the web seed");
+                self.peers
+                    .with_peer_mut(peer, "ban_web_seed", |p| p.ban(&self.peers));
+            }
+            return;
+        };
         if !self.peers.ban_for_bad_data(ip) {
             return;
         }
@@ -530,7 +552,7 @@ impl TorrentStateLive {
             }
             let outgoing = p.connected_out() == Some(true);
             match p.get_live() {
-                Some(live) if !web_seed::is_web_seed(handle) => Some(self.peers.claim_peer_id(
+                Some(live) if handle.sends_peer_id() => Some(self.peers.claim_peer_id(
                     handle,
                     live.peer_id(),
                     outgoing,
@@ -693,7 +715,7 @@ struct PeerHandler {
     // extended handshake that names ut_pex.
     pex_started: AtomicBool,
 
-    addr: SocketAddr,
+    addr: PeerHandle,
     incoming: bool,
     tx: PeerTx,
     // The answers to the peer's requests that wait for the writer.
@@ -843,16 +865,26 @@ pub(crate) struct WriteJob {
 /// again once its writes are done.
 struct Written(Option<Arc<PeerDisk>>);
 
-/// A write for the disk threads: a received block, or a whole piece its
-/// storage held in memory, checked and now to be written.
-pub(crate) enum DiskWrite {
-    Block(WriteJob),
-    Piece(PieceWrite),
+/// A whole piece its storage held in memory, checked and passed, handed to
+/// the storage to write (`TorrentStorage::store_verified_piece`). The
+/// storage writes it on a thread of its own and says how the write ended
+/// with [`StoredPiece::stored`]; the piece is had only then, on the hashing
+/// thread, as it would be had the write been made there. Dropped unsaid,
+/// the piece was not written and is fetched again, as a check dropped
+/// unrun is.
+pub struct StoredPiece {
+    job: Option<HashJob>,
+    // The upload epoch taken before the storage was handed the piece, which
+    // its refusal is judged at (`handle_disk_error`).
+    epoch: u64,
 }
 
-/// A piece that passed its check on the hashing thread, and what its check
-/// carried: the storage writes it whole, and it is had once it did.
-pub(crate) struct PieceWrite(HashJob);
+/// How the storage's write of a passed piece ended, carried back to the
+/// hashing thread.
+pub(crate) enum Stored {
+    Written(anyhow::Result<()>, u64),
+    Dropped,
+}
 
 /// The check of a piece whose last block was written. Like the write, it
 /// belongs to the torrent and runs whatever became of the connection
@@ -868,8 +900,9 @@ pub(crate) struct HashJob {
     senders: crate::piece_tracker::Senders,
     check: PieceCheck,
     // The piece counted while it waits whole in its storage's memory, and
-    // the connection told when it waits no more: both until the piece is
-    // written, or its check failed, or the job is dropped.
+    // the connection told when it waits no more: both until the storage
+    // said the piece is written, or its check failed, or the job is
+    // dropped.
     waiting: Option<crate::disk::Span>,
     written: Written,
     // Counted among its session's checks that wait for the hashing thread,
@@ -877,6 +910,9 @@ pub(crate) struct HashJob {
     queued: Option<crate::spawn_utils::QueuedCheck>,
     // Dropped when the check is over, for a connection that waits for it.
     ended: Option<tokio::sync::oneshot::Sender<()>>,
+    // Set on a passed piece its storage has written or dropped: the job is
+    // back on the hashing thread to act on that, not to hash.
+    stored: Option<Stored>,
     _run: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 

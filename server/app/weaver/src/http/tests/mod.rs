@@ -1017,10 +1017,19 @@ fn sample_schedules() -> weaver_server_core::bandwidth::schedule_metrics::Schedu
         actions: ActionKind::ALL
             .into_iter()
             .flat_map(|action| {
-                action.tracks().iter().flat_map(move |track| {
-                    ActionOutcome::ALL
-                        .into_iter()
-                        .map(move |outcome| (action, *track, outcome, 1))
+                let classes: Vec<_> = if action.over_class() {
+                    weaver_server_core::jobs::HeldClass::all()
+                        .map(Some)
+                        .collect()
+                } else {
+                    vec![None]
+                };
+                classes.into_iter().flat_map(move |class| {
+                    action.tracks().iter().flat_map(move |track| {
+                        ActionOutcome::ALL
+                            .into_iter()
+                            .map(move |outcome| (action, class, *track, outcome, 1))
+                    })
                 })
             })
             .collect(),
@@ -1048,6 +1057,7 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
     use weaver_server_core::proxies::network_metrics::{
         EgressHealthLabel, EgressMetrics, LegDialResult, LegMetrics, LegStateLabel,
         NetworkMetricsSnapshot, PROXY_KINDS, PoolMemberMetrics, PoolMetrics, RungStateLabel,
+        TunnelBytesMetrics,
     };
     NetworkMetricsSnapshot {
         legs: vec![
@@ -1117,6 +1127,22 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
             .into_iter()
             .flat_map(|kind| [(kind, true, 1), (kind, false, 0)])
             .collect(),
+        tunnels: vec![
+            TunnelBytesMetrics {
+                egress_id: 2,
+                proxy_id: 11,
+                via: Vec::new(),
+                reserved_bytes: 120 * 1024 * 1024,
+                limit_bytes: 516 * 1024 * 1024,
+            },
+            TunnelBytesMetrics {
+                egress_id: 2,
+                proxy_id: 13,
+                via: vec![11, 12],
+                reserved_bytes: 40 * 1024 * 1024,
+                limit_bytes: 516 * 1024 * 1024,
+            },
+        ],
     }
 }
 
@@ -1146,6 +1172,10 @@ fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::Tunn
         rung_cooldowns: vec![1; RUNGS],
         rung_fallbacks: vec![2; RUNGS],
         revocations: 3,
+        socket_give_backs: 2,
+        socket_give_back_bytes: 4096,
+        socket_peers_dropped: 5,
+        socket_idle_retired: 6,
     }
 }
 
@@ -1625,8 +1655,6 @@ fn sample_trackers() -> weaver_server_core::torrents::metrics::tracker::TrackerS
     trackers.announces[udp][AnnounceEvent::Periodic as usize][TrackerResult::Timeout as usize] = 71;
     trackers.announce_nanos = [2_500_000_000, 30_000_000_000];
     trackers.peers = [72, 73];
-    trackers.scrapes[http][TrackerResult::BadReply as usize] = 74;
-    trackers.scrape_nanos = [250_000_000, 0];
     trackers
 }
 
@@ -1858,6 +1886,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             seeders: 3,
         },
         piece_steals: 8,
+        untracked_dropped: 9,
         outgoing_encryption: [50, 30, 6, 4, 3],
         disk: {
             use weaver_server_core::torrents::metrics::{

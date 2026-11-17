@@ -93,10 +93,14 @@ pub struct ServerTransferSnapshot {
 // subtraction, so a check is one clock read and a compare, and the read loop
 // can share that clock read between the progress mark and the read timeout
 // it derives next.
+//
+// A budget may also carry its caller's stop: once set, the transfer ends at
+// its next read turn, whatever the server is still sending.
 #[derive(Debug)]
 pub(crate) struct ActiveTransferBudget {
     limit: Duration,
     deadline: Instant,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 // Far enough that an unrepresentable deadline never expires within the life
@@ -112,7 +116,19 @@ impl ActiveTransferBudget {
         Self {
             limit,
             deadline: Self::deadline_from(now, limit),
+            stop: None,
         }
+    }
+
+    pub(crate) fn with_stop(mut self, stop: Option<Arc<AtomicBool>>) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Acquire))
     }
 
     // The transfer made progress at `now`: bytes arrived, or a deliberate
@@ -161,6 +177,9 @@ pub(crate) fn active_transfer_read_timeout_at(
     let Some(budget) = budget else {
         return Ok((command_timeout, false));
     };
+    if budget.stopped() {
+        return Err(NntpError::Stopped);
+    }
     let remaining = budget.remaining_at(now);
     if remaining.is_zero() {
         return Err(active_transfer_timeout(budget));
@@ -1348,10 +1367,6 @@ impl RateCharge {
             + Duration::from_micros(self.ticket.target_micros.saturating_sub(RATE_BURST_MICROS))
     }
 
-    pub(crate) async fn wait_async(self) -> Duration {
-        self.control.wait_async(self.ticket).await
-    }
-
     pub(crate) fn wait_blocking(self) -> Duration {
         self.control.wait_blocking(self.ticket)
     }
@@ -1395,13 +1410,6 @@ impl BodyTransferPermit {
         };
         self.throttle_wait = self.throttle_wait.saturating_add(waited);
         waited
-    }
-
-    // Charge received bytes and preserve rate debt without delaying cleanup.
-    pub(crate) fn record_without_wait(&mut self, bytes: usize) {
-        let bytes = bytes as u64;
-        self.record_bytes(bytes);
-        let _ = self.control.reserve_rate(bytes);
     }
 
     // Charge bytes against the quota without pacing or rate debt, for

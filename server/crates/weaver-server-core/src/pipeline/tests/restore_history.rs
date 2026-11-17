@@ -526,6 +526,63 @@ async fn a_job_under_a_missing_folder_gives_up_what_the_reading_found_and_is_the
     retire_pipeline_database(pipeline).await;
 }
 
+// A script a later job of the page gains while an earlier one is swept, as
+// a mark queues one, keeps that job's folder: it is left unswept and
+// unstamped, as a job with a script at the page's read is.
+#[tokio::test]
+async fn a_script_a_later_job_gains_mid_page_keeps_its_folder() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let (first, marked) = (JobId(30097), JobId(30098));
+    let first_dir = marked_working_dir(&intermediate_dir, "first", first).await;
+    let marked_dir = marked_working_dir(&intermediate_dir, "marked", marked).await;
+    for id in [first, marked] {
+        let mut row = history_row_finished_at(id, "failed", PathBuf::new(), 2);
+        row.output_dir = None;
+        pipeline.db.insert_job_history(&row).unwrap();
+    }
+    pipeline.report_all_for_test();
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    let mut places =
+        crate::pipeline::queue::SweepPlaces::new(Some(&crate::jobs::working_dir::RootScan {
+            marked: vec![(first, first_dir.clone()), (marked, marked_dir.clone())],
+            unreadable: 0,
+        }));
+    // On the first job's turn, after the page's read, the second gains a
+    // script.
+    let held: std::rc::Rc<std::cell::RefCell<Vec<Box<dyn std::any::Any>>>> = Default::default();
+    {
+        let (db, held) = (pipeline.db.clone(), held.clone());
+        crate::pipeline::queue::between_sweeps::set(move |id| {
+            if id == first {
+                held.borrow_mut().push(Box::new(
+                    crate::post_processing::events::hold_test_event_run(&db, marked.0, "marked"),
+                ));
+            }
+        });
+    }
+
+    assert!(
+        queue
+            .clone()
+            .sweep_failed_page(
+                &resources,
+                &[],
+                &mut places,
+                100,
+                vec![(first, None), (marked, None)],
+            )
+            .await
+    );
+    assert!(!first_dir.exists());
+    assert!(swept_at(&pipeline, first).await.is_some());
+    assert!(marked_dir.exists());
+    assert_eq!(swept_at(&pipeline, marked).await, None);
+    held.borrow_mut().clear();
+    retire_pipeline_database(pipeline).await;
+}
+
 // A reading of the root that could not read one of its entries stamps no
 // job: the entry it missed may be any job's. What it did find still goes.
 #[tokio::test]

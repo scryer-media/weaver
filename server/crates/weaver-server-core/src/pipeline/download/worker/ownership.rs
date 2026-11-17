@@ -185,8 +185,8 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
-        if let Some((volume, _)) = self.volume_reserved_by_job.get(&job_id) {
-            return Some(Arc::clone(volume));
+        if let Some(reserved) = self.volume_reserved_by_job.get(&job_id) {
+            return Some(Arc::clone(reserved.volume()));
         }
         self.graph_jobs
             .get(&job_id)
@@ -195,21 +195,25 @@ impl Pipeline {
     }
 
     // Reserve `work` on the volume its job writes to, as it is leased:
-    // false when it does not fit there (`Volume::reserve`). A job that
-    // writes through no writer reserves nothing.
+    // false when it does not fit below the lease limit there
+    // (`VolumeLeases::lease_limit`). A job that writes through no writer
+    // reserves nothing.
     pub(in crate::pipeline) fn reserve_lane_work(&mut self, work: &DownloadWork) -> bool {
         let job_id = work.segment_id.file_id.job_id;
+        let bytes = Self::reserved_bytes_of(work.byte_estimate);
+        if let Some(reserved) = self.volume_reserved_by_job.get_mut(&job_id) {
+            let share = reserved.volume().loop_share();
+            return reserved.reserve(bytes, share);
+        }
         let Some(volume) = self.article_volume(job_id) else {
             return true;
         };
-        let bytes = Self::reserved_bytes_of(work.byte_estimate);
-        if !volume.reserve(bytes) {
+        let share = volume.loop_share();
+        let mut reserved = Reservation::none(volume);
+        if !reserved.reserve(bytes, share) {
             return false;
         }
-        self.volume_reserved_by_job
-            .entry(job_id)
-            .or_insert_with(|| (volume, 0))
-            .1 += bytes;
+        self.volume_reserved_by_job.insert(job_id, reserved);
         true
     }
 
@@ -223,11 +227,10 @@ impl Pipeline {
             return;
         };
         let bytes = Self::reserved_bytes_of(work.byte_estimate);
-        volume.charge(bytes);
         self.volume_reserved_by_job
             .entry(job_id)
-            .or_insert_with(|| (volume, 0))
-            .1 += bytes;
+            .or_insert_with(|| Reservation::none(volume))
+            .count(bytes);
     }
 
     // Give back the reservation of `work`, which left its lane or was
@@ -238,27 +241,28 @@ impl Pipeline {
 
     // Give back the reservation of `work`, which left its lane with
     // `arrived` bytes of it: those count from here as arrived, in the same
-    // step (`Volume::settle`), until the loop hands them on. Whoever asked
-    // to be woken at the line the volume has now reached is woken.
+    // step (`Reservation::settle`), until the loop hands them on. Whoever
+    // asked to be woken at the line the volume has now reached is woken.
     fn settle_lane_work(&mut self, work: &DownloadWork, arrived: u64) {
         let job_id = work.segment_id.file_id.job_id;
-        let Some((volume, held)) = self.volume_reserved_by_job.get_mut(&job_id) else {
+        let Some(reserved) = self.volume_reserved_by_job.get_mut(&job_id) else {
             if arrived != 0 {
                 self.note_volume_arrived(job_id, arrived);
             }
             return;
         };
-        let volume = Arc::clone(volume);
-        let bytes = Self::reserved_bytes_of(work.byte_estimate).min(*held);
-        *held -= bytes;
-        if *held == 0 {
+        let bytes = Self::reserved_bytes_of(work.byte_estimate).min(reserved.bytes());
+        let mut part = reserved.split(bytes);
+        if reserved.bytes() == 0 {
             self.volume_reserved_by_job.remove(&job_id);
         }
-        if arrived != 0 {
-            self.hold_volume_arrived(job_id, &volume, arrived);
-        }
-        volume.settle(bytes, arrived);
-        if volume.take_wake() {
+        let woke = if arrived != 0 {
+            self.hold_volume_arrived(job_id, part, arrived, true)
+        } else {
+            part.give_back(bytes);
+            self.volume_writers.take_wake(part.volume())
+        };
+        if woke {
             self.volume_room_changed();
         }
     }

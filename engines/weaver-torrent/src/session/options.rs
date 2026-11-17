@@ -113,6 +113,14 @@ pub struct AddTorrentOptions {
     #[serde(default)]
     pub banned_peers: Vec<IpAddr>,
 
+    /// Of `initial_peers`, those a save found elsewhere than the torrent's
+    /// trackers and the operator (see
+    /// [`ResumePeers::found`](crate::ResumePeers::found)). They come back
+    /// marked so: a private torrent keeps them only until a tracker
+    /// answers, as before the restart.
+    #[serde(default)]
+    pub found_peers: Vec<SocketAddr>,
+
     /// Web seeds beside those the torrent names; a magnet link's `ws` join
     /// them (libtorrent `add_torrent_params::url_seeds`).
     #[serde(default)]
@@ -181,12 +189,6 @@ pub struct AddTorrentOptions {
     /// `torrent_flags::super_seeding`). Off by default.
     #[serde(default)]
     pub super_seeding: bool,
-    /// Take peers from the torrent's trackers alone, as a private torrent
-    /// does (BEP 27) whatever its metainfo says: no DHT, local discovery or
-    /// peer exchange, and none of the session's trackers beside its own.
-    /// Off by default; a private torrent is held to it either way.
-    #[serde(default)]
-    pub trackers_only: bool,
     /// Neither announce the torrent on the DHT nor take peers from it,
     /// while the session runs it for others (libtorrent
     /// `torrent_flags::disable_dht`). Off by default.
@@ -267,6 +269,7 @@ impl Default for AddTorrentOptions {
             ratelimits: LimitsConfig::default(),
             initial_peers: None,
             banned_peers: Vec::new(),
+            found_peers: Vec::new(),
             web_seeds: Vec::new(),
             peer_limit: None,
             preferred_id: None,
@@ -280,7 +283,6 @@ impl Default for AddTorrentOptions {
             totals: TorrentTotals::default(),
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,
-            trackers_only: false,
             disable_dht: false,
             disable_lsd: false,
             disable_pex: false,
@@ -304,6 +306,12 @@ pub struct ListOnlyResponse {
     pub output_folder: PathBuf,
     pub seen_peers: Vec<SocketAddr>,
     pub torrent_bytes: Bytes,
+    /// The web seeds the add named beside the metainfo:
+    /// [`AddTorrentOptions::web_seeds`], then a magnet link's `ws`. They are not in
+    /// `torrent_bytes`; the run that follows takes them as its
+    /// [`AddTorrentOptions::web_seeds`] (libtorrent keeps a magnet's
+    /// `add_torrent_params::url_seeds` across `torrent::set_metadata`).
+    pub web_seeds: Vec<WebSeed>,
     /// The tracker task the metadata fetch announced from, held for the run
     /// that follows on this session (see
     /// [`AddTorrentOptions::tracker_handover`]). Dropping it first sends

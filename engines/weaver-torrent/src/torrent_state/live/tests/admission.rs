@@ -169,7 +169,10 @@ async fn a_connection_we_asked_to_close_counts_no_failure() {
         let (peer, _rx) = h.peer(addr);
         let counters = peer.counters.clone();
         peer.on_peer_died(Some(error)).unwrap();
-        let failcount = h.peers.with_peer(sock(addr), |p| p.failcount()).unwrap();
+        let failcount = h
+            .peers
+            .with_peer(sock(addr).into(), |p| p.failcount())
+            .unwrap();
         failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
     }
     assert_eq!(failcounts, [(0, 0), (1, 1)]);
@@ -199,7 +202,10 @@ async fn a_connect_refused_on_our_side_counts_no_failure() {
         let (peer, _rx) = h.peer(addr);
         let counters = peer.counters.clone();
         peer.on_peer_died(Some(error)).unwrap();
-        let failcount = h.peers.with_peer(sock(addr), |p| p.failcount()).unwrap();
+        let failcount = h
+            .peers
+            .with_peer(sock(addr).into(), |p| p.failcount())
+            .unwrap();
         failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
     }
     assert_eq!(failcounts, [(0, 0), (0, 0), (0, 0), (1, 1)]);
@@ -214,7 +220,7 @@ async fn a_finished_torrent_still_dials_a_leecher_and_not_a_seed() {
     let h = Harness::seeding("finished_dials").await;
     let listens = |peer: &PeerHandler| {
         let mut hs = ExtendedHandshake::new();
-        hs.p = Some(u32::from(peer.addr.port()));
+        hs.p = Some(u32::from(peer.addr.addr().unwrap().port()));
         peer.on_extended_handshake(&hs).unwrap();
     };
     let (leecher, _leecher_rx) = h.new_peer("127.0.0.1:6881");
@@ -246,7 +252,7 @@ async fn a_changed_ip_filter_takes_the_peers_it_refuses_off_the_list() {
     for addr in ["203.0.113.1:6881", "203.0.113.2:80", "203.0.113.3:6881"] {
         h.add_peer(sock(addr), PeerSourceFlag::Tracker);
     }
-    let listed = |addr: &str| h.peers.with_peer(sock(addr), |_| ()).is_some();
+    let listed = |addr: &str| h.peers.with_peer(sock(addr).into(), |_| ()).is_some();
 
     h._session.set_ip_filter(crate::IpFilter {
         blocked: Arc::new(crate::IpRanges::new(
@@ -446,7 +452,7 @@ async fn an_incoming_connection_at_the_cap_replaces_the_oldest_connect_while_man
     for addr in ["203.0.113.1:6881", "203.0.113.2:6881"] {
         h.peers.add_peer(sock(addr), PeerSourceFlag::Tracker);
         let (addr, rx, tx) = h.peers.connect_next(tokio::time::Instant::now()).unwrap();
-        held.push(h.hold(addr, &tx));
+        held.push(h.hold(addr.into(), &tx));
         connects.push((addr, rx));
         tokio::time::advance(Duration::from_secs(1)).await;
     }
@@ -468,7 +474,7 @@ async fn an_incoming_connection_at_the_cap_replaces_the_oldest_connect_while_man
     assert!(!asked_to_close(newer_rx));
     assert!(live.iter_mut().all(|rx| !asked_to_close(rx)));
     assert!(!h.holds_place("203.0.113.1:6881"));
-    assert!(h.places.lock().contains_key(newer));
+    assert!(h.places.lock().contains_key(&PeerHandle::from(*newer)));
     assert!(h.holds_place("192.0.2.1:6881"));
     assert_eq!(h.connections(), (10, 10));
 }
@@ -553,7 +559,7 @@ async fn an_incoming_encrypted_connection_is_advertised_encrypted_in_our_pex() {
 
     let flags = |addr| {
         h.peers
-            .with_live(sock(addr), |live| live.advertised_pex_flags())
+            .with_live(sock(addr).into(), |live| live.advertised_pex_flags())
             .unwrap()
     };
     assert_eq!(flags("192.0.2.1:6881") & PEX_ENCRYPTION, PEX_ENCRYPTION);
@@ -598,6 +604,126 @@ impl crate::network::SocketFactory for DialedTcp {
                 .await
         })
     }
+}
+
+// A dial whose route is crowded out of TCP room: every look leaves a want,
+// counted while it is held; the dial still seats, as one over a transport the
+// route has room on does.
+struct CrowdedDial {
+    dialed: crate::peer_info_reader::tests::Dialed,
+    held: Arc<std::sync::atomic::AtomicUsize>,
+    gone: Arc<tokio::sync::Notify>,
+}
+
+struct CountedWant(
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<tokio::sync::Notify>,
+);
+
+impl Drop for CountedWant {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.1.notify_one();
+    }
+}
+
+impl crate::network::SocketFactory for CrowdedDial {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            crate::network::BoxAsyncReadVectored,
+            crate::network::BoxAsyncWrite,
+        )>,
+    > {
+        self.dialed.connect_tcp(addr)
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        self.dialed.listen_tcp(addr)
+    }
+
+    fn tcp_room(&self) -> crate::network::TcpRoom {
+        self.held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::network::TcpRoom::Crowded(crate::network::TcpWant::new(CountedWant(
+            Arc::clone(&self.held),
+            Arc::clone(&self.gone),
+        )))
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+    {
+        self.dialed.bind_udp(addr)
+    }
+}
+
+// The torrent's last candidate is dialled with the route crowded out of TCP
+// room, so the look leaves a want, and the dial seats: the peer comes live.
+// With the dial ended and no one left to dial, no TCP dial is possible, so
+// the connect loop looks again and lets the want go while the peer is still
+// live. Nothing else would wake it: the far end says nothing after its
+// handshake, and only the connection's closing on its silence would.
+#[tokio::test(start_paused = true)]
+async fn the_want_goes_once_the_last_dial_comes_live() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tx, mut dialed) = unbounded_channel();
+    let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gone = Arc::new(tokio::sync::Notify::new());
+    let opts = SessionOptions {
+        socket_factory: Arc::new(CrowdedDial {
+            dialed: crate::peer_info_reader::tests::Dialed(tx),
+            held: Arc::clone(&held),
+            gone: Arc::clone(&gone),
+        }),
+        connect: Some(crate::stream_connect::ConnectionOptions {
+            enable_tcp: true,
+            enable_utp: None,
+            peer_opts: None,
+        }),
+        ..isolated_session_opts(false)
+    };
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        initial_peers: Some(vec![sock("127.0.0.1:6881")]),
+        ..Default::default()
+    };
+    let h = Harness::build_added("last_dial_live", PIECES, 0x00, opts, add).await;
+    let (_, mut far) = dialed.recv().await.unwrap();
+    assert_eq!(
+        held.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the look left a want"
+    );
+    let mut greeting = [0; 68];
+    far.read_exact(&mut greeting).await.unwrap();
+    let mut answer = [0; 68];
+    let len = Handshake::new(h.shared.info_hash, crate::torrent_state::Id20::new([7; 20]))
+        .serialize_unchecked_len(&mut answer);
+    far.write_all(&answer[..len]).await.unwrap();
+
+    loop {
+        let notified = gone.notified();
+        if held.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            break;
+        }
+        notified.await;
+    }
+    assert!(!h.tcp_wants.holds());
+    assert_eq!(
+        h.peers.stats().live,
+        1,
+        "the want went while the peer was live"
+    );
+    assert_eq!(h.peers.dialling(), 0);
 }
 
 /// A torrent with no piece, of a session whose connections take
@@ -826,5 +952,129 @@ async fn a_connection_to_ourselves_is_closed_and_its_address_never_dialed_again(
     assert_eq!(
         h.peers.next_candidate(tokio::time::Instant::now()),
         peers::NextCandidate::None
+    );
+}
+
+// A look finds the torrent's route crowded out; the receiver ends once the
+// want it left is let go. The look lands before the connect loop's wait, and
+// the wait lets the want go on entry, or in it, and leaves none.
+fn crowded_out(h: &Harness) -> tokio::sync::oneshot::Receiver<()> {
+    let (gone, released) = tokio::sync::oneshot::channel::<()>();
+    h.tcp_wants.looked(crate::network::TcpRoom::Crowded(
+        crate::network::TcpWant::new(gone),
+    ));
+    released
+}
+
+// A torrent crowded out of TCP room and then held at its own peer limit
+// dials no one, so it lets its want go: the route stops counting it as
+// pressing, and usenet's share may grow back.
+#[tokio::test]
+async fn a_torrent_waiting_at_its_peer_limit_holds_no_tcp_want() {
+    let h = turnover_harness("tcp_want_peer_limit", 1, 200).await;
+    let _held = h.peer_semaphore.clone().try_acquire_owned().unwrap();
+    h.peers
+        .add_peer(sock("203.0.113.1:6881"), PeerSourceFlag::Tracker);
+    let released = crowded_out(&h);
+    assert!(released.await.is_err(), "the want is let go");
+    assert!(!h.tcp_wants.holds());
+    assert_eq!(h.peers.stats().connecting, 0, "held at the peer limit");
+}
+
+// A free look lets a want go.
+#[test]
+fn a_free_look_lets_the_tcp_want_go() {
+    let wants = crate::stream_connect::TcpWants::default();
+    let (gone, mut released) = tokio::sync::oneshot::channel::<()>();
+    wants.looked(crate::network::TcpRoom::Crowded(
+        crate::network::TcpWant::new(gone),
+    ));
+    assert!(wants.holds());
+    wants.looked(crate::network::TcpRoom::Free);
+    assert!(!wants.holds());
+    assert_eq!(
+        released.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    );
+}
+
+// A pause lets a held want go, and no crowded look after it leaves one.
+#[test]
+fn a_pause_lets_the_tcp_want_go_and_no_look_after_it_leaves_one() {
+    let wants = crate::stream_connect::TcpWants::default();
+    let crowded = || {
+        let (gone, released) = tokio::sync::oneshot::channel::<()>();
+        wants.looked(crate::network::TcpRoom::Crowded(
+            crate::network::TcpWant::new(gone),
+        ));
+        released
+    };
+    let mut before = crowded();
+    assert!(wants.holds());
+    wants.close();
+    assert!(!wants.holds());
+    assert_eq!(
+        before.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    );
+    let mut after = crowded();
+    assert!(!wants.holds(), "a look after the pause left a want");
+    assert_eq!(
+        after.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    );
+}
+
+// A wait in which the connect loop can dial no one lets the want go on
+// entry, and a look that lands while it lasts leaves none; once the loop is
+// out of it, a crowded look holds a want again.
+#[tokio::test]
+async fn a_look_during_a_wait_that_can_dial_no_one_leaves_no_tcp_want() {
+    let wants = crate::stream_connect::TcpWants::default();
+    let crowded = || {
+        let (gone, released) = tokio::sync::oneshot::channel::<()>();
+        wants.looked(crate::network::TcpRoom::Crowded(
+            crate::network::TcpWant::new(gone),
+        ));
+        released
+    };
+    let mut before = crowded();
+    assert!(wants.holds());
+    let mut during = None;
+    wants
+        .idle(async {
+            assert_eq!(
+                before.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+                "the wait lets the want go on entry"
+            );
+            during = Some(crowded());
+        })
+        .await;
+    assert_eq!(
+        during.expect("a look in the wait").try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+        "a look in the wait leaves no want"
+    );
+    assert!(!wants.holds());
+    let _after = crowded();
+    assert!(wants.holds(), "out of the wait, a look holds a want");
+}
+
+// Once the torrent is paused, a dial still under way that finds its route
+// crowded out leaves no want: it is let go at once.
+#[tokio::test]
+async fn a_dial_that_ends_after_the_pause_leaves_no_tcp_want() {
+    let h = Harness::new("tcp_want_after_pause").await;
+    let handle = h._session.get(h.shared.id.into()).unwrap();
+    h._session.pause(&handle).await.unwrap();
+    let (gone, mut released) = tokio::sync::oneshot::channel::<()>();
+    h.tcp_wants.looked(crate::network::TcpRoom::Crowded(
+        crate::network::TcpWant::new(gone),
+    ));
+    assert!(!h.tcp_wants.holds());
+    assert_eq!(
+        released.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
     );
 }

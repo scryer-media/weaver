@@ -32,7 +32,7 @@ const TAIL_PROBE_INPUT: usize = 256;
 const MAX_HEADER_SCAN_BYTES: usize = 64 * 1024;
 
 #[cfg(unix)]
-fn thread_cpu_time() -> Option<Duration> {
+pub(crate) fn thread_cpu_time() -> Option<Duration> {
     let mut timespec = std::mem::MaybeUninit::<libc::timespec>::uninit();
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, timespec.as_mut_ptr()) };
     if rc != 0 {
@@ -45,7 +45,7 @@ fn thread_cpu_time() -> Option<Duration> {
 }
 
 #[cfg(windows)]
-fn thread_cpu_time() -> Option<Duration> {
+pub(crate) fn thread_cpu_time() -> Option<Duration> {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
 
     const ZERO: windows_sys::Win32::Foundation::FILETIME =
@@ -72,11 +72,11 @@ fn thread_cpu_time() -> Option<Duration> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn thread_cpu_time() -> Option<Duration> {
+pub(crate) fn thread_cpu_time() -> Option<Duration> {
     None
 }
 
-fn add_cpu_delta(total: &mut Duration, started: Option<Duration>) {
+pub(crate) fn add_cpu_delta(total: &mut Duration, started: Option<Duration>) {
     let Some(started) = started else {
         return;
     };

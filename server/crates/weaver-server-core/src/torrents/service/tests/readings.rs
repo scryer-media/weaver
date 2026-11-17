@@ -293,7 +293,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     // tick writes the ledger it changed, and a clean stop writes the ledger
     // as it stands.
     rig.service.tick().await;
-    clock.0.fetch_add(30_000, Ordering::SeqCst);
+    clock.shift_unix_ms(30_000);
     rig.service.tick().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!(kept.active_duration_s, 30);
@@ -533,7 +533,7 @@ fn session_limits(session: &Session) -> (Option<u32>, Option<u32>) {
 // the rate comes back. A torrent on another egress is untouched throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
-    use crate::bandwidth::TorrentRates;
+    use crate::bandwidth::ClassRates;
 
     let mut seeded = seeded().await;
     let service = seeded.rig.service.clone();
@@ -564,7 +564,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
     assert_eq!(session_limits(&seeding), (None, None));
 
     // Past the soft cap: the egress's uploads trickle.
-    let trickle = TorrentRates {
+    let trickle = ClassRates {
         download: None,
         upload: Some(crate::proxies::DEFAULT_UPLOAD_TRICKLE_BPS),
     };
@@ -582,7 +582,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
 
     // At the hard cap: a budget of no bytes. The torrent still seeds, and
     // its next announce still goes out as a seed's.
-    let stopped = TorrentRates {
+    let stopped = ClassRates {
         download: None,
         upload: Some(0),
     };
@@ -595,7 +595,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
     assert_eq!(seeded.view().await.state, TorrentState::Seeding);
 
     // Lifted: the session moves as it did.
-    let at = ring(SYSTEM_EGRESS_ID, TorrentRates::default());
+    let at = ring(SYSTEM_EGRESS_ID, ClassRates::default());
     applied.wait_for(|applied| *applied >= at).await.unwrap();
     assert_eq!(session_limits(&seeding), (None, None));
     assert_eq!(session_limits(&elsewhere), (None, None));
@@ -685,7 +685,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     );
 
     rig.service.tick().await;
-    clock.0.fetch_add(5_000, Ordering::SeqCst);
+    clock.shift_unix_ms(5_000);
     rig.service.tick().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (5, 5));
@@ -699,7 +699,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
         (view.state, view.progress, view.completed_at_ms),
         (TorrentState::Stalled, 0.0, None)
     );
-    clock.0.fetch_add(5_000, Ordering::SeqCst);
+    clock.shift_unix_ms(5_000);
     rig.service.tick().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (10, 5));
@@ -927,5 +927,37 @@ async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
     drop(connection);
     rig.service.tick().await;
     assert_eq!(seen(), Some(at));
+    rig.service.stop().await;
+}
+
+// A torrent's ETA is over the bytes it wants and has not: an Ignored file,
+// never to come, adds nothing to it (qBittorrent `TorrentImpl::eta`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_eta_counts_only_the_wanted_bytes_left() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let files = [
+        ("set/a.bin", &[1u8; 6_000][..]),
+        ("set/b.bin", &[2u8; 30_000][..]),
+    ];
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(metainfo("set", &files, 4_096, false)))
+        })
+        .await
+        .unwrap();
+    let settings = rig.service.settings();
+    let mut live = rig.service.inner.live.lock().await;
+    let torrent = live.get_mut(&job_id).unwrap();
+    torrent.levels = vec![FilePriority::Normal, FilePriority::Ignored];
+    let mut reading = torrent.reading(0);
+    reading.file_have = vec![2_000, 10_000];
+    reading.speeds = (1_000, 0);
+    let view = rig.service.view_of(&settings, torrent, reading, 0);
+    drop(live);
+    assert_eq!((view.wanted_bytes, view.wanted_have_bytes), (6_000, 2_000));
+    assert_eq!(view.eta_seconds, Some(4));
     rig.service.stop().await;
 }

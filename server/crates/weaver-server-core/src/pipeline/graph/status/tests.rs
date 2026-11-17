@@ -727,7 +727,8 @@ fn a_posted_file_that_never_arrived_is_what_its_name_says() {
 
 // A member withheld by its object's refusal is neither whole nor short:
 // nothing whole beside it fails the job, worded by the refusal, one wording
-// for a password whether it shut the bytes or the headers.
+// for a password whether it shut the bytes or the headers, its names sorted
+// whatever order the objects refused in.
 #[test]
 fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
     let withheld = |whole: &[&str], withheld: &[(&str, Why)]| Delivery {
@@ -762,6 +763,19 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
             "WEAVER_PASSWORD_REQUIRED: lantern.part1.rar, lantern.part2.rar needs a password and none was given; \
              ember.7z never placed every member it named"
         )
+    );
+    assert_eq!(
+        withheld(
+            &[],
+            &[
+                ("lantern.part3.rar", Why::Unmapped),
+                ("ember.7z", Why::Unmapped),
+                ("lantern.part1.rar", Why::Unmapped),
+            ]
+        )
+        .withheld_error()
+        .as_deref(),
+        Some("ember.7z, lantern.part1.rar, lantern.part3.rar never placed every member it named")
     );
     assert_eq!(
         withheld(&["ember.mkv"], &[("lantern.rar", Why::Encrypted)]).status(None),

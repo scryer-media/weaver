@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -196,13 +196,15 @@ pub struct BlockingBodyLane {
     // request-by-request instead of batch-by-batch.
     ring: BodyRing,
     idle_since: std::sync::Mutex<Option<Instant>>,
+    // The caller's stop, when it has one. See [`Self::set_stop`].
+    stop: Option<Arc<AtomicBool>>,
     _permit: BlockingConnectionPermit,
 }
 
 pub struct BlockingNntpConnection {
     pub route_path: Option<weaver_tunnel::pipe::DialPath>,
     egress_control: Option<Arc<ServerTransferControl>>,
-    route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+    pub(crate) route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
     transport: BlockingTransport,
     codec: NntpCodec,
     read_buf: BytesMut,
@@ -217,12 +219,16 @@ pub struct BlockingNntpConnection {
     current_group: Option<String>,
     credentials: Option<(String, String)>,
     poisoned: bool,
-    // The server answered a pipelined BODY with 480: the session expired,
-    // but the socket is still framed. Nothing new may be written until every
-    // reply queued behind that 480 has been read and the session has been
-    // re-authenticated in place. See
+    // The server answered a pipelined BODY with 480, asking for a login,
+    // and the socket is still framed. Nothing new may be written until every
+    // reply queued behind that 480 has been read and the session has logged
+    // in in place. See
     // [`Self::reauthenticate_expired_session`].
     reauth_pending: bool,
+    // A 480 at a BODY was answered by logging in, and no BODY has been
+    // answered on this socket since. A 480 now is the server refusing the
+    // account it just took, not another request to log in.
+    login_unproven: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
     body_activity: Option<Arc<AtomicU64>>,
@@ -235,6 +241,9 @@ pub struct BlockingNntpConnection {
     // How long the last decoded article waited for its status line. The lane
     // takes this to separate distance from transfer cost.
     last_response_line_wait: Duration,
+    // Command-to-status-line time of the CAPABILITIES exchange session setup
+    // made, when it made one.
+    capabilities_round_trip: Option<Duration>,
     // Armed when session setup declined to select a group this caller
     // offered, because the server has never been shown to need one. See
     // [`crate::server_caps`].
@@ -255,6 +264,14 @@ impl BlockingBodyLane {
     // a lane reused by another job cannot carry previous checkpoint state.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
+    }
+
+    // Once `stop` is set, a BODY in flight ends at its next read turn with
+    // [`NntpError::Stopped`] and the connection is let go, even while the
+    // server is still sending: a caller that is done with the answer does
+    // not wait out a slow article.
+    pub fn set_stop(&mut self, stop: Arc<AtomicBool>) {
+        self.stop = Some(stop);
     }
 
     pub fn connect(
@@ -306,6 +323,7 @@ impl BlockingBodyLane {
                 ring: BodyRing::default(),
                 _permit: permit,
                 idle_since: std::sync::Mutex::new(None),
+                stop: None,
             });
         }
         for group in groups {
@@ -327,6 +345,7 @@ impl BlockingBodyLane {
                         soft_timeout,
                         ring: BodyRing::default(),
                         idle_since: std::sync::Mutex::new(None),
+                        stop: None,
                         _permit: permit,
                     });
                 }
@@ -352,6 +371,7 @@ impl BlockingBodyLane {
                 soft_timeout,
                 ring: BodyRing::default(),
                 idle_since: std::sync::Mutex::new(None),
+                stop: None,
                 _permit: permit,
             })
         } else {
@@ -500,6 +520,12 @@ impl BlockingBodyLane {
         self._permit.health_lease.0.probing()
     }
 
+    // Whether this lane may be kept idle between leases. See
+    // [`crate::recovery::ConnectionHealth::may_rest_idle`].
+    pub fn may_rest_idle(&self) -> bool {
+        self._permit.health_lease.0.may_rest_idle()
+    }
+
     pub fn accepts_new_work(&self) -> bool {
         self._permit.health_lease.0.current() && self._permit.socket_slot.claim_reuse()
     }
@@ -510,9 +536,8 @@ impl BlockingBodyLane {
     // assumed, because a probe written behind an unread BODY response would
     // read that article's payload as its own status line.
     //
-    // `inconclusive` carries the same meaning as it does for the async
-    // client — nothing here may be reported as a missing article unless the
-    // server actually said so.
+    // `inconclusive` means nothing here may be reported as a missing article
+    // unless the server actually said so.
     pub fn probe_exists(&mut self, message_ids: &[String]) -> ProbeBatchResult {
         if message_ids.is_empty() {
             return ProbeBatchResult {
@@ -677,8 +702,9 @@ impl BlockingBodyLane {
             }
             // The whole batch is read: a session that expired part-way
             // through logs in again before the lane is handed back.
+            let mut result = result;
             if idx + 1 == requested && !closed_early {
-                self.reauthenticate_drained_session();
+                self.reauthenticate_drained_session(&mut result);
             }
             if self.conn.poisoned
                 || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -901,8 +927,9 @@ impl BlockingBodyLane {
         // The last reply owed behind a 480 has been read: log in again on
         // this socket. A refusal poisons the connection, so the window below
         // closes as unhealthy and the caller discards the lane.
+        let mut result = result;
         if self.ring.outstanding.is_empty() && !self.ring.closed {
-            self.reauthenticate_drained_session();
+            self.reauthenticate_drained_session(&mut result);
         }
         if self.conn.poisoned
             || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -959,9 +986,15 @@ impl BlockingBodyLane {
         dropped
     }
 
-    // Re-authenticate a session that expired mid-batch, once nothing is
-    // outstanding on it. A no-op unless a 480 is pending.
-    fn reauthenticate_drained_session(&mut self) {
+    // Log in again on a session a 480 asked to, once nothing is outstanding
+    // on it, and give `result`, the reply just read, the login's refusal if
+    // that reply was itself a 480 asking for it: the refusal is the answer
+    // the article got, and is told to health as one. A no-op unless a 480
+    // is pending.
+    fn reauthenticate_drained_session(
+        &mut self,
+        result: &mut std::result::Result<DecodedBody, DecodedBodyError>,
+    ) {
         if !self.conn.reauth_pending() || self.conn.poisoned {
             return;
         }
@@ -969,13 +1002,21 @@ impl BlockingBodyLane {
         match self.conn.reauthenticate_expired_session(Some(&budget)) {
             Ok(()) => debug!(
                 server = self.server_id.0,
-                "re-authenticated an expired session in place"
+                "logged in again in place after a 480"
             ),
-            Err(error) => debug!(
-                server = self.server_id.0,
-                error = %error,
-                "could not re-authenticate an expired session; dropping the connection"
-            ),
+            Err(error) => {
+                debug!(
+                    server = self.server_id.0,
+                    error = %error,
+                    "the login a 480 asked for was not taken; dropping the connection"
+                );
+                if matches!(
+                    result,
+                    Err(DecodedBodyError::Nntp(NntpError::SessionExpired))
+                ) {
+                    *result = Err(DecodedBodyError::Nntp(error));
+                }
+            }
         }
     }
 
@@ -1017,7 +1058,7 @@ impl BlockingBodyLane {
         message_id: &str,
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        let mut budget = ActiveTransferBudget::new(self.soft_timeout).with_stop(self.stop.clone());
         self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self.conn.stream_yenc_article_with_active_budget(
             message_id,
@@ -1033,7 +1074,7 @@ impl BlockingBodyLane {
     }
 
     fn read_next_decoded_body(&mut self) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        let mut budget = ActiveTransferBudget::new(self.soft_timeout).with_stop(self.stop.clone());
         self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self
             .conn
@@ -1071,11 +1112,12 @@ impl BlockingBodyLane {
                 FetchAttemptOutcome::QuotaUnrequested,
                 Some("BODY was not issued after quota rejection".to_string()),
             ),
-            Err(DecodedBodyError::Nntp(
-                NntpError::AuthenticationFailed
-                | NntpError::AuthenticationRejected
-                | NntpError::AccessDenied,
-            )) => (
+            // A login a 480 asked for and the server did not take, or a 480
+            // to the first BODY after it, is the server refusing the account
+            // as surely as a refused login at the dial is, and health must
+            // hear it as one: told as anything else, the server is never held
+            // and the article is asked of it again without end.
+            Err(DecodedBodyError::Nntp(error)) if error.is_credentials_refusal() => (
                 FetchAttemptOutcome::AuthenticationFailure,
                 Some("authentication/access failure".to_string()),
             ),
@@ -1334,19 +1376,20 @@ impl BlockingNntpConnection {
             credentials: None,
             poisoned: false,
             reauth_pending: false,
+            login_unproven: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
             body_activity: None,
             egress_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
+            capabilities_round_trip: None,
             group_probe_armed: false,
             health: None,
         };
 
         // The route's setup evidence is whether the server answered over this
-        // connection, as on the asynchronous path: a greeting that arrived is
-        // a reached server, whatever the session makes of it afterwards. A
+        // connection: a greeting that arrived is a reached server, whatever the session makes of it afterwards. A
         // session that the server drops after greeting it is not an address,
         // proxy, or pool member that fails to answer.
         let greeting = match conn.read_response() {
@@ -1460,6 +1503,23 @@ impl BlockingNntpConnection {
         &self.capabilities
     }
 
+    // How long the CAPABILITIES command session setup sent took to answer;
+    // `None` when setup sent none.
+    pub fn capabilities_round_trip(&self) -> Option<Duration> {
+        self.capabilities_round_trip
+    }
+
+    // Name of the negotiated TLS cipher suite, as the backend reports it;
+    // `None` on plaintext.
+    pub fn negotiated_cipher_suite(&self) -> Option<String> {
+        match &self.transport {
+            BlockingTransport::Plain(_) => None,
+            BlockingTransport::Rustls(inner) => inner.session.negotiated_cipher_suite(),
+            #[cfg(not(windows))]
+            BlockingTransport::S2n(inner) => inner.negotiated_cipher_suite(),
+        }
+    }
+
     pub fn current_group(&self) -> Option<&str> {
         self.current_group.as_deref()
     }
@@ -1513,7 +1573,9 @@ impl BlockingNntpConnection {
     }
 
     fn fetch_capabilities(&mut self) -> Result<()> {
+        let started = Instant::now();
         let resp = self.send_command(&Command::Capabilities)?;
+        self.capabilities_round_trip = Some(started.elapsed());
         if resp.code.raw() == 101 {
             let data = self.read_multiline_data()?;
             self.capabilities = Capabilities::parse(&data);
@@ -1585,15 +1647,13 @@ impl BlockingNntpConnection {
         self.reauth_pending
     }
 
-    // Re-authenticate, on this socket, a session the server expired part-way
-    // through a batch. Call it only once every reply queued behind the 480
+    // Log in, on this socket, a session a 480 part-way through a batch asked
+    // to. Call it only once every reply queued behind the 480
     // has been read: an AUTHINFO written earlier would be answered by one of
     // them.
     //
-    // The login replies are classified as at dial time. Any refusal, or a
-    // socket that goes away, poisons the connection: the next dial then logs
-    // in from the start, and that is where a credential that has really gone
-    // bad is booked.
+    // Any refusal, or a socket that goes away, poisons the connection, and
+    // the refusal is returned for the caller to tell.
     pub(crate) fn reauthenticate_expired_session(
         &mut self,
         budget: Option<&ActiveTransferBudget>,
@@ -1601,23 +1661,47 @@ impl BlockingNntpConnection {
         if !self.reauth_pending || self.poisoned {
             return Ok(());
         }
-        let Some((user, pass)) = self.credentials.clone() else {
-            // Never set without credentials; kept total for safety.
-            self.fail_body_pipeline();
-            return Err(NntpError::SessionExpired);
-        };
-        match self.authenticate_with_active_budget(&user, &pass, budget) {
+        match self.log_in_for_body(budget) {
             Ok(()) => {
                 self.reauth_pending = false;
-                // As on the sequential re-auth: a new session need not keep
-                // the old one's group.
-                self.current_group = None;
                 Ok(())
             }
             Err(error) => {
                 self.fail_body_pipeline();
                 Err(error)
             }
+        }
+    }
+
+    // Log in on this socket because the server answered a BODY with 480,
+    // which asks for a login whether or not an account is configured. With
+    // none, the name and password sent are empty: a server that needs no
+    // login takes them (281), and one that wants an account refuses them.
+    // The dial never logs in without an account; only a 480 does.
+    //
+    // A login not taken is the server refusing the account. Any answer
+    // other than a refusal, a connection limit or a busy server, and a
+    // connection closed in place of an answer, is told as a refused login.
+    fn log_in_for_body(&mut self, budget: Option<&ActiveTransferBudget>) -> Result<()> {
+        let (user, pass) = self.credentials.clone().unwrap_or_default();
+        match self.authenticate_with_active_budget(&user, &pass, budget) {
+            Ok(()) => {
+                // A new session need not keep the old one's group.
+                self.current_group = None;
+                self.login_unproven = true;
+                Ok(())
+            }
+            Err(error)
+                if error.is_credentials_refusal()
+                    || matches!(
+                        error,
+                        NntpError::TooManyConnections | NntpError::ServiceUnavailable
+                    )
+                    || (is_transient(&error) && !matches!(error, NntpError::ConnectionClosed)) =>
+            {
+                Err(error)
+            }
+            Err(_) => Err(NntpError::AuthenticationFailed),
         }
     }
 
@@ -1826,6 +1910,10 @@ impl BlockingNntpConnection {
             }
             self.poisoned = true;
             self.current_group = None;
+        } else if matches!(error, NntpError::Stopped) {
+            // A request may be on the wire with its answer unread.
+            self.poisoned = true;
+            self.current_group = None;
         }
     }
 
@@ -1963,7 +2051,7 @@ impl BlockingNntpConnection {
                 Ok(results) => stat_verdict = Some(results),
                 // The server has just retired STAT, which `stat_batch` has
                 // recorded. HEAD alone has to settle the batch now.
-                Err(error) if crate::connection::reports_unsupported_command(&error) => {}
+                Err(error) if reports_unsupported_command(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1992,7 +2080,7 @@ impl BlockingNntpConnection {
             Ok(confirmed) => confirmed,
             // HEAD is gone too. If STAT answered, its verdict is the final
             // one; if it did not, nothing here can settle the batch.
-            Err(error) if crate::connection::reports_unsupported_command(&error) => {
+            Err(error) if reports_unsupported_command(&error) => {
                 return if have_stat {
                     Ok(exists)
                 } else {
@@ -2011,28 +2099,73 @@ impl BlockingNntpConnection {
         Ok(exists)
     }
 
-    // One pipelined STAT batch. Every response is read even after a refusal,
-    // so the socket is left exactly where the next command expects it.
+    // One pipelined STAT batch.
     fn stat_batch(&mut self, message_ids: &[String]) -> Result<Vec<bool>> {
-        let pipelined = self.capabilities.supports_pipelining();
-        if pipelined {
-            self.write_probe_batch(message_ids.iter().map(String::as_str), Command::Stat)?;
-        }
+        let ids: Vec<&str> = message_ids.iter().map(String::as_str).collect();
+        self.probe_batch(&ids, Command::Stat, Self::classify_stat_response)
+    }
 
-        let mut results = Vec::with_capacity(message_ids.len());
+    // One pipelined HEAD batch, used to second-guess a STAT miss.
+    fn head_batch(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
+        self.probe_batch(message_ids, Command::Head, Self::classify_head_response)
+    }
+
+    // Ask `command` of every id, in one write where the server pipelines,
+    // and turn each status line into a verdict with `classify`. Every reply
+    // is read even after a refusal, so the socket is left exactly where the
+    // next command expects it.
+    //
+    // A 480 asks for a login, as it does at a BODY: once every reply of the
+    // batch is read, the connection logs in on the same socket (the stored
+    // account, or the empty login the BODY path sends) and the ids the 480s
+    // answered are asked once more. A 480 to that second asking, or to the
+    // first command after an earlier 480's login, is the server refusing the
+    // account it took.
+    fn probe_batch(
+        &mut self,
+        message_ids: &[&str],
+        command: fn(ArticleId) -> Command,
+        classify: fn(&mut Self, &Response) -> Result<Result<bool>>,
+    ) -> Result<Vec<bool>> {
+        let mut results = vec![false; message_ids.len()];
         let mut refusal = None;
-        for message_id in message_ids {
-            if !pipelined {
-                self.write_probe_batch(std::iter::once(message_id.as_str()), Command::Stat)?;
+        let mut asking: Vec<usize> = (0..message_ids.len()).collect();
+        let mut logged_in = false;
+        loop {
+            let pipelined = self.capabilities.supports_pipelining();
+            if pipelined {
+                self.write_probe_batch(asking.iter().map(|&index| message_ids[index]), command)?;
             }
-            let response = self.read_response()?;
-            match self.classify_stat_response(&response) {
-                Ok(exists) => results.push(exists),
-                Err(error) => {
-                    results.push(false);
-                    let _ = refusal.get_or_insert(error);
+            let mut wants_login = Vec::new();
+            for &index in &asking {
+                if !pipelined {
+                    self.write_probe_batch(std::iter::once(message_ids[index]), command)?;
+                }
+                let response = self.read_response()?;
+                if response.code.raw() == 480 && !logged_in && !self.login_unproven {
+                    wants_login.push(index);
+                    continue;
+                }
+                if response.code.raw() != 480 {
+                    // Any other answer: the login holds.
+                    self.login_unproven = false;
+                }
+                match classify(self, &response)? {
+                    Ok(exists) => results[index] = exists,
+                    Err(error) => {
+                        let _ = refusal.get_or_insert(error);
+                    }
                 }
             }
+            if wants_login.is_empty() {
+                break;
+            }
+            if let Err(error) = self.log_in_for_body(None) {
+                self.fail_body_pipeline();
+                return Err(error);
+            }
+            logged_in = true;
+            asking = wants_login;
         }
         match refusal {
             Some(error) => Err(error),
@@ -2040,47 +2173,11 @@ impl BlockingNntpConnection {
         }
     }
 
-    // One pipelined HEAD batch, used to second-guess a STAT miss.
-    //
-    // A 221 carries headers that have to be drained before the next status
-    // line can be read, so the multi-line body is consumed and discarded in
-    // place; only its arrival matters.
-    fn head_batch(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
-        let pipelined = self.capabilities.supports_pipelining();
-        if pipelined {
-            self.write_probe_batch(message_ids.iter().copied(), Command::Head)?;
-        }
-
-        let mut results = Vec::with_capacity(message_ids.len());
-        let mut refusal = None;
-        for message_id in message_ids {
-            if !pipelined {
-                self.write_probe_batch(std::iter::once(*message_id), Command::Head)?;
-            }
-            let response = self.read_response()?;
-            match response.code.raw() {
-                221 => {
-                    self.read_multiline_data()?;
-                    results.push(true);
-                }
-                430 | 423 => results.push(false),
-                code if crate::server_caps::is_command_unsupported(code) => {
-                    if crate::server_caps::note_head_unsupported(&self.host, self.port) {
-                        debug!(host = %self.host, port = self.port, "server does not implement HEAD");
-                    }
-                    results.push(false);
-                    let _ = refusal.get_or_insert(NntpError::CommandNotRecognized);
-                }
-                _ => {
-                    results.push(false);
-                    let _ = refusal
-                        .get_or_insert(NntpError::from_status(response.code, &response.message));
-                }
-            }
-        }
-        match refusal {
-            Some(error) => Err(error),
-            None => Ok(results),
+    // The demanded command was answered with its 2xx status line. See
+    // [`crate::recovery::ConnectionHealth::answered`].
+    fn note_answered(&self) {
+        if let Some(health) = &self.health {
+            health.answered();
         }
     }
 
@@ -2113,10 +2210,17 @@ impl BlockingNntpConnection {
     // A 500/501 is the server saying it does not implement STAT. That is an
     // answer about the command, not a fault on the socket: it is recorded so
     // the probe switches to HEAD, and the connection stays healthy.
-    fn classify_stat_response(&mut self, response: &Response) -> Result<bool> {
-        match response.code.raw() {
-            223 => Ok(true),
-            430 | 423 => Ok(false),
+    //
+    // The outer result is the socket failing; the inner one is the server's
+    // answer, a verdict or a refusal. 451 is the article missing, beside 430
+    // and 423, as it is at a BODY.
+    fn classify_stat_response(&mut self, response: &Response) -> Result<Result<bool>> {
+        Ok(match response.code.raw() {
+            223 => {
+                self.note_answered();
+                Ok(true)
+            }
+            430 | 423 | 451 => Ok(false),
             code if crate::server_caps::is_command_unsupported(code) => {
                 if crate::server_caps::note_stat_unsupported(&self.host, self.port) {
                     debug!(host = %self.host, port = self.port, "server does not implement STAT");
@@ -2124,7 +2228,31 @@ impl BlockingNntpConnection {
                 Err(NntpError::CommandNotRecognized)
             }
             _ => Err(NntpError::from_status(response.code, &response.message)),
-        }
+        })
+    }
+
+    // Turn one HEAD status line into an existence verdict.
+    //
+    // A 221 carries headers that have to be drained before the next status
+    // line can be read, so the multi-line body is consumed and discarded in
+    // place; only its arrival matters. The outer result is the socket
+    // failing, the inner one the server's answer.
+    fn classify_head_response(&mut self, response: &Response) -> Result<Result<bool>> {
+        Ok(match response.code.raw() {
+            221 => {
+                self.note_answered();
+                self.read_multiline_data()?;
+                Ok(true)
+            }
+            430 | 423 | 451 => Ok(false),
+            code if crate::server_caps::is_command_unsupported(code) => {
+                if crate::server_caps::note_head_unsupported(&self.host, self.port) {
+                    debug!(host = %self.host, port = self.port, "server does not implement HEAD");
+                }
+                Err(NntpError::CommandNotRecognized)
+            }
+            _ => Err(NntpError::from_status(response.code, &response.message)),
+        })
     }
 
     pub fn select_group(&mut self, group: &str) -> Result<()> {
@@ -2221,27 +2349,22 @@ impl BlockingNntpConnection {
                 return Err(error.into());
             }
         };
-        let initial = if initial.code.raw() == 480 {
-            if let Some((user, pass)) = self.credentials.clone() {
-                if let Err(error) =
-                    self.authenticate_with_active_budget(&user, &pass, budget.as_deref())
-                {
+        let initial = if initial.code.raw() == 480 && !self.login_unproven {
+            // The server asks for a login: log in and ask again. A 480 to
+            // the BODY asked again, or to the first BODY after an earlier
+            // 480's login, is the server refusing the account it took.
+            if let Err(error) = self.log_in_for_body(budget.as_deref()) {
+                self.poison_on_soft_timeout(&error);
+                self.abort_active_body();
+                return Err(error.into());
+            }
+            match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
+                Ok(initial) => initial,
+                Err(error) => {
                     self.poison_on_soft_timeout(&error);
                     self.abort_active_body();
                     return Err(error.into());
                 }
-                self.current_group = None;
-                match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
-                    Ok(initial) => initial,
-                    Err(error) => {
-                        self.poison_on_soft_timeout(&error);
-                        self.abort_active_body();
-                        return Err(error.into());
-                    }
-                }
-            } else {
-                self.abort_active_body();
-                return Err(NntpError::AuthenticationRequired.into());
             }
         } else {
             initial
@@ -2291,28 +2414,26 @@ impl BlockingNntpConnection {
                 return Err(error.into());
             }
         };
-        if initial.code.raw() == 480 {
-            // Mid-batch, a 480 says the session expired, not that the
-            // credentials are wrong: they were accepted when this connection
-            // was set up. Reporting it as an auth failure disabled the whole
-            // server for the auth backoff.
+        if initial.code.raw() == 480 && !self.login_unproven {
+            // Mid-batch, a 480 asks for a login: the session expired, or the
+            // server wants one on a connection that sent none. It is not a
+            // refusal of the account, and the article spends no try.
             //
             // A 480 is one line, so the reply stream is still in step. The
             // rest of the batch's replies are queued behind it and an AUTHINFO
             // written now would be answered by one of them, so the session is
-            // only marked: the caller reads those replies first, then
-            // re-authenticates on this socket (RFC 4643 §2.3; SABnzbd and
-            // NZBGet do the same).
-            if self.credentials.is_some() {
-                self.abort_active_body();
-                self.reauth_pending = true;
-            } else {
-                // An anonymous session has nothing to re-authenticate with:
-                // the connection is dropped and the next dial meets the
-                // server's demand for credentials where it is booked today.
-                self.fail_body_pipeline();
-            }
+            // only marked: the caller reads those replies first, then logs in
+            // on this socket (RFC 4643 §2.3).
+            self.abort_active_body();
+            self.reauth_pending = true;
             return Err(NntpError::SessionExpired.into());
+        }
+        if initial.code.raw() == 480 {
+            // The first BODY after a 480's login is refused again: the
+            // server refuses the account it took. Logging in once more
+            // would ask the article again without end.
+            self.fail_body_pipeline();
+            return Err(NntpError::AuthenticationRequired.into());
         }
         self.last_response_line_wait = response_started.elapsed();
         self.stream_yenc_article_response(initial, budget, on_chunk)
@@ -2327,6 +2448,10 @@ impl BlockingNntpConnection {
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
+        if initial.code.raw() != 480 {
+            // A BODY answered with anything but 480: the login holds.
+            self.login_unproven = false;
+        }
         let mut decoder = match FusedYencArticleDecoder::from_body_response(initial) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -2345,9 +2470,7 @@ impl BlockingNntpConnection {
                 return Err(error);
             }
         };
-        if let Some(health) = &self.health {
-            health.answered();
-        }
+        self.note_answered();
         let profile_cpu = profile_cpu_timings_enabled();
         decoder.set_profile_cpu(profile_cpu);
         decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
@@ -2379,7 +2502,7 @@ impl BlockingNntpConnection {
                 }
                 Ok(Some(mut article)) => {
                     let chunks = std::mem::take(&mut article.chunks);
-                    if let Err(error) = crate::connection::deliver_fused_output_chunks(
+                    if let Err(error) = deliver_fused_output_chunks(
                         chunks,
                         &mut article_chunks,
                         &mut on_chunk,
@@ -2405,7 +2528,7 @@ impl BlockingNntpConnection {
                     return Ok(article);
                 }
                 Ok(None) => {
-                    if let Err(error) = crate::connection::deliver_fused_output_chunks(
+                    if let Err(error) = deliver_fused_output_chunks(
                         decoder.drain_output_chunks(),
                         &mut article_chunks,
                         &mut on_chunk,
@@ -3025,6 +3148,18 @@ impl BlockingS2nStream {
         unsafe { s2n::s2n_peek_buffered(self.conn.as_ptr()) }
     }
 
+    fn negotiated_cipher_suite(&self) -> Option<String> {
+        // s2n owns the returned static string; a null means no suite.
+        let name = unsafe { s2n::s2n_connection_get_cipher(self.conn.as_ptr()) };
+        if name.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(name) }
+            .to_str()
+            .ok()
+            .map(str::to_string)
+    }
+
     fn write_all(&mut self, mut bytes: &[u8], timeout: Duration) -> Result<()> {
         let started = Instant::now();
         while !bytes.is_empty() {
@@ -3286,6 +3421,54 @@ fn decoded_raw_size_from_fused_stats(stats: &FusedYencArticleStats) -> u32 {
         .min(u32::MAX as u64) as u32
 }
 
+// Hand every decoded batch the fused decoder has produced to `on_chunk`, in
+// order, before appending it to the article's own chunk list.
+//
+// This is what makes the streaming design observable to a caller: batches are
+// delivered as they are decoded, not once at article finish.
+fn deliver_fused_output_chunks<F>(
+    chunks: Vec<Box<[u8]>>,
+    article_chunks: &mut Vec<Box<[u8]>>,
+    on_chunk: &mut F,
+    output_callback_cpu: &mut Duration,
+    profile_cpu: bool,
+) -> std::result::Result<(), FusedYencError>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    if chunks.is_empty() {
+        return Ok(());
+    }
+
+    let cpu_started = profile_cpu
+        .then(crate::fused_yenc::thread_cpu_time)
+        .flatten();
+    for chunk in chunks {
+        if let Err(err) = on_chunk(&chunk) {
+            crate::fused_yenc::add_cpu_delta(output_callback_cpu, cpu_started);
+            return Err(err.into());
+        }
+        article_chunks.push(chunk);
+    }
+    crate::fused_yenc::add_cpu_delta(output_callback_cpu, cpu_started);
+    Ok(())
+}
+
+// Whether an error is the server refusing the command itself (500/501)
+// rather than answering it.
+//
+// 500 is mapped to its own variant; 501 arrives as an unexpected response,
+// so both shapes have to be recognised here.
+fn reports_unsupported_command(error: &NntpError) -> bool {
+    match error {
+        NntpError::CommandNotRecognized => true,
+        NntpError::UnexpectedResponse { code, .. } => {
+            crate::server_caps::is_command_unsupported(code.raw())
+        }
+        _ => false,
+    }
+}
+
 fn profile_cpu_timings_enabled() -> bool {
     matches!(
         std::env::var("WEAVER_PROFILE_NNTP_CPU")
@@ -3329,9 +3512,9 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::TlsRequired => NntpError::TlsRequired,
         NntpError::PoolExhausted => NntpError::PoolExhausted,
         NntpError::PoolShutdown => NntpError::PoolShutdown,
+        NntpError::Stopped => NntpError::Stopped,
         NntpError::SoftTimeout(seconds) => NntpError::SoftTimeout(*seconds),
         NntpError::AcquireTimeout(seconds) => NntpError::AcquireTimeout(*seconds),
-        NntpError::WorkObsolete => NntpError::WorkObsolete,
         NntpError::QuotaBlocked(rejection) => NntpError::QuotaBlocked(rejection.clone()),
         NntpError::BodyNotRequestedDueToQuota {
             preceding_rejection,
@@ -3368,7 +3551,7 @@ fn decoded_result_keeps_connection(
     match result {
         Ok(_) => true,
         // A 480 at the status line is one line too. When it cost the socket
-        // (no credentials, or the re-auth after the drain failed) the lane
+        // (the re-auth after the drain failed) the lane
         // closes its window as unhealthy on its own.
         Err(DecodedBodyError::Nntp(NntpError::SessionExpired)) => true,
         Err(DecodedBodyError::Nntp(error)) => error.is_article_not_found(),

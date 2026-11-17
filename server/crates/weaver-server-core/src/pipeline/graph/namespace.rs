@@ -294,6 +294,9 @@ pub(crate) struct NamespaceWriter {
     refused_in_batch: BTreeSet<(NodeId, MemberId)>,
     // Archives given up on since the job last asked, for its events.
     given_back: Vec<GivenBack>,
+    // Ranges of root members given back that came and are no longer in
+    // hand, since the job last asked: the job fetches them again.
+    unkept: Vec<(MemberId, ByteRange)>,
     // The archives already given up on: the object that gave its members
     // back (true), or the namespace whose members nothing held (false). One
     // archive is one event however many volumes it had.
@@ -307,8 +310,11 @@ pub(crate) struct NamespaceWriter {
     // The budgets each member has spilled past, said once each.
     spills_said: BTreeSet<(NodeId, MemberId, Budget)>,
     // The members whose file the file system refused to create for its
-    // name (`skip_unnamable`).
+    // name (`skip_unnamable`), until the ledger renames them.
     unnamable: BTreeSet<(NodeId, MemberId)>,
+    // How many times a member was skipped for its name.
+    #[cfg(test)]
+    pub(crate) names_skipped: usize,
     // Their damage, to apply once the refused write has returned.
     unnamed_damage: Vec<Effect>,
     #[cfg(test)]
@@ -419,11 +425,14 @@ impl NamespaceWriter {
             acknowledging: None,
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
+            unkept: Vec::new(),
             given_up: BTreeSet::new(),
             gave_back: None,
             left_to_write: None,
             spills_said: BTreeSet::new(),
             unnamable: BTreeSet::new(),
+            #[cfg(test)]
+            names_skipped: 0,
             unnamed_damage: Vec::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
@@ -551,6 +560,12 @@ impl NamespaceWriter {
     // The members given back since this was last asked.
     pub(crate) fn take_given_back(&mut self) -> Vec<GivenBack> {
         std::mem::take(&mut self.given_back)
+    }
+
+    // The root members' ranges a give-back left not in hand since this was
+    // last asked.
+    pub(crate) fn take_unkept(&mut self) -> Vec<(MemberId, ByteRange)> {
+        std::mem::take(&mut self.unkept)
     }
 
     // The breach of the job's extraction budget, once one stands.
@@ -967,6 +982,61 @@ impl NamespaceWriter {
         write: Write,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        let end = BatchEnd::of(effects);
+        for effect in effects.drain(..) {
+            self.apply(tree, builder, segments, effect, write, out)?;
+            self.apply_unnamed(tree, builder, segments, out)?;
+        }
+        self.finish_batch(tree, builder, segments, end, out)
+    }
+
+    // What a batch leaves to do once every effect of it is applied.
+    fn finish_batch(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        BatchEnd {
+            bound,
+            folded,
+            given_back,
+            reached,
+        }: BatchEnd,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        if given_back {
+            self.prune(tree)?;
+        }
+        let depth = self.reached_now.len();
+        self.reached_now.extend(reached);
+        let mut handed = Ok(());
+        for (node, member, child) in bound {
+            handed = self.hand_over(tree, builder, segments, (node, member), child, out);
+            if handed.is_err() {
+                break;
+            }
+        }
+        self.reached_now.truncate(depth);
+        handed?;
+        for (node, copy, held) in folded {
+            self.fold_over(tree, builder, segments, (node, copy), &held, out)?;
+        }
+        Ok(())
+    }
+}
+
+// What a batch of effects leaves to do once all of them are applied, read
+// off the batch before the first is.
+#[derive(Default)]
+struct BatchEnd {
+    bound: Vec<(NodeId, MemberId, NodeId)>,
+    folded: Vec<(NodeId, MemberId, Coverage)>,
+    given_back: bool,
+    reached: Vec<(NodeId, MemberId, (NodeId, VolumeIndex), ByteRange)>,
+}
+
+impl BatchEnd {
+    fn of(effects: &[Effect]) -> Self {
         // What a member received before it was bound reaches its object
         // once every effect raised with the bind is applied: the tree said
         // them in order, and bytes it gave the owner before the bind, for
@@ -1024,30 +1094,16 @@ impl NamespaceWriter {
                 _ => None,
             })
             .collect();
-        for effect in effects.drain(..) {
-            self.apply(tree, builder, segments, effect, write, out)?;
-            self.apply_unnamed(tree, builder, segments, out)?;
+        Self {
+            bound,
+            folded,
+            given_back,
+            reached,
         }
-        if given_back {
-            self.prune(tree)?;
-        }
-        let depth = self.reached_now.len();
-        self.reached_now.extend(reached);
-        let mut handed = Ok(());
-        for (node, member, child) in bound {
-            handed = self.hand_over(tree, builder, segments, (node, member), child, out);
-            if handed.is_err() {
-                break;
-            }
-        }
-        self.reached_now.truncate(depth);
-        handed?;
-        for (node, copy, held) in folded {
-            self.fold_over(tree, builder, segments, (node, copy), &held, out)?;
-        }
-        Ok(())
     }
+}
 
+impl NamespaceWriter {
     // What a posting received before it folded into the member it repeats:
     // held, or in its own file when it was a leaf first. It goes down as
     // the member's bytes, each run with the provenance `held` says it
@@ -1176,6 +1232,9 @@ impl NamespaceWriter {
             };
             self.caps.admit_name(new)?;
             self.intend(*node, *member, new);
+            // A member renamed since its name was refused is tried again
+            // under the new one; a refusal of that marks it again.
+            self.unnamable.remove(&(*node, *member));
             // A name no file of the member sits at is free in the ledger
             // once it moved the member off it. The database may still give
             // it the member, as its name or the one its file waits for, so
@@ -1985,12 +2044,21 @@ impl NamespaceWriter {
 
     // A byte the member's coverage says arrived that neither the envelope
     // given back as its file nor its holds have is not in hand, as a
-    // restart's lost range is not, and comes again. Only a restore leaves
-    // one: an envelope comes back as far as its record and its file reach,
-    // the member's coverage as far as what arrived, which counts bytes that
-    // were only held in memory. A range held as damage may never have
-    // arrived at all, and stays.
-    fn uncover_unkept(&self, tree: &mut Tree, (node, member): (NodeId, MemberId), kept: &Coverage) {
+    // restart's lost range is not, and comes again. A restore leaves one:
+    // an envelope comes back as far as its record and its file reach, the
+    // member's coverage as far as what arrived, which counts bytes that
+    // were only held in memory. So does an object that placed a volume's
+    // bytes in a member of its own before the volume's last header said it
+    // is not where the object held it. A root member's range is fetched
+    // again, by the job; until it is in, the member is not whole, and
+    // nothing rules on it as though it were. A range held as damage may
+    // never have arrived at all, and stays.
+    fn uncover_unkept(
+        &mut self,
+        tree: &mut Tree,
+        (node, member): (NodeId, MemberId),
+        kept: &Coverage,
+    ) {
         let Some(record) = tree.namespace(node).and_then(|found| found.get(member)) else {
             return;
         };
@@ -2009,6 +2077,10 @@ impl NamespaceWriter {
             }
         }
         let unkept: Vec<ByteRange> = unkept.runs().map(|run| run.range).collect();
+        if node == NodeId::ROOT {
+            self.unkept
+                .extend(unkept.iter().map(|range| (member, *range)));
+        }
         if let Some(namespace) = tree.namespace_mut(node) {
             for range in unkept {
                 namespace.uncover(member, range);
@@ -2700,19 +2772,9 @@ impl NamespaceWriter {
         result: Result<(), WriteError>,
     ) -> Result<(), WriteError> {
         let Err(WriteError::Leaf(error)) = &result else {
-            // A member renamed since its name was refused, and now written
-            // under the new one, has a file: it is no longer marked. A close
-            // with nothing written leaves the mark.
-            if result.is_ok()
-                && !self.unnamable.is_empty()
-                && self
-                    .files
-                    .get(&node)
-                    .and_then(|files| files.leaves.get(&member))
-                    .is_some_and(Leaf::on_disk)
-            {
-                self.unnamable.remove(&(node, member));
-            }
+            // A write that returns has not proved the name: on a volume's
+            // writer it returns at hand-over and the refusal comes back
+            // later. Only a rename (`moved`) lifts the mark.
             return result;
         };
         let creating = self
@@ -2735,6 +2797,10 @@ impl NamespaceWriter {
         self.caps.forget(tree, node, member);
         if !self.unnamable.insert((node, member)) {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.names_skipped += 1;
         }
         let name_bytes = tree
             .namespace(node)
@@ -3804,5 +3870,6 @@ pub(crate) use moves::restored_at;
 #[cfg(test)]
 pub(crate) use moves::{TALLY, Tally};
 pub(crate) use recovery::{Coming, Lender, SetState};
+pub(crate) use refusal::GivingUp;
 #[cfg(test)]
 mod tests;

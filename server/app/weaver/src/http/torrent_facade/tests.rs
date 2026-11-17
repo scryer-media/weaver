@@ -15,6 +15,7 @@ use tokio::sync::{RwLock, broadcast};
 use tower::ServiceExt;
 
 use weaver_server_core::auth::{ApiKeyAuthRow, ApiKeyCache, LoginAuthCache, hash_api_key};
+use weaver_server_core::clock::SystemClock;
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::operations::metrics::PipelineMetrics;
 use weaver_server_core::post_processing::model::PostProcessingSettings;
@@ -27,9 +28,7 @@ use weaver_server_core::settings::{
 };
 use weaver_server_core::torrents::identity::IDENTITY;
 use weaver_server_core::torrents::net::LegKind;
-use weaver_server_core::torrents::service::{
-    JobEnv, SystemClock, TorrentService, TorrentSettings, TorrentView,
-};
+use weaver_server_core::torrents::service::{JobEnv, TorrentService, TorrentSettings, TorrentView};
 use weaver_server_core::torrents::sessions::{
     IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };
@@ -665,7 +664,6 @@ fn every_weaver_state_maps_to_one_client_state() {
         (
             TorrentView {
                 completed_at_ms: done,
-                detail: Some(status::Stated::GoalMet.as_str().into()),
                 stated: Some(status::Stated::GoalMet),
                 ..view(TorrentState::Stopped)
             },
@@ -1819,9 +1817,10 @@ async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
     rig.add_file(&metainfo("two.mkv", 4000, false), &[]).await;
     let queue = rig.context.inner.handle.state().clone();
     let held = || {
-        queue
-            .holds()
-            .held_by(HoldOrigin::Manual, HoldOwner::Torrents)
+        queue.holds().held_by(
+            HoldOrigin::Manual,
+            HoldOwner::Class(weaver_server_core::torrents::CLASS),
+        )
     };
     let named = |torrents: &[Value], name: &str, field: &str| {
         torrents
@@ -3596,18 +3595,24 @@ async fn a_read_key_sees_no_trackers_passkey() {
     assert_eq!(urls(ADMIN).await, [PRIVATE]);
 }
 
-// The exported metainfo carries its trackers' URLs as added, so only a key
-// that controls may have it.
-#[tokio::test]
-async fn only_a_key_that_controls_exports_the_metainfo() {
-    const ANNOUNCE: &[u8] = b"https://tracker.invalid/announce?passkey=export5ecret";
-    const CONTROLLER: &str = "facade-control-key";
-    let rig = rig().await;
+const CONTROLLER: &str = "facade-control-key";
+
+// Adds a key that controls but is not an Admin.
+fn with_control_key(rig: &Rig) {
     rig.keys.upsert(ApiKeyAuthRow {
         key_hash: hash_api_key(CONTROLLER),
         id: 3,
         scope: "control".to_owned(),
     });
+}
+
+// The exported metainfo carries its trackers' URLs as added, so only a key
+// that controls may have it.
+#[tokio::test]
+async fn only_a_key_that_controls_exports_the_metainfo() {
+    const ANNOUNCE: &[u8] = b"https://tracker.invalid/announce?passkey=export5ecret";
+    let rig = rig().await;
+    with_control_key(&rig);
     let plain = metainfo("one.mkv", 3000, true);
     let mut torrent = b"d".to_vec();
     bstr(&mut torrent, b"announce");
@@ -3635,6 +3640,69 @@ async fn only_a_key_that_controls_exports_the_metainfo() {
         assert_eq!(exported.status, StatusCode::OK, "{key}");
         assert_eq!(exported.body.as_bytes(), torrent, "{key}");
     }
+}
+
+// A web seed's URL can carry a secret only an Admin may read: a key that
+// controls exports the metainfo with its web seeds' user names, passwords
+// and queries taken out, and every other byte as added, its trackers'
+// passkeys among them.
+#[tokio::test]
+async fn only_an_admin_exports_the_web_seeds_secrets() {
+    const ANNOUNCE: &[u8] = b"https://tracker.invalid/announce?passkey=tracker5ecret";
+    let rig = rig().await;
+    with_control_key(&rig);
+    let plain = metainfo("one.mkv", 3000, false);
+    let info = &plain[1..plain.len() - 1];
+    let torrent = |http_seed: &[u8], url_list: &[&[u8]]| {
+        let mut torrent = b"d".to_vec();
+        bstr(&mut torrent, b"announce");
+        bstr(&mut torrent, ANNOUNCE);
+        bstr(&mut torrent, b"httpseeds");
+        bstr(&mut torrent, http_seed);
+        torrent.extend_from_slice(info);
+        bstr(&mut torrent, b"url-list");
+        torrent.push(b'l');
+        for url in url_list {
+            bstr(&mut torrent, url);
+        }
+        torrent.extend_from_slice(b"ee");
+        torrent
+    };
+    let added = torrent(
+        b"http://seed.invalid:8080/seed?key=http5ecret",
+        &[
+            b"https://user:pw5ecret@seed.invalid/files/?token=list5ecret#part",
+            b"not a url",
+            b"https://other.invalid/set/",
+        ],
+    );
+    let redacted = torrent(
+        b"http://seed.invalid:8080/seed",
+        &[
+            b"https://seed.invalid/files/",
+            b"https://other.invalid/set/",
+        ],
+    );
+    assert_eq!(rig.add_file(&added, &[]).await.status, StatusCode::OK);
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let export = |key: &'static str| {
+        let (rig, hash) = (&rig, &hash);
+        async move {
+            rig.send(
+                Request::get(format!("/api/v2/torrents/export?hash={hash}"))
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let controlled = export(CONTROLLER).await;
+    assert_eq!(controlled.status, StatusCode::OK);
+    assert_eq!(controlled.body.as_bytes(), redacted);
+    let admin = export(ADMIN).await;
+    assert_eq!(admin.status, StatusCode::OK);
+    assert_eq!(admin.body.as_bytes(), added);
 }
 
 // A request with the login cookie that changes anything must come from a
@@ -4015,9 +4083,10 @@ async fn rss_articles_are_each_feeds_last_fifty() {
     assert_eq!(items["one"]["articles"].as_array().unwrap().len(), 50);
 }
 
-// A feed's or a blocklist's URL can carry a passkey: a key that only reads
-// sees its scheme, host and port, one that controls sees it whole. A
-// blocklist path reads as it is.
+// A feed's or a blocklist's URL can carry a passkey: a key that is not an
+// Admin sees the feed's scheme, host and port, an Admin sees it whole. A
+// blocklist's URL is hidden from a key that only reads. A blocklist path
+// reads as it is.
 #[tokio::test]
 async fn a_read_key_sees_no_feed_or_blocklist_passkey() {
     const FEED: &str = "https://user:pw@feeds.invalid/rss?passkey=feed5ecret";
@@ -4025,6 +4094,7 @@ async fn a_read_key_sees_no_feed_or_blocklist_passkey() {
     const PATH: &str = "/var/lib/weaver/level1.p2p";
     const PREFERENCES: &str = "/api/v2/app/preferences";
     let rig = rig().await;
+    with_control_key(&rig);
     let added = rig
         .post(
             "/api/v2/rss/addFeed",
@@ -4045,9 +4115,11 @@ async fn a_read_key_sees_no_feed_or_blocklist_passkey() {
         }
     };
     for path in ["/api/v2/rss/items", "/api/v2/rss/items?withData=true"] {
-        let reader = read(path, READER).await;
-        assert!(!reader.body.contains("5ecret"), "{path}");
-        assert_eq!(reader.json()["one"]["url"], "https://feeds.invalid:443/…");
+        for key in [READER, CONTROLLER] {
+            let shown = read(path, key).await;
+            assert!(!shown.body.contains("5ecret"), "{path} {key}");
+            assert_eq!(shown.json()["one"]["url"], "https://feeds.invalid:443/…");
+        }
         assert_eq!(read(path, ADMIN).await.json()["one"]["url"], FEED);
     }
     let reader = read(PREFERENCES, READER).await.json();
@@ -4076,8 +4148,8 @@ async fn a_read_key_sees_no_feed_or_blocklist_passkey() {
 }
 
 // An article's link is its download link, which can carry an indexer's key
-// or a tracker's passkey: a key that only reads sees its scheme, host and
-// port, and of a magnet only its scheme. One that controls sees it whole.
+// or a tracker's passkey: a key that is not an Admin sees its scheme, host
+// and port, and of a magnet only its scheme. An Admin sees it whole.
 #[tokio::test]
 async fn a_read_key_sees_no_article_link_passkey() {
     const INDEXER: &str = "https://indexer.invalid/api?t=get&id=1&apikey=item5ecret";
@@ -4085,6 +4157,7 @@ async fn a_read_key_sees_no_article_link_passkey() {
         &tr=https%3A%2F%2Ftracker.invalid%2Fmagnet5ecret%2Fannounce";
     const PATH: &str = "/api/v2/rss/items?withData=true";
     let rig = rig().await;
+    with_control_key(&rig);
     let added = rig
         .post(
             "/api/v2/rss/addFeed",
@@ -4139,22 +4212,25 @@ async fn a_read_key_sees_no_article_link_passkey() {
             .collect()
     };
 
-    let reader = read(READER).await;
-    assert!(!reader.body.contains("5ecret"), "{}", reader.body);
-    assert!(!reader.body.contains("tr="), "{}", reader.body);
-    let mut shown = links(&reader.json());
-    shown.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(
-        shown,
-        vec![
-            (
-                "indexer".to_owned(),
-                json!("https://indexer.invalid:443/…"),
-                json!("https://indexer.invalid:443/…"),
-            ),
-            ("magnet".to_owned(), json!("magnet:…"), json!("magnet:…")),
-        ]
-    );
+    for key in [READER, CONTROLLER] {
+        let reader = read(key).await;
+        assert!(!reader.body.contains("5ecret"), "{key} {}", reader.body);
+        assert!(!reader.body.contains("tr="), "{key} {}", reader.body);
+        let mut shown = links(&reader.json());
+        shown.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            shown,
+            vec![
+                (
+                    "indexer".to_owned(),
+                    json!("https://indexer.invalid:443/…"),
+                    json!("https://indexer.invalid:443/…"),
+                ),
+                ("magnet".to_owned(), json!("magnet:…"), json!("magnet:…")),
+            ],
+            "{key}"
+        );
+    }
 
     let admin = read(ADMIN).await;
     let mut shown = links(&admin.json());

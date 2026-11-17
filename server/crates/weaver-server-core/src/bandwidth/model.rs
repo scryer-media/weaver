@@ -31,10 +31,15 @@ pub enum ScheduleAction {
     Pause,
     Resume,
     PauseAll,
-    // Stop every torrent, seeding too, as one hold; each torrent's own
-    // pause or resume stands under it.
-    PauseTorrents,
-    ResumeTorrents,
+    // Stop every job of one class as one hold, as far as the operator's
+    // pause of it stops them; each job's own pause or resume stands under
+    // it.
+    PauseClass {
+        class: crate::jobs::HeldClass,
+    },
+    ResumeClass {
+        class: crate::jobs::HeldClass,
+    },
     PausePostProcessing,
     ResumePostProcessing,
     PauseWatchFolderScanning,
@@ -136,7 +141,8 @@ pub struct PruneFiles {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScheduleTrack {
     Downloads,
-    Torrents,
+    // One class's own hold.
+    Class(crate::jobs::HeldClass),
     PostProcessing,
     WatchFolder,
     Rss,
@@ -162,7 +168,9 @@ impl ScheduleAction {
                 ScheduleTrack::Rss,
             ],
             Self::Pause => vec![ScheduleTrack::Downloads],
-            Self::PauseTorrents | Self::ResumeTorrents => vec![ScheduleTrack::Torrents],
+            Self::PauseClass { class } | Self::ResumeClass { class } => {
+                vec![ScheduleTrack::Class(*class)]
+            }
             Self::PausePostProcessing | Self::ResumePostProcessing => {
                 vec![ScheduleTrack::PostProcessing]
             }

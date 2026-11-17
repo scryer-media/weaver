@@ -451,7 +451,7 @@ impl DialError {
             Self::Skipped(reason) => ProxyFault::Other {
                 detail: reason.clone(),
             },
-            Self::AtCapacity(_) => ProxyFault::Other {
+            Self::AtCapacity(_) | Self::SessionBudget => ProxyFault::Other {
                 detail: self.to_string(),
             },
             Self::Bind(error) => ProxyFault::EgressUnusable {

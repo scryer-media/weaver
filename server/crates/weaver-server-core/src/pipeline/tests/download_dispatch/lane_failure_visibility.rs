@@ -11,6 +11,7 @@
 
 use super::*;
 
+use crate::pipeline::download::owned_lane::TestRoutePress;
 use crate::pipeline::download::transport::DownloadLaneMode;
 use crate::pipeline::download::{
     DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL, DOWNLOAD_RETRY_STORM_THRESHOLD,
@@ -40,6 +41,7 @@ fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works,
     }
 }
@@ -151,6 +153,252 @@ async fn repeated_acquire_failures_report_at_most_once_a_window() {
             .last_emitted_at(job_id),
         Some(first),
         "the second failure inside the window is counted, not logged again"
+    );
+}
+
+// A lane refused because the server's network route is full (a tunnel at
+// capacity, or its session budget spent) is a wait, not a fault: the lane
+// parks as capacity, and every leased article waits the lane-unavailable
+// delay with its retry budget untouched and nothing failed. It does not come
+// straight back, since nothing tells the scheduler when the route frees.
+#[tokio::test]
+async fn a_full_route_parks_as_capacity_and_paces_its_work_without_failing_it() {
+    for refusal in [
+        weaver_tunnel::pipe::DialError::AtCapacity(Default::default()),
+        weaver_tunnel::pipe::DialError::SessionBudget,
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(41504);
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            standalone_job_spec("Full Route", &many_standalone_files("full-route", 4)),
+        )
+        .await;
+
+        let lease = lease_for(&mut pipeline, job_id);
+        let leased: Vec<_> = lease.works.iter().map(|work| work.segment_id).collect();
+        let retry_counts: Vec<_> = lease.works.iter().map(|work| work.retry_count).collect();
+        pipeline.active_download_connections = 1;
+        pipeline
+            .active_download_connections_by_job
+            .insert(job_id, 1);
+        let parks_error_before = pipeline
+            .metrics
+            .download_lane_parks_error_total
+            .load(Ordering::Relaxed);
+        // No counter counts a capacity park, so the park is heard as its
+        // line, which names the reason.
+        let (parks, parks_guard) = StateLines::hear("download lane parked");
+
+        let mut pending = std::collections::VecDeque::new();
+        pipeline.handle_owned_download_lane_event(
+            OwnedDownloadLaneEvent::AcquireFailed {
+                lease,
+                error: weaver_nntp::client::BlockingBodyLaneAcquireError::RouteCapacity(
+                    weaver_nntp::NntpError::Route(Arc::new(refusal)),
+                ),
+            },
+            &mut pending,
+        );
+
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_id)
+                .unwrap()
+                .articles
+                .active()
+                .unwrap()
+                .download_queue
+                .len(),
+            0,
+            "a full route must not hand its work straight back to redial it"
+        );
+        assert_eq!(pending.len(), leased.len());
+        assert_eq!(
+            pipeline
+                .metrics
+                .download_lane_parks_error_total
+                .load(Ordering::Relaxed),
+            parks_error_before,
+            "the lane parks as capacity, not as an error"
+        );
+        let parked = parks.take();
+        drop(parks_guard);
+        assert_eq!(parked.len(), 1, "{parked:?}");
+        assert!(parked[0].contains(" reason=Capacity"), "{parked:?}");
+        assert!(
+            parked[0].contains(" released_connection=true"),
+            "{parked:?}"
+        );
+        assert_eq!(pipeline.active_download_connections, 0);
+
+        let watermark = tokio::time::Instant::now();
+        while let Some(result) = pending.pop_front() {
+            pipeline.handle_download_done(result).await;
+        }
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(state.failed_bytes, 0);
+        assert_eq!(
+            pipeline
+                .metrics
+                .segments_failed_permanent
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            pipeline
+                .download_wait_by_job
+                .get(&job_id)
+                .map(|wait| wait.reason),
+            Some("NNTP server's network route is full")
+        );
+        assert_eq!(pipeline.infrastructure_retries.len(), leased.len());
+        for (deadline, retry) in pipeline.infrastructure_retries.iter_with_deadlines() {
+            let index = leased
+                .iter()
+                .position(|segment| *segment == retry.work.segment_id)
+                .expect("only the leased articles wait");
+            assert_eq!(
+                retry.work.retry_count, retry_counts[index],
+                "waiting for the route spends no retry"
+            );
+            let deadline = deadline.expect("the wait is paced, not open-ended");
+            assert!(
+                deadline >= watermark + std::time::Duration::from_millis(250),
+                "the work waits the lane-unavailable delay before redialling"
+            );
+        }
+    }
+}
+
+// A lease of the job's queued work, its articles carrying the job's counters
+// as a real handout's do.
+fn counted_lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
+    let mut lease = lease_for(pipeline, job_id);
+    let counters = pipeline.shared_state.queue.job_counters(job_id).unwrap();
+    for work in &mut lease.works {
+        work.counters = Some(Arc::clone(&counters));
+    }
+    lease
+}
+
+// `lease`'s lane is refused for a full route: the pipeline hears it, and the
+// leased articles wait their paced retry.
+async fn refuse_for_a_full_route(pipeline: &mut Pipeline, lease: DownloadBatchLease) {
+    let job_id = lease.job_id;
+    pipeline.active_download_connections += 1;
+    *pipeline
+        .active_download_connections_by_job
+        .entry(job_id)
+        .or_default() += 1;
+    let mut pending = std::collections::VecDeque::new();
+    pipeline.handle_owned_download_lane_event(
+        OwnedDownloadLaneEvent::AcquireFailed {
+            lease,
+            error: weaver_nntp::client::BlockingBodyLaneAcquireError::RouteCapacity(
+                weaver_nntp::NntpError::Route(Arc::new(
+                    weaver_tunnel::pipe::DialError::SessionBudget,
+                )),
+            ),
+        },
+        &mut pending,
+    );
+    while let Some(result) = pending.pop_front() {
+        pipeline.handle_download_done(result).await;
+    }
+}
+
+// Every paced retry of the job back on its queue, as their delay ending
+// puts them.
+fn requeue_every_retry(pipeline: &mut Pipeline) {
+    let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+    for retry in pipeline.infrastructure_retries.take_due(later) {
+        pipeline.receive_retry_work(retry);
+    }
+}
+
+// A lane refused for a full route presses while its work waits to be handed
+// out again, through a pass that runs before its refusal is heard and while
+// the work waits its paced retry. Once the work is handed to another lane
+// and a pass finds nothing left to hand out, the press is over, with no wait
+// for the idle lane's release.
+#[tokio::test]
+async fn a_route_press_ends_once_its_work_went_to_another_lane_and_none_waits() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41521);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Press Ends", &many_standalone_files("press-ends", 4)),
+    )
+    .await;
+
+    let lease = counted_lease_for(&mut pipeline, job_id);
+    let press = TestRoutePress::refused(&pipeline.shared_state, &lease);
+    pipeline.dispatch_downloads();
+    assert!(
+        press.stands(),
+        "a pass before the refusal is heard sees the work in flight, not gone"
+    );
+    refuse_for_a_full_route(&mut pipeline, lease).await;
+    pipeline.dispatch_downloads();
+    assert!(press.stands(), "the work waits its paced retry");
+
+    requeue_every_retry(&mut pipeline);
+    pipeline.publish_download_drained();
+    assert!(press.stands(), "the work waits on the queue");
+    // Another lane, holding a connection, takes it.
+    let _elsewhere = counted_lease_for(&mut pipeline, job_id);
+    pipeline.dispatch_downloads();
+    assert!(
+        !press.stands(),
+        "the work went to another lane and nothing else waits"
+    );
+}
+
+// A job that has moved on past its download lets every press it left go:
+// each lane's refused dial is heard, and the pass that finds the job with
+// nothing to hand out ends them all.
+#[tokio::test]
+async fn a_job_moved_past_its_download_lets_every_route_press_go() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41522);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Moved On", &many_standalone_files("moved-on", 4)),
+    )
+    .await;
+
+    let mut presses = Vec::new();
+    for _ in 0..2 {
+        let lease = counted_lease_for(&mut pipeline, job_id);
+        presses.push(TestRoutePress::refused(&pipeline.shared_state, &lease));
+        refuse_for_a_full_route(&mut pipeline, lease).await;
+        requeue_every_retry(&mut pipeline);
+    }
+    let last = counted_lease_for(&mut pipeline, job_id);
+    refuse_for_a_full_route(&mut pipeline, last).await;
+    pipeline.dispatch_downloads();
+    assert!(presses.iter().all(TestRoutePress::stands));
+
+    // The job's download ends: what it waited on is settled, and it moves
+    // on to its verification.
+    let _ = pipeline
+        .infrastructure_retries
+        .take_due(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
+    pipeline.pending_retries_by_job.remove(&job_id);
+    pipeline.jobs.get_mut(&job_id).unwrap().status = crate::JobStatus::Verifying;
+    pipeline.dispatch_downloads();
+    assert!(
+        presses.iter().all(|press| !press.stands()),
+        "no press outlives the job's download"
     );
 }
 

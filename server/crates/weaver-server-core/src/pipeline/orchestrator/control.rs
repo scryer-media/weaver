@@ -831,13 +831,74 @@ impl Pipeline {
         }
     }
 
+    // Apply the working directory's storage class and filesystem, learned
+    // after start-up: the tuner's machine takes them, and the backlog limits
+    // sized on the storage class are sized again.
+    pub(in crate::pipeline) fn apply_storage_classification(
+        &mut self,
+        storage_class: crate::runtime::system_profile::StorageClass,
+        filesystem: crate::runtime::system_profile::FilesystemType,
+    ) {
+        self.applied_storage_classification = Some((storage_class.clone(), filesystem.clone()));
+        self.tuner.set_storage(storage_class, filesystem);
+        let profile = self.tuner.system_profile();
+        self.write_backlog_budget_bytes =
+            super::runtime::compute_write_backlog_budget_bytes(profile, self.backlog_base_bytes);
+        self.decode_backlog_budget_bytes = super::runtime::compute_decode_backlog_budget_bytes(
+            profile,
+            self.backlog_base_bytes,
+            self.write_backlog_budget_bytes,
+        );
+        self.uu_spool_max_bytes =
+            super::runtime::compute_uu_spool_max_bytes(self.write_backlog_budget_bytes);
+        info!(
+            storage = ?profile.disk.storage_class,
+            filesystem = ?profile.disk.filesystem,
+            decode_backlog_budget_mb = self.decode_backlog_budget_bytes / (1024 * 1024),
+            write_backlog_budget_mb = self.write_backlog_budget_bytes / (1024 * 1024),
+            "storage classified after start-up"
+        );
+    }
+
+    // A WireGuard tunnel woke usenet to give back what it owes there: read
+    // what it owes now and retire enough connections on it to cover that,
+    // less those already marked for it, through the pool's own idle recall,
+    // which charges the servers nothing. Idle ones close now; for the rest,
+    // busy ones are marked to close once their article is done, as a
+    // lowered limit marks them, and are never interrupted. None is dialled
+    // again while usenet holds past its share, since the tunnel refuses it.
+    // An answer that needed some and could close none tells the tunnel, so
+    // it does not wake usenet again until usenet's holdings there change.
+    fn give_back_idle_connections(&self, ask: &crate::jobs::TunnelGiveBack) {
+        let owed = ask.owed.bytes();
+        if owed == 0 {
+            return;
+        }
+        let connections = owed.div_ceil(crate::proxies::usenet_socket_bytes().max(1));
+        let connections = usize::try_from(connections).unwrap_or(usize::MAX);
+        let (needed, retired) = self.nntp.pool().retire_idle_on(
+            connections,
+            |path| ask.holds(path),
+            ask.owed.standing(),
+        );
+        if needed > 0 && retired == 0 {
+            ask.owed.dry();
+        }
+        weaver_tunnel::metrics::record_socket_idle_retired(retired as u64);
+    }
+
     async fn apply_queue_globals(&mut self) {
-        let pending = self
-            .shared_state
-            .queue
-            .write(|inner| Change::unchanged(inner.nntp.take()));
+        let (pending, give_backs) = self.shared_state.queue.write(|inner| {
+            Change::unchanged((
+                inner.nntp.take(),
+                std::mem::take(&mut inner.socket_give_backs),
+            ))
+        });
         if let Some((generation, client, connections)) = pending {
             self.activate_nntp(client, connections, generation);
+        }
+        for ask in give_backs {
+            self.give_back_idle_connections(&ask);
         }
         let iops = self
             .shared_state
@@ -846,6 +907,18 @@ impl Pipeline {
         if let Some(iops) = iops.filter(|iops| self.applied_random_read_iops != Some(*iops)) {
             self.applied_random_read_iops = Some(iops);
             self.tuner.set_random_read_iops(iops);
+        }
+        let applied = &self.applied_storage_classification;
+        let storage = self.shared_state.queue.read(|inner| {
+            inner
+                .globals
+                .storage_classification
+                .as_ref()
+                .filter(|storage| applied.as_ref() != Some(*storage))
+                .cloned()
+        });
+        if let Some((storage_class, filesystem)) = storage {
+            self.apply_storage_classification(storage_class, filesystem);
         }
         // An extraction writes what it unpacks under the intermediate
         // directory, or, when the job's destination is on another device, in

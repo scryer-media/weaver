@@ -21,8 +21,94 @@ use tracing::debug;
 use super::{ConnectionKind, Failed, Failure, Link, SingleStatAtomic, Transports};
 use crate::{
     DialErrors, Error, Result,
-    network::{SocketFactory, UtpSocket},
+    network::{SocketFactory, TcpRoom, TcpWant, UtpSocket},
 };
+
+/// The TCP want a torrent holds while it wants TCP room its route gives
+/// others: the route counts the torrent pressing for the room for as long.
+/// A look before a TCP dial that finds the route crowded out leaves one, and
+/// a later such look replaces it. It is held, with no gap, until a TCP dial
+/// is no longer blocked or no longer possible: a look that finds room or
+/// none owed, a wait of the connect loop in which it can dial no one
+/// (`idle`: at its peer limit, at the session's, wanting no peers, or with
+/// no candidate at all), or a pause. Waiting for a candidate's reconnect
+/// time is none of these: the torrent still wants the room then. A look
+/// that lands while the loop is in such a wait, or after a pause, leaves no
+/// want: the state it is checked against is read under the lock it is
+/// stored under.
+#[derive(Debug, Default)]
+pub(crate) struct TcpWants {
+    want: parking_lot::Mutex<Wanted>,
+}
+
+#[derive(Debug, Default)]
+struct Wanted {
+    want: Option<TcpWant>,
+    // The torrent was paused: no look leaves a want again.
+    closed: bool,
+    // The connect loop waits where it can dial no one: no look leaves a
+    // want until it is out of the wait.
+    idle: bool,
+}
+
+impl TcpWants {
+    // A look before a TCP dial found `room`. Only a crowded one leaves a
+    // want, and none while the loop can dial no one or once the torrent is
+    // paused.
+    pub(crate) fn looked(&self, room: TcpRoom) {
+        let old = {
+            let mut wanted = self.want.lock();
+            match room {
+                TcpRoom::Crowded(want) if !wanted.closed && !wanted.idle => {
+                    wanted.want.replace(want)
+                }
+                // Refused while idle or paused, the want goes with this look.
+                TcpRoom::Crowded(_) | TcpRoom::Free | TcpRoom::Full => wanted.want.take(),
+            }
+        };
+        drop(old);
+    }
+
+    /// The torrent is paused: it wants no TCP socket, and no dial still
+    /// under way leaves one after.
+    pub(crate) fn close(&self) {
+        let old = {
+            let mut wanted = self.want.lock();
+            wanted.closed = true;
+            wanted.want.take()
+        };
+        drop(old);
+    }
+
+    /// Whether the torrent holds a want.
+    #[cfg(test)]
+    pub(crate) fn holds(&self) -> bool {
+        self.want.lock().want.is_some()
+    }
+
+    /// Waits out `wait`, a wait of the connect loop in which it can dial no
+    /// one: the want goes on entry, and none is left while it lasts.
+    pub(crate) async fn idle<T>(&self, wait: impl Future<Output = T>) -> T {
+        let old = {
+            let mut wanted = self.want.lock();
+            wanted.idle = true;
+            wanted.want.take()
+        };
+        drop(old);
+        let _idle = Idle(self);
+        wait.await
+    }
+}
+
+// The connect loop is out of a wait in which it could dial no one, however
+// the wait ended.
+struct Idle<'a>(&'a TcpWants);
+
+impl Drop for Idle<'_> {
+    fn drop(&mut self) {
+        self.0.want.lock().idle = false;
+    }
+}
 
 /// Counts one transport's attempt: started when the connect starts, and
 /// ended once, as it ended, or, when it is dropped unfinished, as timed out
@@ -100,6 +186,15 @@ pub(crate) trait PeerDialer: Send + Sync {
         true
     }
 
+    /// What the route has for one more connection over it, and why not.
+    fn look(&self) -> TcpRoom {
+        if self.room() {
+            TcpRoom::Free
+        } else {
+            TcpRoom::Full
+        }
+    }
+
     /// A link to `to`, its attempt counted by `tally`; `None` when no socket
     /// can be had for it now, and nothing was tried.
     fn dial<'a>(&'a self, to: SocketAddr, tally: Tally<'a>) -> BoxFuture<'a, Result<Option<Link>>>;
@@ -117,7 +212,7 @@ impl PeerDialer for TcpDialer {
         self.enabled && transports == Transports::Any
     }
 
-    fn room(&self) -> bool {
+    fn look(&self) -> TcpRoom {
         self.sockets.tcp_room()
     }
 
@@ -276,38 +371,48 @@ impl DialPlan<2> {
 
 // Which steps of `plan` a connection over `transports` tries: each whose
 // dialer may dial, but one with no socket free on the route when another
-// step's socket is held.
+// step's socket is held. What a look at TCP's room found goes to `wants`.
 fn tried<'d, const N: usize>(
     plan: DialPlan<N>,
     dialers: impl Fn(ConnectionKind) -> &'d dyn PeerDialer,
     to: SocketAddr,
     transports: Transports,
+    wants: Option<&TcpWants>,
 ) -> [bool; N] {
     let may = plan
         .steps
         .map(|step| dialers(step.kind).may_dial(to, transports));
     std::array::from_fn(|i| {
         may[i] && {
-            let dialer = dialers(plan.steps[i].kind);
-            dialer.room()
-                || !plan
-                    .steps
-                    .iter()
-                    .enumerate()
-                    .any(|(j, other)| j != i && may[j] && dialers(other.kind).ready())
+            let kind = plan.steps[i].kind;
+            let room = dialers(kind).look();
+            let free = room.is_free();
+            if kind == ConnectionKind::Tcp
+                && let Some(wants) = wants
+            {
+                wants.looked(room);
+            }
+            free || !plan
+                .steps
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && may[j] && dialers(other.kind).ready())
         }
     })
 }
 
 /// Races `plan`'s dialers to `to`. `tally` gives each attempt its counts.
+/// The torrent's TCP want, in `wants`, is settled by the look at TCP's
+/// room.
 pub(super) async fn race<'d, const N: usize>(
     plan: DialPlan<N>,
     dialers: impl Fn(ConnectionKind) -> &'d dyn PeerDialer,
     tally: impl Fn(ConnectionKind) -> Tally<'d>,
     to: SocketAddr,
     transports: Transports,
+    wants: Option<&TcpWants>,
 ) -> Result<Link> {
-    let tried = tried(plan, &dialers, to, transports);
+    let tried = tried(plan, &dialers, to, transports, wants);
     // Kept for an attempt behind another when that one fails before it
     // waits, as one does on its first poll.
     let failed: [tokio::sync::Notify; N] = std::array::from_fn(|_| tokio::sync::Notify::new());
@@ -525,6 +630,7 @@ mod tests {
                 },
                 TO,
                 transports,
+                None,
             )
         }
 

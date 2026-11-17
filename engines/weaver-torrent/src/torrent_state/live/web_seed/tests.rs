@@ -165,6 +165,7 @@ fn serve(mut conn: TcpStream, respond: &Respond, seen: &Mutex<Vec<Head>>) {
 #[derive(Default)]
 struct Fake {
     bitfield: Mutex<Option<Vec<u8>>>,
+    handshaken: AtomicBool,
     unchoked: AtomicBool,
     pieces: Mutex<Vec<(u32, u32, Vec<u8>)>>,
     arrived: Notify,
@@ -209,6 +210,7 @@ impl PeerConnectionHandler for &Fake {
         Ok(0)
     }
     fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+        self.handshaken.store(true, Ordering::SeqCst);
         Ok(())
     }
     fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
@@ -536,7 +538,7 @@ async fn an_error_status_loses_the_file_and_the_seed_waits_retry_after() {
 
     let interesting = |l: &Lacks| layout.bitfield(l).any();
     assert_eq!(has(&layout, &lacking(&[2], &[])), [true, true, false]);
-    let due = |at| seeds.due(at, |_| false, interesting, false).len();
+    let due = |at| seeds.due(at, interesting, false).len();
     assert_eq!(due(now + Duration::from_secs(119)), 0);
     assert_eq!(due(now + Duration::from_secs(120)), 1);
 
@@ -1108,6 +1110,68 @@ async fn a_truncated_body_fails_after_its_whole_blocks() {
     assert!(entry(&seeds, |e| e.lacks.files.is_empty() && !e.disabled));
 }
 
+// A web seed's URL can carry a credential in its user, its path or its
+// query. The error a failed connection ends with, which the torrent logs
+// and keeps as the peer's error, names the seed by scheme, host and port
+// only, whatever failed: an error status, a body cut short, a refused
+// connection, a move with no location, the SSRF check (SECURITY.md,
+// "Credentials stay with their scope").
+#[tokio::test(start_paused = true)]
+async fn a_failed_web_seed_names_no_credential() {
+    const SECRET: &str = "s3cret";
+    let a = content(PIECE as usize, 7);
+    let layout = layout(&[("a", u64::from(PIECE), false)]);
+    // A port nothing listens on.
+    let refused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let replies: Vec<Reply> = vec![
+        Reply::status(404),
+        Reply {
+            sent: Some(20000),
+            ..Reply::status(206)
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", a.len() - 1, a.len()),
+                )
+                .body(a.clone())
+        },
+        Reply::status(302),
+        Reply::status(200),
+        Reply::status(200),
+    ];
+    for (case, reply) in replies.into_iter().enumerate() {
+        let reply = Mutex::new(Some(reply));
+        // Holds the paused clock while the request is out (see Server).
+        let server = Server::start(move |_| reply.lock().take().unwrap());
+        let at = match case {
+            3 => refused,
+            _ => server.addr,
+        };
+        let url = match case {
+            // A query to a local address: refused before it is asked.
+            4 => format!("http://user:{SECRET}@{at}/{SECRET}/a?pk={SECRET}"),
+            _ => format!("http://user:{SECRET}@{at}/{SECRET}/a"),
+        };
+        let (_seeds, link) = one_seed(url, WebSeedKind::Url);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
+        let Err(e) = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 2).await else {
+            panic!("case {case}: the connection did not fail");
+        };
+        let shown = format!("{e:#} {e:?}");
+        assert!(!shown.contains(SECRET), "case {case}: {shown}");
+        assert!(!shown.contains("user"), "case {case}: {shown}");
+        // A request that got no answer is named by its error alone.
+        if case != 3 {
+            assert!(
+                shown.contains(&format!("http://{at}/…")),
+                "case {case}: {shown}"
+            );
+        }
+    }
+}
+
 // A response must answer the range asked for: one naming none disables
 // the seed, one naming another fails the connection (libtorrent
 // `get_range`, `web_peer_connection::on_receive`).
@@ -1367,25 +1431,22 @@ fn a_bad_piece_loses_the_seed_its_file_or_itself() {
     ]);
     let piece = |i| padded.lengths.validate_piece_index(i).unwrap();
     let seeds = WebSeeds::new([url()]);
-    let have = seeds.piece_failed(handle_of(0), piece(1), &padded).unwrap();
+    let have = seeds
+        .piece_failed(PeerHandle::WebSeed(0), piece(1), &padded)
+        .unwrap();
     assert_eq!(bits(have, 3), [false, false, true]);
     assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[0], &[]));
     assert_eq!(has(&padded, &lacking(&[0], &[])), [false, false, true]);
     assert_eq!(
         seeds
-            .due(
-                Instant::now(),
-                |_| false,
-                |l| padded.bitfield(l).any(),
-                false
-            )
+            .due(Instant::now(), |l| padded.bitfield(l).any(), false)
             .len(),
         1
     );
     // A handle no seed has.
     assert!(
         seeds
-            .piece_failed(handle_of(1), piece(2), &padded)
+            .piece_failed(PeerHandle::WebSeed(1), piece(2), &padded)
             .is_none()
     );
 
@@ -1397,20 +1458,19 @@ fn a_bad_piece_loses_the_seed_its_file_or_itself() {
     ]);
     let piece = |i| spans.lengths.validate_piece_index(i).unwrap();
     let seeds = WebSeeds::new([url()]);
-    let have = seeds.piece_failed(handle_of(0), piece(0), &spans).unwrap();
+    let have = seeds
+        .piece_failed(PeerHandle::WebSeed(0), piece(0), &spans)
+        .unwrap();
     assert_eq!(bits(have, 3), [false, true, true]);
     assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[], &[0]));
-    let have = seeds.piece_failed(handle_of(0), piece(2), &spans).unwrap();
+    let have = seeds
+        .piece_failed(PeerHandle::WebSeed(0), piece(2), &spans)
+        .unwrap();
     assert_eq!(bits(have, 3), [false, false, false]);
     assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[2], &[0]));
     assert!(
         seeds
-            .due(
-                Instant::now(),
-                |_| false,
-                |l| spans.bitfield(l).any(),
-                false
-            )
+            .due(Instant::now(), |l| spans.bitfield(l).any(), false)
             .is_empty()
     );
 
@@ -1418,8 +1478,59 @@ fn a_bad_piece_loses_the_seed_its_file_or_itself() {
     let single = layout(&[("f", 70000, false)]);
     let seeds = WebSeeds::new([url()]);
     let piece = single.lengths.validate_piece_index(1).unwrap();
-    let have = seeds.piece_failed(handle_of(0), piece, &single).unwrap();
+    let have = seeds
+        .piece_failed(PeerHandle::WebSeed(0), piece, &single)
+        .unwrap();
     assert!(!have.any());
+}
+
+// A seed banned once its connection was opening, before the connection
+// runs, tells the torrent nothing: no handshake, no bitfield, no unchoke.
+#[tokio::test]
+async fn a_connection_to_a_seed_banned_before_it_runs_tells_the_torrent_nothing() {
+    let layout = layout(&[("f", 70000, false)]);
+    let (seeds, link) = one_seed("http://192.0.2.1/f".into(), WebSeedKind::Url);
+    assert!(seeds.ban(link.handle()));
+    let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
+    let fake = Fake::default();
+    let (_tx, rx) = unbounded_channel();
+    conn.run(&fake, rx).await.unwrap();
+    assert!(!fake.handshaken.load(Ordering::SeqCst));
+    assert!(fake.bitfield.lock().is_none());
+    assert!(!fake.unchoked.load(Ordering::SeqCst));
+    assert!(fake.pieces.lock().is_empty());
+}
+
+// The web seed tick finds a seed due, then opens its connection. A seed
+// banned between the two is not connected to; one banned once its
+// connection is opening has that connection ended, and is due no more.
+#[test]
+fn a_seed_banned_after_it_was_found_due_is_not_connected_to() {
+    let now = Instant::now();
+    let any = |_: &Lacks| true;
+    let seeds = || {
+        Arc::new(WebSeeds::new([WebSeed {
+            url: "http://192.0.2.1/f".into(),
+            kind: WebSeedKind::Url,
+            named_by: NamedBy::Torrent,
+        }]))
+    };
+
+    let banned_before_link = seeds();
+    let due = banned_before_link.due(now, any, false);
+    assert_eq!(due.len(), 1);
+    assert!(banned_before_link.ban(PeerHandle::WebSeed(due[0].id)));
+    assert!(banned_before_link.link(due[0].id).is_none());
+
+    let banned_after_link = seeds();
+    let due = banned_after_link.due(now, any, false);
+    let link = banned_after_link.link(due[0].id).unwrap();
+    assert!(!link.cancel.is_cancelled());
+    assert!(banned_after_link.ban(link.handle()));
+    assert!(link.cancel.is_cancelled());
+    drop(link);
+    assert!(banned_after_link.due(now, any, false).is_empty());
+    assert!(banned_after_link.link(due[0].id).is_none());
 }
 
 #[test]
@@ -1436,17 +1547,17 @@ fn which_seeds_are_due() {
     let seeds = Arc::new(WebSeeds::new(
         (0..5).map(|i| seed(&format!("http://h{i}.example/"))),
     ));
-    let due = seeds.due(now, |_| false, any, false);
+    let due = seeds.due(now, any, false);
     assert_eq!(due.len(), MAX_WEB_SEED_CONNECTIONS);
     assert!(due.iter().all(|d| d.endpoint.is_none()));
     let _link = seeds.link(due[0].id).unwrap();
     assert!(seeds.link(due[0].id).is_none());
     assert_eq!(
-        seeds.due(now, |_| false, any, false).len(),
+        seeds.due(now, any, false).len(),
         MAX_WEB_SEED_CONNECTIONS - 1
     );
     // A seed with no piece to give is not counted.
-    assert_eq!(seeds.due(now, |_| false, |_| false, false).len(), 0);
+    assert_eq!(seeds.due(now, |_| false, false).len(), 0);
 
     // (url, banned, listed afterwards, disabled afterwards, endpoint)
     let cases = [
@@ -1483,7 +1594,10 @@ fn which_seeds_are_due() {
     ];
     for (url, banned, listed, disabled, endpoint) in cases {
         let seeds = WebSeeds::new([seed(url)]);
-        let due = seeds.due(now, |h| banned && h == handle_of(0), any, false);
+        if banned {
+            assert!(seeds.ban(PeerHandle::WebSeed(0)));
+        }
+        let due = seeds.due(now, any, false);
         assert_eq!(seeds.list().len(), usize::from(listed), "{url}");
         let present = seeds.with_entry(0, |e| e.disabled);
         assert_eq!(present.unwrap_or(false), disabled, "{url}");
@@ -1498,7 +1612,7 @@ fn which_seeds_are_due() {
         "http://b\u{fc}cher.example/f",
     ] {
         let seeds = WebSeeds::new([seed(url)]);
-        assert_eq!(seeds.due(now, |_| false, any, true).len(), 1, "{url}");
+        assert_eq!(seeds.due(now, any, true).len(), 1, "{url}");
         assert_eq!(seeds.with_entry(0, |e| e.disabled), Some(false), "{url}");
     }
 
@@ -1508,13 +1622,14 @@ fn which_seeds_are_due() {
     {
         let _capture = lines.capture();
         let disabled = WebSeeds::new([seed("ftp://h.example/0123passkey/f?pk=s3cret")]);
-        disabled.due(now, |_| false, any, false);
+        disabled.due(now, any, false);
         let removed = WebSeeds::new([seed("http://h.example:0/0123passkey/f?pk=s3cret")]);
-        removed.due(now, |_| false, any, false);
+        removed.due(now, any, false);
         let bad = WebSeeds::new([seed("https://u:pw@h.example:8443/0123passkey/?pk=s3cret")]);
         let single = layout(&[("f", 70000, false)]);
         let piece = single.lengths.validate_piece_index(0).unwrap();
-        bad.piece_failed(handle_of(0), piece, &single).unwrap();
+        bad.piece_failed(PeerHandle::WebSeed(0), piece, &single)
+            .unwrap();
     }
     let text = lines.text();
     for (url, message) in [
@@ -1622,11 +1737,300 @@ async fn a_torrent_downloads_from_its_web_seed_alone() -> anyhow::Result<()> {
     Ok(())
 }
 
+// A magnet link's `ws` web seed, its peer and the session that fetches
+// its metadata. The peer has the metainfo and none of the content: once
+// the metadata is in, the web seed is the content's only source. The seed
+// is named by the link, so its host is a public name (`seed.test`, at
+// 8.8.8.8) that the session's clients reach the server at.
+struct MagnetWithSeed {
+    t: crate::tests::embedder_util::TestTorrent,
+    server: Server,
+    seed: WebSeed,
+    magnet: String,
+    _peer: Arc<crate::Session>,
+    _peer_dir: tempfile::TempDir,
+    out: tempfile::TempDir,
+    session: Arc<crate::Session>,
+}
+
+impl MagnetWithSeed {
+    async fn new(name: &str) -> anyhow::Result<Self> {
+        use crate::{
+            AddTorrent, AddTorrentOptions, Session,
+            core::{magnet::Magnet, torrent_metainfo::torrent_from_bytes},
+            tests::embedder_util::{TestTorrent, isolated_session_opts},
+        };
+
+        let t = TestTorrent::new(name, 3 * 16384 + 100, 16384).await?;
+        let content = t.content.clone();
+        let server = Server::start(move |head| {
+            if head.target.ends_with("/0.data") {
+                Reply::ranged(&content, head)
+            } else {
+                Reply::status(404)
+            }
+        });
+        let peer_dir = tempfile::TempDir::with_prefix("magnet_ws_peer")?;
+        let peer =
+            Session::new_with_opts(peer_dir.path().into(), isolated_session_opts(true)).await?;
+        peer.add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                output_folder: Some(peer_dir.path().to_str().unwrap().to_owned()),
+                overwrite: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+        let peer_addr = peer.listen_addr().context("the peer is not listening")?;
+
+        let seed = WebSeed {
+            url: format!("http://seed.test:{}/seed/", server.addr.port()),
+            kind: WebSeedKind::Url,
+            named_by: NamedBy::Torrent,
+        };
+        let mut magnet = Magnet::of(
+            torrent_from_bytes(&t.torrent)?.info_hashes,
+            None,
+            Vec::new(),
+        );
+        magnet.peers.push(peer_addr);
+        magnet.web_seeds.push(seed.url.clone());
+        let magnet = magnet.to_string();
+        assert!(magnet.contains("&ws="), "{magnet}");
+
+        let out = tempfile::TempDir::with_prefix("magnet_ws_out")?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            crate::SessionOptions {
+                http_client: Some(Wired::new(server.addr)),
+                resolver: Some(names(&[("seed.test", "8.8.8.8")])),
+                ..isolated_session_opts(false)
+            },
+        )
+        .await?;
+        Ok(Self {
+            t,
+            server,
+            seed,
+            magnet,
+            _peer: peer,
+            _peer_dir: peer_dir,
+            out,
+            session,
+        })
+    }
+
+    // Adds the torrent with `add` and `opts` and waits for it to complete;
+    // checks that the web seed alone served the content.
+    async fn downloads(
+        &self,
+        add: crate::AddTorrent<'static>,
+        opts: crate::AddTorrentOptions,
+    ) -> anyhow::Result<crate::torrent_state::ManagedTorrentHandle> {
+        use crate::{
+            AddTorrentOptions, storage::StorageFactory, tests::embedder_util::MemoryStorageFactory,
+        };
+        let storage = MemoryStorageFactory::default();
+        let handle = self
+            .session
+            .add_torrent(
+                add,
+                Some(AddTorrentOptions {
+                    storage_factory: Some(storage.clone_box()),
+                    output_folder: Some(self.out.path().to_str().unwrap().to_owned()),
+                    ..opts
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        handle.wait_until_completed().await?;
+        assert!(
+            storage.log.file_contents(0) == self.t.content,
+            "content differs"
+        );
+        let total = self.t.content.len() as u64;
+        let live = handle.stats().live.context("expected a live torrent")?;
+        assert_eq!(live.snapshot.fetched_bytes, total);
+        let seen = self.server.seen();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter()
+                .all(|h| h.target.starts_with("/seed/") && h.target.ends_with("/0.data")),
+            "{seen:?}"
+        );
+        Ok(handle)
+    }
+}
+
+// A magnet link's `ws` seed is the torrent's once its metadata is in, and
+// is asked for the content (libtorrent `torrent::torrent` puts
+// `add_torrent_params::url_seeds` in `m_web_seeds`, which
+// `torrent::set_metadata` keeps).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_magnets_web_seed_serves_the_torrent_once_its_metadata_is_in() -> anyhow::Result<()> {
+    let m = MagnetWithSeed::new("magnet_ws_run").await?;
+    let handle = m
+        .downloads(
+            crate::AddTorrent::from_url(m.magnet.clone()),
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(handle.web_seeds(), std::slice::from_ref(&m.seed));
+    m.session.stop().await;
+    Ok(())
+}
+
+// A list-only add of a magnet names the link's `ws` seeds beside the
+// metainfo, which does not hold them; the torrent added from that
+// metainfo and those seeds asks the seed for its content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_list_only_magnet_names_its_web_seeds() -> anyhow::Result<()> {
+    use crate::{AddTorrent, AddTorrentOptions, AddTorrentResponse};
+
+    let m = MagnetWithSeed::new("magnet_ws_list").await?;
+    let listed = match m
+        .session
+        .add_torrent(
+            AddTorrent::from_url(m.magnet.clone()),
+            Some(AddTorrentOptions {
+                list_only: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+    {
+        AddTorrentResponse::ListOnly(listed) => listed,
+        _ => anyhow::bail!("expected a list-only response"),
+    };
+    assert_eq!(listed.web_seeds, std::slice::from_ref(&m.seed));
+    let meta = crate::core::torrent_metainfo::torrent_from_bytes(&listed.torrent_bytes)?;
+    assert!(meta.url_list.is_none(), "the metainfo is not rewritten");
+    assert!(m.server.seen().is_empty());
+
+    let handle = m
+        .downloads(
+            AddTorrent::from_bytes(listed.torrent_bytes),
+            AddTorrentOptions {
+                web_seeds: listed.web_seeds,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(handle.web_seeds(), std::slice::from_ref(&m.seed));
+    m.session.stop().await;
+    Ok(())
+}
+
+// A seed added or removed is found by its URL and kind in one lookup: the
+// seeds kept, in their order, and what each add and remove returns, are
+// what passing over the list says, over seeded adds and removes.
 #[test]
-fn a_web_seed_handle_is_no_peers() {
-    assert!(is_web_seed(handle_of(0)));
-    assert!(is_web_seed(handle_of(u32::MAX)));
-    assert_ne!(handle_of(1), handle_of(65536));
-    assert!(!is_web_seed("[100::1]:6881".parse().unwrap()));
-    assert!(!is_web_seed("1.2.3.4:0".parse().unwrap()));
+fn seeds_found_by_lookup_are_those_a_pass_finds() {
+    let mut rng = 0x6a09_e667_f3bc_c908u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _ in 0..50 {
+        let seeds = WebSeeds::default();
+        let mut reference: Vec<WebSeed> = Vec::new();
+        for _ in 0..200 {
+            let r = next();
+            let seed = WebSeed {
+                url: format!("http://seed{}.test/", r % 12),
+                kind: if r & 0x100 != 0 {
+                    WebSeedKind::Url
+                } else {
+                    WebSeedKind::Http
+                },
+                named_by: if r & 0x200 != 0 {
+                    NamedBy::Torrent
+                } else {
+                    NamedBy::Operator
+                },
+            };
+            if r & 0x400 != 0 {
+                let was = reference.iter().position(|s| same_seed(s, &seed));
+                if let Some(at) = was {
+                    reference.remove(at);
+                }
+                assert_eq!(seeds.remove(&seed), was.is_some());
+            } else {
+                let had = reference.iter().any(|s| same_seed(s, &seed));
+                if !had {
+                    reference.push(seed.clone());
+                }
+                assert_eq!(seeds.add(seed), !had);
+            }
+            assert_eq!(seeds.list(), reference);
+        }
+    }
+}
+
+// The slices found from a binary search for the first file are those a
+// pass over every file finds, over seeded layouts with empty and pad files
+// and ranges anywhere in the torrent.
+#[test]
+fn slices_found_by_search_are_those_a_pass_finds() {
+    // The pass over every file the search replaced.
+    fn every_file(layout: &Layout, offset: u64, len: u64) -> Vec<Slice> {
+        let end = offset + len;
+        layout
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.len > 0 && f.offset < end && f.offset + f.len > offset)
+            .map(|(file, f)| {
+                let start = offset.max(f.offset);
+                let stop = end.min(f.offset + f.len);
+                Slice {
+                    file,
+                    offset: start - f.offset,
+                    len: stop - start,
+                }
+            })
+            .collect()
+    }
+    let mut rng = 0xbb67_ae85_84ca_a73bu64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _ in 0..300 {
+        let names: Vec<String> = (0..1 + next() % 20).map(|i| format!("f{i}")).collect();
+        let files: Vec<(&str, u64, bool)> = names
+            .iter()
+            .map(|name| {
+                let r = next();
+                let len = match r % 4 {
+                    0 => 0,
+                    1 => 1 + (r >> 8) % 100,
+                    _ => 1 + (r >> 8) % 100_000,
+                };
+                (name.as_str(), len, r & 0x80 != 0)
+            })
+            .collect();
+        if files.iter().all(|f| f.1 == 0) {
+            continue;
+        }
+        let layout = layout(&files);
+        let total: u64 = files.iter().map(|f| f.1).sum();
+        for _ in 0..50 {
+            let offset = next() % total;
+            let len = 1 + next() % (total - offset);
+            assert_eq!(
+                layout.slices(offset, len),
+                every_file(&layout, offset, len),
+                "{files:?} {offset}+{len}"
+            );
+        }
+    }
 }

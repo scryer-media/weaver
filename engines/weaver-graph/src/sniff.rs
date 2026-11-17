@@ -1286,6 +1286,12 @@ mod tests {
         assert_eq!(sniff("a.PART02.RAR", RAR5, None), object(Kind::RarStore));
         assert_eq!(sniff("a.z01", b"PK\x07\x08", None), object(Kind::Zip));
         assert_eq!(sniff("a.z02", &plain(600), None), Sniff::Leaf);
+        // RAR numbers its old volumes on through `.z99`: such a volume's
+        // front signs it a RAR volume, never a zip part.
+        assert_eq!(sniff("a.y99", RAR4, None), object(Kind::RarStore));
+        assert_eq!(sniff("a.z00", RAR4, None), object(Kind::RarStore));
+        assert_eq!(sniff("a.z01", RAR4, None), object(Kind::RarStore));
+        assert_eq!(sniff("a.Z99", RAR4, None), object(Kind::RarStore));
     }
 
     #[test]

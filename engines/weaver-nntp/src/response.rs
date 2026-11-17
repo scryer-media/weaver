@@ -184,8 +184,8 @@ mod tests {
     #[test]
     fn check_error_unknown_code() {
         let resp = Response {
-            code: StatusCode::new(503),
-            message: "Internal Fault".into(),
+            code: StatusCode::new(501),
+            message: "Syntax Error".into(),
         };
         let err = check_response(resp).unwrap_err();
         assert!(matches!(err, NntpError::UnexpectedResponse { .. }));

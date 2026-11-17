@@ -355,7 +355,6 @@ async fn stored_sockets(
         &profiles,
         &pools,
         &connections,
-        super::wireguard_socket_cap(),
     ))
 }
 

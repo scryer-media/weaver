@@ -154,7 +154,7 @@ where
     let mut name = |addr, source| {
         seen.insert(addr);
         peers.add_peer(addr, source);
-        if peers.with_peer(addr, |_| ()).is_none() {
+        if peers.with_peer(addr.into(), |_| ()).is_none() {
             found_unable(addr);
         }
     };
@@ -183,7 +183,7 @@ where
                     let failed = e
                         .downcast_ref::<crate::Error>()
                         .is_none_or(crate::Error::is_failure);
-                    peers.with_peer_mut(addr, "metadata_failed", |peer| {
+                    peers.with_peer_mut(addr.into(), "metadata_failed", |peer| {
                         peers.connection_closed(peer, Instant::now(), failed, false)
                     });
                     found_unable(addr);
@@ -264,7 +264,7 @@ mod tests {
 
     /// A list with `addrs` on it, as a torrent is added with.
     fn listing(addrs: impl IntoIterator<Item = SocketAddr>) -> PeerList {
-        PeerList::resumed(addrs, [])
+        PeerList::resumed(addrs, &[], [])
     }
 
     #[tokio::test(start_paused = true)]
@@ -295,7 +295,7 @@ mod tests {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         tx.unbounded_send((banned, PeerSourceFlag::Tracker))
             .unwrap();
-        let list = PeerList::resumed([addr(1)], [banned.ip()]);
+        let list = PeerList::resumed([addr(1)], &[], [banned.ip()]);
         let (found, _, _, _) = first_answer(list, Default::default(), rx, &unable, ask).await;
 
         assert_eq!(found, Some(addr(1)));

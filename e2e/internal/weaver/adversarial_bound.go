@@ -60,6 +60,7 @@ func runAdversarialBounded(args []string) error {
 	configureWeaverReleaseCommandCancellation(cmd)
 	cmd.Dir = e2eDir()
 	cmd.Env = mergeChildEnv(os.Environ(), map[string]string{adversarialBoundedEnv: "1"})
+	passFullRunLock(cmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()

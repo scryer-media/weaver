@@ -243,7 +243,7 @@ impl NetworkRuntime {
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
             quota_watch: Mutex::new(None),
-            cap_watch: Mutex::new(None),
+            give_backs: Arc::default(),
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
             route_health: None,

@@ -10,7 +10,7 @@ pub(crate) const LARGE_FILE_CACHE_ADVICE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn copy_large_file(src: &Path, dst: &Path) -> io::Result<u64> {
-    copy_large_file_with_progress(src, dst, |_| {})
+    copy_large_file_with_progress(src, dst, |_| Ok(()))
 }
 
 pub(crate) fn copy_large_file_with_progress<F>(
@@ -19,7 +19,7 @@ pub(crate) fn copy_large_file_with_progress<F>(
     mut on_copied: F,
 ) -> io::Result<u64>
 where
-    F: FnMut(u64),
+    F: FnMut(u64) -> io::Result<()>,
 {
     let metadata = fs::metadata(src)?;
     let mut input = File::open(src)?;
@@ -40,7 +40,9 @@ where
             }
             output.write_all(&buf[..read])?;
             copied += read as u64;
-            on_copied(read as u64);
+            // What has landed is told before the next read, and a stop
+            // there discards the copy as a failed write does.
+            on_copied(read as u64)?;
         }
         output.flush()?;
         super::fs::apply_metadata_change(

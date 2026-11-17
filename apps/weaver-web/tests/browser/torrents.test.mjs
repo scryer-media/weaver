@@ -72,7 +72,8 @@ test("the add dialog sends a torrent file and a magnet link through submit, read
 
   // The daemon's refusal is shown as it gave it, and the dialog stays open for it.
   await dialog.getByText("This torrent is already in the queue.", { exact: true }).waitFor();
-  const input = { upload: null, category: null, paused: true, password: null, unpack: null, tags: [] };
+  // No tags were given, so none are sent.
+  const input = { upload: null, category: null, tags: [], paused: true, password: null, unpack: null };
   const submitted = (await sent(page)).filter((entry) => entry.name === "Submit").map((entry) => entry.variables);
   assert.deepEqual(submitted, [
     { input: { ...input, text: "magnet:?xt=urn:btih:duplicate" } },
@@ -182,15 +183,23 @@ test("a torrent's detail names where each seeding term comes from, and its swarm
   const { page, errors } = await open("seeding");
   const seeding = (source) => page.getByLabel(source, { exact: true }).getByRole("region", { name: "Seeding", exact: true });
   await seeding("TORRENT").waitFor();
-  // The ratio goal comes from the level each torrent names; its five other terms from the global settings.
-  assert.equal(await seeding("TORRENT").getByText("Override", { exact: true }).count(), 1);
-  assert.equal(await seeding("TORRENT").getByText("Global", { exact: true }).count(), 5);
-  assert.equal(await seeding("CATEGORY").getByText("Category movies", { exact: true }).count(), 1);
-  assert.equal(await seeding("CATEGORY").getByText("Global", { exact: true }).count(), 5);
-  assert.equal(await seeding("GLOBAL").getByText("Global", { exact: true }).count(), 6);
+  // Each term in force, then where it comes from: the ratio goal from the level each torrent
+  // names, its six other terms (seed time counting among them) from the global settings.
+  const terms = (ratioGoal) => [
+    "SEEDING", "Override seeding",
+    "RATIO GOAL", ratioGoal,
+    "SEED TIME GOAL", "No goalGlobal",
+    "INACTIVE GOAL", "No goalGlobal",
+    "GOALS MET", "AnyGlobal",
+    "THEN", "StopGlobal",
+    "SEED TIME COUNTS", "All seedingGlobal",
+    "UPLOAD CAP PER TORRENT", "—Global",
+  ];
+  const shown = async (source) => (await seeding(source).innerText()).split("\n");
   // The terms in force are the daemon's: the override's goal, then the category's.
-  assert.equal(await seeding("TORRENT").getByText("2.50", { exact: true }).count(), 1);
-  assert.equal(await seeding("CATEGORY").getByText("1.50", { exact: true }).count(), 1);
+  assert.deepEqual(await shown("TORRENT"), terms("2.50Override"));
+  assert.deepEqual(await shown("CATEGORY"), terms("1.50Category movies"));
+  assert.deepEqual(await shown("GLOBAL"), terms("1.00Global"));
 
   const swarm = page.getByLabel("GLOBAL", { exact: true }).getByRole("region", { name: "Transfer", exact: true });
   assert.equal(await swarm.getByText("3 (12 total)", { exact: true }).count(), 1);
@@ -247,9 +256,10 @@ test("a public torrent announces on the DHT from its trackers, and a private one
   await page.close();
 
   const closed = await open("privateTrackers");
-  await closed.page.getByTitle("http://a.test/announce", { exact: true }).waitFor();
-  // The block's own Reannounce comes first, before each tracker's.
-  await closed.page.getByRole("button", { name: "Reannounce", exact: true }).first().waitFor();
+  const trackers = closed.page.getByRole("region", { name: "Trackers", exact: true });
+  await trackers.getByTitle("http://a.test/announce", { exact: true }).getByRole("button", { name: "Reannounce", exact: true }).waitFor();
+  // It still announces to its trackers: once for the whole torrent, and once on each of its two trackers.
+  assert.equal(await trackers.getByRole("button", { name: "Reannounce", exact: true }).count(), 3);
   assert.equal(await closed.page.getByRole("button", { name: "DHT announce", exact: true }).count(), 0);
   assert.equal(closed.errors.length, 0, closed.errors.join("\n"));
   await closed.page.close();

@@ -1148,6 +1148,12 @@ impl Dialer for MemberPin {
     fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
         self.member.dialer.room(purpose)
     }
+    fn wait_room(
+        &self,
+        purpose: &weaver_tunnel::pipe::Purpose,
+    ) -> Result<(), weaver_tunnel::pipe::Capacity> {
+        self.member.dialer.wait_room(purpose)
+    }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn weaver_tunnel::endpoint::DatagramTransport>> {
         Arc::clone(&self.member.dialer).datagrams()
     }
@@ -1227,7 +1233,7 @@ impl Dialer for PoolStage {
             // the caller waits for: a socket freed on any member, or a change
             // to the members, is room again.
             Err(DialError::AtCapacity(mut waits)) => {
-                waits.extend(self.state.room(&target.purpose).1);
+                waits.waits.extend(self.state.room(&target.purpose).1);
                 Err(DialError::AtCapacity(waits))
             }
             result => result,

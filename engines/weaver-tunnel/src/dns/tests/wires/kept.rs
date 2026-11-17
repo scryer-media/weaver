@@ -6,7 +6,6 @@ use super::super::trust::{PROXY, WINDOW};
 use super::*;
 use crate::pipe::{
     DialPath, DnsChoice, Keeper, Names, NamesSlot, SessionHop, SessionSockets, SocketClass,
-    SocketShares,
 };
 use std::time::Duration;
 
@@ -613,10 +612,10 @@ impl Dialer for Beneath {
 }
 
 // A session hop, as the runtime builds one for a saved proxy, whose tunnel
-// reaches `servers`, its sockets held to `shares` when given.
-fn session_hop(servers: &Arc<Servers>, shares: Option<SocketShares>) -> SessionHop {
+// reaches `servers`, its reserve holding `streams` DNS streams when given.
+fn session_hop(servers: &Arc<Servers>, streams: Option<u64>) -> SessionHop {
     SessionHop {
-        sockets: Arc::new(shares.map_or_else(SessionSockets::default, SessionSockets::new)),
+        sockets: Arc::new(streams.map_or_else(SessionSockets::default, crate::pipe::reserve_of)),
         capacity: Default::default(),
         activity: Default::default(),
         id: PROXY,
@@ -705,9 +704,10 @@ async fn a_proxy_turned_off_closes_what_was_kept_and_on_again_dials_afresh() {
     }
 }
 
-// The session's reserve share holds one socket, and a kept connection holds
-// it: a claim of the share takes it at once, the kept connection closes,
-// and the server sees it end.
+// The session's reserve holds one DNS stream's bytes, and a kept connection
+// holds them: a claim of the reserve closes the kept connection, and takes
+// its bytes once they are back, here at once, since the fixture's stream
+// holds no socket in a tunnel's stack. The server sees it end.
 #[tokio::test(start_paused = true)]
 async fn a_claim_on_a_full_share_closes_a_kept_connection_and_succeeds() {
     let authority = Authority::new();
@@ -720,19 +720,19 @@ async fn a_claim_on_a_full_share_closes_a_kept_connection_and_succeeds() {
         Trust::AsSent,
         &authority.roots(),
     );
-    let shares = SocketShares {
-        nntp: 1,
-        torrent: 1,
-        core: 1,
-        http: 1,
-    };
-    let hop = session_hop(&servers, Some(shares));
+    let hop = session_hop(&servers, Some(1));
+    let one = crate::pipe::dns_stream_bytes();
     through_hop(&naming, &hop, "a.test").await;
     assert_eq!(servers.open_now(), 1);
-    assert_eq!(hop.sockets.held(SocketClass::ReserveCore), 1);
+    assert_eq!(hop.sockets.held(SocketClass::Reserve), one);
+    // It is registered at exactly the bytes its dial reserved.
+    assert_eq!(hop.sockets.keeper().held(), [(SocketClass::Reserve, one)]);
+    // The kept stream holds the session busy as well as its bytes.
+    assert!(hop.activity.try_write().is_err());
 
-    let claim = hop.sockets.take(SocketClass::ReserveCore);
+    let claim = hop.sockets.take(SocketClass::Reserve, one);
     assert!(matches!(claim, Ok(Some(_))));
+    assert!(hop.activity.try_write().is_ok());
     assert_eq!(servers.open_now(), 0);
     assert_eq!(sessions(&naming).kept().len(), 0);
     servers.ended.acquire().await.unwrap().forget();
@@ -742,7 +742,7 @@ async fn a_claim_on_a_full_share_closes_a_kept_connection_and_succeeds() {
     let resolution = through_hop(&naming, &hop, "b.test").await;
     assert_eq!(resolution.addresses, seven());
     assert_eq!(servers.dials().len(), 2);
-    assert_eq!(hop.sockets.held(SocketClass::ReserveCore), 1);
+    assert_eq!(hop.sockets.held(SocketClass::Reserve), one);
 }
 
 // A SOCKS5 hop stacked on a session hop, as the runtime builds a proxy

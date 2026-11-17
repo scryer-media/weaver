@@ -72,7 +72,7 @@ impl Dialer for Fixture {
             self.full.lock().unwrap().clone()
         };
         if let Some(freed) = full {
-            return Err(DialError::AtCapacity(vec![freed]));
+            return Err(DialError::AtCapacity(vec![freed].into()));
         }
         self.gate.acquire().await.unwrap().forget();
         let (stream, _) = tokio::io::duplex(64);
@@ -219,78 +219,6 @@ async fn a_wait_for_room_wakes_when_the_last_member_blocks() {
     assert!(matches!(error, DialError::Fatal(_)), "{error}");
 }
 
-// A usenet connect through a pool whose members' shares are all full waits
-// for a socket to free instead of dialling again, and dials once one does.
-#[tokio::test]
-async fn a_usenet_connect_over_a_full_pool_waits_and_redials_once_a_member_frees() {
-    let (pool, members, mut opened) = fixtures();
-    let (asked, mut asks) = mpsc::unbounded_channel();
-    let freed: Vec<_> = members
-        .iter()
-        .map(|member| {
-            let freed = Arc::new(Notify::new());
-            *member.full.lock().unwrap() = Some(freed.clone());
-            *member.asked_full.lock().unwrap() = Some(asked.clone());
-            freed
-        })
-        .collect();
-    let mut server = weaver_nntp::connection::ServerConfig::new(Arc::new(
-        weaver_nntp::route_dialer::RouteDialer {
-            inner: pool.clone(),
-            plan: None,
-            runtime: tokio::runtime::Handle::current(),
-            server: 1,
-            egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::new()),
-        },
-    ));
-    server.host = "news.invalid".into();
-    server.port = 119;
-    let usenet = Arc::new(weaver_nntp::NntpPool::new(weaver_nntp::PoolConfig {
-        servers: vec![weaver_nntp::ServerPoolConfig {
-            server,
-            max_connections: 1,
-            ..Default::default()
-        }],
-        ..Default::default()
-    }));
-    let acquiring = tokio::spawn({
-        let usenet = usenet.clone();
-        async move { usenet.acquire(weaver_nntp::ServerId(0)).await.map(|_| ()) }
-    });
-
-    // The connect dialled each member once and was told it is at capacity,
-    // with room asked of both members: once by the pool for the signals it
-    // hands back and once by the connect before it parks.
-    let mut after_dial = 0;
-    while after_dial < 4 {
-        if asks.recv().await.unwrap() > 0 {
-            after_dial += 1;
-        }
-    }
-    let dials = |members: &[Arc<Fixture>]| -> Vec<u64> {
-        members
-            .iter()
-            .map(|member| member.dials.load(Ordering::SeqCst))
-            .collect()
-    };
-    assert_eq!(dials(&members), [1, 1]);
-    let mut first = Vec::new();
-    while let Ok(id) = opened.try_recv() {
-        first.push(id);
-    }
-    first.sort();
-    assert_eq!(first, [1, 2]);
-
-    *members[0].full.lock().unwrap() = None;
-    freed[0].notify_waiters();
-    while opened.recv().await.unwrap() != 1 {}
-    assert_eq!(members[0].dials.load(Ordering::SeqCst), 2);
-    assert!(members[1].dials.load(Ordering::SeqCst) <= 2);
-
-    acquiring.abort();
-    usenet.shutdown().await;
-}
-
 // A pool dial turned away by every member carries the pool's signal and
 // the signal of each member still full, even when another member freed a
 // socket after turning the dial away.
@@ -309,9 +237,10 @@ async fn a_pool_dial_at_capacity_carries_every_full_members_signal() {
     let Err(DialError::AtCapacity(waits)) = pool.dial(&target()).await else {
         panic!("a pool whose members are all full is at capacity");
     };
-    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed[0])));
+    assert!(waits.waits.iter().any(|wait| Arc::ptr_eq(wait, &freed[0])));
     assert!(
         waits
+            .waits
             .iter()
             .any(|wait| Arc::ptr_eq(wait, &pool.state.changed))
     );

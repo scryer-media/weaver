@@ -377,6 +377,9 @@ pub(super) struct DownloadBatchLease {
     // Byte pressure at lease time. Carried onto every observation this lease
     // produces so the depth explorer can discard distorted samples.
     pub(super) pressure_clear: bool,
+    // The job's repeated-article cache, when several of its files share an
+    // article: the lane answers those references from it.
+    pub(super) repeated: Option<Arc<download::repeated::RepeatedArticles>>,
     pub(super) works: Vec<DownloadWork>,
 }
 
@@ -558,6 +561,10 @@ pub(super) enum DownloadFailureKind {
     CapacityUnavailable,
     ServerQuota,
     LaneUnavailable,
+    // The server's network route had no room for the lane: a tunnel on it
+    // is full, or its WireGuard session budget is spent. Requeued as an
+    // unavailable lane is, and no verdict about the server or the article.
+    RouteCapacity,
     Unrequested,
     ConnectionEstablishment,
     EstablishedTransport,
@@ -578,6 +585,7 @@ impl DownloadFailureKind {
             Self::CapacityUnavailable
                 | Self::ServerQuota
                 | Self::LaneUnavailable
+                | Self::RouteCapacity
                 | Self::Unrequested
                 | Self::ConnectionEstablishment
                 | Self::EstablishedTransport
@@ -591,6 +599,7 @@ impl DownloadFailureKind {
             Self::CapacityUnavailable => Some("provider connection capacity unavailable"),
             Self::ServerQuota => Some("NNTP server quota blocked"),
             Self::LaneUnavailable => Some("no eligible NNTP server"),
+            Self::RouteCapacity => Some("NNTP server's network route is full"),
             Self::Unrequested => Some("NNTP lane replaced"),
             Self::ConnectionEstablishment => Some("NNTP connection unavailable"),
             Self::EstablishedTransport | Self::Unanswered => {
@@ -691,10 +700,6 @@ impl DownloadFailure {
             // Never got a socket before the deadline: local lane capacity, not
             // a transport fault of the server.
             | NntpError::AcquireTimeout(_) => Some(DownloadFailureKind::CapacityUnavailable),
-            // The lease's own guard turned the work away before a command
-            // went out: nothing was requested, and nothing is known about the
-            // article or the server.
-            NntpError::WorkObsolete => Some(DownloadFailureKind::Unrequested),
             // A session that expired part-way through a batch costs the
             // connection, not the server and not the article: the 480 stood
             // where the article's status line would have, so the article is
@@ -730,14 +735,23 @@ impl DownloadFailure {
         if let NntpError::QuotaBlocked(rejection) = error {
             return Self::server_quota(error.to_string(), rejection.as_ref().clone());
         }
+        if error.is_route_capacity() {
+            return Self::new(DownloadFailureKind::RouteCapacity, error.to_string());
+        }
 
+        // Nothing read before a lane is open is an answer about an article.
+        // A server that answered GROUP 411 for every newsgroup the work lists
+        // does not carry the post: the articles move to the next server as on
+        // a 430 (the refusal names its server). An answer with no class (an
+        // odd greeting, a 483, an unknown AUTHINFO reply, a line that does not
+        // parse) is the server refusing the connection: the dial has cooled
+        // it, and the articles wait like any refused connect.
         let kind = Self::infrastructure_kind(error, DownloadFailureKind::ConnectionEstablishment)
             .unwrap_or(match error {
-                NntpError::NoSuchGroup
-                | NntpError::CommandNotRecognized
-                | NntpError::TlsRequired
-                | NntpError::UnexpectedResponse { .. }
-                | NntpError::MalformedResponse(_) => DownloadFailureKind::ContentOrProtocol,
+                NntpError::NoSuchGroup => DownloadFailureKind::ArticleNotFound,
+                error if error.is_unclassed_setup_answer() => {
+                    DownloadFailureKind::ConnectionEstablishment
+                }
                 _ => DownloadFailureKind::LaneUnavailable,
             });
 
@@ -806,8 +820,8 @@ impl DownloadError {
     //
     // `Unanswered` says nothing about the socket either. A 480 at the status
     // line is one complete line; the blocking lane drains the replies behind
-    // it and re-authenticates in place, and when that fails, or the session
-    // had no credentials, or the batch was abandoned, the lane reports the
+    // it and re-authenticates in place, and when that fails, or the batch
+    // was abandoned, the lane reports the
     // connection discarded (`connection_discarded`, `ring_is_closed`) and that
     // verdict drops it.
     //
@@ -1886,7 +1900,10 @@ pub struct Pipeline {
     // Jobs installed mid-move, whose move resumes once their install batch
     // is in place.
     pub(crate) moves_to_resume: Vec<JobId>,
-    // Channels for pipeline stage results.
+    // Channels for pipeline stage results. Every article now arrives as a
+    // download lane event; the sender is held so the receiver stays open,
+    // and tests still feed results through it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
     pub(super) download_refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
@@ -1968,6 +1985,13 @@ pub struct Pipeline {
     pub(super) applied_holds: crate::jobs::HoldSet,
     pub(super) applied_random_read_iops: Option<f64>,
     pub(super) applied_sequential_write_mbps: Option<f64>,
+    pub(super) applied_storage_classification: Option<(
+        crate::runtime::system_profile::StorageClass,
+        crate::runtime::system_profile::FilesystemType,
+    )>,
+    // The memory tier's base size the backlog limits are sized on, kept to
+    // size them again when the storage class is learned after start-up.
+    pub(super) backlog_base_bytes: usize,
     // Estimated bytes charged to the speed limiter for in-flight downloads.
     pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
     // The operator's global bandwidth limits.
@@ -2159,9 +2183,8 @@ pub struct Pipeline {
     // when dispatch should look again (a volume fell below the line it
     // was stopped at, or an operation failed), and whether a job was
     // refused dispatch because a volume held its budget of bytes.
-    pub(super) volume_writers: Arc<crate::operations::disk::writer::VolumeWriters>,
-    pub(super) volume_reports:
-        tokio::sync::mpsc::UnboundedReceiver<crate::operations::disk::writer::Report>,
+    pub(super) volume_writers: Arc<crate::pipeline::graph::disk::PipelineWriters>,
+    pub(super) volume_rooms: tokio::sync::mpsc::UnboundedReceiver<()>,
     pub(super) volume_budget_held: std::sync::atomic::AtomicBool,
     // The clock the shutdown settle of the volume writers goes by, and how
     // long a volume may stand still before it is left behind. The machine's
@@ -2170,17 +2193,15 @@ pub struct Pipeline {
     // What queues each volume's first write-rate probe on its writer, once.
     pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
     // The keeper of every volume's buffer limits.
-    pub(super) volume_buffers: Arc<download::volume_pace::VolumeBuffers>,
-    // For each job with released results waiting for the loop: the volume
-    // their bytes are counted on as arrived, and how many of them.
-    pub(super) volume_arrived_by_job:
-        HashMap<JobId, (Arc<crate::operations::disk::volume::Volume>, u64)>,
-    // For each job with articles leased to lanes: the volume they are
-    // reserved on (`Volume::reserve`), and how many bytes of them. Each
-    // article is reserved once, as it is leased, and given back once, as
-    // it leaves its lane's record however it ends (`note_lane_work_left`).
-    pub(super) volume_reserved_by_job:
-        HashMap<JobId, (Arc<crate::operations::disk::volume::Volume>, u64)>,
+    pub(super) volume_buffers: Arc<crate::operations::VolumeBuffers>,
+    // For each job with released results waiting for the loop: their bytes,
+    // counted as arrived on the one volume they are held on.
+    pub(super) volume_arrived_by_job: HashMap<JobId, crate::operations::disk::volume::Reservation>,
+    // For each job with articles leased to lanes: their bytes, reserved on
+    // the volume the job writes to (`Reservation::reserve`). Each article
+    // is reserved once, as it is leased, and given back once, as it leaves
+    // its lane's record however it ends (`note_lane_work_left`).
+    pub(super) volume_reserved_by_job: HashMap<JobId, crate::operations::disk::volume::Reservation>,
     // What decode windows took from each disk they go on, for every graph
     // job together.
     pub(super) window_ledgers: graph::window::WindowLedgers,

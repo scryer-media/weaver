@@ -273,6 +273,7 @@ async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
     let saved = ResumePeers {
         peers: vec!["127.0.0.2:6881".parse().unwrap()],
         banned: vec!["127.0.0.3".parse().unwrap()],
+        found: Vec::new(),
     };
     assert!(rig.db.save_torrent_peers(job_id, &saved).unwrap());
 
@@ -376,6 +377,7 @@ async fn a_banned_peer_stays_banned_across_a_restart() {
     let saved = ResumePeers {
         peers: vec!["127.0.0.5:6881".parse().unwrap()],
         banned: vec![in_session, off],
+        found: Vec::new(),
     };
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
     again.stop().await;
@@ -487,7 +489,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
             .await
             .unwrap();
         rig.service
-            .resolved(magnet, Bytes::from(bytes), None)
+            .resolved(magnet, Bytes::from(bytes), &[], None)
             .await
             .unwrap();
         jobs.push(magnet);
@@ -1317,4 +1319,104 @@ async fn a_torrent_removed_and_added_again_takes_a_new_identity() {
     assert_ne!(second.key, first.key);
     assert_ne!(second.peer_id, first.peer_id);
     rig.service.stop().await;
+}
+
+// Trackers named `count` ways over three tiers, some twice, some not URLs,
+// some with spaces about them: what a long edit or a big metainfo gives.
+fn many_trackers(count: usize, named_by: NamedBy) -> Vec<TrackerEntry> {
+    (0..count)
+        .map(|index| {
+            let url = match index % 7 {
+                0 => format!("http://host{}.invalid/announce", index / 2),
+                1 => "not a url".to_owned(),
+                2 => format!("  udp://host{index}.invalid:80/announce "),
+                _ => format!("http://host{index}.invalid/announce"),
+            };
+            TrackerEntry {
+                tier: (index % 3) as u32,
+                url,
+                named_by,
+            }
+        })
+        .collect()
+}
+
+// `tidy_trackers` keeps the same trackers, in the same order, as it did
+// when it looked for each URL in every tracker kept before it.
+#[test]
+fn tidy_trackers_keeps_what_the_scan_kept() {
+    fn by_scan(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
+        let mut tidy: Vec<TrackerEntry> = Vec::with_capacity(trackers.len());
+        for entry in trackers {
+            let url = entry.url.trim();
+            if weaver_torrent::Url::parse(url).is_err() {
+                continue;
+            }
+            if tidy.iter().all(|known| known.url != url) {
+                tidy.push(TrackerEntry {
+                    tier: entry.tier,
+                    url: url.to_owned(),
+                    named_by: entry.named_by,
+                });
+            }
+        }
+        tidy.sort_by_key(|entry| entry.tier);
+        tidy
+    }
+    let mut trackers = many_trackers(3_000, NamedBy::Torrent);
+    trackers.extend(many_trackers(1_000, NamedBy::Operator));
+    let tidy = tidy_trackers(trackers.clone());
+    assert!(tidy.len() > 2_000);
+    assert_eq!(tidy, by_scan(trackers));
+}
+
+// An edit names each tracker as whoever first named it in the list it
+// edits, and the operator any other, as the search of the list did.
+#[test]
+fn an_edit_names_trackers_as_the_search_named_them() {
+    use crate::torrents::service::trackers::named_as_listed;
+    let mut listed = many_trackers(2_000, NamedBy::Torrent);
+    listed.extend(many_trackers(500, NamedBy::Operator));
+    let edited = tidy_trackers(many_trackers(3_000, NamedBy::Operator));
+    let by_search: Vec<TrackerEntry> = edited
+        .clone()
+        .into_iter()
+        .map(|tracker| TrackerEntry {
+            named_by: listed
+                .iter()
+                .find(|known| known.url == tracker.url)
+                .map_or(NamedBy::Operator, |known| known.named_by),
+            ..tracker
+        })
+        .collect();
+    let named = named_as_listed(&listed, edited);
+    assert!(
+        named
+            .iter()
+            .any(|tracker| tracker.named_by == NamedBy::Torrent)
+    );
+    assert!(
+        named
+            .iter()
+            .any(|tracker| tracker.named_by == NamedBy::Operator)
+    );
+    assert_eq!(named, by_search);
+}
+
+// A removal of many URLs leaves the trackers the search of the URLs left.
+#[test]
+fn a_removal_leaves_what_the_search_left() {
+    use crate::torrents::service::trackers::without_urls;
+    let trackers = tidy_trackers(many_trackers(3_000, NamedBy::Torrent));
+    let urls: Vec<String> = trackers
+        .iter()
+        .step_by(3)
+        .map(|tracker| format!(" {} ", tracker.url))
+        .chain(["http://absent.invalid/announce".to_owned()])
+        .collect();
+    let mut by_search = trackers.clone();
+    by_search.retain(|tracker| !urls.iter().any(|url| url.trim() == tracker.url));
+    let left = without_urls(trackers.clone(), &urls);
+    assert!(!left.is_empty() && left.len() < trackers.len());
+    assert_eq!(left, by_search);
 }

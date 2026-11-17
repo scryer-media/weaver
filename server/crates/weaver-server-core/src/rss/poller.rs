@@ -258,9 +258,23 @@ impl RssService {
                     report.errors.extend(feed_report.errors.iter().cloned());
                     report.feed_results.push(feed_report);
                 }
+                // The routes were mid-reload: the feed is left due, with no
+                // error recorded, and the reload's end wakes the poller.
+                Err(RssServiceError::RoutesChanging) => {
+                    if !due_only {
+                        report.errors.push(format!(
+                            "{}: {}",
+                            feed.name,
+                            RssServiceError::RoutesChanging
+                        ));
+                    }
+                }
                 Err(error) => {
                     let now = self.now();
                     let message = error.to_string();
+                    // One line per failed poll of a feed: a feed is polled
+                    // again only at its next interval, so this is bounded.
+                    warn!(feed_id = feed.id, feed = %feed.name, error = %message, "RSS feed poll failed");
                     let _ = self
                         .inner
                         .db
@@ -289,7 +303,7 @@ impl RssService {
     // held while they were off, before the feeds are read: those feeds are
     // then read whole. With none held this is one indexed read, no write.
     async fn take_up_waiting_items(&self) {
-        if !self.torrents_take_new() {
+        if !self.classes_take_new() {
             return;
         }
         let db = self.inner.db.clone();
@@ -377,12 +391,13 @@ impl RssService {
     // Between the row insert and the proxy runtime reload that installs its
     // route, a new feed has none, so a sweep leaves it for the wake the
     // reload sends instead of polling it unrouted or recording a failure.
+    // A feed is left the same way while any reload is in progress.
     // Without a runtime no feed has a route.
     fn has_route(&self, feed_id: u32) -> bool {
         self.inner
             .handle
             .proxy_runtime()
-            .is_some_and(|runtime| runtime.routes_consumer(crate::proxies::Consumer::Rss(feed_id)))
+            .is_some_and(|runtime| runtime.feed_routable(crate::proxies::Consumer::Rss(feed_id)))
     }
 
     async fn sync_feed(
@@ -519,13 +534,8 @@ impl RssService {
                         // A torrent while torrents are off: held, once, so
                         // later polls fetch nothing for it, and judged anew
                         // once torrents are on.
-                        Err(NotAdded::Waiting) => {
-                            record!(
-                                &item,
-                                RssSeenDecision::Waiting,
-                                None,
-                                Some(crate::torrents::status::TORRENTS_OFF)
-                            );
+                        Err(NotAdded::Waiting(reason)) => {
+                            record!(&item, RssSeenDecision::Waiting, None, Some(&reason));
                         }
                         Err(NotAdded::Failed(error)) => {
                             if cancellation.is_cancelled() {

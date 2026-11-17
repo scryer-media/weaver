@@ -1319,3 +1319,91 @@ fn damaged_bytes_raise_no_recovery_volume_before_a_ruling() {
         ]
     );
 }
+
+// A recovery volume of noise: the last seven bytes read as a RAR3 footer
+// when `footer` gives counts a set could have.
+fn noise_rev(seed: u64, footer: [u8; 3]) -> Vec<u8> {
+    let mut rev = payload(seed, 1024 - RAR3_FOOTER);
+    rev.extend_from_slice(&footer);
+    rev.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
+    rev
+}
+
+// Sixty-four recovery volumes of noise beside an archive none of their names
+// covers. One footer reads as a RAR3 set of twenty-one data volumes. The set
+// covers no data volume, so it rules on nothing, and says the same whether
+// it ruled before that footer arrived or after.
+#[test]
+fn a_set_that_covers_no_data_volume_rules_on_nothing_whenever_its_footers_arrive() {
+    const COUNT: u64 = 64;
+    const LOOKALIKE: u64 = 27;
+    let footer = |index: u64| {
+        if index == LOOKALIKE {
+            [20, 63, 0]
+        } else {
+            [0xFF, 0xFF, 0xFF]
+        }
+    };
+
+    // Ruled before any recovery volume's footer arrived.
+    let mut early = job();
+    volume(&mut early, "archive.rar", &payload(5, 300));
+    for index in 0..COUNT {
+        let name = format!("stem-{index:02}.rev");
+        let bytes = noise_rev(index, footer(index));
+        let front = &bytes[..64];
+        let volume = match early.object.claim(&name, front, None)[..] {
+            [volume] => volume,
+            [] if early.store.volumes.is_empty() => VolumeIndex(0),
+            _ => panic!("{name} is a volume of the set"),
+        };
+        let member = early.namespace.announce(&name, Some(bytes.len() as u64));
+        early.namespace.bind(member, OWN);
+        early.object.bound(volume, &name, front, None);
+        early.store.volumes.insert(volume, bytes);
+    }
+    bind(&mut early);
+    assert!(early.object.header().is_none(), "no footer is in yet");
+    let before = early
+        .object
+        .repair(&mut early.store, weaver_graph::Budget::default());
+
+    // Ruled once every recovery volume is in, the lookalike footer with it.
+    let mut late = job();
+    volume(&mut late, "archive.rar", &payload(5, 300));
+    for index in 0..COUNT {
+        rev(
+            &mut late,
+            &format!("stem-{index:02}.rev"),
+            &noise_rev(index, footer(index)),
+        )
+        .expect("a volume of the set");
+    }
+    bind(&mut late);
+    assert_eq!(
+        late.object.header().map(|header| header.data_count),
+        Some(21),
+        "the lookalike footer reads as a RAR3 set"
+    );
+    assert!(late.object.bound.is_empty(), "{:?}", late.object.bound);
+    assert_eq!(late.object.slots(), 0);
+    let after = late
+        .object
+        .repair(&mut late.store, weaver_graph::Budget::default());
+
+    assert_eq!(before, RepairOutcome::Unread);
+    assert_eq!(after, before);
+    assert_eq!(late.object.outcome(), Some(RepairOutcome::Unread));
+    assert_eq!(early.object.outcome(), Some(RepairOutcome::Unread));
+}
+
+// A RAR3 footer counts the volumes of a set that covers one: one data volume
+// in, a footer naming three, and the two absent ones are missing.
+#[test]
+fn a_rar3_footer_counts_the_volumes_of_a_set_that_covers_one() {
+    let mut job = job();
+    rev(&mut job, "lantern.part1.rev", &rev3(3, 300));
+    data(&mut job, "lantern.part01.rar");
+    bind(&mut job);
+    assert_eq!(job.object.slots(), 3);
+}

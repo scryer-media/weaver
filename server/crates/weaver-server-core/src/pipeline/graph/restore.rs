@@ -126,10 +126,10 @@ pub(crate) struct RestoreSeat {
     // The volume writers and the disk owner the restored job's files are
     // written through.
     volumes: (
-        Arc<crate::operations::disk::writer::VolumeWriters>,
+        Arc<super::disk::PipelineWriters>,
         Arc<crate::operations::StorageCapacity>,
         Arc<super::disk::VolumeProbes>,
-        Arc<crate::pipeline::download::volume_pace::VolumeBuffers>,
+        Arc<crate::operations::VolumeBuffers>,
     ),
 }
 

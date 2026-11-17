@@ -347,7 +347,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
     await row(page, "Notify").waitFor();
     await action(table(page), "Add job").click();
     const editor = creator(page);
-    await editor.getByText("new job", { exact: true }).waitFor();
+    await editor.waitFor();
     // Nothing can be saved until there is a script to run.
     await action(editor, "Script").getByText("Choose a script", { exact: true }).waitFor();
     assert.equal(await action(editor, "Save").isDisabled(), true);

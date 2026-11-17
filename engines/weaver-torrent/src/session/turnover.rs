@@ -5,10 +5,11 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::torrent_state::TorrentStateLive;
 use crate::torrent_state::live::choker::{OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL};
+use crate::type_aliases::PeerHandle;
 use anyhow::Context;
 use tracing::debug_span;
 
@@ -101,7 +102,7 @@ impl Session {
 
     // The peer at `addr` of `torrent` said it is interested: it takes one of
     // the session's upload slots when one is free.
-    pub(crate) fn peer_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
+    pub(crate) fn peer_interested(&self, torrent: &TorrentStateLive, addr: PeerHandle) {
         self.choker.peer_interested(torrent, addr);
     }
 
@@ -137,6 +138,31 @@ impl Session {
         }
     }
 
+    /// Closes up to `peers` TCP peer connections so the tunnel they ride
+    /// gets their bytes back, and says how many. The torrents give them up in
+    /// the order a connection past the session's cap takes one
+    /// (`disconnect_candidate_rank`), and each its connections worth least
+    /// first (`disconnect_lowest`). Only peers at an address `among` takes
+    /// are closed: those whose socket rides the tunnel that asks. The close
+    /// is no failure: the peers stay connect candidates, unmarked.
+    pub fn give_back_tcp_peers(
+        &self,
+        peers: usize,
+        among: &(dyn Fn(std::net::SocketAddr) -> bool + Send + Sync),
+    ) -> usize {
+        let mut torrents = self.live_torrents();
+        torrents.sort_by_key(|torrent| disconnect_candidate_rank(torrent));
+        let now = tokio::time::Instant::now();
+        let mut closed = 0;
+        for torrent in torrents {
+            if closed == peers {
+                break;
+            }
+            closed += torrent.give_back_tcp_peers(peers - closed, now, among);
+        }
+        closed
+    }
+
     // An incoming connection at `addr` of `live` that the slack let in past
     // the session's cap takes a place under it: a free one, or that of the
     // lowest-ranked connection of the torrent that holds the most, when it
@@ -146,7 +172,7 @@ impl Session {
     // `peer_connection::attach_to_torrent`, `find_disconnect_candidate_torrent`,
     // `torrent::find_lowest_ranking_peer`). One that displaced a connection
     // of its own torrent took that one's place, and is under the cap.
-    pub(crate) fn settle_over_limit(&self, live: &TorrentStateLive, addr: SocketAddr) {
+    pub(crate) fn settle_over_limit(&self, live: &TorrentStateLive, addr: PeerHandle) {
         if !live.exceeds_limit(addr, &self.connection_slots) {
             return;
         }

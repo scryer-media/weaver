@@ -2682,3 +2682,40 @@ fn a_repeated_round_over_many_gaps_is_answered_from_the_memo() {
     round(&mut root);
     assert!(SEEK_MAPPED.with(std::cell::Cell::get) > 0);
 }
+
+// A volume placed only in order, as uuencode is, declares no part ends: each
+// part lands where the one before it ended, and one every server failed is
+// passed, so the parts after it land one hole early. The lost run starts
+// where the part in hand before it ended, never over that part's bytes: a
+// recovery set reads bytes told lost back as nothing, so a slice that
+// arrived whole and was proved whole would feed its repair as zeros.
+#[test]
+fn an_ordered_volume_tells_a_lost_run_from_the_end_of_the_part_before_it() {
+    const ARTICLES: u32 = 32;
+    const PART: u64 = 768;
+    // uuencode's encoded size, about four thirds of the part and its lines.
+    const ENCODED: u32 = 1050;
+    const LOST: u32 = 16;
+    let sizes: Vec<(u32, u32)> = (0..ARTICLES).map(|ordinal| (ordinal, ENCODED)).collect();
+    let mut map = super::source::ArticleMap::new(&[sizes]);
+    let volume = VolumeIndex(0);
+    map.set_ordered_only(volume);
+    for ordinal in (0..ARTICLES).filter(|ordinal| *ordinal != LOST) {
+        let place = u64::from(if ordinal < LOST { ordinal } else { ordinal - 1 });
+        map.arrived(
+            volume,
+            ordinal,
+            ByteRange::at(place * PART, PART),
+            None,
+            false,
+        );
+    }
+    map.lost(volume, LOST);
+    let mut told = Vec::new();
+    map.take_damage(&mut told).unwrap();
+    assert_eq!(told.len(), 1, "{told:?}");
+    let (at, range) = told[0];
+    assert_eq!(at, volume);
+    // Part 15 arrived at 11520..12288: the run starts at its end.
+    assert_eq!(range.start, u64::from(LOST) * PART, "{range:?}");
+}

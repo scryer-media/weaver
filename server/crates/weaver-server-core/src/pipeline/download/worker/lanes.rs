@@ -814,15 +814,26 @@ impl Pipeline {
                 self.restore_stopped_owned_lane_lease(lease);
             }
             OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
+                // Heard, whatever comes of it: a press this report left waits
+                // on a pass after it (see `JobCounters::drained_through`).
+                if let Some(counters) = lease.works.iter().find_map(|work| work.counters.as_ref()) {
+                    counters
+                        .lane_refusals_heard
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 if !self.download_lane_is_live(lease.lane_id) {
                     return;
                 }
                 // Capacity admission and health-mutex contention are both
-                // "ask again shortly": the work goes back to the scheduler on
-                // the owned fast path instead of being demoted to an async
-                // lane on what is not a verdict about the servers at all.
+                // "ask again shortly": the work goes back to the scheduler,
+                // since neither is a verdict about the servers at all.
                 self.note_owned_lane_acquire_failure(&lease, &error);
-                if error.should_requeue_owned_work() {
+                // A full network route is "ask again" too, but nothing tells
+                // the scheduler when it frees: its work takes the paced
+                // requeue below (no retry spent, nothing failed) rather than
+                // coming straight back to redial the full route.
+                let route_full = error.is_route_capacity();
+                if error.should_requeue_owned_work() && !route_full {
                     let DownloadBatchLease {
                         lane_id,
                         job_id,
@@ -861,16 +872,29 @@ impl Pipeline {
                 // is the answer these articles get, so each one takes the
                 // failure and the normal result path decides whether to retry
                 // it elsewhere.
-                debug!(
-                    job_id = lease.job_id.0,
-                    works = lease.works.len(),
-                    error = %error,
-                    "owned blocking lane unavailable; failing the leased articles"
-                );
-                crate::runtime::perf_probe::record_value(
-                    "download.owned_lane.acquire_failed_lease_failed",
-                    1,
-                );
+                if route_full {
+                    debug!(
+                        job_id = lease.job_id.0,
+                        works = lease.works.len(),
+                        error = %error,
+                        "owned blocking lane not opened: the server's network route is full; requeueing the leased articles after the lane-unavailable delay"
+                    );
+                    crate::runtime::perf_probe::record_value(
+                        "download.owned_lane.acquire_failed_route_capacity_requeue",
+                        1,
+                    );
+                } else {
+                    debug!(
+                        job_id = lease.job_id.0,
+                        works = lease.works.len(),
+                        error = %error,
+                        "owned blocking lane unavailable; failing the leased articles"
+                    );
+                    crate::runtime::perf_probe::record_value(
+                        "download.owned_lane.acquire_failed_lease_failed",
+                        1,
+                    );
+                }
                 let failure = DownloadFailure::from_lane_acquire_failure(error.nntp_error());
                 // A refusal one server gave is that server's answer for the
                 // articles, so the result names it the way a fetch would.
@@ -893,7 +917,9 @@ impl Pipeline {
                         super::spawn::lane_acquire_failure_for_work(&failure, work_index);
                     let policy_outcome = matches!(
                         work_failure.kind,
-                        DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+                        DownloadFailureKind::ServerQuota
+                            | DownloadFailureKind::Unrequested
+                            | DownloadFailureKind::RouteCapacity
                     );
                     let result = DownloadResult {
                         lane_id,
@@ -944,6 +970,8 @@ impl Pipeline {
                     completion_critical,
                     reason: if policy_blocked {
                         LaneParkReason::ServerQuota
+                    } else if route_full {
+                        LaneParkReason::Capacity
                     } else {
                         LaneParkReason::Error
                     },
@@ -1019,7 +1047,7 @@ impl Pipeline {
     // Counts one owned-lane acquire failure by kind, and warns about it at
     // most once a minute per job.
     //
-    // Both arms of the caller — requeue and async fallback — keep the download
+    // Both arms of the caller, requeue and failing the lease, keep the download
     // running, so nothing above debug said that a lane had failed to open. A
     // job whose owned lanes all fail this way still finishes, on a fraction of
     // the connections it was given, with no line in the log to explain it.
@@ -1032,6 +1060,7 @@ impl Pipeline {
         // the failure path of every dispatch pass while a server is refusing.
         let metric = match error.kind() {
             "provider_capacity" => "download.owned_lane.acquire_failed.provider_capacity",
+            "route_capacity" => "download.owned_lane.acquire_failed.route_capacity",
             "local_capacity" => "download.owned_lane.acquire_failed.local_capacity",
             "server_recovering" => "download.owned_lane.acquire_failed.server_recovering",
             "credentials_refused" => "download.owned_lane.acquire_failed.credentials_refused",
@@ -1073,7 +1102,7 @@ impl Pipeline {
                 kind = error.kind(),
                 error = %error,
                 requeued_works = lease.works.len(),
-                requeue = error.should_requeue_owned_work(),
+                requeue = error.should_requeue_owned_work() && !error.is_route_capacity(),
                 suppressed_since_last,
                 candidate_servers = ?servers,
                 candidate_recovery = ?recovery,
@@ -1087,7 +1116,7 @@ impl Pipeline {
             kind = error.kind(),
             error = %error,
             requeued_works = lease.works.len(),
-            requeue = error.should_requeue_owned_work(),
+            requeue = error.should_requeue_owned_work() && !error.is_route_capacity(),
             suppressed_since_last,
             candidate_servers = ?servers,
             candidate_recovery = ?recovery,

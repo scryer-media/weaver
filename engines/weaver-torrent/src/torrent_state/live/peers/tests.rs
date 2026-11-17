@@ -36,8 +36,8 @@ fn make_peer_states() -> PeerStates {
     )
 }
 
-// Returns the peer handle, keeping the receiving end of the peer channel alive.
-fn add_live_peer(peers: &PeerStates, addr: &str) -> (PeerHandle, PeerRx) {
+// Returns the peer address, keeping the receiving end of the peer channel alive.
+fn add_live_peer(peers: &PeerStates, addr: &str) -> (SocketAddr, PeerRx) {
     let addr: SocketAddr = addr.parse().unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     peers
@@ -66,14 +66,14 @@ fn peer_addr(i: usize) -> SocketAddr {
 }
 
 fn state_of(peers: &PeerStates, addr: SocketAddr) -> Option<&'static str> {
-    peers.with_peer(addr, |peer| peer.get_state().name())
+    peers.with_peer(addr.into(), |peer| peer.get_state().name())
 }
 
 // Connects to `addr`, which must be due at `at`, and fails the connection
 // at `at`.
 fn fail_at(peers: &PeerStates, addr: SocketAddr, at: Instant) {
     peers
-        .with_peer_mut(addr, "test", |peer| {
+        .with_peer_mut(addr.into(), "test", |peer| {
             peer.connect_if_due(at, peers).expect("a due candidate");
             peers.connection_closed(peer, at, true, false);
         })
@@ -111,7 +111,7 @@ fn failed_once(peers: &PeerStates, addr: SocketAddr, at: Instant) {
     peers.add_peer(addr, PeerSourceFlag::Tracker);
     fail_at(peers, addr, at);
     peers
-        .with_peer_mut(addr, "test", |peer| peer.set_not_needed(peers))
+        .with_peer_mut(addr.into(), "test", |peer| peer.set_not_needed(peers))
         .unwrap();
 }
 
@@ -120,7 +120,7 @@ fn failed_once(peers: &PeerStates, addr: SocketAddr, at: Instant) {
 fn never_failed(peers: &PeerStates, addr: SocketAddr) {
     peers.add_peer(addr, PeerSourceFlag::Tracker);
     peers
-        .with_peer_mut(addr, "test", |peer| peer.set_not_needed(peers))
+        .with_peer_mut(addr.into(), "test", |peer| peer.set_not_needed(peers))
         .unwrap();
 }
 

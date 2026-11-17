@@ -43,6 +43,7 @@ fn lease_works_to_new_lane(
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works,
     };
     pipeline.activate_download_batch_lease(&lease, &Pipeline::activation_items(&lease), true);

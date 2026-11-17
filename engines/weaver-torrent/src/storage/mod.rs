@@ -44,6 +44,8 @@ use tokio::sync::Notify;
 
 use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
 
+pub use crate::torrent_state::StoredPiece;
+
 /// Whether a write failed in a way later writes likely will too while reads
 /// still work: no space, a quota, a read-only or forbidding file system, a
 /// file past its size limit. The torrent stops downloading and keeps seeding
@@ -269,6 +271,19 @@ pub trait TorrentStorage: Send + Sync {
         false
     }
 
+    /// A piece the storage holds in memory (`writes_to_memory`) passed its
+    /// check: write it whole, and say how that ended through
+    /// [`StoredPiece::stored`], from any thread, once it did. The piece is
+    /// had only then; until then it is still read from the storage's
+    /// memory. The call must not wait for the write. A `stored` dropped
+    /// unsaid means the piece was not written: it is fetched again. Only a
+    /// storage that holds pieces in memory is handed pieces this way.
+    /// Default implementation writes it here and now through
+    /// [`Self::on_piece_completed`].
+    fn store_verified_piece(&self, piece_index: ValidPieceIndex, stored: StoredPiece) {
+        stored.stored(self.on_piece_completed(piece_index));
+    }
+
     /// Callback called every time a piece failed its hash check, before it is queued again:
     /// a downloaded piece, or one a check of the files did not find, which the storage then
     /// holds no longer. Default implementation does nothing, but can be override in trait
@@ -389,6 +404,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn writes_to_memory(&self) -> bool {
         (**self).writes_to_memory()
+    }
+
+    fn store_verified_piece(&self, piece_id: ValidPieceIndex, stored: StoredPiece) {
+        (**self).store_verified_piece(piece_id, stored)
     }
 
     fn on_piece_hash_failed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {

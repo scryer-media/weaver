@@ -134,7 +134,7 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(efficient.decode_threads, 2);
     assert_eq!(efficient.extract_threads, 4);
     assert_eq!(efficient.max_concurrent_downloads_cap, Some(10));
-    assert_eq!(efficient.wireguard_socket_cap, 256);
+    assert_eq!(efficient.wireguard_usenet_receive_bytes, 256 * 1024);
 
     let balanced = HardwareProfile::Balanced.tuning(&large);
     assert_eq!(balanced.sevenz_decode_memory_bytes, GIB);
@@ -143,7 +143,7 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(balanced.decode_threads, 4);
     assert_eq!(balanced.extract_threads, 8);
     assert_eq!(balanced.max_concurrent_downloads_cap, None);
-    assert_eq!(balanced.wireguard_socket_cap, 512);
+    assert_eq!(balanced.wireguard_usenet_receive_bytes, 1024 * 1024);
 
     let performance = HardwareProfile::Performance.tuning(&large);
     assert_eq!(performance.sevenz_decode_memory_bytes, 4 * GIB);
@@ -152,7 +152,31 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.decode_threads, 16);
     assert_eq!(performance.extract_threads, 8);
     assert_eq!(performance.max_concurrent_downloads_cap, None);
-    assert_eq!(performance.wireguard_socket_cap, 1024);
+    assert_eq!(performance.wireguard_usenet_receive_bytes, 4 * 1024 * 1024);
+}
+
+// On every profile the tunnel gives a usenet socket the receive buffer the
+// profile names, unclamped, beside the 64 KiB send buffer.
+#[test]
+fn a_usenet_socket_gets_its_profiles_receive_buffer_whole() {
+    let large = machine(16, 32);
+    for profile in [
+        HardwareProfile::Efficient,
+        HardwareProfile::Balanced,
+        HardwareProfile::Performance,
+    ] {
+        let receive = profile.tuning(&large).wireguard_usenet_receive_bytes;
+        let buffers = weaver_tunnel::wireguard::TcpBuffers::new(
+            receive,
+            weaver_tunnel::pipe::USENET_SEND_BYTES,
+        );
+        assert_eq!(buffers.receive(), receive, "{profile:?}");
+        assert_eq!(
+            buffers.send(),
+            weaver_tunnel::pipe::USENET_SEND_BYTES,
+            "{profile:?}"
+        );
+    }
 }
 
 // Every profile lends a window over the ceiling from scratch; where the

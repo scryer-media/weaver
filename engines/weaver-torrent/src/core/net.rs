@@ -30,7 +30,7 @@ use std::{
 /// transport abstraction this trait is adapted to.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 
-pub use weaver_utp::{DatagramSend, Fragmenting};
+pub use weaver_utp::{DatagramSend, Departure, DepartureSlot, Fragmenting, RecordsDeparture};
 
 /// An unconnected, message-oriented socket: the shape of a UDP socket, without
 /// requiring it to be one.

@@ -81,6 +81,7 @@ async fn a_recovery_lease_takes_an_owned_lane() {
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
 
@@ -132,6 +133,7 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
 
@@ -979,9 +981,20 @@ fn lane_acquire_failure_preserves_retry_semantics() {
     ));
     assert_eq!(auth_failure.kind, DownloadFailureKind::Auth);
 
-    let setup_failure =
+    // Every group refused: the named server does not carry the post.
+    let not_carried =
         DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::NoSuchGroup));
-    assert_eq!(setup_failure.kind, DownloadFailureKind::ContentOrProtocol);
+    assert_eq!(not_carried.kind, DownloadFailureKind::ArticleNotFound);
+
+    // An odd answer before the lane opened is the server's, not the article's.
+    let odd_greeting = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::unexpected(weaver_nntp::StatusCode::new(500), "maintenance"),
+    ));
+    assert_eq!(
+        odd_greeting.kind,
+        DownloadFailureKind::ConnectionEstablishment
+    );
+    assert!(odd_greeting.preserves_article_retry_budget());
 }
 
 #[tokio::test]
@@ -1143,6 +1156,7 @@ fn infrastructure_failures_preserve_article_retry_budget() {
         DownloadFailureKind::Auth,
         DownloadFailureKind::ServerQuota,
         DownloadFailureKind::LaneUnavailable,
+        DownloadFailureKind::RouteCapacity,
         DownloadFailureKind::Unrequested,
     ] {
         assert!(kind.preserves_article_retry_budget(), "kind={kind:?}");

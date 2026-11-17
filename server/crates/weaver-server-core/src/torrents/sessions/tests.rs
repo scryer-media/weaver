@@ -4,6 +4,7 @@
 mod outgoing_utp;
 mod pool_members;
 mod system_utp;
+mod tcp_want;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -93,7 +94,7 @@ pub(crate) struct FakeRoutes {
     pub(crate) egress_of: Mutex<BTreeMap<String, u32>>,
     // What each egress allows its sessions, unlimited when unset, and the
     // signals rung as it changes.
-    pub(crate) egress_rates: Mutex<BTreeMap<u32, crate::bandwidth::TorrentRates>>,
+    pub(crate) egress_rates: Mutex<BTreeMap<u32, crate::bandwidth::ClassRates>>,
     pub(crate) egress_policy: tokio::sync::watch::Sender<u64>,
     pub(crate) egress_capacity: tokio::sync::watch::Sender<u64>,
     // The legs it opens run no local service discovery, so a session on
@@ -206,7 +207,7 @@ impl FakeRoutes {
     }
 
     // Egress `egress_id` allows `rates` from now, and says so.
-    pub(crate) fn set_egress_rates(&self, egress_id: u32, rates: crate::bandwidth::TorrentRates) {
+    pub(crate) fn set_egress_rates(&self, egress_id: u32, rates: crate::bandwidth::ClassRates) {
         self.egress_rates.lock().unwrap().insert(egress_id, rates);
         self.egress_policy.send_modify(|revision| *revision += 1);
     }
@@ -339,6 +340,7 @@ impl Routes for FakeRoutes {
             &LegKind::System,
             crate::torrents::net::system_dialer(),
             None,
+            None,
         )?;
         Ok(OpenLeg {
             kind: plan.kind.clone(),
@@ -354,6 +356,7 @@ impl Routes for FakeRoutes {
             names,
             http,
             leg,
+            tunnels: None,
         })
     }
 
@@ -384,7 +387,7 @@ impl Routes for FakeRoutes {
         ))
     }
 
-    fn egress_rates(&self, egress_id: u32) -> crate::bandwidth::TorrentRates {
+    fn egress_rates(&self, egress_id: u32) -> crate::bandwidth::ClassRates {
         self.egress_rates
             .lock()
             .unwrap()
@@ -2405,6 +2408,7 @@ fn leg(kind: LegKind) -> OpenLeg {
         &LegKind::System,
         crate::torrents::net::system_dialer(),
         None,
+        None,
     )
     .unwrap();
     OpenLeg {
@@ -2415,6 +2419,7 @@ fn leg(kind: LegKind) -> OpenLeg {
         names,
         http,
         leg: None,
+        tunnels: None,
     }
 }
 
@@ -2668,7 +2673,7 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
         .await
         .unwrap();
     assert_eq!(rate(&one), None);
-    sessions.rates().set(crate::bandwidth::TorrentRates {
+    sessions.rates().set(crate::bandwidth::ClassRates {
         download: Some(1_000_000),
         upload: None,
     });
@@ -2685,12 +2690,12 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
     assert_eq!(sessions.rates().sample(), 0);
 
     // Nothing closes the sessions.
-    sessions.rates().set(crate::bandwidth::TorrentRates {
+    sessions.rates().set(crate::bandwidth::ClassRates {
         download: Some(0),
         upload: None,
     });
     assert_eq!((rate(&one), rate(&two)), (Some(0), Some(0)));
-    sessions.rates().set(crate::bandwidth::TorrentRates {
+    sessions.rates().set(crate::bandwidth::ClassRates {
         download: None,
         upload: None,
     });
@@ -3646,6 +3651,201 @@ async fn a_routes_naming_ends_with_its_last_torrent_and_client() {
     while Arc::strong_count(&slot) > unheld {
         tokio::task::yield_now().await;
     }
+    proxies.network.shutdown().await;
+}
+
+// The leg's dialer, noting each dial: what it was for, who answers the
+// names in scope as it is made, and the leg of the route that counts it.
+struct Noting {
+    leg: Arc<dyn weaver_tunnel::pipe::Dialer>,
+    dials: Mutex<Vec<Noted>>,
+}
+
+// One dial's purpose, the names in scope, and the route's leg counting it.
+type Noted = (
+    weaver_tunnel::pipe::Purpose,
+    Option<weaver_tunnel::pipe::DnsChoice>,
+    Option<usize>,
+);
+
+#[async_trait::async_trait]
+impl weaver_tunnel::pipe::Dialer for Noting {
+    async fn dial(
+        &self,
+        target: &weaver_tunnel::pipe::Target,
+    ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+        let names = weaver_tunnel::pipe::Names::current().map(|names| names.choice().clone());
+        let dialed = self.leg.dial(target).await?;
+        self.dials
+            .lock()
+            .unwrap()
+            .push((target.purpose.clone(), names, dialed.path.leg));
+        Ok(dialed)
+    }
+    async fn resolve(
+        &self,
+        host: &str,
+    ) -> Result<weaver_tunnel::pipe::Resolution, weaver_tunnel::pipe::DialError> {
+        self.leg.resolve(host).await
+    }
+    fn budget(&self) -> Duration {
+        self.leg.budget()
+    }
+    fn describe(&self) -> String {
+        self.leg.describe()
+    }
+}
+
+// A route's web seed on a shared ladder leg rides a bridge of its own on the
+// leg: its request names by that route's profile (the proxy is handed the
+// name, where the leg's own profile would have the host look it up), dials
+// for a web seed, and is counted on the route's leg. Once the leg drops, the
+// bridge is revoked, so the web seed server sees its connection end, and a
+// web seed asked after that fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routes_web_seed_rides_its_own_bridge_on_the_leg() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use weaver_torrent::{ClientShape, HttpClients};
+    use weaver_tunnel::pipe::{DnsChoice, Purpose};
+
+    // The web seed server: it answers one request, says what it received,
+    // and says when the connection ends.
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let (received_tx, received) = tokio::sync::oneshot::channel();
+    let served = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.ends_with(b"\r\n\r\n") {
+            let read = stream.read(&mut buf).await.unwrap();
+            assert!(read > 0, "the request ended early");
+            head.extend_from_slice(&buf[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        received_tx.send(String::from_utf8(head).unwrap()).unwrap();
+        // The connection is kept until the far side ends it.
+        while matches!(stream.read(&mut buf).await, Ok(read) if read > 0) {}
+    });
+    let proxy = weaver_tunnel::test_support::proxy::ProxyServerDouble::start(
+        weaver_tunnel::transport::TransportKind::Socks5,
+        None,
+        std::collections::HashMap::from([(("seed.invalid".to_owned(), 80), origin_addr)]),
+    )
+    .await;
+
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&loopback_proxy(proxy.addr.port()))
+        .unwrap();
+    let handed = db
+        .save_dns_profile(
+            crate::proxies::DnsProfile {
+                kind: crate::proxies::DnsProfileKind::Route,
+                id: 0,
+                name: "Proxy".into(),
+                who: crate::proxies::DnsWho::Proxy,
+                transit: None,
+                trust: crate::proxies::DnsTrust::AsSent,
+                server_list_id: None,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
+    let category = TorrentScope::Category(3);
+    let through = |profile: u32| RoutingPolicy {
+        legs: vec![RouteLeg {
+            egress_id: SYSTEM_EGRESS_ID,
+            weight: 100,
+            path: ladder(1),
+        }],
+        dns_profile_id: Some(profile),
+        ..Default::default()
+    };
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &through(crate::proxies::SYSTEM_DNS_PROFILE_ID),
+    )
+    .unwrap();
+    db.save_proxy_routing_policy(Consumer::Torrent(category), &through(handed.id))
+        .unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
+    let by_default = routes.plan(TorrentScope::Default);
+    let by_category = routes.plan(category);
+    assert_eq!(by_default.key, by_category.key, "one session on the leg");
+    let open = routes.open(&by_default, 8).await.unwrap();
+    let leg = open.leg.clone().expect("a ladder's leg");
+    let slot = routes
+        .scope_names(&by_category)
+        .expect("category 3's names");
+    let handed_choice = slot.get().expect("category 3's names").choice().clone();
+    assert!(matches!(handed_choice, DnsChoice::Proxy { .. }));
+    let leg_choice = routes
+        .scope_names(&by_default)
+        .and_then(|slot| slot.get())
+        .map(|names| names.choice().clone());
+    assert_ne!(leg_choice, Some(handed_choice.clone()));
+
+    // The leg's naming as a session builds it, over the leg's dialer.
+    let noting = Arc::new(Noting {
+        leg: leg.dialer(),
+        dials: Mutex::default(),
+    });
+    let naming = LegNaming::new(
+        LegKind::Ladder,
+        noting.clone(),
+        Some(Arc::clone(&leg)),
+        Arc::clone(&open.names),
+        Arc::clone(&open.http),
+    );
+    let torrent = TorrentNames::new(naming.of(category, Some(Arc::clone(&slot))).unwrap());
+    // The route's tracker bridge starts with its naming; its web seed's on
+    // the first web seed asked.
+    assert_eq!(leg.own_bridges(), 1);
+    let seed = |n: u8| ClientShape::FETCH.for_torrent(weaver_torrent::core::Id20::new([n; 20]));
+    let client = torrent.client(None, &seed(1)).unwrap();
+    assert_eq!(leg.own_bridges(), 2);
+    let response = client
+        .get("http://seed.invalid/piece")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let head = received.await.unwrap();
+    assert!(head.starts_with("GET "), "{head}");
+    assert!(head.contains("/piece"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("host: seed.invalid"),
+        "{head}"
+    );
+    // The proxy was handed the name, as category 3's profile says.
+    assert_eq!(
+        *proxy.targets.lock().unwrap(),
+        vec![("seed.invalid".to_owned(), 80)]
+    );
+    // A web seed dial, under category 3's names, counted on the route's leg.
+    let dials = std::mem::take(&mut *noting.dials.lock().unwrap());
+    assert_eq!(dials.len(), 1, "one dial");
+    let (purpose, names, counted) = &dials[0];
+    assert!(matches!(purpose, Purpose::TorrentWebSeed), "{purpose:?}");
+    assert_eq!(*names, Some(handed_choice));
+    assert_eq!(*counted, Some(0));
+
+    // The leg drops: the session's hold on it, the naming's and this one.
+    let gone = Arc::downgrade(&leg);
+    drop((open, naming, leg));
+    assert!(gone.upgrade().is_none(), "the leg dropped");
+    // Its bridges are revoked, so the web seed server's connection ends
+    // while the client still holds it.
+    served.await.unwrap();
+    let after = torrent.client(None, &seed(2)).unwrap_err();
+    assert!(after.to_string().contains("leg revoked"), "{after:#}");
+    drop(client);
     proxies.network.shutdown().await;
 }
 

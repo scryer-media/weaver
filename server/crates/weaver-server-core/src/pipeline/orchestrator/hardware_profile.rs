@@ -97,7 +97,10 @@ impl Pipeline {
         self.shared_state.set_hardware_profile_in_force(in_force);
         self.size_volume_buffers();
         let tuning = in_force.active.tuning(self.tuner.system_profile());
-        crate::proxies::set_wireguard_socket_cap(tuning.wireguard_socket_cap);
+        crate::proxies::set_usenet_receive_bytes(
+            tuning.wireguard_usenet_receive_bytes,
+            self.shared_state.proxy_runtime(),
+        );
         if tuning == self.tuner.profile_tuning() {
             return;
         }

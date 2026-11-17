@@ -5,7 +5,6 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use super::add::merge_two_optional_streams;
 use super::options::AddTorrentOptions;
 use std::{
     collections::HashSet,
@@ -16,19 +15,21 @@ use std::{
 use crate::core::{hash_id::InfoHashes, torrent_metainfo::TorrentMetaV1Owned};
 use crate::ssl::{SslHttpClients, SslTorrent};
 use crate::tracker::{
-    Reachable, ToldPorts, Tracker, TrackerAnnounce, TrackerComms, TrackerStatus, TrackerTask,
-    Unreachable,
+    Reachable, Tracker, TrackerAnnounce, TrackerComms, TrackerNet, TrackerProtocols, TrackerSetup,
+    TrackerStatus, TrackerTask, Unreachable,
 };
 use crate::{
     ManagedTorrent,
     torrent_state::{ManagedTorrentHandle, TorrentTotals},
-    type_aliases::{PeerSource, PeerSourceFlag, PeerStream},
+    type_aliases::{PeerSource, PeerStream},
 };
-use futures::{FutureExt, StreamExt, future::BoxFuture};
+use futures::{FutureExt, future::BoxFuture};
 use tokio::sync::Notify;
 use tracing::{trace, warn};
 
-use super::{PeerRequest, PeerRxTorrentInfo, Session, TrackerStart, dht_peers};
+use super::peer_finder::{self, PeerAsk, TrackerAsk};
+use super::ports::AnnouncePort;
+use super::{PeerRxTorrentInfo, Session};
 
 fn parse_tracker_url(tracker: &[u8]) -> Option<url::Url> {
     match std::str::from_utf8(tracker) {
@@ -68,22 +69,13 @@ pub(super) fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<Trac
     opts.tracker_tiers.clone()
 }
 
-/// Whether a torrent takes peers from its trackers alone: its metainfo
-/// marks it `private` (BEP 27), or it was added
-/// [`trackers_only`](AddTorrentOptions::trackers_only). Such a torrent
-/// neither looks for peers on the DHT, the local network or by peer
-/// exchange, nor announces to any tracker but its own.
-pub(crate) const fn trackers_only(private: bool, added_trackers_only: bool) -> bool {
-    private || added_trackers_only
-}
-
 /// Where a torrent looks for peers beside its trackers, as each of
 /// libtorrent's per-torrent flags leaves it: the DHT unless
 /// `torrent_flags::disable_dht` (`torrent::should_announce_dht`), the local
-/// network unless `disable_lsd` (`torrent::lsd_announce`). A torrent that
-/// takes peers from its trackers alone looks at neither, whatever its
-/// flags say: a private torrent is never announced on either
-/// (`should_announce_dht` and `lsd_announce` both return on `priv()`).
+/// network unless `disable_lsd` (`torrent::lsd_announce`). A private
+/// torrent looks at neither, whatever its flags say: both return on
+/// `priv()`. Each flag turns off its own source and nothing else; all of
+/// them off leaves a public torrent public.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Discovery {
     pub dht: bool,
@@ -91,30 +83,26 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    pub(crate) const fn of(trackers_only: bool, disable_dht: bool, disable_lsd: bool) -> Self {
+    pub(crate) const fn of(private: bool, disable_dht: bool, disable_lsd: bool) -> Self {
         Self {
-            dht: !trackers_only && !disable_dht,
-            lsd: !trackers_only && !disable_lsd,
+            dht: !private && !disable_dht,
+            lsd: !private && !disable_lsd,
         }
     }
 
     /// Under `opts`, for a torrent `private` or not.
     pub(crate) const fn added(private: bool, opts: &AddTorrentOptions) -> Self {
-        Self::of(
-            trackers_only(private, opts.trackers_only),
-            opts.disable_dht,
-            opts.disable_lsd,
-        )
+        Self::of(private, opts.disable_dht, opts.disable_lsd)
     }
 }
 
 /// Whether a torrent speaks peer exchange: the session runs it, the torrent
-/// was not added with `disable_pex`, and it takes peers from more than its
-/// trackers. libtorrent's `create_ut_pex_plugin` adds no plugin to a
-/// private torrent, and `ut_pex_plugin::tick` and
-/// `ut_pex_peer_plugin::on_extended` return while `disable_pex` is set.
-pub(crate) const fn speaks_pex(session_pex: bool, trackers_only: bool, disable_pex: bool) -> bool {
-    session_pex && !trackers_only && !disable_pex
+/// was not added with `disable_pex`, and it is not private. libtorrent's
+/// `create_ut_pex_plugin` adds no plugin to a private torrent, and
+/// `ut_pex_plugin::tick` and `ut_pex_peer_plugin::on_extended` return while
+/// `disable_pex` is set.
+pub(crate) const fn speaks_pex(session_pex: bool, private: bool, disable_pex: bool) -> bool {
+    session_pex && !private && !disable_pex
 }
 
 /// Where a magnet's metadata fetch asks for peers. Until its metadata says
@@ -229,14 +217,15 @@ pub(super) async fn follow_fetch(
 
 /// The tiers a torrent announces to: its own tiers in order, then each of
 /// `extra`, which the operator named, as a tier of its own, unless the
-/// torrent takes peers from its own trackers only. A tracker listed more
-/// than once keeps its first place, and empty tiers are dropped.
+/// torrent is private (or taken to be, as a magnet is until its metadata
+/// arrives). A tracker listed more than once keeps its first place, and
+/// empty tiers are dropped.
 pub(super) fn merge_tracker_tiers(
     own: Vec<Vec<Tracker>>,
     extra: impl IntoIterator<Item = url::Url>,
-    trackers_only: bool,
+    private: bool,
 ) -> Vec<Vec<Tracker>> {
-    let extra = (!trackers_only).then(|| extra.into_iter().map(|t| vec![Tracker::operator(t)]));
+    let extra = (!private).then(|| extra.into_iter().map(|t| vec![Tracker::operator(t)]));
     crate::tracker::tidy_tiers(own.into_iter().chain(extra.into_iter().flatten()))
 }
 
@@ -255,33 +244,48 @@ impl Session {
         t: &ManagedTorrentHandle,
         announce: bool,
     ) -> Option<PeerSource> {
-        self.make_peer_rx(PeerRequest {
-            info_hashes: t.info_hashes(),
-            identity: &t.shared().identity(),
-            naming: &t.shared().naming,
-            tracker_tiers: t.shared().tracker_tiers(),
-            announce,
-            force_tracker_interval: t.shared().options.force_tracker_interval,
-            initial_peers: t.shared().options.initial_peers.clone(),
-            trackers_only: t.takes_peers_from_trackers_only(),
-            discovery: t.discovery(),
-            dht_announce: t.shared().dht_announce.subscribe(),
-            ssl: t.shared().ssl.as_ref(),
-            trackers: None,
-        })
+        let ssl = t.shared().ssl.as_ref();
+        self.make_peer_rx(
+            PeerAsk {
+                info_hashes: t.info_hashes(),
+                ssl,
+                port: self.told_port(ssl),
+                announce,
+                dht_announce: t.shared().dht_announce.subscribe(),
+                initial_peers: t.shared().options.initial_peers.clone(),
+                trackers: TrackerAsk {
+                    identity: &t.shared().identity(),
+                    naming: t.shared().naming.clone(),
+                    tiers: t.shared().tracker_tiers(),
+                    force_interval: t.shared().options.force_tracker_interval,
+                    private: t.is_private(),
+                    running: None,
+                },
+            },
+            t.discovery(),
+        )
+    }
+
+    /// The port a torrent is reached at, which its finders tell: an SSL
+    /// torrent's is the SSL listener's.
+    pub(super) fn told_port(&self, ssl: Option<&Arc<SslTorrent>>) -> Arc<AnnouncePort> {
+        match ssl {
+            Some(_) => self.ssl_port.clone(),
+            None => self.announce_port.clone(),
+        }
     }
 
     /// The tiers a torrent announces to: its own, then the session's trackers
-    /// unless it takes peers from its own trackers only.
+    /// unless it is private.
     pub(crate) fn announce_tiers(
         &self,
         tracker_tiers: Vec<Vec<Tracker>>,
-        trackers_only: bool,
+        private: bool,
     ) -> Vec<Vec<Tracker>> {
         if self.disable_trackers {
             return Vec::new();
         }
-        merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), trackers_only)
+        merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), private)
     }
 
     /// Whether the session may reach `ip`, whoever is there: a peer, a web
@@ -334,50 +338,51 @@ impl Session {
     // A torrent's tracker task, under every hash it goes by. The task runs
     // with no tracker too, so trackers added later are announced to; a
     // session without trackers starts none.
-    pub(super) fn start_trackers(self: &Arc<Self>, start: TrackerStart<'_>) -> Option<TrackerTask> {
-        let TrackerStart {
-            info_hashes,
-            identity,
-            naming,
-            tracker_tiers,
-            force_tracker_interval,
-            trackers_only,
-            ssl,
-        } = start;
+    pub(super) fn start_trackers(
+        self: &Arc<Self>,
+        info_hashes: InfoHashes,
+        trackers: &mut TrackerAsk<'_>,
+        ssl: Option<&Arc<SslTorrent>>,
+        port: &AnnouncePort,
+    ) -> Option<TrackerTask> {
         if self.disable_trackers {
             return None;
         }
+        // The torrent's trackers are looked up and asked over HTTP as its
+        // route names.
+        let naming = &trackers.naming;
         let stats = PeerRxTorrentInfo {
             info_hashes,
             session: Arc::downgrade(self),
             torrent: Default::default(),
         };
-        let task = TrackerComms::start_with_tiers(
-            info_hashes,
-            identity.clone(),
-            self.announce_tiers(tracker_tiers, trackers_only),
-            Box::new(stats),
-            force_tracker_interval,
-            match ssl {
-                Some(_) => self.ssl_port.subscribe(),
-                None => self.announce_port.subscribe(),
-            },
-            self.external_ips.tracker_vote(),
-            match ssl {
+        let protocols = TrackerProtocols::new(TrackerNet {
+            http_clients: match ssl {
                 Some(ssl) => Arc::new(SslHttpClients {
                     inner: naming.http_clients.clone(),
                     ssl: ssl.clone(),
                 }),
                 None => naming.http_clients.clone(),
             },
-            self.reachable(),
-            self.udp_tracker_client
+            reachable: self.reachable(),
+            udp_client: self
+                .udp_tracker_client
                 .with_resolver(naming.resolver.clone()),
-            self.stopped_announces.clone(),
-            self.http_announces.clone(),
-            self.allow_idna,
-            self.stats.trackers.clone(),
-        );
+            http_announces: self.http_announces.clone(),
+            allow_idna: self.allow_idna,
+        });
+        let task = TrackerComms::start_with_tiers(TrackerSetup {
+            info_hashes,
+            identity: trackers.identity.clone(),
+            tiers: self.announce_tiers(std::mem::take(&mut trackers.tiers), trackers.private),
+            stats: Box::new(stats),
+            force_interval: trackers.force_interval,
+            listen_port: port.subscribe(),
+            vote: self.external_ips.tracker_vote(),
+            protocols,
+            stopped: self.stopped_announces.clone(),
+            counts: self.stats.trackers.clone(),
+        });
         // The table rings the session's watcher at each change, until the
         // table is gone.
         if let Some(changed) = &self.trackers_changed {
@@ -392,131 +397,20 @@ impl Session {
         Some(task)
     }
 
-    // Get a peer stream from both DHT and trackers, under every hash the
-    // torrent goes by (libtorrent `torrent::dht_announce`, `lsd_announce`
-    // and `announce_with_tracker` each loop over `info_hash_t::for_each`).
-    pub(super) fn make_peer_rx(self: &Arc<Self>, request: PeerRequest<'_>) -> Option<PeerSource> {
-        let PeerRequest {
-            info_hashes,
-            identity,
-            naming,
-            tracker_tiers,
-            announce,
-            force_tracker_interval,
-            initial_peers,
-            trackers_only,
-            discovery,
-            dht_announce,
-            ssl,
-            trackers,
-        } = request;
+    // The peers every finder `discovery` allows names, and the announce
+    // table of the torrent's trackers.
+    pub(super) fn make_peer_rx(
+        self: &Arc<Self>,
+        ask: PeerAsk<'_>,
+        discovery: Discovery,
+    ) -> Option<PeerSource> {
+        let mut ask = ask;
         // An SSL torrent with no identity asks no one for peers.
-        if ssl.is_some_and(|ssl| !ssl.has_identity()) {
+        if ask.ssl.is_some_and(|ssl| !ssl.has_identity()) {
             return None;
         }
-        let discovery_rx =
-            self.discovery_peers(info_hashes, announce, dht_announce, ssl, discovery);
-
-        let (tracker_rx, trackers) = trackers
-            .or_else(|| {
-                self.start_trackers(TrackerStart {
-                    info_hashes,
-                    identity,
-                    naming,
-                    tracker_tiers,
-                    force_tracker_interval,
-                    trackers_only,
-                    ssl,
-                })
-            })
-            .map(|task| (task.peers, task.status))
-            .unzip();
-
-        let initial_peers_rx = if initial_peers.is_empty() {
-            None
-        } else {
-            Some(futures::stream::iter(initial_peers))
-        };
-        // Each peer goes with who named it (libtorrent `torrent::add_peer`'s
-        // `peer_source_flags_t`; a torrent's own peers are `resume_data`).
-        let named = |source| move |addr| (addr, source);
-        merge_two_optional_streams(
-            merge_two_optional_streams(
-                tracker_rx.map(|s| s.map(named(PeerSourceFlag::Tracker))),
-                initial_peers_rx.map(|s| s.map(named(PeerSourceFlag::ResumeData))),
-            ),
-            discovery_rx,
-        )
-        .map(|peers| PeerSource { peers, trackers })
-    }
-
-    // The peers the DHT and local discovery name, under every hash the
-    // torrent goes by, each only where `discovery` looks; None when it
-    // looks at neither the session runs.
-    pub(super) fn discovery_peers(
-        self: &Arc<Self>,
-        info_hashes: InfoHashes,
-        announce: bool,
-        dht_announce: tokio::sync::watch::Receiver<()>,
-        ssl: Option<&Arc<SslTorrent>>,
-        discovery: Discovery,
-    ) -> Option<PeerStream> {
-        // The port the torrent's peers are told to reach it at: an SSL
-        // torrent's is the SSL listener's.
-        let port = || match ssl {
-            Some(_) => self.ssl_port.subscribe(),
-            None => self.announce_port.subscribe(),
-        };
-        let dht_rx = self.dht.as_ref().filter(|_| discovery.dht).map(|dht| {
-            futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                dht_peers(
-                    dht.clone(),
-                    info_hash,
-                    if announce {
-                        port()
-                    } else {
-                        tokio::sync::watch::channel(ToldPorts::default()).1
-                    },
-                    dht_announce.clone(),
-                )
-            }))
-        });
-
-        // Each source starts when the torrent first asks it for peers, which
-        // is once it is checked and running: trackers and the DHT by their
-        // streams, the LSD by registering here (libtorrent
-        // `torrent::start_announcing` runs only after `files_checked`, never
-        // while paused).
-        let lsd_rx = self.lsd.as_ref().filter(|_| discovery.lsd).map(|lsd| {
-            // Local peers are told the port the torrent's listener is
-            // reached at: the one a mapper got on the gateway, else the
-            // listen port, whatever announce port is set, read at each
-            // announce (libtorrent `torrent::lsd_announce`,
-            // torrent.cpp:2980-2983, takes `session_impl::listen_port` or
-            // `ssl_listen_port`, which give the listen socket's
-            // `tcp_external_port`, session_impl.cpp:5776-5805).
-            let port = announce.then(|| {
-                let port = match ssl {
-                    Some(_) => self.ssl_port.clone(),
-                    None => self.announce_port.clone(),
-                };
-                let port: crate::lsd::AnnouncedPort = Arc::new(move || port.external(false));
-                port
-            });
-            futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                let lsd = lsd.clone();
-                let port = port.clone();
-                futures::stream::once(async move { lsd.announce(info_hash, port) })
-                    .flatten()
-                    .boxed()
-            }))
-        });
-
-        let named = |source| move |addr| (addr, source);
-        merge_two_optional_streams(
-            dht_rx.map(|s| s.map(named(PeerSourceFlag::Dht))),
-            lsd_rx.map(|s| s.map(named(PeerSourceFlag::Lsd))),
-        )
+        let (peers, trackers) = peer_finder::run(self, &mut ask, discovery);
+        peers.map(|peers| PeerSource { peers, trackers })
     }
 }
 

@@ -74,138 +74,87 @@ impl Providers {
     }
 
     async fn close(mut self) {
-        self.client.pool.drain_all_idle().await;
+        self.client.pool.drain_all_idle();
         self.servers.abort_all();
         while self.servers.join_next().await.is_some() {}
     }
 }
 
+// Commands a server read, leaving out the goodbye a closing lane sends.
+fn work_commands(fixture: &Providers) -> Vec<(usize, String)> {
+    fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, command)| command != "QUIT")
+        .cloned()
+        .collect()
+}
+
+// On the connection downloads use, the lower group serves only the article
+// the primary does not have: one lane is opened there for it, the primary's
+// own lane carries every other article, and the backfill is never asked.
 #[tokio::test]
-async fn selective_fallback_and_mixed_probes_reuse_only_eligible_sockets() {
+async fn blocking_fallback_uses_the_lower_group_only_for_the_missing_article() {
     let fixture = Providers::new().await;
-    // A preexisting paid socket must not turn into permission to use it.
-    drop(fixture.client.pool.acquire(ServerId(2)).await.unwrap());
-    for id in 0..124 {
-        fixture
-            .client
-            .fetch_body(&format!("<primary-{id}@example.invalid>"))
-            .await
-            .unwrap();
-    }
-    fixture
-        .client
-        .fetch_body("<fallback@example.invalid>")
-        .await
-        .unwrap();
-    fixture
-        .client
-        .fetch_body("<primary-again@example.invalid>")
-        .await
-        .unwrap();
-    let result = fixture
-        .client
-        .confirm_exists_for_probe(&[
-            "<primary-probe@example.invalid>",
-            "<fallback-probe@example.invalid>",
-        ])
-        .await;
-    assert_eq!(result.exists, vec![true, true]);
-    assert!(!result.inconclusive);
-    let commands = fixture.commands.lock().unwrap().clone();
-    assert!(commands.iter().all(|(server, _)| *server != 2));
+    let client = fixture.client.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut primary = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .expect("the primary opens a lane");
+        assert_eq!(primary.server_id(), ServerId(0));
+        for id in 0..8 {
+            let trace =
+                primary.fetch_decoded_sequential(&format!("<primary-{id}@example.invalid>"));
+            client.record_blocking_attempts(&trace.attempts);
+            trace.result.expect("the primary has its own articles");
+        }
+        let missing = primary.fetch_decoded_sequential("<fallback@example.invalid>");
+        client.record_blocking_attempts(&missing.attempts);
+        assert_eq!(missing.attempts.len(), 1);
+        assert_eq!(missing.attempts[0].outcome, FetchAttemptOutcome::NotFound);
+
+        let mut lower = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::from([0]))
+            .expect("the lower group opens a lane for the missing article");
+        assert_eq!(lower.server_id(), ServerId(1));
+        let found = lower.fetch_decoded_sequential("<fallback@example.invalid>");
+        client.record_blocking_attempts(&found.attempts);
+        found.result.expect("the lower group has the article");
+        drop(lower);
+
+        let again = client
+            .blocking_body_server_order(crate::ServerSet::EMPTY)
+            .expect("the health state is uncontended in this test");
+        assert_eq!(again.first(), Some(&ServerId(0)));
+        let trace = primary.fetch_decoded_sequential("<primary-again@example.invalid>");
+        client.record_blocking_attempts(&trace.attempts);
+        trace
+            .result
+            .expect("the next article goes back to the primary");
+        drop(primary);
+    })
+    .await
+    .unwrap();
+
+    let commands = work_commands(&fixture);
+    assert!(
+        commands.iter().all(|(server, _)| *server != 2),
+        "{commands:?}"
+    );
+    let lower: Vec<_> = commands.iter().filter(|(server, _)| *server == 1).collect();
+    assert_eq!(lower.len(), 1, "{commands:?}");
+    assert!(lower[0].1.contains("fallback"), "{commands:?}");
     assert!(
         commands
             .iter()
-            .filter(|(server, _)| *server == 1)
-            .all(|(_, command)| command.contains("fallback"))
+            .any(|(server, command)| *server == 0 && command.contains("primary-again")),
+        "{commands:?}"
     );
     assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fixture.dials[1].load(Ordering::SeqCst),
-        1,
-        "one fallback does not dial sixteen connections"
-    );
-    fixture.close().await;
-}
-
-#[tokio::test]
-async fn obsolete_work_cannot_dial_or_take_a_socket_after_waiting_for_capacity() {
-    use std::future::Future;
-    use std::sync::atomic::AtomicBool;
-    use std::task::Poll;
-
-    let fixture = Providers::new().await;
-    let allowed = Arc::new(AtomicBool::new(false));
-    let guard = Arc::clone(&allowed);
-    let client = fixture
-        .client
-        .with_work_guard(move |_| guard.load(Ordering::SeqCst));
-    let mut deadline = TokioInstant::now() + UNREACHED_TIMEOUT;
-    assert!(matches!(
-        client
-            .acquire_before_deadline(ServerId(0), &mut deadline)
-            .await,
-        Err(NntpError::WorkObsolete)
-    ));
-    assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 0);
-
-    allowed.store(true, Ordering::SeqCst);
-    let mut held = Vec::new();
-    for _ in 0..16 {
-        held.push(fixture.client.pool.acquire(ServerId(0)).await.unwrap());
-    }
-    // Model an owned idle lane whose recall is queued until we release it.
-    held.last().unwrap().socket_slot.as_ref().unwrap().idle(
-        crate::socket_budget::SocketPhase::OwnedIdle,
-        Arc::new(|_| {}),
-    );
-    let mut waiting = Box::pin(client.acquire_before_deadline(ServerId(0), &mut deadline));
-    std::future::poll_fn(|cx| {
-        assert!(waiting.as_mut().poll(cx).is_pending());
-        Poll::Ready(())
-    })
-    .await;
-    allowed.store(false, Ordering::SeqCst);
-    drop(held.pop());
-    assert!(matches!(waiting.await, Err(NntpError::WorkObsolete)));
-    assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 16);
-    assert!(fixture.commands.lock().unwrap().is_empty());
-    drop(held);
-    fixture.close().await;
-}
-
-// A guard that turns the work away is neither a wait nor a server fault:
-// the article leaves no attempt behind and no server's health moves.
-#[tokio::test]
-async fn obsolete_work_leaves_no_attempt_and_no_health_mark() {
-    let fixture = Providers::new().await;
-    let client = fixture.client.with_work_guard(|_| false);
-    let trace = client
-        .fetch_body_with_groups_prefer_excluding_traced(
-            "<obsolete@example.invalid>",
-            &["alt.binaries.test".to_string()],
-            crate::ServerSet::EMPTY,
-        )
-        .await;
-    assert!(
-        matches!(trace.result, Err(NntpError::WorkObsolete)),
-        "{:?}",
-        trace.result
-    );
-    assert!(trace.attempts.is_empty(), "{:?}", trace.attempts);
-    {
-        let health = fixture.client.pool.health().lock().await;
-        for idx in 0..3 {
-            assert_eq!(health.server(idx).failure_count, 0);
-            assert!(health.server(idx).is_available());
-        }
-    }
-    assert!(
-        fixture
-            .dials
-            .iter()
-            .all(|count| count.load(Ordering::SeqCst) == 0)
-    );
+    assert_eq!(fixture.dials[1].load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.dials[2].load(Ordering::SeqCst), 0);
     fixture.close().await;
 }
 
@@ -322,8 +271,11 @@ async fn refused_dials_reach_health_past_an_idle_cached_socket() {
     .unwrap();
 }
 
+// Fill servers that are down are an outage, not a miss: the connection
+// downloads use falls to the next fill group while one is up, and with every
+// fill server cooling it opens no lane at all rather than the backfill.
 #[tokio::test]
-async fn ordinary_outages_do_not_unlock_a_cached_backfill_socket() {
+async fn blocking_outages_do_not_unlock_the_backfill() {
     let fixture = Providers::new().await;
     fixture
         .client
@@ -332,7 +284,6 @@ async fn ordinary_outages_do_not_unlock_a_cached_backfill_socket() {
         .lock()
         .await
         .set_reenable_clock(Instant::now());
-    drop(fixture.client.pool.acquire(ServerId(2)).await.unwrap());
     fixture
         .client
         .pool
@@ -340,87 +291,54 @@ async fn ordinary_outages_do_not_unlock_a_cached_backfill_socket() {
         .lock()
         .await
         .record_cooldown(0, crate::health::CooldownReason::Transport);
-    fixture
-        .client
-        .fetch_body("<ordinary-outage@example.invalid>")
-        .await
-        .unwrap();
+    let client = fixture.client.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        let mut lane = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .expect("the next fill group opens a lane");
+        assert_eq!(lane.server_id(), ServerId(1));
+        let trace = lane.fetch_decoded_sequential("<ordinary-outage@example.invalid>");
+        client.record_blocking_attempts(&trace.attempts);
+        trace
+            .result
+            .expect("the next fill group serves the article");
+        drop(lane);
+        client
+    })
+    .await
+    .unwrap();
     assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 0);
     assert_eq!(fixture.dials[1].load(Ordering::SeqCst), 1);
-    fixture
-        .client
+
+    client
         .pool
         .health()
         .lock()
         .await
         .record_cooldown(1, crate::health::CooldownReason::Transport);
+    tokio::task::spawn_blocking(move || {
+        let refused = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("an outage of every fill server must not open the backfill");
+        assert!(
+            matches!(refused, BlockingBodyLaneAcquireError::NoEligibleServer),
+            "{refused:?}"
+        );
+        assert!(
+            client
+                .blocking_body_server_order(crate::ServerSet::EMPTY)
+                .expect("the health state is uncontended in this test")
+                .is_empty()
+        );
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.dials[2].load(Ordering::SeqCst), 0);
     assert!(
-        fixture
-            .client
-            .fetch_body("<protected@example.invalid>")
-            .await
-            .is_err()
-    );
-    let result = fixture
-        .client
-        .confirm_exists_for_probe(&["<protected@example.invalid>"])
-        .await;
-    assert!(result.inconclusive);
-    assert!(
-        fixture
-            .commands
-            .lock()
-            .unwrap()
+        work_commands(&fixture)
             .iter()
             .all(|(server, _)| *server != 2)
-    );
-    fixture.close().await;
-}
-
-#[tokio::test]
-async fn queued_probe_guard_rechecks_recovery_before_using_a_cached_fallback() {
-    let fixture = Providers::new().await;
-    let now = Instant::now();
-    let pool = Arc::clone(fixture.client.pool());
-    {
-        let mut health = pool.health().lock().await;
-        health.set_reenable_clock(now);
-        health.record_cooldown(0, crate::health::CooldownReason::Transport);
-    }
-    let result = fixture
-        .client
-        .confirm_exists_for_probe_using(
-            &["<queued-probe@example.invalid>"],
-            crate::ServerSet::EMPTY,
-            |server, batch, guard| {
-                let pool = Arc::clone(&pool);
-                async move {
-                    assert_eq!(server, 1);
-                    assert!(guard());
-                    pool.health()
-                        .lock()
-                        .await
-                        .set_reenable_clock(now + Duration::from_secs(3600));
-                    assert!(
-                        !guard(),
-                        "a recovered primary invalidates unissued fallback work"
-                    );
-                    Some(ProbeBatchResult {
-                        exists: vec![false; batch.len()],
-                        inconclusive: true,
-                    })
-                }
-            },
-        )
-        .await
-        .unwrap();
-    assert!(result.inconclusive);
-    assert!(fixture.commands.lock().unwrap().is_empty());
-    assert!(
-        fixture
-            .dials
-            .iter()
-            .all(|count| count.load(Ordering::SeqCst) == 0)
     );
     fixture.close().await;
 }

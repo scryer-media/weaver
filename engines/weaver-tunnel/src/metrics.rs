@@ -90,7 +90,8 @@ impl DialResult {
     pub fn of<T>(result: &Result<T, DialError>) -> Self {
         match result {
             Ok(_) => Self::Success,
-            Err(DialError::Skipped(_)) => Self::Skipped,
+            // Counted as it was before it had a variant of its own.
+            Err(DialError::Skipped(_) | DialError::SessionBudget) => Self::Skipped,
             Err(DialError::AtCapacity(_)) => Self::AtCapacity,
             Err(DialError::Bind(_)) => Self::Bind,
             Err(DialError::Egress(_)) => Self::Egress,
@@ -171,6 +172,12 @@ static DNS_WIRES: [AtomicU64; WireKind::ALL.len()] =
     [const { AtomicU64::new(0) }; WireKind::ALL.len()];
 static DNS_TRUST: [AtomicU64; TrustOutcome::ALL.len()] =
     [const { AtomicU64::new(0) }; TrustOutcome::ALL.len()];
+// Give-backs a tunnel asked of a side over its share, and their bytes; the
+// peers dropped and idle usenet connections retired to answer them.
+static SOCKET_GIVE_BACKS: AtomicU64 = AtomicU64::new(0);
+static SOCKET_GIVE_BACK_BYTES: AtomicU64 = AtomicU64::new(0);
+static SOCKET_PEERS_DROPPED: AtomicU64 = AtomicU64::new(0);
+static SOCKET_IDLE_RETIRED: AtomicU64 = AtomicU64::new(0);
 
 fn rung(index: usize) -> usize {
     index.min(RUNGS - 1)
@@ -249,6 +256,22 @@ pub fn record_revocation() {
     REVOCATIONS.fetch_add(1, Ordering::Relaxed);
 }
 
+// A tunnel asked a side over its share to give `bytes` back.
+pub fn record_socket_give_back(bytes: u64) {
+    SOCKET_GIVE_BACKS.fetch_add(1, Ordering::Relaxed);
+    SOCKET_GIVE_BACK_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+// Torrent peers dropped to give a tunnel's bytes back.
+pub fn record_socket_peers_dropped(peers: u64) {
+    SOCKET_PEERS_DROPPED.fetch_add(peers, Ordering::Relaxed);
+}
+
+// Idle usenet connections retired to give a tunnel's bytes back.
+pub fn record_socket_idle_retired(connections: u64) {
+    SOCKET_IDLE_RETIRED.fetch_add(connections, Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TunnelMetricsSnapshot {
     pub streams: Vec<(TunnelKind, DialResult, u64)>,
@@ -262,6 +285,10 @@ pub struct TunnelMetricsSnapshot {
     pub rung_cooldowns: Vec<u64>,
     pub rung_fallbacks: Vec<u64>,
     pub revocations: u64,
+    pub socket_give_backs: u64,
+    pub socket_give_back_bytes: u64,
+    pub socket_peers_dropped: u64,
+    pub socket_idle_retired: u64,
 }
 
 pub fn snapshot() -> TunnelMetricsSnapshot {
@@ -308,6 +335,10 @@ pub fn snapshot() -> TunnelMetricsSnapshot {
         rung_cooldowns: RUNG_COOLDOWNS.iter().map(load).collect(),
         rung_fallbacks: RUNG_FALLBACKS.iter().map(load).collect(),
         revocations: load(&REVOCATIONS),
+        socket_give_backs: load(&SOCKET_GIVE_BACKS),
+        socket_give_back_bytes: load(&SOCKET_GIVE_BACK_BYTES),
+        socket_peers_dropped: load(&SOCKET_PEERS_DROPPED),
+        socket_idle_retired: load(&SOCKET_IDLE_RETIRED),
     }
 }
 
@@ -347,7 +378,7 @@ mod tests {
         let io = || std::io::Error::other("x");
         let errors = [
             DialError::Skipped("x".into()),
-            DialError::AtCapacity(Vec::new()),
+            DialError::AtCapacity(Default::default()),
             DialError::Bind(io()),
             DialError::Egress(io()),
             DialError::Hop {

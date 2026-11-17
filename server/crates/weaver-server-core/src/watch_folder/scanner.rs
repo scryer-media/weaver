@@ -13,9 +13,9 @@ use tokio::sync::Mutex;
 use crate::categories::CategoryConfig;
 use crate::ingest::{SubmissionOptions, SubmitNzbError, classify, submit_nzb_bytes_with_options};
 use crate::jobs::SubmissionOrigin;
+use crate::jobs::class::{AddRefusal, ClassIntake, Route, Submission};
 use crate::runtime::fs as runtime_fs;
 use crate::settings::SharedConfig;
-use crate::torrents::service::{AddError, AddRequest, AddSource, TorrentService};
 use crate::{Database, SchedulerHandle};
 use weaver_model::files::{FileRole, archive_base_name};
 
@@ -102,8 +102,6 @@ pub struct WatchFolderScanner {
     db: Database,
     handle: SchedulerHandle,
     config: SharedConfig,
-    // The torrent client the torrents found here go to, once it runs.
-    torrents: Arc<std::sync::OnceLock<TorrentService>>,
     scan_lock: Arc<Mutex<()>>,
     transient_tracker: Arc<Mutex<TransientTracker>>,
 }
@@ -114,15 +112,9 @@ impl WatchFolderScanner {
             db,
             handle,
             config,
-            torrents: Arc::default(),
             scan_lock: Arc::new(Mutex::new(())),
             transient_tracker: Arc::new(Mutex::new(TransientTracker::default())),
         }
-    }
-
-    /// Send the torrents found from now on to `torrents`.
-    pub fn use_torrents(&self, torrents: TorrentService) {
-        let _ = self.torrents.set(torrents);
     }
 
     pub async fn scan_once(
@@ -281,9 +273,18 @@ impl WatchFolderScanner {
             report.push_permanent(&source_path, reason);
         }
         for entry in intake_output.nzbs {
-            let added = match classify(&entry.bytes).torrent(entry.bytes) {
-                Ok(source) => self.add_torrent(source, candidate.category.clone()).await,
-                Err(bytes) => self.submit_nzb(&bytes, &entry.filename, &candidate).await,
+            let kind = classify(&entry.bytes);
+            let added = match self.handle.state().classes().route(&kind) {
+                Ok(Route::Class(intake)) => {
+                    let mut submission = Submission::of(kind, entry.bytes);
+                    submission.category = candidate.category.clone();
+                    add_to_class(intake, submission).await
+                }
+                Ok(Route::Pipeline) => {
+                    self.submit_nzb(&entry.bytes, &entry.filename, &candidate)
+                        .await
+                }
+                Err(refusal) => refused(refusal),
             };
             match added {
                 Added::Queued(job_id) => {
@@ -357,37 +358,6 @@ impl WatchFolderScanner {
             Ok(job) => Added::Queued(job.job_id.0),
             Err(error) if is_permanent_submit_error(&error) => Added::Permanent(error.to_string()),
             Err(error) => Added::Transient(error.to_string()),
-        }
-    }
-
-    // A torrent goes to the torrent client with the folder's category, whose
-    // route it takes. A refusal that a change of route or settings can lift
-    // is tried again.
-    async fn add_torrent(&self, source: AddSource, category: Option<String>) -> Added {
-        let Some(torrents) = self.torrents.get() else {
-            return Added::Transient("the torrent client is not running".into());
-        };
-        let request = AddRequest {
-            source,
-            category,
-            policy_override: None,
-            paused: false,
-            forced: false,
-            unpack: None,
-            metadata: Vec::new(),
-            upload_limit: None,
-            download_limit: None,
-            placement: Default::default(),
-            tags: Vec::new(),
-        };
-        match torrents.add(request).await {
-            Ok(job_id) => Added::Queued(job_id.0),
-            Err(error @ (AddError::Invalid(_) | AddError::Refused(_) | AddError::Duplicate(_))) => {
-                Added::Permanent(error.to_string())
-            }
-            Err(error @ (AddError::NoNetwork(_) | AddError::Off | AddError::State(_))) => {
-                Added::Transient(error.to_string())
-            }
         }
     }
 
@@ -638,6 +608,26 @@ async fn await_stable_candidates(
 
 fn fingerprint_all(paths: &[PathBuf]) -> std::io::Result<Vec<FileFingerprint>> {
     paths.iter().map(|path| fingerprint(path)).collect()
+}
+
+// An entry another class takes goes to it with the folder's category, whose
+// route it takes. A refusal that a change of route or settings can lift is
+// tried again.
+async fn add_to_class(intake: &dyn ClassIntake, submission: Submission) -> Added {
+    match intake.add(submission).await {
+        Ok(job_id) => Added::Queued(job_id.0),
+        Err(refusal) => refused(refusal),
+    }
+}
+
+// A class's refusal, the registry's or the class's own: tried again when a
+// change of route or settings can lift it.
+fn refused(refusal: AddRefusal) -> Added {
+    if refusal.transient() {
+        Added::Transient(refusal.text)
+    } else {
+        Added::Permanent(refusal.text)
+    }
 }
 
 fn fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
@@ -1314,8 +1304,9 @@ mod tests {
 
     mod torrents {
         use super::*;
+        use crate::clock::SystemClock;
         use crate::settings::Config;
-        use crate::torrents::service::{JobEnv, SystemClock, TorrentSettings};
+        use crate::torrents::service::{JobEnv, TorrentService, TorrentSettings};
         use crate::torrents::sessions::tests::{FakeRoutes, env};
         use crate::torrents::sessions::{Routes, Sessions};
         use crate::{PipelineMetrics, SharedPipelineState};
@@ -1454,7 +1445,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_torrent_file_is_added_with_the_folders_category_and_marked_queued() {
             let rig = rig().await;
-            rig.scanner.use_torrents(rig.torrents.clone());
+            rig.torrents.publish_to(rig.scanner.handle.clone());
             let source = rig.put("set.torrent", &metainfo("set.bin"));
 
             let report = rig.scan().await;
@@ -1499,7 +1490,7 @@ mod tests {
                 "{report:?}"
             );
 
-            rig.scanner.use_torrents(rig.torrents.clone());
+            rig.torrents.publish_to(rig.scanner.handle.clone());
             rig.routes.set_down(Some("tunnel gone"));
             let report = rig.scan().await;
             assert!(!source.exists(), "{report:?}");

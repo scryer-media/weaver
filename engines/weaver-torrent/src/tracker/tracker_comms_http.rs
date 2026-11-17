@@ -6,13 +6,11 @@
 // Weaver authors from 2026-10-20 onward.
 
 use crate::EncryptionPolicy;
-use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
 use crate::core::net::{
     ClientShape, ClientUse, HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_idna,
     is_public,
 };
-use crate::tracker::ScrapeOk;
 use crate::tracker::shape::AnnounceShape;
 use crate::tracker::tracker_comms::{NotPublic, Reachable, only_reachable};
 use anyhow::Context;
@@ -343,7 +341,7 @@ fn has_tracker_query(query: &str) -> bool {
 /// reach another resource once the server decodes it, as
 /// `/announce%2F..%2Fx`, is refused, and so is a passkey path,
 /// `/<passkey>/announce` or `/announce/<passkey>`. The URL judged is the one
-/// asked, so a scrape, asked at its scrape URL, is never sent to loopback.
+/// asked.
 /// The client picks the address it connects to, so every address must
 /// pass. Only a tracker the operator named reaches it: one that came with
 /// the torrent is never asked at loopback (see [`NamedBy::may_ask`]). An
@@ -454,8 +452,8 @@ fn moved_by_a_public_tracker(endpoint: Option<IpAddr>, addrs: &[IpAddr]) -> bool
     }
 }
 
-/// The body of a tracker's answer to a GET of `tracker`, its announce or
-/// scrape URL, named by `named_by`, with `query` added ahead of the URL's
+/// The body of a tracker's answer to a GET of `tracker`, its announce URL,
+/// named by `named_by`, with `query` added ahead of the URL's
 /// own. The GET is not
 /// sent when the URL's own query already names an announce argument, and
 /// goes only where [`reach`] lets it. A redirect is a GET of where it
@@ -562,50 +560,6 @@ async fn read_body(
         }
         body.extend_from_slice(&chunk);
     }
-}
-
-/// The scrape URL of an announce URL (BEP 48): the last path component's
-/// leading `announce` becomes `scrape`. None when it does not start with
-/// `announce`, as the tracker then offers no scrape.
-pub(crate) fn scrape_url(announce: &url::Url) -> Option<url::Url> {
-    let path = announce.path();
-    let (dir, last) = path.rsplit_once('/')?;
-    let rest = last.strip_prefix("announce")?;
-    let mut url = announce.clone();
-    url.set_path(&format!("{dir}/scrape{rest}"));
-    Some(url)
-}
-
-/// The counts a scrape reply gives for `info_hash`: the `files` entry keyed
-/// by the raw hash (libtorrent `parse_tracker_response` with
-/// `scrape_request`). A count the entry leaves out, or gives below zero, is
-/// None.
-pub(crate) fn parse_scrape(body: &[u8], info_hash: &Id20) -> anyhow::Result<ScrapeOk> {
-    if let Ok((error, _)) = crate::bencode::from_bytes_with_rest::<TrackerError>(body) {
-        anyhow::bail!(
-            "tracker returned failure. Failure reason: {}",
-            error.failure_reason
-        )
-    }
-    let reply = crate::bencode::dyn_from_bytes::<ByteBuf>(body).map_err(|e| e.into_kind())?;
-    let BencodeValue::Dict(reply) = reply else {
-        anyhow::bail!("the scrape reply is not a dictionary")
-    };
-    let Some(BencodeValue::Dict(files)) = reply.get(&b"files"[..]) else {
-        anyhow::bail!("the scrape reply has no files dictionary")
-    };
-    let Some(BencodeValue::Dict(entry)) = files.get(&info_hash.0[..]) else {
-        anyhow::bail!("the scrape reply lists no counts for the torrent")
-    };
-    let count = |key: &[u8]| match entry.get(key) {
-        Some(BencodeValue::Integer(n)) => u32::try_from(*n).ok(),
-        _ => None,
-    };
-    Ok(ScrapeOk {
-        complete: count(b"complete"),
-        incomplete: count(b"incomplete"),
-        downloaded: count(b"downloaded"),
-    })
 }
 
 #[cfg(test)]
@@ -1095,18 +1049,6 @@ mod tests {
         assert_eq!(checked, 13 * 5 * 3 * 2 * 3 * 2 * 2);
     }
 
-    // A scrape escapes the hash as the row's announces do.
-    #[test]
-    fn a_scrape_escapes_as_its_rows_announces() {
-        let id = Id20::new(CAPTURED_HASH);
-        let request = captured_request(&id, &id, EncryptionPolicy::Disabled);
-        for shape in [&AnnounceShape::WEAVER, &qbittorrent::SHAPE] {
-            let announce = request.as_querystring(shape);
-            let scrape = shape.scrape_query(&id);
-            assert!(announce.starts_with(&format!("{scrape}&")), "{scrape}");
-        }
-    }
-
     // The request a tracker reads off the wire for a GET of `tracker` in
     // `shape`, the tracker answering an empty announce, and the port it
     // listened on, which `tracker` names as `PORT`.
@@ -1418,66 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn scrape_url_replaces_the_announce_that_starts_the_last_component() {
-        let scrape = |s: &str| scrape_url(&url::Url::parse(s).unwrap()).map(|u| u.to_string());
-        assert_eq!(
-            scrape("http://t.invalid/announce").as_deref(),
-            Some("http://t.invalid/scrape")
-        );
-        assert_eq!(
-            scrape("https://t.invalid/x/announce.php?passkey=k").as_deref(),
-            Some("https://t.invalid/x/scrape.php?passkey=k")
-        );
-        // Not the last component, or not at its start: no scrape.
-        assert_eq!(scrape("http://t.invalid/announce/x"), None);
-        assert_eq!(scrape("http://t.invalid/x_announce"), None);
-        assert_eq!(scrape("http://announce.invalid/a"), None);
-        assert_eq!(scrape("http://t.invalid/"), None);
-    }
-
-    #[test]
-    fn scrape_reply_gives_the_torrents_counts() {
-        let hash = Id20::new([1; 20]);
-        let reply = |entry: &str| {
-            let mut b = b"d5:filesd20:".to_vec();
-            b.extend_from_slice(&hash.0);
-            b.extend_from_slice(entry.as_bytes());
-            b.extend_from_slice(b"ee");
-            b
-        };
-        let counts = parse_scrape(
-            &reply("d8:completei4e10:downloadedi9e10:incompletei6ee"),
-            &hash,
-        )
-        .unwrap();
-        assert_eq!(
-            counts,
-            ScrapeOk {
-                complete: Some(4),
-                incomplete: Some(6),
-                downloaded: Some(9),
-            }
-        );
-
-        // A count left out, or below zero, is not given.
-        let counts = parse_scrape(&reply("d8:completei-1e10:incompletei2ee"), &hash).unwrap();
-        assert_eq!(
-            counts,
-            ScrapeOk {
-                complete: None,
-                incomplete: Some(2),
-                downloaded: None,
-            }
-        );
-
-        // Another torrent's counts, no files, or a failure are no answer.
-        assert!(parse_scrape(&reply("de"), &Id20::new([2; 20])).is_err());
-        assert!(parse_scrape(b"d8:intervali1800ee", &hash).is_err());
-        let e = parse_scrape(b"d14:failure reason4:nopee", &hash).unwrap_err();
-        assert!(format!("{e:#}").contains("nope"), "{e:#}");
-    }
-
-    #[test]
     fn a_query_naming_an_announce_argument_is_one_a_tracker_url_may_not_carry() {
         // libtorrent has_tracker_query_string: the names, ignoring case.
         for q in [
@@ -1525,8 +1407,7 @@ mod tests {
                 "http://h/announce\\x",
                 "http://h/admin",
                 "http://h/",
-                // A scrape is asked at the scrape URL, which never starts
-                // `/announce`.
+                // A scrape path never starts `/announce`.
                 "http://h/scrape",
                 "http://h/scrape.php",
                 "http://h/abcd/scrape",

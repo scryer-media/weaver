@@ -17,6 +17,7 @@ use crate::runtime::system_profile::{FilesystemType, StorageClass};
 pub(crate) mod holes;
 mod storage_kind;
 pub(crate) mod volume;
+pub(crate) mod volume_buffers;
 pub(crate) mod volume_label;
 mod volume_probe;
 pub(crate) mod volume_rate;
@@ -24,9 +25,13 @@ mod volume_view;
 mod volumes;
 pub(crate) mod writer;
 
+#[cfg(target_vendor = "apple")]
+pub(crate) use storage_kind::filesystem_name;
 pub(crate) use storage_kind::{StorageKind, storage_kind};
+pub use volume_buffers::VolumeBuffers;
 #[allow(unused_imports)]
 pub(crate) use volume_probe::{ProbeStore, probe_once};
+pub use writer::VolumeWriters;
 
 // Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]
@@ -1328,8 +1333,9 @@ fn on_demand_wait() -> Duration {
 // [`ON_DEMAND_TIMEOUT`]. These readings have no ledger and take no part in
 // admission, the reserve or the hold.
 //
-// A path's storage class and filesystem, which only diagnostics asks, are
-// read by a look of their own, held and shared the same way.
+// A path's storage class and filesystem, which diagnostics ask and start-up
+// hands over when its own look did not answer in time, are read by a look
+// of their own, held and shared the same way.
 //
 // At most [`PATH_CACHE_MAX`] paths are held. A new path past that drops
 // the one asked after longest ago that has no look out; a path with a look
@@ -1596,14 +1602,21 @@ fn spawn_look(
 
 // Start one look at `path`'s storage class and filesystem on the blocking
 // pool, stored and handed out as [`spawn_look`] does.
-fn spawn_class_look(clock: Arc<Clock>, path: PathBuf, cache: Arc<Mutex<PathCache>>) -> ClassWatch {
+fn spawn_class_look(
+    clock: Arc<Clock>,
+    path: PathBuf,
+    cache: Option<Arc<Mutex<PathCache>>>,
+    classify: SharedClassifyFn,
+) -> ClassWatch {
     let (sender, receiver) = tokio::sync::watch::channel(None);
     drop(tokio::task::spawn_blocking(move || {
         let class = Arc::new(ClassLook {
-            class: read_classification(&path),
+            class: classify(&path),
             at: clock.now(),
         });
-        if let Some(entry) = lock_paths(&cache).entries.get_mut(&path) {
+        if let Some(cache) = &cache
+            && let Some(entry) = lock_paths(cache).entries.get_mut(&path)
+        {
             entry.class = Some(Arc::clone(&class));
             entry.class_flight = None;
         }
@@ -1959,7 +1972,13 @@ pub struct StorageCapacity {
     // How long an on-demand look may take (`ON_DEMAND_TIMEOUT`, unless a
     // test pipeline set it).
     on_demand_timeout_nanos: AtomicU64,
+    // Reads a path's storage class and filesystem for a class look.
+    classify: SharedClassifyFn,
 }
+
+// What a class look reads: [`read_classification`], unless a test stands
+// in for it.
+type SharedClassifyFn = Arc<dyn Fn(&Path) -> Classification + Send + Sync>;
 
 impl fmt::Debug for StorageCapacity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2101,6 +2120,7 @@ impl StorageCapacity {
             root_looks: Arc::default(),
             volume_rates: Arc::default(),
             on_demand_timeout_nanos: AtomicU64::new(on_demand_wait().as_nanos() as u64),
+            classify: Arc::new(read_classification),
         }
     }
 
@@ -2113,6 +2133,13 @@ impl StorageCapacity {
     // torrents alike, until their steps end.
     pub(crate) fn promises(&self) -> &super::room_wait::RoomPromises {
         &self.promises
+    }
+
+    // This owner, with its class looks read by `classify` instead.
+    #[cfg(test)]
+    fn with_classify(mut self, classify: SharedClassifyFn) -> Self {
+        self.classify = classify;
+        self
     }
 
     // How long `spaces` waits for this owner's looks.
@@ -2411,50 +2438,199 @@ impl StorageCapacity {
     // The storage class and filesystem of each path, in the order asked: a
     // current classification, or one made now, all made together. A path
     // whose look does not return within [`ON_DEMAND_TIMEOUT`], or is lost,
-    // answers `None`, and the others still answer.
-    pub async fn classifications(&self, paths: &[PathBuf]) -> Vec<Option<Classification>> {
-        let deadline = tokio::time::Instant::now() + self.on_demand_timeout();
+    // answers `None`, and the others still answer. Without an owner each path
+    // gets a look of its own that nothing keeps.
+    pub async fn classifications(
+        storage: Option<&Self>,
+        paths: &[PathBuf],
+    ) -> Vec<Option<Classification>> {
+        let deadline = tokio::time::Instant::now()
+            + storage.map_or_else(on_demand_wait, StorageCapacity::on_demand_timeout);
         let tickets: Vec<Result<Arc<ClassLook>, ClassWatch>> = paths
             .iter()
             .map(|path| {
-                let mut cache = lock_paths(&self.paths);
-                let entry = Self::entry(&mut cache, path);
-                if let Some(look) = &entry.class
-                    && !look.failed()
-                    && self.clock.age(look.at) < self.interval
-                {
-                    return Ok(Arc::clone(look));
-                }
-                if let Some(flight) = &entry.class_flight
-                    && flight.has_changed().is_ok()
-                {
-                    return Err(flight.clone());
-                }
-                let flight = spawn_class_look(
-                    Arc::clone(&self.clock),
-                    path.clone(),
-                    Arc::clone(&self.paths),
-                );
-                entry.class_flight = Some(flight.clone());
-                Err(flight)
+                let Some(storage) = storage else {
+                    return Err(spawn_class_look(
+                        Arc::new(Clock::new()),
+                        path.clone(),
+                        None,
+                        Arc::new(read_classification),
+                    ));
+                };
+                storage.class_ticket(path)
             })
             .collect();
-        let mut answers = Vec::with_capacity(tickets.len());
-        for ticket in tickets {
-            answers.push(match ticket {
-                Ok(look) => Some(look.class.clone()),
-                Err(mut flight) => {
-                    match tokio::time::timeout_at(deadline, flight.wait_for(Option::is_some)).await
-                    {
-                        Ok(Ok(look)) => look.as_ref().map(|look| look.class.clone()),
-                        Ok(Err(_)) | Err(_) => None,
-                    }
-                }
-            });
-        }
-        answers
+        settle_classes(tickets, deadline).await
     }
 
+    // One ask of `path`'s class of this owner: a current classification
+    // that read something, else the look out for it, else a new one. Never
+    // waits.
+    fn class_ticket(&self, path: &Path) -> Result<Arc<ClassLook>, ClassWatch> {
+        let mut cache = lock_paths(&self.paths);
+        let entry = Self::entry(&mut cache, path);
+        if let Some(look) = &entry.class
+            && !look.failed()
+            && self.clock.age(look.at) < self.interval
+        {
+            return Ok(Arc::clone(look));
+        }
+        if let Some(flight) = &entry.class_flight
+            && flight.has_changed().is_ok()
+        {
+            return Err(flight.clone());
+        }
+        let flight = spawn_class_look(
+            Arc::clone(&self.clock),
+            path.to_path_buf(),
+            Some(Arc::clone(&self.paths)),
+            Arc::clone(&self.classify),
+        );
+        entry.class_flight = Some(flight.clone());
+        Err(flight)
+    }
+
+    // The storage class and filesystem of `path`, asked at start-up before
+    // any owner exists: one look of its own, waited for
+    // [`ON_DEMAND_TIMEOUT`] at most. A look that read nothing, was lost or
+    // had not returned by then is handed back late, holding the look still
+    // out, for [`LateClassification::settle`] once the owner exists.
+    pub async fn startup_classification(
+        path: PathBuf,
+    ) -> Result<Classification, LateClassification> {
+        let flight = spawn_class_look(
+            Arc::new(Clock::new()),
+            path.clone(),
+            None,
+            Arc::new(read_classification),
+        );
+        settle_startup(path, flight, tokio::time::Instant::now() + on_demand_wait()).await
+    }
+
+    // Share the start-up look still out for `path` with this owner's own
+    // asks, unless one of its own is already out.
+    fn adopt_class_flight(&self, path: &Path, flight: &ClassWatch) {
+        let mut cache = lock_paths(&self.paths);
+        let entry = Self::entry(&mut cache, path);
+        if !entry
+            .class_flight
+            .as_ref()
+            .is_some_and(|out| out.has_changed().is_ok())
+        {
+            entry.class_flight = Some(flight.clone());
+        }
+    }
+
+    // Keep `look`, made without this owner, as its answer for `path`.
+    fn keep_class(&self, path: &Path, look: &Arc<ClassLook>) {
+        let mut cache = lock_paths(&self.paths);
+        let entry = Self::entry(&mut cache, path);
+        entry.class = Some(Arc::clone(look));
+        if entry
+            .class_flight
+            .as_ref()
+            .is_some_and(|out| out.has_changed().is_err())
+        {
+            entry.class_flight = None;
+        }
+    }
+}
+
+// A start-up classification that came back without an answer: the path,
+// and the look still out for it, if one is.
+#[derive(Debug)]
+pub struct LateClassification {
+    path: PathBuf,
+    flight: Option<ClassWatch>,
+}
+
+impl LateClassification {
+    // The answer start-up did not get, once there is one. The start-up
+    // look still out is shared with `owner` at once, so the path is never
+    // looked at twice together, and its answer is taken the moment it
+    // returns: no timer runs while a look is out. Only a look that ends
+    // without reading anything is followed by another, one of the owner's,
+    // an interval of the owner's later, until one reads something. The
+    // owner keeps the answer, and nothing more is asked once it is held.
+    pub fn settle(
+        self,
+        owner: Arc<StorageCapacity>,
+    ) -> impl std::future::Future<Output = Classification> + Send + 'static {
+        let Self { path, mut flight } = self;
+        if let Some(flight) = &flight {
+            owner.adopt_class_flight(&path, flight);
+        }
+        async move {
+            loop {
+                let ticket = match flight.take() {
+                    Some(flight) => Err(flight),
+                    None => owner.class_ticket(&path),
+                };
+                let look = match ticket {
+                    Ok(look) => Some(look),
+                    Err(mut flight) => flight
+                        .wait_for(Option::is_some)
+                        .await
+                        .ok()
+                        .and_then(|look| look.as_ref().map(Arc::clone)),
+                };
+                if let Some(look) = look
+                    && !look.failed()
+                {
+                    owner.keep_class(&path, &look);
+                    return look.class.clone();
+                }
+                tokio::time::sleep(owner.interval).await;
+            }
+        }
+    }
+}
+
+// What the start-up look answers by `deadline`: its class when it read
+// something, else the classification handed back late.
+async fn settle_startup(
+    path: PathBuf,
+    mut flight: ClassWatch,
+    deadline: tokio::time::Instant,
+) -> Result<Classification, LateClassification> {
+    let answered = match tokio::time::timeout_at(deadline, flight.wait_for(Option::is_some)).await {
+        Ok(Ok(look)) => Some(look.as_ref().map(Arc::clone)),
+        Ok(Err(_)) => Some(None),
+        Err(_) => None,
+    };
+    match answered {
+        Some(Some(look)) if !look.failed() => Ok(look.class.clone()),
+        Some(_) => Err(LateClassification { path, flight: None }),
+        None => Err(LateClassification {
+            path,
+            flight: Some(flight),
+        }),
+    }
+}
+
+// What each classification ticket answers by `deadline`: a held look's
+// class, or its look's once it returns; `None` for a look that is lost or
+// has not returned by then.
+async fn settle_classes(
+    tickets: Vec<Result<Arc<ClassLook>, ClassWatch>>,
+    deadline: tokio::time::Instant,
+) -> Vec<Option<Classification>> {
+    let mut answers = Vec::with_capacity(tickets.len());
+    for ticket in tickets {
+        answers.push(match ticket {
+            Ok(look) => Some(look.class.clone()),
+            Err(mut flight) => {
+                match tokio::time::timeout_at(deadline, flight.wait_for(Option::is_some)).await {
+                    Ok(Ok(look)) => look.as_ref().map(|look| look.class.clone()),
+                    Ok(Err(_)) | Err(_) => None,
+                }
+            }
+        });
+    }
+    answers
+}
+
+impl StorageCapacity {
     // The kind of storage `path` lies on, as the owner holds it: a root's,
     // read once after each retarget, or a folder's, from its latest look.
     // Unknown when neither is held. Never looks.
@@ -2536,6 +2712,13 @@ impl StorageCapacity {
                 .wait_while(state, |state| state.path != path || !state.probed)
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
+    }
+
+    // Block until the pipeline told `folder` as a configured folder and its
+    // device was read: that read looks at the disk off the samplers.
+    #[cfg(feature = "test-support")]
+    pub fn wait_for_folder_read_for_test(&self, folder: &Path) {
+        self.volumes.wait_folder_read(folder);
     }
 
     // Rung when a root that someone waits on for room has a new reading.
@@ -4208,16 +4391,191 @@ mod tests {
             && direct.1 == FilesystemType::Unknown(String::new()));
         let looks = DISK_LOOKS.load(Ordering::Relaxed);
         assert_eq!(
-            storage.classifications(&paths).await,
+            StorageCapacity::classifications(Some(&storage), &paths).await,
             vec![Some(direct.clone())]
         );
         assert_eq!(DISK_LOOKS.load(Ordering::Relaxed), looks + 1);
-        assert_eq!(storage.classifications(&paths).await, vec![Some(direct)]);
+        assert_eq!(
+            StorageCapacity::classifications(Some(&storage), &paths).await,
+            vec![Some(direct)]
+        );
         assert_eq!(
             DISK_LOOKS.load(Ordering::Relaxed),
             looks + if kept { 1 } else { 2 },
             "a current classification is not read again"
         );
+    }
+
+    // Without an owner, as at start-up, each ask is a look of its own that
+    // reads what a direct read finds, and nothing keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn a_classification_without_an_owner_is_a_look_nothing_keeps() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = [dir.path().to_path_buf()];
+        let direct = crate::runtime::system_probe::classify_storage(dir.path());
+        let looks = DISK_LOOKS.load(Ordering::Relaxed);
+        for asked in 1..=2 {
+            assert_eq!(
+                StorageCapacity::classifications(None, &paths).await,
+                vec![Some(direct.clone())]
+            );
+            assert_eq!(DISK_LOOKS.load(Ordering::Relaxed), looks + asked);
+        }
+    }
+
+    // A look that has not returned by the deadline answers `None`, and does
+    // not hold the asker past it; the other paths still answer. The look
+    // stays out: its sender is held for the whole test.
+    #[tokio::test(start_paused = true)]
+    async fn a_classification_look_that_never_returns_answers_none_at_the_deadline() {
+        let (_still_out, never) = tokio::sync::watch::channel(None);
+        let held = Arc::new(ClassLook {
+            class: (StorageClass::Ssd, FilesystemType::Apfs),
+            at: Instant::now(),
+        });
+        let deadline = tokio::time::Instant::now() + on_demand_wait();
+        assert_eq!(
+            settle_classes(vec![Err(never), Ok(held)], deadline).await,
+            vec![None, Some((StorageClass::Ssd, FilesystemType::Apfs))]
+        );
+    }
+
+    // A classifier for the owner that counts its looks and answers, in
+    // turn, what it is given; its last answer once they run out.
+    fn counted_classify(answers: Vec<Classification>) -> (SharedClassifyFn, Arc<AtomicU64>) {
+        let looks = Arc::new(AtomicU64::new(0));
+        let classify: SharedClassifyFn = {
+            let looks = Arc::clone(&looks);
+            Arc::new(move |_: &Path| {
+                let at = looks.fetch_add(1, Ordering::Relaxed) as usize;
+                answers[at.min(answers.len() - 1)].clone()
+            })
+        };
+        (classify, looks)
+    }
+
+    fn failed_class() -> Classification {
+        (
+            StorageClass::Unknown,
+            FilesystemType::Unknown(String::new()),
+        )
+    }
+
+    // The start-up look that had not answered by its deadline is the one
+    // whose answer is kept when it comes: the owner makes no look of its
+    // own, an ask of the owner meanwhile waits on that same look, and once
+    // it is held nothing more is asked.
+    #[tokio::test(start_paused = true)]
+    async fn the_late_answer_of_the_start_up_look_is_kept_and_no_other_look_is_made() {
+        let path = PathBuf::from("/data/late");
+        let (out, flight) = tokio::sync::watch::channel(None);
+        let Err(late) = settle_startup(
+            path.clone(),
+            flight,
+            tokio::time::Instant::now() + ON_DEMAND_TIMEOUT,
+        )
+        .await
+        else {
+            panic!("a look that has not answered is late");
+        };
+        assert!(late.flight.is_some(), "the look still out is handed on");
+
+        let interval = Duration::from_secs(5);
+        let (classify, looks) = counted_classify(vec![failed_class()]);
+        let owner = Arc::new(
+            StorageCapacity::with_probe(roots(), interval, Arc::new(probe_disk_space))
+                .with_classify(classify),
+        );
+        let settled = tokio::spawn(late.settle(Arc::clone(&owner)));
+        let Err(mut asked) = owner.class_ticket(&path) else {
+            panic!("nothing is held yet");
+        };
+
+        let answer = (StorageClass::Hdd, FilesystemType::Ext4);
+        out.send_replace(Some(Arc::new(ClassLook {
+            class: answer.clone(),
+            at: owner.clock.now(),
+        })));
+        drop(out);
+        assert_eq!(settled.await.unwrap(), answer);
+        let shared = asked.wait_for(Option::is_some).await.unwrap();
+        assert_eq!(
+            shared.as_ref().map(|look| look.class.clone()),
+            Some(answer.clone()),
+            "an ask meanwhile shares the look out"
+        );
+        drop(shared);
+        assert_eq!(
+            StorageCapacity::classifications(Some(&owner), std::slice::from_ref(&path)).await,
+            vec![Some(answer)],
+            "the owner holds the answer"
+        );
+        tokio::time::advance(interval * 10).await;
+        tokio::task::yield_now().await;
+        assert_eq!(looks.load(Ordering::Relaxed), 0, "no look of the owner's");
+    }
+
+    // A look that read nothing is followed by one of the owner's an
+    // interval later, and so on until one reads something; that answer is
+    // kept and nothing more is asked.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_look_is_asked_again_an_interval_later_until_it_reads_something() {
+        let path = PathBuf::from("/data/failed");
+        let (out, flight) = tokio::sync::watch::channel(None);
+        out.send_replace(Some(Arc::new(ClassLook {
+            class: failed_class(),
+            at: Instant::now(),
+        })));
+        drop(out);
+        let Err(late) = settle_startup(path.clone(), flight, tokio::time::Instant::now()).await
+        else {
+            panic!("a look that read nothing is late");
+        };
+        assert!(late.flight.is_none(), "a finished look is not handed on");
+
+        let interval = Duration::from_secs(5);
+        let answer = (StorageClass::Ssd, FilesystemType::Apfs);
+        let (classify, looks) = counted_classify(vec![failed_class(), answer.clone()]);
+        let owner = Arc::new(
+            StorageCapacity::with_probe(roots(), interval, Arc::new(probe_disk_space))
+                .with_classify(classify),
+        );
+        let started = tokio::time::Instant::now();
+        assert_eq!(late.settle(Arc::clone(&owner)).await, answer);
+        assert_eq!(
+            looks.load(Ordering::Relaxed),
+            2,
+            "one failed look, one more"
+        );
+        assert!(
+            started.elapsed() >= interval,
+            "the second waited an interval"
+        );
+
+        tokio::time::advance(interval * 10).await;
+        tokio::task::yield_now().await;
+        assert_eq!(looks.load(Ordering::Relaxed), 2, "nothing asked once held");
+    }
+
+    // A look whose blocking thread was lost (its sender dropped with no
+    // answer) is asked again by the owner at once, as no look is out.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_start_up_look_is_asked_again_by_the_owner() {
+        let path = PathBuf::from("/data/lost");
+        let (out, flight) = tokio::sync::watch::channel(None);
+        drop(out);
+        let Err(late) = settle_startup(path.clone(), flight, tokio::time::Instant::now()).await
+        else {
+            panic!("a lost look is late");
+        };
+        let answer = (StorageClass::Network, FilesystemType::Nfs);
+        let (classify, looks) = counted_classify(vec![answer.clone()]);
+        let owner = Arc::new(
+            StorageCapacity::with_probe(roots(), NEVER, Arc::new(probe_disk_space))
+                .with_classify(classify),
+        );
+        assert_eq!(late.settle(owner).await, answer);
+        assert_eq!(looks.load(Ordering::Relaxed), 1);
     }
 
     fn known(available_bytes: u64, sampled_at: Instant, stale: bool) -> Capacity {

@@ -814,28 +814,208 @@ pub fn runtime_lanes_from_status_snapshot(
     }
 }
 
-// What a job downloads over.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Protocol {
-    #[default]
-    Nzb,
-    Torrent,
+// The protocols, from one list: the enum, `ALL` in the same order, and the
+// exhaustive `index` every per-protocol entry is read through. A variant is
+// added to the list and nowhere else; `names` then fails to compile until
+// its row is written.
+macro_rules! protocols {
+    ($(#[$meta:meta])* pub enum Protocol { $($(#[$attr:meta])* $variant:ident => $index:literal),+ $(,)? }) => {
+        $(#[$meta])*
+        pub enum Protocol {
+            $($(#[$attr])* $variant),+
+        }
+
+        impl Protocol {
+            /// Every one, in the order their entries are indexed.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+            pub const COUNT: usize = Self::ALL.len();
+
+            /// Where the protocol's entry sits in every per-protocol table.
+            pub const fn index(self) -> usize {
+                match self {
+                    $(Self::$variant => $index),+
+                }
+            }
+        }
+    };
 }
 
+protocols! {
+    // What a job downloads over: its class of job.
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    )]
+    pub enum Protocol {
+        #[default]
+        Nzb => 0,
+        Torrent => 1,
+    }
+}
+
+// Every protocol's index is its place in `ALL`, and `ALL` holds each index
+// once: an index written out of order, twice or past the end fails the build.
+const _: () = {
+    let mut at = 0;
+    while at < Protocol::COUNT {
+        assert!(Protocol::ALL[at].index() == at);
+        at += 1;
+    }
+};
+
+/// Which of some job ids a class still keeps live, read from the database
+/// whether or not the class runs. Blocking: called off the async runtime.
+pub type LiveAmong =
+    fn(&crate::Database, &[JobId]) -> Result<std::collections::BTreeSet<JobId>, crate::StateError>;
+
+/// Every name a class of job goes by, and what an operator's hold over it
+/// does: one row per protocol, read in place of a match at each caller.
+#[derive(Debug)]
+pub struct ClassNames {
+    /// Lower case, stable: stored values, schedule actions, GraphQL.
+    pub key: &'static str,
+    /// What runs the class's jobs, as a refusal names it while it is not
+    /// running.
+    pub runner: &'static str,
+    /// The GraphQL error code of an add the class cannot take because it is
+    /// not running or is turned off.
+    pub disabled_code: &'static str,
+    /// The operator's hold over the class alone, when it has one.
+    pub hold: Option<ClassHold>,
+    /// Which jobs the class keeps live past their history row, whose
+    /// folders are the class's; `None` when a history row is the whole job.
+    pub live: Option<LiveAmong>,
+}
+
+/// An operator's hold over one class, and where it is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassHold {
+    /// What the hold stops of the class's jobs.
+    pub scope: crate::jobs::handle::HoldScope,
+    /// The setting it is kept in across a restart.
+    pub setting: &'static str,
+}
+
+const NZB_CLASS: ClassNames = ClassNames {
+    key: "nzb",
+    runner: "download pipeline",
+    disabled_code: "NZB_DISABLED",
+    hold: None,
+    live: None,
+};
+
+const TORRENT_CLASS: ClassNames = ClassNames {
+    key: "torrent",
+    runner: "torrent client",
+    disabled_code: "TORRENTS_DISABLED",
+    // The operator's pause of the torrents stops them whole, seeding too.
+    hold: Some(ClassHold {
+        scope: crate::jobs::handle::HoldScope::Everything,
+        setting: "torrent_paused",
+    }),
+    live: Some(crate::torrents::live_among),
+};
+
 impl Protocol {
-    pub const fn as_str(self) -> &'static str {
+    pub const fn names(self) -> &'static ClassNames {
         match self {
-            Self::Nzb => "nzb",
-            Self::Torrent => "torrent",
+            Self::Nzb => &NZB_CLASS,
+            Self::Torrent => &TORRENT_CLASS,
         }
     }
 
+    pub const fn as_str(self) -> &'static str {
+        self.names().key
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "nzb" => Some(Self::Nzb),
-            "torrent" => Some(Self::Torrent),
-            _ => None,
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|protocol| protocol.as_str() == value)
+    }
+
+    /// The class a classified payload belongs to; `None` for a URL whose
+    /// bytes are not fetched yet.
+    pub const fn of_kind(kind: &crate::ingest::Kind) -> Option<Self> {
+        use crate::ingest::Kind;
+        match kind {
+            Kind::Nzb => Some(Self::Nzb),
+            Kind::Metainfo | Kind::Magnet(_) => Some(Self::Torrent),
+            Kind::Url(_) => None,
         }
+    }
+
+    /// Which of `job_ids` any class keeps live, as one batched lookup per
+    /// class that keeps them. Blocking: called off the async runtime.
+    pub fn live_among(
+        db: &crate::Database,
+        job_ids: &[JobId],
+    ) -> Result<std::collections::BTreeSet<JobId>, crate::StateError> {
+        let mut live = std::collections::BTreeSet::new();
+        for protocol in Self::ALL {
+            if let Some(among) = protocol.names().live {
+                live.extend(among(db, job_ids)?);
+            }
+        }
+        Ok(live)
+    }
+}
+
+/// A class an operator can hold apart from the rest: only a protocol whose
+/// row has a hold makes one, so no hold can name a class it would not stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeldClass(Protocol);
+
+impl HeldClass {
+    /// The held class of `protocol`, when its row has a hold.
+    pub const fn of(protocol: Protocol) -> Option<Self> {
+        match protocol.names().hold {
+            Some(_) => Some(Self(protocol)),
+            None => None,
+        }
+    }
+
+    /// The held class of `protocol`, for a constant: fails the build when
+    /// its row has no hold.
+    pub const fn must(protocol: Protocol) -> Self {
+        match Self::of(protocol) {
+            Some(class) => class,
+            None => panic!("the protocol has no hold of its own"),
+        }
+    }
+
+    pub const fn protocol(self) -> Protocol {
+        self.0
+    }
+
+    pub const fn hold(self) -> &'static ClassHold {
+        match &self.0.names().hold {
+            Some(hold) => hold,
+            None => unreachable!(),
+        }
+    }
+
+    /// Every class an operator can hold apart, in the table's order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Protocol::ALL.iter().copied().filter_map(Self::of)
+    }
+}
+
+// A held class is stored and sent by its protocol's key; a key that names no
+// class, or a class with no hold, is refused.
+impl Serialize for HeldClass {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for HeldClass {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let key = String::deserialize(deserializer)?;
+        let protocol = Protocol::parse(&key)
+            .ok_or_else(|| serde::de::Error::custom(format!("no class of job is named {key}")))?;
+        Self::of(protocol)
+            .ok_or_else(|| serde::de::Error::custom(format!("the {key} class has no hold")))
     }
 }
 

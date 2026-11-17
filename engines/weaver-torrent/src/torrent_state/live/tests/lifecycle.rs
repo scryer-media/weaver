@@ -60,7 +60,7 @@ impl Harness {
     /// A web seed of the torrent, connected and live with every piece of
     /// the files it serves, the queue of what we send it, and its link,
     /// whose hold keeps the torrent from connecting to the seed itself.
-    fn web_seed(&self) -> (PeerHandler, PeerRx, web_seed::SeedLink) {
+    pub(super) fn web_seed(&self) -> (PeerHandler, PeerRx, web_seed::SeedLink) {
         use crate::core::torrent_metainfo::{WebSeed, WebSeedKind};
 
         let seeds = &self.shared.web_seeds;
@@ -181,10 +181,14 @@ async fn the_web_seed_of_a_single_file_torrent_that_fails_a_piece_is_banned() {
     assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
     assert!(h.banned(&seed));
     assert!(told_to_disconnect(&mut rx));
+    // The ban is the seed's, on this torrent alone: no address is banned
+    // for the session, and none is saved for a restart.
+    assert!(h._session.bad_data_bans.is_empty());
+    assert!(h.peers.resume_peers().banned.is_empty());
+    assert!(h.shared.web_seeds.list().is_empty());
     drop(link);
     let due = h.shared.web_seeds.due(
         tokio::time::Instant::now(),
-        |handle| h.peers.is_banned(handle.ip()),
         |lacks| h.web_layout.bitfield(lacks).any(),
         false,
     );
@@ -286,6 +290,7 @@ async fn saved_peers_and_bans_come_back_as_initial_peers_and_bans() {
         crate::ResumePeers {
             peers: vec![connectable],
             banned: vec![banned.ip()],
+            found: Vec::new(),
         }
     );
 
@@ -348,6 +353,7 @@ async fn a_checked_torrent_keeps_its_peer_list_until_its_state_changes() {
     let saved = crate::ResumePeers {
         peers: vec!["127.0.0.3:6881".parse().unwrap()],
         banned: vec!["127.0.0.4".parse().unwrap()],
+        found: Vec::new(),
     };
     // Every check waits here, so the session's own check of the torrent
     // does not start; the test runs the check itself.

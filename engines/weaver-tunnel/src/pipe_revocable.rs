@@ -149,6 +149,9 @@ impl Dialer for Revocable {
     fn room(&self, purpose: &super::Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
         self.inner.room(purpose)
     }
+    fn wait_room(&self, purpose: &super::Purpose) -> Result<(), super::Capacity> {
+        self.inner.wait_room(purpose)
+    }
     // The leg's datagrams, while it is not revoked.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         if self.is_revoked() {

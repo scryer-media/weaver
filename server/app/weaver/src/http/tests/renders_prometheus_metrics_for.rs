@@ -1488,6 +1488,7 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(r#"weaver_torrent_session_connected_peers{{{ROUTE},transport="utp"}} 2"#),
         format!("weaver_torrent_session_connected_seeders{{{ROUTE}}} 3"),
         format!("weaver_torrent_session_piece_steals_total{{{ROUTE}}} 8"),
+        format!("weaver_torrent_session_peers_dropped_untracked_total{{{ROUTE}}} 9"),
         format!(
             r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="plaintext"}} 50"#
         ),
@@ -1516,12 +1517,6 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
             r#"weaver_torrent_session_tracker_announce_seconds_total{{{ROUTE},kind="udp"}} 30"#
         ),
         format!(r#"weaver_torrent_session_tracker_peers_total{{{ROUTE},kind="udp"}} 73"#),
-        format!(
-            r#"weaver_torrent_session_tracker_scrapes_total{{{ROUTE},kind="http",result="bad_reply"}} 74"#
-        ),
-        format!(
-            r#"weaver_torrent_session_tracker_scrape_seconds_total{{{ROUTE},kind="http"}} 0.25"#
-        ),
         format!(r#"weaver_torrent_dht_queries_sent_total{{{ROUTE},type="get_peers"}} 80"#),
         format!(
             r#"weaver_torrent_dht_query_results_total{{{ROUTE},type="get_peers",result="timeout"}} 81"#
@@ -2192,6 +2187,19 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     assert!(!rendered.contains("member_id=\"12\""));
     assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
     assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
+    assert!(rendered.contains("weaver_network_socket_give_backs_total 2"));
+    assert!(rendered.contains("weaver_network_socket_give_back_bytes_total 4096"));
+    assert!(rendered.contains("weaver_network_socket_peers_dropped_total 5"));
+    assert!(rendered.contains("weaver_network_socket_idle_retired_total 6"));
+    assert!(rendered.contains(
+        "weaver_network_tunnel_socket_bytes{egress_id=\"2\",proxy_id=\"11\",via=\"\"} 125829120"
+    ));
+    assert!(rendered.contains(
+        "weaver_network_tunnel_socket_bytes{egress_id=\"2\",proxy_id=\"13\",via=\"11,12\"} 41943040"
+    ));
+    assert!(rendered.contains(
+        "weaver_network_tunnel_socket_limit_bytes{egress_id=\"2\",proxy_id=\"13\",via=\"11,12\"} 541065216"
+    ));
     assert!(rendered.contains("weaver_egress_upload_bytes_total{egress_id=\"2\"} 4096"));
 }
 

@@ -141,12 +141,12 @@ impl WalkedRow {
     }
 }
 
-/// Where a walked row's report lives: the queue's own rows, or the published
-/// torrents, by index.
+/// Where a walked row's report lives: the queue's own rows, or the rows
+/// another class published, by index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowSource {
     Queue,
-    Torrent(usize),
+    Owned(weaver_server_core::jobs::Protocol, usize),
 }
 
 /// One walk of the queue: a row per job, in queue order.
@@ -201,19 +201,19 @@ impl QueueWalk {
                 )
             })
         };
-        // The torrents fall in among the queue's rows by when each was
-        // added, as the job list orders them.
-        let mut torrents = inner.torrents().iter().enumerate().peekable();
-        let push_torrent = |walk: &mut QueueWalk,
-                            category_index: &mut HashMap<String, u32>,
-                            index: usize,
-                            job: &JobInfo| {
+        // Other classes' rows fall in among the queue's rows by when each
+        // was added, as the job list orders them.
+        let mut owned = inner.owned_rows().peekable();
+        let push_owned = |walk: &mut QueueWalk,
+                          category_index: &mut HashMap<String, u32>,
+                          source: RowSource,
+                          job: &JobInfo| {
             let category = walk.category_of(category_index, job);
             walk.rows.push(WalkedRow {
                 id: job.job_id,
                 state: queue_item_state(QueueStateFacts::of_job(job)),
                 protocol: job.protocol.into(),
-                source: RowSource::Torrent(index),
+                source,
                 priority: QueuePriority::from_metadata(&job.metadata),
                 category,
                 total_bytes: job.total_bytes,
@@ -235,10 +235,11 @@ impl QueueWalk {
         for row in &inner.jobs {
             let view = row.view(&inner.globals);
             let job = view.job();
-            while let Some((index, torrent)) = torrents
-                .next_if(|(_, torrent)| torrent.created_at_epoch_ms < job.created_at_epoch_ms)
-            {
-                push_torrent(&mut walk, &mut category_index, index, torrent);
+            while let Some((protocol, index, owned_job)) = owned.next_if(|(_, _, owned_job)| {
+                owned_job.created_at_epoch_ms < job.created_at_epoch_ms
+            }) {
+                let source = RowSource::Owned(protocol, index);
+                push_owned(&mut walk, &mut category_index, source, owned_job);
             }
             let category = walk.category_of(&mut category_index, job);
             walk.rows.push(WalkedRow {
@@ -265,8 +266,9 @@ impl QueueWalk {
             });
             walk.leading += usize::from(walk.rows.last().is_some_and(WalkedRow::leads));
         }
-        for (index, torrent) in torrents {
-            push_torrent(&mut walk, &mut category_index, index, torrent);
+        for (protocol, index, owned_job) in owned {
+            let source = RowSource::Owned(protocol, index);
+            push_owned(&mut walk, &mut category_index, source, owned_job);
         }
         walk
     }
@@ -973,7 +975,9 @@ impl PageRead {
                 .zip(&plan.sources)
                 .filter_map(|(id, source)| match source {
                     RowSource::Queue => inner.row(*id).map(|row| row.info(&inner.globals)),
-                    RowSource::Torrent(index) => inner.torrents().get(*index).cloned(),
+                    RowSource::Owned(protocol, index) => {
+                        inner.owned(*protocol).get(*index).cloned()
+                    }
                 })
                 .collect();
             PageRead {
@@ -997,7 +1001,7 @@ pub(crate) fn read_listing(
     take: usize,
 ) -> Vec<JobInfo> {
     state.read_queue(|inner| {
-        let mut torrents = inner.torrents().iter().peekable();
+        let mut owned = inner.owned_rows().map(|(_, _, job)| job).peekable();
         let mut listing = Vec::new();
         let mut skipped = 0;
         // Whether a kept row is passed over, copied, or ends the listing.
@@ -1012,11 +1016,8 @@ pub(crate) fn read_listing(
         for row in &inner.jobs {
             let view = row.view(&inner.globals);
             let created_at = view.job().created_at_epoch_ms;
-            while let Some(torrent) =
-                torrents.next_if(|torrent| torrent.created_at_epoch_ms < created_at)
-            {
-                if matches_info_filter_prepared(torrent, filter)
-                    && !keep(&mut listing, &|| torrent.clone())
+            while let Some(job) = owned.next_if(|job| job.created_at_epoch_ms < created_at) {
+                if matches_info_filter_prepared(job, filter) && !keep(&mut listing, &|| job.clone())
                 {
                     return listing;
                 }
@@ -1027,10 +1028,8 @@ pub(crate) fn read_listing(
                 return listing;
             }
         }
-        for torrent in torrents {
-            if matches_info_filter_prepared(torrent, filter)
-                && !keep(&mut listing, &|| torrent.clone())
-            {
+        for job in owned {
+            if matches_info_filter_prepared(job, filter) && !keep(&mut listing, &|| job.clone()) {
                 break;
             }
         }
@@ -1038,13 +1037,13 @@ pub(crate) fn read_listing(
     })
 }
 
-/// Copies one row, found through the position index, or one torrent.
+/// Copies one row, found through the position index, or another class's.
 pub(crate) fn read_row(state: &SharedPipelineState, id: JobId) -> Option<JobInfo> {
     state.read_queue(|inner| {
         inner
             .row(id)
             .map(|row| row.info(&inner.globals))
-            .or_else(|| inner.torrent(id).cloned())
+            .or_else(|| inner.owned_job(id).cloned())
     })
 }
 
@@ -1062,7 +1061,7 @@ pub(crate) fn summary(
             summary.downloaded_bytes += view.job().downloaded_bytes;
             summary.count_state(row_state(&view));
         }
-        for job in inner.torrents() {
+        for (_, _, job) in inner.owned_rows() {
             summary.total_items += 1;
             summary.total_bytes += job.total_bytes;
             summary.downloaded_bytes += job.downloaded_bytes;

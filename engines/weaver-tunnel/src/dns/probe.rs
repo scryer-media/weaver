@@ -114,8 +114,12 @@ impl Carrier for Slotted<'_> {
                 Err(said) => said,
             };
             drop(dialling);
+            // A lookup's socket is the reserve's, which leaves no demand: the
+            // refusal names only the signals.
             let mut named = match stage.failure.into_inner().expect("dns stage failure") {
-                Some(DialError::AtCapacity(freed)) if !freed.is_empty() => freed,
+                Some(DialError::AtCapacity(capacity)) if !capacity.waits.is_empty() => {
+                    capacity.waits
+                }
                 _ => return Err(said),
             };
             // The share's own signal too, when it is full: it can differ

@@ -4,15 +4,19 @@
 // How a RAR set numbers its volumes in their names: `name.part1.rar`,
 // `name.part2.rar`, … counted from one, or the old `name.rar`, `name.r00`,
 // … `name.r99`, then `name.s00` … `name.s99`, `name.t00` and on, a hundred
-// to a letter. Case never matters.
+// to a letter, through `name.z99`, as RAR counts them on. Case never
+// matters. A split zip names its parts `name.z01`, `name.z02`, … too: by
+// name alone a `.zNN` is either, and what tells them apart is the part's
+// front, RAR's signature or the zip's, and which set its stem is. A RAR set
+// is claimed by its signature, so a zip part never joins one.
 
 use std::ops::RangeInclusive;
 
 use crate::engine::SetName;
 
-// The letters the old numbering runs through. It stops before `z`, whose
-// `.zNN` names are a split zip's.
-const OLD_LETTERS: RangeInclusive<u8> = b'r'..=b'y';
+// The letters the old numbering runs through: nine hundred volumes after
+// the `.rar`.
+const OLD_LETTERS: RangeInclusive<u8> = b'r'..=b'z';
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Scheme {
@@ -76,6 +80,7 @@ fn parse_rar_volume(lower: &str) -> Option<u32> {
         let ext = &lower.as_bytes()[lower.len() - 4..];
         if ext[0] == b'.'
             && OLD_LETTERS.contains(&ext[1])
+            && ext[2..].iter().all(u8::is_ascii_digit)
             && let Ok(n) = lower[lower.len() - 2..].parse::<u32>()
         {
             return Some(u32::from(ext[1] - OLD_LETTERS.start()) * 100 + n + 1);
@@ -123,20 +128,23 @@ pub(crate) fn sibling(reference: &str, index: u32) -> Option<String> {
 // The set a recovery volume's name covers, as far as the name alone says:
 // `name.part1.rev` covers the volumes of `name`, and an old-numbered set's
 // `name1.rev` does too, its number written straight after the set's name.
-// Where the set's own name ends in digits the name alone cannot tell, so
-// `covers` settles it against the data volumes' names.
+// RAR 3.0 named them `name5_3_1.rev` (see `old_style`). Where the set's own
+// name ends in digits the name alone cannot tell, so `covers` settles it
+// against the data volumes' names.
 pub(crate) fn recovery_stem(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".rev")?;
-    let stem = match stem.rfind(".part") {
-        Some(at) if stem[at + 5..].parse::<u32>().is_ok() => &stem[..at],
+    let stem = match (old_style(stem), stem.rfind(".part")) {
+        (Some(set), _) => set.strip_suffix(".part").unwrap_or(set),
+        (None, Some(at)) if stem[at + 5..].parse::<u32>().is_ok() => &stem[..at],
         _ => stem.trim_end_matches(|ch: char| ch.is_ascii_digit()),
     };
     (!stem.is_empty()).then(|| stem.to_owned())
 }
 
 // Whether the recovery volume `name` is one of the set called `stem`: the
-// set's name, then `.part` and a number, or the number alone.
+// set's name, then `.part` and a number, or the number alone, or RAR 3.0's
+// three numbers, straight after the name or after an underscore.
 pub(crate) fn recovery_covers(name: &str, stem: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let Some(rest) = lower
@@ -146,7 +154,35 @@ pub(crate) fn recovery_covers(name: &str, stem: &str) -> bool {
         return false;
     };
     let number = rest.strip_prefix(".part").unwrap_or(rest);
-    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    let numbered = !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit());
+    numbered || old_style(number).is_some_and(|before| before.is_empty() || before == "_")
+}
+
+// A RAR 3.0 recovery volume's name ends, before `.rev`, in three numbers:
+// `<data>_<recovery>_<position>`, the set's data volumes, its recovery
+// volumes, and this one's place among them. Each is 1 to 255, with
+// `data + recovery` and `data + position - 1` at most 255, as RAR reads
+// them. The data count is the digits straight before the second-to-last
+// underscore. What comes before those digits is returned: the set's name,
+// with any underscore it ends in. `None` when the name is not of that form.
+fn old_style(stem: &str) -> Option<&str> {
+    let mut parts = stem.rsplitn(3, '_');
+    let position = rev_count(parts.next()?)?;
+    let recovery = rev_count(parts.next()?)?;
+    let head = parts.next()?;
+    let at = head.trim_end_matches(|ch: char| ch.is_ascii_digit()).len();
+    let data = rev_count(&head[at..])?;
+    (data + recovery <= 255 && data + position - 1 <= 255).then(|| &head[..at])
+}
+
+fn rev_count(digits: &str) -> Option<u32> {
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits
+        .parse::<u32>()
+        .ok()
+        .filter(|count| (1..=255).contains(count))
 }
 
 #[cfg(test)]
@@ -162,7 +198,16 @@ mod tests {
         assert_eq!(sibling("a.part01.RAR", 9).as_deref(), Some("a.part10.RAR"));
         assert_eq!(sibling("a.r00", 0).as_deref(), Some("a.rar"));
         assert_eq!(sibling("a.rar", 1).as_deref(), Some("a.r00"));
-        for name in ["a.part3.rar", "a.r05", "a.rar", "a.r99", "a.s00", "a.y99"] {
+        for name in [
+            "a.part3.rar",
+            "a.r05",
+            "a.rar",
+            "a.r99",
+            "a.s00",
+            "a.y99",
+            "a.z00",
+            "a.z99",
+        ] {
             let index = parse(name).unwrap().index();
             assert_eq!(sibling(name, index).as_deref(), Some(name));
         }
@@ -179,6 +224,9 @@ mod tests {
             ("a.s99", 200),
             ("a.t00", 201),
             ("a.y99", 800),
+            ("a.z00", 801),
+            ("a.Z01", 802),
+            ("a.z99", 900),
         ] {
             assert_eq!(parse(name).unwrap().index(), index, "{name}");
             assert_eq!(
@@ -186,9 +234,12 @@ mod tests {
                 Some(name.to_ascii_lowercase().as_str())
             );
         }
-        assert_eq!(sibling("a.rar", 801), None);
-        assert_eq!(parse("a.z01"), None);
+        assert_eq!(sibling("a.rar", 901), None);
         assert_eq!(parse("a.q00"), None);
+        assert_eq!(parse("a.z1"), None);
+        assert_eq!(parse("a.z100"), None);
+        assert_eq!(parse("a.r+1"), None);
+        assert_eq!(parse("a.zip"), None);
         assert!(parse("a.s00").unwrap().same_set(&parse("a.r00").unwrap()));
     }
 
@@ -211,6 +262,79 @@ mod tests {
         assert_eq!(
             parse("archive.part2.rar").unwrap().stem(),
             parse("archive.r00").unwrap().stem()
+        );
+    }
+
+    // RAR 3.0 wrote `<set><data>_<recovery>_<position>.rev`.
+    #[test]
+    fn a_rar_3_0_recovery_volume_names_its_set_by_three_numbers() {
+        assert_eq!(recovery_stem("Arc5_3_1.rev").as_deref(), Some("arc"));
+        assert_eq!(recovery_stem("arc5_3_3.rev").as_deref(), Some("arc"));
+        assert_eq!(recovery_stem("arc_5_3_1.rev").as_deref(), Some("arc_"));
+        assert_eq!(recovery_stem("arc.part5_3_1.rev").as_deref(), Some("arc"));
+        assert!(recovery_covers("Arc5_3_1.rev", "arc"));
+        assert!(recovery_covers("arc_5_3_1.rev", "arc"));
+        assert!(recovery_covers("arc_5_3_1.rev", "arc_"));
+        assert!(recovery_covers("arc.part5_3_1.rev", "arc"));
+        assert!(!recovery_covers("arc5_3_1.rev", "ar"));
+        assert!(!recovery_covers("arc__5_3_1.rev", "arc"));
+        assert!(!recovery_covers("arcx5_3_1.rev", "arc"));
+        assert!(!recovery_covers("arc5_3.rev", "arc"));
+        assert!(!recovery_covers("arc5_3_1_.rev", "arc"));
+    }
+
+    // Each number is 1 to 255, `data + recovery` and `data + position - 1`
+    // at most 255.
+    #[test]
+    fn a_rar_3_0_recovery_name_holds_to_the_limits_rar_reads() {
+        for good in [
+            "a1_1_1.rev",
+            "a250_5_6.rev",
+            "a1_254_255.rev",
+            "a005_3_1.rev",
+        ] {
+            assert!(recovery_covers(good, "a"), "{good}");
+        }
+        for bad in [
+            "a0_3_1.rev",
+            "a5_0_1.rev",
+            "a5_3_0.rev",
+            "a256_1_1.rev",
+            "a200_60_1.rev",
+            "a250_5_7.rev",
+            "a5_3_99999999999.rev",
+        ] {
+            assert!(!recovery_covers(bad, "a"), "{bad}");
+        }
+        // Out of range, the name is no RAR 3.0 one; it is read as the newer
+        // scheme, whose number is the digits at its end.
+        assert_eq!(recovery_stem("a0_3_1.rev").as_deref(), Some("a0_3_"));
+    }
+
+    // A set whose own name ends in digits or underscores keeps them: only
+    // the three numbers are the recovery volume's. Where the digits before
+    // the first number could be the set's, the data volumes' names settle
+    // it, as they do for the newer scheme.
+    #[test]
+    fn a_rar_3_0_recovery_name_takes_nothing_of_the_set_name() {
+        assert!(recovery_covers("show25_3_1.rev", "show2"));
+        assert!(recovery_covers("show25_3_1.rev", "show"));
+        assert!(!recovery_covers("show25_3_1.rev", "show25"));
+        assert!(recovery_covers("show_2019_5_3_1.rev", "show_2019"));
+        assert!(recovery_covers("show_2019_5_3_1.rev", "show_2019_"));
+        assert!(!recovery_covers("show_2019_5_3_1.rev", "show_"));
+        assert_eq!(
+            recovery_stem("show_2019_5_3_1.rev").as_deref(),
+            Some("show_2019_")
+        );
+        assert!(recovery_covers("set__5_3_1.rev", "set_"));
+        assert!(!recovery_covers("set__5_3_1.rev", "set"));
+        // The newer scheme of a set named like the three numbers' tail is
+        // still the newer scheme.
+        assert!(recovery_covers("show_1_20191.rev", "show_1_2019"));
+        assert_eq!(
+            recovery_stem("show_2019_1.rev").as_deref(),
+            Some("show_2019_")
         );
     }
 }

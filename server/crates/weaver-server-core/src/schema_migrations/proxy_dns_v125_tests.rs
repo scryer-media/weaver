@@ -8,7 +8,7 @@ use super::super::{apply_version_range, embedded_catalog, embedded_payload_bytes
 use super::*;
 use crate::migration_assets::MigrationInstallKind;
 
-async fn below_schema_124() -> SqlitePool {
+async fn below_schema_125() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -26,7 +26,7 @@ async fn below_schema_124() -> SqlitePool {
     pool
 }
 
-async fn upgrade_to_124(pool: &SqlitePool) {
+async fn upgrade_to_125(pool: &SqlitePool) {
     apply_version_range(
         pool,
         &embedded_catalog().unwrap(),
@@ -134,8 +134,8 @@ async fn lists(pool: &SqlitePool) -> Vec<(i64, String, Value)> {
         .collect()
 }
 
-// A proxy as a build below 124 saved it.
-fn before_124(name: &str, kind: &str, resolver: &str, dns_servers: &str) -> String {
+// A proxy as a build below 125 saved it.
+fn before_125(name: &str, kind: &str, resolver: &str, dns_servers: &str) -> String {
     format!(
         r#"{{"id":0,"name":"{name}","kind":"{kind}","enabled":true,"host":"proxy.invalid","port":1080,"resolver":"{resolver}","dns_servers":{dns_servers},"tunnel_addresses":[],"peer_public_key":null,"mtu":1420,"keepalive_seconds":null,"timeout_seconds":30,"host_key_fingerprint":null,"revision":3,"natpmp":false,"forwarded_port":null}}"#
     )
@@ -163,12 +163,12 @@ fn plain_list(addresses: &[&str]) -> Value {
 
 #[tokio::test]
 async fn each_distinct_proxy_setting_becomes_one_profile() {
-    let pool = below_schema_124().await;
-    save_proxy(&pool, 1, &before_124("host", "Socks5", "Weaver", "[]")).await;
+    let pool = below_schema_125().await;
+    save_proxy(&pool, 1, &before_125("host", "Socks5", "Weaver", "[]")).await;
     save_proxy(
         &pool,
         2,
-        &before_124(
+        &before_125(
             "listed",
             "Socks5",
             "Weaver",
@@ -180,7 +180,7 @@ async fn each_distinct_proxy_setting_becomes_one_profile() {
     save_proxy(
         &pool,
         3,
-        &before_124(
+        &before_125(
             "listed again",
             "HttpConnect",
             "Weaver",
@@ -188,21 +188,21 @@ async fn each_distinct_proxy_setting_becomes_one_profile() {
         ),
     )
     .await;
-    save_proxy(&pool, 4, &before_124("handed", "Ssh", "Proxy", "[]")).await;
+    save_proxy(&pool, 4, &before_125("handed", "Ssh", "Proxy", "[]")).await;
     save_proxy(
         &pool,
         5,
-        &before_124("carried", "Socks5", "Proxy", r#"["192.0.2.54"]"#),
+        &before_125("carried", "Socks5", "Proxy", r#"["192.0.2.54"]"#),
     )
     .await;
     save_proxy(
         &pool,
         6,
-        &before_124("tunnel", "WireGuard", "Proxy", r#"["10.64.0.1"]"#),
+        &before_125("tunnel", "WireGuard", "Proxy", r#"["10.64.0.1"]"#),
     )
     .await;
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     assert_eq!(
         profiles(&pool).await,
@@ -289,12 +289,12 @@ async fn each_distinct_proxy_setting_becomes_one_profile() {
 
 #[tokio::test]
 async fn a_list_keeps_at_most_ten_servers() {
-    let pool = below_schema_124().await;
+    let pool = below_schema_125().await;
     let servers: Vec<String> = (1..=12).map(|n| format!("\"192.0.2.{n}\"")).collect();
     save_proxy(
         &pool,
         1,
-        &before_124(
+        &before_125(
             "many",
             "Socks5",
             "Weaver",
@@ -303,7 +303,7 @@ async fn a_list_keeps_at_most_ten_servers() {
     )
     .await;
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     let (_, _, stored) = lists(&pool).await.remove(0);
     assert_eq!(stored["servers"].as_array().unwrap().len(), 10);
@@ -312,15 +312,15 @@ async fn a_list_keeps_at_most_ten_servers() {
 
 #[tokio::test]
 async fn a_route_takes_the_profile_of_its_first_legs_proxy() {
-    let pool = below_schema_124().await;
+    let pool = below_schema_125().await;
     save_proxy(
         &pool,
         1,
-        &before_124("listed", "Socks5", "Weaver", r#"["192.0.2.53"]"#),
+        &before_125("listed", "Socks5", "Weaver", r#"["192.0.2.53"]"#),
     )
     .await;
-    save_proxy(&pool, 2, &before_124("handed", "Socks5", "Proxy", "[]")).await;
-    save_proxy(&pool, 3, &before_124("host", "Socks5", "Weaver", "[]")).await;
+    save_proxy(&pool, 2, &before_125("handed", "Socks5", "Proxy", "[]")).await;
+    save_proxy(&pool, 3, &before_125("host", "Socks5", "Weaver", "[]")).await;
     save_pool(&pool, 1, "[2,1]").await;
     save_route(
         &pool,
@@ -378,7 +378,7 @@ async fn a_route_takes_the_profile_of_its_first_legs_proxy() {
     )
     .await;
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     let listed = profile_named(&pool, "listed", "route").await;
     let handed = profile_named(&pool, "handed", "route").await;
@@ -397,14 +397,14 @@ async fn a_route_takes_the_profile_of_its_first_legs_proxy() {
 // goes through a proxy.
 #[tokio::test]
 async fn a_route_with_a_direct_leg_keeps_its_proxys_dns() {
-    let pool = below_schema_124().await;
+    let pool = below_schema_125().await;
     save_proxy(
         &pool,
         1,
-        &before_124("listed", "Socks5", "Weaver", r#"["192.0.2.53"]"#),
+        &before_125("listed", "Socks5", "Weaver", r#"["192.0.2.53"]"#),
     )
     .await;
-    save_proxy(&pool, 2, &before_124("handed", "Socks5", "Proxy", "[]")).await;
+    save_proxy(&pool, 2, &before_125("handed", "Socks5", "Proxy", "[]")).await;
     let direct_then = |id: u32| {
         json!({
             "legs": [
@@ -430,7 +430,7 @@ async fn a_route_with_a_direct_leg_keeps_its_proxys_dns() {
     )
     .await;
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     let listed = profile_named(&pool, "listed", "route").await;
     let handed = profile_named(&pool, "handed", "route").await;
@@ -451,15 +451,15 @@ async fn a_route_with_a_direct_leg_keeps_its_proxys_dns() {
 // was handed is never looked up elsewhere after the upgrade.
 #[tokio::test]
 async fn a_route_with_any_proxy_the_proxy_resolved_for_takes_the_proxy_profile() {
-    let pool = below_schema_124().await;
+    let pool = below_schema_125().await;
     save_proxy(
         &pool,
         1,
-        &before_124("listed", "Socks5", "Weaver", r#"["192.0.2.53"]"#),
+        &before_125("listed", "Socks5", "Weaver", r#"["192.0.2.53"]"#),
     )
     .await;
-    save_proxy(&pool, 2, &before_124("handed", "Socks5", "Proxy", "[]")).await;
-    save_proxy(&pool, 3, &before_124("host", "Socks5", "Weaver", "[]")).await;
+    save_proxy(&pool, 2, &before_125("handed", "Socks5", "Proxy", "[]")).await;
+    save_proxy(&pool, 3, &before_125("host", "Socks5", "Weaver", "[]")).await;
     save_pool(&pool, 1, "[1,2]").await;
     let ladder =
         |rungs: Value| json!({ "kind": "ladder", "rungs": rungs, "directFallback": false });
@@ -499,7 +499,7 @@ async fn a_route_with_any_proxy_the_proxy_resolved_for_takes_the_proxy_profile()
     )
     .await;
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     let handed = profile_named(&pool, "handed", "route").await;
     for consumer in ["server:1", "server:2", "server:3", "server:4"] {
@@ -518,12 +518,12 @@ async fn a_route_with_any_proxy_the_proxy_resolved_for_takes_the_proxy_profile()
 // answered for, so the later proxy's names never move to the host.
 #[tokio::test]
 async fn a_route_whose_later_proxy_listed_servers_takes_that_profile_over_system() {
-    let pool = below_schema_124().await;
-    save_proxy(&pool, 1, &before_124("host", "Socks5", "Weaver", "[]")).await;
+    let pool = below_schema_125().await;
+    save_proxy(&pool, 1, &before_125("host", "Socks5", "Weaver", "[]")).await;
     save_proxy(
         &pool,
         2,
-        &before_124("listed", "Socks5", "Weaver", r#"["192.0.2.53"]"#),
+        &before_125("listed", "Socks5", "Weaver", r#"["192.0.2.53"]"#),
     )
     .await;
     save_route(
@@ -543,7 +543,7 @@ async fn a_route_whose_later_proxy_listed_servers_takes_that_profile_over_system
     )
     .await;
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     let listed: i64 =
         sqlx::query_scalar("SELECT id FROM dns_profiles WHERE who = 'weaver' AND kind = 'route'")
@@ -560,9 +560,9 @@ async fn a_route_whose_later_proxy_listed_servers_takes_that_profile_over_system
 // proxy answers, never System.
 #[tokio::test]
 async fn an_unreadable_proxy_is_left_as_it_was_and_its_routes_hand_names_to_the_proxy() {
-    let pool = below_schema_124().await;
+    let pool = below_schema_125().await;
     save_proxy(&pool, 1, r#"{"resolver":"Elsewhere"}"#).await;
-    save_proxy(&pool, 2, &before_124("host", "Socks5", "Weaver", "[]")).await;
+    save_proxy(&pool, 2, &before_125("host", "Socks5", "Weaver", "[]")).await;
     save_route(
         &pool,
         "server:1",
@@ -577,7 +577,7 @@ async fn an_unreadable_proxy_is_left_as_it_was_and_its_routes_hand_names_to_the_
     )
     .await;
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     assert_eq!(
         saved_proxy(&pool, 1).await,
@@ -602,8 +602,8 @@ async fn an_unreadable_proxy_is_left_as_it_was_and_its_routes_hand_names_to_the_
 // Routes are given their profiles past the bind limit of one statement.
 #[tokio::test]
 async fn routes_past_the_bind_limit_are_all_given_their_profile() {
-    let pool = below_schema_124().await;
-    save_proxy(&pool, 1, &before_124("handed", "Socks5", "Proxy", "[]")).await;
+    let pool = below_schema_125().await;
+    save_proxy(&pool, 1, &before_125("handed", "Socks5", "Proxy", "[]")).await;
     let routes = 2 * crate::persistence::sql_runtime::SQLITE_BATCH_BIND_LIMIT + 3;
     let policy = through(json!({ "kind": "proxy", "id": 1 }), false).to_string();
     let mut tx = pool.begin().await.unwrap();
@@ -617,7 +617,7 @@ async fn routes_past_the_bind_limit_are_all_given_their_profile() {
     }
     tx.commit().await.unwrap();
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     let given: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM proxy_routes WHERE dns_profile_id = 1")
@@ -629,8 +629,8 @@ async fn routes_past_the_bind_limit_are_all_given_their_profile() {
 
 #[tokio::test]
 async fn an_install_with_no_proxy_dns_writes_nothing() {
-    let pool = below_schema_124().await;
-    save_proxy(&pool, 1, &before_124("host", "Socks5", "Weaver", "[]")).await;
+    let pool = below_schema_125().await;
+    save_proxy(&pool, 1, &before_125("host", "Socks5", "Weaver", "[]")).await;
     save_route(
         &pool,
         "server:1",
@@ -638,7 +638,7 @@ async fn an_install_with_no_proxy_dns_writes_nothing() {
     )
     .await;
 
-    upgrade_to_124(&pool).await;
+    upgrade_to_125(&pool).await;
 
     assert!(profiles(&pool).await.is_empty());
     assert!(lists(&pool).await.is_empty());
@@ -652,11 +652,11 @@ async fn an_install_with_no_proxy_dns_writes_nothing() {
 #[tokio::test]
 async fn a_stream_proxy_handed_names_with_servers_listed_keeps_the_hosts_name_profile() {
     for kind in ["Socks5", "HttpConnect", "Http3Connect", "Ssh"] {
-        let pool = below_schema_124().await;
+        let pool = below_schema_125().await;
         save_proxy(
             &pool,
             1,
-            &before_124("carried", kind, "Proxy", r#"["192.0.2.54"]"#),
+            &before_125("carried", kind, "Proxy", r#"["192.0.2.54"]"#),
         )
         .await;
         save_route(
@@ -666,7 +666,7 @@ async fn a_stream_proxy_handed_names_with_servers_listed_keeps_the_hosts_name_pr
         )
         .await;
 
-        upgrade_to_124(&pool).await;
+        upgrade_to_125(&pool).await;
 
         assert_eq!(proxy_name_profile(&pool, 1).await, 0, "{kind}");
         let named: i64 =

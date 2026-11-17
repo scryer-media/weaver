@@ -203,6 +203,9 @@ pub struct ProxyRuntime {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    // A feed was turned away while the routes were changing; the reload's
+    // end wakes the feed poller for it. Set and taken under `routes`.
+    feeds_passed_over: AtomicBool,
     stopped: AtomicBool,
     // Whether feeds and Default outbound may reach private addresses: the
     // one switch, `WEAVER_RSS_ALLOW_PRIVATE_NETWORK`.
@@ -254,37 +257,11 @@ impl ProxyRuntime {
             reloaded: tokio::sync::watch::Sender::new(()),
             #[cfg(test)]
             pause: Mutex::new(None),
+            feeds_passed_over: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             allow_private_network: AtomicBool::new(true),
         });
-        let task = handle.spawn(Self::follow_socket_cap(
-            Arc::downgrade(&runtime),
-            super::follow_wireguard_socket_cap(),
-        ));
-        runtime.network.hold_cap_watch(task);
         Ok(runtime)
-    }
-    // Reload whenever the socket cap moves, so the tunnels are rebuilt to
-    // it and every tunnel's socket shares are budgeted against it. The
-    // reload joins any a save asked for, as every other reload does.
-    async fn follow_socket_cap(
-        runtime: std::sync::Weak<Self>,
-        mut cap: tokio::sync::watch::Receiver<usize>,
-    ) {
-        while cap.changed().await.is_ok() {
-            let Some(runtime) = runtime.upgrade() else {
-                break;
-            };
-            if runtime.network.socket_cap() == *cap.borrow_and_update() {
-                continue;
-            }
-            if let Err(error) = runtime.reload().await {
-                tracing::warn!(
-                    error,
-                    "rebuilding the WireGuard tunnels for a new socket cap failed"
-                );
-            }
-        }
     }
     // Everyone who owns a route, each with its name and how many connections
     // it holds: every server and feed, default outbound, the default torrent
@@ -355,6 +332,25 @@ impl ProxyRuntime {
             .expect("proxy consumers")
             .contains(&consumer)
     }
+    // Whether a feed can be polled now: it is a consumer and the routes are
+    // not mid-reload. A feed turned away by a reload is polled when the
+    // reload ends, through the wake it sends.
+    pub fn feed_routable(&self, consumer: Consumer) -> bool {
+        let _routes = self.routes.lock().expect("proxy routes");
+        if self.changing(consumer) {
+            return false;
+        }
+        self.routes_consumer(consumer)
+    }
+    // Whether the routes are mid-reload, noting a feed turned away for it.
+    // Called with `routes` held, so the reload's end cannot slip between.
+    fn changing(&self, consumer: Consumer) -> bool {
+        let changing = self.updating.load(Ordering::Acquire);
+        if changing && matches!(consumer, Consumer::Rss(_)) {
+            self.feeds_passed_over.store(true, Ordering::Release);
+        }
+        changing
+    }
     pub fn set_allow_private_network(&self, allow: bool) {
         self.allow_private_network.store(allow, Ordering::Release);
     }
@@ -375,8 +371,11 @@ impl ProxyRuntime {
         timeout: Duration,
     ) -> Result<Arc<ConsumerRoute>, String> {
         let mut routes = self.routes.lock().expect("proxy routes");
-        if self.updating.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
-            return Err("proxy runtime is changing or stopped".into());
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("proxy runtime is stopped".into());
+        }
+        if self.changing(consumer) {
+            return Err(ROUTES_CHANGING.into());
         }
         if !self
             .consumers
@@ -440,21 +439,23 @@ impl ProxyRuntime {
         self.run_reloads().await
     }
 
-    // Passes until none is asked for that the last one did not cover.
+    // Passes until none is asked for that the last one did not cover. The
+    // routes read as changing from the first pass until the last ends.
     async fn run_reloads(&self) -> Result<(), String> {
         struct Running<'a>(&'a ProxyRuntime);
         impl Drop for Running<'_> {
             fn drop(&mut self) {
                 self.0.reloads.lock().expect("proxy reloads").running = false;
-                self.0.updating.store(false, Ordering::Release);
                 self.0.reloaded.send_replace(());
             }
         }
         let _running = Running(self);
-        self.updating.store(true, Ordering::Release);
+        // Dropped before `_running`: the routes stop changing, and a feed
+        // turned away meanwhile is woken, before a waiting reload is told.
+        let mut reloading = self.begin_reload()?;
         loop {
             let covered = self.reloads.lock().expect("proxy reloads").asked;
-            let outcome = self.reload_pass().await;
+            let outcome = self.reload_pass(&mut reloading).await;
             let again = {
                 let mut reloads = self.reloads.lock().expect("proxy reloads");
                 reloads.answered = covered;
@@ -468,7 +469,18 @@ impl ProxyRuntime {
         }
     }
 
-    async fn reload_pass(&self) -> Result<(), String> {
+    // Marks the routes as changing until the returned guard drops.
+    pub(crate) fn begin_reload(&self) -> Result<Reloading<'_>, String> {
+        if self.updating.swap(true, Ordering::AcqRel) {
+            return Err("proxy runtime reload already in progress".into());
+        }
+        Ok(Reloading {
+            runtime: self,
+            new_feeds: false,
+        })
+    }
+
+    async fn reload_pass(&self, reloading: &mut Reloading<'_>) -> Result<(), String> {
         let db = self.db.clone();
         let (policies, consumers) = tokio::task::spawn_blocking(move || {
             Ok::<_, crate::StateError>((db.list_proxy_routes()?, Self::load_consumers(&db)?))
@@ -524,12 +536,10 @@ impl ProxyRuntime {
         for route in obsolete {
             route.revoke().await;
         }
+        // The poller skipped these feeds while they had no route; once the
+        // reload ends, poll them through it without waiting a tick.
+        reloading.new_feeds |= new_feeds;
         self.network.reload().await?;
-        if new_feeds {
-            // The poller skipped these feeds while they had no route; now
-            // that one exists, poll them through it without waiting a tick.
-            self.db.wake_rss_scheduler();
-        }
         Ok(())
     }
     pub async fn stop_all(&self) {
@@ -538,6 +548,35 @@ impl ProxyRuntime {
         let routes = std::mem::take(&mut *self.routes.lock().expect("proxy routes"));
         for (_, route) in routes {
             route.revoke().await;
+        }
+    }
+}
+
+// The refusal a consumer meets while the routes are mid-reload. It is a short
+// internal state, not a failure of the consumer: a feed meeting it is left
+// due and polled when the reload ends.
+pub const ROUTES_CHANGING: &str = "proxy routes are changing";
+
+// A reload in progress. Dropping it, on success or error, ends the reload and
+// then wakes the feed poller if a feed was turned away meanwhile or new feeds
+// appeared, so the wake never lands while the routes still refuse.
+pub(crate) struct Reloading<'a> {
+    runtime: &'a ProxyRuntime,
+    new_feeds: bool,
+}
+impl Drop for Reloading<'_> {
+    fn drop(&mut self) {
+        let runtime = self.runtime;
+        let passed_over = {
+            let _routes = runtime
+                .routes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            runtime.updating.store(false, Ordering::Release);
+            runtime.feeds_passed_over.swap(false, Ordering::AcqRel)
+        };
+        if passed_over || self.new_feeds {
+            runtime.db.wake_rss_scheduler();
         }
     }
 }

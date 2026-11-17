@@ -18,6 +18,35 @@ impl Pipeline {
             .or_default() += 1;
     }
 
+    // The exclusions an article carries to the next server once its tries
+    // on `source` are spent on answers to BODY the client has no class for,
+    // or `None` when it stays where it is: the failure is of another kind,
+    // no server is named, the server is already excluded, or no other server
+    // may serve the article (then the spent tries end it).
+    //
+    // The server joins the exclusions as one without the article does, so a
+    // fill server spent this way counts toward opening the backfill tier: it
+    // could not produce the article in its tries, which is what backfill is
+    // for. Constant work per article: one pass over the configured servers.
+    fn next_server_after_spent_tries(
+        &mut self,
+        job_id: JobId,
+        kind: DownloadFailureKind,
+        source: Option<usize>,
+        excludes: weaver_nntp::ServerSet,
+    ) -> Option<weaver_nntp::ServerSet> {
+        if kind != DownloadFailureKind::ContentOrProtocol {
+            return None;
+        }
+        let source = source?;
+        if source >= self.nntp.pool().server_count() || excludes.contains(source) {
+            return None;
+        }
+        let mut next = excludes;
+        next.insert(source);
+        (!self.no_server_can_serve(job_id, next)).then_some(next)
+    }
+
     fn note_infrastructure_retry_scheduled(
         &mut self,
         job_id: JobId,
@@ -499,12 +528,16 @@ impl Pipeline {
         }
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.release_result");
         let stale_generation = result.runtime_generation != self.pool_generation;
+        // The same list the lanes mark a refused lease clean by: none of
+        // these says anything of the server's connection.
         let policy_outcome = matches!(
             &result.data,
             Err(DownloadError::Fetch(failure))
                 if matches!(
                     failure.kind,
-                    DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+                    DownloadFailureKind::ServerQuota
+                        | DownloadFailureKind::Unrequested
+                        | DownloadFailureKind::RouteCapacity
                 )
         );
         if !policy_outcome && !stale_generation {
@@ -627,21 +660,13 @@ impl Pipeline {
     // the volume and become the step's loop credit. The fixture writes it
     // and ends the step with `Self::end_hand_on_for_test`.
     #[cfg(test)]
-    pub(crate) fn begin_hand_on_for_test(
-        &mut self,
-        job_id: JobId,
-        bytes: u64,
-    ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
+    pub(crate) fn begin_hand_on_for_test(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
         self.note_volume_arrived(job_id, bytes);
         self.arm_volume_credit(job_id, bytes)
     }
 
     #[cfg(test)]
-    pub(crate) fn end_hand_on_for_test(
-        &mut self,
-        job_id: JobId,
-        credit: Option<Arc<crate::operations::disk::volume::Volume>>,
-    ) {
+    pub(crate) fn end_hand_on_for_test(&mut self, job_id: JobId, credit: Option<Prepaid>) {
         self.settle_volume_credit(credit);
         if !self
             .pending_released_download_results_by_job
@@ -662,71 +687,78 @@ impl Pipeline {
         else {
             return;
         };
-        self.hold_volume_arrived(job_id, &volume, bytes);
-        volume.charge(bytes);
-    }
-
-    // Hold `bytes` that arrived for the job as counted on `volume`, the
-    // volume its articles are written to, until the loop has handed them
-    // on. The caller counts them on the volume. One map entry per job with
-    // results waiting; nothing is walked. A job whose bytes now count on
-    // another volume than those it holds, its volume having changed while
-    // they waited, moves those it holds there as well: the entry names the
-    // one volume all of them count on, so each volume gives back only what
-    // it counted.
-    pub(in crate::pipeline) fn hold_volume_arrived(
-        &mut self,
-        job_id: JobId,
-        volume: &Arc<crate::operations::disk::volume::Volume>,
-        bytes: u64,
-    ) {
-        let (counted_on, held) = self
-            .volume_arrived_by_job
-            .entry(job_id)
-            .or_insert_with(|| (Arc::clone(volume), 0));
-        let moved = (!Arc::ptr_eq(counted_on, volume))
-            .then(|| (std::mem::replace(counted_on, Arc::clone(volume)), *held));
-        *held = held.saturating_add(bytes);
-        volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
-        if let Some((before, held)) = moved {
-            before.arrived_bytes.fetch_sub(held, Ordering::SeqCst);
-            before.release(held);
-            volume.arrived_bytes.fetch_add(held, Ordering::SeqCst);
-            volume.charge(held);
-            if before.take_wake() {
-                self.volume_room_changed();
-            }
+        if self.hold_volume_arrived(job_id, Reservation::none(volume), bytes, false) {
+            self.volume_room_changed();
         }
     }
 
-    // The loop is about to hand on `bytes` of the job that arrived: they
-    // become the volume's loop credit, which the writes of this step take
-    // first (`Submitter::write`). The volume, for `settle_volume_credit`.
-    fn arm_volume_credit(
+    // Hold `bytes` that arrived for the job as counted on the volume of
+    // `from`, the volume its articles are written to, until the loop has
+    // handed them on. `from` is what of the article's lease is reserved
+    // there, settled here to what arrived; nothing for bytes no lease
+    // reserved, which are counted here. One map entry per job with results
+    // waiting; nothing is walked. A job whose bytes now count on another
+    // volume than those it holds, its volume having changed while they
+    // waited, moves those it holds there as well: the entry names the one
+    // volume all of them count on, so each volume gives back only what it
+    // counted. Whether a wake was taken: on the volume left, and, when
+    // `take` says so, on the volume settled.
+    pub(in crate::pipeline) fn hold_volume_arrived(
         &mut self,
         job_id: JobId,
+        mut from: Reservation,
         bytes: u64,
-    ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
-        let (volume, held) = self.volume_arrived_by_job.get_mut(&job_id)?;
-        let moved = bytes.min(*held);
-        *held -= moved;
-        volume.arrived_bytes.fetch_sub(moved, Ordering::SeqCst);
-        volume.loop_credit.store(moved, Ordering::Relaxed);
-        Some(Arc::clone(volume))
+        take: bool,
+    ) -> bool {
+        let volume = from.volume();
+        let held = self
+            .volume_arrived_by_job
+            .entry(job_id)
+            .or_insert_with(|| Reservation::none(Arc::clone(volume)));
+        let moved = (!Arc::ptr_eq(held.volume(), volume))
+            .then(|| std::mem::replace(held, Reservation::none(Arc::clone(volume))));
+        volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let mut woke = false;
+        if let Some(mut before) = moved {
+            let bytes = before.bytes();
+            before
+                .volume()
+                .arrived_bytes
+                .fetch_sub(bytes, Ordering::SeqCst);
+            before.give_back(bytes);
+            volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
+            held.count(bytes);
+            woke = self.volume_writers.take_wake(before.volume());
+        }
+        let of = from.bytes();
+        from.settle(of, bytes);
+        if take {
+            woke |= self.volume_writers.take_wake(from.volume());
+        }
+        held.join(from);
+        woke
     }
 
-    // The step is done: what of the credit its writes did not take no
+    // The loop is about to hand on `bytes` of the job that arrived: they
+    // are prepaid for the writes of this step, which take them first
+    // (`Owner::prepay`). What was prepaid, for `settle_volume_credit`.
+    fn arm_volume_credit(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
+        let held = self.volume_arrived_by_job.get_mut(&job_id)?;
+        let moved = bytes.min(held.bytes());
+        held.volume()
+            .arrived_bytes
+            .fetch_sub(moved, Ordering::SeqCst);
+        Some(self.volume_writers.prepay(held, moved))
+    }
+
+    // The step is done: what was prepaid and its writes did not take no
     // longer counts.
-    fn settle_volume_credit(
-        &mut self,
-        volume: Option<Arc<crate::operations::disk::volume::Volume>>,
-    ) {
-        let Some(volume) = volume else {
+    fn settle_volume_credit(&mut self, credit: Option<Prepaid>) {
+        let Some(credit) = credit else {
             return;
         };
-        let left = volume.loop_credit.swap(0, Ordering::Relaxed);
-        volume.release(left);
-        if left != 0 && volume.take_wake() {
+        let left = credit.settle();
+        if left != 0 && self.volume_writers.take_wake(credit.volume()) {
             self.volume_room_changed();
         }
     }
@@ -735,14 +767,17 @@ impl Pipeline {
     // as arrived no longer counts, and dispatch that asked to be woken at
     // the line the volume has now reached looks again.
     fn note_volume_handed_on(&mut self, job_id: JobId) {
-        let Some((volume, held)) = self.volume_arrived_by_job.remove(&job_id) else {
+        let Some(mut held) = self.volume_arrived_by_job.remove(&job_id) else {
             return;
         };
-        if held != 0 {
-            volume.arrived_bytes.fetch_sub(held, Ordering::SeqCst);
-            volume.release(held);
+        let bytes = held.bytes();
+        if bytes != 0 {
+            held.volume()
+                .arrived_bytes
+                .fetch_sub(bytes, Ordering::SeqCst);
+            held.give_back(bytes);
         }
-        if volume.take_wake() {
+        if self.volume_writers.take_wake(held.volume()) {
             self.volume_room_changed();
         }
     }
@@ -1243,7 +1278,11 @@ impl Pipeline {
                     self.maybe_finish_download_pass(job_id);
                     return;
                 }
-                if failure.kind == DownloadFailureKind::LaneUnavailable {
+                if matches!(
+                    failure.kind,
+                    DownloadFailureKind::LaneUnavailable | DownloadFailureKind::RouteCapacity
+                ) {
+                    let route_full = failure.kind == DownloadFailureKind::RouteCapacity;
                     // A work item no server may serve (failure exclusions,
                     // retention, credential refusals) can never be served: the
                     // order it builds is empty, so it would requeue through
@@ -1291,10 +1330,34 @@ impl Pipeline {
                     // local lane capacity was spent. That is self-clearing and
                     // has nothing to do with server health or credentials, so
                     // it neither warns nor sends anyone to their account page.
-                    if matches!(
+                    // A full network route is the same kind of wait, told as
+                    // what it is.
+                    let eligible = matches!(
                         availability,
                         weaver_nntp::pool::BodyServerAvailability::Eligible
-                    ) {
+                    );
+                    if eligible && route_full {
+                        if let Some(suppressed_since_last) = self
+                            .body_lane_capacity_log_throttle
+                            .admit(job_id, BODY_LANE_CAPACITY_LOG_INTERVAL)
+                        {
+                            info!(
+                                job_id = job_id.0,
+                                segment = %result.segment_id,
+                                configured_server_count = server_count,
+                                excluded_server_count = unavailable_server_count,
+                                retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                                failure_kind = ?failure.kind,
+                                suppressed_since_last,
+                                error = %failure.message,
+                                "downloads waiting: the news server's network route is full; the work retries as the route frees"
+                            );
+                            self.dump_job_debug_ring(
+                                job_id,
+                                "downloads waiting: the news server's network route is full",
+                            );
+                        }
+                    } else if eligible {
                         if let Some(suppressed_since_last) = self
                             .body_lane_capacity_log_throttle
                             .admit(job_id, BODY_LANE_CAPACITY_LOG_INTERVAL)
@@ -1343,7 +1406,7 @@ impl Pipeline {
                         result.retry_count,
                         excluded_servers,
                         retry_delay,
-                        DownloadFailureKind::LaneUnavailable,
+                        failure.kind,
                     ) {
                         debug!(
                             job_id = job_id.0,
@@ -1372,6 +1435,7 @@ impl Pipeline {
                     | DownloadFailureKind::ServerQuota
                     | DownloadFailureKind::CapacityUnavailable
                     | DownloadFailureKind::LaneUnavailable
+                    | DownloadFailureKind::RouteCapacity
                     | DownloadFailureKind::ConnectionEstablishment
                     | DownloadFailureKind::EstablishedTransport
                     | DownloadFailureKind::Unanswered
@@ -1393,7 +1457,8 @@ impl Pipeline {
                         .download_failures_article_not_found
                         .fetch_add(1, Ordering::Relaxed),
                     DownloadFailureKind::CapacityUnavailable
-                    | DownloadFailureKind::LaneUnavailable => self
+                    | DownloadFailureKind::LaneUnavailable
+                    | DownloadFailureKind::RouteCapacity => self
                         .metrics
                         .download_failures_capacity_unavailable
                         .fetch_add(1, Ordering::Relaxed),
@@ -1569,11 +1634,39 @@ impl Pipeline {
                     let preserves_retry_budget =
                         failure.preserves_article_retry_budget() && !article_local_transport;
                     let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
-                    let next_retry = if preserves_retry_budget || source_not_found {
+                    let mut next_retry = if preserves_retry_budget || source_not_found {
                         result.retry_count
                     } else {
                         result.retry_count + 1
                     };
+                    // A server that answered BODY with something unreadable
+                    // for every try could not produce the article: with its
+                    // tries spent it joins the article's exclusions, as a
+                    // server without the article does, and the next server is
+                    // asked with a fresh count. Only with none left is the
+                    // article booked below.
+                    let mut retry_exclude_servers = retry_exclude_servers;
+                    let next_server_excludes = (next_retry > MAX_SEGMENT_RETRIES)
+                        .then(|| {
+                            self.next_server_after_spent_tries(
+                                job_id,
+                                failure.kind,
+                                source_server_idx,
+                                retry_exclude_servers,
+                            )
+                        })
+                        .flatten();
+                    let moved_to_next_server = next_server_excludes.is_some();
+                    if let Some(excludes) = next_server_excludes {
+                        debug!(
+                            segment = %seg_id,
+                            error = %failure.message,
+                            server = ?source_server_idx,
+                            "article's tries spent on one server; asking the next server"
+                        );
+                        retry_exclude_servers = excludes;
+                        next_retry = 0;
+                    }
 
                     if next_retry > MAX_SEGMENT_RETRIES {
                         warn!(
@@ -1644,7 +1737,7 @@ impl Pipeline {
                                 SEGMENT_TRANSPORT_HOLD_DELAY
                             } else if infrastructure_retry {
                                 std::time::Duration::from_secs(1)
-                            } else if source_not_found {
+                            } else if source_not_found || moved_to_next_server {
                                 std::time::Duration::ZERO
                             } else {
                                 std::time::Duration::from_secs(1 << (next_retry - 1))

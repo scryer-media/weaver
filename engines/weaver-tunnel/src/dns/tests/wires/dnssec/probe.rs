@@ -191,12 +191,7 @@ impl Shared {
     fn new(carrier: impl Carrier + 'static, core: usize) -> Arc<Self> {
         Arc::new(Self {
             carrier: Arc::new(carrier),
-            sockets: crate::pipe::SessionSockets::new(crate::pipe::SocketShares {
-                nntp: 0,
-                torrent: 0,
-                core,
-                http: 0,
-            }),
+            sockets: crate::pipe::reserve_of(core as u64),
             at_capacity: AtomicUsize::new(0),
             refused: tokio::sync::Notify::new(),
         })
@@ -204,7 +199,10 @@ impl Shared {
     // The share's one socket class for DNS.
     fn take(&self) -> crate::pipe::SocketPermit {
         self.sockets
-            .take(crate::pipe::SocketClass::ReserveCore)
+            .take(
+                crate::pipe::SocketClass::Reserve,
+                crate::pipe::dns_stream_bytes(),
+            )
             .unwrap()
             .unwrap()
     }
@@ -258,17 +256,23 @@ impl AsyncWrite for Holding {
 impl Dialer for Shared {
     fn room(&self, purpose: &crate::pipe::Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
         self.sockets
-            .room(crate::pipe::SocketClass::of(purpose))
-            .map_err(|freed| vec![freed])
+            .room(
+                crate::pipe::SocketClass::of(purpose),
+                crate::pipe::dns_stream_bytes(),
+            )
+            .map_err(|freed| vec![freed.notify()])
     }
     async fn dial(&self, target: &Target) -> Result<crate::pipe::Dialed, DialError> {
         let socket = self
             .sockets
-            .take(crate::pipe::SocketClass::of(&target.purpose))
-            .map_err(|freed| {
+            .take(
+                crate::pipe::SocketClass::of(&target.purpose),
+                crate::pipe::dns_stream_bytes(),
+            )
+            .map_err(|refused| {
                 self.at_capacity.fetch_add(1, Ordering::Relaxed);
                 self.refused.notify_waiters();
-                DialError::AtCapacity(vec![freed])
+                DialError::AtCapacity(refused.into())
             })?;
         let server = DnsServer {
             address: SocketAddr::new(target.addresses[0], target.port),
@@ -330,7 +334,7 @@ struct Refusing {
 impl Dialer for Refusing {
     async fn dial(&self, _target: &Target) -> Result<crate::pipe::Dialed, DialError> {
         self.dials.fetch_add(1, Ordering::Relaxed);
-        Err(DialError::AtCapacity(vec![self.freed.clone()]))
+        Err(DialError::AtCapacity(vec![self.freed.clone()].into()))
     }
     fn budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs(1)
@@ -354,10 +358,10 @@ struct FreesOnRefusal {
 impl Dialer for FreesOnRefusal {
     async fn dial(&self, _target: &Target) -> Result<crate::pipe::Dialed, DialError> {
         match self.dials.fetch_add(1, Ordering::Relaxed) {
-            0 => Err(DialError::AtCapacity(vec![self.freed.clone()])),
+            0 => Err(DialError::AtCapacity(vec![self.freed.clone()].into())),
             1 => {
                 self.freed.notify_waiters();
-                Err(DialError::AtCapacity(vec![self.freed.clone()]))
+                Err(DialError::AtCapacity(vec![self.freed.clone()].into()))
             }
             _ => Ok(dialed(Box::new(tokio::io::duplex(64).0))),
         }
@@ -383,9 +387,9 @@ impl Dialer for FreshSignals {
     async fn dial(&self, _target: &Target) -> Result<crate::pipe::Dialed, DialError> {
         let dials = self.dials.fetch_add(1, Ordering::Relaxed) + 1;
         assert!(dials <= 100, "dialled {dials} times");
-        Err(DialError::AtCapacity(vec![Arc::new(
-            tokio::sync::Notify::new(),
-        )]))
+        Err(DialError::AtCapacity(
+            vec![Arc::new(tokio::sync::Notify::new())].into(),
+        ))
     }
     fn budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs(1)
@@ -410,7 +414,9 @@ impl Dialer for NamesFive {
             return Ok(dialed(Box::new(tokio::io::duplex(64).0)));
         }
         named.push(Arc::new(tokio::sync::Notify::new()));
-        Err(DialError::AtCapacity(vec![named[named.len() - 1].clone()]))
+        Err(DialError::AtCapacity(
+            vec![named[named.len() - 1].clone()].into(),
+        ))
     }
     fn budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs(1)
@@ -502,10 +508,7 @@ async fn probes_past_the_tunnels_socket_share_wait_for_a_socket_and_each_is_aske
     }
     // The share was full while the probes ran, so some of them waited.
     assert!(shared.at_capacity.load(Ordering::Relaxed) > 0);
-    assert_eq!(
-        shared.sockets.held(crate::pipe::SocketClass::ReserveCore),
-        0
-    );
+    assert_eq!(shared.sockets.held(crate::pipe::SocketClass::Reserve), 0);
 }
 
 // A probe's time limit runs only while it is being asked. The test holds
@@ -724,10 +727,7 @@ async fn probes_dropped_mid_dial_and_mid_wait_leave_the_share_free() {
             probed = other => panic!("{probed:?}"),
         }
     }
-    assert_eq!(
-        shared.sockets.held(crate::pipe::SocketClass::ReserveCore),
-        0
-    );
+    assert_eq!(shared.sockets.held(crate::pipe::SocketClass::Reserve), 0);
     let refused = shared.at_capacity.load(Ordering::Relaxed);
     // Hanging has nothing at 853, so a dial that gets the socket fails at
     // once, in the server's words.

@@ -17,7 +17,7 @@ use weaver_graph::{MemberId, NodeId, VolumeIndex, Why};
 use self::fakes::{Fakes, Mode, OPENS};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::engine::echo::{HEADER, SIGNATURE};
-use crate::pipeline::graph::engine::{Heard, RunMail, Runs};
+use crate::pipeline::graph::engine::{Heard, RunMail, Runs, Said};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
@@ -109,7 +109,42 @@ fn refusing(mode: Mode, count: u32, candidates: &[&str]) -> Refusing {
 }
 
 impl Refusing {
+    // Volume `volume` arrives, and the job is given the turns the loop
+    // gives it until a give-up it started has read back every volume.
     fn deliver(&mut self, volume: u32) {
+        self.deliver_only(volume);
+        while self.job.giving_up() {
+            self.give_up_turn();
+        }
+    }
+
+    // One turn of the loop for the job's give-up, as the wake it rings is
+    // heard.
+    fn give_up_turn(&mut self) {
+        self.job
+            .run_said(
+                Said {
+                    scope: 1,
+                    node: NodeId::ROOT,
+                    generation: 0,
+                    heard: Heard::GivingUp,
+                },
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+    }
+
+    // The root members the job has given back so far.
+    fn refused_count(&self) -> usize {
+        (0..self.volumes.len() as u32)
+            .filter(|member| self.refused(*member).is_some())
+            .count()
+    }
+
+    // Volume `volume` arrives, and nothing more: a give-up it starts reads
+    // back its first volume on this turn and waits for the next.
+    fn deliver_only(&mut self, volume: u32) {
         let bytes = &self.volumes[volume as usize];
         self.job
             .intake(
@@ -572,4 +607,98 @@ async fn a_refusing_engine_over_three_volumes_is_one_event() {
     refusing.until_refused(0).await;
     let given = given_back(&mut refusing);
     assert_eq!(given.len(), 1, "{given:#?}");
+}
+
+// A locked store of `count` volumes no candidate opens, every volume
+// arrived: the job went quiet and gave the store up.
+fn given_up(count: u32, one_turn: bool) -> Refusing {
+    let mut refusing = refusing(Mode::Locked, count, &WRONG);
+    if one_turn {
+        refusing.job.give_up_in_one_turn();
+    }
+    for volume in 0..count {
+        refusing.deliver_only(volume);
+    }
+    refusing
+}
+
+// What the job's status and events say, with its directory left out, and
+// the write stamps too: they are drawn from one sequence every namespace in
+// the process shares, so two rigs never draw the same ones.
+fn said(refusing: &mut Refusing) -> (String, String) {
+    // Paths are spelled plain and in their debug form, which doubles each
+    // Windows separator.
+    let dir = refusing.dir.path().display().to_string();
+    let quoted = format!("{:?}", refusing.dir.path());
+    let debug_dir = quoted.trim_matches('"').to_string();
+    let unpath = |text: String| text.replace(&debug_dir, "<dir>").replace(&dir, "<dir>");
+    let notes = format!("{:?}", refusing.job.take_notes());
+    let status = unpath(refusing.status());
+    let mut parts = status.split("stamp: ");
+    let mut unstamped = parts.next().unwrap_or_default().to_string();
+    for part in parts {
+        unstamped.push_str("stamp: _");
+        unstamped.push_str(part.trim_start_matches(|c: char| c.is_ascii_digit()));
+    }
+    (unstamped, unpath(notes))
+}
+
+// A store given up as the job goes quiet reads back one volume a turn, so
+// the loop turns between them; what it ends with is what the one-turn give-up
+// ends with, byte for byte and event for event.
+#[test]
+fn a_store_given_up_at_quiet_reads_back_one_volume_a_turn() {
+    let mut turns = given_up(3, false);
+    let mut whole = given_up(3, true);
+    assert!(!whole.job.giving_up());
+    assert_eq!(whole.refused_count(), 3);
+
+    assert!(turns.job.giving_up());
+    assert!(turns.job.working(), "the checkpoint is owed while it waits");
+    assert_eq!(turns.refused_count(), 1, "one volume on the quiet's turn");
+    turns.give_up_turn();
+    assert!(turns.job.giving_up());
+    assert_eq!(turns.refused_count(), 2, "one volume on the next turn");
+    turns.give_up_turn();
+    assert!(!turns.job.giving_up());
+    assert!(!turns.job.working());
+    assert_eq!(turns.refused_count(), 3);
+    // A wake heard after the give-up ended does nothing.
+    let before = said(&mut turns);
+    turns.give_up_turn();
+    let after = said(&mut turns);
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, "[]");
+
+    let mut turns = given_up(3, false);
+    while turns.job.giving_up() {
+        turns.give_up_turn();
+    }
+    assert_eq!(said(&mut turns), said(&mut whole));
+    assert_eq!(turns.internal(), whole.internal());
+    turns.checkpoint(1);
+    whole.checkpoint(1);
+    for volume in 0..3 {
+        let name = format!("lantern.part{}.rar", volume + 1);
+        assert_eq!(turns.file(&name), whole.file(&name));
+        assert_eq!(turns.file(&name), turns.volumes[volume]);
+    }
+    assert_eq!(turns.internal(), whole.internal());
+    assert_eq!(said(&mut turns), said(&mut whole));
+    assert_eq!(turns.job.phase(), RootPhase::Done);
+}
+
+// A cancel posted after the first volume is read back is applied before the
+// second is copied: the give-up is dropped, and a later wake copies nothing.
+#[test]
+fn a_cancel_between_volumes_of_a_give_up_drops_the_rest() {
+    let mut refusing = given_up(3, false);
+    assert_eq!(refusing.refused_count(), 1);
+    refusing.job.request_stop();
+    assert!(!refusing.job.giving_up());
+    assert!(!refusing.job.work_pending());
+    let internal = refusing.internal();
+    refusing.give_up_turn();
+    assert_eq!(refusing.refused_count(), 1, "nothing more is copied");
+    assert_eq!(refusing.internal(), internal);
 }

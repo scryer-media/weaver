@@ -214,6 +214,7 @@ fn intent_and_counters_update_in_place() {
     let peers = weaver_torrent::ResumePeers {
         peers: vec!["10.0.0.1:6881".parse().unwrap()],
         banned: Vec::new(),
+        found: Vec::new(),
     };
     assert!(
         db.save_torrent_resume(JobId(3), None, Some(&peers))
@@ -452,6 +453,7 @@ fn a_torrents_peers_and_bans_round_trip() {
             "[2001:db8::1]:51413".parse().unwrap(),
         ],
         banned: vec!["10.0.0.9".parse().unwrap(), "2001:db8::9".parse().unwrap()],
+        found: vec!["[2001:db8::1]:51413".parse().unwrap()],
     };
     assert!(db.save_torrent_peers(JobId(1), &saved).unwrap());
     assert_eq!(db.torrent_peers(JobId(1)).unwrap(), saved);
@@ -465,6 +467,43 @@ fn a_torrents_peers_and_bans_round_trip() {
 
     assert!(!db.save_torrent_peers(JobId(2), &saved).unwrap());
     assert_eq!(db.torrent_peers(JobId(2)).unwrap(), ResumePeers::default());
+}
+
+// A saved peer mark that does not read costs the marks alone: the
+// torrent's peers and bans still restore, on its own read and the boot's.
+#[test]
+fn a_mark_that_does_not_read_keeps_the_peers_and_bans() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    use weaver_torrent::ResumePeers;
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(1, Some([1; 20]), None), &[])
+        .unwrap();
+    let saved = ResumePeers {
+        peers: vec!["10.0.0.1:6881".parse().unwrap()],
+        banned: vec!["10.0.0.9".parse().unwrap()],
+        found: vec!["10.0.0.1:6881".parse().unwrap()],
+    };
+    assert!(db.save_torrent_peers(JobId(1), &saved).unwrap());
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(
+            datastore.write_exec(),
+            "UPDATE torrent_counters SET found_peers = {} WHERE job_id = {}",
+            &[SqlArg::Text("not a list".to_owned()), SqlArg::I64(1)],
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+
+    let unmarked = ResumePeers {
+        found: Vec::new(),
+        ..saved
+    };
+    assert_eq!(db.torrent_peers(JobId(1)).unwrap(), unmarked);
+    let boot = db.torrent_counters_by_job().unwrap();
+    assert_eq!(boot[&JobId(1)].peers.as_ref().unwrap(), &unmarked);
 }
 
 #[test]
@@ -720,4 +759,137 @@ fn a_torrents_history_end_is_the_jobs_stored_status() {
             error: "cancelled".to_owned()
         }
     );
+}
+
+// Trackers enough to take several statements' worth of binds, many hosts
+// named twice.
+fn many_tracker_rows(count: u32) -> Vec<TrackerEntry> {
+    (0..count)
+        .map(|index| TrackerEntry {
+            tier: index % 5,
+            url: format!(
+                "http://host{}.invalid:{}/announce",
+                index / 3,
+                1_000 + index
+            ),
+            named_by: if index % 2 == 0 {
+                NamedBy::Torrent
+            } else {
+                NamedBy::Operator
+            },
+        })
+        .collect()
+}
+
+// A torrent's trackers written in a few statements read back as the rows a
+// statement per tracker wrote: every one, and every host once.
+#[test]
+fn many_trackers_are_written_as_one_statement_each_wrote_them() {
+    let trackers = many_tracker_rows(700);
+    let db = Database::open_in_memory().unwrap();
+    assert_eq!(
+        db.insert_torrent(&torrent(3, Some([3; 20]), None), &trackers)
+            .unwrap(),
+        TorrentInsert::Inserted
+    );
+    let mut expected = trackers.clone();
+    expected.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+    let mut read = db.list_torrent_trackers(JobId(3)).unwrap();
+    read.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+    assert_eq!(read, expected);
+    let mut hosts: Vec<String> = (0..700 / 3 + 1)
+        .map(|host| format!("host{host}.invalid"))
+        .collect();
+    hosts.sort();
+    assert_eq!(db.list_tracker_hosts().unwrap(), hosts);
+
+    // A second torrent naming the same hosts adds none.
+    db.set_torrent_trackers(JobId(3), &many_tracker_rows(10))
+        .unwrap();
+    assert_eq!(db.list_tracker_hosts().unwrap(), hosts);
+    assert_eq!(db.list_torrent_trackers(JobId(3)).unwrap().len(), 10);
+}
+
+// The batched writes of queue places, categories, forced flags and removal
+// marks leave each torrent as a statement per row, in turn, left it, a
+// torrent named twice taking the value named last.
+#[test]
+fn batched_torrent_columns_end_as_a_statement_per_row_left_them() {
+    const COUNT: u64 = 700;
+    let seeded = || {
+        let db = Database::open_in_memory().unwrap();
+        for job in 1..=COUNT {
+            let mut v1 = [0; 20];
+            v1[..8].copy_from_slice(&job.to_be_bytes());
+            db.insert_torrent(&torrent(job, Some(v1), None), &[])
+                .unwrap();
+        }
+        db
+    };
+    let positions: Vec<(JobId, i64)> = (1..=COUNT)
+        .map(|job| (JobId(job), (COUNT - job) as i64 * 3))
+        .chain([(JobId(5), -1), (JobId(COUNT + 1), 9)])
+        .collect();
+    let categories: Vec<(JobId, Option<u32>)> = (1..=COUNT)
+        .step_by(2)
+        .map(|job| (JobId(job), (job % 3 != 0).then_some(job as u32 % 7)))
+        .chain([(JobId(1), None), (JobId(3), Some(42))])
+        .collect();
+    let forced: Vec<(JobId, bool)> = (1..=COUNT)
+        .step_by(3)
+        .map(|job| (JobId(job), job % 2 == 0))
+        .chain([(JobId(4), false), (JobId(4), true)])
+        .collect();
+    let marks: Vec<(JobId, bool)> = (1..=COUNT)
+        .step_by(4)
+        .map(|job| (JobId(job), job % 3 == 0))
+        .chain([(JobId(1), true), (JobId(1), false)])
+        .collect();
+
+    let batched = seeded();
+    batched.set_torrent_queue_positions(&positions).unwrap();
+    batched
+        .set_torrent_categories_and_forced(&categories, &forced)
+        .unwrap();
+
+    let by_row = seeded();
+    for &(job_id, position) in &positions {
+        by_row
+            .set_torrent_queue_positions(&[(job_id, position)])
+            .unwrap();
+    }
+    for &(job_id, category) in &categories {
+        by_row.set_torrent_category(job_id, category).unwrap();
+    }
+    for &(job_id, on) in &forced {
+        by_row.set_torrent_forced(job_id, on).unwrap();
+    }
+    let mut listed = batched.list_torrents().unwrap();
+    listed.sort_by_key(|record| record.job_id);
+    let mut expected = by_row.list_torrents().unwrap();
+    expected.sort_by_key(|record| record.job_id);
+    assert_eq!(listed.len(), COUNT as usize);
+    assert_eq!(listed, expected);
+    assert_eq!(listed[4].queue_position, -1);
+    assert!(listed[3].forced);
+
+    // A torrent marked retiring no longer lists.
+    batched.mark_torrents_retiring(&marks).unwrap();
+    for &(job_id, delete_files) in &marks {
+        by_row.mark_torrent_retiring(job_id, delete_files).unwrap();
+    }
+    let retiring = |db: &Database| {
+        let mut rows: Vec<(JobId, bool)> = db
+            .retiring_torrents()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.job_id, row.delete_files))
+            .collect();
+        rows.sort();
+        rows
+    };
+    let marked = retiring(&batched);
+    assert_eq!(marked.len(), COUNT.div_ceil(4) as usize);
+    assert_eq!(marked[0], (JobId(1), false));
+    assert_eq!(marked, retiring(&by_row));
 }

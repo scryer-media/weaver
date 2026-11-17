@@ -69,12 +69,14 @@ pub struct PeerInfo {
 impl PeerInfo {
     /// The connection to `peer`, of a torrent of `total_pieces` pieces,
     /// when it is live; `optimistic` when the peer holds an optimistic slot.
+    /// A web seed is no peer of the swarm, at no address, and has none.
     pub(crate) fn of(peer: &Peer, total_pieces: u32, optimistic: bool) -> Option<Self> {
+        let addr = peer.addr.addr()?;
         let live = peer.get_live()?;
         let pieces = u32::try_from(live.bitfield.count_ones()).unwrap_or(u32::MAX);
         let moved = live.this_connection(&peer.stats.counters);
         Some(Self {
-            addr: peer.addr,
+            addr,
             client: live
                 .client_name
                 .clone()

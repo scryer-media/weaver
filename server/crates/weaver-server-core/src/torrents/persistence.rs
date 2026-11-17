@@ -21,13 +21,30 @@ use weaver_torrent::ResumePeers;
 
 // A tracker row holds where the tracker sits in the announce list and who
 // named it; how announcing to it goes is read from the session.
-const TRACKER_INSERT: &str =
-    "INSERT INTO torrent_trackers (job_id, tier, url, named_by) VALUES ({}, {}, {}, {})";
+const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url, named_by) VALUES ";
+const TRACKER_ROW: &str = "({}, {}, {}, {})";
 // Every host a torrent has announced to stays known after the torrent is
 // gone, so a tracker rule can be picked from them. The URL is not kept: a
 // private tracker's carries the operator's passkey.
-const TRACKER_HOST_INSERT: &str =
-    "INSERT INTO tracker_hosts (host) VALUES ({}) ON CONFLICT (host) DO NOTHING";
+const TRACKER_HOST_INSERT: &str = "INSERT INTO tracker_hosts (host) VALUES ";
+const TRACKER_HOST_ROW: &str = "({})";
+const TRACKER_HOST_CONFLICT: &str = " ON CONFLICT (host) DO NOTHING";
+
+/// Seed mode as a pass over the torrents found it, written together by
+/// [`Database::write_torrent_seed_modes`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TorrentSeedWrites {
+    /// Left seed mode: no check passed in it is kept.
+    pub(crate) left: Vec<JobId>,
+    /// The pieces each still in it has checked, a bitfield as the wire's.
+    pub(crate) verified: Vec<(JobId, Vec<u8>)>,
+}
+
+impl TorrentSeedWrites {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.left.is_empty() && self.verified.is_empty()
+    }
+}
 
 // The statement that writes a torrent's ledger and the peers and bans it
 // begins with, each only when given; none when neither is.
@@ -57,10 +74,11 @@ fn resume_update(
         ]);
     }
     if let Some(peers) = peers {
-        sets.push("peers = {}, banned_peers = {}");
+        sets.push("peers = {}, banned_peers = {}, found_peers = {}");
         args.extend([
             SqlArg::OptText(stored_list(&peers.peers)?),
             SqlArg::OptText(stored_list(&peers.banned)?),
+            SqlArg::OptText(stored_list(&peers.found)?),
         ]);
     }
     if sets.is_empty() {
@@ -81,22 +99,71 @@ async fn insert_trackers(
     job_id: i64,
     trackers: &[TrackerEntry],
 ) -> Result<(), StateError> {
-    for tracker in trackers {
-        let args = [
-            SqlArg::I64(job_id),
-            SqlArg::I64(i64::from(tracker.tier)),
-            SqlArg::Text(tracker.url.clone()),
-            SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
-        ];
-        tx.execute(TRACKER_INSERT, &args).await?;
+    // As many rows a statement as its binds allow.
+    for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 4)) {
+        let sql = format!(
+            "{TRACKER_INSERT}{}",
+            vec![TRACKER_ROW; chunk.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(chunk.len() * 4);
+        for tracker in chunk {
+            args.extend([
+                SqlArg::I64(job_id),
+                SqlArg::I64(i64::from(tracker.tier)),
+                SqlArg::Text(tracker.url.clone()),
+                SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
+            ]);
+        }
+        tx.execute(&sql, &args).await?;
     }
-    let hosts: std::collections::BTreeSet<String> = trackers
+    let hosts: Vec<String> = trackers
         .iter()
         .filter_map(|tracker| tracker_host(&tracker.url))
+        .collect::<std::collections::BTreeSet<String>>()
+        .into_iter()
         .collect();
-    for host in hosts {
-        tx.execute(TRACKER_HOST_INSERT, &[SqlArg::Text(host)])
-            .await?;
+    for chunk in hosts.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 1)) {
+        let sql = format!(
+            "{TRACKER_HOST_INSERT}{}{TRACKER_HOST_CONFLICT}",
+            vec![TRACKER_HOST_ROW; chunk.len()].join(", ")
+        );
+        let args: Vec<SqlArg> = chunk.iter().cloned().map(SqlArg::Text).collect();
+        tx.execute(&sql, &args).await?;
+    }
+    Ok(())
+}
+
+// One column of each torrent `rows` names, each row its id and the value,
+// as `UPDATE ... CASE` statements of as many rows as their binds allow.
+// A torrent named twice takes the value named last, as one statement per
+// row in turn left it.
+async fn update_column_tx(
+    tx: &mut SqlTx<'_>,
+    column: &str,
+    rows: &[(i64, SqlArg)],
+) -> Result<(), StateError> {
+    let mut seen = std::collections::HashSet::with_capacity(rows.len());
+    let mut last: Vec<&(i64, SqlArg)> = rows
+        .iter()
+        .rev()
+        .filter(|(id, _)| seen.insert(*id))
+        .collect();
+    last.reverse();
+    // Three binds a row: the CASE arm's id and value, and the id in the
+    // list.
+    for chunk in last.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 3)) {
+        let sql = format!(
+            "UPDATE torrents SET {column} = CASE job_id {}END WHERE job_id IN ({})",
+            "WHEN {} THEN {} ".repeat(chunk.len()),
+            vec!["{}"; chunk.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for (id, value) in chunk {
+            args.push(SqlArg::I64(*id));
+            args.push(value.clone());
+        }
+        args.extend(chunk.iter().map(|(id, _)| SqlArg::I64(*id)));
+        tx.execute(&sql, &args).await?;
     }
     Ok(())
 }
@@ -165,6 +232,38 @@ impl Database {
             )
             .await?;
             Ok(())
+        })
+    }
+
+    // The removal marks of a batch of torrents (`mark_torrent_retiring`),
+    // in one transaction of few statements.
+    pub(crate) fn mark_torrents_retiring(&self, marks: &[(JobId, bool)]) -> Result<(), StateError> {
+        #[cfg(test)]
+        match MARK_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return Err(StateError::OutOfSpace("database or disk is full".into())),
+            2 => return Err(StateError::Database("the mark was refused".into())),
+            _ => {}
+        }
+        if marks.is_empty() {
+            return Ok(());
+        }
+        let rows = marks
+            .iter()
+            .map(|&(job_id, delete_files)| {
+                Ok((
+                    stored(job_id.0)?,
+                    SqlArg::Text(RetiringMark::of(delete_files).as_str().to_owned()),
+                ))
+            })
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "mark_torrents_retiring", |tx| {
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "retiring", &rows).await })
+            })
+            .await
         })
     }
 
@@ -975,6 +1074,20 @@ fn listed<T: serde::de::DeserializeOwned>(
     .map(Option::unwrap_or_default)
 }
 
+// Which saved peers were found elsewhere than the torrent's trackers and
+// the operator. The marks never cost the peers or bans they sit beside: a
+// value that does not read is no marks.
+fn found_marks(
+    job_id: JobId,
+    json: Result<Option<String>, StateError>,
+) -> Vec<std::net::SocketAddr> {
+    json.and_then(|json| listed("found_peers", json))
+        .unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's saved peer marks did not read; its peers restore unmarked");
+            Vec::new()
+        })
+}
+
 fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
     let policy_override = SeedingPolicy::kept(torrent.policy_override)
         .map(|policy| serde_json::to_string(&policy))
@@ -1123,6 +1236,81 @@ impl Database {
             SqlArg::I64(stored(job_id.0)?),
         ];
         self.set_torrent_column("state", args)
+    }
+
+    // Seed mode as a pass found it, in one transaction: the torrents that
+    // left it, as `clear_torrent_seed_mode` writes one, and the pieces each
+    // still in it checked, as `set_torrent_seed_verified` writes one. Each
+    // list goes in bind-limit chunks, one statement a chunk. The statements
+    // are built once, the bitfields moved into them: a retry of the
+    // transaction copies none.
+    pub(crate) fn write_torrent_seed_modes(
+        &self,
+        writes: TorrentSeedWrites,
+    ) -> Result<(), StateError> {
+        use crate::persistence::sql_runtime::max_rows_for_engine;
+
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        let engine = datastore.engine();
+        let mut statements: Vec<(String, Vec<SqlArg>)> = Vec::new();
+        // One bind for the seed mode, then the ids.
+        let rows = max_rows_for_engine(engine, 1).saturating_sub(1).max(1);
+        for chunk in writes.left.chunks(rows) {
+            let placeholders = vec!["{}"; chunk.len()].join(", ");
+            let mut args = Vec::with_capacity(chunk.len() + 1);
+            args.push(SqlArg::Bool(false));
+            for job_id in chunk {
+                args.push(SqlArg::I64(stored(job_id.0)?));
+            }
+            statements.push((
+                format!(
+                    "UPDATE torrents SET seed_mode = {{}}, seed_verified = NULL WHERE job_id IN ({placeholders})"
+                ),
+                args,
+            ));
+        }
+        // Each row binds its id and bitfield in the CASE and its id in the
+        // list.
+        let rows = max_rows_for_engine(engine, 3);
+        let mut verified = writes.verified.into_iter().peekable();
+        while verified.peek().is_some() {
+            let chunk: Vec<(i64, Vec<u8>)> = verified
+                .by_ref()
+                .take(rows)
+                .map(|(job_id, pieces)| Ok((stored(job_id.0)?, pieces)))
+                .collect::<Result<_, StateError>>()?;
+            let ids: Vec<i64> = chunk.iter().map(|(id, _)| *id).collect();
+            let mut args = Vec::with_capacity(chunk.len() * 3);
+            for (id, pieces) in chunk {
+                args.push(SqlArg::I64(id));
+                args.push(SqlArg::OptBytes(Some(pieces)));
+            }
+            args.extend(ids.iter().copied().map(SqlArg::I64));
+            let cases = vec!["WHEN {} THEN {}"; ids.len()].join(" ");
+            let placeholders = vec!["{}"; ids.len()].join(", ");
+            statements.push((
+                format!(
+                    "UPDATE torrents SET seed_verified = CASE job_id {cases} END WHERE job_id IN ({placeholders})"
+                ),
+                args,
+            ));
+        }
+        let statements = std::sync::Arc::new(statements);
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "write_torrent_seed_modes", |tx| {
+                let statements = std::sync::Arc::clone(&statements);
+                Box::pin(async move {
+                    for (sql, args) in statements.iter() {
+                        tx.execute(sql, args).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 
     // Each group's kept intent for every torrent of its ids, and no other
@@ -1833,25 +2021,55 @@ impl Database {
         &self,
         positions: &[(JobId, i64)],
     ) -> Result<(), StateError> {
+        if positions.is_empty() {
+            return Ok(());
+        }
         let rows = positions
             .iter()
-            .map(|&(job_id, position)| {
-                Ok(vec![SqlArg::I64(position), SqlArg::I64(stored(job_id.0)?)])
-            })
+            .map(|&(job_id, position)| Ok((stored(job_id.0)?, SqlArg::I64(position))))
             .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_queue_positions", |tx| {
-                let rows = rows.clone();
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "queue_position", &rows).await })
+            })
+            .await
+        })
+    }
+
+    // The categories and the forced flags of a batch of torrents, each its
+    // one column and no other, in one transaction of few statements.
+    pub(crate) fn set_torrent_categories_and_forced(
+        &self,
+        categories: &[(JobId, Option<u32>)],
+        forced: &[(JobId, bool)],
+    ) -> Result<(), StateError> {
+        if categories.is_empty() && forced.is_empty() {
+            return Ok(());
+        }
+        let categories = categories
+            .iter()
+            .map(|&(job_id, category_id)| {
+                Ok((
+                    stored(job_id.0)?,
+                    SqlArg::OptI64(category_id.map(i64::from)),
+                ))
+            })
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let forced = forced
+            .iter()
+            .map(|&(job_id, forced)| Ok((stored(job_id.0)?, SqlArg::Bool(forced))))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let columns = std::sync::Arc::new((categories, forced));
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_categories_and_forced", |tx| {
+                let columns = std::sync::Arc::clone(&columns);
                 Box::pin(async move {
-                    for args in &rows {
-                        tx.execute(
-                            "UPDATE torrents SET queue_position = {} WHERE job_id = {}",
-                            args,
-                        )
-                        .await?;
-                    }
-                    Ok(())
+                    update_column_tx(tx, "category_id", &columns.0).await?;
+                    update_column_tx(tx, "forced", &columns.1).await
                 })
             })
             .await
@@ -1878,7 +2096,7 @@ impl Database {
         let row = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT peers, banned_peers FROM torrent_counters WHERE job_id = {}",
+                "SELECT peers, banned_peers, found_peers FROM torrent_counters WHERE job_id = {}",
                 &[SqlArg::I64(id)],
             )
             .await
@@ -1889,6 +2107,7 @@ impl Database {
         Ok(ResumePeers {
             peers: listed("peers", row.opt_text("peers")?)?,
             banned: listed("banned_peers", row.opt_text("banned_peers")?)?,
+            found: found_marks(job_id, row.opt_text("found_peers")),
         })
     }
 
@@ -1908,7 +2127,7 @@ impl Database {
                 "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
                         last_seen_complete_ms, finished_duration_s, last_activity_ms,
                         consecutive_seeding_s, failed_bytes, redundant_bytes, pieces,
-                        pieces_checking, peers, banned_peers
+                        pieces_checking, peers, banned_peers, found_peers
                    FROM torrent_counters",
                 &[],
             )
@@ -1932,7 +2151,12 @@ impl Database {
                             let banned = row
                                 .opt_text("banned_peers")
                                 .and_then(|banned| listed("banned_peers", banned))?;
-                            Ok(ResumePeers { peers, banned })
+                            let found = found_marks(job_id, row.opt_text("found_peers"));
+                            Ok(ResumePeers {
+                                peers,
+                                banned,
+                                found,
+                            })
                         });
                     Ok((
                         job_id,

@@ -590,6 +590,7 @@ impl Pipeline {
                     weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan
                 }),
             pressure_clear: pressure.state == DownloadPressureState::Clear,
+            repeated: self.repeated_articles.get(&job_id).cloned(),
             works: reserved,
         })
     }

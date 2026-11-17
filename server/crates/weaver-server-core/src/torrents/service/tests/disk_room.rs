@@ -15,6 +15,7 @@ use super::*;
 use crate::jobs::handle::DISK_SPACE_WAIT_REASON;
 use crate::operations::disk::{DiskProbeError, DiskSpace, StorageCapacity, StorageRoot};
 use crate::operations::room_wait::Disk;
+use crate::torrents::status::Stated;
 
 // What the disk keeps free, the room it reads over that, and a sampler
 // that reads only when asked.
@@ -153,7 +154,7 @@ async fn a_full_disk_holds_the_torrent_seeding_until_a_reading_shows_room() {
     assert!(run.upload_mode());
     let view = service.torrent(disk.job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
-    assert_eq!(view.detail.as_deref(), Some(DISK_SPACE_WAIT_REASON));
+    assert_eq!(view.stated, Some(Stated::DiskSpace));
     service.publish_job(disk.job_id).await;
     assert_eq!(
         service.inner.queue.lock().unwrap().as_ref().map(|queue| {
@@ -194,7 +195,7 @@ async fn a_resume_lets_a_torrent_waiting_for_room_fetch_again() {
     assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
     assert!(!run.upload_mode());
     let view = service.torrent(disk.job_id).await.unwrap();
-    assert_ne!(view.detail.as_deref(), Some(DISK_SPACE_WAIT_REASON));
+    assert_ne!(view.stated, Some(Stated::DiskSpace));
     assert!(!disk.capacity.ledger(StorageRoot::Complete).waited_on());
     service.stop().await;
 }
@@ -218,7 +219,7 @@ async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
     let mut disk = on_disk(&room).await;
     let service = &disk.rig.service;
     let view = view_once(service, &mut disk.changes, disk.job_id, |view| {
-        view.detail.as_deref() == Some(DISK_SPACE_WAIT_REASON)
+        view.stated == Some(Stated::DiskSpace)
     })
     .await;
     assert_eq!(view.state, TorrentState::Queued);
@@ -230,7 +231,7 @@ async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
     room.store(PLENTY, Ordering::Release);
     disk.capacity.request_refresh(StorageRoot::Complete);
     view_once(service, &mut disk.changes, disk.job_id, |view| {
-        view.detail.as_deref() != Some(DISK_SPACE_WAIT_REASON)
+        view.stated != Some(Stated::DiskSpace)
     })
     .await;
     let torrent = handle_of(service, disk.job_id).await;
@@ -416,24 +417,19 @@ async fn a_refusal_heard_after_the_wake_installs_no_wait() {
     let service = &disk.rig.service;
     let ledger = disk.capacity.ledger(StorageRoot::Complete);
     let run = held(&disk).await.live().unwrap();
-    // The seeder goes first, so no piece written after the wake can be
-    // refused and enter upload mode on its own.
     disk.seeding.stop().await;
     ledger.release(60 << 10);
     run.wait_for_upload_mode(false).await;
     waits_for_room(service, disk.job_id, false).await;
-    let intake = service.inner.live.lock().await[&disk.job_id]
-        .intake
-        .clone()
-        .unwrap();
-    // What the wake handed the torrent goes back, and the room is promised
-    // elsewhere: the piece below books on the ledger and is refused.
-    intake.room().give_back();
-    ledger.promise(1 << 40);
-    let piece = bytes::Bytes::from(vec![0u8; 16_384]);
-    assert!(weaver_torrent::storage::write_refused(
-        &intake.verified(0, &piece).unwrap_err()
-    ));
+    // The refusal of a write made before the wake, heard now. It is said as
+    // the intake says one, and the ledger is left with room: a piece the
+    // run fetched before the wake may still be written after it, and with
+    // room for all four pieces no such write is refused and enters upload
+    // mode on its own.
+    service.inner.signal.heard(
+        disk.job_id,
+        crate::torrents::intake::Heard::NotBooked(16_384),
+    );
     service
         .inner
         .settled
@@ -444,8 +440,7 @@ async fn a_refusal_heard_after_the_wake_installs_no_wait() {
     assert!(!run.upload_mode());
     assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
     let view = service.torrent(disk.job_id).await.unwrap();
-    assert_ne!(view.detail.as_deref(), Some(DISK_SPACE_WAIT_REASON));
-    ledger.release(1 << 40);
+    assert_ne!(view.stated, Some(Stated::DiskSpace));
     assert!(!ledger.waited_on());
     service.stop().await;
 }
@@ -498,7 +493,7 @@ async fn a_short_disk_holds_a_torrent_that_never_downloaded_and_starts_one_that_
         };
         torrent.wait_until_initialized().await.unwrap();
         view_once(service, &mut disk.changes, job_id, |view| {
-            view.detail.as_deref() == Some(DISK_SPACE_WAIT_REASON)
+            view.stated == Some(Stated::DiskSpace)
         })
         .await;
         assert!(not_running(service, job_id).await);
@@ -515,13 +510,13 @@ async fn a_short_disk_holds_a_torrent_that_never_downloaded_and_starts_one_that_
         .downloaded_bytes = 8_192;
     service.apply_queue().await;
     let view = service.torrent(second).await.unwrap();
-    assert_ne!(view.detail.as_deref(), Some(DISK_SPACE_WAIT_REASON));
+    assert_ne!(view.stated, Some(Stated::DiskSpace));
     assert!(
         !not_running(service, second).await,
         "the one that downloaded starts"
     );
     let view = service.torrent(disk.job_id).await.unwrap();
-    assert_eq!(view.detail.as_deref(), Some(DISK_SPACE_WAIT_REASON));
+    assert_eq!(view.stated, Some(Stated::DiskSpace));
     assert!(
         not_running(service, disk.job_id).await,
         "the other stays held"
@@ -760,7 +755,7 @@ async fn a_refusal_kept_aside_is_heard_once_the_run_enters_upload_mode() {
         .await
         .unwrap();
     let view = service.torrent(job_id).await.unwrap();
-    assert_eq!(view.detail.as_deref(), Some(DISK_SPACE_WAIT_REASON));
+    assert_eq!(view.stated, Some(Stated::DiskSpace));
     service.stop().await;
     seeding.stop().await;
 }
@@ -933,7 +928,6 @@ fn the_disk_warning_names_the_volume_and_the_waiting() {
 async fn a_full_disk_leaves_the_selection_as_it_was() {
     use crate::operations::disk::{Capacity, CapacityReading};
     use crate::torrents::net::{LegKind, LegSockets};
-    use crate::torrents::status::Stated;
 
     let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
     let files = [("set/a.bin", data.as_slice())];
@@ -991,7 +985,10 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     rig.service.tick().await;
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
-    assert_eq!(view.detail.as_deref(), Some(Stated::DiskFull.as_str()));
+    assert_eq!(
+        (view.stated, view.detail.as_deref()),
+        (Some(Stated::DiskFull), None)
+    );
     assert_eq!(view.completed_at_ms, None);
     assert_eq!(torrent.file_priorities(), [FilePriority::Normal]);
     let warnings = rig.service.warnings().await;
@@ -1004,7 +1001,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
             .unwrap()
             .download_wait_reason
             .as_deref(),
-        Some(Stated::DiskFull.as_str())
+        Some("disk_full")
     );
     rig.service.stop().await;
     seeding.stop().await;

@@ -6,10 +6,13 @@
 // found, and what carries a query.
 use crate::{
     TunnelError, TunnelStream,
-    pipe::{DialError, Dialer, KeeperRef, Purpose, Target},
+    pipe::{DialError, Dialer, KeeperRef, Purpose, Reservation, Target},
 };
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 // One DNS server Weaver asks, and how it is asked.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -123,6 +126,16 @@ pub(super) const FAMILIES: [u16; 2] = [1, 28];
 pub(super) trait Carrier: Send + Sync {
     async fn open(&self, server: &DnsServer) -> Result<Box<dyn TunnelStream>, TunnelError>;
 
+    // As `open`, with the bytes the stream's sockets reserved in each
+    // session's share, which a connection kept for later is reclaimed at.
+    // None by default: what keeps it is reclaimed only by a cut.
+    async fn open_reserving(&self, server: &DnsServer) -> Result<Opened, TunnelError> {
+        Ok(Opened {
+            stream: self.open(server).await?,
+            reserved: Vec::new(),
+        })
+    }
+
     // The keepers of the stages a connection opened here rides, the
     // dialling stage's first, which a connection kept for later is tied to.
     // None keeps nothing.
@@ -141,6 +154,10 @@ pub(super) struct Stage<'a> {
 #[async_trait::async_trait]
 impl Carrier for Stage<'_> {
     async fn open(&self, server: &DnsServer) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        Ok(self.open_reserving(server).await?.stream)
+    }
+
+    async fn open_reserving(&self, server: &DnsServer) -> Result<Opened, TunnelError> {
         let ip = server.address.ip();
         let target = Target {
             host: ip.to_string(),
@@ -149,7 +166,13 @@ impl Carrier for Stage<'_> {
             addresses: vec![ip],
         };
         match self.dialer.dial(&target).await {
-            Ok(dialed) => Ok(dialed.into_observed_stream()),
+            Ok(dialed) => {
+                let reserved = dialed.outcome.reservations();
+                Ok(Opened {
+                    stream: dialed.into_observed_stream(),
+                    reserved,
+                })
+            }
             Err(error) => {
                 let said = TunnelError::Engine(error.to_string());
                 *self.failure.lock().expect("dns stage failure") = Some(error);
@@ -160,6 +183,48 @@ impl Carrier for Stage<'_> {
 
     fn keepers(&self) -> Vec<KeeperRef> {
         self.dialer.keepers()
+    }
+}
+
+// A stream a carrier opened, and the bytes its sockets reserved, by share.
+pub(super) struct Opened {
+    pub(super) stream: Box<dyn TunnelStream>,
+    pub(super) reserved: Vec<Reservation>,
+}
+
+impl AsyncRead for Opened {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Opened {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
     }
 }
 

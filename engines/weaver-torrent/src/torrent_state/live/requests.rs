@@ -6,7 +6,6 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
-    net::SocketAddr,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -22,6 +21,7 @@ use crate::{
     peer_connection::WriterRequest,
     piece_tracker::{AcquireRequest, AcquireResult, PickOptions},
     session_stats::swarm::{self},
+    type_aliases::PeerHandle,
 };
 
 use super::peer::{InflightRequest, RemoveInflightRequestResult};
@@ -38,7 +38,7 @@ impl PeerHandler {
         let choked = self.choked_by_peer();
 
         // Steal info to process after releasing the peer lock
-        let mut steal_info: Option<(SocketAddr, ValidPieceIndex)> = None;
+        let mut steal_info: Option<(PeerHandle, ValidPieceIndex)> = None;
         // Whether this pick started the last queued piece, so the end game
         // began: peers with nothing to ask may now double blocks.
         let mut end_game_began = false;

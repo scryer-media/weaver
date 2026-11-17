@@ -386,7 +386,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let holds = self.holds();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
         for torrent in self.inner.live.lock().await.values() {
             if torrent.resumed()
@@ -412,10 +412,6 @@ impl TorrentService {
     /// unless a wind-down asked for keeps them running until they end.
     pub async fn set_settings(&self, settings: TorrentSettings) {
         let enabled = settings.torrent.enabled;
-        let peer_limit = |torrent: &TorrentConfig| {
-            crate::torrents::sessions::session_limits(torrent).connections_limit
-        };
-        let peers = peer_limit(&settings.torrent);
         self.inner.sessions.set_config(settings.torrent.clone());
         let was = std::mem::replace(
             &mut *self
@@ -443,14 +439,6 @@ impl TorrentService {
         }
         if turned_on {
             self.resume_wound_down().await;
-        }
-        // Each torrent leg says how far its tunnel holds TCP peers below the
-        // peer limit, so a new limit reads the routes again.
-        if peers != peer_limit(&was)
-            && let Some(proxies) = self.queue().and_then(|queue| queue.proxy_runtime())
-            && let Err(error) = proxies.reload().await
-        {
-            tracing::warn!(error, "the routes did not take the new torrent peer limit");
         }
         // The download limit and the seeding levels take hold now, not at
         // the next tick.
@@ -578,7 +566,7 @@ impl TorrentService {
     // Every torrent is read before its session changes, as `stop` reads
     // before the sessions close.
     async fn turn(&self, on: bool) {
-        self.read(self.inner.clock.now_ms(), true).await;
+        self.read(self.inner.clock.unix_ms(), true).await;
         self.inner.sessions.turn(on).await;
         self.read_sessions().await;
         self.run(on).await;

@@ -3,6 +3,7 @@
 
 mod archive_password;
 pub mod assembly;
+pub mod class;
 pub mod diagnostic_names;
 pub mod diagnostic_tables;
 pub mod download_summary;
@@ -30,6 +31,10 @@ pub mod support_facts;
 mod support_facts_persistence;
 pub mod working_dir;
 
+pub use class::{
+    AddRefusal, ByProtocol, ClassIntake, ClassRate, ClassRates, JobClass, JobClasses, Owed,
+    OwnedRows, PipelineClass, RefusalReason, Route, Submission, TunnelGiveBack,
+};
 pub use duplicate::{
     CallerScopedIdempotency, DuplicateAction, DuplicateDecision, DuplicateJobLifecycle,
     DuplicateMatch, DuplicateMode, DuplicatePolicy, FingerprintEvidence, FingerprintKind,
@@ -55,10 +60,10 @@ pub use handle::{
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{
-    ArchivePasswordCandidate, ArchivePasswordSource, DownloadState, FieldUpdate, FileSpec, JobSpec,
-    JobState, JobStatus, JobUpdate, MessageIds, PostState, Protocol, RunState, SegmentSpec,
-    derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
-    runtime_lanes_from_status_snapshot,
+    ArchivePasswordCandidate, ArchivePasswordSource, ClassHold, ClassNames, DownloadState,
+    FieldUpdate, FileSpec, HeldClass, JobSpec, JobState, JobStatus, JobUpdate, MessageIds,
+    PostState, Protocol, RunState, SegmentSpec, derive_legacy_job_status, epoch_ms_now,
+    job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
 };
 pub use phase_progress::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
 pub use record::{ActiveFileIdentity, ActiveJob, FileIdentitySource, RecoveredJob};

@@ -81,9 +81,11 @@ function Fixture(){
  return <MemoryRouter><main className="bg-wv-bg text-wv-primary" style={{padding:16,maxWidth:width,margin:"auto",display:"grid",gap:16}}><button onClick={()=>setDown(!down)}>Toggle all down</button><NetworkFlow flow={flow} egresses={egresses} profiles={profiles} pools={pools} consumers={consumers} onEdit={setEditing} traffic trace/><FlowEditor target={editing} onClose={()=>setEditing(null)} data={data} egresses={egresses} consumers={consumers} flow={flow} action={action} busy={false} proxyEditor={(id,onClose)=><ProxyEditorFor key={id} id={id} onClose={onClose} onChanged={()=>{}}/>}/>
  <RouteEditor value={route} onChange={setRoute} egresses={egresses} profiles={profiles} pools={pools} cap={50} status={flow.legs.filter(leg=>leg.consumer==="server:1")}/><output aria-label="Route weights">{route.legs.map(l=>l.weight).join(",")}</output></main></MemoryRouter>;
 }
+// Torrents on: the editors show their torrent parts, as they did before those parts asked.
+const torrentsOn={torrents:"on",torrentPresence:{enabled:true,jobs:false,running:false,windingDown:false,windDown:null}} as NextData;
 createRoot(document.getElementById("root")!).render(<TranslateContext.Provider value={{t:(key,values)=>translateDictionary(en,key,values),uiLanguage:"eng",selectedLanguage:{code:"eng",label:"English"},setLanguagePreference:()=>{}}}><Provider value={client}><DnsReads><Fixture/></DnsReads></Provider></TranslateContext.Provider>);
 
-/* Holds the DNS profile reads as NextDataProvider does, for the editors that offer them. */
+/* Holds the DNS profile reads as NextDataProvider does, for the editors that offer them, with torrents on. */
 function DnsReads({ children }: { children: ReactNode }) {
-  return <NextDataContext.Provider value={useDnsProfileReads() as NextData}>{children}</NextDataContext.Provider>;
+  return <NextDataContext.Provider value={{...torrentsOn,...useDnsProfileReads()} as NextData}>{children}</NextDataContext.Provider>;
 }

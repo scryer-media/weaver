@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 use super::*;
 use crate::operations::disk::volume::Volume;
 use crate::operations::disk::writer::Hold;
+use crate::pipeline::graph::disk::VolumeLeases;
 use crate::pipeline::graph::disk::threads;
 use crate::pipeline::tests::{job_status_for_assert, settle_failed_releases};
 
@@ -665,6 +666,235 @@ async fn a_job_cancelled_with_bytes_queued_ends_once_its_volume_let_go() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A job that fails while its volume's thread still holds operations on its
+// files keeps them, unlike a cancelled one: a failed job keeps what it
+// delivered, so the bytes queued for its file are written and a removal
+// queued for a file that no longer belongs to it runs, both before its
+// working directory is released.
+#[tokio::test]
+async fn a_job_failed_with_operations_queued_runs_them_before_its_release() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_416);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let leftover = working_dir.join("lantern.half");
+    std::fs::write(&leftover, b"half of a decode").unwrap();
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    let removed = leftover.clone();
+    pipeline.graph_jobs[&job_id]
+        .disk()
+        .unwrap()
+        .working()
+        .run(None, leftover.clone(), move || {
+            std::fs::remove_file(&removed)
+        });
+    hold.wait_held();
+    pipeline.fail_job(job_id, "no file was delivered whole".to_string());
+    assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    // Asked while the volume stands still: a wait of the loop would not
+    // have come back.
+    no_loop_waits(&volume);
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    settle_failed_releases(&mut pipeline).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+    assert!(!leftover.exists(), "the queued removal did not run");
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job that fails while a move waits on a checkpoint that itself waits for
+// the volume's writer: that checkpoint is never written now, and the move
+// hears so at once, so the job's retirement ends once the writer returns
+// instead of waiting for word of a commit that never comes.
+#[tokio::test]
+async fn a_job_failed_with_a_commit_owed_behind_its_writer_still_settles() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_417);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    hold.wait_held();
+    let mail = pipeline.graph_runs.written();
+    // The checkpoint taken so far commits, so nothing of the job is on its
+    // way to the database.
+    let first = pipeline.graph_jobs[&job_id].pending().stamp();
+    if pipeline.graph_jobs[&job_id]
+        .pending()
+        .await_commit(first, job_id.0, &mail, &pipeline.db)
+        .is_none()
+    {
+        loop {
+            let said = pipeline.graph_runs.recv().await.unwrap();
+            let written = matches!(said.heard, Heard::Written { .. });
+            pipeline.graph_run_said(said);
+            if written {
+                break;
+            }
+        }
+    }
+    // The next waits for the held writer, and a move waits on its commit,
+    // as `checkpoint_graph_job` leaves one.
+    pipeline.flush_graph_checkpoint(job_id);
+    {
+        let graph = pipeline.graph_jobs.get_mut(&job_id).unwrap();
+        let pending = graph.pending().clone();
+        assert!(pending.gated());
+        assert!(
+            pending
+                .await_commit(pending.stamp(), job_id.0, &mail, &pipeline.db)
+                .is_none()
+        );
+        graph.owe_mail(pending.stamp());
+    }
+    pipeline.fail_job(job_id, "no file was delivered whole".to_string());
+    assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    no_loop_waits(&volume);
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    settle_failed_releases(&mut pipeline).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job stopped while its last checkpoint waits for the volume's writer, as
+// one held for a full disk is, waits on that checkpoint's commit. A cancel
+// then stops its checkpoints, so the commit never comes: the stopped graph
+// hears so at once and goes once the writer returns, and the cancel can
+// end.
+#[tokio::test]
+async fn a_stopped_job_cancelled_with_a_commit_owed_behind_its_writer_still_goes() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_419);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    hold.wait_held();
+    let mail = pipeline.graph_runs.written();
+    // The checkpoint taken so far commits, so nothing of the job is on its
+    // way to the database.
+    let first = pipeline.graph_jobs[&job_id].pending().stamp();
+    if pipeline.graph_jobs[&job_id]
+        .pending()
+        .await_commit(first, job_id.0, &mail, &pipeline.db)
+        .is_none()
+    {
+        loop {
+            let said = pipeline.graph_runs.recv().await.unwrap();
+            let written = matches!(said.heard, Heard::Written { .. });
+            pipeline.graph_run_said(said);
+            if written {
+                break;
+            }
+        }
+    }
+    // The next waits for the held writer, and the stop waits on its commit.
+    pipeline.flush_graph_checkpoint(job_id);
+    assert!(pipeline.graph_jobs[&job_id].pending().gated());
+    pipeline.retire_graph_job(job_id);
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
+    pipeline.cancel_graph_checkpoint_retries(job_id);
+    no_loop_waits(&volume);
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job that fails while its volume's thread holds operations on its files,
+// where the thread returns the last of them as the graph stops: the graph
+// held something when the failure looked, and nothing once stopped. The
+// failure is still carried out, by the release a graph that holds nothing
+// goes to, and the job ends Failed instead of waiting for a retirement
+// that was never kept.
+#[tokio::test]
+async fn a_job_whose_writer_returns_as_it_fails_still_settles() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_420);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    hold.wait_held();
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    assert!(!disk.quiet());
+    crate::pipeline::activation::before_kept::set(move || {
+        hold.open();
+        disk.barrier().wait_returned();
+    });
+    pipeline.fail_job(job_id, "no file was delivered whole".to_string());
+    assert!(!pipeline.retiring_graph_jobs.contains_key(&job_id));
+    assert!(
+        pipeline.releasing_failed_jobs.contains(&job_id),
+        "nothing carries the failure out"
+    );
+    settle_failed_releases(&mut pipeline).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job that failed with its writer already caught up is released at once,
+// and its graph stopped later, as its runtime is purged. Whatever was
+// queued for its files in between still runs: a failed job keeps its file
+// operations whichever path stops its graph, and its working directory is
+// released only once its writer has returned the release of its handles.
+#[tokio::test]
+async fn a_failed_job_stopped_later_still_runs_what_was_queued_for_it() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_418);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let leftover = working_dir.join("lantern.half");
+    std::fs::write(&leftover, b"half of a decode").unwrap();
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    disk.barrier().wait_returned();
+    let (volume, hold) = held(&pipeline, job_id);
+    pipeline.fail_job(job_id, "no file was delivered whole".to_string());
+    // Nothing held the graph, so the failure went straight to its release,
+    // which waits for the writer to let the job's handles go.
+    assert!(!pipeline.retiring_graph_jobs.contains_key(&job_id));
+    assert!(pipeline.releasing_failed_jobs.contains(&job_id));
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    let removed = leftover.clone();
+    disk.working().run(None, leftover.clone(), move || {
+        std::fs::remove_file(&removed)
+    });
+    pipeline.retire_graph_job(job_id);
+    assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    no_loop_waits(&volume);
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    settle_failed_releases(&mut pipeline).await;
+    assert!(!leftover.exists(), "the queued removal did not run");
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+    assert!(!working_dir.join(".weaver-chunks").exists());
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
 // A volume that holds the write budget stops dispatch for its job. The
 // batch that brings it below the line wakes the loop, and the job is
 // handed work again.
@@ -695,9 +925,9 @@ async fn a_job_held_by_a_full_write_buffer_is_dispatched_again_once_woken() {
     // have come back.
     no_loop_waits(&volume);
     hold.open();
-    let report = pipeline.volume_reports.recv().await.unwrap();
-    assert!(report.below);
-    pipeline.volume_batch_returned(report);
+    // The writer's word of room: the line was crossed.
+    pipeline.volume_rooms.recv().await.unwrap();
+    pipeline.volume_room_heard();
     assert!(pipeline.download_dispatch_wake);
     assert!(!pipeline.volume_holds_budget(job_id));
     assert!(pipeline.lease_for_server_for_test(0).is_some());
@@ -741,7 +971,7 @@ async fn a_graceful_stop_drains_the_volumes_and_then_checkpoints() {
 // bytes it never saw put down, and the restarted job fetches them again.
 #[tokio::test]
 async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
-    use crate::operations::disk::writer::{Leaping, SettleBound};
+    use crate::operations::disk::writer::SettleBound;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_413);
@@ -755,7 +985,9 @@ async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
         // A clock a minute later at each look: the volume's span is over
         // the first time the stop finds it standing still.
         pipeline.shutdown_settle = SettleBound {
-            clock: Arc::new(Leaping(std::sync::atomic::AtomicU64::new(0))),
+            clock: Arc::new(crate::clock::ManualClock::stepping(
+                std::time::Duration::from_secs(60),
+            )),
             span: std::time::Duration::from_secs(30),
         };
         let handle =
@@ -824,9 +1056,11 @@ async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
 // Stop the pipeline with a clock a minute later at each look, so a volume
 // that stands still is given up the first time the stop finds it so.
 async fn stop_past_a_still_volume(pipeline: &mut Pipeline) {
-    use crate::operations::disk::writer::{Leaping, SettleBound};
+    use crate::operations::disk::writer::SettleBound;
     pipeline.shutdown_settle = SettleBound {
-        clock: Arc::new(Leaping(std::sync::atomic::AtomicU64::new(0))),
+        clock: Arc::new(crate::clock::ManualClock::stepping(
+            std::time::Duration::from_secs(60),
+        )),
         span: std::time::Duration::from_secs(30),
     };
     let handle =
@@ -928,7 +1162,8 @@ async fn a_stop_does_not_wait_for_a_repair_held_by_a_still_volume() {
 // checkpointed as any other, not left at an older checkpoint.
 #[tokio::test]
 async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
-    use crate::operations::disk::writer::{HandClock, SettleBound};
+    use crate::clock::ManualClock;
+    use crate::operations::disk::writer::SettleBound;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_418);
@@ -950,7 +1185,7 @@ async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
     // writes come down. The volume is let go once the settle stands still
     // for it, which is after the repair came back stopped and was kept.
     pipeline.shutdown_settle = SettleBound {
-        clock: Arc::new(HandClock::default()),
+        clock: Arc::new(ManualClock::default()),
         span: std::time::Duration::from_secs(30),
     };
     let release = std::thread::spawn(move || {
@@ -993,7 +1228,7 @@ async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
 // not fail, and it is left at its last written checkpoint.
 #[tokio::test]
 async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_end() {
-    use crate::operations::disk::writer::HandClock;
+    use crate::clock::ManualClock;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_419);
@@ -1025,7 +1260,7 @@ async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_
     assert!(pipeline.graph_jobs[&job_id].repair_out());
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
     let volume = Arc::clone(disk.working().volume());
-    let clock = Arc::new(HandClock::default());
+    let clock = Arc::new(ManualClock::default());
     let span = std::time::Duration::from_secs(30);
     // The repair's return is in hand and everything before it is down when
     // the stop is rung and the volume stands still.
@@ -1037,7 +1272,7 @@ async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_
             disk.barrier().wait_aside();
             let hold = pipeline.volume_writers.hold(&volume);
             let writers = Arc::clone(&pipeline.volume_writers);
-            writers.end_loop_waits_at(Arc::clone(&clock) as _, span);
+            writers.end_waits_at(Arc::clone(&clock) as _, clock.instant(span));
             writers.stop_waits();
             let (watched, clock) = (Arc::clone(&volume), Arc::clone(&clock));
             watcher = Some(std::thread::spawn(move || {
@@ -1634,5 +1869,251 @@ async fn a_profile_change_sizes_the_volume_limits_again() {
     pipeline.set_configured_hardware_profile(other);
 
     assert_eq!(volume.buffer_limits(), (will * 70 / 100, will));
+    retire_pipeline_database(pipeline).await;
+}
+
+// A volume's probe waits for the first job's writes: it is queued as the job
+// is given the volume's writer, and runs on the volume's thread once that
+// writer first runs out of work, after the job's file is down whole. The
+// rate it measures is the one extraction admission reads: on a disk whose
+// writes run under 100 MB/s one extraction runs at a time, where two did
+// before the volume was measured.
+#[tokio::test]
+async fn a_volume_is_probed_after_its_first_jobs_writes_and_a_slow_one_runs_one_extraction() {
+    use std::sync::{Mutex, mpsc};
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_430);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (said, probed) = mpsc::channel();
+    let said = Mutex::new(said);
+    let job_file = Arc::new(std::sync::OnceLock::<PathBuf>::new());
+    let file_of_job = Arc::clone(&job_file);
+    pipeline.volume_probes = Arc::new(crate::pipeline::graph::disk::VolumeProbes::with(
+        move |volume, _| {
+            let said = said.lock().unwrap().clone();
+            let file_of_job = Arc::clone(&file_of_job);
+            Box::new(move || {
+                // What the job's file holds as the probe begins.
+                let held = file_of_job.get().and_then(|file| std::fs::read(file).ok());
+                volume.write_rate.store(60_000_000, Ordering::Relaxed);
+                let _ = said.send((Arc::clone(&volume), held));
+                Ok(())
+            })
+        },
+    ));
+    // A drive with seeks to spare: two extractions while its writes are not
+    // measured.
+    pipeline.tuner.set_random_read_iops(600.0);
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.tuner.max_concurrent_extractions(), 2);
+
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec("lantern joined", &posts, ARTICLE),
+    )
+    .await;
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    job_file.set(working_dir.join("lantern.bin")).unwrap();
+    let (volume, hold) = held(&pipeline, job_id);
+    assert!(Arc::ptr_eq(
+        &volume,
+        &pipeline.storage_capacity.volume(&pipeline.intermediate_dir)
+    ));
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    // The thread stands before the job's first write: the probe has not
+    // run ahead of it.
+    hold.wait_held();
+    assert!(probed.try_recv().is_err(), "not ahead of the job's writes");
+    hold.open();
+    let (probed_volume, held_then) = probed.recv().unwrap();
+    assert!(Arc::ptr_eq(&probed_volume, &volume));
+    assert_eq!(
+        held_then.as_deref(),
+        Some(posts[0].bytes.as_slice()),
+        "the probe ran once the job's file was down whole"
+    );
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+
+    // The next turn reads the probed rate: one extraction at a time.
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.tuner.max_concurrent_extractions(), 1);
+    no_loop_waits(&volume);
+    drop(hold);
+    retire_pipeline_database(pipeline).await;
+}
+
+// The volume's probe runs once a job's file is down, beside the job's
+// delivery: held while its scratch file is there, the file is not among the
+// entries of the job's folder the final move lists, and once let go it is
+// gone and the delivery moves the job's own file alone.
+#[tokio::test]
+async fn a_probe_holding_its_scratch_file_leaves_the_jobs_folder_and_delivery_alone() {
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_431);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (made, scratch) = mpsc::channel::<PathBuf>();
+    let (release, released) = mpsc::channel::<()>();
+    let (made, released) = (Mutex::new(made), Mutex::new(released));
+    let store = crate::operations::disk::ProbeStore::writing_with(data.path(), move |path| {
+        made.lock().unwrap().send(path.to_path_buf()).unwrap();
+        released.lock().unwrap().recv().unwrap();
+        Some(crate::runtime::system_probe::ProbeWrite {
+            bytes: 1_000_000,
+            elapsed: Duration::from_millis(10),
+        })
+    });
+    let (ended, probe_ended) = mpsc::channel::<()>();
+    let ended = Mutex::new(ended);
+    pipeline.volume_probes = Arc::new(crate::pipeline::graph::disk::VolumeProbes::with(
+        move |volume, dir| {
+            let probe = crate::operations::disk::probe_once(volume, dir, Arc::clone(&store));
+            let ended = ended.lock().unwrap().clone();
+            Box::new(move || {
+                let probed = probe();
+                let _ = ended.send(());
+                probed
+            })
+        },
+    ));
+
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec("lantern joined", &posts, ARTICLE),
+    )
+    .await;
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    hold.wait_held();
+    hold.open();
+
+    // The probe made its file once the job's writes were down, and holds.
+    let scratch = scratch.recv().unwrap();
+    assert!(scratch.is_file());
+    let listed: Vec<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !listed.iter().any(|name| name.contains("volume-probe")),
+        "the job's folder lists {listed:?}"
+    );
+    assert!(listed.contains(&"lantern.bin".to_string()), "{listed:?}");
+    assert!(!scratch.starts_with(&working_dir), "{}", scratch.display());
+    assert_eq!(
+        scratch.parent().and_then(Path::parent),
+        Some(pipeline.intermediate_dir.as_path())
+    );
+
+    // Let go, the probe removes its file and its directory.
+    release.send(()).unwrap();
+    probe_ended.recv().unwrap();
+    assert!(!scratch.exists());
+    assert!(!scratch.parent().unwrap().exists());
+    assert!(volume.write_rate.load(Ordering::Relaxed) > 0);
+
+    pipeline.start_move_to_complete(job_id).await.unwrap();
+    while !pipeline.inflight_moves.contains(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+        pipeline.start_move_to_complete(job_id).await.unwrap();
+    }
+    let done = pipeline.move_done_rx.recv().await.unwrap();
+    pipeline.handle_move_to_complete_done(done).await;
+    let status = job_status_for_assert(&pipeline, job_id);
+    assert!(
+        !matches!(status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+    let mut delivered = Vec::new();
+    let mut dirs = vec![pipeline.complete_dir.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(entry.path());
+            } else {
+                delivered.push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+    delivered.retain(|(name, _)| !name.starts_with(".weaver-"));
+    assert_eq!(
+        delivered,
+        vec![("lantern.bin".to_string(), posts[0].bytes.clone())]
+    );
+    drop(hold);
+    retire_pipeline_database(pipeline).await;
+}
+
+// Hear the next report or mail the loop is sent.
+async fn hear_next(pipeline: &mut Pipeline) {
+    tokio::select! {
+        Some(()) = pipeline.volume_rooms.recv() => pipeline.volume_room_heard(),
+        Some(said) = pipeline.graph_runs.recv() => pipeline.graph_run_said(said),
+    }
+}
+
+// A file the volume's writer cannot make for its name is skipped once. Each
+// later write of it returns at hand-over, before its own refusal comes back:
+// the member stays marked through it, and the refusal that follows skips
+// nothing more, so it is logged and damaged once.
+#[tokio::test]
+async fn a_name_a_volumes_thread_refuses_is_skipped_once_over_later_writes() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_431);
+    // One part of 300 bytes, past the 255 a part may hold.
+    let name = format!("{}.bin", "a".repeat(296));
+    let posts = [Post::plain(&name, payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let unnamable = |pipeline: &Pipeline| {
+        pipeline.graph_jobs[&job_id]
+            .writer()
+            .unnamable(weaver_graph::NodeId::ROOT, MemberId(0))
+    };
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    while !unnamable(&pipeline) {
+        hear_next(&mut pipeline).await;
+    }
+    for ordinal in 1..3 {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+        assert!(unnamable(&pipeline), "article {ordinal}");
+        let barrier = pipeline.graph_jobs[&job_id].disk().unwrap().barrier();
+        while !barrier.passed() {
+            hear_next(&mut pipeline).await;
+        }
+        assert!(unnamable(&pipeline), "article {ordinal}");
+    }
+    let job = &pipeline.graph_jobs[&job_id];
+    assert_eq!(job.writer().names_skipped, 1);
+    let whole = ByteRange::new(0, posts[0].bytes.len() as u64);
+    assert!(
+        job.namespace()
+            .get(MemberId(0))
+            .unwrap()
+            .coverage
+            .damaged(whole)
+    );
+    let listed: Vec<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !listed.iter().any(|listed| listed.ends_with(".bin")),
+        "{listed:?}"
+    );
     retire_pipeline_database(pipeline).await;
 }

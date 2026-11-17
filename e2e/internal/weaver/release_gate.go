@@ -371,6 +371,7 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 	if err != nil {
 		return err
 	}
+	recordFullRunLockTempRoot(runDir)
 	phases, err := newWeaverReleasePhases(runDir, specs)
 	if err != nil {
 		return err
@@ -882,6 +883,7 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase, qu
 				env[weaverReleaseFlowDeadlineEnv] = deadline.UTC().Format(time.RFC3339Nano)
 			}
 			cmd.Env = mergeChildEnv(os.Environ(), env)
+			passFullRunLock(cmd)
 			cmd.Stdout = io.MultiWriter(logFile, os.Stdout)
 			cmd.Stderr = io.MultiWriter(logFile, os.Stderr)
 			_, _ = fmt.Fprintf(logFile, "flow queued at %s, started at %s after %s in the queue\n",
@@ -890,6 +892,7 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase, qu
 			_ = logFile.Close()
 		}
 	}
+	flowEnded := time.Now()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		err = fmt.Errorf("flow exceeded %s", timeout)
 	}
@@ -900,6 +903,7 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase, qu
 		configureWeaverReleaseCommandCancellation(finalizeCmd)
 		finalizeCmd.Dir = e2eDir()
 		finalizeCmd.Env = mergeChildEnv(os.Environ(), phase.env())
+		passFullRunLock(finalizeCmd)
 		finalizeCmd.Stdout = os.Stdout
 		finalizeCmd.Stderr = os.Stderr
 		finalizeErr := finalizeCmd.Run()
@@ -921,6 +925,7 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase, qu
 	if stagesErr != nil {
 		log.Printf("warning: read stage timings for %s: %v", weaverReleaseFlowKey(phase), stagesErr)
 	}
+	stages = closeWeaverReleaseStages(stages, flowEnded, err)
 	playwright, lifecycle := splitWeaverReleaseFlowTime(duration, stages)
 	status.FinishedAt = time.Now().UTC()
 	status.DurationMS = duration.Milliseconds()
@@ -1026,6 +1031,10 @@ func (phase *weaverReleasePhase) env() map[string]string {
 			files = append(files, filepath.Join(e2eDir(), file))
 		}
 		env["COMPOSE_FILE"] = composeutil.ComposeFileValue(append(files, phase.ComposeOverride)...)
+		if phase.Spec.NetworkLayout == weaverNetworkLayoutDefault && phase.Flow != "proxy-routing" {
+			// The override is the subnet alone, so stack-up may move it.
+			env[stackNetworkOverrideEnv] = phase.ComposeOverride
+		}
 	}
 	if len(phase.Spec.ComposeFiles) > 0 {
 		env["E2E_RUST_TOOLCHAIN"] = weaverPinnedRustToolchain(weaverRepoPath())
@@ -2598,7 +2607,8 @@ func runWeaverReleasePlaywright(ctx context.Context, script string) (err error) 
 	if stage == "" {
 		stage = script
 	}
-	defer endWeaverReleaseStage("playwright "+stage, weaverReleaseStagePlaywright, time.Now(), &err)
+	defer endWeaverReleaseStage("playwright "+stage, weaverReleaseStagePlaywright,
+		beginWeaverReleaseStage("playwright "+stage, weaverReleaseStagePlaywright), &err)
 	err = runWeaverReleasePlaywrightOnce(ctx, script)
 	if err == nil || !isWeaverBrowserCrash(err) {
 		return err

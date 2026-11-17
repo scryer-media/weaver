@@ -7,9 +7,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 
 use super::JobDisk;
-use crate::operations::disk::volume::Volume;
+use crate::operations::disk::volume::{Reservation, Volume};
 use crate::operations::disk::writer::{Hold, Report, VolumeWriters};
 use crate::pipeline::graph::checkpoint::Pending;
+use crate::pipeline::graph::disk::VolumeLeases;
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::leaf::Leaf;
 use crate::pipeline::graph::root::tests::{decoded, file, job_through, job_with};
@@ -75,7 +76,7 @@ fn writers() -> Writers {
     let (send, reports) = mpsc::channel();
     let send = Mutex::new(send);
     Writers {
-        writers: VolumeWriters::new(move |report| {
+        writers: VolumeWriters::reporting(move |report| {
             let _ = send.lock().unwrap().send(report);
         }),
         reports,
@@ -85,7 +86,7 @@ fn writers() -> Writers {
 
 impl Writers {
     fn disk(&self) -> JobDisk {
-        JobDisk::new(self.writers.submitter(&self.volume, 1), None)
+        JobDisk::new(self.writers.test_submitter(&self.volume, 1), None)
     }
 
     fn hold(&self) -> Hold {
@@ -239,7 +240,7 @@ fn a_read_waits_for_the_writes_of_its_range() {
     let dir = tempfile::tempdir().unwrap();
     let through = writers();
     let hold = through.hold();
-    let to = through.writers.submitter(&through.volume, 1);
+    let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
     leaf.write(0, b"lantern", None).unwrap();
     leaf.write(7, b"light", None).unwrap();
@@ -266,7 +267,7 @@ fn a_read_waits_for_the_writes_of_its_range() {
 fn the_loop_reads_an_open_file_through_one_handle_until_it_closes() {
     let dir = tempfile::tempdir().unwrap();
     let through = writers();
-    let to = through.writers.submitter(&through.volume, 1);
+    let to = through.writers.test_submitter(&through.volume, 1);
     let reads = || through.volume.writer.loop_reads.load(Ordering::Relaxed);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
     leaf.write(0, b"lanternlight", None).unwrap();
@@ -306,7 +307,7 @@ fn the_length_of_a_file_whose_write_failed_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let through = writers();
     let hold = through.hold();
-    let to = through.writers.submitter(&through.volume, 1);
+    let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
     leaf.write(0, b"lantern", None).unwrap();
     leaf.write(7, b"light", None).unwrap();
@@ -329,7 +330,7 @@ fn a_move_follows_the_last_write_of_its_file() {
     let dir = tempfile::tempdir().unwrap();
     let through = writers();
     let hold = through.hold();
-    let to = through.writers.submitter(&through.volume, 1);
+    let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "from.bin").through(Some(&to));
     leaf.write(0, b"lantern", None).unwrap();
     leaf.write(7, b"light", None).unwrap();
@@ -482,18 +483,20 @@ fn a_volume_counts_what_is_being_decoded_with_what_waits_for_its_writer() {
     let disk = through.disk();
     through.volume.set_buffer_limits(700, 1000);
     assert_eq!(through.volume.lease_limit(), 938);
-    through.volume.charge(400);
+    let mut held = Reservation::none(Arc::clone(&through.volume));
+    held.count(400);
     assert_eq!(disk.intake(), VolumeIntake::Open);
-    through.volume.charge(300);
+    held.count(300);
     assert_eq!(through.volume.unwritten_bytes(), 700);
     assert_eq!(disk.intake(), VolumeIntake::Open);
-    through.volume.charge(300);
+    held.count(300);
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
-    through.volume.release(600);
+    held.give_back(600);
     assert_eq!(disk.intake(), VolumeIntake::Open);
     through.volume.set_buffer_limits(280, 400);
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
-    through.volume.release(400);
+    held.give_back(400);
+    assert_eq!(through.volume.unwritten_bytes(), 0);
 }
 
 // A job whose delivered files lie on another volume than its working
@@ -509,8 +512,11 @@ fn a_job_on_two_volumes_waits_for_both() {
     std::fs::create_dir_all(&working_dir).unwrap();
     std::fs::create_dir_all(&output_dir).unwrap();
     let disk = JobDisk::new(
-        through.writers.submitter(&through.volume, 1),
-        Some((output_dir.clone(), through.writers.submitter(&other, 1))),
+        through.writers.test_submitter(&through.volume, 1),
+        Some((
+            output_dir.clone(),
+            through.writers.test_submitter(&other, 1),
+        )),
     );
     let (hold, other_hold) = (through.hold(), through.writers.hold(&other));
     for root in [&working_dir, &output_dir] {
@@ -572,15 +578,83 @@ fn a_volume_is_probed_once_when_a_job_first_writes_to_it() {
     });
     // The job's directory is not made yet: the probe is given the nearest
     // one above it that is.
-    probes.first_seen(&through.writers, &through.volume, &working_dir.join("one"));
+    probes.first_seen(
+        &through.writers,
+        through.writers.test_owner(),
+        &through.volume,
+        &working_dir.join("one"),
+    );
     assert_eq!(probed.recv().unwrap(), (None, dir.path().to_path_buf()));
-    probes.first_seen(&through.writers, &through.volume, &working_dir.join("two"));
-    probes.first_seen(&through.writers, &other, &output_dir);
-    assert_eq!(probed.recv().unwrap(), (Some(2), output_dir.clone()));
-    probes.first_seen(&through.writers, &other, &output_dir);
+    probes.first_seen(
+        &through.writers,
+        through.writers.test_owner(),
+        &through.volume,
+        &working_dir.join("two"),
+    );
+    // The job's directory is there: the probe is given the one above it.
+    probes.first_seen(
+        &through.writers,
+        through.writers.test_owner(),
+        &other,
+        &output_dir,
+    );
+    assert_eq!(probed.recv().unwrap(), (Some(2), dir.path().to_path_buf()));
+    probes.first_seen(
+        &through.writers,
+        through.writers.test_owner(),
+        &other,
+        &output_dir,
+    );
     // Every sender left is in a probe still queued: none is.
     drop(probes);
     assert!(probed.recv().is_err(), "no volume is probed twice");
+}
+
+// The probe writes beside a job's folder, never in it, for every folder a
+// job writes to: a working directory under its plain or its suffixed name,
+// made or not yet, under a root made or not yet, and a staging directory
+// under a destination's `.weaver-staging`.
+#[test]
+fn the_probe_writes_outside_every_job_folder() {
+    use crate::jobs::ids::JobId;
+    use crate::jobs::working_dir::{claim_working_dir, compute_working_dir, make_job_staging_dir};
+    let dir = tempfile::tempdir().unwrap();
+    let intermediate = dir.path().join("intermediate");
+    let complete = dir.path().join("complete");
+    let beside = |job_dir: &Path, expected: &Path| {
+        let probed = super::probed_dir(job_dir).unwrap();
+        assert_eq!(probed, expected, "for {}", job_dir.display());
+        assert!(!probed.starts_with(job_dir), "not in {}", job_dir.display());
+    };
+
+    // Not made yet, nor its root: the nearest directory there.
+    beside(
+        &compute_working_dir(&intermediate, JobId(1), "lantern"),
+        dir.path(),
+    );
+    let plain = claim_working_dir(&intermediate, JobId(1), "lantern").unwrap();
+    beside(&plain.path, &intermediate);
+    let suffixed = claim_working_dir(&intermediate, JobId(2), "lantern").unwrap();
+    assert_ne!(suffixed.path, plain.path);
+    beside(&suffixed.path, &intermediate);
+    beside(
+        &compute_working_dir(&intermediate, JobId(3), "lantern later"),
+        &intermediate,
+    );
+
+    std::fs::create_dir(&complete).unwrap();
+    let staging = complete
+        .join("tv")
+        .join(crate::jobs::working_dir::STAGING_DIR_NAME)
+        .join("4");
+    beside(&staging, &complete);
+    make_job_staging_dir(&staging, JobId(4)).unwrap();
+    beside(&staging, staging.parent().unwrap());
+
+    // Where the intermediate root is the complete root, the jobs' folders
+    // are still its children.
+    let shared = claim_working_dir(&complete, JobId(5), "lantern").unwrap();
+    beside(&shared.path, &complete);
 }
 
 // On a machine that will start no thread for a volume, a job's first
@@ -595,7 +669,7 @@ fn a_job_fails_at_once_where_no_writer_thread_can_start() {
         let _ = send.lock().unwrap().send(report);
     });
     let volume = Arc::new(Volume::new(None, "test".to_owned()));
-    let disk = JobDisk::new(writers.submitter(&volume, 1), None);
+    let disk = JobDisk::new(writers.test_submitter(&volume, 1), None);
     let (mut job, dir, _) = job_through(&files(), Vec::new(), |_| Some(disk.clone()));
     for (at, ordinal) in seeded() {
         arrive(&mut job, at, ordinal);
@@ -718,7 +792,7 @@ fn a_released_file_is_released_again_only_after_another_operation() {
     let dir = tempfile::tempdir().unwrap();
     let through = writers();
     let hold = through.hold();
-    let to = through.writers.submitter(&through.volume, 1);
+    let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
     leaf.write(0, b"lantern", None).unwrap();
     leaf.release_handle();
@@ -761,7 +835,7 @@ fn a_fold_never_waits_for_the_file_s_operations() {
     let dir = tempfile::tempdir().unwrap();
     let through = writers();
     let hold = through.hold();
-    let to = through.writers.submitter(&through.volume, 1);
+    let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
     leaf.write(0, b"lantern", None).unwrap();
     leaf.release_handle();

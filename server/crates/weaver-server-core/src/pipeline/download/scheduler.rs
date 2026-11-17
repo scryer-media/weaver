@@ -406,7 +406,7 @@ impl Pipeline {
     }
 
     // How many of a job's articles one lane may hold for the room the
-    // job's volume has left below its lease limit (`Volume::lease_room`),
+    // job's volume has left below its lease limit (`VolumeLeases::lease_room`),
     // in articles the size of the job's next one: its part of that room
     // over every connection, more than it holds now, and never less than a
     // full pipe, but never more than the room holds either. The next

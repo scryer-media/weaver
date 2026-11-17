@@ -49,7 +49,9 @@ async fn each_pex_message_from_the_shared_map_is_the_one_a_fresh_map_gives() {
         // A burst first, so the first round has more than 50 to add.
         for i in 0..90 {
             if let Ok(rx) = connected_to_us(&peers, host(i)) {
-                peers.with_peer_mut(host(i), "test", |peer| peer.listens_at(host(i), &peers));
+                peers.with_peer_mut(host(i).into(), "test", |peer| {
+                    peer.listens_at(host(i), &peers)
+                });
                 keep_rx.push(rx);
             }
         }
@@ -61,7 +63,8 @@ async fn each_pex_message_from_the_shared_map_is_the_one_a_fresh_map_gives() {
                     if let Ok(rx) = connected_to_us(&peers, a) {
                         keep_rx.push(rx);
                         if r & 16 != 0 {
-                            peers.with_peer_mut(a, "test", |peer| peer.listens_at(a, &peers));
+                            peers
+                                .with_peer_mut(a.into(), "test", |peer| peer.listens_at(a, &peers));
                         }
                     }
                 }
@@ -73,30 +76,30 @@ async fn each_pex_message_from_the_shared_map_is_the_one_a_fresh_map_gives() {
                         } else {
                             ConnectionKind::Tcp
                         };
-                        peers.with_peer_mut(handle, "test", |peer| {
+                        peers.with_peer_mut(handle.into(), "test", |peer| {
                             peer.connecting_to_live(Id20::default(), &peers, kind);
                         });
                         keep.push((rx, tx));
                     }
                 }
                 2 => {
-                    peers.with_peer_mut(a, "test", |peer| {
+                    peers.with_peer_mut(a.into(), "test", |peer| {
                         if peer.connected_out().is_some() {
                             peers.connection_closed(peer, now, r & 16 != 0, false);
                         }
                     });
                 }
                 3 => {
-                    peers.drop_peer(a);
+                    peers.drop_peer(a.into());
                 }
-                4 => peers.handshake_encryption(a, handshake(r & 16 != 0)),
+                4 => peers.handshake_encryption(a.into(), handshake(r & 16 != 0)),
                 5 => {
                     let bitfield = if r & 16 != 0 {
                         full_bitfield()
                     } else {
                         empty_bitfield()
                     };
-                    peers.update_bitfield(a, bitfield);
+                    peers.update_bitfield(a.into(), bitfield);
                 }
                 _ => {
                     let mut shared: Option<PexListed> = None;
@@ -191,7 +194,11 @@ async fn a_paused_list_keeps_the_peers_that_rank_highest() {
 
     let list = peers.idle_list();
     assert_eq!(list.peers.len(), MAX_PAUSED_PEERLIST_SIZE);
-    let kept = list.peers.iter().map(|p| p.addr).collect::<HashSet<_>>();
+    let kept = list
+        .peers
+        .iter()
+        .filter_map(|p| p.addr.addr())
+        .collect::<HashSet<_>>();
     assert!(queued.iter().all(|addr| kept.contains(addr)));
     assert!(kept.contains(&live));
     assert!(most_failed.iter().all(|addr| !kept.contains(addr)));
@@ -275,6 +282,7 @@ fn the_smart_ban_records_of_a_peer_leave_the_list_with_it_and_outlive_its_connec
         peers.add_peer(addr, PeerSourceFlag::Tracker);
     }
     let senders: Senders = [closed, erased, dropped, stranger]
+        .map(PeerHandle::from)
         .map(Some)
         .into_iter()
         .collect();
@@ -294,14 +302,14 @@ fn the_smart_ban_records_of_a_peer_leave_the_list_with_it_and_outlive_its_connec
 
     // The connection closes: the peer stays on the list.
     peers
-        .with_peer_mut(closed, "test", |peer| {
+        .with_peer_mut(closed.into(), "test", |peer| {
             peer.take_state(&peers);
             peers.connection_closed(peer, t0, false, false);
         })
         .unwrap();
     while closed_rx.try_recv().is_ok() {}
     // One peer is dropped, another pushed out of the full list.
-    peers.drop_peer(dropped).unwrap();
+    peers.drop_peer(dropped.into()).unwrap();
     fail_out(&peers, erased, t0);
     for i in 4.. {
         if peers.listed() == MAX_PEERLIST_SIZE {
@@ -316,7 +324,7 @@ fn the_smart_ban_records_of_a_peer_leave_the_list_with_it_and_outlive_its_connec
     assert!(peers.piece_failed(piece, failed).is_empty());
     assert_eq!(
         senders_recorded(peers.piece_passed(piece)),
-        BTreeSet::from([closed])
+        BTreeSet::from([closed.into()])
     );
 }
 
@@ -338,7 +346,7 @@ fn a_smart_ban_record_made_before_a_pause_names_its_sender_after_it() {
     let peers = make_peer_states();
     let sender = peer_addr(1);
     peers.add_peer(sender, PeerSourceFlag::Tracker);
-    let senders: Senders = [sender; 4].map(Some).into_iter().collect();
+    let senders: Senders = [sender.into(); 4].map(Some).into_iter().collect();
     let filled = |byte: u8| {
         move |_, _: &ChunkInfo, buf: &mut [u8]| {
             buf.fill(byte);
@@ -354,7 +362,10 @@ fn a_smart_ban_record_made_before_a_pause_names_its_sender_after_it() {
         u32::try_from(TOTAL_PIECES).unwrap(),
     );
     let failed = read_back(&lengths, piece, &senders, filled(1));
-    assert_eq!(next.piece_failed(piece, failed), BTreeSet::from([sender]));
+    assert_eq!(
+        next.piece_failed(piece, failed),
+        BTreeSet::from([sender.into()])
+    );
 }
 
 // libtorrent `torrent::do_pause` disconnects every peer and keeps
@@ -371,7 +382,7 @@ fn the_next_run_is_founded_on_the_list_a_pause_leaves() {
     peers.add_peer(failed, PeerSourceFlag::Tracker);
     fail_at(&peers, failed, t0);
     peers
-        .with_peer_mut(failed, "test", |p| p.piece_failed(false, &peers))
+        .with_peer_mut(failed.into(), "test", |p| p.piece_failed(false, &peers))
         .unwrap();
     let connecting = peer_addr(3);
     peers.add_peer(connecting, PeerSourceFlag::Tracker);
@@ -389,11 +400,14 @@ fn the_next_run_is_founded_on_the_list_a_pause_leaves() {
     next.add_peer(banned, PeerSourceFlag::Tracker);
     assert_eq!(state_of(&next, banned), None);
     let standing = |list: &PeerStates| {
-        list.with_peer(failed, |p| (p.trust(), p.reconnect_at()))
+        list.with_peer(failed.into(), |p| (p.trust(), p.reconnect_at()))
             .unwrap()
     };
     assert_eq!(standing(&next), standing(&peers));
-    assert!(next.with_peer(failed, |p| p.trust().on_parole()).unwrap());
+    assert!(
+        next.with_peer(failed.into(), |p| p.trust().on_parole())
+            .unwrap()
+    );
     assert_eq!(state_of(&next, connecting), Some("queued"));
     assert_eq!(state_of(&peers, connecting), Some("connecting"));
     assert_eq!(next.stats().queued, 2);
@@ -424,7 +438,7 @@ fn a_dial_counts_as_connecting_until_it_ends() {
     assert_eq!(connecting(), (2, 2));
 
     peers
-        .with_peer_mut(dialled[0], "test", |peer| {
+        .with_peer_mut(dialled[0].into(), "test", |peer| {
             peers.connection_closed(peer, t0, true, false);
         })
         .unwrap();
@@ -452,7 +466,7 @@ async fn a_pause_starts_no_reconnect_wait_for_the_peers_it_disconnects() {
     );
     let live = peer_addr(3);
     let _live_rx = connected_to_us(&peers, live).unwrap();
-    let idle_wait = peers.with_peer(idle, |p| p.reconnect_at()).unwrap();
+    let idle_wait = peers.with_peer(idle.into(), |p| p.reconnect_at()).unwrap();
 
     let paused_at = t0 + Duration::from_secs(10);
     peers.close_all(paused_at);
@@ -462,9 +476,9 @@ async fn a_pause_starts_no_reconnect_wait_for_the_peers_it_disconnects() {
         u32::try_from(TOTAL_PIECES).unwrap(),
     );
     let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
-    assert_eq!(reconnect_at(connecting), Some(paused_at));
-    assert_eq!(reconnect_at(live), Some(paused_at));
-    assert_eq!(reconnect_at(idle), idle_wait);
+    assert_eq!(reconnect_at(connecting.into()), Some(paused_at));
+    assert_eq!(reconnect_at(live.into()), Some(paused_at));
+    assert_eq!(reconnect_at(idle.into()), idle_wait);
     assert_eq!(idle_wait, Some(t0 + MIN_RECONNECT_TIME * 2));
 }
 
@@ -480,7 +494,7 @@ async fn a_pause_of_a_finished_torrent_starts_no_wait_for_its_peers() {
     for addr in [seed, leecher] {
         peers.add_peer(addr, PeerSourceFlag::Tracker);
         peers
-            .with_peer_mut(addr, "test", |peer| {
+            .with_peer_mut(addr.into(), "test", |peer| {
                 peer.connect_if_due(t0, &peers).unwrap();
                 assert!(
                     peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp)
@@ -489,8 +503,10 @@ async fn a_pause_of_a_finished_torrent_starts_no_wait_for_its_peers() {
             })
             .unwrap();
     }
-    peers.update_bitfield(seed, full_bitfield()).unwrap();
-    peers.update_bitfield(leecher, empty_bitfield()).unwrap();
+    peers.update_bitfield(seed.into(), full_bitfield()).unwrap();
+    peers
+        .update_bitfield(leecher.into(), empty_bitfield())
+        .unwrap();
 
     let paused_at = t0 + Duration::from_secs(10);
     peers.close_all(paused_at);
@@ -500,8 +516,8 @@ async fn a_pause_of_a_finished_torrent_starts_no_wait_for_its_peers() {
         u32::try_from(TOTAL_PIECES).unwrap(),
     );
     let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
-    assert_eq!(reconnect_at(seed), Some(paused_at));
-    assert_eq!(reconnect_at(leecher), Some(paused_at));
+    assert_eq!(reconnect_at(seed.into()), Some(paused_at));
+    assert_eq!(reconnect_at(leecher.into()), Some(paused_at));
 
     for mut peer in next.states.iter_mut() {
         peer.value_mut().finished(true, &next);
@@ -518,8 +534,8 @@ async fn a_pause_of_a_finished_torrent_starts_no_wait_for_its_peers() {
 async fn a_seed_live_at_the_pause_stays_upload_only() {
     let peers = make_peer_states();
     let (seed, _rx) = add_live_peer(&peers, "127.0.0.1:1234");
-    peers.update_bitfield(seed, full_bitfield()).unwrap();
-    assert_eq!(peers.with_peer(seed, |p| p.needed(true)), Some(true));
+    peers.update_bitfield(seed.into(), full_bitfield()).unwrap();
+    assert_eq!(peers.with_peer(seed.into(), |p| p.needed(true)), Some(true));
 
     peers.close_all(Instant::now());
     let next = PeerStates::founded_on(
@@ -527,8 +543,8 @@ async fn a_seed_live_at_the_pause_stays_upload_only() {
         Default::default(),
         u32::try_from(TOTAL_PIECES).unwrap(),
     );
-    assert_eq!(next.with_peer(seed, |p| p.needed(true)), Some(false));
-    assert_eq!(next.with_peer(seed, |p| p.needed(false)), Some(true));
+    assert_eq!(next.with_peer(seed.into(), |p| p.needed(true)), Some(false));
+    assert_eq!(next.with_peer(seed.into(), |p| p.needed(false)), Some(true));
 }
 
 // libtorrent `peer_list::is_connect_candidate`, `(p.seed ||
@@ -544,7 +560,7 @@ async fn a_finished_torrent_with_only_seeds_on_its_list_opens_no_connection() {
     for seed in [one, two] {
         peers.add_peer(seed, PeerSourceFlag::Tracker);
         peers
-            .with_peer_mut(seed, "test", |peer| {
+            .with_peer_mut(seed.into(), "test", |peer| {
                 peer.connect_if_due(t0, &peers).unwrap();
                 assert!(
                     peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp)
@@ -552,7 +568,7 @@ async fn a_finished_torrent_with_only_seeds_on_its_list_opens_no_connection() {
                 );
             })
             .unwrap();
-        peers.update_bitfield(seed, full_bitfield()).unwrap();
+        peers.update_bitfield(seed.into(), full_bitfield()).unwrap();
     }
     peers.close_all(t0);
 
@@ -598,12 +614,10 @@ fn a_refused_peer_leaves_the_list_once_it_has_no_connection() {
     peers.add_peer(idle, PeerSourceFlag::Tracker);
     peers.add_peer(other, PeerSourceFlag::Tracker);
     let (live, mut live_rx) = add_live_peer(&peers, "10.0.0.3:50000");
-    let seed = SocketAddr::new(
-        std::net::Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 1).into(),
-        0,
-    );
+    // A web seed is at no address, so the filter is never asked of it.
+    let seed = PeerHandle::WebSeed(1);
     peers.admit_web_seed(seed).unwrap();
-    let refused = |addr: SocketAddr| addr == idle || addr == live || addr == seed;
+    let refused = |addr: SocketAddr| addr == idle || addr == live;
     peers.refuse(refused);
     assert_eq!(state_of(&peers, idle), None);
     assert_eq!(state_of(&peers, other), Some("queued"));
@@ -612,20 +626,123 @@ fn a_refused_peer_leaves_the_list_once_it_has_no_connection() {
         live_rx.try_recv(),
         Ok(WriterRequest::Disconnect(Ok(())))
     ));
-    assert_eq!(state_of(&peers, seed), Some("connecting"));
+    assert_eq!(
+        peers.with_peer(seed, |peer| peer.get_state().name()),
+        Some("connecting")
+    );
 
     // Its connection closed, the refused peer goes too.
     peers
-        .with_peer_mut(live, "test", |peer| {
+        .with_peer_mut(live.into(), "test", |peer| {
             peer.take_state(&peers);
             peers.connection_closed(peer, Instant::now(), false, false);
         })
         .unwrap();
-    peers.refuse_at(live, refused);
+    peers.refuse_at(live.into(), refused);
     assert_eq!(state_of(&peers, live), None);
-    peers.refuse_at(other, refused);
+    peers.refuse_at(other.into(), refused);
     assert_eq!(state_of(&peers, other), Some("queued"));
     assert_eq!(peers.stats().live, 0);
+}
+
+// A save marks the peers only the DHT, local discovery or PEX named, not
+// one that connected in, and a peer it marked so comes back marked: it is
+// no operator's word, so a private torrent's list restarted with it owes
+// it. Owed, the list saves it marked again, and with it the peers that
+// connected in, which it owes too; a tracker's answer drops them all,
+// while a peer the operator named stays, and so does a found one a
+// tracker names after the restart. A list restarted with no such
+// peer owes nothing.
+#[test]
+fn a_save_marks_the_peers_found_elsewhere_and_a_restart_keeps_the_mark() {
+    let (operator, resumed_found) = (peer_addr(1), peer_addr(2));
+    let peers = PeerStates::founded_on(
+        PeerList::resumed([operator, resumed_found], &[resumed_found], []),
+        Default::default(),
+        u32::try_from(TOTAL_PIECES).unwrap(),
+    );
+    let (tracker, dht, lsd, pex, both) = (
+        peer_addr(3),
+        peer_addr(4),
+        peer_addr(5),
+        peer_addr(6),
+        peer_addr(7),
+    );
+    peers.add_peer(tracker, PeerSourceFlag::Tracker);
+    peers.add_peer(dht, PeerSourceFlag::Dht);
+    peers.add_peer(lsd, PeerSourceFlag::Lsd);
+    peers.add_peer(pex, PeerSourceFlag::Pex);
+    peers.add_peer(both, PeerSourceFlag::Dht);
+    peers.add_peer(both, PeerSourceFlag::Tracker);
+    let incoming = peer_addr(8);
+    peers.add_refused_incoming(incoming, ConnectionKind::Utp);
+
+    let saved = peers.resume_peers();
+    let sorted = |mut v: Vec<SocketAddr>| {
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        sorted(saved.peers.clone()),
+        vec![
+            operator,
+            resumed_found,
+            tracker,
+            dht,
+            lsd,
+            pex,
+            both,
+            incoming
+        ]
+    );
+    assert_eq!(
+        sorted(saved.found.clone()),
+        vec![resumed_found, dht, lsd, pex]
+    );
+
+    // Restored, the found peers are still no operator's: owed, they are
+    // saved again until a tracker answers, then leave, and the operator's
+    // stays. One a tracker names after the restart is the tracker's, and
+    // stays too.
+    let tracker_named = dht;
+    let list = PeerList::resumed(
+        [operator, resumed_found, tracker_named],
+        &[resumed_found, tracker_named],
+        [],
+    )
+    .owing_found();
+    assert!(list.owes_untracked());
+    let peers = PeerStates::founded_on(
+        list,
+        Default::default(),
+        u32::try_from(TOTAL_PIECES).unwrap(),
+    );
+    peers.add_refused_incoming(incoming, ConnectionKind::Utp);
+    let saved = peers.resume_peers();
+    assert_eq!(
+        sorted(saved.found),
+        vec![resumed_found, tracker_named, incoming]
+    );
+    peers.add_peer(tracker_named, PeerSourceFlag::Tracker);
+    let saved = peers.resume_peers();
+    assert_eq!(
+        sorted(saved.peers),
+        vec![operator, resumed_found, tracker_named, incoming]
+    );
+    assert_eq!(sorted(saved.found), vec![resumed_found, incoming]);
+    peers.drop_untracked();
+    assert_eq!(state_of(&peers, resumed_found), None);
+    assert_eq!(state_of(&peers, incoming), None);
+    assert_eq!(state_of(&peers, operator), Some("queued"));
+    assert_eq!(state_of(&peers, tracker_named), Some("queued"));
+    assert!(peers.resume_peers().found.is_empty());
+
+    // A list restarted with no peer found elsewhere owes nothing.
+    assert!(
+        !PeerList::resumed([operator], &[], [])
+            .owing_found()
+            .owes_untracked()
+    );
 }
 
 // A private torrent's list, once a tracker answers, keeps the peers a
@@ -637,7 +754,7 @@ fn a_refused_peer_leaves_the_list_once_it_has_no_connection() {
 fn a_trackers_answer_drops_the_peers_no_tracker_or_operator_named() {
     let operator = peer_addr(1);
     let peers = PeerStates::founded_on(
-        PeerList::resumed([operator], []).taking_trackers_alone(false),
+        PeerList::resumed([operator], &[], []).taking_trackers_alone(false),
         Default::default(),
         u32::try_from(TOTAL_PIECES).unwrap(),
     );
@@ -676,12 +793,12 @@ fn a_trackers_answer_drops_the_peers_no_tracker_or_operator_named() {
 
     // Its connection closed, the incoming peer goes too.
     peers
-        .with_peer_mut(incoming, "test", |peer| {
+        .with_peer_mut(incoming.into(), "test", |peer| {
             peer.take_state(&peers);
             peers.connection_closed(peer, Instant::now(), false, false);
         })
         .unwrap();
-    peers.untracked_closed(incoming);
+    peers.untracked_closed(incoming.into());
     assert_eq!(state_of(&peers, incoming), None);
 
     // Once only: a peer the DHT names later is not dropped by a second
@@ -705,12 +822,12 @@ fn a_peer_a_tracker_names_while_it_closes_stays() {
     peers.drop_untracked();
     peers.add_peer(incoming, PeerSourceFlag::Tracker);
     peers
-        .with_peer_mut(incoming, "test", |peer| {
+        .with_peer_mut(incoming.into(), "test", |peer| {
             peer.take_state(&peers);
             peers.connection_closed(peer, Instant::now(), false, false);
         })
         .unwrap();
-    peers.untracked_closed(incoming);
+    peers.untracked_closed(incoming.into());
     assert!(state_of(&peers, incoming).is_some());
 }
 
@@ -721,8 +838,11 @@ fn a_peer_a_tracker_names_while_it_closes_stays() {
 #[test]
 fn a_fetched_list_takes_trackers_alone_now_or_at_the_first_answer() {
     let fetched = || {
-        let peers =
-            PeerStates::founded_on(PeerList::resumed([peer_addr(1)], []), Default::default(), 0);
+        let peers = PeerStates::founded_on(
+            PeerList::resumed([peer_addr(1)], &[], []),
+            Default::default(),
+            0,
+        );
         peers.add_peer(peer_addr(2), PeerSourceFlag::Tracker);
         peers.add_peer(peer_addr(3), PeerSourceFlag::Dht);
         peers.add_peer(peer_addr(4), PeerSourceFlag::Lsd);
@@ -766,7 +886,7 @@ fn a_banned_address_is_disconnected_and_never_admitted_again_on_any_port() {
 
     // The closed connection leaves the peer Dead, needed or not.
     peers
-        .with_peer_mut(live, "test", |peer| {
+        .with_peer_mut(live.into(), "test", |peer| {
             peer.take_state(&peers);
             peers.connection_closed(peer, t0, true, false);
         })
@@ -809,7 +929,7 @@ fn an_incoming_peer_refused_a_slot_is_kept() {
     peers.add_refused_incoming(utp, ConnectionKind::Utp);
     assert_eq!(state_of(&peers, utp), Some("queued"));
     assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
-    let incoming = peers.with_peer(utp, |peer| {
+    let incoming = peers.with_peer(utp.into(), |peer| {
         peer.stats
             .counters
             .incoming_connections
@@ -861,7 +981,7 @@ fn a_holepunched_peer_is_connected_to_next_whatever_its_failures() {
     // The holepunched connection goes over uTP alone, and fails too:
     // the peer is out again, and may be dialed over TCP once more.
     peers
-        .with_peer_mut(failed, "test", |peer| {
+        .with_peer_mut(failed.into(), "test", |peer| {
             assert!(peer.holepunched());
             assert_eq!(peer.transports(), Transports::Utp);
             peers.connection_closed(peer, last, true, false);
@@ -902,24 +1022,24 @@ fn the_introducer_is_a_holepunch_peer_whose_pex_named_the_address() {
     let target = peer_addr(1);
     let (named, _named_rx) = add_live_peer(&peers, "10.0.1.1:6881");
     let (speaks, _speaks_rx) = add_live_peer(&peers, "10.0.1.2:6881");
-    peers.with_live_mut(named, "test", |live| {
+    peers.with_live_mut(named.into(), "test", |live| {
         live.pex_named(named_by(vec![target]), std::iter::empty())
     });
     assert!(peers.introducer(target).is_none());
 
-    peers.with_live_mut(speaks, "test", |live| {
+    peers.with_live_mut(speaks.into(), "test", |live| {
         live.supports_holepunch = true;
         live.pex_named(named_by(vec![target]), std::iter::empty());
     });
     assert!(peers.introducer(target).is_some());
-    peers.with_live_mut(speaks, "test", |live| {
+    peers.with_live_mut(speaks.into(), "test", |live| {
         live.pex_named(std::iter::empty(), [target].into_iter())
     });
     assert!(peers.introducer(target).is_none());
 
     let v4 = (0..300).map(peer_addr);
     let v6 = (0..300).map(|i| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, i], 6881)));
-    peers.with_live_mut(speaks, "test", |live| {
+    peers.with_live_mut(speaks.into(), "test", |live| {
         // Each family takes peers while it has room; the news is what it took.
         let news = live.pex_named(named_by(v4.chain(v6).collect()), std::iter::empty());
         assert_eq!(news.len(), 2 * MAX_PEX_PEERS);
@@ -1026,7 +1146,7 @@ fn a_peer_at_a_connected_address_is_dialed_once_the_connection_closes() {
     assert_eq!(peers.next_candidate(t0), NextCandidate::None);
 
     peers
-        .with_peer_mut(from, "test", |peer| {
+        .with_peer_mut(from.into(), "test", |peer| {
             peer.take_state(&peers);
             peers.connection_closed(peer, t0, false, false);
         })
@@ -1101,18 +1221,20 @@ fn turnover_closes_the_connections_worth_least_first() {
         unreachable!()
     };
     for addr in [seed, fast, slow, on_parole] {
-        peers.with_live_mut(addr, "test", |live| live.interest(true, now));
+        peers.with_live_mut(addr.into(), "test", |live| live.interest(true, now));
     }
-    peers.update_bitfield(seed, full_bitfield()).unwrap();
+    peers.update_bitfield(seed.into(), full_bitfield()).unwrap();
     for (addr, fetched) in [(fast, 1000), (slow, 10), (on_parole, 1000)] {
-        peers.with_peer(addr, |peer| {
+        peers.with_peer(addr.into(), |peer| {
             peer.stats
                 .counters
                 .fetched_bytes
                 .fetch_add(fetched, Ordering::Relaxed)
         });
     }
-    peers.with_peer_mut(on_parole, "test", |peer| peer.piece_failed(false, &peers));
+    peers.with_peer_mut(on_parole.into(), "test", |peer| {
+        peer.piece_failed(false, &peers)
+    });
 
     let order = [uninteresting, on_parole, slow, fast, seed];
     for n in 1..=order.len() {
@@ -1125,6 +1247,105 @@ fn turnover_closes_the_connections_worth_least_first() {
             );
         }
     }
+}
+
+// Bytes a tunnel asks back close TCP peers alone, those worth least first,
+// exactly as many as asked: a uTP peer holds no socket of the tunnel and
+// stays, however little it is worth.
+#[test]
+fn a_give_back_closes_the_tcp_peers_worth_least() {
+    let peers = make_peer_states();
+    let now = Instant::now();
+    let mut tcp = Vec::new();
+    for i in 1..=4 {
+        tcp.push(add_live_peer(&peers, &format!("10.0.0.{i}:6881")));
+    }
+    let mut utp = Vec::new();
+    for i in 5..=6 {
+        let addr: SocketAddr = format!("10.0.0.{i}:6881").parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        peers
+            .add_incoming(addr, Id20::default(), tx, ConnectionKind::Utp, OUR_PORT)
+            .unwrap();
+        utp.push(rx);
+    }
+    // The first TCP peer is uninteresting; the rest sent 10, 1000 and 2000.
+    for ((addr, _), fetched) in tcp[1..].iter().zip([10, 1000, 2000]) {
+        peers.with_live_mut((*addr).into(), "test", |live| live.interest(true, now));
+        peers.with_peer((*addr).into(), |peer| {
+            peer.stats
+                .counters
+                .fetched_bytes
+                .fetch_add(fetched, Ordering::Relaxed)
+        });
+    }
+
+    assert_eq!(peers.disconnect_lowest_tcp(2, now, &|_| true), 2);
+    let closed: Vec<bool> = tcp.iter_mut().map(|(_, rx)| told_to_close(rx)).collect();
+    assert_eq!(closed, [true, true, false, false]);
+    assert!(
+        utp.iter_mut().all(|rx| !told_to_close(rx)),
+        "a uTP peer closed"
+    );
+}
+
+// A give-back closes only the TCP peers `among` takes, the asking tunnel's,
+// those worth least first among them: a peer on another tunnel stays,
+// however little it is worth, and fewer close than asked when the tunnel
+// holds fewer.
+#[test]
+fn a_give_back_closes_only_the_peers_among_takes() {
+    let peers = make_peer_states();
+    let now = Instant::now();
+    let mut tcp = Vec::new();
+    for i in 1..=4 {
+        tcp.push(add_live_peer(&peers, &format!("10.0.0.{i}:6881")));
+    }
+    // The two worth least, 10.0.0.1 and 10.0.0.2, ride another tunnel.
+    for ((addr, _), fetched) in tcp[1..].iter().zip([10, 1000, 2000]) {
+        peers.with_live_mut((*addr).into(), "test", |live| live.interest(true, now));
+        peers.with_peer((*addr).into(), |peer| {
+            peer.stats
+                .counters
+                .fetched_bytes
+                .fetch_add(fetched, Ordering::Relaxed)
+        });
+    }
+    let asking: Vec<SocketAddr> = tcp[2..].iter().map(|(addr, _)| *addr).collect();
+    let among = |addr: SocketAddr| asking.contains(&addr);
+
+    // Asked for three, the tunnel holds two.
+    assert_eq!(peers.disconnect_lowest_tcp(3, now, &among), 2);
+    let closed: Vec<bool> = tcp.iter_mut().map(|(_, rx)| told_to_close(rx)).collect();
+    assert_eq!(closed, [false, false, true, true]);
+}
+
+// Of the asking tunnel's peers, the one worth least closes first.
+#[test]
+fn a_give_back_among_a_tunnel_closes_its_peer_worth_least_first() {
+    let peers = make_peer_states();
+    let now = Instant::now();
+    let mut tcp = Vec::new();
+    for i in 1..=3 {
+        tcp.push(add_live_peer(&peers, &format!("10.0.0.{i}:6881")));
+    }
+    for ((addr, _), fetched) in tcp.iter().zip([10, 2000, 1000]) {
+        peers.with_live_mut((*addr).into(), "test", |live| live.interest(true, now));
+        peers.with_peer((*addr).into(), |peer| {
+            peer.stats
+                .counters
+                .fetched_bytes
+                .fetch_add(fetched, Ordering::Relaxed)
+        });
+    }
+    // 10.0.0.1, worth least, rides another tunnel.
+    let asking: Vec<SocketAddr> = tcp[1..].iter().map(|(addr, _)| *addr).collect();
+    assert_eq!(
+        peers.disconnect_lowest_tcp(1, now, &|addr| asking.contains(&addr)),
+        1
+    );
+    let closed: Vec<bool> = tcp.iter_mut().map(|(_, rx)| told_to_close(rx)).collect();
+    assert_eq!(closed, [false, false, true]);
 }
 
 /// How an outgoing connection in [`attempt_at`] ends.
@@ -1152,7 +1373,7 @@ fn handshake(encrypted: bool) -> Encryption {
 // `at`. Returns whether it tried the encrypted handshake.
 fn attempt_at(peers: &PeerStates, addr: SocketAddr, at: Instant, ends: Ends) -> bool {
     peers
-        .with_peer_mut(addr, "test", |peer| {
+        .with_peer_mut(addr.into(), "test", |peer| {
             peer.connect_if_due(at, peers).expect("a due candidate");
             let encrypted = peer.encrypt_outgoing();
             if let Ends::Completed = ends {
@@ -1237,7 +1458,7 @@ async fn an_encrypted_handshake_the_peer_closed_is_retried_plain_before_failed_c
             .unwrap()
     };
     ended(
-        closed,
+        closed.into(),
         MseError::Closed {
             stage: "reading the peer's public key",
             source: None,
@@ -1245,7 +1466,7 @@ async fn an_encrypted_handshake_the_peer_closed_is_retried_plain_before_failed_c
         .into(),
     );
     ended(
-        unsynced,
+        unsynced.into(),
         MseError::NotSynchronised {
             stage: "looking for the peer's verification constant",
         }
@@ -1265,7 +1486,7 @@ async fn an_encrypted_handshake_the_peer_closed_is_retried_plain_before_failed_c
     assert_eq!(order, expected);
 
     peers
-        .with_peer_mut(closed, "test", |peer| {
+        .with_peer_mut(closed.into(), "test", |peer| {
             assert!(!peer.encrypt_outgoing());
             peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
             peer.handshake_encryption(Encryption::None, &peers);
@@ -1449,14 +1670,14 @@ async fn a_seed_flag_for_a_connected_peer_is_ignored() {
     }
     peers.set_finished(true);
     peers
-        .with_peer_mut(higher, "test", |peer| {
+        .with_peer_mut(higher.into(), "test", |peer| {
             peer.connect_if_due(t0, &peers).expect("a due candidate");
             peer.pex_flags(PEX_SEED, &peers);
             peers.connection_closed(peer, t0, false, true);
         })
         .unwrap();
     peers
-        .with_peer_mut(lower, "test", |peer| {
+        .with_peer_mut(lower.into(), "test", |peer| {
             peer.connect_if_due(t0, &peers).expect("a due candidate");
             peers.connection_closed(peer, t0, false, true);
         })
@@ -1529,7 +1750,7 @@ async fn a_connection_that_asks_nothing_toggles_nothing() {
         peers.next_candidate(t0 + reconnect_wait(1)),
         NextCandidate::At(t0 + reconnect_wait(1) + reconnect_wait(2))
     );
-    let tried = peers.with_peer_mut(a, "test", |peer| peer.encrypt_outgoing());
+    let tried = peers.with_peer_mut(a.into(), "test", |peer| peer.encrypt_outgoing());
     assert_eq!(tried, Some(true));
 }
 
@@ -1565,7 +1786,7 @@ async fn our_pex_flags_a_peer_whose_connection_is_encrypted() {
     let now = Instant::now();
     for (addr, encrypt) in [(encrypted, true), (plain, false)] {
         peers.add_peer(addr, PeerSourceFlag::Tracker);
-        peers.with_peer_mut(addr, "test", |peer| {
+        peers.with_peer_mut(addr.into(), "test", |peer| {
             peer.connect_if_due(now, &peers).expect("a due candidate");
             peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
             peer.handshake_encryption(handshake(encrypt), &peers);
@@ -1592,14 +1813,14 @@ async fn a_handshake_the_peer_opened_leaves_which_one_ours_try_alone() {
     ] {
         let (addr, rx) = add_live_peer(&peers, addr);
         ends.push(rx);
-        peers.handshake_encryption(addr, handshake(encrypted));
-        let advertised = peers.with_live(addr, |live| live.advertised_pex_flags());
+        peers.handshake_encryption(addr.into(), handshake(encrypted));
+        let advertised = peers.with_live(addr.into(), |live| live.advertised_pex_flags());
         assert_eq!(advertised.unwrap() & PEX_ENCRYPTION, flag);
 
-        peers.with_peer_mut(addr, "test", |peer| {
+        peers.with_peer_mut(addr.into(), "test", |peer| {
             peers.connection_closed(peer, Instant::now(), false, false)
         });
-        assert!(peers.encrypt_outgoing(addr), "{addr}");
+        assert!(peers.encrypt_outgoing(addr.into()), "{addr}");
     }
 }
 
@@ -1622,7 +1843,7 @@ fn the_saved_peers_are_the_connectable_trusted_ones_those_connected_to_first() {
     let distrusted = peer_addr(4);
     peers.add_peer(distrusted, PeerSourceFlag::Tracker);
     peers
-        .with_peer_mut(distrusted, "test", |p| p.piece_failed(false, &peers))
+        .with_peer_mut(distrusted.into(), "test", |p| p.piece_failed(false, &peers))
         .unwrap();
     // Connected to us: we know no address to connect to it at.
     let (_, _incoming_rx) = add_live_peer(&peers, "10.0.0.5:50000");
@@ -1635,6 +1856,7 @@ fn the_saved_peers_are_the_connectable_trusted_ones_those_connected_to_first() {
         ResumePeers {
             peers: vec![connecting, never],
             banned: vec![banned.ip()],
+            found: Vec::new(),
         }
     );
     // The list a pause leaves saves the same.
@@ -1666,7 +1888,7 @@ fn peers_never_connected_to_fill_the_saved_list_to_a_hundred() {
 fn a_saved_ban_refuses_the_peer() {
     let banned = peer_addr(1);
     let peers = PeerStates::founded_on(
-        PeerList::resumed([], [banned.ip()]),
+        PeerList::resumed([], &[], [banned.ip()]),
         Default::default(),
         u32::try_from(TOTAL_PIECES).unwrap(),
     );
@@ -1687,4 +1909,37 @@ fn a_saved_ban_refuses_the_peer() {
         Some(IncomingRefused::Banned)
     );
     assert_eq!(peers.resume_peers().banned, vec![banned.ip()]);
+}
+
+// The connect loop waits on dials to swarm peers under way: a web seed's
+// connection is none of them, though it counts as connecting. A dial that
+// ends, live or not, wakes the loop to look again.
+#[test]
+fn a_dial_that_ends_wakes_the_connect_loop_and_a_web_seed_is_no_dial() {
+    use futures::FutureExt;
+    let peers = make_peer_states();
+    let seed = PeerHandle::WebSeed(1);
+    peers.admit_web_seed(seed).unwrap();
+    assert_eq!(peers.stats().connecting, 1);
+    assert_eq!(peers.dialling(), 0, "a web seed is no dial");
+
+    let addr = peer_addr(1);
+    peers.add_peer(addr, PeerSourceFlag::Tracker);
+    let (dialled, _rx, _tx) = peers.connect_next(Instant::now()).unwrap();
+    assert_eq!(dialled, addr);
+    assert_eq!(peers.dialling(), 1);
+    // What woke the loop before the dial ended is taken first.
+    let _ = peers.candidates_changed().now_or_never();
+    assert!(peers.candidates_changed().now_or_never().is_none());
+
+    peers
+        .with_peer_mut(addr.into(), "test", |peer| {
+            peer.take_state(&peers);
+        })
+        .unwrap();
+    assert_eq!(peers.dialling(), 0);
+    assert!(
+        peers.candidates_changed().now_or_never().is_some(),
+        "the dial's end wakes the connect loop"
+    );
 }

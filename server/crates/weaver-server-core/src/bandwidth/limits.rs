@@ -134,6 +134,25 @@ impl BandwidthSplit {
     }
 }
 
+// The split in force, as the bandwidth service last put it in force, for
+// what divides by it outside the pipeline: each WireGuard tunnel's bytes.
+// Zero is no split set.
+static SPLIT_IN_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn publish_split_in_force(split: Option<BandwidthSplit>) {
+    SPLIT_IN_FORCE.store(
+        split.map_or(0, |split| split.usenet_pct),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn split_in_force() -> Option<BandwidthSplit> {
+    match SPLIT_IN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        usenet_pct => Some(BandwidthSplit { usenet_pct }),
+    }
+}
+
 // What usenet and torrents each downloaded at over the last tick, in bytes
 // per second: the bytes each counted since the tick before, over the time
 // between them.
@@ -176,14 +195,8 @@ pub fn lower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-// The rates torrents move at, one per direction: their side of the download
-// split, and the whole upload limit, since usenet uploads nothing. `None` is
-// no limit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TorrentRates {
-    pub download: Option<u64>,
-    pub upload: Option<u64>,
-}
+// The rates a class of job moves at, one per direction.
+pub use crate::jobs::class::ClassRates;
 
 // The split as it stands, as the API shows it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -215,6 +228,11 @@ pub fn per_second(bytes: u64, elapsed: std::time::Duration) -> u64 {
 // A side moving at 95% or more of the rate it was given presses it: it may
 // want more than it was given.
 const DEMAND_PCT: u128 = 95;
+
+// Whether a side that `used` this much of what it was `given` presses it.
+pub fn presses(used: u64, given: u64) -> bool {
+    used as u128 * 100 >= given as u128 * DEMAND_PCT
+}
 // A side that does not press its rate keeps what it moved at and a fifth
 // more, so the next tick, moving as it did, it does not press.
 const HEADROOM_PCT: u128 = 120;
@@ -249,7 +267,7 @@ pub fn share_out(cap: u64, shares: &[u64], given: &[Option<u64>], used: &[u64]) 
         .zip(shares)
         .map(|(given, &share)| given.filter(|&given| given <= cap).unwrap_or(share))
         .collect();
-    let presses = |side: usize| used[side] as u128 * 100 >= given[side] as u128 * DEMAND_PCT;
+    let presses = |side: usize| presses(used[side], given[side]);
     let probe = (cap as u128 * PROBE_PCT / 100).max(1);
     // What a side that does not press keeps, past its share or not.
     let keeps = |side: usize| {

@@ -58,13 +58,14 @@ impl TorrentStateLive {
             debug!(addr = %checked_peer.addr, "finished with upload closed, refusing incoming peer");
             return Ok(AddIncomingPeerResult::NotWanted);
         }
+        let handle = PeerHandle::from(checked_peer.addr);
         let (tx, rx) = unbounded_channel();
         // Held until the newcomer holds its place, so the connection it
         // displaces keeps its own until then.
         let mut places = self.places.lock();
         let room = match self.peer_semaphore.clone().try_acquire_owned() {
             Ok(permit) => Room::Free(permit),
-            Err(_) => match self.displaced_by(&places, checked_peer.addr) {
+            Err(_) => match self.displaced_by(&places, handle) {
                 Some(displaced) => Room::Displacing(displaced),
                 None => {
                     drop(places);
@@ -125,13 +126,13 @@ impl TorrentStateLive {
                 (place.permit, place.slot)
             }
         };
-        let held = self.hold_place_in(&mut places, checked_peer.addr, &tx, permit, slot);
+        let held = self.hold_place_in(&mut places, handle, &tx, permit, slot);
         drop(places);
 
         // Incoming peers are live before their task is polled, so its
         // lifetime must already be owned when the task is scheduled.
         let handler = PeerLifetime(Some(PeerHandler {
-            addr: checked_peer.addr,
+            addr: handle,
             incoming: true,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
@@ -217,9 +218,10 @@ impl TorrentStateLive {
         let state = self;
         let options = state.shared.options.peer_opts;
         let base_timeout = options.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let handle = PeerHandle::from(addr);
         let (counters, transports, connect_timeout) = state
             .peers
-            .with_peer(addr, |p| {
+            .with_peer(handle, |p| {
                 (
                     p.stats.counters.clone(),
                     p.transports(),
@@ -229,7 +231,7 @@ impl TorrentStateLive {
             .ok_or(Error::BugPeerNotFound)?;
 
         let handler = PeerHandler {
-            addr,
+            addr: handle,
             incoming: false,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
@@ -379,7 +381,7 @@ impl TorrentStateLive {
                 // Nothing to fetch and nothing to give: connect to no one until
                 // the peers are wanted again.
                 debug!("connect loop idle: no peers are wanted");
-                state.peers.candidates_changed().await;
+                state.tcp_wants.idle(state.peers.candidates_changed()).await;
                 continue;
             }
             // Why the loop waits, so a torrent that connects to no one shows
@@ -400,7 +402,27 @@ impl TorrentStateLive {
                     );
                 }
             }
-            state.peers.wait_for_candidate().await;
+            // Wait for a candidate due. Waiting out a candidate's reconnect
+            // time, or a dial under way, the torrent still wants TCP room,
+            // so a want stands through it; with no candidate at all and no
+            // dial under way it can dial no one, and wants none.
+            loop {
+                match state.peers.next_candidate(tokio::time::Instant::now()) {
+                    peers::NextCandidate::Due => break,
+                    peers::NextCandidate::At(at) => {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(at) => {}
+                            () = state.peers.candidates_changed() => {}
+                        }
+                    }
+                    peers::NextCandidate::None if state.peers.dialling() > 0 => {
+                        state.peers.candidates_changed().await;
+                    }
+                    peers::NextCandidate::None => {
+                        state.tcp_wants.idle(state.peers.candidates_changed()).await;
+                    }
+                }
+            }
             // A session closed under the torrent ends its adder: that is
             // how a torrent leaves a session, not a fault.
             let Some(session) = state.shared.session.upgrade() else {
@@ -420,7 +442,10 @@ impl TorrentStateLive {
                         limit = state.peer_limit,
                         "connect loop waiting: the torrent is at its peer limit"
                     );
-                    state.peer_semaphore.clone().acquire_owned().await?
+                    state
+                        .tcp_wants
+                        .idle(state.peer_semaphore.clone().acquire_owned())
+                        .await?
                 }
             };
             let slot = match slots.try_open() {
@@ -431,7 +456,7 @@ impl TorrentStateLive {
                         limit = slots.limit(),
                         "connect loop waiting: the session is at its connection limit"
                     );
-                    slots.open().await?
+                    state.tcp_wants.idle(slots.open()).await?
                 }
             };
             // The slots may have taken a while: we may have finished since,
@@ -443,7 +468,7 @@ impl TorrentStateLive {
                 continue;
             };
             slots.begin_connect().await;
-            let held = state.hold_place(addr, &tx, permit, slot);
+            let held = state.hold_place(addr.into(), &tx, permit, slot);
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
@@ -556,6 +581,18 @@ impl TorrentStateLive {
             .max(1)
             .min(self.peers.connect_candidates());
         self.peers.disconnect_lowest(n, tokio::time::Instant::now());
+    }
+
+    /// Closes up to `n` of the torrent's live TCP connections at addresses
+    /// `among` takes, those it would keep least first, and says how many;
+    /// see [`super::peers::PeerStates::disconnect_lowest_tcp`].
+    pub(crate) fn give_back_tcp_peers(
+        &self,
+        n: usize,
+        now: tokio::time::Instant,
+        among: &(dyn Fn(std::net::SocketAddr) -> bool + Send + Sync),
+    ) -> usize {
+        self.peers.disconnect_lowest_tcp(n, now, among)
     }
 
     // The connection at `addr`, whose writer queue is `tx`, begins: it holds

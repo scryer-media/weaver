@@ -1,46 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::live::Live;
 use super::moves::Moving;
+use super::policy::goal_met;
 use super::retire::{held_tops, resolved};
-use super::scripts::Ending;
-use super::settings::{TorrentSettings, WindDown};
 use super::{TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced};
 use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::model::JobStatus;
-use crate::post_processing::model::{QueueEvent, vars};
+use crate::post_processing::model::QueueEvent;
 use crate::runtime::panic_trap::JobScope;
-use crate::settings::model::TrackerRule;
-use crate::settings::{Seeding, SeedingAction};
 use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::model::HistoryEnd;
 use crate::torrents::relocate::Existing;
 use crate::torrents::store::TorrentStore;
 use crate::torrents::tee::{Tee, plan_outputs};
-use crate::torrents::{KeptIntent, TorrentIntent, status};
+use crate::torrents::{KeptIntent, TorrentIntent};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-
-// The seeding terms of a torrent whose seeding goal is met, `None` while one
-// is left or for a forced torrent, which seeds past its goal.
-fn goal_met(
-    settings: &TorrentSettings,
-    rules: &[TrackerRule],
-    torrent: &Live,
-    now: i64,
-) -> Option<Seeding> {
-    if torrent.record.forced {
-        return None;
-    }
-    let policy = settings.policy(&torrent.record, torrent.rule(rules));
-    status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now)
-        .is_none()
-        .then_some(policy)
-}
 
 impl TorrentService {
     // Torrents a wind-down to the downloads alone stopped resume, now that
@@ -49,7 +28,7 @@ impl TorrentService {
     // or their goals did, stay stopped, and so does one whose goal is met
     // by now: its mark is cleared in the same write, as its goal's stop.
     pub(super) async fn resume_wound_down(&self) {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let settings = self.settings();
         let rules = self.rules();
         let mut landings = Vec::new();
@@ -317,7 +296,7 @@ impl TorrentService {
     // The job is done: its completion is written on its own, so an intent
     // written beside it keeps it, and the ledger and peers as they stand.
     pub(super) async fn completed(&self, job_id: JobId) {
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let (landing, downloaded) = {
             let mut live = self.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {
@@ -393,7 +372,7 @@ impl TorrentService {
         self.completed(job_id).await;
         let status = short_status(&store.whole_names(), placed, &why);
         let settings = self.settings();
-        let now = self.inner.clock.now_ms();
+        let now = self.inner.clock.unix_ms();
         let (report, hash) = {
             let mut live = self.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {
@@ -409,106 +388,6 @@ impl TorrentService {
         }
         self.finish(report, HistoryEnd::delivered(&status), hash, now)
             .await;
-    }
-
-    // A seeding torrent whose seeding goal is met does what its policy says.
-    pub(super) async fn apply_goals(&self, now: i64) {
-        let settings = self.settings();
-        let rules = self.rules();
-        let mut actions = Vec::new();
-        let mut landings = Vec::new();
-        // Winding down to the downloads alone, a torrent done downloading,
-        // forced or not, seeding or waiting to, stops: its goal is not met.
-        let downloads_only =
-            !settings.torrent.enabled && self.wind_down() == Some(WindDown::FinishDownloads);
-        {
-            let mut live = self.inner.live.lock().await;
-            // Stopped by the wind-down, and by their goals: their intents
-            // are written together.
-            let mut wound_down = Vec::new();
-            let mut met = Vec::new();
-            for torrent in live.values_mut() {
-                // A seed whose goal is met in this pass ends by its goal,
-                // wind-down or not.
-                let met_policy = (torrent.seeding() && torrent.resumed())
-                    .then(|| goal_met(&settings, &rules, torrent, now))
-                    .flatten();
-                if met_policy.is_none()
-                    && downloads_only
-                    && torrent.resumed()
-                    && (torrent.complete() || torrent.seeding())
-                {
-                    torrent.settle(now);
-                    // Not the operator's stop: it resumes when torrents are
-                    // turned on again.
-                    torrent.record.kept = KeptIntent::WoundDown;
-                    wound_down.push(torrent.record.job_id);
-                    landings.extend(self.queue_resume(torrent, now, true));
-                    continue;
-                }
-                let Some(policy) = met_policy else {
-                    continue;
-                };
-                let finished = self.script_event(
-                    torrent,
-                    QueueEvent::SeedingFinished,
-                    &[(vars::SEEDING_ACTION, policy.action.as_str())],
-                );
-                match policy.action {
-                    SeedingAction::Stop => {
-                        torrent.settle(now);
-                        torrent.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
-                        met.push(torrent.record.job_id);
-                        landings.extend(self.queue_resume(torrent, now, true));
-                        self.queue_script_event(finished);
-                    }
-                    SeedingAction::Remove => {
-                        actions.push((torrent.record.job_id, false, finished));
-                    }
-                    SeedingAction::RemoveWithData => {
-                        actions.push((torrent.record.job_id, true, finished));
-                    }
-                }
-            }
-            // One transaction, off the runtime. `live` is held across it,
-            // as for every other intent write: a resume taken between the
-            // two would otherwise be written over.
-            if !wound_down.is_empty() || !met.is_empty() {
-                let db = self.inner.db.clone();
-                match tokio::task::spawn_blocking(move || {
-                    db.update_torrent_intents(&[
-                        (KeptIntent::WoundDown, &wound_down),
-                        (KeptIntent::Intent(TorrentIntent::Stopped), &met),
-                    ])
-                })
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(error = %error, "could not keep the stops of torrents done");
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "could not keep the stops of torrents done");
-                    }
-                }
-            }
-        }
-        for landing in landings {
-            let _ = self.landed(Some(landing)).await;
-        }
-        // A removed torrent's event is queued once its job is in history,
-        // where the queue finds it.
-        for (job_id, delete_files, finished) in actions {
-            match self
-                .remove_as(job_id, delete_files, true, Ending::Goal)
-                .await
-            {
-                Ok(()) => self.queue_script_event(finished),
-                Err(error) => {
-                    tracing::warn!(job_id = job_id.0, error = %error, "a torrent that met its goal was not removed");
-                }
-            }
-        }
     }
 }
 

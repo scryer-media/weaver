@@ -16,14 +16,15 @@ use chrono::NaiveDateTime;
 
 use super::model::{ScheduleAction, ScheduleTrack};
 use super::schedule::SharedSchedules;
+use crate::jobs::{ByProtocol, HeldClass, Protocol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ActionKind {
     Pause,
     Resume,
     PauseAll,
-    PauseTorrents,
-    ResumeTorrents,
+    PauseClass,
+    ResumeClass,
     PausePostProcessing,
     ResumePostProcessing,
     PauseWatchFolderScanning,
@@ -43,8 +44,8 @@ impl ActionKind {
         Self::Pause,
         Self::Resume,
         Self::PauseAll,
-        Self::PauseTorrents,
-        Self::ResumeTorrents,
+        Self::PauseClass,
+        Self::ResumeClass,
         Self::PausePostProcessing,
         Self::ResumePostProcessing,
         Self::PauseWatchFolderScanning,
@@ -64,8 +65,8 @@ impl ActionKind {
             ScheduleAction::Pause => Self::Pause,
             ScheduleAction::Resume => Self::Resume,
             ScheduleAction::PauseAll => Self::PauseAll,
-            ScheduleAction::PauseTorrents => Self::PauseTorrents,
-            ScheduleAction::ResumeTorrents => Self::ResumeTorrents,
+            ScheduleAction::PauseClass { .. } => Self::PauseClass,
+            ScheduleAction::ResumeClass { .. } => Self::ResumeClass,
             ScheduleAction::PausePostProcessing => Self::PausePostProcessing,
             ScheduleAction::ResumePostProcessing => Self::ResumePostProcessing,
             ScheduleAction::PauseWatchFolderScanning => Self::PauseWatchFolderScanning,
@@ -86,8 +87,8 @@ impl ActionKind {
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::PauseAll => "pause_all",
-            Self::PauseTorrents => "pause_torrents",
-            Self::ResumeTorrents => "resume_torrents",
+            Self::PauseClass => "pause_class",
+            Self::ResumeClass => "resume_class",
             Self::PausePostProcessing => "pause_post_processing",
             Self::ResumePostProcessing => "resume_post_processing",
             Self::PauseWatchFolderScanning => "pause_watch_folder_scanning",
@@ -107,11 +108,41 @@ impl ActionKind {
         matches!(self, Self::PruneHistory)
     }
 
+    /// Whether an action of this kind is over one class of job, counted
+    /// for each class apart.
+    pub const fn over_class(self) -> bool {
+        self.class_cell().is_some()
+    }
+
+    // Where a class action's counts sit among each class's cells; `None`
+    // for an action over no one class.
+    const fn class_cell(self) -> Option<usize> {
+        match self {
+            Self::PauseClass => Some(0),
+            Self::ResumeClass => Some(1),
+            Self::Pause
+            | Self::Resume
+            | Self::PauseAll
+            | Self::PausePostProcessing
+            | Self::ResumePostProcessing
+            | Self::PauseWatchFolderScanning
+            | Self::ResumeWatchFolderScanning
+            | Self::PauseRss
+            | Self::ResumeRss
+            | Self::SpeedLimit
+            | Self::BandwidthSplit
+            | Self::HardwareProfile
+            | Self::SetServerActive
+            | Self::SetQuotaMetering
+            | Self::PruneHistory => None,
+        }
+    }
+
     // The tracks an action of this kind can be applied on.
     pub fn tracks(self) -> &'static [TrackKind] {
         match self {
             Self::Pause => &[TrackKind::Downloads],
-            Self::PauseTorrents | Self::ResumeTorrents => &[TrackKind::Torrents],
+            Self::PauseClass | Self::ResumeClass => &[TrackKind::Class],
             Self::Resume | Self::PauseAll => {
                 &[TrackKind::Downloads, TrackKind::WatchFolder, TrackKind::Rss]
             }
@@ -133,7 +164,7 @@ impl ActionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TrackKind {
     Downloads,
-    Torrents,
+    Class,
     PostProcessing,
     WatchFolder,
     Rss,
@@ -148,7 +179,7 @@ pub enum TrackKind {
 impl TrackKind {
     pub const ALL: [Self; 11] = [
         Self::Downloads,
-        Self::Torrents,
+        Self::Class,
         Self::PostProcessing,
         Self::WatchFolder,
         Self::Rss,
@@ -163,7 +194,7 @@ impl TrackKind {
     pub fn of(track: ScheduleTrack) -> Self {
         match track {
             ScheduleTrack::Downloads => Self::Downloads,
-            ScheduleTrack::Torrents => Self::Torrents,
+            ScheduleTrack::Class(_) => Self::Class,
             ScheduleTrack::PostProcessing => Self::PostProcessing,
             ScheduleTrack::WatchFolder => Self::WatchFolder,
             ScheduleTrack::Rss => Self::Rss,
@@ -178,7 +209,7 @@ impl TrackKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Downloads => "downloads",
-            Self::Torrents => "torrents",
+            Self::Class => "class",
             Self::PostProcessing => "post_processing",
             Self::WatchFolder => "watch_folder",
             Self::Rss => "rss",
@@ -285,9 +316,16 @@ const ACTIONS: usize = ActionKind::ALL.len();
 const TRACKS: usize = TrackKind::ALL.len();
 const OUTCOMES: usize = ActionOutcome::ALL.len();
 
+const CLASS_ACTIONS: usize = 2;
+
 static EVALUATIONS: AtomicU64 = AtomicU64::new(0);
+// The actions over no one class, by kind, track and outcome.
 static ACTIONS_APPLIED: [[[AtomicU64; OUTCOMES]; TRACKS]; ACTIONS] =
     [const { [const { [const { AtomicU64::new(0) }; OUTCOMES] }; TRACKS] }; ACTIONS];
+// A class's pauses and resumes, each class's on its own track, by outcome.
+static CLASS_ACTIONS_APPLIED: ByProtocol<[[AtomicU64; OUTCOMES]; CLASS_ACTIONS]> = ByProtocol::new(
+    [const { [const { [const { AtomicU64::new(0) }; OUTCOMES] }; CLASS_ACTIONS] }; Protocol::COUNT],
+);
 static ONE_SHOT_FIRES: [AtomicU64; ACTIONS] = [const { AtomicU64::new(0) }; ACTIONS];
 static REPLAYS: [AtomicU64; ReplayReason::ALL.len()] =
     [const { AtomicU64::new(0) }; ReplayReason::ALL.len()];
@@ -341,9 +379,23 @@ pub(crate) fn record_action(
     utc: NaiveDateTime,
     replay: Option<ReplayReason>,
 ) {
-    let track = track.map_or(TrackKind::OneShot, TrackKind::of);
-    ACTIONS_APPLIED[ActionKind::of(action) as usize][track as usize][outcome as usize]
-        .fetch_add(1, Ordering::Relaxed);
+    let kind = ActionKind::of(action);
+    let class = match action {
+        ScheduleAction::PauseClass { class } | ScheduleAction::ResumeClass { class } => {
+            Some(*class)
+        }
+        _ => None,
+    };
+    match (class, kind.class_cell()) {
+        (Some(class), Some(cell)) => CLASS_ACTIONS_APPLIED[class.protocol()][cell]
+            [outcome as usize]
+            .fetch_add(1, Ordering::Relaxed),
+        _ => {
+            let track = track.map_or(TrackKind::OneShot, TrackKind::of);
+            ACTIONS_APPLIED[kind as usize][track as usize][outcome as usize]
+                .fetch_add(1, Ordering::Relaxed)
+        }
+    };
     if let (ActionOutcome::Applied, Some(reason)) = (outcome, replay) {
         REPLAYS[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -396,8 +448,9 @@ pub struct RuleMetrics {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScheduleMetricsSnapshot {
     pub evaluations: u64,
-    // Every outcome of every track each action kind can be applied on.
-    pub actions: Vec<(ActionKind, TrackKind, ActionOutcome, u64)>,
+    // Every outcome of every track each action kind can be applied on, and
+    // for a class's action, of each class an operator can hold apart.
+    pub actions: Vec<(ActionKind, Option<HeldClass>, TrackKind, ActionOutcome, u64)>,
     pub one_shot_fires: Vec<(ActionKind, u64)>,
     pub replays: Vec<(ReplayReason, u64)>,
     pub clock_jumps: Vec<(Evaluator, u64)>,
@@ -416,20 +469,43 @@ pub fn counters_snapshot() -> ScheduleMetricsSnapshot {
         evaluations: load(&EVALUATIONS),
         actions: ActionKind::ALL
             .into_iter()
-            .flat_map(|action| {
-                action.tracks().iter().flat_map(move |track| {
-                    ActionOutcome::ALL.into_iter().map(move |outcome| {
-                        (
-                            action,
-                            *track,
-                            outcome,
-                            load(
-                                &ACTIONS_APPLIED[action as usize][*track as usize]
-                                    [outcome as usize],
-                            ),
-                        )
-                    })
-                })
+            .flat_map(|action| -> Vec<_> {
+                match action.class_cell() {
+                    Some(cell) => HeldClass::all()
+                        .flat_map(|class| {
+                            ActionOutcome::ALL.into_iter().map(move |outcome| {
+                                (
+                                    action,
+                                    Some(class),
+                                    TrackKind::Class,
+                                    outcome,
+                                    load(
+                                        &CLASS_ACTIONS_APPLIED[class.protocol()][cell]
+                                            [outcome as usize],
+                                    ),
+                                )
+                            })
+                        })
+                        .collect(),
+                    None => action
+                        .tracks()
+                        .iter()
+                        .flat_map(|track| {
+                            ActionOutcome::ALL.into_iter().map(move |outcome| {
+                                (
+                                    action,
+                                    None,
+                                    *track,
+                                    outcome,
+                                    load(
+                                        &ACTIONS_APPLIED[action as usize][*track as usize]
+                                            [outcome as usize],
+                                    ),
+                                )
+                            })
+                        })
+                        .collect(),
+                }
             })
             .collect(),
         one_shot_fires: ActionKind::ALL
@@ -589,6 +665,66 @@ mod tests {
                 .replays
                 .iter()
                 .any(|(r, n)| *r == ReplayReason::Startup && *n >= 1)
+        );
+    }
+
+    // A class's pause is counted in that class's own cells, under its key,
+    // on the class track; the cells of actions over no one class are not
+    // touched by it.
+    #[test]
+    fn a_class_action_is_counted_per_class() {
+        let class = crate::torrents::CLASS;
+        let at = chrono::DateTime::from_timestamp(1_700_000_060, 0)
+            .unwrap()
+            .naive_utc();
+        let count = |snapshot: &ScheduleMetricsSnapshot, kind: ActionKind| {
+            snapshot
+                .actions
+                .iter()
+                .filter(|(action, of, track, outcome, _)| {
+                    *action == kind
+                        && *of == Some(class)
+                        && *track == TrackKind::Class
+                        && *outcome == ActionOutcome::Applied
+                })
+                .map(|(.., count)| *count)
+                .collect::<Vec<_>>()
+        };
+        let before = counters_snapshot();
+        record_action(
+            "schedule-metrics-class",
+            &ScheduleAction::PauseClass { class },
+            Some(ScheduleTrack::Class(class)),
+            ActionOutcome::Applied,
+            at,
+            None,
+        );
+        let after = counters_snapshot();
+        let (was, now) = (
+            count(&before, ActionKind::PauseClass),
+            count(&after, ActionKind::PauseClass),
+        );
+        assert_eq!(was.len(), 1, "one cell per held class");
+        assert!(now[0] > was[0]);
+        assert!(
+            after
+                .actions
+                .iter()
+                .filter(|(action, ..)| matches!(
+                    action,
+                    ActionKind::PauseClass | ActionKind::ResumeClass
+                ))
+                .all(|(_, of, track, ..)| of.is_some() && *track == TrackKind::Class)
+        );
+        assert!(
+            after
+                .actions
+                .iter()
+                .filter(|(action, ..)| !matches!(
+                    action,
+                    ActionKind::PauseClass | ActionKind::ResumeClass
+                ))
+                .all(|(_, of, ..)| of.is_none())
         );
     }
 }

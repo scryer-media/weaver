@@ -599,7 +599,18 @@ impl Volume {
                 untold = true;
                 continue;
             }
-            let range = self.span(start, end)?;
+            let mut range = self.span(start, end)?;
+            // A volume placed in order lays each article where the one
+            // before it ended, so a run behind an article in hand starts
+            // there: never over bytes that arrived, which would be told lost.
+            if self.ordered_only
+                && let Some(State::Arrived(Some(before))) = start
+                    .checked_sub(1)
+                    .and_then(|before| self.articles.get(before))
+                    .map(|article| article.state)
+            {
+                range = ByteRange::new(range.start.max(before.end).min(range.end), range.end);
+            }
             if !range.is_empty() {
                 out.push(range);
             }

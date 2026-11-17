@@ -835,6 +835,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	if err != nil {
 		log.Fatalf("create full-suite temp root: %v", err)
 	}
+	recordFullRunLockTempRoot(tempRoot)
 
 	phases, err := newFullPhaseContextsFor(tempRoot, options.includePhase)
 	if err != nil {
@@ -1220,36 +1221,6 @@ func fullGeneralPhaseJobs(phaseCount int) int {
 	return general
 }
 
-// fullPhaseWaitsForGate reports whether a phase starts only once the Product
-// Behavior Gate has finished. The filesystem gate builds the server from
-// scratch inside its container, a long all-core compile that starves the
-// shared VM; run beside the gate it stalls the gate's timed browser flows.
-// It runs after the gate instead, while the other suites keep their slots.
-func fullPhaseWaitsForGate(phase *fullPhaseContext) bool {
-	return phase.Command == "filesystem"
-}
-
-// fullGateDone is closed once every Product Behavior Gate phase of the run has
-// ended, and at once when the run has none.
-type fullGateDone struct {
-	pending sync.WaitGroup
-	done    chan struct{}
-}
-
-func newFullGateDone(phases []*fullPhaseContext) *fullGateDone {
-	gate := &fullGateDone{done: make(chan struct{})}
-	for _, phase := range phases {
-		if phase.Command == "release-gate" {
-			gate.pending.Add(1)
-		}
-	}
-	go func() {
-		gate.pending.Wait()
-		close(gate.done)
-	}()
-	return gate
-}
-
 // slotFor is the slot channel a phase waits on before it starts.
 func (s fullPhaseSlots) slotFor(phase *fullPhaseContext) chan struct{} {
 	if phase.Command == "release-gate" {
@@ -1272,29 +1243,12 @@ func runFullPipeline(
 	// a fixed number of slots instead of all starting together. A phase holds
 	// its slot from seeding through its own cleanup.
 	slots := newFullPhaseSlots(len(phases))
-	gate := newFullGateDone(phases)
 
 	var wg sync.WaitGroup
 	for _, phase := range phases {
 		wg.Add(1)
 		go func(phase *fullPhaseContext) {
 			defer wg.Done()
-			if phase.Command == "release-gate" {
-				defer gate.pending.Done()
-			}
-			// A phase that waits for the gate takes no slot until the gate
-			// has ended, so it holds none of the other suites back meanwhile.
-			if fullPhaseWaitsForGate(phase) {
-				dashboard.setPhaseDetail(phase.Name, "waiting for the Product Behavior Gate")
-				select {
-				case <-gate.done:
-				case <-ctx.Done():
-					canceledErr := fmt.Errorf("canceled before the phase started: %w", ctx.Err())
-					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, time.Now(), canceledErr)
-					dashboard.markPhaseResult(phase.Name, "fail")
-					return
-				}
-			}
 			slot := slots.slotFor(phase)
 			select {
 			case slot <- struct{}{}:
@@ -1437,6 +1391,7 @@ func runSelfWithEnv(ctx context.Context, phase *fullPhaseContext, command string
 	configureFullPhaseCommandCancellation(cmd)
 	cmd.Dir = e2eDir()
 	cmd.Env = mergeChildEnv(os.Environ(), phase.env())
+	passFullRunLock(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

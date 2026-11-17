@@ -11,12 +11,14 @@ use bytes::Bytes;
 use tempfile::TempDir;
 
 use super::add::torrent_file_from_info_bytes;
+use super::peer_finder;
 use super::peer_sources::{merge_tracker_tiers, metainfo_tracker_tiers};
 use super::{
     AddTorrent, AddTorrentOptions, Discovery, ManagedTorrentHandle, Session, SessionOptions,
-    Tracker, is_bare_info_hash, torrent_from_bytes,
+    is_bare_info_hash, torrent_from_bytes,
 };
 use crate::tracker::ToldPorts;
+use crate::tracker::Tracker;
 
 fn url(s: &str) -> url::Url {
     url::Url::parse(s).unwrap()
@@ -334,6 +336,24 @@ async fn a_pcp_port_is_announced_over_ipv6_only() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A NAT-PMP / PCP mapper for `requests` asking over `route` through
+/// `session`'s clients.
+fn natpmp_over(
+    session: &Session,
+    route: Result<crate::natpmp::GatewayRoute, String>,
+    requests: Vec<crate::upnp::PortMapRequest>,
+) -> crate::natpmp::NatPmpMapper {
+    crate::natpmp::NatPmpMapper::new(route, requests, None, session.http_clients.clone())
+}
+
+/// `mapper`, its reports announced.
+fn announced(mapper: crate::natpmp::NatPmpMapper) -> super::ports::Planned {
+    super::ports::Planned {
+        mapper: Box::new(mapper),
+        announced: true,
+    }
+}
+
 // A session on `[::]` maps its port over PCP from each global IPv6
 // address, each from its own gateway (libtorrent starts a mapper on each
 // expanded IPv6 listen socket, session_impl.cpp:5912-5919). It tells
@@ -377,19 +397,23 @@ async fn each_ipv6_address_is_mapped_and_the_first_one_announced() -> anyhow::Re
             })
         })
         .collect();
-    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
-    session.map_ipv6_over(
-        routes,
-        vec![PortMapRequest {
-            protocol: PortmapProtocol::Tcp,
-            local_port,
-            external_port: local_port,
-        }],
-        events_tx,
-        Some(forward.clone()),
+    let requests = vec![PortMapRequest {
+        protocol: PortmapProtocol::Tcp,
+        local_port,
+        external_port: local_port,
+    }];
+    let routes: Vec<Result<GatewayRoute, String>> = routes;
+    session.run_port_mappers(
+        routes
+            .into_iter()
+            .enumerate()
+            .map(|(at, route)| super::ports::Planned {
+                mapper: Box::new(natpmp_over(&session, route, requests.clone()).ipv6()),
+                announced: at == 0,
+            }),
+        Some(forward),
     );
-    session.follow_port_mappings(events, None, Some(forward));
     for (gateway, granted) in gateways.iter().zip([2004u16, 2006]) {
         let mut buf = [0u8; 1100];
         let (n, mapper) = gateway.recv_from(&mut buf).await?;
@@ -502,18 +526,16 @@ async fn an_ssl_torrent_announces_the_port_mapped_for_the_ssl_listener() {
         })
         .collect();
     let mut ssl_announced = session.ssl_port.subscribe();
-    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
-    session.map_over(
-        Ok(GatewayRoute {
-            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
-            gateway: gateway.address(),
-            interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
-        }),
-        requests,
-        events_tx,
+    let route = Ok(GatewayRoute {
+        local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+        gateway: gateway.address(),
+        interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+    });
+    session.run_port_mappers(
+        [announced(natpmp_over(&session, route, requests))],
+        Some(forward),
     );
-    session.follow_port_mappings(events, session.ssl_mapped_port(), Some(forward));
 
     let mut granted = Vec::new();
     while granted.len() < 2 {
@@ -578,22 +600,21 @@ async fn legs_behind_one_gateway_map_their_own_ports_and_announce_the_set_one() 
 
     let mut forwarded = Vec::new();
     for (session, &port) in sessions.iter().zip(&ports) {
-        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let (forward, reports) = tokio::sync::mpsc::unbounded_channel();
-        session.map_over(
-            Ok(GatewayRoute {
-                local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
-                gateway: gateway.address(),
-                interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
-            }),
-            vec![PortMapRequest {
-                protocol: PortmapProtocol::Tcp,
-                local_port: port,
-                external_port: port,
-            }],
-            events_tx,
+        let route = Ok(GatewayRoute {
+            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            gateway: gateway.address(),
+            interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+        });
+        let requests = vec![PortMapRequest {
+            protocol: PortmapProtocol::Tcp,
+            local_port: port,
+            external_port: port,
+        }];
+        session.run_port_mappers(
+            [announced(natpmp_over(session, route, requests))],
+            Some(forward),
         );
-        session.follow_port_mappings(events, None, Some(forward));
         forwarded.push(reports);
     }
 
@@ -664,21 +685,23 @@ async fn an_ipv6_mapping_over_pcp_moves_the_announced_port() {
     });
 
     let mut announced = session.announce_port_changes();
-    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
-    session.map_over(
-        Ok(GatewayRoute {
-            local_ip: Ipv6Addr::LOCALHOST.into(),
-            gateway: gateway_addr,
-            interface_addresses: vec![Ipv6Addr::LOCALHOST.into()],
-        }),
-        vec![PortMapRequest {
-            protocol: PortmapProtocol::Tcp,
-            local_port: port,
-            external_port: port,
+    let route = Ok(GatewayRoute {
+        local_ip: Ipv6Addr::LOCALHOST.into(),
+        gateway: gateway_addr,
+        interface_addresses: vec![Ipv6Addr::LOCALHOST.into()],
+    });
+    let requests = vec![PortMapRequest {
+        protocol: PortmapProtocol::Tcp,
+        local_port: port,
+        external_port: port,
+    }];
+    session.run_port_mappers(
+        [super::ports::Planned {
+            mapper: Box::new(natpmp_over(&session, route, requests)),
+            announced: true,
         }],
-        events_tx,
+        None,
     );
-    session.follow_port_mappings(events, None, None);
 
     let request = heard.await.unwrap();
     assert_eq!(request[0], 2, "PCP");
@@ -1381,6 +1404,118 @@ async fn a_torrent_url_past_the_byte_limit_is_refused() {
     assert_eq!(parsed.torrent_bytes, torrent);
 }
 
+// A `.torrent` link's user, password, path and query never reach an error:
+// it is named by scheme, host and port only (SECURITY.md, "Credentials stay
+// with their scope").
+#[tokio::test]
+async fn a_torrent_url_error_names_only_scheme_host_and_port() {
+    let clients = crate::test_support::loopback();
+    let secret = |url: String| {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, _) = rest.split_once('/').unwrap();
+        (
+            format!("{scheme}://u5er:pa55word@{host}/dl/0123passkey/a.torrent?passkey=s3cret"),
+            format!("{scheme}://{host}/…"),
+        )
+    };
+    let check = |error: anyhow::Error, shown: &str| {
+        let text = format!("{error:#} {error:?}");
+        assert!(text.contains(shown), "{text}");
+        for part in ["u5er", "pa55word", "0123passkey", "s3cret", "a.torrent"] {
+            assert!(!text.contains(part), "{part} in {text}");
+        }
+    };
+    // A status that is not success.
+    let (url, shown) = secret(
+        serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into(),
+            Bytes::new(),
+        )
+        .await,
+    );
+    check(
+        super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .err()
+            .unwrap(),
+        &shown,
+    );
+    // A length past the limit.
+    let limit = crate::core::torrent_metainfo::MAX_TORRENT_FILE_BYTES;
+    let (url, shown) = secret(
+        serve_once(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", limit + 1),
+            Bytes::new(),
+        )
+        .await,
+    );
+    check(
+        super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .err()
+            .unwrap(),
+        &shown,
+    );
+    // A body that ends short of its length: the client's error names the URL
+    // unless it is stripped.
+    let (url, shown) = secret(
+        serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".into(),
+            Bytes::from_static(b"d8:announce"),
+        )
+        .await,
+    );
+    check(
+        super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .err()
+            .unwrap(),
+        &shown,
+    );
+    // A request that fails to send: nothing listens at the address.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (url, _) = secret(format!("http://{addr}/a.torrent"));
+    let error = super::torrent_from_url(clients.as_ref(), &url)
+        .await
+        .err()
+        .unwrap();
+    let text = format!("{error:#} {error:?}");
+    for part in ["u5er", "pa55word", "0123passkey", "s3cret", "a.torrent"] {
+        assert!(!text.contains(part), "{part} in {text}");
+    }
+}
+
+// A link of a scheme the session does not fetch is refused by scheme, host
+// and port, not by its user, password, path or query.
+#[tokio::test]
+async fn an_unsupported_torrent_url_is_refused_without_its_secrets() {
+    let dir = TempDir::new().unwrap();
+    let session = Session::new_with_opts(
+        dir.path().to_owned(),
+        crate::test_support::session_options(),
+    )
+    .await
+    .unwrap();
+    let error = session
+        .add_torrent(
+            AddTorrent::Url(
+                "ftp://u5er:pa55word@files.test/0123passkey/a.torrent?pk=s3cret".into(),
+            ),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+    let text = format!("{error:#}");
+    assert!(text.contains("ftp://files.test:21/…"), "{text}");
+    for part in ["u5er", "pa55word", "0123passkey", "s3cret", "a.torrent"] {
+        assert!(!text.contains(part), "{part} in {text}");
+    }
+    session.stop().await;
+}
+
 #[test]
 fn test_metainfo_tracker_tiers() {
     let parsed = torrent_from_bytes(torrent_bytes("x", false)).unwrap();
@@ -1435,7 +1570,7 @@ async fn test_private_torrent_announces_only_to_its_own_tiers() {
     .await
     .unwrap();
 
-    let add = |name: &'static str, private: bool, trackers_only: bool| {
+    let add = |name: &'static str, private: bool, all_off: bool| {
         let session = session.clone();
         let output_folder = dir.path().join(name).to_str().unwrap().to_owned();
         async move {
@@ -1446,7 +1581,9 @@ async fn test_private_torrent_announces_only_to_its_own_tiers() {
                         paused: true,
                         output_folder: Some(output_folder),
                         trackers: Some(vec!["http://added.test/announce".to_owned()]),
-                        trackers_only,
+                        disable_dht: all_off,
+                        disable_lsd: all_off,
+                        disable_pex: all_off,
                         ..Default::default()
                     }),
                 )
@@ -1458,35 +1595,35 @@ async fn test_private_torrent_announces_only_to_its_own_tiers() {
     };
 
     let private = add("private", true, false).await;
-    assert!(private.takes_peers_from_trackers_only());
+    assert!(private.is_private());
     assert_eq!(private.shared().tracker_tiers(), own_tiers());
     assert_eq!(
         session.announce_tiers(private.shared().tracker_tiers(), true),
         own_tiers()
     );
 
-    // A torrent its metainfo does not mark private, added to take peers
-    // from its trackers alone, is held to the same.
-    let trackers_only = add("trackers_only", false, true).await;
-    assert!(trackers_only.takes_peers_from_trackers_only());
-    assert_eq!(trackers_only.shared().tracker_tiers(), own_tiers());
-    assert_eq!(
-        session.announce_tiers(
-            trackers_only.shared().tracker_tiers(),
-            trackers_only.takes_peers_from_trackers_only()
-        ),
-        own_tiers()
-    );
-
     let public = add("public", false, false).await;
-    assert!(!public.takes_peers_from_trackers_only());
+    assert!(!public.is_private());
     let mut with_added = own_tiers();
     with_added.push(operator("http://added.test/announce"));
     assert_eq!(public.shared().tracker_tiers(), with_added);
-    let mut with_session = with_added;
+    let mut with_session = with_added.clone();
     with_session.push(operator("http://session.test/announce"));
     assert_eq!(
-        session.announce_tiers(public.shared().tracker_tiers(), false),
+        session.announce_tiers(public.shared().tracker_tiers(), public.is_private()),
+        with_session
+    );
+
+    // A public torrent added without the DHT, local discovery and peer
+    // exchange is still public: it announces to the added and the
+    // session's trackers as any public one does. libtorrent's
+    // `disable_dht`, `disable_lsd` and `disable_pex` touch no tracker;
+    // only `priv()` keeps a torrent from them.
+    let all_off = add("all_off", false, true).await;
+    assert!(!all_off.is_private());
+    assert_eq!(all_off.shared().tracker_tiers(), with_added);
+    assert_eq!(
+        session.announce_tiers(all_off.shared().tracker_tiers(), all_off.is_private()),
         with_session
     );
 
@@ -1497,8 +1634,9 @@ async fn test_private_torrent_announces_only_to_its_own_tiers() {
 // added without the DHT or the local network looks for peers on neither,
 // while the session runs them for its other torrents. A private torrent
 // looks on neither whatever it was added with
-// (`torrent::should_announce_dht`, `torrent::lsd_announce`), and neither
-// does one added to take peers from its trackers alone.
+// (`torrent::should_announce_dht`, `torrent::lsd_announce`). A public
+// torrent added without all three of the DHT, local discovery and peer
+// exchange stays public: each flag turns off its own source only.
 #[tokio::test]
 async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
     use crate::lsd::RecordingSocket;
@@ -1548,6 +1686,7 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
 
     let public = add("public", false, AddTorrentOptions::default()).await;
     assert_eq!(public.discovery(), everywhere);
+    assert!(public.speaks_pex());
     let no_dht = add(
         "no_dht",
         false,
@@ -1564,6 +1703,35 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
             lsd: true
         }
     );
+    assert!(no_dht.speaks_pex());
+    let no_lsd = add(
+        "no_lsd",
+        false,
+        AddTorrentOptions {
+            disable_lsd: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        no_lsd.discovery(),
+        Discovery {
+            dht: true,
+            lsd: false
+        }
+    );
+    assert!(no_lsd.speaks_pex());
+    let no_pex = add(
+        "no_pex",
+        false,
+        AddTorrentOptions {
+            disable_pex: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(no_pex.discovery(), everywhere);
+    assert!(!no_pex.speaks_pex());
     let neither = add(
         "neither",
         false,
@@ -1577,30 +1745,37 @@ async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
     assert_eq!(neither.discovery(), nowhere);
     let private = add("private", true, AddTorrentOptions::default()).await;
     assert_eq!(private.discovery(), nowhere);
-    let trackers_only = add(
-        "trackers_only",
+    let all_off = add(
+        "all_off",
         false,
         AddTorrentOptions {
-            trackers_only: true,
+            disable_dht: true,
+            disable_lsd: true,
+            disable_pex: true,
             ..Default::default()
         },
     )
     .await;
-    assert_eq!(trackers_only.discovery(), nowhere);
+    assert_eq!(all_off.discovery(), nowhere);
+    assert!(!all_off.is_private());
+    assert!(!all_off.speaks_pex());
 
     // The session runs local discovery: a torrent that looks there is
     // handed its peers, one that looks nowhere is handed none.
     let peers = |t: &ManagedTorrentHandle| {
-        session.discovery_peers(
+        let identity = session.identity().clone();
+        peer_finder::after_trackers(
+            &session,
             t.info_hashes(),
-            false,
+            &identity,
             tokio::sync::watch::channel(()).1,
-            None,
             t.discovery(),
         )
     };
     assert!(peers(&public).is_some());
     assert!(peers(&no_dht).is_some());
+    assert!(peers(&no_lsd).is_none());
+    assert!(peers(&no_pex).is_some());
     assert!(peers(&neither).is_none());
     assert!(peers(&private).is_none());
 

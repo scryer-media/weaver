@@ -12,8 +12,7 @@
 //! [`LAYER_CHUNK`]: crate::v2_hashes::LAYER_CHUNK
 
 use std::{
-    collections::HashMap,
-    net::SocketAddr,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Range,
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -44,7 +43,7 @@ const REQUESTS_PER_PEER: usize = 2;
 
 /// A request out to a peer, and when the run it asks for may go to another.
 struct Out {
-    peer: SocketAddr,
+    peer: PeerHandle,
     deadline: Instant,
 }
 
@@ -74,13 +73,14 @@ enum Kind {
 /// hashes of a piece.
 struct Wanted {
     request: HashRequest,
-    /// The pieces a peer must have one of to be asked.
-    pieces: Range<u32>,
+    /// The pieces a peer must have one of to be asked: a run of a layer
+    /// covers pieces in every file of its root.
+    pieces: Vec<Range<u32>>,
     kind: Kind,
     /// The peers asked for it whose answer is still due.
     out: Vec<Out>,
     /// The peers that rejected it, which are not asked for it again.
-    rejected_by: Vec<SocketAddr>,
+    rejected_by: Vec<PeerHandle>,
 }
 
 impl Wanted {
@@ -96,7 +96,7 @@ enum Wake {
     /// None: no want came free, and no connection's held requests fell.
     Nobody,
     /// These, whose held requests fell, and none other.
-    Peers(Vec<SocketAddr>),
+    Peers(Vec<PeerHandle>),
     /// Every connection: a want came free or may go to another sooner, or a
     /// new one is wanted.
     All,
@@ -118,7 +118,7 @@ impl Wake {
     // at `now`: its own held requests fell, and the want came free or may
     // go to another sooner when it is due earlier than it was, or not at
     // all.
-    fn taken_off(peer: SocketAddr, was: Option<Instant>, now: Option<Instant>) -> Wake {
+    fn taken_off(peer: PeerHandle, was: Option<Instant>, now: Option<Instant>) -> Wake {
         match (was, now) {
             (Some(was), Some(now)) if now >= was => Wake::Peers(vec![peer]),
             _ => Wake::All,
@@ -205,41 +205,136 @@ pub(crate) fn failed_blocks(
         .collect()
 }
 
+/// A want's place in [`Wants::by_order`].
+type Key = i64;
+
+/// What a request is found by: its fields, in order.
+type RequestKey = (Id32, u32, u32, u32, u32);
+
+fn request_key(r: &HashRequest) -> RequestKey {
+    (r.root, r.base, r.index, r.count, r.proof_layers)
+}
+
+/// The hashes wanted, in the order they are picked, and found by their
+/// request, by the peers they are out to or rejected by, and by the piece
+/// whose block hashes they are, so no change looks at every want.
+#[derive(Default)]
+struct Wants {
+    /// In the order they are picked: the block hashes of failed pieces,
+    /// the latest first, then the runs of the layers in order.
+    by_order: BTreeMap<Key, Wanted>,
+    /// Each want by its request, the first of a request first.
+    by_request: BTreeSet<(RequestKey, Key)>,
+    /// The wants each peer is asked for and has not answered.
+    out_of: HashMap<PeerHandle, HashSet<Key>>,
+    /// The wants each peer rejected.
+    rejected_of: HashMap<PeerHandle, HashSet<Key>>,
+    /// The wants for the block hashes of each piece.
+    blocks_of: BTreeSet<(u32, Key)>,
+    /// The key the next want put first takes, less one.
+    front: Key,
+    /// The key the next want put last takes.
+    back: Key,
+}
+
+impl Wants {
+    fn new(wanted: impl IntoIterator<Item = Wanted>) -> Self {
+        let mut wants = Self::default();
+        for w in wanted {
+            wants.insert(w, false);
+        }
+        wants
+    }
+
+    // Puts `w`, which no peer is asked for or rejected, first or last.
+    fn insert(&mut self, w: Wanted, first: bool) {
+        let key = if first {
+            self.front -= 1;
+            self.front
+        } else {
+            self.back += 1;
+            self.back - 1
+        };
+        self.by_request.insert((request_key(&w.request), key));
+        if let Kind::Blocks { piece, .. } = w.kind {
+            self.blocks_of.insert((piece.get(), key));
+        }
+        self.by_order.insert(key, w);
+    }
+
+    // The first want of `request`.
+    fn first(&self, request: &HashRequest) -> Option<Key> {
+        let r = request_key(request);
+        self.by_request
+            .range((r, Key::MIN)..=(r, Key::MAX))
+            .next()
+            .map(|&(_, key)| key)
+    }
+
+    // Takes the want of `key` out, and the peers it was out to.
+    fn remove(&mut self, key: Key) -> Option<Wanted> {
+        let w = self.by_order.remove(&key)?;
+        self.by_request.remove(&(request_key(&w.request), key));
+        if let Kind::Blocks { piece, .. } = w.kind {
+            self.blocks_of.remove(&(piece.get(), key));
+        }
+        for o in &w.out {
+            unmark(&mut self.out_of, o.peer, key);
+        }
+        for &p in &w.rejected_by {
+            unmark(&mut self.rejected_of, p, key);
+        }
+        Some(w)
+    }
+
+    // How many wants `peer` is asked for.
+    fn held(&self, peer: PeerHandle) -> usize {
+        self.out_of.get(&peer).map_or(0, HashSet::len)
+    }
+}
+
+// `key` is no longer one of `peer`'s in `index`.
+fn unmark(index: &mut HashMap<PeerHandle, HashSet<Key>>, peer: PeerHandle, key: Key) {
+    if let Some(keys) = index.get_mut(&peer) {
+        keys.remove(&key);
+        if keys.is_empty() {
+            index.remove(&peer);
+        }
+    }
+}
+
 /// The hashes a torrent lacks, and which peers they are out to (libtorrent
 /// `hash_picker::m_piece_hash_requested`, `m_piece_block_requests`).
 pub(crate) struct LayerFetch {
-    wanted: Mutex<Vec<Wanted>>,
+    wanted: Mutex<Wants>,
     /// Each v2 connection's bell, rung when a change may give it new work:
     /// a want came free, or may go to another sooner, or is new, rung for
     /// every connection; a request of its own answered, rejected or
     /// dropped, for it alone. A connection no change can give work is left
     /// asleep. Taken after `wanted` is let go.
-    waiters: Mutex<HashMap<SocketAddr, Arc<Notify>>>,
+    waiters: Mutex<HashMap<PeerHandle, Arc<Notify>>>,
 }
 
 impl LayerFetch {
     pub fn new(v2: Option<&V2Hashes>) -> Self {
-        let wanted = v2
-            .into_iter()
-            .flat_map(|v2| {
-                v2.missing_chunks().map(|(file, chunk)| Wanted {
-                    request: v2.chunk_request(file, chunk),
-                    pieces: v2.chunk_pieces(file, chunk),
-                    kind: Kind::Layer,
-                    out: Vec::new(),
-                    rejected_by: Vec::new(),
-                })
+        let wanted = v2.into_iter().flat_map(|v2| {
+            v2.missing_chunks().map(|(file, chunk)| Wanted {
+                request: v2.chunk_request(file, chunk),
+                pieces: v2.root_chunk_pieces(file, chunk),
+                kind: Kind::Layer,
+                out: Vec::new(),
+                rejected_by: Vec::new(),
             })
-            .collect();
+        });
         Self {
-            wanted: Mutex::new(wanted),
+            wanted: Mutex::new(Wants::new(wanted)),
             waiters: Mutex::default(),
         }
     }
 
     /// The bell of `peer`'s connection; see [`Self::waiters`]. A ring that
     /// comes before the connection waits is kept for it.
-    pub(super) fn waiter(&self, peer: SocketAddr) -> Arc<Notify> {
+    pub(super) fn waiter(&self, peer: PeerHandle) -> Arc<Notify> {
         self.waiters.lock().entry(peer).or_default().clone()
     }
 
@@ -269,19 +364,17 @@ impl LayerFetch {
     /// `hash_picker::pick_hashes`).
     pub fn pick(
         &self,
-        peer: SocketAddr,
+        peer: PeerHandle,
         has_any: impl Fn(Range<u32>) -> bool,
         timeout: Duration,
         now: Instant,
     ) -> Pick {
-        let mut wanted = self.wanted.lock();
-        let mut held = wanted
-            .iter()
-            .filter(|w| w.out.iter().any(|o| o.peer == peer))
-            .count();
+        let mut guard = self.wanted.lock();
+        let wants = &mut *guard;
+        let mut held = wants.held(peer);
         let mut send = Vec::new();
         let mut wake: Option<Instant> = None;
-        for w in wanted.iter_mut() {
+        for (&key, w) in wants.by_order.iter_mut() {
             if held >= REQUESTS_PER_PEER {
                 break;
             }
@@ -294,13 +387,14 @@ impl LayerFetch {
                 wake = Some(wake.map_or(due, |at| at.min(due)));
                 continue;
             }
-            if !has_any(w.pieces.clone()) {
+            if !w.pieces.iter().any(|pieces| has_any(pieces.clone())) {
                 continue;
             }
             w.out.push(Out {
                 peer,
                 deadline: now + timeout,
             });
+            wants.out_of.entry(peer).or_default().insert(key);
             send.push(w.request);
             held += 1;
         }
@@ -313,10 +407,11 @@ impl LayerFetch {
 
     /// `peer` answered `request`: what it asked for, when it was out to it
     /// (libtorrent `bt_peer_connection::on_hashes` ignores the others).
-    fn answered(&self, peer: SocketAddr, request: &HashRequest) -> Option<Asked> {
-        let (asked, wake) = match self.take_out(peer, request) {
-            Some((w, wake)) => (
-                Some(match w.kind {
+    fn answered(&self, peer: PeerHandle, request: &HashRequest) -> Option<Asked> {
+        let mut wants = self.wanted.lock();
+        let (asked, wake) = match take_out(&mut wants, peer, request) {
+            Some((key, wake)) => (
+                wants.by_order.get(&key).map(|w| match w.kind {
                     Kind::Layer => Asked::Layer,
                     Kind::Blocks { piece, .. } => Asked::Blocks(piece),
                 }),
@@ -324,6 +419,7 @@ impl LayerFetch {
             ),
             None => (None, Wake::Nobody),
         };
+        drop(wants);
         self.wake(wake);
         asked
     }
@@ -331,11 +427,10 @@ impl LayerFetch {
     /// The hashes `request` asks for are held: the blocks they were wanted
     /// to judge, if any.
     fn landed(&self, request: &HashRequest) -> Vec<FailedBlock> {
-        let mut wanted = self.wanted.lock();
+        let mut wants = self.wanted.lock();
         // The peers it is still out to hold one request fewer.
-        let (failed, wake) = match wanted.iter().position(|w| w.request == *request) {
-            Some(at) => {
-                let w = wanted.remove(at);
+        let (failed, wake) = match wants.first(request).and_then(|key| wants.remove(key)) {
+            Some(w) => {
                 let wake = Wake::Peers(w.out.iter().map(|o| o.peer).collect());
                 match w.kind {
                     Kind::Blocks { failed, .. } => (failed, wake),
@@ -344,7 +439,7 @@ impl LayerFetch {
             }
             None => (Vec::new(), Wake::Nobody),
         };
-        drop(wanted);
+        drop(wants);
         self.wake(wake);
         failed
     }
@@ -359,90 +454,110 @@ impl LayerFetch {
         piece: ValidPieceIndex,
         failed: Vec<FailedBlock>,
     ) {
-        let mut wanted = self.wanted.lock();
+        let mut wants = self.wanted.lock();
         // More failed blocks to judge change no pick: only a new want wakes.
-        let wake = if let Some(Kind::Blocks { failed: had, .. }) = wanted
-            .iter_mut()
-            .find(|w| w.request == request)
-            .map(|w| &mut w.kind)
-        {
+        let had = wants
+            .first(&request)
+            .and_then(|key| wants.by_order.get_mut(&key));
+        let wake = if let Some(Kind::Blocks { failed: had, .. }) = had.map(|w| &mut w.kind) {
             had.extend(failed);
             Wake::Nobody
         } else {
-            wanted.insert(
-                0,
+            wants.insert(
                 Wanted {
                     request,
-                    pieces: piece.get()..piece.get() + 1,
+                    pieces: std::iter::once(piece.get()..piece.get() + 1).collect(),
                     kind: Kind::Blocks { piece, failed },
                     out: Vec::new(),
                     rejected_by: Vec::new(),
                 },
+                true,
             );
             Wake::All
         };
-        drop(wanted);
+        drop(wants);
         self.wake(wake);
     }
 
     /// `piece` passed: the blocks it failed with are judged by the good
-    /// copy, and its block hashes are no longer wanted.
+    /// copy, and its block hashes are no longer wanted. The peers they
+    /// were out to hold one request fewer each, and may be given another.
     pub fn piece_passed(&self, piece: ValidPieceIndex) {
-        self.wanted
-            .lock()
-            .retain(|w| !matches!(w.kind, Kind::Blocks { piece: p, .. } if p == piece));
+        let mut wants = self.wanted.lock();
+        let p = piece.get();
+        let keys: Vec<Key> = wants
+            .blocks_of
+            .range((p, Key::MIN)..=(p, Key::MAX))
+            .map(|&(_, key)| key)
+            .collect();
+        let mut wake = Wake::Nobody;
+        for key in keys {
+            if let Some(w) = wants.remove(key)
+                && !w.out.is_empty()
+            {
+                wake = wake.and(Wake::Peers(w.out.iter().map(|o| o.peer).collect()));
+            }
+        }
+        drop(wants);
+        self.wake(wake);
     }
 
     /// `peer` rejected `request`: the run may go to another peer at once
     /// (libtorrent `hash_picker::hashes_rejected`), and is not asked of it
     /// again.
-    fn rejected(&self, peer: SocketAddr, request: &HashRequest) {
-        let wake = match self.take_out(peer, request) {
-            Some((mut w, wake)) => {
-                w.rejected_by.push(peer);
+    fn rejected(&self, peer: PeerHandle, request: &HashRequest) {
+        let mut guard = self.wanted.lock();
+        let wants = &mut *guard;
+        let wake = match take_out(wants, peer, request) {
+            Some((key, wake)) => {
+                if let Some(w) = wants.by_order.get_mut(&key) {
+                    w.rejected_by.push(peer);
+                    wants.rejected_of.entry(peer).or_default().insert(key);
+                }
                 wake
             }
             None => Wake::Nobody,
         };
+        drop(guard);
         self.wake(wake);
     }
 
     /// `peer` left: what it held may go to another, and its bell goes.
-    pub fn forget(&self, peer: SocketAddr) {
+    pub fn forget(&self, peer: PeerHandle) {
         let mut wake = Wake::Nobody;
-        for w in self.wanted.lock().iter_mut() {
-            let was = w.due();
-            let before = w.out.len();
-            w.out.retain(|o| o.peer != peer);
-            if w.out.len() != before {
+        {
+            let mut guard = self.wanted.lock();
+            let wants = &mut *guard;
+            for key in wants.out_of.remove(&peer).unwrap_or_default() {
+                let Some(w) = wants.by_order.get_mut(&key) else {
+                    continue;
+                };
+                let was = w.due();
+                w.out.retain(|o| o.peer != peer);
                 wake = wake.and(Wake::taken_off(peer, was, w.due()));
             }
-            w.rejected_by.retain(|p| *p != peer);
+            for key in wants.rejected_of.remove(&peer).unwrap_or_default() {
+                if let Some(w) = wants.by_order.get_mut(&key) {
+                    w.rejected_by.retain(|p| *p != peer);
+                }
+            }
         }
         self.waiters.lock().remove(&peer);
         self.wake(wake);
     }
+}
 
-    /// The run `request` asks for, taken off `peer`'s requests, when it was
-    /// out to it, and whom that may give work.
-    fn take_out(
-        &self,
-        peer: SocketAddr,
-        request: &HashRequest,
-    ) -> Option<(parking_lot::MappedMutexGuard<'_, Wanted>, Wake)> {
-        let wanted = self.wanted.lock();
-        let mut wake = Wake::Nobody;
-        let w = parking_lot::MutexGuard::try_map(wanted, |wanted| {
-            let w = wanted.iter_mut().find(|w| w.request == *request)?;
-            let at = w.out.iter().position(|o| o.peer == peer)?;
-            let was = w.due();
-            w.out.swap_remove(at);
-            wake = Wake::taken_off(peer, was, w.due());
-            Some(w)
-        })
-        .ok()?;
-        Some((w, wake))
-    }
+/// The want `request` asks for, its first, taken off `peer`'s requests when
+/// it was out to it, and whom that may give work.
+fn take_out(wants: &mut Wants, peer: PeerHandle, request: &HashRequest) -> Option<(Key, Wake)> {
+    let key = wants.first(request)?;
+    let w = wants.by_order.get_mut(&key)?;
+    let at = w.out.iter().position(|o| o.peer == peer)?;
+    let was = w.due();
+    w.out.swap_remove(at);
+    let wake = Wake::taken_off(peer, was, w.due());
+    unmark(&mut wants.out_of, peer, key);
+    Some((key, wake))
 }
 
 // Whether `bitfield` has any of `pieces`, a word at a time; a piece past
@@ -589,7 +704,7 @@ impl PeerHandler {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, net::SocketAddr};
 
     use futures::FutureExt;
 
@@ -605,19 +720,16 @@ mod tests {
 
     impl Side {
         fn new(wants: &[(HashRequest, Range<u32>)]) -> Self {
-            let wanted = wants
-                .iter()
-                .map(|(request, pieces)| Wanted {
-                    request: *request,
-                    pieces: pieces.clone(),
-                    kind: Kind::Layer,
-                    out: Vec::new(),
-                    rejected_by: Vec::new(),
-                })
-                .collect();
+            let wanted = wants.iter().map(|(request, pieces)| Wanted {
+                request: *request,
+                pieces: vec![pieces.clone()],
+                kind: Kind::Layer,
+                out: Vec::new(),
+                rejected_by: Vec::new(),
+            });
             Self {
                 fetch: LayerFetch {
-                    wanted: Mutex::new(wanted),
+                    wanted: Mutex::new(Wants::new(wanted)),
                     waiters: Mutex::default(),
                 },
                 sent: HashMap::new(),
@@ -629,7 +741,7 @@ mod tests {
         fn run(&mut self, peer: SocketAddr, has: &[bool], timeout: Duration, now: Instant) {
             loop {
                 let pick = self.fetch.pick(
-                    peer,
+                    peer.into(),
                     |pieces| pieces.into_iter().any(|p| has[p as usize]),
                     timeout,
                     now,
@@ -648,6 +760,380 @@ mod tests {
             self.wake_at
                 .get(&peer)
                 .is_some_and(|at| at.is_some_and(|at| at <= now))
+        }
+    }
+
+    // Files of the same content share a root and one layer: a peer that
+    // has pieces of any of them is asked for its runs, not only one with
+    // pieces of the first.
+    #[test]
+    fn a_peer_with_pieces_of_any_file_of_a_root_is_asked_for_its_layer() {
+        use crate::core::{
+            torrent_metainfo::torrent_from_bytes,
+            v2_test_torrent::{TestTorrent, payload},
+        };
+        let data = payload(3 * 16384, 1);
+        let mut t = TestTorrent::new(vec![("a", data.clone()), ("b", data)], 16384);
+        t.layers = false;
+        let bytes = t.torrent_bytes();
+        let meta = torrent_from_bytes(&bytes).unwrap();
+        let info = meta.info.data.clone().validate().unwrap();
+        let v2 = V2Hashes::new(&info, Vec::new()).unwrap();
+        let fetch = LayerFetch::new(Some(&v2));
+        let peer = PeerHandle::from(SocketAddr::from(([10, 0, 0, 1], 6881)));
+        // The peer has b's pieces, 3..6, and none of a's.
+        let pick = fetch.pick(
+            peer,
+            |pieces| pieces.start.max(3) < pieces.end.min(6),
+            Duration::from_secs(5),
+            Instant::now(),
+        );
+        let Pick::Send(sent) = pick else {
+            panic!("the peer with b's pieces was not asked");
+        };
+        assert_eq!(sent, vec![v2.chunk_request(0, 0)]);
+        // A peer with no piece of the root is not.
+        let other = PeerHandle::from(SocketAddr::from(([10, 0, 0, 2], 6881)));
+        assert!(matches!(
+            fetch.pick(other, |_| false, Duration::from_secs(5), Instant::now()),
+            Pick::Wait(_)
+        ));
+    }
+
+    // A piece passes while the request for its block hashes is out: the
+    // peer asked for them holds one request fewer, and its connection is
+    // woken to be given another.
+    #[test]
+    fn a_passed_piece_wakes_the_peers_asked_for_its_block_hashes() {
+        let lengths = Lengths::new(64, 1).unwrap();
+        let request = |index| HashRequest {
+            root: Id32::default(),
+            base: 0,
+            index,
+            count: 1,
+            proof_layers: 0,
+        };
+        let fetch = LayerFetch::new(None);
+        let (peer, other): (PeerHandle, PeerHandle) = (
+            SocketAddr::from(([10, 0, 0, 1], 6881)).into(),
+            SocketAddr::from(([10, 0, 0, 2], 6881)).into(),
+        );
+        let (bell, other_bell) = (fetch.waiter(peer), fetch.waiter(other));
+        let piece = lengths.validate_piece_index(3).unwrap();
+        fetch.verify_blocks(request(1), piece, Vec::new());
+        // The new want rang every connection.
+        for b in [&bell, &other_bell] {
+            assert!(b.notified().now_or_never().is_some());
+        }
+        let now = Instant::now();
+        let Pick::Send(sent) = fetch.pick(peer, |_| true, Duration::from_secs(5), now) else {
+            panic!("the block hashes were not asked for");
+        };
+        assert_eq!(sent, vec![request(1)]);
+        fetch.piece_passed(piece);
+        assert!(bell.notified().now_or_never().is_some());
+        // The other peer was asked for nothing, and is left asleep.
+        assert!(other_bell.notified().now_or_never().is_none());
+        assert_eq!(fetch.wanted.lock().held(peer), 0);
+        assert!(fetch.wanted.lock().by_order.is_empty());
+    }
+
+    /// The fetch as it was before it was indexed: a list searched for each
+    /// change. The reference the indexed fetch is compared with.
+    struct Listed(Vec<Wanted>);
+
+    impl Listed {
+        fn pick(
+            &mut self,
+            peer: PeerHandle,
+            has_any: impl Fn(Range<u32>) -> bool,
+            timeout: Duration,
+            now: Instant,
+        ) -> Pick {
+            let mut held = self
+                .0
+                .iter()
+                .filter(|w| w.out.iter().any(|o| o.peer == peer))
+                .count();
+            let mut send = Vec::new();
+            let mut wake: Option<Instant> = None;
+            for w in self.0.iter_mut() {
+                if held >= REQUESTS_PER_PEER {
+                    break;
+                }
+                if w.out.iter().any(|o| o.peer == peer) || w.rejected_by.contains(&peer) {
+                    continue;
+                }
+                if let Some(due) = w.due()
+                    && due > now
+                {
+                    wake = Some(wake.map_or(due, |at| at.min(due)));
+                    continue;
+                }
+                if !w.pieces.iter().any(|pieces| has_any(pieces.clone())) {
+                    continue;
+                }
+                w.out.push(Out {
+                    peer,
+                    deadline: now + timeout,
+                });
+                send.push(w.request);
+                held += 1;
+            }
+            if send.is_empty() {
+                Pick::Wait(wake)
+            } else {
+                Pick::Send(send)
+            }
+        }
+
+        fn take_out(&mut self, peer: PeerHandle, request: &HashRequest) -> Option<&mut Wanted> {
+            let w = self.0.iter_mut().find(|w| w.request == *request)?;
+            let at = w.out.iter().position(|o| o.peer == peer)?;
+            w.out.swap_remove(at);
+            Some(w)
+        }
+
+        fn answered(&mut self, peer: PeerHandle, request: &HashRequest) -> Option<Asked> {
+            self.take_out(peer, request).map(|w| match w.kind {
+                Kind::Layer => Asked::Layer,
+                Kind::Blocks { piece, .. } => Asked::Blocks(piece),
+            })
+        }
+
+        fn landed(&mut self, request: &HashRequest) -> Vec<FailedBlock> {
+            match self.0.iter().position(|w| w.request == *request) {
+                Some(at) => match self.0.remove(at).kind {
+                    Kind::Blocks { failed, .. } => failed,
+                    Kind::Layer => Vec::new(),
+                },
+                None => Vec::new(),
+            }
+        }
+
+        fn verify_blocks(
+            &mut self,
+            request: HashRequest,
+            piece: ValidPieceIndex,
+            failed: Vec<FailedBlock>,
+        ) {
+            if let Some(Kind::Blocks { failed: had, .. }) = self
+                .0
+                .iter_mut()
+                .find(|w| w.request == request)
+                .map(|w| &mut w.kind)
+            {
+                had.extend(failed);
+            } else {
+                self.0.insert(
+                    0,
+                    Wanted {
+                        request,
+                        pieces: std::iter::once(piece.get()..piece.get() + 1).collect(),
+                        kind: Kind::Blocks { piece, failed },
+                        out: Vec::new(),
+                        rejected_by: Vec::new(),
+                    },
+                );
+            }
+        }
+
+        fn piece_passed(&mut self, piece: ValidPieceIndex) {
+            self.0
+                .retain(|w| !matches!(w.kind, Kind::Blocks { piece: p, .. } if p == piece));
+        }
+
+        fn rejected(&mut self, peer: PeerHandle, request: &HashRequest) {
+            if let Some(w) = self.take_out(peer, request) {
+                w.rejected_by.push(peer);
+            }
+        }
+
+        fn forget(&mut self, peer: PeerHandle) {
+            for w in self.0.iter_mut() {
+                w.out.retain(|o| o.peer != peer);
+                w.rejected_by.retain(|p| *p != peer);
+            }
+        }
+    }
+
+    // What a pick says, to compare.
+    fn picked(pick: Pick) -> (Vec<HashRequest>, Option<Option<Instant>>) {
+        match pick {
+            Pick::Send(sent) => (sent, None),
+            Pick::Wait(at) => (Vec::new(), Some(at)),
+        }
+    }
+
+    fn asked(asked: Option<Asked>) -> Option<Option<u32>> {
+        asked.map(|a| match a {
+            Asked::Layer => None,
+            Asked::Blocks(piece) => Some(piece.get()),
+        })
+    }
+
+    fn blocks(failed: Vec<FailedBlock>) -> Vec<(u32, PeerHandle, Id32)> {
+        failed
+            .into_iter()
+            .map(|b| (b.block, b.sender, b.leaf))
+            .collect()
+    }
+
+    // The indexed fetch picks what the listed one picks, for each peer and
+    // in the same order, holds the same requests, and answers each change
+    // as it does, over seeded runs of picks, answers, rejects, block hash
+    // wants (some for a request a layer run has too), passed pieces,
+    // peers leaving and joining, and time passing.
+    #[test]
+    fn the_indexed_fetch_does_what_the_listed_one_did() {
+        const PIECES: u32 = 64;
+        let mut rng = 0x1f83_d9ab_fb41_bd6bu64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let lengths = Lengths::new(u64::from(PIECES), 1).unwrap();
+        let request = |index: u32| HashRequest {
+            root: Id32::default(),
+            base: 0,
+            index,
+            count: 1,
+            proof_layers: 0,
+        };
+        for run in 0..40 {
+            let wants: Vec<Wanted> = (0..30)
+                .map(|i| {
+                    let start = u32::try_from(next() % u64::from(PIECES)).unwrap();
+                    let end = (start + 1 + u32::try_from(next() % 16).unwrap()).min(PIECES);
+                    let more = u32::try_from(next() % u64::from(PIECES)).unwrap();
+                    Wanted {
+                        request: request(i),
+                        pieces: vec![start..end, more..more + 1],
+                        kind: Kind::Layer,
+                        out: Vec::new(),
+                        rejected_by: Vec::new(),
+                    }
+                })
+                .collect();
+            let copy = |w: &Wanted| Wanted {
+                request: w.request,
+                pieces: w.pieces.clone(),
+                kind: Kind::Layer,
+                out: Vec::new(),
+                rejected_by: Vec::new(),
+            };
+            let mut listed = Listed(wants.iter().map(copy).collect());
+            let indexed = LayerFetch {
+                wanted: Mutex::new(Wants::new(wants.iter().map(copy))),
+                waiters: Mutex::default(),
+            };
+            let peers: Vec<(PeerHandle, Vec<bool>, Duration)> = (0..6u16)
+                .map(|i| {
+                    let has = (0..PIECES).map(|_| next() % 3 == 0).collect();
+                    let timeout = Duration::from_millis(1000 + next() % 4000);
+                    (
+                        SocketAddr::from(([10, 0, 0, 1], 6881 + i)).into(),
+                        has,
+                        timeout,
+                    )
+                })
+                .collect();
+            let mut now = Instant::now();
+            for step in 0..500 {
+                let r = next();
+                let (peer, ..) = peers[(r >> 8) as usize % peers.len()];
+                let held: Vec<HashRequest> = listed
+                    .0
+                    .iter()
+                    .filter(|w| w.out.iter().any(|o| o.peer == peer))
+                    .map(|w| w.request)
+                    .collect();
+                let failing: Vec<ValidPieceIndex> = listed
+                    .0
+                    .iter()
+                    .filter_map(|w| match w.kind {
+                        Kind::Blocks { piece, .. } => Some(piece),
+                        Kind::Layer => None,
+                    })
+                    .collect();
+                match r % 7 {
+                    0 | 1 if !held.is_empty() => {
+                        let a = held[(r >> 16) as usize % held.len()];
+                        assert_eq!(
+                            asked(indexed.answered(peer, &a)),
+                            asked(listed.answered(peer, &a)),
+                            "run {run} step {step}"
+                        );
+                        if r & 0x100 != 0 {
+                            assert_eq!(
+                                blocks(indexed.landed(&a)),
+                                blocks(listed.landed(&a)),
+                                "run {run} step {step}"
+                            );
+                        }
+                    }
+                    2 if !held.is_empty() => {
+                        let a = held[(r >> 16) as usize % held.len()];
+                        indexed.rejected(peer, &a);
+                        listed.rejected(peer, &a);
+                    }
+                    3 => {
+                        let piece = lengths
+                            .validate_piece_index(
+                                u32::try_from((r >> 16) % u64::from(PIECES)).unwrap(),
+                            )
+                            .unwrap();
+                        // Now and then the request of a layer run, or of a
+                        // piece that failed before.
+                        let index = match r & 0x300 {
+                            0x100 => u32::try_from((r >> 24) % 30).unwrap(),
+                            0x200 => 1000,
+                            _ => 1001 + u32::try_from(step).unwrap(),
+                        };
+                        let failed: Vec<FailedBlock> = (0..(r >> 40) % 3)
+                            .map(|b| FailedBlock {
+                                block: u32::try_from(b).unwrap(),
+                                sender: peer,
+                                leaf: Id32::new([u8::try_from(step % 256).unwrap(); 32]),
+                            })
+                            .collect();
+                        indexed.verify_blocks(request(index), piece, failed.clone());
+                        listed.verify_blocks(request(index), piece, failed);
+                    }
+                    4 => {
+                        indexed.forget(peer);
+                        listed.forget(peer);
+                    }
+                    5 if !failing.is_empty() => {
+                        let piece = failing[(r >> 16) as usize % failing.len()];
+                        indexed.piece_passed(piece);
+                        listed.piece_passed(piece);
+                    }
+                    _ => now += Duration::from_millis(next() % 3000),
+                }
+                for (peer, has, timeout) in &peers {
+                    let has = |pieces: Range<u32>| pieces.into_iter().any(|p| has[p as usize]);
+                    assert_eq!(
+                        picked(indexed.pick(*peer, has, *timeout, now)),
+                        picked(listed.pick(*peer, has, *timeout, now)),
+                        "run {run} step {step} peer {peer:?}"
+                    );
+                }
+                let wanted = indexed.wanted.lock();
+                let order: Vec<HashRequest> = wanted.by_order.values().map(|w| w.request).collect();
+                let reference: Vec<HashRequest> = listed.0.iter().map(|w| w.request).collect();
+                assert_eq!(order, reference, "run {run} step {step}");
+                for (peer, ..) in &peers {
+                    let reference = listed
+                        .0
+                        .iter()
+                        .filter(|w| w.out.iter().any(|o| o.peer == *peer))
+                        .count();
+                    assert_eq!(wanted.held(*peer), reference, "run {run} step {step}");
+                }
+            }
         }
     }
 
@@ -715,7 +1201,7 @@ mod tests {
             let mut joined = vec![true; peers.len()];
             let mut now = Instant::now();
             for (peer, ..) in &peers {
-                new.fetch.waiter(*peer);
+                new.fetch.waiter((*peer).into());
             }
             for (peer, has, timeout) in &peers {
                 old.run(*peer, has, *timeout, now);
@@ -730,16 +1216,28 @@ mod tests {
                     .fetch
                     .wanted
                     .lock()
-                    .iter()
-                    .filter(|w| w.out.iter().any(|o| o.peer == peer))
+                    .by_order
+                    .values()
+                    .filter(|w| w.out.iter().any(|o| o.peer == peer.into()))
                     .map(|w| w.request)
                     .collect();
-                let event = match r % 6 {
+                let failing: Vec<ValidPieceIndex> = old
+                    .fetch
+                    .wanted
+                    .lock()
+                    .by_order
+                    .values()
+                    .filter_map(|w| match w.kind {
+                        Kind::Blocks { piece, .. } => Some(piece),
+                        Kind::Layer => None,
+                    })
+                    .collect();
+                let event = match r % 7 {
                     0 | 1 if !held.is_empty() => {
                         let asked = held[(r >> 16) as usize % held.len()];
                         let landed = r & 0x100 != 0;
                         for side in [&mut old, &mut new] {
-                            side.fetch.answered(peer, &asked);
+                            side.fetch.answered(peer.into(), &asked);
                             if landed {
                                 side.fetch.landed(&asked);
                             }
@@ -749,7 +1247,7 @@ mod tests {
                     2 if !held.is_empty() => {
                         let asked = held[(r >> 16) as usize % held.len()];
                         for side in [&mut old, &mut new] {
-                            side.fetch.rejected(peer, &asked);
+                            side.fetch.rejected(peer.into(), &asked);
                         }
                         true
                     }
@@ -767,17 +1265,25 @@ mod tests {
                         }
                         true
                     }
+                    // A piece whose block hashes are wanted passes.
+                    5 if !failing.is_empty() => {
+                        let piece = failing[(r >> 16) as usize % failing.len()];
+                        for side in [&mut old, &mut new] {
+                            side.fetch.piece_passed(piece);
+                        }
+                        true
+                    }
                     4 if r & 0x400 != 0 => {
                         // The connection leaves, or one that left joins again.
                         if joined[at] {
                             joined[at] = false;
                             for side in [&mut old, &mut new] {
-                                side.fetch.forget(peer);
+                                side.fetch.forget(peer.into());
                                 side.wake_at.remove(&peer);
                             }
                         } else {
                             joined[at] = true;
-                            new.fetch.waiter(peer);
+                            new.fetch.waiter(peer.into());
                             let (_, has, timeout) = &peers[at];
                             old.run(peer, has, *timeout, now);
                             new.run(peer, has, *timeout, now);
@@ -796,7 +1302,12 @@ mod tests {
                     if event || old.timer_due(*peer, now) {
                         old.run(*peer, has, *timeout, now);
                     }
-                    let rung = new.fetch.waiter(*peer).notified().now_or_never().is_some();
+                    let rung = new
+                        .fetch
+                        .waiter((*peer).into())
+                        .notified()
+                        .now_or_never()
+                        .is_some();
                     if rung || new.timer_due(*peer, now) {
                         new.run(*peer, has, *timeout, now);
                     }

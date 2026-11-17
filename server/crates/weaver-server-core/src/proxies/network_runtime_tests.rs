@@ -1012,7 +1012,7 @@ async fn a_used_up_egress_quota_takes_its_leg_down_and_its_share_moves_to_the_ot
 // caps back. Each crossing rings. Another egress adds no limit.
 #[tokio::test]
 async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
-    use crate::bandwidth::TorrentRates;
+    use crate::bandwidth::ClassRates;
 
     let db = Database::open_in_memory().unwrap();
     let mut capped = metered_egress(1_000_000);
@@ -1033,7 +1033,7 @@ async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
     )
     .unwrap();
     let mut changes = runtime.egress_limit_changes().unwrap();
-    let rates = |download, upload| TorrentRates { download, upload };
+    let rates = |download, upload| ClassRates { download, upload };
     assert_eq!(
         runtime.torrent_egress_rates(capped.id),
         rates(Some(80_000), Some(50_000))
@@ -1054,7 +1054,7 @@ async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
     );
     assert_eq!(
         runtime.torrent_egress_rates(capped.id + 1),
-        TorrentRates::default()
+        ClassRates::default()
     );
 
     policy.reset_egress_usage(capped.id).unwrap();
@@ -2133,64 +2133,14 @@ fn idle_wireguard_profile(id: u32) -> ProxyProfile {
     }
 }
 
-// A WireGuard tunnel is built to the socket cap in force, so a new cap
-// rebuilds the sessions and legs with a WireGuard hop on them and leaves
-// every other leg as it stood.
+// Each WireGuard session holds its sockets to the tunnel's bytes, the
+// reserve kept apart; a SOCKS session holds none. A tunnel its usenet asks
+// more of than it holds beside what it keeps, as a lowered profile leaves
+// one, holds usenet to what fits, and every leg over it says so.
 #[tokio::test]
-async fn a_new_socket_cap_rebuilds_wireguard_legs_alone() {
-    let runtime = NetworkRuntime::new(
-        Database::open_in_memory().unwrap(),
-        tokio::runtime::Handle::current(),
-    )
-    .unwrap();
-    let mut config = runtime.configuration.read().unwrap().clone();
-    config.socket_cap = 256;
-    config.profiles.insert(1, idle_wireguard_profile(1));
-    config.profiles.insert(2, proxy_with_id(2));
-    for (server, proxy) in [(1, 1), (2, 2)] {
-        config.consumers.insert(Consumer::Server(server).key());
-        config.policies.insert(
-            Consumer::Server(server).key(),
-            wireguard_ladder(Rung::Proxy { id: proxy }),
-        );
-    }
-    runtime.apply_configuration(config.clone()).unwrap();
-    let route = |server| {
-        runtime
-            .route(Consumer::Server(server), 5, Duration::from_secs(1))
-            .unwrap()
-    };
-    let (tunnel, socks) = (first_stage(&route(1)), first_stage(&route(2)));
-    let keys = |runtime: &NetworkRuntime| {
-        let mut keys: Vec<_> = runtime.sessions.lock().unwrap().keys().cloned().collect();
-        keys.sort();
-        keys
-    };
-    assert!(
-        keys(&runtime)
-            .iter()
-            .any(|key| key.ends_with(":sockets=256"))
-    );
-
-    config.socket_cap = 512;
-    runtime.apply_configuration(config).unwrap();
-    assert!(!Arc::ptr_eq(&tunnel, &first_stage(&route(1))));
-    assert!(Arc::ptr_eq(&socks, &first_stage(&route(2))));
-    assert!(
-        keys(&runtime)
-            .iter()
-            .any(|key| key.ends_with(":sockets=512"))
-    );
-    runtime.shutdown().await;
-}
-
-// Each WireGuard session holds its sockets to the shares its routes leave:
-// usenet's connections and replacements, the reserve, and torrent peers over
-// TCP the rest, which a torrent leg reports when it is below the peer
-// limit. A save re-budgets the live session; a new cap builds the session
-// again at its own shares. A SOCKS session takes no share.
-#[tokio::test]
-async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
+async fn wireguard_sessions_hold_their_sockets_to_the_tunnels_bytes() {
+    use crate::proxies::WIREGUARD_INSTANCE_BYTES;
+    use weaver_tunnel::pipe::{SocketBudget, stream_bytes};
     let runtime = NetworkRuntime::new(
         Database::open_in_memory().unwrap(),
         tokio::runtime::Handle::current(),
@@ -2198,7 +2148,6 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
     .unwrap();
     let torrent = Consumer::Torrent(TorrentScope::Default);
     let mut config = runtime.configuration.read().unwrap().clone();
-    config.socket_cap = 256;
     config.profiles.insert(1, idle_wireguard_profile(1));
     config.profiles.insert(2, proxy_with_id(2));
     for (consumer, proxy) in [
@@ -2215,38 +2164,32 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         config.socket_ledger = config.ledger(&HashMap::from([(1, connections), (2, 10)]));
         config.warnings.clear();
         config.warn_over_budget();
-        config.warn_peer_clamps(200);
-    };
-    let shares = |runtime: &NetworkRuntime, cap: usize| {
-        let map = runtime.session_sockets.lock().unwrap();
-        let built: Vec<_> = map
-            .values()
-            .filter(|(_, built, _)| *built == cap)
-            .map(|(path, _, sockets)| (path.clone(), sockets.shares().unwrap()))
-            .collect();
-        assert_eq!(built.len(), 1, "one WireGuard session at cap {cap}");
-        assert_eq!(built[0].0, (0, vec![1]));
-        built[0].1
     };
     budget(&mut config, 100);
     runtime.apply_configuration(config.clone()).unwrap();
     for consumer in [Consumer::Server(1), Consumer::Server(2), torrent] {
         runtime.route(consumer, 5, Duration::from_secs(1)).unwrap();
     }
-    assert_eq!(
-        shares(&runtime, 256),
-        SocketShares {
-            nntp: 101,
-            torrent: 86,
-            core: 13,
-            http: 8
-        }
-    );
-    // The SOCKS session has no share at all.
-    assert_eq!(runtime.session_sockets.lock().unwrap().len(), 1);
-    let warning = |runtime: &NetworkRuntime| {
+    {
+        let map = runtime.session_sockets.lock().unwrap();
+        // The SOCKS session holds no bytes at all.
+        assert_eq!(map.len(), 1);
+        let (path, sockets, _) = map.values().next().unwrap();
+        assert_eq!(*path, (0, vec![1]));
+        assert_eq!(
+            sockets.budget(),
+            Some(SocketBudget {
+                bytes: WIREGUARD_INSTANCE_BYTES,
+                reserve: 12 * stream_bytes(None),
+                // The one torrent session's listeners and datagram sockets.
+                torrent_kept: crate::proxies::socket_ledger::torrent_session_bytes(1420),
+                mtu: 1420,
+            })
+        );
+    }
+    let warning = |runtime: &NetworkRuntime, consumer| {
         runtime
-            .route(torrent, 5, Duration::from_secs(1))
+            .route(consumer, 5, Duration::from_secs(1))
             .unwrap()
             .legs
             .read()
@@ -2254,58 +2197,16 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
             .warning
             .clone()
     };
-    assert_eq!(
-        warning(&runtime).as_deref(),
-        Some(
-            "WireGuard proxy 1 holds torrent peers over TCP to 86 of 200; the rest connect over uTP."
-        )
-    );
+    assert_eq!(warning(&runtime, torrent), None);
 
-    budget(&mut config, 50);
-    runtime.apply_configuration(config.clone()).unwrap();
-    assert_eq!(
-        shares(&runtime, 256),
-        SocketShares {
-            nntp: 51,
-            torrent: 136,
-            core: 13,
-            http: 8
-        }
-    );
-
-    // A tunnel its usenet asks more of than it holds, as a lowered profile
-    // leaves one, holds usenet to what the reserve and the peer floor
-    // leave, and every leg over it says so beside any other warning.
-    budget(&mut config, 230);
-    runtime.apply_configuration(config.clone()).unwrap();
-    let over = "Usenet servers ask 231 sockets of WireGuard proxy 1 on egress 0, 69 are reserved and 16 kept for torrent peers, over the 256 it holds; usenet is held to 171.";
-    assert_eq!(
-        warning(&runtime).as_deref(),
-        Some(format!("{over} WireGuard proxy 1 holds torrent peers over TCP to 16 of 200; the rest connect over uTP.").as_str())
-    );
-    let server_warning = runtime
-        .route(Consumer::Server(1), 5, Duration::from_secs(1))
-        .unwrap()
-        .legs
-        .read()
-        .unwrap()[0]
-        .warning
-        .clone();
-    assert_eq!(server_warning.as_deref(), Some(over));
-
-    config.socket_cap = 512;
-    budget(&mut config, 50);
+    budget(&mut config, 400);
     runtime.apply_configuration(config).unwrap();
+    let over = "Usenet servers ask 401 connections of WireGuard proxy 1 on egress 0, 428 MiB, and the tunnel keeps 134 MiB for itself, over the 516 MiB it holds; usenet is held to 358.";
+    assert_eq!(warning(&runtime, torrent).as_deref(), Some(over));
     assert_eq!(
-        shares(&runtime, 512),
-        SocketShares {
-            nntp: 51,
-            torrent: 368,
-            core: 13,
-            http: 16
-        }
+        warning(&runtime, Consumer::Server(1)).as_deref(),
+        Some(over)
     );
-    assert_eq!(warning(&runtime), None);
     runtime.shutdown().await;
 }
 
@@ -2616,7 +2517,6 @@ fn server_test_runtime(active: Option<u16>) -> (Arc<NetworkRuntime>, Arc<Mutex<V
         }),
     );
     let mut config = runtime.configuration.read().unwrap().clone();
-    config.socket_cap = 256;
     config.profiles.insert(1, idle_wireguard_profile(1));
     config.profiles.insert(
         3,
@@ -2712,23 +2612,28 @@ async fn a_server_test_takes_probe_room_beside_servers_holding_all_of_usenet() {
     let sockets = {
         let map = runtime.session_sockets.lock().unwrap();
         assert_eq!(map.len(), 1);
-        map.values().next().unwrap().2.clone()
+        map.values().next().unwrap().1.clone()
     };
-    let shares = sockets.shares().unwrap();
-    assert_eq!(shares.nntp, 21);
-    assert!(shares.nntp + shares.torrent + shares.core + shares.http <= 256);
-    let take_all =
-        |class| std::iter::from_fn(|| sockets.take(class).ok().flatten()).collect::<Vec<_>>();
+    let stream = weaver_tunnel::pipe::stream_bytes(None);
+    let take_all = |class| {
+        std::iter::from_fn(|| sockets.take(class, stream).ok().flatten()).collect::<Vec<_>>()
+    };
     let usenet = take_all(SocketClass::Nntp);
-    assert_eq!(usenet.len(), shares.nntp);
+    assert!(!usenet.is_empty());
 
     let error = server_test(&runtime, 2, Rung::Proxy { id: 1 }).await;
     assert!(!matches!(*error, DialError::AtCapacity(_)), "{error}");
     assert!(taken(&events).contains(&"dial tunnel".to_owned()));
-    assert_eq!(sockets.held(SocketClass::Nntp), shares.nntp);
+    assert_eq!(
+        sockets.held(SocketClass::Nntp),
+        usenet.len() as u64 * stream
+    );
 
-    let probes = take_all(SocketClass::ReserveCore);
-    assert_eq!(probes.len(), shares.core);
+    let probes = take_all(SocketClass::Reserve);
+    assert_eq!(
+        probes.len() as u64,
+        sockets.budget().unwrap().reserve / stream
+    );
     let error = server_test(&runtime, 2, Rung::Proxy { id: 1 }).await;
     assert!(matches!(*error, DialError::AtCapacity(_)), "{error}");
     assert!(!taken(&events).contains(&"dial tunnel".to_owned()));
@@ -3066,5 +2971,74 @@ async fn each_hop_of_a_chain_names_its_address_by_its_own_proxy() {
         listed_servers(&second[0]),
         Some(vec!["192.0.2.99:53".parse().unwrap()])
     );
+    runtime.shutdown().await;
+}
+
+// Two sessions on one path, as an edited WireGuard profile's old session and
+// its new one while the old drains, are one tunnel in the figures: their
+// bytes and limits summed under the path's labels, never two series of the
+// same labels.
+#[tokio::test]
+async fn two_sessions_on_one_path_are_one_tunnels_bytes() {
+    use weaver_tunnel::pipe::{SocketClass, stream_bytes};
+    let runtime = NetworkRuntime::new(
+        crate::Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let budget = SocketBudget {
+        bytes: WIREGUARD_INSTANCE_BYTES,
+        reserve: 4 * stream_bytes(None),
+        torrent_kept: 0,
+        mtu: 1420,
+    };
+    let path: SessionPath = (0, vec![1]);
+    let mut held = Vec::new();
+    for (key, streams) in [("1:old", 2), ("1:new", 3)] {
+        let sockets = Arc::new(SessionSockets::new(
+            budget,
+            Arc::new(super::SplitDivider::InForce),
+        ));
+        for _ in 0..streams {
+            held.push(
+                sockets
+                    .take(SocketClass::Reserve, stream_bytes(None))
+                    .unwrap(),
+            );
+        }
+        let task = GiveBackTask::spawn(
+            &tokio::runtime::Handle::current(),
+            &sockets,
+            path.clone(),
+            runtime.give_backs.clone(),
+        );
+        runtime
+            .session_sockets
+            .lock()
+            .unwrap()
+            .insert(key.into(), (path.clone(), sockets, task));
+    }
+    let sessions: Vec<_> = runtime
+        .session_sockets
+        .lock()
+        .unwrap()
+        .values()
+        .map(|(_, sockets, _)| (sockets.reserved(), sockets.limit()))
+        .collect();
+    let (reserved, limit) = sessions.iter().fold((0, 0), |(r, l), &(reserved, limit)| {
+        (r + reserved, l + limit)
+    });
+    assert!(reserved > 0 && limit > 0);
+    assert_eq!(runtime.tunnel_bytes(), vec![(path, reserved, limit)]);
+    let metrics = super::super::network_metrics::snapshot(&runtime);
+    assert_eq!(metrics.tunnels.len(), 1);
+    assert_eq!(
+        (
+            metrics.tunnels[0].reserved_bytes,
+            metrics.tunnels[0].limit_bytes
+        ),
+        (reserved, limit)
+    );
+    drop(held);
     runtime.shutdown().await;
 }

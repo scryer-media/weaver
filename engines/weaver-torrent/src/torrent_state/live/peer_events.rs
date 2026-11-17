@@ -99,7 +99,7 @@ impl PeerHandler {
     /// `Session::dht_port_told`).
     pub(super) fn told_dht_port(&self) -> Option<u16> {
         let dht = self.dht()?;
-        let ipv6 = self.addr.ip().to_canonical().is_ipv6();
+        let ipv6 = self.addr.ip()?.to_canonical().is_ipv6();
         let session = self.state.shared.session.upgrade()?;
         Some(session.dht_port_told(&dht, ipv6))
     }
@@ -130,8 +130,11 @@ impl PeerHandler {
             .peers
             .with_live_mut(self.addr, "dht_port", |live| live.dht_node_named(port))
             .unwrap_or(false);
-        if news && let Some(dht) = self.dht() {
-            dht.add_node(SocketAddr::new(self.addr.ip(), port));
+        if news
+            && let Some(dht) = self.dht()
+            && let Some(ip) = self.addr.ip()
+        {
+            dht.add_node(SocketAddr::new(ip, port));
         }
         self.send_dht_port();
     }
@@ -140,6 +143,11 @@ impl PeerHandler {
     /// extension; from one that did not it is ignored (libtorrent
     /// `bt_peer_connection::on_holepunch`).
     pub(super) fn on_holepunch(&self, msg: UtHolepunch) {
+        // Only a swarm peer, at an address, speaks the extension.
+        debug_assert!(self.addr.addr().is_some(), "a web seed sent a holepunch");
+        let Some(me) = self.addr.addr() else {
+            return;
+        };
         let supported = self
             .state
             .peers
@@ -154,10 +162,10 @@ impl PeerHandler {
             return;
         }
         match msg {
-            UtHolepunch::Rendezvous(target) => self.on_rendezvous(target),
+            UtHolepunch::Rendezvous(target) => self.on_rendezvous(me, target),
             // A local address is taken only from a local peer.
             UtHolepunch::Connect(addr) => {
-                if !is_local(addr.ip()) || is_local(self.addr.ip()) {
+                if !is_local(addr.ip()) || is_local(me.ip()) {
                     self.count_holepunch(HolepunchEvent::Connect);
                     self.state.holepunch(addr);
                 } else {
@@ -180,20 +188,19 @@ impl PeerHandler {
         self.state.session_stats.network.holepunch(event);
     }
 
-    fn on_rendezvous(&self, target: SocketAddr) {
+    fn on_rendezvous(&self, me: SocketAddr, target: SocketAddr) {
         let send = |tx: &PeerTx, msg: UtHolepunch| {
             let _ = tx.send(WriterRequest::Message(Message::Extended(
                 ExtendedMessage::UtHolepunch(msg),
             )));
         };
-        let found = self
-            .state
-            .peers
-            .with_live(target, |live| (live.supports_holepunch, live.tx.clone()));
+        let found = self.state.peers.with_live(target.into(), |live| {
+            (live.supports_holepunch, live.tx.clone())
+        });
         let refused = match &found {
             None => Some(ut_holepunch::error::NOT_CONNECTED),
             Some((false, _)) => Some(ut_holepunch::error::NO_SUPPORT),
-            Some(_) if target == self.addr => Some(ut_holepunch::error::NO_SELF),
+            Some(_) if target == me => Some(ut_holepunch::error::NO_SELF),
             Some(_) => None,
         };
         if let Some(code) = refused {
@@ -201,7 +208,7 @@ impl PeerHandler {
             send(&self.tx, UtHolepunch::Error(target, code));
             return;
         }
-        if is_local(target.ip()) != is_local(self.addr.ip()) {
+        if is_local(target.ip()) != is_local(me.ip()) {
             self.count_holepunch(HolepunchEvent::Refused);
             debug!(?target, "not introducing a local peer to one that is not");
             return;
@@ -209,7 +216,7 @@ impl PeerHandler {
         if let Some((_, target_tx)) = found {
             self.count_holepunch(HolepunchEvent::Introduced);
             send(&self.tx, UtHolepunch::Connect(target));
-            send(&target_tx, UtHolepunch::Connect(self.addr));
+            send(&target_tx, UtHolepunch::Connect(me));
         }
     }
     pub(super) fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
@@ -334,9 +341,11 @@ impl PeerHandler {
         // is not dialed again (libtorrent `peer_connection::disconnect`:
         // `self_connection` bans the peer's `torrent_peer`, one per address
         // with `allow_multiple_connections_per_ip` off).
-        if matches!(error, Some(crate::Error::ConnectingToOurselves)) {
+        if matches!(error, Some(crate::Error::ConnectingToOurselves))
+            && let Some(ip) = handle.ip()
+        {
             debug!(addr = %handle, "the peer is ourselves");
-            peers.ban(handle.ip());
+            peers.ban(ip);
         }
         // A peer the IP filter came to refuse while it was connected leaves
         // the list now its connection is gone.
@@ -344,10 +353,13 @@ impl PeerHandler {
         // So does a private torrent's peer no tracker named, asked to close
         // once a tracker answered.
         peers.untracked_closed(handle);
-        if rendezvous && let Some(introducer) = peers.introducer(handle) {
+        if rendezvous
+            && let Some(at) = handle.addr()
+            && let Some(introducer) = peers.introducer(at)
+        {
             self.count_holepunch(HolepunchEvent::Asked);
             let _ = introducer.send(WriterRequest::Message(Message::Extended(
-                ExtendedMessage::UtHolepunch(UtHolepunch::Rendezvous(handle)),
+                ExtendedMessage::UtHolepunch(UtHolepunch::Rendezvous(at)),
             )));
         }
         if let Some(held_slot) = held_slot
@@ -485,7 +497,9 @@ impl PeerHandler {
     /// The peer said it is interested. A fast peer is first sent the pieces it
     /// may fetch while we choke it, unless we upload nothing.
     pub(super) fn on_peer_interested(&self) {
-        if !self.state.torrent().options.disable_upload() {
+        if !self.state.torrent().options.disable_upload()
+            && let Some(ip) = self.addr.ip()
+        {
             let info_hash = self
                 .state
                 .shared
@@ -495,7 +509,7 @@ impl PeerHandler {
                 .peers
                 .with_live_mut(self.addr, "send_allowed_fast", |live| {
                     live.send_allowed_fast(
-                        self.addr.ip(),
+                        ip,
                         info_hash,
                         &self.state.lengths,
                         self.state.super_seeding,
@@ -663,7 +677,7 @@ impl PeerHandler {
         if len > MAX_PEX_MESSAGE_LEN {
             anyhow::bail!("PEX message of {len} bytes, past {MAX_PEX_MESSAGE_LEN}");
         }
-        let from_local = is_local(self.addr.ip());
+        let from_local = self.addr.ip().is_some_and(is_local);
         let news = self
             .state
             .peers

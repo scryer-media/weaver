@@ -35,8 +35,7 @@ use super::peer::{
 };
 
 use super::{
-    Admitted, DiskWrite, HashJob, Landed, PeerHandler, PieceCheck, TorrentStateLive, WriteJob,
-    Written,
+    Admitted, HashJob, Landed, PeerHandler, PieceCheck, TorrentStateLive, WriteJob, Written,
 };
 
 impl PeerHandler {
@@ -137,20 +136,16 @@ impl PeerHandler {
         if self.disk.queued(pool.charge(block.buf_mut())) {
             self.state.shared.spawner.stats().peer_stopped();
         }
-        self.state
-            .shared
-            .spawner
-            .disk()
-            .push(DiskWrite::Block(WriteJob {
-                state: self.state.clone(),
-                tx: self.tx.clone(),
-                addr: self.addr,
-                counters: self.counters.clone(),
-                chunk: chunk_info,
-                block,
-                written: Written(Some(self.disk.clone())),
-                _run: self.state.tasks.token(),
-            }));
+        self.state.shared.spawner.disk().push(WriteJob {
+            state: self.state.clone(),
+            tx: self.tx.clone(),
+            addr: self.addr,
+            counters: self.counters.clone(),
+            chunk: chunk_info,
+            block,
+            written: Written(Some(self.disk.clone())),
+            _run: self.state.tasks.token(),
+        });
         Ok(())
     }
 
@@ -223,6 +218,7 @@ impl PeerHandler {
                 written: Written(Some(self.disk.clone())),
                 queued: Some(spawner.check_queued()),
                 ended: None,
+                stored: None,
                 _run: self.state.tasks.token(),
             });
             return Ok(());
@@ -246,6 +242,7 @@ impl PeerHandler {
             written: Written(None),
             queued: Some(spawner.check_queued()),
             ended: Some(ended),
+            stored: None,
             _run: self.state.tasks.token(),
         });
         // Dropped unsent when the check is over, however it ended.
@@ -472,9 +469,10 @@ pub(super) fn hash_landed_piece(
         .with_context(|| format!("error checking piece={}", piece_index.get()))
 }
 
-// What follows a piece's verdict: one that passed is handed to the storage,
-// which writes it whole when it held it in memory, and is had once the
-// storage took it; one that failed is fetched again.
+// What follows a piece's verdict: one that passed is had once the storage
+// took it; one that failed is fetched again. A passed piece its storage
+// holds in memory does not come here: it is handed over to be written
+// (`StoredPiece`), and comes back to `piece_stored`.
 pub(super) fn settle_landed_piece(
     state: &TorrentStateLive,
     addr: PeerHandle,
@@ -490,9 +488,6 @@ pub(super) fn settle_landed_piece(
         state.file_ops().read_chunk(who, chunk, buf)
     };
 
-    let stats = state.shared.spawner.stats();
-    let piece_len = u64::from(state.lengths.piece_length(piece_index));
-    let from_memory = state.files.writes_to_memory();
     match verdict {
         Verdict::Inconsistent => {
             state
@@ -502,77 +497,22 @@ pub(super) fn settle_landed_piece(
             return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
         }
         Verdict::Passed => {
-            state.layer_fetch.piece_passed(piece_index);
-            let failed = state.peers.piece_passed(piece_index);
-            // Before the storage takes the piece, while the good bytes
-            // are still there to read back.
-            for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
-                state.ban_for_bad_data(sender.ip());
-            }
-            // The piece is ours only once the storage has taken it
-            // (libtorrent: the write completes before the hash job,
-            // and only then `torrent::piece_passed`). One it refuses
-            // is downloaded again, and its senders are neither
-            // credited nor blamed: on a disk error libtorrent
-            // `torrent::on_piece_verified` calls neither
-            // `piece_passed` nor `piece_failed`. A refusal for want
-            // of room puts the torrent in upload mode
-            // (`torrent::handle_disk_error`).
-            // A storage that held the piece in memory writes it whole
-            // here; one that wrote its blocks as they came has nothing
-            // left to write.
-            // Taken before the storage is asked, which may refuse it.
-            let epoch = state.upload_epoch();
-            let written = {
-                let _call = from_memory.then(|| {
-                    let call = stats.call(DiskOp::PieceWrite);
-                    call.bytes(piece_len);
-                    call
-                });
-                state.files.on_piece_completed(piece_index)
-            };
-            if let Err(e) = written {
-                warn!(
-                    id = state.shared.id,
-                    info_hash = ?state.shared.info_hash,
-                    "the storage refused piece={index}: {e:#}"
-                );
-                state.handle_disk_error(&e, epoch);
-                state
-                    .session_stats
-                    .swarm
-                    .piece_check(swarm::PieceCheck::StorageRefused);
-                return state.requeue_piece(piece_index);
-            }
-            state
-                .session_stats
-                .swarm
-                .piece_check(swarm::PieceCheck::Passed);
-            state.on_piece_completed(piece_index)?;
-            // Every peer that sent a block of it earns a point and
-            // leaves parole (libtorrent `torrent::piece_passed`).
-            for peer in senders.participants() {
-                state
-                    .peers
-                    .with_peer_mut(peer, "piece_passed", |p| p.piece_passed(&state.peers));
-            }
-
-            let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
-            if let Some(time) = full_piece_download_time {
-                #[allow(clippy::cast_possible_truncation)]
-                state
-                    .stats
-                    .total_piece_download_ms
-                    .fetch_add(time.as_millis() as u64, Ordering::Relaxed);
-
-                // Per-peer piece counters.
-                counters.on_piece_completed(piece_len, time);
-            }
-
-            trace!(piece = index, "successfully downloaded and verified");
-
-            state.transmit_haves(chunk_info.piece_index);
-            state.update_interest_of_holders(chunk_info.piece_index);
+            let epoch = piece_passing(state, piece_index);
+            // A storage that writes blocks as they come has nothing left
+            // to write: it is told here, on this thread. One that holds the
+            // piece in memory is handed it to write instead
+            // (`StoredPiece`), and the piece comes back to
+            // `piece_stored` once it did.
+            let written = state.files.on_piece_completed(piece_index);
+            return piece_stored(
+                state,
+                counters,
+                chunk_info,
+                full_piece_download_time,
+                senders,
+                epoch,
+                written,
+            );
         }
         Verdict::Failed => {
             warn!(
@@ -597,7 +537,7 @@ pub(super) fn settle_landed_piece(
             // Before the storage lets go of the failed bytes.
             let blocks = smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
             for liar in state.peers.piece_failed(piece_index, blocks) {
-                state.ban_for_bad_data(liar.ip());
+                state.ban_for_bad_data(liar);
             }
             // Checked by v2, a piece of more than one sender has its
             // block hashes fetched, which name the senders of its bad
@@ -645,5 +585,86 @@ pub(super) fn settle_landed_piece(
             state.requeue_piece(piece_index)?
         }
     };
+    Ok(())
+}
+
+// A piece passed its check, before its storage takes it: the fetch of its
+// layer and its peers hear it, and the senders of the bad blocks it
+// replaced are banned while the good bytes are still there to read back.
+// The upload epoch, taken before the storage is asked, which may refuse it.
+pub(super) fn piece_passing(state: &TorrentStateLive, piece_index: ValidPieceIndex) -> u64 {
+    let read_block = |who: PeerHandle, chunk: &ChunkInfo, buf: &mut [u8]| {
+        state.file_ops().read_chunk(who, chunk, buf)
+    };
+    state.layer_fetch.piece_passed(piece_index);
+    let failed = state.peers.piece_passed(piece_index);
+    for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
+        state.ban_for_bad_data(sender);
+    }
+    state.upload_epoch()
+}
+
+// A passed piece its storage took, or refused with `written`'s error.
+//
+// The piece is ours only once the storage has taken it (libtorrent: the
+// write completes before the hash job, and only then
+// `torrent::piece_passed`). One it refuses is downloaded again, and its
+// senders are neither credited nor blamed: on a disk error libtorrent
+// `torrent::on_piece_verified` calls neither `piece_passed` nor
+// `piece_failed`. A refusal for want of room puts the torrent in upload
+// mode (`torrent::handle_disk_error`), judged at `epoch`.
+pub(super) fn piece_stored(
+    state: &TorrentStateLive,
+    counters: &AtomicPeerCounters,
+    chunk_info: &ChunkInfo,
+    full_piece_download_time: Option<Duration>,
+    senders: crate::piece_tracker::Senders,
+    epoch: u64,
+    written: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let index = chunk_info.piece_index.get();
+    let piece_index = chunk_info.piece_index;
+    if let Err(e) = written {
+        warn!(
+            id = state.shared.id,
+            info_hash = ?state.shared.info_hash,
+            "the storage refused piece={index}: {e:#}"
+        );
+        state.handle_disk_error(&e, epoch);
+        state
+            .session_stats
+            .swarm
+            .piece_check(swarm::PieceCheck::StorageRefused);
+        return state.requeue_piece(piece_index);
+    }
+    state
+        .session_stats
+        .swarm
+        .piece_check(swarm::PieceCheck::Passed);
+    state.on_piece_completed(piece_index)?;
+    // Every peer that sent a block of it earns a point and leaves parole
+    // (libtorrent `torrent::piece_passed`).
+    for peer in senders.participants() {
+        state
+            .peers
+            .with_peer_mut(peer, "piece_passed", |p| p.piece_passed(&state.peers));
+    }
+
+    let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
+    if let Some(time) = full_piece_download_time {
+        #[allow(clippy::cast_possible_truncation)]
+        state
+            .stats
+            .total_piece_download_ms
+            .fetch_add(time.as_millis() as u64, Ordering::Relaxed);
+
+        // Per-peer piece counters.
+        counters.on_piece_completed(piece_len, time);
+    }
+
+    trace!(piece = index, "successfully downloaded and verified");
+
+    state.transmit_haves(chunk_info.piece_index);
+    state.update_interest_of_holders(chunk_info.piece_index);
     Ok(())
 }

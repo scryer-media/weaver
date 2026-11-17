@@ -28,8 +28,11 @@ pub struct TorrentLeg {
     route: Arc<super::weighted::Weighted>,
     handle: tokio::runtime::Handle,
     bridge: Mutex<Option<PathBridge>>,
+    // The bridge the leg's web seed transfers ride, apart from its trackers'.
+    seeds: Mutex<Option<PathBridge>>,
     // The bridges a torrent route's own lookups ride, one for each route
-    // on the leg that names apart from it, stopped with the leg.
+    // on the leg that names apart from it and each purpose it dials for,
+    // stopped with the leg.
     scoped: Mutex<Vec<PathBridge>>,
 }
 impl TorrentLeg {
@@ -41,23 +44,43 @@ impl TorrentLeg {
             route: self.route.clone(),
         })
     }
-    // The bridge onto the leg's stage, started the first time it is asked for.
+    // The bridge onto the leg's stage its trackers and metainfo ride, started
+    // the first time it is asked for. Their dials take the tunnel's reserve.
     pub fn bridge(&self) -> Result<PathBridge, String> {
+        self.started(&self.bridge, Purpose::TorrentHttp)
+    }
+    // The bridge onto the leg's stage its web seed transfers ride, started
+    // the first time it is asked for. Their dials take the torrent side, so
+    // a long web seed transfer never holds what announces are kept.
+    pub fn seed_bridge(&self) -> Result<PathBridge, String> {
+        self.started(&self.seeds, Purpose::TorrentWebSeed)
+    }
+    fn started(
+        &self,
+        slot: &Mutex<Option<PathBridge>>,
+        purpose: Purpose,
+    ) -> Result<PathBridge, String> {
         // A panic while starting the bridge left it unstarted: start it.
-        let mut bridge = self.bridge.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut bridge = slot.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(bridge) = bridge.as_ref() {
             return Ok(bridge.clone());
         }
-        let started = self.start_bridge(self.dialer())?;
+        let started = self.start_bridge(self.dialer(), purpose)?;
         *bridge = Some(started.clone());
         Ok(started)
     }
     /// A bridge of its own onto `dialer`, the leg's dialer under a torrent
-    /// route's names: what that route's HTTP rides, its checked addresses
-    /// pinned apart from every other route's. It stops with the leg, or
-    /// once nothing holds what it hands back nor any client built on it.
-    pub fn bridge_on(self: &Arc<Self>, dialer: Arc<dyn Dialer>) -> Result<PathBridge, String> {
-        let started = self.start_bridge(dialer)?;
+    /// route's names: what that route's HTTP for `purpose` rides (its
+    /// trackers and metainfo, or its web seed transfers), its checked
+    /// addresses pinned apart from every other route's. It stops with the
+    /// leg, or once nothing holds what it hands back nor any client built
+    /// on it.
+    pub fn bridge_on(
+        self: &Arc<Self>,
+        dialer: Arc<dyn Dialer>,
+        purpose: Purpose,
+    ) -> Result<PathBridge, String> {
+        let started = self.start_bridge(dialer, purpose)?;
         self.scoped
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -93,10 +116,14 @@ impl TorrentLeg {
         drop(scoped);
         self.handle.spawn(async move { released.revoke().await });
     }
-    fn start_bridge(&self, dialer: Arc<dyn Dialer>) -> Result<PathBridge, String> {
+    fn start_bridge(
+        &self,
+        dialer: Arc<dyn Dialer>,
+        purpose: Purpose,
+    ) -> Result<PathBridge, String> {
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|_| "could not generate bridge credentials")?;
-        let path = Arc::new(TorrentProvider::new(dialer));
+        let path = Arc::new(TorrentProvider::new(dialer, purpose));
         Ok(PathBridge {
             bridge: Bridge::start(
                 &self.handle,
@@ -171,11 +198,14 @@ impl Drop for TorrentLeg {
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        let own = self
-            .bridge
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let mut own = Vec::with_capacity(2);
+        for slot in [&mut self.bridge, &mut self.seeds] {
+            own.extend(
+                slot.get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(),
+            );
+        }
         for bridge in own.into_iter().chain(scoped) {
             self.handle.spawn(async move { bridge.revoke().await });
         }
@@ -241,6 +271,11 @@ impl Dialer for PinnedMember {
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
         self.current().map_err(|_| Vec::new())?.room(purpose)
     }
+    fn wait_room(&self, purpose: &Purpose) -> Result<(), weaver_tunnel::pipe::Capacity> {
+        self.current()
+            .map_err(|_| weaver_tunnel::pipe::Capacity::default())?
+            .wait_room(purpose)
+    }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         self.current().ok()?.datagrams()
     }
@@ -305,6 +340,9 @@ impl Dialer for Carried {
     }
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
         self.stage.room(purpose)
+    }
+    fn wait_room(&self, purpose: &Purpose) -> Result<(), weaver_tunnel::pipe::Capacity> {
+        self.stage.wait_room(purpose)
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         Arc::clone(&self.stage).datagrams()
@@ -372,16 +410,18 @@ impl InboundListener for CarriedListener {
         Ok(accepted)
     }
 }
-// The leg under a torrent bridge, and the addresses a client checked for
-// each name it hands the bridge.
+// The leg under a torrent bridge, what its dials are for, and the addresses
+// a client checked for each name it hands the bridge.
 struct TorrentProvider {
     leg: Arc<dyn Dialer>,
+    purpose: Purpose,
     pinned: Mutex<HashMap<String, Vec<IpAddr>>>,
 }
 impl TorrentProvider {
-    fn new(leg: Arc<dyn Dialer>) -> Self {
+    fn new(leg: Arc<dyn Dialer>, purpose: Purpose) -> Self {
         Self {
             leg,
+            purpose,
             pinned: Mutex::default(),
         }
     }
@@ -433,7 +473,7 @@ impl TunnelProvider for TorrentProvider {
             .dial(&Target {
                 host: host.into(),
                 port,
-                purpose: Purpose::TorrentHttp,
+                purpose: self.purpose.clone(),
                 addresses: self.addresses(host),
             })
             .await
@@ -610,11 +650,11 @@ impl NetworkRuntime {
     /// trickle, and past the hard cap move nothing; downloads move nothing
     /// once the download quota is used. The global limits are not in it.
     /// An egress with no policy adds no limit.
-    pub fn torrent_egress_rates(&self, egress_id: u32) -> crate::bandwidth::TorrentRates {
+    pub fn torrent_egress_rates(&self, egress_id: u32) -> crate::bandwidth::ClassRates {
         let Some(policy) = &self.quota_policy else {
-            return crate::bandwidth::TorrentRates::default();
+            return crate::bandwidth::ClassRates::default();
         };
-        crate::bandwidth::TorrentRates {
+        crate::bandwidth::ClassRates {
             download: policy.egress_rate(
                 egress_id,
                 crate::bandwidth::Direction::Download,
@@ -749,6 +789,7 @@ impl NetworkRuntime {
             route: route.weighted.clone(),
             handle: self.handle.clone(),
             bridge: Mutex::new(None),
+            seeds: Mutex::new(None),
             scoped: Mutex::new(Vec::new()),
         }))
     }
@@ -959,7 +1000,7 @@ mod tests {
             asked: Mutex::default(),
             dialed: Mutex::default(),
         });
-        let path = Arc::new(TorrentProvider::new(leg.clone()));
+        let path = Arc::new(TorrentProvider::new(leg.clone(), Purpose::TorrentHttp));
         let bridge = PathBridge {
             bridge: Bridge::start(
                 &tokio::runtime::Handle::current(),
@@ -980,7 +1021,7 @@ mod tests {
             Resolved::Addresses(found) => found.iter().map(SocketAddr::ip).collect(),
             Resolved::AtExit => Vec::new(),
         };
-        let client = tracker_client(&LegKind::Ladder, leg.clone(), Some(bridge.clone()))
+        let client = tracker_client(&LegKind::Ladder, leg.clone(), Some(bridge.clone()), None)
             .unwrap()
             .client(
                 Some(HttpTarget {
@@ -1076,7 +1117,7 @@ mod tests {
             first.clone(),
             second.clone(),
         ]));
-        let path = Arc::new(TorrentProvider::new(ladder.clone()));
+        let path = Arc::new(TorrentProvider::new(ladder.clone(), Purpose::TorrentHttp));
         let bridge = PathBridge {
             bridge: Bridge::start(
                 &tokio::runtime::Handle::current(),
@@ -1097,7 +1138,7 @@ mod tests {
             panic!("the first rung resolves names");
         };
         let addrs: Vec<IpAddr> = found.iter().map(SocketAddr::ip).collect();
-        let client = tracker_client(&LegKind::Ladder, ladder, Some(bridge.clone()))
+        let client = tracker_client(&LegKind::Ladder, ladder, Some(bridge.clone()), None)
             .unwrap()
             .client(
                 Some(HttpTarget {
