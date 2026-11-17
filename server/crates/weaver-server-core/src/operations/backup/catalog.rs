@@ -139,6 +139,7 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("torrent_trackers", ResetOnRestore, RequireEmpty),
     table!("torrent_counters", ResetOnRestore, RequireEmpty),
     table!("torrent_held_paths", ResetOnRestore, RequireEmpty),
+    table!("torrent_file_stamps", ResetOnRestore, RequireEmpty),
     // The hosts torrents have announced to outlive the torrents, and a
     // restore brings them back with the tracker rules picked from them.
     table!("tracker_hosts", Export, Replace),

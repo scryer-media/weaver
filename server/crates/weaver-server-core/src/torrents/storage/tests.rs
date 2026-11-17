@@ -488,6 +488,139 @@ fn a_kept_store_looks_at_each_file_once() {
     }
 }
 
+// The files' times for a torrent of 2,000 files, one piece each: the
+// checkpoint after every piece came looks at each file once, the next one
+// at none, and the restart looks at each once and reads no byte. A file
+// whose time then changes has its piece checked again, alone: the session
+// is handed its blocks to check, and its time is not taken until the check
+// says.
+#[test]
+fn file_times_cost_one_look_per_file_per_checkpoint_and_per_start() {
+    use crate::torrents::files::{LOOKS, STATS};
+    let looks = || LOOKS.with(std::cell::Cell::get);
+    let count = 2000usize;
+    let files: Vec<PieceFile> = (0..count)
+        .map(|at| file(&format!("f/{at}.bin"), 1024))
+        .collect();
+    let layout = Arc::new(PieceLayout::new(1024, files).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("f")).unwrap();
+    for at in 0..count {
+        std::fs::write(dir.path().join(format!("f/{at}.bin")), [7u8; 1024]).unwrap();
+    }
+
+    // Every piece found: every file's time is due once.
+    let store = store_in(&layout, dir.path(), None);
+    for piece in 0..count as u32 {
+        assert!(store.found(piece).unwrap());
+    }
+    LOOKS.with(|looks| looks.set(0));
+    let stamps = store.stamping().unwrap().look();
+    assert_eq!((looks(), stamps.len()), (count as u64, count));
+    assert!(stamps.iter().all(|(_, time)| time.is_some()));
+    // Nothing written since: the next checkpoint looks at nothing.
+    LOOKS.with(|looks| looks.set(0));
+    assert!(store.stamping().is_none());
+    assert_eq!(looks(), 0);
+    let kept = store.kept();
+    store.forget_now();
+
+    // The restart: one look per file, no read, nothing to check again.
+    let saved: std::collections::HashMap<u32, i64> = stamps
+        .iter()
+        .map(|(file, time)| (*file, time.unwrap()))
+        .collect();
+    let reads = STATS.snapshot().reads.calls;
+    let again = store_in(&layout, dir.path(), Some(&kept));
+    again.set_stamps(saved.clone());
+    LOOKS.with(|looks| looks.set(0));
+    assert_eq!(again.drop_unbacked(), Some(0));
+    assert_eq!(looks(), count as u64);
+    assert_eq!(STATS.snapshot().reads.calls, reads);
+    let checkpoint = again.initial_checkpoint(false).unwrap();
+    assert_eq!(checkpoint.have.count_ones(), count);
+    assert!(checkpoint.blocks.is_none());
+    assert!(again.stamping().is_none(), "read back, not written");
+    again.forget_now();
+
+    // File 7's time moves on: its piece alone is checked again.
+    let seven = dir.path().join("f/7.bin");
+    let was = std::fs::metadata(&seven).unwrap().modified().unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&seven)
+        .unwrap()
+        .set_modified(was + std::time::Duration::from_secs(5))
+        .unwrap();
+    let again = store_in(&layout, dir.path(), Some(&kept));
+    again.set_stamps(saved);
+    assert_eq!(again.drop_unbacked(), Some(0));
+    let checkpoint = again.initial_checkpoint(false).unwrap();
+    assert_eq!(checkpoint.have.count_ones(), count - 1);
+    assert!(!checkpoint.have[7]);
+    let lengths = Lengths::new(layout.total(), 1024).unwrap();
+    let blocks = checkpoint.blocks.unwrap();
+    assert_eq!(
+        blocks.iter_ones().collect::<Vec<_>>(),
+        lengths
+            .chunk_range(lengths.try_validate_piece_index(7).unwrap())
+            .collect::<Vec<_>>()
+    );
+    // Kept as it was until the check says; its time not taken meanwhile.
+    assert!(again.kept() == kept);
+    assert!(again.stamping().is_none());
+    // The check finds it: had again, and its new time is due.
+    assert!(again.found(7).unwrap());
+    let due = again.stamping().unwrap().look();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].0, 7);
+}
+
+// A piece checked again that the check does not find is had no longer,
+// and its file's time is due.
+#[test]
+fn a_piece_checked_again_that_fails_is_dropped() {
+    let count = 4usize;
+    let files: Vec<PieceFile> = (0..count)
+        .map(|at| file(&format!("f/{at}.bin"), 1024))
+        .collect();
+    let layout = Arc::new(PieceLayout::new(1024, files).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("f")).unwrap();
+    for at in 0..count {
+        std::fs::write(dir.path().join(format!("f/{at}.bin")), [7u8; 1024]).unwrap();
+    }
+    let kept = Kept {
+        bits: vec![0xf0],
+        checking: false,
+    };
+    let modified = |at: usize| {
+        let path = dir.path().join(format!("f/{at}.bin"));
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    };
+    let saved: std::collections::HashMap<u32, i64> = (0..count)
+        .map(|at| (at as u32, files::stamp(Some(modified(at))).unwrap()))
+        .collect();
+    let two = dir.path().join("f/2.bin");
+    let was = modified(2);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&two)
+        .unwrap()
+        .set_modified(was + std::time::Duration::from_secs(5))
+        .unwrap();
+    let store = store_in(&layout, dir.path(), Some(&kept));
+    store.set_stamps(saved);
+    assert_eq!(store.drop_unbacked(), Some(0));
+    assert_eq!(store.count(), 3);
+    assert!(!store.failed(2).unwrap(), "it was not had to lose");
+    assert_eq!(store.count(), 3);
+    assert!(!store.has(2));
+    assert_eq!(store.kept().bits, vec![0b1101_0000]);
+    let due = store.stamping().unwrap().look();
+    assert_eq!(due.iter().map(|(file, _)| *file).collect::<Vec<_>>(), [2]);
+}
+
 // libtorrent `torrent::force_recheck`: once a check of every piece began, a
 // run stopped before it gave every piece its verdict has only what it found,
 // and checks every piece again.

@@ -7,6 +7,7 @@ use crate::StateError;
 use crate::jobs::JobId;
 use crate::persistence::Database;
 use crate::torrents::TorrentCounters;
+use crate::torrents::files::Stamping;
 use crate::torrents::store::{Kept, TorrentStore};
 use crate::torrents::tee::Tee;
 use std::collections::BTreeSet;
@@ -52,6 +53,8 @@ pub(super) struct CheckpointTaken {
     job_id: JobId,
     store: Arc<TorrentStore>,
     pieces: Option<Kept>,
+    // The files whose times go with them, taken on the database's lane.
+    stamping: Option<Stamping>,
     resume: Option<Resume>,
 }
 
@@ -60,12 +63,14 @@ pub(super) fn take_checkpoint(torrent: &mut Live, now: i64) -> Option<Checkpoint
     let job_id = torrent.record.job_id;
     let store = Arc::clone(torrent.store.as_ref()?);
     let pieces = store.unsaved();
+    let stamping = store.stamping();
     torrent.settle(now);
     let resume = torrent.take_resume(now, false);
     Some(CheckpointTaken {
         job_id,
         store,
         pieces,
+        stamping,
         resume,
     })
 }
@@ -199,10 +204,11 @@ impl TorrentService {
             job_id,
             store,
             pieces,
+            stamping,
             resume,
         } = taken;
         // Nothing changed since the last write: none is queued.
-        if pieces.is_none() && resume.is_none() {
+        if pieces.is_none() && stamping.is_none() && resume.is_none() {
             return CheckpointSave {
                 job_id,
                 landed: None,
@@ -213,9 +219,18 @@ impl TorrentService {
         let (counters, peers, lost) = resume.map_or((None, None, None), |resume| {
             (resume.counters, resume.peers, Some(resume.lost))
         });
-        let wrote = pieces.is_some().then(|| Arc::clone(&store));
+        let wrote = (pieces.is_some() || stamping.is_some()).then(|| Arc::clone(&store));
         let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
-            db.save_torrent_checkpoint(job_id, pieces.as_ref(), counters.as_ref(), peers.as_ref())
+            // The files are looked at here, on the lane's own thread, not
+            // the runtime's: one look each, just before the write.
+            let stamps = stamping.map(|stamping| stamping.look()).unwrap_or_default();
+            db.save_torrent_checkpoint(
+                job_id,
+                pieces.as_ref(),
+                &stamps,
+                counters.as_ref(),
+                peers.as_ref(),
+            )
         });
         CheckpointSave {
             job_id,

@@ -494,18 +494,46 @@ impl Files {
     // How many bytes the file holds on disk, by its size alone: none when
     // what is there is not a file, and nothing known when nothing can be
     // found there at all.
+    #[cfg(test)]
     pub(crate) fn held(&self, file: usize) -> Option<u64> {
+        self.held_since(file).map(|(held, _)| held)
+    }
+
+    // `held`, with the file's time as [`stamp`] takes it, from the same one
+    // look: none when it has no usable one.
+    pub(crate) fn held_since(&self, file: usize) -> Option<(u64, Option<i64>)> {
         let name = self.name(file).ok()?;
         let dir = self.at().dir.clone();
         #[cfg(test)]
         LOOKS.with(|looks| looks.set(looks.get() + 1));
         match beneath::look(&dir, name) {
-            Ok(found) => Some(if found.is_file { found.len } else { 0 }),
+            Ok(found) if found.is_file => Some((found.len, stamp(found.modified))),
+            Ok(_) => Some((0, None)),
             // Something is there, but through a link that leads out of the
             // folder: it holds none of the torrent's bytes.
-            Err(error) if beneath::is_outside(&error) => Some(0),
+            Err(error) if beneath::is_outside(&error) => Some((0, None)),
             Err(_) => None,
         }
+    }
+
+    // Where the files are now, or none while a move holds them: a caller
+    // that must not wait out a move asks this.
+    pub(crate) fn dir_unless_moving(&self) -> Option<PathBuf> {
+        match self.at.try_read() {
+            Ok(at) => Some(at.dir.clone()),
+            Err(std::sync::TryLockError::Poisoned(at)) => Some(at.into_inner().dir.clone()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    // The files `files` names under `dir`, to have their times taken off
+    // this thread.
+    pub(crate) fn stamping(&self, dir: PathBuf, files: Vec<u32>) -> Stamping {
+        let names = files
+            .into_iter()
+            .filter_map(|file| Some((file, self.names.get(file as usize)?.clone()?)))
+            .collect();
+        Stamping { dir, names }
     }
 
     // Every handle to read let go, so the files can be moved, removed or
@@ -638,6 +666,46 @@ pub(crate) fn adopted_paths(adopted: &super::model::Adopted) -> HashSet<PathBuf>
         .iter()
         .filter_map(|name| relative(name).ok())
         .collect()
+}
+
+// A file's modified time as the database keeps it, nanoseconds since the
+// epoch: none when the filesystem gives none, or one at or before the epoch
+// or past what the column holds, which says nothing of a change.
+pub(crate) fn stamp(modified: Option<std::time::SystemTime>) -> Option<i64> {
+    let since = modified?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    if since.is_zero() {
+        return None;
+    }
+    i64::try_from(since.as_nanos()).ok()
+}
+
+// Files whose times a checkpoint takes, where they are as it is taken.
+pub(crate) struct Stamping {
+    dir: PathBuf,
+    names: Vec<(u32, PathBuf)>,
+}
+
+impl Stamping {
+    // Each file's time, one look each: none for one with no usable time,
+    // or not there as a file under the folder.
+    pub(crate) fn look(&self) -> Vec<(u32, Option<i64>)> {
+        self.names
+            .iter()
+            .map(|(file, name)| {
+                #[cfg(test)]
+                LOOKS.with(|looks| looks.set(looks.get() + 1));
+                let time = beneath::look(&self.dir, name)
+                    .ok()
+                    .filter(|found| found.is_file)
+                    .and_then(|found| stamp(found.modified));
+                (*file, time)
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }
 
 // How many times this thread looked at a file's size.
