@@ -311,7 +311,7 @@ async fn an_oversized_archive_piece_reads_back_in_smaller_reads_when_scratch_is_
     assert_eq!(rig.fallbacks(), u64::from(rig.layout.piece_count()));
     assert_eq!(rig.scratch_peak(), 0);
     assert!(rig.resident_peak() <= BUDGET);
-    assert!(storage.resident_peak() + rig.resident_peak() <= BUDGET + READ_BACK_BYTES);
+    assert!(storage.resident_peak() <= BUDGET);
     assert_eq!(rig.holds.accountant.namespace_usage(rig.holds.namespace).resident, 0);
     rig.tee.forget();
 }
