@@ -25,7 +25,18 @@ pub struct TorrentsQuery;
 impl TorrentsQuery {
     #[graphql(guard = "ReadGuard")]
     async fn torrent(&self, ctx: &Context<'_>, id: u64) -> Result<Option<Torrent>> {
-        Ok(service(ctx)?.torrent(JobId(id)).await.map(Into::into))
+        let field = ctx.look_ahead();
+        // The save path is read from the files: a torrent of one file
+        // named as it is sits in its folder.
+        let shown = Shown {
+            files: field.field("files").exists() || field.field("savePath").exists(),
+            trackers: field.field("trackers").exists(),
+            tags: field.field("tags").exists(),
+        };
+        Ok(service(ctx)?
+            .torrent_shown(JobId(id), shown)
+            .await
+            .map(Into::into))
     }
 
     /// The torrent's live peer connections, by address.

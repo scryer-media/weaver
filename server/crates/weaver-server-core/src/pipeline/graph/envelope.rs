@@ -51,7 +51,16 @@ pub(crate) struct Shelf {
     readers: Mutex<Vec<Weak<ReadFiles>>>,
 }
 
-pub(crate) type ReadFiles = Mutex<BTreeMap<u32, std::fs::File>>;
+pub(crate) type ReadFiles = Mutex<RunFiles>;
+
+// A run's open envelope files, and the read turn it holds on their volume
+// (`Reading`): under one lock, which a read takes already, so a read in a
+// turn held costs nothing more. A drain lets both go.
+#[derive(Debug, Default)]
+pub(crate) struct RunFiles {
+    pub(crate) open: BTreeMap<u32, std::fs::File>,
+    pub(crate) reading: crate::operations::disk::reader::Reading,
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Shelved {
@@ -432,6 +441,12 @@ thread_local! {
 }
 
 impl Shelf {
+    // The volume the shelf's envelopes are written to, whose read turns a
+    // run reading them takes. `None` when the job writes through no writer.
+    pub(crate) fn volume(&self) -> Option<&Arc<crate::operations::disk::volume::Volume>> {
+        self.to.as_ref().map(|to| to.volume())
+    }
+
     pub(crate) fn reader_files(&self) -> Arc<ReadFiles> {
         let files = Arc::new(ReadFiles::default());
         let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
@@ -449,7 +464,9 @@ impl Shelf {
             let Some(files) = reader.upgrade() else {
                 return false;
             };
-            files.lock().unwrap_or_else(PoisonError::into_inner).clear();
+            let mut files = files.lock().unwrap_or_else(PoisonError::into_inner);
+            files.open.clear();
+            files.reading.let_go();
             true
         });
     }

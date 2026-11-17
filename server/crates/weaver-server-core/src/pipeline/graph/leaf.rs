@@ -409,6 +409,12 @@ impl Leaf {
             .map(|queued| queued.to.barrier_at(queued.last))
     }
 
+    // The volume the file's writer writes to, whose read turns a reader of
+    // the file takes. `None` for a leaf that runs its own operations.
+    pub(crate) fn volume(&self) -> Option<&Arc<crate::operations::disk::volume::Volume>> {
+        self.queued.as_ref().map(|queued| queued.to.volume())
+    }
+
     fn create(&self, length: Option<u64>) -> Create {
         Create {
             path: self.path.clone(),

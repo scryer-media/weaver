@@ -709,6 +709,308 @@ async fn a_magnets_selection_is_kept_with_its_metainfo() {
     seeding.stop().await;
 }
 
+// The web seeds a torrent's run has, once the torrent is attached.
+async fn attached_seeds(service: &TorrentService, job_id: JobId) -> Vec<String> {
+    let mut published = service.inner.published.subscribe();
+    loop {
+        published.borrow_and_update();
+        {
+            let live = service.inner.live.lock().await;
+            if let Some(attached) = live
+                .get(&job_id)
+                .and_then(|torrent| torrent.attached.as_ref())
+            {
+                let mut seeds: Vec<String> = attached
+                    .handle
+                    .web_seeds()
+                    .into_iter()
+                    .map(|seed| seed.url)
+                    .collect();
+                seeds.sort();
+                return seeds;
+            }
+        }
+        published.changed().await.unwrap();
+    }
+}
+
+// The metainfo column of a torrent's row, as stored.
+fn stored_metainfo(db: &Database, job_id: JobId) -> Vec<u8> {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let datastore = db.datastore();
+    db.run_sql_blocking_read(async move {
+        let rows = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT metainfo FROM torrents WHERE job_id = {}",
+            &[SqlArg::I64(job_id.0 as i64)],
+        )
+        .await?;
+        let metainfo = rows[0].bytes("metainfo")?;
+        Ok::<_, crate::StateError>(metainfo)
+    })
+    .unwrap()
+}
+
+// `urls` as a bencoded list.
+fn bencoded_list(urls: &[&str]) -> Vec<u8> {
+    let mut list = b"l".to_vec();
+    for url in urls {
+        list.extend_from_slice(format!("{}:{url}", url.len()).as_bytes());
+    }
+    list.push(b'e');
+    list
+}
+
+// A magnet's web seeds (`ws`) are kept with its metainfo, each once, in the
+// stored row sealed with the rest of it, and the torrent's run has them, as
+// it does again after a restart reads them back from that row. The seeds
+// are on loopback, so the run never asks them: a seed the torrent names is
+// asked at a public address only (`NamedBy::may_ask`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnets_web_seeds_are_stored_with_its_metainfo_and_kept_across_a_restart() {
+    use weaver_torrent::torrent_from_bytes;
+
+    let data: Vec<u8> = (0..40_000u32).map(|at| (at % 233) as u8).collect();
+    let shared = metainfo("set", &[("set/a.bin", &data)], 16_384, false);
+    let seeds = tempfile::tempdir().unwrap();
+    let (seeding, _) = sharing(seeds.path(), &shared, &[]).await;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let one = "http://127.0.0.1:9/one";
+    let two = "http://127.0.0.1:9/two";
+    let magnet = magnet_of_peer(
+        &shared,
+        seeding.listen_addr().unwrap(),
+        &format!("&ws={one}&ws={two}&ws={one}"),
+    );
+    let (job_id, _) = resolved_magnet(&rig.service, magnet).await;
+    assert_eq!(attached_seeds(&rig.service, job_id).await, [one, two]);
+
+    // Stored once each, after the fetched metainfo's own (it has none), in
+    // a metainfo of the torrent's info hash.
+    let opened = rig
+        .db
+        .get_torrent(job_id)
+        .unwrap()
+        .unwrap()
+        .metainfo
+        .unwrap();
+    let read = torrent_from_bytes(&opened).unwrap();
+    assert_eq!(
+        read.url_list.as_ref().map(|list| list.0.0),
+        Some(&bencoded_list(&[one, two])[..])
+    );
+    assert_eq!(
+        parse(&opened).unwrap().hashes.v1,
+        parse(&shared).unwrap().hashes.v1
+    );
+    // The row holds it sealed: no seed is readable in it.
+    let stored = stored_metainfo(&rig.db, job_id);
+    assert!(stored.starts_with(b"enc:b1:"));
+    assert!(!stored.windows(11).any(|at| at == b"127.0.0.1:9"));
+
+    rig.service.stop().await;
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert_eq!(attached_seeds(&again, job_id).await, [one, two]);
+    again.stop().await;
+    seeding.stop().await;
+}
+
+// A magnet's web seed, named by a public-looking host that the route's
+// exit resolves, is asked for the torrent's data once its metainfo is in
+// hand, and again after a restart reads the seed back from the stored
+// metainfo. The route is a SOCKS5 proxy double that is handed the name and
+// maps it to a seed server on loopback; the magnet's peer gives the
+// metainfo and no piece, so only the web seed can serve the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnets_web_seed_is_asked_once_its_metainfo_is_known_and_after_a_restart() {
+    use crate::proxies::{DnsProfile, DnsProfileKind, DnsTrust, DnsWho, Rung};
+    use tokio::io::AsyncReadExt;
+    use weaver_tunnel::test_support::proxy::ProxyServerDouble;
+    use weaver_tunnel::transport::TransportKind;
+
+    let data: Vec<u8> = (0..40_000u32).map(|at| (at % 227) as u8).collect();
+    let shared = metainfo("set", &[("set/a.bin", &data)], 16_384, false);
+    let seeds = tempfile::tempdir().unwrap();
+    // It holds no file: it gives the metainfo and no piece.
+    let (peer, _) = sharing(seeds.path(), &shared, &[]).await;
+    let peer_addr = peer.listen_addr().unwrap();
+
+    // The seed server: each request's head, in the order they came. Each
+    // connection is held open unanswered, so the seed asks no more on it.
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let (heads_tx, mut heads) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let served = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let heads_tx = heads_tx.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(read) if read > 0 => head.extend_from_slice(&buf[..read]),
+                        _ => return,
+                    }
+                }
+                let _ = heads_tx.send(String::from_utf8_lossy(&head).into_owned());
+                while matches!(stream.read(&mut buf).await, Ok(read) if read > 0) {}
+            });
+        }
+    });
+    let proxy = ProxyServerDouble::start(
+        TransportKind::Socks5,
+        None,
+        std::collections::HashMap::from([
+            (("seed.example".to_owned(), 80), origin_addr),
+            ((peer_addr.ip().to_string(), peer_addr.port()), peer_addr),
+        ]),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&loopback_proxy(proxy.addr.port()))
+        .unwrap();
+    // Names resolve at the proxy: the seed's host is handed to it.
+    let handed = db
+        .save_dns_profile(
+            DnsProfile {
+                kind: DnsProfileKind::Route,
+                id: 0,
+                name: "Proxy".into(),
+                who: DnsWho::Proxy,
+                transit: None,
+                trust: DnsTrust::AsSent,
+                server_list_id: None,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: LegPath::Ladder {
+                    rungs: vec![Rung::Proxy { id: 1 }],
+                    direct_fallback: false,
+                },
+            }],
+            dns_profile_id: Some(handed.id),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes: Arc<dyn Routes> = Arc::new(crate::torrents::sessions::NetworkRoutes::new(
+        Arc::clone(&proxies),
+        Duration::from_secs(30),
+    ));
+    let asked = |head: &str| {
+        let lower = head.to_ascii_lowercase();
+        assert!(head.starts_with("GET /"), "{head}");
+        assert!(lower.contains("host: seed.example"), "{head}");
+        assert!(lower.contains("range: bytes="), "{head}");
+    };
+
+    let service = service_over(&db, dir.path(), Arc::clone(&routes), job_env(), set_clock());
+    service.open().await.unwrap();
+    let magnet = magnet_of_peer(&shared, peer_addr, "&ws=http://seed.example/");
+    let (job_id, _) = resolved_magnet(&service, magnet).await;
+    asked(&heads.recv().await.unwrap());
+    service.stop().await;
+    // What the first run asked is behind it.
+    while heads.try_recv().is_ok() {}
+
+    let again = service_over(&db, dir.path(), Arc::clone(&routes), job_env(), set_clock());
+    reopen(&again).await;
+    assert!(again.inner.live.lock().await.contains_key(&job_id));
+    asked(&heads.recv().await.unwrap());
+    // The name went to the proxy, never to a resolver here.
+    assert!(
+        proxy
+            .targets
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(host, port)| host == "seed.example" && *port == 80)
+    );
+    again.stop().await;
+    served.abort();
+    peer.stop().await;
+    proxies.network.shutdown().await;
+}
+
+// The seeds a magnet names join the metainfo's own `url-list` after them,
+// each URL once; a link that names none, or names more than a torrent file
+// may hold, leaves the metainfo as fetched.
+#[test]
+fn a_magnets_web_seeds_join_the_metainfos_url_list_once() {
+    use super::super::intake::with_web_seeds;
+    use weaver_torrent::bencode::bencode_serialize_to_writer;
+    use weaver_torrent::{
+        ByteBuf, MAX_TORRENT_FILE_BYTES, SeedUrls, WebSeed, WebSeedKind, torrent_from_bytes,
+    };
+
+    let seed = |url: &str, kind| WebSeed {
+        url: url.to_owned(),
+        kind,
+        named_by: Default::default(),
+    };
+    let own = "http://a.example/";
+    let added = "http://b.example/";
+    let fetched = plain("set", 1);
+    let url_list = |bytes: &[u8]| {
+        torrent_from_bytes(bytes)
+            .unwrap()
+            .url_list
+            .map(|list| list.0.0.to_vec())
+    };
+
+    // None named: the bytes as fetched.
+    assert_eq!(with_web_seeds(Bytes::from(fetched.clone()), &[]), fetched);
+    let http = [seed(added, WebSeedKind::Http), seed("", WebSeedKind::Url)];
+    assert_eq!(with_web_seeds(Bytes::from(fetched.clone()), &http), fetched);
+
+    // The metainfo's own seed, a string, stays first; the link's copy of it
+    // and its own second copy are written once.
+    let mut meta = torrent_from_bytes(&fetched).unwrap();
+    let string = format!("{}:{own}", own.len()).into_bytes();
+    meta.url_list = Some(SeedUrls(ByteBuf(&string)));
+    let mut with_own = Vec::new();
+    bencode_serialize_to_writer(&meta, &mut with_own).unwrap();
+    let named = [
+        seed(own, WebSeedKind::Url),
+        seed(added, WebSeedKind::Url),
+        seed(added, WebSeedKind::Url),
+    ];
+    let merged = with_web_seeds(Bytes::from(with_own.clone()), &named);
+    assert_eq!(url_list(&merged), Some(bencoded_list(&[own, added])));
+    assert_eq!(
+        parse(&merged).unwrap().hashes.v1,
+        parse(&fetched).unwrap().hashes.v1
+    );
+    // Merged again, nothing changes.
+    assert_eq!(with_web_seeds(merged.clone(), &named), merged);
+
+    // A seed that takes the metainfo past what a torrent file may hold is
+    // not kept.
+    let huge = format!("http://c.example/{}", "x".repeat(MAX_TORRENT_FILE_BYTES));
+    let refused = with_web_seeds(
+        Bytes::from(with_own.clone()),
+        &[seed(&huge, WebSeedKind::Url)],
+    );
+    assert_eq!(refused, with_own);
+}
+
 // The server's settings over the rig's categories, stored as a server stores
 // them, for the service to make a category in.
 fn making_in(rig: &Rig) -> crate::settings::SharedConfig {

@@ -157,7 +157,7 @@ pub(crate) struct TorrentStore {
     // there. Taken to read for a piece's write or a read, and to write only
     // by a change of which files are, so a change waits on every write and
     // read under way and none starts until it is done.
-    aside: RwLock<Vec<bool>>,
+    aside: RwLock<Arc<Vec<bool>>>,
     side: Arc<Mutex<Side>>,
     // Its writes, through the writer of the volume its files are on.
     writes: Writes,
@@ -199,7 +199,7 @@ impl TorrentStore {
             have: Arc::new(Mutex::new(have)),
             saved: Mutex::new(None),
             tee,
-            aside: RwLock::new(Vec::new()),
+            aside: RwLock::new(Arc::new(Vec::new())),
             side: Arc::new(Mutex::new(Side::none())),
             writes,
             moves: Mutex::default(),
@@ -290,23 +290,23 @@ impl TorrentStore {
             opened.drop_piece(piece)?;
         }
         opened.record(&aside)?;
-        *self.aside.get_mut().unwrap_or_else(PoisonError::into_inner) = aside;
+        *self.aside.get_mut().unwrap_or_else(PoisonError::into_inner) = Arc::new(aside);
         *lock(&self.side) = opened;
         Ok(self)
     }
 
-    fn aside(&self) -> RwLockReadGuard<'_, Vec<bool>> {
+    fn aside(&self) -> RwLockReadGuard<'_, Arc<Vec<bool>>> {
         self.aside.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     // Holds off a change of which files are set aside while held, as a
     // piece's write or a read under way does.
     #[cfg(test)]
-    pub(crate) fn hold_reads(&self) -> RwLockReadGuard<'_, Vec<bool>> {
+    pub(crate) fn hold_reads(&self) -> RwLockReadGuard<'_, Arc<Vec<bool>>> {
         self.aside()
     }
 
-    fn aside_mut(&self) -> RwLockWriteGuard<'_, Vec<bool>> {
+    fn aside_mut(&self) -> RwLockWriteGuard<'_, Arc<Vec<bool>>> {
         self.aside.write().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -411,7 +411,7 @@ impl TorrentStore {
             // the next copy or open.
             side.record(&wanted)?;
         }
-        *aside = wanted;
+        *aside = Arc::new(wanted);
         for piece in touched {
             let shares = self.layout.spans(piece).iter().any(|span| aside[span.file]);
             if !shares {
@@ -943,14 +943,14 @@ impl TorrentStore {
         } = parked;
         let aside = self.aside();
         self.writes.queue_paying(paying, move |batch| {
-            let mut kept: Option<Vec<bool>> = None;
+            let mut kept: Option<Arc<Vec<bool>>> = None;
             for span in self.layout.spans(piece) {
                 if self.layout.file(span.file).is_none_or(|file| file.padding) {
                     continue;
                 }
                 if aside.get(span.file).copied().unwrap_or(false) {
                     if kept.is_none() {
-                        kept = Some(aside.clone());
+                        kept = Some(Arc::clone(&aside));
                     }
                     continue;
                 }
@@ -1107,6 +1107,10 @@ impl Pieces for TorrentStore {
 
     fn will_read(&self, file: usize, offset: u64, len: u64) {
         self.files.will_read(file, offset, len);
+    }
+
+    fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
+        self.writes.read_turns()
     }
 
     fn readv(&self, file: usize, mut offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {

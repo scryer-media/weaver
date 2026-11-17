@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
+use super::reader::VolumeReads;
 use super::volume::{LoopWait, Volume};
 use super::{StorageCapacity, StorageKind, lock_paths};
 use crate::operations::instrumentation::VolumeSnapshot;
@@ -548,6 +549,12 @@ impl StorageCapacity {
             self.volume_rates.kinds().insert(device, kind);
         }
         kind
+    }
+
+    // The read turns of `volume`, made for the kind the owner holds for its
+    // device the first time they are asked for. Never looks at a disk.
+    pub(crate) fn volume_reads<'v>(&self, volume: &'v Volume) -> &'v VolumeReads {
+        volume.reads(|| self.kind_on_device(volume.device))
     }
 
     // The kind the owner holds for a root or a folder found on `device`;

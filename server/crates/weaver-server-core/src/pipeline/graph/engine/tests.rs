@@ -69,6 +69,88 @@ fn a_read_waits_for_its_bytes() {
     assert_eq!(shelf.reached(), Some((FIRST, 12)));
 }
 
+// A run reads its envelopes in turns of the volume they are written to, and
+// reads what a run without them reads. On solid state it holds one turn
+// across its reads, gives it back while it waits for bytes, and takes one
+// again at its next read; on a spinning volume each read takes the one turn
+// and gives it back. Letting go at the end gives back the last.
+#[test]
+fn a_run_reads_in_its_volumes_turns_what_it_reads_without_them() {
+    use crate::operations::disk::StorageKind;
+    use crate::operations::disk::reader::{SOLID_READERS, SPINNING_READERS};
+    use crate::operations::disk::volume::Volume;
+    use crate::operations::disk::writer::VolumeWriters;
+
+    let body: Vec<u8> = (0..64u8).collect();
+    let reads = [(0, 16), (16, 16), (40, 24)];
+    let read_all = |volumes: &RunVolumes| -> Vec<Vec<u8>> {
+        reads
+            .iter()
+            .map(|&(at, len)| read(volumes, at, len).unwrap())
+            .collect()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 0, &body, Provenance::Fresh)
+        .unwrap();
+    let plain = reader(&shelf);
+    let old = read_all(&plain);
+    let waiting = Arc::clone(&plain);
+    let later = std::thread::spawn(move || read(&waiting, 64, 6));
+    envelopes
+        .keep(NODE, 0, 64, b"-tail-", Provenance::Fresh)
+        .unwrap();
+    let old_later = later.join().unwrap().unwrap();
+    assert_eq!(old_later, b"-tail-");
+    for kind in [StorageKind::Solid, StorageKind::Rotational] {
+        let dir = tempfile::tempdir().unwrap();
+        let writers = VolumeWriters::inline(|_| {});
+        let volume = Arc::new(Volume::new(None, "test".to_owned()));
+        let turns = Arc::clone(volume.reads(|| kind).turns());
+        let solid = kind != StorageKind::Rotational;
+        let all = if solid {
+            SOLID_READERS
+        } else {
+            SPINNING_READERS
+        };
+        let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+        envelopes.write_through(Some(writers.test_submitter(&volume, 1)));
+        let shelf = envelopes.shelf(NODE);
+        envelopes
+            .keep(NODE, 0, 0, &body, Provenance::Fresh)
+            .unwrap();
+        let volumes = reader(&shelf);
+        assert_eq!(read_all(&volumes), old, "{kind:?}");
+        assert_eq!(volumes.holds_turn(), solid, "{kind:?}");
+        assert_eq!(
+            turns.available_permits(),
+            if solid { all - 1 } else { all },
+            "{kind:?}"
+        );
+        let waiting = Arc::clone(&volumes);
+        let later = std::thread::spawn(move || read(&waiting, 64, 6));
+        // Every turn comes free while the read waits for its bytes: on
+        // solid state only once the run gave back the one it held.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let every = runtime
+            .block_on(Arc::clone(&turns).acquire_many_owned(all as u32))
+            .unwrap();
+        assert!(!volumes.holds_turn(), "{kind:?}");
+        drop(every);
+        envelopes
+            .keep(NODE, 0, 64, b"-tail-", Provenance::Fresh)
+            .unwrap();
+        assert_eq!(later.join().unwrap().unwrap(), old_later, "{kind:?}");
+        assert_eq!(volumes.holds_turn(), solid, "{kind:?}");
+        volumes.let_go();
+        assert!(!volumes.holds_turn(), "{kind:?}");
+        assert_eq!(turns.available_permits(), all, "{kind:?}");
+    }
+}
+
 // Damaged bytes are read only once repaired: the read waits over them as it
 // waits for bytes still on their way, and the repair lands ahead of what the
 // run read, so the run goes on reading and is never stopped.

@@ -47,21 +47,25 @@ use tracing::{Instrument, debug, trace, trace_span};
 use crate::mse::{Encryption, EncryptionPolicy};
 use crate::session_stats::{Transport, disk::DiskOp};
 use crate::{
+    file_ops::HeldPiece,
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
     ssl::SslTorrent,
+    storage::ReadTurns,
     stream_connect::{Guard, Link, StreamConnector, Transports},
     type_aliases::BoxAsyncReadVectored,
 };
 
 /// Reads blocks to upload, from any thread.
 pub trait ChunkReader: Send + Sync {
-    /// Each of `chunks` read into its buffer of `bufs`; on an error, the
-    /// first block not read and why.
+    /// Each of `chunks` read into its buffer of `bufs`, out of whole pieces
+    /// held in `held` when given; on an error, the first block not read and
+    /// why.
     fn read_chunks(
         &self,
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
+        held: Option<&mut HeldPiece>,
     ) -> std::result::Result<(), (usize, anyhow::Error)>;
 }
 
@@ -192,13 +196,21 @@ pub trait PeerConnectionHandler {
     fn chunk_reader(&self) -> Option<Arc<dyn ChunkReader>> {
         None
     }
-    /// Each of `chunks` read into its buffer of `bufs`. On an error, the
-    /// first block not read and why: the blocks before it are read whole.
-    /// A handler with no faster way reads them one at a time.
+    /// The read turns the connection's upload reads take, asked once when
+    /// it starts uploading. A handler that names no volume shares the
+    /// private turns of every storage that names none.
+    fn read_turns(&self) -> ReadTurns {
+        ReadTurns::private()
+    }
+    /// Each of `chunks` read into its buffer of `bufs`, out of whole pieces
+    /// held in `held` when given. On an error, the first block not read and
+    /// why: the blocks before it are read whole. A handler with no faster
+    /// way reads them one at a time, and holds nothing.
     fn read_chunks(
         &self,
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
+        _held: Option<&mut HeldPiece>,
     ) -> std::result::Result<(), (usize, anyhow::Error)> {
         for (i, (chunk, buf)) in chunks.iter().zip(bufs.iter_mut()).enumerate() {
             self.read_chunk(chunk, buf).map_err(|e| (i, e))?;
@@ -351,6 +363,9 @@ pub enum WriterRequest {
     Answer(Answer),
     ReadChunkRequest(ChunkInfo),
     Disconnect(anyhow::Result<()>),
+    /// The torrent's files moved: the connection's upload reads take these
+    /// turns, of the volume they are on now, from here on.
+    ReadTurns(ReadTurns),
 }
 
 #[derive(Default, Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -1076,9 +1091,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         }
 
         // A connection on a uTP thread reads the blocks it uploads on the
-        // session's disk threads, its buffer handed there and back: nothing
-        // that blocks runs on a uTP thread. Its reads run in order under a
-        // key of its own.
+        // session's blocking threads, its buffer handed there and back:
+        // nothing that blocks runs on a uTP thread. It has one batch out at
+        // a time, so its reads run in order. Every upload read takes a read
+        // turn of the torrent's volume; on one that reads whole pieces the
+        // connection holds the last piece it read, and serves the blocks
+        // asked of it from there.
+        // A move of the torrent's files hands the connection the turns of
+        // the volume they moved to (`WriterRequest::ReadTurns`), between
+        // two batches, the piece it held let go.
+        let mut turns = self.handler.read_turns();
+        let mut held = turns.whole_pieces().then(HeldPiece::default);
         let on_utp = weaver_utp::on_shard_thread();
         let upload_reader = if on_utp {
             self.handler.chunk_reader()
@@ -1105,7 +1128,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         if supports_extended {
             stats.sent(transport);
         }
-        let read_key = crate::off_shard::reader_key();
 
         let writer = async move {
             let keep_alive_interval = self.options.keep_alive_interval();
@@ -1198,6 +1220,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             PIECE_MESSAGE_PREAMBLE_LEN + chunk.size as usize
                         }
                         WriterRequest::Disconnect(_) => 0,
+                        // New turns are taken between two batches: the
+                        // blocks framed before them read on the old ones.
+                        WriterRequest::ReadTurns(_) if batch.iter().any(|framed| framed.read) => {
+                            usize::MAX
+                        }
+                        WriterRequest::ReadTurns(_) => 0,
                         _ => longest_frame,
                     };
                     if filled > 0 && buf.len() - filled < needs {
@@ -1284,6 +1312,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 })
                             }
                         }
+                        WriterRequest::ReadTurns(moved) => {
+                            held = moved.whole_pieces().then(HeldPiece::default);
+                            turns = moved;
+                            None
+                        }
                         WriterRequest::Disconnect(res) => {
                             trace!("disconnect requested, closing writer");
                             ending = Some(match res {
@@ -1333,22 +1366,24 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 None => (std::mem::take(&mut write_buf), false),
                             };
                             let reader = reader.clone();
-                            let stats = self.spawner.stats().clone();
-                            let (owned, read) = self
+                            let mut piece = held.take();
+                            let (owned, piece, read) = self
                                 .spawner
-                                .read_off_shard(read_key, move || {
+                                .read_off_shard(&turns, move |stats| {
                                     let (mut buf, was_lent) = owned;
                                     let mut payloads = payloads_in(&mut buf, &spans);
                                     let call = stats.call(DiskOp::UploadReadUtp);
                                     call.bytes(read_len(&chunks));
                                     stats.upload_read(Transport::Utp, chunks.len() as u64);
-                                    let read = reader.read_chunks(&chunks, &mut payloads);
+                                    let read =
+                                        reader.read_chunks(&chunks, &mut payloads, piece.as_mut());
                                     drop(call);
                                     drop(payloads);
-                                    ((buf, was_lent), read)
+                                    ((buf, was_lent), piece, read)
                                 })
                                 .await
                                 .ok_or(Error::TorrentIsNotLive)?;
+                            held = piece;
                             match owned {
                                 (buf, true) => lent = Some(buf),
                                 (buf, false) => write_buf = buf,
@@ -1357,12 +1392,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         }
                         None => {
                             let mut payloads = payloads_in(buf, &spans);
+                            let piece = held.as_mut();
                             self.spawner
-                                .block_in_place_with_semaphore(|| {
+                                .block_in_place_in_turn(&turns, || {
                                     let call = stats.call(DiskOp::UploadReadTcp);
                                     call.bytes(read_len(&chunks));
                                     stats.upload_read(Transport::Tcp, chunks.len() as u64);
-                                    self.handler.read_chunks(&chunks, &mut payloads)
+                                    self.handler.read_chunks(&chunks, &mut payloads, piece)
                                 })
                                 .await
                         }
@@ -1573,6 +1609,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::ReadTurns;
     use std::{
         io,
         net::SocketAddr,
@@ -2630,6 +2667,11 @@ mod tests {
         told: parking_lot::Mutex<Vec<Told>>,
         /// The piece whose block fails to read, if any.
         fails: Option<u32>,
+        /// The turns the connection starts with, the private ones if none.
+        turns: Option<ReadTurns>,
+        /// Turns watched: how many of each were free at each block read.
+        watched: Vec<Arc<tokio::sync::Semaphore>>,
+        free: parking_lot::Mutex<Vec<Vec<usize>>>,
     }
 
     impl PeerConnectionHandler for &Recorder {
@@ -2660,7 +2702,16 @@ mod tests {
         fn upload_done(&self, chunk: &ChunkInfo) {
             self.told.lock().push(Told::Done(chunk.piece_index.get()));
         }
+        fn read_turns(&self) -> ReadTurns {
+            self.turns.clone().unwrap_or_else(ReadTurns::private)
+        }
         fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
+            self.free.lock().push(
+                self.watched
+                    .iter()
+                    .map(|turns| turns.available_permits())
+                    .collect(),
+            );
             anyhow::ensure!(
                 self.fails != Some(chunk.piece_index.get()),
                 "piece {} cannot be read",
@@ -3168,6 +3219,32 @@ mod tests {
                 Told::Done(1)
             ]
         );
+    }
+
+    // The files moved while blocks were queued: the blocks queued before
+    // the move read in a turn of the volume they left, those after in one
+    // of the volume they are on now, and every turn comes back.
+    #[tokio::test(start_paused = true)]
+    async fn blocks_queued_after_the_files_moved_read_on_the_new_volumes_turns() {
+        let one = || Arc::new(tokio::sync::Semaphore::new(1));
+        let (left, now) = (one(), one());
+        let recorder = Recorder {
+            turns: Some(ReadTurns::new(Arc::clone(&left), false)),
+            watched: vec![Arc::clone(&left), Arc::clone(&now)],
+            ..Recorder::default()
+        };
+        let block = blocks_of(5);
+        let queued = vec![
+            WriterRequest::ReadChunkRequest(block(0)),
+            WriterRequest::ReadTurns(ReadTurns::new(Arc::clone(&now), false)),
+            WriterRequest::ReadChunkRequest(block(1)),
+            WriterRequest::Message(Message::Have(4)),
+        ];
+        let (result, wire, _) = serve_queued(&recorder, queued, &have_frame(4)).await;
+        assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
+        assert!(wire.ends_with(&[block_frame(0), block_frame(1), have_frame(4)].concat()));
+        assert_eq!(*recorder.free.lock(), [vec![0, 1], vec![1, 0]]);
+        assert_eq!((left.available_permits(), now.available_permits()), (1, 1));
     }
 
     // A request framed behind a block that fails to read is not written, and
