@@ -244,6 +244,105 @@ async fn the_list_carries_the_files_it_asks_for() {
     assert_eq!(listed["torrents"][0]["files"], listed["torrent"]["files"]);
 }
 
+// One torrent's read builds only what the query selects: its own fields
+// alone read no files, trackers or tags, and a query that selects them gets
+// what the whole torrent's read gives, its save path included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_torrent_reads_only_what_the_query_selects() {
+    use weaver_server_core::jobs::ids::JobId;
+    use weaver_server_core::torrents::service::listing::Shown;
+
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let replaced = rig
+        .execute(&format!(
+            r#"mutation {{ replaceTorrentTrackers(id: {id}, trackers: [{{ tier: 0, url: "udp://b.invalid:80" }}]) }}"#
+        ))
+        .await;
+    assert!(replaced.errors.is_empty(), "{:?}", replaced.errors);
+    rig.harness
+        .db
+        .add_job_tags(&[JobId(id)], ["tv", "HD"])
+        .unwrap();
+
+    let whole = rig.torrents.torrent(JobId(id)).await.unwrap();
+    assert!(!whole.files.is_empty() && !whole.trackers.is_empty() && !whole.tags.is_empty());
+    let bare = rig
+        .torrents
+        .torrent_shown(JobId(id), Shown::BARE)
+        .await
+        .unwrap();
+    assert!(bare.files.is_empty() && bare.trackers.is_empty() && bare.tags.is_empty());
+    // Its own fields are the whole read's.
+    assert_eq!(
+        (
+            bare.job_id,
+            &bare.name,
+            &bare.infohash,
+            bare.state,
+            bare.total_bytes,
+            &bare.storage_dir,
+            &bare.files_dir
+        ),
+        (
+            whole.job_id,
+            &whole.name,
+            &whole.infohash,
+            whole.state,
+            whole.total_bytes,
+            &whole.storage_dir,
+            &whole.files_dir
+        )
+    );
+
+    let read = |query: String| {
+        let rig = &rig;
+        async move {
+            let response = rig.execute(&query).await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            response.data.into_json().unwrap()["torrent"].clone()
+        }
+    };
+    let own = read(format!("{{ torrent(id: {id}) {{ id state name }} }}")).await;
+    assert_eq!(own["id"], id);
+    assert_eq!(own["name"], whole.name);
+    let full = read(format!(
+        "{{ torrent(id: {id}) {{ id savePath tags files {{ path length }} trackers {{ tier url }} }} }}"
+    ))
+    .await;
+    let (save_path, _) = whole.paths();
+    assert_eq!(
+        full["savePath"],
+        serde_json::json!((!save_path.is_empty()).then_some(save_path))
+    );
+    assert_eq!(full["tags"], serde_json::json!(whole.tags));
+    assert_eq!(full["tags"], serde_json::json!(["HD", "tv"]));
+    assert_eq!(full["files"][0]["path"], "one.mkv");
+    assert_eq!(full["files"][0]["length"], 3000);
+    assert_eq!(
+        full["trackers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tracker| tracker["url"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        whole
+            .trackers
+            .iter()
+            .map(|tracker| tracker.url.clone())
+            .collect::<Vec<_>>()
+    );
+    // The save path alone still reads the files it is made from.
+    let saved = read(format!("{{ torrent(id: {id}) {{ savePath }} }}")).await;
+    assert_eq!(saved["savePath"], full["savePath"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_duplicate_is_refused() {
     let rig = rig().await;
