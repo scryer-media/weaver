@@ -129,7 +129,12 @@ fn config_roundtrip() {
             unchoke_slots_limit: crate::settings::TorrentLimit::Unlimited,
             connection_speed: std::num::NonZeroU32::new(12).unwrap(),
             allow_multiple_connections_per_ip: true,
-            peer_protocol: crate::settings::TorrentPeerProtocol::UtpFirst,
+            transports: crate::settings::PeerTransports {
+                tcp: true,
+                utp: false,
+                prefer_downloading: crate::settings::PeerTransport::Tcp,
+                prefer_seeding: crate::settings::PeerTransport::Tcp,
+            },
             dht_bootstrap_nodes: "router.example:6881,192.0.2.1:25401".to_owned(),
             blocklist_enabled: true,
             blocklist: Some(r"C:\lists\level1.p2p".to_owned()),
@@ -435,7 +440,9 @@ fn clearing_the_global_seeding_policy_removes_it() {
 #[test]
 fn tracker_rules_crud() {
     use crate::settings::model::TrackerRule;
-    use crate::settings::{SeedingAction, SeedingPolicy, TorrentEncryption, TorrentPeerProtocol};
+    use crate::settings::{
+        PeerTransport, SeedingAction, SeedingPolicy, TorrentEncryption, TransportRule,
+    };
 
     let db = Database::open_in_memory().unwrap();
     assert!(db.list_tracker_rules().unwrap().is_empty());
@@ -449,7 +456,12 @@ fn tracker_rules_crud() {
     let first = db
         .insert_tracker_rule(
             &TrackerRule {
-                peer_protocol: Some(TorrentPeerProtocol::UtpFirst),
+                transports: TransportRule {
+                    tcp: None,
+                    utp: Some(true),
+                    prefer_downloading: Some(PeerTransport::Utp),
+                    prefer_seeding: None,
+                },
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -473,7 +485,7 @@ fn tracker_rules_crud() {
     let second = db
         .insert_tracker_rule(
             &TrackerRule {
-                peer_protocol: None,
+                transports: Default::default(),
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -522,7 +534,12 @@ fn tracker_rules_crud() {
         pex: Some(false),
         lsd: Some(false),
         encryption: Some(TorrentEncryption::Disabled),
-        peer_protocol: Some(TorrentPeerProtocol::UtpOnly),
+        transports: TransportRule {
+            tcp: Some(false),
+            utp: None,
+            prefer_downloading: None,
+            prefer_seeding: Some(PeerTransport::Tcp),
+        },
         upload_cap: Leaf::Set(4_096),
         forced: false,
         ..first.clone()
@@ -543,7 +560,7 @@ fn a_kept_transmission_client_reads_as_weaver() {
     let kept = db
         .insert_tracker_rule(
             &TrackerRule {
-                peer_protocol: None,
+                transports: Default::default(),
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -603,7 +620,7 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
     let kept = db
         .insert_tracker_rule(
             &TrackerRule {
-                peer_protocol: None,
+                transports: Default::default(),
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -767,6 +784,110 @@ fn a_bound_rule_refuses_a_change_to_a_locked_field() {
     assert_eq!((saved[0].pex, saved[0].never_pause), (Some(true), true));
     assert_eq!(saved[0].ssl, rule.ssl);
     assert_eq!(saved[0].bound, rule.bound);
+}
+
+// A tracker file fills a rule's encryption and transports with any value
+// they take, as the API names them: a required one is locked against the
+// ordinary save by its field's name, and the preview shows each.
+#[test]
+fn a_tracker_file_fills_and_locks_a_rules_encryption_and_transports() {
+    use crate::settings::model::TrackerRule;
+    use crate::settings::{PeerTransport, TorrentEncryption, TransportRule};
+
+    let db = Database::open_in_memory().unwrap();
+    let file = tracker_file(
+        "revision = \"1\"\n[required]\nencryption = \"disabled\"\npeer_utp = false\nprefer_seeding = \"tcp\"\n\
+         [recommended]\npeer_tcp = true\nprefer_downloading = \"tcp\"",
+        None,
+    );
+    let preview = file.preview(None, String::new());
+    let shown: Vec<(&str, bool, Option<&str>)> = preview
+        .changes
+        .iter()
+        .map(|change| (change.field, change.locked, change.new.as_deref()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("peer_tcp", false, Some("true")),
+            ("peer_utp", true, Some("false")),
+            ("encryption", true, Some("disabled")),
+            ("prefer_downloading", false, Some("tcp")),
+            ("prefer_seeding", true, Some("tcp")),
+        ]
+    );
+    let rule = db.apply_tracker_file(&file, 10).unwrap();
+    assert_eq!(
+        rule.bound.as_ref().unwrap().locked,
+        ["encryption", "peer_utp", "prefer_seeding"]
+    );
+    assert_eq!(rule.encryption, Some(TorrentEncryption::Disabled));
+    assert_eq!(
+        rule.transports,
+        TransportRule {
+            tcp: Some(true),
+            utp: Some(false),
+            prefer_downloading: Some(PeerTransport::Tcp),
+            prefer_seeding: Some(PeerTransport::Tcp),
+        }
+    );
+    assert_eq!(
+        db.list_tracker_rules().unwrap(),
+        std::slice::from_ref(&rule)
+    );
+
+    let input = |transports| TrackerRule {
+        bound: None,
+        transports,
+        ..rule.clone()
+    };
+    for (transports, field) in [
+        (
+            TransportRule {
+                utp: None,
+                ..rule.transports
+            },
+            "peer_utp",
+        ),
+        (
+            TransportRule {
+                prefer_seeding: Some(PeerTransport::Utp),
+                ..rule.transports
+            },
+            "prefer_seeding",
+        ),
+    ] {
+        let refusal = db
+            .save_tracker_rule(Some(rule.id), input(transports), true, true, 11)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            refusal.starts_with(&format!("{field} is locked")),
+            "{refusal}"
+        );
+    }
+    // A recommended value is the user's to change.
+    let saved = db
+        .save_tracker_rule(
+            Some(rule.id),
+            input(TransportRule {
+                tcp: None,
+                prefer_downloading: None,
+                ..rule.transports
+            }),
+            true,
+            true,
+            12,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            saved[0].transports.tcp,
+            saved[0].transports.prefer_downloading
+        ),
+        (None, None)
+    );
 }
 
 // A bound rule's pattern is what its file finds it by, so the ordinary save
@@ -1071,7 +1192,7 @@ fn a_removed_route_owner_takes_its_route_row() {
     let rule = db
         .insert_tracker_rule(
             &TrackerRule {
-                peer_protocol: None,
+                transports: Default::default(),
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,

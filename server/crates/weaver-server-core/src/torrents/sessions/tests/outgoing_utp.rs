@@ -13,8 +13,9 @@ use std::{
 
 use anyhow::Context;
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, CreateTorrentOptions, IpFilter, ListenerMode, ListenerOptions,
-    Session, SessionOptions, SocketFactory, StreamListener, create_torrent,
+    AddTorrent, AddTorrentOptions, CreateTorrentOptions, DialOrder, DialOrders, IpFilter,
+    ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionOptions, SocketFactory,
+    StreamListener, create_torrent,
     network::{BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket},
     spawn_utils::BlockingSpawner,
 };
@@ -25,7 +26,7 @@ use weaver_tunnel::{
 };
 
 use crate::{
-    settings::{TorrentConfig, TorrentPeerProtocol},
+    settings::{PeerTransports, TorrentConfig},
     torrents::{
         identity::IDENTITY,
         net::{LegKind, LegSockets},
@@ -158,9 +159,81 @@ impl SocketFactory for RoutedFactory {
     }
 }
 
+// What a download over the datagram-only route sent: TCP connects through
+// the route and through the factory, uTP sockets bound before the torrent
+// was added and in all.
+#[derive(Debug, PartialEq, Eq)]
+struct Sent {
+    route_tcp: usize,
+    factory_tcp: usize,
+    utp_before_add: usize,
+    utp: usize,
+}
+
 #[tokio::test]
 async fn a_non_listening_datagram_route_completes_a_utp_only_torrent_transfer() -> anyhow::Result<()>
 {
+    let utp_only = PeerTransports {
+        tcp: false,
+        ..PeerTransports::default()
+    };
+    let sent = transfer(utp_only, None).await?;
+    assert_eq!(
+        sent,
+        Sent {
+            route_tcp: 0,
+            factory_tcp: 0,
+            utp_before_add: 1,
+            utp: 1,
+        }
+    );
+    Ok(())
+}
+
+// A tracker rule may broaden the global transports: under uTP alone, its
+// torrent dials TCP first, through the route, and completes over uTP behind
+// it (the route carries no TCP); a torrent under no rule never dials TCP.
+#[tokio::test]
+async fn a_rules_tcp_first_order_dials_tcp_under_a_global_utp_only_setting() -> anyhow::Result<()> {
+    let utp_only = PeerTransports {
+        tcp: false,
+        ..PeerTransports::default()
+    };
+    let sent = transfer(utp_only, Some(DialOrders::both(DialOrder::TcpFirst))).await?;
+    assert!(sent.route_tcp >= 1 && sent.factory_tcp >= 1, "{sent:?}");
+    assert_eq!((sent.utp_before_add, sent.utp), (1, 1));
+    Ok(())
+}
+
+// A tracker rule may narrow the global transports, and dial a transport they
+// turn off: under TCP alone the session binds no uTP socket and listens on
+// none, and a rule's uTP-only torrent binds one on its first dial, dials no
+// TCP and completes over uTP.
+#[tokio::test]
+async fn a_rules_utp_only_order_dials_no_tcp_under_a_global_tcp_only_setting() -> anyhow::Result<()>
+{
+    let tcp_only = PeerTransports {
+        utp: false,
+        ..PeerTransports::default()
+    }
+    .checked()
+    .unwrap();
+    let sent = transfer(tcp_only, Some(DialOrders::both(DialOrder::UtpOnly))).await?;
+    assert_eq!(
+        sent,
+        Sent {
+            route_tcp: 0,
+            factory_tcp: 0,
+            utp_before_add: 0,
+            utp: 1,
+        }
+    );
+    Ok(())
+}
+
+// Download a torrent from a uTP-only seed over a datagram-only route whose
+// session runs `transports`, the torrent dialing in `orders` when given.
+async fn transfer(transports: PeerTransports, orders: Option<DialOrders>) -> anyhow::Result<Sent> {
     let directory = tempfile::tempdir()?;
     let seed_directory = directory.path().join("seed");
     let download_directory = directory.path().join("download");
@@ -231,7 +304,7 @@ async fn a_non_listening_datagram_route_completes_a_utp_only_torrent_transfer() 
     leg.shape = shape;
     leg.factory = factory.clone();
     let torrent = TorrentConfig {
-        peer_protocol: TorrentPeerProtocol::UtpOnly,
+        transports,
         ..Default::default()
     };
     let mut options = super::session_options(
@@ -248,18 +321,26 @@ async fn a_non_listening_datagram_route_completes_a_utp_only_torrent_transfer() 
         .connect
         .as_ref()
         .context("missing outgoing policy")?;
-    assert!(!connect.enable_tcp);
+    // A dialer for each transport the leg carries; the orders say which a
+    // dial takes.
+    assert!(connect.enable_tcp);
     assert_eq!(connect.enable_utp, Some(true));
+    assert_eq!(connect.utp_on_demand, !transports.utp);
     options.dht = None;
     options.disable_trackers = true;
     options.disable_local_service_discovery = true;
     options.ipv4_only = true;
     let client = Session::new_with_opts(download_directory.clone(), options).await?;
+    let utp_before_add = factory.utp.load(Ordering::Relaxed);
     let download = client
         .add_torrent(
             AddTorrent::from_bytes(metadata),
             Some(AddTorrentOptions {
                 initial_peers: Some(vec![peer]),
+                peer_opts: orders.map(|orders| PeerConnectionOptions {
+                    dial_orders: Some(orders),
+                    ..Default::default()
+                }),
                 output_folder: Some(
                     download_directory
                         .to_str()
@@ -280,9 +361,12 @@ async fn a_non_listening_datagram_route_completes_a_utp_only_torrent_transfer() 
     assert!(
         carrier.sent.load(Ordering::Relaxed) > 0 && carrier.received.load(Ordering::Relaxed) > 0
     );
-    assert_eq!(carrier.tcp.load(Ordering::Relaxed), 0);
-    assert_eq!(factory.utp.load(Ordering::Relaxed), 1);
-    assert_eq!(factory.tcp.load(Ordering::Relaxed), 0);
+    let sent = Sent {
+        route_tcp: carrier.tcp.load(Ordering::Relaxed),
+        factory_tcp: factory.tcp.load(Ordering::Relaxed),
+        utp_before_add,
+        utp: factory.utp.load(Ordering::Relaxed),
+    };
     assert_eq!(factory.listeners.load(Ordering::Relaxed), 0);
     assert_eq!(client.listen_addr(), None);
     assert_eq!(client.ssl_listen_addr(), None);
@@ -301,5 +385,5 @@ async fn a_non_listening_datagram_route_completes_a_utp_only_torrent_transfer() 
             .all(|socket| socket.upgrade().is_none())
     );
     seed.stop().await;
-    Ok(())
+    Ok(sent)
 }

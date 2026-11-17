@@ -1609,7 +1609,6 @@ type HistoryItem {
 	health: Int!
 	hasPassword: Boolean!
 	category: String
-	attributes: [Attribute!]!
 	clientRequestId: String
 	outputDir: String
 	createdAt: DateTime!
@@ -1622,6 +1621,11 @@ type HistoryItem {
 	Null while it is not archived.
 	"""
 	archivedAt: DateTime
+	"""
+	The job's attributes. An RSS job's item link and id are among them
+	for an admin only.
+	"""
+	attributes: [Attribute!]!
 	"""
 	The job's tags, in tag order.
 	"""
@@ -1854,9 +1858,13 @@ type Job {
 	health: Int!
 	hasPassword: Boolean!
 	category: String
-	metadata: [MetadataEntry!]!
 	outputDir: String
 	createdAt: Float
+	"""
+	The job's metadata. An RSS job's item link and id are in it for an
+	admin only.
+	"""
+	metadata: [MetadataEntry!]!
 	"""
 	The job's tags, in tag order.
 	"""
@@ -3326,6 +3334,14 @@ enum PeerSource {
 	INCOMING
 }
 
+"""
+A transport peers are reached and taken on.
+"""
+enum PeerTransport {
+	TCP
+	UTP
+}
+
 type PeerUploadResult {
 	outcome: UploadOutcome!
 	bytes: Float!
@@ -4128,7 +4144,6 @@ type QueueItem {
 	remainingParCount: Int!
 	hasPassword: Boolean!
 	category: String
-	attributes: [Attribute!]!
 	clientRequestId: String
 	outputDir: String
 	createdAt: DateTime!
@@ -4138,6 +4153,11 @@ type QueueItem {
 	NZB material and credentials, which remain unavailable to GraphQL.
 	"""
 	duplicateSummary: DuplicateSummaryInfo
+	"""
+	The job's attributes. An RSS job's item link and id are among them
+	for an admin only.
+	"""
+	attributes: [Attribute!]!
 	"""
 	The job's tags, in tag order.
 	"""
@@ -6191,7 +6211,9 @@ type SubscriptionRoot {
 	(at most 500), or every torrent. The first push is the torrents as
 	they are, with `fullUpdate`; each later one comes when one of them
 	changes, a tracker's answer as soon as it lands, and carries only the
-	torrents that changed or came and the ids of the ones gone.
+	torrents that changed or came and the ids of the ones gone. Every
+	torrent is followed only once the stored torrents are all read at
+	start: asked before, it is an error with code `TORRENTS_LOADING`.
 	"""
 	torrentUpdates(id: Int, ids: [Int!]): TorrentChanges!
 }
@@ -6706,12 +6728,6 @@ type TorrentPeerFlags {
 	holepunched: Boolean!
 }
 
-enum TorrentPeerProtocol {
-	TCP_FIRST
-	UTP_FIRST
-	UTP_ONLY
-}
-
 type TorrentPeers {
 	"""
 	Torrents the client holds now.
@@ -6884,7 +6900,26 @@ type TorrentSettings {
 	unchokeSlotsLimit: Int
 	connectionSpeed: Int!
 	allowMultipleConnectionsPerIp: Boolean!
-	peerProtocol: TorrentPeerProtocol!
+	"""
+	Whether peers are reached and taken over TCP: listened on and
+	dialed.
+	"""
+	peerTcp: Boolean!
+	"""
+	Whether peers are reached and taken over uTP.
+	"""
+	peerUtp: Boolean!
+	"""
+	The transport a dial tries first while its torrent downloads, as
+	set; while one transport is off, the one left on is used.
+	"""
+	preferDownloading: PeerTransport!
+	"""
+	The transport a dial tries first once its torrent holds every piece
+	it wants, as set; while one transport is off, the one left on is
+	used.
+	"""
+	preferSeeding: PeerTransport!
 	dhtBootstrapNodes: String!
 	blocklistEnabled: Boolean!
 	"""
@@ -6929,7 +6964,14 @@ input TorrentSettingsInput {
 	unchokeSlotsLimit: Int
 	connectionSpeed: Int
 	allowMultipleConnectionsPerIp: Boolean
-	peerProtocol: TorrentPeerProtocol
+	"""
+	TCP and uTP may not both be off. The preferences are kept as set
+	either way.
+	"""
+	peerTcp: Boolean
+	peerUtp: Boolean
+	preferDownloading: PeerTransport
+	preferSeeding: PeerTransport
 	dhtBootstrapNodes: String
 	blocklistEnabled: Boolean
 	"""
@@ -7192,10 +7234,23 @@ type TrackerRule {
 	"""
 	encryption: TorrentEncryption
 	"""
-	The transport order its torrents dial peers in, within the
-	transports the session runs; absent inherits.
+	Whether its torrents dial peers over TCP; absent inherits. The
+	session listens as the global setting says.
 	"""
-	peerProtocol: TorrentPeerProtocol
+	peerTcp: Boolean
+	"""
+	Whether its torrents dial peers over uTP; absent inherits.
+	"""
+	peerUtp: Boolean
+	"""
+	The transport its torrents try first while downloading; absent
+	inherits.
+	"""
+	preferDownloading: PeerTransport
+	"""
+	The transport its torrents try first while seeding; absent inherits.
+	"""
+	preferSeeding: PeerTransport
 	"""
 	The upload cap its torrents take in place of their category's and
 	the global one.
@@ -7240,9 +7295,23 @@ input TrackerRuleInput {
 	lsd: Boolean
 	encryption: TorrentEncryption
 	"""
+	Left out inherits. TCP and uTP may not both be off once resolved
+	over the global setting. A preference is kept as set; while its
+	transport is off, the one left on is used.
+	"""
+	peerTcp: Boolean
+	"""
 	Left out inherits.
 	"""
-	peerProtocol: TorrentPeerProtocol
+	peerUtp: Boolean
+	"""
+	Left out inherits.
+	"""
+	preferDownloading: PeerTransport
+	"""
+	Left out inherits.
+	"""
+	preferSeeding: PeerTransport
 	"""
 	Left out inherits.
 	"""

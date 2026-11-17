@@ -983,7 +983,7 @@ async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
 #[tokio::test]
 async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse_out_of_range() {
     let h = TestHarness::new().await;
-    const FIELDS: &str = "connectionsLimit unchokeSlotsLimit connectionSpeed allowMultipleConnectionsPerIp peerProtocol dhtBootstrapNodes blocklistEnabled blocklist stopTrackerTimeoutSecs";
+    const FIELDS: &str = "connectionsLimit unchokeSlotsLimit connectionSpeed allowMultipleConnectionsPerIp peerTcp peerUtp preferDownloading preferSeeding dhtBootstrapNodes blocklistEnabled blocklist stopTrackerTimeoutSecs";
     let defaults = h
         .execute(&format!("{{ settings {{ torrent {{ {FIELDS} }} }} }}"))
         .await;
@@ -993,7 +993,10 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
     assert_eq!(torrent["unchokeSlotsLimit"], 8);
     assert_eq!(torrent["connectionSpeed"], 30);
     assert_eq!(torrent["allowMultipleConnectionsPerIp"], false);
-    assert_eq!(torrent["peerProtocol"], "TCP_FIRST");
+    assert_eq!(torrent["peerTcp"], true);
+    assert_eq!(torrent["peerUtp"], true);
+    assert_eq!(torrent["preferDownloading"], "TCP");
+    assert_eq!(torrent["preferSeeding"], "UTP");
     assert_eq!(
         torrent["dhtBootstrapNodes"],
         "dht.transmissionbt.com:6881,dht.libtorrent.org:25401"
@@ -1006,7 +1009,7 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
         .execute(&format!(
             r#"mutation {{ updateSettings(input: {{ torrent: {{
                 connectionsLimit: null, unchokeSlotsLimit: 16, connectionSpeed: 60,
-                allowMultipleConnectionsPerIp: true, peerProtocol: UTP_FIRST,
+                allowMultipleConnectionsPerIp: true, preferDownloading: UTP,
                 dhtBootstrapNodes: " router.example:6881 ,, 192.0.2.9:25401", blocklistEnabled: true,
                 blocklist: " C:\\lists\\level1.p2p ", stopTrackerTimeoutSecs: 0
             }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
@@ -1018,7 +1021,8 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
     assert_eq!(torrent["unchokeSlotsLimit"], 16);
     assert_eq!(torrent["connectionSpeed"], 60);
     assert_eq!(torrent["allowMultipleConnectionsPerIp"], true);
-    assert_eq!(torrent["peerProtocol"], "UTP_FIRST");
+    assert_eq!(torrent["preferDownloading"], "UTP");
+    assert_eq!(torrent["preferSeeding"], "UTP");
     assert_eq!(
         torrent["dhtBootstrapNodes"],
         "router.example:6881,192.0.2.9:25401"
@@ -1029,8 +1033,12 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
     let stored = h.db.load_config().unwrap();
     assert_eq!(stored.torrent, h.config.read().await.torrent);
     assert_eq!(
-        stored.torrent.peer_protocol,
-        weaver_server_core::settings::TorrentPeerProtocol::UtpFirst
+        stored.torrent.transports.dial_orders(),
+        weaver_server_core::settings::PeerTransports {
+            prefer_downloading: weaver_server_core::settings::PeerTransport::Utp,
+            ..Default::default()
+        }
+        .dial_orders()
     );
     assert_eq!(
         stored.torrent.connections_limit,
@@ -1042,6 +1050,8 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
         "unchokeSlotsLimit: 0",
         "connectionSpeed: 0",
         r#"dhtBootstrapNodes: "router.example""#,
+        // TCP and uTP cannot both be off.
+        "peerTcp: false, peerUtp: false",
     ] {
         let refused = h
             .execute(&format!(
@@ -1056,6 +1066,53 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
         );
         assert_eq!(h.config.read().await.torrent, stored.torrent, "{input}");
     }
+
+    // With one transport off, the preferences are kept as set and the
+    // dials use the one left on; turned on again, the kept ones are used.
+    use weaver_server_core::settings::{PeerTransport, PeerTransports};
+    // The orders of TCP alone, and of uTP first in both states.
+    let tcp_only = PeerTransports {
+        utp: false,
+        ..PeerTransports::default()
+    }
+    .dial_orders();
+    let utp_first = PeerTransports {
+        prefer_downloading: PeerTransport::Utp,
+        ..PeerTransports::default()
+    }
+    .dial_orders();
+    let off = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{
+                peerUtp: false, preferDownloading: UTP, preferSeeding: UTP
+            }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&off);
+    let torrent = &response_data(&off)["updateSettings"]["torrent"];
+    assert_eq!(torrent["peerTcp"], true);
+    assert_eq!(torrent["peerUtp"], false);
+    assert_eq!(torrent["preferDownloading"], "UTP");
+    assert_eq!(torrent["preferSeeding"], "UTP");
+    let kept = h.db.load_config().unwrap().torrent.transports;
+    assert_eq!(
+        (kept.prefer_downloading, kept.prefer_seeding),
+        (PeerTransport::Utp, PeerTransport::Utp)
+    );
+    assert_eq!(kept.dial_orders(), tcp_only);
+    let on = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{ peerUtp: true }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&on);
+    let torrent = &response_data(&on)["updateSettings"]["torrent"];
+    assert_eq!(torrent["preferDownloading"], "UTP");
+    assert_eq!(torrent["preferSeeding"], "UTP");
+    assert_eq!(
+        h.db.load_config().unwrap().torrent.transports.dial_orders(),
+        utp_first
+    );
 
     // An empty blocklist clears it, and the switch stays as it was.
     let cleared = h

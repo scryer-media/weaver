@@ -1819,17 +1819,17 @@ scope = "all"
 
 [[migration]]
 version = 128
-description = "a tracker rule may name the transport its torrents dial peers on first"
+description = "a tracker rule may set the transports its torrents dial peers on, and the one each tries first"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0128_tracker_rule_peer_protocol/sqlite.sql"
+file = "migrations/0128_tracker_rule_transports/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0128_tracker_rule_peer_protocol/postgres.sql"
+file = "migrations/0128_tracker_rule_transports/postgres.sql"
 engine = "postgres"
 scope = "all"

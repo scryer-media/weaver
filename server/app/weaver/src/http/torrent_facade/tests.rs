@@ -1503,7 +1503,7 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
-                peer_protocol: None,
+                transports: Default::default(),
                 bound: None,
                 archive_passwords: Default::default(),
                 id: 0,
@@ -2543,36 +2543,49 @@ async fn preferences_read_and_apply_the_mapped_keys() {
     assert_eq!(after["ip_filter_path"], "/var/lib/weaver/level1.p2p");
     let saved = rig.config.read().await.torrent.clone();
     assert_eq!(
-        saved.peer_protocol,
-        weaver_server_core::settings::TorrentPeerProtocol::TcpFirst
+        saved.transports,
+        weaver_server_core::settings::PeerTransports::default()
     );
 
-    // uTP alone is 2; both keeps uTP first once it is set; TCP alone is not
-    // a setting, and is refused.
+    // qBittorrent's 0, 1 and 2 set both, TCP alone and uTP alone, and read
+    // back as set. The preferred transports have no field there and are
+    // kept as they were through the round trip; the dials use the one left
+    // on meanwhile.
     {
-        use weaver_server_core::settings::TorrentPeerProtocol;
-        assert_eq!(
-            rig.set_preferences(r#"{"bittorrent_protocol":2}"#).await,
-            StatusCode::OK
-        );
-        let after = rig.get("/api/v2/app/preferences").await.json();
-        assert_eq!(after["bittorrent_protocol"], 2);
-        let saved = rig.config.read().await.torrent.peer_protocol;
-        assert_eq!(saved, TorrentPeerProtocol::UtpOnly);
-        rig.config.write().await.torrent.peer_protocol = TorrentPeerProtocol::UtpFirst;
-        assert_eq!(
-            rig.set_preferences(r#"{"bittorrent_protocol":0}"#).await,
-            StatusCode::OK
-        );
-        let saved = rig.config.read().await.torrent.peer_protocol;
-        assert_eq!(saved, TorrentPeerProtocol::UtpFirst);
+        use weaver_server_core::settings::{PeerTransport, PeerTransports};
+        let transports = |tcp, utp, downloading, seeding| PeerTransports {
+            tcp,
+            utp,
+            prefer_downloading: downloading,
+            prefer_seeding: seeding,
+        };
+        let (tcp, utp) = (PeerTransport::Tcp, PeerTransport::Utp);
+        let before = rig.config.read().await.torrent.transports;
+        assert_eq!(before, transports(true, true, tcp, utp));
+        for (protocol, expected, effective) in [
+            (2, transports(false, true, tcp, utp), (utp, utp)),
+            (0, transports(true, true, tcp, utp), (tcp, utp)),
+            (1, transports(true, false, tcp, utp), (tcp, tcp)),
+            (0, transports(true, true, tcp, utp), (tcp, utp)),
+        ] {
+            assert_eq!(
+                rig.set_preferences(&format!(r#"{{"bittorrent_protocol":{protocol}}}"#))
+                    .await,
+                StatusCode::OK
+            );
+            let after = rig.get("/api/v2/app/preferences").await.json();
+            assert_eq!(after["bittorrent_protocol"], protocol);
+            let saved = rig.config.read().await.torrent.transports;
+            assert_eq!(saved, expected);
+            let used = saved.effective();
+            assert_eq!((used.prefer_downloading, used.prefer_seeding), effective);
+        }
+        assert_eq!(rig.config.read().await.torrent.transports, before);
         assert_ne!(
-            rig.set_preferences(r#"{"bittorrent_protocol":1}"#).await,
+            rig.set_preferences(r#"{"bittorrent_protocol":3}"#).await,
             StatusCode::OK
         );
-        let saved = rig.config.read().await.torrent.peer_protocol;
-        assert_eq!(saved, TorrentPeerProtocol::UtpFirst);
-        rig.config.write().await.torrent.peer_protocol = TorrentPeerProtocol::TcpFirst;
+        assert_eq!(rig.config.read().await.torrent.transports, before);
     }
 
     // qBittorrent's zero or less is no limit for connections and upload

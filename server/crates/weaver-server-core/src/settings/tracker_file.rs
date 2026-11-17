@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    ArchivePasswords, Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy,
-    TorrentEncryption, TrackerCertificate, TrackerRule,
+    ArchivePasswords, Leaf, PeerTransport, SeedTimeCounting, SeedingAction, SeedingGoalMode,
+    SeedingPolicy, TorrentEncryption, TrackerCertificate, TrackerRule,
 };
 
 // The largest upload accepted, in bytes.
@@ -90,6 +90,12 @@ pub struct Terms {
     pub pex: Option<bool>,
     pub lsd: Option<bool>,
     pub encryption: Option<TorrentEncryption>,
+    // The transports the rule's torrents dial, and the one each tries first
+    // while downloading and while seeding.
+    pub peer_tcp: Option<bool>,
+    pub peer_utp: Option<bool>,
+    pub prefer_downloading: Option<PeerTransport>,
+    pub prefer_seeding: Option<PeerTransport>,
     // Only ever recommended: a seeding goal is a stop rule, and a tracker
     // that locked one would hold the user to stopping.
     pub seeding: Option<SeedingTerms>,
@@ -114,6 +120,10 @@ pub const FIELD_DHT: &str = "dht";
 pub const FIELD_PEX: &str = "pex";
 pub const FIELD_LSD: &str = "lsd";
 pub const FIELD_ENCRYPTION: &str = "encryption";
+pub const FIELD_PEER_TCP: &str = "peer_tcp";
+pub const FIELD_PEER_UTP: &str = "peer_utp";
+pub const FIELD_PREFER_DOWNLOADING: &str = "prefer_downloading";
+pub const FIELD_PREFER_SEEDING: &str = "prefer_seeding";
 pub const FIELD_SSL: &str = "ssl";
 
 impl Terms {
@@ -124,6 +134,10 @@ impl Terms {
             (FIELD_PEX, self.pex.is_some()),
             (FIELD_LSD, self.lsd.is_some()),
             (FIELD_ENCRYPTION, self.encryption.is_some()),
+            (FIELD_PEER_TCP, self.peer_tcp.is_some()),
+            (FIELD_PEER_UTP, self.peer_utp.is_some()),
+            (FIELD_PREFER_DOWNLOADING, self.prefer_downloading.is_some()),
+            (FIELD_PREFER_SEEDING, self.prefer_seeding.is_some()),
         ]
         .into_iter()
         .filter_map(|(field, set)| set.then_some(field))
@@ -180,6 +194,37 @@ impl TrackerFile {
             before.encryption,
         );
         applied.encryption = required.encryption.or(encryption).or(applied.encryption);
+        let transports = &mut applied.transports;
+        take(
+            &mut transports.tcp,
+            required.peer_tcp,
+            recommended.peer_tcp,
+            before.peer_tcp,
+        );
+        take(
+            &mut transports.utp,
+            required.peer_utp,
+            recommended.peer_utp,
+            before.peer_utp,
+        );
+        for (value, required, recommended, before) in [
+            (
+                &mut transports.prefer_downloading,
+                required.prefer_downloading,
+                recommended.prefer_downloading,
+                before.prefer_downloading,
+            ),
+            (
+                &mut transports.prefer_seeding,
+                required.prefer_seeding,
+                recommended.prefer_seeding,
+                before.prefer_seeding,
+            ),
+        ] {
+            *value = required
+                .or(recommend(*value, recommended, before))
+                .or(*value);
+        }
         // Each seeding leaf the file recommends is taken while the rule's
         // leaf is still what the last file recommended.
         if let Some(seeding) = recommended.seeding {
@@ -269,6 +314,12 @@ pub fn check_locks(rule: &TrackerRule, changed: &TrackerRule) -> Result<(), Stri
         FIELD_PEX => rule.pex != changed.pex,
         FIELD_LSD => rule.lsd != changed.lsd,
         FIELD_ENCRYPTION => rule.encryption != changed.encryption,
+        FIELD_PEER_TCP => rule.transports.tcp != changed.transports.tcp,
+        FIELD_PEER_UTP => rule.transports.utp != changed.transports.utp,
+        FIELD_PREFER_DOWNLOADING => {
+            rule.transports.prefer_downloading != changed.transports.prefer_downloading
+        }
+        FIELD_PREFER_SEEDING => rule.transports.prefer_seeding != changed.transports.prefer_seeding,
         FIELD_SSL => rule.ssl != changed.ssl,
         _ => false,
     };
@@ -349,6 +400,20 @@ impl TrackerFile {
                 old.lsd,
                 applied.lsd,
             ),
+            (
+                FIELD_PEER_TCP,
+                required.peer_tcp,
+                recommended.peer_tcp,
+                old.transports.tcp,
+                applied.transports.tcp,
+            ),
+            (
+                FIELD_PEER_UTP,
+                required.peer_utp,
+                recommended.peer_utp,
+                old.transports.utp,
+                applied.transports.utp,
+            ),
         ] {
             let set = required.is_some() || recommended.is_some();
             push(field, required.is_some(), set, flag(old), flag(new));
@@ -361,6 +426,31 @@ impl TrackerFile {
             encryption(old.encryption),
             encryption(applied.encryption),
         );
+        let transport = |value: Option<PeerTransport>| value.map(|t| t.as_str().to_owned());
+        for (field, required, recommended, old, new) in [
+            (
+                FIELD_PREFER_DOWNLOADING,
+                required.prefer_downloading,
+                recommended.prefer_downloading,
+                old.transports.prefer_downloading,
+                applied.transports.prefer_downloading,
+            ),
+            (
+                FIELD_PREFER_SEEDING,
+                required.prefer_seeding,
+                recommended.prefer_seeding,
+                old.transports.prefer_seeding,
+                applied.transports.prefer_seeding,
+            ),
+        ] {
+            push(
+                field,
+                required.is_some(),
+                required.is_some() || recommended.is_some(),
+                transport(old),
+                transport(new),
+            );
+        }
         if let Some(seeding) = recommended.seeding {
             // A leaf as a change shows it: absent while it inherits.
             fn text<T>(leaf: Leaf<T>, show: impl Fn(T) -> String) -> Option<String> {
@@ -959,6 +1049,13 @@ fn parse(text: &str, members: &Members) -> Result<TrackerFile, String> {
     {
         return Err(format!("{field} is in both [required] and [recommended]."));
     }
+    if required.peer_tcp.or(recommended.peer_tcp) == Some(false)
+        && required.peer_utp.or(recommended.peer_utp) == Some(false)
+    {
+        return Err(format!(
+            "{FIELD_PEER_TCP} and {FIELD_PEER_UTP} cannot both be false."
+        ));
+    }
     Ok(TrackerFile {
         name,
         revision,
@@ -1017,17 +1114,19 @@ fn terms(table: &toml::Table, section_name: &str) -> Result<Terms, String> {
             FIELD_DHT => terms.dht = switch()?,
             FIELD_PEX => terms.pex = switch()?,
             FIELD_LSD => terms.lsd = switch()?,
-            FIELD_ENCRYPTION => match value {
-                toml::Value::String(mode) if mode == TorrentEncryption::Require.as_str() => {
-                    terms.encryption = Some(TorrentEncryption::Require);
-                }
-                toml::Value::String(mode) => {
-                    return Err(format!(
-                        "{path} may only be \"require\", not \"{mode}\"; a tracker may only tighten it."
-                    ));
-                }
-                _ => return Err(format!("{path} must be \"require\".")),
-            },
+            FIELD_ENCRYPTION => {
+                terms.encryption =
+                    Some(named(value, &path, TorrentEncryption::parse, ENCRYPTIONS)?);
+            }
+            FIELD_PEER_TCP => terms.peer_tcp = switch()?,
+            FIELD_PEER_UTP => terms.peer_utp = switch()?,
+            FIELD_PREFER_DOWNLOADING => {
+                terms.prefer_downloading =
+                    Some(named(value, &path, PeerTransport::parse, TRANSPORTS)?);
+            }
+            FIELD_PREFER_SEEDING => {
+                terms.prefer_seeding = Some(named(value, &path, PeerTransport::parse, TRANSPORTS)?);
+            }
             "seeding" if required => {
                 return Err(format!(
                     "{path} is refused: a seeding goal may be recommended, never required."
@@ -1038,6 +1137,25 @@ fn terms(table: &toml::Table, section_name: &str) -> Result<Terms, String> {
         }
     }
     Ok(terms)
+}
+
+// The values the API names each setting's choices by.
+const ENCRYPTIONS: &str = "\"prefer\", \"require\" or \"disabled\"";
+const TRANSPORTS: &str = "\"tcp\" or \"utp\"";
+
+// A value named by text, or a refusal naming the field and what it may be.
+fn named<T>(
+    value: &toml::Value,
+    path: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    names: &str,
+) -> Result<T, String> {
+    match value {
+        toml::Value::String(name) => {
+            parse(name).ok_or_else(|| format!("{path} must be {names}, not \"{name}\"."))
+        }
+        _ => Err(format!("{path} must be {names}.")),
+    }
 }
 
 fn seeding(value: &toml::Value, path: &str) -> Result<SeedingTerms, String> {

@@ -6,8 +6,8 @@ use crate::persistence::Database;
 use crate::persistence::encryption::{EncryptionKey, decrypt_value, encrypt_value, is_encrypted};
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
 use crate::settings::model::{
-    ArchivePasswords, Client, Leaf, SeedingPolicy, TorrentEncryption, TorrentPeerProtocol,
-    TrackerCertificate, TrackerRule,
+    ArchivePasswords, Client, Leaf, PeerTransport, SeedingPolicy, TorrentEncryption,
+    TrackerCertificate, TrackerRule, TransportRule,
 };
 
 #[cfg(test)]
@@ -17,7 +17,17 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key, bound, archive_passwords, peer_protocol";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key, bound, archive_passwords, peer_tcp, peer_utp, prefer_downloading, prefer_seeding";
+
+fn prefer_of(row: &SqlRow, column: &str) -> Result<Option<PeerTransport>, StateError> {
+    row.opt_text(column)?
+        .map(|transport| {
+            PeerTransport::parse(&transport).ok_or_else(|| {
+                StateError::Database(format!("tracker rule {column} {transport} is not known"))
+            })
+        })
+        .transpose()
+}
 
 fn tracker_rule_from_row(
     row: &SqlRow,
@@ -61,16 +71,12 @@ fn tracker_rule_from_row(
                 })
             })
             .transpose()?,
-        peer_protocol: row
-            .opt_text("peer_protocol")?
-            .map(|protocol| {
-                TorrentPeerProtocol::parse(&protocol).ok_or_else(|| {
-                    StateError::Database(format!(
-                        "tracker rule peer protocol {protocol} is not known"
-                    ))
-                })
-            })
-            .transpose()?,
+        transports: TransportRule {
+            tcp: row.opt_bool("peer_tcp")?,
+            utp: row.opt_bool("peer_utp")?,
+            prefer_downloading: prefer_of(row, "prefer_downloading")?,
+            prefer_seeding: prefer_of(row, "prefer_seeding")?,
+        },
         upload_cap: {
             let text = row.opt_text("upload_cap")?;
             Leaf::from_text(text.as_deref()).ok_or_else(|| {
@@ -202,9 +208,17 @@ fn tracker_rule_args(
                 .map_err(|error| StateError::Database(error.to_string()))?,
         ),
         SqlArg::OptText(seal_archive_passwords(key, &rule.archive_passwords)?),
+        SqlArg::OptBool(rule.transports.tcp),
+        SqlArg::OptBool(rule.transports.utp),
         SqlArg::OptText(
-            rule.peer_protocol
-                .map(|protocol| protocol.as_str().to_owned()),
+            rule.transports
+                .prefer_downloading
+                .map(|transport| transport.as_str().to_owned()),
+        ),
+        SqlArg::OptText(
+            rule.transports
+                .prefer_seeding
+                .map(|transport| transport.as_str().to_owned()),
         ),
     ])
 }
@@ -256,7 +270,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO tracker_rules ({TRACKER_RULE_COLUMNS}, created_at_ms, updated_at_ms)
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &values,
                     )
@@ -280,7 +294,8 @@ impl Database {
                     SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
                         dht = {}, pex = {}, lsd = {}, encryption = {}, upload_cap = {}, forced = {},
                         ssl_certificate = {}, ssl_private_key = {}, bound = {}, archive_passwords = {},
-                        peer_protocol = {}, updated_at_ms = {}
+                        peer_tcp = {}, peer_utp = {}, prefer_downloading = {}, prefer_seeding = {},
+                        updated_at_ms = {}
                   WHERE id = {}",
                 &args,
             )
