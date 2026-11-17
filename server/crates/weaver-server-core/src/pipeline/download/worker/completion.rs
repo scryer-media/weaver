@@ -315,6 +315,7 @@ impl Pipeline {
             RetryWork {
                 scheduled_pool_generation,
                 infrastructure_retry: true,
+                hold: crate::pipeline::RetryHold::Ordinary,
                 work,
             },
         );
@@ -468,6 +469,7 @@ impl Pipeline {
                 .send(crate::pipeline::RetryWork {
                     scheduled_pool_generation,
                     infrastructure_retry: false,
+                    hold: crate::pipeline::RetryHold::Ordinary,
                     work,
                 })
                 .await;
@@ -1623,9 +1625,14 @@ impl Pipeline {
                             self.metrics
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
-                            let delay = if self
+                            let hold = if self
                                 .transport_streak_holds_retry(transport_streak, source_server_idx)
                             {
+                                crate::pipeline::RetryHold::ProbeHold
+                            } else {
+                                crate::pipeline::RetryHold::Ordinary
+                            };
+                            let delay = if hold == crate::pipeline::RetryHold::ProbeHold {
                                 // The failure that quarantines a server is
                                 // followed by one probe, and the probe takes
                                 // the highest-priority work — this segment
@@ -1668,6 +1675,7 @@ impl Pipeline {
                             let retry = crate::pipeline::RetryWork {
                                 scheduled_pool_generation,
                                 infrastructure_retry,
+                                hold,
                                 work,
                             };
                             if infrastructure_retry {

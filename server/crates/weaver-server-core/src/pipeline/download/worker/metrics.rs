@@ -64,7 +64,7 @@ impl Pipeline {
     // download work. Its wait is the earliest future deadline among the
     // holds the scheduler keeps on it — a propagation deferral, a restart
     // durable-lead retry, a timed infrastructure retry of one of its
-    // articles — or the soft byte-pressure delay every job shares. A job
+    // articles other than a probe hold — or the soft byte-pressure delay every job shares. A job
     // whose articles are being built, or all of whose queued download work
     // waits on a fill server refusing the login
     // ([`Self::job_login_refusal_wait`]), waits until now, so the stall
@@ -77,7 +77,12 @@ impl Pipeline {
     //
     // Retries that sleep in their own task (a body-lane or blocked-server
     // recheck, a server quota wait) keep no deadline here, so they do not
-    // explain a stall; their articles are not in the queue either.
+    // explain a stall; their articles are not in the queue either. Nor does
+    // a retry held past a quarantined server's recovery backoff
+    // ([`RetryWork::explains_dispatch_wait`]): the hold steers that server's
+    // probe to other work, and a probe failing on every visit would
+    // otherwise keep one such hold in the future at all times and the
+    // stall explained for good.
     pub(in crate::pipeline) fn earliest_explained_dispatch_wait(
         &self,
         now: Instant,
@@ -96,6 +101,9 @@ impl Pipeline {
     fn explained_dispatch_waits(&self, now: Instant) -> HashMap<JobId, Instant> {
         let mut retry_deadlines: HashMap<JobId, Instant> = HashMap::new();
         for (deadline, retry) in self.infrastructure_retries.iter_with_deadlines() {
+            if !retry.explains_dispatch_wait() {
+                continue;
+            }
             let Some(deadline) = deadline.map(tokio::time::Instant::into_std) else {
                 continue;
             };
@@ -219,9 +227,11 @@ impl Pipeline {
         // contended ranking says nothing about the servers and holds the
         // clock too. Accepted narrower case: while any server is available,
         // a stalled job whose articles only a cooled-down server holds still
-        // escalates after the windows. A fill server refusing the login is
-        // the exception: while the job's work waits on it alone, the clock
-        // restarts (see `explained_dispatch_waits`).
+        // escalates after the windows, however often that server's probe
+        // fails: the hold a failed probe's article is parked under explains
+        // nothing (see `explained_dispatch_waits`). A fill server refusing
+        // the login is the exception: while the job's work waits on it
+        // alone, the clock restarts (see `explained_dispatch_waits`).
         if self.dispatchable_server_count() == 0 {
             if let Some(watch) = self.download_dispatch_stall.as_mut() {
                 watch.since = now;

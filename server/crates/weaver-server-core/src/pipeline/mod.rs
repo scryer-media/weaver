@@ -491,7 +491,29 @@ pub(super) struct DownloadResult {
 pub(in crate::pipeline) struct RetryWork {
     pub(in crate::pipeline) scheduled_pool_generation: u64,
     pub(in crate::pipeline) infrastructure_retry: bool,
+    pub(in crate::pipeline) hold: RetryHold,
     pub(in crate::pipeline) work: DownloadWork,
+}
+
+// What a retry's delay is for. Kept in memory only, with the retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) enum RetryHold {
+    // The ordinary wait before the article is asked again: while it runs,
+    // its job waits on it.
+    Ordinary,
+    // Held past a quarantined server's recovery backoff
+    // (`SEGMENT_TRANSPORT_HOLD_DELAY`) so the server's probe carries other
+    // work. It steers the probe; the job does not wait on it.
+    ProbeHold,
+}
+
+impl RetryWork {
+    // Whether this retry's deadline, while parked, is a wait its job's
+    // dispatch stall is explained by. The one owner of that answer: a probe
+    // hold never is.
+    pub(in crate::pipeline) fn explains_dispatch_wait(&self) -> bool {
+        self.hold == RetryHold::Ordinary
+    }
 }
 
 #[derive(Debug, Clone)]

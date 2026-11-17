@@ -1208,6 +1208,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
             RetryWork {
                 scheduled_pool_generation: pipeline.pool_generation,
                 infrastructure_retry: true,
+                hold: crate::pipeline::RetryHold::Ordinary,
                 work: DownloadWork {
                     counters: None,
                     segment_id,
