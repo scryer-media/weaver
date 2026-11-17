@@ -120,6 +120,8 @@ async fn every_rung_passes_against_a_loopback_tracker_and_seeder() {
     );
     assert_eq!(report.mapped_port, None);
     assert_eq!(report.upload, None);
+    // The default settings turn uTP on, and the leg carries it: the session
+    // listens on uTP as well, and says so.
     assert_eq!(
         report.exposure,
         Some(Exposure {
@@ -129,7 +131,7 @@ async fn every_rung_passes_against_a_loopback_tracker_and_seeder() {
             inbound: false,
             udp_trackers: true,
             dht: true,
-            utp: false,
+            utp: true,
         })
     );
 

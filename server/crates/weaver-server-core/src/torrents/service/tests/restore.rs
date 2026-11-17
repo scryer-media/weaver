@@ -984,6 +984,9 @@ async fn the_tick_and_the_list_answer_while_restores_are_held() {
     again.restored().await;
     assert_eq!(written.borrow().checkpoints_read, 1);
     assert!(again.inner.live.lock().await[&job_id].store.is_some());
+    // Back in its session, the torrent checks what was saved of it until
+    // the engine has it, and then no longer reads as starting.
+    super::listing::settled(&again, 1).await;
     assert_ne!(
         again.torrent(job_id).await.unwrap().state,
         TorrentState::CheckingResumeData
