@@ -1099,6 +1099,51 @@ async fn an_add_is_answered_before_its_routes_session_opens() {
     rig.service.stop().await;
 }
 
+// A route's session that a torrent asks to open while the sweep of idle
+// sessions runs is not taken for idle: the torrent joins it once it opens.
+// The sweep is held once it has read the routes the torrents use; when it
+// holds nothing there, the add plans its route and asks it to open before
+// the sweep reads the sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_route_opened_while_idle_sessions_are_swept_is_kept() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    let mut held = rig.service.sweeps_held();
+    let reached = *held.borrow_and_update();
+    rig.service.hold_sweep(true);
+    let sweep = {
+        let service = rig.service.clone();
+        tokio::spawn(async move { service.drop_idle_sessions().await })
+    };
+    held.wait_for(|held| *held > reached).await.unwrap();
+
+    let sweep_holds_torrents = rig.service.inner.live.try_lock().is_err();
+    let adding = {
+        let service = rig.service.clone();
+        tokio::spawn(async move {
+            service
+                .add(request(AddSource::Metainfo(plain("set", 1))))
+                .await
+        })
+    };
+    if !sweep_holds_torrents {
+        asked.wait_for(|asked| *asked > before).await.unwrap();
+    }
+    rig.service.hold_sweep(false);
+    sweep.await.unwrap();
+    let job_id = adding.await.unwrap().unwrap();
+
+    rig.routes.unanswered.send_replace(false);
+    rig.service.opened(job_id).await;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.route_reason, None);
+    handle_of(&rig.service, job_id).await;
+    rig.service.stop().await;
+}
+
 // An add whose route then fails to open is answered as opening, and goes on
 // to say why the route did not open: nothing of it went anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
