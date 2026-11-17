@@ -6704,9 +6704,9 @@ type TorrentPeerFlags {
 }
 
 enum TorrentPeerProtocol {
-	TCP
-	UTP
-	BOTH
+	TCP_FIRST
+	UTP_FIRST
+	UTP_ONLY
 }
 
 type TorrentPeers {
@@ -6836,6 +6836,7 @@ enum TorrentRouteReason {
 	LISTEN_PORT_BIND_FAILED
 	SESSION_STATE_UNREADABLE
 	SESSION_BUILD_FAILED
+	UTP_UNAVAILABLE
 	BLOCKLIST_FAILED
 	SESSION_LIMIT
 	OPENING

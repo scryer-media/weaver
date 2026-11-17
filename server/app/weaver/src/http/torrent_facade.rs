@@ -3230,9 +3230,8 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "connection_speed": torrent.connection_speed,
         "enable_multi_connections_from_same_ip": torrent.allow_multiple_connections_per_ip,
         "bittorrent_protocol": match torrent.peer_protocol {
-            TorrentPeerProtocol::Both => 0,
-            TorrentPeerProtocol::Tcp => 1,
-            TorrentPeerProtocol::Utp => 2,
+            TorrentPeerProtocol::TcpFirst | TorrentPeerProtocol::UtpFirst => 0,
+            TorrentPeerProtocol::UtpOnly => 2,
         },
         "dht_bootstrap_nodes": torrent.dht_bootstrap_nodes,
         "ip_filter_enabled": torrent.blocklist_enabled,
@@ -3329,10 +3328,12 @@ fn torrent_preferences(
         torrent.allow_multiple_connections_per_ip = allow;
     }
     if let Some(protocol) = changes.get("bittorrent_protocol") {
+        // qBittorrent's both keeps the order set when it is one of TCP and
+        // uTP both; TCP alone is not a setting here.
         torrent.peer_protocol = match protocol.as_i64() {
-            Some(0) => TorrentPeerProtocol::Both,
-            Some(1) => TorrentPeerProtocol::Tcp,
-            Some(2) => TorrentPeerProtocol::Utp,
+            Some(0) if torrent.peer_protocol.tcp() => torrent.peer_protocol,
+            Some(0) => TorrentPeerProtocol::TcpFirst,
+            Some(2) => TorrentPeerProtocol::UtpOnly,
             _ => return Err(out_of_range("bittorrent_protocol")),
         };
     }

@@ -993,7 +993,7 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
     assert_eq!(torrent["unchokeSlotsLimit"], 8);
     assert_eq!(torrent["connectionSpeed"], 30);
     assert_eq!(torrent["allowMultipleConnectionsPerIp"], false);
-    assert_eq!(torrent["peerProtocol"], "TCP");
+    assert_eq!(torrent["peerProtocol"], "TCP_FIRST");
     assert_eq!(
         torrent["dhtBootstrapNodes"],
         "dht.transmissionbt.com:6881,dht.libtorrent.org:25401"
@@ -1006,7 +1006,7 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
         .execute(&format!(
             r#"mutation {{ updateSettings(input: {{ torrent: {{
                 connectionsLimit: null, unchokeSlotsLimit: 16, connectionSpeed: 60,
-                allowMultipleConnectionsPerIp: true, peerProtocol: BOTH,
+                allowMultipleConnectionsPerIp: true, peerProtocol: UTP_FIRST,
                 dhtBootstrapNodes: " router.example:6881 ,, 192.0.2.9:25401", blocklistEnabled: true,
                 blocklist: " C:\\lists\\level1.p2p ", stopTrackerTimeoutSecs: 0
             }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
@@ -1018,7 +1018,7 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
     assert_eq!(torrent["unchokeSlotsLimit"], 16);
     assert_eq!(torrent["connectionSpeed"], 60);
     assert_eq!(torrent["allowMultipleConnectionsPerIp"], true);
-    assert_eq!(torrent["peerProtocol"], "BOTH");
+    assert_eq!(torrent["peerProtocol"], "UTP_FIRST");
     assert_eq!(
         torrent["dhtBootstrapNodes"],
         "router.example:6881,192.0.2.9:25401"
@@ -1028,6 +1028,10 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
     assert_eq!(torrent["stopTrackerTimeoutSecs"], 0);
     let stored = h.db.load_config().unwrap();
     assert_eq!(stored.torrent, h.config.read().await.torrent);
+    assert_eq!(
+        stored.torrent.peer_protocol,
+        weaver_server_core::settings::TorrentPeerProtocol::UtpFirst
+    );
     assert_eq!(
         stored.torrent.connections_limit,
         weaver_server_core::settings::TorrentLimit::Unlimited

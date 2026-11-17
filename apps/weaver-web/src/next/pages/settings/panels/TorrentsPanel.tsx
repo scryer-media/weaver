@@ -1128,7 +1128,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
 }
 
 type TorrentEncryption = "PREFER" | "REQUIRE";
-type TorrentPeerProtocol = "TCP" | "UTP" | "BOTH";
+type TorrentPeerProtocol = "TCP_FIRST" | "UTP_FIRST" | "UTP_ONLY";
 
 interface TorrentConnection {
   enabled: boolean;
@@ -1176,7 +1176,7 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   unchokeSlotsLimit: 8,
   connectionSpeed: 30,
   allowMultipleConnectionsPerIp: false,
-  peerProtocol: "TCP",
+  peerProtocol: "TCP_FIRST",
   dhtBootstrapNodes: "dht.transmissionbt.com:6881,dht.libtorrent.org:25401",
   blocklistEnabled: false,
   blocklist: null,
@@ -1191,10 +1191,11 @@ const DEFAULT_CONNECTION: TorrentConnection = {
 /** The SSL port an operator's own starts from. */
 const DEFAULT_SSL_PORT = 4433;
 
-const PEER_PROTOCOLS: { value: TorrentPeerProtocol; label: string }[] = [
-  { value: "TCP", label: "next.torrents.peerProtocolTcp" },
-  { value: "UTP", label: "next.torrents.peerProtocolUtp" },
-  { value: "BOTH", label: "next.torrents.peerProtocolBoth" },
+/** Each order's label and the help line shown while it is chosen. */
+const PEER_PROTOCOLS: { value: TorrentPeerProtocol; label: string; help: string }[] = [
+  { value: "TCP_FIRST", label: "next.torrents.peerProtocolTcpFirst", help: "next.torrents.peerProtocolTcpFirstHelp" },
+  { value: "UTP_FIRST", label: "next.torrents.peerProtocolUtpFirst", help: "next.torrents.peerProtocolUtpFirstHelp" },
+  { value: "UTP_ONLY", label: "next.torrents.peerProtocolUtpOnly", help: "next.torrents.peerProtocolUtpOnlyHelp" },
 ];
 
 /** Option labels are translation keys, resolved when the panel renders. */
@@ -1386,11 +1387,15 @@ export function TorrentsPanel() {
             {
               id: "peerProtocol",
               label: t("next.torrents.peerProtocol"),
-              keywords: "tcp utp protocol",
+              keywords: "tcp utp protocol order",
+              help: t(
+                (PEER_PROTOCOLS.find((option) => option.value === values.torrent.peerProtocol) ?? PEER_PROTOCOLS[0])
+                  .help,
+              ),
               control: {
-                kind: "segmented",
+                kind: "select",
                 value: values.torrent.peerProtocol,
-                options: PEER_PROTOCOLS.map((option) => ({ ...option, label: t(option.label) })),
+                options: PEER_PROTOCOLS.map((option) => ({ value: option.value, label: t(option.label) })),
                 onChange: (peerProtocol) => patchTorrent({ peerProtocol: peerProtocol as TorrentPeerProtocol }),
               },
             },

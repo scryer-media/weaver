@@ -2447,7 +2447,7 @@ async fn preferences_read_and_apply_the_mapped_keys() {
     assert_eq!(before["max_uploads"], 8);
     assert_eq!(before["connection_speed"], 30);
     assert_eq!(before["enable_multi_connections_from_same_ip"], false);
-    assert_eq!(before["bittorrent_protocol"], 1);
+    assert_eq!(before["bittorrent_protocol"], 0);
     assert_eq!(
         before["dht_bootstrap_nodes"],
         "dht.transmissionbt.com:6881,dht.libtorrent.org:25401"
@@ -2501,8 +2501,36 @@ async fn preferences_read_and_apply_the_mapped_keys() {
     let saved = rig.config.read().await.torrent.clone();
     assert_eq!(
         saved.peer_protocol,
-        weaver_server_core::settings::TorrentPeerProtocol::Both
+        weaver_server_core::settings::TorrentPeerProtocol::TcpFirst
     );
+
+    // uTP alone is 2; both keeps uTP first once it is set; TCP alone is not
+    // a setting, and is refused.
+    {
+        use weaver_server_core::settings::TorrentPeerProtocol;
+        assert_eq!(
+            rig.set_preferences(r#"{"bittorrent_protocol":2}"#).await,
+            StatusCode::OK
+        );
+        let after = rig.get("/api/v2/app/preferences").await.json();
+        assert_eq!(after["bittorrent_protocol"], 2);
+        let saved = rig.config.read().await.torrent.peer_protocol;
+        assert_eq!(saved, TorrentPeerProtocol::UtpOnly);
+        rig.config.write().await.torrent.peer_protocol = TorrentPeerProtocol::UtpFirst;
+        assert_eq!(
+            rig.set_preferences(r#"{"bittorrent_protocol":0}"#).await,
+            StatusCode::OK
+        );
+        let saved = rig.config.read().await.torrent.peer_protocol;
+        assert_eq!(saved, TorrentPeerProtocol::UtpFirst);
+        assert_ne!(
+            rig.set_preferences(r#"{"bittorrent_protocol":1}"#).await,
+            StatusCode::OK
+        );
+        let saved = rig.config.read().await.torrent.peer_protocol;
+        assert_eq!(saved, TorrentPeerProtocol::UtpFirst);
+        rig.config.write().await.torrent.peer_protocol = TorrentPeerProtocol::TcpFirst;
+    }
 
     // qBittorrent's zero or less is no limit for connections and upload
     // slots, and a negative stop tracker timeout is none.

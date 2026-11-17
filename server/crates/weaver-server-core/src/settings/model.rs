@@ -971,7 +971,7 @@ impl Default for TorrentConfig {
             unchoke_slots_limit: TorrentLimit::Count(NonZeroU32::new(8).unwrap()),
             connection_speed: NonZeroU32::new(30).unwrap(),
             allow_multiple_connections_per_ip: false,
-            peer_protocol: TorrentPeerProtocol::Tcp,
+            peer_protocol: TorrentPeerProtocol::TcpFirst,
             // The routers the engine bootstraps from when told none.
             dht_bootstrap_nodes: weaver_torrent::dht::DHT_BOOTSTRAP.join(","),
             blocklist_enabled: false,
@@ -1133,42 +1133,50 @@ impl BlocklistSource {
     }
 }
 
-// The transports peers are reached and taken on (libtorrent
-// `enable_outgoing_tcp`, `enable_incoming_tcp`, `enable_outgoing_utp`,
-// `enable_incoming_utp`, set together as qBittorrent's `BTProtocol` does).
+// The transports peers are reached and taken on, and the order an outgoing
+// connection tries them in. TCP first dials a peer over TCP and races uTP
+// behind it; uTP first dials uTP alone and TCP once that fails, as
+// libtorrent does with `enable_outgoing_utp` and `enable_outgoing_tcp` both
+// on; uTP only neither dials nor takes TCP.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentPeerProtocol {
     #[default]
-    Tcp,
-    Utp,
-    Both,
+    TcpFirst,
+    UtpFirst,
+    UtpOnly,
 }
 
 impl TorrentPeerProtocol {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Tcp => "tcp",
-            Self::Utp => "utp",
-            Self::Both => "both",
+            Self::TcpFirst => "tcp_first",
+            Self::UtpFirst => "utp_first",
+            Self::UtpOnly => "utp_only",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "tcp" => Some(Self::Tcp),
-            "utp" => Some(Self::Utp),
-            "both" => Some(Self::Both),
+            "tcp_first" => Some(Self::TcpFirst),
+            "utp_first" => Some(Self::UtpFirst),
+            "utp_only" => Some(Self::UtpOnly),
             _ => None,
         }
     }
 
+    /// Whether peers are dialed and taken over TCP; uTP always is, where
+    /// the route carries datagrams.
     pub const fn tcp(self) -> bool {
-        matches!(self, Self::Tcp | Self::Both)
+        !matches!(self, Self::UtpOnly)
     }
 
-    pub const fn utp(self) -> bool {
-        matches!(self, Self::Utp | Self::Both)
+    /// The order an outgoing connection tries the transports in.
+    pub const fn dial_order(self) -> weaver_torrent::DialOrder {
+        match self {
+            Self::TcpFirst => weaver_torrent::DialOrder::TcpFirst,
+            Self::UtpFirst | Self::UtpOnly => weaver_torrent::DialOrder::UtpFirst,
+        }
     }
 }
 
@@ -1545,7 +1553,7 @@ name = "tv"
             unchoke_slots_limit: TorrentLimit::Count(NonZeroU32::new(20).unwrap()),
             connection_speed: NonZeroU32::new(50).unwrap(),
             allow_multiple_connections_per_ip: true,
-            peer_protocol: TorrentPeerProtocol::Both,
+            peer_protocol: TorrentPeerProtocol::UtpFirst,
             dht_bootstrap_nodes: "router.example:6881".to_owned(),
             blocklist_enabled: true,
             blocklist: Some("https://lists.example/level1.p2p".to_owned()),
@@ -1566,14 +1574,18 @@ name = "tv"
 
     #[test]
     fn torrent_session_settings_default_to_libtorrents() {
-        // libtorrent settings_pack.cpp, with peers over TCP alone as before.
+        // libtorrent settings_pack.cpp: TCP first, uTP raced behind it.
         let count = |count| TorrentLimit::Count(NonZeroU32::new(count).unwrap());
         let torrent = TorrentConfig::default();
         assert_eq!(torrent.connections_limit, count(200));
         assert_eq!(torrent.unchoke_slots_limit, count(8));
         assert_eq!(torrent.connection_speed.get(), 30);
         assert!(!torrent.allow_multiple_connections_per_ip);
-        assert_eq!(torrent.peer_protocol, TorrentPeerProtocol::Tcp);
+        assert_eq!(torrent.peer_protocol, TorrentPeerProtocol::TcpFirst);
+        assert_eq!(
+            torrent.peer_protocol.dial_order(),
+            weaver_torrent::DialOrder::TcpFirst
+        );
         // The engine's own routers, as before the setting.
         assert_eq!(
             torrent.dht_bootstrap_nodes,
@@ -1597,12 +1609,12 @@ data_dir = "/tmp/weaver-data"
 enabled = true
 connections_limit = 80
 unchoke_slots_limit = "unlimited"
-peer_protocol = "utp"
+peer_protocol = "utp_only"
 "#,
         )
         .unwrap();
         assert_eq!(config.torrent.connections_limit, count(80));
-        assert_eq!(config.torrent.peer_protocol, TorrentPeerProtocol::Utp);
+        assert_eq!(config.torrent.peer_protocol, TorrentPeerProtocol::UtpOnly);
         assert_eq!(config.torrent.unchoke_slots_limit, TorrentLimit::Unlimited);
         assert_eq!(config.torrent.connection_speed.get(), 30);
         assert_eq!(config.torrent.stop_tracker_timeout_secs, 5);

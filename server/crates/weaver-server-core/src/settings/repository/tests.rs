@@ -129,7 +129,7 @@ fn config_roundtrip() {
             unchoke_slots_limit: crate::settings::TorrentLimit::Unlimited,
             connection_speed: std::num::NonZeroU32::new(12).unwrap(),
             allow_multiple_connections_per_ip: true,
-            peer_protocol: crate::settings::TorrentPeerProtocol::Both,
+            peer_protocol: crate::settings::TorrentPeerProtocol::UtpFirst,
             dht_bootstrap_nodes: "router.example:6881,192.0.2.1:25401".to_owned(),
             blocklist_enabled: true,
             blocklist: Some(r"C:\lists\level1.p2p".to_owned()),

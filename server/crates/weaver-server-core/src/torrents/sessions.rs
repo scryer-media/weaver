@@ -69,6 +69,8 @@ pub enum TorrentRouteReason {
     ListenPortBindFailed,
     SessionStateUnreadable,
     SessionBuildFailed,
+    /// uTP only is set, and the route carries no uTP.
+    UtpUnavailable,
     BlocklistFailed,
     /// Every session there can be is in use by other routes.
     SessionLimit,
@@ -129,6 +131,9 @@ impl RouteFailure {
                 "the session's stored ports could not be read"
             }
             TorrentRouteReason::SessionBuildFailed => "the session could not be opened",
+            TorrentRouteReason::UtpUnavailable => {
+                "uTP only is set, and this route does not carry uTP"
+            }
             TorrentRouteReason::BlocklistFailed => "the blocklist could not be loaded",
             TorrentRouteReason::SessionLimit => "every session is in use by other routes",
             TorrentRouteReason::Opening => "the route's session is opening",
@@ -755,7 +760,7 @@ pub(crate) const fn encryption_policy(
 /// to build, and its route holds closed.
 fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, bool, bool) {
     let protocol = torrent.peer_protocol;
-    let utp = protocol.utp() && shape.utp;
+    let utp = shape.utp;
     let mode = match (protocol.tcp(), utp) {
         (true, true) => Some(ListenerMode::TcpAndUtp),
         (false, true) => Some(ListenerMode::UtpOnly),
@@ -856,6 +861,7 @@ pub fn session_options(
         connections_limit: limits.connections_limit,
         unchoke_slots_limit: limits.unchoke_slots_limit,
         connection_speed: limits.connection_speed,
+        dial_order: torrent.peer_protocol.dial_order(),
         allow_multiple_connections_per_ip: torrent.allow_multiple_connections_per_ip,
         tracker_stopped_timeout: Some(Duration::from_secs(
             torrent.stop_tracker_timeout_secs.into(),
@@ -1691,6 +1697,10 @@ impl Sessions {
         let port = slot_port(&torrent, slot)
             .ok_or_else(|| RouteFailure::from(TorrentRouteReason::ListenPortUnavailable))?;
         let opening = Opening::of(&self.env, &torrent, leg.shape);
+        // uTP only over a leg that carries no uTP has no way to a peer.
+        if !opening.tcp && !opening.utp {
+            return Err(TorrentRouteReason::UtpUnavailable.into());
+        }
         let ip_filter = self.ip_filter(&torrent).await.map_err(|detail| {
             RouteFailure::with_detail(TorrentRouteReason::BlocklistFailed, detail)
         })?;
@@ -2029,8 +2039,8 @@ impl Configured {
         Some(filter_over(torrent, blocked))
     }
 
-    // Every open session holds to the settings' limits, encryption and
-    // connections per address and, once the blocklist they name is loaded,
+    // Every open session holds to the settings' limits, encryption,
+    // connections per address and dial order and, once the blocklist they name is loaded,
     // to their IP filter; whether it is.
     fn lay_over(&mut self) -> bool {
         let limits = session_limits(&self.torrent);
@@ -2048,6 +2058,7 @@ impl Configured {
                     session.set_allow_multiple_connections_per_ip(
                         torrent.allow_multiple_connections_per_ip,
                     );
+                    session.set_dial_order(torrent.peer_protocol.dial_order());
                 }
                 if let Some(filter) = filter.as_ref().filter(|_| open) {
                     session.set_ip_filter(filter.clone());

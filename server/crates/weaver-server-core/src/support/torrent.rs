@@ -874,6 +874,7 @@ fn route_reason(reason: TorrentRouteReason) -> &'static str {
         TorrentRouteReason::ListenPortBindFailed => "listen_port_bind_failed",
         TorrentRouteReason::SessionStateUnreadable => "session_state_unreadable",
         TorrentRouteReason::SessionBuildFailed => "session_build_failed",
+        TorrentRouteReason::UtpUnavailable => "utp_unavailable",
         TorrentRouteReason::BlocklistFailed => "blocklist_failed",
         TorrentRouteReason::SessionLimit => "session_limit",
         TorrentRouteReason::Opening => "opening",

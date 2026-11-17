@@ -1985,8 +1985,8 @@ async fn the_torrent_settings_reach_the_sessions() {
     sessions.stop_all().await;
 }
 
-// A route whose session would have no way to reach a peer holds closed:
-// uTP alone over a leg that does not listen.
+// A route whose session would have no way to reach a peer holds closed,
+// and says why: uTP only over a leg that carries no uTP.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_route_with_no_transport_holds_closed() {
     let dir = tempfile::tempdir().unwrap();
@@ -1997,7 +1997,7 @@ async fn a_route_with_no_transport_holds_closed() {
         Database::open_in_memory().unwrap(),
     );
     sessions.set_config(TorrentConfig {
-        peer_protocol: crate::settings::TorrentPeerProtocol::Utp,
+        peer_protocol: crate::settings::TorrentPeerProtocol::UtpOnly,
         ..TorrentConfig::default()
     });
     let plan = routes.plan(TorrentScope::Default);
@@ -2006,9 +2006,10 @@ async fn a_route_with_no_transport_holds_closed() {
         Err(SessionError::Build(_))
     ));
     let held = sessions.view(&plan.key).await.unwrap().held.unwrap();
-    assert!(
-        held.message().contains("no way to connect to peers"),
-        "{held:?}"
+    assert_eq!(held.reason, TorrentRouteReason::UtpUnavailable, "{held:?}");
+    assert_eq!(
+        held.message(),
+        "uTP only is set, and this route does not carry uTP"
     );
     sessions.stop_all().await;
 }
@@ -2256,7 +2257,7 @@ fn the_built_session_options_carry_the_configured_values() {
     assert_eq!(options.ip_filter, filter);
     assert_eq!(options.tracker_stopped_timeout, Some(Duration::ZERO));
 
-    // The defaults are libtorrent's, and peers go over TCP alone.
+    // The defaults are libtorrent's.
     let defaults = session_options(
         &leg(LegKind::System),
         6881,
@@ -2286,11 +2287,14 @@ fn the_built_session_options_carry_the_configured_values() {
         defaults.tracker_stopped_timeout,
         Some(Duration::from_secs(5))
     );
+    // TCP first: peers are taken over both and dialed over TCP first.
     assert!(matches!(
         defaults.listen.as_ref().unwrap().mode,
-        ListenerMode::TcpOnly
+        ListenerMode::TcpAndUtp
     ));
     assert!(defaults.connect.as_ref().unwrap().enable_tcp);
+    assert_eq!(defaults.connect.as_ref().unwrap().enable_utp, Some(true));
+    assert_eq!(defaults.dial_order, weaver_torrent::DialOrder::TcpFirst);
 }
 
 #[test]
@@ -2317,20 +2321,32 @@ fn the_peer_protocol_picks_the_transports_the_leg_carries() {
             options.listen.map(|listen| listen.mode),
             connect.enable_tcp,
             connect.enable_utp,
+            options.dial_order,
         )
     };
+    use weaver_torrent::DialOrder;
     let system = leg(LegKind::System);
     assert!(matches!(
-        built(&system, TorrentPeerProtocol::Tcp),
-        (Some(ListenerMode::TcpOnly), true, Some(false))
+        built(&system, TorrentPeerProtocol::TcpFirst),
+        (
+            Some(ListenerMode::TcpAndUtp),
+            true,
+            Some(true),
+            DialOrder::TcpFirst
+        )
     ));
     assert!(matches!(
-        built(&system, TorrentPeerProtocol::Utp),
-        (Some(ListenerMode::UtpOnly), false, Some(true))
+        built(&system, TorrentPeerProtocol::UtpFirst),
+        (
+            Some(ListenerMode::TcpAndUtp),
+            true,
+            Some(true),
+            DialOrder::UtpFirst
+        )
     ));
     assert!(matches!(
-        built(&system, TorrentPeerProtocol::Both),
-        (Some(ListenerMode::TcpAndUtp), true, Some(true))
+        built(&system, TorrentPeerProtocol::UtpOnly),
+        (Some(ListenerMode::UtpOnly), false, Some(true), _)
     ));
     // Incoming policy is independent of the transports a leg dials over.
     let mut datagrams = leg(LegKind::Ladder);
@@ -2338,10 +2354,12 @@ fn the_peer_protocol_picks_the_transports_the_leg_carries() {
     datagrams.shape.utp = true;
     for ladder in [&tunnel, &datagrams] {
         assert!(!ladder.shape.listen);
-        let (listen, tcp, utp) = built(ladder, TorrentPeerProtocol::Both);
-        assert!(listen.is_none() && tcp);
-        assert_eq!(utp, Some(ladder.shape.utp));
-        let (listen, tcp, utp) = built(ladder, TorrentPeerProtocol::Utp);
+        for protocol in [TorrentPeerProtocol::TcpFirst, TorrentPeerProtocol::UtpFirst] {
+            let (listen, tcp, utp, _) = built(ladder, protocol);
+            assert!(listen.is_none() && tcp);
+            assert_eq!(utp, Some(ladder.shape.utp));
+        }
+        let (listen, tcp, utp, _) = built(ladder, TorrentPeerProtocol::UtpOnly);
         assert!(listen.is_none() && !tcp);
         assert_eq!(utp, Some(ladder.shape.utp));
     }
@@ -2374,7 +2392,7 @@ fn a_listening_ladder_takes_tcp_peers_and_announces_its_port() {
             &IDENTITY.identity(),
         )
     };
-    for protocol in [TorrentPeerProtocol::Tcp, TorrentPeerProtocol::Both] {
+    for protocol in [TorrentPeerProtocol::TcpFirst, TorrentPeerProtocol::UtpFirst] {
         let options = built(protocol, None);
         let listen = options.listen.expect("a listening ladder listens");
         assert!(matches!(listen.mode, ListenerMode::TcpOnly));
@@ -2383,10 +2401,12 @@ fn a_listening_ladder_takes_tcp_peers_and_announces_its_port() {
         assert!(!listen.enable_upnp_port_forwarding);
         assert!(options.connect.unwrap().enable_tcp);
     }
-    let listen = built(TorrentPeerProtocol::Tcp, Some(51413)).listen.unwrap();
+    let listen = built(TorrentPeerProtocol::TcpFirst, Some(51413))
+        .listen
+        .unwrap();
     assert_eq!(listen.announce_port, Some(51413));
     // Asked for uTP alone, it has no transport the tunnel carries.
-    let options = built(TorrentPeerProtocol::Utp, None);
+    let options = built(TorrentPeerProtocol::UtpOnly, None);
     assert!(options.listen.is_none());
     assert!(!options.connect.unwrap().enable_tcp);
 }
@@ -3046,17 +3066,19 @@ fn port_mapping_is_what_a_mapping_leg_opens_with() {
     );
 }
 
-// The peer protocol is what a session opens with: a route open with one
-// is outdated once the settings give another, and its next session listens
-// with the new one. The line that says each opened names the transports it
-// uses.
+// The transports are what a session opens with: a route open with TCP and
+// uTP is outdated once the settings ask for uTP alone, and its next session
+// listens with it. The order between TCP first and uTP first is laid over
+// the open session, which stays. The line that says each opened names the
+// transports it uses.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_peer_protocol_reopens_the_route_with_it() {
     use crate::settings::TorrentPeerProtocol;
+    use weaver_torrent::DialOrder;
 
     let dir = tempfile::tempdir().unwrap();
     let both = TorrentConfig {
-        peer_protocol: TorrentPeerProtocol::Both,
+        peer_protocol: TorrentPeerProtocol::TcpFirst,
         ..any_port()
     };
     let routes = Arc::new(FakeRoutes::default());
@@ -3073,13 +3095,22 @@ async fn a_new_peer_protocol_reopens_the_route_with_it() {
         crate::pipeline::graph::lines::Lines::capture_at("weaver", tracing::Level::INFO);
     sessions.set_config(both.clone());
     let plan = routes.plan(TorrentScope::Default);
-    sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert!(sessions.view(&plan.key).await.unwrap().utp);
     assert!(sessions.outdated().await.is_empty());
+    assert_eq!(session.dial_order(), DialOrder::TcpFirst);
 
     sessions.set_config(TorrentConfig {
-        peer_protocol: TorrentPeerProtocol::Tcp,
+        peer_protocol: TorrentPeerProtocol::UtpFirst,
         ..both.clone()
+    });
+    assert!(sessions.outdated().await.is_empty());
+    assert_eq!(session.dial_order(), DialOrder::UtpFirst);
+    drop(session);
+
+    sessions.set_config(TorrentConfig {
+        peer_protocol: TorrentPeerProtocol::UtpOnly,
+        ..both
     });
     assert_eq!(
         sessions.outdated().await,
@@ -3087,24 +3118,16 @@ async fn a_new_peer_protocol_reopens_the_route_with_it() {
     );
     sessions.drop_route(&plan.key).await;
     sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
-    assert!(!sessions.view(&plan.key).await.unwrap().utp);
-    assert!(sessions.outdated().await.is_empty());
-
-    sessions.set_config(TorrentConfig {
-        peer_protocol: TorrentPeerProtocol::Utp,
-        ..both
-    });
-    sessions.drop_route(&plan.key).await;
-    sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert!(sessions.view(&plan.key).await.unwrap().utp);
+    assert!(sessions.outdated().await.is_empty());
     drop(guard);
     let opened = lines.of("a route's session opened");
-    let named: Vec<bool> = ["tcp+utp", "tcp", "utp"]
+    let named: Vec<bool> = ["tcp+utp", "utp"]
         .iter()
         .zip(&opened)
         .map(|(names, line)| line.contains(&format!(" transports=\"{names}\"")))
         .collect();
-    assert_eq!((opened.len(), named), (3, vec![true; 3]), "{opened:?}");
+    assert_eq!((opened.len(), named), (2, vec![true; 2]), "{opened:?}");
     sessions.stop_all().await;
 }
 
@@ -3278,7 +3301,7 @@ async fn an_own_socket_legs_session_opens_its_sockets_through_the_leg() {
     let torrent = TorrentConfig {
         upnp: false,
         dht_bootstrap_nodes: String::new(),
-        peer_protocol: crate::settings::TorrentPeerProtocol::Tcp,
+        peer_protocol: crate::settings::TorrentPeerProtocol::TcpFirst,
         ..TorrentConfig::default()
     };
     for kind in [LegKind::System, LegKind::Interface(LOOPBACK_DEVICE.into())] {

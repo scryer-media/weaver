@@ -159,7 +159,7 @@ async fn a_system_leg_session_with_both_transports_builds_and_moves_data_over_ut
         env(&directory.path().join("seed-state")),
         Database::open_in_memory()?,
     );
-    seeds.set_config(on_port(seed_port, TorrentPeerProtocol::Both));
+    seeds.set_config(on_port(seed_port, TorrentPeerProtocol::TcpFirst));
     let seed_plan = seed_routes.plan(TorrentScope::Default);
     let seed = seeds
         .session(&seed_plan, &IDENTITY.identity())
@@ -206,7 +206,7 @@ async fn a_system_leg_session_with_both_transports_builds_and_moves_data_over_ut
         env(&directory.path().join("download-state")),
         Database::open_in_memory()?,
     );
-    downloads.set_config(on_port(download_port, TorrentPeerProtocol::Utp));
+    downloads.set_config(on_port(download_port, TorrentPeerProtocol::UtpOnly));
     let download_plan = download_routes.plan(TorrentScope::Default);
     let client = downloads
         .session(&download_plan, &IDENTITY.identity())

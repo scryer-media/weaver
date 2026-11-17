@@ -231,7 +231,7 @@ async fn a_non_listening_datagram_route_completes_a_utp_only_torrent_transfer() 
     leg.shape = shape;
     leg.factory = factory.clone();
     let torrent = TorrentConfig {
-        peer_protocol: TorrentPeerProtocol::Utp,
+        peer_protocol: TorrentPeerProtocol::UtpOnly,
         ..Default::default()
     };
     let mut options = super::session_options(

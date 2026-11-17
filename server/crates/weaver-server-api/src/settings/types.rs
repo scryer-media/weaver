@@ -1704,18 +1704,18 @@ impl From<TorrentEncryptionGql> for weaver_server_core::settings::TorrentEncrypt
 #[graphql(name = "TorrentPeerProtocol")]
 pub enum TorrentPeerProtocolGql {
     #[default]
-    Tcp,
-    Utp,
-    Both,
+    TcpFirst,
+    UtpFirst,
+    UtpOnly,
 }
 
 impl From<weaver_server_core::settings::TorrentPeerProtocol> for TorrentPeerProtocolGql {
     fn from(value: weaver_server_core::settings::TorrentPeerProtocol) -> Self {
         use weaver_server_core::settings::TorrentPeerProtocol;
         match value {
-            TorrentPeerProtocol::Tcp => Self::Tcp,
-            TorrentPeerProtocol::Utp => Self::Utp,
-            TorrentPeerProtocol::Both => Self::Both,
+            TorrentPeerProtocol::TcpFirst => Self::TcpFirst,
+            TorrentPeerProtocol::UtpFirst => Self::UtpFirst,
+            TorrentPeerProtocol::UtpOnly => Self::UtpOnly,
         }
     }
 }
@@ -1723,9 +1723,9 @@ impl From<weaver_server_core::settings::TorrentPeerProtocol> for TorrentPeerProt
 impl From<TorrentPeerProtocolGql> for weaver_server_core::settings::TorrentPeerProtocol {
     fn from(value: TorrentPeerProtocolGql) -> Self {
         match value {
-            TorrentPeerProtocolGql::Tcp => Self::Tcp,
-            TorrentPeerProtocolGql::Utp => Self::Utp,
-            TorrentPeerProtocolGql::Both => Self::Both,
+            TorrentPeerProtocolGql::TcpFirst => Self::TcpFirst,
+            TorrentPeerProtocolGql::UtpFirst => Self::UtpFirst,
+            TorrentPeerProtocolGql::UtpOnly => Self::UtpOnly,
         }
     }
 }
