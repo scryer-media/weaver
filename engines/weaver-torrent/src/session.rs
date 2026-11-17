@@ -511,6 +511,27 @@ impl Session {
         }
     }
 
+    /// Starts the session's IPv6 DHT once its route has an IPv6 address the
+    /// internet reaches, for a caller that saw the interfaces change, as
+    /// libtorrent opens a listen socket, and a DHT node on it, for an
+    /// address that appears (`on_ip_change`, session_impl.cpp:2002-2014,
+    /// then 2206-2211, v2.0.15). Asks the route nothing when the IPv6 DHT
+    /// runs already, the session is IPv4-only, or it runs no DHT. Whether it
+    /// started.
+    pub fn follow_ipv6_route(&self) -> bool {
+        let Some(dht) = &self.dht else {
+            return false;
+        };
+        if dht.runs_ipv6() {
+            return false;
+        }
+        if self.ipv4_only || !crate::route_interface::runs_ipv6_dht(self.http_clients.as_ref()) {
+            return false;
+        }
+        dht.start_ipv6();
+        true
+    }
+
     /// The limits the session holds to now.
     pub fn limits(&self) -> SessionLimits {
         SessionLimits {
