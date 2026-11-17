@@ -616,6 +616,31 @@ impl TorrentStateLive {
         }
     }
 
+    /// A PEX message added `addr` with `flags`, as [`Self::add_peer`] takes
+    /// a peer. While the torrent's connections are plain only, a peer new to
+    /// it that its sender reached encrypted is not taken, so never dialled,
+    /// and only counted.
+    pub(crate) fn add_pex_peer(&self, addr: SocketAddr, flags: u8) {
+        let addr = crate::network::canonical_socket_addr(addr);
+        let swarm = &self.session_stats.swarm;
+        swarm.peer_named(swarm::PeerSource::Pex);
+        if self.may_connect_to(addr) {
+            let plain_only = self.encryption() == crate::EncryptionPolicy::Disabled;
+            if self.peers.add_pex_peer(addr, flags, plain_only) {
+                swarm.pex_encrypted_skipped();
+            }
+        }
+    }
+
+    /// The encryption the torrent's connections are made and kept under
+    /// now: its own, else the session's.
+    pub(crate) fn encryption(&self) -> crate::EncryptionPolicy {
+        self.shared
+            .options
+            .peer_opts
+            .encryption_under(self.shared.connector.encryption())
+    }
+
     /// A holepunch asks us to connect to `addr`: over uTP, so only when we
     /// speak it (libtorrent `bt_peer_connection::on_holepunch`, `connect`).
     fn holepunch(&self, addr: SocketAddr) {

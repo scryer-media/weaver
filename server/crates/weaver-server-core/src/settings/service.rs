@@ -7,9 +7,9 @@ use crate::persistence::Database;
 use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
-    Config, DeliveryNamingOverrides, DirectStoreOverrides, Leaf, MetricsConfig, PerJobSeries,
-    RetryOverrides, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig,
-    TorrentEncryption, TorrentPeerProtocol,
+    Config, DeliveryNamingOverrides, DirectStoreOverrides, Leaf, MetricsConfig, PeerTransport,
+    PeerTransports, PerJobSeries, RetryOverrides, SeedTimeCounting, SeedingAction, SeedingGoalMode,
+    SeedingPolicy, TorrentConfig, TorrentEncryption,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -364,7 +364,14 @@ impl Database {
             "torrent.allow_multiple_connections_per_ip",
             &torrent.allow_multiple_connections_per_ip.to_string(),
         )?;
-        self.set_setting("torrent.peer_protocol", torrent.peer_protocol.as_str())?;
+        let transports = torrent.transports;
+        self.set_setting("torrent.peer_tcp", &transports.tcp.to_string())?;
+        self.set_setting("torrent.peer_utp", &transports.utp.to_string())?;
+        self.set_setting(
+            "torrent.prefer_downloading",
+            transports.prefer_downloading.as_str(),
+        )?;
+        self.set_setting("torrent.prefer_seeding", transports.prefer_seeding.as_str())?;
         self.set_setting("torrent.ssl_enabled", &torrent.ssl_enabled.to_string())?;
         match torrent.ssl_port {
             Some(port) => self.set_setting("torrent.ssl_port", &port.to_string())?,
@@ -626,10 +633,18 @@ fn torrent_config_from_settings(
             "torrent.allow_multiple_connections_per_ip",
         )
         .unwrap_or(defaults.allow_multiple_connections_per_ip),
-        peer_protocol: settings
-            .get("torrent.peer_protocol")
-            .and_then(|v| TorrentPeerProtocol::parse(v))
-            .unwrap_or(defaults.peer_protocol),
+        transports: PeerTransports {
+            tcp: parsed_setting(settings, "torrent.peer_tcp").unwrap_or(defaults.transports.tcp),
+            utp: parsed_setting(settings, "torrent.peer_utp").unwrap_or(defaults.transports.utp),
+            prefer_downloading: settings
+                .get("torrent.prefer_downloading")
+                .and_then(|v| PeerTransport::parse(v))
+                .unwrap_or(defaults.transports.prefer_downloading),
+            prefer_seeding: settings
+                .get("torrent.prefer_seeding")
+                .and_then(|v| PeerTransport::parse(v))
+                .unwrap_or(defaults.transports.prefer_seeding),
+        },
         dht_bootstrap_nodes: settings
             .get("torrent.dht_bootstrap_nodes")
             .cloned()

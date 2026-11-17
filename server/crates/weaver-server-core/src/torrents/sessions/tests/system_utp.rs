@@ -19,7 +19,7 @@ use super::{FakeRoutes, env, two_free_ports};
 use crate::{
     persistence::Database,
     proxies::TorrentScope,
-    settings::{TorrentConfig, TorrentPeerProtocol},
+    settings::{PeerTransports, TorrentConfig},
     torrents::{
         identity::IDENTITY,
         net::LegKind,
@@ -111,10 +111,10 @@ fn system_route(factory: Arc<dyn SocketFactory>) -> Arc<FakeRoutes> {
 
 // Settings that keep a session to loopback: no gateway mapping, no DHT
 // bootstrap node.
-fn on_port(base_port: u16, peer_protocol: TorrentPeerProtocol) -> TorrentConfig {
+fn on_port(base_port: u16, transports: PeerTransports) -> TorrentConfig {
     TorrentConfig {
         base_port,
-        peer_protocol,
+        transports,
         upnp: false,
         dht_bootstrap_nodes: String::new(),
         ..TorrentConfig::default()
@@ -159,7 +159,7 @@ async fn a_system_leg_session_with_both_transports_builds_and_moves_data_over_ut
         env(&directory.path().join("seed-state")),
         Database::open_in_memory()?,
     );
-    seeds.set_config(on_port(seed_port, TorrentPeerProtocol::Both));
+    seeds.set_config(on_port(seed_port, PeerTransports::default()));
     let seed_plan = seed_routes.plan(TorrentScope::Default);
     let seed = seeds
         .session(&seed_plan, &IDENTITY.identity())
@@ -206,7 +206,15 @@ async fn a_system_leg_session_with_both_transports_builds_and_moves_data_over_ut
         env(&directory.path().join("download-state")),
         Database::open_in_memory()?,
     );
-    downloads.set_config(on_port(download_port, TorrentPeerProtocol::Utp));
+    downloads.set_config(on_port(
+        download_port,
+        PeerTransports {
+            tcp: false,
+            ..PeerTransports::default()
+        }
+        .checked()
+        .unwrap(),
+    ));
     let download_plan = download_routes.plan(TorrentScope::Default);
     let client = downloads
         .session(&download_plan, &IDENTITY.identity())

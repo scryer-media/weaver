@@ -943,6 +943,11 @@ pub trait Dialer: Send + Sync {
     fn source_toward(&self, _to: SocketAddr) -> Option<io::Result<IpAddr>> {
         None
     }
+    // The IPv6 addresses this stage's egress may send from. Only an egress
+    // says: past a proxy, the exit picks.
+    fn ipv6_sources(&self) -> Option<io::Result<crate::egress::Ipv6Sources>> {
+        None
+    }
     // The first proxy hop on this stage's path, counted from the egress,
     // whose own last attempt failed.
     fn failing_hop(&self) -> Option<FailingHop> {
@@ -1231,6 +1236,9 @@ impl Dialer for Egress {
     }
     fn source_toward(&self, to: SocketAddr) -> Option<io::Result<IpAddr>> {
         Some(self.binding.source_toward(to))
+    }
+    fn ipv6_sources(&self) -> Option<io::Result<crate::egress::Ipv6Sources>> {
+        Some(self.binding.ipv6_sources())
     }
     fn keepers(&self) -> Vec<KeeperRef> {
         vec![self.keeper.handle()]

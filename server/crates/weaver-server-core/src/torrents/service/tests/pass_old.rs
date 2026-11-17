@@ -441,6 +441,7 @@ async fn a_hold_and_a_never_pause_rule_apply_as_before() {
                 .db
                 .insert_tracker_rule(
                     &TrackerRule {
+                        transports: Default::default(),
                         archive_passwords: Default::default(),
                         bound: None,
                         id: 0,

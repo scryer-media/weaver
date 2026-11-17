@@ -29,6 +29,7 @@ use tokio::sync::Notify;
 
 use crate::operations::StorageCapacity;
 use crate::operations::VolumeBuffers;
+use crate::operations::disk::beneath::{self, Access};
 use crate::operations::disk::volume::{Reservation, Volume};
 use crate::operations::disk::writer::{
     Barrier, Create, DiskOwner, Failure, OpenSteps, Opened, Owner, Submitter, VolumeWriters,
@@ -583,12 +584,12 @@ impl Writes {
     // The file at `path` made at least `length` long, after every write
     // queued before: run on the writer, waited for here. For a thread that
     // may wait on a disk.
-    pub(crate) fn grow(&self, path: PathBuf, length: u64) -> io::Result<()> {
+    pub(crate) fn grow(&self, place: Place, length: u64) -> io::Result<()> {
         let generation = self.generation();
         let (told, grown) = mpsc::sync_channel(1);
-        let at = path.clone();
+        let path = place.path.clone();
         generation.submitter.ask(path, move || {
-            let _ = told.send(grow_file(&at, length));
+            let _ = told.send(grow_file(&place, length));
         });
         drop(generation);
         grown.recv().unwrap_or_else(|_| {
@@ -640,15 +641,23 @@ pub(crate) struct Batch<'a> {
     paid: Paid,
 }
 
+// Where a torrent's file is: its path, and the save folder it must resolve
+// inside, through any link on the way.
+pub(crate) struct Place {
+    pub(crate) path: PathBuf,
+    pub(crate) within: PathBuf,
+}
+
 impl Batch<'_> {
-    // `bytes` written at `offset` of `file`, which is opened at the path
-    // `path` gives, and made when it is not there.
+    // `bytes` written at `offset` of `file`, which is opened where `place`
+    // says, and made when it is not there. Asked only when the file is not
+    // open already.
     pub(crate) fn write(
         &mut self,
         file: usize,
         offset: u64,
         bytes: Bytes,
-        path: impl FnOnce() -> PathBuf,
+        place: impl FnOnce() -> Place,
     ) {
         let file = file as u64;
         let submitter = &self.generation.submitter;
@@ -668,10 +677,12 @@ impl Batch<'_> {
                 {
                     submitter.release(oldest);
                 }
+                let Place { path, within } = place();
                 Some(Create {
-                    path: path(),
+                    path,
                     length: None,
                     open: open_piece_file,
+                    within: Some(Arc::from(within)),
                 })
             }
         };
@@ -726,9 +737,11 @@ impl<L: FnOnce(Done)> Drop for Landing<L> {
 
 // A torrent's file opened for writing, made with the folders it is in when
 // it is not there, as the torrent's files have always been made. A name the
-// system will not take fails the torrent: it is no refusal of one file.
-fn open_piece_file(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
-    let file = open_for_write(path).map_err(|error| {
+// system will not take fails the torrent: it is no refusal of one file. One
+// that leads outside its save folder through a link is refused, and fails
+// the torrent with why.
+fn open_piece_file(path: &Path, _length: Option<u64>, within: Option<&Path>) -> io::Result<Opened> {
+    let file = open_for_write(path, within).map_err(|error| {
         if error.kind() == io::ErrorKind::InvalidFilename {
             io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
         } else {
@@ -742,7 +755,22 @@ fn open_piece_file(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
     })
 }
 
-fn open_for_write(path: &Path) -> io::Result<File> {
+// Opened inside `within`, when given, through the canonical owner of opens
+// beneath a folder; by path when not, for files no torrent names.
+fn open_for_write(path: &Path, within: Option<&Path>) -> io::Result<File> {
+    if let Some(within) = within {
+        let name = path.strip_prefix(within).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not under {}, so it is not opened",
+                    path.display(),
+                    within.display()
+                ),
+            )
+        })?;
+        return beneath::open(within, name, Access::Write);
+    }
     let open = || {
         OpenOptions::new()
             .read(true)
@@ -765,8 +793,8 @@ fn open_for_write(path: &Path) -> io::Result<File> {
 // The file made `length` long when it is shorter, so a file whose pieces
 // are all had is there whole, an empty one among them. A longer one stays
 // as it is.
-fn grow_file(path: &Path, length: u64) -> io::Result<()> {
-    let file = open_for_write(path)?;
+fn grow_file(place: &Place, length: u64) -> io::Result<()> {
+    let file = open_for_write(&place.path, Some(&place.within))?;
     if file.metadata()?.len() < length {
         file.set_len(length)?;
     }

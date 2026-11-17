@@ -48,8 +48,22 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.peers.encrypt_outgoing(self.addr)
     }
 
+    fn seeding(&self) -> bool {
+        self.state.peers.is_finished()
+    }
+
     fn tcp_wants(&self) -> Option<&crate::stream_connect::TcpWants> {
         Some(&self.state.tcp_wants)
+    }
+
+    fn on_utp_dialed(&self, opened: bool) {
+        self.state.peers.utp_dialed(self.addr, opened);
+    }
+
+    fn on_outgoing_method_worked(&self, encrypted: bool) {
+        self.state
+            .peers
+            .outgoing_method_worked(self.addr, encrypted);
     }
 
     fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {

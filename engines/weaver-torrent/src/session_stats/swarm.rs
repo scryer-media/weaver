@@ -383,6 +383,7 @@ pub struct SwarmStats {
     piece_picks: Tally<{ PiecePick::COUNT }>,
     wasted_bytes: Tally<{ Waste::COUNT }>,
     peers_named: Tally<{ PeerSource::COUNT }>,
+    pex_encrypted_skipped: AtomicU64,
 }
 
 impl SwarmStats {
@@ -446,6 +447,13 @@ impl SwarmStats {
         add(&self.peers_named, source as usize, 1);
     }
 
+    /// A PEX message named a peer, new to its torrent, that its sender
+    /// reached encrypted, while the torrent's connections are plain only:
+    /// the peer is not taken, so never dialled.
+    pub fn pex_encrypted_skipped(&self) {
+        self.pex_encrypted_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> SwarmSnapshot {
         SwarmSnapshot {
             messages: self.messages.each_ref().map(read),
@@ -458,6 +466,7 @@ impl SwarmStats {
             piece_picks: read(&self.piece_picks),
             wasted_bytes: read(&self.wasted_bytes),
             peers_named: read(&self.peers_named),
+            pex_encrypted_skipped: self.pex_encrypted_skipped.load(Ordering::Relaxed),
         }
     }
 }
@@ -480,6 +489,8 @@ pub struct SwarmSnapshot {
     pub piece_picks: [u64; PiecePick::COUNT],
     pub wasted_bytes: [u64; Waste::COUNT],
     pub peers_named: [u64; PeerSource::COUNT],
+    /// See [`SwarmStats::pex_encrypted_skipped`].
+    pub pex_encrypted_skipped: u64,
 }
 
 impl SwarmSnapshot {

@@ -1023,6 +1023,7 @@ async fn an_incoming_peer_that_sends_no_handshake_ends_at_the_handshake_timeout(
                 connect: Some(super::ConnectionOptions {
                     enable_tcp: true,
                     enable_utp: None,
+                    utp_on_demand: false,
                     peer_opts: Some(PeerConnectionOptions {
                         read_write_timeout: Some(std::time::Duration::from_secs(120)),
                         ..Default::default()
@@ -1064,12 +1065,10 @@ async fn an_incoming_peer_that_sends_no_handshake_ends_at_the_handshake_timeout(
 async fn memory_a_metadata_connection_leaves_is_read_by_the_torrents_connector_afterwards() {
     use crate::{
         mse::EncryptionPolicy,
-        peer_info_reader::tests::{Dialed, MockPeer, halves, metadata},
-        read_buf::ReadBuf,
+        peer_info_reader::tests::{Dialed, MockPeer, metadata},
         storage::StorageFactory,
         tests::embedder_util::{MemoryStorageFactory, isolated_session_opts},
     };
-    use std::time::Duration;
 
     let (info, hashes) = metadata(10);
     let (tx, mut dials) = tokio::sync::mpsc::unbounded_channel();
@@ -1082,6 +1081,7 @@ async fn memory_a_metadata_connection_leaves_is_read_by_the_torrents_connector_a
             connect: Some(super::ConnectionOptions {
                 enable_tcp: true,
                 enable_utp: None,
+                utp_on_demand: false,
                 peer_opts: None,
             }),
             ..isolated_session_opts(false)
@@ -1101,36 +1101,101 @@ async fn memory_a_metadata_connection_leaves_is_read_by_the_torrents_connector_a
         }),
     );
     let peer = async {
-        // The peer speaks only plaintext: the first metadata
-        // connection's encrypted handshake is no BitTorrent one.
+        // The peer speaks only the encrypted handshake: the first metadata
+        // connection, plain as to any new peer, is refused.
         let (_, stream) = dials.recv().await.unwrap();
-        let (mut read, write) = halves(stream);
-        let refused = ReadBuf::new()
-            .read_handshake(&mut read, Duration::MAX)
-            .await;
+        let refused = MockPeer::greet_encrypted(stream, hashes).await;
         assert!(refused.is_err());
-        drop((read, write));
-        // The next sends the plaintext one and gets the metadata.
+        // The next tries the encrypted one and gets the metadata.
         let (_, stream) = dials.recv().await.unwrap();
-        let mut fetched = MockPeer::greet(stream, hashes).await;
+        let mut fetched = MockPeer::greet_encrypted(stream, hashes).await.unwrap();
         fetched
             .send_extended_handshake(u32::try_from(info.len()).unwrap())
             .await;
         let piece = fetched.next_request().await.unwrap();
         fetched.send_piece(&info, piece).await;
-        // Then the torrent connects.
+        // Then the torrent connects, encrypted: plain, it would be refused.
         let (_, stream) = dials.recv().await.unwrap();
-        let (mut read, _write) = halves(stream);
-        let greeting = ReadBuf::new()
-            .read_handshake(&mut read, Duration::MAX)
-            .await;
-        (greeting.map(|h| h.info_hash), fetched)
+        let connected = MockPeer::greet_encrypted(stream, hashes).await;
+        (connected.map(|_| ()), fetched)
     };
 
-    let (added, (greeting, _fetched)) = tokio::join!(add, peer);
+    let (added, (connected, _fetched)) = tokio::join!(add, peer);
     added.unwrap();
-    assert_eq!(greeting.unwrap(), hashes.v1.unwrap());
+    connected.unwrap();
     let stats = session.connector.stats().encryption.snapshot();
-    assert_eq!(stats.failures, 1, "{stats:?}");
+    assert_eq!(
+        (stats.plaintext, stats.attempts, stats.failures),
+        (1, 2, 0),
+        "{stats:?}"
+    );
     session.stop().await;
+}
+
+// The first bytes a new peer receives from us, by policy, as qBittorrent's
+// three encryption modes set libtorrent (`pe_enabled`, `pe_forced`,
+// `pe_disabled`): the plain BitTorrent handshake where encryption is
+// preferred (`torrent_peer::pe_support` starts false) or disabled, the key
+// exchange where it is required.
+#[tokio::test(start_paused = true)]
+async fn a_new_peer_is_sent_the_plain_handshake_first_unless_encryption_is_required() {
+    use crate::{
+        mse::EncryptionPolicy,
+        peer_info_reader::tests::{Dialed, halves, metadata},
+        storage::StorageFactory,
+        tests::embedder_util::{MemoryStorageFactory, isolated_session_opts},
+    };
+    use tokio::io::AsyncReadExt;
+
+    const PLAIN: &[u8; 20] = b"\x13BitTorrent protocol";
+    let (_, hashes) = metadata(10);
+    for (policy, plain) in [
+        (EncryptionPolicy::Disabled, true),
+        (EncryptionPolicy::Prefer, true),
+        (EncryptionPolicy::Require, false),
+    ] {
+        let (tx, mut dials) = tokio::sync::mpsc::unbounded_channel();
+        let dir = TempDir::with_prefix("first_bytes").unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                socket_factory: Arc::new(Dialed(tx)),
+                encryption: policy,
+                connect: Some(super::ConnectionOptions {
+                    enable_tcp: true,
+                    enable_utp: None,
+                    utp_on_demand: false,
+                    peer_opts: None,
+                }),
+                ..isolated_session_opts(false)
+            },
+        )
+        .await
+        .unwrap();
+        let add = session.add_torrent(
+            AddTorrent::from_url(format!(
+                "magnet:?xt=urn:btih:{}",
+                hashes.v1.unwrap().as_string()
+            )),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                initial_peers: Some(vec!["127.0.0.1:6881".parse().unwrap()]),
+                ..Default::default()
+            }),
+        );
+        let peer = async {
+            let (_, stream) = dials.recv().await.unwrap();
+            let (mut read, write) = halves(stream);
+            let mut first = [0u8; 20];
+            read.read_exact(&mut first).await.unwrap();
+            (first, read, write)
+        };
+        let (first, _read, _write) = tokio::select! {
+            biased;
+            first = peer => first,
+            added = add => panic!("{policy:?}: added before a dial: {:?}", added.err()),
+        };
+        assert_eq!(&first == PLAIN, plain, "{policy:?}");
+        session.stop().await;
+    }
 }

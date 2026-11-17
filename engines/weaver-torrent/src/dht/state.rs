@@ -831,6 +831,10 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                     next_entered.as_mut().enable();
                     let mut next_router = std::pin::pin!(self.dht.routers_known.notified());
                     next_router.as_mut().enable();
+                    // No search while the IPv6 node is stopped or idle.
+                    if !is_v4 {
+                        self.dht.ipv6.running().await;
+                    }
                     let turn = self.dht.admit_walk().await;
                     // Before the search starts: a growth from here on is
                     // one it did not start from.
@@ -1242,6 +1246,10 @@ impl Latch {
         }
     }
 
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
     async fn opened(&self) {
         loop {
             let mut opened = std::pin::pin!(self.opened.notified());
@@ -1251,6 +1259,82 @@ impl Latch {
             }
             opened.await;
         }
+    }
+}
+
+/// Where the IPv6 node of a DHT stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv6Phase {
+    /// Not started: the route has given it no address yet. It holds no
+    /// table, sends nothing and reads nothing.
+    Waits,
+    /// It runs. `proving` while its route is a proxy's and its first
+    /// bootstrap has not yet heard an IPv6 node answer.
+    Runs { proving: bool },
+    /// Stopped as the route's address went (libtorrent deletes the node of
+    /// a listen socket it closes, session_impl.cpp:2159-2163, v2.0.15). Its
+    /// table is kept, so a returning address resumes from it; it sends
+    /// nothing and reads nothing.
+    Stopped,
+    /// Idle: its proxy carried no IPv6. It sends nothing and reads nothing
+    /// until the route or the proxy setting changes, which opens a new
+    /// session; never on a timer.
+    Idle,
+}
+
+// The IPv6 node's phase, and a wake for what waits on it changing. Read
+// per datagram, so the running bit is kept beside it.
+struct Ipv6Node {
+    phase: tokio::sync::watch::Sender<Ipv6Phase>,
+    running: AtomicBool,
+    // Its route is a proxy's: it never stops on an interface change.
+    proxied: bool,
+}
+
+impl Ipv6Node {
+    fn new(phase: Ipv6Phase) -> Self {
+        Self {
+            running: AtomicBool::new(matches!(phase, Ipv6Phase::Runs { .. })),
+            proxied: phase == Ipv6Phase::Runs { proving: true },
+            phase: tokio::sync::watch::Sender::new(phase),
+        }
+    }
+
+    fn runs(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    fn phase(&self) -> Ipv6Phase {
+        *self.phase.borrow()
+    }
+
+    // Moves to `to` when `from` holds of the phase now; whether it moved.
+    fn shift(&self, from: impl Fn(Ipv6Phase) -> bool, to: Ipv6Phase) -> bool {
+        self.phase.send_if_modified(|phase| {
+            if *phase == to || !from(*phase) {
+                return false;
+            }
+            *phase = to;
+            self.running
+                .store(matches!(to, Ipv6Phase::Runs { .. }), Ordering::Release);
+            true
+        })
+    }
+
+    // Resolves once the phase holds `wanted`; a wake signal, never a timer.
+    async fn until(&self, wanted: impl Fn(Ipv6Phase) -> bool) {
+        let mut phase = self.phase.subscribe();
+        let _ = phase.wait_for(|phase| wanted(*phase)).await;
+    }
+
+    async fn running(&self) {
+        self.until(|phase| matches!(phase, Ipv6Phase::Runs { .. }))
+            .await;
+    }
+
+    async fn halted(&self) {
+        self.until(|phase| !matches!(phase, Ipv6Phase::Runs { .. }))
+            .await;
     }
 }
 
@@ -1466,6 +1550,17 @@ pub struct DhtState {
     // search that fell short waits on to search again.
     growth_v4: Growth,
     growth_v6: Growth,
+    // Where the IPv6 node stands (see `Ipv6Phase`). While it does not run,
+    // it sends nothing and reads nothing: its refreshes and searches wait,
+    // an IPv6 datagram is dropped unread, and an IPv6 node a peer names is
+    // not asked. libtorrent starts no IPv6 node until a listen socket on an
+    // IPv6 address it gives a node is opened (session_impl.cpp:2206-2211,
+    // v2.0.15; see `route_interface::ipv6_dht`).
+    ipv6: Ipv6Node,
+    // Open once a datagram of the family has arrived: what the IPv6 node
+    // on a proxied route judges its proxy by (see `refresh_self_rounds`).
+    heard_v4: Latch,
+    heard_v6: Latch,
     listen_addr: SocketAddr,
 
     // Sending requests to the worker.
@@ -1524,6 +1619,9 @@ impl DhtState {
             bootstrap_sent_v6: Latch::new(),
             growth_v4: Growth::new(),
             growth_v6: Growth::new(),
+            ipv6: Ipv6Node::new(Ipv6Phase::Runs { proving: false }),
+            heard_v4: Latch::new(),
+            heard_v6: Latch::new(),
             worker_sender: sender,
             listen_addr,
             rate_limiter: make_rate_limiter(),
@@ -1750,6 +1848,9 @@ impl DhtState {
                 depth,
                 "own id refreshed"
             );
+            if !is_v4 && outcome.answered + outcome.failed > 0 {
+                self.judge_proxy(outcome.answered > 0).await;
+            }
             if outcome.answered + outcome.failed == 0 {
                 tokio::select! {
                     () = next_entered => {}
@@ -1774,6 +1875,60 @@ impl DhtState {
             }
             retry = (retry * 2).min(SELF_REFRESH_INTERVAL);
         }
+    }
+
+    // The IPv6 node's refreshes, while it runs: they wait for it to start,
+    // end as it stops or goes idle, and start again from the table it kept
+    // as it runs again, so a returning address does not bootstrap cold.
+    async fn run_ipv6(self: Arc<Self>) -> crate::dht::Result<()> {
+        loop {
+            self.ipv6.running().await;
+            tokio::select! {
+                done = self.clone().refresh_self(false) => done?,
+                done = self.clone().refresh_table(false) => done?,
+                () = self.ipv6.halted() => {}
+            }
+        }
+    }
+
+    // After a round of the IPv6 node's own id that asked someone: on a
+    // proxied route, still proving, the round tells whether the proxy
+    // carries IPv6. An IPv6 answer, or any IPv6 datagram read, proves it,
+    // and the node runs on as any other. None while the route carries IPv4
+    // answers means the proxy refused the IPv6 targets or dropped them in
+    // silence (a SOCKS5 relay drops what it cannot relay, and reports
+    // nothing per datagram), and the node goes idle: it sends nothing more,
+    // and never tries again on a timer; a change of route or proxy setting
+    // opens a new session, whose node proves its proxy afresh. Neither yet
+    // waits for the first datagram of either family, without a timer.
+    async fn judge_proxy(&self, answered: bool) {
+        if self.ipv6.phase() != (Ipv6Phase::Runs { proving: true }) {
+            return;
+        }
+        if !answered && !self.heard_v6.is_open() {
+            tokio::select! {
+                () = self.heard_v6.opened() => {}
+                () = self.heard_v4.opened() => {}
+            }
+        }
+        if answered || self.heard_v6.is_open() {
+            self.ipv6.shift(
+                |p| p == Ipv6Phase::Runs { proving: true },
+                Ipv6Phase::Runs { proving: false },
+            );
+            debug!("the proxy carries IPv6: the IPv6 node runs");
+            return;
+        }
+        // operator ruling 2026-11-17: a proxied route keeps the IPv6 DHT
+        // when the proxy carries IPv6; libtorrent runs none
+        // (session_impl.cpp:2078-2090, v2.0.15).
+        if self
+            .ipv6
+            .shift(|p| p == Ipv6Phase::Runs { proving: true }, Ipv6Phase::Idle)
+        {
+            debug!("the proxy carried no IPv6: the IPv6 node is idle");
+        }
+        std::future::pending::<()>().await;
     }
 
     // Keeps the `is_v4` table fresh as libtorrent's `node::tick` does, one
@@ -1905,6 +2060,12 @@ impl DhtState {
         slot: Option<SendSlot>,
     ) -> crate::dht::Result<()> {
         let ip = datagram.addr.ip();
+        if ip.is_ipv6() && !self.ipv6.runs() {
+            return Err(Error::Send(std::io::Error::new(
+                std::io::ErrorKind::NetworkUnreachable,
+                "the IPv6 node does not run",
+            )));
+        }
         self.worker_sender
             .send(datagram)
             .map_err(|_| Error::DhtDead)?;
@@ -2576,6 +2737,21 @@ impl DhtWorker {
                 addr,
             }) = input_rx.recv().await
             {
+                // A datagram queued before the IPv6 node stopped or went
+                // idle is not sent.
+                if addr.is_ipv6() && !self.dht.ipv6.runs() {
+                    if let Some(tid) = our_tid {
+                        self.on_send_error(
+                            tid,
+                            addr,
+                            Error::Send(std::io::Error::new(
+                                std::io::ErrorKind::NetworkUnreachable,
+                                "the IPv6 node does not run",
+                            )),
+                        );
+                    }
+                    continue;
+                }
                 if our_tid.is_none() {
                     trace!("{}: sending {:?}", addr, &message);
                 }
@@ -2617,6 +2793,15 @@ impl DhtWorker {
                 // IPv6; it is the IPv4 node it is, which our requests to it
                 // are keyed under.
                 let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+                // No IPv6 node running, nothing read from IPv6.
+                if addr.is_ipv6() {
+                    if !self.dht.ipv6.runs() {
+                        continue;
+                    }
+                    self.dht.heard_v6.open();
+                } else {
+                    self.dht.heard_v4.open();
+                }
                 if let Some(msg) = self.dht.read_datagram(&buf[..size], addr)
                     && output_tx.send((msg, addr)).await.is_err()
                 {
@@ -2674,30 +2859,24 @@ impl DhtWorker {
             .clone()
             .refresh_self(true)
             .instrument(debug_span!("refresh_self_v4"));
-        let refresh_self_v6 = self
+        let ipv6 = self
             .dht
             .clone()
-            .refresh_self(false)
-            .instrument(debug_span!("refresh_self_v6"));
+            .run_ipv6()
+            .instrument(debug_span!("ipv6_node"));
 
         let refresh_table_v4 = self
             .dht
             .clone()
             .refresh_table(true)
             .instrument(debug_span!("refresh_table_v4"));
-        let refresh_table_v6 = self
-            .dht
-            .clone()
-            .refresh_table(false)
-            .instrument(debug_span!("refresh_table_v6"));
 
         let send_windows_sweep = self.dht.send_guard.sweep();
 
         tokio::pin!(send_windows_sweep);
         tokio::pin!(refresh_self_v4);
-        tokio::pin!(refresh_self_v6);
+        tokio::pin!(ipv6);
         tokio::pin!(refresh_table_v4);
-        tokio::pin!(refresh_table_v6);
         tokio::pin!(framer);
         tokio::pin!(bootstrap);
         tokio::pin!(response_reader);
@@ -2720,14 +2899,11 @@ impl DhtWorker {
                 err = &mut refresh_self_v4 => {
                     return Error::task_finished(&"refresh_self_v4", err);
                 },
-                err = &mut refresh_self_v6 => {
-                    return Error::task_finished(&"refresh_self_v6", err);
+                err = &mut ipv6 => {
+                    return Error::task_finished(&"ipv6_node", err);
                 },
                 err = &mut refresh_table_v4 => {
                     return Error::task_finished(&"refresh_table_v4", err);
-                },
-                err = &mut refresh_table_v6 => {
-                    return Error::task_finished(&"refresh_table_v6", err);
                 },
                 err = &mut response_reader => {
                     return Error::task_finished(&"response_reader", err);
@@ -2769,6 +2945,14 @@ pub struct DhtConfig {
     /// Track the DHT's worker in this tracker. The worker owns the socket, so once the
     /// tracker is empty after cancellation, the socket is gone.
     pub tasks: Option<TaskTracker>,
+    /// Start the IPv6 node only once [`DhtState::start_ipv6`] is called, for
+    /// a route with no IPv6 address the internet reaches yet. Until then it
+    /// holds no table, a saved one too, and sends and reads nothing.
+    pub ipv6_waits: bool,
+    /// The route is a proxy's: the IPv6 node starts, and goes idle unless
+    /// its first bootstrap hears IPv6 back (see [`Ipv6Phase::Idle`]).
+    /// Ignored with `ipv6_waits`.
+    pub ipv6_proving: bool,
 }
 
 // An entirely random node id.
@@ -2831,9 +3015,12 @@ impl DhtState {
                 .routing_table
                 .filter(|t| t.id() == peer_id)
                 .map(|t| t.of_family(true));
+            // An IPv6 node that waits keeps no saved table: libtorrent keeps
+            // the nodes of a family only in a node of it, and starts each
+            // node from the routers (dht_tracker.cpp:124-157, 184-197).
             let routing_table_v6 = config
                 .routing_table_v6
-                .filter(|t| t.id() == peer_id)
+                .filter(|t| t.id() == peer_id && !config.ipv6_waits)
                 .map(|t| t.of_family(false));
             let bootstrap_addrs = config.bootstrap_addrs.unwrap_or_else(|| {
                 crate::dht::DHT_BOOTSTRAP
@@ -2845,7 +3032,7 @@ impl DhtState {
             let token = config.cancellation_token.take().unwrap_or_default();
 
             let (in_tx, in_rx) = unbounded_channel();
-            let state = Arc::new(Self::new_internal(
+            let mut state = Self::new_internal(
                 peer_id,
                 in_tx,
                 routing_table,
@@ -2853,7 +3040,15 @@ impl DhtState {
                 listen_addr,
                 token,
                 config.client_version.map(ByteBufOwned::from),
-            ));
+            );
+            if config.ipv6_waits {
+                info!("no IPv6 address that gives a DHT node: the IPv6 DHT waits for one");
+                state.ipv6 = Ipv6Node::new(Ipv6Phase::Waits);
+            } else if config.ipv6_proving {
+                info!("a proxied route: the IPv6 DHT runs while the proxy carries IPv6");
+                state.ipv6 = Ipv6Node::new(Ipv6Phase::Runs { proving: true });
+            }
+            let state = Arc::new(state);
 
             spawn_with_cancel(
                 debug_span!("dht"),
@@ -2901,12 +3096,75 @@ impl DhtState {
         self.listen_addr
     }
 
+    /// Whether the IPv6 node runs.
+    pub fn runs_ipv6(&self) -> bool {
+        self.ipv6.runs()
+    }
+
+    /// Where the IPv6 node stands.
+    pub fn ipv6_phase(&self) -> Ipv6Phase {
+        self.ipv6.phase()
+    }
+
+    // Resolves once the IPv6 node stands at `phase`.
+    #[cfg(test)]
+    pub(crate) async fn until_ipv6_phase(&self, phase: Ipv6Phase) {
+        self.ipv6.until(|now| now == phase).await;
+    }
+
+    // Resolves once the IPv6 table `holds`, woken as nodes enter it.
+    #[cfg(test)]
+    pub(crate) async fn until_v6_table(&self, holds: impl Fn(&RoutingTable) -> bool) {
+        let entered = self.routing_table_v6.read().entered();
+        loop {
+            let mut next = std::pin::pin!(entered.notified());
+            next.as_mut().enable();
+            if holds(&self.routing_table_v6.read()) {
+                return;
+            }
+            next.await;
+        }
+    }
+
+    /// Starts the IPv6 node of a DHT made with [`DhtConfig::ipv6_waits`],
+    /// or one stopped. A node that never ran fills its table from the
+    /// routers, as libtorrent starts a node for a listen socket opened later
+    /// (`dht_tracker::new_socket`, dht_tracker.cpp:124-157, v2.0.15); a
+    /// stopped one goes on from the table it kept. A node that runs, or an
+    /// idle one, is left alone.
+    pub fn start_ipv6(&self) {
+        if self.ipv6.shift(
+            |p| matches!(p, Ipv6Phase::Waits | Ipv6Phase::Stopped),
+            Ipv6Phase::Runs { proving: false },
+        ) {
+            info!("an IPv6 address that gives a DHT node: the IPv6 DHT runs");
+        }
+    }
+
+    /// Stops the IPv6 node as its route's address goes, as libtorrent
+    /// deletes the node of a listen socket it closes
+    /// (session_impl.cpp:2159-2163, v2.0.15). It sends and reads nothing
+    /// until [`Self::start_ipv6`], and keeps its table for then. Only a node
+    /// that runs from an address of its own stops: one that waits, one on a
+    /// proxied route and an idle one are left alone.
+    pub fn stop_ipv6(&self) {
+        if self.ipv6.shift(
+            |p| p == Ipv6Phase::Runs { proving: false } && !self.ipv6.proxied,
+            Ipv6Phase::Stopped,
+        ) {
+            info!("no IPv6 address that gives a DHT node: the IPv6 DHT stops");
+        }
+    }
+
     /// Pings a node a peer named (BEP 5 PORT) and, when it answers, adds it
     /// to the routing table under the id it answered with (libtorrent
     /// `node::add_node`: "ping the node, and if we get a reply, it will be
     /// added to the routing table").
     pub fn add_node(self: &Arc<Self>, addr: SocketAddr) {
         let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        if addr.is_ipv6() && !self.ipv6.runs() {
+            return;
+        }
         let dht = self.clone();
         spawn_with_cancel(
             debug_span!("dht_add_node", %addr),

@@ -838,12 +838,14 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
 }
 
 // A tracker rule keeps its torrents' DHT, PEX and LSD, each on its own,
-// their encryption, upload cap and forced start; absent inherits, and an
-// upload cap switched off is none.
+// their encryption, transports, upload cap and forced start; absent
+// inherits, and an upload cap switched off is none. A preference for a
+// transport the rule leaves off is kept as set, and a rule that leaves both
+// off over the global transports is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let rig = rig().await;
-    let fields = "id dht pex lsd encryption uploadCap { state value } forced";
+    let fields = "id dht pex lsd encryption peerTcp peerUtp preferDownloading preferSeeding uploadCap { state value } forced";
     let save = |id: &str, terms: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
@@ -855,7 +857,7 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let response = rig
         .execute(&save(
             "",
-            "dht: false, pex: false, lsd: true, encryption: PREFER, uploadCap: { state: OFF }, forced: true",
+            "dht: false, pex: false, lsd: true, encryption: PREFER, peerUtp: false, preferSeeding: UTP, uploadCap: { state: OFF }, forced: true",
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -865,22 +867,33 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
         saved["saveTrackerRule"][0],
         serde_json::json!({
             "id": id, "dht": false, "pex": false, "lsd": true, "encryption": "PREFER",
+            "peerTcp": null, "peerUtp": false, "preferDownloading": null, "preferSeeding": "UTP",
             "uploadCap": { "state": "OFF", "value": null }, "forced": true,
         })
     );
 
     for (terms, read) in [
         (
-            "dht: true, lsd: false, encryption: REQUIRE, uploadCap: { state: SET, value: 4096 }",
+            "dht: true, lsd: false, encryption: REQUIRE, peerTcp: false, preferDownloading: UTP, uploadCap: { state: SET, value: 4096 }",
             serde_json::json!({
                 "id": id, "dht": true, "pex": null, "lsd": false, "encryption": "REQUIRE",
+                "peerTcp": false, "peerUtp": null, "preferDownloading": "UTP", "preferSeeding": null,
                 "uploadCap": { "state": "SET", "value": 4096 }, "forced": false,
+            }),
+        ),
+        (
+            "encryption: DISABLED",
+            serde_json::json!({
+                "id": id, "dht": null, "pex": null, "lsd": null, "encryption": "DISABLED",
+                "peerTcp": null, "peerUtp": null, "preferDownloading": null, "preferSeeding": null,
+                "uploadCap": { "state": "INHERIT", "value": null }, "forced": false,
             }),
         ),
         (
             "",
             serde_json::json!({
                 "id": id, "dht": null, "pex": null, "lsd": null, "encryption": null,
+                "peerTcp": null, "peerUtp": null, "preferDownloading": null, "preferSeeding": null,
                 "uploadCap": { "state": "INHERIT", "value": null }, "forced": false,
             }),
         ),
@@ -894,6 +907,50 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
         let rules = response.data.into_json().unwrap();
         assert_eq!(rules["trackerRules"], serde_json::json!([read]));
     }
+
+    // Both off is refused, on the rule's own fields or over the global
+    // ones, and the rule stays as it was.
+    let kept = serde_json::json!([{
+        "id": id, "dht": null, "pex": null, "lsd": null, "encryption": null,
+        "peerTcp": null, "peerUtp": null, "preferDownloading": null, "preferSeeding": null,
+        "uploadCap": { "state": "INHERIT", "value": null }, "forced": false,
+    }]);
+    let refused = rig
+        .execute(&save(
+            &format!("id: {id},"),
+            "peerTcp: false, peerUtp: false",
+        ))
+        .await;
+    assert!(!refused.errors.is_empty());
+    let global_utp_off = rig
+        .execute("mutation { updateSettings(input: { torrent: { peerUtp: false } }) { torrent { peerUtp } } }")
+        .await;
+    assert!(
+        global_utp_off.errors.is_empty(),
+        "{:?}",
+        global_utp_off.errors
+    );
+    let refused = rig
+        .execute(&save(&format!("id: {id},"), "peerTcp: false"))
+        .await;
+    assert!(!refused.errors.is_empty());
+    // A rule that turns uTP back on broadens the global setting.
+    let broadened = rig
+        .execute(&save(
+            &format!("id: {id},"),
+            "peerTcp: false, peerUtp: true",
+        ))
+        .await;
+    assert!(broadened.errors.is_empty(), "{:?}", broadened.errors);
+    let saved = broadened.data.into_json().unwrap();
+    assert_eq!(saved["saveTrackerRule"][0]["peerTcp"], false);
+    assert_eq!(saved["saveTrackerRule"][0]["peerUtp"], true);
+    let response = rig.execute(&save(&format!("id: {id},"), "")).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let response = rig
+        .execute(&format!("{{ trackerRules {{ {fields} }} }}"))
+        .await;
+    assert_eq!(response.data.into_json().unwrap()["trackerRules"], kept);
 }
 
 // A tracker rule keeps the certificate its SSL torrents present: read back

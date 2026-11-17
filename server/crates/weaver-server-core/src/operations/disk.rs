@@ -14,6 +14,7 @@ use crate::operations::instrumentation::DiskSpaceSnapshot;
 use crate::runtime::StartupDiskGate;
 use crate::runtime::system_profile::{FilesystemType, StorageClass};
 
+pub(crate) mod beneath;
 pub(crate) mod holes;
 pub(crate) mod reader;
 mod storage_kind;

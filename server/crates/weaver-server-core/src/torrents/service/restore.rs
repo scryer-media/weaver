@@ -35,7 +35,7 @@ use crate::torrents::store::{Kept, Replayed, TorrentStore};
 use crate::torrents::tee::{Parts, Plan, Tee};
 use crate::torrents::{FilePriority, KeptIntent, TorrentCounters, TorrentIntent, TrackerEntry};
 use bytes::Bytes;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -141,7 +141,7 @@ struct Joining {
     paused: bool,
     ratelimits: LimitsConfig,
     have: (
-        Option<bitvec::boxed::BitBox<u8, bitvec::order::Msb0>>,
+        Option<Checkpoint>,
         bool,
         Arc<TorrentStore>,
     ),
@@ -299,6 +299,7 @@ impl TorrentService {
             side,
             ignored,
             kept,
+            stamps: boot_stamps,
         } = made;
         // One policy for both of a restore's database reads, the pieces it
         // kept and the tee's checkpoint: one the database fails to give
@@ -321,6 +322,29 @@ impl TorrentService {
                 None
             }
         };
+        // Each file's time as taken with the pieces: as the boot read them
+        // with the pieces, or read here as they were, only for a torrent
+        // that kept some, under the same policy. One the database fails to
+        // give leaves each file judged by its size.
+        let stamps = if let Some(boot) = boot_stamps {
+            boot.into_iter().collect()
+        } else if kept.is_some() {
+            match self
+                .inner
+                .db
+                .torrent_file_stamps(job_id)
+                .map_err(|error| hold(error.to_string()))
+            {
+                Ok(stamps) => stamps,
+                Err(Ok(wait)) => return Err(Unmade::Waits(wait)),
+                Err(Err(error)) => {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file times; its files are judged by their sizes");
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
         let writes = self.inner.env.disk.writes(job_id.0, &files);
         let files = Files::new(&layout, files).map_err(|error| Unmade::Fails(error.to_string()))?;
         let mut notes = Vec::new();
@@ -337,6 +361,7 @@ impl TorrentService {
             .map_err(|error| {
                 Unmade::Fails(format!("could not open the torrent's side store: {error}"))
             })?;
+        store.set_stamps(stamps);
         if let Some(reason) = store.side_reset() {
             tracing::warn!(
                 job_id = job_id.0,
@@ -463,6 +488,7 @@ impl TorrentService {
             side: self.side_store(torrent.record.job_id),
             ignored: ignored_of(&torrent.levels),
             kept: None,
+            stamps: None,
         })
     }
 
@@ -790,6 +816,7 @@ impl TorrentService {
                     let made = self.making(torrent, &global)?;
                     Some(Making {
                         kept: torrent.kept_at_boot.take(),
+                        stamps: torrent.stamps_at_boot.take(),
                         ..made
                     })
                 })
@@ -1164,7 +1191,7 @@ impl TorrentService {
                 self.held_back(&settings, &rules, torrent, now),
                 ratelimits,
                 (
-                    store.initial_have(placed(&torrent.record)),
+                    store.initial_checkpoint(placed(&torrent.record)),
                     torrent.record.seed_mode,
                     store,
                 ),
@@ -2020,7 +2047,7 @@ impl TorrentService {
     fn read_torrent(&self, row: RestoredTorrent, now: i64) -> Read {
         let record = row.record;
         let job_id = record.job_id;
-        let (ledger, resume, kept) = match row.counters {
+        let (ledger, resume, kept, stamps) = match row.counters {
             Some(stored) => (
                 stored.counters.unwrap_or_else(|error| {
                     tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's ledger");
@@ -2033,11 +2060,13 @@ impl TorrentService {
                 stored.kept.map_err(|error| {
                     tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's pieces");
                 }).ok(),
+                stored.stamps,
             ),
             None => (
                 TorrentCounters::default(),
                 ResumePeers::default(),
                 Some(None),
+                Vec::new(),
             ),
         };
         // The rule is the one its trackers match now (libtorrent keeps
@@ -2097,6 +2126,7 @@ impl TorrentService {
                 let unpack = self.describe(&mut torrent, &parsed, levels);
                 torrent.kept(row.failure, kept.as_ref().and_then(Option::as_ref));
                 torrent.kept_at_boot = kept;
+                torrent.stamps_at_boot = Some(stamps);
                 if torrent.record.seed_mode {
                     torrent.verified_at_boot = row
                         .seed_verified
@@ -2293,15 +2323,14 @@ impl TorrentService {
 }
 
 // The checkpoint the session starts from, so it does not check the files:
-// the pieces the job has, and no block of any other. The storage keeps a
+// the pieces the job has, and no block of any other but the pieces kept in
+// a file changed since the last run, which the session checks alone before
+// it starts (`TorrentStore::initial_checkpoint`). The storage keeps a
 // piece's blocks in memory until the piece verifies, so no block of a piece
 // not had is ever written to the job's files. None while the job vouches
 // for nothing: the session checks every piece.
-fn apply_initial_have(
-    options: &mut AddTorrentOptions,
-    have: Option<bitvec::boxed::BitBox<u8, bitvec::order::Msb0>>,
-) {
-    options.checkpoint = have.map(Checkpoint::pieces);
+fn apply_initial_have(options: &mut AddTorrentOptions, have: Option<Checkpoint>) {
+    options.checkpoint = have;
 }
 
 // A seed-mode torrent's pieces are had from where its files were placed,
@@ -2572,4 +2601,6 @@ struct Making {
     ignored: Vec<bool>,
     // The pieces it kept as the boot read them; none to read its row.
     kept: Option<Option<Kept>>,
+    // Its files' times as the boot read them; none to read its rows.
+    stamps: Option<Vec<(u32, i64)>>,
 }

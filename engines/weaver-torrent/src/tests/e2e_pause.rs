@@ -164,6 +164,7 @@ async fn test_a_paused_torrent_asks_nothing_of_its_tracker_or_peers() -> anyhow:
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 enable_utp: None,
+                utp_on_demand: false,
                 peer_opts: None,
             }),
             ..tracker_session_opts()?
@@ -247,6 +248,7 @@ async fn test_a_resumed_torrent_dials_the_peer_it_let_go_at_once() -> anyhow::Re
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 enable_utp: None,
+                utp_on_demand: false,
                 peer_opts: None,
             }),
             ..tracker_session_opts()?
@@ -314,6 +316,7 @@ async fn test_a_pause_reports_the_block_it_cut_in_the_stopped_announce() -> anyh
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 enable_utp: None,
+                utp_on_demand: false,
                 peer_opts: None,
             }),
             ..tracker_session_opts()?
@@ -390,6 +393,7 @@ async fn test_a_torrent_whose_files_changed_serves_none_of_them_unchecked() -> a
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 enable_utp: None,
+                utp_on_demand: false,
                 peer_opts: None,
             }),
             ..tracker_session_opts()?
@@ -491,6 +495,7 @@ async fn test_a_recheck_says_stopped_with_the_runs_counters_then_started_from_ze
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 enable_utp: None,
+                utp_on_demand: false,
                 peer_opts: None,
             }),
             ..tracker_session_opts()?

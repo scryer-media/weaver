@@ -9,7 +9,7 @@
 // again for it. The files are what the torrent seeds from; nothing else
 // writes them.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -19,13 +19,15 @@ use bitvec::order::Msb0;
 use bitvec::vec::BitVec;
 use bytes::Bytes;
 
-use super::files::{Files, Placed};
+use super::files::{Files, Placed, Stamping};
 use super::layout::PieceLayout;
 use super::side::Side;
 use super::storage::Pieces;
 use super::tee::Tee;
-use super::writes::{Done, Paid, Paying, VolumeRoom, Writes};
+use super::writes::{Done, Paid, Paying, Place, VolumeRoom, Writes};
 use tokio::sync::Notify;
+use weaver_torrent::Checkpoint;
+use weaver_torrent::core::lengths::Lengths;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -67,6 +69,15 @@ struct Have {
     // and the write that ends it (`TorrentStore::mid_move`): the pieces
     // kept meanwhile are to be checked, as that row says.
     mid_move: bool,
+    // The files written since their time was last taken for the database,
+    // one bit per file: the next checkpoint takes it again.
+    stale: BitVec<u8, Msb0>,
+    // The pieces kept from the last run in a file whose time changed since
+    // then: had no longer, and checked again as the session starts, each
+    // had again once the check finds it. Kept for the next run until then.
+    recheck: BitVec<u8, Msb0>,
+    // Each file's pieces in `recheck`: its time is not taken while any is.
+    rechecking: Vec<u32>,
 }
 
 // A move of a torrent's placed files is under way until this is dropped
@@ -88,6 +99,9 @@ impl Have {
             file_have: vec![0; layout.file_count()],
             count: 0,
             mid_move: false,
+            stale: BitVec::repeat(false, layout.file_count()),
+            recheck: BitVec::repeat(false, count),
+            rechecking: vec![0; layout.file_count()],
         }
     }
 
@@ -104,10 +118,13 @@ impl Have {
                 have.unchecked.fill(true);
             }
         }
+        // Read back, not written: their times are as the database has them.
+        have.stale.fill(false);
         have
     }
 
-    // Had now; true when it was not before.
+    // Had now; true when it was not before. A piece come to be had was
+    // written, or found, in its files: their times are taken again.
     fn set(&mut self, layout: &PieceLayout, piece: u32, had: bool) -> bool {
         let Some(mut bit) = self.pieces.get_mut(piece as usize) else {
             return false;
@@ -121,6 +138,7 @@ impl Have {
             let have = &mut self.file_have[span.file];
             if had {
                 *have += span.range.len();
+                self.stale.set(span.file, true);
             } else {
                 *have -= span.range.len();
             }
@@ -131,6 +149,60 @@ impl Have {
             self.count -= 1;
         }
         true
+    }
+
+    // The piece, kept from the last run, is checked again before it is had:
+    // had no longer, and in `recheck` until the check says.
+    fn hold_for_check(&mut self, layout: &PieceLayout, piece: u32) -> bool {
+        if !self.set(layout, piece, false) {
+            return false;
+        }
+        self.recheck.set(piece as usize, true);
+        for span in layout.spans(piece) {
+            self.rechecking[span.file] += 1;
+        }
+        true
+    }
+
+    // The check of a piece in `recheck` said, whatever it said: its files'
+    // times are taken again, now that they vouch for what they hold.
+    fn rechecked(&mut self, layout: &PieceLayout, piece: u32) {
+        let Some(mut bit) = self.recheck.get_mut(piece as usize) else {
+            return;
+        };
+        if !*bit {
+            return;
+        }
+        bit.set(false);
+        drop(bit);
+        for span in layout.spans(piece) {
+            self.rechecking[span.file] -= 1;
+            self.stale.set(span.file, true);
+        }
+    }
+
+    // The files were written outside a piece coming to be had: their times
+    // are taken again.
+    fn wrote(&mut self, files: impl IntoIterator<Item = usize>) {
+        for file in files {
+            if let Some(mut bit) = self.stale.get_mut(file) {
+                bit.set(true);
+            }
+        }
+    }
+
+    // Every file it has bytes of: their times are taken again.
+    fn all_written(&mut self) {
+        let held: Vec<usize> = (0..self.file_have.len())
+            .filter(|file| self.file_have[*file] > 0)
+            .collect();
+        self.wrote(held);
+    }
+
+    // No piece waits on a check of its own: a check of every piece begins.
+    fn recheck_none(&mut self) {
+        self.recheck.fill(false);
+        self.rechecking.fill(0);
     }
 }
 
@@ -164,6 +236,10 @@ pub(crate) struct TorrentStore {
     // Whether its files are moving, and the pieces handed over meanwhile:
     // the thread that hands a piece over never waits for a move.
     moves: Mutex<Moves>,
+    // Each file's time as the database last took it, read as the store is
+    // made and given up once the files have been looked at
+    // (`drop_unbacked`): a file whose time is not that one is checked again.
+    stamps: Mutex<HashMap<u32, i64>>,
 }
 
 // A piece handed over while its files moved, queued for the files where
@@ -203,6 +279,7 @@ impl TorrentStore {
             side: Arc::new(Mutex::new(Side::none())),
             writes,
             moves: Mutex::default(),
+            stamps: Mutex::default(),
         };
         *store.saved() = Some(store.kept());
         store
@@ -228,6 +305,47 @@ impl TorrentStore {
     // the next checkpoint writes them.
     pub(crate) fn lost_saved(&self) {
         *self.saved() = None;
+        // And the times went with them: they are taken again.
+        self.have().all_written();
+    }
+
+    // Each file's time as the database last took it, for the look at the
+    // files that follows (`drop_unbacked`).
+    pub(crate) fn set_stamps(&self, stamps: HashMap<u32, i64>) {
+        *lock(&self.stamps) = stamps;
+    }
+
+    // The files whose times the next checkpoint takes, in the same step as
+    // its pieces: each written since its time was last taken, and none
+    // with a piece still waiting on its check, whose old time stays until
+    // the check says. None when there is none. Their times are taken as
+    // taken: a write that lands after marks its file again. None while a
+    // move holds the files: a checkpoint never waits out a move, and the
+    // times stay due for the one after it.
+    pub(crate) fn stamping(&self) -> Option<Stamping> {
+        if !self.have().stale.any() {
+            return None;
+        }
+        let dir = self.files.dir_unless_moving()?;
+        let files: Vec<u32> = {
+            let mut have = self.have();
+            let taken: Vec<usize> = have
+                .stale
+                .iter_ones()
+                .filter(|file| have.rechecking[*file] == 0)
+                .collect();
+            for file in &taken {
+                have.stale.set(*file, false);
+            }
+            // Padding is on no disk: it has no time to take.
+            taken
+                .into_iter()
+                .filter(|file| self.layout.file(*file).is_some_and(|found| !found.padding))
+                .map(|file| file as u32)
+                .collect()
+        };
+        let stamping = self.files.stamping(dir, files);
+        (!stamping.is_empty()).then_some(stamping)
     }
 
     // The store with its side store at `side`, and the files `ignored`
@@ -255,6 +373,8 @@ impl TorrentStore {
         let checking = self.have().unchecked.any();
         // Dropped once the copies out of them are written.
         let mut copied = Vec::new();
+        // The files written: their times are taken again.
+        let mut wrote = Vec::new();
         {
             let placed = self.files.placed();
             let barrier = self.writes.queue(|batch| {
@@ -271,8 +391,9 @@ impl TorrentStore {
                         if opened.recorded(span.file) && !aside[span.file] {
                             let mut buffer = vec![0; span.range.len() as usize];
                             opened.read(piece, span.at, &mut buffer)?;
-                            let path = placed.path(span.file)?;
-                            batch.write(span.file, span.range.start, Bytes::from(buffer), || path);
+                            let place = placed.place(span.file)?;
+                            batch.write(span.file, span.range.start, Bytes::from(buffer), || place);
+                            wrote.push(span.file);
                         }
                     }
                     if !self.layout.spans(piece).iter().any(|span| aside[span.file]) {
@@ -286,6 +407,7 @@ impl TorrentStore {
                 return Err(unwritten());
             }
         }
+        self.have().wrote(wrote);
         for piece in copied {
             opened.drop_piece(piece)?;
         }
@@ -393,8 +515,8 @@ impl TorrentStore {
                         }
                         let mut buffer = vec![0; span.range.len() as usize];
                         side.read(*piece, span.at, &mut buffer)?;
-                        let path = placed.path(span.file)?;
-                        batch.write(span.file, span.range.start, Bytes::from(buffer), || path);
+                        let place = placed.place(span.file)?;
+                        batch.write(span.file, span.range.start, Bytes::from(buffer), || place);
                     }
                 }
                 io::Result::Ok(batch.barrier())
@@ -403,6 +525,14 @@ impl TorrentStore {
             if barrier.unwritten() {
                 return Err(unwritten());
             }
+            // The files written: their times are taken again.
+            self.have().wrote(
+                touched
+                    .iter()
+                    .flat_map(|piece| self.layout.spans(*piece))
+                    .map(|span| span.file)
+                    .filter(|file| turned_on(*file)),
+            );
         }
         drop(placed);
         if !touched.is_empty() {
@@ -502,7 +632,9 @@ impl TorrentStore {
             for piece in had.iter_ones() {
                 have.set(&self.layout, piece as u32, false);
             }
-            had.any()
+            let rechecking = have.recheck.any();
+            have.recheck_none();
+            had.any() || rechecking
         };
         self.files.let_read();
         had
@@ -526,8 +658,16 @@ impl TorrentStore {
     // The pieces to keep for the next run.
     pub(crate) fn kept(&self) -> Kept {
         let have = self.have();
+        let mut bits = have.pieces.as_raw_slice().to_vec();
+        // A piece waiting on its check is kept as it was: had, unless the
+        // check says it is not.
+        if have.recheck.any() {
+            for (byte, recheck) in bits.iter_mut().zip(have.recheck.as_raw_slice()) {
+                *byte |= *recheck;
+            }
+        }
         Kept {
-            bits: have.pieces.as_raw_slice().to_vec(),
+            bits,
             checking: have.unchecked.any() || have.mid_move,
         }
     }
@@ -561,12 +701,43 @@ impl TorrentStore {
             self.check_every_piece();
         }
         let have = self.have();
-        if have.unchecked.any() || (placed && have.count == 0) {
+        if have.unchecked.any() || (placed && have.count == 0 && !have.recheck.any()) {
             return None;
         }
         let mut pieces = have.pieces.clone();
         pieces.set_uninitialized(false);
         Some(pieces.into_boxed_bitslice())
+    }
+
+    // `initial_have` as the session's checkpoint, with every block of each
+    // piece waiting on its check marked written: the session checks those
+    // pieces alone before it starts, and the store has each again that the
+    // check finds (libtorrent `torrent::on_resume_data_checked`, which
+    // verifies each unfinished piece whose blocks are all there).
+    pub(crate) fn initial_checkpoint(&self, placed: bool) -> Option<Checkpoint> {
+        let have = self.initial_have(placed)?;
+        let mut checkpoint = Checkpoint::pieces(have);
+        let recheck = self.have().recheck.clone();
+        if !recheck.any() {
+            return Some(checkpoint);
+        }
+        // A layout the engine cannot take is one it refuses whole: the
+        // pieces had go on as they were, and those waiting are fetched.
+        let piece_length = u32::try_from(self.layout.piece_length()).ok();
+        let Some(lengths) = piece_length.and_then(|piece_length| {
+            Lengths::new(self.layout.total(), piece_length).ok()
+        }) else {
+            return Some(checkpoint);
+        };
+        let chunks = lengths.chunk_bitfield_bytes();
+        let mut blocks: BitBox<u8, Msb0> = BitBox::from_boxed_slice(vec![0u8; chunks].into());
+        for piece in recheck.iter_ones() {
+            if let Some(piece) = lengths.validate_piece_index(piece as u32) {
+                blocks[lengths.chunk_range(piece)].fill(true);
+            }
+        }
+        checkpoint.blocks = Some(blocks);
+        Some(checkpoint)
     }
 
     // Whether every file `wanted` names is had whole.
@@ -694,30 +865,54 @@ impl TorrentStore {
                 Some((file, found.length))
             })
             .collect();
-        let held: Vec<(usize, u64, Option<u64>)> = touched
+        let held: Vec<_> = touched
             .into_iter()
-            .map(|(file, length)| (file, length, self.files.held(file)))
+            .map(|(file, length)| (file, length, self.files.held_since(file)))
             .collect();
         if !held.is_empty() && held.iter().all(|(_, _, held)| held.is_none()) {
             return None;
         }
+        // Looked at: the times read with the pieces are not needed again.
+        let stamps = std::mem::take(&mut *lock(&self.stamps));
         let mut dropped = 0;
+        let (mut changed, mut rechecked) = (0u32, 0u32);
         for (file, length, held) in held {
-            let held = held.unwrap_or(0);
-            if held >= length {
-                continue;
-            }
+            let (held, time) = held.unwrap_or((0, None));
             let mut have = self.have();
-            for piece in self.layout.file_pieces(file) {
-                let past = !backed(file, piece)
-                    && self
-                        .layout
-                        .share(file, piece)
-                        .is_some_and(|share| share.end > held);
-                if past && have.set(&self.layout, piece, false) {
-                    dropped += 1;
+            if held < length {
+                for piece in self.layout.file_pieces(file) {
+                    let past = !backed(file, piece)
+                        && self
+                            .layout
+                            .share(file, piece)
+                            .is_some_and(|share| share.end > held);
+                    if past && have.set(&self.layout, piece, false) {
+                        dropped += 1;
+                    }
                 }
             }
+            // A file whose time is not the one taken with its pieces was
+            // changed since: what it still holds of them is checked again.
+            // One written in this run already, or with no usable time now
+            // or then, is judged by its size alone.
+            let then = stamps.get(&(file as u32)).copied();
+            let differs = matches!((then, time), (Some(then), Some(now)) if then != now);
+            if !differs || have.stale.get(file).is_some_and(|bit| *bit) {
+                continue;
+            }
+            changed += 1;
+            for piece in self.layout.file_pieces(file) {
+                if !backed(file, piece) && have.hold_for_check(&self.layout, piece) {
+                    rechecked += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            tracing::info!(
+                files = changed,
+                pieces = rechecked,
+                "a torrent's files changed since it last ran; their pieces are checked again"
+            );
         }
         Some(dropped)
     }
@@ -816,6 +1011,11 @@ impl TorrentStore {
         if self.files.is_shut() {
             self.unvouch();
         }
+        // A move may copy the files, and a copy keeps no time: every file
+        // it has bytes of has its time taken again where it is now.
+        if moved.is_ok() {
+            self.have().all_written();
+        }
         self.end_move();
         moved
     }
@@ -847,6 +1047,7 @@ impl TorrentStore {
                 |_| false,
             )
             .unwrap_or_else(|never| match never {});
+        self.have().all_written();
         self.end_move();
     }
 
@@ -961,7 +1162,12 @@ impl TorrentStore {
                     span.file,
                     span.range.start,
                     held.slice(at..at + len),
-                    || placed.path(span.file).unwrap_or_default(),
+                    || {
+                        placed.place(span.file).unwrap_or_else(|_| Place {
+                            path: PathBuf::new(),
+                            within: PathBuf::new(),
+                        })
+                    },
                 );
             }
             let have = Arc::clone(&self.have);
@@ -1064,6 +1270,7 @@ impl Pieces for TorrentStore {
         if let Some(mut bit) = have.unchecked.get_mut(piece as usize) {
             bit.set(false);
         }
+        have.rechecked(&self.layout, piece);
         Ok(have.set(&self.layout, piece, false))
     }
 
@@ -1095,6 +1302,7 @@ impl Pieces for TorrentStore {
             if let Some(mut bit) = have.unchecked.get_mut(piece as usize) {
                 bit.set(false);
             }
+            have.rechecked(&self.layout, piece);
             have.set(&self.layout, piece, true)
         };
         self.replay(piece)?;
@@ -1144,8 +1352,12 @@ impl Pieces for TorrentStore {
         if !whole {
             return Ok(());
         }
-        let path = self.files.placed().path(file)?;
-        let grown = self.writes.grow(path, length);
+        let place = self.files.placed().place(file)?;
+        let grown = self.writes.grow(place, length);
+        if grown.is_ok() {
+            // Made its length: its time is taken again.
+            self.have().wrote([file]);
+        }
         // A torrent with every piece holds its volume's writer no longer.
         if self.have().count == self.layout.piece_count() {
             self.writes.let_go();

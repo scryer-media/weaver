@@ -379,6 +379,9 @@ pub struct Session {
     pub(crate) disable_pex: bool,
     // Whether the session listens on uTP, and so connects over it.
     pub(crate) utp: bool,
+    // The name its uTP threads share, when it has threads of its own.
+    #[cfg(test)]
+    pub(crate) utp_threads: Option<String>,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -511,6 +514,43 @@ impl Session {
         }
     }
 
+    /// Starts the session's IPv6 DHT once its route has an IPv6 address
+    /// libtorrent would give a node, and stops it once the route has none,
+    /// for a caller that saw the interfaces change. libtorrent opens a
+    /// listen socket, and a DHT node on it, for an address that appears
+    /// (`on_ip_change`, session_impl.cpp:2002-2014, then 2206-2211), and
+    /// deletes the node of a socket whose address went (2159-2163, v2.0.15).
+    /// A stopped node keeps its table, so a returning address goes on from
+    /// it. Asks the route nothing when the session is IPv4-only or runs no
+    /// DHT, and changes nothing on a proxied route, whose IPv6 node a new
+    /// session tries again as the route or proxy changes. What changed.
+    pub fn follow_ipv6_route(&self) -> Option<Ipv6RouteChange> {
+        let dht = self.dht.as_ref()?;
+        if self.ipv4_only {
+            return None;
+        }
+        let before = dht.ipv6_phase();
+        if !matches!(
+            before,
+            crate::dht::Ipv6Phase::Waits
+                | crate::dht::Ipv6Phase::Stopped
+                | crate::dht::Ipv6Phase::Runs { proving: false }
+        ) {
+            return None;
+        }
+        match crate::route_interface::ipv6_dht(self.http_clients.as_ref()) {
+            crate::route_interface::Ipv6Dht::Runs if !dht.runs_ipv6() => {
+                dht.start_ipv6();
+                dht.runs_ipv6().then_some(Ipv6RouteChange::Started)
+            }
+            crate::route_interface::Ipv6Dht::None if dht.runs_ipv6() => {
+                dht.stop_ipv6();
+                (!dht.runs_ipv6()).then_some(Ipv6RouteChange::Stopped)
+            }
+            _ => None,
+        }
+    }
+
     /// The limits the session holds to now.
     pub fn limits(&self) -> SessionLimits {
         SessionLimits {
@@ -538,6 +578,18 @@ impl Session {
     /// keep what they negotiated.
     pub fn set_encryption(&self, policy: crate::mse::EncryptionPolicy) {
         self.connector.set_encryption(policy);
+    }
+
+    /// The orders the session's outgoing connections try TCP and uTP in
+    /// now, while a torrent downloads and while it seeds.
+    pub fn dial_orders(&self) -> crate::DialOrders {
+        self.connector.dial_orders()
+    }
+
+    /// Dial peers in `orders` from the next dial on: a dial under way keeps
+    /// its plan, and a connection made keeps its transport.
+    pub fn set_dial_orders(&self, orders: crate::DialOrders) {
+        self.connector.set_dial_orders(orders);
     }
 
     /// Whether peers at one address may each hold a connection to a torrent
@@ -620,6 +672,7 @@ impl Session {
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
             encryption: other.encryption.or(self.peer_opts.encryption),
+            dial_orders: other.dial_orders.or(self.peer_opts.dial_orders),
         }
     }
 
@@ -753,6 +806,15 @@ impl Session {
         self.listen_addr
     }
 
+    /// The session's connections that ran on its uTP threads: incoming,
+    /// outgoing, and those of either on its first uTP thread.
+    #[cfg(test)]
+    pub(crate) fn on_utp_threads(&self) -> [usize; 3] {
+        self.utp_threads
+            .as_deref()
+            .map_or([0; 3], crate::peer_connection::on_utp_threads)
+    }
+
     /// Whether the session listens on uTP as well, on the listen address.
     pub fn listens_utp(&self) -> bool {
         self.utp
@@ -860,3 +922,14 @@ mod incoming_tests;
 mod local_tests;
 #[cfg(test)]
 mod tests;
+
+/// What [`Session::follow_ipv6_route`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv6RouteChange {
+    /// The route has an IPv6 address that gives a DHT node: the IPv6 DHT
+    /// runs.
+    Started,
+    /// The route's last such address went: the IPv6 DHT stopped, its table
+    /// kept.
+    Stopped,
+}

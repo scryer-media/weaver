@@ -383,7 +383,10 @@ impl TorrentStateInitializing {
     /// its blocks dropped, to be fetched again (libtorrent
     /// `torrent::on_resume_data_checked`: `verify_piece` on each unfinished
     /// piece `is_piece_finished`, then `piece_passed` or `piece_failed`).
-    /// Returns the blocks left.
+    /// The storage hears each verdict as a check of the files tells it:
+    /// [`crate::storage::TorrentStorage::on_piece_checked`] for one that passed, and
+    /// [`crate::storage::TorrentStorage::on_piece_hash_failed`] for one that did not, so what
+    /// it holds is what the check found. Returns the blocks left.
     async fn verify_finished(&self, have: &mut BF, mut blocks: BF) -> anyhow::Result<BF> {
         let lengths = *self.metadata.lengths();
         let finished: Vec<_> = lengths
@@ -403,19 +406,36 @@ impl TorrentStateInitializing {
                     &self.files,
                     self.shared.options.disable_v1_hashes,
                 );
+                // The storage hears each verdict here, on the check's
+                // thread, as a check of every piece tells it.
                 finished
                     .iter()
-                    .map(|piece| (*piece, fo.check_piece_whole(*piece)))
-                    .collect::<Vec<_>>()
+                    .map(|piece| {
+                        let piece = *piece;
+                        let passed = match fo.check_piece_whole(piece) {
+                            Ok(Verdict::Passed) => true,
+                            Ok(Verdict::Inconsistent) => return Err(inconsistent_hashes(piece)),
+                            Ok(Verdict::Failed | Verdict::Unknown) | Err(_) => false,
+                        };
+                        if passed {
+                            self.files
+                                .on_piece_checked(piece)
+                                .with_context(|| format!("the storage did not take piece {piece}"))?;
+                        } else {
+                            self.files.on_piece_hash_failed(piece).with_context(|| {
+                                format!("the storage did not let go of piece {piece}")
+                            })?;
+                        }
+                        Ok((piece, passed))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
             })
-            .await;
-        for (piece, verdict) in verdicts {
-            match verdict {
-                Ok(Verdict::Passed) => have.set(piece.get_usize(), true),
-                Ok(Verdict::Inconsistent) => return Err(inconsistent_hashes(piece)),
-                Ok(Verdict::Failed | Verdict::Unknown) | Err(_) => {
-                    blocks[lengths.chunk_range(piece)].fill(false)
-                }
+            .await?;
+        for (piece, passed) in verdicts {
+            if passed {
+                have.set(piece.get_usize(), true);
+            } else {
+                blocks[lengths.chunk_range(piece)].fill(false);
             }
         }
         Ok(blocks)

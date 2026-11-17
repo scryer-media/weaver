@@ -1641,6 +1641,7 @@ fn sample_swarm() -> weaver_server_core::torrents::metrics::swarm::SwarmSnapshot
     swarm.piece_picks[PiecePick::EndGame as usize] = 59;
     swarm.wasted_bytes[Waste::CutShort as usize] = 60;
     swarm.peers_named[PeerSource::Dht as usize] = 61;
+    swarm.pex_encrypted_skipped = 62;
     swarm
 }
 
@@ -1851,10 +1852,10 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             ("not_needed", 1),
         ],
         connects: vec![
-            ("tcp", "v4", [30, 20, 3, 4, 2]),
-            ("tcp", "v6", [0, 0, 0, 0, 0]),
-            ("utp", "v4", [12, 7, 0, 0, 5]),
-            ("utp", "v6", [0, 0, 0, 0, 0]),
+            ("tcp", "v4", [30, 20, 3, 4, 2, 1]),
+            ("tcp", "v6", [0, 0, 0, 0, 0, 0]),
+            ("utp", "v4", [12, 7, 0, 0, 5, 0]),
+            ("utp", "v6", [0, 0, 0, 0, 0, 0]),
         ],
         dht: Some((150, 20, 6)),
         swarm: sample_swarm(),

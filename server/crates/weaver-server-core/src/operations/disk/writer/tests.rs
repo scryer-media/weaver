@@ -7,7 +7,7 @@ use super::*;
 use crate::clock::ManualClock;
 
 // Opens the file with nothing said of its length: every close sets it.
-fn open(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
+fn open(path: &Path, _length: Option<u64>, _: Option<&Path>) -> io::Result<Opened> {
     Ok(Opened {
         file: open_file(path)?,
         length: None,
@@ -29,6 +29,7 @@ fn create(path: &Path) -> Option<Create> {
         path: path.to_path_buf(),
         length: None,
         open,
+        within: None,
     })
 }
 
@@ -98,9 +99,9 @@ fn a_written_buffer_is_let_go_on_the_writer() {
 }
 
 // Opens a file a second after the writer's clock, as a slow open would.
-fn open_slowly(path: &Path, length: Option<u64>) -> io::Result<Opened> {
+fn open_slowly(path: &Path, length: Option<u64>, _: Option<&Path>) -> io::Result<Opened> {
     step_clock(Duration::from_secs(1));
-    open(path, length)
+    open(path, length, None)
 }
 
 // A volume's write time is the time inside its write calls: an open between
@@ -121,6 +122,7 @@ fn a_batch_counts_only_the_time_inside_its_write_calls() {
             path: path.to_path_buf(),
             length: None,
             open: open_slowly,
+            within: None,
         })
     };
     job.write(1, 0, Bytes::from_static(b"lan"), slow(&first));
@@ -157,6 +159,7 @@ fn a_callers_code_between_two_writes_is_not_write_time() {
         path: path.clone(),
         length: None,
         open: open_slowly,
+        within: None,
     });
     job.write(1, 0, Bytes::from_static(b"lan"), slow);
     job.barrier().then(|| step_clock(Duration::from_secs(1)));
@@ -240,6 +243,7 @@ fn a_close_and_a_move_follow_the_writes_before_them() {
             path: from.clone(),
             length: None,
             open,
+            within: None,
         },
     );
     let (moved_from, moved_to) = (from.clone(), to.clone());
@@ -278,6 +282,7 @@ fn a_reader_does_not_wait_behind_the_drop_of_a_closed_files_handle() {
             path: path.clone(),
             length: None,
             open,
+            within: None,
         },
     );
     job.release(1);
@@ -331,6 +336,7 @@ fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
             path: closed_path.clone(),
             length: None,
             open,
+            within: None,
         },
     );
     closing.release(1);
@@ -385,6 +391,7 @@ fn a_stopped_keys_code_is_dropped_after_the_handles_the_key_let_go() {
             path: closed_path.clone(),
             length: None,
             open,
+            within: None,
         },
     );
     job.release(1);
@@ -1372,7 +1379,7 @@ fn an_operation_its_caller_makes_itself_is_no_failure_on_a_volume_with_no_thread
 // A refusal still to be heard is not a failure of the key.
 #[test]
 fn a_refused_name_is_not_a_failed_barrier() {
-    fn refuse(_: &Path, _: Option<u64>) -> io::Result<Opened> {
+    fn refuse(_: &Path, _: Option<u64>, _: Option<&Path>) -> io::Result<Opened> {
         Err(io::ErrorKind::InvalidFilename.into())
     }
     let dir = tempfile::tempdir().unwrap();
@@ -1388,6 +1395,7 @@ fn a_refused_name_is_not_a_failed_barrier() {
             path: path.clone(),
             length: None,
             open: refuse,
+            within: None,
         }),
     );
     // The later writes of the refused file are dropped without a word.
@@ -1792,7 +1800,7 @@ fn a_write_given_up_at_the_stops_end_leaves_nothing_counted() {
 
 // Opens a new file sized to its declared length, as a file system that makes
 // holes is given it, and says so.
-fn open_sized(path: &Path, length: Option<u64>) -> io::Result<Opened> {
+fn open_sized(path: &Path, length: Option<u64>, _: Option<&Path>) -> io::Result<Opened> {
     let file = open_file(path)?;
     let length = length.unwrap_or(0);
     file.set_len(length)?;
@@ -1804,7 +1812,7 @@ fn open_sized(path: &Path, length: Option<u64>) -> io::Result<Opened> {
 }
 
 // Opens a new file that grows as it is written, and says it is empty.
-fn open_grown(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
+fn open_grown(path: &Path, _length: Option<u64>, _: Option<&Path>) -> io::Result<Opened> {
     Ok(Opened {
         file: open_file(path)?,
         length: Some(0),
@@ -1817,6 +1825,7 @@ fn made_by(path: &Path, length: u64, open: OpenFn) -> Create {
         path: path.to_path_buf(),
         length: Some(length),
         open,
+        within: None,
     }
 }
 
@@ -1893,7 +1902,7 @@ fn a_file_grown_by_its_writes_is_set_at_close_only_when_short() {
     assert_eq!((skipped, sets), (1, 1));
 }
 
-fn graphs_opener(path: &Path, length: Option<u64>) -> io::Result<Opened> {
+fn graphs_opener(path: &Path, length: Option<u64>, _: Option<&Path>) -> io::Result<Opened> {
     use crate::pipeline::graph::sparse::{PlatformMarker, create_sized_known};
     create_sized_known(path, &PlatformMarker, length)
 }
@@ -2025,6 +2034,7 @@ fn a_closed_file_is_placed_before_another_files_open() {
             path: closed_path.clone(),
             length: None,
             open,
+            within: None,
         },
     );
     hold.release(1);

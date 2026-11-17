@@ -501,6 +501,14 @@ pub trait HttpClients: Send + Sync + 'static {
         Egress::Proxied
     }
 
+    /// The IPv6 addresses these clients' route may send from, as the routing
+    /// layer lists them; none through a proxy, which says nothing of where
+    /// it exits. Clients that do not list them name the one public IPv6
+    /// traffic leaves from, as [`Self::egress`] says.
+    fn ipv6_sources(&self) -> Option<io::Result<Ipv6Sources>> {
+        sources_of(self.egress(PUBLIC_PROBE_V6))
+    }
+
     /// A datagram socket bound at `local`, the address a port mapper asks
     /// the gateway from, on the network the gateway is reached on.
     fn gateway_socket<'a>(
@@ -571,11 +579,43 @@ impl HttpClients for NoClients {
         }
     }
 
+    fn ipv6_sources(&self) -> Option<io::Result<Ipv6Sources>> {
+        self.sockets.ipv6_sources()
+    }
+
     fn gateway_socket<'a>(
         &'a self,
         local: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         self.sockets.gateway_socket(local)
+    }
+}
+
+pub use weaver_tunnel::egress::{Ipv6Source, Ipv6Sources};
+
+/// The IPv6 documentation address no host answers at: where traffic toward
+/// it leaves from names the route toward the internet. Nothing is sent.
+pub(crate) const PUBLIC_PROBE_V6: SocketAddr = SocketAddr::new(
+    IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+    9,
+);
+
+/// The IPv6 sources of a route that names only `egress`, where public IPv6
+/// traffic leaves from: that one address, on the interface of the internet
+/// route; none through a proxy.
+pub(crate) fn sources_of(egress: Egress) -> Option<io::Result<Ipv6Sources>> {
+    match egress {
+        Egress::Proxied => None,
+        Egress::From(IpAddr::V6(ip)) => Some(Ok(Ipv6Sources {
+            addresses: vec![Ipv6Source {
+                ip,
+                loopback_interface: ip.is_loopback(),
+                point_to_point: false,
+                internet_route: true,
+            }],
+            any_internet_route: true,
+        })),
+        Egress::From(IpAddr::V4(_)) | Egress::NoRoute => Some(Ok(Ipv6Sources::default())),
     }
 }
 
