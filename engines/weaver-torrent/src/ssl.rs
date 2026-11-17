@@ -635,6 +635,10 @@ impl crate::HttpClients for SslHttpClients {
     fn egress(&self, to: std::net::SocketAddr) -> crate::Egress {
         self.inner.egress(to)
     }
+
+    fn ipv6_sources(&self) -> Option<std::io::Result<crate::Ipv6Sources>> {
+        self.inner.ipv6_sources()
+    }
 }
 
 #[cfg(test)]

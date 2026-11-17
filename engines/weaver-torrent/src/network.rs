@@ -183,6 +183,18 @@ pub trait SocketFactory: Send + Sync + 'static {
         None
     }
 
+    /// The IPv6 addresses this route may send from, as the routing layer
+    /// lists them; None when the route does not say, as one through a proxy
+    /// does not. A route that does not list them names the one public IPv6
+    /// traffic leaves from, as [`Self::source_toward`] says.
+    fn ipv6_sources(&self) -> Option<io::Result<crate::core::net::Ipv6Sources>> {
+        let egress = match self.source_toward(crate::core::net::PUBLIC_PROBE_V6)? {
+            Ok(ip) => crate::Egress::From(ip),
+            Err(_) => crate::Egress::NoRoute,
+        };
+        crate::core::net::sources_of(egress)
+    }
+
     /// A datagram socket bound at `local` on the network the gateway is
     /// reached on: the one a port mapper asks the gateway from. A route with
     /// no such socket has no gateway to ask.

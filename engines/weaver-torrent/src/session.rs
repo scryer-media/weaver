@@ -514,25 +514,41 @@ impl Session {
         }
     }
 
-    /// Starts the session's IPv6 DHT once its route has an IPv6 address the
-    /// internet reaches, for a caller that saw the interfaces change, as
-    /// libtorrent opens a listen socket, and a DHT node on it, for an
-    /// address that appears (`on_ip_change`, session_impl.cpp:2002-2014,
-    /// then 2206-2211, v2.0.15). Asks the route nothing when the IPv6 DHT
-    /// runs already, the session is IPv4-only, or it runs no DHT. Whether it
-    /// started.
-    pub fn follow_ipv6_route(&self) -> bool {
-        let Some(dht) = &self.dht else {
-            return false;
-        };
-        if dht.runs_ipv6() {
-            return false;
+    /// Starts the session's IPv6 DHT once its route has an IPv6 address
+    /// libtorrent would give a node, and stops it once the route has none,
+    /// for a caller that saw the interfaces change. libtorrent opens a
+    /// listen socket, and a DHT node on it, for an address that appears
+    /// (`on_ip_change`, session_impl.cpp:2002-2014, then 2206-2211), and
+    /// deletes the node of a socket whose address went (2159-2163, v2.0.15).
+    /// A stopped node keeps its table, so a returning address goes on from
+    /// it. Asks the route nothing when the session is IPv4-only or runs no
+    /// DHT, and changes nothing on a proxied route, whose IPv6 node a new
+    /// session tries again as the route or proxy changes. What changed.
+    pub fn follow_ipv6_route(&self) -> Option<Ipv6RouteChange> {
+        let dht = self.dht.as_ref()?;
+        if self.ipv4_only {
+            return None;
         }
-        if self.ipv4_only || !crate::route_interface::runs_ipv6_dht(self.http_clients.as_ref()) {
-            return false;
+        let before = dht.ipv6_phase();
+        if !matches!(
+            before,
+            crate::dht::Ipv6Phase::Waits
+                | crate::dht::Ipv6Phase::Stopped
+                | crate::dht::Ipv6Phase::Runs { proving: false }
+        ) {
+            return None;
         }
-        dht.start_ipv6();
-        true
+        match crate::route_interface::ipv6_dht(self.http_clients.as_ref()) {
+            crate::route_interface::Ipv6Dht::Runs if !dht.runs_ipv6() => {
+                dht.start_ipv6();
+                dht.runs_ipv6().then_some(Ipv6RouteChange::Started)
+            }
+            crate::route_interface::Ipv6Dht::None if dht.runs_ipv6() => {
+                dht.stop_ipv6();
+                (!dht.runs_ipv6()).then_some(Ipv6RouteChange::Stopped)
+            }
+            _ => None,
+        }
     }
 
     /// The limits the session holds to now.
@@ -906,3 +922,14 @@ mod incoming_tests;
 mod local_tests;
 #[cfg(test)]
 mod tests;
+
+/// What [`Session::follow_ipv6_route`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv6RouteChange {
+    /// The route has an IPv6 address that gives a DHT node: the IPv6 DHT
+    /// runs.
+    Started,
+    /// The route's last such address went: the IPv6 DHT stopped, its table
+    /// kept.
+    Stopped,
+}

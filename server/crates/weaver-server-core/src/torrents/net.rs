@@ -483,6 +483,12 @@ impl SocketFactory for LegSockets {
         self.dialer.source_toward(to)
     }
 
+    // The IPv6 addresses the leg's route may send from, as its egress
+    // lists them.
+    fn ipv6_sources(&self) -> Option<io::Result<weaver_torrent::Ipv6Sources>> {
+        self.dialer.ipv6_sources()
+    }
+
     fn gateway_socket<'a>(
         &'a self,
         local: SocketAddr,
@@ -1464,6 +1470,15 @@ where
             }
             None => Egress::Proxied,
         }
+    }
+
+    // The IPv6 addresses a request may leave from, as `egress` says where
+    // one leaves: none through the bridge, where the proxy exits.
+    fn ipv6_sources(&self) -> Option<io::Result<weaver_torrent::Ipv6Sources>> {
+        if self.bridge.is_some() || self.kind == LegKind::Ladder {
+            return None;
+        }
+        self.dialer.ipv6_sources()
     }
 
     // The port mapper's socket, bound by the leg's route as its own

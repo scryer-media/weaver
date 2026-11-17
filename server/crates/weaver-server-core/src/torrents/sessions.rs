@@ -1898,8 +1898,9 @@ impl Sessions {
     }
 
     /// Starts the IPv6 DHT of every running session whose route now has an
-    /// IPv6 address the internet reaches (see `Session::follow_ipv6_route`).
-    /// The routes are asked off the async threads.
+    /// IPv6 address that gives a DHT node, and stops it where the route has
+    /// none left (see `Session::follow_ipv6_route`). The routes are asked
+    /// off the async threads.
     pub async fn follow_ipv6_routes(&self) {
         let open: Vec<_> = self.running().await.into_iter().collect();
         if open.is_empty() {
@@ -1907,11 +1908,16 @@ impl Sessions {
         }
         let asked = tokio::task::spawn_blocking(move || {
             for (key, session) in open {
-                if session.follow_ipv6_route() {
-                    tracing::info!(
+                match session.follow_ipv6_route() {
+                    Some(weaver_torrent::Ipv6RouteChange::Started) => tracing::info!(
                         route = key.as_str(),
-                        "the route has an IPv6 address the internet reaches: its IPv6 DHT starts"
-                    );
+                        "the route has an IPv6 address that gives a DHT node: its IPv6 DHT runs"
+                    ),
+                    Some(weaver_torrent::Ipv6RouteChange::Stopped) => tracing::info!(
+                        route = key.as_str(),
+                        "the route has no IPv6 address that gives a DHT node: its IPv6 DHT stops"
+                    ),
+                    None => {}
                 }
             }
         })
@@ -1921,8 +1927,8 @@ impl Sessions {
         }
     }
 
-    /// Joins local service discovery again, and starts an IPv6 DHT that
-    /// waits for an address, each time `changes` rings, until its sender
+    /// Joins local service discovery again, and starts or stops the IPv6
+    /// DHT as its route's addresses change, each time `changes` rings, until its sender
     /// goes. Changes that ring while a run goes on are taken by one more,
     /// on the interfaces up then.
     pub async fn follow_interfaces(
