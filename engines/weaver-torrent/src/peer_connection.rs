@@ -48,20 +48,24 @@ use crate::mse::{Encryption, EncryptionPolicy};
 use crate::session_stats::{Transport, disk::DiskOp};
 use crate::{
     read_buf::ReadBuf,
+    file_ops::HeldPiece,
     spawn_utils::BlockingSpawner,
     ssl::SslTorrent,
+    storage::ReadTurns,
     stream_connect::{Guard, Link, StreamConnector, Transports},
     type_aliases::BoxAsyncReadVectored,
 };
 
 /// Reads blocks to upload, from any thread.
 pub trait ChunkReader: Send + Sync {
-    /// Each of `chunks` read into its buffer of `bufs`; on an error, the
-    /// first block not read and why.
+    /// Each of `chunks` read into its buffer of `bufs`, out of whole pieces
+    /// held in `held` when given; on an error, the first block not read and
+    /// why.
     fn read_chunks(
         &self,
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
+        held: Option<&mut HeldPiece>,
     ) -> std::result::Result<(), (usize, anyhow::Error)>;
 }
 
@@ -192,13 +196,21 @@ pub trait PeerConnectionHandler {
     fn chunk_reader(&self) -> Option<Arc<dyn ChunkReader>> {
         None
     }
-    /// Each of `chunks` read into its buffer of `bufs`. On an error, the
-    /// first block not read and why: the blocks before it are read whole.
-    /// A handler with no faster way reads them one at a time.
+    /// The read turns the connection's upload reads take, asked once when
+    /// it starts uploading. A handler that names no volume shares the
+    /// private turns of every storage that names none.
+    fn read_turns(&self) -> ReadTurns {
+        ReadTurns::private()
+    }
+    /// Each of `chunks` read into its buffer of `bufs`, out of whole pieces
+    /// held in `held` when given. On an error, the first block not read and
+    /// why: the blocks before it are read whole. A handler with no faster
+    /// way reads them one at a time, and holds nothing.
     fn read_chunks(
         &self,
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
+        _held: Option<&mut HeldPiece>,
     ) -> std::result::Result<(), (usize, anyhow::Error)> {
         for (i, (chunk, buf)) in chunks.iter().zip(bufs.iter_mut()).enumerate() {
             self.read_chunk(chunk, buf).map_err(|e| (i, e))?;
@@ -1076,9 +1088,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         }
 
         // A connection on a uTP thread reads the blocks it uploads on the
-        // session's disk threads, its buffer handed there and back: nothing
-        // that blocks runs on a uTP thread. Its reads run in order under a
-        // key of its own.
+        // session's blocking threads, its buffer handed there and back:
+        // nothing that blocks runs on a uTP thread. It has one batch out at
+        // a time, so its reads run in order. Every upload read takes a read
+        // turn of the torrent's volume; on one that reads whole pieces the
+        // connection holds the last piece it read, and serves the blocks
+        // asked of it from there.
+        let turns = self.handler.read_turns();
+        let mut held = turns.whole_pieces().then(HeldPiece::default);
         let on_utp = weaver_utp::on_shard_thread();
         let upload_reader = if on_utp {
             self.handler.chunk_reader()
@@ -1105,7 +1122,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         if supports_extended {
             stats.sent(transport);
         }
-        let read_key = crate::off_shard::reader_key();
 
         let writer = async move {
             let keep_alive_interval = self.options.keep_alive_interval();
@@ -1333,22 +1349,24 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 None => (std::mem::take(&mut write_buf), false),
                             };
                             let reader = reader.clone();
-                            let stats = self.spawner.stats().clone();
-                            let (owned, read) = self
+                            let mut piece = held.take();
+                            let (owned, piece, read) = self
                                 .spawner
-                                .read_off_shard(read_key, move || {
+                                .read_off_shard(&turns, move |stats| {
                                     let (mut buf, was_lent) = owned;
                                     let mut payloads = payloads_in(&mut buf, &spans);
                                     let call = stats.call(DiskOp::UploadReadUtp);
                                     call.bytes(read_len(&chunks));
                                     stats.upload_read(Transport::Utp, chunks.len() as u64);
-                                    let read = reader.read_chunks(&chunks, &mut payloads);
+                                    let read =
+                                        reader.read_chunks(&chunks, &mut payloads, piece.as_mut());
                                     drop(call);
                                     drop(payloads);
-                                    ((buf, was_lent), read)
+                                    ((buf, was_lent), piece, read)
                                 })
                                 .await
                                 .ok_or(Error::TorrentIsNotLive)?;
+                            held = piece;
                             match owned {
                                 (buf, true) => lent = Some(buf),
                                 (buf, false) => write_buf = buf,
@@ -1357,12 +1375,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         }
                         None => {
                             let mut payloads = payloads_in(buf, &spans);
+                            let piece = held.as_mut();
                             self.spawner
-                                .block_in_place_with_semaphore(|| {
+                                .block_in_place_in_turn(&turns, || {
                                     let call = stats.call(DiskOp::UploadReadTcp);
                                     call.bytes(read_len(&chunks));
                                     stats.upload_read(Transport::Tcp, chunks.len() as u64);
-                                    self.handler.read_chunks(&chunks, &mut payloads)
+                                    self.handler.read_chunks(&chunks, &mut payloads, piece)
                                 })
                                 .await
                         }

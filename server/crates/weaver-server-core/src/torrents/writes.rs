@@ -523,6 +523,21 @@ impl Writes {
         lock(&self.current.state).dir = dir.to_path_buf();
     }
 
+    // The read turns of the volume the files are under now, from memory
+    // alone: the files' reads share them with every other reader of that
+    // volume, usenet's too. A volume whose kind is not known reads as a
+    // solid-state one.
+    pub(crate) fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
+        let dir = lock(&self.current.state).dir.clone();
+        let disk = &self.current.disk;
+        let volume = disk.volume(&dir);
+        let reads = match &disk.capacity {
+            Some(capacity) => capacity.volume_reads(&volume),
+            None => volume.reads(|| crate::operations::disk::StorageKind::Unknown),
+        };
+        weaver_torrent::storage::ReadTurns::new(Arc::clone(reads.turns()), reads.whole_pieces())
+    }
+
     // The same, for a torrent that writes nothing and whose volume is read
     // when it next does.
     pub(crate) fn placed(&self, dir: &Path) {

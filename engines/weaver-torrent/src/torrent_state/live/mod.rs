@@ -259,6 +259,10 @@ pub struct TorrentStateLive {
     // Closed off the uTP threads: the last hold of the run may be a peer's
     // task on one.
     pub(crate) files: DropOffShard<FileStorage>,
+    // The read turns of the volume the files are on, asked of the storage
+    // once when the run begins: every read of the files during the run
+    // takes one of them.
+    pub(crate) reads: crate::storage::ReadTurns,
 
     per_piece_locks: Vec<RwLock<()>>,
 
@@ -809,8 +813,9 @@ impl crate::peer_connection::ChunkReader for UploadReader {
         &self,
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
+        held: Option<&mut crate::file_ops::HeldPiece>,
     ) -> std::result::Result<(), (usize, anyhow::Error)> {
-        self.state.file_ops().read_chunks(self.addr, chunks, bufs)
+        self.state.file_ops().read_chunks(self.addr, chunks, bufs, held)
     }
 }
 

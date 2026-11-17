@@ -53,9 +53,8 @@ pub struct BlockingSpawner {
     // The thread that checks a piece whose last block landed: the session's
     // one, on the session's runtime, there while it has a check to run.
     hash: DiskQueue<HashJob>,
-    // The threads that read the blocks peers on uTP threads upload.
-    reads: DiskQueue<crate::off_shard::ReadJob>,
-    // What the session's disk calls, permits and peer sockets did.
+    // What the session's disk calls, permits, read turns and peer sockets
+    // did.
     stats: Arc<DiskStats>,
 }
 
@@ -89,9 +88,6 @@ impl BlockingSpawner {
             // one (libtorrent `settings_pack::hashing_threads`, a pool beside
             // `aio_threads`, mmap_disk_io.cpp:1685).
             hash: DiskQueue::new(handle.clone(), HASH_THREADS),
-            // Uploads are read on threads as many again (libtorrent reads
-            // on its `aio_threads` too).
-            reads: DiskQueue::new(handle.clone(), permits),
             concurrent_block_in_place_semaphore: Arc::new(Semaphore::new(permits)),
             handle,
             stats: Arc::default(),
@@ -111,7 +107,6 @@ impl BlockingSpawner {
         snapshot.permits = self.permits as u64;
         snapshot.permits_in_use = self.permits.saturating_sub(free) as u64;
         snapshot.write_jobs_queued = self.disk.waiting();
-        snapshot.read_jobs_queued = self.reads.waiting();
         snapshot.queued_write_bytes = self.pool.queued_bytes();
         snapshot.check_pieces_waiting = self.checks.spans();
         snapshot.check_bytes_waiting = self.checks.queued_bytes();
@@ -179,35 +174,26 @@ impl BlockingSpawner {
         f()
     }
 
-    /// Like [`Self::block_in_place_with_semaphore`], holding every permit
-    /// free once one is had, up to `most`: `f` is given how many it holds,
-    /// the threads it may run at once.
-    pub async fn block_in_place_with_permits<F: FnOnce(usize) -> R, R>(
+    /// Like [`Self::block_in_place_with_semaphore`], in a read turn of
+    /// `turns` in the place of a blocking permit: a read of a torrent's
+    /// files, which its volume bounds with every other reader of it.
+    pub(crate) async fn block_in_place_in_turn<F: FnOnce() -> R, R>(
         &self,
-        most: usize,
+        turns: &crate::storage::ReadTurns,
         f: F,
     ) -> R {
         no_block_on_utp_thread();
-        let semaphore = &self.concurrent_block_in_place_semaphore;
-        let mut permits = vec![self.permit().await];
-        while permits.len() < most
-            && let Ok(permit) = semaphore.try_acquire()
-        {
-            self.stats.permit_taken();
-            permits.push(permit);
-        }
-        let threads = permits.len();
-        if self.allow_block_in_place {
-            return tokio::task::block_in_place(|| f(threads));
-        }
-        f(threads)
+        let _turn = turns.turn(&self.stats).await;
+        self.block_in_place(f)
     }
 
-    /// The most threads a check hashes on: half the blocking permits, at
-    /// least one, so peers' reads and piece writes always find the rest.
-    /// libtorrent hashes on its own `hashing_threads` pool (default 1)
-    /// beside the disk threads; here the two share one pool, and the cap
-    /// keeps the share a check takes of it bounded.
+    /// The most threads the initial check of a torrent runs on, its reader
+    /// and its hashers: half the blocking permits, at least one, as before
+    /// the check's reads took turns on their volume. The reader reads a
+    /// piece at a time in one read turn; the hashers read nothing and take
+    /// no turn. libtorrent hashes on its own `hashing_threads` pool
+    /// (default 1) beside the disk threads; here the cap keeps the threads
+    /// a check runs on bounded.
     pub fn check_threads(&self) -> usize {
         (self.permits / 2).max(1)
     }
@@ -233,38 +219,47 @@ impl BlockingSpawner {
         Ok(permit)
     }
 
+    /// Runs `f` on one of the session's blocking threads for a reader on a
+    /// uTP thread, in a read turn of `turns` taken first without blocking,
+    /// and hands the result back with the others that finish meanwhile, in
+    /// one wake of the uTP thread. None when the session's runtime shut
+    /// down before it ran, or it panicked.
+    pub(crate) async fn read_off_shard<F, R>(
+        &self,
+        turns: &crate::storage::ReadTurns,
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&DiskStats) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        crate::off_shard::read_off_shard(&self.handle, turns, &self.stats, f).await
+    }
+
     /// Runs `f` on one of the session's blocking threads once it holds a
-    /// blocking permit, from any thread, a uTP thread too: the work runs on
-    /// the session's pool, never on the calling runtime's own, and disk
-    /// work that cannot run in place counts against the same bound as the
-    /// work that does. An error when the session's runtime shut down before
-    /// it ran, or it panicked: the error says which, and carries what the
-    /// panic said.
-    pub(crate) async fn spawn_blocking_with_permit<F, R>(&self, f: F) -> anyhow::Result<R>
+    /// read turn of `turns`, from any thread, a uTP thread too: the work
+    /// runs on the session's pool, never on the calling runtime's own, and
+    /// a read that cannot run in place counts against the same bound, its
+    /// volume's reads, as the reads that do. An error when the session's
+    /// runtime shut down before it ran, or it panicked: the error says
+    /// which, and carries what the panic said.
+    pub(crate) async fn spawn_blocking_in_turn<F, R>(
+        &self,
+        turns: &crate::storage::ReadTurns,
+        f: F,
+    ) -> anyhow::Result<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let permit = self.owned_permit().await?;
+        let turn = turns.owned_turn(&self.stats).await;
         Ok(self
             .handle
             .spawn_blocking(move || {
-                let _permit = permit;
+                let _turn = turn;
                 f()
             })
             .await?)
-    }
-
-    /// Runs `f` on a disk thread for a reader on a uTP thread, its reads in
-    /// order under `key`, and hands the result back with the others that
-    /// finish meanwhile, in one wake of the uTP thread. None when the
-    /// session's runtime shut down before it ran, or it panicked.
-    pub(crate) fn read_off_shard<F, R>(&self, key: usize, f: F) -> crate::off_shard::ReadDone<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        crate::off_shard::read_off_shard(&self.reads, key, f)
     }
 }
 
@@ -344,47 +339,58 @@ mod tests {
         let other = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
+        let turns = turns(4);
         let flavor = other.block_on(async {
             spawner
-                .spawn_blocking_with_permit(|| tokio::runtime::Handle::current().runtime_flavor())
+                .spawn_blocking_in_turn(&turns, || {
+                    tokio::runtime::Handle::current().runtime_flavor()
+                })
                 .await
                 .unwrap()
         });
         assert_eq!(flavor, tokio::runtime::RuntimeFlavor::MultiThread);
     }
 
-    // Work handed off with a permit that panics gives its caller an error
-    // that carries what the panic said, and the permit comes back.
+    fn turns(n: usize) -> crate::storage::ReadTurns {
+        crate::storage::ReadTurns::new(std::sync::Arc::new(tokio::sync::Semaphore::new(n)), false)
+    }
+
+    // Work handed off in a read turn that panics gives its caller an error
+    // that carries what the panic said, and the turn comes back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_panic_in_work_handed_off_with_a_permit_is_told_to_its_caller() {
+    async fn a_panic_in_work_handed_off_in_a_turn_is_told_to_its_caller() {
         let spawner = BlockingSpawner::new(1);
+        let turns = turns(1);
         let failed = spawner
-            .spawn_blocking_with_permit(|| -> u32 { panic!("the piece could not be read") })
+            .spawn_blocking_in_turn(&turns, || -> u32 {
+                panic!("the piece could not be read")
+            })
             .await
             .unwrap_err();
         assert!(
             format!("{failed:#}").contains("the piece could not be read"),
             "{failed:#}"
         );
-        assert_eq!(spawner.semaphore().available_permits(), 1);
+        assert_eq!(turns.semaphore().available_permits(), 1);
     }
 
-    // Blocking work handed off with a permit holds it while it runs: with
-    // every permit held, the next does not start until one comes back.
+    // Blocking work handed off in a read turn holds it while it runs: with
+    // every turn held, the next does not start until one comes back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn work_handed_off_with_a_permit_counts_against_the_blocking_bound() {
+    async fn work_handed_off_in_a_turn_counts_against_the_volumes_reads() {
         use std::sync::mpsc::channel;
 
-        let spawner = BlockingSpawner::new(2);
+        let spawner = BlockingSpawner::new(8);
+        let turns = turns(2);
         let (started_tx, started_rx) = channel();
         let (release_tx, release_rx) = channel::<()>();
         let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
         let job = |n: u32| {
             let (started, release) = (started_tx.clone(), release_rx.clone());
-            let spawner = spawner.clone();
+            let (spawner, turns) = (spawner.clone(), turns.clone());
             tokio::spawn(async move {
                 spawner
-                    .spawn_blocking_with_permit(move || {
+                    .spawn_blocking_in_turn(&turns, move || {
                         started.send(n).unwrap();
                         release.lock().unwrap().recv().unwrap();
                         n
@@ -400,9 +406,9 @@ mod tests {
         let (mut two, started_rx) = started.await.unwrap();
         two.sort_unstable();
         assert_eq!(two, [1, 2]);
-        assert_eq!(spawner.semaphore().available_permits(), 0);
+        assert_eq!(turns.semaphore().available_permits(), 0);
 
-        // The third waits for a permit, which only a finished job gives.
+        // The third waits for a turn, which only a finished job gives.
         let third = job(3);
         for _ in 0..3 {
             release_tx.send(()).unwrap();
@@ -411,7 +417,8 @@ mod tests {
         assert_eq!(second.await.unwrap().unwrap(), 2);
         assert_eq!(third.await.unwrap().unwrap(), 3);
         assert_eq!(started_rx.try_recv(), Ok(3));
-        assert_eq!(spawner.semaphore().available_permits(), 2);
+        assert_eq!(turns.semaphore().available_permits(), 2);
+        assert_eq!(spawner.disk_snapshot().permit_acquisitions, 3);
     }
 
     // An owned permit counts as every permit does: one taken free is a
@@ -430,18 +437,6 @@ mod tests {
         let counted = spawner.disk_snapshot();
         assert_eq!((counted.permit_acquisitions, counted.permit_waits), (2, 1));
         assert_eq!(spawner.semaphore().available_permits(), 1);
-    }
-
-    // Every blocking permit a call holds is one the permit counters see:
-    // a call that runs on two permits is two permits taken.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn each_permit_a_check_runs_on_is_counted() {
-        let spawner = BlockingSpawner::new(2);
-        let threads = spawner
-            .block_in_place_with_permits(2, |threads| threads)
-            .await;
-        assert_eq!(threads, 2);
-        assert_eq!(spawner.disk_snapshot().permit_acquisitions, 2);
     }
 
     // Says, when dropped, whether it was dropped on a uTP thread.

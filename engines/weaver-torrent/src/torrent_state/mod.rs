@@ -1409,12 +1409,16 @@ impl ManagedTorrent {
             if !seed.unchecked(piece) {
                 return Some(Ok(true));
             }
-            // One of the session's blocking permits for the read, as a
+            // One read turn of the torrent's volume for the read, as a
             // running torrent's check of the piece holds. It is waited
-            // for before the torrent's state is held, so nothing that
+            // for after the torrent's state is let go, so nothing that
             // would change or read that state waits with it; the state is
-            // looked at again once the permit is had.
-            let _permit = seed_mode::blocking_permit(&self.shared.spawner);
+            // looked at again once the turn is had.
+            let turns = match &self.locked.read().state {
+                ManagedTorrentState::Paused(paused) => paused.files.read_turns(),
+                _ => continue,
+            };
+            let _turn = seed_mode::read_turn(&self.shared.spawner, &turns);
             let g = self.locked.read();
             let ManagedTorrentState::Paused(paused) = &g.state else {
                 continue;

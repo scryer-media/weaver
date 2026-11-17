@@ -294,7 +294,7 @@ impl TorrentStateInitializing {
         let is_broken = self
             .shared
             .spawner
-            .block_in_place_with_semaphore(|| {
+            .block_in_place_in_turn(&self.files.read_turns(), || {
                 let fo = crate::file_ops::FileOps::new(
                     &self.metadata,
                     &self.files,
@@ -397,7 +397,7 @@ impl TorrentStateInitializing {
         let verdicts = self
             .shared
             .spawner
-            .block_in_place_with_semaphore(|| {
+            .block_in_place_in_turn(&self.files.read_turns(), || {
                 let fo = FileOps::new(
                     &self.metadata,
                     &self.files,
@@ -511,13 +511,11 @@ impl TorrentStateInitializing {
             None => None,
         };
         info!("Doing initial checksum validation, this might take a while...");
-        let outcome = self
-            .shared
-            .spawner
-            .block_in_place_with_permits(
-                (self.metadata.lengths().total_pieces() as usize)
-                    .min(self.shared.spawner.check_threads()),
-                |threads| {
+        // The check's reader takes a read turn of the torrent's volume for
+        // each read; its hashers read nothing and take none.
+        let threads = (self.metadata.lengths().total_pieces() as usize)
+            .min(self.shared.spawner.check_threads());
+        let outcome = self.shared.spawner.block_in_place(|| {
                     let stats = self.shared.spawner.stats();
                     let call = stats.call(crate::session_stats::disk::DiskOp::InitialCheck);
                     let before = self.checked_bytes.load(Ordering::Relaxed);
@@ -539,9 +537,7 @@ impl TorrentStateInitializing {
                             .saturating_sub(before),
                     );
                     outcome
-                },
-            )
-            .await?;
+        })?;
         let have_pieces = match outcome {
             CheckOutcome::Done(have) => have,
             CheckOutcome::Paused(at) => {
