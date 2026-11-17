@@ -772,14 +772,22 @@ impl TorrentStore {
                 self.writes.moved(&to);
                 Ok((to, outcome))
             },
-            shut,
+            // Files that come out shut are vouched for by nothing saved:
+            // the pieces kept for the next run say so (`kept`), and that
+            // run checks them all, until a check of every piece has found
+            // them. Said while the move still holds the files, so no
+            // checkpoint finds them moved and the pieces vouched for.
+            |ended| {
+                let shut = shut(ended);
+                if shut {
+                    self.unvouch();
+                }
+                shut
+            },
         );
-        // Files that came out shut are vouched for by nothing saved: the
-        // pieces kept for the next run say so from here (`kept`), and that
-        // run checks them all, until a check of every piece has found
-        // them.
+        // And files shut by a move before this one stay unvouched for.
         if self.files.is_shut() {
-            self.have().unchecked.fill(true);
+            self.unvouch();
         }
         self.end_move();
         moved
@@ -789,6 +797,13 @@ impl TorrentStore {
     // piece has yet to find them.
     pub(crate) fn unvouched(&self) -> bool {
         self.have().unchecked.any()
+    }
+
+    // The store vouches for none of its pieces from here, until a check of
+    // every piece has found them: the pieces kept for the next run say so
+    // (`kept`). It forgets none; that is `check_every_piece`.
+    pub(crate) fn unvouch(&self) {
+        self.have().unchecked.fill(true);
     }
 
     // The files are under `to` from now on, moved by no one: a torrent held

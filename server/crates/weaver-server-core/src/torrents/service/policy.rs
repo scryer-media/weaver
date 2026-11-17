@@ -792,6 +792,9 @@ impl TorrentService {
                     torrent.disk_held = None;
                 }
                 let attached = torrent.attached.as_ref()?;
+                if run && torrent.start_waits_on_move() {
+                    return None;
+                }
                 return run_command(run, attached.handle.is_paused()).map(Command::Run);
             }
             Intent::Sequential(on) => {

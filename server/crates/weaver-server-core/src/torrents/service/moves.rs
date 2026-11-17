@@ -438,16 +438,28 @@ impl TorrentService {
                     // were says nothing of where they are now.
                     dirs: moved.dirs.clone(),
                 });
-                db.record_torrent_files_move(
+                // A file kept there is not the torrent's own: a start
+                // before its pieces are forgotten checks them all. The
+                // store says so before the row does, so a checkpoint taken
+                // from here on writes the same, and none between the row's
+                // write and the end of the move vouches for every piece at
+                // the new place.
+                if !moved.kept.is_empty() {
+                    store.unvouch();
+                }
+                let recorded = db.record_torrent_files_move(
                     job_id,
                     &moved.to.to_string_lossy(),
                     &moved.outputs,
                     adopted.as_ref(),
                     &moved.held,
-                    // A file kept there is not the torrent's own: a start
-                    // before its pieces are forgotten checks them all.
-                    store.unvouched() || !moved.kept.is_empty(),
-                )
+                    store.unvouched(),
+                );
+                #[cfg(test)]
+                if let Some(meets) = super::locked(&super::MOVE_RECORDED_MEETS).take() {
+                    meets();
+                }
+                recorded
             });
             moved.inspect_err(|not_moved| {
                 // The row takes back what is where it was. A file of the
@@ -710,7 +722,8 @@ impl TorrentService {
 
     // The move ended, its check begun where it owed one: the torrent is no
     // longer moving, and an unpacking that waited on the move places its
-    // files now.
+    // files now. A start that waited on the move (`start_waits_on_move`)
+    // is made by the pass over the queue this ends with.
     async fn move_over(&self, job_id: JobId) {
         let _ = self
             .with_torrent(job_id, |torrent| {
@@ -719,6 +732,7 @@ impl TorrentService {
             })
             .await;
         self.inner.signal.mark(job_id);
+        self.apply_queue().await;
     }
 
     // A move kept a file already at the torrent's new place, so its files

@@ -1750,12 +1750,16 @@ mod tests {
             } = checking_with_a_tracker("shut_under_check", None).await?;
             door.refusing.store(true, Ordering::Release);
             door.open();
-            while !(door.forgotten.load(Ordering::Acquire) > 0
-                && handle.with_state(|state| {
-                    matches!(state, crate::ManagedTorrentState::Initializing(init) if !init.is_checking())
-                }))
-            {
-                tokio::task::yield_now().await;
+            loop {
+                let changed = handle.next_state_change();
+                if door.forgotten.load(Ordering::Acquire) > 0
+                    && handle.with_state(|state| {
+                        matches!(state, crate::ManagedTorrentState::Initializing(init) if !init.is_checking())
+                    })
+                {
+                    break;
+                }
+                changed.await;
             }
             assert!(
                 handle.tracker_status().is_none(),

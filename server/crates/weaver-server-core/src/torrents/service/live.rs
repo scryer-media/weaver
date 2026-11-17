@@ -343,6 +343,23 @@ impl Live {
         self.record.intent() == TorrentIntent::Resumed
     }
 
+    // Whether a start of the torrent's run now would wait on a move of its
+    // files. The start after an error forgets every piece to check them
+    // all (`ManagedTorrent::start`), which opens the files to reads
+    // (`TorrentStore::check_every_piece`), and a move holds the files
+    // until it ends, a copy to another disk included. The move owns the
+    // check of them until then, as it does for a recheck asked for
+    // meanwhile: the start is left for the pass the move ends with
+    // (`move_over`).
+    pub(super) fn start_waits_on_move(&self) -> bool {
+        matches!(self.moving, Some(Moving::Dir(_) | Moving::Files))
+            && self.attached.as_ref().is_some_and(|attached| {
+                attached.handle.with_state(|state| {
+                    matches!(state, weaver_torrent::ManagedTorrentState::Error(_))
+                })
+            })
+    }
+
     // The session took a change to the torrent's run, or refused it.
     pub(super) fn ran(&mut self, result: anyhow::Result<()>) {
         if let Err(error) = &result {

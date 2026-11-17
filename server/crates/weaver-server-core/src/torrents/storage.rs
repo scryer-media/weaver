@@ -573,6 +573,10 @@ impl TorrentStorage for PieceStorage {
     }
 
     fn on_check_everything(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if super::service::CHECK_EVERYTHING_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            bail!("refused by its test");
+        }
         self.inner.pieces.checking()?;
         Ok(())
     }

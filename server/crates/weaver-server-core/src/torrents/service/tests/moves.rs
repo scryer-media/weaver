@@ -1183,3 +1183,101 @@ async fn a_seed_mode_add_of_complete_files_announces_nothing_downloaded() {
     assert_eq!(std::fs::read(save.join("placed/a.bin")).unwrap(), data);
     rig.service.stop().await;
 }
+
+// A checkpoint taken once a move that kept someone else's file has written
+// its row, the files still held by the move, writes the pieces as the row
+// has them: to be checked. The store says so before the row is written,
+// not after the move lets the files go, so no checkpoint between the two
+// vouches for every piece at the new place, for a run that ends there to
+// start from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_as_a_move_that_kept_a_file_is_recorded_still_says_checking() {
+    let (rig, job_id, data, _, _) = seeding_beside_a_taken_name().await;
+    let free = rig.dir.path().join("free");
+    std::fs::create_dir_all(&free).unwrap();
+    {
+        let (at, theirs) = (free.join("a.bin"), strangers(&data));
+        *locked(&crate::torrents::service::MOVE_BEGIN_MEETS) =
+            Some(Box::new(move || std::fs::write(at, theirs).unwrap()));
+    }
+    // What the row holds after the checkpoint: whether its pieces are to
+    // be checked, and whether it has any.
+    let saved = Arc::new(Mutex::new(None));
+    {
+        let (service, db, saved) = (rig.service.clone(), rig.db.clone(), Arc::clone(&saved));
+        let runtime = tokio::runtime::Handle::current();
+        *locked(&crate::torrents::service::MOVE_RECORDED_MEETS) = Some(Box::new(move || {
+            runtime.block_on(service.save_checkpoints([job_id].into()));
+            let pieces = db.torrent_pieces(job_id).unwrap().unwrap();
+            let had = pieces.bits.iter().any(|byte| *byte != 0);
+            *locked(&saved) = Some((pieces.checking, had));
+        }));
+    }
+    let held = move_held_before_its_check(&rig, job_id, &free).await;
+    assert_eq!(
+        *locked(&saved),
+        Some((true, true)),
+        "(to be checked, pieces had) as the checkpoint wrote them"
+    );
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().files_dir,
+        Some(free.to_string_lossy().into_owned())
+    );
+    held.release.send(()).unwrap();
+    held.moving.await.unwrap().unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.stats().progress_bytes, 0);
+    rig.service.stop().await;
+}
+
+// A torrent in error is started by a check of every piece, which opens its
+// files to reads; a move holds those files until it ends. A resume asked
+// for while the move has them returns at once and starts nothing: the move
+// owns the check until it ends, as it does for a recheck. The pass the
+// move ends with makes the start, and the check finds every piece where
+// the files went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_in_error_resumed_mid_move_starts_once_the_move_ends() {
+    use weaver_torrent::ManagedTorrentState;
+    let (rig, job_id, data, _, _) = seeding_beside_a_taken_name().await;
+    let handle = handle_of(&rig.service, job_id).await;
+    let errored = |handle: &weaver_torrent::ManagedTorrent| {
+        handle.with_state(|state| matches!(state, ManagedTorrentState::Error(_)))
+    };
+
+    // Paused, then left in error by a recheck its store refused.
+    rig.service.pause(job_id).await.unwrap();
+    assert!(handle.is_paused());
+    crate::torrents::service::CHECK_EVERYTHING_FAILS.store(true, Ordering::Release);
+    rig.service.recheck(job_id).await.unwrap_err();
+    assert!(errored(&handle), "the torrent is not in error");
+
+    // A move, held while it has the files.
+    let plain = rig.dir.path().join("plain");
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    *locked(&crate::torrents::service::MOVE_RECORD_MEETS) = Some(Box::new(move || {
+        reached_tx.send(()).unwrap();
+        released.recv().unwrap();
+    }));
+    let moving = {
+        let (service, to) = (rig.service.clone(), plain.to_string_lossy().into_owned());
+        tokio::spawn(async move { service.set_location(job_id, to).await })
+    };
+    reached.await.unwrap();
+
+    rig.service.resume(job_id).await.unwrap();
+    assert!(
+        errored(&handle),
+        "it was started while the move had its files"
+    );
+
+    release.send(()).unwrap();
+    moving.await.unwrap().unwrap();
+    assert!(!errored(&handle), "the end of the move did not start it");
+    handle.wait_until_initialized().await.unwrap();
+    assert!(!handle.is_paused());
+    assert_eq!(handle.stats().progress_bytes, data.len() as u64);
+    rig.service.stop().await;
+}

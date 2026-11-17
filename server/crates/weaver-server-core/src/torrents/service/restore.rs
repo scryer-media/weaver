@@ -1300,6 +1300,7 @@ impl TorrentService {
                 );
                 if let Some(attached) = &torrent.attached
                     && attached.handle.is_paused() != paused_now
+                    && (paused_now || !torrent.start_waits_on_move())
                 {
                     let result = if paused_now {
                         attached.session.pause(&attached.handle).await
