@@ -2940,6 +2940,8 @@ type MutationRoot {
 	setTorrentForced(id: Int!, forced: Boolean!): Boolean!
 	"""
 	Move the torrent's directory under `path`; it goes on from there.
+	A key that only controls may name only a path under the default
+	save folder or a category's folder.
 	"""
 	setTorrentLocation(id: Int!, path: String!): Boolean!
 	"""
@@ -6555,6 +6557,7 @@ enum TorrentDisableMode {
 enum TorrentEncryption {
 	PREFER
 	REQUIRE
+	DISABLED
 }
 
 """
@@ -7189,6 +7192,11 @@ type TrackerRule {
 	"""
 	encryption: TorrentEncryption
 	"""
+	The transport order its torrents dial peers in, within the
+	transports the session runs; absent inherits.
+	"""
+	peerProtocol: TorrentPeerProtocol
+	"""
 	The upload cap its torrents take in place of their category's and
 	the global one.
 	"""
@@ -7231,6 +7239,10 @@ input TrackerRuleInput {
 	pex: Boolean
 	lsd: Boolean
 	encryption: TorrentEncryption
+	"""
+	Left out inherits.
+	"""
+	peerProtocol: TorrentPeerProtocol
 	"""
 	Left out inherits.
 	"""

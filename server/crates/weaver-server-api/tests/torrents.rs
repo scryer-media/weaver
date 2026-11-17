@@ -739,12 +739,12 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
 }
 
 // A tracker rule keeps its torrents' DHT, PEX and LSD, each on its own,
-// their encryption, upload cap and forced start; absent inherits, and an
-// upload cap switched off is none.
+// their encryption, peer protocol, upload cap and forced start; absent
+// inherits, and an upload cap switched off is none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let rig = rig().await;
-    let fields = "id dht pex lsd encryption uploadCap { state value } forced";
+    let fields = "id dht pex lsd encryption peerProtocol uploadCap { state value } forced";
     let save = |id: &str, terms: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
@@ -756,7 +756,7 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let response = rig
         .execute(&save(
             "",
-            "dht: false, pex: false, lsd: true, encryption: PREFER, uploadCap: { state: OFF }, forced: true",
+            "dht: false, pex: false, lsd: true, encryption: PREFER, peerProtocol: UTP_FIRST, uploadCap: { state: OFF }, forced: true",
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -766,22 +766,33 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
         saved["saveTrackerRule"][0],
         serde_json::json!({
             "id": id, "dht": false, "pex": false, "lsd": true, "encryption": "PREFER",
+            "peerProtocol": "UTP_FIRST",
             "uploadCap": { "state": "OFF", "value": null }, "forced": true,
         })
     );
 
     for (terms, read) in [
         (
-            "dht: true, lsd: false, encryption: REQUIRE, uploadCap: { state: SET, value: 4096 }",
+            "dht: true, lsd: false, encryption: REQUIRE, peerProtocol: UTP_ONLY, uploadCap: { state: SET, value: 4096 }",
             serde_json::json!({
                 "id": id, "dht": true, "pex": null, "lsd": false, "encryption": "REQUIRE",
+                "peerProtocol": "UTP_ONLY",
                 "uploadCap": { "state": "SET", "value": 4096 }, "forced": false,
+            }),
+        ),
+        (
+            "encryption: DISABLED",
+            serde_json::json!({
+                "id": id, "dht": null, "pex": null, "lsd": null, "encryption": "DISABLED",
+                "peerProtocol": null,
+                "uploadCap": { "state": "INHERIT", "value": null }, "forced": false,
             }),
         ),
         (
             "",
             serde_json::json!({
                 "id": id, "dht": null, "pex": null, "lsd": null, "encryption": null,
+                "peerProtocol": null,
                 "uploadCap": { "state": "INHERIT", "value": null }, "forced": false,
             }),
         ),

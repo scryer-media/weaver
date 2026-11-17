@@ -435,7 +435,7 @@ fn clearing_the_global_seeding_policy_removes_it() {
 #[test]
 fn tracker_rules_crud() {
     use crate::settings::model::TrackerRule;
-    use crate::settings::{SeedingAction, SeedingPolicy, TorrentEncryption};
+    use crate::settings::{SeedingAction, SeedingPolicy, TorrentEncryption, TorrentPeerProtocol};
 
     let db = Database::open_in_memory().unwrap();
     assert!(db.list_tracker_rules().unwrap().is_empty());
@@ -449,6 +449,7 @@ fn tracker_rules_crud() {
     let first = db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: Some(TorrentPeerProtocol::UtpFirst),
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -472,6 +473,7 @@ fn tracker_rules_crud() {
     let second = db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: None,
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -519,7 +521,8 @@ fn tracker_rules_crud() {
         dht: None,
         pex: Some(false),
         lsd: Some(false),
-        encryption: Some(TorrentEncryption::Require),
+        encryption: Some(TorrentEncryption::Disabled),
+        peer_protocol: Some(TorrentPeerProtocol::UtpOnly),
         upload_cap: Leaf::Set(4_096),
         forced: false,
         ..first.clone()
@@ -540,6 +543,7 @@ fn a_kept_transmission_client_reads_as_weaver() {
     let kept = db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: None,
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -599,6 +603,7 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
     let kept = db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: None,
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -1066,6 +1071,7 @@ fn a_removed_route_owner_takes_its_route_row() {
     let rule = db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: None,
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,

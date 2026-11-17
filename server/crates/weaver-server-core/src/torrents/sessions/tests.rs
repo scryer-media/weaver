@@ -2346,7 +2346,12 @@ fn the_peer_protocol_picks_the_transports_the_leg_carries() {
     ));
     assert!(matches!(
         built(&system, TorrentPeerProtocol::UtpOnly),
-        (Some(ListenerMode::UtpOnly), false, Some(true), _)
+        (
+            Some(ListenerMode::UtpOnly),
+            false,
+            Some(true),
+            DialOrder::UtpOnly
+        )
     ));
     // Incoming policy is independent of the transports a leg dials over.
     let mut datagrams = leg(LegKind::Ladder);

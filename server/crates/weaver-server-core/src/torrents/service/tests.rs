@@ -1011,6 +1011,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
         pool_member: None,
     };
     let rule = TrackerRule {
+        peer_protocol: None,
         id: 1,
         host_pattern: "tracker.test".into(),
         seeding: None,

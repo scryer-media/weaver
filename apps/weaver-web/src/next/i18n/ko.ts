@@ -1966,6 +1966,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.encryption": "암호화",
   "next.torrents.encryptionPrefer": "선호",
   "next.torrents.encryptionRequire": "필수",
+  "next.torrents.encryptionDisabled": "사용 안 함",
   "next.torrents.maxActiveDownloads": "최대 활성 다운로드",
   "next.torrents.maxPeers": "토렌트당 피어",
   "next.torrents.bittorrent": "BitTorrent",

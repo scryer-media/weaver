@@ -34,7 +34,7 @@ use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::graph::status::{Delivery, Failure};
 use crate::pipeline::graph::window::ScratchLedger;
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
-use crate::settings::{Config, TorrentEncryption};
+use crate::settings::{Config, TorrentEncryption, TorrentPeerProtocol};
 use crate::torrents::identity::TorrentIdentity;
 use crate::torrents::intake::Heard as IntakeHeard;
 use crate::torrents::layout::PieceLayout;
@@ -85,7 +85,7 @@ pub(crate) use retire::{ListedRemoval, LiveHeld, finish_retiring, remove_history
 #[cfg(test)]
 pub(in crate::torrents) use retire::{delete_written, deletion, listed_files};
 pub use settings::{
-    DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEX, Presence, RATIO_GOAL, SCOPE,
+    DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEER_PROTOCOL, PEX, Presence, RATIO_GOAL, SCOPE,
     SEED_TIME_COUNTING, SEED_TIME_GOAL, SEEDING_ACTION, SEEDING_MODE, ScheduleSeeding,
     SeedingLevels, TorrentSettings, UNPACK, UPLOAD_CAP, WindDown,
 };
@@ -135,15 +135,16 @@ pub const CHECKPOINT_PIECES: u32 = 16;
 
 // What a torrent's session holds its peers to under its tracker rule:
 // whether it looks for them on the DHT, on the local network and by peer
-// exchange, each switch on its own, and the encryption
-// its connections are made under over the session's. A change of any takes
-// the torrent through its session again.
+// exchange, each switch on its own, and the encryption its connections are
+// made under and the transport order they are dialed in, each over the
+// session's. A change of any takes the torrent through its session again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PeerTerms {
     disable_dht: bool,
     disable_pex: bool,
     disable_lsd: bool,
     encryption: Option<TorrentEncryption>,
+    peer_protocol: Option<TorrentPeerProtocol>,
 }
 
 impl PeerTerms {
@@ -157,6 +158,7 @@ impl PeerTerms {
             disable_pex: off(&PEX),
             disable_lsd: off(&LSD),
             encryption: settings.levels(&ENCRYPTION, None, None, rule).resolve(),
+            peer_protocol: settings.levels(&PEER_PROTOCOL, None, None, rule).resolve(),
         }
     }
 
@@ -165,10 +167,14 @@ impl PeerTerms {
         options.disable_dht = self.disable_dht;
         options.disable_pex = self.disable_pex;
         options.disable_lsd = self.disable_lsd;
-        options.peer_opts = self.encryption.map(|encryption| PeerConnectionOptions {
-            encryption: Some(encryption_policy(encryption)),
-            ..Default::default()
-        });
+        options.peer_opts =
+            (self.encryption.is_some() || self.peer_protocol.is_some()).then(|| {
+                PeerConnectionOptions {
+                    encryption: self.encryption.map(encryption_policy),
+                    dial_order: self.peer_protocol.map(TorrentPeerProtocol::dial_order),
+                    ..Default::default()
+                }
+            });
     }
 }
 

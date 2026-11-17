@@ -1461,6 +1461,7 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: None,
                 bound: None,
                 archive_passwords: Default::default(),
                 id: 0,

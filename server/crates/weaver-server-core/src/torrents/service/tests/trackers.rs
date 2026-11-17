@@ -169,6 +169,7 @@ async fn a_tracker_rules_client_names_its_torrents() {
     rig.db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: None,
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -754,6 +755,7 @@ async fn the_rule_a_tracker_edit_picks_is_the_one_a_restart_reads() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: None,
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,

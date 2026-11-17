@@ -750,6 +750,7 @@ pub(crate) const fn encryption_policy(
     match policy {
         TorrentEncryption::Prefer => weaver_torrent::EncryptionPolicy::Prefer,
         TorrentEncryption::Require => weaver_torrent::EncryptionPolicy::Require,
+        TorrentEncryption::Disabled => weaver_torrent::EncryptionPolicy::Disabled,
     }
 }
 

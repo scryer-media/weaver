@@ -1966,6 +1966,7 @@ export const nextPt: LocaleDictionary = {
   "next.torrents.encryption": "Criptografia",
   "next.torrents.encryptionPrefer": "Preferir",
   "next.torrents.encryptionRequire": "Exigir",
+  "next.torrents.encryptionDisabled": "Desativada",
   "next.torrents.maxActiveDownloads": "Máx. downloads ativos",
   "next.torrents.maxPeers": "Pares por torrent",
   "next.torrents.bittorrent": "BitTorrent",

@@ -571,6 +571,10 @@ pub struct TrackerRule {
     // The encryption its torrents' connections are made under, over the
     // global one; `None` inherits.
     pub encryption: Option<TorrentEncryption>,
+    // The order its torrents' outgoing connections try TCP and uTP in,
+    // over the global one; `None` inherits. uTP only here keeps the
+    // torrents' dials off TCP; what the session listens on stays global.
+    pub peer_protocol: Option<TorrentPeerProtocol>,
     // The upload cap each of its torrents takes, over its category's and
     // the global one.
     pub upload_cap: Leaf<u64>,
@@ -1175,17 +1179,24 @@ impl TorrentPeerProtocol {
     pub const fn dial_order(self) -> weaver_torrent::DialOrder {
         match self {
             Self::TcpFirst => weaver_torrent::DialOrder::TcpFirst,
-            Self::UtpFirst | Self::UtpOnly => weaver_torrent::DialOrder::UtpFirst,
+            Self::UtpFirst => weaver_torrent::DialOrder::UtpFirst,
+            Self::UtpOnly => weaver_torrent::DialOrder::UtpOnly,
         }
     }
 }
 
+// Peer connection encryption, as qBittorrent's three modes set libtorrent:
+// prefer is `pe_enabled` (each peer tried with the handshake it last
+// completed, plain first), require is `pe_forced` (encrypted only, a plain
+// handshake refused either way) and disabled is `pe_disabled` (plain only;
+// a new peer PEX says was reached encrypted is not dialled).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentEncryption {
     #[default]
     Prefer,
     Require,
+    Disabled,
 }
 
 impl TorrentEncryption {
@@ -1193,6 +1204,7 @@ impl TorrentEncryption {
         match self {
             Self::Prefer => "prefer",
             Self::Require => "require",
+            Self::Disabled => "disabled",
         }
     }
 
@@ -1200,6 +1212,7 @@ impl TorrentEncryption {
         match value {
             "prefer" => Some(Self::Prefer),
             "require" => Some(Self::Require),
+            "disabled" => Some(Self::Disabled),
             _ => None,
         }
     }
@@ -1310,6 +1323,7 @@ mod tests {
 
     fn rule(id: u32, host_pattern: &str) -> TrackerRule {
         TrackerRule {
+            peer_protocol: None,
             archive_passwords: Default::default(),
             bound: None,
             id,
@@ -1490,6 +1504,40 @@ mod tests {
             tracker_rule_for(&tied, ["http://a.example.org/"]).map(|rule| rule.id),
             Some(5)
         );
+    }
+
+    // A rule's handshake and dial order overrides are keyed by host alone: an
+    // announce URL carrying a passkey finds them by its host, and a rule
+    // cannot be given the URL, so its passkey is never kept with them.
+    #[test]
+    fn handshake_and_dial_order_overrides_follow_the_host_never_the_passkey() {
+        let passkeyed = "https://Private.Example.ORG/0123456789abcdef/announce?passkey=secret";
+        assert!(TrackerRule::pattern(passkeyed).is_err());
+        let private = TrackerRule {
+            encryption: Some(TorrentEncryption::Disabled),
+            peer_protocol: Some(TorrentPeerProtocol::UtpFirst),
+            ..rule(1, "private.example.org")
+        };
+        let public = TrackerRule {
+            encryption: Some(TorrentEncryption::Require),
+            ..rule(2, "*.public.test")
+        };
+        let rules = [private, public];
+        let ruled = tracker_rule_for(&rules, [passkeyed]).unwrap();
+        assert_eq!(ruled.host_pattern, "private.example.org");
+        assert_eq!(
+            (ruled.encryption, ruled.peer_protocol),
+            (
+                Some(TorrentEncryption::Disabled),
+                Some(TorrentPeerProtocol::UtpFirst)
+            )
+        );
+        let open = tracker_rule_for(&rules, ["udp://tracker.public.test:1337/announce"]).unwrap();
+        assert_eq!(
+            (open.encryption, open.peer_protocol),
+            (Some(TorrentEncryption::Require), None)
+        );
+        assert!(!format!("{rules:?}").contains("secret"));
     }
 
     #[test]

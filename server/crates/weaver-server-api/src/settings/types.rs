@@ -1445,6 +1445,9 @@ pub struct TrackerRule {
     /// The encryption its torrents' connections are made under; absent
     /// inherits.
     pub encryption: Option<TorrentEncryptionGql>,
+    /// The transport order its torrents dial peers in, within the
+    /// transports the session runs; absent inherits.
+    pub peer_protocol: Option<TorrentPeerProtocolGql>,
     /// The upload cap its torrents take in place of their category's and
     /// the global one.
     pub upload_cap: LeafGql<u64>,
@@ -1574,6 +1577,7 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             pex: rule.pex,
             lsd: rule.lsd,
             encryption: rule.encryption.map(Into::into),
+            peer_protocol: rule.peer_protocol.map(Into::into),
             upload_cap: LeafGql::of(rule.upload_cap),
             forced: rule.forced,
             has_ssl: rule.ssl.is_some(),
@@ -1599,6 +1603,8 @@ pub struct TrackerRuleInput {
     pub pex: Option<bool>,
     pub lsd: Option<bool>,
     pub encryption: Option<TorrentEncryptionGql>,
+    /// Left out inherits.
+    pub peer_protocol: Option<TorrentPeerProtocolGql>,
     /// Left out inherits.
     pub upload_cap: Option<LeafInput<u64>>,
     #[graphql(default)]
@@ -1633,6 +1639,7 @@ impl TrackerRuleInput {
             pex: self.pex,
             lsd: self.lsd,
             encryption: self.encryption.map(Into::into),
+            peer_protocol: self.peer_protocol.map(Into::into),
             upload_cap: leaf_of(self.upload_cap)?,
             forced: self.forced,
             ssl: self.ssl.take().map(|ssl| TrackerCertificate {
@@ -1679,6 +1686,7 @@ pub enum TorrentEncryptionGql {
     #[default]
     Prefer,
     Require,
+    Disabled,
 }
 
 impl From<weaver_server_core::settings::TorrentEncryption> for TorrentEncryptionGql {
@@ -1687,6 +1695,7 @@ impl From<weaver_server_core::settings::TorrentEncryption> for TorrentEncryption
         match value {
             TorrentEncryption::Prefer => Self::Prefer,
             TorrentEncryption::Require => Self::Require,
+            TorrentEncryption::Disabled => Self::Disabled,
         }
     }
 }
@@ -1696,6 +1705,7 @@ impl From<TorrentEncryptionGql> for weaver_server_core::settings::TorrentEncrypt
         match value {
             TorrentEncryptionGql::Prefer => Self::Prefer,
             TorrentEncryptionGql::Require => Self::Require,
+            TorrentEncryptionGql::Disabled => Self::Disabled,
         }
     }
 }

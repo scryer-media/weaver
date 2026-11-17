@@ -9,7 +9,7 @@ use crate::proxies::TorrentScope;
 use crate::settings::model::TrackerRule;
 use crate::settings::{
     Config, Leaf, Level, Levels, SeedTimeCounting, Seeding, SeedingAction, SeedingGoalMode,
-    SeedingPolicy, TorrentConfig, TorrentEncryption,
+    SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentPeerProtocol,
 };
 use crate::torrents::TorrentRecord;
 use crate::torrents::status::Held;
@@ -39,6 +39,7 @@ pub struct TorrentSettings {
 /// | unpack                   | yes     | yes  | yes      | yes             |
 /// | DHT, PEX, LSD            | no      | yes  | no       | the session's   |
 /// | encryption               | no      | yes  | no       | the session's   |
+/// | peer protocol            | no      | yes  | no       | the session's   |
 /// | route scope              | no      | yes  | yes      | the default     |
 ///
 /// (1) A torrent's own upload limit is not a level of the cap: the tighter
@@ -110,6 +111,14 @@ pub const LSD: Field<bool> = Field {
 pub const ENCRYPTION: Field<TorrentEncryption> = Field {
     torrent: None,
     rule: Some(|rule| Leaf::of(rule.encryption)),
+    category: None,
+    global: |_| Leaf::Inherit,
+};
+// The transport order a rule's torrents dial peers in over the session's,
+// within the transports the session runs.
+pub const PEER_PROTOCOL: Field<TorrentPeerProtocol> = Field {
+    torrent: None,
+    rule: Some(|rule| Leaf::of(rule.peer_protocol)),
     category: None,
     global: |_| Leaf::Inherit,
 };

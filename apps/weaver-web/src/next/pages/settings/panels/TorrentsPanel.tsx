@@ -81,6 +81,8 @@ interface TrackerRule {
   lsd: boolean | null;
   /** Null inherits the global encryption. */
   encryption: TorrentEncryption | null;
+  /** Null inherits the global peer protocol. */
+  peerProtocol: TorrentPeerProtocol | null;
   /** The upload cap its torrents take in place of their category's and the global one. */
   uploadCap: Leaf<number>;
   forced: boolean;
@@ -138,6 +140,7 @@ interface TrackerRuleForm {
   pex: boolean | null;
   lsd: boolean | null;
   encryption: TorrentEncryption | null;
+  peerProtocol: TorrentPeerProtocol | null;
   uploadCap: Leaf<number>;
   forced: boolean;
   /** A certificate and key pasted to replace the rule's; both blank keeps it. */
@@ -160,6 +163,7 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   pex: null,
   lsd: null,
   encryption: null,
+  peerProtocol: null,
   uploadCap: INHERIT,
   forced: false,
   certificatePem: "",
@@ -338,6 +342,7 @@ const CHANGE_VALUES: Record<string, string> = {
   false: "next.common.off",
   prefer: "next.torrents.encryptionPrefer",
   require: "next.torrents.encryptionRequire",
+  disabled: "next.torrents.encryptionDisabled",
   any: "next.seeding.modeAny",
   all: "next.seeding.modeAll",
   stop: "next.seeding.actionStop",
@@ -693,6 +698,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           pex: rule.pex,
           lsd: rule.lsd,
           encryption: rule.encryption,
+          peerProtocol: rule.peerProtocol,
           uploadCap: leafFrom(rule.uploadCap),
           forced: rule.forced,
           certificatePem: "",
@@ -721,6 +727,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         pex: form.pex,
         lsd: form.lsd,
         encryption: form.encryption,
+        peerProtocol: form.peerProtocol,
         uploadCap: leafInput(form.uploadCap),
         forced: form.forced,
         ...sslInput(form),
@@ -981,6 +988,27 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                 { value: "inherit", label: t("next.torrents.unpackInherit") },
                 ...ENCRYPTIONS.map((option) => ({ ...option, label: t(option.label) })),
               ]),
+              {
+                id: "peerProtocol",
+                label: t("next.torrents.peerProtocol"),
+                keywords: "peer protocol tcp utp transport",
+                help: form.peerProtocol
+                  ? t((PEER_PROTOCOLS.find((option) => option.value === form.peerProtocol) ?? PEER_PROTOCOLS[0]).help)
+                  : undefined,
+                control: {
+                  kind: "select",
+                  value: form.peerProtocol ?? "inherit",
+                  options: [
+                    { value: "inherit", label: t("next.torrents.unpackInherit") },
+                    ...PEER_PROTOCOLS.map((option) => ({ value: option.value, label: t(option.label) })),
+                  ],
+                  onChange: (peerProtocol) =>
+                    setForm((current) => ({
+                      ...current,
+                      peerProtocol: peerProtocol === "inherit" ? null : (peerProtocol as TorrentPeerProtocol),
+                    })),
+                },
+              },
               uploadCapField(t, form.uploadCap, (uploadCap) => setForm((current) => ({ ...current, uploadCap })), "trackerRule"),
               {
                 id: "forced",
@@ -1127,7 +1155,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
   return { block, overlays };
 }
 
-type TorrentEncryption = "PREFER" | "REQUIRE";
+type TorrentEncryption = "PREFER" | "REQUIRE" | "DISABLED";
 type TorrentPeerProtocol = "TCP_FIRST" | "UTP_FIRST" | "UTP_ONLY";
 
 interface TorrentConnection {
@@ -1202,6 +1230,7 @@ const PEER_PROTOCOLS: { value: TorrentPeerProtocol; label: string; help: string 
 const ENCRYPTIONS: { value: TorrentEncryption; label: string }[] = [
   { value: "PREFER", label: "next.torrents.encryptionPrefer" },
   { value: "REQUIRE", label: "next.torrents.encryptionRequire" },
+  { value: "DISABLED", label: "next.torrents.encryptionDisabled" },
 ];
 
 const validPort = (port: number | null) => port === null || (Number.isInteger(port) && port >= 1 && port <= 65535);

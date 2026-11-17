@@ -843,6 +843,7 @@ fn a_tracker_rule_with_its_own_route_is_a_consumer() {
 
     let db = Database::open_in_memory().unwrap();
     let rule = |host_pattern: &str, torrent_route| TrackerRule {
+        peer_protocol: None,
         archive_passwords: Default::default(),
         bound: None,
         id: 0,

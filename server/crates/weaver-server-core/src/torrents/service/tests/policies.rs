@@ -141,9 +141,9 @@ async fn the_tighter_of_a_torrents_limit_and_its_upload_cap_holds() {
 // the global terms throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
-    use crate::settings::TorrentEncryption;
-    use weaver_torrent::EncryptionPolicy;
+    use crate::settings::{TorrentEncryption, TorrentPeerProtocol};
     use weaver_torrent::limits::LimitKind;
+    use weaver_torrent::{DialOrder, EncryptionPolicy};
 
     let bps = |bps: u32| LimitKind::Bps(std::num::NonZeroU32::new(bps).unwrap());
     let rig = rig(set_clock());
@@ -156,6 +156,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: Some(TorrentPeerProtocol::UtpFirst),
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -210,10 +211,12 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
     );
     assert!(!handle.speaks_pex());
     assert_eq!(handle.encryption(), Some(EncryptionPolicy::Prefer));
+    assert_eq!(handle.dial_order(), Some(DialOrder::UtpFirst));
     assert_eq!(handle.ratelimits().upload_bps, LimitKind::Unlimited);
     let other = handle_of(&rig.service, unruled).await;
     assert!(other.discovery().dht && other.discovery().lsd && other.speaks_pex());
     assert_eq!(other.encryption(), None);
+    assert_eq!(other.dial_order(), None);
     assert_eq!(other.ratelimits().upload_bps, bps(2_000));
 
     rig.db
@@ -223,8 +226,9 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
                 pex: None,
                 lsd: None,
                 encryption: Some(TorrentEncryption::Require),
+                peer_protocol: Some(TorrentPeerProtocol::UtpOnly),
                 upload_cap: Leaf::Set(1_000),
-                ..rule
+                ..rule.clone()
             },
             EPOCH_MS,
         )
@@ -235,9 +239,28 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
     assert!(!Arc::ptr_eq(&handle, &again));
     assert!(again.discovery().dht && again.discovery().lsd && again.speaks_pex());
     assert_eq!(again.encryption(), Some(EncryptionPolicy::Require));
+    assert_eq!(again.dial_order(), Some(DialOrder::UtpOnly));
     assert_eq!(again.ratelimits().upload_bps, bps(1_000));
     assert!(Arc::ptr_eq(&other, &handle_of(&rig.service, unruled).await));
     assert_eq!(other.ratelimits().upload_bps, bps(2_000));
+
+    // A rule may turn encryption off for its torrents, and a protocol it
+    // stops setting goes back to the session's.
+    rig.db
+        .update_tracker_rule(
+            &TrackerRule {
+                encryption: Some(TorrentEncryption::Disabled),
+                peer_protocol: None,
+                ..rule
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    rig.service.tick().await;
+    let off = handle_of(&rig.service, ruled).await;
+    assert_eq!(off.encryption(), Some(EncryptionPolicy::Disabled));
+    assert_eq!(off.dial_order(), None);
     rig.service.stop().await;
 }
 

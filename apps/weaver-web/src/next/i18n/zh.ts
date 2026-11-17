@@ -1966,6 +1966,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.encryption": "加密",
   "next.torrents.encryptionPrefer": "优先",
   "next.torrents.encryptionRequire": "强制",
+  "next.torrents.encryptionDisabled": "禁用",
   "next.torrents.maxActiveDownloads": "最大活动下载数",
   "next.torrents.maxPeers": "每个种子的对等节点数",
   "next.torrents.bittorrent": "BitTorrent",

@@ -3223,6 +3223,7 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "encryption": match torrent.encryption {
             TorrentEncryption::Prefer => 0,
             TorrentEncryption::Require => 1,
+            TorrentEncryption::Disabled => 2,
         },
         "max_connec_per_torrent": torrent.max_peers_total,
         "max_connec": limit(torrent.connections_limit),

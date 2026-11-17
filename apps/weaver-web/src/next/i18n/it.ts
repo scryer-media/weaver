@@ -1966,6 +1966,7 @@ export const nextIt: LocaleDictionary = {
   "next.torrents.encryption": "Crittografia",
   "next.torrents.encryptionPrefer": "Preferisci",
   "next.torrents.encryptionRequire": "Richiedi",
+  "next.torrents.encryptionDisabled": "Disattivata",
   "next.torrents.maxActiveDownloads": "Download attivi max",
   "next.torrents.maxPeers": "Peer per torrent",
   "next.torrents.bittorrent": "BitTorrent",

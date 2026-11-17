@@ -1966,6 +1966,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.encryption": "暗号化",
   "next.torrents.encryptionPrefer": "優先",
   "next.torrents.encryptionRequire": "必須",
+  "next.torrents.encryptionDisabled": "無効",
   "next.torrents.maxActiveDownloads": "最大同時ダウンロード数",
   "next.torrents.maxPeers": "トレントあたりのピア数",
   "next.torrents.bittorrent": "BitTorrent",

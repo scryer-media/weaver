@@ -1777,3 +1777,20 @@ scope = "all"
 kind = "rust"
 hook_id = "dns_profiles_from_proxies_v125"
 scope = "upgrade_only"
+
+[[migration]]
+version = 126
+description = "a tracker rule may name the transport its torrents dial peers on first"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0126_tracker_rule_peer_protocol/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0126_tracker_rule_peer_protocol/postgres.sql"
+engine = "postgres"
+scope = "all"

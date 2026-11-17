@@ -1641,6 +1641,7 @@ fn sample_swarm() -> weaver_server_core::torrents::metrics::swarm::SwarmSnapshot
     swarm.piece_picks[PiecePick::EndGame as usize] = 59;
     swarm.wasted_bytes[Waste::CutShort as usize] = 60;
     swarm.peers_named[PeerSource::Dht as usize] = 61;
+    swarm.pex_encrypted_skipped = 62;
     swarm
 }
 

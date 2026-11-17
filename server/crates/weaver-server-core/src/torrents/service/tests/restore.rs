@@ -1559,6 +1559,7 @@ async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
 // A rule for torrents announcing under `host`, holding `passwords`.
 fn password_rule(host: &str, passwords: &[&str]) -> TrackerRule {
     TrackerRule {
+        peer_protocol: None,
         archive_passwords: crate::settings::model::ArchivePasswords::new(
             passwords.iter().map(|value| (*value).to_owned()),
         )

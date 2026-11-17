@@ -1766,6 +1766,7 @@ const TRACKER_RULE_FIELDS = `
     pex
     lsd
     encryption
+    peerProtocol
     uploadCap {
       state
       value

@@ -771,6 +771,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         pool_member: None,
     };
     let mut rules = [TrackerRule {
+        peer_protocol: None,
         archive_passwords: Default::default(),
         bound: None,
         id: 1,
@@ -984,6 +985,7 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
         torrent: TorrentConfig::default(),
     };
     let mut rule = TrackerRule {
+        peer_protocol: None,
         archive_passwords: Default::default(),
         bound: None,
         id: 3,
@@ -1076,6 +1078,7 @@ async fn empty_seeding_terms_inherit_the_chain() {
     rig.db
         .insert_tracker_rule(
             &TrackerRule {
+                peer_protocol: None,
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
