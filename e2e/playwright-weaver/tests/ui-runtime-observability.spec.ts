@@ -235,8 +235,8 @@ test("the analyzer renders and downloads a redacted report without queueing", as
   expect(parsed.job).toBeNull();
 
   const infohash = "0123456789abcdef0123456789abcdef01234567";
-  await page.getByRole("textbox", { name: "Magnet link", exact: true }).fill(`magnet:?xt=urn:btih:${infohash}&dn=${sentinel}`);
-  await page.getByRole("button", { name: "Analyze", exact: true }).click();
+  await page.getByTestId(runtimeIds.analyzerMagnet).fill(`magnet:?xt=urn:btih:${infohash}&dn=${sentinel}`);
+  await page.getByTestId(runtimeIds.analyzerAnalyze).click();
   await expect(report).toContainText("source magnet");
   await expect(report).not.toContainText(sentinel);
   await expect(report).not.toContainText(infohash);

@@ -266,6 +266,7 @@ impl PrometheusMetricsExporter {
             weaver_server_core::proxies::network_metrics::snapshot(&runtime.network)
         });
         let tunnel = weaver_server_core::proxies::network_metrics::tunnel::snapshot();
+        let dns = weaver_server_core::proxies::network_metrics::tunnel::dns_snapshot();
         let speed_tests = weaver_server_core::speed_test::speed_test_metrics_snapshot();
         // What the torrent service last published, and its event counters.
         let torrents = self.torrents.as_ref().map(|torrents| torrents.metrics());
@@ -310,6 +311,7 @@ impl PrometheusMetricsExporter {
         input.schedules = Some(&schedules);
         input.network = network.as_ref();
         input.tunnel = Some(&tunnel);
+        input.dns = Some(&dns);
         input.speed_tests = Some(&speed_tests);
         input.torrents = torrents.as_ref();
         input.build = self.build;

@@ -30,6 +30,10 @@ pub struct TorrentLeg {
     bridge: Mutex<Option<PathBridge>>,
     // The bridge the leg's web seed transfers ride, apart from its trackers'.
     seeds: Mutex<Option<PathBridge>>,
+    // The bridges a torrent route's own lookups ride, one for each route
+    // on the leg that names apart from it and each purpose it dials for,
+    // stopped with the leg.
+    scoped: Mutex<Vec<PathBridge>>,
 }
 impl TorrentLeg {
     /// The leg's dialer, whose connections the route counts as its own.
@@ -61,10 +65,66 @@ impl TorrentLeg {
         if let Some(bridge) = bridge.as_ref() {
             return Ok(bridge.clone());
         }
+        let started = self.start_bridge(self.dialer(), purpose)?;
+        *bridge = Some(started.clone());
+        Ok(started)
+    }
+    /// A bridge of its own onto `dialer`, the leg's dialer under a torrent
+    /// route's names: what that route's HTTP for `purpose` rides (its
+    /// trackers and metainfo, or its web seed transfers), its checked
+    /// addresses pinned apart from every other route's. It stops with the
+    /// leg, or once nothing holds what it hands back nor any client built
+    /// on it.
+    pub fn bridge_on(
+        self: &Arc<Self>,
+        dialer: Arc<dyn Dialer>,
+        purpose: Purpose,
+    ) -> Result<PathBridge, String> {
+        let started = self.start_bridge(dialer, purpose)?;
+        self.scoped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(started.clone());
+        let hold = BridgeHold {
+            leg: Arc::downgrade(self),
+            bridge: started.clone(),
+        };
+        Ok(PathBridge {
+            keep: Some(Arc::new(hold)),
+            ..started
+        })
+    }
+    /// How many of its own bridges from `bridge_on` the leg runs.
+    #[cfg(test)]
+    pub fn own_bridges(&self) -> usize {
+        self.scoped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+    // Stop `bridge`, one of the leg's own from `bridge_on`, and let go of
+    // it.
+    fn release_bridge(&self, bridge: &PathBridge) {
+        let mut scoped = self.scoped.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(at) = scoped
+            .iter()
+            .position(|held| Arc::ptr_eq(&held.bridge, &bridge.bridge))
+        else {
+            return;
+        };
+        let released = scoped.swap_remove(at);
+        drop(scoped);
+        self.handle.spawn(async move { released.revoke().await });
+    }
+    fn start_bridge(
+        &self,
+        dialer: Arc<dyn Dialer>,
+        purpose: Purpose,
+    ) -> Result<PathBridge, String> {
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|_| "could not generate bridge credentials")?;
-        let path = Arc::new(TorrentProvider::new(self.dialer(), purpose));
-        let started = PathBridge {
+        let path = Arc::new(TorrentProvider::new(dialer, purpose));
+        Ok(PathBridge {
             bridge: Bridge::start(
                 &self.handle,
                 path.clone(),
@@ -73,9 +133,8 @@ impl TorrentLeg {
             )
             .map_err(|e| e.to_string())?,
             path,
-        };
-        *bridge = Some(started.clone());
-        Ok(started)
+            keep: None,
+        })
     }
     /// Why the pool member the leg holds carries nothing now, when it does
     /// not: no pool on its egress holds it as it was, which revokes the leg,
@@ -134,14 +193,21 @@ fn held(stage: &Revocable, member: &PinnedMember) -> Result<Arc<MemberPin>, Stri
 }
 impl Drop for TorrentLeg {
     fn drop(&mut self) {
-        for slot in [&mut self.bridge, &mut self.seeds] {
-            if let Some(bridge) = slot
+        let scoped = std::mem::take(
+            self.scoped
                 .get_mut()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-            {
-                self.handle.spawn(async move { bridge.revoke().await });
-            }
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let mut own = Vec::with_capacity(2);
+        for slot in [&mut self.bridge, &mut self.seeds] {
+            own.extend(
+                slot.get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(),
+            );
+        }
+        for bridge in own.into_iter().chain(scoped) {
+            self.handle.spawn(async move { bridge.revoke().await });
         }
     }
 }
@@ -685,15 +751,17 @@ impl NetworkRuntime {
             (leg.stage.clone(), leg.definition.clone())
         };
         let counted = Arc::downgrade(&stage);
+        let names = member_names(&stage);
         let (stage, member) = match member {
             None => (stage, None),
             Some(member) => {
                 let pool = pool_of(&definition.path).ok_or("the leg has no pool")?;
+                let key = (pool, definition.egress_id);
                 let stage = self
                     .pools
                     .lock()
                     .expect("network pools")
-                    .get(&(pool, definition.egress_id))
+                    .get(&key)
                     .cloned()
                     .ok_or_else(|| format!("pool {pool} is not running"))?;
                 let pin = stage.pin_member(member).ok_or_else(|| {
@@ -707,8 +775,9 @@ impl NetworkRuntime {
                     pin: Mutex::new(pin),
                     gone: std::sync::OnceLock::new(),
                 });
+                // The member names what it dials by the leg's DNS profile.
                 (
-                    Arc::new(Revocable::new(member.clone() as Arc<dyn Dialer>)),
+                    Arc::new(Revocable::named(member.clone() as Arc<dyn Dialer>, names)),
                     Some(member),
                 )
             }
@@ -721,6 +790,7 @@ impl NetworkRuntime {
             handle: self.handle.clone(),
             bridge: Mutex::new(None),
             seeds: Mutex::new(None),
+            scoped: Mutex::new(Vec::new()),
         }))
     }
 
@@ -780,13 +850,40 @@ impl NetworkRuntime {
     /// nothing now does not, by id, as `PoolStage::members_down` says. A pool
     /// no route has started yet holds every member up.
     pub fn pool_members_down(&self, pool: u32, egress_id: u32) -> HashMap<u32, String> {
-        let stage = self
-            .pools
-            .lock()
-            .expect("network pools")
-            .get(&(pool, egress_id))
-            .cloned();
+        let key = (pool, egress_id);
+        let stage = self.pools.lock().expect("network pools").get(&key).cloned();
         stage.map(|stage| stage.members_down()).unwrap_or_default()
+    }
+}
+
+// The names a pool member on `stage` dials by: the stage's, or, on a stage
+// with none, names that refuse every lookup, so the host never answers.
+fn member_names(stage: &Revocable) -> Arc<weaver_tunnel::pipe::NamesSlot> {
+    stage.names_slot().unwrap_or_else(|| {
+        Arc::new(weaver_tunnel::pipe::NamesSlot::new(
+            weaver_tunnel::pipe::Names::new(
+                weaver_tunnel::pipe::DnsChoice::Refused(
+                    "the pool's leg names by no DNS profile".into(),
+                ),
+                None,
+            ),
+        ))
+    })
+}
+
+// What keeps one of a leg's own bridges up: when the last holder of it
+// goes, the bridge is stopped and let go, unless the leg has gone first and
+// stopped it itself.
+struct BridgeHold {
+    leg: std::sync::Weak<TorrentLeg>,
+    bridge: PathBridge,
+}
+
+impl Drop for BridgeHold {
+    fn drop(&mut self) {
+        if let Some(leg) = self.leg.upgrade() {
+            leg.release_bridge(&self.bridge);
+        }
     }
 }
 
@@ -913,6 +1010,7 @@ mod tests {
             )
             .unwrap(),
             path,
+            keep: None,
         };
         let port = exit.port();
         let addrs: Vec<IpAddr> = match LegNames(leg.clone())
@@ -1029,6 +1127,7 @@ mod tests {
             )
             .unwrap(),
             path,
+            keep: None,
         };
         let port = exit.port();
         let Resolved::Addresses(found) = LegNames(ladder.clone())
@@ -1110,9 +1209,9 @@ mod tests {
     }
 
     // A runtime whose default torrent scope rides a ladder through a SOCKS5
-    // proxy named by `resolver`, asking no DNS servers of its own. The proxy
-    // is never dialled: only names are looked up on the leg.
-    fn ladder_runtime(resolver: crate::proxies::Resolver) -> (Arc<NetworkRuntime>, Configuration) {
+    // proxy, on DNS profile 1, where `who` answers its names. The proxy is
+    // never dialled: only names are looked up on the leg.
+    fn ladder_runtime(who: crate::proxies::DnsWho) -> (Arc<NetworkRuntime>, Configuration) {
         let runtime = NetworkRuntime::new(
             crate::Database::open_in_memory().unwrap(),
             tokio::runtime::Handle::current(),
@@ -1123,13 +1222,13 @@ mod tests {
         config.profiles.insert(
             1,
             ProxyProfile {
+                dns_profile_id: 0,
                 id: 1,
                 name: "socks".into(),
                 kind: ProxyKind::Socks5,
                 enabled: true,
                 host: "127.0.0.1".into(),
                 port: 1,
-                resolver,
                 dns_servers: vec![],
                 tunnel_addresses: vec![],
                 peer_public_key: None,
@@ -1143,6 +1242,7 @@ mod tests {
                 secrets: Default::default(),
             },
         );
+        config.dns = Arc::new(dns_with(who));
         config.consumers.insert(consumer.key());
         config.policies.insert(
             consumer.key(),
@@ -1155,11 +1255,30 @@ mod tests {
                         direct_fallback: false,
                     },
                 }],
+                dns_profile_id: Some(1),
                 ..Default::default()
             },
         );
         runtime.apply_configuration(config.clone()).unwrap();
         (runtime, config)
+    }
+
+    // The saved DNS with one profile, of id 1, where `who` answers.
+    fn dns_with(who: crate::proxies::DnsWho) -> crate::proxies::StoredDns {
+        let profile = crate::proxies::DnsProfile {
+            kind: crate::proxies::DnsProfileKind::Route,
+            id: 1,
+            name: "Leg".into(),
+            who,
+            transit: None,
+            trust: crate::proxies::DnsTrust::AsSent,
+            server_list_id: None,
+            system_fallback: false,
+        };
+        crate::proxies::StoredDns {
+            profiles: HashMap::from([(1, profile)]),
+            ..Default::default()
+        }
     }
 
     // What an announce to `host` on a leg does before it sends: the name
@@ -1196,7 +1315,7 @@ mod tests {
     // naming holds, and both ride the one client built for that host.
     #[tokio::test]
     async fn two_announces_to_one_host_on_a_leg_resolve_once_and_share_a_client() {
-        let (runtime, _) = ladder_runtime(crate::proxies::Resolver::Weaver);
+        let (runtime, _) = ladder_runtime(crate::proxies::DnsWho::System);
         let leg = runtime
             .torrent_leg(TorrentScope::Default, 0, 8, Duration::from_secs(30))
             .unwrap();
@@ -1219,51 +1338,43 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    // A proxy's resolver edited from Weaver to Proxy revokes the leg the
-    // session opened on: the session's names and clients go with it, and
-    // the leg the route gives now hands the name to the proxy, reusing
-    // neither the answer the old naming held nor its clients. The host's
-    // resolver is not asked on the proxied leg.
+    // The route's DNS profile edited from the host answering to the proxy
+    // answering keeps the leg the session opened on, and its next announce
+    // hands the name to the proxy: it reuses neither the answer the old
+    // naming held nor the client held to that answer's addresses. The
+    // host's resolver is not asked on the proxied leg.
     #[tokio::test]
     async fn a_resolver_edit_from_weaver_to_proxy_reuses_no_answer_or_client() {
-        let (runtime, mut config) = ladder_runtime(crate::proxies::Resolver::Weaver);
+        let (runtime, mut config) = ladder_runtime(crate::proxies::DnsWho::System);
         let timeout = Duration::from_secs(30);
-        let old = runtime
+        let leg = runtime
             .torrent_leg(TorrentScope::Default, 0, 8, timeout)
             .unwrap();
-        let old_clients = crate::torrents::net::LegClients::new(
+        let clients = crate::torrents::net::LegClients::new(
             || Ok(reqwest::Client::builder().no_proxy()),
-            Some(old.bridge().unwrap()),
+            Some(leg.bridge().unwrap()),
             LegKind::Ladder,
-            old.dialer(),
+            leg.dialer(),
         );
-        let (held, _) = reach_on(&LegNames(old.dialer()), &old_clients, "localhost", 6969).await;
+        let (held, _) = reach_on(&LegNames(leg.dialer()), &clients, "localhost", 6969).await;
         assert_eq!(held.unwrap().by, ResolvedBy::Host);
+        assert_eq!(clients.built(), 1);
 
-        let profile = config.profiles.get_mut(&1).unwrap();
-        profile.resolver = crate::proxies::Resolver::Proxy;
-        profile.revision += 1;
+        config.dns = Arc::new(dns_with(crate::proxies::DnsWho::Proxy));
         runtime.apply_configuration(config).unwrap();
-        assert!(old.stage.is_revoked());
-
-        let new = runtime
+        assert!(!leg.stage.is_revoked());
+        let again = runtime
             .torrent_leg(TorrentScope::Default, 0, 8, timeout)
             .unwrap();
-        assert!(!Arc::ptr_eq(&old.stage, &new.stage));
-        let new_clients = crate::torrents::net::LegClients::new(
-            || Ok(reqwest::Client::builder().no_proxy()),
-            Some(new.bridge().unwrap()),
-            LegKind::Ladder,
-            new.dialer(),
-        );
+        assert!(Arc::ptr_eq(&leg.stage, &again.stage));
+
         let before = host_lookups();
-        let (handed, addrs) =
-            reach_on(&LegNames(new.dialer()), &new_clients, "localhost", 6969).await;
+        let (handed, addrs) = reach_on(&LegNames(leg.dialer()), &clients, "localhost", 6969).await;
         let handed = handed.unwrap();
         assert_eq!(handed.by, ResolvedBy::Proxy);
         assert!(!handed.cached);
         assert!(addrs.is_empty(), "{addrs:?}");
-        assert_eq!(new_clients.built(), 1);
+        assert_eq!(clients.built(), 2);
         assert_eq!(host_lookups(), before);
         runtime.shutdown().await;
     }
@@ -1289,5 +1400,19 @@ mod tests {
         let mut noted = noted.addresses;
         noted.sort();
         assert_eq!(noted, found.iter().map(SocketAddr::ip).collect::<Vec<_>>());
+    }
+
+    // A member on a stage that has no names refuses every lookup: a name
+    // only the host knows does not resolve.
+    #[tokio::test]
+    async fn a_member_on_a_stage_without_names_refuses_lookups() {
+        let system = crate::torrents::net::system_dialer();
+        let stage = Revocable::new(Arc::clone(&system));
+        let member = Revocable::named(system, member_names(&stage));
+        let refused = member.resolve("localhost").await.unwrap_err();
+        assert!(
+            refused.to_string().contains("names by no DNS profile"),
+            "{refused}"
+        );
     }
 }

@@ -42,6 +42,7 @@ import { useNextData } from "@/next/data/next-data";
 import { LimitControl } from "@/next/features/networking/limits";
 import { informationFields, transferFields, transferNote, type TorrentField } from "@/next/features/torrents/general";
 import { countLabel } from "@/next/i18n/labels";
+import { testIds, torrentIds } from "@/next/testids";
 import { durationText, seedingFields, seedingFrom, seedingInherits, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
 const TRACKER_COLUMNS = {
@@ -90,24 +91,40 @@ const ACTION_KEYS = {
 } as const;
 
 /** A torrent's seeding terms in force, each with the level it comes from. */
-function seedingRows(t: Translate, torrent: TorrentData): { label: string; value: string; level: SettingLevel }[] {
+function seedingRows(
+  t: Translate,
+  torrent: TorrentData,
+): { term: string; label: string; value: string; level: SettingLevel }[] {
   const terms = torrent.seedingPolicy;
   const minutes = (value: number | null) => (value === null ? t("next.seeding.noGoal") : durationText(t, value));
   return [
     {
+      term: "ratioGoal",
       label: t("next.seeding.ratioGoal"),
       value: terms.ratioGoal === null ? t("next.seeding.noGoal") : terms.ratioGoal.toFixed(2),
       level: terms.levels.ratioGoal,
     },
-    { label: t("next.seeding.seedTimeGoal"), value: minutes(terms.seedTimeGoalMinutes), level: terms.levels.seedTimeGoalMinutes },
-    { label: t("next.seeding.inactiveGoal"), value: minutes(terms.inactiveGoalMinutes), level: terms.levels.inactiveGoalMinutes },
     {
+      term: "seedTimeGoalMinutes",
+      label: t("next.seeding.seedTimeGoal"),
+      value: minutes(terms.seedTimeGoalMinutes),
+      level: terms.levels.seedTimeGoalMinutes,
+    },
+    {
+      term: "inactiveGoalMinutes",
+      label: t("next.seeding.inactiveGoal"),
+      value: minutes(terms.inactiveGoalMinutes),
+      level: terms.levels.inactiveGoalMinutes,
+    },
+    {
+      term: "mode",
       label: t("next.seeding.mode"),
       value: t(terms.mode === "ALL" ? "next.seeding.modeAll" : "next.seeding.modeAny"),
       level: terms.levels.mode,
     },
-    { label: t("next.seeding.action"), value: t(ACTION_KEYS[terms.action]), level: terms.levels.action },
+    { term: "action", label: t("next.seeding.action"), value: t(ACTION_KEYS[terms.action]), level: terms.levels.action },
     {
+      term: "seedTimeCounting",
       label: t("next.seeding.seedTimeCounting"),
       value: t(
         terms.seedTimeCounting === "CONSECUTIVE"
@@ -117,6 +134,7 @@ function seedingRows(t: Translate, torrent: TorrentData): { label: string; value
       level: terms.levels.seedTimeCounting,
     },
     {
+      term: "uploadCap",
       label: t("next.seeding.uploadCap"),
       value: terms.uploadCap === null ? EM_DASH : formatRate(terms.uploadCap),
       level: terms.levels.uploadCap,
@@ -143,7 +161,11 @@ function GeneralGrid({ fields }: { fields: TorrentField[] }) {
   return (
     <div className="grid grid-cols-2 gap-x-4 gap-y-[13px] sm:grid-cols-3">
       {fields.map((field) => (
-        <div key={field.label} className={field.wide ? "col-span-full min-w-0" : "min-w-0"}>
+        <div
+          key={field.key}
+          data-testid={torrentIds.field(field.key)}
+          className={field.wide ? "col-span-full min-w-0" : "min-w-0"}
+        >
           <Field label={field.label} value={field.value} title={field.value} />
         </div>
       ))}
@@ -362,6 +384,7 @@ function TrackersBlock({
         torrent.trackers.map((tracker) => (
           <GridRow
             key={`${tracker.tier}-${tracker.url}`}
+            testId={torrentIds.tracker(tracker.url)}
             columns={TRACKER_COLUMNS}
             gap={14}
             className="h-[38px] border-t border-wv-hairline"
@@ -373,7 +396,10 @@ function TrackersBlock({
                 .filter(Boolean)
                 .join(" · ")}
             </span>
-            <span className="font-wv-mono text-[11.5px] text-wv-muted">
+            <span
+              data-testid={torrentIds.trackerStatus(tracker.updating ? "UPDATING" : tracker.status)}
+              className="font-wv-mono text-[11.5px] text-wv-muted"
+            >
               {t(tracker.updating ? "next.torrent.tracker.UPDATING" : `next.torrent.tracker.${tracker.status}`)}
             </span>
             <span
@@ -592,6 +618,7 @@ function FilesBlock({
           {torrent.files.map((file) => (
             <GridRow
               key={file.index}
+              testId={torrentIds.file}
               columns={FILE_COLUMNS}
               gap={14}
               selected={picked.has(file.index)}
@@ -603,11 +630,15 @@ function FilesBlock({
                 checked={picked.has(file.index)}
                 onChange={() => pick(file.index)}
               />
-              <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{file.path}</span>
+              <span data-testid={torrentIds.filePath} className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">
+                {file.path}
+              </span>
               <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
                 {formatSize(file.length)}
               </span>
-              <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(file.progress * 100).toFixed(1)}%`}</span>
+              <span data-testid={torrentIds.fileProgress} className="text-right font-wv-mono text-[12px] text-wv-muted">
+                {`${(file.progress * 100).toFixed(1)}%`}
+              </span>
               <Select
                 label={t("next.torrent.filePriority", { name: file.path })}
                 value={file.priority}
@@ -670,6 +701,7 @@ export function TorrentDetail({
         right={
           <button
             type="button"
+            data-testid={torrentIds.seedingOverride}
             onClick={() => setEditing(seedingFrom(torrent.seedingOverride))}
             className="cursor-pointer text-wv-dim hover:text-wv-fg"
           >
@@ -680,12 +712,14 @@ export function TorrentDetail({
         <div className="grid gap-x-4 gap-y-[13px]" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))" }}>
           {seedingRows(t, torrent).map((row) => (
             <Field
-              key={row.label}
+              key={row.term}
               label={row.label}
               value={
                 <>
-                  <span>{row.value}</span>
-                  <span className="ml-[6px] text-wv-muted">{levelText(t, torrent, row.level)}</span>
+                  <span data-testid={torrentIds.seedingTerm(row.term)}>{row.value}</span>
+                  <span data-testid={torrentIds.seedingLevel(row.term, row.level)} className="ml-[6px] text-wv-muted">
+                    {levelText(t, torrent, row.level)}
+                  </span>
                 </>
               }
             />
@@ -701,6 +735,7 @@ export function TorrentDetail({
 
       <RecordEditor
         open={editing !== null}
+        testId={testIds.dialog("torrent-seeding")}
         title={t("next.torrent.overrideSeeding")}
         note={torrent.name}
         busy={seedingState.fetching}

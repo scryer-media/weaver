@@ -619,6 +619,8 @@ func runRealUsenetCase(api realUsenetAPI, config *realUsenetConfig, root string,
 	var profileIDs []int
 	var proxyID, poolID int
 	var serverID int
+	// Zero is the built-in System DNS profile: the host resolves.
+	var dnsProfileID, dnsListID int
 	defer func() {
 		if serverID != 0 {
 			err = errors.Join(err, api.query("mutation($id:Int!) {removeServer(id:$id) {id}}", map[string]any{"id": serverID}, nil))
@@ -628,6 +630,12 @@ func runRealUsenetCase(api realUsenetAPI, config *realUsenetConfig, root string,
 		}
 		for _, id := range profileIDs {
 			err = errors.Join(err, api.query("mutation($id:Int!) {deleteProxyProfile(id:$id)}", map[string]any{"id": id}, nil))
+		}
+		if dnsProfileID != 0 {
+			err = errors.Join(err, api.query("mutation($id:Int!) {deleteDnsProfile(id:$id)}", map[string]any{"id": dnsProfileID}, nil))
+		}
+		if dnsListID != 0 {
+			err = errors.Join(err, api.query("mutation($id:Int!) {deleteDnsServerList(id:$id)}", map[string]any{"id": dnsListID}, nil))
 		}
 	}()
 	if testCase.Kind == "chain" || testCase.Kind == "pool" {
@@ -693,12 +701,41 @@ func runRealUsenetCase(api realUsenetAPI, config *realUsenetConfig, root string,
 		var saved struct{ SaveProxyProfile struct{ ID int } }
 		if err := api.query("mutation($input:ProxyProfileInput!) {saveProxyProfile(input:$input) {id}}", map[string]any{"input": map[string]any{
 			"name": testCase.Name, "kind": kind, "enabled": true, "host": relayIP, "port": port,
-			"username": "fixture", "password": "fixture", "resolver": "PROXY", "dnsServers": []string{relayIP},
+			"username": "fixture", "password": "fixture",
 		}}, &saved); err != nil {
 			return result, err
 		}
 		proxyID = saved.SaveProxyProfile.ID
 		profileIDs = append(profileIDs, proxyID)
+	}
+	switch testCase.Kind {
+	case "direct":
+	case "chain", "pool":
+		// The tunnel's own DNS servers answer the provider's name. A config
+		// without a DNS line is refused when it is read, so every hop has them.
+		var saved struct{ SaveDnsProfile struct{ ID int } }
+		if err := api.query("mutation($input:DnsProfileInput!) {saveDnsProfile(input:$input) {id}}", map[string]any{"input": map[string]any{
+			"name": testCase.Name + "-dns", "kind": "ROUTE", "who": "PROXY", "transit": nil, "trust": "AS_SENT", "serverListId": nil, "systemFallback": false,
+		}}, &saved); err != nil {
+			return result, err
+		}
+		dnsProfileID = saved.SaveDnsProfile.ID
+	default:
+		// The relay's DNS server, asked through the proxy.
+		var list struct{ SaveDnsServerList struct{ ID int } }
+		if err := api.query("mutation($input:DnsServerListInput!) {saveDnsServerList(input:$input) {id}}", map[string]any{"input": map[string]any{
+			"name": testCase.Name + "-dns", "servers": []map[string]any{{"wire": "PLAIN", "address": relayIP, "tlsName": nil, "url": nil}},
+		}}, &list); err != nil {
+			return result, err
+		}
+		dnsListID = list.SaveDnsServerList.ID
+		var saved struct{ SaveDnsProfile struct{ ID int } }
+		if err := api.query("mutation($input:DnsProfileInput!) {saveDnsProfile(input:$input) {id}}", map[string]any{"input": map[string]any{
+			"name": testCase.Name + "-dns", "kind": "ROUTE", "who": "WEAVER", "transit": "PROXY", "trust": "AS_SENT", "serverListId": dnsListID, "systemFallback": false,
+		}}, &saved); err != nil {
+			return result, err
+		}
+		dnsProfileID = saved.SaveDnsProfile.ID
 	}
 	serverInput := map[string]any{"host": config.Host, "port": config.Port, "tls": true, "username": config.Username, "password": config.Password,
 		"connections": config.Connections, "active": false, "priority": 0, "backfill": false, "retentionDays": 0}
@@ -718,7 +755,7 @@ func runRealUsenetCase(api realUsenetAPI, config *realUsenetConfig, root string,
 		}
 		path = map[string]any{"ladder": map[string]any{"rungs": []map[string]any{rung}, "directFallback": false}}
 	}
-	route := map[string]any{"failover": "HOLD", "legs": []map[string]any{{"egressId": egressID, "weight": 100, "path": path}}}
+	route := map[string]any{"failover": "HOLD", "dnsProfileId": dnsProfileID, "legs": []map[string]any{{"egressId": egressID, "weight": 100, "path": path}}}
 	if err := api.query("mutation($id:Int!, $input:RouteInput!) {saveNetworkRoute(kind:SERVER,id:$id,input:$input) {consumer}}", map[string]any{"id": serverID, "input": route}, nil); err != nil {
 		return result, err
 	}

@@ -45,7 +45,7 @@ test("forwards only infrastructure names to the container resolver", async () =>
   await once(upstream, "listening");
   const fixture = await startProxyFixture({
     ip: "127.0.0.1",
-    ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 },
+    ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, dnsAlt: 0, nntp: 0, http: 0, control: 0 },
     nameservers: [{ address: "127.0.0.1", port: upstream.address().port }],
   });
   const socket = dgram.createSocket("udp4");
@@ -80,7 +80,7 @@ test("a silent resolver does not keep an infrastructure name from the one that a
   await once(answering, "listening");
   const fixture = await startProxyFixture({
     ip: "127.0.0.1",
-    ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 },
+    ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, dnsAlt: 0, nntp: 0, http: 0, control: 0 },
     nameservers: [{ address: "127.0.0.1", port: silent.address().port }, { address: "127.0.0.1", port: answering.address().port }],
   });
   const socket = dgram.createSocket("udp4");
@@ -98,7 +98,7 @@ test("a silent resolver does not keep an infrastructure name from the one that a
 });
 
 test("canary answers destination DNS locally and records host queries", async () => {
-  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 } });
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, dnsAlt: 0, nntp: 0, http: 0, control: 0 } });
   const socket = dgram.createSocket("udp4");
   try {
     const header = Buffer.from([0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
@@ -113,7 +113,7 @@ test("canary answers destination DNS locally and records host queries", async ()
 });
 
 test("HTTP CONNECT preserves pipelined data and refuses non-fixture targets", async () => {
-  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 } });
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, dnsAlt: 0, nntp: 0, http: 0, control: 0 } });
   try {
     const request = async (host, port, payload = "", authorization = Buffer.from("fixture:fixture").toString("base64")) => {
       const socket = net.connect(fixture.ports.primary, "127.0.0.1");
@@ -134,7 +134,7 @@ test("HTTP CONNECT preserves pipelined data and refuses non-fixture targets", as
 });
 
 test("SOCKS5 accepts a pipelined authenticated handshake", async () => {
-  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 } });
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, dnsAlt: 0, nntp: 0, http: 0, control: 0 } });
   try {
     const socket = net.connect(fixture.ports.secondary, "127.0.0.1");
     socket.setTimeout(3000, () => socket.destroy(new Error("fixture timeout")));
@@ -154,7 +154,7 @@ test("SOCKS5 accepts a pipelined authenticated handshake", async () => {
   } finally { await fixture.close(); }
 });
 
-const zeroPorts = { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 };
+const zeroPorts = { primary: 0, secondary: 0, tertiary: 0, dns: 0, dnsAlt: 0, nntp: 0, http: 0, control: 0 };
 const control = async (fixture, path, body) => {
   const response = await fetch(`http://127.0.0.1:${fixture.ports.control}${path}`, body ? { method: "POST", body: JSON.stringify(body) } : undefined);
   return { status: response.status, body: await response.json() };
@@ -309,6 +309,39 @@ test("download paths ignore the query string and the non-NZB body is served", as
     assert.equal(await probe.text(), "<nzb/>");
     const junk = await fetch(`http://127.0.0.1:${fixture.ports.http}/not-an-nzb.nzb`);
     assert.match(await junk.text(), /not an nzb/);
+  } finally { await fixture.close(); }
+});
+
+test("the root is answered with no records, and each listener names its port", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: zeroPorts, nameservers: [] });
+  const socket = dgram.createSocket("udp4");
+  const ask = async (query, port) => {
+    const response = once(socket, "message");
+    socket.send(query, port, "127.0.0.1");
+    return (await response)[0];
+  };
+  try {
+    // The root SOA, as a plain capability probe asks it.
+    const root = await ask(Buffer.from([0, 9, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 1]), fixture.ports.dnsUdp);
+    assert.equal(root.readUInt16BE(2), 0x8180);
+    assert.equal(root.readUInt16BE(6), 0);
+    const alt = await ask(dnsQuery(10, "named.proxy.test"), fixture.ports.dnsAltUdp);
+    assert.deepEqual([...alt.subarray(-4)], [127, 0, 0, 1]);
+    await ask(dnsQuery(11, "named.proxy.test"), fixture.ports.dnsUdp);
+    // Unit-test ports are allocated per protocol, so each event names its listener's TCP port.
+    assert.deepEqual(fixture.events.filter(event => event.kind === "direct-dns").map(event => event.port), [fixture.ports.dnsAlt, fixture.ports.dns]);
+  } finally { socket.close(); await fixture.close(); }
+});
+
+test("a forwarded connection carries its number, listed as open until it closes", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: zeroPorts });
+  try {
+    await exchange(fixture.ports.primary, `CONNECT news.proxy.test:${fixture.ports.http} HTTP/1.1\r\nProxy-Authorization: Basic ${Buffer.from("fixture:fixture").toString("base64")}\r\n\r\nGET /feed.xml HTTP/1.1\r\nHost: news.proxy.test\r\nConnection: close\r\n\r\n`);
+    const connected = fixture.events.filter(event => event.kind === "connected");
+    assert.deepEqual(connected.map(event => event.connection), [1]);
+    let state;
+    do { state = (await control(fixture, "/")).body; } while (state.open.length > 0);
+    assert.deepEqual(state.open, []);
   } finally { await fixture.close(); }
 });
 

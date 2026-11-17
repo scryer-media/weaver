@@ -31,9 +31,44 @@ pub(crate) async fn write_routing(
         return Ok(());
     };
     let policy = super::network_persistence::validate_policy(tx, consumer, policy).await?;
-    tx.execute("INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {}) ON CONFLICT(consumer) DO UPDATE SET policy = excluded.policy", &[SqlArg::Text(consumer.key()), SqlArg::Text(serde_json::to_string(&policy).map_err(error)?)]).await?;
-    super::network_persistence::validate_stored_network(tx, before).await?;
+    insert_route(tx, consumer.key(), &policy).await?;
+    super::network_persistence::validate_stored_network(
+        tx,
+        before,
+        super::dns_persistence::Touched::Route(consumer),
+    )
+    .await?;
     Ok(())
+}
+
+// Write a route row. A policy that names no DNS profile keeps the stored
+// one, or takes the System profile for a new route.
+async fn insert_route(
+    tx: &mut crate::persistence::sql_runtime::SqlTx<'_>,
+    key: String,
+    policy: &RoutingPolicy,
+) -> Result<(), StateError> {
+    let profile = SqlArg::OptI64(policy.dns_profile_id.map(i64::from));
+    tx.execute(
+        "INSERT INTO proxy_routes (consumer, policy, dns_profile_id) VALUES ({}, {}, COALESCE(CAST({} AS BIGINT), 0)) ON CONFLICT(consumer) DO UPDATE SET policy = excluded.policy, dns_profile_id = COALESCE(CAST({} AS BIGINT), proxy_routes.dns_profile_id)",
+        &[
+            SqlArg::Text(key),
+            SqlArg::Text(serde_json::to_string(policy).map_err(error)?),
+            profile.clone(),
+            profile,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+// A stored route row's policy, with the DNS profile from its own column.
+pub(super) fn route_policy(
+    row: &crate::persistence::sql_runtime::SqlRow,
+) -> Result<RoutingPolicy, StateError> {
+    let mut policy: RoutingPolicy = serde_json::from_str(&row.text("policy")?).map_err(error)?;
+    policy.dns_profile_id = Some(u32::try_from(row.i64("dns_profile_id")?).map_err(error)?);
+    Ok(policy)
 }
 
 impl Database {
@@ -43,7 +78,7 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 store.read_exec(),
-                "SELECT id, config, password FROM proxy_profiles ORDER BY id",
+                "SELECT id, config, password, dns_profile_id FROM proxy_profiles ORDER BY id",
                 &[],
             )
             .await?;
@@ -52,6 +87,8 @@ impl Database {
                     let mut profile: ProxyProfile =
                         serde_json::from_str(&row.text("config")?).map_err(error)?;
                     profile.id = u32::try_from(row.i64("id")?).map_err(error)?;
+                    profile.dns_profile_id =
+                        u32::try_from(row.i64("dns_profile_id")?).map_err(error)?;
                     if let Some(encrypted) = row.opt_text("password")? {
                         let key = key.as_ref().ok_or_else(|| {
                             error("encryption key required for proxy credentials")
@@ -129,12 +166,13 @@ impl Database {
                     } else if reset_trust {
                         return Err(NetworkRefusal::ProxyGone.into());
                     }
-                    tx.execute("INSERT INTO proxy_profiles (id, config, password) VALUES ({}, {}, {}) ON CONFLICT(id) DO UPDATE SET config = excluded.config, password = excluded.password", &[
+                    tx.execute("INSERT INTO proxy_profiles (id, config, password, dns_profile_id) VALUES ({}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET config = excluded.config, password = excluded.password, dns_profile_id = excluded.dns_profile_id", &[
                         SqlArg::I64(i64::from(profile.id)),
                         SqlArg::Text(serde_json::to_string(&profile).map_err(error)?),
                         SqlArg::Text(password),
+                        SqlArg::I64(i64::from(profile.dns_profile_id)),
                     ]).await?;
-                    super::network_persistence::validate_stored_network(tx, &before).await?;
+                    super::network_persistence::validate_stored_network(tx, &before, super::dns_persistence::Touched::Proxy(profile.id)).await?;
                     Ok(profile)
                 })
             }).await
@@ -189,17 +227,12 @@ impl Database {
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 store.read_exec(),
-                "SELECT consumer, policy FROM proxy_routes",
+                "SELECT consumer, policy, dns_profile_id FROM proxy_routes",
                 &[],
             )
             .await?
             .into_iter()
-            .map(|r| {
-                Ok((
-                    r.text("consumer")?,
-                    serde_json::from_str(&r.text("policy")?).map_err(error)?,
-                ))
-            })
+            .map(|r| Ok((r.text("consumer")?, route_policy(&r)?)))
             .collect()
         })
     }
@@ -213,11 +246,11 @@ impl Database {
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 store.read_exec(),
-                "SELECT policy FROM proxy_routes WHERE consumer = {}",
+                "SELECT policy, dns_profile_id FROM proxy_routes WHERE consumer = {}",
                 &[SqlArg::Text(key)],
             )
             .await?
-            .map(|r| serde_json::from_str(&r.text("policy")?).map_err(error))
+            .map(|r| route_policy(&r))
             .transpose()
             .map(|v| v.unwrap_or_default())
         })
@@ -234,15 +267,23 @@ impl Database {
         let store = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&store, "save_proxy_route", |tx| {
-                let key = key.clone(); let policy = policy.clone();
+                let key = key.clone();
+                let policy = policy.clone();
                 Box::pin(async move {
                     let before = super::network_persistence::lock_network_asks(tx).await?;
-                    let policy = super::network_persistence::validate_policy(tx,consumer,&policy).await?;
-                    tx.execute("INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {}) ON CONFLICT(consumer) DO UPDATE SET policy = excluded.policy", &[SqlArg::Text(key), SqlArg::Text(serde_json::to_string(&policy).map_err(error)?)]).await?;
-                    super::network_persistence::validate_stored_network(tx, &before).await?;
+                    let policy =
+                        super::network_persistence::validate_policy(tx, consumer, &policy).await?;
+                    insert_route(tx, key, &policy).await?;
+                    super::network_persistence::validate_stored_network(
+                        tx,
+                        &before,
+                        super::dns_persistence::Touched::Route(consumer),
+                    )
+                    .await?;
                     Ok(())
                 })
-            }).await
+            })
+            .await
         })
     }
 

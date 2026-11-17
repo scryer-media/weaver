@@ -22,6 +22,7 @@ import {
   type Consumer,
   type NetworkingPage,
 } from "./data";
+import { DnsPage } from "./DnsPage";
 import { EgressPage } from "./EgressPage";
 import { FlowEditor } from "./FlowEditor";
 import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
@@ -98,8 +99,8 @@ export function NetworkingWorkspace({
   const workspace = useNetworkingWorkspace(page);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
   const { data, error, fetching, flow, consumers, egresses, profiles, pools, action, busy, message, failed } = workspace;
-  // The pages draw their blocks only once the data is here.
-  useSearchReport(0, !data && fetching);
+  // The pages draw their blocks only once the data is here. The DNS page reads and reports its own.
+  useSearchReport(0, page !== "dns" && !data && fetching);
   // Held while what it names is the same: the diagram reads each sample itself.
   const overviewBlocks = useMemo<SettingsBlock[]>(
     () => [
@@ -118,6 +119,9 @@ export function NetworkingWorkspace({
 
   if (!NETWORKING_PAGES.includes(page as NetworkingPage)) {
     return <Navigate to="/settings/networking/overview" replace />;
+  }
+  if (page === "dns") {
+    return <DnsPage />;
   }
 
   return (

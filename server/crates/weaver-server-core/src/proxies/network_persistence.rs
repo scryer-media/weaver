@@ -94,7 +94,7 @@ fn quota_row(row: &SqlRow) -> Result<EgressQuota, StateError> {
     })
 }
 
-fn pool_row(row: SqlRow) -> Result<ProxyPool, StateError> {
+pub(super) fn pool_row(row: SqlRow) -> Result<ProxyPool, StateError> {
     Ok(ProxyPool {
         id: u32::try_from(row.i64("id")?).map_err(error)?,
         name: row.text("name")?,
@@ -117,14 +117,12 @@ pub(super) fn stored_route(json: &str) -> Result<Route, StateError> {
     }
 }
 
-async fn profiles(tx: &mut SqlTx<'_>) -> Result<HashMap<u32, ProxyProfile>, StateError> {
-    tx.fetch_all("SELECT id, config FROM proxy_profiles", &[])
+pub(super) async fn profiles(tx: &mut SqlTx<'_>) -> Result<HashMap<u32, ProxyProfile>, StateError> {
+    tx.fetch_all("SELECT id, config, dns_profile_id FROM proxy_profiles", &[])
         .await?
         .into_iter()
         .map(|row| {
-            let mut profile: ProxyProfile =
-                serde_json::from_str(&row.text("config")?).map_err(error)?;
-            profile.id = u32::try_from(row.i64("id")?).map_err(error)?;
+            let profile = super::dns_persistence::stored_proxy(&row)?;
             Ok((profile.id, profile))
         })
         .collect()
@@ -233,12 +231,16 @@ pub(super) async fn validate_policy(
     let route = policy.route();
     consumer.validate_route(&route)?;
     route.validate_references(&egresses, &profiles, &pools)?;
-    Ok(RoutingPolicy::from_route(route, &pools))
+    Ok(RoutingPolicy {
+        dns_profile_id: policy.dns_profile_id,
+        ..RoutingPolicy::from_route(route, &pools)
+    })
 }
 
 pub(super) async fn validate_stored_network(
     tx: &mut SqlTx<'_>,
     before: &SocketAsks,
+    touched: super::dns_persistence::Touched,
 ) -> Result<(), StateError> {
     let profiles = profiles(tx).await?;
     let pools = tx
@@ -292,6 +294,7 @@ pub(super) async fn validate_stored_network(
     }
     super::validate_wireguard_paths(&routes, &profiles, &pools)?;
     super::validate_instance_budget(&routes, &profiles, &pools, super::max_wireguard_instances())?;
+    super::dns_persistence::validate_route_dns(&mut tx.conn(), &profiles, &pools, touched).await?;
     validate_stored_sockets(tx, before).await
 }
 
@@ -560,7 +563,12 @@ impl Database {
                     tx.execute("INSERT INTO proxy_pools (id, name, kind, member_ids, enabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind, member_ids = excluded.member_ids, enabled = excluded.enabled, updated_at = excluded.updated_at", &[
                         SqlArg::I64(i64::from(pool.id)), SqlArg::Text(pool.name.clone()), SqlArg::Text(serde_json::to_string(&pool.kind).map_err(error)?), SqlArg::Text(serde_json::to_string(&pool.member_ids).map_err(error)?), SqlArg::Bool(pool.enabled), SqlArg::I64(now), SqlArg::I64(now),
                     ]).await?;
-                    validate_stored_network(tx, &before).await?;
+                    validate_stored_network(
+                        tx,
+                        &before,
+                        super::dns_persistence::Touched::Pool(pool.id),
+                    )
+                    .await?;
                     Ok(pool)
                 })
             }).await

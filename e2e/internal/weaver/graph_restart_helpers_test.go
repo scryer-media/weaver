@@ -175,6 +175,71 @@ scope = "all"
 	}
 }
 
+// writeSQLMigrations writes a manifest of one SQL step per migration, in
+// version order, and returns its folder.
+func writeSQLMigrations(t *testing.T, versions []int, sql map[int]string) string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "migrations")
+	manifest := "format_version = 1\n"
+	for _, version := range versions {
+		folder := fmt.Sprintf("%04d_m", version)
+		if err := os.MkdirAll(filepath.Join(dir, folder), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, folder, "schema.sql"), []byte(sql[version]), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		manifest += fmt.Sprintf("\n[[migration]]\nversion = %d\ndescription = \"m\"\n\n[[migration.steps]]\nkind = \"sql\"\nfile = \"migrations/%s/schema.sql\"\nscope = \"all\"\n", version, folder)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.toml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// A write to a table that was there before is passed only when a reverse
+// lists that very statement; another write to the same table is named.
+func TestLaterMigrationsPassOnlyTheWritesAReverseLists(t *testing.T) {
+	listed := "UPDATE egress_interfaces\n   SET download_bps = NULLIF(max_download_speed, 0),\n       quota_download_bytes = download_quota_limit_bytes,\n       quota_download_enabled = download_quota_enabled;\n"
+	dir := writeSQLMigrations(t, []int{93, 94}, map[int]string{94: listed})
+	later, err := readLaterMigrations(dir, 93)
+	if err != nil || !reflect.DeepEqual(later.Hooks, []string{"egress_bandwidth_columns_v94"}) {
+		t.Fatalf("listed write = %+v, %v; want its reverse", later, err)
+	}
+	dir = writeSQLMigrations(t, []int{93, 94}, map[int]string{94: listed + "UPDATE egress_interfaces SET upload_bps = 1;\n"})
+	if _, err := readLaterMigrations(dir, 93); err == nil || !strings.Contains(err.Error(), "UPDATE egress_interfaces SET upload_bps = 1") {
+		t.Fatalf("unlisted write = %v, want it named", err)
+	}
+}
+
+// A later migration that makes, IF NOT EXISTS, a table, index or column an
+// earlier one left in place is named: the rewind would drop it from the older
+// build. One an earlier migration dropped again is the later one's own.
+func TestLaterMigrationsRefuseRemakingWhatAnEarlierOneMade(t *testing.T) {
+	earlier := "CREATE TABLE t (id INTEGER PRIMARY KEY);\nCREATE INDEX idx_t ON t (id);\nALTER TABLE t ADD COLUMN c TEXT;\nCREATE TABLE gone (id INTEGER);\nDROP TABLE gone;\nCREATE TABLE old_name (id INTEGER);\nALTER TABLE old_name RENAME TO kept;\n"
+	for _, tc := range []struct{ later, refusal string }{
+		{"CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY);", "creates table t"},
+		{"CREATE INDEX IF NOT EXISTS idx_t ON t (id);", "creates index idx_t"},
+		{"ALTER TABLE t ADD COLUMN IF NOT EXISTS c TEXT;", "creates column t.c"},
+		{"CREATE TABLE IF NOT EXISTS kept (id INTEGER);", "creates table kept"},
+		{"CREATE TABLE IF NOT EXISTS gone (id INTEGER);", ""},
+		{"CREATE TABLE IF NOT EXISTS old_name (id INTEGER);", ""},
+	} {
+		dir := writeSQLMigrations(t, []int{1, 2}, map[int]string{1: earlier, 2: tc.later})
+		_, err := readLaterMigrations(dir, 1)
+		if tc.refusal == "" {
+			if err != nil {
+				t.Fatalf("%s: %v, want it read", tc.later, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), "migration 2 "+tc.refusal) {
+			t.Fatalf("%s: %v, want %q", tc.later, err, tc.refusal)
+		}
+	}
+}
+
 // A created index and a Rust step with a named reverse are steps the rewind
 // can undo, and are reported.
 func TestLaterMigrationsReportIndexesAndReversibleRustSteps(t *testing.T) {
@@ -303,6 +368,73 @@ func TestServerTrimReverseRefusesAListPastTheLimit(t *testing.T) {
 	}
 }
 
+// The reverses of migrations 94 and 125 refuse what an older build cannot
+// hold before the rewind changes anything, and pass a database without it.
+func TestBandwidthAndDNSReversesRefuseWhatAnOlderBuildCannotHold(t *testing.T) {
+	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
+	rewind := schemaRewind{Reverses: []string{"move_bandwidth_to_networking_v94", "egress_bandwidth_columns_v94", "dns_profiles_from_proxies_v125"}, LedgerFrom: 94}
+	for _, tc := range []struct {
+		name, plant, refusal string
+	}{
+		{"nothing to refuse", "", ""},
+		{"a global limit of 0", `UPDATE network_bandwidth SET download_bps = 0`, "global download limit is 0"},
+		{"a global upload limit", `UPDATE network_bandwidth SET upload_bps = 100`, "global upload limit is set"},
+		{"a usenet split", `UPDATE network_bandwidth SET usenet_split_pct = 40`, "split between usenet and torrents"},
+		{"an egress limit of 0", `UPDATE egress_interfaces SET download_bps = 0`, "1 rows of egress_interfaces: egresses have a download limit of 0"},
+		{"an egress upload limit", `UPDATE egress_interfaces SET upload_bps = 100`, "egresses have an upload limit"},
+		{"an egress upload quota", `UPDATE egress_interfaces SET quota_upload_soft_bytes = 100`, "egresses have an upload quota"},
+		{"an egress hard upload quota", `UPDATE egress_interfaces SET quota_upload_hard_bytes = 100`, "egresses have a hard upload quota"},
+		{"an egress upload trickle", `UPDATE egress_interfaces SET quota_upload_trickle_bps = 0`, "upload trickle other than the default"},
+		{"counted uploads", `INSERT INTO egress_download_usage (egress_id, upload_lifetime_bytes) VALUES (0, 5)`, "egresses have counted uploads"},
+		{"an upload quota baseline", `INSERT INTO egress_download_usage (egress_id, upload_quota_baseline_bytes) VALUES (0, 5)`, "upload quota baseline"},
+		{"a set schedule limit", `INSERT INTO settings (key, value) VALUES ('schedules', '[{"action":{"type":"speed_limit","limits":[{"bytes_per_sec":500,"upload_bytes_per_sec":null}]}}]')`, ""},
+		{"a lifted schedule limit", `INSERT INTO settings (key, value) VALUES ('schedules', '[{"action":{"type":"speed_limit","limits":[{"bytes_per_sec":null}]}}]')`, ""},
+		{"a schedule split", `INSERT INTO settings (key, value) VALUES ('schedules', '[{"action":{"type":"bandwidth_split","usenet_pct":40}}]')`, "shares the download limit between usenet and torrents"},
+		{"a schedule split lifted", `INSERT INTO settings (key, value) VALUES ('schedules', '[{"action":{"type":"bandwidth_split","usenet_pct":null}}]')`, "shares the download limit between usenet and torrents"},
+		{"a quota rule for one egress", `INSERT INTO settings (key, value) VALUES ('schedules', '[{"action":{"type":"set_quota_metering","enabled":true,"target":{"kind":"egress","id":0}}}]')`, ""},
+		{"a schedule limit of 0", `INSERT INTO settings (key, value) VALUES ('schedules', '[{"action":{"type":"speed_limit","limits":[{"bytes_per_sec":0}]}}]')`, "lets nothing through with 0"},
+		{"a schedule upload limit", `INSERT INTO settings (key, value) VALUES ('schedules', '[{"action":{"type":"speed_limit","limits":[{"bytes_per_sec":500,"upload_bytes_per_sec":100}]}}]')`, "sets an upload limit"},
+		{"a DNS profile", `INSERT INTO dns_profiles (id) VALUES (1)`, "rows in dns_profiles"},
+	} {
+		dbPath := filepath.Join(t.TempDir(), "state.db")
+		setup := []string{
+			`CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success BOOLEAN NOT NULL)`,
+			`INSERT INTO _sqlx_migrations VALUES (93, 1), (94, 1)`,
+			`CREATE TABLE settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)`,
+			`CREATE TABLE network_bandwidth (id INTEGER PRIMARY KEY, download_bps INTEGER, upload_bps INTEGER, usenet_split_pct INTEGER)`,
+			`INSERT INTO network_bandwidth VALUES (1, NULL, NULL, NULL)`,
+			`CREATE TABLE egress_interfaces (id INTEGER PRIMARY KEY, download_bps INTEGER, upload_bps INTEGER, quota_download_bytes INTEGER, quota_download_enabled BOOLEAN NOT NULL DEFAULT FALSE, quota_upload_soft_bytes INTEGER, quota_upload_trickle_bps INTEGER NOT NULL DEFAULT 2048, quota_upload_hard_bytes INTEGER, quota_period TEXT NOT NULL DEFAULT 'one_time')`,
+			`CREATE TABLE egress_download_usage (egress_id INTEGER PRIMARY KEY, upload_lifetime_bytes INTEGER NOT NULL DEFAULT 0, upload_quota_baseline_bytes INTEGER NOT NULL DEFAULT 0)`,
+			`INSERT INTO egress_interfaces (id) VALUES (0)`,
+			`CREATE TABLE dns_server_lists (id INTEGER PRIMARY KEY)`,
+			`CREATE TABLE dns_profiles (id INTEGER PRIMARY KEY)`,
+		}
+		if tc.plant != "" {
+			setup = append(setup, tc.plant)
+		}
+		if err := execAll(dbPath, setup); err != nil {
+			t.Fatal(err)
+		}
+		err := applySchemaRewind(dbPath, rewind, nil)
+		versions, readErr := migrationVersions(dbPath)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if tc.refusal == "" {
+			if err != nil || !reflect.DeepEqual(versions, map[int]bool{93: true}) {
+				t.Fatalf("%s: rewind = %v, ledger %v; want it rewound to 93", tc.name, err, versions)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.refusal) {
+			t.Fatalf("%s: rewind = %v, want it refused with %q", tc.name, err, tc.refusal)
+		}
+		if !reflect.DeepEqual(versions, map[int]bool{93: true, 94: true}) {
+			t.Fatalf("%s: ledger %v, want it untouched", tc.name, versions)
+		}
+	}
+}
+
 // The 0.16.5 rewind undoes what came after the graph-engine migration as the
 // engine-stamped one does, on top of its own part, naming each thing once.
 func TestRewindTo0165FollowsTheLaterMigrations(t *testing.T) {
@@ -400,6 +532,16 @@ var testRustSteps = map[string][]string{
 	},
 	// The step deletes servers only past 50; these tests hold fewer.
 	"trim_servers_to_limit_v92": nil,
+	"move_bandwidth_to_networking_v94": {
+		`INSERT INTO network_bandwidth (id, download_bps, upload_bps) SELECT 1, CAST(value AS INTEGER), NULL FROM settings WHERE key = 'max_download_speed' AND CAST(value AS INTEGER) > 0 ON CONFLICT(id) DO UPDATE SET download_bps = excluded.download_bps`,
+		`DELETE FROM settings WHERE key = 'max_download_speed'`,
+		// The step writes each speed rule's limit of 0 as null. Before 94 no
+		// rule had an upload limit, so only the download limit matches.
+		`UPDATE settings SET value = replace(value, '"bytes_per_sec":0', '"bytes_per_sec":null') WHERE key = 'schedules'`,
+	},
+	// These tests hold no torrents and no proxies.
+	"fill_tracker_hosts_v105":        nil,
+	"dns_profiles_from_proxies_v125": nil,
 }
 
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
@@ -432,7 +574,7 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 				migrations = append(migrations, statements...)
 				continue
 			}
-			if strings.Contains(step.File, "postgres") {
+			if step.Engine == "postgres" || strings.Contains(step.File, "postgres") {
 				continue
 			}
 			data, err := os.ReadFile(filepath.Join(filepath.Dir(testMigrationsDir), filepath.FromSlash(step.File)))
@@ -455,6 +597,19 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 		`CREATE TABLE settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)`,
 		`CREATE TABLE servers (id INTEGER PRIMARY KEY NOT NULL)`,
 		`INSERT INTO servers (id) VALUES (1), (2)`,
+		`CREATE TABLE categories (id INTEGER PRIMARY KEY NOT NULL)`,
+		// Migration 21's seen RSS items, which migration 123 indexes.
+		`CREATE TABLE rss_seen_items (feed_id INTEGER NOT NULL, decision TEXT)`,
+		`CREATE TABLE proxy_profiles (id INTEGER PRIMARY KEY NOT NULL, config TEXT NOT NULL)`,
+		`CREATE TABLE proxy_routes (consumer TEXT PRIMARY KEY NOT NULL, policy TEXT NOT NULL)`,
+		// Migration 53's egress tables, with a global limit and an egress
+		// limit and quota that migration 94 moves.
+		`CREATE TABLE egress_interfaces (id BIGINT PRIMARY KEY CHECK (id >= 0), name TEXT NOT NULL, binding_kind TEXT NOT NULL, binding_value TEXT, enabled BOOLEAN NOT NULL, max_download_speed BIGINT NOT NULL CHECK (max_download_speed >= 0), download_quota_enabled BOOLEAN NOT NULL DEFAULT FALSE, download_quota_limit_bytes BIGINT NOT NULL DEFAULT 0 CHECK (download_quota_limit_bytes >= 0), download_quota_period TEXT NOT NULL DEFAULT 'one_time', download_quota_reset_time_minutes_local BIGINT NOT NULL DEFAULT 0, download_quota_weekly_reset_weekday TEXT NOT NULL DEFAULT 'mon', download_quota_monthly_reset_day BIGINT NOT NULL DEFAULT 1, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)`,
+		`INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, created_at, updated_at) VALUES (0, 'System', 'system', NULL, TRUE, 4096, TRUE, 9000, 'monthly', 0, 0)`,
+		`CREATE TABLE egress_download_usage (egress_id BIGINT PRIMARY KEY NOT NULL, lifetime_bytes BIGINT NOT NULL DEFAULT 0, quota_baseline_bytes BIGINT NOT NULL DEFAULT 0)`,
+		`INSERT INTO settings (key, value) VALUES ('max_download_speed', '2048')`,
+		// A schedule from before 94: one rule lifts the limit with 0, one sets it.
+		`INSERT INTO settings (key, value) VALUES ('schedules', '` + strings.ReplaceAll(schedulesBefore94, "'", "''") + `')`,
 		`CREATE TABLE graph_members (job_id INTEGER, member_id INTEGER)`,
 		`CREATE TABLE graph_envelopes (job_id INTEGER, node_id INTEGER)`,
 		`CREATE TABLE graph_holds (job_id INTEGER)`,
@@ -469,6 +624,13 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	if got := storedNZBs(t, dbPath, `SELECT job_id, hex(nzb_zstd) AS nzb FROM job_nzbs`); got != "3=0203 7=0107" {
 		t.Fatalf("job_nzbs after the upgrade = %s", got)
 	}
+	if got := savedSchedulesIn(t, dbPath); got != schedulesSince94 {
+		t.Fatalf("schedules after the upgrade = %s, want %s", got, schedulesSince94)
+	}
+	// An egress made since migration 94, with no limit and no quota amount.
+	if err := execAll(dbPath, []string{`INSERT INTO egress_interfaces (id, name, binding_kind, enabled, created_at, updated_at) VALUES (1, 'Second', 'interface', TRUE, 0, 0)`}); err != nil {
+		t.Fatal(err)
+	}
 	later, err := readLaterMigrations(testMigrationsDir, graphEngineMigration)
 	if err != nil {
 		t.Fatal(err)
@@ -478,6 +640,10 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	}
 	if got := storedNZBs(t, dbPath, `SELECT job_id, hex(nzb_zstd) AS nzb FROM active_jobs UNION ALL SELECT job_id, hex(nzb_zstd) AS nzb FROM job_history`); got != "3=0203 7=0107 8=" {
 		t.Fatalf("NZBs on the rewound rows = %s", got)
+	}
+	// A lifted schedule limit is back as 0, the rest of the schedule as it was.
+	if got := savedSchedulesIn(t, dbPath); got != schedulesBefore94 {
+		t.Fatalf("rewound schedules = %s, want %s", got, schedulesBefore94)
 	}
 	err = withStateDB(dbPath, func(db *stateConn) error {
 		tables, err := existingTables(db)
@@ -503,6 +669,28 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 		if seeded != 0 {
 			t.Fatalf("rewound database keeps the retention migration 89 seeded")
 		}
+		// Migration 94's limits are back where an older build kept them.
+		var global string
+		if err := db.QueryRow(`SELECT value FROM settings WHERE key = 'max_download_speed'`).Scan(&global); err != nil || global != "2048" {
+			t.Fatalf("rewound global limit = %q, %v; want 2048", global, err)
+		}
+		var speed, limit int
+		var enabled bool
+		var period string
+		if err := db.QueryRow(`SELECT max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period FROM egress_interfaces WHERE id = 0`).Scan(&speed, &enabled, &limit, &period); err != nil {
+			return fmt.Errorf("rewound egress: %w", err)
+		}
+		if speed != 4096 || !enabled || limit != 9000 || period != "monthly" {
+			t.Fatalf("rewound egress = %d %v %d %s, want 4096 true 9000 monthly", speed, enabled, limit, period)
+		}
+		// Migration 53's columns hold no NULL: no limit and no quota amount
+		// are 0 there, with the quota off.
+		if err := db.QueryRow(`SELECT max_download_speed, download_quota_enabled, download_quota_limit_bytes FROM egress_interfaces WHERE id = 1`).Scan(&speed, &enabled, &limit); err != nil {
+			return fmt.Errorf("rewound second egress: %w", err)
+		}
+		if speed != 0 || enabled || limit != 0 {
+			t.Fatalf("rewound second egress = %d %v %d, want 0 false 0", speed, enabled, limit)
+		}
 		return nil
 	})
 	if err != nil {
@@ -513,6 +701,9 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	}
 	if got := storedNZBs(t, dbPath, `SELECT job_id, hex(nzb_zstd) AS nzb FROM job_nzbs`); got != "3=0203 7=0107" {
 		t.Fatalf("job_nzbs after the second upgrade = %s", got)
+	}
+	if got := savedSchedulesIn(t, dbPath); got != schedulesSince94 {
+		t.Fatalf("schedules after the second upgrade = %s, want %s", got, schedulesSince94)
 	}
 	err = withStateDB(dbPath, func(db *stateConn) error {
 		var retention string
@@ -531,6 +722,26 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(versions, map[int]bool{73: true}) {
 		t.Fatalf("historical ledger = %v, error = %v", versions, err)
 	}
+}
+
+// schedulesBefore94 is a saved schedule from before migration 94, in the
+// key order the rewind writes: one rule lifts the limit with 0, one sets it.
+// The name carries a quote the rewind must write back whole.
+const schedulesBefore94 = `[{"action":{"limits":[{"bytes_per_sec":0,"target":{"kind":"global"}}],"type":"speed_limit"},"name":"Night's lift"},{"action":{"limits":[{"bytes_per_sec":500,"target":{"id":1,"kind":"server"}}],"type":"speed_limit"},"name":"Day"}]`
+
+// schedulesSince94 is schedulesBefore94 as migration 94 leaves it.
+var schedulesSince94 = strings.Replace(schedulesBefore94, `"bytes_per_sec":0`, `"bytes_per_sec":null`, 1)
+
+// savedSchedulesIn is the saved schedules setting of the database.
+func savedSchedulesIn(t *testing.T, dbPath string) string {
+	t.Helper()
+	var raw string
+	if err := withStateDB(dbPath, func(db *stateConn) error {
+		return db.QueryRow(`SELECT value FROM settings WHERE key = 'schedules'`).Scan(&raw)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 // storedNZBs is "job=hex" for each (job_id, nzb) row the query gives, in job order.

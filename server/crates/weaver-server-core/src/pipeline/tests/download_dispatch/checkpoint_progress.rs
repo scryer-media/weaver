@@ -465,6 +465,7 @@ fn park_one(pipeline: &mut Pipeline, delay: Option<Duration>) {
         RetryWork {
             scheduled_pool_generation: pipeline.pool_generation,
             infrastructure_retry: true,
+            hold: crate::pipeline::RetryHold::Ordinary,
             work,
         },
     );

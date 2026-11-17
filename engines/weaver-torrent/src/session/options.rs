@@ -20,7 +20,7 @@ use crate::Identity;
 use crate::buffers::ByteBufOwned;
 use crate::core::{
     magnet::Magnet,
-    net::{HttpClients, Resolver},
+    net::{HttpClients, Resolver, TorrentNaming},
     torrent_metainfo::{ValidatedTorrentMetaV1Info, WebSeed},
 };
 use crate::dht::{DhtPersistenceConfig, Id20};
@@ -166,6 +166,10 @@ pub struct AddTorrentOptions {
     /// the session's identity is used.
     #[serde(skip)]
     pub identity: Option<Identity>,
+    /// How the torrent looks its names up and asks its trackers and web
+    /// seeds. If not set, the session's resolver and HTTP clients are used.
+    #[serde(skip)]
+    pub naming: Option<TorrentNaming>,
     /// What the torrent moved before this session took it, as another
     /// session's [`ManagedTorrent::totals`] last read: its counters, and
     /// what its trackers hear, go on from there.
@@ -275,6 +279,7 @@ impl Default for AddTorrentOptions {
             checkpoint: None,
             piece_priorities: None,
             identity: None,
+            naming: None,
             totals: TorrentTotals::default(),
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,

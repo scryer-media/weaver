@@ -15,6 +15,7 @@ import { formatSize } from "@/next/data/format";
 import { WV } from "@/next/data/palette";
 import { countLabel } from "@/next/i18n/labels";
 import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
+import { testIds, torrentIds } from "@/next/testids";
 import { useTorrentAddsOffered } from "@/next/data/use-torrents-shown";
 
 const NO_CATEGORY_VALUE = "__none__";
@@ -117,6 +118,7 @@ export function AddNzbDialog({
       title={t("next.addNzb.title")}
       onDismiss={onClose}
       width={620}
+      testId={testIds.dialog("add")}
       footer={
         <>
           <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
@@ -125,6 +127,7 @@ export function AddNzbDialog({
               readyCount === 0 || upload.staging || upload.fetching
             }
             onClick={() => void submit()}
+            testId={torrentIds.addSubmit}
           >
             {readyCount > 1
               ? t("next.addNzb.submitMany", { count: readyCount })
@@ -136,6 +139,7 @@ export function AddNzbDialog({
       <div className="flex flex-col">
         <button
           type="button"
+          data-testid={torrentIds.addDrop}
           onClick={upload.openPicker}
           onDragOver={(event) => {
             event.preventDefault();
@@ -230,6 +234,7 @@ export function AddNzbDialog({
                 onChange={upload.setText}
                 placeholder={torrentsOn ? "https:// · magnet:?" : "https://"}
                 className="w-full"
+                testId={torrentIds.addLink}
               />
               {upload.textError === null ? null : (
                 <span className="text-[11.5px] text-wv-error-text">{upload.textError}</span>
@@ -262,7 +267,12 @@ export function AddNzbDialog({
             />
           </FormRow>
           <FormRow label={t("next.addNzb.paused")}>
-            <Toggle label={t("next.addNzb.paused")} checked={upload.paused} onChange={upload.setPaused} />
+            <Toggle
+              label={t("next.addNzb.paused")}
+              checked={upload.paused}
+              onChange={upload.setPaused}
+              testId={torrentIds.addPaused}
+            />
           </FormRow>
           {torrent ? (
             <FormRow label={t("next.torrents.unpack")}>

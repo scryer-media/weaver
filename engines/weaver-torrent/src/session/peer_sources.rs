@@ -255,6 +255,7 @@ impl Session {
                 initial_peers: t.shared().options.initial_peers.clone(),
                 trackers: TrackerAsk {
                     identity: &t.shared().identity(),
+                    naming: t.shared().naming.clone(),
                     tiers: t.shared().tracker_tiers(),
                     force_interval: t.shared().options.force_tracker_interval,
                     private: t.is_private(),
@@ -347,6 +348,9 @@ impl Session {
         if self.disable_trackers {
             return None;
         }
+        // The torrent's trackers are looked up and asked over HTTP as its
+        // route names.
+        let naming = &trackers.naming;
         let stats = PeerRxTorrentInfo {
             info_hashes,
             session: Arc::downgrade(self),
@@ -355,13 +359,15 @@ impl Session {
         let protocols = TrackerProtocols::new(TrackerNet {
             http_clients: match ssl {
                 Some(ssl) => Arc::new(SslHttpClients {
-                    inner: self.http_clients.clone(),
+                    inner: naming.http_clients.clone(),
                     ssl: ssl.clone(),
                 }),
-                None => self.http_clients.clone(),
+                None => naming.http_clients.clone(),
             },
             reachable: self.reachable(),
-            udp_client: self.udp_tracker_client.clone(),
+            udp_client: self
+                .udp_tracker_client
+                .with_resolver(naming.resolver.clone()),
             http_announces: self.http_announces.clone(),
             allow_idna: self.allow_idna,
         });

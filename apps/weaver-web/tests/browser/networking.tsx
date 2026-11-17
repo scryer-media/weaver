@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { Client, Provider } from "urql";
@@ -9,7 +9,7 @@ import { fromValue, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import { translateDictionary } from "@/lib/i18n";
 import en from "@/lib/i18n/locales/en";
-import { NextDataContext, type NextData } from "@/next/data/next-data";
+import { NextDataContext, useDnsProfileReads, type NextData } from "@/next/data/next-data";
 import { plannedFlow, type Consumer, type NetworkingAction, type NetworkingData } from "@/next/features/networking/data";
 import { FlowEditor } from "@/next/features/networking/FlowEditor";
 import { NetworkFlow, type FlowTarget } from "@/next/features/networking/NetworkFlow";
@@ -22,7 +22,7 @@ import "@/next/theme.css";
 const quota=(downloadBytes:number)=>({downloadBytes,uploadSoftBytes:null,uploadTrickleBps:2048,uploadHardBytes:null,period:"MONTHLY" as const,resetTimeMinutesLocal:0,weeklyResetWeekday:"MON" as const,monthlyResetDay:1});
 const usage=(usedBytes:number,stopped:boolean)=>({down:{usedBytes,remainingBytes:null,state:stopped?"STOPPED" as const:"NORMAL" as const},up:{usedBytes:0,remainingBytes:null,state:"NORMAL" as const},state:stopped?"STOPPED" as const:"NORMAL" as const,periodStartEpochMs:null,periodEndEpochMs:null,timezoneName:"UTC"});
 const egresses:Egress[]=[{id:0,name:"System",addresses:["192.0.2.21","2001:db8::21"],bindingKind:"SYSTEM",interfaceName:null,sourceAddress:null,enabled:true,downloadBps:null,uploadBps:null,health:"UP",reason:null},{id:1,name:"WAN Fiber",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"192.0.2.10",enabled:true,downloadBps:52_428_800,uploadBps:null,quota:quota(536_870_912_000),quotaUsage:usage(128_849_018_880,false),health:"UP",reason:null},{id:2,name:"LTE standby",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"198.51.100.10",enabled:true,downloadBps:null,uploadBps:null,quota:quota(21_474_836_480),quotaUsage:usage(21_474_836_480,true),health:"DOWN",reason:"Interface is down"},{id:3,name:"Spare uplink",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"203.0.113.10",enabled:true,downloadBps:null,uploadBps:null,health:"UP",reason:null}];
-const profile=(id:number,name:string,kind:ProxyKind,enabled=true):ProxyProfile=>({id,name,kind,enabled,host:`${name.toLowerCase().replaceAll(" ","-")}.fixture.invalid`,port:kind==="WIRE_GUARD"?51820:1080,resolver:kind==="WIRE_GUARD"?"WEAVER":"PROXY",dnsServers:[],tunnelAddresses:kind==="WIRE_GUARD"?[`10.0.0.${id}/32`]:[],peerPublicKey:null,tunnelPublicKey:null,mtu:1420,keepaliveSeconds:null,timeoutSeconds:10,hostKeyFingerprint:null,natpmp:false,forwardedPort:null,hasUsername:false,hasPassword:false,hasPrivateKey:kind==="WIRE_GUARD",hasPassphrase:false,hasPresharedKey:false});
+const profile=(id:number,name:string,kind:ProxyKind,enabled=true):ProxyProfile=>({id,name,kind,enabled,host:`${name.toLowerCase().replaceAll(" ","-")}.fixture.invalid`,port:kind==="WIRE_GUARD"?51820:1080,dnsServers:[],tunnelAddresses:kind==="WIRE_GUARD"?[`10.0.0.${id}/32`]:[],peerPublicKey:null,tunnelPublicKey:null,mtu:1420,keepaliveSeconds:null,timeoutSeconds:10,hostKeyFingerprint:null,natpmp:false,forwardedPort:null,hasUsername:false,hasPassword:false,hasPrivateKey:kind==="WIRE_GUARD",hasPassphrase:false,hasPresharedKey:false});
 const profiles=[profile(1,"Amsterdam","WIRE_GUARD"),profile(2,"Frankfurt","WIRE_GUARD"),profile(3,"Lisbon","WIRE_GUARD",false),profile(4,"Relay one","SOCKS5"),profile(5,"Relay two","SOCKS5"),profile(6,"Exit","HTTP_CONNECT")];
 // A pool can be saved before it has a member; no route may use it until it does.
 const pools=[{id:1,name:"Europe",kind:"WIRE_GUARD" as const,memberIds:[2,3,1],enabled:true},{id:2,name:"Relays",kind:"SOCKS5" as const,memberIds:[4],enabled:true},{id:3,name:"Empty",kind:"SOCKS5" as const,memberIds:[],enabled:true}];
@@ -71,7 +71,7 @@ const client=new Client({url:"http://fixture.invalid/graphql",exchanges:[()=>ope
  const definition=operation.query.definitions.find(entry=>entry.kind==="OperationDefinition");
  const name=definition?.kind==="OperationDefinition"?definition.name?.value??"":"";
  const flow={...flowFor(initial,false),consumers:consumersFor(initial),proxies:profiles,proxyPools:pools,egresses};
- return fromValue({operation,data:name==="ProxyProfiles"?{proxyProfiles:profiles}:name==="Networking"?data:name==="NetworkFlow"||name==="NetworkFlowUpdates"?{networkFlow:flow}:name==="TestVia"?{testVia:testVia(operation.variables as TestVariables)}:{},stale:false,hasNext:false});
+ return fromValue({operation,data:name==="ProxyProfiles"?{proxyProfiles:profiles}:(name==="Networking"||name==="DraftRoute")?data:name==="NetworkFlow"||name==="NetworkFlowUpdates"?{networkFlow:flow}:name==="TestVia"?{testVia:testVia(operation.variables as TestVariables)}:{},stale:false,hasNext:false});
 }))]});
 const action:NetworkingAction=async()=>null;
 const width=Number(new URLSearchParams(location.search).get("width")??1400);
@@ -83,4 +83,9 @@ function Fixture(){
 }
 // Torrents on: the editors show their torrent parts, as they did before those parts asked.
 const torrentsOn={torrents:"on",torrentPresence:{available:true,enabled:true,jobs:false,running:false,windingDown:false,windDown:null}} as NextData;
-createRoot(document.getElementById("root")!).render(<TranslateContext.Provider value={{t:(key,values)=>translateDictionary(en,key,values),uiLanguage:"eng",selectedLanguage:{code:"eng",label:"English"},setLanguagePreference:()=>{}}}><Provider value={client}><NextDataContext.Provider value={torrentsOn}><Fixture/></NextDataContext.Provider></Provider></TranslateContext.Provider>);
+createRoot(document.getElementById("root")!).render(<TranslateContext.Provider value={{t:(key,values)=>translateDictionary(en,key,values),uiLanguage:"eng",selectedLanguage:{code:"eng",label:"English"},setLanguagePreference:()=>{}}}><Provider value={client}><DnsReads><Fixture/></DnsReads></Provider></TranslateContext.Provider>);
+
+/* Holds the DNS profile reads as NextDataProvider does, for the editors that offer them, with torrents on. */
+function DnsReads({ children }: { children: ReactNode }) {
+  return <NextDataContext.Provider value={{...torrentsOn,...useDnsProfileReads()} as NextData}>{children}</NextDataContext.Provider>;
+}

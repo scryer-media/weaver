@@ -88,7 +88,14 @@ impl DatagramTransport for SessionDatagrams {
         // Every datagram socket the tunnel hands out is sized as a carrier,
         // and is freed the moment it is dropped.
         let mtu = sockets.budget().map_or(0, |budget| budget.mtu);
-        let share = take_bytes(&sockets, self.1, datagram_bytes(mtu))?;
+        // Bytes of kept connections closed to make room are waited for.
+        let share = sockets
+            .claim(self.1, datagram_bytes(mtu))
+            .await
+            .map_err(|refused| TunnelError::AtCapacity {
+                open: refused.open,
+                freed: refused.freed,
+            })?;
         match provider.0.bind(peer).await {
             Ok(socket) => {
                 crate::resolution::record::bound(peer, true);

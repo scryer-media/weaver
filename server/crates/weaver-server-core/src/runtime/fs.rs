@@ -622,8 +622,10 @@ fn directory_fingerprint_from_path(path: &Path) -> io::Result<DirectoryFingerpri
 
 // Give a delivered tree to the user Weaver runs as: every entry under
 // `path`, and `path` itself, owned by the effective uid and gid, and each
-// file 0o666 and directory 0o777 less the process umask. Links are owned
-// over but never followed or given a mode. Unix only; elsewhere nothing.
+// file granting at least 0o666 and directory 0o777 less the process umask.
+// An entry that already has that owner and grants that much is not written
+// to. Links are owned over but never followed or given a mode. Unix only;
+// elsewhere nothing.
 pub(crate) fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
     normalize_extracted_path(path, true)
 }
@@ -688,14 +690,21 @@ fn normalize_extracted_tree_unix(path: &Path, recursive: bool) -> io::Result<()>
             return Ok(());
         }
 
-        let mode = (if metadata.is_dir() { 0o777 } else { 0o666 }) & !umask;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(mode);
-        if let Err(error) = std::fs::set_permissions(path, permissions) {
-            if error.kind() == io::ErrorKind::NotFound {
-                return Ok(());
+        // Only an entry that withholds access is given a mode, and it keeps
+        // the bits it has. Setting a mode on a share that manages access
+        // itself (a Synology ACL share) drops the rules the entry inherited
+        // from its folder, so an entry that already grants enough is left.
+        let wanted = (if metadata.is_dir() { 0o777 } else { 0o666 }) & !umask;
+        let current = metadata.permissions().mode();
+        if current & wanted != wanted {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode((current & 0o7777) | wanted);
+            if let Err(error) = std::fs::set_permissions(path, permissions) {
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Ok(());
+                }
+                apply_metadata_change(path, "mode", Err(error))?;
             }
-            apply_metadata_change(path, "mode", Err(error))?;
         }
 
         if recursive && metadata.is_dir() {
@@ -1133,7 +1142,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn normalize_extracted_tree_applies_runtime_umask_modes() {
+    fn normalize_extracted_tree_opens_entries_the_umask_would_have_left_open() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1144,23 +1153,54 @@ mod tests {
         std::fs::write(&file, b"media").unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         normalize_extracted_tree(&root).unwrap();
 
         let mask = current_umask();
         assert_eq!(
             std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-            0o777 & !mask
+            0o700 | (0o777 & !mask)
         );
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o777 & !mask
+            0o700 | (0o777 & !mask)
         );
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-            0o666 & !mask
+            0o600 | (0o666 & !mask)
         );
+    }
+
+    // A share that manages access itself (a Synology ACL share shows every
+    // entry as 0o777) drops its inherited rules from an entry the moment the
+    // entry is given a mode. An entry that already grants everything the
+    // umask allows is therefore left exactly as it is.
+    #[cfg(unix)]
+    #[test]
+    fn normalize_extracted_tree_leaves_an_entry_that_already_grants_enough() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("out");
+        let dir = root.join("nested");
+        let file = dir.join("movie.mkv");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, b"media").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        normalize_extracted_tree(&root).unwrap();
+
+        for path in [&root, &dir, &file] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o777,
+                "{} was given a mode it did not need",
+                path.display()
+            );
+        }
     }
 
     #[cfg(unix)]

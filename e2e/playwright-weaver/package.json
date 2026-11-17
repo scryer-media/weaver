@@ -26,6 +26,7 @@
     "test:advanced-networking-routes": "playwright test tests/network-ladders.spec.ts --grep-invert \"@no-net-raw|@extended|F09 |F1[0-9] \"",
     "test:advanced-networking-routes-hops": "playwright test tests/network-ladders.spec.ts --grep \"F09 |F1[0-9] \" --grep-invert \"@no-net-raw|@extended\"",
     "test:advanced-networking-sessions": "playwright test tests/network-sessions.spec.ts tests/network-rss.spec.ts --grep-invert \"@no-net-raw|@extended\"",
+    "test:advanced-networking-dns": "playwright test tests/network-dns.spec.ts --grep-invert \"@no-net-raw|@extended\"",
     "test:speed-test": "playwright test tests/speed-test.spec.ts",
     "test:advanced-networking-pools": "playwright test tests/network-pools.spec.ts --grep-invert \"@no-net-raw|@extended|P02 |P08 |P09 |P1[0-9] \"",
     "test:advanced-networking-pool-members": "playwright test tests/network-pools.spec.ts --grep \"P08 |P09 |P1[0-9] \" --grep-invert \"@no-net-raw|@extended\"",

@@ -286,6 +286,7 @@ export function CategoriesPanel() {
                         checked={form.torrentRoute}
                         label={t("next.categories.torrentRoute")}
                         onChange={(torrentRoute) => setForm((current) => ({ ...current, torrentRoute }))}
+                        testId={testIds.field("torrentRoute")}
                       />
                       {form.torrentRoute && typeof editingId === "number" ? (
                         <Link

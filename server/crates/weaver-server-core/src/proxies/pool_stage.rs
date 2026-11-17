@@ -19,7 +19,7 @@ use weaver_nntp::{
     candidate_plan::{Attempt, CandidatePlan, PlanSnapshot},
 };
 use weaver_tunnel::{
-    pipe::{DialError, Dialed, Dialer, Resolution, SetupHandle, Target},
+    pipe::{DialError, Dialed, Dialer, Names, Resolution, SetupHandle, Target},
     resolution::record::Recording,
 };
 
@@ -594,10 +594,13 @@ impl PoolState {
                         }
                         let target = target.clone();
                         let noting = recording.is_some();
-                        race.spawn(async move {
+                        // Each member dials in a task of its own, with the
+                        // names of the route dialling.
+                        let names = Names::current();
+                        race.spawn(Names::scope(names, async move {
                             let (result, notes) = noted(noting, member.dial(&target)).await;
                             (member, result, notes)
-                        });
+                        }));
                     }
                     let mut winner = None;
                     let mut slow = Vec::new();
@@ -1207,13 +1210,18 @@ impl Dialer for PoolStage {
             return Err(DialError::Skipped("pool stopped".into()));
         }
         let (reply, answer) = oneshot::channel();
-        // The pool dials in a task of its own; a test's recording goes with it.
+        // The pool dials in a task of its own. The names of the route
+        // dialling go with it, and so does a test's recording.
         let recording = Recording::current();
+        let names = Names::current();
         {
             let mut tasks = self.tasks.lock().expect("pool tasks");
             while tasks.try_join_next().is_some() {}
             tasks.spawn_on(
-                self.state.clone().run(target.clone(), reply, recording),
+                Names::scope(
+                    names,
+                    self.state.clone().run(target.clone(), reply, recording),
+                ),
                 &self.handle,
             );
         }

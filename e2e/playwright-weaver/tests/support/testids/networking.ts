@@ -62,5 +62,16 @@ export const networkIds = {
   proxySwitch: (proxyId: number) => `flow-switch-proxy-${proxyId}`,
   egressSwitch: (egressId: number) => `flow-switch-egress-${egressId}`,
   switchSide: (switchId: string, side: "up" | "down") => `${switchId}-${side}`,
+
+  // Networking -> DNS: a server list's capability test, and each server's result by form row and probe.
+  dnsTestCapabilities: "action-dnsTestCapabilities",
+  dnsTestRun: "dns-test-run",
+  dnsCapabilities: "table-dnsCapabilities",
+  dnsServerResult: (row: number, probe: string) => `result-dnsServer-${row}-${probe}`,
+
+  // A route's editor: a leg's egress by the leg's position, Save, and the refusal line.
+  routeLegEgress: (leg: number) => `route-leg-${leg}-egress`,
+  routeSave: "route-save",
+  routeError: "route-error",
 } as const;
 // testids:end

@@ -352,7 +352,7 @@ impl RssService {
             .ok_or_else(|| RssServiceError::Http("RSS request has no route".into()))?;
         let options = FetchOptions {
             label: "RSS",
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(120),
             redirects: MAX_RSS_REDIRECTS,
             user_agent: "weaver-rss/0.1",
             https_only: false,

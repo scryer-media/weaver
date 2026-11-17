@@ -9,6 +9,7 @@ pub(crate) mod intake;
 pub(crate) mod layout;
 pub mod metrics;
 pub mod model;
+pub mod naming;
 pub mod net;
 pub mod persistence;
 pub mod queries;

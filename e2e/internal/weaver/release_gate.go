@@ -98,6 +98,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	advancedNetworkingPartition("egress", []string{"network-egress.spec.ts", "network-reload.spec.ts"}, true, 20*time.Minute),   // all but E07, ~4-6 min
 	advancedNetworkingPartition("routes-hops", []string{"network-ladders.spec.ts"}, false, 15*time.Minute),                      // F09-F17, ~3-4 min
 	advancedNetworkingPartition("pool-members", []string{"network-pools.spec.ts"}, false, 15*time.Minute),                       // P08-P14, ~3-5 min
+	advancedNetworkingPartition("dns", []string{"network-dns.spec.ts"}, false, 15*time.Minute),                                  // D01-D13
 	advancedNetworkingNoNetRawReleaseFlow(),
 	advancedNetworkingExtendedReleaseFlow(),
 	browserReleaseFlow("ui-settings-crud", 6*time.Minute),

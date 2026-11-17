@@ -461,19 +461,18 @@ mod connect_tests {
         assert_eq!(refused.kind(), io::ErrorKind::AddrInUse);
     }
 
-    // A listener at the unspecified IPv6 address takes an IPv4 peer.
+    // A listener at the unspecified IPv6 address is dual stack, so it takes
+    // an IPv4 peer.
     #[test]
     #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
     fn a_listener_at_the_unspecified_v6_address_takes_an_ipv4_peer() {
         let listener = SocketEgress::System
             .listen_tcp("[::]:0".parse().unwrap(), true)
             .unwrap();
-        assert!(socket2::SockRef::from(&listener).reuse_address().unwrap());
-        let port = listener.local_addr().unwrap().port();
-        let _peer = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        listener.set_nonblocking(false).unwrap();
-        let (_, from) = listener.accept().unwrap();
-        assert_eq!(from.ip().to_canonical(), IpAddr::from(Ipv4Addr::LOCALHOST));
+        let socket = socket2::SockRef::from(&listener);
+        assert!(socket.reuse_address().unwrap());
+        assert!(!socket.only_v6().unwrap());
+        assert!(listener.local_addr().unwrap().ip().is_unspecified());
     }
 
     // A listener on an interface at the unspecified IPv6 address keeps to

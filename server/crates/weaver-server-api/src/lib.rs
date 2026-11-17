@@ -5,6 +5,7 @@ pub mod auth;
 pub mod backup;
 pub mod categories;
 pub mod context;
+pub mod dns;
 pub mod history;
 pub mod jobs;
 pub mod networking;

@@ -649,6 +649,256 @@ type DiskUsage {
 	freeBytes: Int!
 }
 
+"""
+What one probe of a server came to.
+"""
+type DnsProbe {
+	supported: Boolean!
+	"""
+	How long the probe took.
+	"""
+	millis: Int!
+	"""
+	Why it failed, in the codes a lookup fails with.
+	"""
+	error: LookupError
+}
+
+"""
+Who answers the names a route on this profile dials, and how.
+"""
+type DnsProfile {
+	id: Int!
+	name: String!
+	"""
+	What the profile answers for. System is ROUTE, and proxies may
+	select it too.
+	"""
+	kind: DnsProfileKind!
+	"""
+	The built-in System profile, which cannot be changed or deleted.
+	"""
+	builtIn: Boolean!
+	who: DnsWho!
+	"""
+	WEAVER only.
+	"""
+	transit: DnsTransit
+	trust: DnsTrust!
+	"""
+	WEAVER only.
+	"""
+	serverListId: Int
+	"""
+	PROXY only: a leg or rung with no proxy is answered by the system
+	resolver when set, and fails its lookups when not.
+	"""
+	systemFallback: Boolean!
+	"""
+	How many routes select this profile. Routes never saved use System.
+	"""
+	usedByRoutes: Int!
+	"""
+	How many proxies find their own address with this profile.
+	"""
+	usedByProxies: Int!
+}
+
+input DnsProfileInput {
+	"""
+	Absent creates a profile.
+	"""
+	id: Int
+	name: String!
+	"""
+	Required on create. On update absent keeps the saved kind, and a
+	different one is refused (DNS_PROFILE_KIND_IMMUTABLE).
+	"""
+	kind: DnsProfileKind
+	who: DnsWho!
+	"""
+	WEAVER only; absent asks from the egress.
+	"""
+	transit: DnsTransit
+	trust: DnsTrust!
+	"""
+	WEAVER only.
+	"""
+	serverListId: Int
+	"""
+	PROXY only. Absent is false on create and keeps the saved value on
+	update.
+	"""
+	systemFallback: Boolean
+}
+
+"""
+What a profile answers for, set when it is created.
+"""
+enum DnsProfileKind {
+	"""
+	The names a route dials. Routes select it.
+	"""
+	ROUTE
+	"""
+	A proxy's own address. Proxies select it; it is answered by the
+	system or by listed servers asked from the egress.
+	"""
+	PROXY_NAME
+}
+
+"""
+One server of a list.
+"""
+type DnsServer {
+	wire: DnsWire!
+	"""
+	The server's IP, with its port when that is not the wire's own.
+	"""
+	address: String!
+	"""
+	TLS: the name its certificate is checked against.
+	"""
+	tlsName: String
+	"""
+	HTTPS: the URL queries are posted to.
+	"""
+	url: String
+}
+
+"""
+What one server of a test supports.
+"""
+type DnsServerCapability {
+	"""
+	The server's position in the test's `servers`, from 0.
+	"""
+	index: Int!
+	"""
+	The server's IP, with its port when that is not its wire's own.
+	"""
+	address: String!
+	"""
+	Plain DNS on port 53, or on the server's own port when it is listed
+	plain.
+	"""
+	plain: DnsProbe!
+	"""
+	DNS over TLS on port 853, or the server's own port and TLS name when
+	it is listed on TLS. Without a name the certificate is checked
+	against the address.
+	"""
+	tls: DnsProbe!
+	"""
+	DNS over HTTPS on port 443 at /dns-query, or the server's own URL
+	when it is listed on HTTPS.
+	"""
+	https: DnsProbe!
+	"""
+	The root's SOA, asked on the server's own wire and checked from the
+	built-in root anchors: the server returns what a DNSSEC check needs.
+	"""
+	dnssec: DnsProbe!
+}
+
+"""
+One server as a save or a test sends it.
+"""
+input DnsServerInput {
+	wire: DnsWire!
+	"""
+	PLAIN and TLS: the server's IP, with a port when it is not the
+	wire's own (`192.0.2.53:5353`, `[2001:db8::53]:853`). HTTPS: unused.
+	"""
+	address: String! = ""
+	"""
+	TLS: the name the certificate is checked against; absent checks it
+	against the address.
+	"""
+	tlsName: String
+	"""
+	HTTPS: the URL queries are posted to, `https://` and an IP.
+	"""
+	url: String
+}
+
+"""
+A saved list of servers, asked in order.
+"""
+type DnsServerList {
+	id: Int!
+	name: String!
+	servers: [DnsServer!]!
+	"""
+	The names of the profiles that use this list, in name order.
+	"""
+	usedByProfiles: [String!]!
+}
+
+input DnsServerListInput {
+	"""
+	Absent creates a list.
+	"""
+	id: Int
+	name: String!
+	servers: [DnsServerInput!]!
+}
+
+"""
+Where Weaver asks its listed servers from.
+"""
+enum DnsTransit {
+	"""
+	The leg's egress.
+	"""
+	EGRESS
+	"""
+	The last hop of the leg's active proxy. A leg with no proxy asks from
+	its egress.
+	"""
+	PROXY
+}
+
+"""
+How answers are judged.
+"""
+enum DnsTrust {
+	AS_SENT
+	"""
+	Weaver checks the DNSSEC signatures itself: an unsigned name
+	resolves, one that fails the check does not.
+	"""
+	VALIDATE
+}
+
+"""
+Who answers the names a route dials.
+"""
+enum DnsWho {
+	"""
+	The host's own resolver.
+	"""
+	SYSTEM
+	"""
+	The leg's active proxy: handed the name, or for WireGuard the
+	tunnel's own DNS servers asked through it.
+	"""
+	PROXY
+	"""
+	The profile's listed servers, asked by Weaver.
+	"""
+	WEAVER
+}
+
+"""
+How a query travels to one server.
+"""
+enum DnsWire {
+	PLAIN
+	TLS
+	HTTPS
+}
+
 type DownloadBlock {
 	kind: DownloadBlockKindGql!
 	"""
@@ -1477,6 +1727,9 @@ type HostResolution {
 	resolvedBy: ResolvedBy!
 	proxyId: Int
 	dnsServers: [String!]!
+	wire: DnsWire
+	answeredBy: String
+	trust: LookupTrust
 	addresses: [String!]!
 	cached: Boolean!
 	connectedAddress: String
@@ -1929,7 +2182,17 @@ enum LookupErrorCode {
 	TIMED_OUT
 	SERVER_FAILURE
 	NO_REPLY
+	BOGUS
+	DNSSEC_UNAVAILABLE
+	TLS_FAILED
 	OTHER
+}
+
+enum LookupTrust {
+	AS_SENT
+	VALIDATED
+	UNSIGNED
+	BOGUS
 }
 
 type MetadataEntry {
@@ -2118,6 +2381,35 @@ input MinutesLeafInput {
 }
 
 type MutationRoot {
+	"""
+	Save a server list: a new one without an id. Every route using it
+	takes the change; no connection is dropped and saved answers are
+	forgotten.
+	"""
+	saveDnsServerList(input: DnsServerListInput!): DnsServerList!
+	"""
+	Delete a server list, refused while a profile uses it.
+	"""
+	deleteDnsServerList(id: Int!): Boolean!
+	"""
+	Save a profile: a new one without an id. Every route using it takes
+	the change; no connection is dropped and saved answers are
+	forgotten.
+	"""
+	saveDnsProfile(input: DnsProfileInput!): DnsProfile!
+	"""
+	Delete a profile, refused for System and while a route or a proxy
+	uses it.
+	"""
+	deleteDnsProfile(id: Int!): Boolean!
+	"""
+	What each server supports, probed through the drafted `route` from
+	where its DNS profile would ask listed servers: the first path's
+	egress, or its proxies when the profile asks through the proxy. One
+	to ten servers, each well formed; nothing is saved. Every probe runs
+	in a runtime of the test's own, with nothing a route holds.
+	"""
+	testDnsServers(route: RouteInput!, servers: [DnsServerInput!]!): [DnsServerCapability!]!
 	"""
 	Reset an egress quota baseline without clearing lifetime usage.
 	"""
@@ -2875,6 +3167,11 @@ type NetworkRoute {
 	consumer: String!
 	legs: [RouteLeg!]!
 	failover: RouteFailover!
+	"""
+	The DNS profile the route's names follow; 0 is the built-in System
+	profile.
+	"""
+	dnsProfileId: Int!
 }
 
 type Networking {
@@ -3203,7 +3500,10 @@ type ProxyProfile {
 	enabled: Boolean!
 	host: String!
 	port: Int!
-	resolver: ProxyResolver!
+	"""
+	WireGuard: the tunnel's own DNS servers, asked in plain through the
+	tunnel when a route's DNS profile has the proxy answer.
+	"""
 	dnsServers: [String!]!
 	tunnelAddresses: [String!]!
 	peerPublicKey: String
@@ -3225,6 +3525,11 @@ type ProxyProfile {
 	hasPrivateKey: Boolean!
 	hasPassphrase: Boolean!
 	hasPresharedKey: Boolean!
+	"""
+	The DNS profile that finds this proxy's own address when it is a
+	name: 0, the built-in System profile, or a PROXY_NAME profile.
+	"""
+	dnsProfileId: Int!
 }
 
 input ProxyProfileInput {
@@ -3233,8 +3538,11 @@ input ProxyProfileInput {
 	enabled: Boolean!
 	host: String!
 	port: Int!
-	resolver: ProxyResolver
-	dnsServers: [String!]! = []
+	"""
+	WireGuard only: the tunnel's own DNS servers, as IPs. Omitted keeps
+	the saved list; a new proxy starts with none.
+	"""
+	dnsServers: [String!]
 	tunnelAddresses: [String!]! = []
 	peerPublicKey: String
 	mtu: Int! = 1280
@@ -3247,11 +3555,12 @@ input ProxyProfileInput {
 	privateKey: String
 	passphrase: String
 	presharedKey: String
-}
-
-enum ProxyResolver {
-	WEAVER
-	PROXY
+	"""
+	The DNS profile that finds the proxy's own address: 0, System, or a
+	PROXY_NAME profile. Absent is 0 on create and keeps the saved one on
+	update.
+	"""
+	dnsProfileId: Int
 }
 
 type ProxyTestResult {
@@ -3265,6 +3574,16 @@ type QueryRoot {
 	backups: [BackupInfo!]!
 	backupSettings: BackupSettings!
 	autoBackupSettings: AutoBackupSettings!
+	"""
+	Every saved server list, in id order.
+	"""
+	dnsServerLists: [DnsServerList!]!
+	"""
+	Every profile, the built-in System profile first, then by id. With
+	`kind`, the profiles something of that kind may select: System, then
+	the saved profiles of that kind.
+	"""
+	dnsProfiles(kind: DnsProfileKind): [DnsProfile!]!
 	networking: Networking!
 	egressInterfaces: [EgressInterface!]!
 	discoverNetworkInterfaces: [DiscoveredNetworkInterface!]!
@@ -4097,6 +4416,11 @@ enum ResolvedBy {
 type Route {
 	legs: [RouteLeg!]!
 	failover: RouteFailover!
+	"""
+	The DNS profile the route's names follow; 0 is the built-in System
+	profile.
+	"""
+	dnsProfileId: Int!
 }
 
 enum RouteFailover {
@@ -4107,6 +4431,12 @@ enum RouteFailover {
 input RouteInput {
 	legs: [RouteLegInput!]!
 	failover: RouteFailover! = REDISTRIBUTE
+	"""
+	The DNS profile the route's names follow. Null or absent keeps a
+	saved route's profile, and is the built-in System profile, 0, for a
+	new one.
+	"""
+	dnsProfileId: Int
 }
 
 input RouteLadderInput {
