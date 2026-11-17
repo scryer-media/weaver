@@ -152,7 +152,7 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 # Authenticated recovery scanning and source-change handling.
-par2-rs = { version = "=0.12.0", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "=0.13.0", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
