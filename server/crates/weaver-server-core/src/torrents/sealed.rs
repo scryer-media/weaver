@@ -221,10 +221,10 @@ impl crate::Database {
     // Seal, once, every secret stored before sealing: each torrent's
     // metainfo and tracker URLs, each RSS feed's URL and each seen item's
     // link and id, take an RSS item's link and id out of the torrents' kept
-    // metadata and the history's attribute rows, and seal them in each
-    // usenet job's, queued or in history. Each step selects in SQL only the
-    // rows it has yet to seal,
-    // a page at a time, each page in one write transaction, so a pass a
+    // metadata and the history's attribute rows, seal them in each usenet
+    // job's, queued or in history, and key each RSS submission's
+    // idempotency row by the item's seen key. Each step selects in SQL only
+    // the rows it has yet to do, a page at a time, each page in one write transaction, so a pass a
     // crash cut short goes on from where it stood. The pass is marked begun
     // before its first write and done after its last: a start that finds it
     // done reads the mark and nothing else. Runs at start, once the
@@ -576,6 +576,7 @@ impl crate::Database {
             Ok(())
         })?;
         self.seal_rss_links(&key)?;
+        self.key_rss_idempotency()?;
         self.set_setting(SEALED_MARK, SEAL_DONE)
     }
 }

@@ -559,6 +559,44 @@ fn seen_lookups_search_by_the_primary_key() {
     }
 }
 
+// The sealing pass's page of RSS idempotency rows still keyed by an item's
+// id is a search of the table's job index from a job on, never a scan.
+#[test]
+fn the_rss_idempotency_page_searches_the_job_index() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    let db = Database::open_in_memory().unwrap();
+    let datastore = db.datastore();
+    let explained = format!(
+        "EXPLAIN QUERY PLAN {}",
+        crate::rss::persistence::RSS_IDEMPOTENCY_PAGE_SQL
+    );
+    let steps = db
+        .run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                &explained,
+                &[SqlArg::I64(5), SqlArg::I64(64)],
+            )
+            .await?
+            .iter()
+            .map(|row| row.text("detail"))
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.starts_with("SEARCH submission_idempotency")
+                && step.contains("USING INDEX idx_submission_idempotency_job (job_id>?)")),
+        "{steps:?}"
+    );
+    assert!(
+        !steps.iter().any(|step| step.starts_with("SCAN")),
+        "{steps:?}"
+    );
+}
+
 // An item seen before a restart is seen after it, under the key it had or
 // a new one after the old was lost: the same row is matched, and a poll
 // that lists it again adds no second. Its link, sealed under the lost key,

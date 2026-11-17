@@ -477,6 +477,176 @@ async fn a_usenet_jobs_rss_link_and_id_are_stored_sealed_and_shown_to_an_admin_o
     }
 }
 
+impl Rig {
+    // Every idempotency row as stored: (scope, key, job), in key order.
+    fn idempotency(&self) -> Vec<(String, String, i64)> {
+        use crate::persistence::sql_runtime::SqlRuntime;
+        let datastore = self.db.datastore();
+        self.db
+            .run_sql_blocking_read(async move {
+                SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    "SELECT caller_scope, idempotency_key, job_id FROM submission_idempotency \
+                      ORDER BY caller_scope, idempotency_key",
+                    &[],
+                )
+                .await?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.text("caller_scope")?,
+                        row.text("idempotency_key")?,
+                        row.i64("job_id")?,
+                    ))
+                })
+                .collect()
+            })
+            .unwrap()
+    }
+
+    // `sql` run as one write.
+    fn write(&self, sql: &str) {
+        use crate::persistence::sql_runtime::SqlRuntime;
+        let (datastore, sql) = (self.db.datastore(), sql.to_owned());
+        self.db
+            .run_sql_blocking(async move {
+                SqlRuntime::execute(datastore.write_exec(), &sql, &[]).await?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    // The feed polled again with `item` forgotten and read whole: the item
+    // is submitted again as the feed gives it.
+    async fn submit_again(&self, item: &str) {
+        assert!(self.db.delete_rss_seen_item(1, item).unwrap());
+        let mut feed = self.db.get_rss_feed(1).unwrap().unwrap();
+        feed.etag = None;
+        feed.last_modified = None;
+        self.db.update_rss_feed(&feed).unwrap();
+        self.service.run_all_sync().await.unwrap();
+    }
+}
+
+// An RSS submission is kept idempotent under the item's seen key, never its
+// id, which is often the link and its passkey: the same item submitted again
+// is the job it made the first time, and no second is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_rss_submission_is_kept_under_the_items_seen_key_and_not_made_twice() {
+    let rig = rig(
+        &item(
+            "a",
+            r#"<enclosure url="http://localhost/download.nzb" length="321" type="application/x-nzb"/>"#,
+        ),
+        None,
+        true,
+    )
+    .await;
+
+    let report = rig.service.run_all_sync().await.unwrap();
+    assert_eq!(report.items_submitted, 1, "{report:?}");
+    let job = rig.nzb_jobs().remove(0).job_id.0 as i64;
+    let kept = vec![("rss:feed:1".to_owned(), rig.db.rss_seen_item_key("a"), job)];
+    assert_eq!(rig.idempotency(), kept);
+
+    rig.submit_again("a").await;
+    assert_eq!(rig.nzb_jobs().len(), 1);
+    assert_eq!(rig.seen()[0].2, Some(job as u64));
+    assert_eq!(rig.idempotency(), kept);
+}
+
+// RSS idempotency rows kept under the item's id before are put back under
+// its seen key by the one pass, across more than one page and a job's rows
+// split between two pages. One whose seen key is there already leaves the
+// row there as it is; another caller's rows, and a row keyed already, stay
+// as they were. A legacy item submitted again is still the job it made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rss_idempotency_rows_kept_under_an_id_are_keyed_by_the_pass() {
+    let rig = rig(
+        &item(
+            "a",
+            r#"<enclosure url="http://localhost/download.nzb" length="321" type="application/x-nzb"/>"#,
+        ),
+        None,
+        true,
+    )
+    .await;
+    rig.service.run_all_sync().await.unwrap();
+    let job = rig.nzb_jobs().remove(0).job_id.0 as i64;
+    // The item's row as a build before keyed it.
+    rig.write(
+        "UPDATE submission_idempotency SET idempotency_key = 'a' WHERE caller_scope = 'rss:feed:1'",
+    );
+
+    const ROWS: i64 = 70;
+    let id = |n: i64| format!("https://indexer.invalid/get/{n}?apikey=SECRET");
+    // Two rows a job, the first page ending inside one.
+    let job_of = |n: i64| 5000 + (n + 1) / 2;
+    let snapshots = (job_of(0)..=job_of(ROWS + 2))
+        .map(|job| format!("({job}, 'completed', 'n', 'accept', 'rss', 1, 1)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    rig.write(&format!(
+        "INSERT INTO duplicate_job_snapshots
+            (job_id, lifecycle, normalized_name, admission_action, origin, created_at, updated_at)
+         VALUES {snapshots}"
+    ));
+    let mut rows: Vec<String> = (0..ROWS)
+        .map(|n| format!("('rss:feed:2', '{}', x'00', {}, 1)", id(n), job_of(n)))
+        .collect();
+    let dup = rig.db.rss_seen_item_key("dup");
+    let keyed = rig.db.rss_seen_item_key("keyed");
+    rows.extend([
+        format!("('rss:feed:2', 'dup', x'00', {}, 1)", job_of(0)),
+        format!("('rss:feed:2', '{dup}', x'00', {}, 1)", job_of(1)),
+        format!("('rss:feed:2', '{keyed}', x'00', {}, 1)", job_of(2)),
+        format!(
+            "('api:key:1', 'client-key', x'00', {}, 1)",
+            job_of(ROWS + 2)
+        ),
+    ]);
+    rig.write(&format!(
+        "INSERT INTO submission_idempotency
+            (caller_scope, idempotency_key, request_hash, job_id, created_at)
+         VALUES {}",
+        rows.join(", ")
+    ));
+
+    rig.db.seal_stored_secrets().unwrap();
+
+    let mut expected: Vec<(String, String, i64)> = (0..ROWS)
+        .map(|n| {
+            (
+                "rss:feed:2".to_owned(),
+                rig.db.rss_seen_item_key(&id(n)),
+                job_of(n),
+            )
+        })
+        .collect();
+    expected.extend([
+        (
+            "api:key:1".to_owned(),
+            "client-key".to_owned(),
+            job_of(ROWS + 2),
+        ),
+        ("rss:feed:1".to_owned(), rig.db.rss_seen_item_key("a"), job),
+        ("rss:feed:2".to_owned(), dup, job_of(1)),
+        ("rss:feed:2".to_owned(), keyed, job_of(2)),
+    ]);
+    expected.sort();
+    let stored = rig.idempotency();
+    assert_eq!(stored, expected);
+    assert!(stored.iter().all(|(_, key, _)| !key.contains("apikey")));
+
+    // Nothing is left: the step reads one empty page and writes nothing.
+    rig.db.key_rss_idempotency().unwrap();
+    assert_eq!(rig.idempotency(), expected);
+
+    rig.submit_again("a").await;
+    assert_eq!(rig.nzb_jobs().len(), 1);
+    assert_eq!(rig.seen()[0].2, Some(job as u64));
+}
+
 // A torrent while torrents are off is held, once: later polls neither read
 // the unchanged feed nor write its row again. Once torrents are on, the
 // feed is read whole and the item is added.

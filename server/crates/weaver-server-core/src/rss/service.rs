@@ -288,9 +288,17 @@ impl RssService {
                 )
                 .map_err(|e| e.to_string())?;
                 // Submission owns durable writes. Once started it must finish before shutdown.
+                // The item is named by its seen key, never by its id: the id
+                // is often the link, which carries the passkey.
                 let idempotency = CallerScopedIdempotency::new(
-                    format!("rss:feed:{}", feed.id),
-                    item.item_id.clone(),
+                    format!(
+                        "{}{}",
+                        crate::rss::persistence::RSS_IDEMPOTENCY_SCOPE,
+                        feed.id
+                    ),
+                    crate::rss::persistence::seen_item_key(crate::rss::persistence::SeenId::Id(
+                        &item.item_id,
+                    )),
                 );
                 let submitted = submit_nzb_bytes_with_options(
                     &self.inner.db,

@@ -88,6 +88,21 @@ fn legacy_seen_key(item_id: &str, title: &str, published_at: Option<i64>) -> Str
     seen_item_key(SeenId::Id(item_id))
 }
 
+// What the idempotency scope of an RSS feed's submissions starts with; the
+// feed's id follows. Its key is the item's seen key (`seen_item_key`).
+pub(crate) const RSS_IDEMPOTENCY_SCOPE: &str = "rss:feed:";
+
+// A page of the RSS idempotency rows still keyed by the item's id, from a
+// job on: walked by the table's job index, as a prefix of the scope is not
+// a range under every collation a PostgreSQL store may have.
+pub(crate) const RSS_IDEMPOTENCY_PAGE_SQL: &str =
+    "SELECT caller_scope, idempotency_key, request_hash, job_id, created_at
+       FROM submission_idempotency
+      WHERE job_id >= {}
+        AND substr(caller_scope, 1, 9) = 'rss:feed:'
+        AND NOT (idempotency_key LIKE 'b3:%' AND length(idempotency_key) = 67)
+      ORDER BY job_id LIMIT {}";
+
 // One seen item forgotten, by either id it may be stored under: an
 // equality on the table's key `(feed_id, item_id)`.
 pub(crate) const SEEN_DELETE_SQL: &str =
@@ -237,6 +252,72 @@ impl Database {
                                 .await?;
                         }
                         insert_rss_seen_rows(tx, &page).await
+                    })
+                })
+                .await?;
+            }
+            Ok(())
+        })
+    }
+
+    // The RSS submissions' idempotency rows of the sealing pass: each keyed
+    // by the item's id as the feed gave it is put back under the item's
+    // seen key, as a submission keys it now, so the id, often the link with
+    // its passkey, is not kept. A row whose seen key is there already is
+    // the one kept. The rows are walked once by the table's job index, a
+    // page at a time, each page in one write transaction: a row put back
+    // no longer matches, so a page never reads one twice.
+    pub(crate) fn key_rss_idempotency(&self) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let mut from = i64::MIN;
+            loop {
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    RSS_IDEMPOTENCY_PAGE_SQL,
+                    &[SqlArg::I64(from), SqlArg::I64(SEAL_PAGE)],
+                )
+                .await?;
+                let Some(last) = rows.last() else { break };
+                from = last.i64("job_id")?;
+                let mut gone = Vec::with_capacity(rows.len());
+                let mut page = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let (scope, id) = (row.text("caller_scope")?, row.text("idempotency_key")?);
+                    page.extend([
+                        SqlArg::Text(scope.clone()),
+                        SqlArg::Text(seen_item_key(SeenId::Id(&id))),
+                        SqlArg::Bytes(row.bytes("request_hash")?),
+                        SqlArg::I64(row.i64("job_id")?),
+                        SqlArg::I64(row.i64("created_at")?),
+                    ]);
+                    gone.extend([SqlArg::Text(scope), SqlArg::Text(id)]);
+                }
+                let count = rows.len();
+                SqlRuntime::run_in_transaction(&datastore, "key_rss_idempotency", |tx| {
+                    let (gone, page) = (gone.clone(), page.clone());
+                    Box::pin(async move {
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO submission_idempotency
+                                    (caller_scope, idempotency_key, request_hash, job_id, created_at)
+                                 VALUES {}
+                                 ON CONFLICT(caller_scope, idempotency_key) DO NOTHING",
+                                vec!["({}, {}, {}, {}, {})"; count].join(", ")
+                            ),
+                            &page,
+                        )
+                        .await?;
+                        tx.execute(
+                            &format!(
+                                "DELETE FROM submission_idempotency WHERE {}",
+                                vec!["(caller_scope = {} AND idempotency_key = {})"; count]
+                                    .join(" OR ")
+                            ),
+                            &gone,
+                        )
+                        .await?;
+                        Ok(())
                     })
                 })
                 .await?;
