@@ -13,6 +13,7 @@ pub mod persistence;
 pub mod queries;
 pub mod rate;
 pub(crate) mod relocate;
+pub(crate) mod sealed;
 pub mod service;
 pub mod sessions;
 pub(crate) mod side;

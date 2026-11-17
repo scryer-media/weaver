@@ -930,3 +930,232 @@ fn batched_torrent_columns_end_as_a_statement_per_row_left_them() {
     assert_eq!(marked[0], (JobId(1), false));
     assert_eq!(marked, retiring(&by_row));
 }
+
+// Every stored text and byte of the torrents' tables and the tracker hosts,
+// as the database holds them.
+// As stored: each torrent's metainfo, each tracker row, each host.
+type RawSecrets = (Vec<(i64, Vec<u8>)>, Vec<(i64, i64, String)>, Vec<String>);
+
+fn raw_secrets(db: &Database) -> RawSecrets {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    let datastore = db.datastore();
+    db.run_sql_blocking_read(async move {
+        let metainfo = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT job_id, metainfo FROM torrents WHERE metainfo IS NOT NULL ORDER BY job_id",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| Ok((row.i64("job_id")?, row.opt_bytes("metainfo")?.unwrap())))
+        .collect::<Result<Vec<_>, crate::StateError>>()?;
+        let urls = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT job_id, tier, url FROM torrent_trackers ORDER BY job_id, tier",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| Ok((row.i64("job_id")?, row.i64("tier")?, row.text("url")?)))
+        .collect::<Result<Vec<_>, crate::StateError>>()?;
+        let hosts = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT host FROM tracker_hosts ORDER BY host",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.text("host"))
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok((metainfo, urls, hosts))
+    })
+    .unwrap()
+}
+
+const PASSKEY: &str = "f00dfacecafe";
+
+// A torrent's metainfo, announcing to a private tracker with a passkey.
+fn passkeyed(job_id: u64) -> (Vec<u8>, String) {
+    let url = format!("https://tracker{job_id}.invalid/{PASSKEY}/announce");
+    (
+        format!("d8:announce{}:{url}4:infod4:name1:xee", url.len()).into_bytes(),
+        url,
+    )
+}
+
+fn holds_passkey(bytes: &[u8]) -> bool {
+    bytes
+        .windows(PASSKEY.len())
+        .any(|at| at == PASSKEY.as_bytes())
+}
+
+// A torrent's passkey is in none of the bytes stored for it: its metainfo
+// and its tracker URLs are sealed, and the host list keeps the host alone.
+// Each reads back as it was written.
+#[test]
+fn no_stored_byte_holds_a_trackers_passkey() {
+    let db = Database::open_in_memory().unwrap();
+    let (metainfo, url) = passkeyed(1);
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.metainfo = Some(metainfo.clone().into());
+    let trackers = [TrackerEntry {
+        tier: 0,
+        url: url.clone(),
+        named_by: NamedBy::Torrent,
+    }];
+    db.insert_torrent(&record, &trackers).unwrap();
+    // A magnet's metainfo and an edit write them again.
+    db.insert_torrent(&torrent(2, Some([2; 20]), None), &[])
+        .unwrap();
+    let (second, second_url) = passkeyed(2);
+    let second_trackers = [TrackerEntry {
+        tier: 0,
+        url: second_url.clone(),
+        named_by: NamedBy::Torrent,
+    }];
+    assert!(
+        db.set_torrent_metainfo(
+            JobId(2),
+            Some([2; 20]),
+            None,
+            "torrent 2",
+            &second,
+            true,
+            "/data/t2",
+            None,
+            &second_trackers,
+            &[],
+            &crate::torrents::model::Adopted::default()
+        )
+        .unwrap()
+    );
+    let edited = [TrackerEntry {
+        tier: 1,
+        url: format!("{url}?again"),
+        named_by: NamedBy::Operator,
+    }];
+    assert!(db.set_torrent_trackers(JobId(1), &edited).unwrap());
+
+    let (metainfos, urls, hosts) = raw_secrets(&db);
+    assert_eq!(metainfos.len(), 2);
+    assert_eq!(urls.len(), 2);
+    for (_, stored) in &metainfos {
+        assert!(!holds_passkey(stored));
+        assert!(crate::torrents::sealed::is_sealed(stored));
+    }
+    for (_, _, stored) in &urls {
+        assert!(!holds_passkey(stored.as_bytes()));
+    }
+    assert_eq!(hosts, ["tracker1.invalid", "tracker2.invalid"]);
+
+    assert_eq!(
+        db.get_torrent(JobId(1))
+            .unwrap()
+            .unwrap()
+            .metainfo
+            .as_deref(),
+        Some(metainfo.as_slice())
+    );
+    assert_eq!(
+        db.get_torrent(JobId(2))
+            .unwrap()
+            .unwrap()
+            .metainfo
+            .as_deref(),
+        Some(second.as_slice())
+    );
+    assert_eq!(db.list_torrent_trackers(JobId(1)).unwrap(), edited);
+    assert_eq!(db.list_torrent_trackers(JobId(2)).unwrap(), second_trackers);
+}
+
+// Rows stored before sealing, as an upgrade finds them, written in the
+// clear past the sealing.
+fn unseal(db: &Database, rows: &[(i64, Vec<u8>, String)]) {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let datastore = db.datastore();
+    let rows = rows.to_vec();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&datastore, "unseal", |tx| {
+            let rows = rows.clone();
+            Box::pin(async move {
+                for (job_id, metainfo, url) in rows {
+                    tx.execute(
+                        "UPDATE torrents SET metainfo = {} WHERE job_id = {}",
+                        &[SqlArg::Bytes(metainfo), SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE torrent_trackers SET url = {} WHERE job_id = {}",
+                        &[SqlArg::Text(url), SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+// A start seals what an older one stored in the clear, a page of torrents
+// at a time, each page in one transaction. A pass cut short leaves pages
+// sealed and pages not: the next start seals the rest and passes by the
+// sealed ones, and a start with nothing to seal changes nothing.
+#[test]
+fn a_sealing_pass_cut_short_completes_at_the_next_start() {
+    const TORRENTS: u64 = 150;
+    let db = Database::open_in_memory().unwrap();
+    let mut written = Vec::new();
+    for job_id in 1..=TORRENTS {
+        let (metainfo, url) = passkeyed(job_id);
+        let mut record = torrent(job_id, Some([job_id as u8; 20]), None);
+        record.infohash_v1.as_mut().unwrap()[1] = (job_id >> 8) as u8;
+        record.metainfo = Some(metainfo.clone().into());
+        let trackers = [TrackerEntry {
+            tier: 0,
+            url: url.clone(),
+            named_by: NamedBy::Torrent,
+        }];
+        db.insert_torrent(&record, &trackers).unwrap();
+        written.push((job_id as i64, metainfo, url));
+    }
+    // The first page was sealed before the cut; the rest is in the clear.
+    unseal(&db, &written[64..]);
+    let (_, before, _) = raw_secrets(&db);
+    assert!(
+        before[..64]
+            .iter()
+            .all(|(.., url)| crate::persistence::encryption::is_encrypted(url))
+    );
+    assert!(
+        before[64..]
+            .iter()
+            .all(|(.., url)| holds_passkey(url.as_bytes()))
+    );
+
+    db.seal_torrent_secrets().unwrap();
+    let sealed = raw_secrets(&db);
+    assert_eq!(sealed.0.len(), TORRENTS as usize);
+    assert_eq!(sealed.1.len(), TORRENTS as usize);
+    assert!(sealed.0.iter().all(|(_, stored)| !holds_passkey(stored)));
+    assert!(
+        sealed
+            .1
+            .iter()
+            .all(|(.., url)| !holds_passkey(url.as_bytes()))
+    );
+    // The first page's values are the ones sealed before the cut.
+    assert_eq!(sealed.1[..64], before[..64]);
+    for (job_id, metainfo, url) in &written {
+        let job_id = JobId(*job_id as u64);
+        assert_eq!(
+            db.get_torrent(job_id).unwrap().unwrap().metainfo.as_deref(),
+            Some(metainfo.as_slice())
+        );
+        assert_eq!(db.list_torrent_trackers(job_id).unwrap()[0].url, *url);
+    }
+
+    db.seal_torrent_secrets().unwrap();
+    assert_eq!(raw_secrets(&db), sealed);
+}

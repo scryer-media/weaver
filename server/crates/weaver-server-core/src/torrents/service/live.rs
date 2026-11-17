@@ -89,6 +89,9 @@ pub(super) struct Live {
     // Why its restore is held, while it is: a checkpoint the database did
     // not give, tried again at each restore until it does.
     pub(super) restore_held: Option<String>,
+    // Why its stored metainfo or tracker URLs did not decrypt at start: it
+    // is held, neither restored nor fetched, while that stands.
+    pub(super) sealed: Option<String>,
     // Not one of the files its pieces are in was there when its store was
     // made: it is in no session, its pieces kept, until a start, a recheck
     // or a move looks again. Found again at each load, never kept.
@@ -210,6 +213,7 @@ impl Live {
             engine: Engine::Absent,
             run_error: None,
             restore_held: None,
+            sealed: None,
             files_missing: false,
             disk_held: None,
             queued: false,
@@ -543,7 +547,9 @@ impl Live {
                 Engine::Absent if self.awaits_restore() => Engine::Starting,
                 engine => engine,
             },
-            has_metadata: self.layout.is_some(),
+            // One whose stored metainfo does not decrypt has its metadata;
+            // it is held, not fetching, and says why.
+            has_metadata: self.layout.is_some() || self.sealed.is_some(),
             fetch: self.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
             complete: self.complete(),
             intent: self.record.intent(),

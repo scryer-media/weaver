@@ -268,3 +268,109 @@ fn a_seen_decision_keeps_its_stored_word() {
         .map(|(id, word)| (id.to_owned(), word.to_owned()))
     );
 }
+
+// Every feed URL and item link as the database holds them.
+fn stored_links(db: &Database) -> (Vec<String>, Vec<Option<String>>) {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    let datastore = db.datastore();
+    db.run_sql_blocking_read(async move {
+        let feeds = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT url FROM rss_feeds ORDER BY id",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.text("url"))
+        .collect::<Result<Vec<_>, _>>()?;
+        let items = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT item_url FROM rss_seen_items ORDER BY feed_id, item_id",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.opt_text("item_url"))
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok((feeds, items))
+    })
+    .unwrap()
+}
+
+// A private tracker's feed URL and item links carry its passkey: each is
+// stored encrypted and reads back as it was. Rows an older start stored in
+// the clear are encrypted by the next start's pass, a page at a time, and a
+// pass with nothing left changes nothing.
+#[test]
+fn feed_urls_and_item_links_hold_no_passkey_at_rest() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    const PASSKEY: &str = "f00dfacecafe";
+    let db = Database::open_in_memory().unwrap();
+    let mut feed = sample_feed(1);
+    feed.url = format!("https://tracker.invalid/rss?passkey={PASSKEY}");
+    db.insert_rss_feed(&feed).unwrap();
+    let item = |n: u32| RssSeenItemRow {
+        feed_id: 1,
+        item_id: format!("guid-{n:03}"),
+        item_title: format!("Item {n}"),
+        published_at: None,
+        size_bytes: None,
+        decision: crate::RssSeenDecision::Accepted,
+        seen_at: i64::from(n),
+        job_id: None,
+        item_url: Some(format!("https://tracker.invalid/dl/{n}?passkey={PASSKEY}")),
+        error: None,
+    };
+    let items: Vec<RssSeenItemRow> = (0..150).map(item).collect();
+    db.insert_rss_seen_items(&items).unwrap();
+    let sealed = stored_links(&db);
+    assert!(sealed.0.iter().all(|url| !url.contains(PASSKEY)));
+    assert!(sealed.1.iter().flatten().all(|url| !url.contains(PASSKEY)));
+    assert_eq!(db.get_rss_feed(1).unwrap().unwrap().url, feed.url);
+    let mut listed = db.list_rss_seen_items(Some(1), None).unwrap();
+    listed.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+    assert_eq!(listed, items);
+
+    // As an older start left them: in the clear.
+    let datastore = db.datastore();
+    let clear_url = feed.url.clone();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(
+            datastore.write_exec(),
+            "UPDATE rss_feeds SET url = {}",
+            &[SqlArg::Text(clear_url)],
+        )
+        .await?;
+        SqlRuntime::execute(
+            datastore.write_exec(),
+            "UPDATE rss_seen_items SET item_url = 'https://tracker.invalid/dl?passkey=' || item_id
+              WHERE item_id > 'guid-064'",
+            &[],
+        )
+        .await
+    })
+    .unwrap();
+    db.seal_rss_links().unwrap();
+    let resealed = stored_links(&db);
+    assert!(resealed.0.iter().all(|url| !url.contains(PASSKEY)));
+    assert!(
+        resealed
+            .1
+            .iter()
+            .flatten()
+            .all(|url| !url.contains("passkey"))
+    );
+    assert_eq!(resealed.1[..65], sealed.1[..65]);
+    assert_eq!(db.get_rss_feed(1).unwrap().unwrap().url, feed.url);
+    let listed = db.list_rss_seen_items(Some(1), None).unwrap();
+    let last = listed
+        .iter()
+        .find(|item| item.item_id == "guid-149")
+        .unwrap();
+    assert_eq!(
+        last.item_url.as_deref(),
+        Some("https://tracker.invalid/dl?passkey=guid-149")
+    );
+    db.seal_rss_links().unwrap();
+    assert_eq!(stored_links(&db), resealed);
+}

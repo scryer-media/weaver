@@ -1068,13 +1068,23 @@ impl TorrentService {
     // the route is up.
     pub(super) async fn resolve(&self, job_id: JobId) {
         let rules = self.rules();
-        let Some((record, rule, own)) = self.inner.live.lock().await.get(&job_id).map(|torrent| {
-            (
-                torrent.record.clone(),
-                torrent.rule(&rules),
-                torrent.identity.clone(),
-            )
-        }) else {
+        // One whose stored secrets did not decrypt is held: nothing of it is
+        // fetched.
+        let Some((record, rule, own)) = self
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .filter(|torrent| torrent.sealed.is_none())
+            .map(|torrent| {
+                (
+                    torrent.record.clone(),
+                    torrent.rule(&rules),
+                    torrent.identity.clone(),
+                )
+            })
+        else {
             return;
         };
         let scope = self.settings().scope(record.category_id, rule);

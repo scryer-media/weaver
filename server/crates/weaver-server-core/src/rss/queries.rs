@@ -110,6 +110,8 @@ impl Database {
                 .map(|row| {
                     let mut feed = rss_feed_from_sql(row)?;
                     feed.password = maybe_decrypt(encryption_key.as_ref(), feed.password);
+                    feed.url =
+                        maybe_decrypt(encryption_key.as_ref(), Some(feed.url)).unwrap_or_default();
                     feed.scripts = attached.remove(&feed.id).unwrap_or_default();
                     Ok(feed)
                 })
@@ -134,6 +136,7 @@ impl Database {
             };
             let mut feed = rss_feed_from_sql(row)?;
             feed.password = maybe_decrypt(encryption_key.as_ref(), feed.password);
+            feed.url = maybe_decrypt(encryption_key.as_ref(), Some(feed.url)).unwrap_or_default();
             feed.scripts = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT instance_id FROM feed_scripts WHERE feed_id = {}
@@ -291,6 +294,7 @@ impl Database {
         feed_id: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Vec<RssSeenItemRow>, StateError> {
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let mut sql = String::from(RSS_SEEN_SELECT);
@@ -305,7 +309,14 @@ impl Database {
                 args.push(SqlArg::I64(i64::from(limit)));
             }
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
-            rows.into_iter().map(map_seen_item_row).collect()
+            rows.into_iter()
+                .map(|row| {
+                    let mut item = map_seen_item_row(row)?;
+                    item.item_url =
+                        crate::persistence::encryption::maybe_decrypt(key.as_ref(), item.item_url);
+                    Ok(item)
+                })
+                .collect()
         })
     }
 
@@ -316,6 +327,7 @@ impl Database {
         &self,
         limit: u32,
     ) -> Result<Vec<RssSeenItemRow>, StateError> {
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -333,7 +345,14 @@ impl Database {
                 &[SqlArg::I64(i64::from(limit))],
             )
             .await?;
-            rows.into_iter().map(map_seen_item_row).collect()
+            rows.into_iter()
+                .map(|row| {
+                    let mut item = map_seen_item_row(row)?;
+                    item.item_url =
+                        crate::persistence::encryption::maybe_decrypt(key.as_ref(), item.item_url);
+                    Ok(item)
+                })
+                .collect()
         })
     }
 }

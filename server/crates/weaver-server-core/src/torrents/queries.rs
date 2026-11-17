@@ -4,6 +4,7 @@
 use crate::StateError;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
+use crate::persistence::encryption::EncryptionKey;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx, max_rows_for_engine};
 use crate::settings::SeedingPolicy;
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
@@ -35,14 +36,22 @@ pub(crate) fn count(row: &SqlRow, column: &str) -> Result<u64, StateError> {
     u64::try_from(value).map_err(|_| corrupt(column, value))
 }
 
-fn tracker_entry(row: &SqlRow) -> Result<TrackerEntry, StateError> {
+// A tracker row, its URL opened; the error is why the URL did not open.
+fn tracker_entry(
+    row: &SqlRow,
+    key: Option<&EncryptionKey>,
+) -> Result<Result<TrackerEntry, String>, StateError> {
     let tier = row.i64("tier")?;
     let named_by = row.text("named_by")?;
-    Ok(TrackerEntry {
+    let url = match super::sealed::open_url(key, &row.text("url")?) {
+        Ok(url) => url,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(Ok(TrackerEntry {
         tier: u32::try_from(tier).map_err(|_| corrupt("tracker tier", tier))?,
-        url: row.text("url")?,
+        url,
         named_by: parse_named_by(&named_by).ok_or_else(|| corrupt("tracker naming", &named_by))?,
-    })
+    }))
 }
 
 fn opt_u64(row: &SqlRow, column: &str) -> Result<Option<u64>, StateError> {
@@ -57,7 +66,30 @@ fn opt_u32(row: &SqlRow, column: &str) -> Result<Option<u32>, StateError> {
         .transpose()
 }
 
-pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError> {
+pub(crate) fn torrent_from_row(
+    row: &SqlRow,
+    key: Option<&EncryptionKey>,
+) -> Result<TorrentRecord, StateError> {
+    let (record, sealed) = torrent_and_seal(row, key)?;
+    if let Some(error) = sealed {
+        tracing::warn!(job_id = record.job_id.0, error = %error, "a torrent's stored metainfo does not decrypt");
+    }
+    Ok(record)
+}
+
+// A torrent's row, its metainfo opened, and why it did not open when it
+// did not: the torrent then reads with no metainfo.
+pub(crate) fn torrent_and_seal(
+    row: &SqlRow,
+    key: Option<&EncryptionKey>,
+) -> Result<(TorrentRecord, Option<String>), StateError> {
+    let (metainfo, sealed) = match row.opt_bytes("metainfo")? {
+        None => (None, None),
+        Some(stored) => match super::sealed::open_metainfo(key, stored) {
+            Ok(metainfo) => (Some(bytes::Bytes::from(metainfo)), None),
+            Err(error) => (None, Some(error)),
+        },
+    };
     let source = row.text("source")?;
     let state = row.text("state")?;
     let kept = KeptIntent::parse(&state).ok_or_else(|| corrupt("intent", &state))?;
@@ -71,13 +103,13 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("metadata", error)))
         .transpose()?
         .unwrap_or_default();
-    Ok(TorrentRecord {
+    let record = TorrentRecord {
         job_id: JobId(count(row, "job_id")?),
         infohash_v1: hash(row, "infohash_v1")?,
         infohash_v2: hash(row, "infohash_v2")?,
         name: row.text("name")?,
         source: TorrentSource::parse(&source).ok_or_else(|| corrupt("source", &source))?,
-        metainfo: row.opt_bytes("metainfo")?.map(bytes::Bytes::from),
+        metainfo,
         category_id: opt_u32(row, "category_id")?,
         added_at_ms: row.i64("added_at_ms")?,
         kept,
@@ -103,7 +135,8 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         queue_position: row.i64("queue_position")?,
         pool_member: opt_u32(row, "pool_member")?,
         private: row.bool("private")?,
-    })
+    };
+    Ok((record, sealed))
 }
 
 // The torrents going by any of `infohashes`; it matches none when empty.
@@ -437,6 +470,7 @@ async fn named_torrents(
 pub(crate) async fn torrent_by_infohash_tx(
     tx: &mut SqlTx<'_>,
     infohashes: &[Infohash],
+    key: Option<&EncryptionKey>,
 ) -> Result<Option<TorrentRecord>, StateError> {
     let (filter, args) = infohash_filter(infohashes);
     tx.fetch_optional(
@@ -445,7 +479,7 @@ pub(crate) async fn torrent_by_infohash_tx(
     )
     .await?
     .as_ref()
-    .map(torrent_from_row)
+    .map(|row| torrent_from_row(row, key))
     .transpose()
 }
 
@@ -459,6 +493,7 @@ impl Database {
     }
 
     pub fn get_torrent(&self, job_id: JobId) -> Result<Option<TorrentRecord>, StateError> {
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
@@ -468,7 +503,7 @@ impl Database {
             )
             .await?
             .as_ref()
-            .map(torrent_from_row)
+            .map(|row| torrent_from_row(row, key.as_ref()))
             .transpose()
         })
     }
@@ -478,6 +513,7 @@ impl Database {
         &self,
         infohashes: &[Infohash],
     ) -> Result<Option<TorrentRecord>, StateError> {
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         let (filter, args) = infohash_filter(infohashes);
         self.run_sql_blocking_read(async move {
@@ -488,7 +524,7 @@ impl Database {
             )
             .await?
             .as_ref()
-            .map(torrent_from_row)
+            .map(|row| torrent_from_row(row, key.as_ref()))
             .transpose()
         })
     }
@@ -621,6 +657,7 @@ impl Database {
     // Every torrent, in the order they were added.
     pub fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StateError> {
         self.torrent_read();
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -632,7 +669,9 @@ impl Database {
                 &[],
             )
             .await?;
-            rows.iter().map(torrent_from_row).collect()
+            rows.iter()
+                .map(|row| torrent_from_row(row, key.as_ref()))
+                .collect()
         })
     }
 
@@ -642,6 +681,7 @@ impl Database {
         &self,
         category_id: Option<u32>,
     ) -> Result<Vec<TorrentRecord>, StateError> {
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = match category_id {
@@ -668,7 +708,9 @@ impl Database {
                     .await?
                 }
             };
-            rows.iter().map(torrent_from_row).collect()
+            rows.iter()
+                .map(|row| torrent_from_row(row, key.as_ref()))
+                .collect()
         })
     }
 
@@ -689,41 +731,65 @@ impl Database {
         })
     }
 
+    // Its URLs are sealed, so they are put in order once opened: by tier,
+    // then URL. One that does not open fails the read.
     pub fn list_torrent_trackers(&self, job_id: JobId) -> Result<Vec<TrackerEntry>, StateError> {
         self.torrent_read();
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT tier, url, named_by FROM torrent_trackers WHERE job_id = {} ORDER BY tier, url",
+                "SELECT tier, url, named_by FROM torrent_trackers WHERE job_id = {}",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
             .await?;
-            rows.iter().map(tracker_entry).collect()
+            let mut trackers = rows
+                .iter()
+                .map(|row| {
+                    tracker_entry(row, key.as_ref())?.map_err(|error| {
+                        StateError::Database(format!(
+                            "a tracker URL of torrent {} does not decrypt: {error}",
+                            job_id.0
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            trackers.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+            Ok(trackers)
         })
     }
 
     /// Every torrent's trackers, by torrent, each in the order
     /// [`Self::list_torrent_trackers`] gives.
-    pub fn torrent_trackers_by_job(
-        &self,
-    ) -> Result<std::collections::BTreeMap<JobId, Vec<TrackerEntry>>, StateError> {
+    /// A torrent one of whose URLs does not open has why in place of its
+    /// list.
+    pub fn torrent_trackers_by_job(&self) -> Result<TrackersByJob, StateError> {
         self.torrent_read();
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, tier, url, named_by FROM torrent_trackers ORDER BY job_id, tier, url",
+                "SELECT job_id, tier, url, named_by FROM torrent_trackers ORDER BY job_id, tier",
                 &[],
             )
             .await?;
-            let mut trackers = std::collections::BTreeMap::<JobId, Vec<TrackerEntry>>::new();
+            let mut trackers = TrackersByJob::new();
             for row in &rows {
                 let job_id = count(row, "job_id")?;
-                trackers
-                    .entry(JobId(job_id))
-                    .or_default()
-                    .push(tracker_entry(row)?);
+                let entry = tracker_entry(row, key.as_ref())?;
+                match (
+                    trackers.entry(JobId(job_id)).or_insert(Ok(Vec::new())),
+                    entry,
+                ) {
+                    (Ok(list), Ok(entry)) => list.push(entry),
+                    (list @ Ok(_), Err(error)) => *list = Err(error),
+                    (Err(_), _) => {}
+                }
+            }
+            for list in trackers.values_mut().filter_map(|list| list.as_mut().ok()) {
+                list.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
             }
             Ok(trackers)
         })
@@ -773,6 +839,7 @@ impl Database {
     // that does not read is that torrent's alone.
     pub(crate) fn restored_torrents(&self) -> Result<Vec<RestoredTorrent>, StateError> {
         self.torrent_read();
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -787,8 +854,10 @@ impl Database {
             .await?;
             rows.iter()
                 .map(|row| {
+                    let (record, sealed) = torrent_and_seal(row, key.as_ref())?;
                     Ok(RestoredTorrent {
-                        record: torrent_from_row(row)?,
+                        record,
+                        sealed,
                         levels: file_priorities_from_row(row),
                         seed_verified: row.opt_bytes("seed_verified"),
                         held_set: row.bool("held_set")?,
@@ -826,8 +895,14 @@ impl Database {
 }
 
 // One torrent's row as a boot reads it.
+/// Every torrent's trackers, by torrent, or why one of its URLs did not
+/// decrypt.
+pub type TrackersByJob = std::collections::BTreeMap<JobId, Result<Vec<TrackerEntry>, String>>;
+
 pub(crate) struct RestoredTorrent {
     pub(crate) record: TorrentRecord,
+    // Why its stored metainfo did not decrypt, when it did not.
+    pub(crate) sealed: Option<String>,
     pub(crate) levels: Result<Vec<FilePriority>, StateError>,
     pub(crate) seed_verified: Result<Option<Vec<u8>>, StateError>,
     // Whether its held paths are its own; when not, what unpacking placed

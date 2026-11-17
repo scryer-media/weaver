@@ -1667,8 +1667,28 @@ impl TorrentService {
             // The rule is the one its trackers match now (libtorrent keeps
             // the trackers, not what was made of them).
             let mut torrent = Live::new(record.clone(), ledger, resume, now);
-            torrent.trackers = in_table_order(trackers.remove(&job_id).unwrap_or_default());
+            let (listed, unopened) = match trackers.remove(&job_id) {
+                Some(Ok(listed)) => (listed, None),
+                Some(Err(error)) => (Vec::new(), Some(format!("a tracker URL: {error}"))),
+                None => (Vec::new(), None),
+            };
+            torrent.trackers = in_table_order(listed);
             torrent.rule_id = self.rule_id(torrent.trackers.iter());
+            // A torrent whose stored secrets do not decrypt with the
+            // instance key is held with why, as it was kept: never restored
+            // from what it lacks, nor fetched again, nor failed.
+            if let Some(why) = row
+                .sealed
+                .map(|error| format!("its metainfo: {error}"))
+                .or(unopened)
+            {
+                let why = format!("its stored secrets do not decrypt: {why}");
+                tracing::warn!(job_id = job_id.0, error = %why, "a torrent is held");
+                torrent.restore_held = Some(why.clone());
+                torrent.sealed = Some(why);
+                self.inner.live.lock().await.insert(job_id, torrent);
+                continue;
+            }
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
                     if !row.held_set {

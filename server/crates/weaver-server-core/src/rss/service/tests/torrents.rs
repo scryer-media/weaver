@@ -51,7 +51,8 @@ async fn rig_seated(
     seated: bool,
 ) -> Rig {
     let dir = TempDir::new().unwrap();
-    let db = Database::open(&dir.path().join("rss.sqlite")).unwrap();
+    let mut db = Database::open(&dir.path().join("rss.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = format!(
         r#"<?xml version="1.0"?>
         <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">

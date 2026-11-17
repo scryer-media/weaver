@@ -98,6 +98,7 @@ async fn insert_trackers(
     tx: &mut SqlTx<'_>,
     job_id: i64,
     trackers: &[TrackerEntry],
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
 ) -> Result<(), StateError> {
     // As many rows a statement as its binds allow.
     for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 4)) {
@@ -110,7 +111,8 @@ async fn insert_trackers(
             args.extend([
                 SqlArg::I64(job_id),
                 SqlArg::I64(i64::from(tracker.tier)),
-                SqlArg::Text(tracker.url.clone()),
+                // Sealed: a private tracker's URL carries the passkey.
+                SqlArg::Text(super::sealed::seal_url(key, &tracker.url)?),
                 SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
             ]);
         }
@@ -137,7 +139,7 @@ async fn insert_trackers(
 // as `UPDATE ... CASE` statements of as many rows as their binds allow.
 // A torrent named twice takes the value named last, as one statement per
 // row in turn left it.
-async fn update_column_tx(
+pub(crate) async fn update_column_tx(
     tx: &mut SqlTx<'_>,
     column: &str,
     rows: &[(i64, SqlArg)],
@@ -298,6 +300,7 @@ impl Database {
                 "the retiring torrents do not read".into(),
             ));
         }
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -313,7 +316,9 @@ impl Database {
                 &[],
             )
             .await?;
-            rows.iter().map(retiring_row).collect()
+            rows.iter()
+                .map(|row| retiring_row(row, key.as_ref()))
+                .collect()
         })
     }
 
@@ -458,7 +463,10 @@ pub(crate) struct RetiringRow {
     pub(crate) history: JobHistoryRow,
 }
 
-fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<RetiringRow, StateError> {
+fn retiring_row(
+    row: &crate::persistence::sql_runtime::SqlRow,
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+) -> Result<RetiringRow, StateError> {
     let job_id = JobId(count(row, "job_id")?);
     let completed = row.opt_i64("completed_at_ms")?;
     let added = row.i64("added_at_ms")?;
@@ -510,7 +518,17 @@ fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<Retirin
         job_id,
         // A mark of any other word keeps its files, as one never asked.
         delete_files: RetiringMark::parse(&row.text("retiring")?) == Some(RetiringMark::Deleted),
-        metainfo: row.opt_bytes("metainfo")?,
+        // One that does not open keeps its files, as one whose metainfo
+        // does not read.
+        metainfo: row
+            .opt_bytes("metainfo")?
+            .and_then(|stored| match super::sealed::open_metainfo(key, stored) {
+                Ok(metainfo) => Some(metainfo),
+                Err(error) => {
+                    tracing::warn!(job_id = job_id.0, error = %error, "a removed torrent's metainfo does not decrypt; its files stay");
+                    None
+                }
+            }),
         storage_dir,
         files_dir: row.opt_text("files_dir")?,
         outputs: match row.opt_text("outputs")? {
@@ -1088,7 +1106,10 @@ fn found_marks(
         })
 }
 
-fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
+fn torrent_args(
+    torrent: &TorrentRecord,
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+) -> Result<Vec<SqlArg>, StateError> {
     let policy_override = SeedingPolicy::kept(torrent.policy_override)
         .map(|policy| serde_json::to_string(&policy))
         .transpose()
@@ -1103,7 +1124,14 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptBytes(torrent.infohash_v2.map(|hash| hash.to_vec())),
         SqlArg::Text(torrent.name.clone()),
         SqlArg::Text(torrent.source.as_str().to_string()),
-        SqlArg::OptBytes(torrent.metainfo.as_deref().map(<[u8]>::to_vec)),
+        // Sealed: its announce list carries a private tracker's passkey.
+        SqlArg::OptBytes(
+            torrent
+                .metainfo
+                .as_deref()
+                .map(|metainfo| super::sealed::seal_metainfo(key, metainfo))
+                .transpose()?,
+        ),
         SqlArg::OptI64(torrent.category_id.map(i64::from)),
         SqlArg::I64(torrent.added_at_ms),
         SqlArg::Text(torrent.kept.as_str().to_string()),
@@ -1173,7 +1201,8 @@ impl Database {
             ));
         }
         let job_id = torrent.job_id;
-        let torrent_args = torrent_args(torrent)?;
+        let key = self.encryption_key().cloned();
+        let torrent_args = torrent_args(torrent, key.as_ref())?;
         let id = stored(job_id.0)?;
         let trackers = trackers.to_vec();
         let datastore = self.datastore();
@@ -1184,8 +1213,11 @@ impl Database {
                 let trackers = trackers.clone();
                 let adopted = adopted.clone();
                 let held = held.clone();
+                let key = key.clone();
                 Box::pin(async move {
-                    if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
+                    if let Some(existing) =
+                        torrent_by_infohash_tx(tx, &infohashes, key.as_ref()).await?
+                    {
                         return Ok(TorrentInsert::Duplicate(existing.job_id));
                     }
                     // One placeholder per value: the column list and the
@@ -1196,7 +1228,7 @@ impl Database {
                         &torrent_args,
                     )
                     .await?;
-                    insert_trackers(tx, id, &trackers).await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
                     insert_held_tx(tx, id, &held).await?;
                     if held_set {
                         tx.execute(
@@ -1710,10 +1742,12 @@ impl Database {
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
         let trackers = trackers.to_vec();
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_trackers", |tx| {
                 let trackers = trackers.clone();
+                let key = key.clone();
                 Box::pin(async move {
                     let known = tx
                         .fetch_optional(
@@ -1729,7 +1763,7 @@ impl Database {
                         &[SqlArg::I64(id)],
                     )
                     .await?;
-                    insert_trackers(tx, id, &trackers).await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
                     Ok(true)
                 })
             })
@@ -1782,11 +1816,12 @@ impl Database {
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
         let adopted = adopted_text(adopted)?;
+        let key = self.encryption_key().cloned();
         let head = vec![
             SqlArg::OptBytes(infohash_v1.map(|hash| hash.to_vec())),
             SqlArg::OptBytes(infohash_v2.map(|hash| hash.to_vec())),
             SqlArg::Text(name.to_owned()),
-            SqlArg::Bytes(metainfo.to_vec()),
+            SqlArg::Bytes(super::sealed::seal_metainfo(key.as_ref(), metainfo)?),
             SqlArg::Bool(private),
             SqlArg::Text(storage_dir.to_owned()),
             SqlArg::OptText(files_dir.map(str::to_owned)),
@@ -1802,6 +1837,7 @@ impl Database {
                 let head = head.clone();
                 let trackers = trackers.clone();
                 let held = held.clone();
+                let key = key.clone();
                 Box::pin(async move {
                     let changed = tx
                         .execute(
@@ -1819,7 +1855,7 @@ impl Database {
                         &[SqlArg::I64(id)],
                     )
                     .await?;
-                    insert_trackers(tx, id, &trackers).await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
                     tx.execute(
                         "DELETE FROM torrent_held_paths WHERE job_id = {}",
                         &[SqlArg::I64(id)],

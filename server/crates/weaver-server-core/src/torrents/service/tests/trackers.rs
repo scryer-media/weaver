@@ -1422,3 +1422,118 @@ fn a_removal_leaves_what_the_search_left() {
     assert!(!left.is_empty() && left.len() < trackers.len());
     assert_eq!(left, by_search);
 }
+
+// A private tracker's URL is sealed at rest, and a restart opens it: the
+// torrent comes back with its tracker, and its announce carries the URL as
+// the torrent was added with it, passkey and all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_torrent_announces_its_sealed_tracker_url() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/announce?passkey=f00dfacecafe",
+        listener.local_addr().unwrap()
+    );
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(announcing(&plain("sealed", 7), &url)))
+        })
+        .await
+        .unwrap();
+    // The operator names it, as a loopback tracker the torrent names alone
+    // is not announced to; a loopback one is asked only at /announce, so
+    // its passkey rides in the query.
+    tracked(&rig.service, job_id, &url).await;
+    let before = listed_trackers(&rig.service, job_id).await;
+    assert!(before.iter().any(|(_, listed, _)| *listed == url));
+    rig.service.stop().await;
+    let datastore = rig.db.datastore();
+    let stored = rig
+        .db
+        .run_sql_blocking_read(async move {
+            crate::persistence::sql_runtime::SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT url FROM torrent_trackers",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| row.text("url"))
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    assert_eq!(stored.len(), before.len());
+    assert!(stored.iter().all(|url| !url.contains("f00dfacecafe")));
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert_eq!(listed_trackers(&again, job_id).await, before);
+    again.resume(job_id).await.unwrap();
+    let (stream, heard) = heard_request(&listener).await;
+    let line = heard.lines().next().unwrap();
+    assert!(line.starts_with("GET /announce?"), "{line}");
+    assert!(line.contains("&passkey=f00dfacecafe "), "{line}");
+    drop(stream);
+    again.stop().await;
+}
+
+// A torrent whose stored secrets do not decrypt with the instance key, as
+// after a key that was replaced, is held at start with why: it stays in
+// the table, unrestored and unfetched, and fails nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_whose_secrets_do_not_decrypt_is_held_with_why() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(announcing(
+            &plain("other key", 3),
+            "http://a.invalid/f00dfacecafe/announce",
+        ))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    let other = crate::persistence::encryption::EncryptionKey::generate();
+    let foreign = crate::torrents::sealed::seal_metainfo(Some(&other), b"d4:infodee").unwrap();
+    let datastore = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET metainfo = {} WHERE job_id = {}",
+                &[SqlArg::Bytes(foreign), SqlArg::I64(job_id.0 as i64)],
+            )
+            .await
+        })
+        .unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let written = again.written();
+    reopen(&again).await;
+    {
+        let live = again.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert!(
+            torrent
+                .restore_held
+                .as_deref()
+                .is_some_and(|why| why.contains("do not decrypt")),
+            "{:?}",
+            torrent.restore_held
+        );
+        assert!(torrent.store.is_none() && torrent.layout.is_none());
+        assert!(torrent.fetching.is_none() && torrent.resolving.is_none());
+    }
+    assert_eq!(written.borrow().checkpoints_read, 0);
+    assert_eq!(
+        again.torrent(job_id).await.unwrap().state,
+        TorrentState::Stopped
+    );
+    assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+    again.stop().await;
+}
