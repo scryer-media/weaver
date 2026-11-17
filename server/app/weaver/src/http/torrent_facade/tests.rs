@@ -522,6 +522,7 @@ fn view(state: TorrentState) -> TorrentView {
         trackers: Vec::new(),
         metadata: Vec::new(),
         tags: Vec::new(),
+        clock: Default::default(),
     }
 }
 

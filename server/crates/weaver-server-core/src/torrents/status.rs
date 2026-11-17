@@ -633,6 +633,9 @@ pub struct Swarm {
     pub leechers: Option<u32>,
     /// Seconds until the soonest tracker announce.
     pub reannounce_seconds: Option<u64>,
+    /// When the soonest tracker announce is, in milliseconds since the
+    /// epoch: what `reannounce_seconds` counts down to.
+    pub next_announce_ms: Option<i64>,
 }
 
 /// The swarm read off how announcing to each tracker went, at `now_ms`.
@@ -641,15 +644,22 @@ pub fn swarm(announces: &[TrackerAnnounce], now_ms: i64) -> Swarm {
         .iter()
         .map(|announce| tracker_view(0, announce))
         .collect();
+    let next_announce_ms = trackers
+        .iter()
+        .filter_map(|tracker| tracker.next_announce_ms)
+        .min();
     Swarm {
         seeds: trackers.iter().filter_map(|tracker| tracker.seeders).max(),
         leechers: trackers.iter().filter_map(|tracker| tracker.leechers).max(),
-        reannounce_seconds: trackers
-            .iter()
-            .filter_map(|tracker| tracker.next_announce_ms)
-            .min()
-            .map(|next| ((next - now_ms).max(0) as u64).div_ceil(1000)),
+        reannounce_seconds: next_announce_ms.map(|next| reannounce_seconds(next, now_ms)),
+        next_announce_ms,
     }
+}
+
+/// Whole seconds from `now_ms` to an announce due at `next_ms`, rounded up;
+/// one already due is due now.
+pub fn reannounce_seconds(next_ms: i64, now_ms: i64) -> u64 {
+    ((next_ms - now_ms).max(0) as u64).div_ceil(1000)
 }
 
 /// A torrent's trackers: the ones its run announces to, each in the tier
@@ -1750,6 +1760,7 @@ mod tests {
                 seeds: Some(7),
                 leechers: Some(9),
                 reannounce_seconds: Some(7),
+                next_announce_ms: Some(1_017_000),
             }
         );
         // An announce already due is due now.

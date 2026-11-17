@@ -7,14 +7,17 @@
 
 use std::collections::HashMap;
 
-use weaver_server_core::torrents::service::TorrentPieces;
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
 use weaver_server_core::torrents::service::listing::FileTotals;
+use weaver_server_core::torrents::service::{TorrentPieces, ViewClock};
 use weaver_server_core::torrents::{FilePriority, NamedBy, TorrentTracker, TrackerStatus};
 
 use super::*;
 
 const TORRENTS: usize = 10_000;
+
+// The time the answers are read at, in seconds since the epoch.
+const AT: i64 = 1_700_000_500;
 
 const STATES: [TorrentState; 12] = [
     TorrentState::Queued,
@@ -286,8 +289,8 @@ async fn torrents_info_answers_the_same_without_the_files() {
         for pairs in asks {
             let params = params(pairs);
             let ask = InfoAsk::of(&params);
-            let old = body(info_list(paged(&whole, &ask), &ask, scope, Api::LATEST)).await;
-            let new = body(info_list(paged(&rows, &ask), &ask, scope, Api::LATEST)).await;
+            let old = body(info_list(paged(&whole, &ask), &ask, scope, Api::LATEST, AT)).await;
+            let new = body(info_list(paged(&rows, &ask), &ask, scope, Api::LATEST, AT)).await;
             assert_eq!(old.0, new.0, "{pairs:?}");
             assert!(old == new, "{pairs:?} {scope:?}");
         }
@@ -301,6 +304,7 @@ async fn torrents_info_answers_the_same_without_the_files() {
         &ask,
         CallerScope::Admin,
         Api::LATEST,
+        AT,
     ))
     .await;
     let listed: Vec<Value> = serde_json::from_slice(&listed.1).unwrap();
@@ -416,7 +420,6 @@ impl NewClient {
 // carry no files or trackers, and only the rows that moved.
 #[test]
 fn maindata_answers_from_the_snapshot_as_from_every_view() {
-    const AT: i64 = 1_700_000_500;
     for scope in [CallerScope::Admin, CallerScope::Read] {
         let mut views: Vec<TorrentView> = (0..TORRENTS).map(seeded_view).collect();
         let snapshot = Snapshot::default();
@@ -497,4 +500,413 @@ fn maindata_answers_from_the_snapshot_as_from_every_view() {
         assert!(new.built <= old.built, "{} > {}", new.built, old.built);
         assert!(new.read < old.built, "{} >= {}", new.read, old.built);
     }
+}
+
+// What the table kept for a `torrents/info` request before the snapshot:
+// the torrents of the hashes it names, each read as 40 hex digits in any
+// case; of the category it names or one under it, in any case, a torrent in
+// none being in the category ""; and of the privacy it asks.
+fn table_keeps(params: &Params, view: &TorrentView) -> bool {
+    let sent = info_hashes(params);
+    let named: Vec<String> = sent
+        .iter()
+        .filter(|hash| hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|hash| hash.to_ascii_lowercase())
+        .collect();
+    let category = view
+        .category
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    (sent.is_empty() || named.contains(&view.infohash))
+        && params.get("category").is_none_or(|name| {
+            let name = name.to_ascii_lowercase();
+            category == name || category.starts_with(&format!("{name}/"))
+        })
+        && params
+            .flag_value("private")
+            .is_none_or(|private| view.private == private)
+}
+
+// The seeded torrents as a run of the service holds them: lowercase hashes,
+// some private, some in a category under another, each read at `AT`.
+fn info_views() -> Vec<TorrentView> {
+    (0..TORRENTS)
+        .map(|index| {
+            let mut view = seeded_view(index);
+            view.infohash = view.infohash.to_ascii_lowercase();
+            view.private = index % 5 == 1;
+            if index % 8 == 2 {
+                view.category = Some("TV/HD".to_owned());
+            }
+            view.clock.at_ms = AT * 1000;
+            view
+        })
+        .collect()
+}
+
+// `torrents/info` from the snapshot's rows answers as it did from the views
+// built for each request, byte for byte, over 10,000 torrents of mixed
+// states, categories, tags and privacy: across status filters, categories,
+// tags, hashes, privacy, sorts, offsets, limits, and the files and trackers
+// listed. The rows carry no files or trackers; those are read for the page
+// alone.
+#[tokio::test]
+async fn torrents_info_answers_from_the_snapshot_as_from_built_views() {
+    let views = info_views();
+    // The order the service lists them in.
+    let mut listed: Vec<&TorrentView> = views.iter().collect();
+    listed.sort_by_key(|view| (view.added_at_ms, view.job_id));
+    let by_id: HashMap<JobId, &TorrentView> =
+        views.iter().map(|view| (view.job_id, view)).collect();
+    let snapshot = Snapshot::default();
+    snapshot.replace_every(&rows_of(&views));
+    let (_, rows) = snapshot.every();
+    assert_eq!(rows.len(), TORRENTS);
+    assert!(rows.iter().all(|row| row.view.trackers.is_empty()));
+
+    let some = format!(
+        "{}|{}| nothex |{}|{}",
+        views[5].infohash.to_ascii_uppercase(),
+        views[77].infohash,
+        views[9_000].infohash,
+        views[77].infohash,
+    );
+    let private = format!("{}|{}", views[1].infohash, views[2].infohash);
+    let asks: &[&[(&str, &str)]] = &[
+        &[],
+        &[("limit", "50"), ("offset", "9990")],
+        &[("offset", "-25")],
+        &[("offset", "-25"), ("limit", "10")],
+        &[("offset", "-20000")],
+        &[("limit", "0"), ("offset", "3")],
+        &[("limit", "-4"), ("offset", "12")],
+        &[("filter", "downloading")],
+        &[("filter", "seeding"), ("limit", "10"), ("offset", "5")],
+        &[("filter", "completed"), ("offset", "-3")],
+        &[("filter", "stopped")],
+        &[("filter", "running"), ("limit", "40")],
+        &[("filter", "active")],
+        &[("filter", "inactive"), ("offset", "100"), ("limit", "100")],
+        &[("filter", "stalled")],
+        &[("filter", "checking")],
+        &[("filter", "moving")],
+        &[("filter", "errored")],
+        &[("filter", "no-such-filter"), ("limit", "7")],
+        &[("category", "tv")],
+        &[("category", "TV"), ("limit", "30"), ("offset", "30")],
+        &[("category", "tv/hd")],
+        &[("category", "")],
+        &[("category", "movies")],
+        &[("tag", "hd")],
+        &[("tag", ""), ("limit", "25")],
+        &[("tag", "a"), ("category", "tv")],
+        &[("private", "true")],
+        &[("private", "false"), ("limit", "60"), ("offset", "7")],
+        &[
+            ("private", "true"),
+            ("category", "tv"),
+            ("filter", "seeding"),
+        ],
+        &[("hashes", some.as_str())],
+        &[
+            ("hashes", some.as_str()),
+            ("sort", "name"),
+            ("reverse", "true"),
+        ],
+        &[("hashes", private.as_str()), ("private", "true")],
+        &[("hashes", "nothex")],
+        &[("hashes", "|")],
+        &[("sort", "name")],
+        &[("sort", "size"), ("reverse", "true"), ("limit", "100")],
+        &[("sort", "amount_left"), ("offset", "20"), ("limit", "30")],
+        &[("sort", "root_path")],
+        &[("sort", "content_path"), ("reverse", "true")],
+        &[("sort", "added_on"), ("offset", "-50")],
+        &[("sort", "dl_limit")],
+        &[("sort", "tracker"), ("limit", "300")],
+        &[("sort", "seeding_time"), ("limit", "100")],
+        &[
+            ("sort", "time_active"),
+            ("reverse", "true"),
+            ("limit", "100"),
+        ],
+        &[("sort", "eta")],
+        &[("sort", "no_such_column")],
+        &[("sort", "files")],
+        &[("sort", "trackers")],
+        &[("filter", "inactive"), ("sort", "progress"), ("tag", "a")],
+        &[("category", "tv"), ("sort", "ratio"), ("limit", "15")],
+        &[("includeTrackers", "true"), ("limit", "200")],
+        &[
+            ("includeTrackers", "true"),
+            ("sort", "trackers"),
+            ("limit", "40"),
+        ],
+        &[("includeTrackers", "true"), ("hashes", some.as_str())],
+        &[("includeFiles", "true"), ("limit", "60")],
+        &[("includeFiles", "true"), ("sort", "files"), ("limit", "30")],
+        &[
+            ("includeFiles", "true"),
+            ("sort", "files"),
+            ("offset", "6"),
+            ("limit", "30"),
+        ],
+        &[
+            ("includeFiles", "true"),
+            ("includeTrackers", "true"),
+            ("filter", "downloading"),
+            ("sort", "name"),
+            ("offset", "-12"),
+        ],
+    ];
+    let read_asks: &[&[(&str, &str)]] = &[
+        &[("limit", "300")],
+        &[("includeTrackers", "true"), ("limit", "200")],
+        &[("sort", "tracker"), ("limit", "300")],
+    ];
+    let mut compared = 0;
+    for (scope, asks) in [(CallerScope::Admin, asks), (CallerScope::Read, read_asks)] {
+        for pairs in asks {
+            let params = params(pairs);
+            let ask = InfoAsk::of(&params);
+            // Before: the table's pick, each view built for the request,
+            // with its files only when they are listed.
+            let kept: Vec<(TorrentView, FileTotals)> = listed
+                .iter()
+                .filter(|view| table_keeps(&params, view))
+                .map(|&view| {
+                    let built = if ask.with_files {
+                        view.clone()
+                    } else {
+                        without_files(view)
+                    };
+                    (built, FileTotals::of(view))
+                })
+                .collect();
+            let old = body(info_list(paged(&kept, &ask), &ask, scope, Api::LATEST, AT)).await;
+            // Now: the rows, with the page's files and trackers read alone.
+            let hashes = info_hashes(&params);
+            let pick = info_pick(&params, &hashes);
+            let new = match info_rows(&rows, &pick.of_rows(), &ask, scope, AT * 1000) {
+                Err(refused) => *refused,
+                Ok(mut page) => {
+                    for (row, fields) in &mut page {
+                        let view = by_id[&row.view.job_id];
+                        let parts = RowParts {
+                            files: view.files.clone(),
+                            file_have: view.file_have.clone(),
+                            trackers: view.trackers.clone(),
+                        };
+                        with_parts(fields, &row.view, parts, &ask, scope, Api::LATEST);
+                    }
+                    info_answer(page)
+                }
+            };
+            let new = body(new).await;
+            assert_eq!(old.0, new.0, "{pairs:?} {scope:?}");
+            assert!(old.1 == new.1, "{pairs:?} {scope:?}");
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, asks.len() + read_asks.len());
+}
+
+// A row's time active and seeding run on from the reading it came from to
+// the time it is read, as a reading then gives them, and its countdown to
+// the next announce runs down; a stopped torrent's times stand still.
+#[test]
+fn a_rows_clock_fields_run_on_to_the_time_it_is_read() {
+    let read_at = |state: TorrentState, active: bool, now_ms: i64| {
+        let mut view = view(state);
+        view.infohash = format!("{:040x}", 1);
+        view.active_seconds = 100;
+        view.seeding_seconds = 40;
+        view.consecutive_seeding_seconds = 10;
+        view.reannounce_seconds = Some(30);
+        view.clock = ViewClock {
+            at_ms: 1_000_000,
+            next_announce_ms: Some(1_030_000),
+            active_ms: 400,
+            finished_ms: 700,
+            consecutive_ms: 0,
+            active,
+        };
+        let snapshot = Snapshot::default();
+        snapshot.replace_every(&[(view.clone(), FileTotals::of(&view))]);
+        let (_, rows) = snapshot.every();
+        let fields = info_fields(&rows[0], CallerScope::Admin, now_ms);
+        [
+            fields["time_active"].clone(),
+            fields["seeding_time"].clone(),
+            fields["reannounce"].clone(),
+        ]
+    };
+    // Read as it was taken: as a view built then gives them.
+    assert_eq!(
+        read_at(TorrentState::Seeding, true, 1_000_000),
+        [json!(100), json!(40), json!(30)]
+    );
+    // 2.5 seconds on: 99.4 s active is 101.9 s, counted up; 40.7 s seeding
+    // is 43.2 s, counted down; 27.5 s to the announce, counted up.
+    assert_eq!(
+        read_at(TorrentState::Seeding, true, 1_002_500),
+        [json!(102), json!(43), json!(28)]
+    );
+    // Stopped: only the countdown runs.
+    assert_eq!(
+        read_at(TorrentState::Stopped, false, 1_002_500),
+        [json!(100), json!(40), json!(28)]
+    );
+    // Past the announce, and before the reading: nothing below zero, and
+    // nothing run back.
+    assert_eq!(read_at(TorrentState::Seeding, true, 1_040_000)[2], json!(0));
+    assert_eq!(
+        read_at(TorrentState::Seeding, true, 999_000),
+        [json!(100), json!(40), json!(31)]
+    );
+}
+
+// Stored torrents, `count` of them, written as the add writes them: magnets
+// paused, resumed or stopped, some private.
+fn stored_torrents(db: &Database, count: u64) {
+    use weaver_server_core::torrents::model::{
+        KeptIntent, TorrentIntent, TorrentRecord, TorrentSource,
+    };
+    for job_id in 1..=count {
+        let mut hash = [0u8; 20];
+        hash[..8].copy_from_slice(&job_id.to_be_bytes());
+        hash[19] = 0x5a;
+        let record = TorrentRecord {
+            job_id: JobId(job_id),
+            infohash_v1: Some(hash),
+            infohash_v2: None,
+            name: format!("t{job_id}"),
+            source: TorrentSource::Magnet,
+            metainfo: None,
+            category_id: None,
+            added_at_ms: 1_700_000_000_000 + (job_id % 997) as i64,
+            // Few resumed: with torrents off, a start costs a whole publish
+            // for each resumed torrent.
+            kept: KeptIntent::Intent(match (job_id % 200, job_id % 3) {
+                (0, _) => TorrentIntent::Resumed,
+                (_, 0) => TorrentIntent::Stopped,
+                _ => TorrentIntent::Paused,
+            }),
+            forced: job_id.is_multiple_of(11),
+            completed_at_ms: None,
+            storage_dir: None,
+            policy_override: None,
+            unpack: None,
+            unpack_in_force: None,
+            metadata: Vec::new(),
+            upload_limit: job_id.is_multiple_of(7).then_some(4096),
+            download_limit: None,
+            sequential: false,
+            first_last_piece_first: false,
+            save_path: None,
+            content_layout: None,
+            files_dir: None,
+            seed_mode: false,
+            move_to: None,
+            queue_position: job_id as i64,
+            pool_member: None,
+            private: job_id % 5 == 1,
+        };
+        db.insert_torrent(&record, &[]).unwrap();
+    }
+}
+
+// With 10,000 torrents loaded and nothing changing, `torrents/info` polls,
+// across filters, sorts, pages, hashes, privacy and the trackers and files
+// listed, and the limit readings of every torrent, build no torrent's view
+// and take the database for no statement. Torrents are off, so no tick
+// publishes while the polls run.
+#[tokio::test]
+async fn torrents_info_polls_build_no_view_and_read_nothing() {
+    const STORED: u64 = 10_000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    stored_torrents(&db, STORED);
+    let torrents = TorrentService::new(
+        db.clone(),
+        Sessions::new(
+            Arc::new(Offline::default()),
+            SessionEnv {
+                root: dir.path().join("sessions"),
+            },
+            db.clone(),
+        ),
+        TorrentSettings {
+            upload_cap: None,
+            complete_dir: dir.path().join("complete"),
+            categories: Vec::new(),
+            seeding: None,
+            torrent: TorrentConfig {
+                enabled: false,
+                ..TorrentConfig::default()
+            },
+        },
+        JobEnv::unbounded(),
+        Arc::new(SystemClock),
+    );
+    torrents.start().await.unwrap();
+    torrents.loaded().await;
+    assert_eq!(torrents.snapshot().len(), STORED as usize);
+    let rig = rig_around(
+        dir,
+        db,
+        Some(torrents.clone()),
+        RuntimeSecurityConfig::default(),
+        scheduler(),
+        Api::LATEST,
+    );
+    // Torrents 3 and 8,000, by the hashes they were stored with.
+    let named = format!(
+        "{:016x}{zeros}5a|{:016X}{zeros}5A",
+        3,
+        8_000,
+        zeros = "0".repeat(22)
+    );
+    // The facade's first request of any kind takes the database once, an
+    // `app/version` as much as a list: that one is not a poll's.
+    assert_eq!(rig.get("/api/v2/app/version").await.status, StatusCode::OK);
+    let (views, statements) = (torrents.views_built(), rig.db.datastore_takes());
+    let mut answered = Vec::new();
+    for _ in 0..3 {
+        for path in [
+            "/api/v2/torrents/info".to_owned(),
+            "/api/v2/torrents/info?filter=stopped&sort=name&limit=50".to_owned(),
+            "/api/v2/torrents/info?private=true&offset=-20".to_owned(),
+            "/api/v2/torrents/info?category=&sort=priority&reverse=true".to_owned(),
+            "/api/v2/torrents/info?tag=&limit=500&offset=9000".to_owned(),
+            "/api/v2/torrents/info?includeTrackers=true&limit=100".to_owned(),
+            "/api/v2/torrents/info?includeFiles=true&limit=100".to_owned(),
+            format!("/api/v2/torrents/info?hashes={named}"),
+            "/api/v2/torrents/uploadLimit?hashes=all".to_owned(),
+            format!("/api/v2/torrents/downloadLimit?hashes={named}"),
+        ] {
+            let reply = rig.get(&path).await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}: {}", reply.body);
+            answered.push((path, reply.json()));
+        }
+    }
+    assert_eq!(torrents.views_built(), views);
+    assert_eq!(rig.db.datastore_takes(), statements);
+    let every = &answered[0].1;
+    assert_eq!(every.as_array().unwrap().len(), STORED as usize);
+    let hashed = answered
+        .iter()
+        .find(|(path, _)| path.contains("info?hashes"))
+        .unwrap();
+    assert_eq!(hashed.1.as_array().unwrap().len(), 2, "{named}");
+    let limits = answered
+        .iter()
+        .find(|(path, _)| path.contains("uploadLimit"))
+        .unwrap();
+    assert_eq!(limits.1.as_object().unwrap().len(), STORED as usize);
+    // The same polls answer the same each time.
+    let rounds: Vec<&[(String, Value)]> = answered.chunks(10).collect();
+    assert!(rounds.windows(2).all(|pair| pair[0] == pair[1]));
+    torrents.stop().await;
 }

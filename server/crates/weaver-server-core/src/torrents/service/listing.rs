@@ -314,6 +314,47 @@ impl Pick<'_> {
     }
 }
 
+/// What a pick keeps, read from the views a list's rows hold in place of
+/// the torrents' records: the hashes, the category and the privacy the
+/// table keeps, for a list the snapshot answers.
+pub struct RowPick<'a> {
+    hashes: Option<HashSet<String>>,
+    category: Option<CategoryPick<'a>>,
+    private: Option<bool>,
+}
+
+impl<'a> Pick<'a> {
+    /// The pick as it reads a row's view.
+    pub fn of_rows(&self) -> RowPick<'a> {
+        RowPick {
+            // A view's infohash is its best hash as text.
+            hashes: self.hashes.map(|hashes| {
+                parsed(hashes)
+                    .into_iter()
+                    .map(|hash| hash.as_string())
+                    .collect()
+            }),
+            category: self.category,
+            private: self.private,
+        }
+    }
+}
+
+impl RowPick<'_> {
+    /// Whether it keeps the torrent `view` shows: as the table keeps its
+    /// record, its category read through its name as
+    /// `TorrentSettings::category` names it.
+    pub fn keeps(&self, view: &TorrentView) -> bool {
+        self.hashes
+            .as_ref()
+            .is_none_or(|hashes| hashes.contains(&view.infohash))
+            && self
+                .category
+                .is_none_or(|category| category.keeps(view.category.as_deref()))
+            && self.private.is_none_or(|private| view.private == private)
+    }
+}
+
 /// The torrents a pick read from the table.
 pub(super) enum Picked {
     /// The page.

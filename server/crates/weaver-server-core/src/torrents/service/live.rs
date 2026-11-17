@@ -445,6 +445,19 @@ impl Live {
         reading
     }
 
+    // Each file's bytes in hand now, as a reading gives them.
+    pub(super) fn file_have_now(&self) -> Vec<u64> {
+        let mut file_have = self.file_have.clone();
+        if let Some(attached) = &self.attached {
+            take_file_have(
+                &mut file_have,
+                &attached.handle.stats().file_progress,
+                self.store.as_deref(),
+            );
+        }
+        file_have
+    }
+
     // The session's figures for the torrent now, over what was kept of it,
     // with its durations as last kept.
     fn sampled(&self, now: i64) -> Reading {
@@ -621,6 +634,12 @@ impl Timed {
             finished_ms: 0,
             consecutive_ms: 0,
         }
+    }
+
+    // The milliseconds each duration ran past its whole seconds: the time
+    // active, the time seeding and the current seeding run.
+    pub(super) fn parts(&self) -> [u64; 3] {
+        [self.active_ms, self.finished_ms, self.consecutive_ms]
     }
 
     // Run on to `now`: the time since runs into the active duration while
