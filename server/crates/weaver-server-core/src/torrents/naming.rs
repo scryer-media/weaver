@@ -202,6 +202,10 @@ impl HttpClients for TorrentNames {
         self.now().0.http.egress(to)
     }
 
+    fn ipv6_sources(&self) -> Option<io::Result<weaver_torrent::Ipv6Sources>> {
+        self.now().0.http.ipv6_sources()
+    }
+
     fn gateway_socket<'a>(
         &'a self,
         local: SocketAddr,
@@ -248,6 +252,9 @@ impl Dialer for Scoped {
     }
     fn source_toward(&self, to: SocketAddr) -> Option<io::Result<std::net::IpAddr>> {
         self.leg.source_toward(to)
+    }
+    fn ipv6_sources(&self) -> Option<io::Result<weaver_tunnel::egress::Ipv6Sources>> {
+        self.leg.ipv6_sources()
     }
     fn budget(&self) -> Duration {
         self.leg.budget()

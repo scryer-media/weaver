@@ -297,6 +297,12 @@ impl Dialer for PinnedMember {
             Err(gone) => Some(Err(std::io::Error::other(gone))),
         }
     }
+    fn ipv6_sources(&self) -> Option<std::io::Result<weaver_tunnel::egress::Ipv6Sources>> {
+        match self.current() {
+            Ok(pin) => pin.ipv6_sources(),
+            Err(gone) => Some(Err(std::io::Error::other(gone))),
+        }
+    }
     fn failing_hop(&self) -> Option<weaver_tunnel::pipe::FailingHop> {
         self.pin().failing_hop()
     }
@@ -362,6 +368,9 @@ impl Dialer for Carried {
     }
     fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
         self.stage.source_toward(to)
+    }
+    fn ipv6_sources(&self) -> Option<std::io::Result<weaver_tunnel::egress::Ipv6Sources>> {
+        self.stage.ipv6_sources()
     }
     fn budget(&self) -> Duration {
         self.stage.budget()

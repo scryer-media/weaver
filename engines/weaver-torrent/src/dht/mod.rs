@@ -23,7 +23,7 @@ pub use error::{Error, Result};
 
 pub use crate::core::hash_id::Id20;
 pub use crate::dht::state::DhtStats;
-pub use crate::dht::state::{DhtConfig, DhtState, RequestPeersStream};
+pub use crate::dht::state::{DhtConfig, DhtState, Ipv6Phase, RequestPeersStream};
 pub use persistence::{DhtPersistenceConfig, PersistentDht, dht_listen_addr};
 
 pub type Dht = Arc<DhtState>;

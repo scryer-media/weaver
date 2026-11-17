@@ -1169,6 +1169,9 @@ impl Dialer for MemberPin {
     fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
         self.member.dialer.source_toward(to)
     }
+    fn ipv6_sources(&self) -> Option<std::io::Result<weaver_tunnel::egress::Ipv6Sources>> {
+        self.member.dialer.ipv6_sources()
+    }
     fn failing_hop(&self) -> Option<weaver_tunnel::pipe::FailingHop> {
         self.member.dialer.failing_hop()
     }

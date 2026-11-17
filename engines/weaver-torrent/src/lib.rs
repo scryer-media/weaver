@@ -106,8 +106,8 @@ pub use peer_connection::PeerConnectionOptions;
 pub use piece_priority::{FilePriority, PiecePriority};
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, Discovery, FetchPhase,
-    IpFilter, ListOnlyResponse, MetadataFetch, SUPPORTED_SCHEMES, Session, SessionLimits,
-    SessionOptions, SessionPersistenceConfig, SharedLimits,
+    IpFilter, Ipv6RouteChange, ListOnlyResponse, MetadataFetch, SUPPORTED_SCHEMES, Session,
+    SessionLimits, SessionOptions, SessionPersistenceConfig, SharedLimits,
 };
 pub use ssl::SslIdentity;
 pub use stream_connect::{
@@ -129,8 +129,8 @@ pub use crate::buffers::*;
 pub use crate::clone_to_owned::CloneToOwned;
 pub use crate::core::magnet::*;
 pub use crate::core::net::{
-    ClientShape, ClientTls, ClientUse, Egress, HttpClients, HttpTarget, NamedBy, NoClients,
-    TorrentNaming,
+    ClientShape, ClientTls, ClientUse, Egress, HttpClients, HttpTarget, Ipv6Source, Ipv6Sources,
+    NamedBy, NoClients, TorrentNaming,
 };
 pub use crate::core::peer_id::*;
 pub use crate::core::torrent_metainfo::*;
