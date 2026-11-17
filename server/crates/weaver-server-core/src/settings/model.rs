@@ -571,6 +571,10 @@ pub struct TrackerRule {
     // The encryption its torrents' connections are made under, over the
     // global one; `None` inherits.
     pub encryption: Option<TorrentEncryption>,
+    // The transports its torrents' outgoing connections dial, and the one
+    // each tries first while downloading and while seeding, field by field
+    // over the global ones. What the session listens on stays global.
+    pub transports: TransportRule,
     // The upload cap each of its torrents takes, over its category's and
     // the global one.
     pub upload_cap: Leaf<u64>,
@@ -838,8 +842,9 @@ pub struct TorrentConfig {
     // Whether peers at one address may each hold a connection to a torrent
     // (libtorrent `allow_multiple_connections_per_ip`).
     pub allow_multiple_connections_per_ip: bool,
-    // The transports peers are reached and taken on.
-    pub peer_protocol: TorrentPeerProtocol,
+    // The transports peers are reached and taken on, and the one an
+    // outgoing connection tries first while downloading and while seeding.
+    pub transports: PeerTransports,
     // The DHT's bootstrap nodes, `host:port` separated by commas, as
     // libtorrent's `dht_bootstrap_nodes` reads them.
     pub dht_bootstrap_nodes: String,
@@ -929,6 +934,9 @@ impl TorrentConfig {
     // What is wrong with the session settings, if anything.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = self.transports.checked() {
+            errors.push(error);
+        }
         for node in self.dht_bootstrap_nodes() {
             let port = node
                 .rsplit_once(':')
@@ -971,7 +979,7 @@ impl Default for TorrentConfig {
             unchoke_slots_limit: TorrentLimit::Count(NonZeroU32::new(8).unwrap()),
             connection_speed: NonZeroU32::new(30).unwrap(),
             allow_multiple_connections_per_ip: false,
-            peer_protocol: TorrentPeerProtocol::Tcp,
+            transports: PeerTransports::default(),
             // The routers the engine bootstraps from when told none.
             dht_bootstrap_nodes: weaver_torrent::dht::DHT_BOOTSTRAP.join(","),
             blocklist_enabled: false,
@@ -1133,24 +1141,19 @@ impl BlocklistSource {
     }
 }
 
-// The transports peers are reached and taken on (libtorrent
-// `enable_outgoing_tcp`, `enable_incoming_tcp`, `enable_outgoing_utp`,
-// `enable_incoming_utp`, set together as qBittorrent's `BTProtocol` does).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+// One transport peers are reached and taken on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TorrentPeerProtocol {
-    #[default]
+pub enum PeerTransport {
     Tcp,
     Utp,
-    Both,
 }
 
-impl TorrentPeerProtocol {
+impl PeerTransport {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
             Self::Utp => "utp",
-            Self::Both => "both",
         }
     }
 
@@ -1158,26 +1161,148 @@ impl TorrentPeerProtocol {
         match value {
             "tcp" => Some(Self::Tcp),
             "utp" => Some(Self::Utp),
-            "both" => Some(Self::Both),
             _ => None,
         }
     }
+}
 
-    pub const fn tcp(self) -> bool {
-        matches!(self, Self::Tcp | Self::Both)
-    }
+// The transports peers are reached and taken on, as qBittorrent's three
+// protocol modes set libtorrent's `enable_incoming_tcp`,
+// `enable_outgoing_tcp`, `enable_incoming_utp` and `enable_outgoing_utp`: a
+// transport turned off is neither listened on nor dialed. With both on, an
+// outgoing connection tries the preferred one first: TCP first dials TCP
+// and races uTP behind it; uTP first dials uTP alone and TCP once that
+// fails, as libtorrent's `torrent::connect_to_peer` does. A torrent that
+// holds every piece it wants dials with the seeding preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PeerTransports {
+    pub tcp: bool,
+    pub utp: bool,
+    pub prefer_downloading: PeerTransport,
+    pub prefer_seeding: PeerTransport,
+}
 
-    pub const fn utp(self) -> bool {
-        matches!(self, Self::Utp | Self::Both)
+impl Default for PeerTransports {
+    fn default() -> Self {
+        Self {
+            tcp: true,
+            utp: true,
+            prefer_downloading: PeerTransport::Tcp,
+            prefer_seeding: PeerTransport::Utp,
+        }
     }
 }
 
+impl PeerTransports {
+    // The transports as they are kept, preferences as set; an error when
+    // both are off.
+    pub fn checked(self) -> Result<Self, String> {
+        if self.tcp || self.utp {
+            Ok(self)
+        } else {
+            Err("torrent.transports: TCP and uTP cannot both be off".to_owned())
+        }
+    }
+
+    // The transports as they are used and shown: with one off, both
+    // preferences are the one left on. The kept preferences come back when
+    // both are on again.
+    pub const fn effective(self) -> Self {
+        let only = match (self.tcp, self.utp) {
+            (true, false) => Some(PeerTransport::Tcp),
+            (false, true) => Some(PeerTransport::Utp),
+            _ => None,
+        };
+        match only {
+            Some(only) => Self {
+                prefer_downloading: only,
+                prefer_seeding: only,
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    // These, each field `rule` sets taken from it.
+    pub fn under(self, rule: &TransportRule) -> Self {
+        Self {
+            tcp: rule.tcp.unwrap_or(self.tcp),
+            utp: rule.utp.unwrap_or(self.utp),
+            prefer_downloading: rule.prefer_downloading.unwrap_or(self.prefer_downloading),
+            prefer_seeding: rule.prefer_seeding.unwrap_or(self.prefer_seeding),
+        }
+    }
+
+    // The orders an outgoing connection tries the transports in, while its
+    // torrent downloads and while it seeds.
+    pub const fn dial_orders(self) -> weaver_torrent::DialOrders {
+        let effective = self.effective();
+        weaver_torrent::DialOrders {
+            downloading: self.order(effective.prefer_downloading),
+            seeding: self.order(effective.prefer_seeding),
+        }
+    }
+
+    const fn order(self, prefer: PeerTransport) -> weaver_torrent::DialOrder {
+        use weaver_torrent::DialOrder;
+        match (self.tcp, self.utp, prefer) {
+            (true, true, PeerTransport::Tcp) => DialOrder::TcpFirst,
+            (true, true, PeerTransport::Utp) => DialOrder::UtpFirst,
+            (true, false, _) => DialOrder::TcpOnly,
+            (false, _, _) => DialOrder::UtpOnly,
+        }
+    }
+}
+
+// A tracker rule's transports, each field `None` to take the global one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportRule {
+    pub tcp: Option<bool>,
+    pub utp: Option<bool>,
+    pub prefer_downloading: Option<PeerTransport>,
+    pub prefer_seeding: Option<PeerTransport>,
+}
+
+impl TransportRule {
+    pub const fn is_set(&self) -> bool {
+        self.tcp.is_some()
+            || self.utp.is_some()
+            || self.prefer_downloading.is_some()
+            || self.prefer_seeding.is_some()
+    }
+
+    // What a torrent under the rule runs with, over `global`. A rule that
+    // global settings changed since its save leave with both off is not
+    // applied: its torrents take the global transports.
+    // The preferences are as kept; `effective` and the dial orders lock
+    // them to the transport left on.
+    pub fn resolve(&self, global: PeerTransports) -> PeerTransports {
+        global.under(self).checked().unwrap_or(global)
+    }
+
+    // The rule as it is kept against `global`, preferences as set: an
+    // error when it leaves both transports off.
+    pub fn checked(self, global: PeerTransports) -> Result<Self, String> {
+        global.under(&self).checked().map_err(|_| {
+            "transports: TCP and uTP cannot both be off, with the global transports".to_owned()
+        })?;
+        Ok(self)
+    }
+}
+
+// Peer connection encryption, as qBittorrent's three modes set libtorrent:
+// prefer is `pe_enabled` (each peer tried with the handshake it last
+// completed, plain first), require is `pe_forced` (encrypted only, a plain
+// handshake refused either way) and disabled is `pe_disabled` (plain only;
+// a new peer PEX says was reached encrypted is not dialled).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentEncryption {
     #[default]
     Prefer,
     Require,
+    Disabled,
 }
 
 impl TorrentEncryption {
@@ -1185,6 +1310,7 @@ impl TorrentEncryption {
         match self {
             Self::Prefer => "prefer",
             Self::Require => "require",
+            Self::Disabled => "disabled",
         }
     }
 
@@ -1192,6 +1318,7 @@ impl TorrentEncryption {
         match value {
             "prefer" => Some(Self::Prefer),
             "require" => Some(Self::Require),
+            "disabled" => Some(Self::Disabled),
             _ => None,
         }
     }
@@ -1302,6 +1429,7 @@ mod tests {
 
     fn rule(id: u32, host_pattern: &str) -> TrackerRule {
         TrackerRule {
+            transports: TransportRule::default(),
             archive_passwords: Default::default(),
             bound: None,
             id,
@@ -1484,6 +1612,219 @@ mod tests {
         );
     }
 
+    // A rule's handshake and dial order overrides are keyed by host alone: an
+    // announce URL carrying a passkey finds them by its host, and a rule
+    // cannot be given the URL, so its passkey is never kept with them.
+    #[test]
+    fn handshake_and_dial_order_overrides_follow_the_host_never_the_passkey() {
+        let passkeyed = "https://Private.Example.ORG/0123456789abcdef/announce?passkey=secret";
+        assert!(TrackerRule::pattern(passkeyed).is_err());
+        let private = TrackerRule {
+            encryption: Some(TorrentEncryption::Disabled),
+            transports: TransportRule {
+                utp: Some(false),
+                ..TransportRule::default()
+            },
+            ..rule(1, "private.example.org")
+        };
+        let public = TrackerRule {
+            encryption: Some(TorrentEncryption::Require),
+            ..rule(2, "*.public.test")
+        };
+        let rules = [private, public];
+        let ruled = tracker_rule_for(&rules, [passkeyed]).unwrap();
+        assert_eq!(ruled.host_pattern, "private.example.org");
+        assert_eq!(
+            (ruled.encryption, ruled.transports.utp),
+            (Some(TorrentEncryption::Disabled), Some(false))
+        );
+        let open = tracker_rule_for(&rules, ["udp://tracker.public.test:1337/announce"]).unwrap();
+        assert_eq!(
+            (open.encryption, open.transports),
+            (Some(TorrentEncryption::Require), TransportRule::default())
+        );
+        assert!(!format!("{rules:?}").contains("secret"));
+    }
+
+    fn transports(
+        tcp: bool,
+        utp: bool,
+        downloading: PeerTransport,
+        seeding: PeerTransport,
+    ) -> PeerTransports {
+        PeerTransports {
+            tcp,
+            utp,
+            prefer_downloading: downloading,
+            prefer_seeding: seeding,
+        }
+    }
+
+    // Each combination of the switches and preferences gives the orders
+    // libtorrent's `enable_outgoing_*` and `torrent::connect_to_peer` would:
+    // with both on the preferred one first, with one on that one alone.
+    #[test]
+    fn each_combination_of_transports_gives_its_dial_orders() {
+        use PeerTransport::{Tcp, Utp};
+        use weaver_torrent::DialOrder::{TcpFirst, TcpOnly, UtpFirst, UtpOnly};
+        let orders = |downloading, seeding| weaver_torrent::DialOrders {
+            downloading,
+            seeding,
+        };
+        for (set, expected) in [
+            (transports(true, true, Tcp, Tcp), orders(TcpFirst, TcpFirst)),
+            (transports(true, true, Tcp, Utp), orders(TcpFirst, UtpFirst)),
+            (transports(true, true, Utp, Tcp), orders(UtpFirst, TcpFirst)),
+            (transports(true, true, Utp, Utp), orders(UtpFirst, UtpFirst)),
+            (transports(true, false, Utp, Utp), orders(TcpOnly, TcpOnly)),
+            (transports(false, true, Tcp, Tcp), orders(UtpOnly, UtpOnly)),
+        ] {
+            assert_eq!(set.checked().unwrap().dial_orders(), expected, "{set:?}");
+        }
+    }
+
+    // A save keeps both preferences as set whatever the switches say, and
+    // refuses both off; with one off, the effective preferences are the one
+    // left on, and the kept ones come back when both are on again.
+    #[test]
+    fn a_save_keeps_the_preferences_and_refuses_both_off() {
+        use PeerTransport::{Tcp, Utp};
+        for set in [
+            transports(true, false, Utp, Utp),
+            transports(false, true, Tcp, Utp),
+            transports(true, true, Utp, Tcp),
+        ] {
+            assert_eq!(set.checked(), Ok(set));
+        }
+        assert!(transports(false, false, Tcp, Utp).checked().is_err());
+        assert_eq!(
+            transports(true, false, Utp, Utp).effective(),
+            transports(true, false, Tcp, Tcp)
+        );
+        assert_eq!(
+            transports(false, true, Tcp, Utp).effective(),
+            transports(false, true, Utp, Utp)
+        );
+        assert_eq!(
+            transports(true, true, Utp, Tcp).effective(),
+            transports(true, true, Utp, Tcp)
+        );
+
+        let saved = TorrentConfig {
+            transports: transports(false, true, Tcp, Tcp),
+            ..TorrentConfig::default()
+        }
+        .checked()
+        .unwrap();
+        assert_eq!(saved.transports, transports(false, true, Tcp, Tcp));
+        assert_eq!(
+            saved.transports.dial_orders(),
+            weaver_torrent::DialOrders::both(weaver_torrent::DialOrder::UtpOnly)
+        );
+        let again = PeerTransports {
+            tcp: true,
+            ..saved.transports
+        };
+        assert_eq!(
+            again.dial_orders(),
+            weaver_torrent::DialOrders::both(weaver_torrent::DialOrder::TcpFirst)
+        );
+        let refused = TorrentConfig {
+            transports: transports(false, false, Tcp, Utp),
+            ..TorrentConfig::default()
+        };
+        assert_eq!(
+            refused.clone().checked(),
+            Err(vec![
+                "torrent.transports: TCP and uTP cannot both be off".to_owned()
+            ])
+        );
+        assert!(refused.validate().is_err());
+    }
+
+    // A rule's fields each override the global one, so a rule may broaden
+    // or narrow the global transports; its save keeps its preferences and
+    // is refused when both end off over the global ones, and a rule a later
+    // global change leaves with both off is not applied.
+    #[test]
+    fn a_rules_transports_broaden_or_narrow_the_global_ones() {
+        use PeerTransport::{Tcp, Utp};
+        use weaver_torrent::DialOrder::{TcpFirst, TcpOnly, UtpFirst, UtpOnly};
+        let utp_only = transports(false, true, Utp, Utp);
+        let tcp_only = transports(true, false, Tcp, Tcp);
+        let both = PeerTransports::default();
+        let rule = |tcp, utp, downloading, seeding| TransportRule {
+            tcp,
+            utp,
+            prefer_downloading: downloading,
+            prefer_seeding: seeding,
+        };
+        // Broadened: TCP on over uTP alone, TCP first while downloading.
+        let tcp_first = rule(Some(true), None, Some(Tcp), None);
+        let resolved = tcp_first.resolve(utp_only);
+        assert_eq!(
+            (
+                resolved.dial_orders().downloading,
+                resolved.dial_orders().seeding
+            ),
+            (TcpFirst, UtpFirst)
+        );
+        // Broadened: uTP on over TCP alone.
+        let resolved = rule(None, Some(true), None, Some(Utp)).resolve(tcp_only);
+        assert_eq!(
+            (
+                resolved.dial_orders().downloading,
+                resolved.dial_orders().seeding
+            ),
+            (TcpFirst, UtpFirst)
+        );
+        // Narrowed: uTP alone, or TCP alone, over both.
+        let utp_alone = rule(Some(false), None, None, None);
+        assert_eq!(
+            utp_alone.resolve(both).dial_orders(),
+            weaver_torrent::DialOrders::both(UtpOnly)
+        );
+        assert_eq!(
+            rule(None, Some(false), None, None)
+                .resolve(both)
+                .dial_orders(),
+            weaver_torrent::DialOrders::both(TcpOnly)
+        );
+        // Each preference on its own.
+        assert_eq!(
+            rule(None, None, Some(Utp), Some(Tcp))
+                .resolve(both)
+                .dial_orders(),
+            weaver_torrent::DialOrders {
+                downloading: UtpFirst,
+                seeding: TcpFirst,
+            }
+        );
+
+        // Saved: a set preference for a transport left off is kept, and
+        // the effective one is the transport left on.
+        let kept = rule(Some(false), None, Some(Tcp), None);
+        assert_eq!(kept.checked(both), Ok(kept));
+        assert_eq!(kept.resolve(both).prefer_downloading, Tcp);
+        assert_eq!(kept.resolve(both).effective().prefer_downloading, Utp);
+        let kept = rule(None, None, Some(Utp), Some(Utp));
+        assert_eq!(kept.checked(tcp_only), Ok(kept));
+        assert_eq!(
+            kept.resolve(tcp_only).dial_orders(),
+            weaver_torrent::DialOrders::both(TcpOnly)
+        );
+        // Refused when both end off, on its own or over the global ones.
+        assert!(
+            rule(Some(false), Some(false), None, None)
+                .checked(both)
+                .is_err()
+        );
+        assert!(utp_alone.checked(tcp_only).is_err());
+        // Saved over both, then left with both off by a global change: the
+        // torrents take the global transports.
+        assert_eq!(utp_alone.resolve(tcp_only), tcp_only);
+    }
+
     #[test]
     fn a_config_without_torrent_keys_loads_the_defaults_and_round_trips() {
         let config: Config = toml::from_str(
@@ -1545,7 +1886,12 @@ name = "tv"
             unchoke_slots_limit: TorrentLimit::Count(NonZeroU32::new(20).unwrap()),
             connection_speed: NonZeroU32::new(50).unwrap(),
             allow_multiple_connections_per_ip: true,
-            peer_protocol: TorrentPeerProtocol::Both,
+            transports: PeerTransports {
+                tcp: true,
+                utp: false,
+                prefer_downloading: PeerTransport::Tcp,
+                prefer_seeding: PeerTransport::Tcp,
+            },
             dht_bootstrap_nodes: "router.example:6881".to_owned(),
             blocklist_enabled: true,
             blocklist: Some("https://lists.example/level1.p2p".to_owned()),
@@ -1566,14 +1912,31 @@ name = "tv"
 
     #[test]
     fn torrent_session_settings_default_to_libtorrents() {
-        // libtorrent settings_pack.cpp, with peers over TCP alone as before.
+        // libtorrent settings_pack.cpp: TCP first, uTP raced behind it.
         let count = |count| TorrentLimit::Count(NonZeroU32::new(count).unwrap());
         let torrent = TorrentConfig::default();
         assert_eq!(torrent.connections_limit, count(200));
         assert_eq!(torrent.unchoke_slots_limit, count(8));
         assert_eq!(torrent.connection_speed.get(), 30);
         assert!(!torrent.allow_multiple_connections_per_ip);
-        assert_eq!(torrent.peer_protocol, TorrentPeerProtocol::Tcp);
+        // Both transports on, TCP first while downloading and uTP first
+        // while seeding.
+        assert_eq!(
+            torrent.transports,
+            PeerTransports {
+                tcp: true,
+                utp: true,
+                prefer_downloading: PeerTransport::Tcp,
+                prefer_seeding: PeerTransport::Utp,
+            }
+        );
+        assert_eq!(
+            torrent.transports.dial_orders(),
+            weaver_torrent::DialOrders {
+                downloading: weaver_torrent::DialOrder::TcpFirst,
+                seeding: weaver_torrent::DialOrder::UtpFirst,
+            }
+        );
         // The engine's own routers, as before the setting.
         assert_eq!(
             torrent.dht_bootstrap_nodes,
@@ -1597,12 +1960,24 @@ data_dir = "/tmp/weaver-data"
 enabled = true
 connections_limit = 80
 unchoke_slots_limit = "unlimited"
-peer_protocol = "utp"
+
+[torrent.transports]
+tcp = false
+prefer_seeding = "tcp"
 "#,
         )
         .unwrap();
         assert_eq!(config.torrent.connections_limit, count(80));
-        assert_eq!(config.torrent.peer_protocol, TorrentPeerProtocol::Utp);
+        // A key left out is its default.
+        assert_eq!(
+            config.torrent.transports,
+            PeerTransports {
+                tcp: false,
+                utp: true,
+                prefer_downloading: PeerTransport::Tcp,
+                prefer_seeding: PeerTransport::Tcp,
+            }
+        );
         assert_eq!(config.torrent.unchoke_slots_limit, TorrentLimit::Unlimited);
         assert_eq!(config.torrent.connection_speed.get(), 30);
         assert_eq!(config.torrent.stop_tracker_timeout_secs, 5);

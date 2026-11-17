@@ -161,6 +161,7 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
 
     db.insert_tracker_rule(
         &TrackerRule {
+            transports: Default::default(),
             archive_passwords: Default::default(),
             bound: None,
             id: 0,
@@ -523,6 +524,7 @@ async fn url_route(category: Option<&str>, matched: bool) {
     let rule = db
         .insert_tracker_rule(
             &TrackerRule {
+                transports: Default::default(),
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
@@ -1660,6 +1662,7 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                transports: Default::default(),
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,

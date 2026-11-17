@@ -204,7 +204,7 @@ values = ["first", " inner space ", "first", "   ", ""]
             pex: Some(false),
             lsd: Some(false),
             encryption: Some(TorrentEncryption::Require),
-            seeding: None,
+            ..Terms::default()
         }
     );
     assert_eq!(
@@ -238,8 +238,56 @@ values = ["first", " inner space ", "first", "   ", ""]
     assert_eq!(cleared.archive_passwords, Some(ArchivePasswords::default()));
 }
 
-// Every key the file may not set is refused by name, as is a loosening, a
-// required seeding goal, and a key in both sections.
+// Each of the encryption and transport fields takes every value the API
+// does, by the same names, in either section.
+#[test]
+fn a_tracker_file_takes_every_encryption_and_transport_value() {
+    for (name, encryption) in [
+        ("prefer", TorrentEncryption::Prefer),
+        ("require", TorrentEncryption::Require),
+        ("disabled", TorrentEncryption::Disabled),
+    ] {
+        for section in ["required", "recommended"] {
+            let file = read(
+                with(&format!("[{section}]\nencryption = \"{name}\"")).as_bytes(),
+                None,
+            )
+            .unwrap();
+            let terms = if section == "required" {
+                file.required
+            } else {
+                file.recommended
+            };
+            assert_eq!(terms.encryption, Some(encryption), "{section} {name}");
+        }
+    }
+    for (tcp, utp, downloading, seeding) in [
+        (true, true, "tcp", "utp"),
+        (true, true, "utp", "tcp"),
+        (true, false, "tcp", "tcp"),
+        (false, true, "utp", "utp"),
+    ] {
+        let text = format!(
+            "[required]\npeer_tcp = {tcp}\nprefer_downloading = \"{downloading}\"\n\
+             [recommended]\npeer_utp = {utp}\nprefer_seeding = \"{seeding}\""
+        );
+        let file = read(with(&text).as_bytes(), None).unwrap();
+        assert_eq!(
+            (
+                file.required.peer_tcp,
+                file.recommended.peer_utp,
+                file.required.prefer_downloading.map(PeerTransport::as_str),
+                file.recommended.prefer_seeding.map(PeerTransport::as_str),
+            ),
+            (Some(tcp), Some(utp), Some(downloading), Some(seeding)),
+            "{text}"
+        );
+    }
+}
+
+// Every key the file may not set is refused by name, as is a value the
+// setting does not take, a required seeding goal, both transports off, and a
+// key in both sections.
 #[test]
 fn a_tracker_file_refuses_what_it_may_not_set() {
     for (extra, named) in [
@@ -264,8 +312,32 @@ fn a_tracker_file_refuses_what_it_may_not_set() {
             "[required]\nseeding = { ratio_goal = 1.0 }",
             "required.seeding",
         ),
-        ("[required]\nencryption = \"prefer\"", "\"prefer\""),
-        ("[recommended]\nencryption = \"prefer\"", "\"prefer\""),
+        (
+            "[required]\nencryption = \"strict\"",
+            "required.encryption must be \"prefer\", \"require\" or \"disabled\", not \"strict\".",
+        ),
+        (
+            "[recommended]\nencryption = true",
+            "recommended.encryption must be",
+        ),
+        ("[required]\npeer_tcp = \"no\"", "required.peer_tcp"),
+        ("[recommended]\npeer_utp = 0", "recommended.peer_utp"),
+        (
+            "[required]\nprefer_downloading = \"udp\"",
+            "required.prefer_downloading must be \"tcp\" or \"utp\", not \"udp\".",
+        ),
+        (
+            "[recommended]\nprefer_seeding = \"TCP\"",
+            "recommended.prefer_seeding must be \"tcp\" or \"utp\"",
+        ),
+        (
+            "[required]\npeer_tcp = false\n[recommended]\npeer_utp = false",
+            "peer_tcp and peer_utp cannot both be false.",
+        ),
+        (
+            "[recommended]\npeer_protocol = \"tcp_first\"",
+            "recommended.peer_protocol",
+        ),
         ("[required]\ndht = \"no\"", "required.dht"),
         (
             "[archive_passwords]\nfile = \"x\"",

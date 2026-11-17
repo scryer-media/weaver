@@ -40,7 +40,7 @@ use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
     BlocklistSource, Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy,
-    TorrentConfig, TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
+    TorrentConfig, TorrentEncryption, TorrentLimit,
 };
 use weaver_server_core::tags::split_tags;
 use weaver_server_core::torrents::metrics::{Published, SessionSeries};
@@ -3267,16 +3267,18 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "encryption": match torrent.encryption {
             TorrentEncryption::Prefer => 0,
             TorrentEncryption::Require => 1,
+            TorrentEncryption::Disabled => 2,
         },
         "max_connec_per_torrent": torrent.max_peers_total,
         "max_connec": limit(torrent.connections_limit),
         "max_uploads": limit(torrent.unchoke_slots_limit),
         "connection_speed": torrent.connection_speed,
         "enable_multi_connections_from_same_ip": torrent.allow_multiple_connections_per_ip,
-        "bittorrent_protocol": match torrent.peer_protocol {
-            TorrentPeerProtocol::Both => 0,
-            TorrentPeerProtocol::Tcp => 1,
-            TorrentPeerProtocol::Utp => 2,
+        // qBittorrent's `BTProtocol`: 0 both, 1 TCP alone, 2 uTP alone.
+        "bittorrent_protocol": match (torrent.transports.tcp, torrent.transports.utp) {
+            (true, false) => 1,
+            (false, true) => 2,
+            _ => 0,
         },
         "dht_bootstrap_nodes": torrent.dht_bootstrap_nodes,
         "ip_filter_enabled": torrent.blocklist_enabled,
@@ -3373,10 +3375,13 @@ fn torrent_preferences(
         torrent.allow_multiple_connections_per_ip = allow;
     }
     if let Some(protocol) = changes.get("bittorrent_protocol") {
-        torrent.peer_protocol = match protocol.as_i64() {
-            Some(0) => TorrentPeerProtocol::Both,
-            Some(1) => TorrentPeerProtocol::Tcp,
-            Some(2) => TorrentPeerProtocol::Utp,
+        // qBittorrent's `BTProtocol` sets the two switches; the preferred
+        // transports have no field there and are kept as set; while one
+        // transport is off, dials use the one left on.
+        (torrent.transports.tcp, torrent.transports.utp) = match protocol.as_i64() {
+            Some(0) => (true, true),
+            Some(1) => (true, false),
+            Some(2) => (false, true),
             _ => return Err(out_of_range("bittorrent_protocol")),
         };
     }

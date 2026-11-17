@@ -110,6 +110,10 @@ impl Session {
             };
 
             let enable_utp = opts.connect.as_ref().and_then(|connect| connect.enable_utp);
+            let utp_on_demand = opts
+                .connect
+                .as_ref()
+                .is_some_and(|connect| connect.utp_on_demand);
             let enable_tcp = opts
                 .connect
                 .as_ref()
@@ -133,30 +137,38 @@ impl Session {
                 };
                 let receive_buffer =
                     crate::udp_options::receive_buffer_for(connection_slots.limit());
-                match crate::listen::bind_utp(
-                    opts.socket_factory.as_ref(),
+                let rebind = crate::stream_connect::UtpRebind {
                     address,
-                    utp_opts.clone(),
+                    opts: utp_opts.clone(),
                     receive_buffer,
-                    Some(&connection_slots),
-                )
-                .await
-                .context("error binding outgoing uTP socket through socket factory")
-                {
-                    Ok(socket) => Some(socket),
-                    // As with the listener, TCP still connects without uTP,
-                    // and the next dial that wants uTP binds it again.
-                    Err(e) if enable_tcp => {
-                        error!("{e:#}");
-                        utp_rebind = Some(crate::stream_connect::UtpRebind {
-                            address,
-                            opts: utp_opts,
-                            receive_buffer,
-                            connection_slots: Arc::clone(&connection_slots),
-                        });
-                        None
+                    connection_slots: Arc::clone(&connection_slots),
+                };
+                if utp_on_demand {
+                    // Bound by the first dial whose torrent dials over uTP,
+                    // and never when none does.
+                    utp_rebind = Some(rebind);
+                    None
+                } else {
+                    match crate::listen::bind_utp(
+                        opts.socket_factory.as_ref(),
+                        address,
+                        utp_opts.clone(),
+                        receive_buffer,
+                        Some(&connection_slots),
+                    )
+                    .await
+                    .context("error binding outgoing uTP socket through socket factory")
+                    {
+                        Ok(socket) => Some(socket),
+                        // As with the listener, TCP still connects without uTP,
+                        // and the next dial that wants uTP binds it again.
+                        Err(e) if enable_tcp => {
+                            error!("{e:#}");
+                            utp_rebind = Some(rebind);
+                            None
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(e) => return Err(e),
                 }
             } else {
                 None
@@ -314,6 +326,7 @@ impl Session {
                 .await
                 .context("error creating stream connector")?,
             );
+            stream_connector.set_dial_orders(opts.dial_orders);
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
@@ -408,6 +421,8 @@ impl Session {
                 utp: listen_result
                     .as_ref()
                     .is_some_and(|l| l.utp_socket.is_some()),
+                #[cfg(test)]
+                utp_threads: utp_shards.as_ref().map(|shards| shards.name().to_owned()),
                 default_storage_factory: opts.default_storage_factory,
                 http_clients,
                 resolver,

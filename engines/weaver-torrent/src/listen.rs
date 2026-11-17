@@ -256,10 +256,15 @@ async fn bind(
             .await
             {
                 Ok((sock, share)) => {
-                    listen_addr = sock.bind_addr();
+                    // A TCP listener's address stays the session's: a
+                    // tunnel's forwarded port reaches TCP, and a uTP socket
+                    // the factory placed elsewhere does not move it.
+                    if tcp_socket.is_none() {
+                        listen_addr = sock.bind_addr();
+                    }
                     info!(
                         "Listening on UDP {:?} for incoming uTP peer connections",
-                        listen_addr
+                        sock.bind_addr()
                     );
                     (Some(sock), share)
                 }

@@ -34,7 +34,7 @@ use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::graph::status::{Delivery, Failure};
 use crate::pipeline::graph::window::ScratchLedger;
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
-use crate::settings::{Config, TorrentEncryption};
+use crate::settings::{Config, TorrentEncryption, TransportRule};
 use crate::torrents::identity::TorrentIdentity;
 use crate::torrents::intake::Heard as IntakeHeard;
 use crate::torrents::layout::PieceLayout;
@@ -136,15 +136,16 @@ pub const CHECKPOINT_PIECES: u32 = 16;
 
 // What a torrent's session holds its peers to under its tracker rule:
 // whether it looks for them on the DHT, on the local network and by peer
-// exchange, each switch on its own, and the encryption
-// its connections are made under over the session's. A change of any takes
-// the torrent through its session again.
+// exchange, each switch on its own, and the encryption its connections are
+// made under and the transport order they are dialed in, each over the
+// session's. A change of any takes the torrent through its session again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PeerTerms {
     disable_dht: bool,
     disable_pex: bool,
     disable_lsd: bool,
     encryption: Option<TorrentEncryption>,
+    dial_orders: Option<weaver_torrent::DialOrders>,
 }
 
 impl PeerTerms {
@@ -158,6 +159,14 @@ impl PeerTerms {
             disable_pex: off(&PEX),
             disable_lsd: off(&LSD),
             encryption: settings.levels(&ENCRYPTION, None, None, rule).resolve(),
+            dial_orders: rule
+                .map(|rule| rule.transports)
+                .filter(TransportRule::is_set)
+                .map(|transports| {
+                    transports
+                        .resolve(settings.torrent.transports)
+                        .dial_orders()
+                }),
         }
     }
 
@@ -166,9 +175,12 @@ impl PeerTerms {
         options.disable_dht = self.disable_dht;
         options.disable_pex = self.disable_pex;
         options.disable_lsd = self.disable_lsd;
-        options.peer_opts = self.encryption.map(|encryption| PeerConnectionOptions {
-            encryption: Some(encryption_policy(encryption)),
-            ..Default::default()
+        options.peer_opts = (self.encryption.is_some() || self.dial_orders.is_some()).then(|| {
+            PeerConnectionOptions {
+                encryption: self.encryption.map(encryption_policy),
+                dial_orders: self.dial_orders,
+                ..Default::default()
+            }
         });
     }
 }

@@ -1445,6 +1445,16 @@ pub struct TrackerRule {
     /// The encryption its torrents' connections are made under; absent
     /// inherits.
     pub encryption: Option<TorrentEncryptionGql>,
+    /// Whether its torrents dial peers over TCP; absent inherits. The
+    /// session listens as the global setting says.
+    pub peer_tcp: Option<bool>,
+    /// Whether its torrents dial peers over uTP; absent inherits.
+    pub peer_utp: Option<bool>,
+    /// The transport its torrents try first while downloading; absent
+    /// inherits.
+    pub prefer_downloading: Option<PeerTransportGql>,
+    /// The transport its torrents try first while seeding; absent inherits.
+    pub prefer_seeding: Option<PeerTransportGql>,
     /// The upload cap its torrents take in place of their category's and
     /// the global one.
     pub upload_cap: LeafGql<u64>,
@@ -1574,6 +1584,10 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             pex: rule.pex,
             lsd: rule.lsd,
             encryption: rule.encryption.map(Into::into),
+            peer_tcp: rule.transports.tcp,
+            peer_utp: rule.transports.utp,
+            prefer_downloading: rule.transports.prefer_downloading.map(Into::into),
+            prefer_seeding: rule.transports.prefer_seeding.map(Into::into),
             upload_cap: LeafGql::of(rule.upload_cap),
             forced: rule.forced,
             has_ssl: rule.ssl.is_some(),
@@ -1599,6 +1613,16 @@ pub struct TrackerRuleInput {
     pub pex: Option<bool>,
     pub lsd: Option<bool>,
     pub encryption: Option<TorrentEncryptionGql>,
+    /// Left out inherits. TCP and uTP may not both be off once resolved
+    /// over the global setting. A preference is kept as set; while its
+    /// transport is off, the one left on is used.
+    pub peer_tcp: Option<bool>,
+    /// Left out inherits.
+    pub peer_utp: Option<bool>,
+    /// Left out inherits.
+    pub prefer_downloading: Option<PeerTransportGql>,
+    /// Left out inherits.
+    pub prefer_seeding: Option<PeerTransportGql>,
     /// Left out inherits.
     pub upload_cap: Option<LeafInput<u64>>,
     #[graphql(default)]
@@ -1633,6 +1657,12 @@ impl TrackerRuleInput {
             pex: self.pex,
             lsd: self.lsd,
             encryption: self.encryption.map(Into::into),
+            transports: weaver_server_core::settings::TransportRule {
+                tcp: self.peer_tcp,
+                utp: self.peer_utp,
+                prefer_downloading: self.prefer_downloading.map(Into::into),
+                prefer_seeding: self.prefer_seeding.map(Into::into),
+            },
             upload_cap: leaf_of(self.upload_cap)?,
             forced: self.forced,
             ssl: self.ssl.take().map(|ssl| TrackerCertificate {
@@ -1679,6 +1709,7 @@ pub enum TorrentEncryptionGql {
     #[default]
     Prefer,
     Require,
+    Disabled,
 }
 
 impl From<weaver_server_core::settings::TorrentEncryption> for TorrentEncryptionGql {
@@ -1687,6 +1718,7 @@ impl From<weaver_server_core::settings::TorrentEncryption> for TorrentEncryption
         match value {
             TorrentEncryption::Prefer => Self::Prefer,
             TorrentEncryption::Require => Self::Require,
+            TorrentEncryption::Disabled => Self::Disabled,
         }
     }
 }
@@ -1696,36 +1728,34 @@ impl From<TorrentEncryptionGql> for weaver_server_core::settings::TorrentEncrypt
         match value {
             TorrentEncryptionGql::Prefer => Self::Prefer,
             TorrentEncryptionGql::Require => Self::Require,
+            TorrentEncryptionGql::Disabled => Self::Disabled,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
-#[graphql(name = "TorrentPeerProtocol")]
-pub enum TorrentPeerProtocolGql {
-    #[default]
+/// A transport peers are reached and taken on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "PeerTransport")]
+pub enum PeerTransportGql {
     Tcp,
     Utp,
-    Both,
 }
 
-impl From<weaver_server_core::settings::TorrentPeerProtocol> for TorrentPeerProtocolGql {
-    fn from(value: weaver_server_core::settings::TorrentPeerProtocol) -> Self {
-        use weaver_server_core::settings::TorrentPeerProtocol;
+impl From<weaver_server_core::settings::PeerTransport> for PeerTransportGql {
+    fn from(value: weaver_server_core::settings::PeerTransport) -> Self {
+        use weaver_server_core::settings::PeerTransport;
         match value {
-            TorrentPeerProtocol::Tcp => Self::Tcp,
-            TorrentPeerProtocol::Utp => Self::Utp,
-            TorrentPeerProtocol::Both => Self::Both,
+            PeerTransport::Tcp => Self::Tcp,
+            PeerTransport::Utp => Self::Utp,
         }
     }
 }
 
-impl From<TorrentPeerProtocolGql> for weaver_server_core::settings::TorrentPeerProtocol {
-    fn from(value: TorrentPeerProtocolGql) -> Self {
+impl From<PeerTransportGql> for weaver_server_core::settings::PeerTransport {
+    fn from(value: PeerTransportGql) -> Self {
         match value {
-            TorrentPeerProtocolGql::Tcp => Self::Tcp,
-            TorrentPeerProtocolGql::Utp => Self::Utp,
-            TorrentPeerProtocolGql::Both => Self::Both,
+            PeerTransportGql::Tcp => Self::Tcp,
+            PeerTransportGql::Utp => Self::Utp,
         }
     }
 }
@@ -1747,7 +1777,18 @@ pub struct TorrentSettings {
     pub unchoke_slots_limit: Option<std::num::NonZeroU32>,
     pub connection_speed: std::num::NonZeroU32,
     pub allow_multiple_connections_per_ip: bool,
-    pub peer_protocol: TorrentPeerProtocolGql,
+    /// Whether peers are reached and taken over TCP: listened on and
+    /// dialed.
+    pub peer_tcp: bool,
+    /// Whether peers are reached and taken over uTP.
+    pub peer_utp: bool,
+    /// The transport a dial tries first while its torrent downloads, as
+    /// set; while one transport is off, the one left on is used.
+    pub prefer_downloading: PeerTransportGql,
+    /// The transport a dial tries first once its torrent holds every piece
+    /// it wants, as set; while one transport is off, the one left on is
+    /// used.
+    pub prefer_seeding: PeerTransportGql,
     pub dht_bootstrap_nodes: String,
     pub blocklist_enabled: bool,
     /// An http, https or file URL, or a path.
@@ -1783,7 +1824,10 @@ impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
             unchoke_slots_limit: value.unchoke_slots_limit.count(),
             connection_speed: value.connection_speed,
             allow_multiple_connections_per_ip: value.allow_multiple_connections_per_ip,
-            peer_protocol: value.peer_protocol.into(),
+            peer_tcp: value.transports.tcp,
+            peer_utp: value.transports.utp,
+            prefer_downloading: value.transports.prefer_downloading.into(),
+            prefer_seeding: value.transports.prefer_seeding.into(),
             dht_bootstrap_nodes: value.dht_bootstrap_nodes.clone(),
             blocklist_enabled: value.blocklist_enabled,
             blocklist: value.blocklist.clone(),
@@ -1814,7 +1858,12 @@ pub struct TorrentSettingsInput {
     pub unchoke_slots_limit: MaybeUndefined<std::num::NonZeroU32>,
     pub connection_speed: Option<std::num::NonZeroU32>,
     pub allow_multiple_connections_per_ip: Option<bool>,
-    pub peer_protocol: Option<TorrentPeerProtocolGql>,
+    /// TCP and uTP may not both be off. The preferences are kept as set
+    /// either way.
+    pub peer_tcp: Option<bool>,
+    pub peer_utp: Option<bool>,
+    pub prefer_downloading: Option<PeerTransportGql>,
+    pub prefer_seeding: Option<PeerTransportGql>,
     pub dht_bootstrap_nodes: Option<String>,
     pub blocklist_enabled: Option<bool>,
     /// An http, https or file URL, or a path.
@@ -1916,8 +1965,18 @@ impl TorrentSettingsInput {
         if let Some(allow) = self.allow_multiple_connections_per_ip {
             torrent.allow_multiple_connections_per_ip = allow;
         }
-        if let Some(protocol) = self.peer_protocol {
-            torrent.peer_protocol = protocol.into();
+        let transports = &mut torrent.transports;
+        if let Some(tcp) = self.peer_tcp {
+            transports.tcp = tcp;
+        }
+        if let Some(utp) = self.peer_utp {
+            transports.utp = utp;
+        }
+        if let Some(prefer) = self.prefer_downloading {
+            transports.prefer_downloading = prefer.into();
+        }
+        if let Some(prefer) = self.prefer_seeding {
+            transports.prefer_seeding = prefer.into();
         }
         if let Some(nodes) = &self.dht_bootstrap_nodes {
             torrent.dht_bootstrap_nodes.clone_from(nodes);

@@ -379,6 +379,9 @@ pub struct Session {
     pub(crate) disable_pex: bool,
     // Whether the session listens on uTP, and so connects over it.
     pub(crate) utp: bool,
+    // The name its uTP threads share, when it has threads of its own.
+    #[cfg(test)]
+    pub(crate) utp_threads: Option<String>,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -561,6 +564,18 @@ impl Session {
         self.connector.set_encryption(policy);
     }
 
+    /// The orders the session's outgoing connections try TCP and uTP in
+    /// now, while a torrent downloads and while it seeds.
+    pub fn dial_orders(&self) -> crate::DialOrders {
+        self.connector.dial_orders()
+    }
+
+    /// Dial peers in `orders` from the next dial on: a dial under way keeps
+    /// its plan, and a connection made keeps its transport.
+    pub fn set_dial_orders(&self, orders: crate::DialOrders) {
+        self.connector.set_dial_orders(orders);
+    }
+
     /// Whether peers at one address may each hold a connection to a torrent
     /// now.
     pub fn allows_multiple_connections_per_ip(&self) -> bool {
@@ -641,6 +656,7 @@ impl Session {
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
             encryption: other.encryption.or(self.peer_opts.encryption),
+            dial_orders: other.dial_orders.or(self.peer_opts.dial_orders),
         }
     }
 
@@ -772,6 +788,15 @@ impl Session {
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {
         self.listen_addr
+    }
+
+    /// The session's connections that ran on its uTP threads: incoming,
+    /// outgoing, and those of either on its first uTP thread.
+    #[cfg(test)]
+    pub(crate) fn on_utp_threads(&self) -> [usize; 3] {
+        self.utp_threads
+            .as_deref()
+            .map_or([0; 3], crate::peer_connection::on_utp_threads)
     }
 
     /// Whether the session listens on uTP as well, on the listen address.

@@ -78,6 +78,11 @@ impl Shards {
         self.0.count
     }
 
+    /// The name the threads take, before each one's `-{index}`.
+    pub fn name(&self) -> &str {
+        &self.0.name
+    }
+
     fn shards(&self) -> Option<&[Shard]> {
         self.0
             .started

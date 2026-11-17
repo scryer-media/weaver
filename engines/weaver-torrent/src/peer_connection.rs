@@ -52,7 +52,7 @@ use crate::{
     spawn_utils::BlockingSpawner,
     ssl::SslTorrent,
     storage::ReadTurns,
-    stream_connect::{Guard, Link, StreamConnector, Transports},
+    stream_connect::{Guard, Link, StreamConnector, Transports, UtpSeen},
     type_aliases::BoxAsyncReadVectored,
 };
 
@@ -75,15 +75,32 @@ pub trait PeerConnectionHandler {
     /// encrypted handshake where encryption is preferred; asked once per
     /// connection (libtorrent `bt_peer_connection::on_connected`, by
     /// `torrent_peer::pe_support`). A handler that remembers nothing of the
-    /// peer tries it.
+    /// peer does not, as a peer with no record starts plain
+    /// (`torrent_peer::pe_support` starts false).
     fn encrypt_outgoing(&self) -> bool {
-        true
+        false
+    }
+    /// Whether the torrent holds every piece it wants, so that a dial
+    /// starting now takes the seeding dial order. A handler that holds no
+    /// pieces of a torrent is downloading.
+    fn seeding(&self) -> bool {
+        false
     }
     /// Where the torrent holds its want for a TCP socket its route held for
     /// others; a handler with none has its dials hold nothing.
     fn tcp_wants(&self) -> Option<&crate::stream_connect::TcpWants> {
         None
     }
+    /// The outgoing connection's dial tried uTP: it `opened` a uTP
+    /// connection, or a uTP attempt failed and none opened. Told once per
+    /// outgoing connection that tried uTP, before it goes on or ends.
+    fn on_utp_dialed(&self, _opened: bool) {}
+    /// The outgoing connection, made where encryption is preferred,
+    /// completed the method it tried: the encryption handshake when
+    /// `encrypted`, told once it is done, else the plain BitTorrent
+    /// handshake, told once the peer answered it (libtorrent
+    /// `bt_peer_connection::on_receive_impl`, `on_receive_handshake`).
+    fn on_outgoing_method_worked(&self, _encrypted: bool) {}
     /// The connection, whichever side opened it, completed its handshake,
     /// as `encryption` says; told right after
     /// [`Self::on_handshake`].
@@ -395,6 +412,11 @@ pub struct PeerConnectionOptions {
     /// under, over the session's.
     #[serde(default)]
     pub encryption: Option<EncryptionPolicy>,
+
+    /// The orders every outgoing connection of the torrent tries TCP and
+    /// uTP in, while it downloads and while it seeds, over the session's.
+    #[serde(default)]
+    pub dial_orders: Option<crate::DialOrders>,
 }
 
 /// libtorrent `settings_pack::handshake_timeout`: a peer that has not
@@ -487,31 +509,41 @@ pub(crate) async fn with_timeout<T>(
     }
 }
 
-/// Connections run on a uTP thread so far, incoming and outgoing.
+/// Connections run on a session's uTP threads so far, by the name its
+/// threads share: incoming, outgoing, and those of either that ran on its
+/// first uTP thread, the one that reads and sends on its sockets. Kept by
+/// session, so tests that run at once each read their own.
 #[cfg(test)]
-pub(crate) static ON_UTP_THREADS: [std::sync::atomic::AtomicUsize; 2] = [
-    std::sync::atomic::AtomicUsize::new(0),
-    std::sync::atomic::AtomicUsize::new(0),
-];
+static ON_UTP_THREADS: std::sync::Mutex<std::collections::BTreeMap<String, [usize; 3]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Connections run so far on a session's first uTP thread, the one that
-/// reads and sends on its sockets.
+/// The connections [`ON_UTP_THREADS`] counted for the session whose uTP
+/// threads are named `name`.
 #[cfg(test)]
-pub(crate) static ON_UTP_IO_THREAD: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn on_utp_threads(name: &str) -> [usize; 3] {
+    ON_UTP_THREADS
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .unwrap_or_default()
+}
 
 #[cfg(test)]
 fn count_on_utp_thread(outgoing: bool) {
-    use std::sync::atomic::Ordering;
-    if weaver_utp::on_shard_thread() {
-        ON_UTP_THREADS[usize::from(outgoing)].fetch_add(1, Ordering::Relaxed);
-        // A session's uTP threads are named `utp{session}-{index}`.
-        if std::thread::current()
-            .name()
-            .is_some_and(|name| name.ends_with("-0"))
-        {
-            ON_UTP_IO_THREAD.fetch_add(1, Ordering::Relaxed);
-        }
+    if !weaver_utp::on_shard_thread() {
+        return;
+    }
+    // A session's uTP threads are named `utp{session}-{index}`.
+    let thread = std::thread::current();
+    let Some((session, index)) = thread.name().and_then(|name| name.rsplit_once('-')) else {
+        return;
+    };
+    let mut counts = ON_UTP_THREADS.lock().unwrap();
+    let counts = counts.entry(session.to_owned()).or_default();
+    counts[usize::from(outgoing)] += 1;
+    if index == "0" {
+        counts[2] += 1;
     }
 }
 
@@ -522,6 +554,8 @@ pub(crate) struct Connected {
     pub link: Link<crate::mse::Outbound>,
     meter: Meter,
     encryption: crate::mse::Encryption,
+    // The connection was made where encryption is preferred.
+    prefer: bool,
     write_buf: Box<[u8]>,
     greeting: Id20,
 }
@@ -912,14 +946,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
         let now = Instant::now();
-        let (link, meter, encryption) = self
+        let seen = UtpSeen::default();
+        let policy = self.options.encryption_under(self.connector.encryption());
+        let prefer = policy == EncryptionPolicy::Prefer;
+        let connected = self
             .connector
             .connect_link(
                 self.addr,
                 self.transports,
                 match &self.ssl {
                     Some(ssl) => Guard::Tls(ssl),
-                    None => Guard::Mse(self.options.encryption_under(self.connector.encryption())),
+                    None => Guard::Mse(policy),
                 },
                 &greeting,
                 &write_buf[..hsz],
@@ -927,13 +964,28 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 connect_timeout,
                 handshake_timeout,
                 self.handler.tcp_wants(),
+                &seen,
+                Some(
+                    self.options
+                        .dial_orders
+                        .unwrap_or_else(|| self.connector.dial_orders())
+                        .pick(self.handler.seeding()),
+                ),
             )
-            .await?;
+            .await;
+        if let Some(opened) = seen.get() {
+            self.handler.on_utp_dialed(opened);
+        }
+        let (link, meter, encryption) = connected?;
         self.handler.on_connected(now.elapsed());
+        if prefer && encryption.is_encrypted() {
+            self.handler.on_outgoing_method_worked(true);
+        }
         Ok(Connected {
             link,
             meter,
             encryption,
+            prefer,
             write_buf,
             greeting,
         })
@@ -956,6 +1008,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 },
             meter,
             encryption,
+            prefer,
             write_buf,
             greeting,
         } = connected;
@@ -988,8 +1041,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.handler
                 .on_handshake(h, ckind, speaks_v2)
                 .map_err(handler_error)?;
-            // The peer answered, so the method this connection tried works
-            // with it (libtorrent `bt_peer_connection::on_receive_impl`).
+            // The peer answered, so a plain handshake works with it; an
+            // encrypted one was told so when it was done (libtorrent
+            // `bt_peer_connection::on_receive_handshake`).
+            if prefer && !encryption.is_encrypted() {
+                self.handler.on_outgoing_method_worked(false);
+            }
             self.handler.on_handshake_encryption(encryption);
 
             self.manage_peer(ManagePeerArgs {
@@ -1779,6 +1836,115 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(start.elapsed(), DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    /// A handler that holds every piece it wants when `0` holds.
+    struct Holding(bool);
+
+    impl PeerConnectionHandler for Holding {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, _: Message<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn seeding(&self) -> bool {
+            self.0
+        }
+    }
+
+    // The dial order is picked from the torrent's state when the dial
+    // starts: under TCP first while downloading and uTP first while
+    // seeding, a peer that listens on both gets a uTP SYN first from a
+    // seeding torrent, and TCP's connect once that is not answered; from a
+    // downloading one it gets TCP's connect and no datagram.
+    #[tokio::test]
+    async fn a_dial_takes_the_order_of_the_torrents_state() {
+        for seeding in [true, false] {
+            let opts = weaver_utp::SocketOpts {
+                syn_resends: std::num::NonZeroUsize::new(1),
+                connect_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            };
+            let ours = crate::listen::bind_utp(
+                &crate::test_support::sockets(),
+                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                opts,
+                crate::udp_options::STREAM_WINDOW,
+                None,
+            )
+            .await
+            .unwrap();
+            let connector = StreamConnector::new(StreamConnectorArgs {
+                enable_tcp: true,
+                utp_socket: Some(ours),
+                encryption: EncryptionPolicy::Disabled,
+                ..StreamConnectorArgs::over(crate::test_support::socket_factory())
+            })
+            .await
+            .unwrap();
+            connector.set_dial_orders(crate::DialOrders {
+                downloading: crate::DialOrder::TcpFirst,
+                seeding: crate::DialOrder::UtpFirst,
+            });
+            let (theirs, listener) = loop {
+                let theirs = crate::test_support::loopback_udp().await;
+                let port = theirs.bind_addr().port();
+                // The port is free for UDP; another test may hold it for TCP.
+                if let Ok(listener) =
+                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+                {
+                    break (theirs, listener);
+                }
+            };
+            let connection = PeerConnection::new(
+                theirs.bind_addr(),
+                InfoHashes {
+                    v1: Some(Id20::new(HASH)),
+                    v2: None,
+                },
+                Id20::new([1; 20]),
+                Holding(seeding),
+                Some(PeerConnectionOptions {
+                    read_write_timeout: Some(Duration::from_secs(120)),
+                    ..Default::default()
+                }),
+                BlockingSpawner::new(1),
+                Arc::new(connector),
+            );
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(async move { connection.manage_peer_outgoing(rx).await });
+            let mut datagram = [0u8; 1500];
+            if seeding {
+                let (len, _) = theirs.recv_from(&mut datagram).await.unwrap();
+                // uTP's packet type is the high nibble of its first byte;
+                // ST_SYN is 4 (BEP 29).
+                assert!(len >= 20);
+                assert_eq!(datagram[0] >> 4, 4, "a uTP SYN first");
+                assert!(futures::poll!(std::pin::pin!(listener.accept())).is_pending());
+                listener.accept().await.unwrap();
+            } else {
+                listener.accept().await.unwrap();
+                assert!(
+                    futures::poll!(std::pin::pin!(theirs.recv_from(&mut datagram))).is_pending(),
+                    "no uTP SYN behind a TCP connect that opened"
+                );
+            }
+            task.abort();
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2627,6 +2793,10 @@ mod tests {
             handshake_timeout: Some(Duration::from_millis(2500)),
             max_request_window: None,
             encryption: None,
+            dial_orders: Some(crate::DialOrders {
+                downloading: crate::DialOrder::UtpOnly,
+                seeding: crate::DialOrder::UtpFirst,
+            }),
         };
         assert_eq!(
             serde_json::to_value(options).unwrap(),
@@ -2637,6 +2807,7 @@ mod tests {
                 "handshake_timeout": 3,
                 "max_request_window": null,
                 "encryption": null,
+                "dial_orders": {"downloading": "utp_only", "seeding": "utp_first"},
             })
         );
         let parsed: PeerConnectionOptions =

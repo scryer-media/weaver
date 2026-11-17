@@ -636,6 +636,11 @@ impl PeerConnectionHandler for Handler {
         self.peers.encrypt_outgoing(self.addr.into())
     }
 
+    fn on_outgoing_method_worked(&self, encrypted: bool) {
+        self.peers
+            .outgoing_method_worked(self.addr.into(), encrypted);
+    }
+
     fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
         if let Some(transport) = self.transport() {
             self.fetch.swarm.handshake(

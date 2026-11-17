@@ -117,7 +117,9 @@ impl Session {
         let mut snapshot =
             SessionStatsSnapshot::from((&*self.stats, self.connector.stats().snapshot()));
         snapshot.disk = self.spawner.disk_snapshot();
-        for socket in &self.utp_sockets {
+        // A socket bound by a dial, on demand or after a failed bind, counts
+        // with the ones bound at start.
+        for socket in self.utp_sockets.iter().chain(self.connector.rebound_utp()) {
             snapshot.utp += socket.0.stats().snapshot();
         }
         snapshot.unchoke_slots_held = self.choker.held();
