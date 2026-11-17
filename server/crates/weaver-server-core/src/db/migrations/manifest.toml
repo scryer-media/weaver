@@ -1780,17 +1780,56 @@ scope = "upgrade_only"
 
 [[migration]]
 version = 126
-description = "a tracker rule may name the transport its torrents dial peers on first"
+description = "a torrent list keeps a privacy in the table"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0126_tracker_rule_peer_protocol/sqlite.sql"
+file = "migrations/0126_torrent_list_private/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0126_tracker_rule_peer_protocol/postgres.sql"
+file = "migrations/0126_torrent_list_private/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_torrent_private_v126"
+scope = "upgrade_only"
+
+[[migration]]
+version = 127
+description = "a tracker row is keyed by its URL's keyed digest"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0127_torrent_tracker_url_key/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0127_torrent_tracker_url_key/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 128
+description = "a tracker rule may name the transport its torrents dial peers on first"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0128_tracker_rule_peer_protocol/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0128_tracker_rule_peer_protocol/postgres.sql"
 engine = "postgres"
 scope = "all"

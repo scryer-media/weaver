@@ -31,6 +31,7 @@ async fn the_ledger_is_written_at_each_tick_it_changed() {
         .uploaded_bytes = 5;
     clock.shift_unix_ms(TICK.as_millis() as i64);
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(written.borrow().ledgers, base + 1);
     assert_eq!(
         rig.db
@@ -42,6 +43,7 @@ async fn the_ledger_is_written_at_each_tick_it_changed() {
     );
     clock.shift_unix_ms(TICK.as_millis() as i64);
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(written.borrow().ledgers, base + 1);
 }
 
@@ -60,13 +62,16 @@ async fn the_checkpoint_is_written_once_a_tick() {
         .unwrap();
     let written = rig.service.written();
     rig.service.tick().await;
+    rig.service.restored().await;
     let base = written.borrow().checkpoints;
     for _ in 0..3 {
         rig.service.inner.signal.mark(job_id);
     }
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(written.borrow().checkpoints, base + 1);
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(written.borrow().checkpoints, base + 1);
 }
 
@@ -320,13 +325,16 @@ async fn an_idle_seeds_times_are_written_on_the_long_timer_not_each_tick() {
     let seeded = seeded().await;
     seeded.advance(super::TIMES_EVERY_MS);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let written = seeded.stored();
     assert_eq!(written, seeded.kept().await);
     let ticks = TICK.as_millis() as i64;
     seeded.advance(ticks);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     seeded.advance(ticks);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     assert_eq!(seeded.stored(), written);
     assert_eq!(
         seeded.kept().await.active_duration_s,
@@ -334,6 +342,7 @@ async fn an_idle_seeds_times_are_written_on_the_long_timer_not_each_tick() {
     );
     seeded.advance(super::TIMES_EVERY_MS);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     assert_eq!(seeded.stored(), seeded.kept().await);
     seeded.advance(ticks);
     let at_stop = seeded.view().await.active_seconds;
@@ -373,6 +382,7 @@ async fn a_torrents_wasted_bytes_survive_a_restart() {
     }
     seeded.advance(TICK.as_millis() as i64);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let kept = seeded.kept().await;
     assert_eq!((kept.failed_bytes, kept.redundant_bytes), (16_384, 16_384));
     let stored = seeded.stored();
@@ -415,6 +425,7 @@ async fn an_unchanged_ledger_is_not_written_and_wasted_bytes_are() {
     let seeded = seeded().await;
     seeded.advance(super::TIMES_EVERY_MS);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let now = seeded.clock.unix_ms();
     let mut live = seeded.rig.service.inner.live.lock().await;
     let torrent = live.get_mut(&seeded.job_id).unwrap();

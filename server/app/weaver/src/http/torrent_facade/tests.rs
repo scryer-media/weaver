@@ -196,6 +196,53 @@ async fn rig_on(
 ) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_in_memory().unwrap();
+    let torrents = if torrents_on {
+        let torrents = client(&db, dir.path(), routes);
+        torrents.start().await.unwrap();
+        torrents.publish_to(handle.clone());
+        Some(torrents)
+    } else {
+        None
+    };
+    rig_around(dir, db, torrents, security, handle, api)
+}
+
+// A torrent client over `db`, its files under `dir`, not yet started.
+fn client(db: &Database, dir: &std::path::Path, routes: Offline) -> TorrentService {
+    let sessions = Sessions::new(
+        Arc::new(routes),
+        SessionEnv {
+            root: dir.join("sessions"),
+        },
+        db.clone(),
+    );
+    TorrentService::new(
+        db.clone(),
+        sessions,
+        TorrentSettings {
+            upload_cap: None,
+            complete_dir: dir.join("complete"),
+            categories: Vec::new(),
+            seeding: None,
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
+        },
+        JobEnv::unbounded(),
+        Arc::new(SystemClock),
+    )
+}
+
+// The facade over `db` and the torrent client given.
+fn rig_around(
+    dir: tempfile::TempDir,
+    db: Database,
+    torrents: Option<TorrentService>,
+    security: RuntimeSecurityConfig,
+    handle: SchedulerHandle,
+    api: Api,
+) -> Rig {
     let complete = dir.path().join("complete");
     let config = config(&complete);
     let keys = ApiKeyCache::default();
@@ -206,37 +253,9 @@ async fn rig_on(
             scope: scope.to_owned(),
         });
     }
-    let torrents = if torrents_on {
-        let sessions = Sessions::new(
-            Arc::new(routes),
-            SessionEnv {
-                root: dir.path().join("sessions"),
-            },
-            db.clone(),
-        );
-        let torrents = TorrentService::new(
-            db.clone(),
-            sessions,
-            TorrentSettings {
-                upload_cap: None,
-                complete_dir: complete.clone(),
-                categories: Vec::new(),
-                seeding: None,
-                torrent: TorrentConfig {
-                    enabled: true,
-                    ..TorrentConfig::default()
-                },
-            },
-            JobEnv::unbounded(),
-            Arc::new(SystemClock),
-        );
-        torrents.start().await.unwrap();
-        torrents.publish_to(handle.clone());
+    if let Some(torrents) = &torrents {
         torrents.make_categories_in(config.clone());
-        Some(torrents)
-    } else {
-        None
-    };
+    }
     let context = TorrentFacadeContext::new(
         db.clone(),
         handle.clone(),
@@ -264,6 +283,29 @@ async fn rig_on(
 
 async fn rig() -> Rig {
     rig_with(true).await
+}
+
+// `before`'s server started again over the torrents it kept, the load of
+// them held before its first page: the facade answers, and none is read.
+async fn rig_loading(before: Rig) -> (Rig, TorrentService) {
+    let Rig {
+        context, db, _dir, ..
+    } = before;
+    context.inner.torrents.as_ref().unwrap().stop().await;
+    let handle = scheduler();
+    let torrents = client(&db, _dir.path(), Offline::default());
+    torrents.hold_load(true);
+    torrents.start_loading().await.unwrap();
+    torrents.publish_to(handle.clone());
+    let rig = rig_around(
+        _dir,
+        db,
+        Some(torrents.clone()),
+        RuntimeSecurityConfig::default(),
+        handle,
+        Api::LATEST,
+    );
+    (rig, torrents)
 }
 
 struct Reply {
@@ -3762,7 +3804,7 @@ async fn peers_are_listed_by_hash_and_a_ban_reaches_every_torrent() {
         )
         .await;
     assert_eq!(banned.status, StatusCode::OK);
-    let views = rig.context.views().await;
+    let views = rig.context.views().await.ok().unwrap();
     assert_eq!(views.len(), 2);
     for job in views.iter().map(|view| view.job_id) {
         let banned: Vec<String> = rig
@@ -4681,6 +4723,7 @@ async fn a_read_key_sees_no_article_link_passkey() {
             .await
         }
     };
+    let id = |item_id: &str| rig.db.rss_seen_item_key(item_id);
     let links = |body: &Value| -> Vec<(String, Value, Value)> {
         body["one"]["articles"]
             .as_array()
@@ -4700,31 +4743,42 @@ async fn a_read_key_sees_no_article_link_passkey() {
         let reader = read(key).await;
         assert!(!reader.body.contains("5ecret"), "{key} {}", reader.body);
         assert!(!reader.body.contains("tr="), "{key} {}", reader.body);
-        let mut shown = links(&reader.json());
-        shown.sort_by(|a, b| a.0.cmp(&b.0));
+        // An article's id is its keyed digest: a feed often gives the
+        // link as the id.
+        assert!(!reader.body.contains("\"id\":\"indexer\""), "{key}");
+        let shown: std::collections::BTreeMap<String, (Value, Value)> = links(&reader.json())
+            .into_iter()
+            .map(|(id, url, link)| (id, (url, link)))
+            .collect();
         assert_eq!(
             shown,
-            vec![
+            [
                 (
-                    "indexer".to_owned(),
-                    json!("https://indexer.invalid:443/…"),
-                    json!("https://indexer.invalid:443/…"),
+                    id("indexer"),
+                    (
+                        json!("https://indexer.invalid:443/…"),
+                        json!("https://indexer.invalid:443/…"),
+                    ),
                 ),
-                ("magnet".to_owned(), json!("magnet:…"), json!("magnet:…")),
-            ],
+                (id("magnet"), (json!("magnet:…"), json!("magnet:…"))),
+            ]
+            .into(),
             "{key}"
         );
     }
 
     let admin = read(ADMIN).await;
-    let mut shown = links(&admin.json());
-    shown.sort_by(|a, b| a.0.cmp(&b.0));
+    let shown: std::collections::BTreeMap<String, (Value, Value)> = links(&admin.json())
+        .into_iter()
+        .map(|(id, url, link)| (id, (url, link)))
+        .collect();
     assert_eq!(
         shown,
-        vec![
-            ("indexer".to_owned(), json!(INDEXER), json!(INDEXER)),
-            ("magnet".to_owned(), json!(MAGNET), json!(MAGNET)),
+        [
+            (id("indexer"), (json!(INDEXER), json!(INDEXER))),
+            (id("magnet"), (json!(MAGNET), json!(MAGNET))),
         ]
+        .into()
     );
 }
 
@@ -5071,4 +5125,151 @@ async fn a_read_takes_get_post_or_head() {
             .await;
         assert_eq!(reply.status, status, "{method}");
     }
+}
+
+// While the stored torrents are still being read at start, an answer or an
+// action over every torrent is 503, never some of them as all; one that
+// names its torrents, or takes a page of the list, is answered from the
+// table, and reads only the torrents it names. An add to the top of the
+// queue made meanwhile is at the top once the last is in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answers_over_every_torrent_wait_for_the_load() {
+    let before = rig().await;
+    for name in ["one.mkv", "two.mkv", "three.mkv"] {
+        let added = before.add_file(&metainfo(name, 3000, false), &[]).await;
+        assert_eq!(added.status, StatusCode::OK);
+    }
+    let rows = before.torrents().await;
+    let hash = |name: &str| {
+        rows.iter().find(|row| row["name"] == name).unwrap()["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (one, two) = (hash("one.mkv"), hash("two.mkv"));
+    let (rig, torrents) = rig_loading(before).await;
+
+    // Every torrent, or more than a page of them: not yet.
+    for path in [
+        "/api/v2/torrents/info",
+        "/api/v2/torrents/info?category=films",
+        "/api/v2/torrents/info?filter=downloading",
+        "/api/v2/torrents/info?limit=501",
+        "/api/v2/torrents/info?offset=1",
+        "/api/v2/torrents/count",
+        "/api/v2/sync/maindata",
+        "/api/v2/sync/maindata?rid=1",
+        "/api/v2/transfer/info",
+        "/api/v2/torrents/uploadLimit?hashes=all",
+    ] {
+        let reply = rig.get(path).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert!(reply.body.contains("loading"), "{path}: {}", reply.body);
+    }
+    for (path, form) in [
+        ("/api/v2/torrents/delete", "hashes=all&deleteFiles=false"),
+        ("/api/v2/torrents/setForceStart", "hashes=all&value=true"),
+        ("/api/v2/torrents/recheck", "hashes=all"),
+        ("/api/v2/torrents/reannounce", "hashes=all"),
+        ("/api/v2/torrents/topPrio", "hashes=all"),
+        ("/api/v2/torrents/setCategory", "hashes=all&category="),
+        ("/api/v2/torrents/setUploadLimit", "hashes=all&limit=1024"),
+        ("/api/v2/transfer/banPeers", "peers=127.0.0.3%3A6881"),
+    ] {
+        let reply = rig.post(path, form).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+    }
+    // A stop or a start of them all is one hold over the torrents, here
+    // or not: it needs none of them.
+    for action in ["stop", "start"] {
+        assert_eq!(
+            rig.post(&format!("/api/v2/torrents/{action}"), "hashes=all")
+                .await
+                .status,
+            StatusCode::OK
+        );
+    }
+    // None of them read a torrent, and none was acted on.
+    assert_eq!(torrents.count().await, 0);
+    assert_eq!(rig.db.list_torrents().unwrap().len(), 3);
+
+    // A torrent named is read, that one alone, and acted on.
+    let named = rig
+        .get(&format!("/api/v2/torrents/info?hashes={one}"))
+        .await;
+    assert_eq!(named.status, StatusCode::OK);
+    let named = named.json();
+    assert_eq!(named.as_array().unwrap().len(), 1);
+    assert_eq!(named[0]["name"], "one.mkv");
+    assert_eq!(torrents.count().await, 1);
+    assert_eq!(
+        rig.get(&format!("/api/v2/torrents/properties?hash={one}"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        rig.post("/api/v2/torrents/stop", &format!("hashes={one}"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    // A page of the list reads the torrents it shows.
+    let paged = rig.get("/api/v2/torrents/info?limit=2").await;
+    assert_eq!(paged.status, StatusCode::OK);
+    let paged = paged.json();
+    let names: Vec<&str> = paged
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["one.mkv", "two.mkv"]);
+    assert_eq!(names.len(), torrents.count().await);
+    // A move, and an add to the top, asked for now.
+    assert_eq!(
+        rig.post("/api/v2/torrents/topPrio", &format!("hashes={two}"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let added = rig
+        .add_file(
+            &metainfo("four.mkv", 3000, false),
+            &[("addToTopOfQueue", "true")],
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+
+    torrents.hold_load(false);
+    torrents.loaded().await;
+    assert_eq!(rig.get("/api/v2/torrents/count").await.body, "4");
+    assert_eq!(
+        rig.get("/api/v2/sync/maindata").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        rig.get("/api/v2/transfer/info").await.status,
+        StatusCode::OK
+    );
+    let rows = rig.torrents().await;
+    let mut order: Vec<(i64, &str)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["priority"].as_i64().unwrap(),
+                row["name"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    order.sort_unstable();
+    // The stopped one keeps its place among those still downloading.
+    assert_eq!(
+        order.iter().map(|(_, name)| *name).collect::<Vec<_>>(),
+        ["four.mkv", "two.mkv", "one.mkv", "three.mkv"]
+    );
+    assert_eq!(
+        rig.post("/api/v2/torrents/stop", "hashes=all").await.status,
+        StatusCode::OK
+    );
 }

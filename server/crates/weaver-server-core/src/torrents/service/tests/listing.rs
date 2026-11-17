@@ -474,11 +474,43 @@ async fn a_row_reads_the_totals_its_files_give() {
 // every torrent's record gave, in the same order, for every category match,
 // named hashes past one statement's binds, privacy and window. Ties in the
 // time added fall back to the job id; some torrents go by a v2 hash alone,
-// some sit in a category the settings no longer name.
+// some sit in a category the settings no longer name. A third carry a
+// private metainfo, a third a public one and a third are magnets with none,
+// whose privacy the table holds as the add and the metadata's arrival write
+// it, and the walk reads as the restore reads it from the metainfo.
 #[test]
 fn the_tables_pick_is_the_walk_of_every_record() {
+    picks_are_the_walk_of_every_record(&Database::open_in_memory().unwrap());
+}
+
+// The same on PostgreSQL, in a schema of its own on the server
+// `WEAVER_TEST_POSTGRES_URL` names; skipped when it names none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tables_pick_is_the_walk_of_every_record_on_postgres() {
+    use crate::persistence::database_target::DatabaseTarget;
+    let Some((admin, schema, url)) =
+        crate::persistence::connection::tests::create_postgres_test_schema("torrent_list").await
+    else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let db = Database::open_target(DatabaseTarget::PostgresUrl(url)).unwrap();
+        picks_are_the_walk_of_every_record(&db);
+    })
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+}
+
+fn picks_are_the_walk_of_every_record(db: &Database) {
+    use crate::schema_migrations::torrent_private_v126::tiny_metainfo;
+    use crate::torrents::service::metainfo_is_private;
     const SEEDED: u64 = 3000;
-    let db = Database::open_in_memory().unwrap();
     let category = |id: u32, name: &str| CategoryConfig {
         upload_cap: Default::default(),
         id,
@@ -518,7 +550,8 @@ fn the_tables_pick_is_the_walk_of_every_record() {
             infohash_v2: (v2_only || job_id % 5 == 0).then_some(v2),
             name: format!("t{job_id}"),
             source: TorrentSource::Magnet,
-            metainfo: None,
+            metainfo: (job_id % 3 != 2)
+                .then(|| tiny_metainfo(&format!("t{job_id}"), job_id % 3 == 0).into()),
             category_id: [None, Some(1), Some(2), Some(3), Some(9), Some(4)][job_id as usize % 6],
             // Three at each instant, added out of job order.
             added_at_ms: EPOCH_MS + ((SEEDED - job_id) / 3) as i64,
@@ -540,15 +573,22 @@ fn the_tables_pick_is_the_walk_of_every_record() {
             move_to: None,
             queue_position: job_id as i64,
             pool_member: None,
+            private: false,
+        };
+        // The privacy the add writes: what the metainfo reads as.
+        let record = TorrentRecord {
+            private: record.metainfo.as_deref().is_some_and(metainfo_is_private),
+            ..record
         };
         db.insert_torrent(&record, &[]).unwrap();
-        let mut torrent = Live::new(
+        let torrent = Live::new(
             record,
             TorrentCounters::default(),
             ResumePeers::default(),
             EPOCH_MS,
         );
-        torrent.private = job_id % 3 == 0;
+        // The privacy is the row's, the one source the list filters on.
+        assert_eq!(torrent.record.private, job_id % 3 == 0);
         live.insert(JobId(job_id), torrent);
     }
     let hex = |live: &Live| hashes_of(&live.record).best().as_string();
@@ -597,10 +637,17 @@ fn the_tables_pick_is_the_walk_of_every_record() {
                     category,
                     private,
                 };
+                // The table's count is the walk's.
+                assert_eq!(
+                    db.count_torrent_list(&pick.filter(&settings)).unwrap(),
+                    pick.paged(&settings, &live, Window::Every).len(),
+                    "hashes {:?}, {category:?}, private {private:?}",
+                    hashes.map(<[&str]>::len)
+                );
                 let (old, new) = (windows(), windows());
                 for ((name, old), (_, new)) in old.into_iter().zip(new) {
                     let old = pick.paged(&settings, &live, old);
-                    let new = pick.picked(&settings, &db, new).unwrap().under(&live);
+                    let new = pick.picked(&settings, db, new).unwrap().under(&live);
                     assert_eq!(
                         new,
                         old,

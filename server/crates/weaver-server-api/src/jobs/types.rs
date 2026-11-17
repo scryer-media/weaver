@@ -49,6 +49,46 @@ pub struct Attribute {
     pub value: String,
 }
 
+/// Put in a request's data to leave every job's RSS link and id out of
+/// its answer whatever the caller's scope: a diagnostics bundle is read by
+/// people other than the admin who made it.
+pub struct HideRssLinks;
+
+// A job's RSS link and id as this request's caller is shown them: opened
+// for an admin, nothing for anyone else. `link` is the job's stored pairs
+// (`rss_link_pairs`); the core owner decides.
+pub(crate) fn rss_link_for_caller(
+    ctx: &async_graphql::Context<'_>,
+    link: &[(String, String)],
+) -> Vec<(String, String)> {
+    if link.is_empty() || ctx.data_opt::<HideRssLinks>().is_some() {
+        return Vec::new();
+    }
+    match (
+        ctx.data_opt::<weaver_server_core::Database>(),
+        ctx.data_opt::<weaver_server_core::auth::CallerScope>(),
+    ) {
+        (Some(db), Some(scope)) => db.rss_link_attributes(link, *scope),
+        _ => Vec::new(),
+    }
+}
+
+// A job's public attributes, then its RSS link and id as this request's
+// caller is shown them.
+pub(crate) fn attributes_for_caller(
+    ctx: &async_graphql::Context<'_>,
+    attributes: &[Attribute],
+    link: &[(String, String)],
+) -> Vec<Attribute> {
+    let mut shown = attributes.to_vec();
+    shown.extend(
+        rss_link_for_caller(ctx, link)
+            .into_iter()
+            .map(|(key, value)| Attribute { key, value }),
+    );
+    shown
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, InputObject)]
 pub struct AttributeInput {
     pub key: String,
@@ -315,7 +355,15 @@ pub struct QueueItem {
     pub remaining_par_count: u32,
     pub has_password: bool,
     pub category: Option<String>,
+    /// The job's public attributes. GraphQL answers them through the
+    /// `attributes` resolver, which adds the RSS link for an admin.
+    #[graphql(skip)]
     pub attributes: Vec<Attribute>,
+    /// The job's RSS link and id as stored, for `rss_link_for_caller`
+    /// alone: never answered or serialised as they are.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub rss_link: Vec<(String, String)>,
     pub client_request_id: Option<String>,
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -328,6 +376,12 @@ pub struct QueueItem {
 
 #[async_graphql::ComplexObject]
 impl QueueItem {
+    /// The job's attributes. An RSS job's item link and id are among them
+    /// for an admin only.
+    async fn attributes(&self, ctx: &async_graphql::Context<'_>) -> Vec<Attribute> {
+        attributes_for_caller(ctx, &self.attributes, &self.rss_link)
+    }
+
     /// The job's tags, in tag order.
     async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
         crate::tags::tags_of(ctx, self.id).await
@@ -1234,13 +1288,32 @@ pub struct Job {
     pub health: u32,
     pub has_password: bool,
     pub category: Option<String>,
+    /// The job's public metadata. GraphQL answers it through the
+    /// `metadata` resolver, which adds the RSS link for an admin.
+    #[graphql(skip)]
     pub metadata: Vec<MetadataEntry>,
+    /// The job's RSS link and id as stored, for `rss_link_for_caller`
+    /// alone.
+    #[graphql(skip)]
+    pub rss_link: Vec<(String, String)>,
     pub output_dir: Option<String>,
     pub created_at: Option<f64>,
 }
 
 #[async_graphql::ComplexObject]
 impl Job {
+    /// The job's metadata. An RSS job's item link and id are in it for an
+    /// admin only.
+    async fn metadata(&self, ctx: &async_graphql::Context<'_>) -> Vec<MetadataEntry> {
+        let mut shown = self.metadata.clone();
+        shown.extend(
+            rss_link_for_caller(ctx, &self.rss_link)
+                .into_iter()
+                .map(|(key, value)| MetadataEntry { key, value }),
+        );
+        shown
+    }
+
     /// The job's tags, in tag order.
     async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
         crate::tags::tags_of(ctx, self.id).await
@@ -1282,6 +1355,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
                     value: v.clone(),
                 })
                 .collect(),
+            rss_link: weaver_server_core::history::attributes::rss_link_pairs(&info.metadata),
             output_dir: info.output_dir.clone(),
             created_at: Some(info.created_at_epoch_ms),
         }
@@ -1584,6 +1658,7 @@ fn queue_item_from_display(
         }),
         category: info.category.clone(),
         attributes,
+        rss_link: weaver_server_core::history::attributes::rss_link_pairs(&info.metadata),
         client_request_id,
         output_dir: info.output_dir.clone(),
         created_at: ms_to_datetime(info.created_at_epoch_ms as i64),
@@ -1637,6 +1712,9 @@ pub fn queue_item_from_submission(
         has_password: submitted.summary.password.is_some(),
         category: submitted.summary.category.clone(),
         attributes,
+        rss_link: weaver_server_core::history::attributes::rss_link_pairs(
+            &submitted.summary.metadata,
+        ),
         client_request_id,
         output_dir: None,
         created_at: ms_to_datetime(submitted.created_at_epoch_ms as i64),

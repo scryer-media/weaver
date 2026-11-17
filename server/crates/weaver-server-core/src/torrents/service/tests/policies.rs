@@ -114,6 +114,7 @@ async fn the_tighter_of_a_torrents_limit_and_its_upload_cap_holds() {
     };
     rig.service.set_settings(capped(1_000)).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(handle.ratelimits().upload_bps, bps(1_000));
     assert_eq!(
         rig.service.torrent(job_id).await.unwrap().upload_limit,
@@ -122,6 +123,7 @@ async fn the_tighter_of_a_torrents_limit_and_its_upload_cap_holds() {
 
     rig.service.set_settings(capped(1_000_000)).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(handle.ratelimits().upload_bps, bps(65_536));
 
     rig.service
@@ -235,6 +237,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
         .unwrap();
     rig.service.reload_tracker_rules().await.unwrap();
     rig.service.tick().await;
+    rig.service.restored().await;
     let again = handle_of(&rig.service, ruled).await;
     assert!(!Arc::ptr_eq(&handle, &again));
     assert!(again.discovery().dht && again.discovery().lsd && again.speaks_pex());
@@ -325,6 +328,7 @@ async fn a_tracker_rules_dht_pex_and_lsd_each_reach_its_torrents() {
         .unwrap();
     rig.service.reload_tracker_rules().await.unwrap();
     rig.service.tick().await;
+    rig.service.restored().await;
     let again = handle_of(&rig.service, ruled).await;
     assert!(!Arc::ptr_eq(&handle, &again));
     assert!(!again.is_private());

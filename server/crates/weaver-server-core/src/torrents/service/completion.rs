@@ -367,7 +367,7 @@ impl TorrentService {
         let _ = self.landed(landing).await;
         // Its files are all there now: what it holds is spelled as the
         // filesystem spells them.
-        self.respell_held(Some(job_id)).await;
+        self.respell_held(vec![job_id]).await;
         // One that downloaded under its download path moves under its save
         // path now, over any file of the same name there (qBittorrent
         // `TorrentImpl::handleTorrentFinished` and `adjustStorageLocation`).

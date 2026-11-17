@@ -334,6 +334,10 @@ pub struct TorrentRecord {
     // The pool member its route's session runs it on, by proxy id, while
     // its route has a pool: it stays there until that member fails.
     pub pool_member: Option<u32>,
+    // Whether its metainfo marks it private, as a read of that metainfo
+    // says; false while a magnet has none. Written with the metainfo, never
+    // apart from it, so a list keeps a privacy in the table.
+    pub private: bool,
 }
 
 impl TorrentRecord {

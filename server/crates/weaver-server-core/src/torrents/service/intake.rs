@@ -5,8 +5,9 @@ use super::live::Live;
 use super::retire::{held_at, held_tops};
 use super::settings::TorrentSettings;
 use super::{
-    NEEDS_DHT, PeerTerms, TorrentService, give_back, hashes_of, held_by, identity_of,
-    in_table_order, queued, state_error, take_turn, tidy_trackers, tracker, tracker_tiers,
+    Asked, NEEDS_DHT, PeerTerms, TorrentService, give_back, hashes_of, held_by, identity_of,
+    in_table_order, locked, once_a_tier, queued, state_error, take_turn, tidy_trackers, tracker,
+    tracker_tiers,
 };
 use crate::auth::CallerScope;
 use crate::categories::CategoryConfig;
@@ -290,6 +291,12 @@ fn infohashes(hashes: InfoHashes) -> Vec<Infohash> {
         .collect()
 }
 
+// Whether a torrent of this metainfo reads as private: what a restore of
+// it reads, false for a metainfo that does not read.
+pub(crate) fn metainfo_is_private(bytes: &[u8]) -> bool {
+    parse(bytes).is_ok_and(|parsed| parsed.private)
+}
+
 pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
     let invalid =
         |error: &dyn std::fmt::Display| AddError::Invalid(format!("not a torrent: {error}"));
@@ -546,6 +553,7 @@ impl TorrentService {
                 record.storage_dir = Some(dir.clone());
                 record.files_dir = files_dir;
                 record.seed_mode = request.placement.seed_mode;
+                record.private = parsed.private;
                 let held = held_at(
                     &record,
                     held_tops(parsed.manifest.paths.iter().map(String::as_str)),
@@ -675,7 +683,24 @@ impl TorrentService {
                 .queue_end
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let turn = end.slots.take(&queued, &holds);
+            let mut turn = end.slots.take(&queued, &holds);
+            // Added while the stored torrents are still being read, it
+            // waits for its turn among all of them: the pass at the load's
+            // end gives it, and its place past every one of them.
+            // Asked under the lock the load ends under, so its place is
+            // given by the load's end or is its own already. A load whose
+            // page failed lets the torrents here run meanwhile.
+            let partial = {
+                let mut marks = locked(&self.inner.load_marks);
+                let loading = self.loading();
+                if loading {
+                    marks.asked.push(Asked::Added(torrent.record.job_id));
+                }
+                loading && marks.fault.is_none()
+            };
+            if partial {
+                turn.active &= queued.forced || queued.seeding;
+            }
             if end.last.is_some_and(|last| place < last) {
                 self.inner.signal.want_pass();
             } else {
@@ -899,6 +924,7 @@ impl TorrentService {
                 .next_queue_position
                 .fetch_add(1, Ordering::Relaxed),
             pool_member: None,
+            private: false,
         }
     }
 
@@ -914,6 +940,9 @@ impl TorrentService {
         // its whole folder until its metainfo arrives.
         held: Option<Vec<String>>,
     ) -> Result<Live, AddError> {
+        // The table keeps a URL once in a tier, the first that names it:
+        // the same list is written and held, so the two never differ.
+        let trackers = &once_a_tier(trackers);
         let rules = self.rules();
         let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
         record.forced |= rule.is_some_and(|rule| rule.forced);
@@ -1170,6 +1199,7 @@ impl TorrentService {
         torrent.record.storage_dir = Some(dir.clone());
         torrent.record.files_dir = files_dir.clone();
         torrent.record.metainfo = Some(bytes.clone());
+        torrent.record.private = parsed.private;
         // The trackers the magnet listed stay, edits included, each as
         // whoever named it; the metainfo's own join after them as the
         // torrent's.
@@ -1184,6 +1214,7 @@ impl TorrentService {
                 torrent.record.infohash_v2,
                 &parsed.manifest.name,
                 &bytes,
+                parsed.private,
                 &dir,
                 files_dir.as_deref(),
                 &trackers,
@@ -1230,13 +1261,23 @@ impl TorrentService {
     // the route is up.
     pub(super) async fn resolve(&self, job_id: JobId) {
         let rules = self.rules();
-        let Some((record, rule, own)) = self.inner.live.lock().await.get(&job_id).map(|torrent| {
-            (
-                torrent.record.clone(),
-                torrent.rule(&rules),
-                torrent.identity.clone(),
-            )
-        }) else {
+        // One whose stored secrets did not decrypt is held: nothing of it is
+        // fetched.
+        let Some((record, rule, own)) = self
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .filter(|torrent| torrent.sealed.is_none())
+            .map(|torrent| {
+                (
+                    torrent.record.clone(),
+                    torrent.rule(&rules),
+                    torrent.identity.clone(),
+                )
+            })
+        else {
             return;
         };
         let scope = self.settings().scope(record.category_id, rule);

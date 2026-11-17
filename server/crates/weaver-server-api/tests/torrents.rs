@@ -2145,6 +2145,100 @@ async fn torrent_updates_follow_the_torrents_named() {
     }
 }
 
+// While the stored torrents are still being read at start, a page of the
+// list is read and answered, and the updates of every torrent are refused
+// under their own code, never begun from some of them; the updates of one
+// torrent are given. Once the last is in, every torrent's are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_updates_of_every_torrent_wait_for_the_load() {
+    use tokio_stream::StreamExt;
+
+    let before = rig().await;
+    let mut ids = Vec::new();
+    for name in ["one.mkv", "two.mkv", "three.mkv"] {
+        let response = before
+            .execute(&submit(&metainfo(name, 3000, false), ""))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        ids.push(
+            response.data.into_json().unwrap()["submitTorrent"]["id"]
+                .as_u64()
+                .unwrap(),
+        );
+    }
+    before.torrents.stop().await;
+    let Rig { harness, _dir, .. } = before;
+    let sessions = Sessions::new(
+        Arc::new(Offline),
+        SessionEnv {
+            root: _dir.path().join("sessions"),
+        },
+        harness.db.clone(),
+    );
+    let torrents = TorrentService::new(
+        harness.db.clone(),
+        sessions,
+        TorrentSettings {
+            upload_cap: None,
+            complete_dir: _dir.path().join("complete"),
+            categories: Vec::new(),
+            seeding: None,
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
+        },
+        JobEnv::unbounded(),
+        Arc::new(SystemClock),
+    );
+    torrents.hold_load(true);
+    torrents.start_loading().await.unwrap();
+    let rig = Rig {
+        harness,
+        torrents,
+        _dir,
+    };
+
+    let paged = rig.execute("{ torrents(first: 2) { id } }").await;
+    assert!(paged.errors.is_empty(), "{:?}", paged.errors);
+    assert_eq!(
+        paged.data.into_json().unwrap()["torrents"],
+        serde_json::json!([{ "id": ids[0] }, { "id": ids[1] }])
+    );
+    let updates = |of: &str| {
+        let request = Request::new(format!(
+            "subscription {{ torrentUpdates{of} {{ fullUpdate torrents {{ id }} }} }}"
+        ))
+        .data(CallerScope::Local)
+        .data(CallerIdentity::Local([7; 32]))
+        .data(rig.torrents.clone());
+        rig.harness.schema.execute_stream(request)
+    };
+    let refused = updates("").next().await.expect("an answer");
+    assert_eq!(code(&refused).as_deref(), Some("TORRENTS_LOADING"));
+    let one = updates(&format!("(id: {})", ids[2]))
+        .next()
+        .await
+        .expect("an answer");
+    assert!(one.errors.is_empty(), "{:?}", one.errors);
+    assert_eq!(
+        one.data.into_json().unwrap()["torrentUpdates"]["torrents"],
+        serde_json::json!([{ "id": ids[2] }])
+    );
+
+    rig.torrents.hold_load(false);
+    rig.torrents.loaded().await;
+    let every = updates("").next().await.expect("an answer");
+    assert!(every.errors.is_empty(), "{:?}", every.errors);
+    assert_eq!(
+        every.data.into_json().unwrap()["torrentUpdates"]["torrents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
 // Operator ruling, 2026-11-16 (PR 129 question 2): a control key moves a
 // torrent only to a folder at or under the default save folder or a
 // category's folder; elsewhere it is forbidden and nothing moves. An admin

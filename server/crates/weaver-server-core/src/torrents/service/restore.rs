@@ -7,10 +7,12 @@ use super::retire::{held_key, held_of, held_tops};
 use super::settings::TorrentSettings;
 use super::tick::Leveling;
 use super::{
-    PeerTerms, RESTORES_AT_ONCE, Signal, TorrentService, certificate_of, fetch_levels, files_dir,
-    held_by, identity_of, ignored_of, in_table_order, load_of, locked, placed, queued,
-    ratelimits_of, ssl_identity, state_error, tracker_tiers, unpacks,
+    Asked, Load, PeerTerms, RESTORES_AT_ONCE, Restores, Signal, TorrentService, certificate_of,
+    fetch_levels, files_dir, held_by, identity_of, ignored_of, in_table_order, load_of, locked,
+    placed, queued, ratelimits_of, ssl_identity, state_error, tracker_tiers, unpacks,
 };
+use tokio::sync::watch;
+
 use crate::LoadError;
 use crate::jobs::JobId;
 use crate::jobs::model::{ArchivePasswordCandidate, ArchivePasswordSource};
@@ -25,6 +27,7 @@ use crate::settings::model::{TrackerCertificate, TrackerRule};
 use crate::torrents::files::Files;
 use crate::torrents::intake::{Holds, Intake, Room};
 use crate::torrents::layout::PieceLayout;
+use crate::torrents::queries::RestoredTorrent;
 use crate::torrents::sessions::{OPENING, RouteKey, RoutePlan};
 use crate::torrents::status::{Engine, Held};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
@@ -32,7 +35,7 @@ use crate::torrents::store::{Kept, Replayed, TorrentStore};
 use crate::torrents::tee::{Parts, Plan, Tee};
 use crate::torrents::{FilePriority, KeptIntent, TorrentCounters, TorrentIntent, TrackerEntry};
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -153,8 +156,19 @@ struct Joining {
 }
 
 impl TorrentService {
-    // Everything but the tick.
+    // Everything but the tick, every stored torrent read before it ends.
     pub(crate) async fn open(&self) -> Result<(), String> {
+        let through = self.begin()?;
+        self.load(through).await?;
+        self.after_load().await;
+        Ok(())
+    }
+
+    // What a start does before it reads a torrent: the tasks that follow
+    // the jobs and the settings, the tracker rules, and the last job a
+    // torrent row has, by the table's key, which is as far as the load
+    // reads. From here the stored torrents are being read.
+    pub(super) fn begin(&self) -> Result<Option<JobId>, String> {
         if let Some(task) = self.inner.env.hear_alone() {
             *locked(&self.inner.hearing) = Some(task);
         }
@@ -163,14 +177,29 @@ impl TorrentService {
         self.spawn_follow_trackers();
         self.spawn_follow_egress_limits();
         self.spawn_follow_interfaces();
-        self.restore().await?;
+        self.load_rules()?;
+        let through = self.inner.db.last_torrent_job().map_err(state_error)?;
+        self.inner.load.send_replace(Load::Running(through));
+        Ok(through)
+    }
+
+    // The stored torrents read, with no task of a start begun.
+    #[cfg(test)]
+    pub(super) async fn restore(&self) -> Result<(), String> {
+        self.load_rules()?;
+        let through = self.inner.db.last_torrent_job().map_err(state_error)?;
+        self.inner.load.send_replace(Load::Running(through));
+        self.load(through).await
+    }
+
+    // What a start does once every stored torrent is read.
+    pub(super) async fn after_load(&self) {
         // Torrents turned on while a wind-down's stops were kept, with no
         // pass since to resume them, resume now.
         if self.settings().torrent.enabled {
             self.resume_wound_down().await;
         }
         self.retry_retiring().await;
-        Ok(())
     }
 
     // The archive passwords a graph built for `torrent` now takes. One
@@ -521,7 +550,11 @@ impl TorrentService {
                 .set_torrent_file_priorities(job_id, &stored)
                 .map_err(state_error)?;
         }
-        self.describe(torrent, parsed, stored);
+        if let Some(unpack) = self.describe(torrent, parsed, stored)
+            && let Err(error) = self.inner.db.set_torrent_unpack_in_force(job_id, unpack)
+        {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
+        }
         let Some(made) = self.making(torrent, &self.global_passwords()) else {
             return Ok(());
         };
@@ -540,18 +573,22 @@ impl TorrentService {
     }
 
     // What the metainfo says of the torrent, without its job. Whether it
-    // unpacks is fixed here and kept, so a restart builds the same tree.
-    fn describe(&self, torrent: &mut Live, parsed: &Parsed, stored: Vec<FilePriority>) {
-        let job_id = torrent.record.job_id;
-        if torrent.record.unpack_in_force.is_none() {
+    // unpacks is fixed here, so a restart builds the same tree: given back
+    // when it was not fixed before, for the caller to keep, one torrent's
+    // alone or a page's in one write.
+    fn describe(
+        &self,
+        torrent: &mut Live,
+        parsed: &Parsed,
+        stored: Vec<FilePriority>,
+    ) -> Option<bool> {
+        let fixed = torrent.record.unpack_in_force.is_none().then(|| {
             let unpack = self
                 .settings()
                 .unpack(&torrent.record, torrent.rule(&self.rules()));
-            if let Err(error) = self.inner.db.set_torrent_unpack_in_force(job_id, unpack) {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
-            }
             torrent.record.unpack_in_force = Some(unpack);
-        }
+            unpack
+        });
         torrent.names = parsed.manifest.paths.clone();
         torrent.total = parsed.total;
         torrent.layout = Some(Arc::clone(&parsed.layout));
@@ -565,12 +602,89 @@ impl TorrentService {
             })
             .collect();
         torrent.about = parsed.about.clone();
-        torrent.private = parsed.private;
+        fixed
+    }
+
+    // `restore_jobs` as a pass of its own, begun off the caller's path: the
+    // tick asks for it and goes on at once, so start-up, the tick and every
+    // request answer while the jobs come back. One pass runs at a time; one
+    // asked while a pass runs follows it, for a torrent a held restore or a
+    // resume left waiting meanwhile.
+    pub(super) fn start_restores(&self) {
+        // Nothing came to wait for its job since the last pass was asked
+        // for: no pass, and no task.
+        if !self.inner.restore_wanted.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut begin = false;
+        self.inner.restores.send_if_modified(|run| match run {
+            Restores::Idle => {
+                *run = Restores::Running;
+                begin = true;
+                true
+            }
+            Restores::Running => {
+                *run = Restores::Again;
+                true
+            }
+            Restores::Again => false,
+        });
+        if !begin {
+            return;
+        }
+        // Ended with the service part way, the pass is none again.
+        struct Ends<'a> {
+            restores: &'a watch::Sender<Restores>,
+            armed: bool,
+        }
+        impl Drop for Ends<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.restores.send_replace(Restores::Idle);
+                }
+            }
+        }
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            let mut ends = Ends {
+                restores: &service.inner.restores,
+                armed: true,
+            };
+            loop {
+                service.restore_jobs().await;
+                let mut again = false;
+                service.inner.restores.send_modify(|run| {
+                    again = *run == Restores::Again;
+                    *run = if again {
+                        Restores::Running
+                    } else {
+                        Restores::Idle
+                    };
+                });
+                if !again {
+                    ends.armed = false;
+                    return;
+                }
+            }
+        }));
+    }
+
+    // Once no restore pass runs: what a test waits on after a tick to read
+    // the jobs that tick restored.
+    #[cfg(test)]
+    pub(crate) async fn restored(&self) {
+        self.inner
+            .restores
+            .subscribe()
+            .wait_for(|run| *run == Restores::Idle)
+            .await
+            .expect("the service keeps its restore pass's sender");
     }
 
     // The jobs of the torrents brought back at start with their records
-    // only, each restored from its checkpoint, RESTORES_AT_ONCE at a time. A
-    // torrent reads as it was kept until its job is back.
+    // only, each restored from its checkpoint, RESTORES_AT_ONCE at a time,
+    // in the order of their job ids. A torrent reads as it was kept, its
+    // restore shown, until its job is back.
     pub(super) async fn restore_jobs(&self) {
         let waiting: Vec<JobId> = self
             .inner
@@ -578,7 +692,7 @@ impl TorrentService {
             .lock()
             .await
             .values()
-            .filter(|torrent| torrent.store.is_none() && torrent.layout.is_some())
+            .filter(|torrent| torrent.awaits_restore())
             .map(|torrent| torrent.record.job_id)
             .collect();
         // RESTORES_AT_ONCE in flight, each torrent attached as soon as its
@@ -588,7 +702,10 @@ impl TorrentService {
         // into libtorrent's async_add_torrent).
         // The global archive passwords, read once for all of them and
         // outside the live lock.
-        let global = (!waiting.is_empty()).then(|| self.global_passwords());
+        if waiting.is_empty() {
+            return;
+        }
+        let global = Some(self.global_passwords());
         let mut restoring = tokio::task::JoinSet::new();
         for job_id in waiting {
             if restoring.len() >= RESTORES_AT_ONCE {
@@ -603,6 +720,10 @@ impl TorrentService {
             });
         }
         while restoring.join_next().await.is_some() {}
+        // Those back read as their sessions have them now, not at the next
+        // tick, as the tick reads them after a pass it waited on.
+        self.read_sessions().await;
+        self.publish().await;
     }
 
     // The job of a torrent that waits for one, restored on a blocking thread
@@ -621,6 +742,7 @@ impl TorrentService {
         job_id: JobId,
         global: Option<Arc<[ArchivePasswordCandidate]>>,
     ) -> bool {
+        self.ensure(&[job_id]).await;
         // However the restore ends, even cancelled or with the runtime, its
         // entry goes: a torrent with its job, or gone, waits for no restore.
         struct Done<'a>(&'a TorrentService, JobId);
@@ -703,6 +825,8 @@ impl TorrentService {
                 let mut live = self.inner.live.lock().await;
                 if let Some(torrent) = live.get_mut(&job_id) {
                     let why = format!("its restore is held: {error}");
+                    // It still waits for its job: the next tick tries again.
+                    self.inner.restore_wanted.store(true, Ordering::Release);
                     if torrent.restore_held.replace(why).is_none() {
                         tracing::warn!(job_id = job_id.0, error = %error, "a torrent's restore is held; it is tried again");
                     } else {
@@ -1125,7 +1249,18 @@ impl TorrentService {
             return;
         };
         let _taking = gate.lock().await;
-        if self.inner.live.lock().await.get(&job_id).is_none() {
+        // One join of a torrent at a time holds its gate, so a torrent
+        // another join put in a session while this one waited is left
+        // there: nothing of it reaches a second session, on this route or
+        // another, and no tracker hears it start twice.
+        if self
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .is_none_or(|torrent| torrent.attached.is_some())
+        {
             return;
         }
         let (identity, tracker_handover) = match fetched {
@@ -1526,148 +1661,536 @@ impl TorrentService {
         self.publish().await;
     }
 
-    // Bring back every stored torrent, its record only. Nothing here waits
-    // on a route or reads a torrent's files: a torrent's job is restored
-    // and it goes into its route's session at the tick, as one whose route
-    // changed does, and a magnet waits for its session on the task that
-    // fetches its metainfo.
-    pub(super) async fn restore(&self) -> Result<(), String> {
-        self.load_rules()?;
-        // Each table a restore and a first attach read, read once for every
-        // torrent. A torrent kept with no tracker list would write its next
-        // edit over the rows it has, and one kept with no ledger would write
-        // zeros over its counts at its next save, so those reads, like the
-        // records', fail the restore when they fail. A history that does
-        // not read is said, and no torrent shows its failure. One
-        // torrent's part that does not read is said, and that torrent goes
-        // on without it: its pieces and seed-mode pieces are then read
-        // again, each by the one it is for.
-        let records = self.inner.db.restored_torrents().map_err(state_error)?;
-        let mut trackers = self
-            .inner
-            .db
-            .torrent_trackers_by_job()
-            .map_err(state_error)?;
-        let mut counters = self
-            .inner
-            .db
-            .torrent_counters_by_job()
-            .map_err(state_error)?;
-        let mut failures = self
-            .inner
-            .db
-            .failed_torrent_histories()
-            .unwrap_or_else(|error| {
-                tracing::warn!(error = %error, "could not read the torrents' history");
-                BTreeMap::new()
-            });
-        let now = self.inner.clock.unix_ms();
-        if let Some(last) = records.iter().map(|row| row.record.queue_position).max() {
-            self.inner
-                .next_queue_position
-                .fetch_max(last + 1, Ordering::Relaxed);
+    // Bring back every stored torrent, its record only, a page of them at a
+    // time in the order of their job ids, as far as `through`. Each page is
+    // read, opened and parsed off the runtime, then joins the live
+    // torrents; no more than a page's rows are held while it is. Nothing
+    // here waits on a route or reads a torrent's files: a torrent's job is
+    // restored and it goes into its route's session at the tick, as one
+    // whose route changed does, and a magnet waits for its session on the
+    // task that fetches its metainfo. What was asked of the queue's order
+    // meanwhile is done, the queue applied and the torrents published
+    // once, when the last page is in. A page the database fails to give
+    // leaves the load where it stands, with why: the torrents read so far
+    // stay, and the tick reads that page again ([`Self::resume_load`]).
+    pub(super) async fn load(&self, through: Option<JobId>) -> Result<(), String> {
+        match self.load_pages(through).await {
+            Ok(()) => {
+                self.end_load().await;
+                Ok(())
+            }
+            Err(error) => {
+                // Said once for each reason, not once for each try.
+                let news = {
+                    let mut marks = locked(&self.inner.load_marks);
+                    let news = marks.fault.as_deref() != Some(error.as_str());
+                    marks.fault = Some(error.clone());
+                    news
+                };
+                if news {
+                    tracing::error!(%error, "the stored torrents did not all load; those read so far run, and the rest are read again");
+                }
+                Err(error)
+            }
         }
-        // Torrents kept before their held paths were written, each with
-        // what it holds by name, written in one transaction after the
-        // loop, from the metainfo the restore reads anyway.
-        let mut unheld = Vec::new();
-        for row in records {
-            let record = row.record;
-            let job_id = record.job_id;
-            let (ledger, resume, kept) = match counters.remove(&job_id) {
-                Some(stored) => (
-                    stored.counters.unwrap_or_else(|error| {
-                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's ledger");
-                        TorrentCounters::default()
-                    }),
-                    stored.peers.unwrap_or_else(|error| {
-                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
-                        ResumePeers::default()
-                    }),
-                    stored.kept.map_err(|error| {
-                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's pieces");
-                    }).ok(),
-                ),
-                None => (
-                    TorrentCounters::default(),
-                    ResumePeers::default(),
-                    Some(None),
-                ),
+    }
+
+    // A load whose page did not read reads it again, off the tick that
+    // asks: one read at a time, from the page that failed. The tick's
+    // period is its only timer, and a read that fails again writes
+    // nothing and says nothing new.
+    pub(super) fn resume_load(&self) {
+        if let Some(resumed) = self.resumed_load() {
+            self.keep(tokio::spawn(resumed));
+        }
+    }
+
+    // The read `resume_load` begins, when there is one to begin.
+    pub(super) fn resumed_load(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let through = {
+            let mut marks = locked(&self.inner.load_marks);
+            if marks.fault.is_none() || marks.resuming {
+                return None;
+            }
+            let Load::Running(through) = *self.inner.load.borrow() else {
+                return None;
             };
-            // The rule is the one its trackers match now (libtorrent keeps
-            // the trackers, not what was made of them).
-            let mut torrent = Live::new(record.clone(), ledger, resume, now);
-            torrent.trackers = in_table_order(trackers.remove(&job_id).unwrap_or_default());
-            torrent.rule_id = self.rule_id(torrent.trackers.iter());
-            match record.metainfo.as_deref().map(parse) {
-                Some(Ok(parsed)) => {
-                    if !row.held_set {
-                        let tops = row.unheld_outputs.as_ref().and_then(|outputs| {
-                            held_tops(
-                                parsed
-                                    .manifest
-                                    .paths
-                                    .iter()
-                                    .chain(outputs)
-                                    .map(String::as_str),
-                            )
-                        });
-                        unheld.push((
-                            job_id,
-                            record.storage_dir.clone(),
-                            record.files_dir.clone(),
-                            tops,
-                        ));
+            marks.resuming = true;
+            through
+        };
+        let service = self.clone();
+        Some(async move {
+            let loaded = service.load(through).await;
+            locked(&service.inner.load_marks).resuming = false;
+            if loaded.is_ok() {
+                tracing::info!("the stored torrents are all loaded");
+                service.after_load().await;
+            }
+        })
+    }
+
+    // The load's end: what was asked of the queue's order while it ran is
+    // done, in the order asked, and the load ends under the lock those are
+    // asked under, so none is asked for and never done.
+    async fn end_load(&self) {
+        loop {
+            let asked = std::mem::take(&mut locked(&self.inner.load_marks).asked);
+            self.order_as_asked(asked).await;
+            let ended = {
+                let mut marks = locked(&self.inner.load_marks);
+                let ended = marks.asked.is_empty();
+                if ended {
+                    marks.fault = None;
+                    self.inner.load.send_replace(Load::Done);
+                    // A read still in flight may hold a torrent taken out
+                    // since: it lets go of them when it ends.
+                    if marks.readers == 0 {
+                        marks.gone.clear();
                     }
-                    let levels = row.levels.unwrap_or_else(|error| {
-                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
-                        Vec::new()
-                    });
-                    self.describe(&mut torrent, &parsed, levels);
-                    torrent.kept(
-                        failures.remove(&job_id),
-                        kept.as_ref().and_then(Option::as_ref),
-                    );
-                    torrent.kept_at_boot = kept;
-                    if torrent.record.seed_mode {
-                        torrent.verified_at_boot = row
-                            .seed_verified
-                            .map_err(|error| {
-                                tracing::warn!(job_id = job_id.0, error = %error, "could not read the pieces a torrent checked in seed mode");
-                            })
-                            .ok();
+                }
+                ended
+            };
+            if ended {
+                break;
+            }
+        }
+        self.apply_queue().await;
+        self.publish().await;
+    }
+
+    // What was asked of the queue's order under the load, done now that
+    // every place is known: a torrent added goes past every stored one,
+    // and a move is made among all of them, each in the order asked. A
+    // torrent taken out since is left out of its move.
+    async fn order_as_asked(&self, asked: Vec<Asked>) {
+        let mut added = Vec::new();
+        for ask in asked {
+            match ask {
+                Asked::Added(job_id) => added.push(job_id),
+                Asked::Reorder(mut jobs, target) => {
+                    self.place_last(std::mem::take(&mut added)).await;
+                    {
+                        let live = self.inner.live.lock().await;
+                        jobs.retain(|job_id| live.contains_key(job_id));
                     }
-                    self.inner.live.lock().await.insert(job_id, torrent);
+                    if let Err(error) = self.reorder_now(&jobs, target).await {
+                        tracing::warn!(error = %error, "a queue move asked for while the stored torrents loaded was not made");
+                    }
                 }
-                Some(Err(error)) => {
-                    self.inner.live.lock().await.insert(job_id, torrent);
-                    self.fail(job_id, error.to_string()).await;
-                }
-                None => {
-                    self.inner.live.lock().await.insert(job_id, torrent);
-                    self.resolve(job_id).await;
+                Asked::Moves(mut moves) => {
+                    self.place_last(std::mem::take(&mut added)).await;
+                    {
+                        let live = self.inner.live.lock().await;
+                        moves.retain(|(job_id, _)| live.contains_key(job_id));
+                    }
+                    for (job_id, moved) in self.move_now(&moves).await.0 {
+                        if let Err(error) = moved {
+                            tracing::warn!(job_id = job_id.0, error = %error, "a queue move asked for while the stored torrents loaded was not made");
+                        }
+                    }
                 }
             }
         }
-        if !unheld.is_empty() {
+        self.place_last(added).await;
+    }
+
+    async fn load_pages(&self, through: Option<JobId>) -> Result<(), String> {
+        let Some(through) = through else {
+            return Ok(());
+        };
+        loop {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let mut held = self.inner.load_seam.held.subscribe();
+                let _ = held.wait_for(|held| !held).await;
+                let fails = self.inner.load_seam.fail_in.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |left| left.checked_sub(1),
+                );
+                if fails == Ok(1) {
+                    return Err("a test failed the read of this page".into());
+                }
+            }
+            let after = locked(&self.inner.load_marks).after;
+            if after.is_some_and(|after| after >= through) {
+                return Ok(());
+            }
+            let rows = self.page_rows();
+            let db = self.inner.db.clone();
+            let sized =
+                tokio::task::spawn_blocking(move || db.torrent_page_sizes(after, through, rows))
+                    .await
+                    .map_err(|error| format!("the read of the stored torrents ended: {error}"))?
+                    .map_err(state_error)?;
+            let Some(&(last, _)) = sized.last() else {
+                return Ok(());
+            };
+            self.bring(sized).await?;
+            locked(&self.inner.load_marks).after = Some(last);
+        }
+    }
+
+    // The rows of a page of the load.
+    fn page_rows(&self) -> usize {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let rows = self.inner.load_seam.page_rows.load(Ordering::Relaxed);
+            if rows > 0 {
+                return rows;
+            }
+        }
+        LOAD_PAGE
+    }
+
+    // The torrents of `jobs` the load has not reached, read now, each by
+    // its key: an action or a reading that names a torrent finds it,
+    // however far the load is. Nothing is read once the load has ended, or
+    // for a torrent here already, and one the load or another asker is
+    // reading now is waited for, that one alone, not read again.
+    //
+    // Every reading of a torrent comes through here, and what a torrent
+    // read here goes on to do reads torrents in turn, so the future is
+    // named: its type would otherwise hold itself.
+    pub(super) fn ensure<'a>(
+        &'a self,
+        jobs: &'a [JobId],
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        if !self.loading() {
+            return Box::pin(std::future::ready(()));
+        }
+        // Counted as in flight under the lock the load ends under: a
+        // torrent taken out while this read runs is kept as gone until it
+        // ends, though the load ends first.
+        let Some((reader, through)) = self.reader() else {
+            return Box::pin(std::future::ready(()));
+        };
+        Box::pin(async move {
+            let _reader = reader;
+            let missing: Vec<JobId> = {
+                let live = self.inner.live.lock().await;
+                jobs.iter()
+                    .filter(|job_id| **job_id <= through && !live.contains_key(job_id))
+                    .copied()
+                    .collect()
+            };
+            if missing.is_empty() {
+                return;
+            }
+            let db = self.inner.db.clone();
+            let sized = match tokio::task::spawn_blocking(move || db.torrent_sizes_of(&missing))
+                .await
+            {
+                Ok(Ok(sized)) => sized,
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "could not read a torrent the load has not reached");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not read a torrent the load has not reached");
+                    return;
+                }
+            };
+            if let Err(error) = self.bring(sized).await {
+                tracing::warn!(error = %error, "could not read a torrent the load has not reached");
+            }
+        })
+    }
+
+    // A read of torrents the load has not reached, begun: counted under
+    // the lock the load ends under, with how far the load reads. None once
+    // the load has ended.
+    pub(super) fn reader(&self) -> Option<(Reader, JobId)> {
+        let mut marks = locked(&self.inner.load_marks);
+        let Load::Running(Some(through)) = *self.inner.load.borrow() else {
+            return None;
+        };
+        marks.readers += 1;
+        Some((
+            Reader {
+                service: self.clone(),
+            },
+            through,
+        ))
+    }
+
+    // The stored torrents of `sized`, each with the bytes its metainfo
+    // takes, brought to join the live ones: a page of them at a time, each
+    // torrent read by one asker however many ask. One another asker is
+    // reading is waited for, that torrent's read alone, and read here only
+    // if that read did not bring it.
+    async fn bring(&self, mut wanted: Vec<(JobId, u64)>) -> Result<(), String> {
+        loop {
+            {
+                let live = self.inner.live.lock().await;
+                wanted.retain(|(job_id, _)| !live.contains_key(job_id));
+            }
+            if wanted.is_empty() {
+                return Ok(());
+            }
+            let (claim, theirs) = self.claim(&mut wanted);
+            for page in pages(&wanted, self.page_rows()) {
+                let page = self.read_page(page).await?;
+                self.take_page(page).await;
+            }
+            drop(claim);
+            if theirs.is_empty() {
+                return Ok(());
+            }
+            wanted.clear();
+            for (job_id, bytes, mut ended) in theirs {
+                // Ended too when its reader is gone.
+                let _ = ended.wait_for(|ended| *ended).await;
+                wanted.push((job_id, bytes));
+            }
+        }
+    }
+
+    // Of `wanted`, the torrents no asker is reading are left in it and
+    // claimed, this asker's to read until the claim is dropped; the others
+    // are given with what tells that their read has ended.
+    pub(super) fn claim(
+        &self,
+        wanted: &mut Vec<(JobId, u64)>,
+    ) -> (Claim, Vec<(JobId, u64, watch::Receiver<bool>)>) {
+        let (ended, ends) = watch::channel(false);
+        let mut theirs = Vec::new();
+        let mut marks = locked(&self.inner.load_marks);
+        wanted.retain(|&(job_id, bytes)| match marks.reading.get(&job_id) {
+            Some(reading) => {
+                theirs.push((job_id, bytes, reading.clone()));
+                false
+            }
+            None => {
+                marks.reading.insert(job_id, ends.clone());
+                true
+            }
+        });
+        let claim = Claim {
+            service: self.clone(),
+            jobs: wanted.iter().map(|(job_id, _)| *job_id).collect(),
+            ended,
+        };
+        (claim, theirs)
+    }
+
+    // The stored torrents of `jobs`, each as it joins the live ones: read,
+    // opened and parsed on a blocking thread. A torrent here already is
+    // read, never parsed.
+    //
+    // A torrent kept with no tracker list would write its next edit over
+    // the rows it has, and one kept with no ledger would write zeros over
+    // its counts at its next save, so those rows, like the records', fail
+    // the page when they fail. One torrent's part that does not read is
+    // said, and that torrent goes on without it: its pieces and seed-mode
+    // pieces are then read again, each by the one it is for.
+    pub(super) async fn read_page(&self, jobs: Vec<JobId>) -> Result<Page, String> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let rows = service
+                .inner
+                .db
+                .restored_torrents(&jobs)
+                .map_err(state_error)?;
+            let here: Vec<bool> = {
+                let live = service.inner.live.blocking_lock();
+                rows.iter()
+                    .map(|row| live.contains_key(&row.record.job_id))
+                    .collect()
+            };
+            let now = service.inner.clock.unix_ms();
+            let mut page = Page {
+                read: Vec::with_capacity(rows.len()),
+            };
+            for (row, here) in rows.into_iter().zip(here) {
+                if !here {
+                    page.read.push(service.read_torrent(row, now));
+                }
+            }
+            Ok(page)
+        })
+        .await
+        .map_err(|error| format!("the read of the stored torrents ended: {error}"))?
+    }
+
+    // One stored torrent as it joins the live ones, and what follows.
+    fn read_torrent(&self, row: RestoredTorrent, now: i64) -> Read {
+        let record = row.record;
+        let job_id = record.job_id;
+        let (ledger, resume, kept) = match row.counters {
+            Some(stored) => (
+                stored.counters.unwrap_or_else(|error| {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's ledger");
+                    TorrentCounters::default()
+                }),
+                stored.peers.unwrap_or_else(|error| {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
+                    ResumePeers::default()
+                }),
+                stored.kept.map_err(|error| {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's pieces");
+                }).ok(),
+            ),
+            None => (
+                TorrentCounters::default(),
+                ResumePeers::default(),
+                Some(None),
+            ),
+        };
+        // The rule is the one its trackers match now (libtorrent keeps
+        // the trackers, not what was made of them).
+        let mut torrent = Live::new(record, ledger, resume, now);
+        let (listed, unopened) = match row.trackers {
+            Ok(listed) => (listed, None),
+            Err(error) => (Vec::new(), Some(format!("a tracker URL: {error}"))),
+        };
+        torrent.trackers = in_table_order(listed);
+        torrent.rule_id = self.rule_id(torrent.trackers.iter());
+        // A torrent whose stored secrets do not decrypt with the
+        // instance key is held with why, as it was kept: never restored
+        // from what it lacks, nor fetched again, nor failed.
+        if let Some(why) = row
+            .sealed
+            .map(|error| format!("its metainfo: {error}"))
+            .or(unopened)
+        {
+            let why = format!("its stored secrets do not decrypt: {why}");
+            tracing::warn!(job_id = job_id.0, error = %why, "a torrent is held");
+            torrent.restore_held = Some(why.clone());
+            torrent.sealed = Some(why);
+            return Read {
+                torrent,
+                then: Then::Stands,
+                unheld: None,
+                unpack: None,
+            };
+        }
+        let parsed = torrent.record.metainfo.as_deref().map(parse);
+        match parsed {
+            Some(Ok(parsed)) => {
+                // Kept before its held paths were written: what it holds
+                // by name, from the metainfo the load reads anyway.
+                let unheld = (!row.held_set).then(|| {
+                    let tops = row.unheld_outputs.as_ref().and_then(|outputs| {
+                        held_tops(
+                            parsed
+                                .manifest
+                                .paths
+                                .iter()
+                                .chain(outputs)
+                                .map(String::as_str),
+                        )
+                    });
+                    held_of(
+                        torrent.record.storage_dir.as_deref(),
+                        torrent.record.files_dir.as_deref(),
+                        tops.as_ref(),
+                    )
+                });
+                let levels = row.levels.unwrap_or_else(|error| {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
+                    Vec::new()
+                });
+                let unpack = self.describe(&mut torrent, &parsed, levels);
+                torrent.kept(row.failure, kept.as_ref().and_then(Option::as_ref));
+                torrent.kept_at_boot = kept;
+                if torrent.record.seed_mode {
+                    torrent.verified_at_boot = row
+                        .seed_verified
+                        .map_err(|error| {
+                            tracing::warn!(job_id = job_id.0, error = %error, "could not read the pieces a torrent checked in seed mode");
+                        })
+                        .ok();
+                }
+                Read {
+                    torrent,
+                    then: Then::Stands,
+                    unheld,
+                    unpack,
+                }
+            }
+            Some(Err(error)) => Read {
+                torrent,
+                then: Then::Fails(error.to_string()),
+                unheld: None,
+                unpack: None,
+            },
+            None => Read {
+                torrent,
+                then: Then::Resolves,
+                unheld: None,
+                unpack: None,
+            },
+        }
+    }
+
+    // A page read joins the live torrents: each torrent not here by now,
+    // and not taken out since the page was read. What follows for each is
+    // done after, under no lock; what the torrents hold and whether each
+    // unpacks, where neither was kept before, are written for the page in
+    // one go, and what they hold is spelled as the filesystem spells it,
+    // off the runtime.
+    pub(super) async fn take_page(&self, page: Page) {
+        let mut then = Vec::new();
+        let mut unheld = Vec::new();
+        let mut unpacks = Vec::new();
+        let mut taken = Vec::new();
+        let mut waits = false;
+        {
+            let mut live = self.inner.live.lock().await;
+            let marks = locked(&self.inner.load_marks);
+            for read in page.read {
+                let job_id = read.torrent.record.job_id;
+                if marks.gone.contains(&job_id) || live.contains_key(&job_id) {
+                    continue;
+                }
+                self.inner
+                    .next_queue_position
+                    .fetch_max(read.torrent.record.queue_position + 1, Ordering::Relaxed);
+                self.inner.presence.send_if_modified(|presence| {
+                    let was = *presence;
+                    presence.note(&read.torrent);
+                    *presence != was
+                });
+                waits |= read.torrent.awaits_restore();
+                live.insert(job_id, read.torrent);
+                taken.push(job_id);
+                if let Some(held) = read.unheld {
+                    unheld.push((job_id, held));
+                }
+                if let Some(unpack) = read.unpack {
+                    unpacks.push((job_id, unpack));
+                }
+                then.push((job_id, read.then));
+            }
+        }
+        if waits {
+            self.inner.restore_wanted.store(true, Ordering::Release);
+        }
+        for (job_id, then) in then {
+            match then {
+                Then::Stands => {}
+                Then::Fails(error) => self.fail(job_id, error).await,
+                Then::Resolves => self.resolve(job_id).await,
+            }
+        }
+        if !unheld.is_empty() || !unpacks.is_empty() {
             let db = self.inner.db.clone();
             let written = tokio::task::spawn_blocking(move || {
-                let held: Vec<(JobId, Vec<String>)> = unheld
-                    .into_iter()
-                    .map(|(job_id, storage, files, tops)| {
-                        (
-                            job_id,
-                            held_of(storage.as_deref(), files.as_deref(), tops.as_ref()),
-                        )
-                    })
-                    .collect();
-                db.set_torrents_held(&held)
+                (
+                    db.set_torrents_held(&unheld),
+                    db.set_torrents_unpack_in_force(&unpacks),
+                )
             })
             .await;
             match written {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "could not write what the torrents hold; each holds its whole folder until its next start")
+                Ok((held, unpacks)) => {
+                    if let Err(error) = held {
+                        tracing::warn!(error = %error, "could not write what the torrents hold; each holds its whole folder until its next start");
+                    }
+                    if let Err(error) = unpacks {
+                        tracing::warn!(error = %error, "could not record whether the torrents unpack");
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "could not write what the torrents hold; each holds its whole folder until its next start")
@@ -1677,22 +2200,74 @@ impl TorrentService {
         // A folder made in another spelling before a torrent's first write
         // holds its files from then on: each start spells what the
         // torrents hold as the filesystem does.
-        self.respell_held(None).await;
-        self.apply_queue().await;
-        self.publish().await;
-        Ok(())
+        self.respell_held(taken).await;
     }
 
-    // What the torrents hold, or only `job_id`, spelled as the filesystem
-    // spells it now ([`held_key`]): a part the torrent named before it was
-    // there, and that came to be in another case or through a link, is
-    // held as it is on disk. One read, and one write only for the rows that
-    // differ; none when none does. Off the runtime.
-    pub(super) async fn respell_held(&self, job_id: Option<JobId>) {
+    // The torrents added while the stored ones were read, placed past every
+    // one of them in the queue, in the order they were added, in one write
+    // made off the runtime with no torrent's lock held.
+    async fn place_last(&self, added: Vec<JobId>) {
+        if added.is_empty() {
+            return;
+        }
+        let positions: Vec<(JobId, i64)> = {
+            let live = self.inner.live.lock().await;
+            let mut placed: Vec<(i64, JobId)> = added
+                .into_iter()
+                .filter_map(|job_id| Some((live.get(&job_id)?.record.queue_position, job_id)))
+                .collect();
+            placed.sort_unstable();
+            placed
+                .into_iter()
+                .map(|(_, job_id)| {
+                    (
+                        job_id,
+                        self.inner
+                            .next_queue_position
+                            .fetch_add(1, Ordering::Relaxed),
+                    )
+                })
+                .collect()
+        };
+        if positions.is_empty() {
+            return;
+        }
+        let db = self.inner.db.clone();
+        let rows = positions.clone();
+        let written =
+            tokio::task::spawn_blocking(move || db.set_torrent_queue_positions(&rows)).await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not keep the queue places of the torrents added at start");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "could not keep the queue places of the torrents added at start");
+                return;
+            }
+        }
+        let mut live = self.inner.live.lock().await;
+        for (job_id, position) in positions {
+            if let Some(torrent) = live.get_mut(&job_id) {
+                torrent.record.queue_position = position;
+            }
+        }
+    }
+
+    // What the torrents of `jobs` hold, spelled as the filesystem spells it
+    // now ([`held_key`]): a part the torrent named before it was there, and
+    // that came to be in another case or through a link, is held as it is
+    // on disk. One read, and one write only for the rows that differ; none
+    // when none does. Off the runtime.
+    pub(super) async fn respell_held(&self, jobs: Vec<JobId>) {
+        if jobs.is_empty() {
+            return;
+        }
         let db = self.inner.db.clone();
         let respelled = tokio::task::spawn_blocking(move || {
             let changed: Vec<(JobId, String, String)> = db
-                .held_rows(job_id)?
+                .held_rows(&jobs)?
                 .into_iter()
                 .filter_map(|(job_id, was)| {
                     let now = held_key(Path::new(&was)).to_string_lossy().into_owned();
@@ -1887,6 +2462,95 @@ impl Note {
             }
         }
     }
+}
+
+// How many stored torrents a start reads at a time, and the bytes of stored
+// metainfo a page reads at most. A torrent's metainfo is most often tens of
+// kilobytes, so the rows bound a page; one may be as large as the engine
+// takes, `MAX_TORRENT_FILE_BYTES`, a hundred megabytes, and 64 of those
+// would be gigabytes held at once. A page stops before the torrent that
+// would take it past 32 MiB, so it holds 32 MiB of stored metainfo or one
+// torrent's, whichever is more, with what parsing makes of it.
+const LOAD_PAGE: usize = 64;
+pub(super) const LOAD_PAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+// `sized` in pages of `rows` torrents and `LOAD_PAGE_BYTES` at most, a
+// torrent larger than that a page alone.
+pub(super) fn pages(sized: &[(JobId, u64)], rows: usize) -> Vec<Vec<JobId>> {
+    let mut pages: Vec<Vec<JobId>> = Vec::new();
+    let mut bytes = 0u64;
+    for &(job_id, size) in sized {
+        match pages.last_mut() {
+            Some(page) if page.len() < rows && bytes.saturating_add(size) <= LOAD_PAGE_BYTES => {
+                page.push(job_id);
+                bytes += size;
+            }
+            _ => {
+                pages.push(vec![job_id]);
+                bytes = size;
+            }
+        }
+    }
+    pages
+}
+
+// A read of torrents the load had not reached, in flight: while one is,
+// the torrents taken out are kept as gone, though the load ends.
+pub(super) struct Reader {
+    service: TorrentService,
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let mut marks = locked(&self.service.inner.load_marks);
+        marks.readers -= 1;
+        if marks.readers == 0 && !self.service.loading() {
+            marks.gone.clear();
+        }
+    }
+}
+
+// The torrents one asker reads now: theirs until this is dropped, which
+// tells those waiting for one that its read has ended.
+pub(super) struct Claim {
+    service: TorrentService,
+    jobs: Vec<JobId>,
+    pub(super) ended: watch::Sender<bool>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        {
+            let mut marks = locked(&self.service.inner.load_marks);
+            for job_id in &self.jobs {
+                marks.reading.remove(job_id);
+            }
+        }
+        self.ended.send_replace(true);
+    }
+}
+
+// A page of stored torrents read.
+pub(super) struct Page {
+    read: Vec<Read>,
+}
+
+// One stored torrent as it joins the live ones, what it holds by name when
+// that was never written, and what follows once it has joined.
+struct Read {
+    torrent: Live,
+    then: Then,
+    unheld: Option<Vec<String>>,
+    // Whether it unpacks, fixed as it was read and not yet kept.
+    unpack: Option<bool>,
+}
+
+enum Then {
+    Stands,
+    // Its metainfo does not parse: it fails.
+    Fails(String),
+    // A magnet with no metainfo yet: it is fetched.
+    Resolves,
 }
 
 // What a torrent's store is made from: the directory its files are in,

@@ -265,6 +265,7 @@ async fn pause_resume_and_force_are_kept() {
         TorrentIntent::Paused
     );
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(
         rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Paused

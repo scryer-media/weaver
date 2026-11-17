@@ -42,7 +42,15 @@ pub struct HistoryItem {
     pub health: u32,
     pub has_password: bool,
     pub category: Option<String>,
+    /// The job's public attributes. GraphQL answers them through the
+    /// `attributes` resolver, which adds the RSS link for an admin.
+    #[graphql(skip)]
     pub attributes: Vec<Attribute>,
+    /// The job's RSS link and id as stored, for `rss_link_for_caller`
+    /// alone: never answered or serialised as they are.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub rss_link: Vec<(String, String)>,
     pub client_request_id: Option<String>,
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -69,6 +77,12 @@ pub struct HistoryItem {
 
 #[ComplexObject]
 impl HistoryItem {
+    /// The job's attributes. An RSS job's item link and id are among them
+    /// for an admin only.
+    async fn attributes(&self, ctx: &async_graphql::Context<'_>) -> Vec<Attribute> {
+        crate::jobs::types::attributes_for_caller(ctx, &self.attributes, &self.rss_link)
+    }
+
     /// The job's tags, in tag order.
     async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
         crate::tags::tags_of(ctx, self.id).await
@@ -790,6 +804,7 @@ fn history_item_from_display(
         ),
         category: row.category.clone(),
         attributes,
+        rss_link: weaver_server_core::history::attributes::rss_link_pairs(metadata),
         client_request_id,
         output_dir: row.output_dir.clone(),
         created_at: secs_to_datetime(row.created_at),

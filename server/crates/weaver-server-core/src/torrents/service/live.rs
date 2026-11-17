@@ -45,9 +45,6 @@ pub(super) struct Live {
     // here as a new list, under the lock that holds this torrent, so a
     // reader takes the list without copying it.
     pub(super) trackers: Arc<[TrackerEntry]>,
-    // Whether its metainfo marks it private; read from the metainfo, never
-    // kept apart from it.
-    pub(super) private: bool,
     // The peers and bans its next start begins with: the one place a ban
     // made here lives until it is written.
     pub(super) resume: ResumePeers,
@@ -89,6 +86,9 @@ pub(super) struct Live {
     // Why its restore is held, while it is: a checkpoint the database did
     // not give, tried again at each restore until it does.
     pub(super) restore_held: Option<String>,
+    // Why its stored metainfo or tracker URLs did not decrypt at start: it
+    // is held, neither restored nor fetched, while that stands.
+    pub(super) sealed: Option<String>,
     // Not one of the files its pieces are in was there when its store was
     // made: it is in no session, its pieces kept, until a start, a recheck
     // or a move looks again. Found again at each load, never kept.
@@ -187,7 +187,6 @@ impl Live {
             identity: TorrentIdentity::fresh(),
             rule_id: None,
             trackers: Arc::from(Vec::new()),
-            private: false,
             ledger: Ledger {
                 written: Some((written, resume.clone())),
                 peers_at_ms: now,
@@ -214,6 +213,7 @@ impl Live {
             engine: Engine::Absent,
             run_error: None,
             restore_held: None,
+            sealed: None,
             files_missing: false,
             disk_held: None,
             queued: false,
@@ -532,6 +532,12 @@ impl Live {
         }
     }
 
+    // Whether it was brought back with its record alone and its job is yet
+    // to be restored from its checkpoint.
+    pub(super) fn awaits_restore(&self) -> bool {
+        self.store.is_none() && self.layout.is_some()
+    }
+
     // Everything the state is read from, with the session reporting
     // `engine`.
     pub(super) fn observed(&self, engine: Engine) -> Observed {
@@ -547,14 +553,23 @@ impl Live {
             Some(DiskHeld::Starting) => true,
             None => false,
         };
+        let engine = self
+            .run_error
+            .clone()
+            .or_else(|| self.copy_error.clone())
+            .or_else(|| self.restore_held.clone())
+            .map_or(engine, Engine::Error);
         Observed {
-            engine: self
-                .run_error
-                .clone()
-                .or_else(|| self.copy_error.clone())
-                .or_else(|| self.restore_held.clone())
-                .map_or(engine, Engine::Error),
-            has_metadata: self.layout.is_some(),
+            // In no session while its job is yet to come back, it shows that
+            // it starts from what was saved, as qBittorrent shows a torrent
+            // whose resume data it is still loading (CheckingResumeData).
+            engine: match engine {
+                Engine::Absent if self.awaits_restore() => Engine::Starting,
+                engine => engine,
+            },
+            // One whose stored metainfo does not decrypt has its metadata;
+            // it is held, not fetching, and says why.
+            has_metadata: self.layout.is_some() || self.sealed.is_some(),
             fetch: self.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
             complete: self.complete(),
             intent: self.record.intent(),

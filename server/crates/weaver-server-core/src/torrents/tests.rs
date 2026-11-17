@@ -38,6 +38,7 @@ pub(crate) fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -
         move_to: None,
         queue_position: job_id as i64,
         pool_member: None,
+        private: false,
     }
 }
 
@@ -332,6 +333,7 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             None,
             "torrent 5",
             b"d4:infodee",
+            false,
             "/data/t5",
             None,
             &more,
@@ -352,6 +354,41 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             "xn--bcher-kva.invalid"
         ]
     );
+}
+
+// A magnet is public in the table until its metainfo arrives; the metainfo
+// writes its privacy with it, and a list of private torrents then keeps it.
+#[test]
+fn a_magnets_privacy_is_written_with_its_metainfo() {
+    use crate::torrents::queries::TorrentListFilter;
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(5, Some([5; 20]), None), &[])
+        .unwrap();
+    let private = TorrentListFilter {
+        private: Some(true),
+        ..TorrentListFilter::default()
+    };
+    assert!(!db.get_torrent(JobId(5)).unwrap().unwrap().private);
+    assert_eq!(db.count_torrent_list(&private).unwrap(), 0);
+    assert!(
+        db.set_torrent_metainfo(
+            JobId(5),
+            Some([5; 20]),
+            None,
+            "torrent 5",
+            b"d4:infodee",
+            true,
+            "/data/t5",
+            None,
+            &[],
+            &[],
+            &crate::torrents::model::Adopted::default()
+        )
+        .unwrap()
+    );
+    assert!(db.get_torrent(JobId(5)).unwrap().unwrap().private);
+    assert_eq!(db.count_torrent_list(&private).unwrap(), 1);
+    assert_eq!(db.torrent_list_ids(&private, 0, None).unwrap(), [JobId(5)]);
 }
 
 #[test]
@@ -502,8 +539,11 @@ fn a_mark_that_does_not_read_keeps_the_peers_and_bans() {
         ..saved
     };
     assert_eq!(db.torrent_peers(JobId(1)).unwrap(), unmarked);
-    let boot = db.torrent_counters_by_job().unwrap();
-    assert_eq!(boot[&JobId(1)].peers.as_ref().unwrap(), &unmarked);
+    let boot = db.restored_torrents(&[JobId(1)]).unwrap();
+    assert_eq!(
+        boot[0].counters.as_ref().unwrap().peers.as_ref().unwrap(),
+        &unmarked
+    );
 }
 
 #[test]
@@ -892,4 +932,695 @@ fn batched_torrent_columns_end_as_a_statement_per_row_left_them() {
     assert_eq!(marked.len(), COUNT.div_ceil(4) as usize);
     assert_eq!(marked[0], (JobId(1), false));
     assert_eq!(marked, retiring(&by_row));
+}
+
+// Every stored text and byte of the torrents' tables and the tracker hosts,
+// as the database holds them.
+// As stored: each torrent's metainfo, each tracker row, each host.
+type RawSecrets = (Vec<(i64, Vec<u8>)>, Vec<(i64, i64, String)>, Vec<String>);
+
+fn raw_secrets(db: &Database) -> RawSecrets {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    let datastore = db.datastore();
+    db.run_sql_blocking_read(async move {
+        let metainfo = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT job_id, metainfo FROM torrents WHERE metainfo IS NOT NULL ORDER BY job_id",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| Ok((row.i64("job_id")?, row.opt_bytes("metainfo")?.unwrap())))
+        .collect::<Result<Vec<_>, crate::StateError>>()?;
+        let urls = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT job_id, tier, url FROM torrent_trackers ORDER BY job_id, tier",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| Ok((row.i64("job_id")?, row.i64("tier")?, row.text("url")?)))
+        .collect::<Result<Vec<_>, crate::StateError>>()?;
+        let hosts = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT host FROM tracker_hosts ORDER BY host",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.text("host"))
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok((metainfo, urls, hosts))
+    })
+    .unwrap()
+}
+
+const PASSKEY: &str = "f00dfacecafe";
+
+// A torrent's metainfo, announcing to a private tracker with a passkey.
+fn passkeyed(job_id: u64) -> (Vec<u8>, String) {
+    let url = format!("https://tracker{job_id}.invalid/{PASSKEY}/announce");
+    (
+        format!("d8:announce{}:{url}4:infod4:name1:xee", url.len()).into_bytes(),
+        url,
+    )
+}
+
+fn holds_passkey(bytes: &[u8]) -> bool {
+    bytes
+        .windows(PASSKEY.len())
+        .any(|at| at == PASSKEY.as_bytes())
+}
+
+// A torrent's passkey is in none of the bytes stored for it: its metainfo
+// and its tracker URLs are sealed, and the host list keeps the host alone.
+// Each reads back as it was written.
+#[test]
+fn no_stored_byte_holds_a_trackers_passkey() {
+    let db = Database::open_in_memory().unwrap();
+    let (metainfo, url) = passkeyed(1);
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.metainfo = Some(metainfo.clone().into());
+    let trackers = [TrackerEntry {
+        tier: 0,
+        url: url.clone(),
+        named_by: NamedBy::Torrent,
+    }];
+    db.insert_torrent(&record, &trackers).unwrap();
+    // A magnet's metainfo and an edit write them again.
+    db.insert_torrent(&torrent(2, Some([2; 20]), None), &[])
+        .unwrap();
+    let (second, second_url) = passkeyed(2);
+    let second_trackers = [TrackerEntry {
+        tier: 0,
+        url: second_url.clone(),
+        named_by: NamedBy::Torrent,
+    }];
+    assert!(
+        db.set_torrent_metainfo(
+            JobId(2),
+            Some([2; 20]),
+            None,
+            "torrent 2",
+            &second,
+            true,
+            "/data/t2",
+            None,
+            &second_trackers,
+            &[],
+            &crate::torrents::model::Adopted::default()
+        )
+        .unwrap()
+    );
+    let edited = [TrackerEntry {
+        tier: 1,
+        url: format!("{url}?again"),
+        named_by: NamedBy::Operator,
+    }];
+    assert!(db.set_torrent_trackers(JobId(1), &edited).unwrap());
+
+    let (metainfos, urls, hosts) = raw_secrets(&db);
+    assert_eq!(metainfos.len(), 2);
+    assert_eq!(urls.len(), 2);
+    for (_, stored) in &metainfos {
+        assert!(!holds_passkey(stored));
+        assert!(crate::torrents::sealed::is_sealed(stored));
+    }
+    for (_, _, stored) in &urls {
+        assert!(!holds_passkey(stored.as_bytes()));
+    }
+    assert_eq!(hosts, ["tracker1.invalid", "tracker2.invalid"]);
+
+    assert_eq!(
+        db.get_torrent(JobId(1))
+            .unwrap()
+            .unwrap()
+            .metainfo
+            .as_deref(),
+        Some(metainfo.as_slice())
+    );
+    assert_eq!(
+        db.get_torrent(JobId(2))
+            .unwrap()
+            .unwrap()
+            .metainfo
+            .as_deref(),
+        Some(second.as_slice())
+    );
+    assert_eq!(db.list_torrent_trackers(JobId(1)).unwrap(), edited);
+    assert_eq!(db.list_torrent_trackers(JobId(2)).unwrap(), second_trackers);
+}
+
+// Rows stored before sealing, as an upgrade finds them, written in the
+// clear past the sealing.
+fn unseal(db: &Database, rows: &[(i64, Vec<u8>, String)]) {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let datastore = db.datastore();
+    let rows = rows.to_vec();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&datastore, "unseal", |tx| {
+            let rows = rows.clone();
+            Box::pin(async move {
+                for (job_id, metainfo, url) in rows {
+                    tx.execute(
+                        "UPDATE torrents SET metainfo = {} WHERE job_id = {}",
+                        &[SqlArg::Bytes(metainfo), SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE torrent_trackers SET url = {}, url_key = NULL WHERE job_id = {}",
+                        &[SqlArg::Text(url), SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+// A start seals what an older one stored in the clear, a page of torrents
+// at a time, each page in one transaction. A pass cut short leaves pages
+// sealed and pages not: the next start seals the rest and passes by the
+// sealed ones, and a start with nothing to seal changes nothing.
+#[test]
+fn a_sealing_pass_cut_short_completes_at_the_next_start() {
+    const TORRENTS: u64 = 150;
+    let db = Database::open_in_memory().unwrap();
+    let mut written = Vec::new();
+    for job_id in 1..=TORRENTS {
+        let (metainfo, url) = passkeyed(job_id);
+        let mut record = torrent(job_id, Some([job_id as u8; 20]), None);
+        record.infohash_v1.as_mut().unwrap()[1] = (job_id >> 8) as u8;
+        record.metainfo = Some(metainfo.clone().into());
+        let trackers = [TrackerEntry {
+            tier: 0,
+            url: url.clone(),
+            named_by: NamedBy::Torrent,
+        }];
+        db.insert_torrent(&record, &trackers).unwrap();
+        written.push((job_id as i64, metainfo, url));
+    }
+    // The first page was sealed before the cut; the rest is in the clear.
+    unseal(&db, &written[64..]);
+    // One metainfo is sealed as text, the form before the binary one, and
+    // one torrent lists its tracker twice in a tier, once sealed, as the
+    // key over the ciphertext let it.
+    {
+        use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+        use base64::Engine as _;
+        let key = db.encryption_key().cloned().unwrap();
+        let text = crate::persistence::encryption::encrypt_value(
+            &key,
+            &base64::engine::general_purpose::STANDARD.encode(&written[148].1),
+        )
+        .unwrap();
+        let twice = crate::persistence::encryption::encrypt_value(&key, &written[149].2).unwrap();
+        let datastore = db.datastore();
+        db.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET metainfo = {} WHERE job_id = 149",
+                &[SqlArg::Bytes(text.into_bytes())],
+            )
+            .await?;
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "INSERT INTO torrent_trackers (job_id, tier, url, named_by) \
+                 VALUES (150, 0, {}, 'torrent')",
+                &[SqlArg::Text(twice)],
+            )
+            .await
+        })
+        .unwrap();
+    }
+    let (_, before, _) = raw_secrets(&db);
+    assert_eq!(before.len(), TORRENTS as usize + 1);
+    assert!(
+        before[..64]
+            .iter()
+            .all(|(.., url)| crate::persistence::encryption::is_encrypted(url))
+    );
+    assert!(
+        before[64..]
+            .iter()
+            .filter(|(.., url)| !crate::persistence::encryption::is_encrypted(url))
+            .all(|(.., url)| holds_passkey(url.as_bytes()))
+    );
+
+    db.seal_stored_secrets().unwrap();
+    let sealed = raw_secrets(&db);
+    assert_eq!(sealed.0.len(), TORRENTS as usize);
+    // The tracker listed twice is listed once.
+    assert_eq!(sealed.1.len(), TORRENTS as usize);
+    assert!(sealed.0.iter().all(|(_, stored)| !holds_passkey(stored)));
+    // Each metainfo is sealed as bytes, the one sealed as text with them.
+    assert!(
+        sealed
+            .0
+            .iter()
+            .all(|(_, stored)| stored.starts_with(b"enc:b1:"))
+    );
+    assert!(
+        sealed
+            .1
+            .iter()
+            .all(|(.., url)| !holds_passkey(url.as_bytes()))
+    );
+    // The first page's values are the ones sealed before the cut.
+    assert_eq!(sealed.1[..64], before[..64]);
+    for (job_id, metainfo, url) in &written {
+        let job_id = JobId(*job_id as u64);
+        assert_eq!(
+            db.get_torrent(job_id).unwrap().unwrap().metainfo.as_deref(),
+            Some(metainfo.as_slice())
+        );
+        assert_eq!(db.list_torrent_trackers(job_id).unwrap()[0].url, *url);
+    }
+
+    db.seal_stored_secrets().unwrap();
+    assert_eq!(raw_secrets(&db), sealed);
+
+    // The pass is one pass: a start after it reads no torrent to look for
+    // work, so a row written in the clear past it stays as it is.
+    unseal(&db, &written[..1]);
+    let clear = raw_secrets(&db);
+    db.seal_stored_secrets().unwrap();
+    assert_eq!(raw_secrets(&db), clear);
+    assert!(holds_passkey(&clear.0[0].1));
+}
+
+// The history of a torrent removed long ago has no row among the torrents:
+// the pass reads the history itself, a page at a time, and takes an RSS
+// item's link and id out of every torrent's row. A usenet job's row keeps
+// them, sealed.
+#[test]
+fn the_history_of_a_removed_torrent_loses_its_rss_link() {
+    const REMOVED: u64 = 150;
+    let db = Database::open_in_memory().unwrap();
+    let kept = |job_id: u64| {
+        serde_json::to_string(&[
+            ("rss.feed_name", "feed".to_owned()),
+            ("rss.item_id", format!("guid-{job_id}")),
+            (
+                "rss.item_url",
+                format!("https://tracker.example/dl/{job_id}?passkey=0123abcd"),
+            ),
+            ("label", "kept".to_owned()),
+        ])
+        .unwrap()
+    };
+    let row = |job_id: u64, protocol, metadata: Option<String>| crate::JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: format!("job {job_id}"),
+        status: "complete".to_owned(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata,
+        server_attribution: None,
+        protocol,
+        archived_at: None,
+    };
+    // More than two pages of removed torrents, none with a torrent row.
+    for job_id in 1..=REMOVED {
+        db.insert_job_history(&row(
+            job_id,
+            crate::jobs::Protocol::Torrent,
+            Some(kept(job_id)),
+        ))
+        .unwrap();
+    }
+    let usenet = REMOVED + 1;
+    db.insert_job_history(&row(usenet, crate::jobs::Protocol::Nzb, Some(kept(usenet))))
+        .unwrap();
+    let plain = REMOVED + 2;
+    let none = serde_json::to_string(&[("label", "kept")]).unwrap();
+    db.insert_job_history(&row(
+        plain,
+        crate::jobs::Protocol::Torrent,
+        Some(none.clone()),
+    ))
+    .unwrap();
+
+    db.seal_stored_secrets().unwrap();
+    let after: std::collections::HashMap<u64, Option<String>> = {
+        use crate::persistence::sql_runtime::SqlRuntime;
+        let datastore = db.datastore();
+        db.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, metadata FROM job_history",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok((row.i64("job_id")? as u64, row.opt_text("metadata")?)))
+            .collect::<Result<_, crate::StateError>>()
+        })
+        .unwrap()
+    };
+    let stored = |job_id: u64| after[&job_id].clone();
+    let stripped = serde_json::to_string(&[("rss.feed_name", "feed"), ("label", "kept")]).unwrap();
+    for job_id in 1..=REMOVED {
+        assert_eq!(
+            stored(job_id).as_deref(),
+            Some(stripped.as_str()),
+            "{job_id}"
+        );
+    }
+    let usenet_pairs: Vec<(String, String)> =
+        serde_json::from_str(stored(usenet).as_deref().unwrap()).unwrap();
+    let kept_pairs: Vec<(String, String)> = serde_json::from_str(&kept(usenet)).unwrap();
+    assert_eq!(usenet_pairs.len(), kept_pairs.len());
+    for ((key, value), (kept_key, kept_value)) in usenet_pairs.iter().zip(&kept_pairs) {
+        assert_eq!(key, kept_key);
+        if key.starts_with("rss.item_") && key != "rss.item_title" {
+            assert!(crate::persistence::encryption::is_encrypted(value), "{key}");
+        } else {
+            assert_eq!(value, kept_value);
+        }
+    }
+    assert_eq!(stored(plain), Some(none));
+}
+
+// The stored metadata of every usenet job, queued or in history: what is
+// kept under `key`, in order.
+fn job_metadata(db: &Database, table: &'static str) -> Vec<(u64, Vec<(String, String)>)> {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    let datastore = db.datastore();
+    db.run_sql_blocking_read(async move {
+        SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            &format!("SELECT job_id, metadata FROM {table} ORDER BY job_id"),
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            Ok((
+                row.i64("job_id")? as u64,
+                crate::history::parse_history_metadata(row.opt_text("metadata")?.as_deref()),
+            ))
+        })
+        .collect::<Result<_, crate::StateError>>()
+    })
+    .unwrap()
+}
+
+// A usenet RSS job stored before links were sealed: its item's link and id
+// are sealed by the one pass, queued and in history, a page at a time, and
+// every other pair stays as it was. The history's attribute rows lose them.
+// An admin reads them back; any other caller, and a start under another
+// key, reads none, and they never make a start need the key.
+#[test]
+fn a_usenet_jobs_rss_link_is_sealed_by_the_pass_and_opens_for_an_admin_only() {
+    use crate::auth::CallerScope;
+    use crate::persistence::encryption::{EncryptionKey, is_encrypted};
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    const JOBS: u64 = 70;
+    const PASSKEY: &str = "0123abcd";
+    let mut db = Database::open_in_memory().unwrap();
+    let pairs = |job_id: u64| {
+        [
+            ("rss.feed_name", "feed".to_owned()),
+            (
+                "rss.item_id",
+                format!("https://tracker.example/dl/{job_id}?passkey={PASSKEY}"),
+            ),
+            ("rss.item_title", format!("Item {job_id}")),
+            (
+                "rss.item_url",
+                format!("https://tracker.example/dl/{job_id}?passkey={PASSKEY}"),
+            ),
+            ("label", "kept".to_owned()),
+        ]
+        .map(|(key, value)| (key.to_owned(), value))
+        .to_vec()
+    };
+    let active = |job_id: u64, metadata: Vec<(String, String)>| crate::ActiveJob {
+        job_id: JobId(job_id),
+        nzb_hash: [0xBC; 32],
+        nzb_path: std::path::PathBuf::from(format!("/invented/job-{job_id}.nzb")),
+        nzb_zstd: Vec::new(),
+        output_dir: std::path::PathBuf::from(format!("/invented/job-{job_id}")),
+        created_at: 1_700_000_000,
+        category: None,
+        metadata,
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+        password_override: None,
+        supplied_password_candidates: Vec::new(),
+    };
+    for job_id in 1..=JOBS {
+        db.create_active_job(&active(job_id, pairs(job_id)))
+            .unwrap();
+    }
+    let unlinked = vec![("label".to_owned(), "kept".to_owned())];
+    db.create_active_job(&active(JOBS + 1, unlinked.clone()))
+        .unwrap();
+    let history = |job_id: u64| crate::JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: format!("job {job_id}"),
+        status: "complete".to_owned(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata: Some(serde_json::to_string(&pairs(job_id)).unwrap()),
+        server_attribution: None,
+        protocol: crate::jobs::Protocol::Nzb,
+        archived_at: None,
+    };
+    let done = 1000..1000 + JOBS;
+    for job_id in done.clone() {
+        db.insert_job_history(&history(job_id)).unwrap();
+    }
+    // The attribute rows an older start listed the link and id under.
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        let mut args = Vec::new();
+        for job_id in 1000..1000 + JOBS {
+            for key in ["rss.item_id", "rss.item_url"] {
+                args.extend([
+                    SqlArg::I64(job_id as i64),
+                    SqlArg::Text(key.to_owned()),
+                    SqlArg::Text(format!(
+                        "https://tracker.example/dl/{job_id}?passkey={PASSKEY}"
+                    )),
+                ]);
+            }
+        }
+        SqlRuntime::execute(
+            datastore.write_exec(),
+            &format!(
+                "INSERT INTO job_history_attributes (job_id, key, value, completed_at) VALUES {}",
+                vec!["({}, {}, {}, 2)"; args.len() / 3].join(", ")
+            ),
+            &args,
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+
+    db.seal_stored_secrets().unwrap();
+
+    // Sealed in place, every other pair as it was, in its order.
+    for (table, rows) in [
+        ("active_jobs", job_metadata(&db, "active_jobs")),
+        ("job_history", job_metadata(&db, "job_history")),
+    ] {
+        assert_eq!(
+            rows.len() as u64,
+            if table == "active_jobs" {
+                JOBS + 1
+            } else {
+                JOBS
+            }
+        );
+        for (job_id, stored) in rows {
+            if job_id == JOBS + 1 {
+                assert_eq!(stored, unlinked);
+                continue;
+            }
+            let plain = pairs(job_id);
+            assert_eq!(stored.len(), plain.len(), "{table} {job_id}");
+            for ((key, value), (_, was)) in stored.iter().zip(&plain) {
+                if key == "rss.item_id" || key == "rss.item_url" {
+                    assert!(
+                        is_encrypted(value) && !value.contains(PASSKEY),
+                        "{table} {job_id}"
+                    );
+                } else {
+                    assert_eq!(value, was, "{table} {job_id} {key}");
+                }
+            }
+            let link = crate::history::attributes::rss_link_pairs(&stored);
+            let opened = [&plain[1], &plain[3]].map(Clone::clone).to_vec();
+            assert_eq!(db.rss_link_attributes(&link, CallerScope::Admin), opened);
+            assert_eq!(db.rss_link_attributes(&link, CallerScope::Local), opened);
+            for scope in [
+                CallerScope::Read,
+                CallerScope::Control,
+                CallerScope::ScriptRun,
+            ] {
+                assert!(db.rss_link_attributes(&link, scope).is_empty(), "{scope:?}");
+            }
+            // Never a public attribute.
+            assert_eq!(
+                crate::history::public_history_attributes(&stored)
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                ["rss.feed_name", "rss.item_title", "label"]
+            );
+        }
+    }
+    let datastore = db.datastore();
+    let listed = db
+        .run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT COUNT(*) AS n FROM job_history_attributes \
+                  WHERE key IN ('rss.item_id', 'rss.item_url')",
+                &[],
+            )
+            .await?[0]
+                .i64("n")
+        })
+        .unwrap();
+    assert_eq!(listed, 0);
+
+    // A link needs no key at start, and under another key reads as none.
+    assert!(!db.has_encrypted_credentials().unwrap());
+    let lost = EncryptionKey::generate();
+    db.validate_encrypted_credentials(&lost).unwrap();
+    let link = crate::history::attributes::rss_link_pairs(&job_metadata(&db, "active_jobs")[0].1);
+    db.set_encryption_key(lost);
+    assert!(db.rss_link_attributes(&link, CallerScope::Admin).is_empty());
+}
+
+// A tracker's URL is sealed, and its ciphertext differs each time it is
+// written: what keeps one URL from a tier twice is its keyed digest.
+#[test]
+fn a_tracker_listed_twice_in_a_tier_is_stored_once() {
+    let db = Database::open_in_memory().unwrap();
+    let (metainfo, url) = passkeyed(1);
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.metainfo = Some(metainfo.into());
+    let entry = |tier: u32, url: &str| TrackerEntry {
+        tier,
+        url: url.to_owned(),
+        named_by: NamedBy::Torrent,
+    };
+    // Twice in one tier, and once in another, which is another row.
+    let listed = [entry(0, &url), entry(0, &url), entry(1, &url)];
+    db.insert_torrent(&record, &listed).unwrap();
+    assert_eq!(raw_secrets(&db).1.len(), 2);
+    assert_eq!(
+        db.list_torrent_trackers(JobId(1)).unwrap(),
+        [entry(0, &url), entry(1, &url)]
+    );
+    let other = format!("{url}&other");
+    assert!(
+        db.set_torrent_trackers(
+            JobId(1),
+            &[entry(0, &other), entry(0, &url), entry(0, &other)]
+        )
+        .unwrap()
+    );
+    assert_eq!(raw_secrets(&db).1.len(), 2);
+    let mut kept = db.list_torrent_trackers(JobId(1)).unwrap();
+    kept.sort_by(|a, b| a.url.cmp(&b.url));
+    assert_eq!(kept, [entry(0, &url), entry(0, &other)]);
+}
+
+// A start that finds no key must know that sealed torrent and RSS secrets
+// need the one they were sealed with, or it would make a new key over them;
+// and a start with the wrong key is refused by one stored value of a sealed
+// column, not found torrent by torrent.
+#[test]
+fn sealed_secrets_are_counted_and_proved_against_the_key_at_start() {
+    let db = Database::open_in_memory().unwrap();
+    let credentials = db.has_encrypted_credentials().unwrap();
+    db.seal_stored_secrets().unwrap();
+    // Marked, with nothing sealed: no more than before.
+    assert_eq!(db.has_encrypted_credentials().unwrap(), credentials);
+    let key = db.encryption_key().cloned().unwrap();
+    db.validate_encrypted_credentials(&key).unwrap();
+
+    let (metainfo, url) = passkeyed(1);
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.metainfo = Some(metainfo.into());
+    let trackers = [TrackerEntry {
+        tier: 0,
+        url,
+        named_by: NamedBy::Torrent,
+    }];
+    db.insert_torrent(&record, &trackers).unwrap();
+    assert!(db.has_encrypted_credentials().unwrap());
+    db.validate_encrypted_credentials(&key).unwrap();
+    let other = crate::persistence::encryption::EncryptionKey::generate();
+    let refused = db.validate_encrypted_credentials(&other).unwrap_err();
+    assert!(
+        refused.to_string().contains("torrent metainfo"),
+        "{refused}"
+    );
+}
+
+// A key held in memory only is gone at the next start, and all it sealed
+// with it: no torrent is stored under one, with why, and the sealing pass
+// neither seals nor marks itself run.
+#[test]
+fn nothing_is_sealed_under_a_key_held_in_memory_only() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate().ephemeral());
+    let (metainfo, url) = passkeyed(1);
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.metainfo = Some(metainfo.into());
+    let trackers = [TrackerEntry {
+        tier: 0,
+        url,
+        named_by: NamedBy::Torrent,
+    }];
+    let refused = db.insert_torrent(&record, &trackers).unwrap_err();
+    assert!(
+        refused.to_string().contains("held in memory only"),
+        "{refused}"
+    );
+    assert!(db.get_torrent(JobId(1)).unwrap().is_none());
+    db.seal_stored_secrets().unwrap();
+    assert_eq!(
+        db.get_setting(crate::torrents::sealed::SEALED_MARK)
+            .unwrap(),
+        None
+    );
 }

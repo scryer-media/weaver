@@ -174,6 +174,8 @@ pub fn bootstrap_encryption(
     }
     db.migrate_plaintext_credentials()
         .map_err(|error| format!("encrypt existing credentials: {error}"))?;
+    db.seal_stored_secrets()
+        .map_err(|error| format!("encrypt existing torrent and RSS secrets: {error}"))?;
 
     let saved_data_dir = config.data_dir.clone();
     let mut reloaded = db

@@ -25,7 +25,9 @@ impl TorrentsSubscription {
     /// (at most 500), or every torrent. The first push is the torrents as
     /// they are, with `fullUpdate`; each later one comes when one of them
     /// changes, a tracker's answer as soon as it lands, and carries only the
-    /// torrents that changed or came and the ids of the ones gone.
+    /// torrents that changed or came and the ids of the ones gone. Every
+    /// torrent is followed only once the stored torrents are all read at
+    /// start: asked before, it is an error with code `TORRENTS_LOADING`.
     #[graphql(guard = "ReadGuard")]
     async fn torrent_updates(
         &self,
@@ -42,7 +44,11 @@ impl TorrentsSubscription {
             (None, Some(ids)) => Follow::Some(ids.into_iter().map(JobId).collect()),
             (None, None) => Follow::Every,
         };
-        let mut updates = service(ctx)?.follow(follow, BEAT);
+        let service = service(ctx)?;
+        if follow == Follow::Every {
+            service.whole().map_err(super::not_ready)?;
+        }
+        let mut updates = service.follow(follow, BEAT);
         Ok(async_stream::stream! {
             loop {
                 yield updates.next().await.into();

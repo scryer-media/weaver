@@ -325,3 +325,120 @@ async fn history_item_says_whether_it_failed_for_memory() {
         );
     }
 }
+
+// An RSS job's item link and id are answered, opened, to an admin only, on
+// every type that carries a job's attributes: the queue's item, the job and
+// the history's item. Any other caller, a diagnostics capture, and a
+// request under a lost key read neither, and never the sealed text.
+#[tokio::test]
+async fn an_rss_link_and_id_are_answered_to_an_admin_only() {
+    use crate::jobs::types::{HideRssLinks, Job, QueueItem, queue_item_from_job};
+    use weaver_server_core::auth::CallerScope;
+    use weaver_server_core::persistence::encryption::{EncryptionKey, encrypt_value};
+
+    const LINK: &str = "https://tracker.invalid/dl/1?passkey=f00d";
+    let key = EncryptionKey::generate();
+    let mut db = weaver_server_core::Database::open_in_memory().unwrap();
+    db.set_encryption_key(key.clone());
+    let row = JobHistoryRow {
+        job_id: 81,
+        job_hash: None,
+        name: "Linked".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 2_000,
+        downloaded_bytes: 2_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(
+            serde_json::to_string(&[
+                ("rss.feed_name", "feed".to_string()),
+                ("rss.item_id", encrypt_value(&key, LINK).unwrap()),
+                ("rss.item_url", encrypt_value(&key, LINK).unwrap()),
+            ])
+            .unwrap(),
+        ),
+        server_attribution: None,
+        protocol: weaver_server_core::Protocol::Nzb,
+        archived_at: None,
+    };
+
+    struct Query(HistoryItem, QueueItem, Job);
+    #[async_graphql::Object]
+    impl Query {
+        async fn history(&self) -> HistoryItem {
+            self.0.clone()
+        }
+        async fn queue(&self) -> QueueItem {
+            self.1.clone()
+        }
+        async fn job(&self) -> Job {
+            self.2.clone()
+        }
+    }
+    let info = crate::history::query::job_info_from_history_row(&row);
+    let item = history_item_from_row(&row, None);
+    // Nothing that is serialised whole holds the link, sealed or not.
+    let serialised = serde_json::to_string(&item).unwrap();
+    assert!(!serialised.contains("enc:v1:") && !serialised.contains("passkey"));
+    let schema = async_graphql::Schema::new(
+        Query(item, queue_item_from_job(&info), Job::from(&info)),
+        async_graphql::EmptyMutation,
+        async_graphql::EmptySubscription,
+    );
+    let query = "{ history { attributes { key value } } queue { attributes { key value } } \
+                 job { metadata { key value } } }";
+    let answer = |db: weaver_server_core::Database, scope: CallerScope, hide: bool| {
+        let schema = schema.clone();
+        async move {
+            let mut request = async_graphql::Request::new(query).data(db).data(scope);
+            if hide {
+                request = request.data(HideRssLinks);
+            }
+            let response = schema.execute(request).await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            response.data.into_json().unwrap()
+        }
+    };
+    let entries = |pairs: &[(&str, &str)]| {
+        serde_json::Value::Array(
+            pairs
+                .iter()
+                .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+                .collect(),
+        )
+    };
+    let shown = |pairs: &[(&str, &str)]| {
+        serde_json::json!({
+            "history": { "attributes": entries(pairs) },
+            "queue": { "attributes": entries(pairs) },
+            "job": { "metadata": entries(pairs) },
+        })
+    };
+    let public = shown(&[("rss.feed_name", "feed")]);
+    let opened = shown(&[
+        ("rss.feed_name", "feed"),
+        ("rss.item_id", LINK),
+        ("rss.item_url", LINK),
+    ]);
+
+    assert_eq!(answer(db.clone(), CallerScope::Admin, false).await, opened);
+    assert_eq!(answer(db.clone(), CallerScope::Local, false).await, opened);
+    for scope in [
+        CallerScope::Read,
+        CallerScope::Control,
+        CallerScope::ScriptRun,
+    ] {
+        assert_eq!(answer(db.clone(), scope, false).await, public, "{scope:?}");
+    }
+    assert_eq!(answer(db.clone(), CallerScope::Admin, true).await, public);
+    db.set_encryption_key(EncryptionKey::generate());
+    assert_eq!(answer(db, CallerScope::Admin, false).await, public);
+}
