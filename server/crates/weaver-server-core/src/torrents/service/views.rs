@@ -5,7 +5,7 @@ use super::disk_room::disk_warning;
 use super::listing::{CategoryPick, FileTotals, Pick, Shown};
 use super::live::Live;
 use super::settings::{Presence, SeedingLevels, TorrentSettings};
-use super::{Reading, TorrentService, files_of, hashes_of, on_disk, report, wanted};
+use super::{NotReady, Reading, TorrentService, files_of, hashes_of, on_disk, report, wanted};
 use crate::categories::model::resolve_category_config;
 use crate::jobs::JobId;
 use crate::jobs::handle::{HoldOrigin, JobInfo};
@@ -403,19 +403,25 @@ impl TorrentService {
         }
     }
 
-    /// Warnings that stand: the disk filling up under waiting torrents.
+    /// Warnings that stand: the stored torrents not all loaded, and the
+    /// disk filling up under waiting torrents.
     pub async fn warnings(&self) -> Vec<String> {
+        let mut warnings: Vec<String> = self
+            .load_fault()
+            .map(|why| NotReady::Faulted(why).to_string())
+            .into_iter()
+            .collect();
         let live = self.inner.live.lock().await;
         let waiting: Vec<&str> = live
             .values()
             .filter(|torrent| torrent.upload_mode())
             .map(|torrent| torrent.record.name.as_str())
             .collect();
-        if waiting.is_empty() {
-            return Vec::new();
+        if !waiting.is_empty() {
+            let volume = self.settings().complete_dir;
+            warnings.push(disk_warning(&volume, &waiting));
         }
-        let volume = self.settings().complete_dir;
-        vec![disk_warning(&volume, &waiting)]
+        warnings
     }
 
     pub(super) fn view(&self, settings: &TorrentSettings, torrent: &Live, now: i64) -> TorrentView {

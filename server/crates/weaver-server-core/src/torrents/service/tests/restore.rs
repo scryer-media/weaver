@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::persistence::sql_runtime::SqlRuntime;
 
 // A restart brings back what the operator asked, not the state last shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1884,8 +1885,9 @@ fn a_torrents_password_list_is_its_rules_then_the_global_list_once_each() {
 }
 
 // The stored torrents load behind the start: with the load held before its
-// first page, the start has ended and the service answers. The whole list
-// shows the torrents in so far; one named by its key, or on a page of the
+// first page, the start has ended and the service answers. A list of every
+// torrent, or of more than a page, is told they are not all here yet, never
+// given some of them as all; one named by its key, or on a page of the
 // list, is read then and there; an
 // add of a torrent stored but not yet in is refused from its row; a remove
 // of one not yet in removes it, and the load does not bring it back; a new
@@ -1893,7 +1895,7 @@ fn a_torrents_password_list_is_its_rules_then_the_global_list_once_each() {
 // in, once, and the one added under it is last in the queue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_service_answers_while_its_stored_torrents_load() {
-    use crate::torrents::service::listing::{Pick, Shown, page};
+    use crate::torrents::service::listing::{PAGE_WHILE_LOADING, Pick, Shown, Window, page};
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let mut stored = Vec::new();
@@ -1911,9 +1913,16 @@ async fn the_service_answers_while_its_stored_torrents_load() {
     rig.service.stop().await;
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.inner.load_held.send_replace(true);
+    again.hold_load(true);
     again.start_seated().await.unwrap();
     assert!(again.loading());
+    assert_eq!(again.whole(), Err(NotReady::Loading));
+    for window in [Window::Every, page(0, PAGE_WHILE_LOADING + 1)] {
+        assert!(matches!(
+            again.picked(Pick::default(), window, Shown::LISTED).await,
+            Err(ListError::NotReady(NotReady::Loading))
+        ));
+    }
     assert_eq!(again.torrents(None).await.len(), 0);
 
     assert_eq!(again.torrent(one).await.unwrap().name, "one");
@@ -1947,17 +1956,13 @@ async fn the_service_answers_while_its_stored_torrents_load() {
         .unwrap();
     assert!(rig.db.get_torrent(four).unwrap().is_some());
 
-    again.inner.load_held.send_replace(false);
-    again
-        .inner
-        .load
-        .subscribe()
-        .wait_for(|load| matches!(load, Load::Done))
-        .await
-        .unwrap();
+    again.hold_load(false);
+    again.loaded().await;
+    assert_eq!(again.whole(), Ok(()));
     let listed: Vec<JobId> = again
-        .torrents(None)
+        .picked(Pick::default(), Window::Every, Shown::LISTED)
         .await
+        .unwrap()
         .iter()
         .map(|view| view.job_id)
         .collect();
@@ -1965,6 +1970,318 @@ async fn the_service_answers_while_its_stored_torrents_load() {
     let place = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().queue_position;
     assert!(place(one) < place(two) && place(two) < place(four));
     again.stop().await;
+}
+
+// The stored torrents in the order a restart would bring their queue back.
+fn kept_order(db: &Database, jobs: &[JobId]) -> Vec<JobId> {
+    let mut kept: Vec<(i64, JobId)> = jobs
+        .iter()
+        .map(|job_id| {
+            (
+                db.get_torrent(*job_id).unwrap().unwrap().queue_position,
+                *job_id,
+            )
+        })
+        .collect();
+    kept.sort_unstable();
+    kept.into_iter().map(|(_, job_id)| job_id).collect()
+}
+
+// A torrent an asker read while the load ran, taken out by the operator
+// before that asker put it among the live ones, and the load ended in
+// between: the asker does not bring it back. Its tracker, which the torrent
+// kept beside it shares, hears that one start and stop, and nothing of the
+// one removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_removed_under_a_read_of_it_is_not_brought_back() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    let (url, mut answered) = answering_tracker("127.0.0.1:1".parse().unwrap()).await;
+    rig.service.open().await.unwrap();
+    let mut jobs = Vec::new();
+    for (name, seed) in [("gone", 1), ("kept", 2)] {
+        let job_id = rig
+            .service
+            .add_opened(request(AddSource::Metainfo(plain(name, seed))))
+            .await
+            .unwrap();
+        tracked(&rig.service, job_id, &url).await;
+        jobs.push(job_id);
+    }
+    let [gone, kept] = jobs[..] else {
+        unreachable!()
+    };
+    answered
+        .wait_for(|events| {
+            events
+                .iter()
+                .filter(|(event, _)| event == "started")
+                .count()
+                == 2
+        })
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    let before = answered.borrow().len();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.hold_load(true);
+    again.start_seated().await.unwrap();
+    // The asker: its read begun, and the torrent's rows read.
+    let (reader, _) = again.reader().unwrap();
+    let page = again.read_page(vec![gone]).await.unwrap();
+    again.remove(gone, false, true).await.unwrap();
+    assert_eq!(rig.db.get_torrent(gone).unwrap(), None);
+    again.hold_load(false);
+    again.loaded().await;
+    // The asker goes on with what it read, the load over.
+    again.take_page(page).await;
+    drop(reader);
+    {
+        let live = again.inner.live.lock().await;
+        assert_eq!(live.keys().copied().collect::<Vec<_>>(), [kept]);
+    }
+    assert!(locked(&again.inner.load_marks).gone.is_empty());
+
+    again.tick().await;
+    again.restored().await;
+    answered
+        .wait_for(|events| events.len() > before)
+        .await
+        .unwrap();
+    again.pause(kept).await.unwrap();
+    let heard = answered
+        .wait_for(|events| events.len() > before + 1)
+        .await
+        .unwrap()[before..]
+        .iter()
+        .map(|(event, _)| event.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(heard, ["started", "stopped"]);
+    let taken: usize = again
+        .inner
+        .sessions
+        .running()
+        .await
+        .values()
+        .map(|session| session.with_torrents(|torrents| torrents.count()))
+        .sum();
+    assert_eq!(taken, 1);
+    again.stop().await;
+}
+
+// A page the load fails to read leaves the load where it stands, with why
+// shown among the service's warnings: the torrents read so far take their
+// turns, an answer over every torrent is refused with the reason, and a
+// read that fails again changes no row. The tick reads the page again, and
+// when the last is in, a torrent added meanwhile is last in the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_that_fails_is_read_again_from_where_the_load_stood() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let mut stored = Vec::new();
+    for (name, seed) in [("one", 1), ("two", 2), ("three", 3)] {
+        stored.push(
+            rig.service
+                .add_opened(request(AddSource::Metainfo(plain(name, seed))))
+                .await
+                .unwrap(),
+        );
+    }
+    let [one, two, three] = stored[..] else {
+        unreachable!()
+    };
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.inner.load_seam.page_rows.store(1, Relaxed);
+    // The first page reads; the second does not.
+    again.inner.load_seam.fail_in.store(2, Relaxed);
+    let why = again.open().await.unwrap_err();
+    assert!(again.loading());
+    assert_eq!(again.whole(), Err(NotReady::Faulted(why.clone())));
+    assert_eq!(
+        again.warnings().await,
+        [NotReady::Faulted(why.clone()).to_string()]
+    );
+    let here = || async {
+        again
+            .inner
+            .live
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(here().await, [one]);
+    // The one read so far takes its turn.
+    again.apply_queue().await;
+    assert!(!again.inner.live.lock().await[&one].queued);
+    let four = again
+        .add(request(AddSource::Metainfo(plain("four", 4))))
+        .await
+        .unwrap();
+
+    // A read that fails again: no row changes, and the reason stands.
+    let rows = || [one, two, three, four].map(|job_id| rig.db.get_torrent(job_id).unwrap());
+    let before = rows();
+    again.inner.load_seam.fail_in.store(1, Relaxed);
+    again.resumed_load().unwrap().await;
+    assert_eq!(rows(), before);
+    assert_eq!(again.whole(), Err(NotReady::Faulted(why)));
+    assert_eq!(here().await, [one, four]);
+
+    // The tick reads on from the page that failed.
+    again.tick().await;
+    again.loaded().await;
+    assert_eq!(again.whole(), Ok(()));
+    assert!(again.warnings().await.is_empty());
+    assert_eq!(here().await, [one, two, three, four]);
+    assert_eq!(
+        kept_order(&rig.db, &[four, three, two, one]),
+        [one, two, three, four]
+    );
+    again.stop().await;
+}
+
+// What is asked of the queue's order while the stored torrents load is
+// done among all of them when the last is in, in the order asked: a move
+// to the top, an add to the top, and a move to the bottom all hold. Until
+// then the order kept is the stored one, and no torrent of the part read
+// so far takes a download turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queue_move_asked_for_under_the_load_holds_after_it() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let mut stored = Vec::new();
+    for (name, seed) in [("a", 1), ("b", 2), ("c", 3)] {
+        stored.push(
+            rig.service
+                .add_opened(request(AddSource::Metainfo(plain(name, seed))))
+                .await
+                .unwrap(),
+        );
+    }
+    let [a, b, c] = stored[..] else {
+        unreachable!()
+    };
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.hold_load(true);
+    again.start_seated().await.unwrap();
+    again.reorder(&[c], QueueMoveTarget::Top).await.unwrap();
+    let d = again
+        .add(request(AddSource::Metainfo(plain("d", 4))))
+        .await
+        .unwrap();
+    again.reorder(&[d], QueueMoveTarget::Top).await.unwrap();
+    let moved = again.move_many(&[(a, QueueMoveTarget::Bottom)]).await;
+    assert!(moved.iter().all(|(_, moved)| moved.is_ok()));
+    assert!(matches!(
+        again.reorder(&[JobId(9_999)], QueueMoveTarget::Top).await,
+        Err(ActionError::NotFound(JobId(9_999)))
+    ));
+    // The stored order stands, and none of the part here has a turn.
+    assert_eq!(kept_order(&rig.db, &[a, b, c]), [a, b, c]);
+    again.apply_queue().await;
+    {
+        let live = again.inner.live.lock().await;
+        assert_eq!(live.keys().copied().collect::<Vec<_>>(), [a, c, d]);
+        assert!(live.values().all(|torrent| torrent.queued));
+    }
+
+    again.hold_load(false);
+    again.loaded().await;
+    assert_eq!(kept_order(&rig.db, &[a, b, c, d]), [d, c, b, a]);
+    {
+        let live = again.inner.live.lock().await;
+        let mut order: Vec<(i64, JobId)> = live
+            .values()
+            .map(|torrent| (torrent.record.queue_position, torrent.record.job_id))
+            .collect();
+        order.sort_unstable();
+        assert_eq!(
+            order
+                .into_iter()
+                .map(|(_, job_id)| job_id)
+                .collect::<Vec<_>>(),
+            [d, c, b, a]
+        );
+        assert!(live.values().any(|torrent| !torrent.queued));
+    }
+    again.stop().await;
+}
+
+// A torrent the load is reading is not read again by one that asks for it
+// meanwhile: the asker waits for that read alone, and reads no row of the
+// torrent itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_being_read_is_waited_for_not_read_twice() {
+    let reads = |db: &Database| db.torrent_reads.load(std::sync::atomic::Ordering::Relaxed);
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let one = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("one", 1))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.hold_load(true);
+    again.start_seated().await.unwrap();
+    // The load's page, as far as its read: the torrent is its to read.
+    let mut wanted = vec![(one, 0)];
+    let (claim, theirs) = again.claim(&mut wanted);
+    assert!(theirs.is_empty());
+    let page = again.read_page(vec![one]).await.unwrap();
+    let base = reads(&rig.db);
+    // The asker waits on that read before the page joins the live
+    // torrents: the load's own hold on the read's end is one, the asker's
+    // the second.
+    let asker = {
+        let again = again.clone();
+        tokio::spawn(async move { again.torrent(one).await })
+    };
+    while claim.ended.receiver_count() < 2 {
+        tokio::task::yield_now().await;
+    }
+    again.take_page(page).await;
+    drop(claim);
+    assert_eq!(asker.await.unwrap().unwrap().name, "one");
+    // The sizes it asked for, to know what to read; never the torrent.
+    assert_eq!(reads(&rig.db), base + 1);
+    again.hold_load(false);
+    again.loaded().await;
+    again.stop().await;
+}
+
+// A page holds no more stored metainfo than its bound, a torrent larger
+// than the bound a page alone, and never more torrents than its rows.
+#[test]
+fn a_page_of_the_load_is_bounded_by_bytes_as_by_rows() {
+    use super::super::restore::{LOAD_PAGE_BYTES, pages};
+    let mib = 1024 * 1024;
+    let sized = |sizes: &[u64]| -> Vec<(JobId, u64)> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(at, size)| (JobId(at as u64 + 1), *size))
+            .collect()
+    };
+    let lens = |sizes: &[u64], rows| -> Vec<usize> {
+        pages(&sized(sizes), rows).iter().map(Vec::len).collect()
+    };
+    assert_eq!(lens(&[1; 5], 2), [2, 2, 1]);
+    assert_eq!(lens(&[16 * mib, 16 * mib, 1], 64), [2, 1]);
+    assert_eq!(lens(&[1, 100 * mib, 1, 1], 64), [1, 1, 2]);
+    assert_eq!(lens(&[LOAD_PAGE_BYTES, LOAD_PAGE_BYTES], 64), [1, 1]);
+    assert!(lens(&[], 64).is_empty());
+    let all: Vec<JobId> = pages(&sized(&[7; 9]), 4).concat();
+    assert_eq!(all, (1..=9).map(JobId).collect::<Vec<_>>());
 }
 
 // A tick that finds no torrent waiting for its job begins no restore pass:
@@ -2138,5 +2455,77 @@ async fn a_restored_torrent_joins_one_session_though_its_route_changed() {
     }
     next.sort_unstable();
     assert_eq!(next, [0, 1], "the torrent was put in both sessions");
+    again.stop().await;
+}
+
+// A recheck of a torrent whose job is not back yet answers without waiting
+// for the torrent to join its route's session: the join is held here, and
+// the recheck returns all the same, the job restored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recheck_of_a_torrent_not_restored_does_not_wait_on_its_route() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let gate = Arc::clone(&again.inner.live.lock().await[&job_id].gate);
+    let held = gate.lock().await;
+    again.recheck(job_id).await.unwrap();
+    {
+        let live = again.inner.live.lock().await;
+        assert!(live[&job_id].store.is_some());
+        assert!(live[&job_id].attached.is_none());
+    }
+    drop(held);
+    again.stop().await;
+}
+
+// The torrents kept before whether each unpacks was, a page of them: the
+// load fixes it for each and keeps them all in one write of the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_keeps_whether_its_older_torrents_unpack() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let mut stored = Vec::new();
+    for (name, seed) in [("one", 1), ("two", 2), ("three", 3)] {
+        stored.push(
+            rig.service
+                .add_opened(request(AddSource::Metainfo(plain(name, seed))))
+                .await
+                .unwrap(),
+        );
+    }
+    rig.service.stop().await;
+    {
+        let datastore = rig.db.datastore();
+        rig.db
+            .run_sql_blocking(async move {
+                SqlRuntime::execute(
+                    datastore.write_exec(),
+                    "UPDATE torrents SET unpack_in_force = NULL",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let kept = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().unpack_in_force;
+    assert!(stored.iter().all(|job_id| kept(*job_id).is_none()));
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    for job_id in &stored {
+        assert_eq!(kept(*job_id), Some(true));
+        let live = again.inner.live.lock().await;
+        assert_eq!(live[job_id].record.unpack_in_force, Some(true));
+    }
     again.stop().await;
 }

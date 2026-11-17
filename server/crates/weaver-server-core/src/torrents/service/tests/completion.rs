@@ -1792,7 +1792,7 @@ async fn a_crash_after_the_mark_leaves_what_a_live_torrent_holds() {
 // Whether the torrents row of `job_id` says its held paths are its own.
 fn held_set(rig: &Rig, job_id: JobId) -> bool {
     rig.db
-        .restored_torrents(crate::torrents::queries::Restoring::Of(&[job_id]))
+        .restored_torrents(&[job_id])
         .unwrap()
         .remove(0)
         .held_set

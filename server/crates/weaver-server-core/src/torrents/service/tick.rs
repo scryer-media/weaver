@@ -367,6 +367,8 @@ impl TorrentService {
     /// Read every torrent, keep their ledgers, follow their routes, and
     /// apply what that changes.
     pub async fn tick(&self) {
+        // A load of the stored torrents whose page failed reads it again.
+        self.resume_load();
         // The jobs still to restore are restored off the tick, which goes on
         // at once: a torrent reads as kept until its job is back.
         self.start_restores();

@@ -579,9 +579,9 @@ impl TorrentService {
         if on {
             // While the stored torrents are still being read no tick runs:
             // the load starts it once the last is in, as the sessions
-            // stand then, so no torrent takes a queue turn among only some
-            // of them.
-            if !self.loading() {
+            // stand then. A load whose page failed runs the tick: the
+            // torrents read so far run, and the tick reads the page again.
+            if !self.partial() {
                 self.spawn_tick();
             }
         } else {

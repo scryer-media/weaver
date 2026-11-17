@@ -5,7 +5,7 @@ use super::live::Live;
 use super::retire::{held_at, held_tops};
 use super::settings::TorrentSettings;
 use super::{
-    Load, NEEDS_DHT, PeerTerms, TorrentService, give_back, hashes_of, held_by, identity_of,
+    Asked, NEEDS_DHT, PeerTerms, TorrentService, give_back, hashes_of, held_by, identity_of,
     in_table_order, locked, queued, state_error, take_turn, tidy_trackers, tracker, tracker_tiers,
 };
 use crate::categories::CategoryConfig;
@@ -321,12 +321,6 @@ impl TorrentService {
     }
 
     pub async fn add(&self, request: AddRequest) -> Result<JobId, AddError> {
-        // The stored torrents did not load: none is added beside them.
-        if let Load::Failed(why) = &*self.inner.load.borrow() {
-            return Err(AddError::State(format!(
-                "the stored torrents did not load: {why}"
-            )));
-        }
         // Off, a wind-down's sessions open included: no torrent is new.
         let settings = self.settings();
         if !self.takes_new() {
@@ -523,11 +517,19 @@ impl TorrentService {
             // Added while the stored torrents are still being read, it
             // waits for its turn among all of them: the pass at the load's
             // end gives it, and its place past every one of them.
-            if self.loading() {
+            // Asked under the lock the load ends under, so its place is
+            // given by the load's end or is its own already. A load whose
+            // page failed lets the torrents here run meanwhile.
+            let partial = {
+                let mut marks = locked(&self.inner.load_marks);
+                let loading = self.loading();
+                if loading {
+                    marks.asked.push(Asked::Added(torrent.record.job_id));
+                }
+                loading && marks.fault.is_none()
+            };
+            if partial {
                 turn.active &= queued.forced || queued.seeding;
-                locked(&self.inner.load_marks)
-                    .added
-                    .push(torrent.record.job_id);
             }
             if end.last.is_some_and(|last| place < last) {
                 self.inner.signal.want_pass();

@@ -316,7 +316,10 @@ impl TorrentService {
                 Ok(())
             })
             .await?;
-            self.attach(job_id, None).await;
+            // Answered without waiting on its route, as the one held for
+            // its files is below.
+            self.apply_queue().await;
+            self.spawn_attach(job_id).await;
             self.publish().await;
             return Ok(());
         }

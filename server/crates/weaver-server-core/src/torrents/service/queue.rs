@@ -6,7 +6,7 @@ use super::intake::Resolving;
 use super::intake::{AddError, AddRequest};
 use super::live::Live;
 use super::scripts::StoppedSeeding;
-use super::{ActionError, Inner, TorrentService, state_error};
+use super::{ActionError, Asked, Inner, TorrentService, locked, state_error};
 use crate::SchedulerError;
 use crate::jobs::JobId;
 use crate::jobs::class::{
@@ -56,9 +56,10 @@ impl TorrentService {
     /// fails the start: a client that failed to start is never the class
     /// the job layer hands torrents to. The stored torrents are then read
     /// on a task the service keeps, a page at a time, and the tick starts
-    /// once the last is in; the caller goes on at once. A load the database
-    /// fails is said: the torrents read so far stay, no tick runs, and an
-    /// add is refused with why.
+    /// once the last is in; the caller goes on at once. A page the database
+    /// fails to give is said, and shown with the service's warnings: the
+    /// tick starts then, the torrents read so far run, and each tick reads
+    /// that page again until the load ends.
     pub(super) async fn start_seated(&self) -> Result<(), String> {
         let through = self.begin()?;
         if let Some(queue) = self.queue() {
@@ -66,15 +67,10 @@ impl TorrentService {
         }
         let service = self.clone();
         self.keep(tokio::spawn(async move {
-            match service.load(through).await {
-                Ok(()) => {
-                    service.after_load().await;
-                    service.run(service.inner.sessions.on()).await;
-                }
-                Err(error) => {
-                    tracing::error!(%error, "the stored torrents did not load; the torrent client does not run");
-                }
+            if service.load(through).await.is_ok() {
+                service.after_load().await;
             }
+            service.run(service.inner.sessions.on()).await;
         }));
         Ok(())
     }
@@ -252,12 +248,42 @@ impl TorrentService {
     /// starting with the first. A seed has no place to move (libtorrent
     /// `torrent::finished` takes it out of the queue). Nothing moves a
     /// torrent past the queue: forcing does that.
+    ///
+    /// Asked for while the stored torrents are still being read, the move
+    /// is kept and made once the last is in, among all of them, after the
+    /// moves asked before it: a place among only some of the queue is no
+    /// place.
     pub async fn reorder(
         &self,
         job_ids: &[JobId],
         target: QueueMoveTarget,
     ) -> Result<(), ActionError> {
         self.ensure(job_ids).await;
+        {
+            let live = self.inner.live.lock().await;
+            if let Some(&missing) = job_ids.iter().find(|job_id| !live.contains_key(job_id)) {
+                return Err(ActionError::NotFound(missing));
+            }
+            // Under the lock the load ends under: kept, or made now.
+            let mut marks = locked(&self.inner.load_marks);
+            if self.loading() {
+                marks.asked.push(Asked::Reorder(job_ids.to_vec(), target));
+                return Ok(());
+            }
+        }
+        if self.reorder_now(job_ids, target).await? {
+            self.apply_queue().await;
+            self.publish().await;
+        }
+        Ok(())
+    }
+
+    // `reorder` among the torrents here now: whether any place changed.
+    pub(super) async fn reorder_now(
+        &self,
+        job_ids: &[JobId],
+        target: QueueMoveTarget,
+    ) -> Result<bool, ActionError> {
         {
             let mut live = self.inner.live.lock().await;
             if let Some(&missing) = job_ids.iter().find(|job_id| !live.contains_key(job_id)) {
@@ -283,7 +309,7 @@ impl TorrentService {
                 .map(|(job_id, place)| (*job_id, place))
                 .collect();
             if moved.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
             self.inner
                 .db
@@ -295,9 +321,7 @@ impl TorrentService {
                 }
             }
         }
-        self.apply_queue().await;
-        self.publish().await;
-        Ok(())
+        Ok(true)
     }
 
     async fn update(&self, job_id: JobId, update: JobUpdate) -> Result<(), ActionError> {

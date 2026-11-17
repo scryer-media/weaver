@@ -797,37 +797,80 @@ impl Database {
         })
     }
 
-    // The torrents a start brings back, never one a removal left retiring,
-    // by job id: a page of them, or those of the jobs named. Each comes
-    // with its files' levels, the pieces it checked in seed mode, its
-    // trackers, its ledger, saved peers and kept pieces, and why unpacking
-    // left it short: what a boot reads of a torrent, four statements a
-    // page, each by its table's key. A row that does not read fails the
-    // read, as [`Self::list_torrents`] does; a level, a seed-mode column, a
-    // tracker URL or a part of the ledger that does not read is that
-    // torrent's alone.
+    // The jobs of the next stored torrents after `after`, none past
+    // `through` nor left retiring by a removal, `limit` at most, each with
+    // the bytes its stored metainfo takes: what a start reads before a
+    // page, by the table's key, to bound the page by its bytes and not its
+    // rows alone. No metainfo is read for it.
+    pub(crate) fn torrent_page_sizes(
+        &self,
+        after: Option<JobId>,
+        through: JobId,
+        limit: usize,
+    ) -> Result<Vec<(JobId, u64)>, StateError> {
+        self.torrent_read();
+        let args = [
+            SqlArg::I64(after.map_or(-1, |job_id| job_id.0 as i64)),
+            SqlArg::I64(through.0 as i64),
+            SqlArg::I64(i64::try_from(limit).unwrap_or(i64::MAX)),
+        ];
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                &format!(
+                    "{METAINFO_SIZES} AND job_id > {{}} AND job_id <= {{}} \
+                     ORDER BY job_id LIMIT {{}}"
+                ),
+                &args,
+            )
+            .await?;
+            rows.iter().map(sized).collect()
+        })
+    }
+
+    // `torrent_page_sizes` for the jobs named, by job id.
+    pub(crate) fn torrent_sizes_of(&self, jobs: &[JobId]) -> Result<Vec<(JobId, u64)>, StateError> {
+        self.torrent_read();
+        let named: Vec<i64> = jobs.iter().map(|job_id| job_id.0 as i64).collect();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let mut sizes = Vec::with_capacity(named.len());
+            for chunk in named.chunks(max_rows_for_engine(datastore.engine(), 1)) {
+                let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "{METAINFO_SIZES} AND job_id IN ({}) ORDER BY job_id",
+                        binds(chunk.len())
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in &rows {
+                    sizes.push(sized(row)?);
+                }
+            }
+            Ok(sizes)
+        })
+    }
+
+    // The torrents of `jobs` as a start brings them back, never one a
+    // removal left retiring, by job id. Each comes with its files' levels,
+    // the pieces it checked in seed mode, its trackers, its ledger, saved
+    // peers and kept pieces, and why unpacking left it short: what a boot
+    // reads of a torrent, four statements a page, each by its table's key.
+    // A row that does not read fails the read, as [`Self::list_torrents`]
+    // does; a level, a seed-mode column, a tracker URL or a part of the
+    // ledger that does not read is that torrent's alone.
     pub(crate) fn restored_torrents(
         &self,
-        which: Restoring<'_>,
+        jobs: &[JobId],
     ) -> Result<Vec<RestoredTorrent>, StateError> {
         self.torrent_read();
         let key = self.encryption_key().cloned();
         let datastore = self.datastore();
-        let (page, named) = match which {
-            Restoring::Page {
-                after,
-                through,
-                limit,
-            } => (
-                Some([
-                    SqlArg::I64(after.map_or(-1, |job_id| job_id.0 as i64)),
-                    SqlArg::I64(through.0 as i64),
-                    SqlArg::I64(i64::try_from(limit).unwrap_or(i64::MAX)),
-                ]),
-                Vec::new(),
-            ),
-            Restoring::Of(jobs) => (None, jobs.iter().map(|job_id| job_id.0 as i64).collect()),
-        };
+        let named: Vec<i64> = jobs.iter().map(|job_id| job_id.0 as i64).collect();
         #[cfg(test)]
         let reads = self.torrent_reads.clone();
         self.run_sql_blocking_read(async move {
@@ -838,34 +881,19 @@ impl Database {
             );
             let per = max_rows_for_engine(datastore.engine(), 1);
             let mut rows = Vec::new();
-            match &page {
-                Some(page) => rows.extend(
+            for chunk in named.chunks(per) {
+                let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
+                rows.extend(
                     SqlRuntime::fetch_all(
                         datastore.read_exec(),
                         &format!(
-                            "{select} AND job_id > {{}} AND job_id <= {{}} \
-                             ORDER BY job_id LIMIT {{}}"
+                            "{select} AND job_id IN ({}) ORDER BY job_id",
+                            binds(chunk.len())
                         ),
-                        page,
+                        &args,
                     )
                     .await?,
-                ),
-                None => {
-                    for chunk in named.chunks(per) {
-                        let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
-                        rows.extend(
-                            SqlRuntime::fetch_all(
-                                datastore.read_exec(),
-                                &format!(
-                                    "{select} AND job_id IN ({}) ORDER BY job_id",
-                                    binds(chunk.len())
-                                ),
-                                &args,
-                            )
-                            .await?,
-                        );
-                    }
-                }
+                );
             }
             let mut restored = rows
                 .into_iter()
@@ -985,16 +1013,13 @@ impl Database {
     }
 }
 
-/// Which torrents a start's read brings back.
-pub(crate) enum Restoring<'a> {
-    /// The next `limit` after `after`, by job id, none past `through`.
-    Page {
-        after: Option<JobId>,
-        through: JobId,
-        limit: usize,
-    },
-    /// Those of these jobs.
-    Of(&'a [JobId]),
+// The bytes each stored torrent's metainfo takes, read from the value's
+// length alone.
+const METAINFO_SIZES: &str = "SELECT job_id, CAST(COALESCE(length(metainfo), 0) AS BIGINT) AS bytes \
+                                FROM torrents WHERE retiring IS NULL";
+
+fn sized(row: &SqlRow) -> Result<(JobId, u64), StateError> {
+    Ok((JobId(count(row, "job_id")?), count(row, "bytes")?))
 }
 
 // One torrent's rows as a boot reads them.

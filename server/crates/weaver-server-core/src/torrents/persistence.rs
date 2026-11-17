@@ -1798,6 +1798,31 @@ impl Database {
         })
     }
 
+    // Whether each of a batch of torrents unpacks, that column alone, in
+    // one transaction of few statements: what a page of a start's load
+    // fixes for the torrents kept before the column was.
+    pub(crate) fn set_torrents_unpack_in_force(
+        &self,
+        unpacks: &[(JobId, bool)],
+    ) -> Result<(), StateError> {
+        if unpacks.is_empty() {
+            return Ok(());
+        }
+        let rows = unpacks
+            .iter()
+            .map(|&(job_id, unpack)| Ok((stored(job_id.0)?, SqlArg::Bool(unpack))))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrents_unpack_in_force", |tx| {
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "unpack_in_force", &rows).await })
+            })
+            .await
+        })
+    }
+
     // A magnet's metainfo once its peers sent it: the hashes and name it
     // carries, the file and whether it marks the torrent private, the
     // directory its files go to and the folder they

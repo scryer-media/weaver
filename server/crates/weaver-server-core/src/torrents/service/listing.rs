@@ -12,7 +12,7 @@ use std::ops::Range;
 
 use weaver_torrent::core::Id20;
 
-use super::{Live, TorrentService, TorrentSettings, TorrentView, hashes_of};
+use super::{ListError, Live, TorrentService, TorrentSettings, TorrentView, hashes_of};
 use crate::jobs::JobId;
 use crate::torrents::FilePriority;
 use crate::torrents::layout::PieceLayout;
@@ -353,18 +353,36 @@ impl TorrentService {
     }
 
     // The ids `pick` keeps at `window`'s places, read from the table.
-    fn picked_ids(&self, pick: Pick<'_>, window: Window) -> Result<Picked, crate::StateError> {
-        pick.picked(&self.settings(), &self.inner.db, window)
+    //
+    // While the stored torrents are still being read, a pick that names
+    // its torrents by hash, or takes a page of `PAGE_WHILE_LOADING` at
+    // most, is answered; any other needs every torrent here, and is told
+    // they are not yet, before the table is read for it.
+    fn picked_ids(&self, pick: Pick<'_>, window: Window) -> Result<Picked, ListError> {
+        let named = pick.hashes.is_some();
+        let paged = match &window {
+            Window::Every => false,
+            Window::Page { first, .. } => *first <= PAGE_WHILE_LOADING,
+            Window::Counted(_) => true,
+        };
+        if !named && !paged {
+            self.whole()?;
+        }
+        let picked = pick.picked(&self.settings(), &self.inner.db, window)?;
+        // A counted window's size is known only now.
+        if !named
+            && let Picked::Page(page) = &picked
+            && page.len() > PAGE_WHILE_LOADING
+        {
+            self.whole()?;
+        }
+        Ok(picked)
     }
 
     // `picked_ids`, each torrent of the page here to be shown: one the
     // start's load has not reached is read now, so a page lists what the
     // table holds however far the load is.
-    async fn picked_here(
-        &self,
-        pick: Pick<'_>,
-        window: Window,
-    ) -> Result<Picked, crate::StateError> {
+    async fn picked_here(&self, pick: Pick<'_>, window: Window) -> Result<Picked, ListError> {
         let picked = self.picked_ids(pick, window)?;
         if let Picked::Page(page) = &picked {
             self.ensure(page).await;
@@ -374,13 +392,16 @@ impl TorrentService {
 
     /// The torrents `pick` keeps, in the order they were added, and of
     /// those the ones at `window`'s places. Only their views are built. An
-    /// error when the table cannot be read, never an empty list.
+    /// error when the table cannot be read, never an empty list; and while
+    /// the stored torrents are still being read at start, an error for a
+    /// pick that needs every one of them: one that names no hash and takes
+    /// more than a page of [`PAGE_WHILE_LOADING`].
     pub async fn picked(
         &self,
         pick: Pick<'_>,
         window: Window,
         shown: Shown,
-    ) -> Result<Vec<TorrentView>, crate::StateError> {
+    ) -> Result<Vec<TorrentView>, ListError> {
         let picked = self.picked_here(pick, window).await?;
         let now = self.inner.clock.unix_ms();
         Ok(self
@@ -398,7 +419,7 @@ impl TorrentService {
         pick: Pick<'_>,
         window: Window,
         shown: Shown,
-    ) -> Result<Vec<(TorrentView, FileTotals)>, crate::StateError> {
+    ) -> Result<Vec<(TorrentView, FileTotals)>, ListError> {
         let picked = self.picked_here(pick, window).await?;
         let now = self.inner.clock.unix_ms();
         Ok(self
@@ -441,7 +462,7 @@ impl TorrentService {
             hashes: Some(&hashes),
             ..Pick::default()
         };
-        let Picked::Page(found) = self.picked_ids(pick, page(0, 1))? else {
+        let Picked::Page(found) = pick.picked(&self.settings(), &self.inner.db, page(0, 1))? else {
             unreachable!("a pick of hashes reads its page from the table")
         };
         Ok(match found.first() {
@@ -450,6 +471,10 @@ impl TorrentService {
         })
     }
 }
+
+/// The most torrents a page may take while the stored torrents are still
+/// being read at start: the page is read for the request that asks.
+pub const PAGE_WHILE_LOADING: usize = 500;
 
 /// The places a page of `first` torrents after `offset` takes.
 pub fn page(offset: usize, first: usize) -> Window {

@@ -22,7 +22,7 @@ use weaver_torrent::{
 use crate::StateError;
 use crate::clock::{Clock, SystemClock};
 use crate::jobs::JobId;
-use crate::jobs::handle::{HoldSet, JobInfo, SchedulerHandle};
+use crate::jobs::handle::{HoldSet, JobInfo, QueueMoveTarget, SchedulerHandle};
 use crate::jobs::model::{JobStatus, Protocol};
 use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress};
 use crate::jobs::report::JobReport;
@@ -694,6 +694,29 @@ impl Signal {
     }
 }
 
+// A test's hold on the load of the stored torrents.
+#[cfg(any(test, feature = "test-support"))]
+struct LoadSeam {
+    // Held, the load reads no page.
+    held: watch::Sender<bool>,
+    // The rows of a page, in place of `LOAD_PAGE`; 0 for that.
+    page_rows: std::sync::atomic::AtomicUsize,
+    // The page read that fails, once, counted from the next as 1; 0 for
+    // none.
+    fail_in: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for LoadSeam {
+    fn default() -> Self {
+        Self {
+            held: watch::channel(false).0,
+            page_rows: std::sync::atomic::AtomicUsize::new(0),
+            fail_in: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
 /// What the service has written so far, and the checkpoints it has read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Written {
@@ -712,25 +735,69 @@ enum Restores {
 }
 
 // Where the read of the stored torrents at start stands: not begun, under
-// way as far as the last job a torrent row had when it began, ended, or
-// ended on a read that failed, with why.
+// way as far as the last job a torrent row had when it began, or ended. A
+// page that does not read leaves it under way: the page is read again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Load {
     Idle,
     Running(Option<JobId>),
     Done,
-    Failed(String),
 }
 
 // What moved under a load of the stored torrents, kept only while it runs.
+// The load ends under this lock, so what is asked here of whether it runs
+// is true of everything else kept here.
 #[derive(Default)]
 struct LoadMarks {
     // The torrents taken out of the live ones: a page read before one went
-    // does not bring it back.
+    // does not bring it back. Kept while the load runs and while a read of
+    // a torrent the load had not reached is in flight, which may outlast it.
     gone: BTreeSet<JobId>,
-    // The torrents added: each takes its place past every stored torrent
-    // once the last of them is read.
-    added: Vec<JobId>,
+    // The reads of torrents the load had not reached that are in flight.
+    readers: usize,
+    // The torrents being read now, each by one reader, and what tells the
+    // others that ask for one that its read has ended.
+    reading: HashMap<JobId, watch::Receiver<bool>>,
+    // What was asked of the queue's order, in the order asked: it is done
+    // once the last stored torrent is read, when every place is known.
+    asked: Vec<Asked>,
+    // The last job the pages have read: the next page follows it.
+    after: Option<JobId>,
+    // Why the last page did not read, while it has not: the tick reads it
+    // again, and the torrents read so far run meanwhile.
+    fault: Option<String>,
+    // A read of the page that failed runs.
+    resuming: bool,
+}
+
+// What was asked of the queue's order while the stored torrents were read.
+enum Asked {
+    // A torrent added: it goes past every stored torrent.
+    Added(JobId),
+    // `TorrentService::reorder`.
+    Reorder(Vec<JobId>, QueueMoveTarget),
+    // `TorrentService::move_many`.
+    Moves(Vec<(JobId, QueueMoveTarget)>),
+}
+
+/// Why an answer that needs every torrent was not given: the stored
+/// torrents are still being read at start. With why, when a read of them
+/// failed and is tried again.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NotReady {
+    #[error("the stored torrents are still being read; ask again shortly")]
+    Loading,
+    #[error("the stored torrents did not load and are being read again: {0}")]
+    Faulted(String),
+}
+
+/// Why a list of torrents was not given.
+#[derive(Debug, thiserror::Error)]
+pub enum ListError {
+    #[error(transparent)]
+    NotReady(#[from] NotReady),
+    #[error(transparent)]
+    State(#[from] StateError),
 }
 
 struct Inner {
@@ -759,9 +826,9 @@ struct Inner {
     // The load of the stored torrents at start, and what moved under it.
     load: watch::Sender<Load>,
     load_marks: Mutex<LoadMarks>,
-    // Held, the load reads no page: a test's hold on it.
-    #[cfg(test)]
-    load_held: watch::Sender<bool>,
+    // A test's hold on the load.
+    #[cfg(any(test, feature = "test-support"))]
+    load_seam: LoadSeam,
     // The torrents whose work crashed the daemon on its last run: each is
     // kept paused, its job not restored, until a resume takes its marker.
     crash_marks: Mutex<crate::runtime::panic_trap::CrashMarks>,
@@ -876,8 +943,8 @@ impl TorrentService {
                 restore_wanted: AtomicBool::new(false),
                 load: watch::channel(Load::Idle).0,
                 load_marks: Mutex::default(),
-                #[cfg(test)]
-                load_held: watch::channel(false).0,
+                #[cfg(any(test, feature = "test-support"))]
+                load_seam: LoadSeam::default(),
                 crash_marks: Mutex::default(),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
@@ -1121,14 +1188,64 @@ impl TorrentService {
         matches!(*self.inner.load.borrow(), Load::Running(_))
     }
 
-    // `job_id` taken out of the live torrents. Under a load, a page read
-    // before it went does not bring it back.
+    // Why the load's last page did not read, while it has not.
+    fn load_fault(&self) -> Option<String> {
+        locked(&self.inner.load_marks).fault.clone()
+    }
+
+    // Whether only some of the stored torrents are here and the rest are on
+    // their way: no torrent takes a download turn among them. A load whose
+    // page failed is not that: the torrents read so far run until it reads.
+    fn partial(&self) -> bool {
+        self.loading() && self.load_fault().is_none()
+    }
+
+    /// Whether every stored torrent is here: an answer or an action over
+    /// every torrent is true only then, and says so otherwise.
+    pub fn whole(&self) -> Result<(), NotReady> {
+        if !self.loading() {
+            return Ok(());
+        }
+        Err(self
+            .load_fault()
+            .map_or(NotReady::Loading, NotReady::Faulted))
+    }
+
+    // `job_id` taken out of the live torrents. Under a load, and while a
+    // read begun under it is in flight, a page read before it went does
+    // not bring it back.
     fn unlive(&self, live: &mut BTreeMap<JobId, Live>, job_id: JobId) -> Option<Live> {
         let torrent = live.remove(&job_id)?;
-        if self.loading() {
-            locked(&self.inner.load_marks).gone.insert(job_id);
+        let mut marks = locked(&self.inner.load_marks);
+        if self.loading() || marks.readers > 0 {
+            marks.gone.insert(job_id);
         }
         Some(torrent)
+    }
+
+    /// Hold the load of the stored torrents before its next page, or let
+    /// it go.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_load(&self, held: bool) {
+        self.inner.load_seam.held.send_replace(held);
+    }
+
+    /// Start as the server starts: the stored torrents are read on a task
+    /// of the service's, and this returns at once.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn start_loading(&self) -> Result<(), String> {
+        self.start_seated().await
+    }
+
+    /// Once every stored torrent is read.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn loaded(&self) {
+        let _ = self
+            .inner
+            .load
+            .subscribe()
+            .wait_for(|load| matches!(load, Load::Done))
+            .await;
     }
 
     async fn with_torrent<T>(

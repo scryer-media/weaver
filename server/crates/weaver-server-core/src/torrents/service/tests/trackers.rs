@@ -440,15 +440,15 @@ async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, S
 }
 
 // Each torrent's trackers are held with it, and a boot reads the last
-// torrent's key, then each torrent table a restore and an attach read once
-// a page of torrents: the torrents' rows, their trackers', their counters'
-// and their history's. A boot of no torrent reads the key alone. From then on
+// torrent's key, then, once a page of torrents, the bytes each takes and
+// each torrent table a restore and an attach read: the torrents' rows,
+// their trackers', their counters' and their history's. A boot of no torrent reads the key alone. From then on
 // publishing, listing, viewing and matching the tracker rules again read
 // none, whether one torrent is live or fifty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
     // Fewer torrents than a page holds, so one page.
-    const BOOT_READS: usize = 5;
+    const BOOT_READS: usize = 6;
     let a = "http://a.invalid/announce";
     let reads = |db: &Database| db.torrent_reads.load(std::sync::atomic::Ordering::Relaxed);
     for count in [1, 50] {
