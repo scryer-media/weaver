@@ -95,12 +95,14 @@ impl SystemSubscription {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let config = ctx.data::<SharedConfig>()?.clone();
         let torrents = ctx.data_opt::<TorrentService>().cloned();
+        let availability = *ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?;
         let initial_metrics = handle.get_metrics();
 
         Ok(async_stream::stream! {
             let torrents = torrents.as_ref();
             let mut last =
-                build_system_metrics_snapshot(&handle, &config, torrents, initial_metrics).await;
+                build_system_metrics_snapshot(&handle, &config, torrents, availability, initial_metrics)
+                    .await;
             yield last.clone();
 
             let mut interval = tokio::time::interval(METRICS_UPDATE_INTERVAL);
@@ -110,7 +112,8 @@ impl SystemSubscription {
                 interval.tick().await;
                 let metrics = handle.get_metrics();
                 let snapshot =
-                    build_system_metrics_snapshot(&handle, &config, torrents, metrics).await;
+                    build_system_metrics_snapshot(&handle, &config, torrents, availability, metrics)
+                        .await;
                 // An idle server's gauges sit still; a tick that would send
                 // the client exactly what it already has sends nothing.
                 if snapshot == last {
@@ -127,6 +130,7 @@ async fn build_system_metrics_snapshot(
     handle: &SchedulerHandle,
     config: &SharedConfig,
     torrents: Option<&TorrentService>,
+    availability: weaver_server_core::torrents::TorrentAvailability,
     metrics: weaver_server_core::MetricsSnapshot,
 ) -> SystemMetricsSnapshot {
     let metrics = Metrics::from(&metrics);
@@ -163,7 +167,7 @@ async fn build_system_metrics_snapshot(
         provider_holdoffs,
         job_download_rates,
         provider_connections,
-        torrents: TorrentPresence::of(torrents_enabled, torrents),
+        torrents: TorrentPresence::of(availability, torrents_enabled, torrents),
     }
 }
 

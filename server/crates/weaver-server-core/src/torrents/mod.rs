@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub mod admission;
+pub mod availability;
 pub(crate) mod files;
 pub mod identity;
 pub(crate) mod intake;
@@ -22,6 +23,7 @@ pub(crate) mod store;
 pub(crate) mod tee;
 pub(crate) mod writes;
 
+pub use availability::{TORRENTS_ENV, TORRENTS_UNAVAILABLE, TorrentAvailability};
 pub use model::{
     ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentFile, TorrentInsert,
     TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,

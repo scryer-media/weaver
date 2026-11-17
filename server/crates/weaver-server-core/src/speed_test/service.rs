@@ -72,6 +72,9 @@ pub struct SpeedTestService {
 pub struct ServiceInner {
     handle: SchedulerHandle,
     torrents: Mutex<Option<crate::torrents::service::TorrentService>>,
+    // Whether this run of the server has torrents at all: a torrent run and
+    // an upload's peer leg need them available as well as turned on.
+    torrents_available: AtomicBool,
     config: SharedConfig,
     db: Database,
     allow_private_network: bool,
@@ -155,6 +158,7 @@ impl SpeedTestService {
             inner: Arc::new(ServiceInner {
                 handle,
                 torrents: Mutex::new(None),
+                torrents_available: AtomicBool::new(true),
                 config,
                 db,
                 allow_private_network,
@@ -173,6 +177,14 @@ impl SpeedTestService {
                 clock: Mutex::new(RunClock::default()),
             }),
         }
+    }
+
+    /// Whether this run of the server has torrents at all; they are taken
+    /// to be available until told otherwise.
+    pub fn set_torrent_availability(&self, availability: crate::torrents::TorrentAvailability) {
+        self.inner
+            .torrents_available
+            .store(availability.available(), Ordering::Relaxed);
     }
 
     pub fn use_torrents(&self, torrents: crate::torrents::service::TorrentService) {
@@ -397,7 +409,7 @@ impl SpeedTestService {
         let consumer = request.consumer;
         let (servers, torrents_on) = {
             let config = inner.config.read().await;
-            (config.servers.clone(), config.torrent.enabled)
+            (config.servers.clone(), inner.torrents_on(&config))
         };
         if request.kind.label() == SpeedTestKindLabel::Torrent && !torrents_on {
             return Err(NetworkRefusal::SpeedTestTorrentsOff.into());
@@ -978,6 +990,13 @@ impl ServiceInner {
             }
         }
         tested
+    }
+
+    // Whether torrents are on: available in this run of the server, and
+    // turned on by the settings.
+    fn torrents_on(&self, config: &crate::settings::Config) -> bool {
+        crate::torrents::TorrentAvailability::of(self.torrents_available.load(Ordering::Relaxed))
+            .on(config.torrent.enabled)
     }
 
     async fn ip_filter(
@@ -1630,7 +1649,8 @@ async fn execute(
             peers: None,
         });
         inner.bump();
-        if inner.config.read().await.torrent.enabled {
+        let torrents_on = inner.torrents_on(&*inner.config.read().await);
+        if torrents_on {
             let opened = tokio::select! {
                 biased;
                 _ = stop.stopped() => return Outcome::Cancelled,

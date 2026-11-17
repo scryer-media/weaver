@@ -1886,3 +1886,20 @@ async fn a_torrent_run_without_leechers_has_no_demand() {
     assert_eq!(upload.peers, Some(PeerUpload::NoDemand));
     fixture.stop().await;
 }
+
+// A server without torrents refuses a torrent run as it does while the
+// settings turn torrents off, whatever the saved setting says.
+#[tokio::test]
+async fn a_torrent_run_is_refused_as_off_on_a_server_without_torrents() {
+    let rig = rig().await;
+    rig.config.write().await.torrent.enabled = true;
+    rig.service
+        .set_torrent_availability(crate::torrents::TorrentAvailability::UNAVAILABLE);
+    assert_eq!(
+        rig.service
+            .start(torrent_request(rig.loopback))
+            .await
+            .unwrap_err(),
+        SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestTorrentsOff)
+    );
+}

@@ -2506,10 +2506,14 @@ async fn a_limit_closed_or_opened_sends_the_whole_state() {
 
 #[tokio::test]
 async fn without_a_torrent_client_the_lists_are_empty_and_adds_conflict() {
+    // As on a server started without torrents: the settings say on, and no
+    // client was built.
     let rig = rig_with(false).await;
+    assert!(rig.config.read().await.torrent.enabled);
     assert!(rig.torrents().await.is_empty());
     let added = rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
     assert_eq!(added.status, StatusCode::CONFLICT);
+    assert_eq!(added.body, "torrents are not enabled");
     assert_eq!(
         rig.post("/api/v2/torrents/stop", "hashes=all").await.status,
         StatusCode::OK

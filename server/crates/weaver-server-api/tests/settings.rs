@@ -1157,3 +1157,112 @@ async fn the_ssl_listener_keeps_its_port() {
     assert_no_errors(&cleared);
     assert_eq!(h.db.load_config().unwrap().torrent.ssl_port, None);
 }
+
+// A request on a server started without `WEAVER_TORRENTS`.
+fn without_torrents(query: &str) -> async_graphql::Request {
+    local_request(query).data(weaver_server_core::torrents::TorrentAvailability::UNAVAILABLE)
+}
+
+fn error_code(response: &async_graphql::Response) -> Option<String> {
+    let error = response.errors.first()?;
+    serde_json::to_value(&error.extensions)
+        .ok()?
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+const PRESENCE: &str =
+    "{ torrentPresence { available enabled jobs running windingDown windDown } }";
+
+#[tokio::test]
+async fn a_server_without_torrents_refuses_turning_them_on_and_names_the_variable() {
+    let h = TestHarness::new().await;
+    let before = h.config.read().await.clone();
+    let refused = h
+        .schema
+        .execute(without_torrents(
+            "mutation { updateSettings(input: { uploadCap: 4096, torrent: { enabled: true, basePort: 51413 } }) { torrent { enabled } } }",
+        ))
+        .await;
+    assert_eq!(
+        error_code(&refused).as_deref(),
+        Some("TORRENTS_UNAVAILABLE")
+    );
+    assert!(
+        refused.errors[0].message.contains("WEAVER_TORRENTS"),
+        "{}",
+        refused.errors[0].message
+    );
+    // Nothing of the refused save was kept, in memory or stored.
+    let stored = h.db.load_config().unwrap();
+    assert!(!stored.torrent.enabled);
+    assert_ne!(stored.torrent.base_port, 51413);
+    assert_eq!(stored.upload_cap, None);
+    let live = h.config.read().await.clone();
+    assert_eq!(live.torrent, before.torrent);
+    assert_eq!(live.upload_cap, before.upload_cap);
+
+    // The settings still read, and every other torrent setting still saves.
+    let read = h
+        .schema
+        .execute(without_torrents(
+            "{ settings { torrent { enabled basePort } } }",
+        ))
+        .await;
+    assert_no_errors(&read);
+    assert_eq!(
+        response_data(&read)["settings"]["torrent"]["enabled"],
+        false
+    );
+    let saved = h
+        .schema
+        .execute(without_torrents(
+            "mutation { updateSettings(input: { torrent: { enabled: false, basePort: 51413 } }) { torrent { enabled basePort } } }",
+        ))
+        .await;
+    assert_no_errors(&saved);
+    assert_eq!(
+        response_data(&saved)["updateSettings"]["torrent"]["basePort"],
+        51413
+    );
+    assert!(!h.db.load_config().unwrap().torrent.enabled);
+}
+
+#[tokio::test]
+async fn a_server_without_torrents_says_so_whatever_is_saved() {
+    let h = TestHarness::new().await;
+    // Saved on while the server had torrents.
+    let on = h
+        .execute("mutation { updateSettings(input: { torrent: { enabled: true } }) { torrent { enabled } } }")
+        .await;
+    assert_no_errors(&on);
+    let with = h.execute(PRESENCE).await;
+    assert_no_errors(&with);
+    let presence = &response_data(&with)["torrentPresence"];
+    assert_eq!(presence["available"], true);
+    assert_eq!(presence["enabled"], true);
+
+    let without = h.schema.execute(without_torrents(PRESENCE)).await;
+    assert_no_errors(&without);
+    assert_eq!(
+        response_data(&without)["torrentPresence"],
+        serde_json::json!({
+            "available": false, "enabled": false, "jobs": false,
+            "running": false, "windingDown": false, "windDown": null
+        })
+    );
+    // The saved setting is as it was: read, and stored.
+    let read = h
+        .schema
+        .execute(without_torrents("{ settings { torrent { enabled } } }"))
+        .await;
+    assert_eq!(response_data(&read)["settings"]["torrent"]["enabled"], true);
+    assert!(h.db.load_config().unwrap().torrent.enabled);
+    // Every torrent query answers as it does while torrents are off.
+    let listed = h
+        .schema
+        .execute(without_torrents("{ torrents { id } }"))
+        .await;
+    assert_eq!(error_code(&listed).as_deref(), Some("TORRENTS_DISABLED"));
+}
