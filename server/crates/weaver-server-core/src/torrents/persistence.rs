@@ -840,7 +840,10 @@ impl Database {
     }
 
     // What each of `torrents` holds, in place of what it held, in one
-    // transaction: its rows are its own from now on.
+    // transaction: its rows are its own from now on. A torrent named twice
+    // holds what its last entry names. A DELETE and an UPDATE per
+    // bind-sized chunk of torrents and a multi-row INSERT per chunk of
+    // rows, whatever the number of torrents.
     pub(crate) fn set_torrents_held(
         &self,
         torrents: &[(JobId, Vec<String>)],
@@ -848,25 +851,62 @@ impl Database {
         if torrents.is_empty() {
             return Ok(());
         }
-        let torrents = torrents
+        let mut last = std::collections::BTreeMap::new();
+        for (job_id, held) in torrents {
+            last.insert(stored(job_id.0)?, held);
+        }
+        let ids: Vec<i64> = last.keys().copied().collect();
+        let rows: Vec<(i64, String)> = last
             .iter()
-            .map(|(job_id, held)| Ok((stored(job_id.0)?, held.clone())))
-            .collect::<Result<Vec<_>, StateError>>()?;
+            .flat_map(|(id, held)| {
+                held.iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .map(|path| (*id, path.clone()))
+            })
+            .collect();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrents_held", |tx| {
-                let torrents = torrents.clone();
+                let (ids, rows) = (ids.clone(), rows.clone());
                 Box::pin(async move {
-                    for (id, held) in &torrents {
+                    // One bind is the flag, the rest the chunk's ids.
+                    let ids_per =
+                        crate::persistence::sql_runtime::max_rows_for_tx(tx, 1).max(2) - 1;
+                    for chunk in ids.chunks(ids_per) {
+                        let placeholders = vec!["{}"; chunk.len()].join(", ");
+                        let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
                         tx.execute(
-                            "DELETE FROM torrent_held_paths WHERE job_id = {}",
-                            &[SqlArg::I64(*id)],
+                            &format!(
+                                "DELETE FROM torrent_held_paths WHERE job_id IN ({placeholders})"
+                            ),
+                            &args,
                         )
                         .await?;
-                        insert_held_tx(tx, *id, held).await?;
+                        let mut args = args;
+                        args.insert(0, SqlArg::Bool(true));
                         tx.execute(
-                            "UPDATE torrents SET held_set = {} WHERE job_id = {}",
-                            &[SqlArg::Bool(true), SqlArg::I64(*id)],
+                            &format!(
+                                "UPDATE torrents SET held_set = {{}} \
+                                 WHERE job_id IN ({placeholders})"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    let rows_per = crate::persistence::sql_runtime::max_rows_for_tx(tx, 2);
+                    for chunk in rows.chunks(rows_per) {
+                        let values = vec!["({}, {})"; chunk.len()].join(", ");
+                        let args = chunk
+                            .iter()
+                            .flat_map(|(id, path)| [SqlArg::I64(*id), SqlArg::Text(path.clone())])
+                            .collect::<Vec<_>>();
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO torrent_held_paths (job_id, path) VALUES {values} \
+                                 ON CONFLICT (job_id, path) DO NOTHING"
+                            ),
+                            &args,
                         )
                         .await?;
                     }
