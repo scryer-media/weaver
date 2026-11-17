@@ -1777,3 +1777,20 @@ scope = "all"
 kind = "rust"
 hook_id = "fill_torrent_private_v125"
 scope = "upgrade_only"
+
+[[migration]]
+version = 126
+description = "a tracker row is keyed by its URL's keyed digest"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0126_torrent_tracker_url_key/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0126_torrent_tracker_url_key/postgres.sql"
+engine = "postgres"
+scope = "all"

@@ -4197,6 +4197,7 @@ async fn a_read_key_sees_no_article_link_passkey() {
             .await
         }
     };
+    let id = |item_id: &str| rig.db.rss_seen_item_key(item_id);
     let links = |body: &Value| -> Vec<(String, Value, Value)> {
         body["one"]["articles"]
             .as_array()
@@ -4216,31 +4217,42 @@ async fn a_read_key_sees_no_article_link_passkey() {
         let reader = read(key).await;
         assert!(!reader.body.contains("5ecret"), "{key} {}", reader.body);
         assert!(!reader.body.contains("tr="), "{key} {}", reader.body);
-        let mut shown = links(&reader.json());
-        shown.sort_by(|a, b| a.0.cmp(&b.0));
+        // An article's id is its keyed digest: a feed often gives the
+        // link as the id.
+        assert!(!reader.body.contains("\"id\":\"indexer\""), "{key}");
+        let shown: std::collections::BTreeMap<String, (Value, Value)> = links(&reader.json())
+            .into_iter()
+            .map(|(id, url, link)| (id, (url, link)))
+            .collect();
         assert_eq!(
             shown,
-            vec![
+            [
                 (
-                    "indexer".to_owned(),
-                    json!("https://indexer.invalid:443/…"),
-                    json!("https://indexer.invalid:443/…"),
+                    id("indexer"),
+                    (
+                        json!("https://indexer.invalid:443/…"),
+                        json!("https://indexer.invalid:443/…"),
+                    ),
                 ),
-                ("magnet".to_owned(), json!("magnet:…"), json!("magnet:…")),
-            ],
+                (id("magnet"), (json!("magnet:…"), json!("magnet:…"))),
+            ]
+            .into(),
             "{key}"
         );
     }
 
     let admin = read(ADMIN).await;
-    let mut shown = links(&admin.json());
-    shown.sort_by(|a, b| a.0.cmp(&b.0));
+    let shown: std::collections::BTreeMap<String, (Value, Value)> = links(&admin.json())
+        .into_iter()
+        .map(|(id, url, link)| (id, (url, link)))
+        .collect();
     assert_eq!(
         shown,
-        vec![
-            ("indexer".to_owned(), json!(INDEXER), json!(INDEXER)),
-            ("magnet".to_owned(), json!(MAGNET), json!(MAGNET)),
+        [
+            (id("indexer"), (json!(INDEXER), json!(INDEXER))),
+            (id("magnet"), (json!(MAGNET), json!(MAGNET))),
         ]
+        .into()
     );
 }
 

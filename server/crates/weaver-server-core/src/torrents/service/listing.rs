@@ -273,7 +273,7 @@ impl Pick<'_> {
             .into_iter()
             .filter(|job_id| {
                 self.private
-                    .is_none_or(|private| live[job_id].private == private)
+                    .is_none_or(|private| live[job_id].record.private == private)
             })
             .collect();
         let places = window.places(ids.len());

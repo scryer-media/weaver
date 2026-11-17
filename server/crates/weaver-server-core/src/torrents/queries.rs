@@ -467,19 +467,20 @@ async fn named_torrents(
     Ok(kept.into_iter().map(|(_, job_id)| JobId(job_id)).collect())
 }
 
+// The job of the torrent kept under one of `infohashes`: its id alone,
+// which is all an add that finds one reads.
 pub(crate) async fn torrent_by_infohash_tx(
     tx: &mut SqlTx<'_>,
     infohashes: &[Infohash],
-    key: Option<&EncryptionKey>,
-) -> Result<Option<TorrentRecord>, StateError> {
+) -> Result<Option<JobId>, StateError> {
     let (filter, args) = infohash_filter(infohashes);
     tx.fetch_optional(
-        &format!("SELECT {TORRENT_COLUMNS} FROM torrents WHERE {filter}"),
+        &format!("SELECT job_id FROM torrents WHERE {filter}"),
         &args,
     )
     .await?
     .as_ref()
-    .map(|row| torrent_from_row(row, key))
+    .map(|row| count(row, "job_id").map(JobId))
     .transpose()
 }
 

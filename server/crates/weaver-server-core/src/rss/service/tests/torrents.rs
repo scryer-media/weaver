@@ -209,9 +209,19 @@ impl Rig {
             .collect()
     }
 
-    // The feed's seen rows, oldest first, as (item, decision, job, error).
+    // The feed's seen rows in their ids' order, as (item, decision, job,
+    // error). A row is listed under its id's keyed digest: each is named
+    // back as the id these tests' feeds give.
     fn seen(&self) -> Vec<(String, String, Option<u64>, Option<String>)> {
         let mut rows = self.db.list_rss_seen_items(Some(1), None).unwrap();
+        for row in &mut rows {
+            if let Some(id) = ["a", "b", "c", "d", "old", "x"]
+                .into_iter()
+                .find(|id| self.db.rss_seen_item_key(id) == row.item_id)
+            {
+                row.item_id = id.to_owned();
+            }
+        }
         rows.sort_by(|a, b| a.item_id.cmp(&b.item_id));
         rows.into_iter()
             .map(|row| {
@@ -311,16 +321,17 @@ async fn a_magnet_link_is_added_without_a_fetch() {
         rig.seen(),
         vec![("a".into(), "submitted".into(), Some(jobs[0]), None)]
     );
-    // The job carries the feed's attributes as an NZB job does.
+    // The job carries the feed's attributes as an NZB job does, but for
+    // the item's link and its id, which is often the link: a private
+    // tracker's carries the passkey, and the attributes are kept in the
+    // clear.
     let stored = rig.db.list_torrents().unwrap();
     assert_eq!(
         stored[0].metadata,
         [
             ("rss.feed_id", "1"),
             ("rss.feed_name", "Torrent Feed"),
-            ("rss.item_id", "a"),
             ("rss.item_title", "Silver Horizon a"),
-            ("rss.item_url", magnet().replace("&amp;", "&").as_str()),
             ("tier", "gold"),
         ]
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -639,12 +650,21 @@ async fn a_poll_records_its_items_together_with_the_rows_one_by_one_gave() {
         ]
     );
     let rows = rig.db.list_rss_seen_items(Some(1), None).unwrap();
-    let old = rows.iter().find(|row| row.item_id == "old").unwrap();
-    assert_eq!(old, &before);
-    let a = rows.iter().find(|row| row.item_id == "a").unwrap();
+    let row = |id: &str| {
+        let listed = rig.db.rss_seen_item_key(id);
+        rows.iter().find(|row| row.item_id == listed).unwrap()
+    };
+    assert_eq!(
+        row("old"),
+        &RssSeenItemRow {
+            item_id: rig.db.rss_seen_item_key("old"),
+            ..before
+        }
+    );
+    let a = row("a");
     assert_eq!(a.item_title, "Silver Horizon a");
     assert_eq!(a.item_url, Some(magnet().replace("&amp;", "&")));
-    let x = rows.iter().find(|row| row.item_id == "x").unwrap();
+    let x = row("x");
     assert_eq!((x.item_url.as_deref(), x.size_bytes), (None, None));
 }
 

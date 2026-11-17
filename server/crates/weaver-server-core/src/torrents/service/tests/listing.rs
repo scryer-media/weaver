@@ -599,18 +599,14 @@ fn picks_are_the_walk_of_every_record(db: &Database) {
             ..record
         };
         db.insert_torrent(&record, &[]).unwrap();
-        let mut torrent = Live::new(
+        let torrent = Live::new(
             record,
             TorrentCounters::default(),
             ResumePeers::default(),
             EPOCH_MS,
         );
-        // The privacy the restore reads from the metainfo; a magnet with
-        // none is public.
-        torrent.private = torrent.record.metainfo.as_deref().is_some_and(|bytes| {
-            crate::torrents::service::intake::parse(bytes).is_ok_and(|parsed| parsed.private)
-        });
-        assert_eq!(torrent.private, job_id % 3 == 0);
+        // The privacy is the row's, the one source the list filters on.
+        assert_eq!(torrent.record.private, job_id % 3 == 0);
         live.insert(JobId(job_id), torrent);
     }
     let hex = |live: &Live| hashes_of(&live.record).best().as_string();

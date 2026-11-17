@@ -1090,7 +1090,7 @@ fn unseal(db: &Database, rows: &[(i64, Vec<u8>, String)]) {
                     )
                     .await?;
                     tx.execute(
-                        "UPDATE torrent_trackers SET url = {} WHERE job_id = {}",
+                        "UPDATE torrent_trackers SET url = {}, url_key = NULL WHERE job_id = {}",
                         &[SqlArg::Text(url), SqlArg::I64(job_id)],
                     )
                     .await?;
@@ -1127,7 +1127,39 @@ fn a_sealing_pass_cut_short_completes_at_the_next_start() {
     }
     // The first page was sealed before the cut; the rest is in the clear.
     unseal(&db, &written[64..]);
+    // One metainfo is sealed as text, the form before the binary one, and
+    // one torrent lists its tracker twice in a tier, once sealed, as the
+    // key over the ciphertext let it.
+    {
+        use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+        use base64::Engine as _;
+        let key = db.encryption_key().cloned().unwrap();
+        let text = crate::persistence::encryption::encrypt_value(
+            &key,
+            &base64::engine::general_purpose::STANDARD.encode(&written[148].1),
+        )
+        .unwrap();
+        let twice = crate::persistence::encryption::encrypt_value(&key, &written[149].2).unwrap();
+        let datastore = db.datastore();
+        db.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET metainfo = {} WHERE job_id = 149",
+                &[SqlArg::Bytes(text.into_bytes())],
+            )
+            .await?;
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "INSERT INTO torrent_trackers (job_id, tier, url, named_by) \
+                 VALUES (150, 0, {}, 'torrent')",
+                &[SqlArg::Text(twice)],
+            )
+            .await
+        })
+        .unwrap();
+    }
     let (_, before, _) = raw_secrets(&db);
+    assert_eq!(before.len(), TORRENTS as usize + 1);
     assert!(
         before[..64]
             .iter()
@@ -1136,14 +1168,23 @@ fn a_sealing_pass_cut_short_completes_at_the_next_start() {
     assert!(
         before[64..]
             .iter()
+            .filter(|(.., url)| !crate::persistence::encryption::is_encrypted(url))
             .all(|(.., url)| holds_passkey(url.as_bytes()))
     );
 
-    db.seal_torrent_secrets().unwrap();
+    db.seal_stored_secrets().unwrap();
     let sealed = raw_secrets(&db);
     assert_eq!(sealed.0.len(), TORRENTS as usize);
+    // The tracker listed twice is listed once.
     assert_eq!(sealed.1.len(), TORRENTS as usize);
     assert!(sealed.0.iter().all(|(_, stored)| !holds_passkey(stored)));
+    // Each metainfo is sealed as bytes, the one sealed as text with them.
+    assert!(
+        sealed
+            .0
+            .iter()
+            .all(|(_, stored)| stored.starts_with(b"enc:b1:"))
+    );
     assert!(
         sealed
             .1
@@ -1161,6 +1202,111 @@ fn a_sealing_pass_cut_short_completes_at_the_next_start() {
         assert_eq!(db.list_torrent_trackers(job_id).unwrap()[0].url, *url);
     }
 
-    db.seal_torrent_secrets().unwrap();
+    db.seal_stored_secrets().unwrap();
     assert_eq!(raw_secrets(&db), sealed);
+
+    // The pass is one pass: a start after it reads no torrent to look for
+    // work, so a row written in the clear past it stays as it is.
+    unseal(&db, &written[..1]);
+    let clear = raw_secrets(&db);
+    db.seal_stored_secrets().unwrap();
+    assert_eq!(raw_secrets(&db), clear);
+    assert!(holds_passkey(&clear.0[0].1));
+}
+
+// A tracker's URL is sealed, and its ciphertext differs each time it is
+// written: what keeps one URL from a tier twice is its keyed digest.
+#[test]
+fn a_tracker_listed_twice_in_a_tier_is_stored_once() {
+    let db = Database::open_in_memory().unwrap();
+    let (metainfo, url) = passkeyed(1);
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.metainfo = Some(metainfo.into());
+    let entry = |tier: u32, url: &str| TrackerEntry {
+        tier,
+        url: url.to_owned(),
+        named_by: NamedBy::Torrent,
+    };
+    // Twice in one tier, and once in another, which is another row.
+    let listed = [entry(0, &url), entry(0, &url), entry(1, &url)];
+    db.insert_torrent(&record, &listed).unwrap();
+    assert_eq!(raw_secrets(&db).1.len(), 2);
+    assert_eq!(
+        db.list_torrent_trackers(JobId(1)).unwrap(),
+        [entry(0, &url), entry(1, &url)]
+    );
+    let other = format!("{url}&other");
+    assert!(
+        db.set_torrent_trackers(
+            JobId(1),
+            &[entry(0, &other), entry(0, &url), entry(0, &other)]
+        )
+        .unwrap()
+    );
+    assert_eq!(raw_secrets(&db).1.len(), 2);
+    let mut kept = db.list_torrent_trackers(JobId(1)).unwrap();
+    kept.sort_by(|a, b| a.url.cmp(&b.url));
+    assert_eq!(kept, [entry(0, &url), entry(0, &other)]);
+}
+
+// A start that finds no key must know that sealed torrent and RSS secrets
+// need the one they were sealed with, or it would make a new key over them;
+// and a start with the wrong key is refused by one stored value of a sealed
+// column, not found torrent by torrent.
+#[test]
+fn sealed_secrets_are_counted_and_proved_against_the_key_at_start() {
+    let db = Database::open_in_memory().unwrap();
+    let credentials = db.has_encrypted_credentials().unwrap();
+    db.seal_stored_secrets().unwrap();
+    // Marked, with nothing sealed: no more than before.
+    assert_eq!(db.has_encrypted_credentials().unwrap(), credentials);
+    let key = db.encryption_key().cloned().unwrap();
+    db.validate_encrypted_credentials(&key).unwrap();
+
+    let (metainfo, url) = passkeyed(1);
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.metainfo = Some(metainfo.into());
+    let trackers = [TrackerEntry {
+        tier: 0,
+        url,
+        named_by: NamedBy::Torrent,
+    }];
+    db.insert_torrent(&record, &trackers).unwrap();
+    assert!(db.has_encrypted_credentials().unwrap());
+    db.validate_encrypted_credentials(&key).unwrap();
+    let other = crate::persistence::encryption::EncryptionKey::generate();
+    let refused = db.validate_encrypted_credentials(&other).unwrap_err();
+    assert!(
+        refused.to_string().contains("torrent metainfo"),
+        "{refused}"
+    );
+}
+
+// A key held in memory only is gone at the next start, and all it sealed
+// with it: no torrent is stored under one, with why, and the sealing pass
+// neither seals nor marks itself run.
+#[test]
+fn nothing_is_sealed_under_a_key_held_in_memory_only() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate().ephemeral());
+    let (metainfo, url) = passkeyed(1);
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.metainfo = Some(metainfo.into());
+    let trackers = [TrackerEntry {
+        tier: 0,
+        url,
+        named_by: NamedBy::Torrent,
+    }];
+    let refused = db.insert_torrent(&record, &trackers).unwrap_err();
+    assert!(
+        refused.to_string().contains("held in memory only"),
+        "{refused}"
+    );
+    assert!(db.get_torrent(JobId(1)).unwrap().is_none());
+    db.seal_stored_secrets().unwrap();
+    assert_eq!(
+        db.get_setting(crate::torrents::sealed::SEALED_MARK)
+            .unwrap(),
+        None
+    );
 }

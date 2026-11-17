@@ -158,6 +158,14 @@ impl TorrentService {
         {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            // One held because its stored secrets do not decrypt lists no
+            // tracker it could not open: an edit would write the list back
+            // without them, so none is taken until the key is back.
+            if let Some(why) = &torrent.sealed {
+                return Err(ActionError::Invalid(format!(
+                    "the torrent's trackers are not changed while it is held: {why}"
+                )));
+            }
             let listed = &torrent.trackers;
             let trackers = edit(listed.to_vec())?;
             tracker_urls(&trackers)?;

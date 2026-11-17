@@ -1537,5 +1537,17 @@ async fn a_torrent_whose_secrets_do_not_decrypt_is_held_with_why() {
         TorrentState::Stopped
     );
     assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+    // Its trackers are not changed while it is held: an edit would write
+    // the list back without whatever did not open.
+    let kept = rig.db.list_torrent_trackers(job_id).unwrap();
+    let refused = again
+        .add_trackers(job_id, vec![vec!["http://b.invalid/announce".into()]])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, ActionError::Invalid(why) if why.contains("do not decrypt")),
+        "{refused:?}"
+    );
+    assert_eq!(rig.db.list_torrent_trackers(job_id).unwrap(), kept);
     again.stop().await;
 }

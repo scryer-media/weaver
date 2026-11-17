@@ -20,9 +20,14 @@ use crate::torrents::{
 use weaver_torrent::ResumePeers;
 
 // A tracker row holds where the tracker sits in the announce list and who
-// named it; how announcing to it goes is read from the session.
-const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url, named_by) VALUES ";
-const TRACKER_ROW: &str = "({}, {}, {}, {})";
+// named it; how announcing to it goes is read from the session. Its URL is
+// sealed, so its ciphertext differs each time it is written: the URL's keyed
+// digest, `url_key`, is what says two rows of a tier are the same tracker,
+// and the second is not kept.
+const TRACKER_INSERT: &str =
+    "INSERT INTO torrent_trackers (job_id, tier, url, url_key, named_by) VALUES ";
+const TRACKER_ROW: &str = "({}, {}, {}, {}, {})";
+const TRACKER_CONFLICT: &str = " ON CONFLICT (job_id, tier, url_key) DO NOTHING";
 // Every host a torrent has announced to stays known after the torrent is
 // gone, so a tracker rule can be picked from them. The URL is not kept: a
 // private tracker's carries the operator's passkey.
@@ -101,18 +106,19 @@ async fn insert_trackers(
     key: Option<&crate::persistence::encryption::EncryptionKey>,
 ) -> Result<(), StateError> {
     // As many rows a statement as its binds allow.
-    for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 4)) {
+    for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 5)) {
         let sql = format!(
-            "{TRACKER_INSERT}{}",
+            "{TRACKER_INSERT}{}{TRACKER_CONFLICT}",
             vec![TRACKER_ROW; chunk.len()].join(", ")
         );
-        let mut args = Vec::with_capacity(chunk.len() * 4);
+        let mut args = Vec::with_capacity(chunk.len() * 5);
         for tracker in chunk {
             args.extend([
                 SqlArg::I64(job_id),
                 SqlArg::I64(i64::from(tracker.tier)),
                 // Sealed: a private tracker's URL carries the passkey.
                 SqlArg::Text(super::sealed::seal_url(key, &tracker.url)?),
+                SqlArg::Bytes(super::sealed::url_key(key, &tracker.url)?),
                 SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
             ]);
         }
@@ -1218,10 +1224,8 @@ impl Database {
                 let held = held.clone();
                 let key = key.clone();
                 Box::pin(async move {
-                    if let Some(existing) =
-                        torrent_by_infohash_tx(tx, &infohashes, key.as_ref()).await?
-                    {
-                        return Ok(TorrentInsert::Duplicate(existing.job_id));
+                    if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
+                        return Ok(TorrentInsert::Duplicate(existing));
                     }
                     // One placeholder per value: the column list and the
                     // values are both TORRENT_COLUMNS' order.

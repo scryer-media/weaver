@@ -1,29 +1,54 @@
 // A torrent's secrets at rest: its tracker URLs, which carry a private
 // tracker's passkey, and its metainfo, which carries them again. Each is
-// sealed with the instance key by the one scheme every stored secret uses
-// (`enc:v1:`, AES-256-GCM), and opened only where it is used. A value
-// written before sealing reads as it was until the start that seals it.
+// sealed with the instance key (AES-256-GCM) and opened only where it is
+// used: a tracker URL as text (`enc:v1:`), a metainfo as bytes (`enc:b1:`,
+// no base64, so it is stored at its own size plus a nonce and a tag). A
+// value written before sealing reads as it was until the one pass that
+// seals it.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
 use crate::StateError;
-use crate::persistence::encryption::{EncryptionKey, decrypt_value, encrypt_value, is_encrypted};
+use crate::persistence::encryption::{
+    ENCRYPTED_BYTES_PREFIX, EncryptionKey, decrypt_bytes, decrypt_value, encrypt_bytes,
+    encrypt_value, is_encrypted, keyed_digest,
+};
 
-// What every sealed value starts with. A bencoded metainfo starts with `d`,
-// so a stored metainfo is told from a sealed one by it.
-const SEALED: &[u8] = b"enc:v1:";
+// What a metainfo sealed as text starts with: the form before `enc:b1:`,
+// still read. A bencoded metainfo starts with `d`, so a stored metainfo is
+// told from a sealed one by its first bytes.
+const SEALED_TEXT: &[u8] = b"enc:v1:";
 
-fn needs_key() -> StateError {
-    StateError::Database("encryption key is required to store secrets".to_string())
+// The domain a tracker URL's keyed digest is made under.
+const URL_KEY_DOMAIN: &str = "weaver/torrent-tracker-url/v1";
+
+// The key a torrent's secrets are sealed with: the instance key, when a
+// store keeps it. One held in memory only is gone at the next start, and
+// every torrent sealed under it with it, so nothing is sealed under it.
+pub(crate) fn kept_key(key: Option<&EncryptionKey>) -> Result<&EncryptionKey, StateError> {
+    let key = key.ok_or_else(|| {
+        StateError::Database("encryption key is required to store secrets".to_string())
+    })?;
+    if key.is_ephemeral() {
+        return Err(StateError::Database(
+            "torrents are not stored while the encryption key is held in memory only: \
+             configure a key store or set WEAVER_ENCRYPTION_KEY"
+                .to_string(),
+        ));
+    }
+    Ok(key)
 }
 
-// A tracker URL as it is stored: sealed.
+// A tracker URL as it is stored: sealed, whatever it starts with.
 pub(crate) fn seal_url(key: Option<&EncryptionKey>, url: &str) -> Result<String, StateError> {
-    if is_encrypted(url) {
-        return Ok(url.to_string());
-    }
-    encrypt_value(key.ok_or_else(needs_key)?, url).map_err(StateError::Database)
+    encrypt_value(kept_key(key)?, url).map_err(StateError::Database)
+}
+
+// What says two stored tracker URLs are the same one: the URL's keyed
+// digest, the same for the same URL where its ciphertext never is.
+pub(crate) fn url_key(key: Option<&EncryptionKey>, url: &str) -> Result<Vec<u8>, StateError> {
+    Ok(keyed_digest(kept_key(key)?, URL_KEY_DOMAIN, url.as_bytes()).to_vec())
 }
 
 // A stored tracker URL, opened.
@@ -37,30 +62,29 @@ pub(crate) fn open_url(key: Option<&EncryptionKey>, stored: &str) -> Result<Stri
     )
 }
 
-// Whether a stored metainfo is sealed.
+// Whether a stored metainfo is sealed, in either form.
 pub(crate) fn is_sealed(stored: &[u8]) -> bool {
-    stored.starts_with(SEALED)
+    stored.starts_with(ENCRYPTED_BYTES_PREFIX) || stored.starts_with(SEALED_TEXT)
 }
 
-// A metainfo as it is stored: its bytes in base64, sealed.
+// A metainfo as it is stored: sealed as bytes.
 pub(crate) fn seal_metainfo(
     key: Option<&EncryptionKey>,
     metainfo: &[u8],
 ) -> Result<Vec<u8>, StateError> {
-    if is_sealed(metainfo) {
-        return Ok(metainfo.to_vec());
-    }
-    encrypt_value(key.ok_or_else(needs_key)?, &STANDARD.encode(metainfo))
-        .map(String::into_bytes)
-        .map_err(StateError::Database)
+    encrypt_bytes(kept_key(key)?, metainfo).map_err(StateError::Database)
 }
 
-// A stored metainfo, opened.
+// A stored metainfo, opened. One that does not open is an error its reader
+// handles: the torrent is held, with why.
 pub(crate) fn open_metainfo(
     key: Option<&EncryptionKey>,
     stored: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
-    if !is_sealed(&stored) {
+    if stored.starts_with(ENCRYPTED_BYTES_PREFIX) {
+        return decrypt_bytes(key.ok_or("no instance key to decrypt a metainfo")?, &stored);
+    }
+    if !stored.starts_with(SEALED_TEXT) {
         return Ok(stored);
     }
     let text = std::str::from_utf8(&stored)
@@ -71,34 +95,82 @@ pub(crate) fn open_metainfo(
         .map_err(|error| format!("a sealed metainfo does not decode: {error}"))
 }
 
-// The torrents a sealing pass reads at a time: each brings its metainfo, or
-// its tracker rows, so a page stays small whatever the table holds.
-const SEAL_PAGE: i64 = 64;
+// The rows a sealing pass reads at a time: a torrent brings its metainfo,
+// or its tracker rows, so a page stays small whatever the table holds.
+pub(crate) const SEAL_PAGE: i64 = 64;
+
+// The setting that says the one sealing pass has run: `begun` from before
+// its first write, `done` once nothing is left. With it set, a start reads
+// none of the sealed tables to look for work.
+pub(crate) const SEALED_MARK: &str = "secrets_sealed_at_rest";
+const SEAL_BEGUN: &str = "begun";
+const SEAL_DONE: &str = "done";
+
+// The keys an RSS item's link was once kept under in a torrent's metadata.
+pub(crate) const RSS_LINK_KEYS: [&str; 2] = ["rss.item_url", "rss.item_id"];
+
+// A metadata list without an RSS item's link or id, or none when it holds
+// neither.
+fn without_rss_link(metadata: &str) -> Option<String> {
+    let mut pairs: Vec<(String, String)> = serde_json::from_str(metadata).ok()?;
+    let before = pairs.len();
+    pairs.retain(|(key, _)| !RSS_LINK_KEYS.contains(&key.as_str()));
+    (pairs.len() != before).then(|| serde_json::to_string(&pairs).ok())?
+}
 
 impl crate::Database {
-    // Seal every torrent secret stored before sealing: each metainfo, then
-    // each tracker URL, a page of torrents at a time, each page in one write
-    // transaction. A value already sealed is passed by, so a pass a crash
-    // cut short goes on from where it stood at the next start, and one with
-    // nothing left to seal writes nothing. Runs at start, once the instance
-    // key is set, before any torrent is read.
-    pub fn seal_torrent_secrets(&self) -> Result<(), StateError> {
+    // The key new secrets are sealed with: the instance key when a store
+    // keeps it, none while it is held in memory only.
+    pub(crate) fn sealing_key(&self) -> Option<&EncryptionKey> {
+        self.encryption_key().filter(|key| !key.is_ephemeral())
+    }
+
+    // Seal, once, every secret stored before sealing: each torrent's
+    // metainfo and tracker URLs, each RSS feed's URL and each seen item's
+    // link and id, and take an RSS item's link out of the torrents' kept
+    // metadata. Each step selects in SQL only the rows it has yet to seal,
+    // a page at a time, each page in one write transaction, so a pass a
+    // crash cut short goes on from where it stood. The pass is marked begun
+    // before its first write and done after its last: a start that finds it
+    // done reads the mark and nothing else. Runs at start, once the
+    // instance key is set, before any torrent is read. Under a key held in
+    // memory only nothing is sealed and nothing is marked.
+    pub fn seal_stored_secrets(&self) -> Result<(), StateError> {
         use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
         use crate::torrents::model::{named_by_str, parse_named_by};
 
-        let Some(key) = self.encryption_key().cloned() else {
+        if self.get_setting(SEALED_MARK)?.as_deref() == Some(SEAL_DONE) {
+            return Ok(());
+        }
+        let Some(key) = self.sealing_key().cloned() else {
+            if self.encryption_key().is_some() {
+                tracing::warn!(
+                    "the encryption key is held in memory only: stored torrent and RSS secrets \
+                     are not sealed, and no torrent is added, until a key store keeps one"
+                );
+            }
             return Ok(());
         };
+        self.set_setting(SEALED_MARK, SEAL_BEGUN)?;
         let datastore = self.datastore();
+        let sealing = key.clone();
         self.run_sql_blocking(async move {
+            let key = sealing;
+            // Each metainfo not yet sealed as bytes: one stored plain, and
+            // one sealed as text, which comes back at its own size.
             let mut after = i64::MIN;
-            let mut sealed = 0usize;
+            let (mut sealed, mut unread) = (0usize, 0usize);
             loop {
                 let rows = SqlRuntime::fetch_all(
                     datastore.read_exec(),
                     "SELECT job_id, metainfo FROM torrents \
-                      WHERE job_id > {} AND metainfo IS NOT NULL ORDER BY job_id LIMIT {}",
-                    &[SqlArg::I64(after), SqlArg::I64(SEAL_PAGE)],
+                      WHERE job_id > {} AND metainfo IS NOT NULL \
+                        AND substr(metainfo, 1, 7) <> {} ORDER BY job_id LIMIT {}",
+                    &[
+                        SqlArg::I64(after),
+                        SqlArg::Bytes(ENCRYPTED_BYTES_PREFIX.to_vec()),
+                        SqlArg::I64(SEAL_PAGE),
+                    ],
                 )
                 .await?;
                 let Some(last) = rows.last() else { break };
@@ -108,11 +180,14 @@ impl crate::Database {
                     let Some(stored) = row.opt_bytes("metainfo")? else {
                         continue;
                     };
-                    if !is_sealed(&stored) {
-                        page.push((
+                    // One another key sealed stays as it is: its torrent
+                    // is held, with why, until that key is back.
+                    match open_metainfo(Some(&key), stored) {
+                        Ok(plain) => page.push((
                             row.i64("job_id")?,
-                            SqlArg::Bytes(seal_metainfo(Some(&key), &stored)?),
-                        ));
+                            SqlArg::Bytes(seal_metainfo(Some(&key), &plain)?),
+                        )),
+                        Err(_) => unread += 1,
                     }
                 }
                 if page.is_empty() {
@@ -128,17 +203,24 @@ impl crate::Database {
                 })
                 .await?;
             }
-            if sealed > 0 {
-                tracing::info!(count = sealed, "sealed the torrents' stored metainfo");
+            if sealed > 0 || unread > 0 {
+                tracing::info!(
+                    count = sealed,
+                    undecryptable = unread,
+                    "sealed the torrents' stored metainfo"
+                );
             }
 
+            // Each tracker row with no key yet: its URL sealed if it was
+            // not, and its key made. A row is taken out and put back whole,
+            // and one the same URL already has in its tier is not put back.
             let mut after = i64::MIN;
-            let mut sealed = 0usize;
+            let (mut sealed, mut unread) = (0usize, 0usize);
             loop {
                 let jobs = SqlRuntime::fetch_all(
                     datastore.read_exec(),
                     "SELECT DISTINCT job_id FROM torrent_trackers \
-                      WHERE job_id > {} ORDER BY job_id LIMIT {}",
+                      WHERE job_id > {} AND url_key IS NULL ORDER BY job_id LIMIT {}",
                     &[SqlArg::I64(after), SqlArg::I64(SEAL_PAGE)],
                 )
                 .await?
@@ -151,69 +233,82 @@ impl crate::Database {
                     datastore.read_exec(),
                     &format!(
                         "SELECT job_id, tier, url, named_by FROM torrent_trackers \
-                          WHERE job_id IN ({})",
+                          WHERE job_id IN ({}) AND url_key IS NULL",
                         vec!["{}"; jobs.len()].join(", ")
                     ),
                     &jobs.iter().copied().map(SqlArg::I64).collect::<Vec<_>>(),
                 )
                 .await?;
-                // The plain rows, each to go as it is and come back sealed.
-                let mut plain = Vec::new();
+                // Each row as it is stored, and as it goes back.
+                let mut keyed = Vec::new();
                 for row in &rows {
-                    let url = row.text("url")?;
-                    if is_encrypted(&url) {
-                        continue;
-                    }
+                    let stored = row.text("url")?;
+                    // Whether a stored URL is sealed is what decrypting it
+                    // says, not what it starts with.
+                    let plain = if is_encrypted(&stored) {
+                        match decrypt_value(&key, &stored) {
+                            Ok(plain) => plain,
+                            Err(_) => {
+                                unread += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        stored.clone()
+                    };
                     let named_by = row.text("named_by")?;
                     let named_by = parse_named_by(&named_by).ok_or_else(|| {
                         StateError::Database(format!(
                             "stored torrent tracker naming is not valid: {named_by}"
                         ))
                     })?;
-                    plain.push((
+                    keyed.push((
                         row.i64("job_id")?,
                         row.i64("tier")?,
-                        url.clone(),
-                        seal_url(Some(&key), &url)?,
+                        stored,
+                        seal_url(Some(&key), &plain)?,
+                        url_key(Some(&key), &plain)?,
                         named_by_str(named_by).to_owned(),
                     ));
                 }
-                if plain.is_empty() {
+                if keyed.is_empty() {
                     continue;
                 }
-                sealed += plain.len();
+                sealed += keyed.len();
                 SqlRuntime::run_in_transaction(&datastore, "seal_torrent_trackers", |tx| {
-                    let plain = plain.clone();
+                    let keyed = keyed.clone();
                     Box::pin(async move {
-                        let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 4);
-                        for chunk in plain.chunks(rows.max(1)) {
-                            // Three binds a row to take it out, four to put
-                            // it back sealed.
+                        let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 5);
+                        for chunk in keyed.chunks(rows.max(1)) {
+                            // Three binds a row to take it out, five to put
+                            // it back sealed and keyed.
                             let gone = vec!["(job_id = {} AND tier = {} AND url = {})"; chunk.len()]
                                 .join(" OR ");
                             let mut args = Vec::with_capacity(chunk.len() * 3);
-                            for (job_id, tier, url, _, _) in chunk {
+                            for (job_id, tier, stored, ..) in chunk {
                                 args.extend([
                                     SqlArg::I64(*job_id),
                                     SqlArg::I64(*tier),
-                                    SqlArg::Text(url.clone()),
+                                    SqlArg::Text(stored.clone()),
                                 ]);
                             }
                             tx.execute(&format!("DELETE FROM torrent_trackers WHERE {gone}"), &args)
                                 .await?;
-                            let mut args = Vec::with_capacity(chunk.len() * 4);
-                            for (job_id, tier, _, sealed, named_by) in chunk {
+                            let mut args = Vec::with_capacity(chunk.len() * 5);
+                            for (job_id, tier, _, sealed, url_key, named_by) in chunk {
                                 args.extend([
                                     SqlArg::I64(*job_id),
                                     SqlArg::I64(*tier),
                                     SqlArg::Text(sealed.clone()),
+                                    SqlArg::Bytes(url_key.clone()),
                                     SqlArg::Text(named_by.clone()),
                                 ]);
                             }
                             tx.execute(
                                 &format!(
-                                    "INSERT INTO torrent_trackers (job_id, tier, url, named_by) VALUES {}",
-                                    vec!["({}, {}, {}, {})"; chunk.len()].join(", ")
+                                    "INSERT INTO torrent_trackers (job_id, tier, url, url_key, named_by) \
+                                     VALUES {} ON CONFLICT (job_id, tier, url_key) DO NOTHING",
+                                    vec!["({}, {}, {}, {}, {})"; chunk.len()].join(", ")
                                 ),
                                 &args,
                             )
@@ -224,11 +319,93 @@ impl crate::Database {
                 })
                 .await?;
             }
-            if sealed > 0 {
-                tracing::info!(count = sealed, "sealed the torrents' stored tracker URLs");
+            if sealed > 0 || unread > 0 {
+                tracing::info!(
+                    count = sealed,
+                    undecryptable = unread,
+                    "sealed the torrents' stored tracker URLs"
+                );
+            }
+
+            // Each torrent whose kept metadata names an RSS item's link or
+            // id, and its history row: both without them.
+            let mut after = i64::MIN;
+            loop {
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    "SELECT job_id, metadata FROM torrents \
+                      WHERE job_id > {} AND metadata LIKE {} ORDER BY job_id LIMIT {}",
+                    &[
+                        SqlArg::I64(after),
+                        SqlArg::Text("%\"rss.item_%".to_string()),
+                        SqlArg::I64(SEAL_PAGE),
+                    ],
+                )
+                .await?;
+                let Some(last) = rows.last() else { break };
+                after = last.i64("job_id")?;
+                let mut page = Vec::new();
+                for row in &rows {
+                    if let Some(kept) = row.opt_text("metadata")?.as_deref().and_then(without_rss_link)
+                    {
+                        page.push((row.i64("job_id")?, kept));
+                    }
+                }
+                let jobs: Vec<SqlArg> = rows
+                    .iter()
+                    .map(|row| row.i64("job_id").map(SqlArg::I64))
+                    .collect::<Result<_, _>>()?;
+                let history = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, metadata FROM job_history WHERE job_id IN ({})",
+                        vec!["{}"; jobs.len()].join(", ")
+                    ),
+                    &jobs,
+                )
+                .await?;
+                let mut had = Vec::new();
+                for row in &history {
+                    if let Some(kept) = row.opt_text("metadata")?.as_deref().and_then(without_rss_link)
+                    {
+                        had.push((row.i64("job_id")?, kept));
+                    }
+                }
+                if page.is_empty() && had.is_empty() {
+                    continue;
+                }
+                SqlRuntime::run_in_transaction(&datastore, "strip_torrent_rss_links", |tx| {
+                    let (page, had) = (page.clone(), had.clone());
+                    Box::pin(async move {
+                        let page: Vec<(i64, SqlArg)> = page
+                            .into_iter()
+                            .map(|(job_id, kept)| (job_id, SqlArg::Text(kept)))
+                            .collect();
+                        crate::torrents::persistence::update_column_tx(tx, "metadata", &page)
+                            .await?;
+                        if !had.is_empty() {
+                            let sql = format!(
+                                "UPDATE job_history SET metadata = CASE job_id {}END \
+                                  WHERE job_id IN ({})",
+                                "WHEN {} THEN {} ".repeat(had.len()),
+                                vec!["{}"; had.len()].join(", ")
+                            );
+                            let mut args = Vec::with_capacity(had.len() * 3);
+                            for (job_id, kept) in &had {
+                                args.extend([SqlArg::I64(*job_id), SqlArg::Text(kept.clone())]);
+                            }
+                            args.extend(had.iter().map(|(job_id, _)| SqlArg::I64(*job_id)));
+                            tx.execute(&sql, &args).await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await?;
             }
             Ok(())
-        })
+        })?;
+        self.seal_rss_links(&key)?;
+        self.set_setting(SEALED_MARK, SEAL_DONE)
     }
 }
 
@@ -242,7 +419,21 @@ mod tests {
         let url = "https://tracker.example/announce?passkey=0123abcd";
         let sealed = seal_url(Some(&key), url).unwrap();
         assert!(!sealed.contains("0123abcd"));
-        assert_eq!(seal_url(Some(&key), &sealed).unwrap(), sealed);
+        // A write always seals: what it is given is the URL, whatever it
+        // starts with.
+        let twice = seal_url(Some(&key), &sealed).unwrap();
+        assert_ne!(twice, sealed);
+        assert_eq!(open_url(Some(&key), &twice).unwrap(), sealed);
+        // The same URL has the same key; another URL, or another instance
+        // key, another.
+        assert_eq!(
+            url_key(Some(&key), url).unwrap(),
+            url_key(Some(&key), url).unwrap()
+        );
+        assert_ne!(
+            url_key(Some(&key), url).unwrap(),
+            url_key(Some(&key), "https://tracker.example/announce").unwrap()
+        );
         assert_eq!(open_url(Some(&key), &sealed).unwrap(), url);
         assert_eq!(open_url(Some(&key), url).unwrap(), url);
 
@@ -260,5 +451,28 @@ mod tests {
         assert!(open_url(Some(&other), &sealed).is_err());
         assert!(open_metainfo(Some(&other), stored).is_err());
         assert!(seal_url(None, url).is_err());
+        assert_ne!(
+            url_key(Some(&other), url).unwrap(),
+            url_key(Some(&key), url).unwrap()
+        );
+
+        // Sealed as bytes: its own size, a nonce and a tag, no base64.
+        assert_eq!(
+            seal_metainfo(Some(&key), &metainfo).unwrap().len(),
+            metainfo.len() + ENCRYPTED_BYTES_PREFIX.len() + 12 + 16
+        );
+        // One sealed as text before still opens.
+        let text = encrypt_value(&key, &STANDARD.encode(&metainfo))
+            .unwrap()
+            .into_bytes();
+        assert!(is_sealed(&text));
+        assert_eq!(open_metainfo(Some(&key), text).unwrap(), metainfo);
+        // One cut short is an error, not a panic.
+        assert!(open_metainfo(Some(&key), b"enc:b1:short".to_vec()).is_err());
+
+        // Nothing is sealed under a key no store keeps.
+        let unkept = EncryptionKey::generate().ephemeral();
+        assert!(seal_url(Some(&unkept), url).is_err());
+        assert!(seal_metainfo(Some(&unkept), &metainfo).is_err());
     }
 }

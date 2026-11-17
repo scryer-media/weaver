@@ -472,7 +472,7 @@ impl TorrentService {
             category: settings
                 .category(record.category_id)
                 .map(|category| category.name.clone()),
-            private: torrent.private,
+            private: torrent.record.private,
             forced: record.forced,
             // Over the bytes it wants, all of them had when it wants none
             // (libtorrent `torrent_status::progress`).

@@ -45,9 +45,6 @@ pub(super) struct Live {
     // here as a new list, under the lock that holds this torrent, so a
     // reader takes the list without copying it.
     pub(super) trackers: Arc<[TrackerEntry]>,
-    // Whether its metainfo marks it private; read from the metainfo, never
-    // kept apart from it.
-    pub(super) private: bool,
     // The peers and bans its next start begins with: the one place a ban
     // made here lives until it is written.
     pub(super) resume: ResumePeers,
@@ -186,7 +183,6 @@ impl Live {
             identity: TorrentIdentity::fresh(),
             rule_id: None,
             trackers: Arc::from(Vec::new()),
-            private: false,
             ledger: Ledger {
                 written: Some((written, resume.clone())),
                 peers_at_ms: now,

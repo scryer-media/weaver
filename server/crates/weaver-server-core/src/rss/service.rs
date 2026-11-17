@@ -264,7 +264,16 @@ impl RssService {
             Route::Class(intake) => {
                 let mut submission = Submission::of(kind, body);
                 submission.category = category;
-                submission.metadata = metadata;
+                // A torrent keeps neither the item's link nor its id, which
+                // is often the link: a private tracker's carries the
+                // passkey, the metadata is kept in the clear and shown with
+                // the job's history, and nothing reads either back.
+                submission.metadata = metadata
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        !crate::torrents::sealed::RSS_LINK_KEYS.contains(&key.as_str())
+                    })
+                    .collect();
                 self.add_to_class(intake, submission).await
             }
             Route::Pipeline => {

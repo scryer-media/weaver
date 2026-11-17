@@ -591,7 +591,6 @@ impl TorrentService {
             })
             .collect();
         torrent.about = parsed.about.clone();
-        torrent.private = parsed.private;
     }
 
     // `restore_jobs` as a pass of its own, begun off the caller's path: the

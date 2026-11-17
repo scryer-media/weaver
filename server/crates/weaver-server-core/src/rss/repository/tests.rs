@@ -79,9 +79,13 @@ fn rss_seen_items_dedupe_and_purge() {
     };
     db.insert_rss_seen_item(&item).unwrap();
     assert!(db.rss_seen_item_exists(1, "guid-1").unwrap());
+    // Listed under its id's keyed digest, the rest as it was seen.
     assert_eq!(
         db.list_rss_seen_items(Some(1), Some(10)).unwrap(),
-        vec![item]
+        vec![RssSeenItemRow {
+            item_id: db.rss_seen_item_key("guid-1"),
+            ..item
+        }]
     );
     assert!(db.delete_rss_seen_item(1, "guid-1").unwrap());
     assert!(!db.rss_seen_item_exists(1, "guid-1").unwrap());
@@ -254,19 +258,18 @@ fn a_seen_decision_keeps_its_stored_word() {
         .map(|row| (row.item_id, row.decision.as_str().to_owned()))
         .collect();
     read.sort();
-    assert_eq!(
-        read,
-        [
-            ("guid-0", "accepted"),
-            ("guid-1", "rejected"),
-            ("guid-2", "ignored"),
-            ("guid-3", "submitted"),
-            ("guid-4", "error"),
-            ("guid-5", "waiting"),
-            ("guid-6", "rejected_by_size"),
-        ]
-        .map(|(id, word)| (id.to_owned(), word.to_owned()))
-    );
+    let mut kept = [
+        ("guid-0", "accepted"),
+        ("guid-1", "rejected"),
+        ("guid-2", "ignored"),
+        ("guid-3", "submitted"),
+        ("guid-4", "error"),
+        ("guid-5", "waiting"),
+        ("guid-6", "rejected_by_size"),
+    ]
+    .map(|(id, word)| (db.rss_seen_item_key(id), word.to_owned()));
+    kept.sort();
+    assert_eq!(read, kept);
 }
 
 // Every feed URL and item link as the database holds them.
@@ -327,11 +330,29 @@ fn feed_urls_and_item_links_hold_no_passkey_at_rest() {
     assert!(sealed.0.iter().all(|url| !url.contains(PASSKEY)));
     assert!(sealed.1.iter().flatten().all(|url| !url.contains(PASSKEY)));
     assert_eq!(db.get_rss_feed(1).unwrap().unwrap().url, feed.url);
-    let mut listed = db.list_rss_seen_items(Some(1), None).unwrap();
-    listed.sort_by(|a, b| a.item_id.cmp(&b.item_id));
-    assert_eq!(listed, items);
+    // An item's id is often its link: it is stored as its keyed digest, and
+    // found by the id the feed gives.
+    let ids: Vec<String> = items.iter().map(|item| item.item_id.clone()).collect();
+    let listed = db.list_rss_seen_items(Some(1), None).unwrap();
+    assert_eq!(listed.len(), items.len());
+    assert!(listed.iter().all(|item| !item.item_id.contains("guid-")));
+    assert!(listed.iter().all(|item| {
+        item.item_url
+            .as_deref()
+            .is_some_and(|url| url.contains(PASSKEY))
+    }));
+    assert_eq!(
+        db.seen_rss_item_ids(1, &ids).unwrap(),
+        ids.iter().cloned().collect()
+    );
+    assert!(db.rss_seen_item_exists(1, "guid-003").unwrap());
+    assert!(!db.rss_seen_item_exists(1, "guid-900").unwrap());
+    // Seen again, an item is the row it was.
+    db.insert_rss_seen_item(&items[3]).unwrap();
+    assert_eq!(db.list_rss_seen_items(Some(1), None).unwrap().len(), 150);
 
-    // As an older start left them: in the clear.
+    // As an older start left them: the feed's URL, and 150 more items'
+    // ids and links, in the clear.
     let datastore = db.datastore();
     let clear_url = feed.url.clone();
     db.run_sql_blocking(async move {
@@ -341,36 +362,84 @@ fn feed_urls_and_item_links_hold_no_passkey_at_rest() {
             &[SqlArg::Text(clear_url)],
         )
         .await?;
-        SqlRuntime::execute(
-            datastore.write_exec(),
-            "UPDATE rss_seen_items SET item_url = 'https://tracker.invalid/dl?passkey=' || item_id
-              WHERE item_id > 'guid-064'",
-            &[],
-        )
-        .await
+        for n in 0..150 {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "INSERT INTO rss_seen_items
+                    (feed_id, item_id, item_title, decision, seen_at, item_url)
+                 VALUES (1, {}, 'Older', 'accepted', {}, {})",
+                &[
+                    SqlArg::Text(format!(
+                        "https://tracker.invalid/old/{n:03}?passkey={PASSKEY}"
+                    )),
+                    SqlArg::I64(1000 + n),
+                    SqlArg::Text(format!(
+                        "https://tracker.invalid/old/{n:03}?passkey={PASSKEY}"
+                    )),
+                ],
+            )
+            .await?;
+        }
+        Ok(())
     })
     .unwrap();
-    db.seal_rss_links().unwrap();
+    let older: Vec<String> = (0..150)
+        .map(|n| format!("https://tracker.invalid/old/{n:03}?passkey={PASSKEY}"))
+        .collect();
+    // Until the pass, an older row is not found by its digest.
+    assert!(db.seen_rss_item_ids(1, &older).unwrap().is_empty());
+
+    db.seal_stored_secrets().unwrap();
     let resealed = stored_links(&db);
     assert!(resealed.0.iter().all(|url| !url.contains(PASSKEY)));
+    assert_eq!(resealed.1.len(), 300);
     assert!(
         resealed
             .1
             .iter()
             .flatten()
-            .all(|url| !url.contains("passkey"))
+            .all(|url| !url.contains(PASSKEY))
     );
-    assert_eq!(resealed.1[..65], sealed.1[..65]);
     assert_eq!(db.get_rss_feed(1).unwrap().unwrap().url, feed.url);
-    let listed = db.list_rss_seen_items(Some(1), None).unwrap();
-    let last = listed
-        .iter()
-        .find(|item| item.item_id == "guid-149")
-        .unwrap();
+    // Every item seen before the pass is seen after it, and no stored id
+    // holds the passkey.
     assert_eq!(
-        last.item_url.as_deref(),
-        Some("https://tracker.invalid/dl?passkey=guid-149")
+        db.seen_rss_item_ids(1, &older).unwrap(),
+        older.iter().cloned().collect()
     );
-    db.seal_rss_links().unwrap();
-    assert_eq!(stored_links(&db), resealed);
+    assert_eq!(
+        db.seen_rss_item_ids(1, &ids).unwrap(),
+        ids.iter().cloned().collect()
+    );
+    let listed = db.list_rss_seen_items(Some(1), None).unwrap();
+    assert_eq!(listed.len(), 300);
+    assert!(listed.iter().all(|item| !item.item_id.contains(PASSKEY)));
+    let last = listed.iter().find(|item| item.seen_at == 1149).unwrap();
+    assert_eq!(last.item_url.as_deref(), Some(older[149].as_str()));
+
+    // The pass is one pass: a start after it reads no row to look for
+    // work, so one written in the clear past it stays as it is.
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(
+            datastore.write_exec(),
+            "INSERT INTO rss_seen_items (feed_id, item_id, item_title, decision, seen_at)
+             VALUES (1, 'past-the-pass', 'Later', 'accepted', 5000)",
+            &[],
+        )
+        .await
+    })
+    .unwrap();
+    db.seal_stored_secrets().unwrap();
+    assert!(
+        db.list_rss_seen_items(Some(1), None)
+            .unwrap()
+            .iter()
+            .any(|item| item.item_id == "past-the-pass")
+    );
+    // An item is forgotten by the id the list gives, or by the feed's.
+    assert!(db.delete_rss_seen_item(1, &last.item_id).unwrap());
+    assert!(db.delete_rss_seen_item(1, &older[0]).unwrap());
+    assert!(db.delete_rss_seen_item(1, "past-the-pass").unwrap());
+    assert_eq!(db.list_rss_seen_items(Some(1), None).unwrap().len(), 298);
 }

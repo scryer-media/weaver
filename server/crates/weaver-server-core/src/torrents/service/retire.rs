@@ -447,7 +447,7 @@ impl TorrentService {
         now: i64,
         confirm_unmet_goal: bool,
     ) -> Result<(), ActionError> {
-        if torrent.private && !confirm_unmet_goal {
+        if torrent.record.private && !confirm_unmet_goal {
             let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
             if let Some(left) =
                 status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now)

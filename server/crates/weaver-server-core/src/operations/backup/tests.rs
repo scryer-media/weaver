@@ -240,7 +240,10 @@ async fn export_and_import_stable_state_roundtrip() {
     assert_eq!(integration_events_tables, 0);
     export_pool.close().await;
 
-    let dest = Database::open_in_memory().unwrap();
+    // The instance key comes back with the state it encrypted: a seen
+    // item's id is kept as its keyed digest, found under that key alone.
+    let mut dest = Database::open_in_memory().unwrap();
+    dest.set_encryption_key(src.encryption_key().unwrap().clone());
     assert!(dest.restore_target_is_pristine().unwrap());
     dest.import_stable_state(temp.path()).unwrap();
     assert_eq!(dest.sum_bandwidth_usage_minutes(42, 43).unwrap(), 420);
