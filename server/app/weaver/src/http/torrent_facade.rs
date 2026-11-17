@@ -42,7 +42,7 @@ use weaver_server_core::settings::{
     BlocklistSource, Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy,
     TorrentConfig, TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
 };
-use weaver_server_core::tags::{TagSnapshot, split_tags};
+use weaver_server_core::tags::split_tags;
 use weaver_server_core::torrents::metrics::{Published, SessionSeries};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
@@ -1292,8 +1292,8 @@ async fn torrents(
         "removeTrackers" => ctx.api().without_result(remove_trackers(ctx, params).await),
         "addTags" | "setTags" | "removeTags" => tag_torrents(ctx, action, params).await,
         "createTags" | "deleteTags" => make_tags(ctx, action, params).await,
-        "tags" => match tag_snapshot(ctx).await {
-            Ok(tags) => axum::Json(json!(tags.made())).into_response(),
+        "tags" => match made_tags(ctx).await {
+            Ok(tags) => axum::Json(json!(tags)).into_response(),
             Err(error) => internal(error),
         },
         "addWebSeeds" | "editWebSeed" | "removeWebSeeds" => unavailable("Web seeds"),
@@ -2964,16 +2964,16 @@ async fn delete(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     ok()
 }
 
-// The tags as stored: from memory when nothing changed them since the last
-// read, else read off the async workers.
-async fn tag_snapshot(
+// Every tag made: from memory when nothing changed the tags since the last
+// read, else read from the made tags alone, off the async workers.
+async fn made_tags(
     ctx: &TorrentFacadeContext,
-) -> Result<Arc<TagSnapshot>, weaver_server_core::StateError> {
+) -> Result<Vec<String>, weaver_server_core::StateError> {
     if let Some(tags) = ctx.inner.db.cached_tag_snapshot() {
-        return Ok(tags);
+        return Ok(tags.made().to_vec());
     }
     let db = ctx.inner.db.clone();
-    tokio::task::spawn_blocking(move || db.tag_snapshot())
+    tokio::task::spawn_blocking(move || db.made_tags())
         .await
         .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
 }
@@ -3761,8 +3761,8 @@ async fn maindata(
         .unwrap_or(0);
     // Each row reads its files' totals alone, not its files.
     let rows = found!(ctx.rows(Pick::default(), Window::Every, false).await);
-    let tags = match tag_snapshot(ctx).await {
-        Ok(tags) => tags.made().to_vec(),
+    let tags = match made_tags(ctx).await {
+        Ok(tags) => tags,
         Err(error) => return internal(error),
     };
     let config = ctx.inner.config.read().await;

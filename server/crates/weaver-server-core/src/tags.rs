@@ -467,8 +467,45 @@ impl Database {
     }
 
     /// One job's tags, in [`tag_order`]: what a script for the job is told.
+    /// From the tags in memory when nothing changed them since, else read
+    /// by the job's id on the table's key, never every job's.
     pub fn job_tags(&self, job_id: JobId) -> Result<Vec<String>, StateError> {
-        Ok(self.tag_snapshot()?.of(job_id).to_vec())
+        if let Some(snapshot) = self.cached_tag_snapshot() {
+            return Ok(snapshot.of(job_id).to_vec());
+        }
+        let Ok(id) = i64::try_from(job_id.0) else {
+            return Ok(Vec::new());
+        };
+        let datastore = self.datastore();
+        let tags = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT tag FROM job_tags WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?
+            .iter()
+            .map(|row| row.text("tag"))
+            .collect::<Result<Vec<_>, _>>()
+        })?;
+        Ok(sorted_tags(tags))
+    }
+
+    /// Every tag made, in [`tag_order`]. From the tags in memory when
+    /// nothing changed them since, else read from the made tags alone.
+    pub fn made_tags(&self) -> Result<Vec<String>, StateError> {
+        if let Some(snapshot) = self.cached_tag_snapshot() {
+            return Ok(snapshot.made().to_vec());
+        }
+        let datastore = self.datastore();
+        let made = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(datastore.read_exec(), "SELECT name FROM tags", &[])
+                .await?
+                .iter()
+                .map(|row| row.text("name"))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        Ok(sorted_tags(made))
     }
 
     // Makes one change to the tags in one transaction, then tells every
@@ -585,9 +622,40 @@ impl Database {
         self.change_tags("untag_job", &[job_id], Change::Clear)
     }
 
-    /// Every tag made, with how many jobs carry it, in [`tag_order`].
+    /// Every tag made, with how many jobs carry it, in [`tag_order`]. From
+    /// the tags in memory when nothing changed them since, else counted in
+    /// the database, a row per tag, never a row per job.
     pub fn tag_counts(&self) -> Result<Vec<TagCount>, StateError> {
-        Ok(self.tag_snapshot()?.counts())
+        if let Some(snapshot) = self.cached_tag_snapshot() {
+            return Ok(snapshot.counts());
+        }
+        let datastore = self.datastore();
+        let (made, counts) = self.run_sql_blocking_read(async move {
+            let made = SqlRuntime::fetch_all(datastore.read_exec(), "SELECT name FROM tags", &[])
+                .await?
+                .iter()
+                .map(|row| row.text("name"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let counts = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT tag, COUNT(*) AS jobs FROM job_tags GROUP BY tag",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok((row.text("tag")?, row.i64("jobs")?)))
+            .collect::<Result<HashMap<String, i64>, StateError>>()?;
+            Ok((made, counts))
+        })?;
+        Ok(sorted_tags(made)
+            .into_iter()
+            .map(|name| TagCount {
+                jobs: counts
+                    .get(&name)
+                    .map_or(0, |jobs| u64::try_from(*jobs).unwrap_or(0)),
+                name,
+            })
+            .collect())
     }
 }
 
