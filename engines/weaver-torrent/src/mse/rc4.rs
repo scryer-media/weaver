@@ -92,18 +92,21 @@ impl Rc4 {
         self.j = j.to_le_bytes()[0];
     }
 
-    /// Sixteen bytes a round, with the state entries for `i` read two steps
+    /// Sixteen bytes a round, with the state entries for `i` read three steps
     /// ahead of their use.
     ///
     /// The next `j` is the last one plus `s[i + 1]`. Read after the store to
     /// `s[j]`, as the textbook loop has it, that entry may be the one just
     /// stored, and Intel's larger cores then hold the read back until the
     /// store's address is known: one load and one add per byte in a row,
-    /// about 8 cycles. Here `s[i + 2]` is read before the step's two stores,
-    /// so it never waits on them; a store that lands on one of the two
-    /// entries read ahead (`j` is `i + 1` or `i + 2`, 2 times in 256) takes a
-    /// cold path that reads both again. The round starts where `i + 1` is a
-    /// multiple of 16, so every `i` offset is a constant, and the sixteen
+    /// about 8 cycles. Here `s[i + 3]` is read before the step's two stores,
+    /// so it never waits on them, and three steps leave the read time to land
+    /// on AMD's cores too; a store that lands on one of the three entries
+    /// read ahead (`j` is `i + 1` to `i + 3`, 3 times in 256) takes a cold
+    /// path that reads them again. That test runs on a counter of its own,
+    /// `j` less the round's first `i`, one add a step, so it never lengthens
+    /// the chain from one `j` to the next. The round starts where `i + 1` is
+    /// a multiple of 16, so every `i` offset is a constant, and the sixteen
     /// keystream bytes are gathered in one SSE register and XORed in at once.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse4.1")]
@@ -122,10 +125,13 @@ impl Rc4 {
         if !rounds.is_empty() {
             let s = &mut self.s;
             let mut j = self.j;
-            // The round's first i, and the entries for it and the next.
+            // The round's first i, and the entries for it and the next two.
             let mut b = usize::from(self.i.wrapping_add(1)) & 0xf0;
             let mut t1 = s[b];
             let mut t2 = s[b + 1];
+            let mut t3 = s[b + 2];
+            // `j` less `b`; only its low byte is read.
+            let mut d = u32::from(j.wrapping_sub(b.to_le_bytes()[0]));
             for round in rounds {
                 let nb = (b + 16) & 0xf0;
                 // Entry `n` of the round, which runs into the next.
@@ -137,15 +143,18 @@ impl Rc4 {
                         j = j.wrapping_add(low(tx));
                         let jj = usize::from(j);
                         let ty = s[jj];
-                        let ahead = s[at($n + 2)];
+                        let ahead = s[at($n + 3)];
                         s[jj] = tx;
                         s[b + $n] = ty;
                         t1 = t2;
-                        t2 = ahead;
-                        if jj.wrapping_sub(b + $n + 1).to_le_bytes()[0] < 2 {
+                        t2 = t3;
+                        t3 = ahead;
+                        d = d.wrapping_add(tx);
+                        if d.wrapping_sub($n + 1).to_le_bytes()[0] < 3 {
                             std::hint::cold_path();
                             t1 = s[at($n + 1)];
                             t2 = s[at($n + 2)];
+                            t3 = s[at($n + 3)];
                         }
                         let k = low(s[(tx as usize + ty as usize) & 0xff]);
                         v = _mm_insert_epi8::<$n>(v, i32::from(k));
@@ -172,6 +181,7 @@ impl Rc4 {
                 let hi: &mut [u8; 8] = hi.try_into().unwrap();
                 *lo = (u64::from_le_bytes(*lo) ^ _mm_cvtsi128_si64(v) as u64).to_le_bytes();
                 *hi = (u64::from_le_bytes(*hi) ^ _mm_extract_epi64::<1>(v) as u64).to_le_bytes();
+                d = d.wrapping_sub(16);
                 b = nb;
             }
             self.i = b.to_le_bytes()[0].wrapping_sub(1);
