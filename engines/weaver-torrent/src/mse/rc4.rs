@@ -68,12 +68,16 @@ impl Rc4 {
             unsafe { self.apply_ahead(buf) };
             return;
         }
+        #[cfg(target_arch = "aarch64")]
+        self.apply_ahead(buf);
+        #[cfg(not(target_arch = "aarch64"))]
         self.apply_words(buf);
     }
 
     /// Eight keystream bytes are gathered into a word and XORed into the
     /// buffer at once, so each byte costs the two state stores and no store
     /// of its own (libtorrent `rc4_encrypt`, src/pe_crypto.cpp, RC_2_1).
+    #[cfg(any(not(target_arch = "aarch64"), test))]
     fn apply_words(&mut self, buf: &mut [u8]) {
         let (mut i, mut j) = (self.i, usize::from(self.j));
         let s = &mut self.s;
@@ -181,6 +185,99 @@ impl Rc4 {
                 let hi: &mut [u8; 8] = hi.try_into().unwrap();
                 *lo = (u64::from_le_bytes(*lo) ^ _mm_cvtsi128_si64(v) as u64).to_le_bytes();
                 *hi = (u64::from_le_bytes(*hi) ^ _mm_extract_epi64::<1>(v) as u64).to_le_bytes();
+                d = d.wrapping_sub(16);
+                b = nb;
+            }
+            self.i = b.to_le_bytes()[0].wrapping_sub(1);
+            self.j = j;
+        }
+        let mut j = usize::from(self.j);
+        for t in tail {
+            *t ^= step(&mut self.s, &mut self.i, &mut j);
+        }
+        self.j = j.to_le_bytes()[0];
+    }
+
+    /// The same idea on aarch64, in plain Rust: sixteen bytes a round, the
+    /// entries for `i` read two steps ahead, before the step's stores.
+    ///
+    /// Arm's Neoverse cores run a read of `s[i + 1]` before an older store
+    /// whose address is not known yet, and start again when the two meet,
+    /// so the textbook loop throws work away. Read ahead, that entry no
+    /// longer waits on the step before it, and two steps are enough on every
+    /// Arm core measured; a deeper read only adds checks and loses on
+    /// Neoverse N1. A store to one of the two entries read ahead (`j` is
+    /// `i + 1` or `i + 2`, 2 times in 256) takes the cold path that reads
+    /// them again, tested on its own counter as on x86-64. The state stays
+    /// a byte per entry, which every Arm core measured prefers, and the
+    /// sixteen keystream bytes are gathered into two words by shift and or,
+    /// about as fast as gathering them in a NEON register, with no vector code.
+    #[cfg(target_arch = "aarch64")]
+    fn apply_ahead(&mut self, buf: &mut [u8]) {
+        let mut at = 0;
+        while at < buf.len() && !self.i.wrapping_add(1).is_multiple_of(16) {
+            let mut j = usize::from(self.j);
+            buf[at] ^= step(&mut self.s, &mut self.i, &mut j);
+            self.j = j.to_le_bytes()[0];
+            at += 1;
+        }
+        let (rounds, tail) = buf[at..].as_chunks_mut::<16>();
+        if !rounds.is_empty() {
+            let s = &mut self.s;
+            let mut j = self.j;
+            // The round's first i, and the entries for it and the next.
+            let mut b = usize::from(self.i.wrapping_add(1)) & 0xf0;
+            let mut t1 = s[b];
+            let mut t2 = s[b + 1];
+            // `j` less `b`; only its low byte is read.
+            let mut d = u32::from(j.wrapping_sub(b.to_le_bytes()[0]));
+            for round in rounds {
+                let nb = (b + 16) & 0xf0;
+                // Entry `n` of the round, which runs into the next.
+                let at = |n: usize| if n < 16 { b + n } else { nb + n - 16 };
+                let mut k = [0u64; 2];
+                macro_rules! step {
+                    ($n:literal) => {
+                        let tx = t1;
+                        j = j.wrapping_add(low(tx));
+                        let jj = usize::from(j);
+                        let ty = s[jj];
+                        let ahead = s[at($n + 2)];
+                        s[b + $n] = ty;
+                        s[jj] = tx;
+                        t1 = t2;
+                        t2 = ahead;
+                        d = d.wrapping_add(u32::from(tx));
+                        if d.wrapping_sub($n + 1).to_le_bytes()[0] < 2 {
+                            std::hint::cold_path();
+                            t1 = s[at($n + 1)];
+                            t2 = s[at($n + 2)];
+                        }
+                        let byte = low(s[(usize::from(tx) + usize::from(ty)) & 0xff]);
+                        k[$n / 8] |= u64::from(byte) << (8 * ($n % 8));
+                    };
+                }
+                step!(0);
+                step!(1);
+                step!(2);
+                step!(3);
+                step!(4);
+                step!(5);
+                step!(6);
+                step!(7);
+                step!(8);
+                step!(9);
+                step!(10);
+                step!(11);
+                step!(12);
+                step!(13);
+                step!(14);
+                step!(15);
+                let (lo, hi) = round.split_at_mut(8);
+                let lo: &mut [u8; 8] = lo.try_into().unwrap();
+                let hi: &mut [u8; 8] = hi.try_into().unwrap();
+                *lo = (u64::from_le_bytes(*lo) ^ k[0]).to_le_bytes();
+                *hi = (u64::from_le_bytes(*hi) ^ k[1]).to_le_bytes();
                 d = d.wrapping_sub(16);
                 b = nb;
             }
@@ -493,13 +590,16 @@ mod tests {
         }
     }
 
-    /// Both x86-64 loops, the read-ahead one and the fallback for a CPU
-    /// without SSE4.1, against the reference, with the loop changed from
+    /// The read-ahead loop and the word loop (on x86-64 the fallback for a
+    /// CPU without SSE4.1) against the reference, with the loop changed from
     /// one call to the next so each picks up where the other left off.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn rc4_read_ahead_and_fallback_loops_match_the_reference_from_any_point() {
-        let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
+        #[cfg(target_arch = "x86_64")]
+        let ahead = std::arch::is_x86_feature_detected!("sse4.1");
+        #[cfg(target_arch = "aarch64")]
+        let ahead = true;
         let mut rng = Seeded(0x00a4_eaad);
         for round in 0..48 {
             let key_len = 1 + rng.below(256);
@@ -518,9 +618,14 @@ mod tests {
                 let plain = rng.bytes(len);
                 let mut got = plain.clone();
                 let mut want = plain;
-                if sse41 && rng.below(2) == 0 {
+                if ahead && rng.below(2) == 0 {
+                    #[cfg(target_arch = "x86_64")]
                     // SAFETY: the CPU has SSE4.1, checked above.
-                    unsafe { c.apply_ahead(&mut got) };
+                    unsafe {
+                        c.apply_ahead(&mut got)
+                    };
+                    #[cfg(target_arch = "aarch64")]
+                    c.apply_ahead(&mut got);
                 } else {
                     c.apply_words(&mut got);
                 }
