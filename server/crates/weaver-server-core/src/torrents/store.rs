@@ -24,7 +24,7 @@ use super::layout::PieceLayout;
 use super::side::Side;
 use super::storage::Pieces;
 use super::tee::Tee;
-use super::writes::{Done, Paid, Paying, VolumeRoom, Writes};
+use super::writes::{Done, Paid, Paying, Place, VolumeRoom, Writes};
 use tokio::sync::Notify;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -271,8 +271,8 @@ impl TorrentStore {
                         if opened.recorded(span.file) && !aside[span.file] {
                             let mut buffer = vec![0; span.range.len() as usize];
                             opened.read(piece, span.at, &mut buffer)?;
-                            let path = placed.path(span.file)?;
-                            batch.write(span.file, span.range.start, Bytes::from(buffer), || path);
+                            let place = placed.place(span.file)?;
+                            batch.write(span.file, span.range.start, Bytes::from(buffer), || place);
                         }
                     }
                     if !self.layout.spans(piece).iter().any(|span| aside[span.file]) {
@@ -393,8 +393,8 @@ impl TorrentStore {
                         }
                         let mut buffer = vec![0; span.range.len() as usize];
                         side.read(*piece, span.at, &mut buffer)?;
-                        let path = placed.path(span.file)?;
-                        batch.write(span.file, span.range.start, Bytes::from(buffer), || path);
+                        let place = placed.place(span.file)?;
+                        batch.write(span.file, span.range.start, Bytes::from(buffer), || place);
                     }
                 }
                 io::Result::Ok(batch.barrier())
@@ -961,7 +961,12 @@ impl TorrentStore {
                     span.file,
                     span.range.start,
                     held.slice(at..at + len),
-                    || placed.path(span.file).unwrap_or_default(),
+                    || {
+                        placed.place(span.file).unwrap_or_else(|_| Place {
+                            path: PathBuf::new(),
+                            within: PathBuf::new(),
+                        })
+                    },
                 );
             }
             let have = Arc::clone(&self.have);
@@ -1144,8 +1149,8 @@ impl Pieces for TorrentStore {
         if !whole {
             return Ok(());
         }
-        let path = self.files.placed().path(file)?;
-        let grown = self.writes.grow(path, length);
+        let place = self.files.placed().place(file)?;
+        let grown = self.writes.grow(place, length);
         // A torrent with every piece holds its volume's writer no longer.
         if self.have().count == self.layout.piece_count() {
             self.writes.let_go();

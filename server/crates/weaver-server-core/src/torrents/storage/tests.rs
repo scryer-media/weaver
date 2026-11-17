@@ -756,6 +756,54 @@ fn deleting_a_torrents_files_follows_no_link_inside_its_folder() {
     assert!(dir.join("sub").exists(), "the link stays");
 }
 
+// Deleting a torrent removes only its listed files and never reaches out
+// through a link: a listed file that is a link to one outside goes as the
+// link, what it pointed at stays, and a file under a link in the middle of
+// its name stays with what that link points at.
+#[cfg(unix)]
+#[test]
+fn deleting_a_torrents_files_never_follows_a_link_outside() {
+    let shim = shim(
+        1024,
+        vec![
+            file("a.bin", 500),
+            file("mid/deep/b.bin", 500),
+            file("c.bin", 500),
+        ],
+    );
+    let torrent = noise(1500, 9);
+    for piece in 0..2 {
+        shim.complete(piece, &torrent);
+    }
+    let dir = shim.dir.path().to_path_buf();
+    shim.store.forget_now();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(elsewhere.path().join("deep")).unwrap();
+    std::fs::write(elsewhere.path().join("target.bin"), b"someone's").unwrap();
+    std::fs::write(elsewhere.path().join("deep/b.bin"), b"someone's").unwrap();
+    std::fs::remove_file(dir.join("a.bin")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path().join("target.bin"), dir.join("a.bin")).unwrap();
+    std::fs::remove_dir_all(dir.join("mid")).unwrap();
+    std::fs::create_dir_all(dir.join("mid")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path().join("deep"), dir.join("mid/deep")).unwrap();
+
+    delete_written(&deletion(shim.store.files(), &Adopted::default(), &[], None));
+    assert!(
+        std::fs::symlink_metadata(dir.join("a.bin")).is_err(),
+        "the link at a listed name goes, as a link"
+    );
+    assert!(!dir.join("c.bin").exists(), "its own file goes");
+    assert_eq!(
+        std::fs::read(elsewhere.path().join("target.bin")).unwrap(),
+        b"someone's"
+    );
+    assert_eq!(
+        std::fs::read(elsewhere.path().join("deep/b.bin")).unwrap(),
+        b"someone's"
+    );
+    assert!(dir.join("mid/deep").exists(), "the link in the middle stays");
+}
+
 // Every path under the directory, relative to it.
 fn walkdir(dir: &Path) -> Vec<String> {
     let mut found = Vec::new();

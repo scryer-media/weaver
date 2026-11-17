@@ -27,6 +27,7 @@ use tokio::time::Instant;
 use weaver_torrent::session_stats::disk::FileEnds;
 
 use super::layout::PieceLayout;
+use crate::operations::disk::beneath::{self, Access};
 
 // What every torrent's file calls and the handle pool did since the process
 // started: one relaxed add per call, read by a scrape without a lock. The
@@ -439,8 +440,9 @@ impl Files {
         let name = self.name(file)?;
         let at = self.at();
         at.read()?;
-        let path = at.dir.join(name);
-        let handle = self.pool.open(at.reads[file], || File::open(&path))?;
+        let handle = self
+            .pool
+            .open(at.reads[file], || beneath::open(&at.dir, name, Access::Read))?;
         counted(
             &self.ends[file].read,
             offset,
@@ -462,8 +464,9 @@ impl Files {
         if at.shut {
             return;
         }
-        let path = at.dir.join(name);
-        if let Ok(handle) = self.pool.open(at.reads[file], || File::open(&path)) {
+        if let Ok(handle) = self
+            .pool
+            .open(at.reads[file], || beneath::open(&at.dir, name, Access::Read)) {
             advise_will_need(&handle, offset, len);
         }
     }
@@ -474,8 +477,9 @@ impl Files {
         let name = self.name(file)?;
         let at = self.at();
         at.read()?;
-        let path = at.dir.join(name);
-        let handle = self.pool.open(at.reads[file], || File::open(&path))?;
+        let handle = self
+            .pool
+            .open(at.reads[file], || beneath::open(&at.dir, name, Access::Read))?;
         let len = outs.iter().map(|out| out.len()).sum();
         counted(
             &self.ends[file].read,
@@ -492,11 +496,16 @@ impl Files {
     // found there at all.
     pub(crate) fn held(&self, file: usize) -> Option<u64> {
         let name = self.name(file).ok()?;
-        let path = self.at().dir.join(name);
+        let dir = self.at().dir.clone();
         #[cfg(test)]
         LOOKS.with(|looks| looks.set(looks.get() + 1));
-        let found = std::fs::metadata(path).ok()?;
-        Some(if found.is_file() { found.len() } else { 0 })
+        match beneath::look(&dir, name) {
+            Ok(found) => Some(if found.is_file { found.len } else { 0 }),
+            // Something is there, but through a link that leads out of the
+            // folder: it holds none of the torrent's bytes.
+            Err(error) if beneath::is_outside(&error) => Some(0),
+            Err(_) => None,
+        }
     }
 
     // Every handle to read let go, so the files can be moved, removed or
@@ -564,6 +573,14 @@ impl Placed<'_> {
     // Where the file is; an error for padding, which is never on disk.
     pub(crate) fn path(&self, file: usize) -> io::Result<PathBuf> {
         Ok(self.at.dir.join(self.files.name(file)?))
+    }
+
+    // Where the file is, with the folder it must resolve inside.
+    pub(crate) fn place(&self, file: usize) -> io::Result<super::writes::Place> {
+        Ok(super::writes::Place {
+            path: self.path(file)?,
+            within: self.at.dir.clone(),
+        })
     }
 
     // A write of `len` bytes at `offset` of the file, counted as it is
@@ -783,5 +800,56 @@ mod tests {
         files.read(0, 0, &mut out).unwrap();
         assert!(pool.is_open(files.at().reads[0]));
         assert_ne!(files.at().reads[0], before);
+    }
+
+    // No byte is read, served or sized through a link that leads out of
+    // the save folder: a file linked to one outside, a linked folder, and a
+    // link in the middle of the name. Each read says why; a look finds
+    // nothing held, so a check counts none of it as there. A link that stays
+    // inside is read through. A look finds such a file holding nothing, so
+    // the pieces kept in it are had no longer at restore.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_through_a_link_that_leads_outside_is_refused() {
+        use std::os::unix::fs::symlink;
+        let top = tempfile::tempdir().unwrap();
+        let (save, away) = (top.path().join("save"), top.path().join("away"));
+        std::fs::create_dir_all(save.join("mid")).unwrap();
+        std::fs::create_dir_all(away.join("deep")).unwrap();
+        put(&away.join("secret"), 0, b"theirs");
+        put(&away.join("payload.bin"), 0, b"theirs");
+        put(&away.join("deep/payload.bin"), 0, b"theirs");
+        symlink(away.join("secret"), save.join("file.bin")).unwrap();
+        symlink(&away, save.join("dir")).unwrap();
+        symlink(&away, save.join("mid/link")).unwrap();
+        std::fs::create_dir_all(save.join("real")).unwrap();
+        put(&save.join("real/ok.bin"), 0, b"inside");
+        symlink("real", save.join("in")).unwrap();
+        let files = Files::in_pool(
+            &layout(&[
+                ("file.bin", 6),
+                ("dir/payload.bin", 6),
+                ("mid/link/deep/payload.bin", 6),
+                ("in/ok.bin", 6),
+            ]),
+            save.clone(),
+            pool(),
+        )
+        .unwrap();
+        for file in 0..3 {
+            let mut out = [0; 6];
+            let read = files.read(file, 0, &mut out).unwrap_err();
+            assert!(read.to_string().contains("leads outside"), "{file}: {read}");
+            let mut outs = [&mut out[..]];
+            let readv = files.readv(file, 0, &mut outs).unwrap_err();
+            assert!(readv.to_string().contains("leads outside"), "{file}: {readv}");
+            assert_eq!(files.held(file), Some(0), "{file}");
+            files.will_read(file, 0, 6);
+            assert_eq!(out, [0; 6]);
+        }
+        let mut out = [0; 6];
+        files.read(3, 0, &mut out).unwrap();
+        assert_eq!(&out, b"inside");
+        assert_eq!(files.held(3), Some(6));
     }
 }
