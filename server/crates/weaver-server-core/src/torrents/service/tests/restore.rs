@@ -1010,6 +1010,8 @@ async fn a_pause_while_restoring_holds_once_the_job_is_back() {
     drop(held);
     again.restored().await;
     assert!(again.inner.live.lock().await[&job_id].store.is_some());
+    // It reads as checking what was saved of it until its session has it.
+    super::listing::settled(&again, 1).await;
     assert_eq!(
         again.torrent(job_id).await.unwrap().state,
         TorrentState::Paused
