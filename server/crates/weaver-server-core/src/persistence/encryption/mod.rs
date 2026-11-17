@@ -30,6 +30,9 @@ const NONCE_LEN: usize = 12;
 #[derive(Clone)]
 pub struct EncryptionKey {
     key_bytes: [u8; 32],
+    // Made in memory for want of any store to keep it in: gone at the next
+    // start, with everything encrypted under it.
+    ephemeral: bool,
 }
 
 impl std::fmt::Debug for EncryptionKey {
@@ -53,13 +56,30 @@ impl EncryptionKey {
         }
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&decoded);
-        Ok(Self { key_bytes: bytes })
+        Ok(Self {
+            key_bytes: bytes,
+            ephemeral: false,
+        })
     }
 
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).expect("getrandom failed");
-        Self { key_bytes: bytes }
+        Self {
+            key_bytes: bytes,
+            ephemeral: false,
+        }
+    }
+
+    // This key, as one no store keeps.
+    pub(crate) fn ephemeral(mut self) -> Self {
+        self.ephemeral = true;
+        self
+    }
+
+    // Whether the key lives in memory only and is gone at the next start.
+    pub fn is_ephemeral(&self) -> bool {
+        self.ephemeral
     }
 
     pub fn to_base64(&self) -> String {
@@ -114,6 +134,69 @@ pub fn decrypt_value(key: &EncryptionKey, stored: &str) -> Result<String, String
         .map_err(|_| "decryption failed (wrong key or corrupted data)".to_string())?;
 
     String::from_utf8(plaintext).map_err(|e| format!("decrypted value is not valid UTF-8: {e}"))
+}
+
+// What a value encrypted as bytes starts with: `enc:b1:`, then the nonce,
+// then the ciphertext and its tag, none of it encoded. The tag after the
+// colon is the format's version.
+pub(crate) const ENCRYPTED_BYTES_PREFIX: &[u8] = b"enc:b1:";
+
+// Encrypt bytes to bytes: `enc:b1:` || nonce || ciphertext || tag. The same
+// cipher and key as [`encrypt_value`], without its base64, for a value kept
+// in a binary column.
+pub(crate) fn encrypt_bytes(key: &EncryptionKey, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new_from_slice(&key.key_bytes)
+        .map_err(|e| format!("failed to create cipher: {e}"))?;
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    getrandom::fill(&mut nonce_bytes).map_err(|e| format!("failed to generate nonce: {e}"))?;
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|e| format!("failed to create nonce: {e}"))?;
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| format!("encryption failed: {e}"))?;
+    let mut stored =
+        Vec::with_capacity(ENCRYPTED_BYTES_PREFIX.len() + NONCE_LEN + ciphertext.len());
+    stored.extend_from_slice(ENCRYPTED_BYTES_PREFIX);
+    stored.extend_from_slice(&nonce_bytes);
+    stored.extend_from_slice(&ciphertext);
+    Ok(stored)
+}
+
+// Decrypt what [`encrypt_bytes`] stored. One of any other shape is an
+// error, never a panic.
+pub(crate) fn decrypt_bytes(key: &EncryptionKey, stored: &[u8]) -> Result<Vec<u8>, String> {
+    let Some(combined) = stored.strip_prefix(ENCRYPTED_BYTES_PREFIX) else {
+        return Err("not an encrypted value".to_string());
+    };
+    if combined.len() < NONCE_LEN + 16 {
+        return Err("encrypted value too short".to_string());
+    }
+    let (nonce_bytes, ciphertext) = combined.split_at(NONCE_LEN);
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|e| format!("invalid nonce: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&key.key_bytes)
+        .map_err(|e| format!("failed to create cipher: {e}"))?;
+    cipher
+        .decrypt(&nonce, ciphertext)
+        .map_err(|_| "decryption failed (wrong key or corrupted data)".to_string())
+}
+
+// A value's keyed digest: HMAC-SHA256 under a key derived from the instance
+// key for `domain` alone, so one domain's digests say nothing of another's
+// and none is the encryption key's own. The same value gives the same
+// digest, which is what a lookup or a uniqueness rule over encrypted values
+// needs; without the instance key a digest tells nothing of its value.
+pub(crate) fn keyed_digest(key: &EncryptionKey, domain: &str, value: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac, digest::KeyInit};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    let mut derive = <HmacSha256 as KeyInit>::new_from_slice(&key.key_bytes)
+        .expect("HMAC takes a key of any length");
+    derive.update(domain.as_bytes());
+    let subkey = derive.finalize().into_bytes();
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(&subkey).expect("HMAC takes a key of any length");
+    mac.update(value);
+    mac.finalize().into_bytes().into()
 }
 
 // Check if a value is encrypted (has the `enc:v1:` prefix).
@@ -283,7 +366,7 @@ pub fn ensure_encryption_key_for_state(
          keystore or set WEAVER_ENCRYPTION_KEY as an escape hatch to decrypt secrets across \
          restarts"
     );
-    Ok(key)
+    Ok(key.ephemeral())
 }
 
 pub fn backup_key_source_name(data_dir: Option<PathBuf>, current_key: &EncryptionKey) -> String {

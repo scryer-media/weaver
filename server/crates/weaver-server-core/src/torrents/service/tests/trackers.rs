@@ -439,20 +439,87 @@ async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, S
         .collect()
 }
 
-// Each torrent's trackers are held with it, and a boot reads each torrent
-// table a restore and an attach read once, for every torrent: the
-// torrents' rows, their trackers', their counters' and their history's. From then on
+// A torrent file that names one tracker twice in a tier is kept with it
+// once, in the table and in memory alike: the list held is the list
+// written, at the add and after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_a_torrent_names_twice_is_held_as_it_is_stored() {
+    use super::super::once_a_tier;
+    let (a, b) = ("http://a.invalid/announce", "http://b.invalid/announce");
+    let entry = |tier: u32, url: &str| TrackerEntry {
+        tier,
+        url: url.to_owned(),
+        named_by: NamedBy::Torrent,
+    };
+    // Once in a tier, the first kept; another tier is another row.
+    assert_eq!(
+        once_a_tier(&[entry(0, a), entry(0, b), entry(0, a), entry(1, a)]),
+        [entry(0, a), entry(0, b), entry(1, a)]
+    );
+
+    // d 8:announce <a> 13:announce-list l l <a> <b> <a> e e ...
+    let rest = plain("twice", 7);
+    let mut bytes = b"d".to_vec();
+    bstr(&mut bytes, b"announce");
+    bstr(&mut bytes, a.as_bytes());
+    bstr(&mut bytes, b"announce-list");
+    bytes.extend_from_slice(b"ll");
+    for url in [a, b, a] {
+        bstr(&mut bytes, url.as_bytes());
+    }
+    bytes.extend_from_slice(b"ee");
+    bytes.extend_from_slice(&rest[1..]);
+
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(bytes))
+        })
+        .await
+        .unwrap();
+    let held = |service: &TorrentService| {
+        let service = service.clone();
+        async move {
+            let live = service.inner.live.lock().await;
+            live.get(&job_id).unwrap().trackers.to_vec()
+        }
+    };
+    let stored = |db: &Database| {
+        let mut stored = db.list_torrent_trackers(job_id).unwrap();
+        stored.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+        stored
+    };
+    let at_add = held(&rig.service).await;
+    assert_eq!(at_add, [entry(0, a), entry(0, b)]);
+    assert_eq!(at_add, stored(&rig.db));
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(held(&again).await, at_add);
+    assert_eq!(stored(&rig.db), at_add);
+    again.stop().await;
+}
+
+// Each torrent's trackers are held with it, and a boot reads the last
+// torrent's key, then, once a page of torrents, the bytes each takes and
+// each torrent table a restore and an attach read: the torrents' rows,
+// their trackers', their counters' and their history's. A boot of no torrent reads the key alone. From then on
 // publishing, listing, viewing and matching the tracker rules again read
 // none, whether one torrent is live or fifty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
-    const BOOT_READS: usize = 4;
+    // Fewer torrents than a page holds, so one page.
+    const BOOT_READS: usize = 6;
     let a = "http://a.invalid/announce";
     let reads = |db: &Database| db.torrent_reads.load(std::sync::atomic::Ordering::Relaxed);
     for count in [1, 50] {
         let rig = rig(set_clock());
         rig.service.open().await.unwrap();
-        assert_eq!(reads(&rig.db), BOOT_READS, "the boot of no torrent");
+        assert_eq!(reads(&rig.db), 1, "the boot of no torrent");
         let mut jobs = Vec::new();
         for seed in 0..count {
             let name = format!("listed-{seed}");
@@ -516,6 +583,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
         let added = reads(&rig.db);
         rig.service.publish().await;
         rig.service.tick().await;
+        rig.service.restored().await;
         rig.service.reload_tracker_rules().await.unwrap();
         let listed = rig.service.torrents(None).await;
         let with_files = rig.service.torrents_with_files().await;
@@ -571,6 +639,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
         let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
         again.open().await.unwrap();
         again.tick().await;
+        again.restored().await;
         for &job_id in &jobs {
             handle_of(&again, job_id).await;
         }
@@ -1475,4 +1544,131 @@ fn a_removal_leaves_what_the_search_left() {
     let left = without_urls(trackers.clone(), &urls);
     assert!(!left.is_empty() && left.len() < trackers.len());
     assert_eq!(left, by_search);
+}
+
+// A private tracker's URL is sealed at rest, and a restart opens it: the
+// torrent comes back with its tracker, and its announce carries the URL as
+// the torrent was added with it, passkey and all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_torrent_announces_its_sealed_tracker_url() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/announce?passkey=f00dfacecafe",
+        listener.local_addr().unwrap()
+    );
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(announcing(&plain("sealed", 7), &url)))
+        })
+        .await
+        .unwrap();
+    // The operator names it, as a loopback tracker the torrent names alone
+    // is not announced to; a loopback one is asked only at /announce, so
+    // its passkey rides in the query.
+    tracked(&rig.service, job_id, &url).await;
+    let before = listed_trackers(&rig.service, job_id).await;
+    assert!(before.iter().any(|(_, listed, _)| *listed == url));
+    rig.service.stop().await;
+    let datastore = rig.db.datastore();
+    let stored = rig
+        .db
+        .run_sql_blocking_read(async move {
+            crate::persistence::sql_runtime::SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT url FROM torrent_trackers",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| row.text("url"))
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    assert_eq!(stored.len(), before.len());
+    assert!(stored.iter().all(|url| !url.contains("f00dfacecafe")));
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert_eq!(listed_trackers(&again, job_id).await, before);
+    again.resume(job_id).await.unwrap();
+    let (stream, heard) = heard_request(&listener).await;
+    let line = heard.lines().next().unwrap();
+    assert!(line.starts_with("GET /announce?"), "{line}");
+    assert!(line.contains("&passkey=f00dfacecafe "), "{line}");
+    drop(stream);
+    again.stop().await;
+}
+
+// A torrent whose stored secrets do not decrypt with the instance key, as
+// after a key that was replaced, is held at start with why: it stays in
+// the table, unrestored and unfetched, and fails nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_whose_secrets_do_not_decrypt_is_held_with_why() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(announcing(
+            &plain("other key", 3),
+            "http://a.invalid/f00dfacecafe/announce",
+        ))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    let other = crate::persistence::encryption::EncryptionKey::generate();
+    let foreign = crate::torrents::sealed::seal_metainfo(Some(&other), b"d4:infodee").unwrap();
+    let datastore = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET metainfo = {} WHERE job_id = {}",
+                &[SqlArg::Bytes(foreign), SqlArg::I64(job_id.0 as i64)],
+            )
+            .await
+        })
+        .unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let written = again.written();
+    reopen(&again).await;
+    {
+        let live = again.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert!(
+            torrent
+                .restore_held
+                .as_deref()
+                .is_some_and(|why| why.contains("do not decrypt")),
+            "{:?}",
+            torrent.restore_held
+        );
+        assert!(torrent.store.is_none() && torrent.layout.is_none());
+        assert!(torrent.fetching.is_none() && torrent.resolving.is_none());
+    }
+    assert_eq!(written.borrow().checkpoints_read, 0);
+    assert_eq!(
+        again.torrent(job_id).await.unwrap().state,
+        TorrentState::Stopped
+    );
+    assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+    // Its trackers are not changed while it is held: an edit would write
+    // the list back without whatever did not open.
+    let kept = rig.db.list_torrent_trackers(job_id).unwrap();
+    let refused = again
+        .add_trackers(job_id, vec![vec!["http://b.invalid/announce".into()]])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, ActionError::Invalid(why) if why.contains("do not decrypt")),
+        "{refused:?}"
+    );
+    assert_eq!(rig.db.list_torrent_trackers(job_id).unwrap(), kept);
+    again.stop().await;
 }

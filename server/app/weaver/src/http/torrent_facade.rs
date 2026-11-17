@@ -50,8 +50,8 @@ use weaver_server_core::torrents::service::listing::{
     CategoryPick, FileTotals, Pick, Shown, Window,
 };
 use weaver_server_core::torrents::service::{
-    ActionError, AddError, AddRequest, AddSource, Placement, TorrentService, TorrentSettings,
-    TorrentView,
+    ActionError, AddError, AddRequest, AddSource, ListError, NotReady, Placement, TorrentService,
+    TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{
     ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
@@ -198,10 +198,14 @@ impl TorrentFacadeContext {
         }
     }
 
-    async fn count(&self) -> usize {
+    // How many torrents there are: every one of them, or not ready.
+    async fn count(&self) -> Result<usize, Response> {
         match &self.inner.torrents {
-            Some(torrents) => torrents.count().await,
-            None => 0,
+            Some(torrents) => {
+                torrents.whole().map_err(not_ready)?;
+                Ok(torrents.count().await)
+            }
+            None => Ok(0),
         }
     }
 
@@ -231,11 +235,12 @@ impl TorrentFacadeContext {
     }
 
     // Every torrent with its files, which its paths follow.
-    async fn views(&self) -> Vec<TorrentView> {
+    async fn views(&self) -> Result<Vec<TorrentView>, Response> {
         let Some(torrents) = &self.inner.torrents else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        torrents.torrents_with_files().await
+        torrents.whole().map_err(not_ready)?;
+        Ok(torrents.torrents_with_files().await)
     }
 
     // The torrent of `hash`; a failure to read the table is the answer to
@@ -256,7 +261,7 @@ impl TorrentFacadeContext {
     // (qBittorrent `applyToTorrents`).
     async fn named(&self, wanted: &str) -> Result<Vec<TorrentView>, Response> {
         if wanted.trim() == "all" {
-            return Ok(self.views().await);
+            return self.views().await;
         }
         let wanted: Vec<&str> = wanted.split('|').map(str::trim).collect();
         self.picked(Pick {
@@ -274,7 +279,7 @@ impl TorrentFacadeContext {
         torrents
             .picked(pick, Window::Every, Shown::WHOLE)
             .await
-            .map_err(internal)
+            .map_err(unlisted)
     }
 
     // The torrents `pick` keeps at `window`'s places, as a list's rows read
@@ -293,7 +298,7 @@ impl TorrentFacadeContext {
         torrents
             .picked_rows(pick, window, shown)
             .await
-            .map_err(internal)
+            .map_err(unlisted)
     }
 
     // Every torrent `pick` keeps, its own fields alone: no files, trackers
@@ -315,7 +320,7 @@ impl TorrentFacadeContext {
         torrents
             .picked(pick, Window::Every, Shown::BARE)
             .await
-            .map_err(internal)
+            .map_err(unlisted)
     }
 
     async fn resolve(&self, key: &str) -> Result<CallerScope, StatusCode> {
@@ -593,6 +598,33 @@ fn held(result: Result<(), weaver_server_core::SchedulerError>) -> Response {
 fn internal(error: impl std::fmt::Display) -> Response {
     tracing::warn!(%error, "torrent client compatibility request failed");
     text(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+// An answer or an action over every torrent, asked for while the stored
+// torrents are still being read at start: 503, never some of them as all.
+// Why a read of them failed is in the log, not in the answer.
+fn not_ready(why: NotReady) -> Response {
+    let said = match why {
+        NotReady::Loading => "the torrents are still loading; ask again shortly",
+        NotReady::Faulted(_) => "the torrents did not all load and are being read again",
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=UTF-8"),
+            (header::RETRY_AFTER, "1"),
+        ],
+        said,
+    )
+        .into_response()
+}
+
+// A list of torrents not given.
+fn unlisted(error: ListError) -> Response {
+    match error {
+        ListError::NotReady(why) => not_ready(why),
+        ListError::State(error) => internal(error),
+    }
 }
 
 // What a read of the torrents found, or, when the table could not be read,
@@ -1149,7 +1181,7 @@ async fn torrents(
     }
     let params = &params;
     match action {
-        "count" => text(StatusCode::OK, ctx.count().await.to_string()),
+        "count" => text(StatusCode::OK, found!(ctx.count().await).to_string()),
         "info" => torrents_info(ctx, params, scope).await,
         "properties" => properties(ctx, params).await,
         "trackers" => trackers(ctx, params, scope).await,
@@ -3982,6 +4014,12 @@ async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         .collect();
     if ips.is_empty() {
         return ok();
+    }
+    // A ban reaches every torrent: none is made while only some are here.
+    if let Some(torrents) = &ctx.inner.torrents
+        && let Err(why) = torrents.whole()
+    {
+        return not_ready(why);
     }
     if let Err(error) = ban_session_wide(ctx, &ips).await {
         return internal(error);

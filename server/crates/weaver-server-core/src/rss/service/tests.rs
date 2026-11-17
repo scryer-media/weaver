@@ -181,7 +181,10 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
     };
     let (base_url, server_task) = start_test_server(state.clone()).await;
 
-    let db = Database::open(&db_path).unwrap();
+    // A restart reads with the instance key the first start wrote with.
+    let key = crate::persistence::encryption::EncryptionKey::generate();
+    let mut db = Database::open(&db_path).unwrap();
+    db.set_encryption_key(key.clone());
     let feed = RssFeedRow {
         scripts: Vec::new(),
         id: 1,
@@ -233,7 +236,8 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
     drop(service);
     drop(db);
 
-    let db = Database::open(&db_path).unwrap();
+    let mut db = Database::open(&db_path).unwrap();
+    db.set_encryption_key(key);
     let service_restart = build_service(temp.path(), db);
     let report = service_restart.run_all_sync().await.unwrap();
     assert_eq!(report.items_new, 0);
@@ -309,7 +313,8 @@ async fn run_sync_uses_conditional_get_and_basic_auth() {
 #[tokio::test]
 async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
     let temp = TempDir::new().unwrap();
-    let db = Database::open(&temp.path().join("rss-failure.sqlite")).unwrap();
+    let mut db = Database::open(&temp.path().join("rss-failure.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let state = TestHttpState {
         feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
         nzb_body: b"not an nzb".to_vec(),
@@ -406,7 +411,8 @@ async fn a_failed_feed_fetch_logs_one_warning_per_poll() {
     let warnings = Arc::new(StdMutex::new(Vec::new()));
     let _subscriber = tracing::subscriber::set_default(WarnRecorder(warnings.clone()));
     let temp = TempDir::new().unwrap();
-    let db = Database::open(&temp.path().join("rss-failure-log.sqlite")).unwrap();
+    let mut db = Database::open(&temp.path().join("rss-failure-log.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let state = TestHttpState {
         feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
         nzb_body: sample_nzb_bytes(),
@@ -457,7 +463,8 @@ async fn a_failed_feed_fetch_logs_one_warning_per_poll() {
 #[tokio::test]
 async fn background_due_sync_skips_when_manual_sync_is_active() {
     let temp = TempDir::new().unwrap();
-    let db = Database::open(&temp.path().join("rss-due.sqlite")).unwrap();
+    let mut db = Database::open(&temp.path().join("rss-due.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let hold = Arc::new(FeedHold::default());
     let state = TestHttpState {
         feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
@@ -802,7 +809,8 @@ async fn assert_oversized_feed_is_rejected(mode: OversizedFeedBodyMode) {
         (format!("http://{address}"), server_task)
     };
 
-    let db = Database::open(&temp.path().join("oversized-rss.sqlite")).unwrap();
+    let mut db = Database::open(&temp.path().join("oversized-rss.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let mut feed = basic_auth_feed(format!("{base_url}/feed"));
     feed.username = None;
     feed.password = None;
@@ -983,7 +991,8 @@ fn sample_nzb_bytes() -> Vec<u8> {
 #[tokio::test]
 async fn pause_all_holds_regular_rss_but_not_manual_fetch() {
     let temp = TempDir::new().unwrap();
-    let db = Database::open(&temp.path().join("state.db")).unwrap();
+    let mut db = Database::open(&temp.path().join("state.db")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let requests = Arc::new(AtomicUsize::new(0));
     let state = TestHttpState {
         feed_body: "<rss version=\"2.0\"><channel><title>Empty</title></channel></rss>".into(),
@@ -1141,7 +1150,8 @@ async fn a_feed_without_a_route_waits_for_the_runtime_reload() {
 #[tokio::test]
 async fn a_poll_during_a_route_reload_records_nothing_and_runs_when_it_ends() {
     let temp = TempDir::new().unwrap();
-    let db = Database::open(&temp.path().join("state.db")).unwrap();
+    let mut db = Database::open(&temp.path().join("state.db")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let requests = Arc::new(AtomicUsize::new(0));
     let (base_url, server) = start_test_server(TestHttpState {
         feed_body: "<rss version=\"2.0\"><channel><title>Empty</title></channel></rss>".into(),
@@ -1255,7 +1265,8 @@ async fn due_feed_selection_loads_only_the_due_feed() {
 #[tokio::test]
 async fn a_new_feeds_first_sweep_leaves_its_items_for_the_rule_added_after_it() {
     let temp = TempDir::new().unwrap();
-    let db = Database::open(&temp.path().join("rss-new-feed.sqlite")).unwrap();
+    let mut db = Database::open(&temp.path().join("rss-new-feed.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let title = "Weaver E2E RSS Behavior Probe";
     let fixture = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>

@@ -20,9 +20,14 @@ use crate::torrents::{
 use weaver_torrent::ResumePeers;
 
 // A tracker row holds where the tracker sits in the announce list and who
-// named it; how announcing to it goes is read from the session.
-const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url, named_by) VALUES ";
-const TRACKER_ROW: &str = "({}, {}, {}, {})";
+// named it; how announcing to it goes is read from the session. Its URL is
+// sealed, so its ciphertext differs each time it is written: the URL's keyed
+// digest, `url_key`, is what says two rows of a tier are the same tracker,
+// and the second is not kept.
+const TRACKER_INSERT: &str =
+    "INSERT INTO torrent_trackers (job_id, tier, url, url_key, named_by) VALUES ";
+const TRACKER_ROW: &str = "({}, {}, {}, {}, {})";
+const TRACKER_CONFLICT: &str = " ON CONFLICT (job_id, tier, url_key) DO NOTHING";
 // Every host a torrent has announced to stays known after the torrent is
 // gone, so a tracker rule can be picked from them. The URL is not kept: a
 // private tracker's carries the operator's passkey.
@@ -98,19 +103,22 @@ async fn insert_trackers(
     tx: &mut SqlTx<'_>,
     job_id: i64,
     trackers: &[TrackerEntry],
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
 ) -> Result<(), StateError> {
     // As many rows a statement as its binds allow.
-    for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 4)) {
+    for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 5)) {
         let sql = format!(
-            "{TRACKER_INSERT}{}",
+            "{TRACKER_INSERT}{}{TRACKER_CONFLICT}",
             vec![TRACKER_ROW; chunk.len()].join(", ")
         );
-        let mut args = Vec::with_capacity(chunk.len() * 4);
+        let mut args = Vec::with_capacity(chunk.len() * 5);
         for tracker in chunk {
             args.extend([
                 SqlArg::I64(job_id),
                 SqlArg::I64(i64::from(tracker.tier)),
-                SqlArg::Text(tracker.url.clone()),
+                // Sealed: a private tracker's URL carries the passkey.
+                SqlArg::Text(super::sealed::seal_url(key, &tracker.url)?),
+                SqlArg::Bytes(super::sealed::url_key(key, &tracker.url)?),
                 SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
             ]);
         }
@@ -137,7 +145,7 @@ async fn insert_trackers(
 // as `UPDATE ... CASE` statements of as many rows as their binds allow.
 // A torrent named twice takes the value named last, as one statement per
 // row in turn left it.
-async fn update_column_tx(
+pub(crate) async fn update_column_tx(
     tx: &mut SqlTx<'_>,
     column: &str,
     rows: &[(i64, SqlArg)],
@@ -298,6 +306,7 @@ impl Database {
                 "the retiring torrents do not read".into(),
             ));
         }
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -313,7 +322,9 @@ impl Database {
                 &[],
             )
             .await?;
-            rows.iter().map(retiring_row).collect()
+            rows.iter()
+                .map(|row| retiring_row(row, key.as_ref()))
+                .collect()
         })
     }
 
@@ -458,7 +469,10 @@ pub(crate) struct RetiringRow {
     pub(crate) history: JobHistoryRow,
 }
 
-fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<RetiringRow, StateError> {
+fn retiring_row(
+    row: &crate::persistence::sql_runtime::SqlRow,
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+) -> Result<RetiringRow, StateError> {
     let job_id = JobId(count(row, "job_id")?);
     let completed = row.opt_i64("completed_at_ms")?;
     let added = row.i64("added_at_ms")?;
@@ -510,7 +524,17 @@ fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<Retirin
         job_id,
         // A mark of any other word keeps its files, as one never asked.
         delete_files: RetiringMark::parse(&row.text("retiring")?) == Some(RetiringMark::Deleted),
-        metainfo: row.opt_bytes("metainfo")?,
+        // One that does not open keeps its files, as one whose metainfo
+        // does not read.
+        metainfo: row
+            .opt_bytes("metainfo")?
+            .and_then(|stored| match super::sealed::open_metainfo(key, stored) {
+                Ok(metainfo) => Some(metainfo),
+                Err(error) => {
+                    tracing::warn!(job_id = job_id.0, error = %error, "a removed torrent's metainfo does not decrypt; its files stay");
+                    None
+                }
+            }),
         storage_dir,
         files_dir: row.opt_text("files_dir")?,
         outputs: match row.opt_text("outputs")? {
@@ -882,37 +906,40 @@ impl Database {
         })
     }
 
-    // What the torrents not leaving hold, each row as written, or only the
-    // rows of `job_id`. One statement: by the table's key for one torrent,
-    // and every row once at a start, as the restore reads its torrents.
-    pub(crate) fn held_rows(
-        &self,
-        job_id: Option<JobId>,
-    ) -> Result<Vec<(JobId, String)>, StateError> {
-        let only = job_id.map(|job_id| stored(job_id.0)).transpose()?;
+    // What the torrents of `jobs` not leaving hold, each row as written:
+    // one statement per bind-sized chunk, each by the table's key.
+    pub(crate) fn held_rows(&self, jobs: &[JobId]) -> Result<Vec<(JobId, String)>, StateError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let jobs = jobs
+            .iter()
+            .map(|job_id| stored(job_id.0))
+            .collect::<Result<Vec<_>, _>>()?;
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let select = "SELECT h.job_id, h.path FROM torrent_held_paths h \
-                          JOIN torrents t ON t.job_id = h.job_id \
-                          WHERE t.retiring IS NULL";
-            let rows = match only {
-                Some(id) => {
-                    SqlRuntime::fetch_all(
-                        datastore.read_exec(),
-                        &format!("{select} AND h.job_id = {{}}"),
-                        &[SqlArg::I64(id)],
-                    )
-                    .await?
-                }
-                None => SqlRuntime::fetch_all(datastore.read_exec(), select, &[]).await?,
-            };
-            rows.into_iter()
-                .map(|row| {
+            let per = crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            let mut held = Vec::new();
+            for chunk in jobs.chunks(per) {
+                let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT h.job_id, h.path FROM torrent_held_paths h \
+                           JOIN torrents t ON t.job_id = h.job_id \
+                          WHERE t.retiring IS NULL AND h.job_id IN ({})",
+                        vec!["{}"; chunk.len()].join(", ")
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
                     let id = u64::try_from(row.i64("job_id")?)
                         .map_err(|error| StateError::Database(error.to_string()))?;
-                    Ok((JobId(id), row.text("path")?))
-                })
-                .collect()
+                    held.push((JobId(id), row.text("path")?));
+                }
+            }
+            Ok(held)
         })
     }
 
@@ -1088,7 +1115,10 @@ fn found_marks(
         })
 }
 
-fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
+fn torrent_args(
+    torrent: &TorrentRecord,
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+) -> Result<Vec<SqlArg>, StateError> {
     let policy_override = SeedingPolicy::kept(torrent.policy_override)
         .map(|policy| serde_json::to_string(&policy))
         .transpose()
@@ -1103,7 +1133,14 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptBytes(torrent.infohash_v2.map(|hash| hash.to_vec())),
         SqlArg::Text(torrent.name.clone()),
         SqlArg::Text(torrent.source.as_str().to_string()),
-        SqlArg::OptBytes(torrent.metainfo.as_deref().map(<[u8]>::to_vec)),
+        // Sealed: its announce list carries a private tracker's passkey.
+        SqlArg::OptBytes(
+            torrent
+                .metainfo
+                .as_deref()
+                .map(|metainfo| super::sealed::seal_metainfo(key, metainfo))
+                .transpose()?,
+        ),
         SqlArg::OptI64(torrent.category_id.map(i64::from)),
         SqlArg::I64(torrent.added_at_ms),
         SqlArg::Text(torrent.kept.as_str().to_string()),
@@ -1129,6 +1166,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptText(torrent.move_to.clone()),
         SqlArg::I64(torrent.queue_position),
         SqlArg::OptI64(torrent.pool_member.map(i64::from)),
+        SqlArg::Bool(torrent.private),
     ])
 }
 
@@ -1172,7 +1210,8 @@ impl Database {
             ));
         }
         let job_id = torrent.job_id;
-        let torrent_args = torrent_args(torrent)?;
+        let key = self.encryption_key().cloned();
+        let torrent_args = torrent_args(torrent, key.as_ref())?;
         let id = stored(job_id.0)?;
         let trackers = trackers.to_vec();
         let datastore = self.datastore();
@@ -1183,9 +1222,10 @@ impl Database {
                 let trackers = trackers.clone();
                 let adopted = adopted.clone();
                 let held = held.clone();
+                let key = key.clone();
                 Box::pin(async move {
                     if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
-                        return Ok(TorrentInsert::Duplicate(existing.job_id));
+                        return Ok(TorrentInsert::Duplicate(existing));
                     }
                     // One placeholder per value: the column list and the
                     // values are both TORRENT_COLUMNS' order.
@@ -1195,7 +1235,7 @@ impl Database {
                         &torrent_args,
                     )
                     .await?;
-                    insert_trackers(tx, id, &trackers).await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
                     insert_held_tx(tx, id, &held).await?;
                     if held_set {
                         tx.execute(
@@ -1800,10 +1840,12 @@ impl Database {
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
         let trackers = trackers.to_vec();
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_trackers", |tx| {
                 let trackers = trackers.clone();
+                let key = key.clone();
                 Box::pin(async move {
                     let known = tx
                         .fetch_optional(
@@ -1819,7 +1861,7 @@ impl Database {
                         &[SqlArg::I64(id)],
                     )
                     .await?;
-                    insert_trackers(tx, id, &trackers).await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
                     Ok(true)
                 })
             })
@@ -1847,8 +1889,34 @@ impl Database {
         })
     }
 
+    // Whether each of a batch of torrents unpacks, that column alone, in
+    // one transaction of few statements: what a page of a start's load
+    // fixes for the torrents kept before the column was.
+    pub(crate) fn set_torrents_unpack_in_force(
+        &self,
+        unpacks: &[(JobId, bool)],
+    ) -> Result<(), StateError> {
+        if unpacks.is_empty() {
+            return Ok(());
+        }
+        let rows = unpacks
+            .iter()
+            .map(|&(job_id, unpack)| Ok((stored(job_id.0)?, SqlArg::Bool(unpack))))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrents_unpack_in_force", |tx| {
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "unpack_in_force", &rows).await })
+            })
+            .await
+        })
+    }
+
     // A magnet's metainfo once its peers sent it: the hashes and name it
-    // carries, the file, the directory its files go to and the folder they
+    // carries, the file and whether it marks the torrent private, the
+    // directory its files go to and the folder they
     // sit in when that is not it, the files and trackers it lists, and what
     // it holds there (`torrent_held_paths`), all in one transaction: a crash
     // leaves the torrent holding its whole folder as a magnet does, or what
@@ -1862,6 +1930,7 @@ impl Database {
         infohash_v2: Option<[u8; 32]>,
         name: &str,
         metainfo: &[u8],
+        private: bool,
         storage_dir: &str,
         files_dir: Option<&str>,
         trackers: &[TrackerEntry],
@@ -1870,11 +1939,13 @@ impl Database {
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
         let adopted = adopted_text(adopted)?;
+        let key = self.encryption_key().cloned();
         let head = vec![
             SqlArg::OptBytes(infohash_v1.map(|hash| hash.to_vec())),
             SqlArg::OptBytes(infohash_v2.map(|hash| hash.to_vec())),
             SqlArg::Text(name.to_owned()),
-            SqlArg::Bytes(metainfo.to_vec()),
+            SqlArg::Bytes(super::sealed::seal_metainfo(key.as_ref(), metainfo)?),
+            SqlArg::Bool(private),
             SqlArg::Text(storage_dir.to_owned()),
             SqlArg::OptText(files_dir.map(str::to_owned)),
             SqlArg::Bool(true),
@@ -1889,11 +1960,12 @@ impl Database {
                 let head = head.clone();
                 let trackers = trackers.clone();
                 let held = held.clone();
+                let key = key.clone();
                 Box::pin(async move {
                     let changed = tx
                         .execute(
                             "UPDATE torrents SET infohash_v1 = {}, infohash_v2 = {}, name = {}, metainfo = {},
-                                     storage_dir = {}, files_dir = {}, held_set = {}, adopted = {}
+                                     private = {}, storage_dir = {}, files_dir = {}, held_set = {}, adopted = {}
                               WHERE job_id = {}",
                             &head,
                         )
@@ -1906,7 +1978,7 @@ impl Database {
                         &[SqlArg::I64(id)],
                     )
                     .await?;
-                    insert_trackers(tx, id, &trackers).await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
                     tx.execute(
                         "DELETE FROM torrent_held_paths WHERE job_id = {}",
                         &[SqlArg::I64(id)],
@@ -2201,66 +2273,66 @@ impl Database {
             found: found_marks(job_id, row.opt_text("found_peers")),
         })
     }
+}
 
-    // Every torrent's ledger, saved peers and kept pieces, by torrent, in
-    // one read: what [`Self::get_torrent_counters`],
-    // [`Self::torrent_peers`] and [`Self::torrent_pieces`] give a
-    // torrent's restore, for all of them. Each part reads on its own, so
-    // one that does not read is that part of that torrent's alone.
-    pub(crate) fn torrent_counters_by_job(
-        &self,
-    ) -> Result<std::collections::BTreeMap<JobId, CountersRow>, StateError> {
-        self.torrent_read();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
-                        last_seen_complete_ms, finished_duration_s, last_activity_ms,
-                        consecutive_seeding_s, failed_bytes, redundant_bytes, pieces,
-                        pieces_checking, peers, banned_peers, found_peers
-                   FROM torrent_counters",
-                &[],
-            )
-            .await?;
-            rows.iter()
-                .map(|row| {
-                    let job_id = JobId(count(row, "job_id")?);
-                    let kept = row.opt_bytes("pieces").and_then(|bits| {
-                        bits.map(|bits| {
-                            Ok(Kept {
-                                bits,
-                                checking: row.bool("pieces_checking")?,
-                            })
-                        })
-                        .transpose()
-                    });
-                    let peers = row
-                        .opt_text("peers")
-                        .and_then(|peers| listed("peers", peers))
-                        .and_then(|peers| {
-                            let banned = row
-                                .opt_text("banned_peers")
-                                .and_then(|banned| listed("banned_peers", banned))?;
-                            let found = found_marks(job_id, row.opt_text("found_peers"));
-                            Ok(ResumePeers {
-                                peers,
-                                banned,
-                                found,
-                            })
-                        });
-                    Ok((
-                        job_id,
-                        CountersRow {
-                            counters: counters_from_row(row),
-                            peers,
-                            kept,
-                        },
-                    ))
+// The ledger, saved peers and kept pieces of the torrents `among`'s binds
+// `args` name, by torrent, in one read by the table's key: what
+// [`Database::get_torrent_counters`], [`Database::torrent_peers`] and
+// [`Database::torrent_pieces`] give a torrent's restore. Each part reads on
+// its own, so one that does not read is that part of that torrent's alone.
+pub(crate) async fn counters_among(
+    datastore: &crate::persistence::sql_runtime::StoreDatastore,
+    among: &str,
+    args: &[SqlArg],
+) -> Result<Vec<(JobId, CountersRow)>, StateError> {
+    let rows = SqlRuntime::fetch_all(
+        datastore.read_exec(),
+        &format!(
+            "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
+                    last_seen_complete_ms, finished_duration_s, last_activity_ms,
+                    consecutive_seeding_s, failed_bytes, redundant_bytes, pieces,
+                    pieces_checking, peers, banned_peers, found_peers
+               FROM torrent_counters WHERE job_id IN ({among})"
+        ),
+        args,
+    )
+    .await?;
+    rows.iter()
+        .map(|row| {
+            let job_id = JobId(count(row, "job_id")?);
+            let kept = row.opt_bytes("pieces").and_then(|bits| {
+                bits.map(|bits| {
+                    Ok(Kept {
+                        bits,
+                        checking: row.bool("pieces_checking")?,
+                    })
                 })
-                .collect()
+                .transpose()
+            });
+            let peers = row
+                .opt_text("peers")
+                .and_then(|peers| listed("peers", peers))
+                .and_then(|peers| {
+                    let banned = row
+                        .opt_text("banned_peers")
+                        .and_then(|banned| listed("banned_peers", banned))?;
+                    let found = found_marks(job_id, row.opt_text("found_peers"));
+                    Ok(ResumePeers {
+                        peers,
+                        banned,
+                        found,
+                    })
+                });
+            Ok((
+                job_id,
+                CountersRow {
+                    counters: counters_from_row(row),
+                    peers,
+                    kept,
+                },
+            ))
         })
-    }
+        .collect()
 }
 
 // One torrent's counters row as a boot reads it.

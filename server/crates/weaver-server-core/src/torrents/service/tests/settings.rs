@@ -143,12 +143,14 @@ async fn turning_torrents_off_to_let_them_finish_ends_after_the_last_goal() {
     );
     // A tick with the torrent still downloading ends nothing.
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(rig.service.wind_down(), Some(WindDown::Finish));
 
     // Its download done, its goal is met: it stops, and torrents are off.
     complete(&rig, job_id).await;
     let mut wind_downs = rig.service.wind_downs();
     rig.service.tick().await;
+    rig.service.restored().await;
     wind_downs
         .wait_for(|wind_down| wind_down.is_none())
         .await
@@ -198,6 +200,7 @@ async fn turning_torrents_off_to_finish_downloads_stops_seeding() {
 
     let intent = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().intent();
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(intent(seeding), TorrentIntent::Stopped);
     assert_eq!(intent(downloading), TorrentIntent::Resumed);
     assert!(rig.service.inner.sessions.on());
@@ -206,6 +209,7 @@ async fn turning_torrents_off_to_finish_downloads_stops_seeding() {
     complete(&rig, downloading).await;
     let mut wind_downs = rig.service.wind_downs();
     rig.service.tick().await;
+    rig.service.restored().await;
     wind_downs
         .wait_for(|wind_down| wind_down.is_none())
         .await
@@ -332,6 +336,7 @@ async fn removing_the_last_torrent_ends_a_wind_down() {
     assert!(!rig.service.presence().running);
     let mut wind_downs = rig.service.wind_downs();
     rig.service.tick().await;
+    rig.service.restored().await;
     wind_downs
         .wait_for(|wind_down| wind_down.is_none())
         .await
@@ -358,6 +363,7 @@ async fn a_restart_with_nothing_running_ends_its_wind_down_at_the_first_tick() {
 
     let mut wind_downs = again.wind_downs();
     again.tick().await;
+    again.restored().await;
     wind_downs
         .wait_for(|wind_down| wind_down.is_none())
         .await
@@ -588,6 +594,7 @@ async fn seeds_a_wind_down_stopped_resume_when_torrents_are_on_again() {
     rig.service.pause(paused).await.unwrap();
     // Its goal met while torrents are on: stopped by its goal.
     rig.service.tick().await;
+    rig.service.restored().await;
     let kept = |job_id| {
         let row = rig.db.get_torrent(job_id).unwrap().unwrap();
         (row.intent(), row.wound_down())
@@ -599,6 +606,7 @@ async fn seeds_a_wind_down_stopped_resume_when_torrents_are_on_again() {
         .await;
     rig.service.set_settings(turned_off(&rig.service)).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(kept(wound), (TorrentIntent::Stopped, true));
     assert_eq!(kept(then_paused), (TorrentIntent::Stopped, true));
     assert_eq!(kept(paused), (TorrentIntent::Paused, false));
@@ -635,6 +643,7 @@ async fn seeds_a_wind_down_stopped_resume_at_a_restart_with_torrents_on() {
         .await;
     rig.service.set_settings(turned_off(&rig.service)).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     let kept = |job_id| {
         let row = rig.db.get_torrent(job_id).unwrap().unwrap();
         (row.intent(), row.wound_down())
@@ -673,6 +682,7 @@ async fn a_seed_meeting_its_goal_as_a_wind_down_stops_it_is_stopped_by_its_goal(
     rig.service.set_settings(turned_off(&rig.service)).await;
 
     rig.service.tick().await;
+    rig.service.restored().await;
 
     let row = rig.db.get_torrent(job_id).unwrap().unwrap();
     assert_eq!(
@@ -718,6 +728,7 @@ async fn a_wound_down_seed_whose_goal_is_met_stays_stopped_when_torrents_are_on(
         .await;
     rig.service.set_settings(turned_off(&rig.service)).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     let kept = |job_id| {
         let row = rig.db.get_torrent(job_id).unwrap().unwrap();
         (row.intent(), row.wound_down())
@@ -769,6 +780,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         move_to: None,
         queue_position: 0,
         pool_member: None,
+        private: false,
     };
     let mut rules = [TrackerRule {
         archive_passwords: Default::default(),
@@ -1052,6 +1064,7 @@ async fn a_torrent_keeps_the_unpack_in_force_once_its_job_is_built() {
     settings.torrent.unpack = false;
     rig.service.set_settings(settings).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(kept(inherits), (None, Some(true)));
     let view = rig.service.torrent(inherits).await.unwrap();
     assert!(view.unpack);

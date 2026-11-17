@@ -110,6 +110,8 @@ impl Database {
                 .map(|row| {
                     let mut feed = rss_feed_from_sql(row)?;
                     feed.password = maybe_decrypt(encryption_key.as_ref(), feed.password);
+                    feed.url =
+                        maybe_decrypt(encryption_key.as_ref(), Some(feed.url)).unwrap_or_default();
                     feed.scripts = attached.remove(&feed.id).unwrap_or_default();
                     Ok(feed)
                 })
@@ -134,6 +136,7 @@ impl Database {
             };
             let mut feed = rss_feed_from_sql(row)?;
             feed.password = maybe_decrypt(encryption_key.as_ref(), feed.password);
+            feed.url = maybe_decrypt(encryption_key.as_ref(), Some(feed.url)).unwrap_or_default();
             feed.scripts = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT instance_id FROM feed_scripts WHERE feed_id = {}
@@ -233,14 +236,24 @@ impl Database {
         })
     }
 
+    /// The id a seen item is stored and listed under: the BLAKE3 digest of
+    /// the id its feed gives it.
+    pub fn rss_seen_item_key(&self, item_id: &str) -> String {
+        super::persistence::seen_item_key(super::persistence::SeenId::Id(item_id))
+    }
+
     pub fn rss_seen_item_exists(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        let item_id = item_id.to_string();
+        let [keyed, item_id] = super::persistence::seen_item_keys(item_id);
         self.run_sql_blocking_read(async move {
             let exists = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT 1 AS exists_value FROM rss_seen_items WHERE feed_id = {} AND item_id = {}",
-                &[SqlArg::I64(i64::from(feed_id)), SqlArg::Text(item_id)],
+                &format!("{} LIMIT 1", seen_lookup_sql(2)),
+                &[
+                    SqlArg::I64(i64::from(feed_id)),
+                    SqlArg::Text(keyed),
+                    SqlArg::Text(item_id),
+                ],
             )
             .await?;
             Ok(exists.is_some())
@@ -248,7 +261,9 @@ impl Database {
     }
 
     /// Which of `item_ids` the feed has seen: one statement per bind-sized
-    /// chunk, served by the table's key.
+    /// chunk, served by the table's key. The ids are the feed's own; each
+    /// is looked up by the digest it is stored as, and by itself, as a row
+    /// stored before the digest holds it until the sealing pass.
     pub fn seen_rss_item_ids(
         &self,
         feed_id: u32,
@@ -258,7 +273,14 @@ impl Database {
             return Ok(Default::default());
         }
         let datastore = self.datastore();
-        let item_ids = item_ids.to_vec();
+        // Each stored id, and the feed's id it stands for.
+        let stored: std::collections::HashMap<String, String> = item_ids
+            .iter()
+            .flat_map(|item_id| {
+                super::persistence::seen_item_keys(item_id).map(|stored| (stored, item_id.clone()))
+            })
+            .collect();
+        let item_ids: Vec<String> = stored.keys().cloned().collect();
         self.run_sql_blocking_read(async move {
             let mut seen = std::collections::HashSet::new();
             // One bind of each chunk is the feed's id.
@@ -266,20 +288,18 @@ impl Database {
                 (crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1) - 1)
                     .max(1);
             for chunk in item_ids.chunks(per_chunk) {
-                let placeholders = vec!["{}"; chunk.len()].join(", ");
                 let mut args = vec![SqlArg::I64(i64::from(feed_id))];
                 args.extend(chunk.iter().cloned().map(SqlArg::Text));
                 let rows = SqlRuntime::fetch_all(
                     datastore.read_exec(),
-                    &format!(
-                        "SELECT item_id FROM rss_seen_items
-                          WHERE feed_id = {{}} AND item_id IN ({placeholders})"
-                    ),
+                    &seen_lookup_sql(chunk.len()),
                     &args,
                 )
                 .await?;
                 for row in rows {
-                    seen.insert(row.text("item_id")?);
+                    if let Some(item_id) = stored.get(&row.text("item_id")?) {
+                        seen.insert(item_id.clone());
+                    }
                 }
             }
             Ok(seen)
@@ -291,6 +311,7 @@ impl Database {
         feed_id: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Vec<RssSeenItemRow>, StateError> {
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let mut sql = String::from(RSS_SEEN_SELECT);
@@ -305,7 +326,13 @@ impl Database {
                 args.push(SqlArg::I64(i64::from(limit)));
             }
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
-            rows.into_iter().map(map_seen_item_row).collect()
+            rows.into_iter()
+                .map(|row| {
+                    let mut item = map_seen_item_row(row)?;
+                    item.item_url = super::persistence::open_seen_link(key.as_ref(), item.item_url);
+                    Ok(item)
+                })
+                .collect()
         })
     }
 
@@ -316,6 +343,7 @@ impl Database {
         &self,
         limit: u32,
     ) -> Result<Vec<RssSeenItemRow>, StateError> {
+        let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -333,9 +361,24 @@ impl Database {
                 &[SqlArg::I64(i64::from(limit))],
             )
             .await?;
-            rows.into_iter().map(map_seen_item_row).collect()
+            rows.into_iter()
+                .map(|row| {
+                    let mut item = map_seen_item_row(row)?;
+                    item.item_url = super::persistence::open_seen_link(key.as_ref(), item.item_url);
+                    Ok(item)
+                })
+                .collect()
         })
     }
+}
+
+// Which of `count` stored ids a feed has seen: an equality on the feed and
+// on each id, which the table's key `(feed_id, item_id)` serves.
+pub(crate) fn seen_lookup_sql(count: usize) -> String {
+    format!(
+        "SELECT item_id FROM rss_seen_items WHERE feed_id = {{}} AND item_id IN ({})",
+        vec!["{}"; count].join(", ")
+    )
 }
 
 fn rss_feed_from_sql(row: SqlRow) -> Result<RssFeedRow, StateError> {

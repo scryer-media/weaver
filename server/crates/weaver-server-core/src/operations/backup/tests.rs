@@ -240,7 +240,10 @@ async fn export_and_import_stable_state_roundtrip() {
     assert_eq!(integration_events_tables, 0);
     export_pool.close().await;
 
-    let dest = Database::open_in_memory().unwrap();
+    // The instance key comes back with the state it encrypted: a seen
+    // item's link is encrypted under it.
+    let mut dest = Database::open_in_memory().unwrap();
+    dest.set_encryption_key(src.encryption_key().unwrap().clone());
     assert!(dest.restore_target_is_pristine().unwrap());
     dest.import_stable_state(temp.path()).unwrap();
     assert_eq!(dest.sum_bandwidth_usage_minutes(42, 43).unwrap(), 420);
@@ -470,4 +473,60 @@ async fn postgres_export_and_import_use_the_portable_sqlite_backup() {
     drop(target);
     drop_postgres_backup_test_schema(source_admin, source_schema).await;
     drop_postgres_backup_test_schema(target_admin, target_schema).await;
+}
+
+// A legacy backup's key check reads values sealed as bytes too: a torrent
+// file sealed with another key, or met with no key, refuses the backup as a
+// sealed text value does.
+#[tokio::test]
+async fn a_legacy_backup_with_a_sealed_blob_is_proved_against_the_key() {
+    use crate::persistence::encryption::{EncryptionKey, encrypt_bytes};
+    let key = EncryptionKey::generate();
+    let other = EncryptionKey::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE torrents (job_id INTEGER PRIMARY KEY, metainfo BLOB) WITHOUT ROWID")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A blob in the clear is no sealed value: nothing to prove, key or not.
+    sqlx::query("INSERT INTO torrents (job_id, metainfo) VALUES (1, ?)")
+        .bind(b"d4:infod4:name3:onee".to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+    super::logical::validate_legacy_encryption_key(&path, None)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO torrents (job_id, metainfo) VALUES (2, ?)")
+        .bind(encrypt_bytes(&key, b"d4:infod4:name3:twoee").unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    super::logical::validate_legacy_encryption_key(&path, Some(&key))
+        .await
+        .unwrap();
+    assert!(
+        super::logical::validate_legacy_encryption_key(&path, Some(&other))
+            .await
+            .is_err()
+    );
+    let refused = super::logical::validate_legacy_encryption_key(&path, None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("no encryption key"),
+        "{refused}"
+    );
 }

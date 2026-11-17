@@ -182,6 +182,7 @@ async fn run(count: usize, archive: bool) {
             let passes = *service.inner.pass_counts.borrow();
             let at = Instant::now();
             service.tick().await;
+            service.restored().await;
             ticks.push(ms(at));
             let after = *service.inner.pass_counts.borrow();
             writes.push(format!(

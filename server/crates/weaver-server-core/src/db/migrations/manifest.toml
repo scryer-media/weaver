@@ -1777,3 +1777,42 @@ scope = "all"
 kind = "rust"
 hook_id = "dns_profiles_from_proxies_v125"
 scope = "upgrade_only"
+
+[[migration]]
+version = 126
+description = "a torrent list keeps a privacy in the table"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0126_torrent_list_private/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0126_torrent_list_private/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_torrent_private_v126"
+scope = "upgrade_only"
+
+[[migration]]
+version = 127
+description = "a tracker row is keyed by its URL's keyed digest"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0127_torrent_tracker_url_key/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0127_torrent_tracker_url_key/postgres.sql"
+engine = "postgres"
+scope = "all"

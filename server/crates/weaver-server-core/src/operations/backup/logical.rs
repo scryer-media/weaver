@@ -2001,23 +2001,51 @@ pub(crate) async fn validate_legacy_encryption_key(
                 .fetch_all(&mut conn)
                 .await
                 .map_err(db_err)?;
-            let key = if values.is_empty() {
+            // A value sealed as bytes (`enc:b1:`), which the text check
+            // above never sees: one of the column, the first found. Every
+            // one is sealed with the one instance key, so one proves the
+            // key, and one such value can be a whole torrent file: the
+            // column's are never all in memory at once.
+            let query = format!(
+                "SELECT {column} FROM {table}
+                  WHERE typeof({column}) = 'blob' AND substr({column}, 1, 7) = x'{prefix}'
+                  LIMIT 1",
+                column = quote_identifier(&column),
+                table = quote_identifier(&table),
+                prefix = sealed_bytes_prefix_hex(),
+            );
+            let sealed = sqlx::query_scalar::<_, Vec<u8>>(sqlx::AssertSqlSafe(query.as_str()))
+                .fetch_optional(&mut conn)
+                .await
+                .map_err(db_err)?;
+            if values.is_empty() && sealed.is_none() {
                 continue;
-            } else {
-                key.ok_or_else(|| {
-                    StateError::Database(
-                        "legacy backup contains encrypted values but the target has no encryption key"
-                            .into(),
-                    )
-                })?
-            };
+            }
+            let key = key.ok_or_else(|| {
+                StateError::Database(
+                    "legacy backup contains encrypted values but the target has no encryption key"
+                        .into(),
+                )
+            })?;
             for value in values {
                 crate::persistence::encryption::decrypt_value(key, &value)
+                    .map_err(StateError::Database)?;
+            }
+            if let Some(sealed) = sealed {
+                crate::persistence::encryption::decrypt_bytes(key, &sealed)
                     .map_err(StateError::Database)?;
             }
         }
     }
     Ok(())
+}
+
+// `enc:b1:` as SQLite writes a blob literal's digits.
+fn sealed_bytes_prefix_hex() -> String {
+    crate::persistence::encryption::ENCRYPTED_BYTES_PREFIX
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect()
 }
 
 // Export an existing schema before opening the application database or running migrations.

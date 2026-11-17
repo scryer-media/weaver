@@ -107,9 +107,29 @@ pub fn parse_history_metadata(metadata: Option<&str>) -> Vec<(String, String)> {
 // value is a password, so it is never kept or listed as an attribute.
 pub const UNPACK_PASSWORD_PARAMETER: &str = "*unpack:password";
 
+// The keys an RSS job's item link and item id are kept under. A private
+// tracker's link carries the passkey, and the id is often the link, so a
+// usenet job keeps both encrypted, and only an admin reads them, through
+// `Database::rss_link_attributes`. They are never a public attribute.
+pub const RSS_LINK_ATTRIBUTE_KEYS: [&str; 2] = ["rss.item_url", "rss.item_id"];
+
 pub fn is_public_history_attribute_key(key: &str) -> bool {
     let key = key.trim().to_ascii_lowercase();
-    !key.starts_with("weaver.") && !key.starts_with("__weaver_") && key != UNPACK_PASSWORD_PARAMETER
+    !key.starts_with("weaver.")
+        && !key.starts_with("__weaver_")
+        && key != UNPACK_PASSWORD_PARAMETER
+        && !RSS_LINK_ATTRIBUTE_KEYS.contains(&key.as_str())
+}
+
+// The pairs of `metadata` an RSS item's link and id are kept under, as
+// stored: what a view carries to give an admin through
+// `Database::rss_link_attributes`, never to show as they are.
+pub fn rss_link_pairs(metadata: &[(String, String)]) -> Vec<(String, String)> {
+    metadata
+        .iter()
+        .filter(|(key, _)| RSS_LINK_ATTRIBUTE_KEYS.contains(&key.as_str()))
+        .cloned()
+        .collect()
 }
 
 pub fn public_history_attributes(metadata: &[(String, String)]) -> Vec<(String, String)> {
@@ -169,6 +189,36 @@ mod tests {
             "lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed".to_string()
         )]));
         assert!(public_history_attributes(&marked).is_empty());
+    }
+
+    // An RSS job's item link and id are never a public attribute, in any
+    // case: they are carried apart, as stored, for an admin's view alone.
+    #[test]
+    fn an_rss_link_and_id_are_never_public_attributes() {
+        let metadata = vec![
+            ("rss.feed_name".into(), "feed".into()),
+            ("rss.item_id".into(), "enc:v1:id".into()),
+            ("rss.item_title".into(), "Item".into()),
+            ("rss.item_url".into(), "enc:v1:url".into()),
+            (
+                " RSS.Item_URL ".into(),
+                "https://x.invalid/?passkey=1".into(),
+            ),
+        ];
+        assert_eq!(
+            public_history_attributes(&metadata),
+            vec![
+                ("rss.feed_name".into(), "feed".into()),
+                ("rss.item_title".into(), "Item".into()),
+            ]
+        );
+        assert_eq!(
+            rss_link_pairs(&metadata),
+            vec![
+                ("rss.item_id".into(), "enc:v1:id".into()),
+                ("rss.item_url".into(), "enc:v1:url".into()),
+            ]
+        );
     }
 
     // No password a job holds is ever an attribute a client reads: neither

@@ -311,6 +311,7 @@ async fn the_metrics_carry_what_the_tick_read() {
     }
     clock.shift_unix_ms(TICK.as_millis() as i64);
     rig.service.tick().await;
+    rig.service.restored().await;
 
     let metrics = rig.service.metrics();
     let view = rig.service.torrent(job_id).await.unwrap();
@@ -532,6 +533,7 @@ async fn turning_torrents_off_publishes_their_routes_closed() {
         .await
         .unwrap();
     rig.service.tick().await;
+    rig.service.restored().await;
     let route = {
         let metrics = rig.service.metrics();
         let job = metrics.published.job(job_id).unwrap();

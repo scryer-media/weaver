@@ -264,16 +264,41 @@ impl RssService {
             Route::Class(intake) => {
                 let mut submission = Submission::of(kind, body);
                 submission.category = category;
-                submission.metadata = metadata;
+                // A torrent keeps neither the item's link nor its id, which
+                // is often the link: a private tracker's carries the
+                // passkey, the metadata is kept in the clear and shown with
+                // the job's history, and nothing reads either back.
+                submission.metadata = metadata
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        !crate::torrents::sealed::RSS_LINK_KEYS.contains(&key.as_str())
+                    })
+                    .collect();
                 self.add_to_class(intake, submission).await
             }
             Route::Pipeline => {
                 let nzb = body;
                 weaver_nzb::parse_nzb(&nzb).map_err(|e| format!("invalid NZB: {e}"))?;
+                // A usenet job keeps the item's link and id sealed: only an
+                // admin reads them back, through `rss_link_attributes`.
+                let mut metadata = metadata;
+                crate::torrents::sealed::seal_rss_link_metadata(
+                    self.inner.db.sealing_key(),
+                    &mut metadata,
+                )
+                .map_err(|e| e.to_string())?;
                 // Submission owns durable writes. Once started it must finish before shutdown.
+                // The item is named by its seen key, never by its id: the id
+                // is often the link, which carries the passkey.
                 let idempotency = CallerScopedIdempotency::new(
-                    format!("rss:feed:{}", feed.id),
-                    item.item_id.clone(),
+                    format!(
+                        "{}{}",
+                        crate::rss::persistence::RSS_IDEMPOTENCY_SCOPE,
+                        feed.id
+                    ),
+                    crate::rss::persistence::seen_item_key(crate::rss::persistence::SeenId::Id(
+                        &item.item_id,
+                    )),
                 );
                 let submitted = submit_nzb_bytes_with_options(
                     &self.inner.db,

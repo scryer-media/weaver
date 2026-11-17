@@ -717,6 +717,7 @@ async fn a_refused_seed_mode_clear_leaves_memory_as_the_disk_says() {
     refuse_seed_writes(&rig.db, "refuse_seed_writes");
 
     rig.service.tick().await;
+    rig.service.restored().await;
     rig.db.flush_write_queue().await.unwrap();
     assert_eq!(live_seed_mode(&rig.service, left).await, (true, 1));
     assert_eq!(stored_seed_mode(&rig.db, left), (true, Some(vec![0x80])));
@@ -731,6 +732,7 @@ async fn a_refused_seed_mode_clear_leaves_memory_as_the_disk_says() {
 
     allow_seed_writes(&rig.db, "refuse_seed_writes");
     rig.service.tick().await;
+    rig.service.restored().await;
     rig.db.flush_write_queue().await.unwrap();
     assert_eq!(live_seed_mode(&rig.service, left).await, (false, 0));
     assert_eq!(stored_seed_mode(&rig.db, left), (false, None));
@@ -849,6 +851,7 @@ async fn a_refused_seed_mode_clear_warns_once_per_streak() {
 
     for _ in 0..5 {
         rig.service.tick().await;
+        rig.service.restored().await;
         rig.db.flush_write_queue().await.unwrap();
         assert_eq!(live_seed_mode(&rig.service, first).await, (true, 1));
         assert_eq!(live_seed_mode(&rig.service, second).await, (true, 1));
@@ -858,6 +861,7 @@ async fn a_refused_seed_mode_clear_warns_once_per_streak() {
 
     allow_seed_writes(&rig.db, "refuse_seed_writes");
     rig.service.tick().await;
+    rig.service.restored().await;
     rig.db.flush_write_queue().await.unwrap();
     assert_eq!(stored_seed_mode(&rig.db, first), (false, None));
     assert_eq!(stored_seed_mode(&rig.db, second), (false, None));
@@ -867,6 +871,7 @@ async fn a_refused_seed_mode_clear_warns_once_per_streak() {
     refuse_seed_writes(&rig.db, "refuse_seed_writes_again");
     for _ in 0..3 {
         rig.service.tick().await;
+        rig.service.restored().await;
         rig.db.flush_write_queue().await.unwrap();
     }
     assert_eq!(live_seed_mode(&rig.service, first).await, (true, 1));
@@ -889,6 +894,7 @@ async fn a_refused_seed_verified_write_keeps_the_last_count() {
     refuse_seed_writes(&rig.db, "refuse_seed_writes");
 
     rig.service.tick().await;
+    rig.service.restored().await;
     rig.db.flush_write_queue().await.unwrap();
     assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 1));
     assert_eq!(
@@ -898,6 +904,7 @@ async fn a_refused_seed_verified_write_keeps_the_last_count() {
 
     allow_seed_writes(&rig.db, "refuse_seed_writes");
     rig.service.tick().await;
+    rig.service.restored().await;
     rig.db.flush_write_queue().await.unwrap();
     assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 2));
     assert_eq!(
@@ -926,6 +933,7 @@ async fn a_refused_seed_verified_write_warns_once_per_streak() {
 
     for _ in 0..5 {
         rig.service.tick().await;
+        rig.service.restored().await;
         rig.db.flush_write_queue().await.unwrap();
         assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 1));
     }
@@ -933,6 +941,7 @@ async fn a_refused_seed_verified_write_warns_once_per_streak() {
 
     allow_seed_writes(&rig.db, "refuse_seed_writes");
     rig.service.tick().await;
+    rig.service.restored().await;
     rig.db.flush_write_queue().await.unwrap();
     assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 2));
     assert_eq!(
@@ -945,6 +954,7 @@ async fn a_refused_seed_verified_write_warns_once_per_streak() {
     refuse_seed_writes(&rig.db, "refuse_seed_writes_again");
     for _ in 0..3 {
         rig.service.tick().await;
+        rig.service.restored().await;
         rig.db.flush_write_queue().await.unwrap();
     }
     assert_eq!(live_seed_mode(&rig.service, job_id).await, (true, 1));

@@ -16,6 +16,7 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
 
     rig.routes.set_down(Some("tunnel gone"));
     rig.service.tick().await;
+    rig.service.restored().await;
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(
@@ -34,6 +35,7 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
 
     rig.routes.set_down(None);
     rig.service.tick().await;
+    rig.service.restored().await;
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.route_reason, None);
     assert_eq!(view.route.as_deref(), Some(first.as_str()));
@@ -55,6 +57,7 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
     assert_eq!(moved.category.as_deref(), Some("tv"));
     assert_ne!(moved.route.as_deref(), Some(first.as_str()));
     rig.service.tick().await;
+    rig.service.restored().await;
     let keys: Vec<String> = rig
         .service
         .inner
@@ -430,6 +433,7 @@ async fn routes_are_planned_from_the_runtime_not_the_route_rows() {
         );
     }
     service.tick().await;
+    service.restored().await;
     service.stop().await;
 
     let reads = || db.proxy_route_reads.load(Ordering::Relaxed);
@@ -718,6 +722,7 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
         .await
         .unwrap();
     service.tick().await;
+    service.restored().await;
 
     let refusal = crate::torrents::sessions::TorrentRouteReason::RouteBroken(
         crate::proxies::TorrentRouteFault::Legs,
@@ -770,6 +775,7 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
     .unwrap();
     proxies.reload().await.unwrap();
     service.tick().await;
+    service.restored().await;
 
     let live = service.inner.live.lock().await;
     assert_eq!(live[&job_id].held, None);
@@ -811,6 +817,7 @@ async fn a_new_listen_port_reopens_the_torrents_route_on_it() {
     settings.torrent.max_peers_total = 12;
     rig.service.set_settings(settings.clone()).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     assert!(Arc::ptr_eq(
         &before,
         &session_of(&rig.service, job_id).await
@@ -819,6 +826,7 @@ async fn a_new_listen_port_reopens_the_torrents_route_on_it() {
     settings.torrent.base_port = 41_000;
     rig.service.set_settings(settings).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     let after = session_of(&rig.service, job_id).await;
     assert!(!Arc::ptr_eq(&before, &after));
     before.cancellation_token().cancelled().await;
@@ -1491,6 +1499,7 @@ async fn a_failing_route_is_opened_once_a_pass_for_all_its_torrents() {
     }
     let before = *rig.routes.asked.borrow();
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(*rig.routes.asked.borrow() - before, 1);
     for job_id in jobs {
         let view = rig.service.torrent(job_id).await.unwrap();
@@ -1612,6 +1621,7 @@ async fn a_removed_torrent_leaves_its_leg_empty_at_the_next_snapshot() {
     let (job_id, sharer, torrent) = connected_to_a_sharer(&rig, &proxies, seeds.path()).await;
     established(&torrent).await;
     rig.service.tick().await;
+    rig.service.restored().await;
 
     rig.service.remove(job_id, false, false).await.unwrap();
     assert_eq!(default_torrent_leg(&proxies.network), (false, 0, 0));
@@ -1718,6 +1728,7 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
         .unwrap();
     rig.service.reload_tracker_rules().await.unwrap();
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(route(ruled).await, Some(key(TorrentScope::Category(1))));
     rig.service.stop().await;
 }
@@ -1872,6 +1883,7 @@ async fn a_member_removed_from_the_pool_moves_only_its_torrents() {
 
     rig.routes.route_pool(TorrentScope::Default, POOL, &[2]);
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(
         pins(&rig.service, &rig.db, &jobs).await,
         [Some(2), Some(2), Some(2)]
@@ -1927,6 +1939,7 @@ async fn a_proxy_in_two_pools_runs_one_session_for_both_scopes() {
 
     rig.routes.route(TorrentScope::Default, 5);
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(
         pins(&rig.service, &rig.db, &[default, category]).await,
         [None, Some(3)]
@@ -1939,6 +1952,7 @@ async fn a_proxy_in_two_pools_runs_one_session_for_both_scopes() {
 
     rig.routes.route(tv, 6);
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(
         pins(&rig.service, &rig.db, &[default, category]).await,
         [None, None]

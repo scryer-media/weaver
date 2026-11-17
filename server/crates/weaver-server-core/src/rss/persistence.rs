@@ -8,7 +8,324 @@ use crate::rss::record::{RssFeedRow, RssRuleRow, RssSeenItemRow};
 
 use super::repository::{encode_categories, encode_metadata};
 
+use crate::persistence::encryption::EncryptionKey;
+use crate::torrents::sealed::SEAL_PAGE;
+
+// What a seen item's stored id starts with: `b3:`, then its digest in hex.
+const SEEN_KEY_PREFIX: &str = "b3:";
+const SEEN_KEY_LEN: usize = SEEN_KEY_PREFIX.len() + 64;
+// The BLAKE3 key derivation contexts a seen key is made under: one for an
+// item the feed gives an id or a link, another for an item named by its
+// title alone, so a title never makes another item's id key. Fixed: a
+// change to either, or to what is hashed, makes every item seen before new.
+const SEEN_ID_CONTEXT: &str = "weaver rss seen item id v1";
+const SEEN_TITLE_CONTEXT: &str = "weaver rss seen item title v1";
+
+// What names a feed's item. Nothing time-like: a feed's dates for an item
+// change.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SeenId<'a> {
+    // The id the feed gives it, else its link; or a stored key already.
+    Id(&'a str),
+    // Neither: its title. Such an item has no link, so it is never added;
+    // its key keeps its seen row alone.
+    Title(&'a str),
+}
+
+// Whether `id` is a seen key as this makes it: `b3:` and 64 hex digits.
+fn is_seen_key(id: &str) -> bool {
+    id.len() == SEEN_KEY_LEN
+        && id.starts_with(SEEN_KEY_PREFIX)
+        && id[SEEN_KEY_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+// A seen item's key, as it is stored: one BLAKE3 over what names the item,
+// under a fixed context, and nothing else. A feed's item id is often the
+// item's link, and a private tracker's link carries the passkey, so the
+// stored key is a digest: the same for the same item, which is all a seen
+// lookup needs. No key, clock or start goes into it, so it reads the same
+// after any restart or key loss. An id that is a key already is its own.
+pub(crate) fn seen_item_key(id: SeenId<'_>) -> String {
+    let digest = match id {
+        SeenId::Id(id) if is_seen_key(id) => return id.to_owned(),
+        SeenId::Id(id) => blake3::derive_key(SEEN_ID_CONTEXT, id.as_bytes()),
+        SeenId::Title(title) => blake3::derive_key(SEEN_TITLE_CONTEXT, title.as_bytes()),
+    };
+    format!("{SEEN_KEY_PREFIX}{}", hex::encode(digest))
+}
+
+// The stored ids an item named by `item_id` may be found under: its key,
+// and the id itself, as a row stored before the key holds it until the
+// sealing pass, which runs only under a key a store keeps.
+pub(crate) fn seen_item_keys(item_id: &str) -> [String; 2] {
+    [seen_item_key(SeenId::Id(item_id)), item_id.to_owned()]
+}
+
+// The key a row stored before keys is put back under. An item with neither
+// id nor link was stored under a SHA-256 of its title and published date,
+// which is told by making it again: of the title and the stored date, or
+// of the title alone, as the stored date may be the feed's updated date
+// where the old id took the published date only. Such a row goes back
+// under its title key; any other id is the feed's own.
+fn legacy_seen_key(item_id: &str, title: &str, published_at: Option<i64>) -> String {
+    // The id an item with neither id nor link was once stored under.
+    fn legacy_untitled_id(title: &str, published_at: Option<i64>) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(title.as_bytes());
+        if let Some(published_at) = published_at {
+            hasher.update(published_at.to_le_bytes());
+        }
+        hex::encode(hasher.finalize())
+    }
+    if (published_at.is_some() && item_id == legacy_untitled_id(title, published_at))
+        || item_id == legacy_untitled_id(title, None)
+    {
+        return seen_item_key(SeenId::Title(title));
+    }
+    seen_item_key(SeenId::Id(item_id))
+}
+
+// What the idempotency scope of an RSS feed's submissions starts with; the
+// feed's id follows. Its key is the item's seen key (`seen_item_key`).
+pub(crate) const RSS_IDEMPOTENCY_SCOPE: &str = "rss:feed:";
+
+// A page of the RSS idempotency rows still keyed by the item's id, from a
+// job on: walked by the table's job index, as a prefix of the scope is not
+// a range under every collation a PostgreSQL store may have.
+pub(crate) const RSS_IDEMPOTENCY_PAGE_SQL: &str =
+    "SELECT caller_scope, idempotency_key, request_hash, job_id, created_at
+       FROM submission_idempotency
+      WHERE job_id >= {}
+        AND substr(caller_scope, 1, 9) = 'rss:feed:'
+        AND NOT (idempotency_key LIKE 'b3:%' AND length(idempotency_key) = 67)
+      ORDER BY job_id LIMIT {}";
+
+// One seen item forgotten, by either id it may be stored under: an
+// equality on the table's key `(feed_id, item_id)`.
+pub(crate) const SEEN_DELETE_SQL: &str =
+    "DELETE FROM rss_seen_items WHERE feed_id = {} AND item_id IN ({}, {})";
+
+// A seen item's stored link, opened. One that does not open, under no key
+// or another key, reads as no link.
+pub(crate) fn open_seen_link(
+    key: Option<&EncryptionKey>,
+    stored: Option<String>,
+) -> Option<String> {
+    use crate::persistence::encryption::{decrypt_value, is_encrypted};
+    let stored = stored?;
+    if !is_encrypted(&stored) {
+        return Some(stored);
+    }
+    decrypt_value(key?, &stored).ok()
+}
+
+// A link as it is stored: encrypted with the instance key, whatever it
+// starts with. Under a key held in memory only it is stored as it is, as it
+// was before links were encrypted: one encrypted under that key would be
+// lost at the next start.
+fn sealed_link(key: Option<&EncryptionKey>, link: &str) -> Result<String, StateError> {
+    if link.is_empty() {
+        return Ok(String::new());
+    }
+    match key {
+        None => Err(StateError::Database(
+            "encryption key is required to store secrets".to_string(),
+        )),
+        Some(key) if key.is_ephemeral() => Ok(link.to_owned()),
+        Some(key) => {
+            crate::persistence::encryption::encrypt_value(key, link).map_err(StateError::Database)
+        }
+    }
+}
+
 impl Database {
+    // The RSS part of [`Database::seal_stored_secrets`]: every feed URL and
+    // seen item link stored in the clear encrypted, and every seen item id
+    // stored as the feed gave it replaced by its digest. Each step selects in SQL only the rows
+    // it has yet to do, a page at a time, each page in one write
+    // transaction, so a pass cut short goes on at the next start.
+    pub(crate) fn seal_rss_links(&self, key: &EncryptionKey) -> Result<(), StateError> {
+        use crate::persistence::encryption::{decrypt_value, encrypt_value, is_encrypted};
+
+        let key = key.clone();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let mut after = i64::MIN;
+            loop {
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    "SELECT id, url FROM rss_feeds \
+                      WHERE id > {} AND url <> '' AND url NOT LIKE 'enc:v1:%' \
+                      ORDER BY id LIMIT {}",
+                    &[SqlArg::I64(after), SqlArg::I64(SEAL_PAGE)],
+                )
+                .await?;
+                let Some(last) = rows.last() else { break };
+                after = last.i64("id")?;
+                let mut page = Vec::new();
+                for row in &rows {
+                    page.push((
+                        row.i64("id")?,
+                        encrypt_value(&key, &row.text("url")?).map_err(StateError::Database)?,
+                    ));
+                }
+                let sql = format!(
+                    "UPDATE rss_feeds SET url = CASE id {}END WHERE id IN ({})",
+                    "WHEN {} THEN {} ".repeat(page.len()),
+                    vec!["{}"; page.len()].join(", ")
+                );
+                let mut args = Vec::with_capacity(page.len() * 3);
+                for (id, url) in &page {
+                    args.extend([SqlArg::I64(*id), SqlArg::Text(url.clone())]);
+                }
+                args.extend(page.iter().map(|(id, _)| SqlArg::I64(*id)));
+                SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
+            }
+
+            // Each seen item whose id is not yet its digest: taken out and
+            // put back under the digest, its link encrypted, so an item
+            // seen before stays seen. The rows put back are passed by: the
+            // read names only ids of another shape.
+            let mut after: Option<(i64, String)> = None;
+            loop {
+                let (filter, mut args) = match &after {
+                    None => (String::new(), Vec::new()),
+                    Some((feed, item)) => (
+                        "AND (feed_id > {} OR (feed_id = {} AND item_id > {}))".to_string(),
+                        vec![
+                            SqlArg::I64(*feed),
+                            SqlArg::I64(*feed),
+                            SqlArg::Text(item.clone()),
+                        ],
+                    ),
+                };
+                args.push(SqlArg::I64(SEAL_PAGE));
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT feed_id, item_id, item_title, published_at, size_bytes, decision,
+                                seen_at, job_id, item_url, error
+                           FROM rss_seen_items
+                          WHERE NOT (item_id LIKE '{SEEN_KEY_PREFIX}%' AND length(item_id) = {SEEN_KEY_LEN})
+                                {filter}
+                          ORDER BY feed_id, item_id LIMIT {{}}"
+                    ),
+                    &args,
+                )
+                .await?;
+                let Some(last) = rows.last() else { break };
+                after = Some((last.i64("feed_id")?, last.text("item_id")?));
+                let mut gone = Vec::with_capacity(rows.len());
+                let mut page = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let mut item = super::repository::map_seen_item_row(row)?;
+                    gone.push((i64::from(item.feed_id), item.item_id.clone()));
+                    // A link this key already encrypted goes back as it is.
+                    let link = item.item_url.take().filter(|url| !url.is_empty());
+                    let link = match link {
+                        Some(url) if is_encrypted(&url) && decrypt_value(&key, &url).is_ok() => {
+                            Some(url)
+                        }
+                        Some(url) => {
+                            Some(encrypt_value(&key, &url).map_err(StateError::Database)?)
+                        }
+                        None => None,
+                    };
+                    let stored =
+                        legacy_seen_key(&item.item_id, &item.item_title, item.published_at);
+                    page.push(seen_row_args(&item, stored, link));
+                }
+                SqlRuntime::run_in_transaction(&datastore, "seal_rss_links", |tx| {
+                    let (gone, page) = (gone.clone(), page.clone());
+                    Box::pin(async move {
+                        for chunk in gone.chunks(max_rows_for_tx(tx, 2)) {
+                            let named =
+                                vec!["(feed_id = {} AND item_id = {})"; chunk.len()].join(" OR ");
+                            let mut args = Vec::with_capacity(chunk.len() * 2);
+                            for (feed_id, item_id) in chunk {
+                                args.extend([SqlArg::I64(*feed_id), SqlArg::Text(item_id.clone())]);
+                            }
+                            tx.execute(&format!("DELETE FROM rss_seen_items WHERE {named}"), &args)
+                                .await?;
+                        }
+                        insert_rss_seen_rows(tx, &page).await
+                    })
+                })
+                .await?;
+            }
+            Ok(())
+        })
+    }
+
+    // The RSS submissions' idempotency rows of the sealing pass: each keyed
+    // by the item's id as the feed gave it is put back under the item's
+    // seen key, as a submission keys it now, so the id, often the link with
+    // its passkey, is not kept. A row whose seen key is there already is
+    // the one kept. The rows are walked once by the table's job index, a
+    // page at a time, each page in one write transaction: a row put back
+    // no longer matches, so a page never reads one twice.
+    pub(crate) fn key_rss_idempotency(&self) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let mut from = i64::MIN;
+            loop {
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    RSS_IDEMPOTENCY_PAGE_SQL,
+                    &[SqlArg::I64(from), SqlArg::I64(SEAL_PAGE)],
+                )
+                .await?;
+                let Some(last) = rows.last() else { break };
+                from = last.i64("job_id")?;
+                let mut gone = Vec::with_capacity(rows.len());
+                let mut page = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let (scope, id) = (row.text("caller_scope")?, row.text("idempotency_key")?);
+                    page.extend([
+                        SqlArg::Text(scope.clone()),
+                        SqlArg::Text(seen_item_key(SeenId::Id(&id))),
+                        SqlArg::Bytes(row.bytes("request_hash")?),
+                        SqlArg::I64(row.i64("job_id")?),
+                        SqlArg::I64(row.i64("created_at")?),
+                    ]);
+                    gone.extend([SqlArg::Text(scope), SqlArg::Text(id)]);
+                }
+                let count = rows.len();
+                SqlRuntime::run_in_transaction(&datastore, "key_rss_idempotency", |tx| {
+                    let (gone, page) = (gone.clone(), page.clone());
+                    Box::pin(async move {
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO submission_idempotency
+                                    (caller_scope, idempotency_key, request_hash, job_id, created_at)
+                                 VALUES {}
+                                 ON CONFLICT(caller_scope, idempotency_key) DO NOTHING",
+                                vec!["({}, {}, {}, {}, {})"; count].join(", ")
+                            ),
+                            &page,
+                        )
+                        .await?;
+                        tx.execute(
+                            &format!(
+                                "DELETE FROM submission_idempotency WHERE {}",
+                                vec!["(caller_scope = {} AND idempotency_key = {})"; count]
+                                    .join(" OR ")
+                            ),
+                            &gone,
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                })
+                .await?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn insert_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
         self.insert_rss_feed_with_routing(feed, None)
     }
@@ -24,7 +341,8 @@ impl Database {
         let metadata = encode_metadata(&feed.default_metadata)?;
         let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &feed.password)
             .map_err(StateError::Database)?;
-        let args = rss_feed_args(feed, metadata, encrypted_password);
+        let encrypted_url = sealed_feed_url(self, feed)?;
+        let args = rss_feed_args(feed, metadata, encrypted_password, encrypted_url);
         let routing = routing.cloned();
         let consumer = crate::proxies::Consumer::Rss(feed.id);
         let (feed_id, scripts) = (feed.id, feed.scripts.clone());
@@ -71,7 +389,8 @@ impl Database {
         let metadata = encode_metadata(&feed.default_metadata)?;
         let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &feed.password)
             .map_err(StateError::Database)?;
-        let mut args = rss_feed_args(feed, metadata, encrypted_password);
+        let encrypted_url = sealed_feed_url(self, feed)?;
+        let mut args = rss_feed_args(feed, metadata, encrypted_password, encrypted_url);
         let id = args.remove(0);
         args.push(id);
         let routing = routing.cloned();
@@ -208,7 +527,7 @@ impl Database {
 
     pub fn insert_rss_seen_item(&self, item: &RssSeenItemRow) -> Result<(), StateError> {
         let datastore = self.datastore();
-        let args = rss_seen_item_args(item);
+        let args = rss_seen_item_args(item, self.encryption_key())?;
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.write_exec(),
@@ -232,14 +551,20 @@ impl Database {
         })
     }
 
+    // Forget one seen item, named by its id as the seen list gives it, or
+    // as the feed does: an equality on the table's key either way.
     pub fn delete_rss_seen_item(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        let item_id = item_id.to_string();
+        let [keyed, item_id] = seen_item_keys(item_id);
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.write_exec(),
-                "DELETE FROM rss_seen_items WHERE feed_id = {} AND item_id = {}",
-                &[SqlArg::I64(i64::from(feed_id)), SqlArg::Text(item_id)],
+                SEEN_DELETE_SQL,
+                &[
+                    SqlArg::I64(i64::from(feed_id)),
+                    SqlArg::Text(item_id),
+                    SqlArg::Text(keyed),
+                ],
             )
             .await?;
             Ok(changed > 0)
@@ -319,7 +644,10 @@ impl Database {
         last_modified: Option<&str>,
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
-        let rows = items.iter().map(rss_seen_item_args).collect::<Vec<_>>();
+        let rows = items
+            .iter()
+            .map(|item| rss_seen_item_args(item, self.encryption_key()))
+            .collect::<Result<Vec<_>, _>>()?;
         let etag = etag.map(str::to_string);
         let last_modified = last_modified.map(str::to_string);
         let result = self.run_sql_blocking(async move {
@@ -352,7 +680,10 @@ impl Database {
             return Ok(());
         }
         let datastore = self.datastore();
-        let rows = items.iter().map(rss_seen_item_args).collect::<Vec<_>>();
+        let rows = items
+            .iter()
+            .map(|item| rss_seen_item_args(item, self.encryption_key()))
+            .collect::<Result<Vec<_>, _>>()?;
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "insert_rss_seen_items", |tx| {
                 let rows = rows.clone();
@@ -446,15 +777,22 @@ impl Database {
     }
 }
 
+// A feed's URL as it is stored: encrypted, as its password is, for a
+// private tracker's feed URL carries the passkey.
+fn sealed_feed_url(db: &crate::Database, feed: &RssFeedRow) -> Result<String, StateError> {
+    sealed_link(db.encryption_key(), &feed.url)
+}
+
 fn rss_feed_args(
     feed: &RssFeedRow,
     metadata: Option<String>,
     encrypted_password: Option<String>,
+    encrypted_url: String,
 ) -> Vec<SqlArg> {
     vec![
         SqlArg::I64(i64::from(feed.id)),
         SqlArg::Text(feed.name.clone()),
-        SqlArg::Text(feed.url.clone()),
+        SqlArg::Text(encrypted_url),
         SqlArg::Bool(feed.enabled),
         SqlArg::I64(i64::from(feed.poll_interval_secs)),
         SqlArg::OptText(feed.username.clone()),
@@ -541,17 +879,37 @@ async fn insert_rss_seen_rows(
     Ok(())
 }
 
-fn rss_seen_item_args(item: &RssSeenItemRow) -> Vec<SqlArg> {
+// A seen item's row as a feed's item makes it: its link encrypted and its
+// id its digest, as a private tracker's link carries the passkey and a feed
+// often gives the link as the id.
+fn rss_seen_item_args(
+    item: &RssSeenItemRow,
+    key: Option<&EncryptionKey>,
+) -> Result<Vec<SqlArg>, StateError> {
+    let item_url = item
+        .item_url
+        .as_deref()
+        .map(|url| sealed_link(key, url))
+        .transpose()?;
+    Ok(seen_row_args(
+        item,
+        seen_item_key(SeenId::Id(&item.item_id)),
+        item_url,
+    ))
+}
+
+// A seen item's row under the id and the link it is stored with.
+fn seen_row_args(item: &RssSeenItemRow, item_id: String, item_url: Option<String>) -> Vec<SqlArg> {
     vec![
         SqlArg::I64(i64::from(item.feed_id)),
-        SqlArg::Text(item.item_id.clone()),
+        SqlArg::Text(item_id),
         SqlArg::Text(item.item_title.clone()),
         SqlArg::OptI64(item.published_at),
         SqlArg::OptI64(item.size_bytes.map(|value| value as i64)),
         SqlArg::Text(item.decision.as_str().to_owned()),
         SqlArg::I64(item.seen_at),
         SqlArg::OptI64(item.job_id.map(|value| value as i64)),
-        SqlArg::OptText(item.item_url.clone()),
+        SqlArg::OptText(item_url),
         SqlArg::OptText(item.error.clone()),
     ]
 }

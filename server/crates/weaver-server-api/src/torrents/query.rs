@@ -110,7 +110,7 @@ impl TorrentsQuery {
         Ok(service(ctx)?
             .picked(pick, page(offset, limit), shown)
             .await
-            .map_err(crate::observability::state_error)?
+            .map_err(super::list_error)?
             .into_iter()
             .map(Into::into)
             .collect())

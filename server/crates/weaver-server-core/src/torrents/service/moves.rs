@@ -100,6 +100,9 @@ impl TorrentService {
                 "the location must be an absolute path".to_owned(),
             ));
         }
+        // Its files are its job's: a job still waiting for the tick is
+        // restored first, as a removal restores it.
+        self.restore_job(job_id).await;
         let (store, from, placed, held) = self
             .with_torrent(job_id, |torrent| {
                 if torrent.moving.is_some() {
@@ -545,6 +548,27 @@ impl TorrentService {
         // checking of them, until it ends: a recheck asked for meanwhile is
         // refused, seen under the live lock the move began under.
         let moving = || ActionError::Invalid("the torrent is already moving".to_owned());
+        // Its check is its job's: a job still waiting for the tick is
+        // restored first, as a removal restores it. In no session yet, it
+        // lets go of every piece and the session it joins checks them all,
+        // as one held for its files does below.
+        if self.restore_job(job_id).await {
+            self.with_torrent(job_id, |torrent| {
+                if let Some(store) = &torrent.store {
+                    Pieces::checking(&**store)
+                        .map_err(|error| ActionError::State(format!("{error:#}")))?;
+                    torrent.hold(store.file_have());
+                }
+                Ok(())
+            })
+            .await?;
+            // Answered without waiting on its route, as the one held for
+            // its files is below.
+            self.apply_queue().await;
+            self.spawn_attach(job_id).await;
+            self.publish().await;
+            return Ok(());
+        }
         // One held for its files missing is in no session: it lets go of
         // the hold and of every piece, and the session it joins checks
         // them all (qBittorrent `TorrentImpl::forceRecheck` clears its
