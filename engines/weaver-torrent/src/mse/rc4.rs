@@ -76,7 +76,8 @@ impl Rc4 {
 
     /// Eight keystream bytes are gathered into a word and XORed into the
     /// buffer at once, so each byte costs the two state stores and no store
-    /// of its own (libtorrent `rc4_encrypt`, src/pe_crypto.cpp, RC_2_1).
+    /// of its own. libtorrent's `rc4_encrypt` (src/pe_crypto.cpp) is a plain
+    /// loop of one byte a step; the gather is Weaver's own.
     #[cfg(any(not(target_arch = "aarch64"), test))]
     fn apply_words(&mut self, buf: &mut [u8]) {
         let (mut i, mut j) = (self.i, usize::from(self.j));
