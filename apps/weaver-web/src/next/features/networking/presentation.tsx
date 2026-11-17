@@ -231,15 +231,18 @@ export function IconButton({
   label,
   onClick,
   disabled = false,
+  testId,
 }: {
   icon: IconName;
   label: string;
   onClick: () => void;
   disabled?: boolean;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       aria-label={label}
       title={label}
       disabled={disabled}
@@ -263,12 +266,15 @@ export function CheckRow({
   label,
   detail,
   disabled,
+  testId,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   label: string;
   detail?: ReactNode;
   disabled?: boolean;
+  /** The box's own test ID. */
+  testId?: string;
 }) {
   return (
     <label
@@ -277,7 +283,7 @@ export function CheckRow({
         disabled ? "cursor-default" : "cursor-pointer",
       )}
     >
-      <CheckBox checked={checked} onChange={onChange} label={label} disabled={disabled} />
+      <CheckBox checked={checked} onChange={onChange} label={label} disabled={disabled} testId={testId} />
       <span className="min-w-0 truncate">{label}</span>
       {detail === undefined ? null : (
         <span className="flex-none font-wv-mono text-[11px] text-wv-muted">{detail}</span>

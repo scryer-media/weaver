@@ -159,9 +159,9 @@ async fn connect_proxy(
 }
 
 fn hop(id: u32, endpoint: SocketAddr, inner: Arc<dyn Dialer>) -> Arc<TransportHop> {
-    Arc::new(TransportHop {
+    Arc::new(TransportHop::new(
         id,
-        spec: TransportProxy {
+        TransportProxy {
             kind: crate::transport::TransportKind::HttpConnect,
             host: endpoint.ip().to_string(),
             port: endpoint.port(),
@@ -169,10 +169,14 @@ fn hop(id: u32, endpoint: SocketAddr, inner: Arc<dyn Dialer>) -> Arc<TransportHo
             password: None,
         },
         inner,
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        failure: Default::default(),
-    })
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
+        Default::default(),
+    ))
 }
 
 #[tokio::test]
@@ -371,20 +375,24 @@ async fn a_socks_reply_names_the_hop_that_refused() {
         reply: Mutex::new(&[5, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0]),
         far: Default::default(),
     });
-    let first = Arc::new(TransportHop {
-        id: 7,
-        spec: TransportProxy {
+    let first = Arc::new(TransportHop::new(
+        7,
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: "192.0.2.1".into(),
             port: 1080,
             username: None,
             password: None,
         },
-        inner: stage,
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        failure: Default::default(),
-    });
+        stage,
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
+        Default::default(),
+    ));
     let chain = hop(8, "192.0.2.2:8080".parse().unwrap(), first.clone());
     let target = target("192.0.2.9:119".parse().unwrap());
     assert!(matches!(
@@ -489,6 +497,7 @@ async fn a_session_hop_is_failing_only_while_its_own_path_fails() {
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
+        tunnel_dns: Vec::new(),
         resolver: None,
         forwarding: Default::default(),
         failure: Default::default(),
@@ -559,6 +568,7 @@ async fn a_wait_on_a_live_session_is_the_destinations() {
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
+        tunnel_dns: Vec::new(),
         resolver: None,
         forwarding: Default::default(),
         failure: HopFailure::watched(turns.clone()),
@@ -609,10 +619,12 @@ async fn a_wait_on_a_live_proxy_is_the_destinations() {
         far: Default::default(),
     });
     let turns = Arc::new(Turns::default());
-    let http = TransportHop {
-        failure: HopFailure::watched(turns.clone()),
-        ..Arc::into_inner(hop(7, "192.0.2.1:8080".parse().unwrap(), stage.clone())).unwrap()
-    };
+    let mut http =
+        Arc::into_inner(hop(7, "192.0.2.1:8080".parse().unwrap(), stage.clone())).unwrap();
+    http.endpoint_names = std::sync::Arc::new(crate::pipe::NamesSlot::new(
+        crate::pipe::Names::new(crate::pipe::DnsChoice::System, None),
+    ));
+    http.failure = HopFailure::watched(turns.clone());
     let target = target("192.0.2.9:119".parse().unwrap());
     assert!(http.dial(&target).await.is_ok());
     *stage.reply.lock().unwrap() = b"";
@@ -634,20 +646,24 @@ async fn a_wait_on_a_live_proxy_is_the_destinations() {
         reply: Mutex::new(&[5, 0]),
         far: Default::default(),
     });
-    let socks = TransportHop {
-        id: 9,
-        spec: TransportProxy {
+    let socks = TransportHop::new(
+        9,
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: "192.0.2.3".into(),
             port: 1080,
             username: None,
             password: None,
         },
-        inner: greeted,
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        failure: Default::default(),
-    };
+        greeted,
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
+        Default::default(),
+    );
     assert!(matches!(
         socks.dial(&target).await,
         Err(DialError::Destination(_))
@@ -755,6 +771,7 @@ async fn idle_retirement_preserves_channels_shared_by_other_consumers() {
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
+        tunnel_dns: Vec::new(),
         resolver: None,
         forwarding: Default::default(),
         failure: Default::default(),
@@ -818,6 +835,7 @@ async fn only_a_path_failure_retires_an_idle_session() {
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
+        tunnel_dns: Vec::new(),
         resolver: None,
         forwarding: Default::default(),
         failure: Default::default(),
@@ -1222,7 +1240,11 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
             },
             endpoint: Some(endpoint),
             timeout: Duration::from_secs(30),
-            naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
+            naming: Naming::proxy_servers(
+                vec![DnsServer::plain("10.0.0.2".parse().unwrap())],
+                Trust::AsSent,
+            ),
+            tunnel_dns: Vec::new(),
             resolver: Some(provider),
             forwarding: Default::default(),
             failure: Default::default(),
@@ -1356,7 +1378,11 @@ fn wireguard_session(
         },
         endpoint: None,
         timeout: Duration::from_secs(30),
-        naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
+        naming: Naming::proxy_servers(
+            vec![DnsServer::plain("10.0.0.2".parse().unwrap())],
+            Trust::AsSent,
+        ),
+        tunnel_dns: Vec::new(),
         resolver: Some(resolver),
         forwarding: Default::default(),
         failure: Default::default(),
@@ -1509,9 +1535,28 @@ fn named_hop(
     naming: Naming,
     inner: Arc<dyn Dialer>,
 ) -> Arc<TransportHop> {
-    Arc::new(TransportHop {
+    named_hop_on(
         id,
-        spec: TransportProxy {
+        host,
+        port,
+        naming,
+        inner,
+        crate::pipe::DnsChoice::System,
+    )
+}
+
+// A hop whose own address is named by `endpoint`.
+fn named_hop_on(
+    id: u32,
+    host: &str,
+    port: u16,
+    naming: Naming,
+    inner: Arc<dyn Dialer>,
+    endpoint: crate::pipe::DnsChoice,
+) -> Arc<TransportHop> {
+    Arc::new(TransportHop::new(
+        id,
+        TransportProxy {
             kind: crate::transport::TransportKind::HttpConnect,
             host: host.into(),
             port,
@@ -1519,10 +1564,22 @@ fn named_hop(
             password: None,
         },
         inner,
-        timeout: Duration::from_secs(30),
+        Duration::from_secs(30),
         naming,
-        failure: Default::default(),
-    })
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            endpoint, None,
+        ))),
+        Default::default(),
+    ))
+}
+
+// A proxy name profile asking the servers at ROUTED_DNS.
+fn listed_routed_dns() -> crate::pipe::DnsChoice {
+    crate::pipe::DnsChoice::Weaver {
+        servers: vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+        trust: Trust::AsSent,
+        transit: crate::pipe::DnsTransit::Egress,
+    }
 }
 
 fn named(host: &str, port: u16) -> Target {
@@ -1562,9 +1619,9 @@ fn asked(targets: &Mutex<Vec<(String, u16)>>) -> Vec<(String, u16)> {
     targets.lock().unwrap().clone()
 }
 
-// Each hop resolves the name dialled through it as its own setting says: the
-// first hop asks its DNS servers through itself for the second hop's
-// endpoint, and the second hop is handed the destination's name.
+// An inner hop on a proxy name profile has its listed servers asked through
+// the hop that carries it, for its own address, and the last hop is handed
+// the destination's name.
 #[tokio::test]
 async fn each_hop_of_a_chain_resolves_the_next_with_its_own_setting() {
     let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1575,7 +1632,7 @@ async fn each_hop_of_a_chain_resolves_the_next_with_its_own_setting() {
         (("10.9.9.9", second.addr.port()), second.addr),
     ])
     .await;
-    let pipe = named_hop(
+    let pipe = named_hop_on(
         8,
         "second.invalid",
         second.addr.port(),
@@ -1584,9 +1641,10 @@ async fn each_hop_of_a_chain_resolves_the_next_with_its_own_setting() {
             7,
             &first.addr.ip().to_string(),
             first.addr.port(),
-            Naming::proxy_servers(vec![ROUTED_DNS.parse().unwrap()]),
+            Naming::Proxy,
             bottom(),
         ),
+        listed_routed_dns(),
     );
 
     let dialed = pipe.dial(&named("news.invalid", 119)).await.unwrap();
@@ -1624,10 +1682,10 @@ async fn each_hop_of_a_chain_resolves_the_next_with_its_own_setting() {
     );
 }
 
-// A hop in the middle of a chain set to have Weaver resolve still has
-// Weaver resolve: the next hop's endpoint is asked of Weaver's servers from
-// the route's egress, never through the hops beneath, and the hop is asked
-// only for the address.
+// The address of a hop on a proxy name profile in the middle of a chain is
+// asked of its listed servers through the hop that carries it, never from
+// the route's egress, and that hop is asked only for the address. A hop on
+// the host's profile beneath it is handed its name by its carrier.
 #[tokio::test]
 async fn a_mid_chain_hop_resolved_by_weaver_has_weaver_resolve_the_next_hop() {
     let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1637,9 +1695,13 @@ async fn a_mid_chain_hop_resolved_by_weaver_has_weaver_resolve_the_next_hop() {
         asked: Mutex::new(Vec::new()),
     });
     let third = connect_double(&[(("news.invalid", 119), origin.local_addr().unwrap())]).await;
-    let second = connect_double(&[(("10.9.9.9", third.addr.port()), third.addr)]).await;
+    let second = connect_double(&[
+        ((ROUTED_DNS, 53), dns.addr),
+        (("10.9.9.9", third.addr.port()), third.addr),
+    ])
+    .await;
     let first = connect_double(&[(("second.invalid", second.addr.port()), second.addr)]).await;
-    let pipe = named_hop(
+    let pipe = named_hop_on(
         9,
         "third.invalid",
         third.addr.port(),
@@ -1648,7 +1710,7 @@ async fn a_mid_chain_hop_resolved_by_weaver_has_weaver_resolve_the_next_hop() {
             8,
             "second.invalid",
             second.addr.port(),
-            Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress.clone()),
+            Naming::Proxy,
             named_hop(
                 7,
                 &first.addr.ip().to_string(),
@@ -1657,6 +1719,7 @@ async fn a_mid_chain_hop_resolved_by_weaver_has_weaver_resolve_the_next_hop() {
                 bottom(),
             ),
         ),
+        listed_routed_dns(),
     );
 
     let dialed = pipe.dial(&named("news.invalid", 119)).await.unwrap();
@@ -1667,19 +1730,25 @@ async fn a_mid_chain_hop_resolved_by_weaver_has_weaver_resolve_the_next_hop() {
         dns.queries.lock().unwrap().first().unwrap(),
         "third.invalid"
     );
-    assert!(!asked(&egress.asked).is_empty());
+    assert!(asked(&egress.asked).is_empty(), "the egress is not asked");
+    // Each dial through the second hop, its lookup's among them, is carried
+    // to it by the first, which is handed its name.
+    let through_first = asked(&first.targets);
+    assert!(!through_first.is_empty());
     assert!(
-        asked(&egress.asked)
+        through_first
             .iter()
-            .all(|asked| asked == &(ROUTED_DNS.to_string(), 53))
+            .all(|asked| asked == &("second.invalid".to_string(), second.addr.port())),
+        "{through_first:?}"
+    );
+    let through_second = asked(&second.targets);
+    assert!(
+        through_second.contains(&(ROUTED_DNS.into(), 53)),
+        "{through_second:?}"
     );
     assert_eq!(
-        asked(&first.targets),
-        vec![("second.invalid".to_string(), second.addr.port())]
-    );
-    assert_eq!(
-        asked(&second.targets),
-        vec![("10.9.9.9".to_string(), third.addr.port())]
+        through_second.last(),
+        Some(&("10.9.9.9".to_string(), third.addr.port()))
     );
     assert_eq!(
         asked(&third.targets),
@@ -1702,7 +1771,11 @@ async fn a_hop_resolved_by_weavers_servers_asks_them_from_the_egress() {
         7,
         &proxy.addr.ip().to_string(),
         proxy.addr.port(),
-        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress.clone()),
+        Naming::servers(
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
+            egress.clone(),
+        ),
         bottom(),
     );
 
@@ -1737,7 +1810,11 @@ async fn a_recorded_dial_says_weavers_servers_resolved_the_name() {
         7,
         &proxy.addr.ip().to_string(),
         proxy.addr.port(),
-        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+        Naming::servers(
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
+            egress,
+        ),
         bottom(),
     );
 
@@ -1754,6 +1831,9 @@ async fn a_recorded_dial_says_weavers_servers_resolved_the_name() {
             by: ResolvedBy::Servers,
             proxy: None,
             servers: vec![ROUTED_DNS.parse().unwrap()],
+            wire: Some(crate::dns::WireKind::Plain),
+            answered_by: Some(ROUTED_DNS.parse().unwrap()),
+            trust: Some(crate::resolution::record::TrustOutcome::AsSent),
             addresses: vec![PUBLIC.parse().unwrap()],
             cached: false,
             connected: Some(PUBLIC.parse().unwrap()),
@@ -1809,7 +1889,11 @@ async fn a_hop_holds_its_servers_answer_for_its_ttl() {
             7,
             &proxy.addr.ip().to_string(),
             proxy.addr.port(),
-            Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+            Naming::servers(
+                vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+                Trust::AsSent,
+                egress,
+            ),
             bottom(),
         );
 
@@ -1842,7 +1926,11 @@ async fn a_hop_forgets_an_answer_its_proxy_could_not_reach() {
         7,
         &proxy.addr.ip().to_string(),
         proxy.addr.port(),
-        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+        Naming::servers(
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
+            egress,
+        ),
         bottom(),
     );
 
@@ -1928,7 +2016,10 @@ async fn servers_asked_through_an_unreachable_hop_fail_as_the_path() {
         7,
         "192.0.2.1",
         8080,
-        Naming::proxy_servers(vec![ROUTED_DNS.parse().unwrap()]),
+        Naming::proxy_servers(
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
+        ),
         inner,
     );
     let Err(error) = pipe.dial(&named("news.invalid", 119)).await else {
@@ -2017,7 +2108,9 @@ impl Dialer for Late {
 
 // A lookup has a window of its own: one that takes 8 s of a hop's 30 still
 // leaves the proxy the whole 30 s to answer, and the hop's budget counts
-// both windows. A hop that hands the name on has no lookup to wait for.
+// both windows. The naming is the one in scope when the hop dials, which a
+// DNS change swaps without rebuilding the hop, so a hop that hands the name
+// on today keeps the lookup window too.
 #[tokio::test(start_paused = true)]
 async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
     let resolving = named_hop(
@@ -2025,7 +2118,8 @@ async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
         "192.0.2.1",
         8080,
         Naming::servers(
-            vec![ROUTED_DNS.parse().unwrap()],
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
             Arc::new(SlowDns {
                 delay: Duration::from_secs(4),
             }),
@@ -2048,7 +2142,7 @@ async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
             delay: Duration::ZERO,
         }),
     );
-    assert_eq!(handing_on.budget(), Duration::from_secs(31));
+    assert_eq!(handing_on.budget(), Duration::from_secs(61));
 }
 
 // A stage that carries datagrams, as a WireGuard session does.
@@ -2305,20 +2399,24 @@ async fn only_a_path_ending_in_wireguard_takes_connections() {
     assert!(stacked.inbound().is_some());
 
     // SOCKS and HTTP CONNECT over WireGuard: no listener.
-    let socks = Arc::new(TransportHop {
-        id: 7,
-        spec: TransportProxy {
+    let socks = Arc::new(TransportHop::new(
+        7,
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: "192.0.2.1".into(),
             port: 1080,
             username: None,
             password: None,
         },
-        inner: wireguard.clone(),
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        failure: Default::default(),
-    });
+        wireguard.clone(),
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
+        Default::default(),
+    ));
     assert!(socks.inbound().is_none());
     let connect = hop(8, "192.0.2.2:8080".parse().unwrap(), wireguard.clone());
     assert!(connect.inbound().is_none());
@@ -2336,6 +2434,7 @@ async fn only_a_path_ending_in_wireguard_takes_connections() {
         endpoint: None,
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
+        tunnel_dns: Vec::new(),
         resolver: None,
         forwarding: Default::default(),
         failure: Default::default(),
@@ -2667,6 +2766,105 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     assert!(!session.has_room(&Purpose::Torrent));
     drop(announce);
     assert_eq!(session.sockets.closing(SocketClass::Reserve), stream);
+}
+
+// A WireGuard session on `near` whose reserve holds one DNS stream and whose
+// torrent side holds one peer.
+fn dns_session(near: &crate::test_support::WireGuardTestPeer) -> Arc<SessionHop> {
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let mtu = near.client_spec("1").mtu;
+    let reserve = super::dns_stream_bytes();
+    Arc::new(SessionHop {
+        sockets: Arc::new(SessionSockets::new(
+            SocketBudget {
+                bytes: overhead_bytes(mtu) + reserve + stream_bytes(None),
+                reserve,
+                torrent_kept: 0,
+                mtu,
+            },
+            Arc::new(TorrentsOnly),
+        )),
+        ..Arc::into_inner(wireguard_session(
+            1,
+            provider.clone(),
+            provider,
+            bottom(),
+            vec![],
+            1,
+        ))
+        .unwrap()
+    })
+}
+
+// Only a DNS dial records the bytes its socket reserved: a connection is
+// kept only after one. A peer's dial records nothing and leaves the
+// session's keeper unmade.
+#[tokio::test]
+async fn only_a_dns_dial_records_what_its_socket_reserved() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let session = dns_session(&near);
+    let target = |purpose| Target {
+        purpose,
+        ..probe_target()
+    };
+    let peer = session.dial(&target(Purpose::Torrent)).await.unwrap();
+    assert!(peer.outcome.reservations().is_empty());
+    assert!(!session.sockets.keeper().asked_for());
+
+    let dns = session.dial(&target(Purpose::Dns)).await.unwrap();
+    let reserved = dns.outcome.reservations();
+    assert_eq!(reserved.len(), 1);
+    assert_eq!(
+        reserved[0].socket.held(),
+        (SocketClass::Reserve, super::dns_stream_bytes())
+    );
+    assert!(reserved[0].keeper.is(&session.sockets.keeper().handle()));
+    drop(peer);
+}
+
+// A DNS dial on a reserve held whole by a kept connection closes it and
+// waits for its bytes, rather than fail: kept, the connection makes nothing
+// fail. With the reserve held by a connection in use, the dial is refused at
+// once.
+#[tokio::test]
+async fn a_dial_on_a_reserve_held_by_a_kept_connection_waits_for_its_bytes() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let session = dns_session(&near);
+    let target = Target {
+        purpose: Purpose::Dns,
+        ..probe_target()
+    };
+    let in_use = session.dial(&target).await.unwrap();
+    assert!(matches!(
+        session.dial(&target).await,
+        Err(DialError::AtCapacity(_))
+    ));
+
+    // The lookup ends and keeps its connection.
+    let reserved = in_use.outcome.reservations().remove(0);
+    let link = Arc::new(Mutex::new(Some(in_use)));
+    let closing = link.clone();
+    let _kept = reserved
+        .keeper
+        .hold(
+            Some(reserved.socket),
+            Box::new(move || closing.lock().unwrap().take().is_some()),
+        )
+        .expect("a live keeper");
+    let next = session.dial(&target).await.unwrap();
+    assert!(link.lock().unwrap().is_none());
+    assert_eq!(session.sockets.keeper().holding(), 0);
+    assert_eq!(
+        session.sockets.held(SocketClass::Reserve),
+        super::dns_stream_bytes()
+    );
+    drop(next);
 }
 
 // A WireGuard session on `near` whose tunnel holds a reserve socket, a
@@ -3039,10 +3237,12 @@ async fn a_watched_proxy_hop_turns_failing_when_its_proxy_goes() {
     let origin_address = origin.local_addr().unwrap();
     let (proxy, proxy_task) = connect_proxy(origin_address.to_string(), origin_address).await;
     let turns = Arc::new(Turns::default());
-    let hop = TransportHop {
-        failure: HopFailure::watched(turns.clone()),
-        ..Arc::into_inner(hop(7, proxy, bottom())).unwrap()
-    };
+    let mut hop = Arc::into_inner(hop(7, proxy, bottom())).unwrap();
+    hop.endpoint_names = std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+        crate::pipe::DnsChoice::System,
+        None,
+    )));
+    hop.failure = HopFailure::watched(turns.clone());
     let dialed = hop.dial(&target(origin_address)).await.unwrap();
     let (peer, _) = origin.accept().await.unwrap();
     assert_eq!(turns.taken(), vec![None]);
@@ -3093,20 +3293,24 @@ async fn a_socks5_proxy_silent_at_its_greeting_is_failing() {
         far: Default::default(),
     });
     let turns = Arc::new(Turns::default());
-    let socks = TransportHop {
-        id: 9,
-        spec: TransportProxy {
+    let socks = TransportHop::new(
+        9,
+        TransportProxy {
             kind: crate::transport::TransportKind::Socks5,
             host: "192.0.2.3".into(),
             port: 1080,
             username: None,
             password: None,
         },
-        inner: stage.clone(),
-        timeout: Duration::from_secs(30),
-        naming: Naming::Proxy,
-        failure: HopFailure::watched(turns.clone()),
-    };
+        stage.clone(),
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
+        HopFailure::watched(turns.clone()),
+    );
     let target = target("192.0.2.9:119".parse().unwrap());
     assert!(matches!(
         socks.dial(&target).await,
@@ -3162,6 +3366,238 @@ async fn a_direct_legs_blocking_lookup_matches_its_async_lookup() {
     );
 }
 
+#[test]
+fn a_tunnel_resolver_serves_only_plain_servers_on_port_53_taken_as_sent() {
+    let ip: IpAddr = "10.0.0.2".parse().unwrap();
+    let plain = DnsServer::plain(ip);
+    assert!(tunnel_resolver_serves(&[], Trust::AsSent));
+    assert!(tunnel_resolver_serves(
+        std::slice::from_ref(&plain),
+        Trust::AsSent
+    ));
+    assert!(!tunnel_resolver_serves(
+        std::slice::from_ref(&plain),
+        Trust::Validate
+    ));
+    let off_port = DnsServer {
+        address: SocketAddr::new(ip, 5353),
+        wire: crate::dns::Wire::Plain,
+    };
+    assert!(!tunnel_resolver_serves(
+        &[plain.clone(), off_port],
+        Trust::AsSent
+    ));
+    let tls = DnsServer {
+        address: SocketAddr::new(ip, 53),
+        wire: crate::dns::Wire::Tls { name: None },
+    };
+    assert!(!tunnel_resolver_serves(
+        &[plain.clone(), tls],
+        Trust::AsSent
+    ));
+    let https = DnsServer {
+        address: SocketAddr::new(ip, 443),
+        wire: crate::dns::Wire::Https {
+            path: "/dns-query".into(),
+        },
+    };
+    assert!(!tunnel_resolver_serves(&[https], Trust::AsSent));
+    // The tunnel's resolver asks only the first server it holds, so a list
+    // of two is asked by Weaver's client, each in turn.
+    let second = DnsServer::plain("10.0.0.3".parse().unwrap());
+    assert!(!tunnel_resolver_serves(&[plain, second], Trust::AsSent));
+}
+
+// A WireGuard hop whose naming its tunnel's own resolver cannot serve asks
+// the servers with Weaver's client, dialled through the hop.
+#[tokio::test]
+async fn a_wireguard_hop_asks_servers_its_tunnel_cannot_serve_through_itself() {
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(String, u16)>>);
+    #[async_trait::async_trait]
+    impl TunnelProvider for Recorder {
+        async fn prepare(&self) -> Result<(), TunnelError> {
+            Ok(())
+        }
+        async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            self.0.lock().unwrap().push((host.to_owned(), port));
+            Err(TunnelError::Engine(
+                "the fixture refuses every stream".into(),
+            ))
+        }
+        fn describe(&self) -> String {
+            "recording fixture".into()
+        }
+    }
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let ip: IpAddr = "10.0.0.2".parse().unwrap();
+    for (server, trust) in [
+        (
+            DnsServer {
+                address: SocketAddr::new(ip, 853),
+                wire: crate::dns::Wire::Tls { name: None },
+            },
+            Trust::AsSent,
+        ),
+        (DnsServer::plain(ip), Trust::Validate),
+    ] {
+        let resolver = Arc::new(crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        ));
+        let recorder = Arc::new(Recorder::default());
+        let hop = wireguard_session(1, recorder.clone(), resolver, bottom(), vec![], 1);
+        let mut hop = Arc::try_unwrap(hop).ok().expect("one owner");
+        hop.naming = Naming::proxy_servers(vec![server.clone()], trust);
+        let hop = Arc::new(hop);
+        hop.resolve("origin.tunnel.test")
+            .await
+            .expect_err("the fixture refuses the stream");
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            [("10.0.0.2".to_owned(), server.address.port())],
+            "{server}, {trust:?}"
+        );
+    }
+}
+
+// A direct leg's egress that names by `dns`, reached through a stage that
+// maps the listed server's address to the double.
+fn egress_naming_by(dns: &crate::test_support::dns::DnsServerDouble) -> Egress {
+    let carrier = Arc::new(Mapped {
+        to: dns.addr,
+        asked: Mutex::new(Vec::new()),
+    });
+    crate::test_support::loopback::egress(4, Duration::from_secs(30)).with_naming(Naming::servers(
+        vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+        Trust::AsSent,
+        carrier,
+    ))
+}
+
+// On a thread handed over to blocking work, a blocking lookup asks the
+// egress's listed servers on the runtime the thread belongs to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_blocking_lookup_on_a_blocking_thread_asks_the_listed_servers() {
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    let egress = Arc::new(egress_naming_by(&dns));
+    let found = tokio::task::spawn_blocking({
+        let egress = egress.clone();
+        move || blocking(|| egress.resolve_blocking("news.invalid"))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(found, vec![PUBLIC.parse::<IpAddr>().unwrap()]);
+    assert!(lookups(&dns, "news.invalid") > 0);
+}
+
+// Asked from a runtime worker, where waiting on the runtime would stall it,
+// a blocking lookup through listed servers fails at once and asks nobody;
+// a debug build stops on it.
+#[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(
+        expected = "a blocking lookup through listed servers runs only inside `blocking`"
+    )
+)]
+async fn a_blocking_lookup_from_a_runtime_worker_fails_at_once() {
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    let egress = egress_naming_by(&dns);
+    let error = egress.resolve_blocking("news.invalid").unwrap_err();
+    assert!(error.to_string().contains("may not block"), "{error}");
+    assert_eq!(lookups(&dns, "news.invalid"), 0);
+}
+
+// Every lookup the host resolver made or answered from its cache.
+fn host_lookups() -> u64 {
+    use crate::metrics::Resolver;
+    let metrics = crate::metrics::snapshot();
+    let resolved: u64 = metrics
+        .resolutions
+        .iter()
+        .filter(|(by, ..)| *by == Resolver::Host)
+        .map(|(_, ok, failed)| ok + failed)
+        .sum();
+    let held: u64 = metrics
+        .cache
+        .iter()
+        .filter(|(by, ..)| *by == Resolver::Host)
+        .map(|(.., count)| count)
+        .sum();
+    resolved + held
+}
+
+// A SOCKS5 hop at `host`:`port` above `inner`, its own address on the
+// host's profile.
+fn socks_on_host(id: u32, host: &str, port: u16, inner: Arc<dyn Dialer>) -> Arc<TransportHop> {
+    Arc::new(TransportHop::new(
+        id,
+        TransportProxy {
+            kind: crate::transport::TransportKind::Socks5,
+            host: host.into(),
+            port,
+            username: None,
+            password: None,
+        },
+        inner,
+        Duration::from_secs(30),
+        Naming::Proxy,
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
+        Default::default(),
+    ))
+}
+
+// A proxy on the host's profile whose address is a name: carried by another
+// proxy in a chain, the name goes to the proxy carrying it and the host is
+// never asked; the same proxy as the only hop is found by the host.
+#[tokio::test]
+async fn an_inner_proxys_name_goes_to_its_carrier_and_a_first_hops_to_the_host() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = origin.local_addr().unwrap().port();
+    let socks = |mapping: Vec<((String, u16), SocketAddr)>| {
+        crate::test_support::proxy::ProxyServerDouble::start(
+            crate::transport::TransportKind::Socks5,
+            None,
+            mapping.into_iter().collect(),
+        )
+    };
+    let b = socks(vec![(
+        ("origin.invalid".into(), origin_port),
+        origin.local_addr().unwrap(),
+    )])
+    .await;
+    let a = socks(vec![(("b.invalid".into(), b.addr.port()), b.addr)]).await;
+    let target = Target {
+        host: "origin.invalid".into(),
+        port: origin_port,
+        purpose: Purpose::Probe,
+        addresses: Vec::new(),
+    };
+
+    let before = host_lookups();
+    let first = socks_on_host(7, &a.addr.ip().to_string(), a.addr.port(), bottom());
+    let chain = socks_on_host(8, "b.invalid", b.addr.port(), first);
+    let dialed = chain.dial(&target).await.unwrap();
+    let _ = origin.accept().await.unwrap();
+    assert_eq!(dialed.path.proxies, vec![7, 8]);
+    assert_eq!(
+        a.targets.lock().unwrap().clone(),
+        vec![("b.invalid".to_string(), b.addr.port())]
+    );
+    assert_eq!(host_lookups(), before);
+
+    let alone = socks_on_host(8, "localhost", b.addr.port(), bottom());
+    let dialed = alone.dial(&target).await.unwrap();
+    let _ = origin.accept().await.unwrap();
+    assert_eq!(dialed.path.proxies, vec![8]);
+    assert!(host_lookups() > before);
+}
+
 // A tunnel that records the buffers each dial through it asked for.
 #[derive(Default)]
 struct SizedRecorder(std::sync::Mutex<Vec<Option<crate::wireguard::TcpBuffers>>>);
@@ -3200,6 +3636,7 @@ fn recording_session(provider: Arc<SizedRecorder>) -> SessionHop {
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
+        tunnel_dns: Vec::new(),
         resolver: None,
         forwarding: Default::default(),
         failure: Default::default(),

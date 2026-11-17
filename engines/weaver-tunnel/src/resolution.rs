@@ -111,24 +111,54 @@ impl Replicate for io::Error {
     }
 }
 
+// What a lookup says of itself, beside its answer or failure: how its
+// answer was judged, which server gave it, and why it failed. A caller that
+// joins the lookup or finds its answer held records the same, never a guess
+// from the error.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Account {
+    pub(crate) judged: Option<record::TrustOutcome>,
+    pub(crate) failure: Option<record::LookupError>,
+    pub(crate) from: Option<record::Answerer>,
+}
+
+impl Account {
+    // Notes this account in the test recording the caller runs in, if any.
+    fn note(&self, name: &str) {
+        if let Some(failure) = &self.failure {
+            record::failed(name, failure.failure, || failure.detail.clone());
+        }
+        if let Some(judged) = self.judged {
+            record::answered(name, self.from, judged);
+        }
+    }
+}
+
 // An answer as the cache holds it.
 #[derive(Clone)]
 struct Answer {
     addresses: Arc<[IpAddr]>,
     nonexistent: bool,
+    judged: Option<record::TrustOutcome>,
+    from: Option<record::Answerer>,
 }
 
 impl Answer {
-    fn of(lookup: &Lookup) -> Self {
+    fn of(lookup: &Lookup, account: &Account) -> Self {
         Self {
             addresses: lookup.addresses.as_slice().into(),
             nonexistent: lookup.nonexistent,
+            judged: account.judged,
+            from: account.from,
         }
     }
     // The addresses, after noting the answer in the test recording the
     // caller runs in, if any. `held` says it was held from before.
     fn noted(&self, name: &str, held: bool) -> Vec<IpAddr> {
         record::cached(name, held);
+        if let Some(judged) = self.judged {
+            record::answered(name, self.from, judged);
+        }
         if self.addresses.is_empty() {
             let (failure, said) = if self.nonexistent {
                 (record::LookupFailure::NoSuchName, "NXDOMAIN")
@@ -142,7 +172,7 @@ impl Answer {
 }
 
 // What a lookup came to, once it lands.
-type Landed<E> = Option<Result<Answer, Arc<E>>>;
+type Landed<E> = Option<Result<Answer, (Arc<E>, Account)>>;
 
 enum Slot<E> {
     Held {
@@ -229,6 +259,24 @@ impl<E: Replicate> ResolutionCache<E> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Lookup, E>>,
     {
+        self.resolve_accounted(resolver, name, || async {
+            (lookup().await, Account::default())
+        })
+        .await
+    }
+
+    // `resolve` for a lookup that gives its account, which callers that
+    // join it or find its answer held record as their own.
+    pub(crate) async fn resolve_accounted<F, Fut>(
+        &self,
+        resolver: Resolver,
+        name: &str,
+        lookup: F,
+    ) -> Result<Vec<IpAddr>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = (Result<Lookup, E>, Account)>,
+    {
         if let Ok(ip) = name.parse() {
             return Ok(vec![ip]);
         }
@@ -275,8 +323,9 @@ impl<E: Replicate> ResolutionCache<E> {
                     metrics::record_cache(resolver, CacheOutcome::Joined);
                     return match answer.as_ref().expect("a landed lookup") {
                         Ok(answer) => Ok(answer.noted(name, false)),
-                        Err(error) => {
+                        Err((error, account)) => {
                             record::cached(name, false);
+                            account.note(name);
                             Err(error.replicate())
                         }
                     };
@@ -292,7 +341,8 @@ impl<E: Replicate> ResolutionCache<E> {
                     };
                     let lookup = lookup.take().expect("a caller asks at most once");
                     record::cached(name, false);
-                    return flight.land(name, lookup().await);
+                    let (found, account) = lookup().await;
+                    return flight.land(name, found, account);
                 }
             }
         }
@@ -329,7 +379,7 @@ impl<E: Replicate> ResolutionCache<E> {
                 slots.names.insert(
                     key,
                     Slot::Held {
-                        answer: Answer::of(&lookup),
+                        answer: Answer::of(&lookup, &Account::default()),
                         until: now + held,
                     },
                 );
@@ -352,7 +402,7 @@ impl<E: Replicate> ResolutionCache<E> {
     // How many callers wait on the lookup in flight for `name`, or `None`
     // when none is.
     #[cfg(test)]
-    fn waiting(&self, name: &str) -> Option<usize> {
+    pub(crate) fn waiting(&self, name: &str) -> Option<usize> {
         match self
             .slots
             .lock()
@@ -397,12 +447,17 @@ struct Flight<'a, E> {
 }
 
 impl<E: Replicate> Flight<'_, E> {
-    fn land(mut self, name: &str, found: Result<Lookup, E>) -> Result<Vec<IpAddr>, E> {
+    fn land(
+        mut self,
+        name: &str,
+        found: Result<Lookup, E>,
+        account: Account,
+    ) -> Result<Vec<IpAddr>, E> {
         let now = Instant::now();
         let mut slots = self.cache.slots.lock().expect("resolution cache");
         let (shared, result) = match found {
             Ok(lookup) => {
-                let answer = Answer::of(&lookup);
+                let answer = Answer::of(&lookup, &account);
                 answer.noted(name, false);
                 match self.cache.policy.hold(&lookup) {
                     Some(held) => {
@@ -423,7 +478,8 @@ impl<E: Replicate> Flight<'_, E> {
             }
             Err(error) => {
                 slots.names.remove(self.key);
-                (Err(Arc::new(error.replicate())), Err(error))
+                account.note(name);
+                (Err((Arc::new(error.replicate()), account)), Err(error))
             }
         };
         self.sender.send_replace(Some(shared));

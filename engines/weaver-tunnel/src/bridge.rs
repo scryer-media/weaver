@@ -20,6 +20,9 @@ type ReadCallback = Arc<dyn Fn(usize) + Send + Sync>;
 pub struct ConnectionOutcome {
     callbacks: Mutex<OutcomeCallbacks>,
     reads: OnceLock<Arc<[ReadCallback]>>,
+    // The bytes the connection's sockets reserved, in each session's share
+    // they are in.
+    reserved: Mutex<Vec<crate::pipe::Reservation>>,
 }
 #[derive(Default)]
 struct OutcomeCallbacks {
@@ -41,6 +44,17 @@ impl std::fmt::Debug for ConnectionOutcome {
     }
 }
 impl ConnectionOutcome {
+    // The connection's socket reserved these bytes in a session's share.
+    pub(crate) fn reserved(&self, reservation: crate::pipe::Reservation) {
+        self.reserved
+            .lock()
+            .expect("connection outcome")
+            .push(reservation);
+    }
+    // The bytes the connection's sockets reserved, by share.
+    pub(crate) fn reservations(&self) -> Vec<crate::pipe::Reservation> {
+        self.reserved.lock().expect("connection outcome").clone()
+    }
     // Recall an idle socket now, or a busy socket at its next article boundary.
     pub fn on_retire(&self, callback: impl Fn() + Send + Sync + 'static) {
         let mut callbacks = self.callbacks.lock().expect("connection outcome");

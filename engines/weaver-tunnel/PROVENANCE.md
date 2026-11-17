@@ -27,6 +27,8 @@ h3-quinn 0.0.10. The two MIT-licensed vendored libraries preserve upstream
 provenance; their narrow patch encodes ordinary CONNECT without scheme/path
 pseudo-headers. TLS 1.3, certificate verification and QUIC packet protection use
 AWS-LC explicitly. The public root bundle is webpki-roots (MPL-2.0).
+DNS over TLS and over HTTPS trust that bundle and the certificates in the
+host's store, read with rustls-native-certs (Apache-2.0 OR ISC OR MIT).
 Local HTTP/3 fixtures reuse this stack and Weaver's existing AWS-LC rcgen
 configuration. Their generated private trust root is only installed in tests.
 

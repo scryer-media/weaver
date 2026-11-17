@@ -65,7 +65,9 @@ struct Claim {
     activity: Weak<RwLock<()>>,
     provider: Weak<dyn TunnelProvider>,
     resolver: Weak<WireGuardTunnelProvider>,
-    // The session's bytes, which a probe lent its tunnel is charged to.
+    // The session's bytes, which a probe lent its tunnel is charged to, and
+    // whose keeper holds what the session keeps open for later: cut before
+    // the session is judged busy.
     sockets: Weak<super::SessionSockets>,
     held: Weak<Held>,
     // The activity of the session this one rides on, when it is carried.
@@ -239,11 +241,16 @@ fn carried_first(claims: &[Claim], claim: &Claim, order: &mut Vec<Claim>) {
 impl Claim {
     // Stops the session's tunnel when nothing uses the session. A probe's
     // runs for a bounded time, so it is waited out; anyone else's busy
-    // session is left up.
+    // session is left up. What the session keeps open for later (a DNS
+    // connection) is not use: it is closed first, as `retire_idle` does, so
+    // it never keeps the old session up beside the new one.
     async fn retire(&self) {
         let Some(activity) = self.activity.upgrade() else {
             return;
         };
+        if let Some(sockets) = self.sockets.upgrade() {
+            sockets.keeper().cut();
+        }
         let _idle = if self.probe {
             activity.write_owned().await
         } else {
@@ -415,7 +422,8 @@ mod tests {
             },
             endpoint: None,
             timeout: Duration::from_secs(30),
-            naming: Naming::proxy_servers(Vec::new()),
+            naming: Naming::proxy_servers(Vec::new(), crate::dns::Trust::AsSent),
+            tunnel_dns: Vec::new(),
             resolver: Some(resolver),
             forwarding: Default::default(),
             failure: Default::default(),
@@ -457,6 +465,44 @@ mod tests {
         new.prepare().await.unwrap();
         assert_eq!(taken(&events), ["up old", "up new"]);
         drop(stream);
+    }
+
+    // What a session keeps open for later is not use: a rival claiming the
+    // same identity closes it and retires the session at once.
+    #[tokio::test]
+    async fn a_session_holding_only_a_kept_connection_is_retired_by_a_rival() {
+        let events = Events::default();
+        let old = session("old", 1, 2, None, &events);
+        let new = session("new", 1, 2, None, &events);
+        old.prepare().await.unwrap();
+        // A kept connection: it holds the session's activity, as a kept DNS
+        // stream does, and its far end sees it end when it is closed.
+        let (kept, mut far) = tokio::io::duplex(64);
+        let riding = Mutex::new(Some((old.activity.clone().read_owned().await, kept)));
+        let riding = Arc::new(riding);
+        let closing = riding.clone();
+        let _registration = old
+            .sockets
+            .keeper()
+            .handle()
+            .hold(
+                None,
+                Box::new(move || closing.lock().unwrap().take().is_some()),
+            )
+            .unwrap();
+        assert_eq!(taken(&events), ["up old"]);
+
+        new.prepare().await.unwrap();
+        assert_eq!(taken(&events), ["down old", "up new"]);
+        assert_eq!(old.sockets.keeper().holding(), 0);
+        assert!(riding.lock().unwrap().is_none());
+        let mut rest = Vec::new();
+        assert_eq!(
+            tokio::io::AsyncReadExt::read_to_end(&mut far, &mut rest)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     // A session the old one carries holds it busy, so the carried session is
@@ -541,6 +587,53 @@ mod tests {
         let rebuilt = session("rebuilt", 1, 2, None, &events);
         rebuilt.prepare().await.unwrap();
         assert_eq!(taken(&events), ["down live", "up rebuilt"]);
+    }
+
+    // A probe keeps nothing between lookups: lent another session's tunnel,
+    // its sockets are in the lender's bytes, which its own keeper could not
+    // reclaim. A session that is no probe keeps through itself first.
+    #[tokio::test]
+    async fn nothing_is_kept_through_a_probe() {
+        use crate::pipe::Dialer;
+        let events = Events::default();
+        let live = session("live", 1, 2, None, &events);
+        let probe = probe("probe", 1, 2, &events);
+        live.prepare().await.unwrap();
+        let _lent = claim(&probe)
+            .await
+            .expect("a probe is lent the live tunnel");
+        assert!(probe.keepers().is_empty());
+        let keepers = live.keepers();
+        assert!(keepers[0].is(&live.sockets.keeper().handle()));
+
+        // A stream proxy hop over the probe keeps nothing either: its link
+        // would hold the lender's bytes and activity. Over the live session
+        // it keeps through itself, then the session.
+        let over = |inner: Arc<SessionHop>| {
+            super::super::TransportHop::new(
+                9,
+                crate::transport::TransportProxy {
+                    kind: crate::transport::TransportKind::Socks5,
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                    username: None,
+                    password: None,
+                },
+                inner,
+                Duration::from_secs(30),
+                Naming::proxy_servers(Vec::new(), crate::dns::Trust::AsSent),
+                Arc::new(super::super::NamesSlot::new(super::super::Names::new(
+                    super::super::DnsChoice::System,
+                    None,
+                ))),
+                Default::default(),
+            )
+        };
+        assert!(over(probe.clone()).keepers().is_empty());
+        let hop = over(live.clone());
+        let keepers = hop.keepers();
+        assert_eq!(keepers.len(), 2);
+        assert!(keepers[1].is(&live.sockets.keeper().handle()));
     }
 
     // A probe whose identity no session holds comes up as itself and holds

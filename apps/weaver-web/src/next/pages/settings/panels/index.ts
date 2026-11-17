@@ -117,6 +117,13 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     Component: NetworkingPanel,
   },
   {
+    slug: "networking/dns",
+    group: "networking",
+    label: "next.dns.title",
+    icon: "dns",
+    Component: NetworkingPanel,
+  },
+  {
     slug: "networking/speed",
     group: "networking",
     label: "next.networking.speed.title",

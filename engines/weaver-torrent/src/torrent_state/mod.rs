@@ -417,6 +417,10 @@ pub struct ManagedTorrentShared {
     /// The torrent's web seeds, kept across its runs.
     pub(crate) web_seeds: Arc<live::web_seed::WebSeeds>,
 
+    /// How the torrent looks its names up and asks its trackers and web
+    /// seeds.
+    pub(crate) naming: crate::core::net::TorrentNaming,
+
     /// An SSL torrent's CA and our identity under it; `None` for any other
     /// torrent.
     pub(crate) ssl: Option<Arc<crate::ssl::SslTorrent>>,

@@ -128,6 +128,7 @@ pub use crate::clone_to_owned::CloneToOwned;
 pub use crate::core::magnet::*;
 pub use crate::core::net::{
     ClientShape, ClientTls, ClientUse, Egress, HttpClients, HttpTarget, NamedBy, NoClients,
+    TorrentNaming,
 };
 pub use crate::core::peer_id::*;
 pub use crate::core::torrent_metainfo::*;

@@ -13,6 +13,7 @@ use super::ports::AnnouncePort;
 use super::{Discovery, Session, dht_peers};
 use crate::Identity;
 use crate::core::hash_id::InfoHashes;
+use crate::core::net::TorrentNaming;
 use crate::ssl::SslTorrent;
 use crate::tracker::{ToldPorts, Tracker, TrackerStatus, TrackerTask};
 use crate::type_aliases::{PeerSourceFlag, PeerStream};
@@ -57,6 +58,7 @@ impl<'a> PeerAsk<'a> {
             initial_peers: Vec::new(),
             trackers: TrackerAsk {
                 identity,
+                naming: session.naming(),
                 tiers: Vec::new(),
                 force_interval: None,
                 private: true,
@@ -69,6 +71,8 @@ impl<'a> PeerAsk<'a> {
 /// What a torrent's trackers are asked with.
 pub(super) struct TrackerAsk<'a> {
     pub identity: &'a Identity,
+    /// How the torrent looks its trackers up and asks them over HTTP.
+    pub naming: TorrentNaming,
     pub tiers: Vec<Vec<Tracker>>,
     pub force_interval: Option<Duration>,
     /// It is private, or taken to be (a magnet until its metadata says),

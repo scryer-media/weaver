@@ -35,7 +35,7 @@ import { Pagination } from "../components/Pagination";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
-import { testIds } from "../testids";
+import { testIds, torrentIds as torrentTestIds } from "../testids";
 import { sameElements, sameEntries, sameItems, shallowEqual, useSettled } from "../data/settled";
 import {
   batchTarget,
@@ -721,6 +721,7 @@ export function DownloadsPage() {
               <ScheduleSeedingNote torrents={torrents} />
               <SecondaryButton
                 icon={torrentsPaused ? "resume" : "pause"}
+                testId={torrentsPaused ? torrentTestIds.resumeTorrents : torrentTestIds.pauseTorrents}
                 onClick={() => {
                   void (torrentsPaused ? resumeClass({ class: "TORRENT" }) : pauseClass({ class: "TORRENT" }));
                 }}
@@ -730,7 +731,7 @@ export function DownloadsPage() {
             </>
           ) : null}
           <SpeedLimitControl />
-          <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>
+          <PrimaryButton icon="add" onClick={() => setUploadOpen(true)} testId={torrentTestIds.addOpen}>{t("next.addNzb.title")}</PrimaryButton>
         </>
       }
       railMiddle={

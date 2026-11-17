@@ -233,7 +233,7 @@ test.describe("lane M", () => {
     test.setTimeout(0);
     const wifi = await egress(request, "wifi");
     const lan = await egress(request, "lan");
-    const connect1 = await saveProxyProfile(request, { name: `m07-connect1-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: stack(), port: 8101, username: "fixture", password: "fixture", dnsServers: [], timeoutSeconds: 5 });
+    const connect1 = await saveProxyProfile(request, { name: `m07-connect1-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: stack(), port: 8101, username: "fixture", password: "fixture", timeoutSeconds: 5 });
     created.profiles.push(connect1.id);
     const id = await server(request, { legs: [ladderLeg(wifi.id, [rung.proxy(connect1.id)], 50), directLeg(lan.id, 50)] });
     await startCapture(request, "m07");

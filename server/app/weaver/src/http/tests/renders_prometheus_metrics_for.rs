@@ -2092,11 +2092,13 @@ fn schedules_render_rule_state_sets_and_the_admission_hold() {
 fn networking_renders_leg_egress_pool_and_tunnel_families() {
     let network = sample_network();
     let tunnel = sample_tunnel();
+    let dns = sample_dns();
     let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
     let server_health = vec![sample_server_health()];
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
+    input.dns = Some(&dns);
     input.server_health = &server_health;
     let rendered = render_area(&input);
 
@@ -2142,6 +2144,25 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
         "outcome",
         &["hit", "joined", "miss"],
     );
+    assert_label_set(
+        &rendered,
+        "weaver_network_dns_answers_total",
+        "wire",
+        &["https", "plain", "tls"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_network_dns_trust_total",
+        "outcome",
+        &["as_sent", "bogus", "unsigned", "validated"],
+    );
+    assert!(rendered.contains("weaver_network_dns_answers_total{wire=\"tls\"} 5"));
+    assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"as_sent\"} 9"));
+    assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"validated\"} 6"));
+    assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"unsigned\"} 8"));
+    assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"bogus\"} 1"));
+    assert!(rendered.contains("# TYPE weaver_network_dnssec_queries_total counter"));
+    assert!(rendered.contains("weaver_network_dnssec_queries_total 11\n"));
 
     assert!(rendered.contains(
         "weaver_network_leg_state{consumer=\"server:7\",position=\"0\",egress_id=\"2\",state=\"probing\"} 1"

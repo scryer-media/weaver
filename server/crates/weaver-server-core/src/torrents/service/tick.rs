@@ -406,6 +406,9 @@ impl TorrentService {
         let mut reattach = Vec::new();
         let mut down = BTreeMap::new();
         let mut unresolved = Vec::new();
+        // Torrents left on their session whose scope changed: they name as
+        // their new scope from here.
+        let mut renamed = Vec::new();
         // One plan per scope a pass: the torrents of a scope share it.
         let mut plans: HashMap<TorrentScope, RoutePlan> = HashMap::new();
         {
@@ -479,7 +482,25 @@ impl TorrentService {
                         torrent.held = None;
                     }
                     reattach.push(torrent.record.job_id);
+                } else if let Some(attached) = torrent
+                    .attached
+                    .as_ref()
+                    .filter(|attached| attached.scope != scope)
+                {
+                    renamed.push((torrent.record.job_id, plan, Arc::clone(&attached.session)));
                 }
+            }
+        }
+        for (job_id, plan, session) in renamed {
+            let naming = self.inner.sessions.scope_naming(&plan, &session).await;
+            let mut live = self.inner.live.lock().await;
+            if let Some(attached) = live
+                .get_mut(&job_id)
+                .and_then(|torrent| torrent.attached.as_mut())
+                .filter(|attached| Arc::ptr_eq(&attached.session, &session))
+            {
+                attached.names.follow(naming);
+                attached.scope = plan.scope;
             }
         }
         for key in &outdated {

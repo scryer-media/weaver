@@ -2,12 +2,16 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::HashSet, net::IpAddr, time::Duration};
 use weaver_tunnel::{
     Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec, TunnelError, TunnelSpec,
-    WireGuardSpec, parse_key,
-    pipe::{Egress, Naming, PortForwarding, gateway_of},
+    WireGuardSpec,
+    dns::DnsServer,
+    parse_key,
+    pipe::{PortForwarding, gateway_of},
 };
+// Which wire a server is asked over, as a lookup's record names it.
+pub use weaver_tunnel::dns::WireKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProxyKind {
@@ -18,13 +22,8 @@ pub enum ProxyKind {
     WireGuard,
 }
 
-// Who resolves a name dialled through a proxy: the next hop's endpoint, or
-// the destination when the proxy is the last hop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Resolver {
-    Weaver,
-    Proxy,
-}
+// The most tunnel addresses a WireGuard proxy takes.
+pub const MAX_TUNNEL_ADDRESSES: usize = 8;
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxySecrets {
@@ -48,9 +47,10 @@ pub struct ProxyProfile {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
-    pub resolver: Resolver,
-    // Asked in order by the resolver. Empty: the resolver's host resolves,
-    // Weaver's own DNS or the proxy's.
+    // WireGuard: the DNS servers the tunnel's configuration lists. A route
+    // whose DNS profile has the proxy answer asks them through the tunnel.
+    // Other kinds keep none.
+    #[serde(default)]
     pub dns_servers: Vec<IpAddr>,
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
@@ -67,6 +67,13 @@ pub struct ProxyProfile {
     // same one. Unused with NAT-PMP.
     #[serde(default)]
     pub forwarded_port: Option<u16>,
+    // The DNS profile that finds this proxy's own address when it is a
+    // name: System, or a proxy name profile. Stored in its own column, so it
+    // is no part of the settings a revision covers: pointing a proxy at
+    // another profile rebuilds nothing, and the next lookup of its address
+    // uses the new profile.
+    #[serde(skip)]
+    pub dns_profile_id: u32,
     #[serde(skip)]
     pub secrets: ProxySecrets,
 }
@@ -98,35 +105,21 @@ impl ProxyProfile {
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.timeout_seconds))
     }
-    // How a hop through this proxy resolves names, Weaver's servers asked
-    // from `egress`.
-    pub fn naming(&self, egress: Arc<Egress>) -> Naming {
-        match (self.resolver, self.dns_servers.is_empty()) {
-            (Resolver::Weaver, true) => Naming::Host,
-            (Resolver::Weaver, false) => Naming::servers(self.dns_servers.clone(), egress),
-            (Resolver::Proxy, true) => Naming::Proxy,
-            (Resolver::Proxy, false) => Naming::proxy_servers(self.dns_servers.clone()),
+    // The tunnel's DNS servers in the engine's terms: each asked in plain
+    // on port 53 from inside the tunnel.
+    pub fn tunnel_dns(&self) -> Vec<DnsServer> {
+        if self.kind != ProxyKind::WireGuard {
+            return Vec::new();
         }
+        self.dns_servers
+            .iter()
+            .copied()
+            .map(DnsServer::plain)
+            .collect()
     }
-    // Who resolves a destination's name dialled through this proxy as the
-    // last hop, as `naming` resolves it.
-    pub fn resolved_by(&self) -> super::ResolvedBy {
-        use super::ResolvedBy;
-        match (self.resolver, self.dns_servers.is_empty()) {
-            (Resolver::Weaver, true) => ResolvedBy::Host,
-            (Resolver::Weaver, false) => ResolvedBy::Servers,
-            (Resolver::Proxy, true) => ResolvedBy::Proxy,
-            (Resolver::Proxy, false) => ResolvedBy::ProxyServers,
-        }
-    }
-    // The DNS servers asked through the proxy itself.
-    pub fn proxy_dns_servers(&self) -> &[IpAddr] {
-        match self.resolver {
-            Resolver::Proxy => &self.dns_servers,
-            Resolver::Weaver => &[],
-        }
-    }
-    pub fn validate(&self) -> Result<(), super::NetworkRefusal> {
+    // What a save checks of the profile's own settings, apart from its
+    // secrets: what can be judged of a profile whose secrets are not in hand.
+    pub fn validate_config(&self) -> Result<(), super::NetworkRefusal> {
         use super::NetworkRefusal as Refusal;
         if self.name.trim().is_empty() || self.name.len() > 128 {
             return Err(Refusal::ProxyNameLength);
@@ -143,16 +136,30 @@ impl ProxyProfile {
         if !(1..=300).contains(&self.timeout_seconds) {
             return Err(Refusal::ProxyTimeoutRange);
         }
-        if self.dns_servers.len() > 4 || self.tunnel_addresses.len() > 8 {
+        if self.tunnel_addresses.len() > MAX_TUNNEL_ADDRESSES {
             return Err(Refusal::ProxyAddressCount);
         }
-        // A WireGuard peer is handed packets, never a name.
-        if self.kind == ProxyKind::WireGuard
-            && self.resolver == Resolver::Proxy
-            && self.dns_servers.is_empty()
-        {
-            return Err(Refusal::ProxyWireGuardNeedsDnsServers);
+        if self.dns_servers.len() > super::MAX_DNS_SERVERS {
+            return Err(Refusal::ProxyDnsServerCount);
         }
+        if self
+            .dns_servers
+            .iter()
+            .enumerate()
+            .any(|(at, ip)| self.dns_servers[..at].contains(ip))
+        {
+            return Err(Refusal::ProxyDnsServerDuplicate);
+        }
+        if self.kind != ProxyKind::WireGuard && !self.dns_servers.is_empty() {
+            return Err(Refusal::ProxyDnsServerInvalid);
+        }
+        Ok(())
+    }
+    // Everything a save checks: the profile's own settings, then those that
+    // need its secrets, such as a WireGuard or SSH key.
+    pub fn validate(&self) -> Result<(), super::NetworkRefusal> {
+        use super::NetworkRefusal as Refusal;
+        self.validate_config()?;
         for secret in [
             &self.secrets.username,
             &self.secrets.password,
@@ -307,7 +314,13 @@ impl ProxyProfile {
                 .iter()
                 .map(|s| s.parse())
                 .collect::<Result<_, _>>()?,
-            dns_servers: self.proxy_dns_servers().to_vec(),
+            // The tunnel's own resolver asks only the first server it is
+            // given, so it is given one only when the tunnel lists exactly
+            // one; a longer list is asked by Weaver's own client in turn.
+            dns_servers: match self.dns_servers.as_slice() {
+                [only] => vec![*only],
+                _ => Vec::new(),
+            },
             mtu: self.mtu,
             persistent_keepalive: self.keepalive_seconds.filter(|v| *v != 0),
             request_timeout: self.timeout(),
@@ -327,6 +340,11 @@ pub struct RoutingPolicy {
     pub legs: Vec<super::RouteLeg>,
     #[serde(default)]
     pub failover: super::Failover,
+    // The DNS profile the route's names follow, stored in its own column
+    // beside the policy. None on a save keeps the stored profile, or takes
+    // the System profile for a new route; a loaded route always has one.
+    #[serde(skip)]
+    pub dns_profile_id: Option<u32>,
 }
 impl Default for RoutingPolicy {
     fn default() -> Self {
@@ -335,10 +353,15 @@ impl Default for RoutingPolicy {
             allow_direct: true,
             legs: Vec::new(),
             failover: super::Failover::Redistribute,
+            dns_profile_id: None,
         }
     }
 }
 impl RoutingPolicy {
+    // The DNS profile the route's names follow.
+    pub fn dns_profile(&self) -> u32 {
+        self.dns_profile_id.unwrap_or(super::SYSTEM_DNS_PROFILE_ID)
+    }
     pub fn route(&self) -> super::Route {
         if self.legs.is_empty() {
             super::Route::from_legacy(self)
@@ -381,6 +404,7 @@ impl RoutingPolicy {
             allow_direct,
             legs: route.legs,
             failover: route.failover,
+            dns_profile_id: None,
         }
     }
 

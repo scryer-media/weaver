@@ -9,8 +9,8 @@ import { expect, graphql, postProbeArticle, setNntpChaos, submitProbeNzb, update
 import { postProbeFile, waitTerminal } from "./downloads";
 import {
   type ConsumerKind, type Egress, type ProxyProfile, type ProxyProfileInput, type RouteInput,
-  createPool, deleteEgress, deletePool, deleteProxyProfile, hostAddress, interfaceEgress,
-  saveProxyProfile, saveRoute,
+  SYSTEM_DNS_PROFILE_ID, createPool, deleteDnsProfile, deleteDnsServerList, deleteEgress, deletePool, deleteProxyProfile,
+  hostAddress, interfaceEgress, listedServersProfile, networkHosts, proxyResolvesProfile, saveProxyProfile, saveRoute,
 } from "./network-flow";
 import { fixtureState, resetRoutes, setFixtureNzb } from "./proxy-fixture";
 import { TOXIPROXY_PORTS, resetToxiproxy, type ToxiproxyName } from "./toxiproxy";
@@ -30,10 +30,17 @@ import { stopCapture } from "./capture";
  */
 export const PROXIED_HOST = "news.proxy.test";
 export const DIRECT_HOST = "nntp";
-const CONNECT_PORTS: Record<string, number> = { connect1: 8101, connect2: 8102, connect3: 8103, connect4: 8104, connect5: 8105, connect6: 8106 };
+export const CONNECT_PORTS: Record<string, number> = { connect1: 8101, connect2: 8102, connect3: 8103, connect4: 8104, connect5: 8105, connect6: 8106 };
 const SOCKS_PORTS: Record<string, number> = { socks1: 8201, socks2: 8202, socks3: 8203, socks4: 8204 };
 
 export type Network = "a" | "b";
+
+/**
+ * How a proxy's routes resolve names: `fixture` asks the proxy fixture's DNS
+ * server through the leg's last proxy hop; `proxy` hands the name to the
+ * proxy (a WireGuard profile asks its tunnel DNS servers).
+ */
+export type DnsNeed = "fixture" | "proxy";
 
 export class NetworkWorld {
   readonly servers: number[] = [];
@@ -43,7 +50,14 @@ export class NetworkWorld {
   readonly pools: number[] = [];
   readonly profiles: number[] = [];
   readonly egresses: number[] = [];
+  readonly dnsProfiles: number[] = [];
+  readonly dnsServerLists: number[] = [];
   private readonly egressByNetwork = new Map<Network, Egress>();
+  private readonly networkByEgress = new Map<number, Network>();
+  private readonly dnsNeeds = new Map<number, DnsNeed>();
+  private readonly wireguardProfiles = new Set<number>();
+  private readonly poolMembers = new Map<number, number[]>();
+  private readonly dnsProfileByKey = new Map<string, number>();
   private chaos = false;
   private held?: HeldChaosSession;
 
@@ -62,6 +76,7 @@ export class NetworkWorld {
     const egress = await interfaceEgress(this.request, `egress-${network}-${Date.now()}`, network);
     this.egresses.push(egress.id);
     this.egressByNetwork.set(network, egress);
+    this.networkByEgress.set(egress.id, network);
     return egress;
   }
 
@@ -79,23 +94,110 @@ export class NetworkWorld {
     const id = (await graphql<{ addServer: { id: number } }>(this.request,
       "mutation($input: ServerInput!) { addServer(input: $input) { id } }", { input })).addServer.id;
     this.servers.push(id);
-    if (options.route) await saveRoute(this.request, "SERVER", id, options.route);
+    if (options.route) await saveRoute(this.request, "SERVER", id, await this.withDns(options.route));
     return id;
   }
 
   async updateServer(id: number, overrides: Record<string, unknown>): Promise<void> {
     const server = (await graphql<{ servers: Array<{ id: number; host: string; port: number; connections: number; active: boolean }> }>(this.request,
       "query { servers { id host port connections active } }")).servers.find(candidate => candidate.id === id)!;
+    const route = overrides.route as RouteInput | undefined;
     await graphql(this.request, "mutation($id: Int!, $input: ServerInput!) { updateServer(id: $id, input: $input) { id } }", {
       id, input: {
         host: server.host, port: server.port, tls: false, username: "e2e-user", password: "e2e-pass",
         connections: server.connections, active: server.active, priority: 0, backfill: false, retentionDays: 0, ...overrides,
+        ...(route ? { route: await this.withDns(route) } : {}),
       },
     });
   }
 
   async route(kind: ConsumerKind, id: number, route: RouteInput) {
-    return saveRoute(this.request, kind, id, route);
+    return saveRoute(this.request, kind, id, await this.withDns(route));
+  }
+
+  /**
+   * `route` with the DNS profile that answers each leg as before routes
+   * chose their DNS, when a leg with no proxy asked the host:
+   *
+   * - a CONNECT or SOCKS hop: the proxy fixture's servers, asked through the
+   *   hop. A direct leg or fallback on that route asks them from its egress,
+   *   so the fixture's address on that egress's network is listed first; the
+   *   fixture gives every address the same answers the host's resolver
+   *   (also the fixture) gave.
+   * - else any proxy: the proxy, and the host for a direct leg or fallback.
+   * - else System.
+   *
+   * A route that names its own profile keeps it. A route no profile can
+   * answer as before throws; give it its own profile.
+   */
+  async withDns(route: RouteInput): Promise<RouteInput> {
+    if (route.dnsProfileId !== undefined && route.dnsProfileId !== null) return route;
+    const needs = new Set<DnsNeed>();
+    const direct = new Set<number>();
+    let wireguard = false;
+    for (const leg of route.legs) {
+      if (!("ladder" in leg.path)) { direct.add(leg.egressId); continue; }
+      if (leg.path.ladder.directFallback) direct.add(leg.egressId);
+      for (const entry of leg.path.ladder.rungs) {
+        const hops = "proxy" in entry ? [entry.proxy] : "chain" in entry ? entry.chain.slice(-1) : this.poolMembers.get(entry.pool) ?? [];
+        for (const hop of hops) {
+          needs.add(this.dnsNeeds.get(hop) ?? "proxy");
+          if (this.wireguardProfiles.has(hop)) wireguard = true;
+        }
+      }
+    }
+    let dnsProfileId = SYSTEM_DNS_PROFILE_ID;
+    if (needs.has("fixture")) {
+      // A WireGuard peer relays only NNTP and HTTP, so the fixture's servers cannot answer inside its tunnel.
+      if (wireguard) throw new Error("a route with a CONNECT or SOCKS hop and a WireGuard hop has no DNS profile that answers both as before");
+      dnsProfileId = await this.fixtureDnsProfile(this.directNetwork(direct));
+    } else if (needs.has("proxy")) {
+      dnsProfileId = await this.proxyDnsProfile(direct.size > 0);
+    }
+    return { ...route, dnsProfileId };
+  }
+
+  /** The one network of `egresses`, or null when there are none. */
+  private directNetwork(egresses: Set<number>): Network | null {
+    const networks = new Set<Network>();
+    for (const id of egresses) {
+      const network = this.networkByEgress.get(id);
+      if (!network) throw new Error(`egress ${id} was not made by world.egress, so the fixture address its direct leg can ask is unknown`);
+      networks.add(network);
+    }
+    if (networks.size > 1) throw new Error("direct legs on both networks beside a CONNECT or SOCKS hop: one server list cannot put each network's fixture address first");
+    return [...networks][0] ?? null;
+  }
+
+  /** This test's profile that hands names to the proxy, made on first use. */
+  private async proxyDnsProfile(systemFallback: boolean): Promise<number> {
+    const key = systemFallback ? "proxy-fallback" : "proxy";
+    return this.cachedDnsProfile(key, async name => (await proxyResolvesProfile(this.request, name, systemFallback)).id);
+  }
+
+  /**
+   * This test's profile that asks the proxy fixture's servers, `first`'s
+   * address first, made on first use. Through a proxy hop any of them
+   * answers; from an egress only the one on its network is shown to.
+   */
+  private async fixtureDnsProfile(first: Network | null): Promise<number> {
+    const network = first ?? "a";
+    return this.cachedDnsProfile(`fixture-${network}`, async name => {
+      const own = hostAddress("proxy-fixture", network);
+      const addresses = [own, ...(networkHosts()["proxy-fixture"] ?? []).filter(address => address !== own)];
+      const { list, profile } = await listedServersProfile(this.request, name, addresses, "PROXY");
+      this.dnsServerLists.push(list.id);
+      return profile.id;
+    });
+  }
+
+  private async cachedDnsProfile(key: string, make: (name: string) => Promise<number>): Promise<number> {
+    const made = this.dnsProfileByKey.get(key);
+    if (made !== undefined) return made;
+    const id = await make(`dns-${key}-${Date.now()}`);
+    this.dnsProfiles.push(id);
+    this.dnsProfileByKey.set(key, id);
+    return id;
   }
 
   async feed(options: { url: string; route?: RouteInput; scriptInstanceIds?: string[] }): Promise<number> {
@@ -107,13 +209,16 @@ export class NetworkWorld {
       "mutation($input: RssFeedInput!) { addRssFeed(input: $input) { id } }", { input })).addRssFeed.id;
     this.feeds.push(id);
     await graphql(this.request, "mutation($id: Int!) { addRssRule(feedId: $id, input: { sortOrder: 0, action: ACCEPT }) { id } }", { id });
-    if (options.route) await saveRoute(this.request, "RSS", id, options.route);
+    if (options.route) await saveRoute(this.request, "RSS", id, await this.withDns(options.route));
     return id;
   }
 
-  async profile(input: ProxyProfileInput): Promise<ProxyProfile> {
+  /** `dns` is how routes through this profile resolve (see `withDns`). */
+  async profile(input: ProxyProfileInput, dns: DnsNeed = "proxy"): Promise<ProxyProfile> {
     const saved = await saveProxyProfile(this.request, input);
     this.profiles.push(saved.id);
+    this.dnsNeeds.set(saved.id, dns);
+    if (input.kind === "WIRE_GUARD") this.wireguardProfiles.add(saved.id);
     return saved;
   }
 
@@ -126,8 +231,8 @@ export class NetworkWorld {
       host: hostAddress(viaToxiproxy ? "toxiproxy" : "proxy-fixture", network),
       port: viaToxiproxy ? TOXIPROXY_PORTS[member as ToxiproxyName] : CONNECT_PORTS[member]!,
       username: "fixture", password: options.password === undefined ? "fixture" : options.password,
-      dnsServers: [hostAddress("proxy-fixture", network)], timeoutSeconds: options.timeoutSeconds ?? 5,
-    });
+      timeoutSeconds: options.timeoutSeconds ?? 5,
+    }, "fixture");
   }
 
   async socks(member: string, options: { network?: Network; direct?: boolean } = {}): Promise<ProxyProfile> {
@@ -137,8 +242,8 @@ export class NetworkWorld {
       name: `${member}-${network}-${Date.now()}`, kind: "SOCKS5", enabled: true,
       host: hostAddress(viaToxiproxy ? "toxiproxy" : "proxy-fixture", network),
       port: viaToxiproxy ? TOXIPROXY_PORTS[member as ToxiproxyName] : SOCKS_PORTS[member]!,
-      username: "fixture", password: "fixture", dnsServers: [hostAddress("proxy-fixture", network)], timeoutSeconds: 5,
-    });
+      username: "fixture", password: "fixture", timeoutSeconds: 5,
+    }, "fixture");
   }
 
   /** An SSH profile on a tunnel-fixture endpoint (ssh1..3 through Toxiproxy when asked). */
@@ -177,12 +282,13 @@ export class NetworkWorld {
       host: carrier?.host ?? hostAddress("tunnel-fixture", network), port: carrier?.port ?? TUNNEL_PORTS[endpoint],
       peerPublicKey: peer.peerPublicKey, privateKey: peer.clientPrivateKey, presharedKey: preshared,
       tunnelAddresses: [peer.clientAddress], dnsServers: [peer.dnsServer], timeoutSeconds: 5,
-    });
+    }, "proxy");
   }
 
   async pool(kind: ProxyProfile["kind"], memberIds: number[]): Promise<number> {
     const pool = await createPool(this.request, { name: `pool-${Date.now()}`, kind, memberIds });
     this.pools.push(pool.id);
+    this.poolMembers.set(pool.id, [...memberIds]);
     return pool.id;
   }
 
@@ -282,7 +388,15 @@ export class NetworkWorld {
     for (const id of this.pools.splice(0)) await attempt(`pool ${id}`, () => deletePool(this.request, id));
     for (const id of this.profiles.splice(0)) await attempt(`profile ${id}`, () => deleteProxyProfile(this.request, id));
     for (const id of this.egresses.splice(0)) await attempt(`egress ${id}`, () => deleteEgress(this.request, id));
+    // The servers and feeds that used these went above, and their routes with them.
+    for (const id of this.dnsProfiles.splice(0)) await attempt(`DNS profile ${id}`, () => deleteDnsProfile(this.request, id));
+    for (const id of this.dnsServerLists.splice(0)) await attempt(`DNS server list ${id}`, () => deleteDnsServerList(this.request, id));
     this.egressByNetwork.clear();
+    this.networkByEgress.clear();
+    this.dnsNeeds.clear();
+    this.wireguardProfiles.clear();
+    this.poolMembers.clear();
+    this.dnsProfileByKey.clear();
     if (failures.length) await info.attach("network-cleanup-failures", { body: failures.join("\n"), contentType: "text/plain" });
   }
 }

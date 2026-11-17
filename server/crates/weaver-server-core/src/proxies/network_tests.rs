@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::proxies::Resolver;
 
 fn route(weights: &[u8], failover: Failover) -> Route {
     Route {
@@ -20,14 +19,17 @@ fn route(weights: &[u8], failover: Failover) -> Route {
 
 fn profile(id: u32, kind: ProxyKind) -> ProxyProfile {
     ProxyProfile {
+        dns_profile_id: 0,
         id,
         name: format!("proxy-{id}"),
         kind,
         enabled: true,
         host: "proxy.example".into(),
         port: 443,
-        resolver: Resolver::Proxy,
-        dns_servers: vec!["192.0.2.53".parse().unwrap()],
+        dns_servers: match kind {
+            ProxyKind::WireGuard => vec!["192.0.2.53".parse().unwrap()],
+            _ => vec![],
+        },
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1420,

@@ -6,13 +6,16 @@ import { useLocation, useNavigate } from "react-router";
 import { SAVE_ROUTE } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
 import { isTorrentConsumer, routeInput, routeProblem, type ConsumerKind, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
+import { SYSTEM_DNS_PROFILE_ID, dnsRouteProblem } from "@/lib/dns";
 import { cn } from "@/lib/utils";
+import { networkIds, testIds } from "@/next/testids";
 import { Dialog } from "../../components/Dialog";
 import { PrimaryButton, SecondaryButton } from "../../components/controls";
 import { Icon } from "../../components/icons";
 import { Cell } from "../../components/rows";
 import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
 import { defaultRoute, speedPage, type Consumer, type NetworkingAction, type NetworkingData } from "./data";
+import { useRouteDnsProfiles } from "./dns-choices";
 import { RouteEditor } from "./RouteEditor";
 import { stateLabel, StatusMark } from "./presentation";
 import { TestViaDialog } from "./TestViaDialog";
@@ -202,6 +205,7 @@ export function RouteDialog({
   const [route, setRoute] = useState<NetworkRoute>(consumer.route ?? defaultRoute());
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
+  const dnsProfiles = useRouteDnsProfiles();
 
   const save = async () => {
     const failure = await action(SAVE_ROUTE, { kind: consumer.kind, id: consumer.id, input: routeInput(route) });
@@ -213,10 +217,16 @@ export function RouteDialog({
   };
 
   const problem = routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools, kind: consumer.kind });
+  const dnsProblem = dnsRouteProblem(
+    route,
+    dnsProfiles?.find((choice) => choice.id === (route.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID)),
+    { proxies: data.proxyProfiles, pools: data.proxyPools },
+  );
 
   return (
     <Dialog
       open
+      testId={testIds.dialog("route")}
       title={t("next.networking.routes.editorTitle", { name: consumer.name })}
       note={t(TYPE_KEYS[consumerType(consumer.kind)])}
       width={720}
@@ -229,7 +239,12 @@ export function RouteDialog({
             </SecondaryButton>
           ) : null}
           <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
-          <PrimaryButton icon="save" disabled={busy || problem !== null} onClick={() => void save()}>
+          <PrimaryButton
+            icon="save"
+            disabled={busy || problem !== null || dnsProblem !== null}
+            testId={networkIds.routeSave}
+            onClick={() => void save()}
+          >
             {busy ? t("settings.saving") : t("next.networking.routes.save")}
           </PrimaryButton>
         </>
@@ -245,10 +260,11 @@ export function RouteDialog({
           cap={consumer.cap}
           kind={consumer.kind}
           status={flow.legs.filter((leg) => leg.consumer === consumer.key)}
+          dnsProfiles={dnsProfiles}
         />
       </div>
       {error ? (
-        <div role="alert" className="flex-none border-t border-wv-hairline px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
+        <div role="alert" data-testid={networkIds.routeError} className="flex-none border-t border-wv-hairline px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
           {error}
         </div>
       ) : null}

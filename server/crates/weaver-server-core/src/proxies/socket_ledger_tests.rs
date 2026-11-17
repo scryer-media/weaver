@@ -4,18 +4,18 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::proxies::{Resolver, RouteLeg, RoutingPolicy, TorrentScope};
+use crate::proxies::{RouteLeg, RoutingPolicy, TorrentScope};
 use weaver_tunnel::pipe::{SocketDivider, overhead_bytes, stream_bytes};
 
 fn profile(id: u32, kind: ProxyKind) -> ProxyProfile {
     ProxyProfile {
+        dns_profile_id: 0,
         id,
         name: format!("proxy-{id}"),
         kind,
         enabled: true,
         host: "192.0.2.1".into(),
         port: 51820,
-        resolver: Resolver::Proxy,
         dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,

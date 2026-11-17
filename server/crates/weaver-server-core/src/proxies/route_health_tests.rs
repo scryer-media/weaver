@@ -5,7 +5,7 @@ use super::*;
 use std::time::Duration;
 
 use crate::clock::{ManualClock, RuntimeClock};
-use crate::proxies::{ProxySecrets, Resolver, RouteLeg};
+use crate::proxies::{ProxySecrets, RouteLeg};
 
 fn interface(id: u32) -> EgressInterface {
     EgressInterface {
@@ -23,13 +23,13 @@ fn interface(id: u32) -> EgressInterface {
 
 fn wireguard(id: u32, revision: u64) -> ProxyProfile {
     ProxyProfile {
+        dns_profile_id: 0,
         id,
         name: format!("wg-{id}"),
         kind: ProxyKind::WireGuard,
         enabled: true,
         host: "vpn.invalid".into(),
         port: 51820,
-        resolver: Resolver::Weaver,
         dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
@@ -533,20 +533,23 @@ impl Hop {
             next: Mutex::new(Beneath::Answers),
             far: Mutex::default(),
         });
-        let hop = weaver_tunnel::pipe::TransportHop {
-            id: proxy,
-            spec: weaver_tunnel::transport::TransportProxy {
+        let hop = weaver_tunnel::pipe::TransportHop::new(
+            proxy,
+            weaver_tunnel::transport::TransportProxy {
                 kind: weaver_tunnel::transport::TransportKind::HttpConnect,
                 host: "192.0.2.1".into(),
                 port: 8080,
                 username: None,
                 password: None,
             },
-            inner: stage.clone(),
-            timeout: Duration::from_secs(5),
-            naming: weaver_tunnel::pipe::Naming::Proxy,
-            failure: weaver_tunnel::pipe::HopFailure::watched(health.watcher(3, beneath, proxy, 1)),
-        };
+            stage.clone(),
+            Duration::from_secs(5),
+            weaver_tunnel::pipe::Naming::Proxy,
+            std::sync::Arc::new(weaver_tunnel::pipe::NamesSlot::new(
+                weaver_tunnel::pipe::Names::new(weaver_tunnel::pipe::DnsChoice::System, None),
+            )),
+            weaver_tunnel::pipe::HopFailure::watched(health.watcher(3, beneath, proxy, 1)),
+        );
         Self { stage, hop }
     }
     // Whether a dial through the hop works, with the stage beneath doing

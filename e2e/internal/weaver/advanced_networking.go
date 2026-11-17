@@ -96,12 +96,13 @@ var advancedNetworkingSpecFiles = []string{
 	"network-sessions.spec.ts",
 	"network-reload.spec.ts",
 	"network-rss.spec.ts",
+	"network-dns.spec.ts",
 }
 
 // The partitions the "advanced-networking" gate mode runs, by name after the
 // "advanced-networking-" prefix.
 var advancedNetworkingPartitionNames = []string{
-	"pool-reselection", "routes", "egress-link", "pools", "legs", "sessions", "egress", "routes-hops", "pool-members",
+	"pool-reselection", "routes", "egress-link", "pools", "legs", "sessions", "egress", "routes-hops", "pool-members", "dns",
 }
 
 func advancedNetworkingArtifacts() []string {

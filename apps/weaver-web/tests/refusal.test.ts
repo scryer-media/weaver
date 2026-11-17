@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { codedSentence, refusalKey, refusalMessage } from "../src/lib/refusal.ts";
+import { codedSentence, refusalKey, refusalMessage, refusalNamesSomething } from "../src/lib/refusal.ts";
 import { nextEn } from "../src/next/i18n/en.ts";
 
 const SENTENCES: Record<string, string> = { [refusalKey("ROUTE_PROXY_REPEATED")]: "Ours, for a repeated proxy." };
@@ -56,16 +56,83 @@ test("a sentence repeats the numbers a refusal names", () => {
   assert.equal(refusalMessage(english, refused), "These routes need 3 WireGuard instances; this host allows 2.");
 });
 
+test("too many DNS servers and too many tunnel addresses each name their own limit", () => {
+  const servers = failed({
+    message: "a DNS setting lists at most 10 servers",
+    extensions: { code: "PROXY_DNS_SERVER_COUNT", params: { limit: 10 } },
+  });
+  assert.equal(refusalMessage(english, servers), "List at most 10 DNS servers.");
+  const addresses = failed({
+    message: "a WireGuard proxy takes at most 8 tunnel addresses",
+    extensions: { code: "PROXY_ADDRESS_COUNT", params: { limit: 8 } },
+  });
+  assert.equal(refusalMessage(english, addresses), "A WireGuard proxy takes at most 8 tunnel addresses.");
+});
+
+test("a refusal that names routes by key reads with their names, and a key with no name stands as itself", () => {
+  const refused = failed({
+    message: "DNS profile is used by server 3",
+    extensions: { code: "DNS_PROFILE_IN_USE", params: { routes: ["server:3", "rss:9"] } },
+  });
+  const names: Record<string, string> = { "server:3": "news.example.com" };
+  assert.equal(refusalNamesSomething(refused), true);
+  assert.equal(
+    refusalMessage(english, refused, { route: (key) => names[key] ?? key }),
+    "These routes still follow this profile: news.example.com, rss:9. Choose another profile for them first.",
+  );
+  assert.equal(refusalNamesSomething(failed({ message: "x", extensions: { code: "X", params: { limit: 2 } } })), false);
+});
+
+test("a profile in use names the proxies that find their address with it, with or without routes", () => {
+  const proxy = (id: number) => (id === 7 ? "Relay" : undefined);
+  const byProxies = failed({ message: "in use", extensions: { code: "DNS_PROFILE_IN_USE", params: { routes: [], proxies: [7, 9] } } });
+  assert.equal(refusalNamesSomething(byProxies), true);
+  assert.equal(
+    refusalMessage(english, byProxies, { proxy }),
+    "These proxies still use this profile to find their address: Relay, Proxy #9. Choose another profile for them first.",
+  );
+  const byBoth = failed({ message: "in use", extensions: { code: "DNS_PROFILE_IN_USE", params: { routes: ["server:3"], proxies: [7] } } });
+  assert.equal(
+    refusalMessage(english, byBoth, { route: () => "news.example.com", proxy }),
+    "These routes still follow this profile: news.example.com. These proxies still use it to find their address: Relay. Choose another profile for them first.",
+  );
+});
+
+test("a refusal that names proxies by id reads with their names, and an unknown one by its number", () => {
+  const silent = failed({
+    message: "WireGuard proxies 4 and 7 list no tunnel DNS",
+    extensions: { code: "DNS_PROFILE_NEEDS_TUNNEL_DNS", params: { proxies: [4, 7], routes: ["server:3"] } },
+  });
+  const names = { route: () => "news.example.com", proxy: (id: number) => (id === 4 ? "Mullvad" : undefined) };
+  assert.equal(refusalNamesSomething(silent), true);
+  assert.equal(
+    refusalMessage(english, silent, names),
+    "These routes have the proxy answer DNS: news.example.com. These WireGuard proxies on them list no DNS servers for their tunnel: Mullvad, Proxy #7. Add the tunnel's DNS servers to each, or choose another profile.",
+  );
+});
+
+test("a sentence names a list of names the refusal carries, joined", () => {
+  const refused = failed({
+    message: "server list is used by profiles",
+    extensions: { code: "DNS_LIST_IN_USE", params: { profiles: ["Checked", "Tunnel"], ids: [1, 2] } },
+  });
+  assert.equal(refusalMessage(english, refused), "These DNS profiles still use this list: Checked, Tunnel.");
+});
+
 // Left to the daemon's own words: the tunnel engine's text, and two refusals of
 // requests this interface never sends.
 const UNWORDED = ["PROXY_TUNNEL_CONFIGURATION", "ROUTE_AND_ROUTING_BOTH", "ROUTE_DIRECT_PATH_FALSE"];
+// Values a refusal's params carry, spelled like codes but never refused with.
+const PARAM_VALUES = ["PROXY_NAME"];
 
 test("every code the daemon refuses with has a sentence here", () => {
   const source = readFileSync(
     new URL("../../../server/crates/weaver-server-core/src/proxies/refusal.rs", import.meta.url),
     "utf8",
   );
-  const codes = [...new Set([...source.matchAll(/"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"/g)].map((match) => match[1]!))].sort();
+  const codes = [...new Set([...source.matchAll(/"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"/g)].map((match) => match[1]!))]
+    .filter((code) => !PARAM_VALUES.includes(code))
+    .sort();
   assert.ok(codes.length > 60, "the daemon's codes were not found where they are defined");
   const worded = Object.keys(nextEn)
     .filter((key) => key.startsWith(refusalKey("")))

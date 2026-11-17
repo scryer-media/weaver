@@ -104,8 +104,8 @@ impl TorrentStateLive {
                 continue;
             };
             let held = self.hold_place(link.handle(), &tx, permit, slot);
-            let clients = session.http_clients.clone();
-            let resolver = session.resolver.clone();
+            let clients = self.shared.naming.http_clients.clone();
+            let resolver = self.shared.naming.resolver.clone();
             self.spawn(
                 debug_span!(parent: self.shared.span.clone(), "web_seed", seed = ?link.handle()),
                 format!("[{}][{}]manage_web_seed", self.shared.id, link.handle()),

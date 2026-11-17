@@ -25,7 +25,9 @@ use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
 };
-use weaver_server_core::proxies::network_metrics::tunnel::TunnelMetricsSnapshot;
+use weaver_server_core::proxies::network_metrics::tunnel::{
+    DnsMetricsSnapshot, TunnelMetricsSnapshot,
+};
 use weaver_server_core::proxies::network_metrics::{
     EgressHealthLabel, EgressMetrics, LegMetrics, LegStateLabel, NetworkMetricsSnapshot,
     PoolMetrics, RungStateLabel, TunnelBytesMetrics, proxy_kind_label,
@@ -88,6 +90,7 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) schedules: Option<&'a ScheduleMetricsSnapshot>,
     pub(crate) network: Option<&'a NetworkMetricsSnapshot>,
     pub(crate) tunnel: Option<&'a TunnelMetricsSnapshot>,
+    pub(crate) dns: Option<&'a DnsMetricsSnapshot>,
     pub(crate) speed_tests: Option<&'a weaver_server_core::speed_test::SpeedTestMetricsSnapshot>,
     // The torrents as their service last published them. Absent when the
     // server runs no torrent service.
@@ -136,6 +139,7 @@ impl<'a> PrometheusRenderInput<'a> {
             schedules: None,
             network: None,
             tunnel: None,
+            dns: None,
             speed_tests: None,
             torrents: None,
             build: BuildInfo {
@@ -203,6 +207,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         schedules,
         network,
         tunnel,
+        dns,
         speed_tests,
         torrents,
         build,
@@ -319,6 +324,9 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
     if let Some(metrics) = tunnel {
         render_tunnel(&mut out, metrics);
+    }
+    if let Some(metrics) = dns {
+        render_dns(&mut out, metrics);
     }
     if let Some(metrics) = speed_tests {
         render_speed_tests(&mut out, metrics);
@@ -2399,6 +2407,22 @@ pub(crate) fn render_tunnel(out: &mut Encoder, metrics: &TunnelMetricsSnapshot) 
         &[],
         metrics.socket_idle_retired,
     );
+}
+
+// Listed DNS servers. Both label sets come from the engine's wire and trust
+// enums, so every series is present from the first scrape.
+pub(crate) fn render_dns(out: &mut Encoder, metrics: &DnsMetricsSnapshot) {
+    for &(wire, count) in &metrics.wires {
+        out.sample(&f::NETWORK_DNS_ANSWERS, &[("wire", wire.as_str())], count);
+    }
+    for &(outcome, count) in &metrics.trust {
+        out.sample(
+            &f::NETWORK_DNS_TRUST,
+            &[("outcome", outcome.as_str())],
+            count,
+        );
+    }
+    out.sample(&f::NETWORK_DNSSEC_QUERIES, &[], metrics.dnssec_queries);
 }
 
 // Speed tests. The run counter's label set comes from the kind and status

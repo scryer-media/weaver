@@ -212,7 +212,18 @@ const CLIENT_CRATES: &[(&str, &[&str])] = &[
             "weaver-tunnel",
         ],
     ),
-    ("hyper", &["axum", "hyper-rustls", "hyper-util", "reqwest"]),
+    (
+        "hyper",
+        &[
+            "axum",
+            "hyper-rustls",
+            "hyper-util",
+            "reqwest",
+            // DNS over HTTPS, on the TLS stream the hop's own dialer opened:
+            // no pooled client, no connector, no resolver.
+            "weaver-tunnel",
+        ],
+    ),
     ("hyper-util", &["axum", "hyper-rustls", "reqwest"]),
     (
         "quinn",

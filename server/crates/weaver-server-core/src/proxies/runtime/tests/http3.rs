@@ -10,7 +10,6 @@ async fn http3_profile_test_never_falls_back_to_tcp_when_dns_is_missing() {
     let mut p = profile(1);
     p.kind = ProxyKind::Http3Connect;
     p.port = listener.local_addr().unwrap().port();
-    p.dns_servers.clear();
     db.save_proxy_profile(&p).unwrap();
     let runtime = ProxyRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
     let route = Route {
@@ -23,7 +22,12 @@ async fn http3_profile_test_never_falls_back_to_tcp_when_dns_is_missing() {
     };
     let tests = runtime
         .network
-        .test_via(&route, TestSubject::Proxy(1), None)
+        .test_via(
+            &route,
+            crate::proxies::SYSTEM_DNS_PROFILE_ID,
+            TestSubject::Proxy(1),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(tests[0].outcome, Err(ProxyFault::TestNeedsDns));

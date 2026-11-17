@@ -1351,7 +1351,11 @@ where
                     plain_builder(&self.kind)
                 }
             };
-            return shape.apply(builder.no_proxy().dns_resolver(Arc::new(NoLookups)));
+            return shape.apply(
+                builder
+                    .no_proxy()
+                    .dns_resolver(Arc::new(NoLookups { _keep: None })),
+            );
         }
         let builder = (self.base)().map_err(anyhow::Error::msg)?;
         let (host, port, addrs) = target.map_or(("", 0, &[][..]), |target| {
@@ -1377,9 +1381,16 @@ where
             }
             None => crate::proxies::pinned(builder, host, port, addrs),
         };
-        shape.apply(match target {
-            None => builder.dns_resolver(Arc::new(NoLookups)),
-            Some(_) => builder.redirect(reqwest::redirect::Policy::none()),
+        // A client on a bridge that is let go once unheld holds it up for as
+        // long as the client lives. Through the bridge the client hands it
+        // every name, so its own resolver is never asked.
+        let keep = self.bridge.as_ref().and_then(|bridge| bridge.keep.clone());
+        shape.apply(match (target, keep) {
+            (None, keep) => builder.dns_resolver(Arc::new(NoLookups { _keep: keep })),
+            (Some(_), None) => builder.redirect(reqwest::redirect::Policy::none()),
+            (Some(_), keep) => builder
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(NoLookups { _keep: keep })),
         })
     }
 }
@@ -1387,8 +1398,11 @@ where
 // The resolver of a leg's client with no target: it answers no name, so a
 // name such a client meets is refused, never asked of the host's own DNS.
 // Through the leg's bridge the name is handed to the leg, and this is never
-// asked.
-struct NoLookups;
+// asked. It holds up the bridge its client rides, when that bridge is let go
+// once unheld.
+struct NoLookups {
+    _keep: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
 
 impl reqwest::dns::Resolve for NoLookups {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
@@ -1751,24 +1765,27 @@ mod tests {
     // A SOCKS5 hop on the leg's egress, or an HTTP CONNECT one, aimed at
     // `endpoint`.
     fn proxy_hop(kind: TransportKind, endpoint: SocketAddr) -> Arc<dyn Dialer> {
-        Arc::new(TransportHop {
-            id: 1,
-            spec: TransportProxy {
+        Arc::new(TransportHop::new(
+            1,
+            TransportProxy {
                 kind,
                 host: endpoint.ip().to_string(),
                 port: endpoint.port(),
                 username: None,
                 password: None,
             },
-            inner: Arc::new(weaver_tunnel::pipe::Egress::new(
+            Arc::new(weaver_tunnel::pipe::Egress::new(
                 4,
                 weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
                 std::time::Duration::from_secs(30),
             )),
-            timeout: std::time::Duration::from_secs(30),
-            naming: weaver_tunnel::pipe::Naming::Proxy,
-            failure: Default::default(),
-        })
+            std::time::Duration::from_secs(30),
+            weaver_tunnel::pipe::Naming::Proxy,
+            std::sync::Arc::new(weaver_tunnel::pipe::NamesSlot::new(
+                weaver_tunnel::pipe::Names::new(weaver_tunnel::pipe::DnsChoice::System, None),
+            )),
+            Default::default(),
+        ))
     }
 
     // A ladder leg on `rung`, as the runtime builds one.
@@ -2310,9 +2327,13 @@ mod tests {
             },
             endpoint: None,
             timeout: std::time::Duration::from_secs(30),
-            naming: weaver_tunnel::pipe::Naming::proxy_servers(vec![
-                weaver_tunnel::test_support::TEST_PEER_ADDRESS.into(),
-            ]),
+            naming: weaver_tunnel::pipe::Naming::proxy_servers(
+                vec![weaver_tunnel::dns::DnsServer::plain(
+                    weaver_tunnel::test_support::TEST_PEER_ADDRESS.into(),
+                )],
+                weaver_tunnel::dns::Trust::AsSent,
+            ),
+            tunnel_dns: Vec::new(),
             resolver: Some(provider),
             forwarding,
             failure: Default::default(),

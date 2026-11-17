@@ -15,6 +15,7 @@ import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 
 import { statusColor, WV } from "@/next/data/palette";
 import { useDownloadRate } from "@/next/data/use-download-rate";
+import { torrentIds } from "@/next/testids";
 import { QueueEtaContext } from "./queue-eta";
 
 /**
@@ -90,6 +91,7 @@ export const DownloadRow = memo(function DownloadRow({
       picked={picked}
       onClick={() => onSelect(job.id)}
       title={name}
+      testId={torrentIds.queueRow(job.id)}
       lead={lead}
       left={
         // The name is never cut short. Where the list is wide the bars are a
@@ -97,7 +99,9 @@ export const DownloadRow = memo(function DownloadRow({
         // whole name fits there; one that does not sends the bars under it,
         // and one longer than the row wraps.
         <div className="flex min-w-0 flex-[1_1_240px] flex-wrap items-center gap-x-5 gap-y-[9px]">
-          <span className="max-w-full min-w-0 flex-[1_1_auto] text-[13.5px] font-medium tracking-[-0.005em] [overflow-wrap:anywhere] text-wv-fg">
+          <span
+            data-testid={torrentIds.queueRowName}
+            className="max-w-full min-w-0 flex-[1_1_auto] text-[13.5px] font-medium tracking-[-0.005em] [overflow-wrap:anywhere] text-wv-fg">
             {name}
           </span>
           <TagChips tags={job.tags} />
@@ -116,13 +120,19 @@ export const DownloadRow = memo(function DownloadRow({
       }
       right={
         <>
-          <span className="min-w-[56px] truncate text-[12.5px] text-wv-secondary">
+          <span
+            data-testid={torrentIds.queueRowProtocol(job.protocol === "TORRENT" ? "TORRENT" : "NZB")}
+            className="min-w-[56px] truncate text-[12.5px] text-wv-secondary"
+          >
             {job.protocol === "TORRENT" ? t("next.protocol.torrent") : t("next.protocol.usenet")}
           </span>
           <div className="flex min-w-[96px] items-center gap-[9px]" title={statusTitle}>
             <Square color={statusColor(progress.status)} />
             <span className="flex min-w-0 flex-col">
-              <span className="truncate text-[12.5px] text-wv-secondary">
+              <span
+                data-testid={torrentIds.queueRowStatus(progress.status)}
+                className="truncate text-[12.5px] text-wv-secondary"
+              >
                 {statusLabel(progress.status)}
               </span>
               {hold !== null ? (
@@ -142,7 +152,7 @@ export const DownloadRow = memo(function DownloadRow({
           {seedingColumn ? (
             <ValueCell width={112}>
               {seeding === null ? null : (
-                <span title={t("next.torrent.seedingCell")}>
+                <span data-testid={torrentIds.queueRowSeeding} title={t("next.torrent.seedingCell")}>
                   {`${seeding.ratio.toFixed(2)} · ↑ ${formatRate(seeding.uploadBps)}`}
                 </span>
               )}
@@ -197,6 +207,7 @@ const RowActions = memo(function RowActions({
         icon={paused ? "resume" : "pause"}
         label={paused ? t("action.resume") : t("action.pause")}
         onClick={() => onPause(id, !paused)}
+        testId={paused ? torrentIds.queueRowResume : torrentIds.queueRowPause}
       />
       <RowIconButton
         icon="cancelDownload"

@@ -328,19 +328,20 @@ async fn get_capped(path: &P2pPath, url: &reqwest::Url) -> Result<Vec<u8>, Strin
         https_only: false,
         allow_private_network: path.allow_private_network,
     };
-    let response = tokio::time::timeout(
-        FETCH_WAIT,
-        fetch_on(&over, url, &options, &|request, _, _| request),
-    )
-    .await
-    .map_err(|_| format!("GET {url} timed out"))?
-    .map_err(|error| match error {
-        AttemptError::Route => format!("GET {url} failed: the path did not carry it"),
-        AttemptError::Routed(error) => format!("GET {url} failed: {error}"),
-        AttemptError::Destination(message) | AttemptError::Answered(message) => {
-            format!("GET {url} failed: {message}")
-        }
-    })?;
+    // The fetch is bounded by its options' timeout, FETCH_WAIT.
+    let response = fetch_on(&over, url, &options, &|request, _, _| request)
+        .await
+        .map_err(|error| match error {
+            AttemptError::TimedOut { .. } => format!("GET {url} timed out"),
+            AttemptError::Route => format!("GET {url} failed: the path did not carry it"),
+            // The request was handed over and failed before its response: by
+            // the path or the destination, which this path cannot tell apart.
+            AttemptError::Sent { cause, .. } => format!("GET {url} failed: {cause}"),
+            AttemptError::Routed(error) => format!("GET {url} failed: {error}"),
+            AttemptError::Destination(message) | AttemptError::Answered(message) => {
+                format!("GET {url} failed: {message}")
+            }
+        })?;
     if !response.status().is_success() {
         return Err(format!("GET {url} answered {}", response.status()));
     }
