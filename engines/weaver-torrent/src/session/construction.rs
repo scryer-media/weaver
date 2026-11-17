@@ -202,10 +202,18 @@ impl Session {
 
             let mut dht_on_listener = false;
             let dht = if let Some(dht_config) = opts.dht.take() {
-                // The IPv6 node waits for an IPv6 address the route's
-                // internet traffic leaves from (see `Session::follow_ipv6_route`).
-                let ipv6_waits = opts.ipv4_only
-                    || !crate::route_interface::runs_ipv6_dht(http_clients.as_ref());
+                // The IPv6 node waits for an IPv6 address of the route that
+                // gives a node (see `Session::follow_ipv6_route`); on a
+                // proxied route it runs while the proxy carries IPv6.
+                let (ipv6_waits, ipv6_proving) = if opts.ipv4_only {
+                    (true, false)
+                } else {
+                    match crate::route_interface::ipv6_dht(http_clients.as_ref()) {
+                        crate::route_interface::Ipv6Dht::Runs => (false, false),
+                        crate::route_interface::Ipv6Dht::Proxied => (false, true),
+                        crate::route_interface::Ipv6Dht::None => (true, false),
+                    }
+                };
                 // The DHT on the port uTP listens on, or asked for the port
                 // the listener was asked for, shares uTP's socket, as
                 // libtorrent runs uTP and its DHT on one socket per listen
@@ -240,6 +248,7 @@ impl Session {
                             client_version: Some(dht_client_version()),
                             tasks: Some(swarm_tasks.clone()),
                             ipv6_waits,
+                            ipv6_proving,
                             ..Default::default()
                         },
                     )
@@ -257,6 +266,7 @@ impl Session {
                         client_version: Some(dht_client_version()),
                         tasks: Some(swarm_tasks.clone()),
                         ipv6_waits,
+                        ipv6_proving,
                         ..Default::default()
                     })
                     .await

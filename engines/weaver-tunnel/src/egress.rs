@@ -82,6 +82,93 @@ fn interface_supports(name: &str, ipv4: bool) -> bool {
         .any(|(interface, family)| interface == name && *family == ipv4)
 }
 
+/// One IPv6 address an egress's sockets may leave from, with what libtorrent
+/// reads of its interface to tell whether a listen socket on it reaches only
+/// the local network (`expand_unspecified_address`, session_impl.cpp:288-345,
+/// v2.0.15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Source {
+    pub ip: Ipv6Addr,
+    /// Its interface is a loopback one: it holds a loopback address.
+    pub loopback_interface: bool,
+    /// Its interface is a point-to-point link.
+    pub point_to_point: bool,
+    /// Its interface holds the address IPv6 traffic toward a public address
+    /// leaves from: it has an IPv6 internet route.
+    pub internet_route: bool,
+}
+
+/// The IPv6 addresses an egress's sockets may leave from, and whether the
+/// egress has an internet route of either family.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ipv6Sources {
+    pub addresses: Vec<Ipv6Source>,
+    pub any_internet_route: bool,
+}
+
+// Documentation addresses no host answers at: where a datagram toward one
+// would leave from names the route toward the internet. Nothing is sent.
+const PUBLIC_PROBE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
+const PUBLIC_PROBE_V6: SocketAddr = SocketAddr::new(
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+    9,
+);
+
+// One address of one interface, as the system lists it.
+struct Listed {
+    name: String,
+    ip: IpAddr,
+    up: bool,
+    point_to_point: bool,
+}
+
+// The IPv6 sources of `egress` among `listed`, whose (deprecated,
+// tentative) flags are `flags`, in the same order. libtorrent takes only an
+// interface's preferred addresses, of an interface that is up
+// (session_impl.cpp:299-322, enum_net.cpp:451, v2.0.15).
+fn pick_ipv6_sources(
+    egress: &SocketEgress,
+    listed: &[Listed],
+    flags: &[(bool, bool)],
+    v6_source: Option<IpAddr>,
+    any_internet_route: bool,
+) -> Ipv6Sources {
+    let holds = |name: &str, wanted: &dyn Fn(IpAddr) -> bool| {
+        listed.iter().any(|l| l.name == name && wanted(l.ip))
+    };
+    let internet_interface = v6_source.and_then(|source| {
+        listed
+            .iter()
+            .find(|l| l.ip == source)
+            .map(|l| l.name.as_str())
+    });
+    let mut addresses: Vec<Ipv6Source> = Vec::new();
+    for (l, &(deprecated, tentative)) in listed.iter().zip(flags) {
+        let IpAddr::V6(ip) = l.ip else { continue };
+        if !l.up || deprecated || tentative {
+            continue;
+        }
+        let in_scope = match egress {
+            SocketEgress::System => true,
+            SocketEgress::Interface(name) => l.name == *name,
+            SocketEgress::SourceAddress(source) => *source == l.ip,
+        };
+        if !in_scope || addresses.iter().any(|a| a.ip == ip) {
+            continue;
+        }
+        addresses.push(Ipv6Source {
+            ip,
+            loopback_interface: holds(&l.name, &|ip: IpAddr| ip.is_loopback()),
+            point_to_point: l.point_to_point,
+            internet_route: internet_interface == Some(l.name.as_str()),
+        });
+    }
+    Ipv6Sources {
+        addresses,
+        any_internet_route,
+    }
+}
+
 impl SocketEgress {
     pub fn supports_address(&self, address: IpAddr) -> bool {
         match self {
@@ -209,6 +296,40 @@ impl SocketEgress {
         let socket = UdpSocket::from(self.udp_socket(to)?);
         socket.connect(to)?;
         Ok(socket.local_addr()?.ip())
+    }
+
+    /// The IPv6 addresses this egress's sockets may leave from: each
+    /// preferred address of an interface that is up, on the egress's device
+    /// when it names one, or the source address it pins. Nothing is sent.
+    pub fn ipv6_sources(&self) -> io::Result<Ipv6Sources> {
+        if let Self::Interface(name) = self
+            && (name.is_empty() || name.as_bytes().contains(&0))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interface name must be nonempty and contain no NUL",
+            ));
+        }
+        let listed: Vec<Listed> = if_addrs::get_if_addrs()?
+            .into_iter()
+            .map(|interface| Listed {
+                up: interface.is_oper_up(),
+                point_to_point: interface.is_p2p(),
+                ip: interface.ip(),
+                name: interface.name,
+            })
+            .collect();
+        let v6_source = self.source_toward(PUBLIC_PROBE_V6).ok();
+        let any_internet_route = v6_source.is_some() || self.source_toward(PUBLIC_PROBE).is_ok();
+        let pairs: Vec<(&str, IpAddr)> = listed.iter().map(|l| (l.name.as_str(), l.ip)).collect();
+        let flags = address_flags_many(&pairs);
+        Ok(pick_ipv6_sources(
+            self,
+            &listed,
+            &flags,
+            v6_source,
+            any_internet_route,
+        ))
     }
 
     // Bind a datagram socket a direct leg's consumer sends from itself, on
@@ -501,6 +622,90 @@ mod connect_tests {
             Err(error) => panic!("{error}"),
         };
         assert!(socket2::SockRef::from(&listener).only_v6().unwrap());
+    }
+
+    // The IPv6 sources an egress may leave from are the preferred addresses
+    // of interfaces that are up, in its scope, with what libtorrent reads of
+    // their interface: whether it holds a loopback address, is a
+    // point-to-point link, and holds the address the internet route leaves
+    // from.
+    #[test]
+    fn the_ipv6_sources_are_the_preferred_addresses_of_interfaces_up_in_scope() {
+        let at = |name: &str, ip: &str, up: bool, point_to_point: bool| Listed {
+            name: name.into(),
+            ip: ip.parse().unwrap(),
+            up,
+            point_to_point,
+        };
+        let listed = [
+            at("lo0", "::1", true, false),
+            at("lo0", "fe80::1", true, false),
+            at("en0", "192.0.2.4", true, false),
+            at("en0", "2001:db8::4", true, false),
+            at("en0", "2001:db8::5", true, false),
+            at("en0", "2001:db8::6", true, false),
+            at("utun1", "fd00::9", true, true),
+            at("en1", "2001:db8::8", false, false),
+        ];
+        // 2001:db8::5 is deprecated, 2001:db8::6 tentative.
+        let flags = [
+            (false, false),
+            (false, false),
+            (false, false),
+            (false, false),
+            (true, false),
+            (false, true),
+            (false, false),
+            (false, false),
+        ];
+        let source = |ip: &str, loopback_interface, point_to_point, internet_route| Ipv6Source {
+            ip: ip.parse().unwrap(),
+            loopback_interface,
+            point_to_point,
+            internet_route,
+        };
+        let internet = Some("2001:db8::4".parse().unwrap());
+
+        let all = pick_ipv6_sources(&SocketEgress::System, &listed, &flags, internet, true);
+        assert_eq!(
+            all,
+            Ipv6Sources {
+                addresses: vec![
+                    source("::1", true, false, false),
+                    source("fe80::1", true, false, false),
+                    source("2001:db8::4", false, false, true),
+                    source("fd00::9", false, true, false),
+                ],
+                any_internet_route: true,
+            }
+        );
+
+        let on_tunnel = pick_ipv6_sources(
+            &SocketEgress::Interface("utun1".into()),
+            &listed,
+            &flags,
+            None,
+            false,
+        );
+        assert_eq!(
+            on_tunnel,
+            Ipv6Sources {
+                addresses: vec![source("fd00::9", false, true, false)],
+                any_internet_route: false,
+            }
+        );
+
+        let held = pick_ipv6_sources(
+            &SocketEgress::SourceAddress("2001:db8::4".parse().unwrap()),
+            &listed,
+            &flags,
+            internet,
+            true,
+        );
+        assert_eq!(
+            held.addresses,
+            vec![source("2001:db8::4", false, false, true)]
+        );
     }
 
     #[test]
