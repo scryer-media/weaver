@@ -14,7 +14,6 @@ pub struct FetchAttempt {
     route: Arc<LiveNetworkRoute>,
     guard: Arc<Revocable>,
     stage: Arc<dyn Dialer>,
-    position: usize,
     purpose: Purpose,
     pacing: Option<Arc<weaver_nntp::transfer::ServerTransferControl>>,
     legacy_status: Arc<ConsumerRoute>,
@@ -22,6 +21,9 @@ pub struct FetchAttempt {
     ladder: Option<Arc<Fallback>>,
     rung: usize,
     transport_error: Mutex<Option<Arc<DialError>>>,
+    // The attempt's latest dial went through its path and was taken on the
+    // leg: what a request on it fails of next is the destination's doing.
+    carried: std::sync::atomic::AtomicBool,
     setups: Mutex<Vec<weaver_tunnel::pipe::SetupHandle>>,
     last_member: bool,
     // The leg's final attempt this sync: no later rung, and no direct
@@ -50,6 +52,43 @@ impl FetchAttempt {
             .lock()
             .expect("fetch transport error")
             .take()
+    }
+    // Whether the attempt's latest dial went through its path, with no
+    // lookup on it since.
+    pub fn carried(&self) -> bool {
+        self.carried.load(std::sync::atomic::Ordering::Acquire)
+    }
+    // Where the route runs the attempt's leg now, if it still runs it.
+    fn place(&self) -> Option<usize> {
+        self.route
+            .weighted
+            .position_of(&(self.guard.clone() as Arc<dyn Dialer>))
+    }
+    // Whether the route still runs the leg the attempt was listed on,
+    // wherever it now sits. One it no longer runs carries nothing more.
+    pub fn leg_current(&self) -> bool {
+        self.place().is_some()
+    }
+    // Whether `other` is an attempt on the same rung of the same leg, as
+    // the members of one pool rung are.
+    pub fn same_rung(&self, other: &FetchAttempt) -> bool {
+        Arc::ptr_eq(&self.guard, &other.guard) && self.rung == other.rung
+    }
+    // A request the path carried failed at its destination. The setups it
+    // rode reached their end; the stage, rung, leg and route status hear
+    // nothing, as a request that fails says nothing of the path.
+    pub fn request_failed(&self) {
+        if self.guard.is_revoked() {
+            return;
+        }
+        for setup in std::mem::take(&mut *self.setups.lock().expect("fetch setup")) {
+            setup.complete(true);
+        }
+    }
+    fn dial_failed(&self, error: DialError) -> TunnelError {
+        let message = error.to_string();
+        *self.transport_error.lock().expect("fetch transport error") = Some(Arc::new(error));
+        TunnelError::Engine(message)
     }
     pub fn report(&self, error: Option<&DialError>) {
         if self.guard.is_revoked() {
@@ -81,11 +120,14 @@ impl FetchAttempt {
         if error.is_some() && !self.last_attempt {
             return;
         }
-        self.route.weighted.report_external(
-            self.position,
-            &(self.guard.clone() as Arc<dyn Dialer>),
-            error,
-        );
+        // A leg the route no longer runs hears nothing.
+        if let Some(position) = self.place() {
+            self.route.weighted.report_external(
+                position,
+                &(self.guard.clone() as Arc<dyn Dialer>),
+                error,
+            );
+        }
     }
 }
 #[async_trait::async_trait]
@@ -93,6 +135,10 @@ impl FetchPath for FetchAttempt {
     // The addresses `host` is reached at, as the attempt's exit resolves
     // it, or `Unresolved` when the exit proxy is handed the name.
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        // A lookup starts a hop: what the hop's request fails of is the
+        // path's until its own dial goes through.
+        self.carried
+            .store(false, std::sync::atomic::Ordering::Release);
         if self.guard.is_revoked() {
             return Err(DialError::Skipped("leg revoked".into()));
         }
@@ -108,8 +154,8 @@ impl FetchPath for FetchAttempt {
     fn budget(&self) -> Duration {
         self.stage.budget()
     }
-    fn body_failed(&self, error: &DialError) {
-        self.report(Some(error));
+    fn body_failed(&self) {
+        self.request_failed();
     }
 }
 #[async_trait::async_trait]
@@ -123,6 +169,8 @@ impl TunnelProvider for FetchAttempt {
         port: u16,
         observed: Arc<ConnectionOutcome>,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        self.carried
+            .store(false, std::sync::atomic::Ordering::Release);
         let host = host.trim_matches(['[', ']']);
         let addresses = self
             .addresses
@@ -142,20 +190,24 @@ impl TunnelProvider for FetchAttempt {
             self.guard.dial_using(self.stage.as_ref(), &target),
         )
         .await
-        .map_err(|error| {
-            let message = error.to_string();
-            *self.transport_error.lock().expect("fetch transport error") = Some(Arc::new(error));
-            TunnelError::Engine(message)
-        })?;
+        .map_err(|error| self.dial_failed(error))?;
         dialed.path.rung = self.selected_proxy.map(|_| self.rung);
-        self.route
-            .weighted
-            .track_external(
-                self.position,
-                &(self.guard.clone() as Arc<dyn Dialer>),
-                &mut dialed,
-            )
-            .map_err(|error| TunnelError::Engine(error.to_string()))?;
+        // A leg the route stopped running under the dial refuses it. That is
+        // no evidence either way: it is kept as the dial's outcome, so the
+        // request it fails is not read as the path's, and the walk skips the
+        // leg's other attempts.
+        self.place()
+            .ok_or_else(|| DialError::Skipped("leg changed during feed connection".into()))
+            .and_then(|position| {
+                self.route.weighted.track_external(
+                    position,
+                    &(self.guard.clone() as Arc<dyn Dialer>),
+                    &mut dialed,
+                )
+            })
+            .map_err(|error| self.dial_failed(error))?;
+        self.carried
+            .store(true, std::sync::atomic::Ordering::Release);
         let outcome = dialed.outcome.clone();
         observed.on_failure(move || outcome.failed());
         let outcome = dialed.outcome.clone();
@@ -327,7 +379,6 @@ impl NetworkRuntime {
                         route: route.clone(),
                         guard: leg.stage.clone(),
                         stage: Arc::new(BlockedPool(pool)),
-                        position,
                         purpose: purpose.clone(),
                         pacing: self
                             .egress_controls
@@ -339,6 +390,7 @@ impl NetworkRuntime {
                         ladder: leg.ladder.clone(),
                         rung: rung_index,
                         transport_error: Mutex::new(None),
+                        carried: Default::default(),
                         setups: Mutex::new(Vec::new()),
                         last_member: true,
                         last_attempt: false,
@@ -390,7 +442,6 @@ impl NetworkRuntime {
                         route: route.clone(),
                         guard: leg.stage.clone(),
                         stage,
-                        position,
                         purpose: purpose.clone(),
                         pacing: self
                             .egress_controls
@@ -402,6 +453,7 @@ impl NetworkRuntime {
                         ladder: leg.ladder.clone(),
                         rung: rung_index,
                         transport_error: Mutex::new(None),
+                        carried: Default::default(),
                         setups: Mutex::new(Vec::new()),
                         last_member: member_index + 1 == count,
                         last_attempt: false,
@@ -421,7 +473,6 @@ impl NetworkRuntime {
                     route: route.clone(),
                     guard: leg.stage.clone(),
                     stage: bottom,
-                    position,
                     purpose: purpose.clone(),
                     pacing: self
                         .egress_controls
@@ -433,6 +484,7 @@ impl NetworkRuntime {
                     ladder: leg.ladder.clone(),
                     rung: direct_rung,
                     transport_error: Mutex::new(None),
+                    carried: Default::default(),
                     setups: Mutex::new(Vec::new()),
                     last_member: true,
                     last_attempt: false,
