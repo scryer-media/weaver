@@ -305,14 +305,31 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Res
 struct At {
     dir: PathBuf,
     reads: Vec<u64>,
+    // No read is made of the files: a move left one among them that is not
+    // the torrent's own while the torrent still holds its pieces as had
+    // (`Files::relocate`), until those are forgotten (`Files::let_read`).
+    // Read under the guard every read already takes to learn where the
+    // files are.
+    shut: bool,
 }
 
 impl At {
-    fn new(dir: PathBuf, count: usize) -> Self {
+    fn new(dir: PathBuf, count: usize, shut: bool) -> Self {
         Self {
             dir,
             reads: (0..count).map(|_| key()).collect(),
+            shut,
         }
+    }
+
+    // A read is refused while the files are shut.
+    fn read(&self) -> io::Result<()> {
+        if self.shut {
+            return Err(io::Error::other(
+                "the torrent's files are not read until its pieces are checked again",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -365,7 +382,7 @@ impl Files {
                 }
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let at = At::new(dir, names.len());
+        let at = At::new(dir, names.len(), false);
         Ok(Self {
             ends: names.iter().map(|_| FileEnds::default()).collect(),
             names,
@@ -422,6 +439,7 @@ impl Files {
     pub(crate) fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> io::Result<()> {
         let name = self.name(file)?;
         let at = self.at();
+        at.read()?;
         let path = at.dir.join(name);
         let handle = self.pool.open(at.reads[file], || File::open(&path))?;
         counted(
@@ -442,6 +460,9 @@ impl Files {
             return;
         };
         let at = self.at();
+        if at.shut {
+            return;
+        }
         let path = at.dir.join(name);
         if let Ok(handle) = self.pool.open(at.reads[file], || File::open(&path)) {
             advise_will_need(&handle, offset, len);
@@ -453,6 +474,7 @@ impl Files {
     pub(crate) fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
         let name = self.name(file)?;
         let at = self.at();
+        at.read()?;
         let path = at.dir.join(name);
         let handle = self.pool.open(at.reads[file], || File::open(&path))?;
         let len = outs.iter().map(|out| out.len()).sum();
@@ -484,22 +506,49 @@ impl Files {
         let mut at = self.at.write().unwrap_or_else(PoisonError::into_inner);
         self.pool.forget(&at.reads);
         let dir = std::mem::take(&mut at.dir);
-        *at = At::new(dir, self.names.len());
+        *at = At::new(dir, self.names.len(), at.shut);
     }
 
     // Move the files, under the lock no write or read gets past, with
     // `relocate`, which is given where they are and says where they went:
     // the files are read and written there from then on. One that fails
     // leaves them where it found them.
+    //
+    // `shut` is asked how the move ended, still under that lock: when it
+    // says so the files come out of the move shut to reads, wherever they
+    // are, and stay shut until `let_read`. For a move that ends with a file
+    // among them that is not the torrent's own while the torrent has not
+    // forgotten its pieces: no read is made of that file, so none of its
+    // bytes is served, from the moment the lock is let go.
     pub(crate) fn relocate<T, E>(
         &self,
         relocate: impl FnOnce(&Path) -> Result<(PathBuf, T), E>,
+        shut: impl FnOnce(Result<&T, &E>) -> bool,
     ) -> Result<T, E> {
         let mut at = self.at.write().unwrap_or_else(PoisonError::into_inner);
         self.pool.forget(&at.reads);
-        let (to, outcome) = relocate(&at.dir)?;
-        *at = At::new(to, self.names.len());
-        Ok(outcome)
+        match relocate(&at.dir) {
+            Ok((to, outcome)) => {
+                let shut = at.shut || shut(Ok(&outcome));
+                *at = At::new(to, self.names.len(), shut);
+                Ok(outcome)
+            }
+            Err(error) => {
+                at.shut |= shut(Err(&error));
+                Err(error)
+            }
+        }
+    }
+
+    // The files are read again: the torrent has forgotten its pieces, so
+    // the only reads to come are its check's, and what that passes.
+    pub(crate) fn let_read(&self) {
+        self.at.write().unwrap_or_else(PoisonError::into_inner).shut = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_shut(&self) -> bool {
+        self.at().shut
     }
 }
 

@@ -739,19 +739,25 @@ impl TorrentStore {
     // for them where they are has been written: those after go where they
     // went. For a thread that may wait on a disk.
     // Pieces handed over while it lasts are kept, and queued as it ends.
+    // `shut` says whether the files come out of it shut to reads
+    // (`Files::relocate`).
     pub(crate) fn relocate<T, E>(
         &self,
         relocate: impl FnOnce(&Path) -> Result<(PathBuf, T), E>,
+        shut: impl FnOnce(Result<&T, &E>) -> bool,
     ) -> Result<T, E> {
         self.begin_move();
-        let moved = self.files.relocate(|dir| {
-            if !self.writes.drain() {
-                tracing::warn!(dir = %dir.display(), "a torrent's files moved with pieces queued for them unwritten");
-            }
-            let (to, outcome) = relocate(dir)?;
-            self.writes.moved(&to);
-            Ok((to, outcome))
-        });
+        let moved = self.files.relocate(
+            |dir| {
+                if !self.writes.drain() {
+                    tracing::warn!(dir = %dir.display(), "a torrent's files moved with pieces queued for them unwritten");
+                }
+                let (to, outcome) = relocate(dir)?;
+                self.writes.moved(&to);
+                Ok((to, outcome))
+            },
+            shut,
+        );
         self.end_move();
         moved
     }
@@ -762,10 +768,13 @@ impl TorrentStore {
     pub(crate) fn place(&self, to: PathBuf) {
         self.begin_move();
         self.files
-            .relocate(|_| {
-                self.writes.placed(&to);
-                Ok::<_, std::convert::Infallible>((to.clone(), ()))
-            })
+            .relocate(
+                |_| {
+                    self.writes.placed(&to);
+                    Ok::<_, std::convert::Infallible>((to.clone(), ()))
+                },
+                |_| false,
+            )
             .unwrap_or_else(|never| match never {});
         self.end_move();
     }

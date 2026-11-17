@@ -383,6 +383,21 @@ async fn fetch_every_piece(service: &TorrentService, job_id: JobId, whole: &[u8]
     fetch_pieces(service, job_id, whole, None, |_| {}).await;
 }
 
+// The read an upload of the torrent's first block to a peer makes: of its
+// first file, through the storage its session reads by.
+async fn upload_read(service: &TorrentService, job_id: JobId) -> anyhow::Result<Vec<u8>> {
+    let live = service.inner.live.lock().await;
+    let torrent = &live[&job_id];
+    let storage = PieceStorage::new(
+        Arc::clone(torrent.layout.as_ref().unwrap()),
+        torrent.intake.clone().unwrap() as Arc<dyn Pieces>,
+        service.resident(job_id),
+    );
+    let mut block = vec![0; 16_384];
+    storage.pread_exact(0, 0, &mut block)?;
+    Ok(block)
+}
+
 // `fetch_every_piece`, or only the pieces `only` names, and `then` done to
 // the torrent before anything the service settles sees them.
 async fn fetch_pieces(
@@ -392,6 +407,28 @@ async fn fetch_pieces(
     only: Option<&[u32]>,
     then: impl FnOnce(&Live),
 ) {
+    // The check its session makes of a torrent it took in is over first.
+    // Until then a piece written here is one that check may have read
+    // short and fails after it is had: a session fetches none while it
+    // checks. The wait is on the torrent's own state, with nothing held.
+    let checking = service.inner.live.lock().await[&job_id]
+        .attached
+        .as_ref()
+        .map(|attached| Arc::clone(&attached.handle));
+    if let Some(checking) = checking {
+        // A check that is paused never ends: said, rather than waited on
+        // for good.
+        assert!(
+            !(checking.is_paused()
+                && matches!(
+                    checking.stats().state,
+                    weaver_torrent::TorrentStatsState::Initializing { .. }
+                )),
+            "the torrent is paused in its check, which will not end: its pieces cannot be fetched here"
+        );
+        // One that ended in error checks nothing.
+        let _ = checking.wait_until_initialized().await;
+    }
     let live = service.inner.live.lock().await;
     let (layout, intake) = {
         let torrent = &live[&job_id];

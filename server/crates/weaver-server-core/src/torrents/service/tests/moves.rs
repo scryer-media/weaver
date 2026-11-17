@@ -560,6 +560,229 @@ async fn a_move_onto_a_file_already_there_keeps_it_and_checks_again() {
     rig.service.stop().await;
 }
 
+// The seeding torrent of `a_move_onto_a_file_already_there_keeps_it_and_checks_again`
+// and the folder where someone else's `a.bin` is.
+async fn seeding_beside_a_taken_name() -> (Rig, JobId, Vec<u8>, PathBuf, PathBuf) {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), &data).unwrap();
+    let (job_id, _, _) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let taken = rig.dir.path().join("taken");
+    std::fs::create_dir_all(&taken).unwrap();
+    std::fs::write(taken.join("a.bin"), b"theirs").unwrap();
+    (rig, job_id, data, save, taken)
+}
+
+// A move that will keep a file already at the new place forgets the
+// torrent's pieces before it moves anything (libtorrent
+// `torrent::force_recheck`: every connection closed, no piece had), so no
+// peer is served the kept file's bytes as the torrent's between the move
+// and the check: held right before its first file moves, the torrent is in
+// no run and has no piece, with both files still as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_that_will_keep_a_file_forgets_the_pieces_before_it_moves() {
+    let (rig, job_id, data, save, taken) = seeding_beside_a_taken_name().await;
+    let handle = handle_of(&rig.service, job_id).await;
+    assert!(handle.live().is_some(), "it does not run");
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *locked(&crate::torrents::service::MOVE_FORGOT_HOLD) = Some((reached_tx, released));
+    let moving = {
+        let service = rig.service.clone();
+        let to = taken.to_string_lossy().into_owned();
+        tokio::spawn(async move { service.set_location(job_id, to).await })
+    };
+    reached.await.unwrap();
+    assert!(handle.live().is_none(), "it still runs, and serves");
+    let stats = handle.stats();
+    assert!(
+        matches!(
+            stats.state,
+            weaver_torrent::TorrentStatsState::Initializing { .. }
+        ),
+        "{:?}",
+        stats.state
+    );
+    assert_eq!(stats.progress_bytes, 0, "it still has pieces");
+    // The move owns the torrent's check until it ends.
+    assert_eq!(
+        rig.service.recheck(job_id).await,
+        Err(ActionError::Invalid(
+            "the torrent is already moving".to_owned()
+        ))
+    );
+    assert_eq!(std::fs::read(taken.join("a.bin")).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+
+    release.send(()).unwrap();
+    moving.await.unwrap().unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.have_bytes, view.state != TorrentState::CheckingFiles),
+        (0, true)
+    );
+    rig.service.stop().await;
+}
+
+// A move that forgot the torrent's pieces and then failed leaves its files
+// where they were, and they are checked there: the torrent has every piece
+// again, and runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_move_that_forgot_the_pieces_checks_them_where_they_stayed() {
+    let (rig, job_id, data, save, taken) = seeding_beside_a_taken_name().await;
+    crate::torrents::service::MOVE_RECORD_FAILS.store(true, Ordering::Release);
+    rig.service
+        .set_location(job_id, taken.to_string_lossy().into_owned())
+        .await
+        .unwrap_err();
+    assert_eq!(std::fs::read(taken.join("a.bin")).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        stored.files_dir.as_deref(),
+        Some(save.to_string_lossy().as_ref())
+    );
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.stats().progress_bytes, data.len() as u64);
+    assert!(handle.live().is_some(), "it does not run again");
+    rig.service.stop().await;
+}
+
+// A move held once it is over, before the torrent is checked again: the
+// held move, and what lets it go on.
+struct HeldMove {
+    moving: tokio::task::JoinHandle<Result<(), ActionError>>,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+async fn move_held_before_its_check(rig: &Rig, job_id: JobId, to: &Path) -> HeldMove {
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *locked(&crate::torrents::service::MOVE_CHECK_HOLD) = Some((reached_tx, released));
+    let moving = {
+        let service = rig.service.clone();
+        let to = to.to_string_lossy().into_owned();
+        tokio::spawn(async move { service.set_location(job_id, to).await })
+    };
+    reached.await.unwrap();
+    HeldMove { moving, release }
+}
+
+// The seed still runs with every piece had, and a peer that asks it for a
+// block is served none: the read its upload makes is refused, which ends
+// that peer's connection with the block unsent
+// (`peer_connection` `a_block_that_fails_to_read_ends_the_connection_after_the_frames_before_it`).
+async fn runs_and_serves_nothing(rig: &Rig, job_id: JobId, whole: usize) {
+    let handle = handle_of(&rig.service, job_id).await;
+    assert!(handle.live().is_some(), "it does not run");
+    assert_eq!(handle.stats().progress_bytes, whole as u64);
+    let refused = upload_read(&rig.service, job_id).await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("not read until"),
+        "{refused:#}"
+    );
+}
+
+// The bytes of someone else's file, as long as the torrent's own and unlike
+// it everywhere: nothing but the store stands between them and a peer.
+fn strangers(data: &[u8]) -> Vec<u8> {
+    data.iter().map(|byte| !byte).collect()
+}
+
+// Seed only verified data. A seed's move that failed after its file moved,
+// its pieces not forgotten since nothing was at the new place, finds
+// someone else's file at the name its own left: that file stays, and the
+// torrent's files are read from the old place again. Until the torrent's
+// pieces are forgotten no peer is served a byte of that file: every read
+// is refused. The check that follows has none of its pieces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_move_that_left_a_strangers_file_serves_none_of_it() {
+    let (rig, job_id, data, save, _) = seeding_beside_a_taken_name().await;
+    let free = rig.dir.path().join("free");
+    assert_eq!(
+        upload_read(&rig.service, job_id).await.unwrap(),
+        data[..16_384],
+        "a peer is served its blocks before the move"
+    );
+    let theirs = strangers(&data);
+    {
+        let (at, theirs) = (save.join("a.bin"), theirs.clone());
+        *locked(&crate::torrents::service::MOVE_RECORD_MEETS) =
+            Some(Box::new(move || std::fs::write(at, theirs).unwrap()));
+    }
+    crate::torrents::service::MOVE_RECORD_FAILS.store(true, Ordering::Release);
+    let held = move_held_before_its_check(&rig, job_id, &free).await;
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), theirs);
+    assert_eq!(std::fs::read(free.join("a.bin")).unwrap(), data);
+    runs_and_serves_nothing(&rig, job_id, data.len()).await;
+
+    held.release.send(()).unwrap();
+    held.moving.await.unwrap().unwrap_err();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.stats().progress_bytes, 0);
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    assert!(!store.files().is_shut(), "its files are read again");
+    assert_eq!(store.files().dir(), save);
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), theirs);
+    rig.service.stop().await;
+}
+
+// Seed only verified data. A file that appears at a seed's new place after
+// the move looked there and before its own file moves is kept, and the
+// torrent's files are read from the new place, where that name is someone
+// else's. The torrent's pieces were not forgotten for the move: until they
+// are, no peer is served a byte of the kept file. The check that follows
+// has none of its pieces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_that_appears_where_a_seed_moves_is_served_to_no_peer() {
+    let (rig, job_id, data, save, _) = seeding_beside_a_taken_name().await;
+    let free = rig.dir.path().join("free");
+    std::fs::create_dir_all(&free).unwrap();
+    let theirs = strangers(&data);
+    {
+        let (at, theirs) = (free.join("a.bin"), theirs.clone());
+        *locked(&crate::torrents::service::MOVE_BEGIN_MEETS) =
+            Some(Box::new(move || std::fs::write(at, theirs).unwrap()));
+    }
+    let held = move_held_before_its_check(&rig, job_id, &free).await;
+    assert_eq!(std::fs::read(free.join("a.bin")).unwrap(), theirs);
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    assert_eq!(store.files().dir(), free, "read from the new place");
+    runs_and_serves_nothing(&rig, job_id, data.len()).await;
+
+    held.release.send(()).unwrap();
+    held.moving.await.unwrap().unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.stats().progress_bytes, 0);
+    assert!(!store.files().is_shut(), "its files are read again");
+    assert_eq!(std::fs::read(free.join("a.bin")).unwrap(), theirs);
+    rig.service.stop().await;
+}
+
 // qBittorrent `TorrentImpl::handleTorrentFinished`: a torrent laid out with
 // no folder of its own that downloaded under its download path moves under
 // its save path once complete, over a file of the same name already there

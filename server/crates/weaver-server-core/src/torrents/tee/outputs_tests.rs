@@ -56,7 +56,7 @@ fn outputs_are_placed_as_the_scans_found_them() {
         &listed.iter().cloned().collect(),
         &spent.iter().cloned().collect(),
         &[],
-        crate::runtime::fs::move_file_exclusive,
+        |from, to| crate::runtime::fs::JobMoves::of(1).move_file(from, to),
     );
     assert!(placed.failed.is_none());
     assert_eq!(expected.len(), 1_200);

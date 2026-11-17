@@ -79,11 +79,11 @@ use intake::client_of;
 pub use intake::{AddError, AddRequest, AddSource, Placement};
 use live::{Live, Timed};
 #[cfg(test)]
-pub(in crate::torrents) use moves::move_listed;
+pub(in crate::torrents) use moves::{Listed, Moved, NotMoved, move_listed};
 use queue::QueueEnd;
 pub(crate) use retire::{ListedRemoval, LiveHeld, finish_retiring, remove_history_files};
 #[cfg(test)]
-pub(in crate::torrents) use retire::{delete_written, deletion};
+pub(in crate::torrents) use retire::{delete_written, deletion, listed_files};
 pub use settings::{
     DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEX, Presence, RATIO_GOAL, SCOPE,
     SEED_TIME_COUNTING, SEED_TIME_GOAL, SEEDING_ACTION, SEEDING_MODE, ScheduleSeeding,
@@ -1241,6 +1241,23 @@ pub(crate) static MOVE_HOLD: Mutex<
     )>,
 > = Mutex::new(None);
 
+// Test seam: the write that ends a failed move of placed files, of what the
+// torrent made as the move left it, is refused once.
+#[cfg(test)]
+pub(crate) static MOVE_UNDO_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: holds a move of placed files that forgot the torrent's pieces,
+// before any file moves, until the test lets it go, saying first that it has
+// reached that point.
+#[cfg(test)]
+pub(crate) static MOVE_FORGOT_HOLD: Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = Mutex::new(None);
+
 // Test seam: run with the name each of a torrent's unpacked files is about
 // to move to, the look having found it free, right before the move.
 #[cfg(test)]
@@ -1258,6 +1275,39 @@ pub(crate) static PLACE_PANICS: std::sync::atomic::AtomicBool =
 // refused.
 #[cfg(test)]
 pub(crate) static KEEP_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: run once a move of a torrent's placed files has moved them,
+// right before the write of the move to its row.
+#[cfg(test)]
+pub(crate) static MOVE_RECORD_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+// Test seam: run as a move of a torrent's placed files begins, after its
+// look at the new place and before any file moves.
+#[cfg(test)]
+pub(crate) static MOVE_BEGIN_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+// Test seam: the next move of a torrent's placed files ends as a crash
+// would end it, its files moved and its row not written.
+#[cfg(test)]
+pub(crate) static MOVE_RECORD_DIES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: holds a move of placed files that will check the torrent
+// again, once the move is over and before any piece is forgotten, until the
+// test lets it go, saying first that it has reached that point.
+#[cfg(test)]
+pub(crate) static MOVE_CHECK_HOLD: Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = Mutex::new(None);
+
+// Test seam: the next write of a move of a torrent's placed files to its
+// row is refused.
+#[cfg(test)]
+pub(crate) static MOVE_RECORD_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: a write of what a torrent holds is refused, 1 once its files

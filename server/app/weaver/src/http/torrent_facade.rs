@@ -2611,13 +2611,22 @@ async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> 
             }
         }
     }
-    // A place the caller may not save at is refused before any URL is
-    // fetched, by the owner the add itself asks
-    // (`TorrentService::may_add_at`): a refused add reaches no host.
+    // An add the service would refuse before it reads the torrent is
+    // refused before any URL is fetched, by the owner the add itself asks
+    // (`TorrentService::may_add_at`): a refused add reaches no host. It is
+    // answered as the add answers it: a place the caller may not save at is
+    // forbidden, and any other refusal fails every torrent of the request.
     let placement = placement(&params);
-    if let Err(AddError::Forbidden(_)) = torrents.may_add_at(scope, category.as_deref(), &placement)
-    {
-        return forbidden();
+    match torrents.may_add_at(scope, category.as_deref(), &placement) {
+        Ok(()) => {}
+        Err(AddError::Forbidden(_)) => return forbidden(),
+        Err(AddError::State(error)) => return internal(error),
+        Err(refused) => {
+            let failed = sources.len() + urls.len();
+            if failed > 0 {
+                return ctx.api().added(&[], failed, Some(refused.to_string()));
+            }
+        }
     }
     for line in urls {
         let body = match classify(line.as_bytes()) {

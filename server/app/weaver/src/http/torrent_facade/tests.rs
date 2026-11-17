@@ -2148,6 +2148,25 @@ async fn an_add_refused_for_its_save_folder_fetches_no_url() {
         );
         assert_eq!(reached.load(Ordering::SeqCst), 0, "{form}");
     }
+    // An add the service refuses for anything else it settles before the
+    // torrent is read, here a category that is not there with a place the
+    // key may save at, is answered as the add answers it, and fetches
+    // nothing either.
+    for form in [
+        format!("urls={url}&category=nosuch"),
+        format!(
+            "urls={url}&category=nosuch&savepath={}",
+            path(&complete.join("shows"))
+        ),
+    ] {
+        let refused = rig.post_as("/api/v2/torrents/add", &form, CONTROLLER).await;
+        assert_eq!(
+            (refused.status, refused.body.as_str()),
+            (StatusCode::CONFLICT, "no category nosuch"),
+            "{form}"
+        );
+        assert_eq!(reached.load(Ordering::SeqCst), 0, "{form}");
+    }
     assert!(rig.torrents().await.is_empty());
 
     let added = rig

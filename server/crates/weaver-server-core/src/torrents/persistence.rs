@@ -1525,6 +1525,95 @@ impl Database {
         })
     }
 
+    // What a torrent's row says the torrent made, written whole in one
+    // statement: `outputs`, the files unpacking placed, and `adopted`, what
+    // was there before the torrent (None for not known). A move of its
+    // placed files writes it before any file moves, to no output and every
+    // file adopted, so a move that stops midway leaves a row that names no
+    // file as the torrent's to delete; and again when a move fails, with
+    // what the move left as it was. False when the torrent has no row.
+    pub(crate) fn set_torrent_made(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+        adopted: Option<&super::model::Adopted>,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(stored_list(outputs)?),
+            SqlArg::OptText(adopted.map(adopted_text).transpose()?.flatten()),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET outputs = {}, adopted = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // A move of a torrent's placed files, recorded whole: the folder its
+    // files are in and its save path are `to`; `outputs` are the files
+    // unpacking placed, under the names the move left them at; `adopted`
+    // is what was there before the torrent with the files the move found
+    // at `to` and kept, None when it is not known; and `held` is what the
+    // torrent holds from now on, in place of what it held. One transaction,
+    // so a restart never finds the new folder beside the names of the old
+    // one.
+    pub(crate) fn record_torrent_files_move(
+        &self,
+        job_id: JobId,
+        to: &str,
+        outputs: &[String],
+        adopted: Option<&super::model::Adopted>,
+        held: &[String],
+    ) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let to = to.to_owned();
+        let outputs = stored_list(outputs)?;
+        let adopted = adopted.map(adopted_text).transpose()?.flatten();
+        let held = held.to_vec();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "record_torrent_files_move", |tx| {
+                let (to, outputs, adopted, held) =
+                    (to.clone(), outputs.clone(), adopted.clone(), held.clone());
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE torrents SET files_dir = {}, save_path = {}, outputs = {}, \
+                             adopted = {}, held_set = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(Some(to.clone())),
+                                SqlArg::OptText(Some(to)),
+                                SqlArg::OptText(outputs),
+                                SqlArg::OptText(adopted),
+                                SqlArg::Bool(true),
+                                SqlArg::I64(id),
+                            ],
+                        )
+                        .await?;
+                    if changed == 0 {
+                        return Err(StateError::Database(
+                            "the torrent has no row to record its move on".to_owned(),
+                        ));
+                    }
+                    tx.execute(
+                        "DELETE FROM torrent_held_paths WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_held_tx(tx, id, &held).await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
     // The row's outputs with `outputs` added and `unplaced` taken out, as
     // the row keeps them.
     fn outputs_with(

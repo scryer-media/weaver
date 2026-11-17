@@ -13,7 +13,7 @@ mod e2e_dht_pause;
 mod e2e_initial_have;
 mod e2e_mse;
 mod e2e_outgoing_utp;
-mod e2e_pause;
+pub(crate) mod e2e_pause;
 mod e2e_peers;
 mod e2e_piece_priority;
 mod e2e_ratelimits;

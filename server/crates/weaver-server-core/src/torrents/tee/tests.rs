@@ -618,7 +618,11 @@ mod numbered_outputs {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::super::{GOES, Placed, place_outputs, walk};
-    use crate::runtime::fs::move_file_exclusive;
+
+    // The product's move, as one job's.
+    fn move_file_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+        crate::runtime::fs::JobMoves::of(1).move_file(from, to)
+    }
 
     fn place(work: &Path, dir: &Path, kept: &[&str]) -> Placed {
         place_using(work, dir, kept, &[], move_file_exclusive)
@@ -814,7 +818,9 @@ mod numbered_outputs {
         let placed = place(&work, &dir, &[]);
         assert_eq!(names(&placed), ["movie.mkv", "subs.srt"]);
         std::fs::write(work.join("subs.srt"), b"made since").unwrap();
-        assert_eq!(placed.put_back(move_file_exclusive), ["subs.srt"]);
+        let stayed = placed.put_back(move_file_exclusive);
+        assert_eq!(stayed.len(), 1);
+        assert_eq!(stayed[0].1, "subs.srt");
         assert_eq!(std::fs::read(work.join("movie.mkv")).unwrap(), b"unpacked");
         assert_eq!(std::fs::read(work.join("subs.srt")).unwrap(), b"made since");
         assert_eq!(on_disk(&dir), ["subs.srt"]);

@@ -11,6 +11,7 @@ use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::model::JobStatus;
 use crate::post_processing::model::QueueEvent;
+use crate::runtime::fs::JobMoves;
 use crate::runtime::panic_trap::JobScope;
 use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::model::HistoryEnd;
@@ -145,7 +146,10 @@ impl TorrentService {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not read the files a torrent placed before");
                 Vec::new()
             });
-            let placed = place_outputs(tee.work(), &dir, &listed, &spent, &kept, move_output);
+            let moves = JobMoves::of(job_id.0);
+            let placed = place_outputs(tee.work(), &dir, &listed, &spent, &kept, |from, to| {
+                move_output(&moves, from, to)
+            });
             #[cfg(test)]
             assert!(
                 !PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
@@ -191,7 +195,12 @@ impl TorrentService {
         if let Err(error) = recorded {
             let gone = placed.gone.clone();
             let there = tokio::task::spawn_blocking(move || {
-                placed.put_back(crate::runtime::fs::move_file_exclusive)
+                let moves = JobMoves::of(job_id.0);
+                placed
+                    .put_back(|from, to| moves.move_file(from, to))
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .collect()
             })
             .await
             .unwrap_or_default();
@@ -425,12 +434,12 @@ pub(super) enum Placing {
 }
 
 // The move every output is placed by: never over what is there.
-fn move_output(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(super) fn move_output(moves: &JobMoves, from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(meets) = locked(&OUTPUT_MEETS).as_mut() {
         meets(to);
     }
-    crate::runtime::fs::move_file_exclusive(from, to)
+    moves.move_file(from, to)
 }
 
 // What a torrent holds for the outputs `names` under `dir`: each one's top

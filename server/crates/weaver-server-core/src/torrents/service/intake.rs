@@ -375,22 +375,57 @@ impl TorrentService {
         self.add_as(CallerScope::Local, request).await
     }
 
-    /// Whether `caller` may add a torrent of `category` at `placement`, as
-    /// [`Self::add_as`] decides it, a path that is not absolute resolved
-    /// first: asked before anything is fetched for the add. A category that
-    /// is not there is the add's to refuse, and its paths are checked here
-    /// as those of a torrent with no category.
+    /// Whether `caller` may add a torrent of `category` at `placement`:
+    /// the answer [`Self::add_as`] gives before it looks at the torrent
+    /// itself, from the same owner (`admitted`). Asked before anything is
+    /// fetched for the add, so an add that would be refused for torrents
+    /// being off, for a category that is not there, for a folder that does
+    /// not resolve or for a place the caller may not save at reaches no
+    /// host.
     pub fn may_add_at(
         &self,
         caller: CallerScope,
         category: Option<&str>,
         placement: &Placement,
     ) -> Result<(), AddError> {
+        self.admitted(caller, category, placement).map(|_| ())
+    }
+
+    // What every add settles before its source is read: torrents take new
+    // ones, its paths, made absolute, are ones `caller` may save at
+    // (`placement_as`), and its category is there. The one owner of those
+    // answers, for the add and for `may_add_at`.
+    fn admitted(
+        &self,
+        caller: CallerScope,
+        category: Option<&str>,
+        placement: &Placement,
+    ) -> Result<(TorrentSettings, Option<CategoryConfig>, Placement), AddError> {
+        // Off, a wind-down's sessions open included: no torrent is new.
         let settings = self.settings();
-        let category = category
-            .filter(|name| !name.trim().is_empty())
-            .and_then(|name| resolve_category_config(&settings.categories, name));
-        placement_as(caller, &settings, category, placement).map(|_| ())
+        if !self.takes_new() {
+            return Err(AddError::Off);
+        }
+        let category = match category.filter(|name| !name.trim().is_empty()) {
+            Some(name) => match resolve_category_config(&settings.categories, name) {
+                Some(category) => Some(category.clone()),
+                None => {
+                    // A place the caller may not save at is refused as that
+                    // first, as it is with a category that is there: the
+                    // answer to a caller held to the save folders does not
+                    // turn on whether the category exists.
+                    if let Err(refused @ AddError::Forbidden(_)) =
+                        placement_as(caller, &settings, None, placement)
+                    {
+                        return Err(refused);
+                    }
+                    return Err(AddError::Invalid(format!("no category {name}")));
+                }
+            },
+            None => None,
+        };
+        let placement = placement_as(caller, &settings, category.as_ref(), placement)?;
+        Ok((settings, category, placement))
     }
 
     /// Add the torrent `request` names for `caller`, who must be allowed
@@ -400,25 +435,10 @@ impl TorrentService {
         caller: CallerScope,
         request: AddRequest,
     ) -> Result<JobId, AddError> {
-        // Off, a wind-down's sessions open included: no torrent is new.
-        let settings = self.settings();
-        if !self.takes_new() {
-            return Err(AddError::Off);
-        }
-        let category = match request
-            .category
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-        {
-            Some(name) => Some(
-                resolve_category_config(&settings.categories, name)
-                    .cloned()
-                    .ok_or_else(|| AddError::Invalid(format!("no category {name}")))?,
-            ),
-            None => None,
-        };
         let mut request = request;
-        request.placement = placement_as(caller, &settings, category.as_ref(), &request.placement)?;
+        let (settings, category, placement) =
+            self.admitted(caller, request.category.as_deref(), &request.placement)?;
+        request.placement = placement;
         match request.source.clone() {
             AddSource::Metainfo(bytes) => {
                 let bytes = Bytes::from(bytes);
