@@ -80,6 +80,7 @@ async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
         ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap(),
     );
     let service = SpeedTestService::new(handle.clone(), config.clone(), db.clone(), true);
+    service.set_torrent_availability(crate::torrents::TorrentAvailability::AVAILABLE);
     // A clock no one moves: no run ends on its maximum duration or a wait's
     // time, only on what the test checks.
     service.run_clock_for_tests(super::HandClock::new().clock());
@@ -1897,6 +1898,26 @@ async fn a_torrent_run_is_refused_as_off_on_a_server_without_torrents() {
         .set_torrent_availability(crate::torrents::TorrentAvailability::UNAVAILABLE);
     assert_eq!(
         rig.service
+            .start(torrent_request(rig.loopback))
+            .await
+            .unwrap_err(),
+        SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestTorrentsOff)
+    );
+}
+
+// A service the server has not told of its torrents has none.
+#[tokio::test]
+async fn a_service_not_told_of_torrents_refuses_a_torrent_run() {
+    let rig = rig().await;
+    rig.config.write().await.torrent.enabled = true;
+    let service = SpeedTestService::new(
+        rig.handle.clone(),
+        rig.config.clone(),
+        Database::open_in_memory().unwrap(),
+        true,
+    );
+    assert_eq!(
+        service
             .start(torrent_request(rig.loopback))
             .await
             .unwrap_err(),

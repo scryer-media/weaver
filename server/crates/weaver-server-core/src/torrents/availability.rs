@@ -28,6 +28,11 @@ pub const TORRENTS_ENV: &str = "WEAVER_TORRENTS";
 /// The refusal of turning torrents on while they are unavailable.
 pub const TORRENTS_UNAVAILABLE: &str = "torrents are not available on this server: set the environment variable WEAVER_TORRENTS=1 and restart Weaver, then turn them on";
 
+/// The refusal of a torrent handed to a server that has none: by an upload,
+/// a watch folder, a feed or the API. It names the variable, since no switch
+/// the operator can see turns them on.
+pub const TORRENT_ADD_UNAVAILABLE: &str = "torrents are not available on this server: set the environment variable WEAVER_TORRENTS=1 and restart Weaver";
+
 /// Whether this run of the server has torrents at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TorrentAvailability(bool);
@@ -66,9 +71,21 @@ impl TorrentAvailability {
         self.0 && enabled
     }
 
+    /// Whether a test may run a torrent over a route, in a speed test or a
+    /// path test: refused, as a speed test's is while the settings turn
+    /// torrents off, on a server without torrents.
+    pub fn may_test(self) -> Result<(), crate::proxies::NetworkRefusal> {
+        if self.0 {
+            Ok(())
+        } else {
+            Err(crate::proxies::NetworkRefusal::SpeedTestTorrentsOff)
+        }
+    }
+
     /// Seat the torrent class of an unavailable server in `queue`: every
-    /// intake's torrent is refused as it is while the settings turn
-    /// torrents off. Nothing is seated while torrents are available; the
+    /// intake's torrent is refused by the variable's name, and held or
+    /// tried again exactly as one is while the settings turn torrents off.
+    /// Nothing is seated while torrents are available; the
     /// client seats itself once it runs.
     pub fn seat(self, queue: &SchedulerHandle) {
         if !self.0 {
@@ -78,8 +95,8 @@ impl TorrentAvailability {
 
     /// The torrent client of this run: what `start` builds while torrents
     /// are available. Unavailable, `start` is never called, so nothing of
-    /// the client opens, listens or loads, and `queue` refuses a torrent as
-    /// it does while the settings turn torrents off.
+    /// the client opens, listens or loads, and `queue` refuses a torrent by
+    /// the variable's name.
     pub async fn client<T, F>(self, queue: &SchedulerHandle, start: impl FnOnce() -> F) -> Option<T>
     where
         F: Future<Output = Option<T>>,
@@ -94,13 +111,13 @@ impl TorrentAvailability {
 }
 
 // The torrents of a server that has none: no job is theirs, and an add is
-// refused as it is while torrents are off.
+// refused in words that name the variable.
 struct Unavailable;
 
-fn off() -> AddRefusal {
+fn unavailable() -> AddRefusal {
     AddRefusal {
-        reason: RefusalReason::Off,
-        text: super::status::TORRENTS_OFF.to_owned(),
+        reason: RefusalReason::Unavailable,
+        text: TORRENT_ADD_UNAVAILABLE.to_owned(),
     }
 }
 
@@ -128,11 +145,11 @@ impl JobClass for Unavailable {
 #[async_trait::async_trait]
 impl ClassIntake for Unavailable {
     fn takes_new(&self) -> Result<(), AddRefusal> {
-        Err(off())
+        Err(unavailable())
     }
 
     async fn add(&self, _submission: Submission) -> Result<JobId, AddRefusal> {
-        Err(off())
+        Err(unavailable())
     }
 }
 
@@ -179,7 +196,7 @@ mod tests {
     }
 
     // Unavailable, the client is never started and the queue refuses a
-    // torrent as off. Available, it is started and nothing is seated in its
+    // torrent by the variable's name. Available, it is started and nothing is seated in its
     // place.
     #[tokio::test]
     async fn the_client_is_started_only_while_torrents_are_available() {
@@ -194,11 +211,13 @@ mod tests {
         assert_eq!(client, None);
         assert!(!started, "nothing of the client is built");
         let refused = match queue.state().classes().route(&Kind::Metainfo) {
-            Ok(Route::Class(intake)) => intake.takes_new().expect_err("off"),
+            Ok(Route::Class(intake)) => intake.takes_new().expect_err("unavailable"),
             _ => panic!("a torrent goes to the class of a server without torrents"),
         };
-        assert_eq!(refused.reason, RefusalReason::Off);
-        assert_eq!(refused.text, crate::torrents::status::TORRENTS_OFF);
+        assert_eq!(refused.reason, RefusalReason::Unavailable);
+        assert!(refused.transient());
+        assert_eq!(refused.text, TORRENT_ADD_UNAVAILABLE);
+        assert!(refused.text.contains(TORRENTS_ENV));
 
         let queue = self::queue();
         let client = TorrentAvailability::AVAILABLE
@@ -209,27 +228,31 @@ mod tests {
         assert!(queue.state().classes().get(Protocol::Torrent).is_none());
     }
 
-    // An unavailable server's torrent class answers every intake as the
-    // client does while the settings turn torrents off.
+    // An unavailable server's torrent class refuses every intake by the
+    // variable's name, as something to hold, not as a fault of the payload.
     #[tokio::test]
-    async fn an_unavailable_servers_torrent_adds_are_refused_as_off() {
+    async fn an_unavailable_servers_torrent_adds_are_refused_by_the_variables_name() {
         let classes = JobClasses::default();
         classes.seat(Arc::new(Unavailable));
         let Ok(Route::Class(intake)) = classes.route(&Kind::Metainfo) else {
             panic!("a torrent goes to the torrent class");
         };
-        let refused = intake.takes_new().expect_err("off");
-        assert_eq!(refused.reason, RefusalReason::Off);
-        assert_eq!(refused.text, crate::torrents::status::TORRENTS_OFF);
+        let refused = intake.takes_new().expect_err("unavailable");
+        assert_eq!(refused.reason, RefusalReason::Unavailable);
+        assert!(refused.transient());
+        assert_eq!(refused.text, TORRENT_ADD_UNAVAILABLE);
+        assert!(refused.text.contains(TORRENTS_ENV));
         let refused = intake
             .add(Submission::of(
                 Kind::Metainfo,
                 b"d4:infod4:name1:aee".to_vec(),
             ))
             .await
-            .expect_err("off");
-        assert_eq!(refused.reason, RefusalReason::Off);
-        assert_eq!(refused.text, crate::torrents::status::TORRENTS_OFF);
+            .expect_err("unavailable");
+        assert_eq!(refused.reason, RefusalReason::Unavailable);
+        assert!(refused.transient());
+        assert_eq!(refused.text, TORRENT_ADD_UNAVAILABLE);
+        assert!(refused.text.contains(TORRENTS_ENV));
         // No job is its own.
         let class = classes.get(Protocol::Torrent).expect("seated");
         let acted = class.act(vec![(JobId(7), QueueAction::Pause)]).await;

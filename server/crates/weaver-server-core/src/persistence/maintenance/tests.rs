@@ -401,6 +401,15 @@ fn recorded_job_ids_among_matches_the_full_read() {
         protocol: crate::jobs::Protocol::Nzb,
     })
     .unwrap();
+    // A torrent's row records its job as a queue row does, retiring or not.
+    for (job_id, byte) in [(9, 1_u8), (11, 2)] {
+        db.insert_torrent(
+            &crate::torrents::tests::torrent(job_id, Some([byte; 20]), None),
+            &[],
+        )
+        .unwrap();
+    }
+    db.mark_torrents_retiring(&[(JobId(11), false)]).unwrap();
     let asked = (1..=40_002u64).collect::<Vec<_>>();
     let all = db.recorded_job_ids().unwrap();
     let narrowed = asked
@@ -408,7 +417,7 @@ fn recorded_job_ids_among_matches_the_full_read() {
         .copied()
         .filter(|id| all.contains(id))
         .collect::<HashSet<_>>();
-    assert_eq!(narrowed, HashSet::from([7, 40_001]));
+    assert_eq!(narrowed, HashSet::from([7, 9, 11, 40_001]));
     assert_eq!(db.recorded_job_ids_among(&asked).unwrap(), narrowed);
     assert_eq!(
         db.recorded_job_ids_among(&[3, 40_001]).unwrap(),

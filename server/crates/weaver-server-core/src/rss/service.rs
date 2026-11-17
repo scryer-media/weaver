@@ -85,7 +85,7 @@ impl From<AddRefusal> for NotAdded {
     fn from(refusal: AddRefusal) -> Self {
         match refusal.reason {
             RefusalReason::Duplicate(_) | RefusalReason::Removing => Self::Ignored(refusal.text),
-            RefusalReason::Off => Self::Waiting(refusal.text),
+            RefusalReason::Off | RefusalReason::Unavailable => Self::Waiting(refusal.text),
             RefusalReason::NotRunning
             | RefusalReason::NoIntake
             | RefusalReason::Invalid

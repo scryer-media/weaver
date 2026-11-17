@@ -873,6 +873,11 @@ async fn test_via_torrent(
     subject: core::TestSubject,
     target: Option<(String, u16)>,
 ) -> Result<Vec<core::PathTest>> {
+    // A server without torrents runs no test torrent: nothing is fetched,
+    // announced or dialled.
+    ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?
+        .may_test()
+        .map_err(refusal_error)?;
     route.legs.first().ok_or("the route has no leg")?;
     // Tests point the test torrent at a loopback source.
     let source = ctx

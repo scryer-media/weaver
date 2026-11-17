@@ -607,6 +607,7 @@ pub(crate) async fn run(
         disk_space: storage_capacity,
         restart: restart_controller.clone(),
         torrents: torrents.clone(),
+        torrent_availability,
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
     // Start-up housekeeping nothing serving a request waits on runs once the

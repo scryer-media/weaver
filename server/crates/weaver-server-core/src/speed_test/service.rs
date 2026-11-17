@@ -158,7 +158,7 @@ impl SpeedTestService {
             inner: Arc::new(ServiceInner {
                 handle,
                 torrents: Mutex::new(None),
-                torrents_available: AtomicBool::new(true),
+                torrents_available: AtomicBool::new(false),
                 config,
                 db,
                 allow_private_network,
@@ -179,8 +179,9 @@ impl SpeedTestService {
         }
     }
 
-    /// Whether this run of the server has torrents at all; they are taken
-    /// to be available until told otherwise.
+    /// Whether this run of the server has torrents at all. A service not
+    /// told has none: every torrent run is refused until the server says
+    /// its torrents are available.
     pub fn set_torrent_availability(&self, availability: crate::torrents::TorrentAvailability) {
         self.inner
             .torrents_available

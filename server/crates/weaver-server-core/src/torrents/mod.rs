@@ -23,7 +23,9 @@ pub(crate) mod store;
 pub(crate) mod tee;
 pub(crate) mod writes;
 
-pub use availability::{TORRENTS_ENV, TORRENTS_UNAVAILABLE, TorrentAvailability};
+pub use availability::{
+    TORRENT_ADD_UNAVAILABLE, TORRENTS_ENV, TORRENTS_UNAVAILABLE, TorrentAvailability,
+};
 pub use model::{
     ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentFile, TorrentInsert,
     TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
@@ -50,4 +52,4 @@ pub(crate) fn live_among(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

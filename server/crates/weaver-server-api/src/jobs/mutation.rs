@@ -1761,7 +1761,9 @@ pub(crate) fn add_refusal_error(protocol: Protocol, refusal: AddRefusal) -> asyn
         RefusalReason::Duplicate(_) => "DUPLICATE",
         RefusalReason::NoNetwork => "NO_NETWORK",
         RefusalReason::State => "INTERNAL",
-        RefusalReason::Off | RefusalReason::NotRunning => protocol.names().disabled_code,
+        RefusalReason::Off | RefusalReason::Unavailable | RefusalReason::NotRunning => {
+            protocol.names().disabled_code
+        }
     };
     graphql_error(code, refusal.text)
 }
