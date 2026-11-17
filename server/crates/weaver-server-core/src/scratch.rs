@@ -515,6 +515,37 @@ impl Lease {
     pub(crate) fn len(&self) -> usize {
         self.mapping.as_ref().map_or(0, sys::Mapping::len)
     }
+
+    // The lease's bytes, to fill.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        let len = self.len();
+        if len == 0 {
+            return &mut [];
+        }
+        let ptr = self.as_mut_ptr();
+        // SAFETY: the mapping is `len` readable and writable bytes that stay
+        // mapped while `self` lives, and the `&mut self` borrow makes this
+        // slice the only access to them for its lifetime.
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    }
+}
+
+// A lease read as bytes, as a lease filled and then handed on is: the
+// bytes stay leased until the last reader of them lets go.
+impl AsRef<[u8]> for Lease {
+    fn as_ref(&self) -> &[u8] {
+        let len = self.len();
+        let Some(mapping) = self.mapping.as_ref() else {
+            return &[];
+        };
+        if len == 0 {
+            return &[];
+        }
+        // SAFETY: the mapping is `len` readable bytes that stay mapped while
+        // `self` lives; the `&self` borrow allows no `as_mut_slice` while the
+        // slice is read.
+        unsafe { std::slice::from_raw_parts(mapping.ptr(), len) }
+    }
 }
 
 // For the tests of leases that are mapped.
@@ -522,15 +553,6 @@ impl Lease {
 impl Lease {
     pub(crate) fn path(&self) -> &Path {
         &self.path
-    }
-
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        let len = self.len();
-        let ptr = self.as_mut_ptr();
-        // SAFETY: the mapping is `len` readable and writable bytes that stay
-        // mapped while `self` lives, and the `&mut self` borrow makes this
-        // slice the only access to them for its lifetime.
-        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 }
 

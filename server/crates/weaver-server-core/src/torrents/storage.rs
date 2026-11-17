@@ -15,6 +15,16 @@
 // piece the budget or the volume has no room for is refused, and the session
 // waits for the room this storage, or the volume's writer, rings when it
 // lets bytes go.
+//
+// A torrent whose piece is larger than the whole resident budget could
+// never hold one, and is written block by block instead, as libtorrent
+// writes every piece: each block goes to the volume's writer as it
+// arrives, the piece is hashed back from its files on the volume's read
+// turns, and a piece that fails is fetched again. The choice is made once,
+// as the storage's maker is made, from the piece's length and the budget
+// then; nothing records it. Such a piece holds a small, fixed room while it
+// arrives (`Pieces::block_room`), its blocks are written one at a time, and
+// its bytes are counted on its volume as each block's write fits.
 
 use std::collections::HashMap;
 use std::io::IoSlice;
@@ -60,6 +70,36 @@ pub(crate) trait Pieces: Send + Sync {
     }
     // The session's run ended: what is queued to be written is given up.
     fn stop_writes(&self) {}
+    // A block of a piece too large to hold, written as it arrives: `bytes`
+    // at `offset` of `file`, `at` bytes into piece `piece`. Written before
+    // this returns, on a thread that may wait on a disk.
+    fn write_block(
+        &self,
+        piece: u32,
+        _file: usize,
+        _offset: u64,
+        _at: u64,
+        _bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        bail!("piece {piece} is written block by block where only whole pieces are stored")
+    }
+    // A piece written block by block verified, every block of it on disk:
+    // it is had once this returns. `room` is what it held while it
+    // arrived, given back once nothing reads the piece back for it.
+    fn sealed(self: Arc<Self>, _piece: u32, room: HeldRoom) -> anyhow::Result<()> {
+        drop(room);
+        Ok(())
+    }
+    // Whether its pieces are written block by block, when it decided so
+    // itself as it was made: none leaves it to the storage.
+    fn writes_blocks(&self) -> Option<bool> {
+        None
+    }
+    // The resident room a piece written block by block holds while it
+    // arrives.
+    fn block_room(&self, piece_length: u64) -> u64 {
+        u64::from(weaver_torrent::core::constants::CHUNK_SIZE).min(piece_length)
+    }
     // A piece failed its hash, fetched or checked on disk: it is not had.
     // True when it was.
     fn failed(&self, piece: u32) -> anyhow::Result<bool>;
@@ -106,6 +146,10 @@ pub(crate) trait Pieces: Send + Sync {
 enum Flight {
     Writing(Arc<Writing>, Option<Paid>),
     Verified(Bytes),
+    // A piece written block by block: its blocks are on disk as they land,
+    // one at a time under its lock, and it holds the room it was started
+    // with until it verified or failed.
+    Blocks(Arc<Mutex<()>>, u64),
 }
 
 // A piece being written: its blocks land here, and it is hashed here once
@@ -150,6 +194,7 @@ impl Flight {
         match self {
             Self::Writing(writing, _) => copy(&writing.read()),
             Self::Verified(bytes) => copy(bytes),
+            Self::Blocks(..) => false,
         }
     }
 
@@ -157,8 +202,23 @@ impl Flight {
         match self {
             Self::Writing(writing, _) => writing.len as u64,
             Self::Verified(_) => 0,
+            Self::Blocks(_, room) => *room,
         }
     }
+
+    // Whether the piece's bytes are read from memory: a piece written block
+    // by block is read from its files.
+    fn in_memory(&self) -> bool {
+        !matches!(self, Self::Blocks(..))
+    }
+}
+
+// The resident room storages hold now, and the most they held at once.
+#[cfg(test)]
+#[derive(Default, Debug)]
+pub(crate) struct ResidentPeak {
+    pub(crate) now: std::sync::atomic::AtomicU64,
+    pub(crate) peak: std::sync::atomic::AtomicU64,
 }
 
 struct Inner {
@@ -169,14 +229,46 @@ struct Inner {
     holds: Holds,
     // What the session waits on for room, as it last asked.
     room: Mutex<Option<Arc<Notify>>>,
+    // Whether its pieces are written block by block as they arrive.
+    blocks: bool,
+    // The resident room it holds now, and the most it held at once,
+    // shared by every storage one factory made.
+    #[cfg(test)]
+    resident: Arc<ResidentPeak>,
 }
 
 impl Inner {
-    // Room given back: the session waiting on it asks again.
-    fn release(&self, bytes: u64) {
+    // `bytes` of resident room asked for: held when granted.
+    fn reserve(&self, bytes: u64) -> bool {
+        let granted = matches!(
+            self.holds
+                .accountant
+                .reserve_resident(self.holds.namespace, bytes),
+            Reserve::Granted
+        );
+        #[cfg(test)]
+        if granted {
+            use std::sync::atomic::Ordering;
+            let now = self.resident.now.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.resident.peak.fetch_max(now, Ordering::AcqRel);
+        }
+        granted
+    }
+
+    // Room given back unrung: the room was the asker's own.
+    fn unreserve(&self, bytes: u64) {
+        #[cfg(test)]
+        self.resident
+            .now
+            .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
         self.holds
             .accountant
             .release_resident(self.holds.namespace, bytes);
+    }
+
+    // Room given back: the session waiting on it asks again.
+    fn release(&self, bytes: u64) {
+        self.unreserve(bytes);
         if let Some(room) = &*self.room.lock().unwrap_or_else(PoisonError::into_inner) {
             room.notify_waiters();
         }
@@ -207,8 +299,36 @@ pub(crate) struct PieceStorage {
     inner: Arc<Inner>,
 }
 
+// Whether a torrent whose pieces are `piece_length` long writes them block
+// by block: one whole piece would not fit in the resident budget at all.
+pub(crate) fn writes_blocks(piece_length: u64, holds: &Holds) -> bool {
+    piece_length > holds.accountant.budgets().resident_limit
+}
+
 impl PieceStorage {
+    // The storage of `pieces`, choosing its write path as the factory does.
+    #[cfg(test)]
     pub(crate) fn new(layout: Arc<PieceLayout>, pieces: Arc<dyn Pieces>, holds: Holds) -> Self {
+        let blocks = pieces
+            .writes_blocks()
+            .unwrap_or_else(|| writes_blocks(layout.piece_length(), &holds));
+        Self::made(
+            layout,
+            pieces,
+            holds,
+            blocks,
+            #[cfg(test)]
+            Arc::default(),
+        )
+    }
+
+    fn made(
+        layout: Arc<PieceLayout>,
+        pieces: Arc<dyn Pieces>,
+        holds: Holds,
+        blocks: bool,
+        #[cfg(test)] resident: Arc<ResidentPeak>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 layout,
@@ -216,8 +336,20 @@ impl PieceStorage {
                 flight: Mutex::new(HashMap::new()),
                 holds,
                 room: Mutex::new(None),
+                blocks,
+                #[cfg(test)]
+                resident,
             }),
         }
+    }
+
+    // The most resident room it held at once.
+    #[cfg(test)]
+    pub(crate) fn resident_peak(&self) -> u64 {
+        self.inner
+            .resident
+            .peak
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn flight(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Flight>> {
@@ -247,9 +379,24 @@ impl PieceStorage {
     }
 
     // Room for a piece not in memory: its resident room, then its volume's.
+    // A piece written block by block holds its small room alone: its
+    // blocks are counted on the volume as each one's write fits.
     fn start_piece(&self, index: u32, length: u64, room: &Arc<Notify>) -> bool {
-        let holds = &self.inner.holds;
-        if let Reserve::Breached(_) = holds.accountant.reserve_resident(holds.namespace, length) {
+        if self.inner.blocks {
+            let held = self.inner.pieces.block_room(length);
+            if !self.inner.reserve(held) {
+                return false;
+            }
+            let mut flight = self.flight();
+            if flight.contains_key(&index) {
+                drop(flight);
+                self.inner.release(held);
+                return true;
+            }
+            flight.insert(index, Flight::Blocks(Arc::default(), held));
+            return true;
+        }
+        if !self.inner.reserve(length) {
             return false;
         }
         // Then its volume, outside the map's lock: the volume's room is
@@ -260,7 +407,7 @@ impl PieceStorage {
             VolumeRoom::Refused => {
                 // Not rung: the room given back is the session's own, and
                 // the volume's writer rings once it has written enough.
-                holds.accountant.release_resident(holds.namespace, length);
+                self.inner.unreserve(length);
                 return false;
             }
         };
@@ -293,6 +440,7 @@ impl TorrentStorage for PieceStorage {
         let (start, piece) = self.place(file_id, offset, buf.len())?;
         if let Some(piece) = piece
             && let Some(held) = self.flight().get(&piece)
+            && held.in_memory()
         {
             let at = (start - self.inner.layout.piece_range(piece).start) as usize;
             if !held.read(at, buf) {
@@ -328,11 +476,9 @@ impl TorrentStorage for PieceStorage {
     // budget as a piece in flight, before it is read; the session waiting
     // for room is rung when it goes back.
     fn hold_whole_piece(&self, bytes: u64) -> Option<HeldRoom> {
-        let holds = &self.inner.holds;
-        match holds.accountant.reserve_resident(holds.namespace, bytes) {
-            Reserve::Granted => Some(HeldRoom::new(bytes, Arc::clone(&self.inner) as _)),
-            Reserve::Breached(_) => None,
-        }
+        self.inner
+            .reserve(bytes)
+            .then(|| HeldRoom::new(bytes, Arc::clone(&self.inner) as _))
     }
 
     // A run of a file's bytes on disk is read in one go; one with any of
@@ -353,7 +499,11 @@ impl TorrentStorage for PieceStorage {
                 let first = start / layout.piece_length();
                 let last = (start + len as u64 - 1) / layout.piece_length();
                 let flight = self.flight();
-                !(first..=last).any(|piece| flight.contains_key(&(piece as u32)))
+                !(first..=last).any(|piece| {
+                    flight
+                        .get(&(piece as u32))
+                        .is_some_and(Flight::in_memory)
+                })
             };
         if !on_disk {
             let mut at = offset;
@@ -379,9 +529,22 @@ impl TorrentStorage for PieceStorage {
         };
         let range = self.inner.layout.piece_range(piece);
         let at = (start - range.start) as usize;
-        let held = match self.flight().get(&piece) {
-            Some(Flight::Writing(writing, _)) => Arc::clone(writing),
+        let landing = match self.flight().get(&piece) {
+            Some(Flight::Writing(writing, _)) => Ok(Arc::clone(writing)),
+            Some(Flight::Blocks(one, _)) => Err(Arc::clone(one)),
             _ => bail!("piece {piece} is written while the session holds no room for it"),
+        };
+        let held = match landing {
+            Ok(writing) => writing,
+            // Outside the map's lock, one block of the piece at a time: the
+            // room it holds is one block's.
+            Err(one) => {
+                let _one = one.lock().unwrap_or_else(PoisonError::into_inner);
+                return self
+                    .inner
+                    .pieces
+                    .write_block(piece, file_id, offset, at as u64, buf);
+            }
         };
         // Outside the map's lock: another piece's blocks land meanwhile.
         let mut bytes = held.write();
@@ -392,9 +555,10 @@ impl TorrentStorage for PieceStorage {
         Ok(())
     }
 
-    // A block is only ever copied into the piece held for it.
+    // A block is only ever copied into the piece held for it, but for a
+    // piece too large to hold, whose blocks go to its files.
     fn writes_to_memory(&self) -> bool {
-        true
+        !self.inner.blocks
     }
 
     fn pwrite_all_vectored(
@@ -446,6 +610,7 @@ impl TorrentStorage for PieceStorage {
                     handed = true;
                     None
                 }
+                Flight::Blocks(..) => None,
             })
             .collect();
         // Outside the map's lock: a piece given up leaves the map as it goes.
@@ -495,8 +660,20 @@ impl TorrentStorage for PieceStorage {
     // The piece goes to the store, and only then does it stop being read
     // from memory, so no read finds it in neither place. Its room is given
     // back first: it is on its way to disk.
+    //
+    // A piece written block by block is on disk already: it is had once the
+    // store says so, and the room it held goes with it to what reads it
+    // back for the tee.
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let index = piece.get();
+        if self.inner.blocks {
+            let room = match self.flight().remove(&index) {
+                Some(entry) => entry.held(),
+                None => bail!("piece {index} completed with nothing written"),
+            };
+            let room = HeldRoom::new(room, Arc::clone(&self.inner) as _);
+            return Arc::clone(&self.inner.pieces).sealed(index, room);
+        }
         let (held, released) = {
             let mut flight = self.flight();
             let Some(entry) = flight.get_mut(&index) else {
@@ -506,6 +683,7 @@ impl TorrentStorage for PieceStorage {
             let held = match std::mem::replace(entry, Flight::Verified(Bytes::new())) {
                 Flight::Writing(writing, _) => Bytes::from(std::mem::take(&mut *writing.write())),
                 Flight::Verified(bytes) => bytes,
+                Flight::Blocks(..) => Bytes::new(),
             };
             *entry = Flight::Verified(held.clone());
             (held, released)
@@ -539,6 +717,11 @@ impl TorrentStorage for PieceStorage {
                         *entry = Flight::Verified(held.clone());
                         (held, None, released)
                     }
+                    // Never handed here: it writes to its files.
+                    Flight::Blocks(one, room) => {
+                        *entry = Flight::Blocks(one, room);
+                        (Bytes::new(), None, 0)
+                    }
                 }
             })
         };
@@ -564,13 +747,14 @@ impl TorrentStorage for PieceStorage {
     }
 
     // A whole piece is hashed where its blocks landed, under its own lock
-    // alone; one already verified, from its bytes.
+    // alone; one already verified, from its bytes; one written block by
+    // block, from its files.
     fn hash_held_piece(&self, piece: ValidPieceIndex, update: &mut dyn FnMut(&[u8])) -> bool {
         // Taken out of the map first, so the hash runs with the map free.
         let held = match self.flight().get(&piece.get()) {
             Some(Flight::Writing(writing, _)) => Ok(Arc::clone(writing)),
             Some(Flight::Verified(bytes)) => Err(bytes.clone()),
-            None => return false,
+            Some(Flight::Blocks(..)) | None => return false,
         };
         let writing = match held {
             Ok(writing) => writing,
@@ -675,19 +859,42 @@ pub(crate) struct PieceStorageFactory {
     layout: Arc<PieceLayout>,
     pieces: Arc<dyn Pieces>,
     holds: Holds,
+    // Whether its pieces are written block by block: chosen here, once,
+    // for every run it makes a storage for.
+    blocks: bool,
+    #[cfg(test)]
+    resident: Arc<ResidentPeak>,
 }
 
 impl PieceStorageFactory {
     pub(crate) fn new(layout: Arc<PieceLayout>, pieces: Arc<dyn Pieces>, holds: Holds) -> Self {
+        let blocks = pieces
+            .writes_blocks()
+            .unwrap_or_else(|| writes_blocks(layout.piece_length(), &holds));
         Self {
             layout,
             pieces,
             holds,
+            blocks,
+            #[cfg(test)]
+            resident: Arc::default(),
         }
     }
 
     pub(crate) fn boxed_factory(self) -> BoxStorageFactory {
         self.boxed()
+    }
+
+    // Whether its pieces are written block by block.
+    #[cfg(test)]
+    pub(crate) fn writes_blocks(&self) -> bool {
+        self.blocks
+    }
+
+    // The most resident room its storages held at once.
+    #[cfg(test)]
+    pub(crate) fn resident_peak(&self) -> Arc<ResidentPeak> {
+        Arc::clone(&self.resident)
     }
 }
 
@@ -699,10 +906,13 @@ impl StorageFactory for PieceStorageFactory {
         _: &ManagedTorrentShared,
         _: &TorrentMetadata,
     ) -> anyhow::Result<PieceStorage> {
-        Ok(PieceStorage::new(
+        Ok(PieceStorage::made(
             Arc::clone(&self.layout),
             Arc::clone(&self.pieces),
             self.holds.clone(),
+            self.blocks,
+            #[cfg(test)]
+            Arc::clone(&self.resident),
         ))
     }
 

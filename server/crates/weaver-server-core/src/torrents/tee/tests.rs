@@ -71,6 +71,7 @@ fn parts(
         limit: 1,
         db: crate::Database::open_in_memory().unwrap(),
         mail: mail.written(),
+        reading: None,
     }
 }
 
@@ -166,7 +167,9 @@ async fn an_archive_share_goes_to_the_job_as_a_view_of_the_hashed_buffer() {
     let held = piece(&layout, &torrent, 1);
     let shares = tee.with(|job| tee.unsettled(job, 1));
     assert_eq!(shares.len(), 1);
-    let decoded = tee.decoded(&shares[0], &held);
+    let at = shares[0].span.at as usize;
+    let len = shares[0].span.range.len() as usize;
+    let decoded = tee.decoded(&shares[0], held.slice(at..at + len));
     assert_eq!(decoded.volume, VolumeIndex(0));
     assert_eq!(decoded.ordinal, 1);
     assert_eq!(decoded.offset, 64);
@@ -607,6 +610,8 @@ async fn a_torrent_unpack_held_for_room_is_woken_when_room_returns() {
     assert!(!outside.waits_for_disk());
     tee.forget();
 }
+
+mod read_back;
 
 // Operator ruling, 2026-11-16 (PR 129 question 10): an unpacked file whose
 // name is taken is placed under a numbered name, never dropped and never
