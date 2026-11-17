@@ -31,6 +31,41 @@
 
 pub mod filesystem;
 
+/// A read the storage refuses because its files changed under the torrent
+/// and are not read until every piece is forgotten
+/// ([`TorrentStorage::on_check_everything`]): what is there may not be the
+/// torrent's own. Not a piece that is missing: a check that meets it ends
+/// there and has every piece checked again, and passes nothing on what it
+/// could not read.
+#[derive(Debug)]
+pub struct FilesShut;
+
+impl std::fmt::Display for FilesShut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the torrent's files are not read until its pieces are checked again")
+    }
+}
+
+impl std::error::Error for FilesShut {}
+
+impl FilesShut {
+    /// The error a read refused for it returns.
+    pub fn refused() -> std::io::Error {
+        std::io::Error::other(Self)
+    }
+
+    /// Whether `err` is a read refused for it.
+    pub fn refused_in(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause.is::<Self>()
+                || cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                    .is_some_and(|inner| inner.is::<Self>())
+        })
+    }
+}
+
 use std::{
     any::{Any, TypeId},
     io::IoSlice,

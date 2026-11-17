@@ -1003,7 +1003,12 @@ fn a_put_back_never_replaces_and_names_what_stayed() {
         "{refused:#}"
     );
     assert!(shim.storage.pread_exact(0, 0, &mut buf).is_err());
-    shim.store.files().let_read();
+    assert!(
+        weaver_torrent::storage::FilesShut::refused_in(&refused),
+        "a check is told the files are shut, not that a piece is missing"
+    );
+    // Whatever has every piece forgotten opens them.
+    shim.storage.on_check_everything().unwrap();
     shim.storage.pread_exact(0, 0, &mut buf).unwrap();
     assert_eq!(buf, torrent[..16]);
 }
@@ -1044,10 +1049,52 @@ fn a_move_that_kept_a_file_unseen_shuts_the_files_until_the_pieces_are_forgotten
             let read = shim.storage.pread_exact(file, 0, &mut buf);
             assert_eq!(read.is_err(), !forgot, "file {file}: {read:?}");
         }
-        shim.store.files().let_read();
+        // Shut files are vouched for by nothing kept for the next run.
+        assert_eq!(shim.store.kept().checking, !forgot);
+        if forgot {
+            continue;
+        }
+        // The one place every piece is forgotten opens them: a recheck,
+        // the start after an error and the move's own check all pass it.
+        assert_eq!(shim.store.count(), 2);
+        shim.storage.on_check_everything().unwrap();
+        assert_eq!(shim.store.count(), 0);
+        assert!(!shim.store.files().is_shut());
         shim.storage.pread_exact(1, 24, &mut buf).unwrap();
         assert_eq!(buf, theirs[24..40], "what is there, read only now");
     }
+}
+
+// A torrent whose files a move left shut joins a session before anything
+// forgot its pieces: it hands that session no piece as had, so the session
+// checks them all, and its files are read by that check.
+#[test]
+fn files_left_shut_join_a_session_with_every_piece_to_check() {
+    let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
+    let torrent = noise(2000, 8);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let moved_dir = tempfile::tempdir().unwrap();
+    let moved = moved_dir.path().to_path_buf();
+    std::fs::write(moved.join("b.bin"), noise(1000, 99)).unwrap();
+    let moving = Listed {
+        job_id: JobId(1),
+        storage: None,
+        outputs: &[],
+        existing: Existing::Keep,
+        to_made: false,
+        forgot: false,
+    };
+    move_listed(&shim.store, moving, moved, |_| Ok(())).unwrap();
+    assert!(shim.store.files().is_shut());
+    assert_eq!(shim.store.count(), 2);
+
+    assert!(shim.store.initial_have(false).is_none());
+    assert_eq!(shim.store.count(), 0, "no piece is had unchecked");
+    assert!(!shim.store.files().is_shut());
+    let mut buf = [0; 16];
+    shim.storage.pread_exact(0, 0, &mut buf).unwrap();
+    assert_eq!(buf, torrent[..16]);
 }
 
 // What was at the new place before a move is told by the move and outlives

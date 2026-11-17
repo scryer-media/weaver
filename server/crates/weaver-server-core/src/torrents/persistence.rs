@@ -1532,26 +1532,47 @@ impl Database {
     // file adopted, so a move that stops midway leaves a row that names no
     // file as the torrent's to delete; and again when a move fails, with
     // what the move left as it was. False when the torrent has no row.
+    //
+    // `checking` is written with it, in the same transaction, as the mark
+    // the saved pieces carry (`Kept::checking`): while it is set the next
+    // start trusts none of them and checks every piece. The write before a
+    // move sets it, so a run that ends mid-move never vouches, at its next
+    // start, for a file the move left at one of the torrent's names; the
+    // write after a failed move says what the store vouches for then.
     pub(crate) fn set_torrent_made(
         &self,
         job_id: JobId,
         outputs: &[String],
         adopted: Option<&super::model::Adopted>,
+        checking: bool,
     ) -> Result<bool, StateError> {
-        let args = vec![
-            SqlArg::OptText(stored_list(outputs)?),
-            SqlArg::OptText(adopted.map(adopted_text).transpose()?.flatten()),
-            SqlArg::I64(stored(job_id.0)?),
-        ];
+        let id = stored(job_id.0)?;
+        let outputs = stored_list(outputs)?;
+        let adopted = adopted.map(adopted_text).transpose()?.flatten();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.write_exec(),
-                "UPDATE torrents SET outputs = {}, adopted = {} WHERE job_id = {}",
-                &args,
-            )
-            .await?;
-            Ok(changed > 0)
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_made", |tx| {
+                let (outputs, adopted) = (outputs.clone(), adopted.clone());
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE torrents SET outputs = {}, adopted = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(outputs),
+                                SqlArg::OptText(adopted),
+                                SqlArg::I64(id),
+                            ],
+                        )
+                        .await?;
+                    tx.execute(
+                        "UPDATE torrent_counters SET pieces_checking = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(checking), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
         })
     }
 
@@ -1562,7 +1583,9 @@ impl Database {
     // at `to` and kept, None when it is not known; and `held` is what the
     // torrent holds from now on, in place of what it held. One transaction,
     // so a restart never finds the new folder beside the names of the old
-    // one.
+    // one. `checking` is the mark the saved pieces carry from then
+    // (`set_torrent_made`): set when the move kept a file at `to`, so a
+    // start that comes before those pieces are forgotten checks them all.
     pub(crate) fn record_torrent_files_move(
         &self,
         job_id: JobId,
@@ -1570,6 +1593,7 @@ impl Database {
         outputs: &[String],
         adopted: Option<&super::model::Adopted>,
         held: &[String],
+        checking: bool,
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
         let to = to.to_owned();
@@ -1601,6 +1625,11 @@ impl Database {
                             "the torrent has no row to record its move on".to_owned(),
                         ));
                     }
+                    tx.execute(
+                        "UPDATE torrent_counters SET pieces_checking = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(checking), SqlArg::I64(id)],
+                    )
+                    .await?;
                     tx.execute(
                         "DELETE FROM torrent_held_paths WHERE job_id = {}",
                         &[SqlArg::I64(id)],

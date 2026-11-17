@@ -970,7 +970,7 @@ mod tests {
     mod checking_in_the_stats {
         use std::path::Path;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         use anyhow::Context;
         use parking_lot::Mutex;
@@ -1154,6 +1154,13 @@ mod tests {
             reading: Mutex<Option<UnboundedSender<()>>>,
             // The bytes read through the door.
             read: AtomicU64,
+            // Every read is refused as of files shut (`FilesShut`), until
+            // every piece is forgotten.
+            refusing: AtomicBool,
+            // The storage cannot forget its pieces.
+            forgets_fail: AtomicBool,
+            // How many times every piece was forgotten.
+            forgotten: AtomicU64,
         }
 
         impl Door {
@@ -1163,6 +1170,9 @@ mod tests {
                     opened: parking_lot::Condvar::new(),
                     reading: Mutex::new(Some(reading)),
                     read: AtomicU64::new(0),
+                    refusing: AtomicBool::new(false),
+                    forgets_fail: AtomicBool::new(false),
+                    forgotten: AtomicU64::new(0),
                 })
             }
 
@@ -1222,10 +1232,24 @@ mod tests {
                 buf: &mut [u8],
             ) -> anyhow::Result<()> {
                 self.door.pass();
+                if self.door.refusing.load(Ordering::Acquire) {
+                    return Err(crate::storage::FilesShut::refused().into());
+                }
                 self.door
                     .read
                     .fetch_add(buf.len() as u64, Ordering::Relaxed);
                 self.inner.pread_exact(file_id, offset, buf)
+            }
+
+            fn on_check_everything(&self) -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    !self.door.forgets_fail.load(Ordering::Acquire),
+                    "the pieces are not forgotten"
+                );
+                self.inner.on_check_everything()?;
+                self.door.refusing.store(false, Ordering::Release);
+                self.door.forgotten.fetch_add(1, Ordering::AcqRel);
+                Ok(())
             }
 
             fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
@@ -1637,6 +1661,181 @@ mod tests {
 
             session.start_check(&handle)?;
             handle.wait_until_initialized().await?;
+            assert_eq!(next(&mut heard).await?, announce(Some("started")));
+            answered(&handle).await?;
+            let queries = tracker.queries.lock().clone();
+            assert_eq!(queries.len(), 1, "{queries:?}");
+            drop(tracker);
+            session.stop().await;
+            Ok(())
+        }
+
+        // The torrent of `a_check_told_to_stop_past_its_last_stop_says_nothing_to_a_tracker`
+        // added to a session with a tracker, its check waiting on its
+        // first read: the session, the torrent, the tracker with what it
+        // heard, and the door.
+        struct Tracked {
+            session: Arc<Session>,
+            handle: Arc<crate::ManagedTorrent>,
+            tracker: crate::tests::e2e_pause::Tracker,
+            heard: tokio::sync::mpsc::UnboundedReceiver<crate::tests::e2e_pause::Heard>,
+            door: Arc<Door>,
+            total: u64,
+            _out: TempDir,
+        }
+
+        async fn checking_with_a_tracker(
+            name: &str,
+            checkpoint: Option<crate::Checkpoint>,
+        ) -> anyhow::Result<Tracked> {
+            let t = TestTorrent::new(name, 8 * 1024, 1024).await?;
+            let out = TempDir::with_prefix(name)?;
+            let (tracker, heard) = crate::tests::e2e_pause::Tracker::start(None);
+            let session = Session::new_with_opts(
+                out.path().into(),
+                crate::tests::e2e_tracker_announces::tracker_session_opts()?,
+            )
+            .await?;
+            let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
+            let door = Door::shut(reading_tx);
+            let storage = ShutStorageFactory {
+                inner: MemoryStorageFactory::holding(vec![t.content.clone()]),
+                door: door.clone(),
+            };
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(storage.clone_box()),
+                        trackers: Some(vec![tracker.url()]),
+                        checkpoint,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            reading.recv().await.context("the check read nothing")?;
+            Ok(Tracked {
+                session,
+                handle,
+                tracker,
+                heard,
+                door,
+                total: 8 * 1024,
+                _out: out,
+            })
+        }
+
+        // A check under way when the torrent's files are shut to reads
+        // (`FilesShut`, as a move that left a file among them that is not
+        // the torrent's own shuts them) does not take the reads it is
+        // refused for pieces that are missing: it ends, every piece is
+        // forgotten, and the torrent does not run with none of them. Its
+        // tracker hears nothing of it. The check that whoever changed the
+        // files then begins reads them, finds every piece, and the tracker
+        // hears the one `started` of the run after it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_check_that_meets_shut_files_ends_and_says_nothing_to_a_tracker()
+        -> anyhow::Result<()> {
+            use crate::tests::e2e_pause::{announce, answered, next};
+            let Tracked {
+                session,
+                handle,
+                tracker,
+                mut heard,
+                door,
+                total,
+                _out,
+            } = checking_with_a_tracker("shut_under_check", None).await?;
+            door.refusing.store(true, Ordering::Release);
+            door.open();
+            while !(door.forgotten.load(Ordering::Acquire) > 0
+                && handle.with_state(|state| {
+                    matches!(state, crate::ManagedTorrentState::Initializing(init) if !init.is_checking())
+                }))
+            {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                handle.tracker_status().is_none(),
+                "the torrent ran on a check that read nothing"
+            );
+            assert!(tracker.queries.lock().is_empty());
+            assert_eq!(door.read.load(Ordering::Relaxed), 0);
+
+            session.forget_for_recheck(&handle).await?;
+            session.start_check(&handle)?;
+            handle.wait_until_initialized().await?;
+            assert_eq!(
+                handle.stats().progress_bytes,
+                total,
+                "a piece was not found"
+            );
+            assert_eq!(next(&mut heard).await?, announce(Some("started")));
+            answered(&handle).await?;
+            let queries = tracker.queries.lock().clone();
+            assert_eq!(queries.len(), 1, "{queries:?}");
+            drop(tracker);
+            session.stop().await;
+            Ok(())
+        }
+
+        // A check ended paused on a stop asked of it past its last place
+        // to stop, for pieces that are then forgotten, and the storage
+        // cannot forget them: the torrent is not left paused with nothing
+        // saying so and nobody to start it. It is in error, with the
+        // reason, and the one who asked is told. Its next start checks
+        // every piece and runs; its tracker hears that run's `started` and
+        // nothing before it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn pieces_that_cannot_be_forgotten_leave_the_torrent_in_error_not_paused()
+        -> anyhow::Result<()> {
+            use crate::tests::e2e_pause::{announce, answered, next};
+            let mut have = crate::BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+            have.set(3, false);
+            let checkpoint = crate::Checkpoint {
+                have,
+                blocks: Some(crate::BF::from_boxed_slice(vec![0xff].into_boxed_slice())),
+                files: None,
+            };
+            let Tracked {
+                session,
+                handle,
+                tracker,
+                mut heard,
+                door,
+                total,
+                _out,
+            } = checking_with_a_tracker("forget_fails", Some(checkpoint)).await?;
+            let forgetting = {
+                let session = session.clone();
+                let handle = handle.clone();
+                tokio::spawn(async move { session.forget_for_recheck(&handle).await })
+            };
+            while !handle.with_state(|state| {
+                matches!(state, crate::ManagedTorrentState::Initializing(init) if init.is_pause_requested())
+            }) {
+                tokio::task::yield_now().await;
+            }
+            door.forgets_fail.store(true, Ordering::Release);
+            door.open();
+            let refused = forgetting.await?.unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("the pieces are not forgotten"),
+                "{refused:#}"
+            );
+            assert!(
+                handle.with_state(|state| matches!(state, crate::ManagedTorrentState::Error(_))),
+                "the torrent is not in error"
+            );
+            assert!(matches!(handle.stats().state, TorrentStatsState::Error));
+            assert!(handle.tracker_status().is_none());
+
+            door.forgets_fail.store(false, Ordering::Release);
+            session.start_check(&handle)?;
+            handle.wait_until_initialized().await?;
+            assert_eq!(handle.stats().progress_bytes, total);
             assert_eq!(next(&mut heard).await?, announce(Some("started")));
             answered(&handle).await?;
             let queries = tracker.queries.lock().clone();

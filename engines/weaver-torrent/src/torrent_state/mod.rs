@@ -999,6 +999,36 @@ impl ManagedTorrent {
                                         return Ok(());
                                     }
 
+                                    // The files shut under the check
+                                    // (`FilesShut`): what it could not
+                                    // read is not missing, so it passes
+                                    // nothing and starts nothing. Every
+                                    // piece is forgotten, which opens the
+                                    // files, and the torrent waits to be
+                                    // checked by whoever changed them, or
+                                    // by the next start: no tracker and no
+                                    // peer hears of a torrent that has
+                                    // none of its pieces.
+                                    if crate::storage::FilesShut::refused_in(&err) {
+                                        let mut g = t.locked.write();
+                                        if let ManagedTorrentState::Initializing(now) = &g.state
+                                            && Arc::ptr_eq(now, &init)
+                                        {
+                                            g.state = match t
+                                                .checking_everything(&g, init.take_peers())
+                                            {
+                                                Ok(again) => {
+                                                    ManagedTorrentState::Initializing(again)
+                                                }
+                                                Err(error) => ManagedTorrentState::Error(error),
+                                            };
+                                        }
+                                        drop(g);
+                                        debug!("check ended: the files were shut under it");
+                                        t.state_change_notify.notify_waiters();
+                                        return Ok(());
+                                    }
+
                                     let result = anyhow::anyhow!("{:?}", err);
                                     t.locked.write().state = ManagedTorrentState::Error(err);
                                     t.state_change_notify.notify_waiters();
@@ -1250,9 +1280,23 @@ impl ManagedTorrent {
             ManagedTorrentState::Error(_) => Default::default(),
             ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
         };
-        g.state = ManagedTorrentState::Initializing(self.checking_everything(g, peers)?);
+        // A storage that could not forget its pieces leaves the torrent
+        // in error, with the reason, for whoever reads its state: its
+        // next start checks every piece (`start`). Never paused with
+        // nothing to say so, and nobody to start it.
+        let forgotten = match self.checking_everything(g, peers) {
+            Ok(init) => {
+                g.state = ManagedTorrentState::Initializing(init);
+                Ok(())
+            }
+            Err(error) => {
+                let reason = anyhow::anyhow!("{error:#}");
+                g.state = ManagedTorrentState::Error(error);
+                Err(reason)
+            }
+        };
         self.state_change_notify.notify_waiters();
-        Ok(())
+        forgotten
     }
 
     /// [`Self::recheck`] for files that changed under the torrent, as a

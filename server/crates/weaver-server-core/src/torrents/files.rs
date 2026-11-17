@@ -307,7 +307,8 @@ struct At {
     reads: Vec<u64>,
     // No read is made of the files: a move left one among them that is not
     // the torrent's own while the torrent still holds its pieces as had
-    // (`Files::relocate`), until those are forgotten (`Files::let_read`).
+    // (`Files::relocate`), until those are forgotten (`Files::let_read`,
+    // which the store calls wherever it forgets every piece).
     // Read under the guard every read already takes to learn where the
     // files are.
     shut: bool,
@@ -325,9 +326,7 @@ impl At {
     // A read is refused while the files are shut.
     fn read(&self) -> io::Result<()> {
         if self.shut {
-            return Err(io::Error::other(
-                "the torrent's files are not read until its pieces are checked again",
-            ));
+            return Err(weaver_torrent::storage::FilesShut::refused());
         }
         Ok(())
     }
@@ -516,7 +515,8 @@ impl Files {
     //
     // `shut` is asked how the move ended, still under that lock: when it
     // says so the files come out of the move shut to reads, wherever they
-    // are, and stay shut until `let_read`. For a move that ends with a file
+    // are, and stay shut until the store forgets every piece
+    // (`let_read`). For a move that ends with a file
     // among them that is not the torrent's own while the torrent has not
     // forgotten its pieces: no read is made of that file, so none of its
     // bytes is served, from the moment the lock is let go.
@@ -540,13 +540,15 @@ impl Files {
         }
     }
 
-    // The files are read again: the torrent has forgotten its pieces, so
-    // the only reads to come are its check's, and what that passes.
-    pub(crate) fn let_read(&self) {
+    // The files are read again: the store has forgotten every piece, so
+    // the only reads to come are a check's, and what that passes. Called
+    // by the store alone, where it forgets them
+    // (`TorrentStore::check_every_piece`), so every way a torrent comes to
+    // check all its pieces opens them.
+    pub(super) fn let_read(&self) {
         self.at.write().unwrap_or_else(PoisonError::into_inner).shut = false;
     }
 
-    #[cfg(test)]
     pub(crate) fn is_shut(&self) -> bool {
         self.at().shut
     }

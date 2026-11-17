@@ -391,7 +391,12 @@ impl TorrentService {
                 files: Vec::new(),
                 dirs: with(adopted.as_ref().map_or(&[][..], |a| &a.dirs), [String::new()]),
             };
-            db.set_torrent_made(job_id, &[], Some(&aside))
+            // The saved pieces are marked to be checked with it: a start
+            // that follows a run ended mid-move trusts none of them, so a
+            // file left at one of the torrent's names that is not its own
+            // is checked before any of it is had. The write that ends the
+            // move says what holds from then.
+            db.set_torrent_made(job_id, &[], Some(&aside), true)
                 .map_err(not_begun)?;
             #[cfg(test)]
             if let Some(meets) = super::locked(&super::MOVE_BEGIN_MEETS).take() {
@@ -439,6 +444,9 @@ impl TorrentService {
                     &moved.outputs,
                     adopted.as_ref(),
                     &moved.held,
+                    // A file kept there is not the torrent's own: a start
+                    // before its pieces are forgotten checks them all.
+                    store.unvouched() || !moved.kept.is_empty(),
                 )
             });
             moved.inspect_err(|not_moved| {
@@ -460,7 +468,12 @@ impl TorrentService {
                 let refused = false;
                 let written = match refused {
                     true => Err(StateError::Database("refused".to_owned())),
-                    false => db.set_torrent_made(job_id, &not_moved.outputs, adopted.as_ref()),
+                    false => db.set_torrent_made(
+                        job_id,
+                        &not_moved.outputs,
+                        adopted.as_ref(),
+                        store.unvouched() || !not_moved.stranded.is_empty(),
+                    ),
                 };
                 if let Err(error) = written {
                     // The row stays as the move set it aside: it names no
@@ -592,12 +605,15 @@ impl TorrentService {
         let (moving, store) = self
             .with_torrent(job_id, |torrent| {
                 torrent.settle(self.inner.clock.unix_ms());
-                Ok((torrent.moving.take(), torrent.store.clone()))
+                Ok((torrent.moving.clone(), torrent.store.clone()))
             })
             .await
             .unwrap_or((None, None));
-        // An unpacking that waited on the move places its files now.
-        self.inner.signal.mark(job_id);
+        // The torrent stays moving until the check of what the move left
+        // has forgotten its pieces (`move_over`): a recheck asked for
+        // before then is refused, as during the move, so none runs on
+        // files the move's own check is about to forget, and a tracker
+        // hears one `stopped` and one `started` of it, not two.
         match outcome {
             Ok(moved) => {
                 let kept_existing = !moved.kept.is_empty();
@@ -651,6 +667,7 @@ impl TorrentService {
                 {
                     self.check_kept(job_id, store).await;
                 }
+                self.move_over(job_id).await;
                 // A move looks again for files that were missing
                 // (qBittorrent `TorrentImpl::handleMoveStorageJobFinished`,
                 // torrentimpl.cpp:2140-2146).
@@ -683,11 +700,25 @@ impl TorrentService {
                 {
                     self.check_kept(job_id, store).await;
                 }
+                self.move_over(job_id).await;
                 Err(ActionError::State(format!(
                     "the torrent's move failed, and it stays where it was: {error}"
                 )))
             }
         }
+    }
+
+    // The move ended, its check begun where it owed one: the torrent is no
+    // longer moving, and an unpacking that waited on the move places its
+    // files now.
+    async fn move_over(&self, job_id: JobId) {
+        let _ = self
+            .with_torrent(job_id, |torrent| {
+                torrent.moving = None;
+                Ok(())
+            })
+            .await;
+        self.inner.signal.mark(job_id);
     }
 
     // A move kept a file already at the torrent's new place, so its files
@@ -715,21 +746,31 @@ impl TorrentService {
                 let attached = torrent.attached.as_ref()?;
                 Some((Arc::clone(&attached.session), Arc::clone(&attached.handle)))
             });
+        #[cfg(test)]
+        let attached =
+            match super::MOVE_CHECK_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                true => {
+                    tracing::warn!(
+                        job_id = job_id.0,
+                        "the check after a move is refused by its test"
+                    );
+                    return;
+                }
+                false => attached,
+            };
         let checked = match attached {
             // A check under way read some of the files where they were: it
             // is stopped and begun again, so no piece it passed there
             // stays had for a file kept here.
             //
-            // Its files are read again only once every piece is forgotten
-            // (`Files::let_read`): a move that left a file among them that
-            // is not its own shut them, and until here no read was made of
-            // them. The check that follows is the first.
+            // Its files are read again only once every piece is forgotten,
+            // where the store forgets them (`TorrentStore::checking`): a
+            // move that left a file among them that is not its own shut
+            // them, and until here no read was made of them. The check
+            // that follows is the first.
             Some((session, handle)) => {
                 let checked = match session.forget_for_recheck(&handle).await {
-                    Ok(()) => {
-                        store.files().let_read();
-                        session.start_check(&handle)
-                    }
+                    Ok(()) => session.start_check(&handle),
                     Err(error) => Err(error),
                 };
                 // The check runs its pieces again: a wait for room from
@@ -739,10 +780,10 @@ impl TorrentService {
                 }
                 checked
             }
-            None => Pieces::checking(&**store).map(|_| store.files().let_read()),
+            None => Pieces::checking(&**store).map(|_| ()),
         };
         if let Err(error) = checked {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not check a torrent again after its move kept files there; its files stay unread until it is checked");
+            tracing::warn!(job_id = job_id.0, error = %error, "could not check a torrent again after its move kept files there; its files stay unread until a recheck, a restart or a new session forgets its pieces and checks them");
         }
     }
 }

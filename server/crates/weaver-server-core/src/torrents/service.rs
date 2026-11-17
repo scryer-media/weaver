@@ -1304,6 +1304,12 @@ pub(crate) static MOVE_CHECK_HOLD: Mutex<
     )>,
 > = Mutex::new(None);
 
+// Test seam: the next check a move owes the torrent once it is over is not
+// begun, as when its pieces could not be forgotten.
+#[cfg(test)]
+pub(crate) static MOVE_CHECK_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // Test seam: the next write of a move of a torrent's placed files to its
 // row is refused.
 #[cfg(test)]

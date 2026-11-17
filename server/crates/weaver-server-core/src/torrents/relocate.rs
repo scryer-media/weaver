@@ -277,6 +277,9 @@ fn move_files_using(
                     // Over what is there. A copy that fails removes only a
                     // file it made: one that was there is not this move's
                     // to remove, whether or not the copy could open it.
+                    // The copy writes into that file in place, so one that
+                    // fails partway leaves it cut short or part written
+                    // over: what it held before is not kept.
                     Existing::Replace => {
                         let made_new = std::fs::symlink_metadata(target).is_err();
                         std::fs::copy(source, target).map(drop).inspect_err(|_| {

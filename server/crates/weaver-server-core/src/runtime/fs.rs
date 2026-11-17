@@ -38,14 +38,23 @@ pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
 
 // `rename_path_exclusive` that never copies: a move of names alone, however
 // large the file. The same exclusive rename, then the same link and unlink.
-// Where the mount has neither (SMB and CIFS, exFAT, FAT, many FUSE mounts)
-// the target is looked at and the entry renamed, as libtorrent moves a
-// torrent's files (`storage_utils.cpp` `move_storage`: `exists`, then
-// `move_file`). That is the filesystem's limit: on such a mount, and only
-// there, an entry made at the target between the look and the rename is
-// replaced by a file, since the mount offers no move that refuses it. A
-// source on another device is answered `CrossesDevices` at every step, and
-// only then does a caller copy.
+// A symbolic link that neither took is made again at the target, which
+// never replaces, and removed at the source.
+//
+// Anything else is looked for at the target and then renamed, as
+// libtorrent moves a torrent's files (`storage_utils.cpp` `move_storage`:
+// `exists`, then `move_file`), exactly when both of these hold:
+//
+// - the exclusive rename was answered as not supported by the mount, and
+// - the link was answered as not supported, or EPERM. link(2) answers
+//   EPERM for a directory, on a mount with no hard links (SMB and CIFS,
+//   exFAT, FAT, many FUSE mounts), and on Linux for a file this process
+//   may not link (`fs.protected_hardlinks`), on a mount that has them.
+//
+// An entry made at the target between that look and that rename is
+// replaced by a file: no move left there refuses it. A link answered
+// EXDEV is another device: the caller is answered `CrossesDevices`, at
+// this step as at every other, and only then does a caller copy.
 pub(crate) fn rename_path_exclusive_in_place(src: &Path, dst: &Path) -> io::Result<()> {
     rename_path_exclusive_or(src, dst, Unlinkable::Renamed)
 }
@@ -309,16 +318,18 @@ fn rename_exclusive_with_link(
     if let Some(settled) = settled_before_copy(src, dst) {
         return settled;
     }
+    // A symbolic link is made again at the target, which never replaces:
+    // neither a copy nor a rename that cannot refuse.
+    if source.file_type().is_symlink() {
+        return move_symlink_no_overwrite(src, dst);
+    }
     if matches!(unlinkable, Unlinkable::Renamed) {
-        // The filesystem's limit (`rename_path_exclusive_in_place`): the
-        // look above, then a rename that cannot refuse.
+        // The limit `rename_path_exclusive_in_place` names: the look
+        // above, then a rename that cannot refuse.
         return std::fs::rename(src, dst);
     }
     if source.is_file() {
         return copy_file_no_overwrite_then_remove_source(src, dst);
-    }
-    if source.file_type().is_symlink() {
-        return move_symlink_no_overwrite(src, dst);
     }
     if !source.is_dir() {
         return Err(io::Error::new(
@@ -1032,6 +1043,28 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&src).unwrap(), b"second");
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    // A symbolic link that no exclusive rename and no link took is made
+    // again at the target, by a call that never replaces: it is not
+    // renamed after a look.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_symlink_moved_in_place_without_links_is_made_again_not_renamed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.link");
+        let dst = dir.path().join("destination.link");
+        std::os::unix::fs::symlink("pointed/at", &src).unwrap();
+        let inode = std::fs::symlink_metadata(&src).unwrap().ino();
+        in_place_without_links(&src, &dst, libc::EPERM).unwrap();
+        let made = std::fs::symlink_metadata(&dst).unwrap();
+        assert!(made.file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&dst).unwrap(), Path::new("pointed/at"));
+        // Made while the source was still there: a rename would have kept
+        // the source's own entry.
+        assert_ne!(made.ino(), inode);
+        assert!(std::fs::symlink_metadata(&src).is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
