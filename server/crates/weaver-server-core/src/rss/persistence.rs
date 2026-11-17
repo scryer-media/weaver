@@ -11,29 +11,100 @@ use super::repository::{encode_categories, encode_metadata};
 use crate::persistence::encryption::EncryptionKey;
 use crate::torrents::sealed::SEAL_PAGE;
 
-// What a seen item's stored id starts with: `wvr1:`, then its keyed digest
-// in hex.
-const SEEN_KEY_PREFIX: &str = "wvr1:";
+// What a seen item's stored id starts with: `b3:`, then its digest in hex.
+const SEEN_KEY_PREFIX: &str = "b3:";
 const SEEN_KEY_LEN: usize = SEEN_KEY_PREFIX.len() + 64;
-const SEEN_KEY_DOMAIN: &str = "weaver/rss-seen-item/v1";
+// The BLAKE3 key derivation contexts a seen key is made under: one for an
+// item the feed gives an id or a link, another for an item named by its
+// title alone, so a title never makes another item's id key. Fixed: a
+// change to either, or to what is hashed, makes every item seen before new.
+const SEEN_ID_CONTEXT: &str = "weaver rss seen item id v1";
+const SEEN_TITLE_CONTEXT: &str = "weaver rss seen item title v1";
 
-// A seen item's id as it is stored. A feed's item id is often the item's
-// link, and a private tracker's link carries the passkey, so the id is kept
-// as its keyed digest: the same for the same id, which is all a seen lookup
-// needs, and no use without the instance key. With no key a store keeps,
-// the id is stored as the feed gave it, as it was before.
-pub(crate) fn seen_item_key(key: Option<&EncryptionKey>, item_id: &str) -> String {
-    match key {
-        Some(key) => format!(
-            "{SEEN_KEY_PREFIX}{}",
-            hex::encode(crate::persistence::encryption::keyed_digest(
-                key,
-                SEEN_KEY_DOMAIN,
-                item_id.as_bytes()
-            ))
-        ),
-        None => item_id.to_owned(),
+// What names a feed's item. Nothing time-like: a feed's dates for an item
+// change.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SeenId<'a> {
+    // The id the feed gives it, else its link; or a stored key already.
+    Id(&'a str),
+    // Neither: its title. Such an item has no link, so it is never added;
+    // its key keeps its seen row alone.
+    Title(&'a str),
+}
+
+// Whether `id` is a seen key as this makes it: `b3:` and 64 hex digits.
+fn is_seen_key(id: &str) -> bool {
+    id.len() == SEEN_KEY_LEN
+        && id.starts_with(SEEN_KEY_PREFIX)
+        && id[SEEN_KEY_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+// A seen item's key, as it is stored: one BLAKE3 over what names the item,
+// under a fixed context, and nothing else. A feed's item id is often the
+// item's link, and a private tracker's link carries the passkey, so the
+// stored key is a digest: the same for the same item, which is all a seen
+// lookup needs. No key, clock or start goes into it, so it reads the same
+// after any restart or key loss. An id that is a key already is its own.
+pub(crate) fn seen_item_key(id: SeenId<'_>) -> String {
+    let digest = match id {
+        SeenId::Id(id) if is_seen_key(id) => return id.to_owned(),
+        SeenId::Id(id) => blake3::derive_key(SEEN_ID_CONTEXT, id.as_bytes()),
+        SeenId::Title(title) => blake3::derive_key(SEEN_TITLE_CONTEXT, title.as_bytes()),
+    };
+    format!("{SEEN_KEY_PREFIX}{}", hex::encode(digest))
+}
+
+// The stored ids an item named by `item_id` may be found under: its key,
+// and the id itself, as a row stored before the key holds it until the
+// sealing pass, which runs only under a key a store keeps.
+pub(crate) fn seen_item_keys(item_id: &str) -> [String; 2] {
+    [seen_item_key(SeenId::Id(item_id)), item_id.to_owned()]
+}
+
+// The key a row stored before keys is put back under. An item with neither
+// id nor link was stored under a SHA-256 of its title and published date,
+// which is told by making it again: of the title and the stored date, or
+// of the title alone, as the stored date may be the feed's updated date
+// where the old id took the published date only. Such a row goes back
+// under its title key; any other id is the feed's own.
+fn legacy_seen_key(item_id: &str, title: &str, published_at: Option<i64>) -> String {
+    // The id an item with neither id nor link was once stored under.
+    fn legacy_untitled_id(title: &str, published_at: Option<i64>) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(title.as_bytes());
+        if let Some(published_at) = published_at {
+            hasher.update(published_at.to_le_bytes());
+        }
+        hex::encode(hasher.finalize())
     }
+    if (published_at.is_some() && item_id == legacy_untitled_id(title, published_at))
+        || item_id == legacy_untitled_id(title, None)
+    {
+        return seen_item_key(SeenId::Title(title));
+    }
+    seen_item_key(SeenId::Id(item_id))
+}
+
+// One seen item forgotten, by either id it may be stored under: an
+// equality on the table's key `(feed_id, item_id)`.
+pub(crate) const SEEN_DELETE_SQL: &str =
+    "DELETE FROM rss_seen_items WHERE feed_id = {} AND item_id IN ({}, {})";
+
+// A seen item's stored link, opened. One that does not open, under no key
+// or another key, reads as no link.
+pub(crate) fn open_seen_link(
+    key: Option<&EncryptionKey>,
+    stored: Option<String>,
+) -> Option<String> {
+    use crate::persistence::encryption::{decrypt_value, is_encrypted};
+    let stored = stored?;
+    if !is_encrypted(&stored) {
+        return Some(stored);
+    }
+    decrypt_value(key?, &stored).ok()
 }
 
 // A link as it is stored: encrypted with the instance key, whatever it
@@ -58,7 +129,7 @@ fn sealed_link(key: Option<&EncryptionKey>, link: &str) -> Result<String, StateE
 impl Database {
     // The RSS part of [`Database::seal_stored_secrets`]: every feed URL and
     // seen item link stored in the clear encrypted, and every seen item id
-    // replaced by its keyed digest. Each step selects in SQL only the rows
+    // stored as the feed gave it replaced by its digest. Each step selects in SQL only the rows
     // it has yet to do, a page at a time, each page in one write
     // transaction, so a pass cut short goes on at the next start.
     pub(crate) fn seal_rss_links(&self, key: &EncryptionKey) -> Result<(), StateError> {
@@ -148,11 +219,9 @@ impl Database {
                         }
                         None => None,
                     };
-                    page.push(seen_row_args(
-                        &item,
-                        seen_item_key(Some(&key), &item.item_id),
-                        link,
-                    ));
+                    let stored =
+                        legacy_seen_key(&item.item_id, &item.item_title, item.published_at);
+                    page.push(seen_row_args(&item, stored, link));
                 }
                 SqlRuntime::run_in_transaction(&datastore, "seal_rss_links", |tx| {
                     let (gone, page) = (gone.clone(), page.clone());
@@ -402,15 +471,14 @@ impl Database {
     }
 
     // Forget one seen item, named by its id as the seen list gives it, or
-    // as the feed does.
+    // as the feed does: an equality on the table's key either way.
     pub fn delete_rss_seen_item(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        let keyed = seen_item_key(self.sealing_key(), item_id);
-        let item_id = item_id.to_string();
+        let [keyed, item_id] = seen_item_keys(item_id);
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.write_exec(),
-                "DELETE FROM rss_seen_items WHERE feed_id = {} AND item_id IN ({}, {})",
+                SEEN_DELETE_SQL,
                 &[
                     SqlArg::I64(i64::from(feed_id)),
                     SqlArg::Text(item_id),
@@ -731,8 +799,8 @@ async fn insert_rss_seen_rows(
 }
 
 // A seen item's row as a feed's item makes it: its link encrypted and its
-// id its keyed digest, as a private tracker's link carries the passkey and
-// a feed often gives the link as the id.
+// id its digest, as a private tracker's link carries the passkey and a feed
+// often gives the link as the id.
 fn rss_seen_item_args(
     item: &RssSeenItemRow,
     key: Option<&EncryptionKey>,
@@ -742,10 +810,9 @@ fn rss_seen_item_args(
         .as_deref()
         .map(|url| sealed_link(key, url))
         .transpose()?;
-    let kept = key.filter(|key| !key.is_ephemeral());
     Ok(seen_row_args(
         item,
-        seen_item_key(kept, &item.item_id),
+        seen_item_key(SeenId::Id(&item.item_id)),
         item_url,
     ))
 }

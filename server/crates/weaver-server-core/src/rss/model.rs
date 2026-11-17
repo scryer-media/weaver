@@ -326,7 +326,8 @@ fn feed_item_from_entry(entry: ParsedFeedEntry) -> FeedItem {
     } else if let Some(url) = download_url.clone().or_else(|| display_url.clone()) {
         url
     } else {
-        fallback_item_id(&title, entry.published_at, None)
+        // Neither: the item is named by its seen key, made from its title.
+        super::persistence::seen_item_key(super::persistence::SeenId::Title(&title))
     };
 
     let size_bytes = media_content
@@ -495,22 +496,4 @@ pub(crate) fn looks_like_direct_download_url(url: &str) -> bool {
     parsed
         .query_pairs()
         .any(|(key, value)| key.eq_ignore_ascii_case("t") && value.eq_ignore_ascii_case("get"))
-}
-
-pub(crate) fn fallback_item_id(
-    title: &str,
-    published_at: Option<i64>,
-    size_bytes: Option<u64>,
-) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(title.as_bytes());
-    if let Some(published_at) = published_at {
-        hasher.update(published_at.to_le_bytes());
-    }
-    if let Some(size_bytes) = size_bytes {
-        hasher.update(size_bytes.to_le_bytes());
-    }
-    hex::encode(hasher.finalize())
 }

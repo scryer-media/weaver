@@ -241,7 +241,7 @@ async fn export_and_import_stable_state_roundtrip() {
     export_pool.close().await;
 
     // The instance key comes back with the state it encrypted: a seen
-    // item's id is kept as its keyed digest, found under that key alone.
+    // item's link is encrypted under it.
     let mut dest = Database::open_in_memory().unwrap();
     dest.set_encryption_key(src.encryption_key().unwrap().clone());
     assert!(dest.restore_target_is_pristine().unwrap());

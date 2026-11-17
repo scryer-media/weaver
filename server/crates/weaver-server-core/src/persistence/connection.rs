@@ -1643,10 +1643,10 @@ pub struct Database {
 }
 
 // Each column the sealing pass seals: what it holds, whether its table has
-// a row that holds one, and one stored value of it. A seen item's id is a
-// keyed digest, which needs the key as a ciphertext does, so its table
-// counts by any row; only its link can be decrypted.
-const SEALED_COLUMNS: [(&str, &str, &str); 4] = [
+// a row that holds one, and one stored value of it. A seen item does not
+// count: its id is a digest no key is needed for, and a link that does not
+// decrypt reads as none, so a key lost never refuses a start for one.
+const SEALED_COLUMNS: [(&str, &str, &str); 3] = [
     (
         "torrent metainfo",
         "SELECT 1 AS held FROM torrents WHERE metainfo IS NOT NULL LIMIT 1",
@@ -1661,11 +1661,6 @@ const SEALED_COLUMNS: [(&str, &str, &str); 4] = [
         "RSS feed URL",
         "SELECT 1 AS held FROM rss_feeds WHERE url <> '' LIMIT 1",
         "SELECT url AS sample FROM rss_feeds WHERE url <> '' LIMIT 1",
-    ),
-    (
-        "RSS item link",
-        "SELECT 1 AS held FROM rss_seen_items LIMIT 1",
-        "SELECT item_url AS sample FROM rss_seen_items WHERE item_url IS NOT NULL LIMIT 1",
     ),
 ];
 
@@ -2518,8 +2513,7 @@ impl Database {
     }
 
     // Whether any torrent or RSS secret is sealed under the instance key:
-    // a torrent's metainfo or tracker URL, a feed's URL, a seen item's id
-    // or link. The sealing pass marks itself before its first write, and
+    // a torrent's metainfo or tracker URL, or a feed's URL. The sealing pass marks itself before its first write, and
     // with its mark set every such value is sealed or about to be, so each
     // table is asked only whether it holds a row: one existence read a
     // column, none of them reading a payload. Without the mark nothing was sealed,

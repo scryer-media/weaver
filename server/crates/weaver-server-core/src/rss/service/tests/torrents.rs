@@ -210,7 +210,7 @@ impl Rig {
     }
 
     // The feed's seen rows in their ids' order, as (item, decision, job,
-    // error). A row is listed under its id's keyed digest: each is named
+    // error). A row is listed under its id's digest: each is named
     // back as the id these tests' feeds give.
     fn seen(&self) -> Vec<(String, String, Option<u64>, Option<String>)> {
         let mut rows = self.db.list_rss_seen_items(Some(1), None).unwrap();
