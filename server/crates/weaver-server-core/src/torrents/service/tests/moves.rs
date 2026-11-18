@@ -470,7 +470,7 @@ async fn placed_files_move_to_a_new_location_and_the_record_follows() {
     std::fs::write(save.join("a.bin"), &data).unwrap();
     // Its job is done, so nothing of it is out and each move happens at
     // once.
-    let (job_id, before, _) = completed_placed(
+    let (job_id, before) = completed_placed(
         &rig,
         metainfo,
         Placement {
@@ -518,7 +518,7 @@ async fn a_move_onto_a_file_already_there_keeps_it_and_checks_again() {
     let save = rig.dir.path().join("flat");
     std::fs::create_dir_all(&save).unwrap();
     std::fs::write(save.join("a.bin"), &data).unwrap();
-    let (job_id, _, _) = completed_placed(
+    let (job_id, _) = completed_placed(
         &rig,
         metainfo,
         Placement {
@@ -571,7 +571,7 @@ pub(super) async fn seeding_beside_a_taken_name() -> (Rig, JobId, Vec<u8>, PathB
     let save = rig.dir.path().join("flat");
     std::fs::create_dir_all(&save).unwrap();
     std::fs::write(save.join("a.bin"), &data).unwrap();
-    let (job_id, _, _) = completed_placed(
+    let (job_id, _) = completed_placed(
         &rig,
         metainfo,
         Placement {
@@ -926,7 +926,7 @@ async fn a_complete_torrent_without_its_folder_moves_from_its_download_path() {
     std::fs::write(save.join("a.bin"), b"older").unwrap();
     let save_text = save.to_string_lossy().into_owned();
 
-    let (job_id, _, mut changes) = completed_placed(
+    let (job_id, _) = completed_placed(
         &rig,
         metainfo,
         Placement {
@@ -937,7 +937,7 @@ async fn a_complete_torrent_without_its_folder_moves_from_its_download_path() {
         },
     )
     .await;
-    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+    let view = view_once(&rig.service, job_id, |view| {
         view.files_dir.as_deref() == Some(save_text.as_str())
     })
     .await;
@@ -1016,7 +1016,7 @@ async fn a_torrent_added_with_relative_paths_keeps_them_absolute() {
     std::fs::write(download.join("a.bin"), &data).unwrap();
     let save_text = save.to_string_lossy().into_owned();
 
-    let (job_id, _, mut changes) = completed_placed(
+    let (job_id, _) = completed_placed(
         &rig,
         metainfo,
         Placement {
@@ -1027,7 +1027,7 @@ async fn a_torrent_added_with_relative_paths_keeps_them_absolute() {
         },
     )
     .await;
-    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+    let view = view_once(&rig.service, job_id, |view| {
         view.files_dir.as_deref() == Some(save_text.as_str())
     })
     .await;
@@ -1054,7 +1054,7 @@ async fn a_download_path_without_a_save_path_moves_to_the_default_save_path() {
     std::fs::create_dir_all(&download).unwrap();
     std::fs::write(download.join("a.bin"), &data).unwrap();
 
-    let (job_id, _, mut changes) = completed_placed(
+    let (job_id, _) = completed_placed(
         &rig,
         metainfo,
         Placement {
@@ -1064,7 +1064,7 @@ async fn a_download_path_without_a_save_path_moves_to_the_default_save_path() {
         },
     )
     .await;
-    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+    let view = view_once(&rig.service, job_id, |view| {
         view.files_dir.as_deref() == Some(complete_text.as_str())
     })
     .await;

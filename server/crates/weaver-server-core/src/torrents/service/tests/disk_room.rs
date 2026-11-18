@@ -28,7 +28,6 @@ struct OnDisk {
     capacity: Arc<StorageCapacity>,
     job_id: JobId,
     seeding: Arc<Session>,
-    changes: watch::Receiver<u64>,
     _seeds: tempfile::TempDir,
 }
 
@@ -90,9 +89,7 @@ async fn on_disks(
         LegKind::Ladder,
         Arc::new(LegSockets::new(loopback, &LegKind::Ladder)),
     );
-    let handle = queue();
-    let changes = handle.state().subscribe_job_changes();
-    rig.service.publish_to(handle);
+    rig.service.publish_to(queue());
     rig.service.open().await.unwrap();
     let mut add = request(AddSource::Metainfo(bytes));
     add.placement.save_path = save.map(|save| save.to_string_lossy().into_owned());
@@ -103,7 +100,6 @@ async fn on_disks(
         capacity,
         job_id,
         seeding,
-        changes,
         _seeds: seeds,
     }
 }
@@ -216,9 +212,9 @@ async fn not_running(service: &TorrentService, job_id: JobId) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
     let room = Arc::new(AtomicU64::new(0));
-    let mut disk = on_disk(&room).await;
+    let disk = on_disk(&room).await;
     let service = &disk.rig.service;
-    let view = view_once(service, &mut disk.changes, disk.job_id, |view| {
+    let view = view_once(service, disk.job_id, |view| {
         view.stated == Some(Stated::DiskSpace)
     })
     .await;
@@ -230,7 +226,7 @@ async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
 
     room.store(PLENTY, Ordering::Release);
     disk.capacity.request_refresh(StorageRoot::Complete);
-    view_once(service, &mut disk.changes, disk.job_id, |view| {
+    view_once(service, disk.job_id, |view| {
         view.stated != Some(Stated::DiskSpace)
     })
     .await;
@@ -471,17 +467,18 @@ async fn on_disk_promised(room: &Arc<AtomicU64>, promised: u64) -> OnDisk {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_short_disk_holds_a_torrent_that_never_downloaded_and_starts_one_that_did() {
     let room = Arc::new(AtomicU64::new(0));
-    let mut disk = on_disk(&room).await;
+    let disk = on_disk(&room).await;
     let service = &disk.rig.service;
     let second = service
         .add_opened(request(AddSource::Metainfo(plain("other", 1))))
         .await
         .unwrap();
     for job_id in [disk.job_id, second] {
-        // A torrent shows its start from what was saved first, and nothing
-        // is published as that start ends: the view is read once it has.
+        // A torrent shows its start from what was saved first: the view is
+        // read once it has. Its join to its session rings nothing (neither
+        // the queue's row nor the service's carries it), so the wait looks
+        // again each turn until it has joined.
         let torrent = loop {
-            disk.changes.borrow_and_update();
             let attached = service.inner.live.lock().await[&job_id]
                 .attached
                 .as_ref()
@@ -489,10 +486,10 @@ async fn a_short_disk_holds_a_torrent_that_never_downloaded_and_starts_one_that_
             if let Some(torrent) = attached {
                 break torrent;
             }
-            disk.changes.changed().await.unwrap();
+            tokio::task::yield_now().await;
         };
         torrent.wait_until_initialized().await.unwrap();
-        view_once(service, &mut disk.changes, job_id, |view| {
+        view_once(service, job_id, |view| {
             view.stated == Some(Stated::DiskSpace)
         })
         .await;
