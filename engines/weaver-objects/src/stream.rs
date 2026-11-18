@@ -262,7 +262,12 @@ impl<D: Decoder> Object for Stream<D> {
     }
 
     // A stream is its one volume: it claims no other.
-    fn claim(&mut self, _name: &str, _first: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        _name: &str,
+        _first: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
         Claim::default()
     }
 

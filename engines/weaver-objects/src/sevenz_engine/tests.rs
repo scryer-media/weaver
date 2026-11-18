@@ -421,19 +421,23 @@ fn claim_takes_a_copy_of_its_file_and_no_numbered_piece() {
         Some(bytes.len() as u64),
     );
     assert_eq!(
-        engine.claim("e93a07c1d25b4f68a0c3e1f7b9d24c85", &bytes[..32], None),
+        engine.claim(
+            "e93a07c1d25b4f68a0c3e1f7b9d24c85",
+            (&bytes[..32]).into(),
+            None
+        ),
         vec![VolumeIndex(0)]
     );
     for name in ["set.7z", "set.7z.001", "set.7z.002", "set.part2.rar"] {
         assert_eq!(
-            engine.claim(name, b"", None),
+            engine.claim(name, (b"").into(), None),
             Vec::<VolumeIndex>::new(),
             "{name}"
         );
     }
     let mut numbered = named(&["Set.7z.001"]);
     assert_eq!(
-        numbered.claim("set.7Z.002", b"", None),
+        numbered.claim("set.7Z.002", (b"").into(), None),
         Vec::<VolumeIndex>::new(),
         "a numbered name founds no set of the engine's"
     );

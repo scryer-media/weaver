@@ -547,6 +547,10 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) posts: Vec<Post>,
     pub(in crate::pipeline::tests) damage: Vec<(u32, u32)>,
     pub(in crate::pipeline::tests) lost: Vec<(u32, u32)>,
+    // Articles posted but absent from the NZB, by their place in the post:
+    // the job never lists them, so its articles are numbered without them,
+    // and those it does list still declare where their bytes go.
+    pub(in crate::pipeline::tests) unlisted: Vec<(u32, u32)>,
     // Articles the first ask is refused for, as a server without them
     // answers: the article goes back on the queue the way the worker
     // retries it after a 430, and the next ask is served.
@@ -620,6 +624,7 @@ impl Scenario {
             posts,
             damage: Vec::new(),
             lost: Vec::new(),
+            unlisted: Vec::new(),
             refused: Vec::new(),
             corrupt_primary: Vec::new(),
             short: Vec::new(),
@@ -845,6 +850,21 @@ impl Scenario {
         self
     }
 
+    // The post's article at `posted` in the file is absent from the NZB.
+    pub(in crate::pipeline::tests) fn unlisted(mut self, file: u32, posted: u32) -> Self {
+        self.unlisted.push((file, posted));
+        self
+    }
+
+    // Where in the post the file's listed article `ordinal` lies: its
+    // ordinal, past every article before it the NZB does not list.
+    pub(in crate::pipeline::tests) fn posted(&self, file: u32, ordinal: u32) -> u32 {
+        (0..)
+            .filter(|posted| !self.unlisted.contains(&(file, *posted)))
+            .nth(ordinal as usize)
+            .unwrap()
+    }
+
     // The article decodes `by` bytes short of the part end it declares.
     pub(in crate::pipeline::tests) fn short(mut self, file: u32, ordinal: u32, by: usize) -> Self {
         self.short.push((file, ordinal, by));
@@ -888,6 +908,25 @@ impl Scenario {
             ..spec(JOB_NAME, &self.posts, self.article)
         };
         spec.metadata.extend(self.metadata.iter().cloned());
+        // An NZB that lacks an article numbers the ones it lists densely,
+        // each keeping its own article number, as the NZB intake does.
+        for (index, file) in spec.files.iter_mut().enumerate() {
+            let index = index as u32;
+            file.segments
+                .retain(|segment| !self.unlisted.contains(&(index, segment.ordinal)));
+            for (ordinal, segment) in file.segments.iter_mut().enumerate() {
+                segment.ordinal = ordinal as u32;
+                segment.message_ids = crate::jobs::MessageIds::new(vec![format!(
+                    "lantern-{index}-{ordinal}@example.com"
+                )]);
+            }
+        }
+        spec.total_bytes = spec
+            .files
+            .iter()
+            .flat_map(|file| &file.segments)
+            .map(|segment| u64::from(segment.bytes))
+            .sum();
         spec
     }
 }
@@ -947,6 +986,8 @@ pub(in crate::pipeline::tests) struct GraphView {
     // Payload members by output name, read off the namespace's marks.
     pub(in crate::pipeline::tests) claims: BTreeMap<String, Claim>,
     pub(in crate::pipeline::tests) blocks_reachable: u64,
+    // The damaged slices every set last reported, as the history keeps them.
+    pub(in crate::pipeline::tests) damaged_slices: u64,
     pub(in crate::pipeline::tests) outcomes: Vec<Option<RepairOutcome>>,
     // What each recovery object last ruled, by the kind of object, in the
     // order of `outcomes`.
@@ -1581,11 +1622,10 @@ async fn serve_from(
     }
     let intact = !scenario.spoils(server, (file, ordinal));
     let post = &scenario.posts[file as usize];
-    let offset = ordinal as usize * post.article(scenario.article);
-    let posted = post
-        .articles(scenario.article)
-        .nth(ordinal as usize)
-        .unwrap();
+    // The article's part in the post, which its header declares.
+    let part = scenario.posted(file, ordinal);
+    let offset = part as usize * post.article(scenario.article);
+    let posted = post.articles(scenario.article).nth(part as usize).unwrap();
     // The checksum the article declares is the posted one, so damaged bytes
     // disagree with it.
     let crc_wrong = scenario.crc_wrong.contains(&(file, ordinal));
@@ -1597,7 +1637,7 @@ async fn serve_from(
     if scenario.uuencoded {
         // The body carries no part number, range or checksum; the last
         // article carries the `end` line.
-        let ended = ordinal as usize + 1 == post.articles(scenario.article).count();
+        let ended = part as usize + 1 == post.articles(scenario.article).count();
         let encoding = SegmentEncoding::Uu(crate::pipeline::UuSegmentFacts {
             damaged: !intact,
             ended,
@@ -1674,7 +1714,7 @@ async fn serve_from(
                         .iter()
                         .find(|(at, _)| *at == file)
                         .map_or(post.bytes.len() as u64, |(_, size)| *size),
-                    part: Some(ordinal + 1),
+                    part: Some(part + 1),
                     total: Some(post.articles(scenario.article).count() as u32),
                     begin: Some(offset as u64 + 1),
                     end: Some(offset as u64 + declared),
@@ -1799,15 +1839,17 @@ pub(in crate::pipeline::tests) fn observe(
         })
         .collect();
     let summary = job.recovery_summary();
-    view.blocks_reachable = summary
+    let rulings: Vec<_> = summary
         .iter()
         .filter_map(|set| tree.recovery(set.node))
-        .map(|recovery| {
+        .flat_map(|recovery| {
             let mut sets = Vec::new();
             recovery.sets(&mut sets);
-            sets.iter().map(|set| set.blocks_reachable).sum::<u64>()
+            sets
         })
-        .sum();
+        .collect();
+    view.blocks_reachable = rulings.iter().map(|set| set.blocks_reachable).sum();
+    view.damaged_slices = rulings.iter().map(|set| set.damaged_slices).sum();
     view.outcomes = summary.iter().map(|set| set.outcome).collect();
     view.rulings = summary
         .iter()

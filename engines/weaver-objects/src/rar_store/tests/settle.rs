@@ -71,7 +71,7 @@ fn a_volume_given_back_takes_its_format_with_it() {
     let mut object = store();
     let front = &stray[..stray.len().min(4096)];
     let at = *object
-        .claim("stray.part2.rar", front, None)
+        .claim("stray.part2.rar", (front).into(), None)
         .first()
         .expect("the stray is claimed by its name");
     object.bound(at, "stray.part2.rar", &[], None);
@@ -95,7 +95,7 @@ fn a_volume_given_back_takes_its_format_with_it() {
     for (index, bytes) in volumes.iter().enumerate() {
         let name = format!("alpha.part{}.rar", index + 1);
         let front = &bytes[..bytes.len().min(4096)];
-        let placed = object.claim(&name, front, None);
+        let placed = object.claim(&name, (front).into(), None);
         let Some(&at) = placed.first() else {
             break;
         };
@@ -126,7 +126,7 @@ fn a_claim_parses_the_set_numbering_once() {
         for (index, bytes) in volumes.iter().enumerate() {
             let name = name(index);
             let front = &bytes[..bytes.len().min(4096)];
-            let placed = object.claim(&name, front, None);
+            let placed = object.claim(&name, (front).into(), None);
             let at = *placed.first().expect("claimed");
             placements.push(placed);
             object.bound(at, &name, &[], None);

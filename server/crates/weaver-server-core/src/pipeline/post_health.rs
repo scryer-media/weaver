@@ -1254,12 +1254,7 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_else(|| crate::jobs::feed_verdict::FeedVerdict::new(reason));
-        let mut lost: BTreeSet<u32> = self
-            .given_up
-            .get(&job_id)
-            .into_iter()
-            .flat_map(GivenUp::missing_files)
-            .collect();
+        let mut lost = self.files_past_saving(job_id);
         lost.extend(verdict.abandoned_files.iter().copied());
         let Some(mut abandoned) = self.take_lost_work(job_id, &lost) else {
             return;
@@ -1279,12 +1274,7 @@ impl Pipeline {
             {
                 break;
             }
-            lost.extend(
-                self.given_up
-                    .get(&job_id)
-                    .into_iter()
-                    .flat_map(GivenUp::missing_files),
-            );
+            lost.extend(self.files_past_saving(job_id));
             match self.take_lost_work(job_id, &lost) {
                 Some(more) if !more.is_empty() => abandoned = more,
                 _ => break,
@@ -1301,6 +1291,21 @@ impl Pipeline {
         self.checkpoint_graph_job(job_id);
         self.update_queue_metrics();
         self.maybe_finish_download_pass(job_id);
+    }
+
+    // The files that lost an article every server said is gone, but for a
+    // recovery volume, whose blocks are what it brings and may yet rebuild
+    // what was lost, and one whose first article was lost and which the
+    // graph is still judging by its bytes past that hole: it may be a
+    // recovery volume the post's names do not declare.
+    fn files_past_saving(&self, job_id: JobId) -> BTreeSet<u32> {
+        let graph = self.graph_jobs.get(&job_id);
+        self.given_up
+            .get(&job_id)
+            .into_iter()
+            .flat_map(GivenUp::missing_files)
+            .filter(|index| !graph.is_some_and(|graph| graph.may_bring_blocks(*index)))
+            .collect()
     }
 
     // Every queued article of a file in `lost`, taken out of both queues in

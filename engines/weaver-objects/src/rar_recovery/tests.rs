@@ -56,7 +56,7 @@ fn rev(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeInd
 // A recovery volume every byte of which has arrived, not yet closed.
 fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeIndex> {
     let front = &bytes[..bytes.len().min(64)];
-    let volume = match job.object.claim(name, front, None)[..] {
+    let volume = match job.object.claim(name, (front).into(), None)[..] {
         [volume] => volume,
         [] if job.store.volumes.is_empty() => VolumeIndex(0),
         _ => return None,
@@ -274,7 +274,7 @@ fn recovery_volumes_of_one_set_are_claimed_and_another_sets_are_not() {
     );
     assert_eq!(
         job.object
-            .claim("lantern.part2.rar", b"Rar!\x1a\x07\x01\x00", None),
+            .claim("lantern.part2.rar", (b"Rar!\x1a\x07\x01\x00").into(), None),
         Vec::<VolumeIndex>::new()
     );
 }
@@ -989,7 +989,7 @@ fn a_set_survives_a_restart() {
 // A recovery volume whose front was handed over, the rest still to come.
 fn sampled(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> VolumeIndex {
     let front = &bytes[..bytes.len().min(64)];
-    let volume = match job.object.claim(name, front, None)[..] {
+    let volume = match job.object.claim(name, (front).into(), None)[..] {
         [volume] => volume,
         _ => VolumeIndex(0),
     };
@@ -1352,7 +1352,7 @@ fn a_set_that_covers_no_data_volume_rules_on_nothing_whenever_its_footers_arrive
         let name = format!("stem-{index:02}.rev");
         let bytes = noise_rev(index, footer(index));
         let front = &bytes[..64];
-        let volume = match early.object.claim(&name, front, None)[..] {
+        let volume = match early.object.claim(&name, (front).into(), None)[..] {
             [volume] => volume,
             [] if early.store.volumes.is_empty() => VolumeIndex(0),
             _ => panic!("{name} is a volume of the set"),

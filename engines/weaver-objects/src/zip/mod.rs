@@ -846,7 +846,12 @@ impl Object for Zip {
         }
     }
 
-    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        name: &str,
+        _first_bytes: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
         self.volume_of(name).into_iter().collect()
     }
 

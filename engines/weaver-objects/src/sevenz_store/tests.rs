@@ -209,19 +209,27 @@ fn a_copy_of_the_file_with_its_signature_is_claimed_as_the_file() {
     let length = Some(bytes.len() as u64);
     object.bound(VolumeIndex(0), "alpha.7z", &bytes[..32], length);
     assert_eq!(
-        object.claim("alpha.7z", &bytes[..32], length),
+        object.claim("alpha.7z", (&bytes[..32]).into(), length),
         vec![VolumeIndex(0)]
     );
     assert_eq!(
-        object.claim("e93a07c1d25b4f68a0c3e1f7b9d24c85", &bytes[..32], length),
+        object.claim(
+            "e93a07c1d25b4f68a0c3e1f7b9d24c85",
+            (&bytes[..32]).into(),
+            length
+        ),
         vec![VolumeIndex(0)]
     );
     assert!(
         object
-            .claim("alpha.7z.002", &bytes[100..132], None)
+            .claim("alpha.7z.002", (&bytes[100..132]).into(), None)
             .is_empty()
     );
-    assert!(object.claim("alpha.7z", &other[..32], None).is_empty());
+    assert!(
+        object
+            .claim("alpha.7z", (&other[..32]).into(), None)
+            .is_empty()
+    );
 }
 
 #[test]

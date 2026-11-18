@@ -48,6 +48,19 @@ const FILE_DESC_BODY_CAP: u64 = 56 + 100_000;
 const IFSC_BODY_CAP: u64 = 16 + 32_768 * 20;
 const CREATOR_BODY_CAP: u64 = 100_000;
 const UNICODE_FILENAME_BODY_CAP: u64 = 16 + 2 * 100_000;
+// The longest metadata body the walker reads: no metadata packet it uses is
+// longer.
+pub(super) const LONGEST_METADATA_BODY: u64 = max(
+    max(MAIN_BODY_CAP, FILE_DESC_BODY_CAP),
+    max(
+        max(IFSC_BODY_CAP, CREATOR_BODY_CAP),
+        UNICODE_FILENAME_BODY_CAP,
+    ),
+);
+
+const fn max(left: u64, right: u64) -> u64 {
+    if left > right { left } else { right }
+}
 // Bytes ahead of the front a volume may hold. Past it, deliveries wait in
 // the volume's file until the front reaches them, and are read from there.
 const HOLD_CAP: usize = 8 * 1024 * 1024;

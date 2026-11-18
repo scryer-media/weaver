@@ -13,7 +13,7 @@ const MEMBER: MemberId = MemberId(0);
 fn set(names: &[&str]) -> Box<dyn Object> {
     let mut object = crate::build(Kind::Split, ObjectId(0), Budget::default()).unwrap();
     for name in names {
-        let places = object.claim(name, &[], None);
+        let places = object.claim(name, (&[]).into(), None);
         let [volume] = places[..] else {
             panic!("{name} claimed at {places:?}");
         };
@@ -525,15 +525,15 @@ fn a_set_restored_mid_move_reads_back_where_it_was_and_closes_once_whole() {
 fn a_piece_is_placed_by_its_number_in_its_own_set() {
     let mut object = set(&["vessel.bin.002"]);
     assert_eq!(
-        object.claim("VESSEL.BIN.005", &[], None),
+        object.claim("VESSEL.BIN.005", (&[]).into(), None),
         vec![VolumeIndex(4)]
     );
     assert_eq!(
-        object.claim("vessel.bin.001", &[], None),
+        object.claim("vessel.bin.001", (&[]).into(), None),
         vec![VolumeIndex(0)]
     );
-    assert!(object.claim("other.bin.001", &[], None).is_empty());
-    assert!(object.claim("vessel.bin", &[], None).is_empty());
+    assert!(object.claim("other.bin.001", (&[]).into(), None).is_empty());
+    assert!(object.claim("vessel.bin", (&[]).into(), None).is_empty());
 }
 
 // A set numbered from zero counts from its `.000`: `.000 .001 .002` is one
@@ -551,9 +551,9 @@ fn a_set_numbered_from_zero_counts_from_its_zeroth_piece() {
     assert!(lengths(&out).contains(&Some(24)));
 
     let mut object = set(&["ember.7z.001"]);
-    assert!(object.claim("ember.7z.000", &[], None).is_empty());
+    assert!(object.claim("ember.7z.000", (&[]).into(), None).is_empty());
     assert_eq!(
-        object.claim("ember.7z.002", &[], None),
+        object.claim("ember.7z.002", (&[]).into(), None),
         vec![VolumeIndex(1)]
     );
 }
@@ -602,7 +602,7 @@ fn a_number_missing_after_a_piece_placed_keeps_its_bytes_where_they_sit() {
     sized(&mut *object, 0, 100);
     let out = deliver(&mut *object, 0, 0, &[7; 60]);
     assert_eq!(placed(&out), vec![(0, 60)]);
-    let places = object.claim("vessel.bin.003", &[], None);
+    let places = object.claim("vessel.bin.003", (&[]).into(), None);
     assert_eq!(places, vec![VolumeIndex(2)]);
     object.bound(VolumeIndex(2), "vessel.bin.003", &[], Some(100));
     assert_eq!(

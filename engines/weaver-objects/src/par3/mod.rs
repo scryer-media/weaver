@@ -46,6 +46,7 @@ use weaver_graph::{
 
 use crate::elimination::{self, Length};
 use crate::par2::combine;
+use crate::past_hole::{Packets, Searched, Searches};
 use crate::recovery_volume::{self, Refusal, Shown};
 
 // How much of each volume's front is kept to read the index from. An index
@@ -125,13 +126,18 @@ impl Volume {
     // header by header from its start through what arrived of its front,
     // reach a recovery packet, or its name says it carries some and its
     // front holds a packet. A recovery volume repeats the index ahead of
-    // its blocks, so its first article may hold only index packets.
+    // its blocks, so its first article may hold only index packets. A
+    // volume whose start never came was taken by a whole packet of the set
+    // past that hole whose hash passed, or by its name: its front says
+    // nothing of what it carries, and a packet past the hole may run past
+    // what of it is kept, as a recovery block does. It may carry blocks
+    // until the repair reads it.
     fn shows_recovery(&self) -> bool {
         let Some(first) = readable(&self.arrived).into_iter().next() else {
             return false;
         };
         if first.start != 0 {
-            return false;
+            return true;
         }
         let end = first.end.min(self.front.len() as u64);
         let mut at = 0u64;
@@ -440,6 +446,14 @@ pub struct Par3 {
     refused_blocks: u64,
     // What the kept fronts were last read as.
     fronts: Mutex<Fronts>,
+    // How many sets the kept fronts described when a volume last closed: a
+    // volume past a lost front that no set could place before may hold a
+    // packet of one found since.
+    known_sets: usize,
+    // What each volume offered past a lost front has shown so far of a
+    // packet of these sets. Not kept across a restart: the bytes past the
+    // hole are offered again.
+    searches: Searches<par3_rs::FingerprintHasher>,
 }
 
 // The packets each volume's kept front held when it was last scanned, and
@@ -472,6 +486,8 @@ impl Par3 {
             shown: Shown::default(),
             refused_blocks: 0,
             fronts: Mutex::new(Fronts::default()),
+            known_sets: 0,
+            searches: Searches::default(),
         }
     }
 
@@ -810,6 +826,57 @@ fn readable(arrived: &Coverage) -> Vec<ByteRange> {
     spans
 }
 
+// PAR3 packets as a search past a hole reads them: of an input set a held
+// volume's front describes, and no longer than the longest such a set
+// holds, a recovery data packet of its block size or the most of a front a
+// volume keeps, past which no packet that describes a set is read.
+struct SetPackets {
+    sets: Arc<Vec<Par3Set>>,
+}
+
+impl Packets for SetPackets {
+    type Hasher = par3_rs::FingerprintHasher;
+    const MAGIC: &'static [u8] = MAGIC;
+    const HEADER: usize = HEADER_SIZE;
+    // The packet hash covers the packet from its length on.
+    const HASHED_FROM: usize = 24;
+
+    fn ours(&self, header: &[u8]) -> Option<u64> {
+        let header = PacketHeader::parse(header, 0).ok()?;
+        self.sets
+            .iter()
+            .any(|set| set.input_set_id() == header.input_set_id)
+            .then_some(header.length)
+    }
+
+    fn longest(&self) -> u64 {
+        let blocks = self
+            .sets
+            .iter()
+            .map(|set| {
+                set.block_size()
+                    .saturating_add(par3_rs::RecoveryDataPacket::BODY_BASE_LEN as u64)
+            })
+            .max()
+            .unwrap_or(0);
+        (HEADER_SIZE as u64)
+            .saturating_add(blocks)
+            .max(FRONT_CAP as u64)
+    }
+
+    fn hasher(&self) -> Self::Hasher {
+        par3_rs::FingerprintHasher::new()
+    }
+
+    fn update(hasher: &mut Self::Hasher, bytes: &[u8]) {
+        hasher.update(bytes);
+    }
+
+    fn passes(hasher: Self::Hasher, header: &[u8]) -> bool {
+        PacketHeader::parse(header, 0).is_ok_and(|header| hasher.finalize() == header.hash)
+    }
+}
+
 // The packets of one readable span. Each span is scanned on its own: a
 // packet a hole cuts is dropped and the scan picks up past the hole, and a
 // span that fails to scan contributes nothing.
@@ -880,8 +947,16 @@ impl Object for Par3 {
         volume.front[offset..end].copy_from_slice(&delivery.bytes[..end - offset]);
     }
 
-    fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
+    // A closed volume's front is all it brings: a set it describes that the
+    // object did not know may place a member it could not before. Asked
+    // once per close, and said only when the sets grew.
+    fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
         self.volume(volume).closed = true;
+        let known = self.front_sets().len();
+        if known > self.known_sets {
+            self.known_sets = known;
+            out.push(Emit::Learned);
+        }
     }
 
     // A loss is a hole in what arrived, which no packet in it passes; the
@@ -946,8 +1021,30 @@ impl Object for Par3 {
     // up to the carrier limit.
     // By the magic its bytes open with, or, before any bytes, by a name
     // that continues the set's: the stem of a volume already held, then a
-    // `.vol` name ending in `.par3`.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    // `.vol` name ending in `.par3`. A member whose front will not come is
+    // one by a packet in its clean bytes past the hole, of an input set a
+    // volume held already shows, its hash passing: searched for as those
+    // bytes are handed over, not yet while the packet has not passed whole,
+    // and none once the search's bound is past (`past_hole`). Magic alone,
+    // or a packet of another set, claims nothing.
+    fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
+        let first_bytes = clean.front();
+        let place = VolumeIndex(self.volumes.len() as u32);
+        if clean.at > 0 {
+            // The sets the held fronts describe, scanned again only where a
+            // front changed since.
+            let sets = self.front_sets();
+            if sets.is_empty() || self.volumes.len() >= MAX_CARRIERS {
+                self.searches.end(name);
+                return Claim::default();
+            }
+            let format = SetPackets { sets };
+            return match self.searches.read(name, (clean.at, clean.bytes), &format) {
+                Searched::Found => Claim::Places(vec![place]),
+                Searched::More => Claim::NotYet(Vec::new()),
+                Searched::Never => Claim::default(),
+            };
+        }
         let ours = if first_bytes.is_empty() {
             self.volumes
                 .iter()
@@ -957,7 +1054,7 @@ impl Object for Par3 {
             first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
         };
         (ours && self.volumes.len() < MAX_CARRIERS)
-            .then_some(VolumeIndex(self.volumes.len() as u32))
+            .then_some(place)
             .into_iter()
             .collect()
     }
@@ -968,6 +1065,7 @@ impl Object for Par3 {
     // the verdict would depend on whether a volume's front decided before
     // or after the damage arrived.
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
+        self.searches.end(name);
         let found = self.volume(volume);
         found.named_blocks = recovery_volume::named_blocks(name, ".par3");
         found.name = Some(name.to_owned());

@@ -16,6 +16,7 @@ mod lent;
 mod lost;
 pub mod par2;
 pub mod par3;
+mod past_hole;
 mod placed;
 mod quiet;
 pub mod rar_engine;

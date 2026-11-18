@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::deliver::Provenance;
 use crate::evidence::Algorithm;
 use crate::marks::Marked;
-use crate::object::{Kind, ObjectId};
+use crate::object::{Clean, Kind, ObjectId};
 use crate::recovery::Recovery;
 use crate::sniff::{Sniff, signed, sniff_among};
 use crate::volume::ByteRange;
@@ -320,11 +320,16 @@ struct Folded {
     open: usize,
 }
 
-// What arrived of a member's first FIRST_BYTES, and how: bytes past a
+// What arrived of FIRST_BYTES of a member from `at`, and how: bytes past a
 // hole are kept, so the front reaches as far as they do once it fills, and
 // damage is a hole with bytes in it, filled by the repair that replaces it.
+// The window starts at the member's start, unless no clean byte arrived in
+// its first FIRST_BYTES: then it starts at the lowest clean byte that did,
+// so a member whose first article never comes clean still shows its clean
+// bytes, and where they start. A clean byte lower down moves it back.
 #[derive(Debug, Default)]
 struct Front {
+    at: u64,
     bytes: Vec<u8>,
     arrived: Coverage,
     // Which write left the front as it is: drawn from one sequence every
@@ -340,6 +345,79 @@ static FRONT_WRITES: AtomicU64 = AtomicU64::new(1);
 // How much of a member's front the namespace keeps. PAR2 identifies a file
 // by the MD5 of its first 16 KiB, and nothing needs more.
 pub const FIRST_BYTES: usize = 16 * 1024;
+
+// Where the kept window starts for a member whose lowest clean byte is at
+// `lowest`: at the start when that byte is inside the first FIRST_BYTES,
+// else at that byte.
+pub fn window_start(lowest: u64) -> u64 {
+    if lowest < FIRST_BYTES as u64 {
+        0
+    } else {
+        lowest
+    }
+}
+
+impl Front {
+    // The window moved to start at `at`: what it held there stays, the rest
+    // goes.
+    fn move_to(&mut self, at: u64) {
+        let window = ByteRange::at(at, FIRST_BYTES as u64);
+        let mut moved = Front {
+            at,
+            bytes: Vec::new(),
+            arrived: Coverage::new(),
+            stamp: self.stamp,
+        };
+        for run in self.arrived.runs() {
+            let Some(range) = run
+                .range
+                .intersect(window)
+                .filter(|range| !range.is_empty())
+            else {
+                continue;
+            };
+            let from = (range.start - self.at) as usize;
+            let to = (range.end - self.at) as usize;
+            let into = (range.start - at) as usize;
+            let end = into + (to - from);
+            if end > moved.bytes.len() {
+                moved.bytes.resize(end, 0);
+            }
+            moved.bytes[into..end].copy_from_slice(&self.bytes[from..to]);
+            moved.arrived.write(range, run.provenance);
+        }
+        *self = moved;
+    }
+
+    fn holds_clean(&self) -> bool {
+        self.arrived.runs().any(|run| !run.provenance.is_damaged())
+    }
+
+    // The first clean run the window holds, and where it starts.
+    fn clean(&self) -> (u64, &[u8]) {
+        let mut start = None;
+        let mut reached = 0;
+        for run in self.arrived.runs() {
+            match start {
+                None if !run.provenance.is_damaged() => {
+                    start = Some(run.range.start);
+                    reached = run.range.end;
+                }
+                None => {}
+                Some(_) if run.range.start == reached && !run.provenance.is_damaged() => {
+                    reached = run.range.end;
+                }
+                Some(_) => break,
+            }
+        }
+        let Some(start) = start else {
+            return (0, &[]);
+        };
+        let from = ((start - self.at) as usize).min(self.bytes.len());
+        let to = ((reached - self.at) as usize).min(self.bytes.len());
+        (start, &self.bytes[from..to])
+    }
+}
 
 impl Namespace {
     pub fn new() -> Self {
@@ -1010,21 +1088,36 @@ impl Namespace {
         if !self.members.contains_key(&member) {
             return;
         }
-        let Ok(start) = usize::try_from(offset) else {
-            return;
-        };
-        if start >= FIRST_BYTES || bytes.is_empty() {
+        if bytes.is_empty() {
             return;
         }
-        let end = start.saturating_add(bytes.len()).min(FIRST_BYTES);
+        // A clean byte below the window, or one anywhere while the window
+        // holds none, moves it.
+        let (held_at, holds_clean) = self
+            .first_bytes
+            .get(&member)
+            .map_or((0, false), |front| (front.at, front.holds_clean()));
+        let at = window_start(offset);
+        let moves = !provenance.is_damaged() && at != held_at && (at < held_at || !holds_clean);
+        let window = ByteRange::at(if moves { at } else { held_at }, FIRST_BYTES as u64);
+        let Some(kept) = ByteRange::at(offset, bytes.len() as u64)
+            .intersect(window)
+            .filter(|kept| !kept.is_empty())
+        else {
+            return;
+        };
         let front = self.first_bytes.entry(member).or_default();
+        if moves {
+            front.move_to(at);
+        }
+        let start = (kept.start - front.at) as usize;
+        let end = (kept.end - front.at) as usize;
+        let from = (kept.start - offset) as usize;
         if end > front.bytes.len() {
             front.bytes.resize(end, 0);
         }
-        front.bytes[start..end].copy_from_slice(&bytes[..end - start]);
-        front
-            .arrived
-            .write(ByteRange::new(start as u64, end as u64), provenance);
+        front.bytes[start..end].copy_from_slice(&bytes[from..from + (end - start)]);
+        front.arrived.write(kept, provenance);
         front.stamp = FRONT_WRITES.fetch_add(1, Ordering::Relaxed);
         if !self.first_bytes(member).is_empty()
             && let Some(record) = self.members.get_mut(&member)
@@ -1040,11 +1133,27 @@ impl Namespace {
         self.stamped_front(member).1
     }
 
+    // The clean bytes the member has, and where they start: its front, or,
+    // with none, the first clean run the kept window holds past the hole
+    // where its front stopped, at most FIRST_BYTES of it. What an object is
+    // offered the member by.
+    pub fn clean(&self, member: MemberId) -> Clean<'_> {
+        let front = self.first_bytes(member);
+        if !front.is_empty() {
+            return Clean::start(front);
+        }
+        let (at, bytes) = self
+            .first_bytes
+            .get(&member)
+            .map_or((0, &[][..]), Front::clean);
+        Clean { at, bytes }
+    }
+
     // The member's front with the stamp of the write that left it so: the
     // same stamp is the same front, and zero is none. Fronts are not kept
     // across a restart, so a restored front comes again under a new stamp.
     pub fn stamped_front(&self, member: MemberId) -> (u64, &[u8]) {
-        let Some(front) = self.first_bytes.get(&member) else {
+        let Some(front) = self.first_bytes.get(&member).filter(|front| front.at == 0) else {
             return (0, &[]);
         };
         let mut reached = 0;
@@ -1881,5 +1990,37 @@ mod tests {
         let restored = namespace.remove(member).unwrap();
         namespace.restore(restored);
         assert_eq!(namespace.announce("b.bin", None), MemberId(1));
+    }
+
+    // A member whose first article is lost keeps the clean run past the
+    // hole: inside the first FIRST_BYTES from the start, from its lowest
+    // clean byte past them. A lower clean byte moves the window down, and a
+    // front that comes moves it back to the start; damage moves nothing.
+    #[test]
+    fn the_window_past_a_lost_front_follows_the_lowest_clean_byte() {
+        let first = FIRST_BYTES as u64;
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("k3x9q0.bin", Some(4 * first));
+        namespace.keep_first_bytes(member, 0, &[0; 64], Provenance::Damaged);
+        namespace.keep_first_bytes(member, 64, &[1; 64], Provenance::Fresh);
+        let clean = namespace.clean(member);
+        assert_eq!((clean.at, clean.bytes), (64, &[1; 64][..]));
+        assert!(clean.front().is_empty());
+
+        // Past the first FIRST_BYTES, the window starts at the clean byte.
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("k3x9q0.bin", Some(4 * first));
+        namespace.keep_first_bytes(member, 0, &[0; 64], Provenance::Damaged);
+        namespace.keep_first_bytes(member, 3 * first, &[3; 32], Provenance::Fresh);
+        assert_eq!(namespace.clean(member).at, 3 * first);
+        // A clean byte lower down moves it there, and damage does not.
+        namespace.keep_first_bytes(member, 2 * first, &[2; 32], Provenance::Fresh);
+        namespace.keep_first_bytes(member, first + 7, &[9; 32], Provenance::Damaged);
+        let clean = namespace.clean(member);
+        assert_eq!((clean.at, clean.bytes), (2 * first, &[2; 32][..]));
+        // The front that comes takes the window back to the start.
+        namespace.keep_first_bytes(member, 0, &[5; 64], Provenance::Repaired);
+        let clean = namespace.clean(member);
+        assert_eq!((clean.at, clean.front()), (0, &[5; 64][..]));
     }
 }

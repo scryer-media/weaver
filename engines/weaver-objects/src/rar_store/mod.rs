@@ -1087,7 +1087,8 @@ impl Object for RarStore {
 
     // The place the volume's headers or name give it, held or not: whether
     // it takes it is the tree's to judge.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
+        let first_bytes = clean.front();
         self.claim_volume(name, first_bytes)
     }
 
