@@ -146,6 +146,18 @@ async fn insert_trackers(
 // as `UPDATE ... CASE` statements of as many rows as their binds allow.
 // A torrent named twice takes the value named last, as one statement per
 // row in turn left it.
+/// A batch of torrents' own settings, by column: each column is written
+/// for the torrents it lists and no other (`Database::set_torrent_settings`).
+#[derive(Debug, Default)]
+pub(crate) struct TorrentSettingRows {
+    pub(crate) forced: Vec<(JobId, bool)>,
+    pub(crate) sequential: Vec<(JobId, bool)>,
+    pub(crate) first_last_piece_first: Vec<(JobId, bool)>,
+    pub(crate) upload_limit: Vec<(JobId, Option<u64>)>,
+    pub(crate) download_limit: Vec<(JobId, Option<u64>)>,
+    pub(crate) policy_override: Vec<(JobId, Option<SeedingPolicy>)>,
+}
+
 pub(crate) async fn update_column_tx(
     tx: &mut SqlTx<'_>,
     column: &str,
@@ -2367,6 +2379,66 @@ impl Database {
                 Box::pin(async move {
                     update_column_tx(tx, "category_id", &columns.0).await?;
                     update_column_tx(tx, "forced", &columns.1).await
+                })
+            })
+            .await
+        })
+    }
+
+    // A batch of torrents' own settings, each column for the torrents it
+    // names and no other, in one transaction of few statements: what
+    // `set_torrent_forced` and the other setters write one torrent at a
+    // time.
+    pub(crate) fn set_torrent_settings(&self, rows: &TorrentSettingRows) -> Result<(), StateError> {
+        fn column<T>(
+            rows: &[(JobId, T)],
+            arg: impl Fn(&T) -> Result<SqlArg, StateError>,
+        ) -> Result<Vec<(i64, SqlArg)>, StateError> {
+            rows.iter()
+                .map(|(job_id, value)| Ok((stored(job_id.0)?, arg(value)?)))
+                .collect()
+        }
+        let limit = |limit: &Option<u64>| Ok(SqlArg::OptI64(limit.map(stored).transpose()?));
+        let columns: Vec<(&'static str, Vec<(i64, SqlArg)>)> = vec![
+            ("forced", column(&rows.forced, |on| Ok(SqlArg::Bool(*on)))?),
+            (
+                "sequential",
+                column(&rows.sequential, |on| Ok(SqlArg::Bool(*on)))?,
+            ),
+            (
+                "first_last_piece_first",
+                column(&rows.first_last_piece_first, |on| Ok(SqlArg::Bool(*on)))?,
+            ),
+            ("upload_limit", column(&rows.upload_limit, limit)?),
+            ("download_limit", column(&rows.download_limit, limit)?),
+            (
+                "policy_override",
+                column(&rows.policy_override, |policy| {
+                    SeedingPolicy::kept(*policy)
+                        .map(|policy| serde_json::to_string(&policy))
+                        .transpose()
+                        .map(SqlArg::OptText)
+                        .map_err(|error| StateError::Database(error.to_string()))
+                })?,
+            ),
+        ];
+        let columns: Vec<_> = columns
+            .into_iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect();
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let columns = std::sync::Arc::new(columns);
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_settings", |tx| {
+                let columns = std::sync::Arc::clone(&columns);
+                Box::pin(async move {
+                    for (name, rows) in columns.iter() {
+                        update_column_tx(tx, name, rows).await?;
+                    }
+                    Ok(())
                 })
             })
             .await

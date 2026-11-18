@@ -786,11 +786,10 @@ fn stored_torrents(db: &Database, count: u64) {
             metainfo: None,
             category_id: None,
             added_at_ms: 1_700_000_000_000 + (job_id % 997) as i64,
-            // Few resumed: with torrents off, a start costs a whole publish
-            // for each resumed torrent.
-            kept: KeptIntent::Intent(match (job_id % 200, job_id % 3) {
-                (0, _) => TorrentIntent::Resumed,
-                (_, 0) => TorrentIntent::Stopped,
+            // A third resumed, a third paused, a third stopped.
+            kept: KeptIntent::Intent(match job_id % 3 {
+                1 => TorrentIntent::Resumed,
+                0 => TorrentIntent::Stopped,
                 _ => TorrentIntent::Paused,
             }),
             forced: job_id.is_multiple_of(11),
@@ -817,17 +816,12 @@ fn stored_torrents(db: &Database, count: u64) {
     }
 }
 
-// With 10,000 torrents loaded and nothing changing, `torrents/info` polls,
-// across filters, sorts, pages, hashes, privacy and the trackers and files
-// listed, and the limit readings of every torrent, build no torrent's view
-// and take the database for no statement. Torrents are off, so no tick
-// publishes while the polls run.
-#[tokio::test]
-async fn torrents_info_polls_build_no_view_and_read_nothing() {
-    const STORED: u64 = 10_000;
+// `count` stored torrents, loaded by a service with torrents off, every
+// resumed magnet's fetch ended.
+async fn started_with(count: u64) -> (tempfile::TempDir, Database, TorrentService) {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_in_memory().unwrap();
-    stored_torrents(&db, STORED);
+    stored_torrents(&db, count);
     let torrents = TorrentService::new(
         db.clone(),
         Sessions::new(
@@ -852,7 +846,150 @@ async fn torrents_info_polls_build_no_view_and_read_nothing() {
     );
     torrents.start().await.unwrap();
     torrents.loaded().await;
-    assert_eq!(torrents.snapshot().len(), STORED as usize);
+    // Every resumed magnet's fetch ends at once with torrents off; each
+    // shows only its own row, so the start builds a few views a torrent.
+    torrents.fetches_ended(count.div_ceil(3)).await;
+    assert!(torrents.views_built() <= 4 * count as usize);
+    assert_eq!(torrents.snapshot().len(), count as usize);
+    (dir, db, torrents)
+}
+
+// The hash torrent `job_id` was stored with.
+fn stored_hash(job_id: u64) -> String {
+    format!("{job_id:016x}{}5a", "0".repeat(22))
+}
+
+// The rows of every torrent, by job, without the time each was built at.
+fn shown(torrents: &TorrentService) -> Vec<TorrentView> {
+    let mut views: Vec<TorrentView> = torrents
+        .snapshot()
+        .every()
+        .1
+        .iter()
+        .map(|row| {
+            let mut view = row.view.clone();
+            view.clock.at_ms = 0;
+            view
+        })
+        .collect();
+    views.sort_by_key(|view| view.job_id);
+    views
+}
+
+// Once no torrent's row shows a metadata fetch running.
+async fn fetches_shown_ended(torrents: &TorrentService) {
+    let mut revision = torrents.snapshot().subscribe();
+    while torrents
+        .snapshot()
+        .every()
+        .1
+        .iter()
+        .any(|row| row.view.state == TorrentState::FetchingMetadata)
+    {
+        revision.changed().await.unwrap();
+    }
+}
+
+// An action on many torrents is one unit of work: each request builds a
+// publish of the torrents, not one for each, and takes the database a few
+// times, not once for each. What it stores and shows is what the same
+// changes made one torrent at a time store and show.
+#[tokio::test]
+async fn actions_on_many_torrents_are_one_unit_each() {
+    // Few enough that the torrents taken one at a time, a publish of every
+    // torrent each, finish quickly.
+    const STORED: u64 = 300;
+    let (dir, db, many) = started_with(STORED).await;
+    let (_alone_dir, alone_db, alone) = started_with(STORED).await;
+    let rig = rig_around(
+        dir,
+        db,
+        Some(many.clone()),
+        RuntimeSecurityConfig::default(),
+        scheduler(),
+        Api::LATEST,
+    );
+    let hashes = (1..=STORED).map(stored_hash).collect::<Vec<_>>().join("|");
+    for (action, form) in [
+        ("setForceStart", "value=true"),
+        ("toggleSequentialDownload", ""),
+        ("toggleFirstLastPiecePrio", ""),
+        ("setUploadLimit", "limit=1024"),
+        ("setDownloadLimit", "limit=2048"),
+        (
+            "setShareLimits",
+            "ratioLimit=2&seedingTimeLimit=60&inactiveSeedingTimeLimit=-2",
+        ),
+        ("stop", ""),
+        ("start", ""),
+        ("setCategory", "category="),
+        ("setForceStart", "value=false"),
+    ] {
+        let (views, takes) = (many.views_built(), rig.db.datastore_takes());
+        let reply = rig
+            .post(
+                &format!("/api/v2/torrents/{action}"),
+                &format!("hashes={hashes}&{form}"),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{action}: {}", reply.body);
+        let built = many.views_built() - views;
+        // One publish of every torrent, and on a start a row for each
+        // magnet whose fetch ends while the request runs. One at a time
+        // they built a publish of every torrent for each.
+        assert!(built <= 3 * STORED as usize, "{action}: {built} views");
+        let took = rig.db.datastore_takes() - takes;
+        assert!(took <= 16, "{action}: {took} takes");
+        // The same request, one torrent at a time.
+        let before = shown(&alone);
+        for view in &before {
+            let job_id = view.job_id;
+            let done = match action {
+                "setForceStart" => alone.set_forced(job_id, form.ends_with("true")).await,
+                "toggleSequentialDownload" => alone.set_sequential(job_id, !view.sequential).await,
+                "toggleFirstLastPiecePrio" => {
+                    alone
+                        .set_first_last_piece_first(job_id, !view.first_last_piece_first)
+                        .await
+                }
+                "setUploadLimit" => alone.set_rate_limits(job_id, Some(Some(1024)), None).await,
+                "setDownloadLimit" => alone.set_rate_limits(job_id, None, Some(Some(2048))).await,
+                // The goals the request names, as the facade reads them.
+                "setShareLimits" => {
+                    let policy = rig.db.get_torrent(job_id).unwrap().unwrap().policy_override;
+                    assert!(policy.is_some());
+                    alone.set_policy_override(job_id, policy).await
+                }
+                "stop" => alone.pause(job_id).await,
+                "start" => alone.resume(job_id).await,
+                _ => alone.set_category(job_id, None).await,
+            };
+            done.unwrap();
+        }
+        assert_eq!(
+            rig.db.list_torrents().unwrap(),
+            alone_db.list_torrents().unwrap(),
+            "{action}"
+        );
+        // A resumed magnet fetches again, and its fetch ends on its own
+        // turn.
+        fetches_shown_ended(&many).await;
+        fetches_shown_ended(&alone).await;
+        assert!(shown(&many) == shown(&alone), "{action}");
+    }
+    many.stop().await;
+    alone.stop().await;
+}
+
+// With 10,000 torrents loaded and nothing changing, `torrents/info` polls,
+// across filters, sorts, pages, hashes, privacy and the trackers and files
+// listed, and the limit readings of every torrent, build no torrent's view
+// and take the database for no statement. Torrents are off, so no tick
+// publishes while the polls run.
+#[tokio::test]
+async fn torrents_info_polls_build_no_view_and_read_nothing() {
+    const STORED: u64 = 10_000;
+    let (dir, db, torrents) = started_with(STORED).await;
     let rig = rig_around(
         dir,
         db,
@@ -861,7 +998,6 @@ async fn torrents_info_polls_build_no_view_and_read_nothing() {
         scheduler(),
         Api::LATEST,
     );
-    // Torrents 3 and 8,000, by the hashes they were stored with.
     let named = format!(
         "{:016x}{zeros}5a|{:016X}{zeros}5A",
         3,

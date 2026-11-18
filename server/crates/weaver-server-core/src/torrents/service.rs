@@ -73,6 +73,7 @@ mod tick;
 mod trackers;
 pub mod updates;
 mod views;
+pub use batch::TorrentSetting;
 use checkpoints::Landing;
 pub use disk_room::disk_warning;
 use disk_room::{DiskWait, NoRoom, Relook, RunMark};
@@ -949,6 +950,10 @@ struct Inner {
     // what the intakes said before it.
     #[cfg(test)]
     settled: watch::Sender<u64>,
+    // How many magnets' fetches were shown ended: what a test waits on to
+    // know every fetch a start began has said its end.
+    #[cfg(any(test, feature = "test-support"))]
+    fetches_ended: watch::Sender<u64>,
     // A test's hold on the sweep of idle sessions, once it has read the
     // routes the torrents use and before it reads the sessions, and how
     // many sweeps reached that hold.
@@ -1028,6 +1033,8 @@ impl TorrentService {
                 disk_waits_moved: watch::channel(0).0,
                 #[cfg(test)]
                 settled: watch::channel(0).0,
+                #[cfg(any(test, feature = "test-support"))]
+                fetches_ended: watch::channel(0).0,
                 #[cfg(test)]
                 sweep_held: watch::channel(false).0,
                 #[cfg(test)]
@@ -1195,7 +1202,16 @@ impl TorrentService {
             .tasks
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        tasks.retain(|task| !task.is_finished());
+        // The ended tasks go when the list is full, not at every keep: a
+        // start keeps a task for each torrent it resumes, and a sweep per
+        // keep would cost the square of them. After a sweep the list has
+        // room for as many again as it holds, so a sweep comes only after
+        // as many keeps as it reads.
+        if tasks.len() == tasks.capacity() {
+            tasks.retain(|task| !task.is_finished());
+            let held = tasks.len().max(1);
+            tasks.reserve(held);
+        }
         tasks.push(task);
     }
 
@@ -1322,6 +1338,17 @@ impl TorrentService {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn start_loading(&self) -> Result<(), String> {
         self.start_seated().await
+    }
+
+    /// Once `count` fetches of magnets have ended and shown their end.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fetches_ended(&self, count: u64) {
+        let _ = self
+            .inner
+            .fetches_ended
+            .subscribe()
+            .wait_for(|ended| *ended >= count)
+            .await;
     }
 
     /// Once every stored torrent is read, and its row is in the snapshot.
