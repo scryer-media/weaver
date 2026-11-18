@@ -804,3 +804,153 @@ async fn a_piece_posted_short_is_rebuilt_to_the_length_its_recovery_set_proves_i
         graph.graph().outcomes
     );
 }
+
+// Pieces posted under names that trail an underscore past the number,
+// `x.mkv.001_` onward, as a subject's closing quote leaves them: the trail is
+// no part of the number, so the pieces join into `x.mkv` at the root, one
+// split and no deeper. SABnzbd read these names as `.001` onward and joined
+// them. Unjoined, the first piece nested a split under a split until the
+// nesting limit refused it.
+fn trailed(bytes: &[u8]) -> Vec<Post> {
+    pieces(bytes)
+        .into_iter()
+        .map(|post| Post::plain(&format!("{}_", post.name), post.bytes))
+        .collect()
+}
+
+#[tokio::test]
+async fn pieces_trailing_an_underscore_are_joined_at_the_root() {
+    let graph = run(&Scenario::new(trailed(&joined()))).await;
+    assert_joined(&graph);
+    assert_eq!(kinds(&graph), vec!["split"]);
+}
+
+// The posted shape of the job that found it: the pieces trail an
+// underscore, a PAR2 set describes the joined file, and a piece is damaged.
+// The set repairs the joined file, and it is delivered.
+#[tokio::test]
+async fn pieces_trailing_an_underscore_under_par2_over_the_joined_file_are_repaired() {
+    let original = joined();
+    let mut posts = trailed(&original);
+    posts[1].bytes[ARTICLE..3 * ARTICLE].fill(0);
+    posts.extend(par2_set("lantern", &[(NAME, &original)], 4));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_joined(&graph);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 2 })]
+    );
+}
+
+// A file whose name ends in a version's short digit tail, `.4.0`, is no
+// piece: it is delivered as it is, whole. Before, `.0` founded a split of
+// one piece, whose output `.4` founded another.
+#[tokio::test]
+async fn a_name_ending_in_a_short_digit_tail_is_delivered_whole() {
+    let notes = b"Microsoft.WindowsAppRuntime release notes.\n".to_vec();
+    for name in [
+        "Microsoft.WindowsAppRuntime.Release%211.4.0",
+        "Microsoft.WindowsAppRuntime.Release%211.4",
+    ] {
+        let archive = crate::pipeline::tests::direct_store::multi_member_store_set(
+            &[(name, notes.clone())],
+            1,
+        )
+        .remove(0)
+        .1;
+        for posts in [
+            vec![Post::plain(name, notes.clone())],
+            vec![Post::plain("lantern.rar", archive)],
+        ] {
+            let graph = run(&Scenario::new(posts)).await;
+            let delivered = format!("lantern beacon/{name}");
+            assert!(
+                graph.completed(),
+                "{name}: {:?} {:?} kinds {:?}",
+                graph.status,
+                graph.failure,
+                kinds(&graph)
+            );
+            assert_eq!(
+                graph.files.keys().cloned().collect::<Vec<_>>(),
+                vec![delivered.clone()]
+            );
+            assert!(graph.files[&delivered] == notes, "{name} not whole");
+            assert!(!kinds(&graph).contains(&"split"), "{:?}", kinds(&graph));
+        }
+    }
+}
+
+// A split's own output whose name ends in a short digit tail is not split
+// again: `notes.4.0.001` and `.002` join into `notes.4.0`, delivered whole.
+#[tokio::test]
+async fn a_joined_file_ending_in_a_short_digit_tail_is_not_split_again() {
+    let original = joined();
+    let posts: Vec<Post> = original
+        .chunks(PIECE)
+        .enumerate()
+        .map(|(index, piece)| Post::plain(&format!("notes.4.0.{:03}", index + 1), piece.to_vec()))
+        .collect();
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec!["lantern beacon/notes.4.0".to_string()]
+    );
+    assert!(graph.files["lantern beacon/notes.4.0"] == original);
+    assert_eq!(kinds(&graph), vec!["split"]);
+}
+
+// Pieces posted under the subject shape of job f586b14d13974344, whose
+// opening quote is missing: `[1/3] - lantern.bin.001" yEnc (1/6)`. The NZB
+// names them through the one naming owner every job built from an NZB
+// uses, and the unpaired quote is no part of any name: they are
+// `lantern.bin.001` onward, no `_` after the number, and they join at the
+// root. Before, the quote stayed in the name and was written as `_`.
+#[tokio::test]
+async fn pieces_posted_under_an_unpaired_closing_quote_are_named_clean_and_joined() {
+    let original = joined();
+    let posted = pieces(&original);
+    let total = posted.len();
+    let files: String = posted
+        .iter()
+        .enumerate()
+        .map(|(index, post)| {
+            format!(
+                r#"  <file poster="test@test.com" date="1234567890" subject="[{n}/{total}] - {name}&quot; yEnc (1/6)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="{bytes}" number="1">piece-{n}@test.com</segment></segments>
+  </file>
+"#,
+                n = index + 1,
+                name = post.name,
+                bytes = post.bytes.len(),
+            )
+        })
+        .collect();
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n{files}</nzb>"
+    );
+    let nzb = weaver_nzb::parse_nzb(xml.as_bytes()).unwrap();
+    let spec =
+        crate::ingest::nzb_to_spec(&nzb, std::path::Path::new("lantern.nzb"), None, Vec::new());
+    let names: Vec<&str> = spec
+        .files
+        .iter()
+        .map(|file| file.filename.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["lantern.bin.001", "lantern.bin.002", "lantern.bin.003"]
+    );
+    assert!(crate::ingest::full_file_names(&spec.metadata).is_empty());
+    let named: Vec<Post> = spec
+        .files
+        .iter()
+        .zip(posted)
+        .map(|(file, post)| Post::plain(&file.filename, post.bytes))
+        .collect();
+    let graph = run(&Scenario::new(named)).await;
+    assert_joined(&graph);
+    assert_eq!(kinds(&graph), vec!["split"]);
+}

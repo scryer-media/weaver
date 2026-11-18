@@ -11,8 +11,12 @@
 // deflate, brotli and SFV, which have no signature, by theirs alone, but
 // for one: a small text member whose lines are all `name CRC32` entries is
 // an SFV under any name, when no member beside it is named a listing or
-// recovery data (`sniff_among`). The one
-// name that outranks a signature is a numbered piece's, `name.001` onward,
+// recovery data (`sniff_among`). An end file, a disk image, an app package,
+// a document or a comic book (`END_FILES`), is built on a container format:
+// when its name and the signature its bytes open agree, it is delivered
+// whole, never opened. A name whose bytes open any other signature is lying,
+// and the bytes decide. The one name that outranks a signature is a
+// numbered piece's, `name.001` onward,
 // whichever piece it is and whatever its bytes open: it founds the split
 // store first, whose pieces join into one file, and that file's own front
 // says what it is. The claim is the name's only until a piece other than
@@ -53,11 +57,14 @@ pub enum Sniff {
 
 pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
     // A name never outvotes bytes that might still turn out to be a signature.
-    // A numbered piece's name outvotes any they open, as the first claim:
-    // the piece is a slice of a file, and what that file is, its own front
-    // says once joined, unless a later piece's own front refutes the set.
+    // An end file's name and the signature its format is built on, together,
+    // say the member is that end file. A numbered piece's name outvotes any
+    // signature, as the first claim: the piece is a slice of a file, and what
+    // that file is, its own front says once joined, unless a later piece's
+    // own front refutes the set.
     match signed(first_bytes, length) {
-        Sniff::Object(_) if numbered_piece(trimmed(name)) => Sniff::Object(Kind::Split),
+        Sniff::Object(kind) if end_file_built_on(trimmed(name), kind) => Sniff::Leaf,
+        Sniff::Object(_) if numbered_piece(name) => Sniff::Object(Kind::Split),
         Sniff::Leaf => named(name)
             .or_else(|| sevenz_by_name(name, first_bytes))
             .map_or(Sniff::Leaf, Sniff::Object),
@@ -500,6 +507,82 @@ fn kind_named(name: &str) -> Option<(Kind, Claims)> {
         .map(|(kind, claims, _)| (*kind, *claims))
 }
 
+// End files: formats built on a container, delivered as they are, each
+// with the signatures it is built on. A member under one of these names
+// whose bytes open one of its signatures is that end file, and a leaf:
+// unpacking it destroys the file the post is. Bytes that open any other
+// signature make the name a lie (usenet is full of them), and they decide.
+// SABnzbd unpacks by name only (`.rar`, `.rNN`, `.sNN`… and numbered
+// volumes, `.zip`, `.7z`, `.7z.NNN`, `.tar`, `.NNN` pieces, `.NN.ts`) and
+// delivers every name here as it is. The one table: a format joins it here
+// and nowhere else.
+//
+//   .dmg   an Apple disk image; a bzip2 one (UDBZ) opens on a bzip2 stream.
+//          zlib (UDZO) and plain images open on no signature the sniffer
+//          knows, and are leaves by their bytes already
+//   .apk .aab .apks .xapk   Android packages and bundles: zips
+//   .ipa   an iOS app: a zip
+//   .jar .war .ear   Java archives: zips
+//   .xpi   a Firefox extension: a zip
+//   .epub  an e-book: a zip
+//   .docx .xlsx .pptx .docm .xlsm .pptm .odt .ods .odp .odg   office
+//          documents, macro-enabled ones too: zips
+//   .msix .msixbundle .appx .appxbundle   Windows app packages and bundles:
+//          zips
+//   .whl .nupkg .vsix   Python, NuGet and VS Code packages: zips
+//   .pima  an Adobe package: a zip
+//   .cbz .cbr .cb7 .cbt   comic books, which readers open whole: a zip, a
+//          RAR, a 7z, a tar of pages
+//
+// Not here, because no signature the sniffer knows opens them, so their
+// bytes already make them leaves and any archive signature under their
+// name is a lie: `.iso` and `.img` (a system area or partition table),
+// `.crx` (`Cr24`, then a zip), `.msi` (an OLE compound file), `.deb` (an
+// `ar` archive), `.rpm` (its lead, then cpio).
+const ZIP: &[Kind] = &[Kind::Zip];
+const END_FILES: &[(&str, &[Kind])] = &[
+    (".dmg", &[Kind::Bzip2]),
+    (".apk", ZIP),
+    (".aab", ZIP),
+    (".apks", ZIP),
+    (".xapk", ZIP),
+    (".ipa", ZIP),
+    (".jar", ZIP),
+    (".war", ZIP),
+    (".ear", ZIP),
+    (".xpi", ZIP),
+    (".epub", ZIP),
+    (".docx", ZIP),
+    (".xlsx", ZIP),
+    (".pptx", ZIP),
+    (".odt", ZIP),
+    (".ods", ZIP),
+    (".odp", ZIP),
+    (".docm", ZIP),
+    (".xlsm", ZIP),
+    (".pptm", ZIP),
+    (".odg", ZIP),
+    (".msix", ZIP),
+    (".msixbundle", ZIP),
+    (".appx", ZIP),
+    (".appxbundle", ZIP),
+    (".whl", ZIP),
+    (".nupkg", ZIP),
+    (".vsix", ZIP),
+    (".pima", ZIP),
+    (".cbz", ZIP),
+    (".cbr", &[Kind::RarStore]),
+    (".cb7", &[Kind::SevenZipStore]),
+    (".cbt", &[Kind::Tar]),
+];
+
+// Whether a name is an end file's that is built on this kind.
+fn end_file_built_on(name: &str, kind: Kind) -> bool {
+    END_FILES
+        .iter()
+        .any(|(extension, kinds)| kinds.contains(&kind) && has_extension(name, extension))
+}
+
 // Whether a name is a container's an object opens: an archive, a tar, or a
 // compressed stream, by the extensions the sniffer knows them by. Recovery
 // data and SFVs are not containers.
@@ -645,12 +728,29 @@ pub fn listed(names: &[&str]) -> Vec<Listed> {
         .collect()
 }
 
-// A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
-// its last extension is all digits. Which piece it is, the object says.
-fn numbered_piece(name: &str) -> bool {
-    name.rsplit_once('.').is_some_and(|(stem, digits)| {
-        !stem.is_empty() && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+// The digits a piece's number has at the least: `.001`, as 7-Zip, HJSplit
+// and SABnzbd's joiner number pieces. A name ending in `.4` or `.0`, or in
+// `.10`, is a version or a repost, never a piece.
+const PIECE_DIGITS: usize = 3;
+
+// A piece of a file split into numbered pieces, `name.001`, `name.002`, …,
+// told by its posted name: its last extension is three or more digits,
+// once the quotes, underscores or dots a posted name trails are off
+// (`trimmed`). It gives the name of the file the pieces were cut from, as it
+// was spelled, and the piece's number. The one owner of what a piece's name
+// is: the sniff founds the split store by it, and the store numbers its
+// pieces and names their file by it, so a name one founds a split store on
+// is always one the other numbers. Which piece it is, the object says.
+pub fn split_piece(name: &str) -> Option<(&str, &str)> {
+    trimmed(name).rsplit_once('.').filter(|(stem, digits)| {
+        !stem.is_empty()
+            && digits.len() >= PIECE_DIGITS
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
     })
+}
+
+fn numbered_piece(name: &str) -> bool {
+    split_piece(name).is_some()
 }
 
 fn has_extension(name: &str, extension: &str) -> bool {
@@ -1077,6 +1177,164 @@ mod tests {
         assert_eq!(sniff("9f3a7c1e", b"BZh9", None), object(Kind::Bzip2));
     }
 
+    // Each end file's own front, as its format writes it, and the kind its
+    // bytes alone found.
+    fn end_file_fronts() -> Vec<(&'static str, Vec<u8>, Kind)> {
+        let zip = b"PK\x03\x04\x14\x00\x08\x00".to_vec();
+        let zipped = |extension| (extension, zip.clone(), Kind::Zip);
+        let mut cbt = ustar(0);
+        cbt[..8].copy_from_slice(b"page.jpg");
+        vec![
+            (".dmg", b"BZh91AY&SY".to_vec(), Kind::Bzip2),
+            zipped(".apk"),
+            zipped(".aab"),
+            zipped(".apks"),
+            zipped(".xapk"),
+            zipped(".ipa"),
+            zipped(".jar"),
+            zipped(".war"),
+            zipped(".ear"),
+            zipped(".xpi"),
+            zipped(".epub"),
+            zipped(".docx"),
+            zipped(".xlsx"),
+            zipped(".pptx"),
+            zipped(".odt"),
+            zipped(".ods"),
+            zipped(".odp"),
+            zipped(".docm"),
+            zipped(".xlsm"),
+            zipped(".pptm"),
+            zipped(".odg"),
+            zipped(".msix"),
+            zipped(".msixbundle"),
+            zipped(".appx"),
+            zipped(".appxbundle"),
+            zipped(".whl"),
+            zipped(".nupkg"),
+            zipped(".vsix"),
+            zipped(".pima"),
+            zipped(".cbz"),
+            (".cbr", RAR5.to_vec(), Kind::RarStore),
+            (".cb7", seven_z(), Kind::SevenZipStore),
+            (".cbt", cbt, Kind::Tar),
+        ]
+    }
+
+    // Every front the sniffer founds an object on, with the kind it founds.
+    fn every_signature() -> Vec<(Vec<u8>, Kind)> {
+        vec![
+            (RAR5.to_vec(), Kind::RarStore),
+            (RAR4.to_vec(), Kind::RarStore),
+            (seven_z(), Kind::SevenZipStore),
+            (b"PK\x03\x04".to_vec(), Kind::Zip),
+            (XZ.to_vec(), Kind::Xz),
+            (GZIP.to_vec(), Kind::Gzip),
+            (vec![0x28, 0xb5, 0x2f, 0xfd], Kind::Zstd),
+            (b"BZh91AY&SY".to_vec(), Kind::Bzip2),
+            (ustar(0), Kind::Tar),
+        ]
+    }
+
+    // An end file's name and the signature it is built on make a leaf; the
+    // same name over any other signature is a lie, and the bytes decide.
+    #[test]
+    fn an_end_file_is_a_leaf_only_over_its_own_signature() {
+        let table = end_file_fronts();
+        assert_eq!(
+            table
+                .iter()
+                .map(|(extension, _, kind)| (*extension, vec![*kind]))
+                .collect::<Vec<_>>(),
+            END_FILES
+                .iter()
+                .map(|(extension, kinds)| (*extension, kinds.to_vec()))
+                .collect::<Vec<_>>(),
+            "every end file has its front here"
+        );
+        for (extension, own, kind) in &table {
+            // Under a name that says nothing, the bytes found their object,
+            // so the pairing is what makes the leaf.
+            assert_eq!(sniff("9f3a7c1e", own, None), object(*kind), "{extension}");
+            for stem in ["Release.v1.0", "RELEASE", "\"quoted"] {
+                let name = format!("{stem}{extension}");
+                let upper = name.to_ascii_uppercase();
+                let trailed = format!("{name}_.");
+                for name in [&name, &upper, &trailed] {
+                    assert_eq!(sniff(name, own, None), Sniff::Leaf, "{name}");
+                    for (front, opens) in every_signature() {
+                        let expected = if opens == *kind {
+                            Sniff::Leaf
+                        } else {
+                            object(opens)
+                        };
+                        assert_eq!(sniff(name, &front, None), expected, "{name} {opens:?}");
+                    }
+                }
+            }
+            // Until the bytes decide, the name waits with them.
+            assert_eq!(sniff(&format!("a{extension}"), b"", None), Sniff::Pending);
+        }
+        // A lying name over an archive's bytes: the archive.
+        assert_eq!(sniff("Sporcle.apk", RAR5, None), object(Kind::RarStore));
+        assert_eq!(
+            sniff("Sporcle.apk", &seven_z(), None),
+            object(Kind::SevenZipStore)
+        );
+        assert_eq!(sniff("Installer.dmg", RAR5, None), object(Kind::RarStore));
+        // A disk image on no signature is a leaf by its bytes.
+        assert_eq!(
+            sniff("Installer.dmg", &[0x78, 0xDA, 0, 0], Some(4)),
+            Sniff::Leaf
+        );
+        // Their numbered pieces are a split file's, whose join is named
+        // the end file again.
+        assert_eq!(
+            sniff("Installer.dmg.001", b"BZh91AY&SY", None),
+            object(Kind::Split)
+        );
+        // An extension only ends a name; a stem that holds one does not count.
+        assert_eq!(
+            sniff("Installer.dmg.bin", b"BZh9", None),
+            object(Kind::Bzip2)
+        );
+        assert_eq!(sniff("app.apk.zip", b"PK\x03\x04", None), object(Kind::Zip));
+    }
+
+    // Formats left out of the table open on no signature the sniffer
+    // knows: their bytes make them leaves, and an archive's bytes under
+    // their names decide.
+    #[test]
+    fn an_image_or_installer_goes_by_its_bytes() {
+        let padded = |front: &[u8]| {
+            let mut bytes = front.to_vec();
+            bytes.resize(1024, 0);
+            bytes
+        };
+        let mut iso = vec![0u8; 32 * 1024];
+        iso.extend_from_slice(b"\x01CD001\x01");
+        let mut mbr = vec![0u8; 512];
+        mbr[510..].copy_from_slice(&[0x55, 0xAA]);
+        for (name, front) in [
+            ("Disc.iso", iso),
+            ("Disk.img", mbr),
+            ("Ext.crx", padded(b"Cr24\x03\x00\x00\x00")),
+            (
+                "Setup.msi",
+                padded(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]),
+            ),
+            ("tool.deb", padded(b"!<arch>\ndebian-binary   ")),
+            ("tool.rpm", padded(&[0xED, 0xAB, 0xEE, 0xDB, 3, 0, 0, 0])),
+        ] {
+            let length = Some(front.len() as u64);
+            assert_eq!(sniff(name, &front, length), Sniff::Leaf, "{name}");
+            assert_eq!(sniff("9f3a7c1e", &front, length), Sniff::Leaf, "{name}");
+            for (front, opens) in every_signature() {
+                assert_eq!(sniff(name, &front, None), object(opens), "{name} {opens:?}");
+            }
+        }
+    }
+
     #[test]
     fn bytes_win_over_names() {
         assert_eq!(sniff("a.bz2", &ustar(0), None), object(Kind::Tar));
@@ -1278,6 +1536,90 @@ mod tests {
         assert_eq!(sniff("a.7z.002", &[], Some(4)), Sniff::Pending);
         assert_eq!(sniff("a.7z.0a2", &bytes, None), Sniff::Leaf);
         assert_eq!(sniff(".001", &bytes, None), Sniff::Leaf);
+    }
+
+    // A ReScene `.srr` opens on its own header block, `69 69 69`, and holds
+    // copies of a RAR set's headers further in: no signature opens it, so it
+    // is a leaf, never a RAR volume.
+    #[test]
+    fn a_rescene_file_is_a_leaf() {
+        let mut srr = vec![0x69, 0x69, 0x69, 0x00, 0x00, 0x07, 0x00];
+        srr.extend_from_slice(&[0x71, 0x71, 0x71, 0x00, 0x00, 0x0c, 0x00, 0x03, 0x00]);
+        srr.extend_from_slice(b"a.r");
+        srr.extend_from_slice(RAR5);
+        srr.extend_from_slice(&plain(300));
+        let length = Some(srr.len() as u64);
+        assert_eq!(sniff("a.srr", &srr, length), Sniff::Leaf);
+        assert_eq!(sniff("9f3a7c1e", &srr, length), Sniff::Leaf);
+    }
+
+    // A piece's number has three digits or more, as 7-Zip, HJSplit and
+    // SABnzbd number pieces: a version's or a repost's short digit tail is
+    // no piece, whatever its bytes open. A posted name's trailed quote or
+    // underscore is no part of the number.
+    #[test]
+    fn a_short_digit_tail_is_no_piece() {
+        let bytes = plain(600);
+        for name in [
+            "Microsoft.WindowsAppRuntime.Release%211.4.0",
+            "Microsoft.WindowsAppRuntime.Release%211.4",
+            "silver.mkv.1",
+            "c0ffee.10",
+            "c0ffee.99",
+        ] {
+            assert_eq!(sniff(name, &bytes, Some(43)), Sniff::Leaf, "{name}");
+            assert_eq!(
+                sniff(name, b"PK\x03\x04", None),
+                object(Kind::Zip),
+                "{name}"
+            );
+            assert_eq!(split_piece(name), None, "{name}");
+            assert!(!names_claimable(name), "{name}");
+        }
+        for (name, whole, number) in [
+            ("a.001", "a", "001"),
+            ("a.mkv.001", "a.mkv", "001"),
+            ("a.7z.001", "a.7z", "001"),
+            ("a.zip.001", "a.zip", "001"),
+            ("a.mkv.1000", "a.mkv", "1000"),
+            ("[71ECB6A7].mkv.001_", "[71ECB6A7].mkv", "001"),
+            ("a.mkv.002\"", "a.mkv", "002"),
+        ] {
+            assert_eq!(split_piece(name), Some((whole, number)), "{name}");
+            assert_eq!(sniff(name, &bytes, None), object(Kind::Split), "{name}");
+        }
+    }
+
+    // The names a split piece is told by. The same table pins
+    // `FileRole::SplitFile` in `shared/crates/weaver-model/tests/files.rs`
+    // (`parse_split_file`), which census, the watch folder and ingest read
+    // roles by; the two rules must agree, and a change to one changes both
+    // tables.
+    const SPLIT_PIECE_NAMES: &[(&str, bool)] = &[
+        ("a.001", true),
+        ("a.mkv.001", true),
+        ("a.mkv.002", true),
+        ("a.mkv.0001", true),
+        ("a.mkv.1000", true),
+        ("[71ECB6A7].mkv.001_", true),
+        ("a.mkv.002\"", true),
+        ("a.mkv.003.", true),
+        ("a.mkv.004 ", true),
+        ("a.mkv.01", false),
+        ("a.mkv.1", false),
+        ("c0ffee.99", false),
+        ("Release%211.4.0", false),
+        (".001", false),
+        ("a.mkv.00a", false),
+        ("a.001.mkv", false),
+        ("a.mkv", false),
+    ];
+
+    #[test]
+    fn split_pieces_follow_the_model_rule() {
+        for &(name, piece) in SPLIT_PIECE_NAMES {
+            assert_eq!(split_piece(name).is_some(), piece, "{name}");
+        }
     }
 
     #[test]

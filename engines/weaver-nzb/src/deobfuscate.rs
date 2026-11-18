@@ -207,13 +207,32 @@ pub fn extract_filename(subject: &str) -> Option<(String, f32)> {
 
 // Strategy 1: Extract filename from double-quoted string.
 fn extract_quoted(subject: &str) -> Option<String> {
-    let first = subject.find('"')?;
-    let second = subject[first + 1..].find('"')?;
-    let name = &subject[first + 1..first + 1 + second];
-    if name.is_empty() {
-        return None;
+    quoted_name(subject).map(str::to_string)
+}
+
+// The first closed quote pair of a subject that holds more than spaces,
+// with the spaces trimmed, as SABnzbd's `subject_name_extractor` reads it
+// (`"([^"]*)"`, then `strip(' "')`). A quote mark is never part of a name:
+// an unpaired one is left to the later strategies, which split on it.
+pub(crate) fn quoted_name(subject: &str) -> Option<&str> {
+    let mut runs = subject.split('"');
+    runs.next();
+    loop {
+        let inside = runs.next()?;
+        // The pair is closed only when a quote follows the run.
+        runs.next()?;
+        let name = inside.trim_matches(' ');
+        if !name.is_empty() {
+            return Some(name);
+        }
     }
-    Some(name.to_string())
+}
+
+// The last word of `text`, words split by whitespace and by quote marks, so
+// an unpaired quote (`name.mkv.001" yEnc`) is never part of the word.
+pub(crate) fn last_word(text: &str) -> Option<&str> {
+    text.rsplit(|ch: char| ch.is_whitespace() || ch == '"')
+        .find(|word| !word.is_empty())
 }
 
 // Strategy 2: Extract filename from `[PRiVATE]` format.
@@ -294,16 +313,9 @@ fn extract_fallback(subject: &str) -> Option<String> {
         trimmed
     };
 
-    // Take the last whitespace-delimited token. Prefer tokens with dots (filenames),
-    // but accept dotless tokens as a last resort (handles "Re: A" edge cases).
-    let token = after_prefix
-        .rsplit_once(' ')
-        .map_or(after_prefix, |(_, t)| t);
-    if !token.is_empty() {
-        Some(token.to_string())
-    } else {
-        None
-    }
+    // Take the last word. Prefer words with dots (filenames), but accept
+    // dotless words as a last resort (handles "Re: A" edge cases).
+    last_word(after_prefix).map(str::to_string)
 }
 
 // Check if a string looks like a segment marker (e.g. "1/10", "34/44")
@@ -559,10 +571,58 @@ mod tests {
 
     #[test]
     fn empty_quotes_fall_through_to_fallback() {
-        // Empty quotes should not match strategy 1
-        let result = extract_filename(r#"[1/1] - "" yEnc some.file.rar"#);
-        // Should fall through to fallback and get some.file.rar or None
-        assert!(result.is_some() || result.is_none());
+        // Empty quotes are no name, and the quotes are no word either: the
+        // text before the yEnc marker names nothing.
+        assert_eq!(extract_filename(r#"[1/1] - "" yEnc some.file.rar"#), None);
+    }
+
+    // A quote mark is never part of a posted name. Each row: the subject,
+    // the name, and the confidence. SABnzbd's `subject_name_extractor`
+    // gives the same name for every row; the quoted rows are its
+    // `RE_SUBJECT_FILENAME_QUOTES`, the rest its basic filename pattern.
+    const QUOTE_SHAPES: &[(&str, &str, f32)] = &[
+        (r#""name.ext" yEnc (1/5)"#, "name.ext", 1.0),
+        (r#"[1/5] - "name.ext" yEnc (1/5)"#, "name.ext", 1.0),
+        // The shape of job f586b14d13974344: the opening quote is missing.
+        (
+            r#"Show.S01E01.1080p.WEB.H264-GRP.[71ECB6A7].mkv.001" yEnc (1/50)"#,
+            "Show.S01E01.1080p.WEB.H264-GRP.[71ECB6A7].mkv.001",
+            0.5,
+        ),
+        (r#"name.mkv.001" yEnc"#, "name.mkv.001", 0.5),
+        (r#"[1/5] - name.mkv.001" yEnc (1/5)"#, "name.mkv.001", 0.5),
+        // The closing quote is missing.
+        (r#"[1/5] - "name.mkv.001 yEnc (1/5)"#, "name.mkv.001", 0.5),
+        (r#""name.mkv.001 yEnc (1/5)"#, "name.mkv.001", 0.5),
+        // A doubled closing quote.
+        (r#"[1/5] - "name.mkv.001"" yEnc (1/5)"#, "name.mkv.001", 1.0),
+        // Spaces inside the quotes are trimmed.
+        (r#"[1/5] - " name.mkv " yEnc (1/5)"#, "name.mkv", 1.0),
+        // An empty or blank pair is passed over for the next one.
+        (r#""" - "name.mkv" yEnc (1/5)"#, "name.mkv", 1.0),
+        (r#"" " - "name.mkv" yEnc (1/5)"#, "name.mkv", 1.0),
+        // Quotes inside the name end it at the first pair, as SABnzbd does.
+        (r#"[1/5] - "He said "hi".mkv" yEnc (1/5)"#, "He said", 1.0),
+    ];
+
+    #[test]
+    fn a_quote_mark_is_never_part_of_a_posted_name() {
+        for &(subject, name, confidence) in QUOTE_SHAPES {
+            assert_eq!(
+                extract_filename(subject),
+                Some((name.to_string(), confidence)),
+                "{subject}"
+            );
+            // The quick name a file's role is read from agrees.
+            let file = crate::NzbFile {
+                poster: String::new(),
+                subject: subject.to_string(),
+                date: 0,
+                groups: Vec::new(),
+                segments: Vec::new(),
+            };
+            assert_eq!(file.filename(), Some(name), "{subject}");
+        }
     }
 
     // ── strip_archive_extension ─────────────────────────────────────────
