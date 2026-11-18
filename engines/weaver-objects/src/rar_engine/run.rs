@@ -1063,6 +1063,11 @@ impl Input {
 impl VolumeProvider for Input {
     fn get_volume(&self, index: usize) -> Result<Box<dyn ReadSeek>, VolumeProviderError> {
         let Ok(Some(volume)) = self.index(index) else {
+            // A member that runs on past the set's last volume is short of
+            // one: the owner knows the set ended, and rules on the open
+            // member once the job is quiet, so the run ends silently. A set
+            // whose volumes sit apart gives them up there to be lifted.
+            self.failed.store(true, Ordering::Release);
             return Err(VolumeProviderError::Unavailable {
                 volume: index,
                 reason: "the set has no such volume".into(),

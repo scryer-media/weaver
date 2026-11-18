@@ -316,6 +316,13 @@ pub trait Standing {
     // The members beside my volumes that no object owns, as a claim reads
     // them: what I can say of them is mine to say.
     fn beside(&self) -> Vec<Beside<'_>>;
+
+    // My volumes lie in a namespace below the root, and no other object of
+    // my kind is bound there: a volume my set lacks is nowhere beside me,
+    // and the namespace above may hold it (`Why::Scattered`).
+    fn liftable(&self) -> bool {
+        false
+    }
 }
 
 // A member no object owns, as the namespace holds it: its name, its first

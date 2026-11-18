@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use weaver_graph::holds::ScratchHold;
 use weaver_graph::{
-    ByteRange, CoverageRecord, CryptRecord, Facts, Kind, MemberId, MemberRecord, NodeId,
-    NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
+    ByteRange, CoverageRecord, CryptRecord, Facts, Kind, LiftRecord, MemberId, MemberRecord,
+    NodeId, NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
 };
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -50,7 +50,7 @@ use super::job::GraphJob;
 use super::root::facts::{self, Parts, RootFacts, RootFactsError};
 use crate::jobs::graph_checkpoint::{
     Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, HeldPartRow, HoldRow,
-    MemberRow, NodeRow, PartRow, Row,
+    Lifted, MemberRow, NodeRow, PartRow, Row,
 };
 use crate::jobs::ids::JobId;
 use crate::persistence::checkpoint_write::{CheckpointControl, CheckpointWrite};
@@ -1749,7 +1749,29 @@ fn member_row(node: i64, member: MemberRecord, state: FileState) -> MemberRow {
         refused: state.refused.map(why_text),
         copy_of: member.copy_of.map(|into| i64::from(into.0)),
         refuted_kind: member.refuted.map(|kind| kind.to_string()),
+        lifted: member.lifted.map(|lift| Lifted {
+            node: i64::from(lift.node.0),
+            member: i64::from(lift.member.0),
+            position: position_text(&lift.position),
+        }),
     }
+}
+
+// A lifted member's position, its member ids from the root down, as the
+// row keeps it: `0.3.1`.
+fn position_text(position: &[MemberId]) -> String {
+    position
+        .iter()
+        .map(|member| member.0.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn position_named(text: &str) -> Option<Vec<MemberId>> {
+    text.split('.')
+        .map(|part| part.parse().ok().map(MemberId))
+        .collect::<Option<Vec<_>>>()
+        .filter(|position| !position.is_empty())
 }
 
 fn coverage_row(node: i64, run: &CoverageRecord) -> CoverageRow {
@@ -1949,6 +1971,20 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
                 .refuted_kind
                 .as_deref()
                 .map(|kind| kind_named(kind).ok_or(refuse("an unknown refuted kind")))
+                .transpose()?,
+            lifted: row
+                .lifted
+                .as_ref()
+                .map(|lift| {
+                    Ok::<_, CheckpointError>(LiftRecord {
+                        node: node_id(row.node, lift.node)?,
+                        member: MemberId(
+                            u32::try_from(lift.member).map_err(|_| refuse("a member id"))?,
+                        ),
+                        position: position_named(&lift.position)
+                            .ok_or(refuse("a lifted member's position"))?,
+                    })
+                })
                 .transpose()?,
         };
         nodes
@@ -2160,7 +2196,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-pub(crate) const REASONS: [Why; 15] = [
+pub(crate) const REASONS: [Why; 16] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -2174,6 +2210,7 @@ pub(crate) const REASONS: [Why; 15] = [
     Why::Unmapped,
     Why::TooDeep,
     Why::InvalidArchive,
+    Why::Scattered,
     Why::TooLarge {
         needed: None,
         allowed: None,
@@ -2199,6 +2236,7 @@ pub(crate) fn why_name(why: Why) -> &'static str {
         Why::Unmapped => "unmapped",
         Why::TooDeep => "too_deep",
         Why::InvalidArchive => "invalid_archive",
+        Why::Scattered => "scattered",
         Why::TooLarge { .. } => "too_large",
         Why::OverMachine { .. } => "over_machine",
     }

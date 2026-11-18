@@ -525,15 +525,24 @@ impl Object for SplitStore {
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
     // A set missing a number, or its first piece, is no file of its own:
-    // what was placed of it is forgotten and its pieces go back. A member
+    // what was placed of it is forgotten and its pieces go back. Below the
+    // root, with no other split set beside it, the missing pieces may lie in
+    // the namespace above, and so may the others of a piece alone: its
+    // pieces go back to be lifted there (`Why::Scattered`). A member
     // never placed whole goes back as any store's does.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        if !self.contiguous() {
-            out.push(Emit::Retract(MEMBER));
-            out.push(Emit::Refuse(Why::Unrepairable));
+        let scattered = standing.liftable();
+        if self.contiguous() && !(scattered && self.pieces.len() == 1) {
+            out.extend(crate::quiet::unplaced(standing).map(Emit::Refuse));
             return;
         }
-        out.extend(crate::quiet::unplaced(standing).map(Emit::Refuse));
+        // A lifted piece is read back through the set, which still holds
+        // what it placed of it: the member is not retracted first, or the
+        // first piece would read back as nothing.
+        match scattered {
+            true => out.push(Emit::Refuse(Why::Scattered)),
+            false => out.extend([Emit::Retract(MEMBER), Emit::Refuse(Why::Unrepairable)]),
+        }
     }
 
     // One article of each piece that has not declared its length: any

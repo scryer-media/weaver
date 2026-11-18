@@ -539,6 +539,35 @@ impl NamespaceWriter {
             && self.refused_above(tree, NodeId::ROOT, node)
     }
 
+    // Below the root, nothing above can bring back what the namespace's
+    // members lost: once nothing more comes to them and nothing above them
+    // reads, a member holds every byte it will, closed or not: its losses
+    // held as damage, and any bytes an object above still holds staying
+    // held until the job is quiet. Its object closes it only once the job
+    // is quiet, and a run reading it keeps the job from being quiet, so the
+    // run is told it holds all it will now.
+    //
+    // Every set of every namespace above has ruled first: one yet to learn
+    // what it covers, to bind a volume by its content, or to read a volume
+    // of its own still arriving covers nothing yet, and may still rebuild
+    // what the member lost once it does.
+    pub(crate) fn lost_for_good(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
+        if node == NodeId::ROOT {
+            return false;
+        }
+        let mut at = node;
+        while at != NodeId::ROOT {
+            let Some((parent, _)) = tree.volumes(at) else {
+                return false;
+            };
+            if !self.ruled(tree, parent, coming) {
+                return false;
+            }
+            at = parent;
+        }
+        self.refused_above(tree, NodeId::ROOT, node)
+    }
+
     // Every member of the namespace holds every byte it will: closed,
     // whole, or a set's own volume, whose object reads what of it comes. A
     // range marked lost is held as damage, so a member open only for bytes

@@ -523,7 +523,7 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
             Delivered {
                 name,
                 from: member.name.clone(),
-                depth: self.tree.depth(node),
+                depth: self.tree.member_depth(node, member.id),
                 whole,
                 crc32: member.crc32,
             },
@@ -543,7 +543,7 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
         // A buried member is no file: it says its object left it open.
         for below in namespace
             .members()
-            .filter(|below| !tree.buried_member(node, below.id))
+            .filter(|below| !tree.holds_no_file(node, below.id))
         {
             self.member(node, below, short);
         }

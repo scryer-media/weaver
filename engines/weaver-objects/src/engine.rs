@@ -154,6 +154,9 @@ pub struct EngineObject<F: Format> {
     bound: BTreeSet<u32>,
     #[serde(skip)]
     password: Option<String>,
+    // Its placement number, which never moves (`Object::placement`).
+    #[serde(skip)]
+    placed: crate::placed::Placed,
 }
 
 impl<F: Format> Durable for EngineObject<F> {
@@ -185,6 +188,7 @@ impl<F: Format> Default for EngineObject<F> {
             windows: BTreeMap::new(),
             bound: BTreeSet::new(),
             password: None,
+            placed: crate::placed::Placed::default(),
         }
     }
 }
@@ -288,11 +292,28 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
     // Nothing more will reach the run. A member it left damaged, a password
     // it is still asking for, a member it named and never closed: the set
-    // cannot be read whole, and its volumes go back as they stand.
+    // cannot be read whole, and its volumes go back as they stand. A set
+    // below the root that is alone in its namespace, its volumes short of
+    // a run from the first or a member it named still open, has volumes
+    // elsewhere: it gives its volumes up to be lifted (`Why::Scattered`).
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         let why = crate::quiet::damaged(standing)
             .or_else(|| standing.asking().then_some(Why::EncryptedHeader))
-            .or_else(|| crate::quiet::unplaced(standing));
+            .or_else(|| {
+                let unplaced = crate::quiet::unplaced(standing);
+                // A member open for bytes lost is short of them, not of
+                // volumes.
+                let open = unplaced.is_some() && !standing.lost();
+                let short = self
+                    .bound
+                    .iter()
+                    .enumerate()
+                    .any(|(at, volume)| at as u64 != u64::from(*volume));
+                match standing.liftable() && (open || short) {
+                    true => Some(Why::Scattered),
+                    false => unplaced,
+                }
+            });
         out.extend(why.map(Emit::Refuse));
     }
 
@@ -304,6 +325,12 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // The fronts it copies out are in its facts, which a restart keeps, and
     // its run reads the volumes themselves: it says nothing of the posted bytes.
     fn unposted(&mut self, _volume: VolumeIndex, _range: ByteRange) {}
+
+    // Every range is its envelope, whatever arrived: `locate` reads
+    // nothing, so its number never moves.
+    fn placement(&self) -> Option<u64> {
+        Some(self.placed.number())
+    }
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {

@@ -154,6 +154,8 @@ impl GraphJob {
         let mut effects = Vec::new();
         job.tree
             .restored(&mut job.writer.placing(&mut *job.builder), &mut effects);
+        #[cfg(test)]
+        job.tree.bound_kinds_recounted().unwrap();
         job.settle(effects)?;
         job.lift_hold_refusals()?;
         job.writer.queue_rechecks(rejected);
