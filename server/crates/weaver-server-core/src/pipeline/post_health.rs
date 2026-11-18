@@ -90,6 +90,14 @@ pub(crate) const DEAD_RELEASE_LANDED_DIVISOR: u64 = 4;
 const BATCH_SIZE: usize = 50;
 // Answers the mail holds before a lane waits for the pipeline to hear one.
 const MAIL_CAPACITY: usize = 64;
+// How long a batch seated on a lane is taken to be answering. A batch is
+// fifty STATs and at most fifty HEADs, each read bounded by its connection's
+// command timeout; at the half to three quarters of a second a reply takes
+// on a slow server, unpipelined, that is about seventy seconds. A round with
+// no batch seated within this window is not making progress, and the
+// dispatch stall it leaves is reported and escalated as any other.
+pub(crate) const SEATED_BATCH_ANSWERS_WITHIN: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60);
 
 // What a round found, once every batch in it is back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +293,10 @@ struct LaneRound {
     known: u64,
     tally: ProbeTally,
     left: usize,
+    // Batches seated on a lane and not yet heard back from.
+    on_lanes: usize,
+    // When the latest of them was seated.
+    seated_at: Option<std::time::Instant>,
 }
 
 // Where a job's probe stands between rounds.
@@ -394,6 +406,81 @@ impl Probes {
         self.retire(job_id);
         self.dead.remove(&job_id);
         self.verdicts.remove(&job_id);
+    }
+
+    // Whether a round has a batch out on the lanes that is still answering
+    // at `now`: seated, not heard back from, and the latest such batch
+    // seated within [`SEATED_BATCH_ANSWERS_WITHIN`]. While one is, the
+    // lanes a dispatch pass finds idle were yielded to it on purpose, and
+    // the connections it asks on are busy with it. A batch that never comes
+    // back stops answering once the window has passed since the last seat.
+    pub(crate) fn answering(&self, now: std::time::Instant) -> bool {
+        self.lane_rounds.values().any(|lane_round| {
+            lane_round.on_lanes > 0
+                && lane_round.seated_at.is_some_and(|seated_at| {
+                    now.saturating_duration_since(seated_at) < SEATED_BATCH_ANSWERS_WITHIN
+                })
+        })
+    }
+
+    // A batch of the round its job waits on was seated on a lane at `now`.
+    fn seated(&mut self, batch: &ProbeBatch, now: std::time::Instant) {
+        if let Some(lane_round) = self
+            .lane_rounds
+            .get_mut(&batch.job_id)
+            .filter(|lane_round| lane_round.round == batch.round)
+        {
+            lane_round.on_lanes += 1;
+            lane_round.seated_at = Some(now);
+        }
+    }
+
+    // A lane gave back a batch of the round its job waits on, answered or
+    // unasked.
+    fn heard_from_lane(&mut self, batch: &ProbeBatch) {
+        if let Some(lane_round) = self
+            .lane_rounds
+            .get_mut(&batch.job_id)
+            .filter(|lane_round| lane_round.round == batch.round)
+        {
+            lane_round.on_lanes = lane_round.on_lanes.saturating_sub(1);
+        }
+    }
+
+    // Batches seated on lanes that no worker started: they are off the
+    // lanes and wait for a seat again.
+    pub(crate) fn wait_again(&mut self, batches: Vec<ProbeBatch>) {
+        for batch in batches {
+            self.heard_from_lane(&batch);
+            self.waiting.push_back(batch);
+        }
+    }
+
+    // A round of `batches` batches out for the job, numbered `round`, every
+    // one seated on a lane at `seated_at`, as the dispatch pass seats them.
+    #[cfg(test)]
+    pub(crate) fn seat_round_for_test(
+        &mut self,
+        job_id: JobId,
+        round: u32,
+        batches: usize,
+        seated_at: std::time::Instant,
+    ) {
+        self.lane_rounds.insert(
+            job_id,
+            LaneRound {
+                round,
+                known: 0,
+                tally: ProbeTally::default(),
+                left: batches,
+                on_lanes: 0,
+                seated_at: None,
+            },
+        );
+        let batch = ProbeBatch::new(job_id, round, Vec::new());
+        for _ in 0..batches {
+            self.seated(&batch, seated_at);
+        }
     }
 
     // Whether `batch` belongs to the round its job is waiting on.
@@ -1171,6 +1258,8 @@ impl Pipeline {
                 known,
                 tally: ProbeTally::default(),
                 left: batches.len(),
+                on_lanes: 0,
+                seated_at: None,
             },
         );
         self.post_probes.waiting.extend(batches);
@@ -1192,6 +1281,7 @@ impl Pipeline {
         if !self.post_probes.current(&batch) {
             return;
         }
+        self.post_probes.heard_from_lane(&batch);
         batch.rebase(&self.pool_layouts, self.pool_generation);
         self.post_probes.waiting.push_back(batch);
         self.download_dispatch_wake = true;
@@ -1209,6 +1299,7 @@ impl Pipeline {
         if !self.post_probes.current(&batch) {
             return;
         }
+        self.post_probes.heard_from_lane(&batch);
         // An answer from a server of a pool since rebuilt names that server
         // as the old pool numbered it: it is folded in under the server's
         // current number, or not at all once the server is gone or changed.
@@ -1234,9 +1325,11 @@ impl Pipeline {
     // has not asked, that is not held back from new connections, and that
     // has a seat left in the pass's ledger. Each seat taken is entered in
     // the ledger, so no article lease takes it too. A batch every server it
-    // may go to has answered for is done; one that finds no seat waits.
+    // may go to has answered for is done; one that finds no seat waits. A
+    // batch handed to a lane is seated at `now`, the pass's instant.
     pub(in crate::pipeline) fn seat_waiting_probes(
         &mut self,
+        now: std::time::Instant,
         sent_this_pass: &mut HashMap<usize, usize>,
         headroom_at_pass_start: &mut HashMap<usize, usize>,
     ) {
@@ -1277,6 +1370,7 @@ impl Pipeline {
             *sent_this_pass.entry(server).or_default() += 1;
             let ids = batch.unfound();
             let unasked = ids.len();
+            self.post_probes.seated(&batch, now);
             // A pool that has stopped seats nothing: the batch is unsettled
             // on that server and goes on to the next.
             if let Err(mut batch) = self.owned_download_lane_pool.probe(
@@ -1286,6 +1380,7 @@ impl Pipeline {
                 batch,
                 self.post_probes.sender(),
             ) {
+                self.post_probes.heard_from_lane(&batch);
                 batch.fold(
                     server,
                     ProbeBatchResult {
