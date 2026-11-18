@@ -208,6 +208,37 @@ async fn pw_rar4_stored_p_every_candidate_wrong_fails_for_the_password() {
     assert_fails_for_the_password(&run(&every_candidate_wrong()).await);
 }
 
+// 5b. A header-encrypted RAR5 set given only wrong passwords: the job fails
+// for the password, and its reason says a password was given and none of
+// them opens the set, never that none was given. The same set given no
+// password at all says none was given.
+#[tokio::test]
+async fn pw_rar5_stored_hp_every_candidate_wrong_says_no_password_given_opens_it() {
+    let volumes = rar5_stored_hp();
+    let names: Vec<String> = volumes.iter().map(|(name, _)| name.clone()).collect();
+    let given = run(&Scenario::new(posts(volumes.clone()))
+        .global_password(WRONG)
+        .global_password("quill-ember-also-wrong"))
+    .await;
+    assert_fails_for_the_password(&given);
+    assert_eq!(
+        given.failure,
+        Some(format!(
+            "WEAVER_PASSWORD_REQUIRED: {} needs a password and no password given opens it",
+            names.join(", ")
+        ))
+    );
+    let none = run(&Scenario::new(posts(volumes))).await;
+    assert_fails_for_the_password(&none);
+    assert_eq!(
+        none.failure,
+        Some(format!(
+            "WEAVER_PASSWORD_REQUIRED: {} needs a password and none was given",
+            names.join(", ")
+        ))
+    );
+}
+
 // 6. RAR4 stored `-p` beside PAR2, one article of the member's cipher
 // damaged: the bytes are not verified when the wrong candidate's checksum
 // fails, so the failure is damage first; the set repairs it and the right
