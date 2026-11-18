@@ -2833,6 +2833,63 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     assert!(!config.read().await.watch_folder.scanning_paused);
 }
 
+// NZBGet's DownloadLimit of 0 is no limit, and it has no stopped rate. With no
+// limit Weaver answers 0 and not paused; with a limit, that limit; with the
+// limit at 0, which in Weaver lets nothing through, paused and standing by,
+// never no limit. `rate 0` keeps NZBGet's meaning: no limit, not a stop.
+#[tokio::test]
+async fn nzbget_status_reports_a_stopped_rate_as_paused_never_as_unlimited() {
+    let db = Database::open_in_memory().unwrap();
+    let config = test_config();
+    let handle = scheduler_handle_with_jobs(vec![]).await;
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        config.clone(),
+        api_key_cache("control-key", "control"),
+    );
+    let fields = |status: &serde_json::Value| {
+        (
+            status["DownloadLimit"].clone(),
+            status["DownloadPaused"].clone(),
+            status["ServerPaused"].clone(),
+            status["Download2Paused"].clone(),
+            status["ServerStandBy"].clone(),
+        )
+    };
+    let answer = |limit: u64, paused: bool| {
+        (
+            serde_json::json!(limit),
+            serde_json::json!(paused),
+            serde_json::json!(paused),
+            serde_json::json!(paused),
+            serde_json::json!(true),
+        )
+    };
+
+    config.write().await.bandwidth.download_bps = None;
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(0, false), "no limit");
+
+    config.write().await.bandwidth.download_bps = Some(2500 * 1024);
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(2500 * 1024, false), "a limit");
+
+    config.write().await.bandwidth.download_bps = Some(0);
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(0, true), "stopped");
+
+    // From the stop, NZBGet's `rate 0` lifts the limit.
+    assert_eq!(
+        rpc_result(app.clone(), "rate", serde_json::json!([0])).await,
+        true
+    );
+    assert_eq!(config.read().await.bandwidth.download_bps, None);
+    assert_eq!(db.network_bandwidth().unwrap().download_bps, None);
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(0, false), "rate 0 after the stop");
+}
+
 #[tokio::test]
 async fn nzbget_history_reports_compound_status_history_time_and_stage_timings() {
     let db = Database::open_in_memory().unwrap();

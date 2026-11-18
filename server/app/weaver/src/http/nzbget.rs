@@ -1550,17 +1550,21 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let session_downloaded = metrics.bytes_downloaded;
     let average_rate = session_downloaded / uptime_secs.max(1);
     let arr_average_rate = average_rate.min(i32::MAX as u64);
+    let download_block = ctx.handle.get_download_block();
+    let config = ctx.config.read().await;
+    // Weaver's limit of 0 lets nothing through; NZBGet's 0 is no limit and it
+    // has no stopped rate, so a stop, saved or scheduled, reads as paused.
+    let download_stopped =
+        config.bandwidth.download_bps == Some(0) || download_block.speed_limit_in_force == Some(0);
     // NZBGet has no word for a speed test, so a speed test's hold reads as
     // DownloadPaused, the same as a manual pause.
-    let download_paused = ctx.handle.is_globally_paused();
-    let download_block = ctx.handle.get_download_block();
+    let download_paused = ctx.handle.is_globally_paused() || download_stopped;
     let quota_reached = matches!(
         download_block.kind,
         weaver_server_core::DownloadBlockKind::EgressQuota
             | weaver_server_core::DownloadBlockKind::ServerQuota
     );
-    let config = ctx.config.read().await;
-    // NZBGet reports no limit as 0.
+    // NZBGet reports no limit as 0; a stop is no limit beyond the pause.
     let download_limit = config.bandwidth.download_bps.unwrap_or(0);
     let arr_download_limit = download_limit.min(i32::MAX as u64);
     let scan_paused = config.watch_folder.scanning_paused;
@@ -1629,7 +1633,8 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "ServerPaused": download_paused,
         "DownloadPaused": download_paused,
         "Download2Paused": download_paused,
-        "ServerStandBy": !any_active,
+        // A stopped instance moves nothing, as a paused NZBGet stands by.
+        "ServerStandBy": !any_active || download_stopped,
         "PostPaused": ctx.handle.is_post_processing_paused(),
         "ScanPaused": scan_paused,
         "QuotaReached": quota_reached,
