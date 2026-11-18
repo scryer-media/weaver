@@ -626,6 +626,12 @@ pub fn may_open_par(first_bytes: &[u8]) -> bool {
     })
 }
 
+// The kinds whose objects judge a member by the clean bytes past the hole
+// where its front stopped, so that one with none beside a member is built
+// to judge it: a PAR2 packet carries its set's id and a hash over its
+// body, so one whose hash passes founds its set wherever it lies.
+pub(crate) const PAST_HOLE: &[Kind] = &[Kind::Par2];
+
 // Whether a posted name is a recovery volume's, as PAR creators spell them:
 // `.par2` and `.par3`, indexes and `.vol<start>+<count>` volumes alike, and
 // the older numbered `.p<N>` and `.par<N>`; and as RAR spells its own,
