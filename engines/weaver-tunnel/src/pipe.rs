@@ -2330,6 +2330,15 @@ pub async fn as_named_by<'a>(
     }))
 }
 
+// Whether a dial for `purpose` waits on a rung that is up but full rather
+// than trying the rungs below it. A usenet connection does: its count on a
+// tunnel is held to the bytes the tunnel has (the leg warns "usenet is held
+// to N"), and the rung below may be the host's own address, which a route
+// falls back to only when the rung above is down, never when it is full.
+fn waits_on_a_full_rung(purpose: &Purpose) -> bool {
+    matches!(purpose, Purpose::Nntp { .. } | Purpose::NntpProbe { .. })
+}
+
 // Whether a dial for `purpose` probes its path, and so tries rungs still
 // cooling.
 fn probes(purpose: &Purpose) -> bool {
@@ -2374,7 +2383,12 @@ impl Dialer for Fallback {
                     return Ok(dialed);
                 }
                 Err(error @ DialError::Fatal(_)) => return Err(error),
-                Err(DialError::AtCapacity(changes)) => capacity_changes.extend(changes),
+                Err(DialError::AtCapacity(changes)) => {
+                    capacity_changes.extend(changes);
+                    if waits_on_a_full_rung(&target.purpose) {
+                        return Err(DialError::AtCapacity(capacity_changes));
+                    }
+                }
                 Err(error) => {
                     self.report_rung(index, Some(&error));
                     if !last.is_evidence() {
