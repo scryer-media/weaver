@@ -12,7 +12,7 @@ import { CONNECT_PORTS, NetworkWorld, PROXIED_HOST } from "./support/network-sce
 import { fixtureEvents, fixtureMark, fixtureState, waitFixtureEvents } from "./support/proxy-fixture";
 import {
   PROXIES_PAGE, chooseRouteProfile, countOperations, expectAddresses, fillProfile, fillServers, newListEditor,
-  openDns, openRoute, pick, resultCell, saveEditor, savedId,
+  openDns, openRoute, resultCell, saveEditor, savedId, turnOnDnssec,
 } from "./support/dns-page";
 import { choose } from "./support/settings-locators";
 import { networkIds, settingsIds, testIds } from "./support/testids";
@@ -193,7 +193,7 @@ test.describe("Networking -> DNS", () => {
     await openDns(page);
     await page.getByTestId(testIds.row("dnsProfiles", String(profile.id))).click();
     const editor = page.getByTestId(testIds.dialog("dnsProfile"));
-    await pick(editor, "dnsTrust", "VALIDATE");
+    await turnOnDnssec(editor);
     expect(await saveEditor(page, editor, "SaveDnsProfile", "saveDnsProfile"), "the edited profile").toBe(profile.id);
 
     // Secondary evidence: the next lookup on the same route validates, and the fixture signs nothing.

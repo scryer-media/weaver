@@ -46,7 +46,6 @@ import {
   type DnsServerRow,
   type DnsTestRun,
   type DnsTransit,
-  type DnsTrust,
   type DnsWho,
 } from "@/lib/dns";
 import { routeInput, type NetworkRoute } from "@/lib/networking";
@@ -640,10 +639,9 @@ function DnsProfileEditor({
                       id: "dnsTrust",
                       label: t("next.dns.trust"),
                       control: {
-                        kind: "segmented" as const,
-                        value: form.trust,
-                        options: trusts.map((trust) => ({ value: trust, label: t(trust === "VALIDATE" ? "next.common.on" : "next.common.off") })),
-                        onChange: (trust: string) => patch({ trust: trust as DnsTrust }),
+                        kind: "toggle" as const,
+                        value: form.trust === "VALIDATE",
+                        onChange: (validate: boolean) => patch({ trust: validate ? "VALIDATE" : "AS_SENT" }),
                       },
                     },
                   ]
