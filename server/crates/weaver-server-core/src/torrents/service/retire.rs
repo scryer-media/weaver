@@ -4,7 +4,9 @@
 use super::intake::{Resolving, parse};
 use super::live::Live;
 use super::scripts::{Ending, StoppedSeeding};
-use super::{ActionError, TorrentService, hashes_of, report, short_status, unpacking_dir};
+use super::{
+    ActionError, MemoryRelease, TorrentService, hashes_of, report, short_status, unpacking_dir,
+};
 #[cfg(test)]
 use super::{MARK_HOLD, MOVE_HOLD, SYNC_HELD_FAILS, locked};
 use crate::StateError;
@@ -150,11 +152,18 @@ impl TorrentService {
             }
         }
         let (report, row) = self.history_of(&torrent, status, error);
+        let short = !torrent.complete();
         // Its history row and its removal are one write: the job is never
         // in neither, so an event raised while it was live, still being
         // queued, finds it.
         self.write_history(row, true, report.job_info(), files, shown)
             .await;
+        // One that left short of complete ended its download here, out of
+        // its session: what it held for that goes back, as a cancelled or
+        // failed NZB job's does. A seed's download ended as it completed.
+        if short {
+            self.release_memory(MemoryRelease::Ended);
+        }
     }
 
     // The torrent's job as it ends now, `status` for `error`, and its

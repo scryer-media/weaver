@@ -6,7 +6,9 @@ use super::policy::goal_met;
 use super::retire::{held_tops, resolved};
 #[cfg(test)]
 use super::{KEEP_FAILS, OUTPUT_MEETS, PLACE_PANICS, locked};
-use super::{TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced};
+use super::{
+    MemoryRelease, TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced,
+};
 use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::model::JobStatus;
@@ -364,6 +366,11 @@ impl TorrentService {
             )
         };
         let (landing, move_to) = landing;
+        // Its download in this run is over: what it held for that goes
+        // back, as a finished NZB job's does.
+        if downloaded {
+            self.release_memory(MemoryRelease::Ended);
+        }
         let _ = self.landed(landing).await;
         // Its files are all there now: what it holds is spelled as the
         // filesystem spells them.
