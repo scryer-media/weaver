@@ -10,7 +10,7 @@
 
 use weaver_graph::recovery::RepairOutcome;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run};
+use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run};
 use super::rar::{delivered, posts};
 use super::rar_rev::rar5_revs;
 use crate::jobs::model::JobStatus;
@@ -206,6 +206,51 @@ async fn an_obfuscated_rar5_recovery_volume_passes_over_a_set_of_the_same_sizes(
         "{}",
         summary(&graph)
     );
+}
+
+// The same, with every volume of the recovery volume's own set that came
+// damaged by a lost article, and a PAR2 set over them that mends them. The
+// first ruling over that set finds no volume whole and proves nothing, so it
+// passes over the set only for the volumes whole then; once the PAR2 set
+// mends them, they prove it, and the recovery volume rebuilds the absent
+// volume.
+#[tokio::test]
+async fn an_obfuscated_rar5_recovery_volume_proves_its_set_once_another_recovery_mends_it() {
+    let first = payload(11 * ARTICLE + 29, 61);
+    let second = payload(11 * ARTICLE + 29, 67);
+    let mut posts = set("amber.coast", OTHER, &second, &[], 0, 0);
+    posts.extend(set("silver.horizon", MEMBER, &first, &[1], 1, 0xa5e0_0000));
+    let present: Vec<(String, Vec<u8>)> = single_member_store_set(MEMBER, &first, 4)
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 1)
+        .map(|(_, (name, bytes))| {
+            let index = name.rsplit_once(".part").map_or(name.as_str(), |(_, n)| n);
+            (format!("silver.horizon.part{index}"), bytes)
+        })
+        .collect();
+    let files: Vec<(&str, &[u8])> = present
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    posts.extend(par2_set("silver.horizon", &files, 4));
+    // Posts 4, 5 and 6 are the set's present volumes: each loses its second
+    // article.
+    let scenario = Scenario::new(posts)
+        .damaged(4, 1)
+        .damaged(5, 1)
+        .damaged(6, 1);
+    let graph = run(&scenario).await;
+    assert_delivered(&graph, &[(MEMBER, &first), (OTHER, &second)]);
+    let rulings = &graph.graph().rulings;
+    for kind in ["par2", "rar_recovery"] {
+        assert!(
+            rulings.iter().any(|(engine, result)| engine == kind
+                && matches!(result, Some(RepairOutcome::Repaired { .. }))),
+            "{kind} did not repair: {rulings:?} {}",
+            summary(&graph)
+        );
+    }
 }
 
 // Two whole sets of the same sizes beside a recovery volume of neither:
