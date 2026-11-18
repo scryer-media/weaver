@@ -222,7 +222,7 @@ impl<D: Decoder> Object for Stream<D> {
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         out.extend(
             crate::quiet::damaged(standing)
-                .or_else(|| crate::quiet::unplaced(standing))
+                .or_else(|| crate::quiet::unplaced(standing, None))
                 .map(Emit::Refuse),
         );
     }

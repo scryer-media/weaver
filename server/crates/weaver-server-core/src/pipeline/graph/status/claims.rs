@@ -398,7 +398,7 @@ impl Delivery {
         };
         let mut reasons: Vec<(String, Vec<&str>)> = Vec::new();
         for (name, why) in &self.withheld {
-            let reason = withheld_because(*why);
+            let reason = withheld_because(name, *why);
             match reasons.iter_mut().find(|(seen, _)| *seen == reason) {
                 Some((_, names)) => names.push(name),
                 None => reasons.push((reason, vec![name])),
@@ -581,12 +581,19 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
 
 // Why a member was withheld, as a job's error words it after its names. A
 // password the object needed is one reason, whether it shut the member's
-// bytes or the headers naming them.
-fn withheld_because(why: Why) -> String {
+// bytes or the headers naming them. A set short of a volume names the one
+// it lacks in the numbering of `name`, a volume of the set, as SABnzbd's
+// "unable to find" does, or its number where the name does not number it.
+fn withheld_because(name: &str, why: Why) -> String {
     let said = match why {
         Why::Encrypted | Why::EncryptedHeader => "needs a password and none was given",
         Why::Compressed => "is compressed and no engine reads it",
         Why::Unmapped => "never placed every member it named",
+        Why::Unfound { volume } => {
+            let lacks = weaver_objects::engine::volume_name(name, volume)
+                .unwrap_or_else(|| format!("volume {}", u64::from(volume) + 1));
+            return format!("never placed every member it named: unable to find {lacks}");
+        }
         Why::InvalidArchive => "is an invalid archive rejected by validation",
         Why::TooLarge { needed, allowed } => return too_large(needed, allowed),
         Why::OverMachine { needed, memory } => {

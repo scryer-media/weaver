@@ -427,7 +427,7 @@ impl Object for Tar {
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         if let Some(why) = crate::quiet::damaged(standing)
             .or_else(|| self.short())
-            .or_else(|| crate::quiet::unplaced(standing))
+            .or_else(|| crate::quiet::unplaced(standing, None))
         {
             self.give_up(why, out);
         }
