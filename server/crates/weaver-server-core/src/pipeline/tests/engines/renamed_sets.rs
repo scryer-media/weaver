@@ -9,8 +9,10 @@
 
 use weaver_graph::recovery::RepairOutcome;
 
+use super::classic_sfv::listing_text;
 use super::harness::{Outcome, Post, Scenario, kinds, par2_volumes_sliced, payload, run};
 use super::rar::delivered;
+use super::sfv::crc;
 use crate::pipeline::tests::direct_store::{
     multi_member_store_set, single_member_rar4_store_set, single_member_rar4_store_set_numbered,
     single_member_store_set,
@@ -239,6 +241,97 @@ async fn an_old_style_rar4_set_under_two_stems_renamed_by_par2_is_one_store() {
     )
     .await;
     old_style_set_under_two_stems(single_member_rar4_store_set(MEMBER, &body(), 8), "rar4").await;
+}
+
+// A 48-volume old-style set posted as one release was: the PAR2 index,
+// then the follow-on volumes under an obfuscated stem, then the first
+// volume as a `part01.rar` of the release name, then an SFV listing the
+// true names under the stem, then the PAR2 volumes. The volumes are fetched side by side, so the follow-on volumes bound
+// before the first one are not a run: `r00` to `r04` with `r08`, `r16`,
+// `r17`, `r24` and `r41` among them, and the first volume comes before
+// `r18` and the rest.
+async fn a_long_old_style_set_fetched_side_by_side(truth: Vec<(String, Vec<u8>)>, format: &str) {
+    let truth: Vec<(String, Vec<u8>)> = truth
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            let name = match index {
+                0 => "final.girl.2015.720p-ulshd.rar".to_string(),
+                n => format!("final.girl.2015.720p-ulshd.r{:02}", n - 1),
+            };
+            (name, bytes)
+        })
+        .collect();
+    let entries: Vec<(&str, u32)> = truth
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), crc(bytes)))
+        .collect();
+    let sfv = listing_text("; listing\n", &entries);
+    let mut files: Vec<(&str, &[u8])> = truth
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    files.push(("final.girl.2015.720p-ulshd.sfv", &sfv));
+    let mut set = par2_volumes_sliced("Final.Girl.2015.720p", &files, FRAME as u64, 4, 1);
+    let index = set.remove(0);
+    let follow_ons = truth.len() as u32 - 1;
+    // Post 0 the index, posts 1 on the follow-on volumes `r00` on, then
+    // the first volume, the SFV, then the PAR2 volumes.
+    let mut posts = vec![index];
+    posts.extend(
+        truth
+            .iter()
+            .skip(1)
+            .enumerate()
+            .map(|(n, (_, bytes))| Post::plain(&format!("65606-1.r{n:02}"), bytes.clone())),
+    );
+    posts.push(Post::plain(
+        "Final.Girl.2015.720p-ULSHD.part01.rar",
+        truth[0].1.clone(),
+    ));
+    posts.push(Post::plain("65606-1.sfv", sfv.clone()));
+    posts.extend(set);
+    let first = follow_ons + 1;
+    let follow_on = |n: u32| n + 1;
+    let mut together: Vec<u32> = vec![0];
+    together.extend([0, 1, 2, 16, 3, 8, 24, 17, 41, 4].map(follow_on));
+    together.extend([first, first + 1]);
+    let early = together.clone();
+    together.extend(
+        (0..follow_ons)
+            .map(follow_on)
+            .filter(|post| !early.contains(post)),
+    );
+    together.extend(first + 2..posts.len() as u32);
+    let body = long_body();
+    let scenario = Scenario::new(posts)
+        .framed(FRAME)
+        .damaged(follow_on(9), 2)
+        .together(&together);
+    let graph = run(&scenario).await;
+    assert_one_store_delivers(&graph, MEMBER, &body, format);
+}
+
+// Forty-eight volumes of three articles each.
+fn long_body() -> Vec<u8> {
+    payload(48 * 3 * FRAME + 13, 87)
+}
+
+#[tokio::test]
+async fn a_long_old_style_set_fetched_side_by_side_renamed_by_par2_is_one_store() {
+    let body = long_body();
+    a_long_old_style_set_fetched_side_by_side(
+        single_member_rar4_store_set_numbered(MEMBER, &body, 48),
+        "rar4 numbered",
+    )
+    .await;
+    a_long_old_style_set_fetched_side_by_side(
+        single_member_rar4_store_set(MEMBER, &body, 48),
+        "rar4",
+    )
+    .await;
+    a_long_old_style_set_fetched_side_by_side(single_member_store_set(MEMBER, &body, 48), "rar5")
+        .await;
 }
 
 // A 24-volume set posted as `part01` to `part09` and then `part010` to

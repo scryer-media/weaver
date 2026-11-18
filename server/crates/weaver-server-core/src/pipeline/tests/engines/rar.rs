@@ -679,6 +679,90 @@ async fn five_nameless_volumes_fetched_side_by_side_are_one_store() {
     }
 }
 
+// The names five volumes of one post went under: hex with a dotted hex
+// tail, which names no RAR volume.
+const DOTTED_HEX: [&str; 5] = [
+    "133b96df280de871b4be607eb998c5.4d",
+    "66c53a9164906e6a325b3bf5d6ee.9c7",
+    "969257bc4228f3055ab9d813204776.e2",
+    "a137c9967b02cdb534166adea9bf8b.3b",
+    "f13eb882128dbe8da64eb54a3.ba9f",
+];
+
+// The posts of `volumes`, post `n` the volume at `shuffle[n]` under the
+// `n`th dotted hex name, so neither name nor post order says the set's.
+fn under_dotted_hex(volumes: Vec<(String, Vec<u8>)>, shuffle: [usize; 5]) -> Vec<Post> {
+    let named: Vec<(String, Vec<u8>)> = shuffle
+        .iter()
+        .zip(DOTTED_HEX)
+        .map(|(volume, name)| (name.to_string(), volumes[*volume].1.clone()))
+        .collect();
+    posts(named)
+}
+
+// Five nameless volumes of a RAR4 set with encrypted data and plain
+// headers, no recovery, the password with the job, fetched side by side.
+// The end records number every volume, and the set is one store that
+// delivers its member.
+#[tokio::test]
+async fn five_nameless_encrypted_rar4_volumes_under_dotted_hex_names_deliver() {
+    let body = body();
+    let volumes = encrypted_rar4_store_set(MEMBER, &body, 5, SECRET, Some([7; 8]));
+    let orders: [[u32; 5]; 4] = [
+        [0, 1, 2, 3, 4],
+        [4, 3, 2, 1, 0],
+        [1, 3, 0, 4, 2],
+        [3, 4, 1, 2, 0],
+    ];
+    for shuffle in [[0, 1, 2, 3, 4], [3, 0, 4, 2, 1]] {
+        for order in orders {
+            let scenario = Scenario::new(under_dotted_hex(volumes.clone(), shuffle))
+                .password(SECRET)
+                .together(&order);
+            let graph = run(&scenario).await;
+            assert!(
+                graph.completed(),
+                "{shuffle:?} {order:?}: {:?} {:?} {:?}",
+                graph.status,
+                graph.failure,
+                graph.graph().delivery
+            );
+            assert_eq!(
+                graph.files.get(&delivered(MEMBER)),
+                Some(&body),
+                "{shuffle:?} {order:?}"
+            );
+        }
+    }
+}
+
+// Five nameless volumes of a six-volume set, the second never posted: no
+// volume can stand where it would, and the job fails with nothing
+// delivered.
+#[tokio::test]
+async fn five_nameless_volumes_of_a_set_without_its_second_fail() {
+    let body = body();
+    let mut volumes = encrypted_rar4_store_set(MEMBER, &body, 6, SECRET, Some([7; 8]));
+    volumes.remove(1);
+    for order in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [1, 3, 0, 4, 2]] {
+        let scenario = Scenario::new(under_dotted_hex(volumes.clone(), [3, 0, 4, 2, 1]))
+            .password(SECRET)
+            .together(&order);
+        let graph = run(&scenario).await;
+        assert!(
+            !graph.completed(),
+            "{order:?}: {:?} {:?}",
+            graph.status,
+            graph.graph().delivery
+        );
+        assert!(
+            !graph.files.contains_key(&delivered(MEMBER)),
+            "{order:?}: {:?}",
+            graph.files.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
 // A nameless RAR4 volume's front states no position: its number is in its
 // end record. Posted backwards, each later volume arrives with no store
 // that can place it and founds one, first; read to its close, its headers
