@@ -599,6 +599,15 @@ impl UsageRecorder {
         self.writes.lock().await
     }
 
+    /// [`hold_writes`] for a blocking thread, so a removal can hold the
+    /// writes, delete the row and retire the server in one task that runs to
+    /// its end even when the request that started it goes away.
+    ///
+    /// [`hold_writes`]: UsageRecorder::hold_writes
+    pub fn hold_writes_blocking(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.writes.blocking_lock()
+    }
+
     /// Stop counting `server_id` as a live server, once its row is deleted.
     ///
     /// What it has waiting, and whatever later readings still show of it
