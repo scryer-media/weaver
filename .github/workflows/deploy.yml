@@ -2282,40 +2282,20 @@ jobs:
           path: ${{ github.workspace }}\.sccache
           key: ${{ steps.windows-arm64-sccache-restore.outputs.cache-primary-key }}
 
-  docker-publish-pr-rc:
-    name: docker-publish-pr-rc
-    if: >-
-      ${{
-        always() &&
-        github.event_name == 'pull_request' &&
-        github.event.pull_request.head.repo.full_name == github.repository &&
-        needs.rust-fmt.result == 'success' &&
-        needs.rust-clippy.result == 'success' &&
-        needs.rust-audit.result == 'success' &&
-        needs.rust-test.result == 'success' &&
-        needs.rust-test-arm.result == 'success' &&
-        needs.rust-test-sde.result == 'success' &&
-        needs.rust-yenc-simd-targets.result == 'success' &&
-        needs.rust-package-linux-x86_64-portable.result == 'success' &&
-        needs.rust-package-linux-arm64-portable.result == 'success'
-      }}
+  docker-prepare-pr-rc:
+    name: docker-prepare-pr-rc
+    if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.rust-package-linux-x86_64-portable.result == 'success' && needs.rust-package-linux-arm64-portable.result == 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 10
     needs:
-      - rust-fmt
-      - rust-clippy
-      - rust-audit
-      - rust-test
-      - rust-test-arm
-      - rust-test-sde
-      - rust-yenc-simd-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-arm64-portable
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Download linux amd64 portable artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -2328,40 +2308,13 @@ jobs:
           path: artifacts
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+      - name: Upload prepared PR build context
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Resolve PR RC tags
-        id: pr_rc_tags
-        shell: bash
-        run: |
-          set -euo pipefail
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          SHORT_SHA="${HEAD_SHA:0:7}"
-          echo "moving_tag=pr-${PR_NUMBER}-rc" >> "$GITHUB_OUTPUT"
-          echo "commit_tag=pr-${PR_NUMBER}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-      - name: Docker meta
-        id: pr_meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/weaver
-          tags: |
-            type=raw,value=${{ steps.pr_rc_tags.outputs.moving_tag }}
-            type=raw,value=${{ steps.pr_rc_tags.outputs.commit_tag }}
-      - name: Build and push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: docker-ctx
-          file: docker/weaver.Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.pr_meta.outputs.tags }}
-          labels: ${{ steps.pr_meta.outputs.labels }}
+          name: weaver-pr-docker-context-${{ github.run_id }}
+          path: docker-ctx/
+          if-no-files-found: error
+          retention-days: 1
 
   docker-publish:
     name: docker-publish
