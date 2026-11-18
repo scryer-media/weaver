@@ -13383,6 +13383,145 @@
       }
     },
     {
+      "path": "testdata/scene-zips-outer-rar/archive.part1.rar",
+      "size": 400000,
+      "blake3": "abf5dcf148d973c528b084e9d4d8f992080f0fdda7df72583a3ae59a47abbaa5",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/scene-zips-outer-rar/archive.part2.rar",
+      "size": 400000,
+      "blake3": "c9f7f9112fc2a2f46fd53c3c174cbe7e9cd453d0c085f7469a8b53bf79b312e7",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/scene-zips-outer-rar/archive.part3.rar",
+      "size": 400000,
+      "blake3": "665b7b9b50d5fdff584560fc53c919c301bc26179c1ff45ed2cea72f36d73022",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/scene-zips-outer-rar/archive.part4.rar",
+      "size": 81359,
+      "blake3": "54cc0983a3ed60ccdb377b9ef8177572a470887c5e759fecb9a485bffbb1ec95",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/scene-zips-root/lbcn0101a.zip",
+      "size": 301984,
+      "blake3": "e58fad18d57e5cfb59511d9bbac6fc3c830f0c4433de4a831583dc04afc9048a",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/scene-zips-root/lbcn0101b.zip",
+      "size": 301984,
+      "blake3": "92b5f11c3f35967e106112fde75c2b710c57401e3ccc5cea8fcb6d95287bb9b4",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/scene-zips-root/lbcn0101c.zip",
+      "size": 301984,
+      "blake3": "b827f4e404a46a30d28fb125a85ba7a80dbc4e794a18193be61eeae7c4a38885",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/scene-zips-root/lbcn0101d.zip",
+      "size": 301984,
+      "blake3": "5724c068719fbdbc40e6e6de49bfbdb2ed01c56a72507be731ac0011e120398f",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/scene-zips-root/lbcn0101e.zip",
+      "size": 72418,
+      "blake3": "5d0718b58dc7cf4448af8c4078b2672df4f83a44c439639b4ca33729d4464efd",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
       "path": "testdata/shared/band-long-1500s-720p-av1.mkv",
       "size": 88534992,
       "blake3": "d6877fa134919a25339b8342cd29440caa9f5a7fd24000d9b76fb5fd1aba79c0",
