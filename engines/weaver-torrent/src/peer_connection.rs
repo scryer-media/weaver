@@ -137,6 +137,13 @@ pub trait PeerConnectionHandler {
     fn block_pool(&self) -> Option<BlockPool> {
         None
     }
+    /// Whether blocks are requested of the peer and not yet received: a
+    /// read offers block buffers only then, or while a block is part way in.
+    /// Read once per message read, so it is an atomic load, not a lookup. A
+    /// handler that does not say is taken to expect them.
+    fn expects_blocks(&self) -> bool {
+        true
+    }
     /// Waits until the connection may read again, when the disk is behind
     /// the blocks the connection queued for it (libtorrent's `bw_disk`
     /// state). A handler that queues nothing never waits.
@@ -1560,6 +1567,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                 }
                 let read_before = reading.consumed();
+                reading.expect_blocks(self.handler.expects_blocks());
                 let message = match reading
                     .read_next(&mut read, rwtimeout, num_pieces, &mut down)
                     .await?
@@ -2390,6 +2398,158 @@ mod tests {
             "{received}"
         );
         assert!(answering.answers.held() >= super::ANSWER_BACKLOG_LIMIT - (1 << 16));
+    }
+
+    /// Takes blocks into buffers of `pool`'s and keeps them, as queued
+    /// writes are kept, and refuses the connection room for the disk once
+    /// `stop_after` arrived, until `open` is rung.
+    struct Stalling {
+        pool: crate::disk::BlockPool,
+        held: parking_lot::Mutex<Vec<crate::disk::Block>>,
+        stop_after: usize,
+        released: std::sync::atomic::AtomicBool,
+        stopped: tokio::sync::Notify,
+        open: tokio::sync::Notify,
+        arrived: tokio::sync::Notify,
+    }
+
+    impl PeerConnectionHandler for &Stalling {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()> {
+            anyhow::bail!("only blocks are sent: {msg:?}")
+        }
+        async fn on_received_block(&self, mut block: crate::disk::Block) -> anyhow::Result<()> {
+            // Queued for the disk, as `queue_block` queues it.
+            self.pool.charge(block.buf_mut());
+            self.held.lock().push(block);
+            self.arrived.notify_one();
+            Ok(())
+        }
+        fn block_pool(&self) -> Option<crate::disk::BlockPool> {
+            Some(self.pool.clone())
+        }
+        async fn disk_room(&self) {
+            if self.held.lock().len() >= self.stop_after && !self.released.load(Ordering::SeqCst) {
+                let open = self.open.notified();
+                self.stopped.notify_one();
+                open.await;
+            }
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A connection refused room for the disk stops taking blocks at the one
+    // that filled it, and holds no block buffer of its own while it waits:
+    // what it read past that block stays in its read buffer. Given room, it
+    // takes them all, each whole.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_refused_disk_room_stops_reading_and_holds_no_block_buffer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const SENT: usize = 40;
+        const STOP_AFTER: usize = 5;
+        let stalling = Stalling {
+            pool: crate::disk::BlockPool::new(crate::disk::MAX_QUEUED_DISK_BYTES),
+            held: Default::default(),
+            stop_after: STOP_AFTER,
+            released: Default::default(),
+            stopped: Default::default(),
+            open: Default::default(),
+            arrived: Default::default(),
+        };
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        let connection = PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            &stalling,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        );
+        let (_tx, rx) = mpsc::unbounded_channel();
+        // Room for the handshake and a few blocks: the rest wait at the peer.
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = halves(ours);
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer: writer.into(),
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::None,
+            meter,
+        };
+        let data = |i: usize| -> Vec<u8> {
+            (0..16384usize)
+                .map(|k| (k ^ (i * 31)).to_le_bytes()[0])
+                .collect()
+        };
+        let peer = async {
+            let mut handshake = [0; 68];
+            theirs.read_exact(&mut handshake).await.unwrap();
+            let sending = async {
+                let mut frame = vec![0u8; 13 + 16384];
+                for i in 0..SENT {
+                    let len = Message::Piece(Piece::from_data(
+                        u32::try_from(i).unwrap(),
+                        0,
+                        &data(i)[..],
+                    ))
+                    .serialize(&mut frame, &Default::default)
+                    .unwrap();
+                    theirs.write_all(&frame[..len]).await.unwrap();
+                }
+            };
+            let watching = async {
+                stalling.stopped.notified().await;
+                // Stopped at the block that filled the room. It reads no
+                // further, so it holds at most the blocks of its last read
+                // that were received and not yet handed on.
+                assert_eq!(stalling.held.lock().len(), STOP_AFTER);
+                assert!(
+                    usize::try_from(stalling.pool.receiving()).unwrap()
+                        <= crate::read_buf::MOST_SLOTS
+                );
+                assert_eq!(stalling.pool.in_use(), STOP_AFTER);
+                stalling.released.store(true, Ordering::SeqCst);
+                stalling.open.notify_one();
+                while stalling.held.lock().len() < SENT {
+                    stalling.arrived.notified().await;
+                }
+            };
+            tokio::join!(sending, watching);
+            theirs
+        };
+        let result = tokio::select! {
+            r = connection.manage_peer_incoming(rx, incoming) => Some(r),
+            theirs = peer => { drop(theirs); None }
+        };
+        assert!(result.is_none(), "{result:?}");
+        let held = stalling.held.lock();
+        assert_eq!(held.len(), SENT);
+        for (i, block) in held.iter().enumerate() {
+            assert_eq!(block.index, u32::try_from(i).unwrap());
+            assert_eq!(block.data(), &data(i)[..], "block {i}");
+        }
+        // Every buffer taken was queued; the connection holds none.
+        assert_eq!(stalling.pool.receiving(), 0);
+        assert_eq!(stalling.pool.in_use(), SENT);
     }
 
     /// Serves every block but those of piece 0, whose check failed.

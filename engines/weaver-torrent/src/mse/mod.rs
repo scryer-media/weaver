@@ -54,6 +54,8 @@ use crate::{
 
 pub(crate) use rc4::Rc4;
 use stream::DecryptingReader;
+#[cfg(test)]
+pub(crate) use stream::DecryptingReader as TestDecryptingReader;
 pub(crate) use stream::Outbound;
 
 /// Whether peer connections use message stream encryption.

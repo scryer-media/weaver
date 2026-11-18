@@ -564,6 +564,7 @@ impl TorrentStateLive {
         h: Handshake,
         connection_kind: ConnectionKind,
         upload: &std::sync::OnceLock<Arc<UploadLedger>>,
+        requests: &std::sync::OnceLock<Arc<AtomicBool>>,
     ) -> bool {
         let claim = self.peers.with_peer_mut(handle, "set_peer_live", |p| {
             p.connecting_to_live(h.peer_id, &self.peers, connection_kind);
@@ -571,6 +572,7 @@ impl TorrentStateLive {
             if let Some(live) = p.get_live_mut() {
                 live.fast = h.supports_fast();
                 upload.get_or_init(|| live.upload_ledger());
+                requests.get_or_init(|| live.requests_outstanding());
             }
             let outgoing = p.connected_out() == Some(true);
             match p.get_live() {
@@ -736,6 +738,10 @@ struct PeerHandler {
     // settles them in without the peer map; bound when the connection goes
     // live, and empty before.
     upload: std::sync::OnceLock<Arc<UploadLedger>>,
+    // Whether blocks are requested of the peer and not yet received: the
+    // connection offers block buffers to a read only then. Bound when the
+    // connection goes live, as `upload` is.
+    requests: std::sync::OnceLock<Arc<AtomicBool>>,
     // Semantically, we don't need a lock here, as this is only requested from
     // one future (requester + manage_peer).
     //

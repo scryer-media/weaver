@@ -1413,6 +1413,7 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(r#"weaver_torrent_peer_requests_sent_total{{{ROUTE},transport="tcp"}} 96"#),
         format!("weaver_torrent_peer_read_buffer_growths_total{{{ROUTE}}} 6"),
         format!("weaver_torrent_peer_batch_buffers{{{ROUTE}}} 2"),
+        format!("weaver_torrent_peer_receive_buffers{{{ROUTE}}} 3"),
         format!(r#"weaver_torrent_session_received_bytes_total{{{ROUTE},kind="payload"}} 5000"#),
         format!(r#"weaver_torrent_session_received_bytes_total{{{ROUTE},kind="protocol"}} 700"#),
         format!(r#"weaver_torrent_session_sent_bytes_total{{{ROUTE},kind="payload"}} 12500"#),

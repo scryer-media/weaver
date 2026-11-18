@@ -418,9 +418,9 @@ impl TorrentStateInitializing {
                             Ok(Verdict::Failed | Verdict::Unknown) | Err(_) => false,
                         };
                         if passed {
-                            self.files
-                                .on_piece_checked(piece)
-                                .with_context(|| format!("the storage did not take piece {piece}"))?;
+                            self.files.on_piece_checked(piece).with_context(|| {
+                                format!("the storage did not take piece {piece}")
+                            })?;
                         } else {
                             self.files.on_piece_hash_failed(piece).with_context(|| {
                                 format!("the storage did not let go of piece {piece}")

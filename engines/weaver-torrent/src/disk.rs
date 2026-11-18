@@ -6,7 +6,11 @@
 //! A peer receives each block of a Piece message into a block buffer of its
 //! own, taken from the session's [`BlockPool`]. The filled buffer moves to
 //! the [`DiskQueue`], whose threads write it and hand it back to the pool:
-//! the block is never copied between the socket and the write.
+//! the block is never copied between the socket and the write. Buffers are
+//! taken for one poll of the socket only: those the poll put no bytes in go
+//! back to the pool before the connection waits again, so a connection
+//! waiting on its socket holds none but the one block it is part way
+//! through.
 //!
 //! The pool follows libtorrent's `disk_buffer_pool` (v2.0.15): the blocks
 //! queued for writing are counted against `max_queued_disk_bytes`, a block
@@ -74,6 +78,9 @@ struct PoolInner {
     // Spans of bytes counted without a buffer of the pool's now
     // (`BlockPool::charge_bytes`).
     spans: AtomicUsize,
+    // Buffers taken and not yet queued for the disk: those connections hold
+    // for a block received, until they queue it or drop it.
+    receiving: AtomicUsize,
 }
 
 struct PoolState {
@@ -113,12 +120,14 @@ impl BlockPool {
             allocated: AtomicUsize::new(0),
             queued: AtomicUsize::new(0),
             spans: AtomicUsize::new(0),
+            receiving: AtomicUsize::new(0),
         }))
     }
 
     /// A buffer for one block.
     pub(crate) fn take(&self) -> BlockBuf {
         let buf = self.0.state.lock().free.pop();
+        self.0.receiving.fetch_add(1, Ordering::Relaxed);
         BlockBuf {
             buf: buf.unwrap_or_else(|| self.allocate()),
             pool: self.clone(),
@@ -131,6 +140,7 @@ impl BlockPool {
         if into.len() >= count {
             return;
         }
+        let taken = count - into.len();
         let mut state = self.0.state.lock();
         while into.len() < count {
             let buf = match state.free.pop() {
@@ -143,6 +153,29 @@ impl BlockPool {
                 charged: false,
             });
         }
+        drop(state);
+        self.0.receiving.fetch_add(taken, Ordering::Relaxed);
+    }
+
+    /// Every buffer of `from`, none of them queued for the disk, back to
+    /// the pool under one lock.
+    pub(crate) fn put_back(&self, from: &mut Vec<BlockBuf>) {
+        if from.is_empty() {
+            return;
+        }
+        let inner = &*self.0;
+        let mut state = inner.state.lock();
+        for block in from.iter_mut() {
+            debug_assert!(!block.charged);
+            let buf = std::mem::take(&mut block.buf);
+            if state.free.len() < inner.kept {
+                state.free.push(buf);
+            }
+        }
+        drop(state);
+        inner.receiving.fetch_sub(from.len(), Ordering::Relaxed);
+        // Each one's buffer is gone, so its drop does nothing more.
+        from.clear();
     }
 
     fn allocate(&self) -> Box<[u8]> {
@@ -156,6 +189,7 @@ impl BlockPool {
     pub(crate) fn charge(&self, block: &mut BlockBuf) -> Charge {
         debug_assert!(!block.charged);
         block.charged = true;
+        self.0.receiving.fetch_sub(1, Ordering::Relaxed);
         self.add(1)
     }
 
@@ -216,6 +250,14 @@ impl BlockPool {
 
     fn give_back(&self, buf: Box<[u8]>, charged: bool) {
         let inner = &*self.0;
+        if buf.is_empty() {
+            // Handed back already, by `put_back`.
+            debug_assert!(!charged);
+            return;
+        }
+        if !charged {
+            inner.receiving.fetch_sub(1, Ordering::Relaxed);
+        }
         let mut state = inner.state.lock();
         let fell = charged && self.sub(&mut state, 1);
         if state.free.len() < inner.kept && !buf.is_empty() {
@@ -230,6 +272,12 @@ impl BlockPool {
     /// Bytes of blocks queued for the disk now, read without a lock.
     pub(crate) fn queued_bytes(&self) -> u64 {
         (self.0.queued.load(Ordering::Relaxed) * BLOCK_LEN) as u64
+    }
+
+    /// Buffers taken and not yet queued for the disk now: the block buffers
+    /// connections hold. Read without a lock.
+    pub(crate) fn receiving(&self) -> u64 {
+        self.0.receiving.load(Ordering::Relaxed) as u64
     }
 
     /// Spans counted now ([`Self::charge_bytes`]), read without a lock.

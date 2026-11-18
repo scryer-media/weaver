@@ -1249,6 +1249,11 @@ pub(crate) struct LivePeerState {
     // When the peer sends us data this is used to track if we asked for it.
     inflight_requests: HashSet<InflightRequest>,
 
+    // Whether `inflight_requests` holds any, for the connection's reader to
+    // read without the peer map: it offers block buffers only then. Kept by
+    // `requests_changed` after each change to the set.
+    requests_outstanding: Arc<std::sync::atomic::AtomicBool>,
+
     // Bounded tolerance for chunks that arrive after we cancel requests.
     // This is intentionally approximate: we track a count instead of storing every
     // canceled chunk, so a peer is not disconnected for racing our cancel messages.
@@ -1424,6 +1429,7 @@ impl LivePeerState {
             bitfield: BF::default(),
             seeder: false,
             inflight_requests: Default::default(),
+            requests_outstanding: Arc::default(),
             late_cancelled_request_tolerance: 0,
             waiting_since: Instant::now(),
             last_piece: Instant::now(),
@@ -1701,6 +1707,7 @@ impl LivePeerState {
             }
             self.request_slots_changed.notify_waiters();
         }
+        self.requests_changed();
         added
     }
 
@@ -1756,6 +1763,7 @@ impl LivePeerState {
             .and_then(|s| s.at(now))
             .map(|s| s.delivered(chunk.size));
         let answer = if self.inflight_requests.remove(chunk) {
+            self.requests_changed();
             RemoveInflightRequestResult::Expected
         } else {
             self.answer_to_no_request()
@@ -1781,6 +1789,7 @@ impl LivePeerState {
     /// delivers.
     pub fn reject_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
         if self.inflight_requests.remove(chunk) {
+            self.requests_changed();
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
         }
@@ -1809,6 +1818,7 @@ impl LivePeerState {
                 .tx
                 .send(WriterRequest::Message(Message::Cancel(wire_request(chunk))));
             self.late_cancelled_request_tolerance += 1;
+            self.requests_changed();
             self.request_slots_changed.notify_waiters();
         }
     }
@@ -1828,6 +1838,7 @@ impl LivePeerState {
         });
 
         if self.inflight_requests.len() != before {
+            self.requests_changed();
             self.request_slots_changed.notify_waiters();
         }
     }
@@ -1840,9 +1851,25 @@ impl LivePeerState {
             .late_cancelled_request_tolerance
             .saturating_add(u32::try_from(taken.len()).unwrap_or(u32::MAX));
         if !taken.is_empty() {
+            self.requests_changed();
             self.request_slots_changed.notify_waiters();
         }
         taken
+    }
+
+    /// `inflight_requests` changed: the flag the connection's reader reads
+    /// follows it.
+    fn requests_changed(&self) {
+        self.requests_outstanding.store(
+            !self.inflight_requests.is_empty(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Whether requests are outstanding to the peer, for its connection's
+    /// reader to read without the peer map.
+    pub(crate) fn requests_outstanding(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.requests_outstanding.clone()
     }
 
     /// Stops waiting for every request outstanding to the peer, and tells

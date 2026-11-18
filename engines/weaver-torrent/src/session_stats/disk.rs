@@ -178,6 +178,9 @@ pub struct DiskStatsSnapshot {
     pub read_buffer_growths: u64,
     /// Peer writers holding a batch buffer for runs of blocks.
     pub batch_buffers: u64,
+    /// Block buffers connections hold now for blocks received and not yet
+    /// queued for the disk.
+    pub receive_buffers: u64,
     /// File reads and writes that did not start where the last one of the
     /// same file ended.
     pub read_seeks: u64,

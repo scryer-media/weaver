@@ -744,6 +744,8 @@ metric_families! {
         "Times a peer connection's read buffer was made larger, since the session opened.");
     TORRENT_PEER_BATCH_BUFFERS = ("weaver_torrent_peer_batch_buffers", Gauge, ["route"],
         "Peer connections holding a 512 KiB buffer for runs of uploaded blocks: one is let go when no run was sent for a keep-alive interval.");
+    TORRENT_PEER_RECEIVE_BUFFERS = ("weaver_torrent_peer_receive_buffers", Gauge, ["route"],
+        "16 KiB block buffers peer connections hold now for blocks they received and have not yet queued for the disk. A connection takes them for one read of its socket and gives back those the read did not fill, so one waiting on its socket holds at most the block it is part way through.");
     TORRENT_DISK_FILE_CALLS = ("weaver_torrent_disk_file_calls_total", Counter, ["direction"],
         "Positional reads and writes of torrents' files since the process started: a write is one file's span of a verified piece. Their bytes and time are in the disk calls by operation.");
     TORRENT_DISK_FILE_SEEKS = ("weaver_torrent_disk_file_seeks_total", Counter, ["direction"],

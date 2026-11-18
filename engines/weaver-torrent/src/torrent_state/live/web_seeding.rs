@@ -151,6 +151,7 @@ impl TorrentStateLive {
             transport: AtomicU8::new(0),
             disk: Default::default(),
             upload: Default::default(),
+            requests: Default::default(),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
