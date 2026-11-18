@@ -568,6 +568,9 @@ impl UsageFlush {
     }
 }
 
+/// How long after a failed read of the next expiry the next batch asks again.
+pub const EXPIRY_RETRY_SECS: i64 = 60;
+
 /// Turns running totals into per-day differences.
 ///
 /// Nothing here runs on the download path: the owner calls [`observe`]
@@ -652,10 +655,15 @@ impl UsageRecorder {
         self.lock().expiry = NextExpiry::At(remove_at_epoch_sec);
     }
 
-    /// Forget when kept rows are next due, so the next batch asks: a read of
-    /// that time failed.
+    /// A read of when kept rows are next due failed: ask again with the
+    /// first batch [`EXPIRY_RETRY_SECS`] after the last reading, not with
+    /// every batch.
     pub fn forget_next_expiry(&self) {
-        self.lock().expiry = NextExpiry::Unknown;
+        let mut state = self.lock();
+        state.expiry = match state.last_tick_epoch_sec {
+            Some(now) => NextExpiry::At(Some(now.saturating_add(EXPIRY_RETRY_SECS))),
+            None => NextExpiry::Unknown,
+        };
     }
 
     /// Count `server_id` as a live server again, for a new server given

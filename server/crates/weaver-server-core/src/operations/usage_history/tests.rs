@@ -1415,11 +1415,23 @@ fn expiry_is_asked_for_only_when_kept_rows_are_due_or_unknown() {
     recorder.retire_server(4, Some("removed-4-1"));
     recorder.observe(&reading(vec![], &[]), today, 2_020);
     assert_eq!(recorder.take(today).expire_removed_at, Some(2_020));
-    // A read of the next time that failed leaves it unknown: the next asks.
-    recorder.note_next_expiry(None);
+    // A read of the next time that failed after the 2_020 batch: the batches
+    // of the next minute ask nothing, and the first one a minute on asks.
     recorder.forget_next_expiry();
-    recorder.observe(&reading(vec![], &[]), today, 2_025);
-    assert_eq!(recorder.take(today).expire_removed_at, Some(2_025));
+    for now in [2_025, 2_050, 2_079] {
+        recorder.observe(&reading(vec![], &[]), today, now);
+        assert_eq!(recorder.take(today).expire_removed_at, None, "{now}");
+    }
+    recorder.observe(&reading(vec![], &[]), today, 2_080);
+    assert_eq!(recorder.take(today).expire_removed_at, Some(2_080));
+    // Failing again backs off again from that batch.
+    recorder.forget_next_expiry();
+    recorder.observe(&reading(vec![], &[]), today, 2_085);
+    assert_eq!(recorder.take(today).expire_removed_at, None);
+    // A removal with kept rows still asks with the next batch.
+    recorder.retire_server(5, Some("removed-5-1"));
+    recorder.observe(&reading(vec![], &[]), today, 2_090);
+    assert_eq!(recorder.take(today).expire_removed_at, Some(2_090));
 }
 
 // An instance with nothing moving, and no removed server's rows due, hands
