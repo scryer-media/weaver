@@ -1147,7 +1147,7 @@ impl Pipeline {
         // at any point after a dispatch pass, even while the loop is busy with
         // another arm, wakes the next wait.
         let mut server_health = self.nntp.pool().server_health_changes();
-        loop {
+        'turn: loop {
             let mut turn_timer = crate::operations::instrumentation::TurnTimer::new(
                 &turn_metrics.pipeline_histograms.turn_duration,
                 &turn_metrics.pipeline_turn,
@@ -1314,15 +1314,23 @@ impl Pipeline {
                     &mut metrics_snapshot_interval,
                 )
                 .await;
-            turn_active |= processed_results > 0;
-            if processed_results > 0 {
-                // A busy turn skips the wait below: it hears a reading, room
-                // given back or a waiter left idle as the wait would.
+            // A turn busy with results does not wait below: under a steady
+            // stream of them the wait would never come, and whatever is heard
+            // only there, a finished move among it, would never be heard. It
+            // runs the same select once over instead, without waiting.
+            let busy = processed_results > 0;
+            turn_active |= busy;
+            if busy {
+                // A reading, room given back or a waiter left idle is heard
+                // as the wait would: the wait's disk arm hears only a ring
+                // that comes while it waits.
                 self.hear_disk_on_busy_turn();
-                // It skips the retries heard there too, and a link that keeps
-                // answering would keep them waiting for as long as it does.
+                // The retries heard there too, a channel's worth, since a
+                // link that keeps answering would keep them waiting for as
+                // long as it does.
                 self.drain_ready_retries();
-            } else {
+            }
+            {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
                 let mut idle_tick = false;
@@ -1333,49 +1341,84 @@ impl Pipeline {
                 // whatever is ready is heard first, else the next batch goes.
                 // A batch out is waited on as any answer is.
                 let restoring = self.restores_waiting;
-                let next_batch = restoring && self.installing.is_empty();
+                let next_batch = !busy && restoring && self.installing.is_empty();
                 // A job that waits for room on a disk wakes on a reading of
                 // a disk someone waits on, never on a timer of its own.
                 let disk_readings = self.storage_capacity.readings();
                 // A job outside the pipeline that begins to wait while the
                 // loop listens for nothing rings it, so it listens.
                 let outside = Arc::clone(&self.graph_outside);
-                self.reconcile_disk_waits();
+                if !busy {
+                    self.reconcile_disk_waits();
+                }
                 let disk_waiting = self.waits_for_disk_room();
-                turn_timer.pause();
+                // The arms this turn heard, one bit each: a busy turn's pass
+                // hears each at most once, so it ends however many are ready.
+                let mut heard: u64 = 0;
+                // A busy turn's pass found nothing more ready.
+                let mut passed = false;
+                macro_rules! open {
+                    ($bit:literal) => {
+                        heard & (1u64 << $bit) == 0
+                    };
+                }
+                macro_rules! hear {
+                    ($bit:literal) => {
+                        heard |= 1u64 << $bit
+                    };
+                }
+                // Taken by reference, so a busy turn's pass can look again.
+                tokio::pin!(
+                    rate_sleep,
+                    durable_lead_retry_sleep,
+                    propagation_sleep,
+                    infrastructure_retry_sleep,
+                    connection_hold_sleep,
+                    login_verdict_sleep,
+                    rename_retry_sleep
+                );
+                if !busy {
+                    turn_timer.pause();
+                }
                 macro_rules! turn_select {
                     ($($biased:tt)?) => {
                         tokio::select! {
                             $($biased;)?
-                            _ = queue.intent_changed() => {
+                            _ = queue.intent_changed(), if open!(0) => {
+                                hear!(0);
                                 turn_timer.resume(PipelinePhase::IntentChanged);
                             }
-                            Some(result) = self.download_done_rx.recv() => {
+                            // A busy turn took the results ready at its start.
+                            Some(result) = self.download_done_rx.recv(), if !busy => {
                                 turn_timer.resume(PipelinePhase::DownloadDone);
-                                if !self.release_download_result(&result) { continue; }
+                                if !self.release_download_result(&result) { continue 'turn; }
                                 self.note_released_download_result_pending(
                                     result.job_id,
                                     Self::released_download_result_lead_bytes(&result),
                                 );
                                 pending_download_results.push_back(result);
                             }
-                            Some(request) = self.download_refill_rx.recv() => {
+                            Some(request) = self.download_refill_rx.recv(), if open!(2) => {
+                                hear!(2);
                                 turn_timer.resume(PipelinePhase::LaneRefill);
                                 self.drain_ready_download_results(&mut pending_download_results);
                                 self.handle_download_lane_refill_request(request);
                             }
-                            Some(parked) = self.download_lane_parked_rx.recv() => {
+                            Some(parked) = self.download_lane_parked_rx.recv(), if open!(3) => {
+                                hear!(3);
                                 turn_timer.resume(PipelinePhase::LaneParked);
                                 self.handle_download_lane_parked(parked);
                             }
-                            Some(event) = self.owned_download_lane_event_rx.recv() => {
+                            Some(event) = self.owned_download_lane_event_rx.recv(), if open!(4) => {
+                                hear!(4);
                                 turn_timer.resume(PipelinePhase::LaneEvent);
                                 self.handle_owned_download_lane_event(
                                     event,
                                     &mut pending_download_results,
                                 );
                             }
-                            Some(said) = self.graph_runs.recv() => {
+                            Some(said) = self.graph_runs.recv(), if open!(5) => {
+                                hear!(5);
                                 turn_timer.resume(PipelinePhase::GraphRun);
                                 self.graph_run_said(said);
                                 #[cfg(test)]
@@ -1385,22 +1428,27 @@ impl Pipeline {
                                     );
                                 }
                             }
-                            Some(()) = self.volume_rooms.recv() => {
+                            Some(()) = self.volume_rooms.recv(), if open!(6) => {
+                                hear!(6);
                                 turn_timer.resume(PipelinePhase::GraphRun);
                                 self.volume_room_heard();
                             }
-                            Some(mail) = self.post_probes.recv() => {
+                            Some(mail) = self.post_probes.recv(), if open!(7) => {
+                                hear!(7);
                                 turn_timer.resume(PipelinePhase::PostProbe);
                                 self.post_probe_mail(mail);
                             }
-                            _ = disk_readings.notified(), if disk_waiting => {
+                            _ = disk_readings.notified(), if open!(8) && disk_waiting => {
+                                hear!(8);
                                 turn_timer.resume(PipelinePhase::GraphRun);
                                 self.disk_reading();
                             }
-                            _ = outside.disk_wait_began(), if !disk_waiting => {
+                            _ = outside.disk_wait_began(), if open!(9) && !disk_waiting => {
+                                hear!(9);
                                 turn_timer.resume(PipelinePhase::GraphRun);
                             }
-                            Some(result) = self.decode_done_rx.recv() => {
+                            Some(result) = self.decode_done_rx.recv(), if open!(10) => {
+                                hear!(10);
                                 turn_timer.resume(PipelinePhase::DecodeDone);
                                 #[cfg(test)]
                                 if restoring {
@@ -1412,29 +1460,35 @@ impl Pipeline {
                                 );
                                 self.handle_decode_done(result).await;
                             }
-                            Some(generation) = self.nntp_handoff_drained_rx.recv() => {
+                            Some(generation) = self.nntp_handoff_drained_rx.recv(), if open!(11) => {
+                                hear!(11);
                                 turn_timer.resume(PipelinePhase::NntpHandoffDrained);
                                 self.handle_nntp_handoff_drained(generation);
                             }
-                            Some(done) = self.job_activated_rx.recv() => {
+                            Some(done) = self.job_activated_rx.recv(), if open!(12) => {
+                                hear!(12);
                                 turn_timer.resume(PipelinePhase::JobActivated);
                                 self.handle_job_activated(done);
                             }
-                            Some(reply) = self.db_reply_rx.recv() => {
+                            Some(reply) = self.db_reply_rx.recv(), if open!(13) => {
+                                hear!(13);
                                 turn_timer.resume(PipelinePhase::DbReply);
                                 self.handle_db_reply(reply).await;
                             }
-                            Some(done) = self.move_done_rx.recv() => {
+                            Some(done) = self.move_done_rx.recv(), if open!(14) => {
+                                hear!(14);
                                 turn_timer.resume(PipelinePhase::MoveDone);
                                 let reported_job = done.job_id;
                                 self.handle_move_to_complete_done(done).await;
                                 self.report_job(reported_job);
                             }
-                            Some(released) = self.failed_release_rx.recv() => {
+                            Some(released) = self.failed_release_rx.recv(), if open!(15) => {
+                                hear!(15);
                                 turn_timer.resume(PipelinePhase::FailedRelease);
                                 self.handle_failed_job_released(released);
                             }
-                            Ok(()) = self.script_effects_rx.changed() => {
+                            Ok(()) = self.script_effects_rx.changed(), if open!(16) => {
+                                hear!(16);
                                 turn_timer.resume(PipelinePhase::ScriptEffects);
                                 for job_id in self.db.take_script_effects() {
                                     let job_id = JobId(job_id);
@@ -1449,17 +1503,20 @@ impl Pipeline {
                                     self.report_job(job_id);
                                 }
                             }
-                            Some(event) = self.terminal_post_processing_done_rx.recv() => {
+                            Some(event) = self.terminal_post_processing_done_rx.recv(), if open!(17) => {
+                                hear!(17);
                                 turn_timer.resume(PipelinePhase::TerminalPostProcessing);
                                 self.handle_terminal_post_processing_event(event).await;
                             }
-                            Some(retry) = self.retry_rx.recv() => {
+                            Some(retry) = self.retry_rx.recv(), if open!(18) => {
+                                hear!(18);
                                 turn_timer.resume(PipelinePhase::Retry);
                                 let reported_job = retry.work.segment_id.file_id.job_id;
                                 self.receive_retry_work(retry);
                                 self.report_job_soon(reported_job);
                             }
-                            _ = metrics_snapshot_interval.tick(), if drive => {
+                            _ = metrics_snapshot_interval.tick(), if open!(19) && drive => {
+                                hear!(19);
                                 turn_timer.resume(PipelinePhase::MetricsTick);
                                 idle_tick = true;
                                 count_periodic_tick();
@@ -1469,39 +1526,48 @@ impl Pipeline {
                                 // wake comes.
                                 self.service_held_download_refills();
                             }
-                            _ = rate_sleep, if !rate_delay.is_zero() => {
+                            _ = &mut rate_sleep, if open!(20) && !rate_delay.is_zero() => {
+                                hear!(20);
                                 turn_timer.resume(PipelinePhase::RateLimit);
                             }
-                            _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
+                            _ = &mut durable_lead_retry_sleep, if open!(21) && durable_lead_retry_delay.is_some() => {
+                                hear!(21);
                                 turn_timer.resume(PipelinePhase::DurableLeadRetry);
                                 self.consume_due_checkpoint_rechecks();
                             }
-                            _ = propagation_sleep, if propagation_delay.is_some() => {
+                            _ = &mut propagation_sleep, if open!(22) && propagation_delay.is_some() => {
+                                hear!(22);
                                 turn_timer.resume(PipelinePhase::Propagation);
                             }
-                            _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
+                            _ = &mut infrastructure_retry_sleep, if open!(23) && infrastructure_retry_deadline.is_some() => {
+                                hear!(23);
                                 turn_timer.resume(PipelinePhase::InfrastructureRetry);
                                 self.requeue_due_infrastructure_retries();
                             }
-                            () = server_health.changed() => {
+                            () = server_health.changed(), if open!(24) => {
+                                hear!(24);
                                 turn_timer.resume(PipelinePhase::ServerHealth);
                                 self.download_dispatch_wake = true;
                             }
-                            _ = connection_hold_sleep, if connection_hold_deadline.is_some() => {
+                            _ = &mut connection_hold_sleep, if open!(25) && connection_hold_deadline.is_some() => {
+                                hear!(25);
                                 turn_timer.resume(PipelinePhase::ConnectionHold);
                                 self.download_dispatch_wake = true;
                             }
                             // The hour of a refused login is up: the work
                             // that waited for the server is weighed again.
-                            _ = login_verdict_sleep, if login_verdict_at.is_some() => {
+                            _ = &mut login_verdict_sleep, if open!(26) && login_verdict_at.is_some() => {
+                                hear!(26);
                                 turn_timer.resume(PipelinePhase::ConnectionHold);
                                 self.tell_login_refusal_verdicts();
                             }
                             // The next turn's queue pass retries the rename.
-                            _ = rename_retry_sleep, if rename_retry_at.is_some() => {
+                            _ = &mut rename_retry_sleep, if open!(27) && rename_retry_at.is_some() => {
+                                hear!(27);
                                 turn_timer.resume(PipelinePhase::RenameRetry);
                             }
-                            _ = tune_interval.tick(), if drive => {
+                            _ = tune_interval.tick(), if open!(28) && drive => {
+                                hear!(28);
                                 turn_timer.resume(PipelinePhase::TuneTick);
                                 idle_tick = true;
                                 count_periodic_tick();
@@ -1548,7 +1614,8 @@ impl Pipeline {
                                 );
                                 }
                             }
-                            _ = stalled_download_interval.tick(), if drive => {
+                            _ = stalled_download_interval.tick(), if open!(29) && drive => {
+                                hear!(29);
                                 turn_timer.resume(PipelinePhase::StallCheck);
                                 count_periodic_tick();
                                 // A stall needs a transfer in flight; with none the
@@ -1558,7 +1625,8 @@ impl Pipeline {
                                     self.auto_pause_stalled_downloads();
                                 }
                             }
-                            _ = state_reconcile_interval.tick(), if drive => {
+                            _ = state_reconcile_interval.tick(), if open!(30) && drive => {
+                                hear!(30);
                                 turn_timer.resume(PipelinePhase::StateReconcile);
                                 idle_tick = true;
                                 count_periodic_tick();
@@ -1568,13 +1636,25 @@ impl Pipeline {
                                 turn_timer.resume(PipelinePhase::RestoreBatch);
                                 idle_tick = true;
                             }
+                            // Last, under the bias: nothing more is ready.
+                            () = std::future::ready(()), if busy => {
+                                passed = true;
+                            }
                         }
                     };
                 }
-                if next_batch {
-                    turn_select!(biased)
-                } else {
-                    turn_select!()
+                // An idle turn waits once for whatever comes. A busy turn
+                // takes, in order, every arm ready now, each at most once,
+                // and goes on when none is.
+                loop {
+                    if busy || next_batch {
+                        turn_select!(biased)
+                    } else {
+                        turn_select!()
+                    }
+                    if !busy || passed {
+                        break;
+                    }
                 }
                 turn_active |= !idle_tick;
             }

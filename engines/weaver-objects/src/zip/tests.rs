@@ -784,3 +784,43 @@ fn a_repaired_zip_directory_remaps_routed_payload_without_an_engine() {
     assert!(owner.refetched.is_empty(), "{:?}", owner.refetched);
     assert_eq!(owner.posted(0).as_deref(), Some(after.as_slice()));
 }
+
+// The 13,000-entry shape: stored entries, the directory read first, the
+// body in 64 KiB deliveries. The pass over local headers looks only at the
+// entries with a byte of their header in hand, and the pass over keys at
+// none, where the passes over every entry looked at each waiting entry,
+// and at every entry, on each delivery. Every member still streams whole.
+#[test]
+fn a_delivery_looks_at_the_local_headers_it_brings_not_every_waiting_one() {
+    const ENTRIES: usize = 13_000;
+    let files: Vec<(String, Vec<u8>)> = (0..ENTRIES)
+        .map(|index| (format!("f{index:05}"), payload(index as u64, 64)))
+        .collect();
+    let entries: Vec<_> = files
+        .iter()
+        .map(|(name, bytes)| Entry::File(name, bytes, stored()))
+        .collect();
+    let archive = write(&entries);
+    let before = super::looked::counts();
+    let began = std::time::Instant::now();
+    let mut owner = Owner::single(Zip::new(), archive);
+    owner.whole(64 * 1024);
+    let took = began.elapsed();
+    let ((locals, every_waiting), (opened, every_entry)) = super::looked::counts();
+    let (locals, every_waiting) = (locals - before.0.0, every_waiting - before.0.1);
+    let (opened, every_entry) = (opened - before.1.0, every_entry - before.1.1);
+    no_trouble(&owner);
+    assert_eq!(owner.members.len(), ENTRIES);
+    for (name, bytes) in &files {
+        let got = owner.member(name);
+        assert!(got.closed, "{name} closed");
+        assert_eq!(&got.bytes, bytes, "{name}");
+    }
+    assert_eq!(opened, 0);
+    assert!(locals < 3 * ENTRIES as u64, "{locals}");
+    eprintln!(
+        "{ENTRIES} entries: local headers looked at {locals}, the look at every waiting entry \
+         {every_waiting}; keys looked at {opened}, the look at every entry {every_entry}; \
+         {took:?} in a test build, which also runs the old looks to check the new"
+    );
+}
