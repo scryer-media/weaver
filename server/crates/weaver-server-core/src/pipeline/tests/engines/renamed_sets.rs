@@ -9,6 +9,10 @@
 
 use weaver_graph::recovery::RepairOutcome;
 
+use super::super::{
+    TEST_RAR5_SIG, build_test_rar_end_header, build_test_rar_file_header,
+    build_test_rar_main_header,
+};
 use super::classic_sfv::listing_text;
 use super::harness::{Outcome, Post, Scenario, kinds, par2_volumes_sliced, payload, run};
 use super::rar::delivered;
@@ -373,5 +377,120 @@ async fn a_shuffled_mixed_width_set_renamed_by_par2_is_one_store() {
         let (posts, damaged) = arranged(&truth, &posted, 3, order);
         let graph = run(&scenario(posts, order, damaged)).await;
         assert_one_store_delivers(&graph, "BGT.S13E15.mkv", &first, &format!("{order:?}"));
+    }
+}
+
+// A whole stored RAR5 archive holding `name`: no volume of any set, its
+// main header says so, and it ends with nothing after it.
+fn whole_archive(name: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut archive = TEST_RAR5_SIG.to_vec();
+    archive.extend_from_slice(&build_test_rar_main_header(0, None));
+    archive.extend_from_slice(&build_test_rar_file_header(
+        name,
+        0,
+        bytes.len() as u64,
+        bytes.len() as u64,
+        Some(crc(bytes)),
+    ));
+    archive.extend_from_slice(bytes);
+    archive.extend_from_slice(&build_test_rar_end_header(false));
+    archive
+}
+
+// The archives of a pack, each a set of its own, as a pack of clips posts
+// them: two sets of several volumes and two whole archives of one, every
+// one of them posted as a `partNN` of one obfuscated stem, `part01` to
+// `part09` and then `part010` on, so the posted names make one set of
+// them all. A PAR2 set over the true names renames each by its content.
+// Every set is its own store after the renames, the whole archives among
+// them, and every clip is delivered, in every order the posts arrive in.
+#[tokio::test]
+async fn whole_archives_posted_as_volumes_of_one_stem_are_each_their_own_set() {
+    let clips: Vec<(String, Vec<u8>)> = vec![
+        ("38_kozjak.mp4".to_string(), payload(13 * FRAME + 7, 41)),
+        ("52_kika.mp4".to_string(), payload(7 * FRAME + 19, 42)),
+        // Each whole archive is posted in one article, as a small clip's
+        // is: it is read to its end before the PAR2 set renames it.
+        ("58_zdr.mp4".to_string(), payload(FRAME - 512, 43)),
+        ("59_macka.mp4".to_string(), payload(FRAME / 3, 44)),
+    ];
+    let renamed = |stem: &str, set: Vec<(String, Vec<u8>)>| -> Vec<(String, Vec<u8>)> {
+        set.into_iter()
+            .enumerate()
+            .map(|(index, (_, bytes))| (format!("{stem}.part{}.rar", index + 1), bytes))
+            .collect()
+    };
+    let mut truth = renamed(
+        "38_kozjak",
+        multi_member_store_set(&[(clips[0].0.as_str(), clips[0].1.clone())], 5),
+    );
+    truth.extend(renamed(
+        "52_kika ",
+        multi_member_store_set(&[(clips[1].0.as_str(), clips[1].1.clone())], 3),
+    ));
+    truth.push((
+        "58_zdr.rar".to_string(),
+        whole_archive(&clips[2].0, &clips[2].1),
+    ));
+    truth.push((
+        "59_macka.rar".to_string(),
+        whole_archive(&clips[3].0, &clips[3].1),
+    ));
+    // The posted numbering interleaves the sets, a whole archive between
+    // volumes of another set, as the pack's was.
+    let order = [5, 0, 6, 1, 2, 7, 8, 3, 9, 4];
+    let posted: Vec<(String, usize)> = order
+        .iter()
+        .enumerate()
+        .map(|(at, volume)| {
+            let number = at + 1;
+            let name = if number < 10 {
+                format!("Pack.XXX-Amateur-U4A.part{number:02}.rar")
+            } else {
+                format!("Pack.XXX-Amateur-U4A.part{number:03}.rar")
+            };
+            (name, *volume)
+        })
+        .collect();
+    for order in ORDERS {
+        let (posts, _) = arranged(&truth, &posted, 0, order);
+        let scenario = match order {
+            Order::Scattered => {
+                // The PAR2 set first, then the volumes side by side, the
+                // whole archives' fronts among the others'.
+                let volumes = posted.len() as u32;
+                let mut together: Vec<u32> = (0..posts.len() as u32 - volumes).collect();
+                let first = together.len() as u32;
+                let mut rest: Vec<u32> = (first..first + volumes).collect();
+                rest.sort_by_key(|post| (post % 2, *post));
+                together.extend(rest);
+                Scenario::new(posts).framed(FRAME).together(&together)
+            }
+            _ => Scenario::new(posts).framed(FRAME),
+        };
+        let graph = run(&scenario).await;
+        let case = format!("{order:?}");
+        assert!(
+            graph.completed(),
+            "{case}: {:?} {:?} kinds {:?} delivery {:?}",
+            graph.status,
+            graph.failure,
+            kinds(&graph),
+            graph.graph().delivery,
+        );
+        for (name, body) in &clips {
+            assert_eq!(
+                graph.files.get(&delivered(name)).map(Vec::as_slice),
+                Some(body.as_slice()),
+                "{case}: {name}; delivered {:?} delivery {:?}",
+                graph.files.keys().collect::<Vec<_>>(),
+                graph.graph().delivery,
+            );
+        }
+        assert!(
+            graph.graph().delivery.withheld.is_empty(),
+            "{case}: {:?}",
+            graph.graph().delivery
+        );
     }
 }
