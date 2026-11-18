@@ -12,9 +12,7 @@ mod run;
 use weaver_graph::{ByteRange, Emit, Engine, MemberId, Object, Placement};
 use weaver_graph::{Extraction, Kind, VolumeIndex};
 
-use std::collections::BTreeMap;
-
-use crate::engine::{EngineObject, Format, Holding, SetName};
+use crate::engine::{EngineObject, Format, Holdings, SetName};
 
 pub struct SevenZip;
 
@@ -58,11 +56,11 @@ impl Format for SevenZip {
     // A copy of the file is the file when its signature header measures the
     // same container.
     fn place(
-        bound: &BTreeMap<u32, Holding<'_, u64>>,
+        bound: &Holdings<'_, u64>,
         front: Option<&u64>,
         _length: Option<u64>,
     ) -> Option<VolumeIndex> {
-        let first = bound.get(&0)?;
+        let first = bound.get(0)?;
         (first.front == Some(front?)).then_some(VolumeIndex(0))
     }
 

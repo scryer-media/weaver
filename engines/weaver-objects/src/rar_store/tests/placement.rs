@@ -9,7 +9,7 @@
 // without end.
 
 use bytes::Bytes;
-use weaver_graph::{Effect, MemberId, NodeId, Posted, Provenance, Tree, VolumeIndex, Why};
+use weaver_graph::{Effect, Kind, MemberId, NodeId, Posted, Provenance, Tree, VolumeIndex, Why};
 
 use super::super::counts;
 use super::writer::{Item, Options, Version, write};
@@ -106,6 +106,16 @@ impl Run {
                 &mut self.effects,
             );
         }
+    }
+
+    // The owner, once it has read each member an engine took over back
+    // through the store that gave it up, buries what that store retired,
+    // as the server's namespace does on `NeedsEngine`.
+    fn bury(&mut self, members: &[MemberId]) {
+        for member in members {
+            self.tree.bury(NodeId::ROOT, *member, &mut self.effects);
+        }
+        self.hand_over();
     }
 
     fn given_back(&self, member: MemberId) -> usize {
@@ -402,6 +412,349 @@ fn a_set_renamed_from_swapped_posted_numbers_is_one_store() {
                 "{version:?} whole {whole} volume {volume}: {places:?}"
             );
         }
+    }
+}
+
+// The same set compressed, so only the engine reads it, in RAR4, whose end
+// records here state no number: names alone order it. A recovery set
+// renames its volumes one at a time to a stem no posted name carries, and
+// each rename weighs against the recovery's own names, not the posted names
+// of volumes it has not renamed yet. A name that moves its volume onto a
+// place a posted name holds takes the place, and the holder is placed
+// again. Posted backwards, one volume founds a store of its own before the
+// engine holds the rest; the recovery's names bring it into the engine. In
+// whatever order the renames come, every volume is one engine's, at its
+// true place.
+#[test]
+fn a_compressed_set_renamed_from_swapped_posted_numbers_is_one_engine() {
+    // Posted number, true volume: the last two swapped, the first two, or
+    // every one backwards.
+    let last = [(1, 0), (2, 1), (3, 2), (4, 3), (5, 5), (6, 4)];
+    let first = [(1, 1), (2, 0), (3, 2), (4, 3), (5, 4), (6, 5)];
+    let backwards = [(1, 5), (2, 4), (3, 3), (4, 2), (5, 1), (6, 0)];
+    let renames = [
+        [0, 1, 2, 3, 5, 4],
+        [4, 5, 3, 2, 1, 0],
+        [1, 2, 3, 4, 5, 0],
+        [5, 4, 3, 2, 1, 0],
+        [2, 0, 1, 3, 4, 5],
+    ];
+    for (posted, order) in [last, first, backwards]
+        .into_iter()
+        .flat_map(|posted| renames.map(|order| (posted, order)))
+    {
+        let mut options = super::split(Version::Rar4);
+        options.split = Some(10_000);
+        options.compressed = Some(0);
+        let set = write(&[Item::File("track.flac", payload(9, 57_000))], &options);
+        assert_eq!(set.len(), 6);
+        let mut run = Run::new();
+        let mut members = [MemberId(0); 6];
+        for (number, volume) in posted {
+            members[volume] =
+                run.announce(&format!("Release.part{number:02}.rar"), set[volume].len());
+        }
+        for (_, volume) in posted {
+            run.deliver(members[volume], 0, &set[volume]);
+            run.close(members[volume]);
+        }
+        run.bury(&members);
+        let engine = run
+            .tree
+            .child_of(NodeId::ROOT, members[0])
+            .map(|(node, _)| node);
+        assert_eq!(
+            engine.and_then(|node| run.tree.kind(node)),
+            Some(Kind::RarEngine)
+        );
+        for volume in order {
+            run.tree.rename(
+                NodeId::ROOT,
+                members[volume],
+                &format!("5Kw2CyRs.part{}.rar", volume + 1),
+                &mut Objects::default(),
+                &mut run.effects,
+            );
+            run.hand_over();
+            run.bury(&members);
+        }
+        let places: Vec<_> = members
+            .iter()
+            .map(|member| run.tree.child_of(NodeId::ROOT, *member))
+            .collect();
+        let engine = places[0].map(|(node, _)| node);
+        assert_eq!(
+            engine.and_then(|node| run.tree.kind(node)),
+            Some(Kind::RarEngine)
+        );
+        for (volume, place) in places.iter().enumerate() {
+            assert_eq!(
+                *place,
+                engine.map(|node| (node, VolumeIndex(volume as u32))),
+                "posted {posted:?}, renamed in {order:?}, volume {volume}: {places:?}"
+            );
+        }
+    }
+}
+
+// Two compressed RAR4 sets posted under one stem, their end records stating
+// no number: set A's four volumes, its last two under each other's numbers,
+// and set B's second volume under the number after A's last, so the engine
+// holds it by its posted name alone. B's recovery set renames that volume
+// first. No member runs across from A's last volume into it, so B's name
+// does not start the engine's recovery numbering: the volume leaves the
+// engine. A's own recovery names then bring A's volumes to their true
+// places, in one engine.
+#[test]
+fn another_sets_volume_held_by_its_posted_name_leaves_when_renamed_first() {
+    let set = |name: &'static str, seed: u64| {
+        let mut options = super::split(Version::Rar4);
+        options.split = Some(10_000);
+        options.compressed = Some(0);
+        write(&[Item::File(name, payload(seed, 37_000))], &options)
+    };
+    let a = set("track.flac", 9);
+    let b = set("other.flac", 11);
+    assert_eq!(a.len(), 4);
+    assert!(b.len() > 2);
+    let mut run = Run::new();
+    // Posted number, volume of A.
+    let posted = [(1, 0), (2, 1), (3, 3), (4, 2)];
+    let mut members = [MemberId(0); 4];
+    for (number, volume) in posted {
+        members[volume] = run.announce(&format!("Release.part{number:02}.rar"), a[volume].len());
+    }
+    let stray = run.announce("Release.part05.rar", b[1].len());
+    for (_, volume) in posted {
+        run.deliver(members[volume], 0, &a[volume]);
+        run.close(members[volume]);
+    }
+    run.deliver(stray, 0, &b[1]);
+    run.close(stray);
+    let mut all = members.to_vec();
+    all.push(stray);
+    run.bury(&all);
+    let engine = run
+        .tree
+        .child_of(NodeId::ROOT, members[0])
+        .map(|(node, _)| node);
+    assert_eq!(
+        engine.and_then(|node| run.tree.kind(node)),
+        Some(Kind::RarEngine)
+    );
+    assert_eq!(
+        run.tree.child_of(NodeId::ROOT, stray),
+        engine.map(|node| (node, VolumeIndex(4))),
+        "the engine holds B's volume by its posted name"
+    );
+    run.tree.rename(
+        NodeId::ROOT,
+        stray,
+        "Other.part2.rar",
+        &mut Objects::default(),
+        &mut run.effects,
+    );
+    run.hand_over();
+    run.bury(&all);
+    let left = run.tree.child_of(NodeId::ROOT, stray).map(|(node, _)| node);
+    assert_ne!(left, engine, "B's volume is still the engine's");
+    for (volume, member) in members.iter().enumerate() {
+        run.tree.rename(
+            NodeId::ROOT,
+            *member,
+            &format!("5Kw2CyRs.part{}.rar", volume + 1),
+            &mut Objects::default(),
+            &mut run.effects,
+        );
+        run.hand_over();
+        run.bury(&all);
+    }
+    let places: Vec<_> = members
+        .iter()
+        .map(|member| run.tree.child_of(NodeId::ROOT, *member))
+        .collect();
+    let engine = places[0].map(|(node, _)| node);
+    assert_eq!(
+        engine.and_then(|node| run.tree.kind(node)),
+        Some(Kind::RarEngine)
+    );
+    for (volume, place) in places.iter().enumerate() {
+        assert_eq!(
+            *place,
+            engine.map(|node| (node, VolumeIndex(volume as u32))),
+            "volume {volume}: {places:?}"
+        );
+    }
+    let left = run.tree.child_of(NodeId::ROOT, stray).map(|(node, _)| node);
+    assert_ne!(left, engine, "B's volume came back to A's engine");
+}
+
+// A compressed RAR4 set, its end records stating no number, some of its
+// volumes held and the rest not yet come. The recovery set renames one
+// volume first while neither volume beside it is held: nothing ties it to
+// the set yet, so it is given back. Its neighbours come after, and the
+// recovery's names for the rest bring it back: the set ends one engine,
+// every volume at its true place, posted in order or with its last two
+// numbers swapped.
+#[test]
+fn a_volume_renamed_before_its_neighbours_come_rejoins_its_engine() {
+    // Volumes in the set, volumes held before the first rename, the volume
+    // renamed first, and the order the rest arrive in.
+    let cases: [(usize, &[usize], usize, &[usize]); 4] = [
+        (4, &[0, 3], 3, &[1, 2]),
+        (4, &[0, 3], 3, &[2, 1]),
+        (6, &[0, 3, 5], 3, &[2, 4, 1]),
+        (6, &[0, 1, 5], 1, &[4, 2, 3]),
+    ];
+    for (count, early, first, rest) in cases {
+        for swapped in [false, true] {
+            let mut options = super::split(Version::Rar4);
+            options.split = Some(10_000);
+            options.compressed = Some(0);
+            let set = write(
+                &[Item::File("track.flac", payload(9, count * 10_000 - 3_000))],
+                &options,
+            );
+            assert_eq!(set.len(), count);
+            let posted = |volume: usize| match volume {
+                _ if swapped && volume == count - 2 => count,
+                _ if swapped && volume == count - 1 => count - 1,
+                _ => volume + 1,
+            };
+            let mut run = Run::new();
+            let members: Vec<MemberId> = (0..count)
+                .map(|volume| {
+                    run.announce(
+                        &format!("Release.part{:02}.rar", posted(volume)),
+                        set[volume].len(),
+                    )
+                })
+                .collect();
+            let arrive = |run: &mut Run, volume: usize| {
+                run.deliver(members[volume], 0, &set[volume]);
+                run.close(members[volume]);
+                run.bury(&members);
+            };
+            let rename = |run: &mut Run, volume: usize| {
+                run.tree.rename(
+                    NodeId::ROOT,
+                    members[volume],
+                    &format!("5Kw2CyRs.part{}.rar", volume + 1),
+                    &mut Objects::default(),
+                    &mut run.effects,
+                );
+                run.hand_over();
+                run.bury(&members);
+            };
+            for volume in early {
+                arrive(&mut run, *volume);
+            }
+            rename(&mut run, first);
+            for volume in rest {
+                arrive(&mut run, *volume);
+            }
+            for volume in (0..count).filter(|volume| *volume != first) {
+                rename(&mut run, volume);
+            }
+            let places: Vec<_> = members
+                .iter()
+                .map(|member| run.tree.child_of(NodeId::ROOT, *member))
+                .collect();
+            let engine = places[0].map(|(node, _)| node);
+            assert_eq!(
+                engine.and_then(|node| run.tree.kind(node)),
+                Some(Kind::RarEngine),
+                "{count} volumes, swapped {swapped}: {places:?}"
+            );
+            for (volume, place) in places.iter().enumerate() {
+                assert_eq!(
+                    *place,
+                    engine.map(|node| (node, VolumeIndex(volume as u32))),
+                    "{count} volumes, swapped {swapped}, early {early:?}, \
+                     first {first}, volume {volume}: {places:?}"
+                );
+            }
+        }
+    }
+}
+
+// A long compressed RAR4 set, its end records stating no number, its last
+// two volumes posted under each other's numbers, renamed one volume at a
+// time by a recovery set to a stem no posted name carries. Placing each
+// volume again reads the volumes bound by index: a rename looks up a few
+// of them, however long the set, and only a volume placed by its links
+// alone walks the set. Every volume is one engine's, at its true place.
+#[test]
+fn a_long_compressed_set_renamed_one_at_a_time_looks_volumes_up() {
+    const VOLUMES: usize = 300;
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(5_000);
+    options.compressed = Some(0);
+    let set = write(
+        &[Item::File("track.flac", payload(9, VOLUMES * 5_000 - 700))],
+        &options,
+    );
+    assert_eq!(set.len(), VOLUMES);
+    let mut run = Run::new();
+    run.enough = 4 * VOLUMES;
+    let posted: Vec<usize> = (0..VOLUMES)
+        .map(|volume| match volume {
+            _ if volume == VOLUMES - 2 => VOLUMES - 1,
+            _ if volume == VOLUMES - 1 => VOLUMES - 2,
+            _ => volume,
+        })
+        .collect();
+    let mut members = vec![MemberId(0); VOLUMES];
+    for (number, volume) in posted.iter().enumerate() {
+        members[*volume] = run.announce(
+            &format!("Release.part{:03}.rar", number + 1),
+            set[*volume].len(),
+        );
+    }
+    for volume in &posted {
+        run.deliver(members[*volume], 0, &set[*volume]);
+        run.close(members[*volume]);
+    }
+    crate::engine::counts::take();
+    // The most volumes a rename looked up, and the renames that walked the
+    // set, with how many volumes each walked.
+    let mut most = 0;
+    let mut walks = Vec::new();
+    for (volume, member) in members.iter().enumerate() {
+        run.tree.rename(
+            NodeId::ROOT,
+            *member,
+            &format!("5Kw2CyRs.part{:03}.rar", volume + 1),
+            &mut Objects::default(),
+            &mut run.effects,
+        );
+        run.hand_over();
+        let counted = crate::engine::counts::take();
+        match counted.walked {
+            0 => most = most.max(counted.lookups),
+            walked => walks.push((volume, walked)),
+        }
+    }
+    assert!(most <= 4, "a rename looked up {most} volumes");
+    // The one rename that moves its volume onto a place a posted name held:
+    // the holder, given back, is placed by its links, once.
+    assert_eq!(walks.len(), 1, "{walks:?}");
+    assert!(walks[0].1 <= VOLUMES, "{walks:?}");
+    let places: Vec<_> = members
+        .iter()
+        .map(|member| run.tree.child_of(NodeId::ROOT, *member))
+        .collect();
+    let engine = places[0].map(|(node, _)| node);
+    assert_eq!(
+        engine.and_then(|node| run.tree.kind(node)),
+        Some(Kind::RarEngine)
+    );
+    for (volume, place) in places.iter().enumerate() {
+        assert_eq!(
+            *place,
+            engine.map(|node| (node, VolumeIndex(volume as u32))),
+            "volume {volume}"
+        );
     }
 }
 
