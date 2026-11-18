@@ -28,7 +28,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 use super::SessionHop;
 use crate::{
@@ -40,7 +40,7 @@ use crate::{
 // claim, and whether it is a probe's.
 #[derive(Default)]
 pub(super) struct Held {
-    pub(super) permit: Mutex<Option<Arc<OwnedSemaphorePermit>>>,
+    pub(super) permit: Mutex<Option<Arc<super::SessionPermit>>>,
     claimed: AtomicBool,
     pub(super) probe: bool,
 }

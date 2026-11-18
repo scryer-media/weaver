@@ -262,6 +262,24 @@ impl NntpError {
         matches!(self, NntpError::Route(route) if route.is_capacity())
     }
 
+    // What rings as a full route gets room again: the slots its tunnel named,
+    // or the session budget's ring when its tunnel could not come up for the
+    // budget. `None` for anything that is not a full route.
+    pub fn route_room_slots(&self) -> Option<Vec<std::sync::Arc<tokio::sync::Notify>>> {
+        match self {
+            NntpError::Route(route) => match route.as_ref() {
+                weaver_tunnel::pipe::DialError::AtCapacity(capacity) => {
+                    Some(capacity.waits.clone())
+                }
+                weaver_tunnel::pipe::DialError::SessionBudget => {
+                    Some(vec![weaver_tunnel::pipe::session_budget_freed()])
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     // The demands a full route's refusal left: usenet presses for the room
     // while whoever wants the connection holds them.
     pub fn route_demand(&self) -> Vec<weaver_tunnel::pipe::Demand> {
