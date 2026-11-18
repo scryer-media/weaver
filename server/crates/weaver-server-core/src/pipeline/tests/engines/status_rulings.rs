@@ -163,3 +163,76 @@ async fn a_recovery_volume_under_a_random_name_counts_as_recovery_bytes() {
         "the volumes the set holds count whatever their names: {renamed} < {control}"
     );
 }
+
+// A Partial job says what it lacks, from its delivery's lists: its report,
+// the record it leaves when it finishes and its history row each carry the
+// same words.
+#[tokio::test]
+async fn a_partial_job_says_what_it_lacks() {
+    let posts: Vec<Post> = tracks_beside(1)
+        .into_iter()
+        .filter(|post| !post.name.ends_with(".par2"))
+        .collect();
+    let graph = run(&Scenario::new(posts).lost(2, 1)).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    let said = "delivered in part; damaged: foo_dr.txt";
+    let history = graph.history.as_ref().expect("a history row");
+    assert_eq!(history.error_message.as_deref(), Some(said));
+    let report = graph.report.as_ref().expect("the job's report");
+    assert_eq!(report.status, JobStatus::Partial);
+    assert_eq!(report.error.as_deref(), Some(said));
+
+    // A set that could not rebuild a track names it unrepaired.
+    let graph = run(&Scenario::new(tracks_beside(1))
+        .lost(0, 0)
+        .lost(0, 1)
+        .lost(TEXT, 1))
+    .await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    let history = graph.history.as_ref().expect("a history row");
+    assert_eq!(
+        history.error_message.as_deref(),
+        Some("delivered in part; unrepaired: 01 Kind Hearted Woman.flac; damaged: foo_dr.txt"),
+    );
+}
+
+// The words name twenty files at most and count the rest.
+#[tokio::test]
+async fn a_partial_job_names_twenty_files_and_counts_the_rest() {
+    let mut posts = vec![Post::plain("whole.mkv", payload(2 * ARTICLE, 21))];
+    posts.extend((0..23u8).map(|index| {
+        Post::plain(
+            &format!("note {index:02}.txt"),
+            payload(2 * ARTICLE, 30 + index),
+        )
+    }));
+    let scenario = (1..=23).fold(Scenario::new(posts), |scenario, file| {
+        scenario.lost(file, 1)
+    });
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    let named: Vec<String> = (0..20)
+        .map(|index| format!("note {index:02}.txt"))
+        .collect();
+    let said = format!(
+        "delivered in part; damaged: {}; and 3 more",
+        named.join(", ")
+    );
+    let history = graph.history.as_ref().expect("a history row");
+    assert_eq!(history.error_message.as_deref(), Some(said.as_str()));
+}

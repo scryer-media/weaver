@@ -751,18 +751,24 @@ impl Pipeline {
         job_id: JobId,
     ) -> Option<crate::post_processing::model::DeliveredVerdict> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
+        let partial = delivery.status(failure.as_ref()) == JobStatus::Partial;
         Some(crate::post_processing::model::DeliveredVerdict {
-            partial: delivery.status(failure.as_ref()) == JobStatus::Partial,
+            partial,
             shortfall_stage: delivery.shortfall_stage(failure.as_ref()),
-            // What the policy left out is said beside any other reason.
-            shortfall_message: match (
-                failure
-                    .map(|failure| failure.message)
-                    .or_else(|| delivery.withheld_error()),
-                delivery.removed_error(),
-            ) {
-                (Some(why), Some(removed)) => Some(format!("{why}; {removed}")),
-                (why, removed) => why.or(removed),
+            // A partial delivery says what it lacks, from its lists; any
+            // other says why, and what the policy left out beside it.
+            shortfall_message: if partial {
+                Some(delivery.partial_error())
+            } else {
+                match (
+                    failure
+                        .map(|failure| failure.message)
+                        .or_else(|| delivery.withheld_error()),
+                    delivery.removed_error(),
+                ) {
+                    (Some(why), Some(removed)) => Some(format!("{why}; {removed}")),
+                    (why, removed) => why.or(removed),
+                }
             },
             recovery_verified: self.graph_recovery_verified(job_id),
             unpacked: self.graph_unpacked(job_id),

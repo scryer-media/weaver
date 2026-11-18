@@ -20,6 +20,10 @@ use super::Failure;
 // delivery.
 const EVIDENCE_PERCENT: u64 = 10;
 
+// How many files a partial delivery's reason names before it counts the
+// rest, as the unwanted extension reason does.
+const PARTIAL_NAMED: usize = 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Claim {
     // Whole: closed at its length, every byte clean.
@@ -446,6 +450,72 @@ impl Delivery {
                 .join("; ");
             format!("{marker}{reasons}")
         })
+    }
+
+    // What a job that delivered in part lacks, worded as its reason: each
+    // list of what is not whole, its names sorted, at most `PARTIAL_NAMED`
+    // names in all and a count of the rest. Something withheld for a
+    // password opens it with the marker integrations read a password
+    // failure by.
+    pub(crate) fn partial_error(&self) -> String {
+        let marker = if self
+            .withheld
+            .iter()
+            .any(|(_, why)| matches!(why, Why::Encrypted | Why::EncryptedHeader))
+        {
+            crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
+        } else {
+            ""
+        };
+        let withheld: Vec<&str> = self
+            .withheld
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let lists: [(&str, Vec<&str>); 5] = [
+            (
+                "unrepaired",
+                self.unrepaired.iter().map(String::as_str).collect(),
+            ),
+            ("damaged", self.damaged.iter().map(String::as_str).collect()),
+            // An unnamed file beside a set that extracted whole leaves the
+            // job no shorter (`status`), and is not named.
+            (
+                "missing",
+                if self.extracted() {
+                    Vec::new()
+                } else {
+                    self.unnamed.iter().map(String::as_str).collect()
+                },
+            ),
+            ("withheld", withheld),
+            (
+                "removed for an unwanted extension",
+                self.removed.iter().map(String::as_str).collect(),
+            ),
+        ];
+        let mut text = format!("{marker}delivered in part");
+        let mut left = PARTIAL_NAMED;
+        let mut more = 0usize;
+        for (label, mut names) in lists {
+            names.sort_unstable();
+            names.dedup();
+            if names.is_empty() {
+                continue;
+            }
+            if left == 0 {
+                more += names.len();
+                continue;
+            }
+            let named = names.len().min(left);
+            left -= named;
+            more += names.len() - named;
+            text.push_str(&format!("; {label}: {}", names[..named].join(", ")));
+        }
+        if more > 0 {
+            text.push_str(&format!("; and {more} more"));
+        }
+        text
     }
 
     // The stage a short delivery names as the one that left it short: the

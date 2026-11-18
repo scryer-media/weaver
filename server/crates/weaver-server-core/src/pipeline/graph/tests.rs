@@ -1512,7 +1512,10 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
         .unwrap();
     assert_eq!(finished.status, JobStatus::Partial);
     let row = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!((row.status.as_str(), row.error_message), ("partial", None));
+    assert_eq!(
+        (row.status.as_str(), row.error_message.as_deref()),
+        ("partial", Some("delivered in part; damaged: lantern.dat"))
+    );
     let states = pipeline.db.nzbget_history_states(&[job_id.0]).unwrap();
     assert_eq!(
         states[&job_id.0].failure_kind,
@@ -1574,7 +1577,10 @@ async fn a_partial_delivery_restarted_after_its_move_stays_partial() {
         .expect("the job finishes");
     assert_eq!(finished.status, JobStatus::Partial);
     let row = restored.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!((row.status.as_str(), row.error_message), ("partial", None));
+    assert_eq!(
+        (row.status.as_str(), row.error_message.as_deref()),
+        ("partial", Some("delivered in part; damaged: lantern.dat"))
+    );
     let states = restored.db.nzbget_history_states(&[job_id.0]).unwrap();
     assert_eq!(
         states[&job_id.0].failure_kind,

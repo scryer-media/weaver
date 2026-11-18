@@ -435,7 +435,12 @@ impl TorrentService {
             };
             torrent.failed = Some(why.clone());
             let mut report = report(self.view(&settings, torrent, now), status.clone(), now);
-            report.shortfall = Some(why);
+            // A partial delivery says so before why, as an NZB job's does.
+            report.shortfall = Some(if status == JobStatus::Partial {
+                format!("delivered in part; {why}")
+            } else {
+                why
+            });
             (report, hashes_of(&torrent.record).best())
         };
         if matches!(status, JobStatus::Failed { .. }) {

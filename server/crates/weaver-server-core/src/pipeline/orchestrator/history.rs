@@ -195,10 +195,12 @@ impl Pipeline {
             job_id,
             job_hash: Some(state.job_hash),
             name: state.spec.name.clone(),
-            error: if let JobStatus::Failed { error } = &state.status {
-                Some(error.clone())
-            } else {
-                None
+            // A failure's error, or what a partial delivery lacks, as its
+            // history row says it.
+            error: match &state.status {
+                JobStatus::Failed { error } => Some(error.clone()),
+                JobStatus::Partial => row.error_message.clone(),
+                _ => None,
             },
             download_wait_reason: None,
             download_retry_at_epoch_ms: None,
