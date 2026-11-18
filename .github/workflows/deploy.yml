@@ -2284,7 +2284,7 @@ jobs:
 
   docker-prepare-pr-rc:
     name: docker-prepare-pr-rc
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.rust-package-linux-x86_64-portable.result == 'success' && needs.rust-package-linux-arm64-portable.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs:
