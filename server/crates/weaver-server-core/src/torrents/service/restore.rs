@@ -561,13 +561,18 @@ impl TorrentService {
     // The torrent's metainfo and its store over it, at once. A store that
     // cannot be made fails the torrent. The files `left_out`, by their
     // index among the manifest's paths, are not downloaded: their level is
-    // `Ignored`, kept as the operator's own would be.
+    // `Ignored`, kept as the operator's own would be. True when the store
+    // already holds every file the torrent wants, as one whose every file is
+    // left out does: no piece is coming to ask for it to be judged, so the
+    // caller has the next settle look at it once the torrent is where a
+    // settle finds it (libtorrent `piece_picker::is_finished` with every
+    // piece filtered).
     pub(super) fn give_metainfo(
         &self,
         torrent: &mut Live,
         parsed: &Parsed,
         left_out: &[usize],
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let job_id = torrent.record.job_id;
         let mut stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
             tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
@@ -598,7 +603,7 @@ impl TorrentService {
             tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
         }
         let Some(made) = self.making(torrent, &self.global_passwords()) else {
-            return Ok(());
+            return Ok(false);
         };
         let (store, notes) = self
             .store::<std::convert::Infallible>(job_id, made, Err)
@@ -610,8 +615,17 @@ impl TorrentService {
             note.say(job_id);
         }
         torrent.files_missing = Note::absent(&notes);
+        let wanted = |file: usize| {
+            torrent
+                .levels
+                .get(file)
+                .copied()
+                .unwrap_or_default()
+                .wanted()
+        };
+        let whole = store.has_files(wanted);
         self.give_store(torrent, store);
-        Ok(())
+        Ok(whole)
     }
 
     // What the metainfo says of the torrent, without its job. Whether it
@@ -894,7 +908,16 @@ impl TorrentService {
             Some(torrent) => {
                 torrent.restore_held = None;
                 torrent.files_missing = missing;
+                // One restored short of complete that holds every file it
+                // wants is judged at the next settle, as an add is.
+                let levels = &torrent.levels;
+                let whole = !torrent.complete()
+                    && store
+                        .has_files(|file| levels.get(file).copied().unwrap_or_default().wanted());
                 self.give_store(torrent, store);
+                if whole {
+                    self.inner.signal.look(job_id);
+                }
                 let copy = self.catch_up_levels(torrent);
                 (torrent.held.is_none() && !missing, copy)
             }

@@ -765,7 +765,7 @@ export const nextIt: LocaleDictionary = {
   "next.general.srrdb": "Ricerca release su SRRDB",
   "next.general.srrdbHelp": "Per i membri di archivio offuscati, inviare solo il loro checksum CRC32 all'indice pubblico SRRDB per recuperare il nome della release.",
   "next.general.unacceptableExtensions": "Estensioni non accettate",
-  "next.general.unacceptableExtensionsHelp": "Separate da virgole. Un download completato che ne contiene una viene rifiutato.",
+  "next.general.unacceptableExtensionsHelp": "Separate da virgole. L'azione qui sotto decide cosa accade a un download completato che ne contiene una.",
   "next.general.unwantedExtensionAction": "Azione sulle estensioni non accettate",
   "next.general.unwantedExtensionActionHelp":
     "Un file nell’elenco non viene mai aperto come archivio. «Fai fallire il job» rifiuta il download; «Elimina solo i file indesiderati» rimuove quei file e consegna il resto come parziale.",

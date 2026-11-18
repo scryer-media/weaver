@@ -641,7 +641,12 @@ impl TorrentService {
                 // Answered without waiting on its route: it reads as opening
                 // until its route's session is open, then goes on by itself.
                 match made {
-                    Ok(()) => self.spawn_attach(job_id).await,
+                    Ok(whole) => {
+                        if whole {
+                            self.inner.signal.look(job_id);
+                        }
+                        self.spawn_attach(job_id).await;
+                    }
                     Err(error) => self.fail(job_id, error).await,
                 }
                 self.inner.counters.event(TorrentEvent::Added);
@@ -1317,9 +1322,13 @@ impl TorrentService {
         }
         let made = self.give_metainfo(torrent, &parsed, &left_out);
         drop(live);
-        if let Err(error) = made {
-            self.fail(job_id, error).await;
-            return Ok(());
+        match made {
+            Ok(true) => self.inner.signal.look(job_id),
+            Ok(false) => {}
+            Err(error) => {
+                self.fail(job_id, error).await;
+                return Ok(());
+            }
         }
         // An SSL torrent's trackers hear it only as it goes live, under its
         // own identity: the fetch's trackers are let go here.

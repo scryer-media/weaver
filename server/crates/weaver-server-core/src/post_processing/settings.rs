@@ -880,14 +880,14 @@ mod tests {
     }
 
     #[test]
-    fn the_unwanted_extension_action_is_fail_job_until_one_is_saved() {
+    fn the_unwanted_extension_action_is_delete_files_until_one_is_saved() {
         let db = Database::open_in_memory().unwrap();
         // Nothing stored at all.
         assert_eq!(
             db.post_processing_settings()
                 .unwrap()
                 .unwanted_extension_action,
-            UnwantedExtensionAction::FailJob
+            UnwantedExtensionAction::DeleteFiles
         );
         // Stored before the action existed.
         db.set_setting(
@@ -898,7 +898,7 @@ mod tests {
         let settings = db.post_processing_settings().unwrap();
         assert_eq!(
             settings.unwanted_extension_action,
-            UnwantedExtensionAction::FailJob
+            UnwantedExtensionAction::DeleteFiles
         );
         assert_eq!(settings.unacceptable_extensions, vec!["exe"]);
     }
@@ -907,6 +907,7 @@ mod tests {
     fn only_the_delete_action_removes_a_listed_name() {
         let fail = PostProcessingSettings {
             unacceptable_extensions: vec!["exe".into()],
+            unwanted_extension_action: UnwantedExtensionAction::FailJob,
             ..PostProcessingSettings::default()
         };
         let delete = PostProcessingSettings {
@@ -952,16 +953,16 @@ mod tests {
         db.save_post_processing_settings(&settings).unwrap();
 
         let saved = db
-            .save_unwanted_extension_action(UnwantedExtensionAction::DeleteFiles)
+            .save_unwanted_extension_action(UnwantedExtensionAction::FailJob)
             .unwrap();
         assert_eq!(
             saved.unwanted_extension_action,
-            UnwantedExtensionAction::DeleteFiles
+            UnwantedExtensionAction::FailJob
         );
         let stored = db.post_processing_settings().unwrap();
         assert_eq!(
             stored.unwanted_extension_action,
-            UnwantedExtensionAction::DeleteFiles
+            UnwantedExtensionAction::FailJob
         );
         assert_eq!(stored.concurrency, 3);
         assert_eq!(stored.unacceptable_extensions, vec!["exe"]);
@@ -969,7 +970,7 @@ mod tests {
             db.get_setting(SETTINGS_KEY)
                 .unwrap()
                 .unwrap()
-                .contains(r#""unwantedExtensionAction":"delete_files""#)
+                .contains(r#""unwantedExtensionAction":"fail_job""#)
         );
 
         // The script settings save and the list save keep the action.
@@ -983,7 +984,7 @@ mod tests {
             db.post_processing_settings()
                 .unwrap()
                 .unwanted_extension_action,
-            UnwantedExtensionAction::DeleteFiles
+            UnwantedExtensionAction::FailJob
         );
     }
 

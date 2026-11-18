@@ -602,6 +602,8 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
     pub(in crate::pipeline::tests) unacceptable: Option<Vec<String>>,
+    // What a job holding one of them comes to, when not the stored action.
+    action: Option<crate::post_processing::model::UnwantedExtensionAction>,
     // Every pipeline the scenario prepares finds the stored settings
     // present but not parsing.
     policy_corrupt: bool,
@@ -652,6 +654,7 @@ impl Scenario {
             leased: false,
             limits: None,
             unacceptable: None,
+            action: None,
             policy_corrupt: false,
             holds: None,
             profile: None,
@@ -741,6 +744,13 @@ impl Scenario {
         self
     }
 
+    // A file with one of those extensions fails the job, the action that is
+    // not the default.
+    pub(in crate::pipeline::tests) fn failing_job(mut self) -> Self {
+        self.action = Some(crate::post_processing::model::UnwantedExtensionAction::FailJob);
+        self
+    }
+
     // What the scenario sets on a pipeline before its job is admitted or
     // restored: its servers, the settings' passwords and policy, and the
     // limits. A scenario whose primary serves some articles damaged has a
@@ -785,6 +795,9 @@ impl Scenario {
             // A save forgets whether any script could run; the runtime works
             // it out at startup, so the job's scripts gate does not wait.
             crate::post_processing::events::refresh_admission_hint(&pipeline.db).unwrap();
+        }
+        if let Some(action) = self.action {
+            pipeline.db.save_unwanted_extension_action(action).unwrap();
         }
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());

@@ -772,7 +772,7 @@ export const nextEn: LocaleDictionary = {
   "next.general.srrdb": "SRRDB release lookup",
   "next.general.srrdbHelp": "For obfuscated archive members, send only their CRC32 checksum to the public SRRDB index to recover a release name.",
   "next.general.unacceptableExtensions": "Unacceptable extensions",
-  "next.general.unacceptableExtensionsHelp": "Comma-separated. A finished download holding one of these is refused.",
+  "next.general.unacceptableExtensionsHelp": "Comma-separated. What happens to a finished download holding one of these is set by the action below.",
   "next.general.unwantedExtensionAction": "Unwanted extension action",
   "next.general.unwantedExtensionActionHelp":
     "A file on the list is never opened as an archive. Fail job refuses the download; delete only unwanted files removes those files and delivers the rest as partial.",
