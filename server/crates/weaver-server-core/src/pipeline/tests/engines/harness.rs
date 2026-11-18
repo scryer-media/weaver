@@ -1134,6 +1134,9 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) history: Option<crate::JobHistoryRow>,
     // How many times each job stage's duration was observed, by stage name.
     pub(in crate::pipeline::tests) stages_timed: Vec<(&'static str, u64)>,
+    // The job's report as the run left it: its finished record once it
+    // has finished.
+    pub(in crate::pipeline::tests) report: Option<crate::jobs::handle::JobInfo>,
 }
 
 // The kind of every object a graph run's tree held, by its name, sorted.
@@ -1386,6 +1389,15 @@ async fn try_run_then(
         .into_iter()
         .map(|(stage, histogram)| (stage, histogram.count))
         .collect();
+    let report = match pipeline
+        .finished_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.job_id == JOB)
+    {
+        Some(finished) => Some(finished),
+        None => pipeline.job_report(JOB),
+    };
     after(&mut pipeline, &complete_dir).await;
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
@@ -1408,6 +1420,7 @@ async fn try_run_then(
         download_summary,
         history,
         stages_timed,
+        report,
     })
 }
 

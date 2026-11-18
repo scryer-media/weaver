@@ -1160,6 +1160,8 @@ async fn a_7z_inside_a_stored_rar_whose_entry_path_climbs_out_is_refused_unsuppo
 }
 
 // Unmapped: every volume is in, and the object never placed what it named.
+// A RAR set that knows the volume after its last is the one it lacks says
+// which (`Why::Unfound`).
 
 #[tokio::test]
 async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped() {
@@ -1176,17 +1178,38 @@ async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped() 
             damaged: &[],
             unrepaired: &[],
             withheld: &[
-                ("silver.horizon.part01.rar", Why::Unmapped),
-                ("silver.horizon.part02.rar", Why::Unmapped),
+                ("silver.horizon.part01.rar", Why::Unfound { volume: 2 }),
+                ("silver.horizon.part02.rar", Why::Unfound { volume: 2 }),
             ],
             refused: &[
-                "kind=rar_store member=silver.horizon.part01.rar why=unmapped",
-                "kind=rar_store member=silver.horizon.part02.rar why=unmapped",
+                "kind=rar_store member=silver.horizon.part01.rar why=unfound",
+                "kind=rar_store member=silver.horizon.part02.rar why=unfound",
             ],
             delivered: &[QUILL],
         },
     )
     .await;
+}
+
+// The same set alone: nothing whole, the job fails, and its error names the
+// volume the set lacks, as SABnzbd's "unable to find" does.
+#[tokio::test]
+async fn a_rar_whose_last_volume_never_arrives_fails_naming_it() {
+    let mut volumes = store(3);
+    volumes.pop();
+    let outcome = try_run(&Scenario::new(posts(&volumes)))
+        .await
+        .unwrap_or_else(|stall| panic!("stalled at {:?}: {}", stall.status, stall.state));
+    let error = "silver.horizon.part01.rar, silver.horizon.part02.rar never placed every member \
+                 it named: unable to find silver.horizon.part03.rar";
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Failed {
+            error: error.to_string()
+        }),
+        "{:?}",
+        outcome.failure
+    );
 }
 
 #[tokio::test]
@@ -1205,16 +1228,16 @@ async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its
             damaged: &[],
             unrepaired: &[],
             withheld: &[
-                ("silver.horizon.part01.rar", Why::Unmapped),
-                ("silver.horizon.part02.rar", Why::Unmapped),
+                ("silver.horizon.part01.rar", Why::Unfound { volume: 2 }),
+                ("silver.horizon.part02.rar", Why::Unfound { volume: 2 }),
             ],
             // The inner set, alone in the outer one, gives its volumes up
             // as scattered; they rise to the root, where the set is ruled
             // on again and refused as it was.
             refused: &[
-                "kind=rar_store member=silver.horizon.part01.rar why=unmapped",
+                "kind=rar_store member=silver.horizon.part01.rar why=unfound",
                 "kind=rar_store member=silver.horizon.part01.rar why=scattered",
-                "kind=rar_store member=silver.horizon.part02.rar why=unmapped",
+                "kind=rar_store member=silver.horizon.part02.rar why=unfound",
                 "kind=rar_store member=silver.horizon.part02.rar why=scattered",
             ],
             delivered: &[QUILL],
@@ -1498,8 +1521,8 @@ async fn a_rar_that_announced_a_member_it_never_placed_refuses_itself_unmapped()
             whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
-            withheld: &[("silver.horizon.part01.rar", Why::Unmapped)],
-            refused: &["kind=rar_store member=silver.horizon.part01.rar why=unmapped"],
+            withheld: &[("silver.horizon.part01.rar", Why::Unfound { volume: 1 })],
+            refused: &["kind=rar_store member=silver.horizon.part01.rar why=unfound"],
             delivered: &[QUILL],
         },
     )

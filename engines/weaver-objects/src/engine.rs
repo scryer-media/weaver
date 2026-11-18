@@ -128,6 +128,21 @@ pub trait SetName: Send + Sync + Sized + Serialize + DeserializeOwned {
     fn slot(&self, _bound: &BTreeMap<u32, Self>) -> Option<u32> {
         Some(self.index())
     }
+
+    // The volume that follows this one, where the name alone says which:
+    // a set numbered on past its last volume, as RAR's are, names the one
+    // a run reads next. `None` where the name may end its set.
+    fn after(&self) -> Option<u32> {
+        None
+    }
+}
+
+// The name of volume `volume` of the set `reference` names a volume of, in
+// its numbering, width and case, for a set whose names number on past
+// their last (`SetName::after`): the volume `Why::Unfound` says a set
+// lacks. `None` where the reference names no such volume.
+pub fn volume_name(reference: &str, volume: u32) -> Option<String> {
+    crate::rar_engine::naming::sibling(reference, volume)
 }
 
 // Its facts are the volumes it has, by name and front. Never the password,
@@ -256,6 +271,18 @@ impl<F: Format> EngineObject<F> {
             (linked, None) => linked,
         }
     }
+
+    // The volume the set lacks, once nothing more reaches its run: with
+    // its volumes bound from the first and none between them missing, a
+    // member its run never placed, nothing lost, ran on past the last,
+    // where a run finds no volume and ends silently (the RAR run's
+    // `Input::get_volume`). The last volume's name says which follows it,
+    // where the set's names number on past their last.
+    fn lacks(&self) -> Option<u32> {
+        let last = self.bound.last()?;
+        let from_first = self.bound.len() as u64 == u64::from(*last) + 1;
+        self.names.get(last)?.after().filter(|_| from_first)
+    }
 }
 
 impl<F: Format + 'static> Object for EngineObject<F> {
@@ -296,19 +323,21 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // below the root that is alone in its namespace, its volumes short of
     // a run from the first or a member it named still open, has volumes
     // elsewhere: it gives its volumes up to be lifted (`Why::Scattered`).
+    // A set short of the volume after its last says which it lacks
+    // (`Why::Unfound`).
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         let why = crate::quiet::damaged(standing)
             .or_else(|| standing.asking().then_some(Why::EncryptedHeader))
             .or_else(|| {
-                let unplaced = crate::quiet::unplaced(standing);
-                // A member open for bytes lost is short of them, not of
-                // volumes.
-                let open = unplaced.is_some() && !standing.lost();
                 let short = self
                     .bound
                     .iter()
                     .enumerate()
                     .any(|(at, volume)| at as u64 != u64::from(*volume));
+                let unplaced = crate::quiet::unplaced(standing, self.lacks());
+                // A member open for bytes lost is short of them, not of
+                // volumes.
+                let open = unplaced.is_some() && !standing.lost();
                 match standing.liftable() && (open || short) {
                     true => Some(Why::Scattered),
                     false => unplaced,

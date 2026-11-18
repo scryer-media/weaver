@@ -497,7 +497,7 @@ impl Namespace {
     }
 
     // The members, each once: a further posting of one is not listed.
-    pub fn members(&self) -> impl Iterator<Item = &Member> {
+    pub fn members(&self) -> impl Iterator<Item = &Member> + Clone {
         self.members
             .values()
             .filter(|member| !self.copies.contains_key(&member.id))

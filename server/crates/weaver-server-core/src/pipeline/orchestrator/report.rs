@@ -117,6 +117,12 @@ impl Pipeline {
     fn reported_error<'a>(&self, state: &'a JobState) -> Option<&'a str> {
         if let JobStatus::Failed { error } = &state.status {
             Some(error)
+        } else if state.status == JobStatus::Partial {
+            // What a partial delivery lacks, as its verdict words it.
+            state
+                .delivered
+                .as_ref()
+                .and_then(|verdict| verdict.shortfall_message.as_deref())
         } else if self.blocked_restores.contains_key(&state.job_id) {
             state.failure_error.as_deref()
         } else {

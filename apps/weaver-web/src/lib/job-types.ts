@@ -25,6 +25,9 @@ export interface JobPhaseProgressData {
   updatedAtEpochMs: number;
 }
 
+/** How a finished job ended. `status` shows a partial delivery as failed. */
+export type JobOutcome = "COMPLETE" | "PARTIAL" | "FAILED";
+
 /** How a job's content is fetched. */
 export type JobProtocol = "NZB" | "TORRENT";
 
@@ -58,6 +61,8 @@ export interface JobData {
   createdAt?: number | null;
   completedAt?: number | null;
   error?: string | null;
+  /** How the job ended, a partial delivery as its own value; selected where it is read: the job page. */
+  outcome?: JobOutcome | null;
   /** Failed for a decode window over the memory profile's ceiling; history rows only. */
   failedForMemory?: boolean;
   outputDir?: string | null;

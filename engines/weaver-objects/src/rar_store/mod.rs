@@ -520,17 +520,33 @@ impl RarStore {
     // held one's end record says a volume follows it, or its last file
     // header says the file goes on in the next.
     fn scattered(&self) -> bool {
-        let held: Vec<(&VolumeIndex, &Volume)> = self
+        self.last_held()
+            .is_some_and(|(from_first, _, last)| !from_first || last.walk.followed())
+    }
+
+    // The volume after the last held, when the volumes are held from the
+    // first with none between them missing, and the last one's end record
+    // says a volume follows it, or its last file header says the file goes
+    // on in the next: the volume the set lacks, as unrar names the volume
+    // it cannot open.
+    fn lacks(&self) -> Option<u32> {
+        let (from_first, index, last) = self.last_held()?;
+        index
+            .0
+            .checked_add(1)
+            .filter(|_| from_first && last.walk.followed())
+    }
+
+    // Whether the volumes held run from the first with none between them
+    // missing, and the last held, with its place.
+    fn last_held(&self) -> Option<(bool, VolumeIndex, &Volume)> {
+        let mut held = self
             .volumes
             .iter()
-            .filter(|(_, volume)| volume.name.is_some())
-            .collect();
-        let Some((last, volume)) = held.last() else {
-            return false;
-        };
-        held.len() as u64 != u64::from(last.0) + 1
-            || volume.walk.successor() == Some(true)
-            || volume.walk.continues()
+            .filter(|(_, volume)| volume.name.is_some());
+        let count = held.clone().count() as u64;
+        let (index, volume) = held.next_back()?;
+        Some((count == u64::from(index.0) + 1, *index, volume))
     }
 
     fn give_up(&mut self, emit: Emit, out: &mut Vec<Emit>) {
@@ -975,7 +991,7 @@ impl Object for RarStore {
             true => Some(Why::FirstBytesLost),
             false => crate::quiet::damaged(standing)
                 .or_else(|| self.shut())
-                .or_else(|| crate::quiet::unplaced(standing)),
+                .or_else(|| crate::quiet::unplaced(standing, self.lacks())),
         };
         if let Some(why) = why {
             self.give_up(Emit::Refuse(why), out);
