@@ -3370,7 +3370,13 @@ async fn recording_tracker(
     let serving = tokio::spawn(async move {
         while let Ok((conn, query)) = read_announce_query(&listener).await {
             let during_check = gate.is_held();
-            if tx.send(Heard { query, during_check }).is_err() {
+            if tx
+                .send(Heard {
+                    query,
+                    during_check,
+                })
+                .is_err()
+            {
                 return;
             }
             let _ = respond(conn, ANSWER).await;
@@ -3409,7 +3415,9 @@ async fn checking(
     gate.hold();
     session.force_recheck(handle).await?;
     gate.reached.notified().await;
-    anyhow::ensure!(handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Initializing(_))));
+    anyhow::ensure!(
+        handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Initializing(_)))
+    );
     Ok(())
 }
 
@@ -3487,7 +3495,10 @@ async fn test_a_tracker_added_while_the_torrent_checks_is_started_once_the_check
     handle.wait_until_completed().await?;
     let completed = heard(&mut at_a).await?;
     assert_eq!(completed.event(), Some("completed"));
-    assert_eq!(completed.param("downloaded"), Some(LEN.to_string().as_str()));
+    assert_eq!(
+        completed.param("downloaded"),
+        Some(LEN.to_string().as_str())
+    );
     all.extend([started, completed]);
 
     // The recheck ends the run: `stopped`, its counters as it ended.

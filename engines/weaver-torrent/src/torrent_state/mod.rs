@@ -1109,10 +1109,9 @@ impl ManagedTorrent {
                         // `start_announcing` announces to it as it stands
                         // (torrent.cpp:6004, :8884, :10346, v2.0.15).
                         if let Some(trackers) = &g.trackers {
-                            trackers.catch_up(session.announce_tiers(
-                                t.shared.tracker_tiers(),
-                                t.is_private(),
-                            ));
+                            trackers.catch_up(
+                                session.announce_tiers(t.shared.tracker_tiers(), t.is_private()),
+                            );
                         }
                     }
                     Ok(())

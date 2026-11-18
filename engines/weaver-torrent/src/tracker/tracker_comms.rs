@@ -1402,9 +1402,10 @@ impl TrackerStatus {
         let held = self.runs().iter().all(|comms| {
             let list = comms.list.lock();
             list.entries.len() == wanted.len()
-                && list.entries.iter().all(|e| {
-                    wanted.get(e.tracker.url()) == Some(&(e.tier, e.tracker.named_by))
-                })
+                && list
+                    .entries
+                    .iter()
+                    .all(|e| wanted.get(e.tracker.url()) == Some(&(e.tier, e.tracker.named_by)))
         });
         if !held {
             self.replace_tiers(&tiers);
