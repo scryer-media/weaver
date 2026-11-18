@@ -272,6 +272,80 @@ mod tests {
 
     use super::{job_reading, state_reading};
 
+    // An idle instance whose kept rows came due writes their expiry once:
+    // the batch that drops them reads that none are left, and the batches
+    // after it are empty, so nothing is written per tick.
+    #[tokio::test]
+    async fn after_an_expiry_the_idle_batches_write_nothing() {
+        use std::sync::Arc;
+        use weaver_server_core::servers::{
+            ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod,
+        };
+        use weaver_server_core::{Database, SchedulerHandle, SharedPipelineState};
+
+        let db = Database::open_in_memory().unwrap();
+        db.insert_server(&ServerConfig {
+            id: 3,
+            host: "news.example.com".to_string(),
+            port: 563,
+            tls: true,
+            username: None,
+            password: None,
+            connections: 4,
+            active: false,
+            supports_pipelining: false,
+            pipelining_depth: None,
+            tls_name_mismatch_certificate_der: None,
+            priority: 0,
+            backfill: false,
+            retention_days: 0,
+            max_download_speed: 0,
+            download_quota: ServerDownloadQuotaConfig {
+                enabled: true,
+                limit_bytes: 1_000_000,
+                period: ServerDownloadQuotaPeriod::Daily,
+                monthly_reset_day: 1,
+                ..ServerDownloadQuotaConfig::default()
+            },
+            tls_ca_cert: None,
+        })
+        .unwrap();
+        // Removed long ago: its kept rows are past their reset.
+        let removed_at = chrono::Local::now() - chrono::Duration::days(30);
+        assert!(
+            db.delete_server_at(3, removed_at)
+                .unwrap()
+                .kept_usage
+                .is_some()
+        );
+        assert!(db.read_next_usage_expiry().unwrap().is_some());
+
+        let state = SharedPipelineState::new(weaver_server_core::PipelineMetrics::new(), vec![]);
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let sources = super::UsageSources {
+            handle: SchedulerHandle::new(events, state),
+            transfer_policy: Arc::new(
+                weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                    db.clone(),
+                    &[],
+                )
+                .unwrap(),
+            ),
+            torrents: None,
+        };
+        let recorder = Arc::new(UsageRecorder::new());
+        super::prime(&recorder, &sources, &db).await;
+
+        super::record_and_flush(&recorder, &sources, &db).await;
+        assert!(db.read_removed_servers().unwrap().is_empty());
+        for _ in 0..3 {
+            super::record_and_flush(&recorder, &sources, &db).await;
+        }
+        // Without the read after the expiry, every batch would still ask.
+        let today = chrono::Local::now().date_naive();
+        assert!(recorder.take(today).is_empty());
+    }
+
     // Each job counter moves once at its event, and the ledger counts what
     // moved once.
     #[test]
