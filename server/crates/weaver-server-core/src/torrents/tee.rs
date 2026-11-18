@@ -1599,6 +1599,46 @@ pub(crate) struct Placed {
 // each free and its move.
 pub(crate) const GOES: usize = 8;
 
+// The files unpacking made under the job's folder `work`, relative to it:
+// none of the job's own, of the torrent's files (`listed`), or of the
+// inputs unpacking spent.
+fn unpacked(work: &Path, listed: &HashSet<PathBuf>, spent: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    walk(work, Path::new(""), &mut found);
+    found
+        .into_iter()
+        .filter(|relative| {
+            let own = relative.components().next().is_some_and(|first| {
+                crate::pipeline::graph::restore::the_jobs(Path::new(first.as_os_str()))
+            });
+            !own && !listed.contains(relative) && !spent.contains(&work.join(relative))
+        })
+        .collect()
+}
+
+// Deletes each file unpacking made that `policy` leaves out of the delivery
+// for its unwanted extension, before the rest are placed: the names of the
+// ones it deleted, `/`-separated, or why one could not be.
+pub(crate) fn remove_unwanted_outputs(
+    work: &Path,
+    listed: &HashSet<PathBuf>,
+    spent: &HashSet<PathBuf>,
+    policy: &crate::post_processing::model::PostProcessingSettings,
+) -> Result<Vec<String>, String> {
+    let mut removed = Vec::new();
+    for relative in unpacked(work, listed, spent) {
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if !policy.removes(&name) {
+            continue;
+        }
+        std::fs::remove_file(work.join(&relative)).map_err(|error| {
+            format!("could not remove {name}, which has an unwanted extension: {error}")
+        })?;
+        removed.push(name);
+    }
+    Ok(removed)
+}
+
 pub(crate) fn place_outputs(
     work: &Path,
     dir: &Path,
@@ -1607,17 +1647,7 @@ pub(crate) fn place_outputs(
     kept: &[String],
     moved: impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Placed {
-    let mut found = Vec::new();
-    walk(work, Path::new(""), &mut found);
-    let found: Vec<PathBuf> = found
-        .into_iter()
-        .filter(|relative| {
-            let own = relative.components().next().is_some_and(|first| {
-                crate::pipeline::graph::restore::the_jobs(Path::new(first.as_os_str()))
-            });
-            !own && !listed.contains(relative) && !spent.contains(&work.join(relative))
-        })
-        .collect();
+    let found = unpacked(work, listed, spent);
     let mut placed = Placed {
         moved: Vec::with_capacity(found.len()),
         names: Vec::with_capacity(found.len()),

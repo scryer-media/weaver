@@ -78,9 +78,58 @@ pub(super) struct Map {
     // walked and then found in it.
     pub(super) checked: bool,
     pub(super) descriptor: Option<super::walk::Descriptor>,
+    // The positions, in order, of the first `filed` entries that were made
+    // with a cipher. Entries are only pushed, and an entry is never given
+    // a cipher later: a cipher is taken out only within a call that puts
+    // it back, or moved onto an entry that holds one. So no entry outside
+    // this list has keys to open. Built again after a restore.
+    #[serde(skip)]
+    pub(super) sealed: Vec<usize>,
+    #[serde(skip)]
+    pub(super) filed: usize,
+    // The positions of entries still waiting for their local header, of
+    // the first `waiting_filed` entries. An entry waits from when it is
+    // made, with what its record says, until its header agrees, and never
+    // waits again: one that stopped waiting elsewhere leaves this set at
+    // the next look at it. Built again after a restore.
+    #[serde(skip)]
+    pub(super) waiting: std::collections::BTreeSet<usize>,
+    #[serde(skip)]
+    pub(super) waiting_filed: usize,
 }
 
 impl Map {
+    // File the entries pushed since the last call, so `sealed` lists every
+    // entry made with a cipher.
+    pub(super) fn file_sealed(&mut self) {
+        for (index, entry) in self.entries.iter().enumerate().skip(self.filed) {
+            if entry.cipher.is_some() {
+                self.sealed.push(index);
+            }
+        }
+        self.filed = self.entries.len();
+    }
+
+    // File the entries pushed since the last call that wait for their
+    // local header.
+    pub(super) fn file_waiting(&mut self) {
+        for (index, entry) in self.entries.iter().enumerate().skip(self.waiting_filed) {
+            if entry.expected.is_some() {
+                self.waiting.insert(index);
+            }
+        }
+        self.waiting_filed = self.entries.len();
+    }
+
+    // Whether every entry holding a cipher is listed, as a test checks at
+    // every pass over the sealed entries.
+    #[cfg(test)]
+    pub(super) fn sealed_lists_every_cipher(&self) -> bool {
+        self.entries.iter().enumerate().all(|(index, entry)| {
+            entry.cipher.is_none() || self.sealed.binary_search(&index).is_ok()
+        })
+    }
+
     pub(super) fn entry(&self, member: MemberId) -> Option<&Entry> {
         self.entries.get(*self.members.get(member.0 as usize)?)
     }

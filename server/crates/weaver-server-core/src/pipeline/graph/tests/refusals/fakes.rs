@@ -318,7 +318,7 @@ impl Object for Store {
         None
     }
 
-    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, _: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
         name.rsplit_once(".part")
             .and_then(|(_, part)| part.strip_suffix(".rar")?.parse::<u32>().ok())
             .filter(|part| *part >= 2)

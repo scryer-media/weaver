@@ -691,3 +691,55 @@ async fn a_split_compressed_members_checksum_reaches_the_naming_plan() {
         graph.graph().delivery.files
     );
 }
+
+// A poster who numbered a set's volumes at more than one width: the first
+// ones at two digits, the later ones at three (`part01.rar` … `part09.rar`,
+// `part010.rar` …). The number is the number whatever its width, as SABnzbd
+// reads it, so the set is one set, in order, and its member is delivered.
+#[tokio::test]
+async fn a_set_numbered_at_mixed_widths_delivers_its_member() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles"
+    );
+    for (fixture, widths) in [
+        ("rar5_lz_four", [2, 2, 3, 3]),
+        ("rar4_lz_four", [2, 2, 3, 3]),
+        ("rar5_lz_four", [1, 2, 2, 3]),
+    ] {
+        let volumes: Vec<(String, Vec<u8>)> = (1..=4usize)
+            .map(|part| {
+                let bytes = std::fs::read(format!("{dir}/{fixture}.part0{part}.rar")).unwrap();
+                let width = widths[part - 1];
+                (format!("Pecos.1936.part{part:0width$}.rar"), bytes)
+            })
+            .collect();
+        let graph = run(&Scenario::new(posts(volumes))).await;
+        assert!(
+            graph.completed(),
+            "{fixture} {widths:?}: {:?} {:?}",
+            graph.status,
+            graph.failure
+        );
+        assert_engine_ran(&graph);
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/extraction_profiles/expected.json"
+        )))
+        .unwrap();
+        let expected = &oracle["archives"][fixture]["compressible.txt"];
+        let member = delivered("compressible.txt");
+        assert_eq!(
+            graph.files.keys().cloned().collect::<Vec<_>>(),
+            vec![member.clone()],
+            "{fixture} {widths:?}"
+        );
+        assert_eq!(
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                &graph.files[&member]
+            )),
+            expected["sha256"].as_str().unwrap(),
+            "{fixture} {widths:?}"
+        );
+    }
+}

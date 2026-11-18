@@ -43,6 +43,7 @@ fn member(id: u32, name: &str) -> MemberRecord {
         copy_of: None,
         fronted: false,
         refuted: None,
+        lifted: None,
     }
 }
 
@@ -319,6 +320,11 @@ pub(super) fn borrowed_node_rows(
             refused: state.refused.map(super::why_text),
             copy_of: member.copy_of.map(|into| i64::from(into.0)),
             refuted_kind: member.refuted.map(|kind| kind.to_string()),
+            lifted: member.lifted.as_ref().map(|lift| super::Lifted {
+                node: i64::from(lift.node.0),
+                member: i64::from(lift.member.0),
+                position: super::position_text(&lift.position),
+            }),
         }
     }));
     out.coverage

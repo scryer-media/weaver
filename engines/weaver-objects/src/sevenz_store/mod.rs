@@ -1008,7 +1008,13 @@ impl Object for SevenZipStore {
     // it. A front whose signature states the container this file's stated
     // is this file posted again, offered its place for the tree to weigh
     // against what holds it, by their fronts.
-    fn claim(&mut self, _name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        _name: &str,
+        clean: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
+        let first_bytes = clean.front();
         match measured(first_bytes) {
             Some(total) if Some(total) == self.measured => vec![FILE].into(),
             _ => Claim::default(),

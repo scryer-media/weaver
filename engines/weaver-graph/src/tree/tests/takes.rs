@@ -90,7 +90,7 @@ impl Object for Holder {
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
-    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, _: crate::object::Clean<'_>, _: Option<u64>) -> Claim {
         match self.place(name) {
             Some(place) => vec![place],
             None if self.taker => vec![self.free()],

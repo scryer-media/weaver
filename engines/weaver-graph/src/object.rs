@@ -18,6 +18,48 @@ use crate::member::MemberId;
 use crate::seek::Seek;
 use crate::volume::{ByteRange, VolumeIndex};
 
+// The clean bytes a member has, and where they start, as a claim is asked
+// by: its front when `at` is zero, or, when its front will not come, the
+// first clean run past the hole where it stopped. An object that knows its
+// volumes only by how they open reads `front`; one whose bytes say what
+// they are anywhere in them may read the run wherever it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Clean<'a> {
+    pub at: u64,
+    pub bytes: &'a [u8],
+}
+
+impl<'a> Clean<'a> {
+    // A front: clean bytes from the member's start.
+    pub fn start(bytes: &'a [u8]) -> Self {
+        Self { at: 0, bytes }
+    }
+
+    // The member's front: these bytes when they start at its start, else
+    // none.
+    pub fn front(&self) -> &'a [u8] {
+        if self.at == 0 { self.bytes } else { &[] }
+    }
+}
+
+impl<'a> From<&'a [u8]> for Clean<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        Self::start(bytes)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [u8; N]> for Clean<'a> {
+    fn from(bytes: &'a [u8; N]) -> Self {
+        Self::start(bytes)
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for Clean<'a> {
+    fn from(bytes: &'a Vec<u8>) -> Self {
+        Self::start(bytes)
+    }
+}
+
 // An object's answer to a claim: the places the member could take, none
 // when there are none, or not yet, while the front in hand is too short for
 // the object to judge the member by, with the places that front gives it.
@@ -316,6 +358,13 @@ pub trait Standing {
     // The members beside my volumes that no object owns, as a claim reads
     // them: what I can say of them is mine to say.
     fn beside(&self) -> Vec<Beside<'_>>;
+
+    // My volumes lie in a namespace below the root, and no other object of
+    // my kind is bound there: a volume my set lacks is nowhere beside me,
+    // and the namespace above may hold it (`Why::Scattered`).
+    fn liftable(&self) -> bool {
+        false
+    }
 }
 
 // A member no object owns, as the namespace holds it: its name, its first
@@ -524,7 +573,10 @@ pub trait Object: Send + Sync {
     // that cannot judge the member by the front it has so far answers not
     // yet, with the places that front gives it, and is asked again as the
     // front grows; once no more of it can come, those places are its answer.
-    fn claim(&mut self, _name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    // A member whose front will not come is asked with the first clean run
+    // past where it stopped, which only an object whose bytes say what they
+    // are wherever they are read can judge it by.
+    fn claim(&mut self, _name: &str, _clean: Clean<'_>, _length: Option<u64>) -> Claim {
         Claim::default()
     }
 

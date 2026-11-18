@@ -68,9 +68,10 @@ impl ArticleMap {
                 volume.know(boundary, offset);
             }
             volume.set_ordered_only(facts.ordered_only);
-            // A tail found short is told again, as a lost article is.
-            for at in 0..volume.articles.len() {
-                volume.cut_after(&mut self.open, at);
+            // Bytes no listed article carries are told again, as a lost
+            // article is.
+            for boundary in 0..=volume.articles.len() {
+                volume.cut_at(&mut self.open, boundary);
             }
             // Raised again through the moves, so the queue built from the
             // post is reclassed as the one that went down was.

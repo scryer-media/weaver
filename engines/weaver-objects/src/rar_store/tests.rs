@@ -259,7 +259,10 @@ fn a_nameless_volume_without_its_predecessor_is_placed_where_it_states() {
     // Volume 2 of the set states its number; volume 1, which nobody holds
     // yet, does not decide where it goes.
     let front = &volumes[2][..4096.min(volumes[2].len())];
-    assert_eq!(object.claim("d00d", front, None), vec![VolumeIndex(2)]);
+    assert_eq!(
+        object.claim("d00d", (front).into(), None),
+        vec![VolumeIndex(2)]
+    );
 }
 
 // A store holding only a set's second volume takes the first volume that
@@ -276,11 +279,11 @@ fn a_first_volume_joins_only_the_set_it_carries_on_into() {
     let mut object = store();
     object.bound(VolumeIndex(1), "c0ffee", &front(&ours[1]), None);
     assert_eq!(
-        object.claim("d00d", &front(&theirs[0]), None),
+        object.claim("d00d", (&front(&theirs[0])).into(), None),
         Vec::<VolumeIndex>::new()
     );
     assert_eq!(
-        object.claim("beef", &front(&ours[0]), None),
+        object.claim("beef", (&front(&ours[0])).into(), None),
         vec![VolumeIndex(0)]
     );
 }
@@ -307,7 +310,7 @@ fn a_one_volume_set_and_a_numbered_set_keep_apart() {
     let mut named = store();
     named.bound(VolumeIndex(0), "lantern.sample.rar", &sample, None);
     assert_eq!(
-        named.claim("alpha.part3.rar", &front(&set[2]), None),
+        named.claim("alpha.part3.rar", (&front(&set[2])).into(), None),
         Vec::<VolumeIndex>::new()
     );
 
@@ -315,7 +318,7 @@ fn a_one_volume_set_and_a_numbered_set_keep_apart() {
     ended.frames(0, 4096);
     ended.close(0);
     assert_eq!(
-        ended.object.claim("d00d", &front(&set[2]), None),
+        ended.object.claim("d00d", (&front(&set[2])).into(), None),
         Vec::<VolumeIndex>::new()
     );
 
@@ -353,22 +356,22 @@ fn a_far_volume_joins_only_the_set_its_name_numbers() {
     let mut first = store();
     first.bound(VolumeIndex(0), "alpha.part1.rar", &front(&ours[0]), None);
     assert_eq!(
-        first.claim("delta.part4.rar", &front(&theirs[3]), None),
+        first.claim("delta.part4.rar", (&front(&theirs[3])).into(), None),
         Vec::<VolumeIndex>::new()
     );
     assert_eq!(
-        first.claim("alpha.part3.rar", &front(&ours[2]), None),
+        first.claim("alpha.part3.rar", (&front(&ours[2])).into(), None),
         vec![VolumeIndex(2)]
     );
 
     let mut last = store();
     last.bound(VolumeIndex(2), "alpha.part3.rar", &front(&ours[2]), None);
     assert_eq!(
-        last.claim("delta.part1.rar", &front(&theirs[0]), None),
+        last.claim("delta.part1.rar", (&front(&theirs[0])).into(), None),
         Vec::<VolumeIndex>::new()
     );
     assert_eq!(
-        last.claim("alpha.part1.rar", &front(&ours[0]), None),
+        last.claim("alpha.part1.rar", (&front(&ours[0])).into(), None),
         vec![VolumeIndex(0)]
     );
 }
@@ -387,7 +390,7 @@ fn an_engine_claims_a_volume_a_store_gave_back_as_one_offered_fresh() {
     let mut giver = store();
     giver.bound(VolumeIndex(0), name, &front(&set[1]), None);
     let given = giver.give_back(VolumeIndex(0)).expect("an unmapped volume");
-    let fresh = engine.claim(name, &front(&set[1]), None);
+    let fresh = engine.claim(name, (&front(&set[1])).into(), None);
     assert_eq!(fresh, vec![VolumeIndex(1)]);
     assert_eq!(engine.reclaim(name, &front(&set[1]), None, &*given), fresh);
 }
@@ -441,7 +444,7 @@ fn a_volume_given_back_is_answered_as_one_offered_fresh() {
         let mut object = store();
         let own = format!("alpha.part{}.rar", held + 1);
         object.bound(VolumeIndex(held), &own, &front(&set[held as usize]), None);
-        let fresh = object.claim(name, short, None);
+        let fresh = object.claim(name, (short).into(), None);
         assert!(matches!(fresh, Claim::NotYet(_)), "{case}: {fresh:?}");
         let mut giver = store();
         giver.bound(VolumeIndex(1), name, short, None);
@@ -472,7 +475,7 @@ fn a_nameless_volume_posted_again_is_the_held_volume_its_neighbours_link_it_to()
         );
     }
     assert_eq!(
-        object.claim("d00d", &volumes[1], None),
+        object.claim("d00d", (&volumes[1]).into(), None),
         vec![VolumeIndex(1)]
     );
 }
@@ -650,7 +653,7 @@ fn a_volume_named_first_yields_the_place_its_own_front_rules_out() {
             "solid={solid}: a holder its front misplaces yields"
         );
         assert_eq!(
-            object.claim("3c9e1f.r00", &front(&volumes[0]), None),
+            object.claim("3c9e1f.r00", (&front(&volumes[0])).into(), None),
             vec![VolumeIndex(0)],
             "solid={solid}"
         );

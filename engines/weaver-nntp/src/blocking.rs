@@ -2292,7 +2292,10 @@ impl BlockingNntpConnection {
     //
     // The batches handed to `on_chunk` are exactly the ones that end up in
     // [`FusedYencArticle::chunks`], in the same order, so a caller can hash or
-    // write incrementally and still fall back to the buffered article.
+    // write incrementally and still fall back to the buffered article. One
+    // exception: a part an unstuffed `..` line left one dot short, and that
+    // checks once the dot is kept, gets the dot in its buffered chunks only
+    // (see [`FusedYencArticle::keep_dropped_dot`]).
     pub fn stream_yenc_article_with_chunks<F>(
         &mut self,
         message_id: &str,
@@ -2525,6 +2528,9 @@ impl BlockingNntpConnection {
                         lane_stats.decoded_articles += 1;
                     }
                     self.finish_active_body();
+                    // The whole part is in hand only now: a dot an unstuffed
+                    // line lost is kept here, after `on_chunk` saw the batch.
+                    article.keep_dropped_dot()?;
                     return Ok(article);
                 }
                 Ok(None) => {

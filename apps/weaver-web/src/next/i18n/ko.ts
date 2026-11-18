@@ -762,6 +762,11 @@ export const nextKo: LocaleDictionary = {
   "next.general.srrdbHelp": "난독화된 아카이브 멤버의 경우 CRC32 체크섬만 공개 SRRDB 색인에 보내 릴리스 이름을 복원합니다.",
   "next.general.unacceptableExtensions": "허용하지 않는 확장자",
   "next.general.unacceptableExtensionsHelp": "쉼표로 구분합니다. 이 중 하나를 포함한 완료된 다운로드는 거부됩니다.",
+  "next.general.unwantedExtensionAction": "허용하지 않는 확장자 처리",
+  "next.general.unwantedExtensionActionHelp":
+    "목록에 있는 파일은 압축 파일로 열지 않습니다. '작업 실패'는 다운로드를 거부하고, '원치 않는 파일만 삭제'는 해당 파일을 지우고 나머지를 부분 완료로 전달합니다.",
+  "next.general.unwantedExtensionAction.fail": "작업 실패",
+  "next.general.unwantedExtensionAction.delete": "원치 않는 파일만 삭제",
   "next.archivePasswords.title": "압축 파일 비밀번호",
   "next.archivePasswords.list": "비밀번호 (한 줄에 하나)",
   "next.archivePasswords.edit": "비밀번호 편집",

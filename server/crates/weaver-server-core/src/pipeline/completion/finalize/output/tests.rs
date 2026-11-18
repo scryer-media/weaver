@@ -566,6 +566,119 @@ fn prepublication_scan_checks_both_delivery_roots() {
     assert!(staging.join("extras/Payload.EXE").exists());
 }
 
+// The delete action removes each file with an unwanted extension from both
+// delivery roots and passes the rest: exactly the wanted files are left.
+#[test]
+fn prepublication_scan_removes_unwanted_files_under_the_delete_action() {
+    use crate::post_processing::model::UnwantedExtensionAction;
+
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(working.join("nested")).unwrap();
+    std::fs::create_dir_all(staging.join("extras")).unwrap();
+    std::fs::write(working.join("safe.mkv"), b"safe").unwrap();
+    std::fs::write(working.join("nested/setup.exe"), b"removed").unwrap();
+    std::fs::write(staging.join("extras/Payload.EXE"), b"removed").unwrap();
+    std::fs::write(staging.join("extras/notes.nfo"), b"kept").unwrap();
+
+    let settings = PostProcessingSettings {
+        unacceptable_extensions: vec!["EXE".into()],
+        unwanted_extension_action: UnwantedExtensionAction::DeleteFiles,
+        ..PostProcessingSettings::default()
+    }
+    .normalized()
+    .unwrap();
+    let validation =
+        validate_delivery_sources(&working, Some(&staging), &settings, &HashSet::new()).unwrap();
+
+    assert_eq!(validation.total_bytes, 8);
+    let mut left: Vec<PathBuf> = walkdir_files(temp.path());
+    left.sort();
+    assert_eq!(
+        left,
+        vec![staging.join("extras/notes.nfo"), working.join("safe.mkv"),]
+    );
+}
+
+// A folder the delete action leaves empty goes with the files, and so does a
+// parent it leaves empty in turn; a folder still holding a wanted file stays,
+// as do one that was empty before and the delivery root itself.
+#[test]
+fn prepublication_scan_removes_folders_the_delete_action_empties() {
+    use crate::post_processing::model::UnwantedExtensionAction;
+
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(working.join("show/extras/tools")).unwrap();
+    std::fs::create_dir_all(working.join("show/season 1")).unwrap();
+    std::fs::create_dir_all(working.join("show/empty before")).unwrap();
+    std::fs::create_dir_all(working.join("bundle/inner")).unwrap();
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(working.join("show/extras/tools/setup.exe"), b"removed").unwrap();
+    std::fs::write(working.join("show/extras/run.exe"), b"removed").unwrap();
+    std::fs::write(working.join("show/season 1/episode.mkv"), b"kept").unwrap();
+    std::fs::write(working.join("show/season 1/patch.exe"), b"removed").unwrap();
+    std::fs::write(working.join("bundle/inner/a.exe"), b"removed").unwrap();
+    std::fs::write(staging.join("only.exe"), b"removed").unwrap();
+
+    let settings = PostProcessingSettings {
+        unacceptable_extensions: vec!["exe".into()],
+        unwanted_extension_action: UnwantedExtensionAction::DeleteFiles,
+        ..PostProcessingSettings::default()
+    }
+    .normalized()
+    .unwrap();
+    let validation =
+        validate_delivery_sources(&working, Some(&staging), &settings, &HashSet::new()).unwrap();
+
+    assert_eq!(validation.total_bytes, 4);
+    assert!(!working.join("show/extras").exists());
+    assert!(!working.join("bundle").exists());
+    assert!(working.join("show/season 1/episode.mkv").is_file());
+    assert!(working.join("show/empty before").is_dir());
+    assert!(working.is_dir());
+    assert!(staging.is_dir());
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+}
+
+// A folder left empty is kept under the fail action, which deletes nothing.
+#[test]
+fn prepublication_scan_keeps_folders_under_the_fail_action() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    std::fs::create_dir_all(working.join("show/empty before")).unwrap();
+    std::fs::write(working.join("show/episode.mkv"), b"kept").unwrap();
+
+    let validation = validate_delivery_sources(
+        &working,
+        None,
+        &PostProcessingSettings::default(),
+        &HashSet::new(),
+    )
+    .unwrap();
+
+    assert_eq!(validation.total_bytes, 4);
+    assert!(working.join("show/empty before").is_dir());
+}
+
+fn walkdir_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
 // The Windows arm of the guard reads a raw attribute bit rather than asking
 // `FileType`, so an inverted or mistyped mask would reject every ordinary
 // delivery instead of just the redirecting ones. The Unix symlink tests

@@ -97,12 +97,24 @@ pub(crate) fn front_facts(
     headers(first_bytes, password, kdf).filter(|facts| facts.is_volume)
 }
 
-// What a front's headers state, of a volume or of an archive that is none.
+// The format whose signature a front opens on, at its first byte. A volume
+// opens on its signature; a member that holds one further in is no volume,
+// whatever it carries: a ReScene `.srr` opens on its own header block and
+// holds copies of a set's volume headers, and a self-extracting `.exe` is
+// never probed. The read is never `read_signature`'s, which scans past the
+// first byte for a self-extractor's stub.
+fn opens_rar(first_bytes: &[u8]) -> Option<ArchiveFormat> {
+    unrar_rs::signature::detect_format(first_bytes).ok()
+}
+
+// What a front's headers state, of a volume or of an archive that is none:
+// nothing for a front that does not open on a signature (`opens_rar`).
 pub(crate) fn headers(
     first_bytes: &[u8],
     password: Option<&str>,
     kdf: Arc<KdfCache>,
 ) -> Option<RarVolumeFacts> {
+    opens_rar(first_bytes)?;
     let walk = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
         Cursor::new(first_bytes.to_vec()),
         password,
@@ -256,7 +268,7 @@ impl RarStore {
     }
 
     fn placing_volume(&self, name: &str, first_bytes: &[u8]) -> Placing {
-        let Ok(format) = unrar_rs::signature::read_signature(&mut Cursor::new(first_bytes)) else {
+        let Some(format) = opens_rar(first_bytes) else {
             return Placing::default();
         };
         self.placing(name, format, self.front_facts(first_bytes).as_ref())

@@ -1427,7 +1427,7 @@ async fn a_volume_whose_file_takes_no_second_name_is_written_afresh() {
     use crate::operations::disk::writer::VolumeWriters;
     use crate::pipeline::graph::disk::JobDisk;
     use crate::pipeline::graph::namespace::claimed::refused::SECOND_NAMES;
-    SECOND_NAMES.store(true, std::sync::atomic::Ordering::SeqCst);
+    SECOND_NAMES.set(true);
     let writers = VolumeWriters::inline(|_| {});
     let volume = Arc::new(Volume::new(None, "test".to_owned()));
     let disk = || JobDisk::new(writers.test_submitter(&volume, 1), None);

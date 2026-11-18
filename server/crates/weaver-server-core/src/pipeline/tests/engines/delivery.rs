@@ -75,6 +75,74 @@ async fn bodies_the_primary_spoils_come_whole_from_the_backup() {
     );
 }
 
+// A body with no `=ybegin` line is a bad copy from the server that sent
+// it, as a body that fails its checksum is: the article is asked of the
+// next server, and the copy there is delivered.
+#[tokio::test]
+async fn a_body_without_its_ybegin_line_is_fetched_from_the_next_server() {
+    let inner = payload(4 * ARTICLE + 23, 35);
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", inner.clone())])
+        .servers(2)
+        .headerless_on(0, 2, 0);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(
+        graph.files[&delivered("ember.bin")] == inner,
+        "the second server's bytes are delivered"
+    );
+    assert_eq!(graph.requests[&(0, 2)], 2, "{:?}", graph.requests);
+    assert_eq!(graph.metrics.segments_failed_permanent, 0);
+    assert_eq!(graph.history.as_ref().map(|row| row.failed_bytes), Some(0));
+}
+
+// An article every server sends without its `=ybegin` line is asked of each
+// server once and lost once: its bytes are counted failed one time, and the
+// other file is delivered whole.
+#[tokio::test]
+async fn an_article_no_server_sends_with_its_ybegin_line_is_lost_once() {
+    let whole = payload(2 * ARTICLE + 5, 36);
+    let cut = payload(3 * ARTICLE + 9, 37);
+    for servers in [1, 2] {
+        let mut scenario = Scenario::new(vec![
+            Post::plain("ember.mkv", whole.clone()),
+            Post::plain("cinder.mkv", cut.clone()),
+        ])
+        .servers(servers);
+        for server in 0..servers {
+            scenario = scenario.headerless_on(1, 1, server);
+        }
+        let graph = run(&scenario).await;
+        assert_eq!(
+            graph.requests.get(&(1, 1)),
+            Some(&servers),
+            "{:?} {:?} {:?}",
+            graph.requests,
+            graph.status,
+            graph.failure
+        );
+        assert_eq!(graph.metrics.segments_failed_permanent, 1, "{servers}");
+        assert_eq!(
+            graph.history.as_ref().map(|row| row.failed_bytes),
+            Some(ARTICLE as u64),
+            "{servers}"
+        );
+        assert!(
+            graph.files.get(&delivered("ember.mkv")) == Some(&whole),
+            "{servers}: {:?} retained {:?} {:?} {:?}",
+            graph.files.keys().collect::<Vec<_>>(),
+            graph.retained_files.keys().collect::<Vec<_>>(),
+            graph.status,
+            graph.failure
+        );
+        assert_eq!(
+            graph.status,
+            Some(crate::jobs::model::JobStatus::Partial),
+            "{servers}: {:?}",
+            graph.failure
+        );
+    }
+}
+
 // Two posts of one name never reach the job as one name: ingest gives the
 // second `.duplicateN` before the job is admitted.
 #[tokio::test]

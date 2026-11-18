@@ -48,6 +48,14 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     if pipeline.fail_graph_job_on_breach(job_id) {
         return;
     }
+    // The tree opened nothing while the policy was unread: what it held
+    // undecided is asked again, once, now that it is read.
+    if let Some(job) = pipeline.graph_jobs.get_mut(&job_id)
+        && let Err(error) = job.open_after_policy()
+    {
+        pipeline.after_graph_result(job_id, Err(error));
+        return;
+    }
     if pipeline.job_has_pending_download_pipeline_work(job_id)
         || pipeline.queue_script_completion_gate(job_id, true)
     {
@@ -195,6 +203,29 @@ fn asker(job_id: JobId) -> AskerId {
     AskerId(job_id.0)
 }
 
+// Whether a root member is a file of the payload, as the census and the
+// delivery read it. The object that holds it says what it is: a member a
+// recovery object holds is recovery whatever its posted name, and one any
+// other object holds is payload. A member no object holds is what its
+// posted name says, and one past the posted files is a file a recovery
+// object announced, which is payload. A member named as recovery that a
+// recovery object refused stays recovery; one another object refused is
+// payload.
+fn is_payload(job: &GraphJob, files: &[crate::jobs::model::FileSpec], member: MemberId) -> bool {
+    let tree = job.tree();
+    if let Some((owner, _)) = tree.child_of(NodeId::ROOT, member) {
+        return !tree.recovers(owner);
+    }
+    if files
+        .get(member.0 as usize)
+        .is_none_or(|file| file.role.counts_toward_health())
+    {
+        return true;
+    }
+    tree.refused_by(NodeId::ROOT, member)
+        .is_some_and(|owner| !tree.recovers(owner))
+}
+
 impl Pipeline {
     // A graph job its extraction budget refused fails now, at the
     // extraction stage, with the refusal as its reason. Asked after every
@@ -312,7 +343,7 @@ impl Pipeline {
             .files
             .iter()
             .zip(0u32..)
-            .filter(|(file, _)| file.role.counts_toward_health())
+            .filter(|(_, index)| is_payload(job, &state.spec.files, MemberId(*index)))
             .filter_map(|(file, index)| {
                 let member = namespace.get(MemberId(index))?;
                 let file_id = NzbFileId {
@@ -496,21 +527,7 @@ impl Pipeline {
         // Once an object owns a member, its role wins over the posted
         // filename. A misleading recovery suffix cannot hide an archive's
         // outputs, including those kept when the archive refused.
-        let payload = |member: MemberId| {
-            if state
-                .spec
-                .files
-                .get(member.0 as usize)
-                .is_none_or(|file| file.role.counts_toward_health())
-            {
-                return true;
-            }
-            let tree = job.tree();
-            tree.child_of(NodeId::ROOT, member)
-                .map(|(owner, _)| owner)
-                .or_else(|| tree.refused_by(NodeId::ROOT, member))
-                .is_some_and(|owner| !tree.recovers(owner))
-        };
+        let payload = |member: MemberId| is_payload(job, &state.spec.files, member);
         // A set whose repair failed covers the member: each failed set with
         // the namespace it lives in, as the summary read them once.
         let failed: Vec<(NodeId, NodeId)> = failure
@@ -616,6 +633,12 @@ impl Pipeline {
             },
             unarrived,
         );
+        // A file with an unwanted extension the policy deletes is no file
+        // of the delivery: the final move leaves it out.
+        let mut delivery = delivery;
+        if let Some(policy) = job.writer().removes() {
+            delivery.remove_unwanted(|name| policy.removes(name));
+        }
         Some((delivery, failure))
     }
 
@@ -693,9 +716,16 @@ impl Pipeline {
         Some(crate::post_processing::model::DeliveredVerdict {
             partial: delivery.status(failure.as_ref()) == JobStatus::Partial,
             shortfall_stage: delivery.shortfall_stage(failure.as_ref()),
-            shortfall_message: failure
-                .map(|failure| failure.message)
-                .or_else(|| delivery.withheld_error()),
+            // What the policy left out is said beside any other reason.
+            shortfall_message: match (
+                failure
+                    .map(|failure| failure.message)
+                    .or_else(|| delivery.withheld_error()),
+                delivery.removed_error(),
+            ) {
+                (Some(why), Some(removed)) => Some(format!("{why}; {removed}")),
+                (why, removed) => why.or(removed),
+            },
             recovery_verified: self.graph_recovery_verified(job_id),
             unpacked: self.graph_unpacked(job_id),
         })

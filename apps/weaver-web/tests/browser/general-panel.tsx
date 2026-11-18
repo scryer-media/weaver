@@ -26,6 +26,7 @@ let settings = {
 let archive: { hasPasswords: boolean; passwordFile: string | null } = { hasPasswords: true, passwordFile: "/data/archive-passwords.txt" };
 // The unwanted extension list, saved apart from the rest and normalized as the daemon does.
 let extensions = ["bat", "cmd", "com", "exe", "js", "lnk", "msi", "ps1", "scr", "vbs"];
+let extensionAction = "FAIL_JOB";
 // A machine that can run more than one hardware profile, so the panel offers the choice.
 const option = (profile: string, threads: number) => ({
   profile, sevenzDecodeMemoryBytes: threads * 256 * 1024 ** 2, decodeThreads: threads, extractThreads: threads, maxConcurrentDownloads: null,
@@ -64,6 +65,10 @@ function store(name: string, variables: Record<string, unknown>): unknown {
     extensions = [...new Set((variables as { extensions: string[] }).extensions.map((entry) => entry.toLowerCase()))].sort();
     return { setUnacceptableExtensions: extensions };
   }
+  if (name === "SetUnwantedExtensionAction") {
+    extensionAction = (variables as { action: string }).action;
+    return { setUnwantedExtensionAction: extensionAction };
+  }
   return {};
 }
 
@@ -91,7 +96,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
   const answer = name === "Settings" ? { settings, globalState: null }
     : name === "ArchivePasswordSettings" ? { archivePasswordSettings: archive }
     : name === "HardwareProfile" ? { hardwareProfile }
-    : name === "UnacceptableExtensions" ? { postProcessingSettings: { unacceptableExtensions: extensions } }
+    : name === "UnacceptableExtensions" ? { postProcessingSettings: { unacceptableExtensions: extensions, unwantedExtensionAction: extensionAction } }
     : {};
   return fromValue({ operation, data: answer, stale: false, hasNext: false });
 }))] });

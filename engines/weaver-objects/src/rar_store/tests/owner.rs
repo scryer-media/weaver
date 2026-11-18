@@ -104,7 +104,7 @@ impl Owner {
         let front = &bytes[..bytes.len().min(FRONT)];
         let volume = owner
             .object
-            .claim(name, front, None)
+            .claim(name, (front).into(), None)
             .first()
             .copied()
             .unwrap_or(VolumeIndex(0));
@@ -157,7 +157,7 @@ impl Owner {
         let (name, bytes) = &self.volumes[volume];
         let first = &bytes[..bytes.len().min(FRONT)];
         assert_eq!(
-            self.object.claim(name, first, None),
+            self.object.claim(name, (first).into(), None),
             vec![VolumeIndex(volume as u32)],
             "claims {name}"
         );
