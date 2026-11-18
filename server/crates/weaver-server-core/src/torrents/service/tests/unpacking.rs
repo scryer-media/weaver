@@ -18,6 +18,8 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
     rig.db
         .save_post_processing_settings(&PostProcessingSettings {
             unacceptable_extensions: vec!["txt".into()],
+            unwanted_extension_action:
+                crate::post_processing::model::UnwantedExtensionAction::FailJob,
             ..PostProcessingSettings::default()
         })
         .unwrap();
@@ -219,6 +221,8 @@ async fn a_finished_torrent_unpacking_refused_seeds_on_and_fails_with_no_usable_
     rig.db
         .save_post_processing_settings(&PostProcessingSettings {
             unacceptable_extensions: vec!["txt".into()],
+            unwanted_extension_action:
+                crate::post_processing::model::UnwantedExtensionAction::FailJob,
             ..PostProcessingSettings::default()
         })
         .unwrap();
@@ -268,6 +272,8 @@ async fn a_finished_torrent_unpacking_refused_beside_a_usable_file_is_partial() 
     rig.db
         .save_post_processing_settings(&PostProcessingSettings {
             unacceptable_extensions: vec!["txt".into()],
+            unwanted_extension_action:
+                crate::post_processing::model::UnwantedExtensionAction::FailJob,
             ..PostProcessingSettings::default()
         })
         .unwrap();

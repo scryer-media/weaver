@@ -1012,6 +1012,7 @@ struct Heard {
     peer_id: String,
     downloaded: u64,
     uploaded: u64,
+    left: u64,
 }
 
 impl Heard {
@@ -1029,6 +1030,7 @@ impl Heard {
             peer_id: field("peer_id").unwrap(),
             downloaded: count("downloaded"),
             uploaded: count("uploaded"),
+            left: count("left"),
         }
     }
 
@@ -1213,6 +1215,81 @@ async fn a_paused_and_resumed_torrent_keeps_its_key_and_peer_id() {
     assert_eq!(stopped.identity(), started.identity());
     assert_eq!(again.identity(), started.identity());
     rig.service.stop().await;
+}
+
+// A private torrent whose every file is on the unwanted list is added with
+// nothing wanted, as qBittorrent adds it (`applyFilenameFilter`), and is
+// finished at once (libtorrent `piece_picker::is_finished` with every piece
+// filtered). Its tracker hears `started` with every byte left and nothing
+// moved, and then only the `stopped` of the shutdown: the torrent never
+// becomes a seed, so it never sends `completed` (libtorrent
+// `torrent::finished` calls `completed` only `if (is_seed())`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_with_every_file_unwanted_starts_and_stops_and_never_completes() {
+    let (url, mut announces) = heard_tracker(&[]).await;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    rig.db
+        .save_post_processing_settings(&PostProcessingSettings {
+            unacceptable_extensions: vec!["exe".into()],
+            ..PostProcessingSettings::default()
+        })
+        .unwrap();
+    let files: [(&str, &[u8]); 2] = [("pack/setup.exe", &[1; 100]), ("pack/readme.exe", &[2; 60])];
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(metainfo("pack", &files, 64, true)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.db.torrent_file_priorities(job_id).unwrap(),
+        [FilePriority::Ignored, FilePriority::Ignored]
+    );
+    tracked(&rig.service, job_id, &url).await;
+    let mut published = rig.service.inner.published.subscribe();
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+    assert_eq!(
+        (started.left, started.downloaded, started.uploaded),
+        (160, 0, 0)
+    );
+    started_accepted(&rig.service, job_id).await;
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!((view.wanted_bytes, view.downloaded_bytes), (0, 0));
+    announces_answered(&rig.service, job_id).await;
+
+    rig.service.stop().await;
+    let mut after = Vec::new();
+    while let Ok(heard) = announces.try_recv() {
+        after.push(heard);
+    }
+    let events: Vec<_> = after
+        .iter()
+        .filter_map(|heard| heard.event.as_deref())
+        .collect();
+    assert_eq!(events, ["stopped"], "{after:?}");
+    let stopped = after.iter().find(|heard| heard.event.is_some()).unwrap();
+    assert_eq!(
+        (stopped.left, stopped.downloaded, stopped.uploaded),
+        (160, 0, 0)
+    );
+    assert_eq!(stopped.identity(), started.identity());
 }
 
 // A torrent whose route changes while its old leg stands goes on over the

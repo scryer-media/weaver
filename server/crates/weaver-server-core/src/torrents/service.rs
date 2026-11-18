@@ -605,6 +605,13 @@ impl Signal {
         self.marked(job_id, 0);
     }
 
+    // Looked at by the next settle, with nothing for its checkpoint: no
+    // piece came or went.
+    pub(super) fn look(&self, job_id: JobId) {
+        locked(&self.dirty).insert(job_id);
+        self.wake.notify_one();
+    }
+
     // Marked, with its checkpoint due at the settle: what changed is the
     // whole ledger, not a piece.
     fn due(&self, job_id: JobId) {

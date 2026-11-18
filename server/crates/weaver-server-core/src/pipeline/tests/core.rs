@@ -839,6 +839,8 @@ async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts()
         .save_post_processing_settings(&crate::post_processing::model::PostProcessingSettings {
             execution_enabled: true,
             unacceptable_extensions: vec!["exe".into()],
+            unwanted_extension_action:
+                crate::post_processing::model::UnwantedExtensionAction::FailJob,
             ..Default::default()
         })
         .unwrap();

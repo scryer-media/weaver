@@ -592,6 +592,13 @@ impl NamespaceWriter {
         self.caps.policy_known()
     }
 
+    // The job's content policy once read (`Caps::policy`).
+    pub(crate) fn policy(
+        &self,
+    ) -> Option<std::sync::Arc<crate::post_processing::model::PostProcessingSettings>> {
+        self.caps.policy()
+    }
+
     // The policy was read: the members the tree asked about before it was
     // are asked again, once (`Tree::rule_known`), and what that binds is
     // handed what its members received, as any bind is.

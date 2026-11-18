@@ -145,29 +145,29 @@ async fn the_unwanted_extension_action_round_trips_and_is_kept_by_the_other_save
         response_data(response)["postProcessingSettings"]["unwantedExtensionAction"].clone()
     };
 
-    // Never stored: fail job.
+    // Never stored: delete only the unwanted files.
     let response = harness.execute(read).await;
     assert_no_errors(&response);
-    assert_eq!(action(&response), json!("FAIL_JOB"));
+    assert_eq!(action(&response), json!("DELETE_FILES"));
 
     let denied = harness
         .execute_as(
-            "mutation { setUnwantedExtensionAction(action: DELETE_FILES) }",
+            "mutation { setUnwantedExtensionAction(action: FAIL_JOB) }",
             CallerScope::Read,
         )
         .await;
     assert_has_errors(&denied);
-    assert_eq!(action(&harness.execute(read).await), json!("FAIL_JOB"));
+    assert_eq!(action(&harness.execute(read).await), json!("DELETE_FILES"));
 
     let response = harness
-        .execute("mutation { setUnwantedExtensionAction(action: DELETE_FILES) }")
+        .execute("mutation { setUnwantedExtensionAction(action: FAIL_JOB) }")
         .await;
     assert_no_errors(&response);
     assert_eq!(
         response_data(&response)["setUnwantedExtensionAction"],
-        json!("DELETE_FILES")
+        json!("FAIL_JOB")
     );
-    assert_eq!(action(&harness.execute(read).await), json!("DELETE_FILES"));
+    assert_eq!(action(&harness.execute(read).await), json!("FAIL_JOB"));
 
     // Saving the script settings or the list leaves the action as it is.
     assert_no_errors(
@@ -182,13 +182,13 @@ async fn the_unwanted_extension_action_round_trips_and_is_kept_by_the_other_save
             .execute(r#"mutation { setUnacceptableExtensions(extensions: ["iso"]) }"#)
             .await,
     );
-    assert_eq!(action(&harness.execute(read).await), json!("DELETE_FILES"));
+    assert_eq!(action(&harness.execute(read).await), json!("FAIL_JOB"));
 
     let response = harness
-        .execute("mutation { setUnwantedExtensionAction(action: FAIL_JOB) }")
+        .execute("mutation { setUnwantedExtensionAction(action: DELETE_FILES) }")
         .await;
     assert_no_errors(&response);
-    assert_eq!(action(&harness.execute(read).await), json!("FAIL_JOB"));
+    assert_eq!(action(&harness.execute(read).await), json!("DELETE_FILES"));
 }
 
 #[tokio::test]
