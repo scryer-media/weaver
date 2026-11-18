@@ -4037,6 +4037,8 @@ fn names_placed_while_the_policy_is_unreadable_are_judged_once_it_reads() {
             if readable.load(Ordering::SeqCst) {
                 Ok(Arc::new(PostProcessingSettings {
                     unacceptable_extensions: vec!["exe".into()],
+                    unwanted_extension_action:
+                        crate::post_processing::model::UnwantedExtensionAction::FailJob,
                     ..PostProcessingSettings::default()
                 }))
             } else {

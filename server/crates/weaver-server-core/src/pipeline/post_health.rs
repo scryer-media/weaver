@@ -44,7 +44,7 @@ use weaver_nntp::client::ProbeBatchResult;
 use weaver_nntp::pool::ServerId;
 
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
-use crate::jobs::model::{FileSpec, JobSpec};
+use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
 use crate::pipeline::download::queue::QueuedWork;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
 
@@ -88,6 +88,9 @@ const MAIL_CAPACITY: usize = 64;
 pub(crate) struct ProbeUpdate {
     pub(crate) job_id: JobId,
     pub(crate) round: u32,
+    // The bytes every server had said are gone when the round was armed:
+    // none of them was asked.
+    pub(crate) known: u64,
     // Articles a batch answered for.
     pub(crate) total: usize,
     // Of those, the ones no server holds.
@@ -146,10 +149,11 @@ impl ProbeTally {
     }
 
     // The update the round reports once every batch is back.
-    pub(crate) fn update(&self, job_id: JobId, round: u32) -> ProbeUpdate {
+    pub(crate) fn update(&self, job_id: JobId, round: u32, known: u64) -> ProbeUpdate {
         ProbeUpdate {
             job_id,
             round,
+            known,
             total: self.checked,
             missed: self.missed,
             unverified: self.unverified,
@@ -269,6 +273,8 @@ pub(crate) enum ProbeMail {
 #[derive(Debug, Clone, Copy)]
 struct LaneRound {
     round: u32,
+    // The bytes every server had said are gone when the round was armed.
+    known: u64,
     tally: ProbeTally,
     left: usize,
 }
@@ -534,18 +540,64 @@ pub(crate) fn first_article_verdict_error(missing: usize, total: usize) -> Strin
     format!("aborted: {missing} of {total} first articles are missing, the post cannot complete")
 }
 
-// The message ids a round samples from: every article of every file that
-// counts toward the post's health, in post order.
-pub(crate) fn candidates(spec: &JobSpec) -> Vec<String> {
-    spec.files
-        .iter()
-        .filter(|file| file.role.counts_toward_health())
-        .flat_map(|file| {
-            file.segments
-                .iter()
-                .map(|segment| segment.message_ids.in_use().to_string())
-        })
-        .collect()
+// The articles a round samples from: every article of every file that
+// counts toward the post's health, in post order. Built from the files
+// alone; an article is found by its place, so a round reads only the
+// articles it looks at.
+pub(crate) struct Candidates<'a> {
+    files: Vec<(u32, &'a FileSpec)>,
+    // Where each file's articles end, counted from the post's first.
+    ends: Vec<usize>,
+}
+
+impl<'a> Candidates<'a> {
+    pub(crate) fn new(spec: &'a JobSpec) -> Self {
+        let mut files = Vec::new();
+        let mut ends = Vec::new();
+        let mut end = 0;
+        for (file, index) in spec.files.iter().zip(0u32..) {
+            if file.role.counts_toward_health() && !file.segments.is_empty() {
+                end += file.segments.len();
+                files.push((index, file));
+                ends.push(end);
+            }
+        }
+        Self { files, ends }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ends.last().copied().unwrap_or(0)
+    }
+
+    // The article at `at`: its file's index, and the article.
+    pub(crate) fn at(&self, at: usize) -> (u32, &'a SegmentSpec) {
+        let slot = self.ends.partition_point(|end| *end <= at);
+        let start = slot.checked_sub(1).map_or(0, |before| self.ends[before]);
+        let (index, file) = self.files[slot];
+        (index, &file.segments[at - start])
+    }
+}
+
+// The candidates a round asks for: at each place `sample_indices` picks,
+// the first article from there to the next pick that `gone` does not say
+// every server already failed. Such an article is in the post's losses
+// exactly; asking for it again would count it twice. Each article is
+// looked at once at most, so a round costs its picks and the known losses
+// it steps over.
+pub(crate) fn sample_unknown(
+    total: usize,
+    round: u32,
+    mut gone: impl FnMut(usize) -> bool,
+) -> Vec<usize> {
+    let picks = sample_indices(total, round);
+    let mut sampled = Vec::with_capacity(picks.len());
+    for (at, start) in picks.iter().enumerate() {
+        let end = picks.get(at + 1).copied().unwrap_or(total);
+        if let Some(unknown) = (*start..end).find(|candidate| !gone(*candidate)) {
+            sampled.push(unknown);
+        }
+    }
+    sampled
 }
 
 // The candidates a round asks for: an even stride of at least ten, or one
@@ -565,13 +617,22 @@ pub(crate) fn sample_indices(total: usize, round: u32) -> Vec<usize> {
     (offset..total).step_by(stride).collect()
 }
 
-// The loss a round projects over the payload: the share of what it asked
-// that is gone, taken over every byte that counts toward health.
-pub(crate) fn projected(tracked_bytes: u64, total: usize, missed: usize) -> Option<u64> {
+// The loss a round projects over the payload: the `known` bytes every
+// server already said are gone, exactly, and the share of what it asked
+// that is gone, taken over the bytes that count toward health past those.
+// The round asked none of the known losses.
+pub(crate) fn projected(
+    tracked_bytes: u64,
+    known: u64,
+    total: usize,
+    missed: usize,
+) -> Option<u64> {
     if total == 0 || missed == 0 || tracked_bytes == 0 {
         return None;
     }
-    Some((u128::from(tracked_bytes) * missed as u128 / total as u128) as u64)
+    let rest = tracked_bytes.saturating_sub(known);
+    let share = (u128::from(rest) * missed as u128 / total as u128) as u64;
+    Some(known.saturating_add(share))
 }
 
 // Whether the damage has the shape a probe exists to catch.
@@ -878,25 +939,39 @@ impl Pipeline {
         if !needed {
             return;
         }
-        let candidates = candidates(&state.spec);
         let round = probe.rounds;
+        let candidates = Candidates::new(&state.spec);
+        let given_up = self.given_up.get(&job_id);
+        let segment_of = |at: usize| {
+            let (file_index, segment) = candidates.at(at);
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number: segment.ordinal,
+            }
+        };
+        let probes: Vec<String> = sample_unknown(candidates.len(), round, |at| {
+            given_up.is_some_and(|given_up| given_up.gone(segment_of(at)))
+        })
+        .into_iter()
+        .map(|at| candidates.at(at).1.message_ids.in_use().to_string())
+        .collect();
+        // What every server already said is gone, which the round does not
+        // ask again: its projection is over the rest.
+        let known = self.missing_bytes(job_id);
         let entry = self.post_probes.states.entry(job_id).or_default();
         entry.rounds = round.wrapping_add(1);
         entry.failing_files = failing_files;
-        if candidates.is_empty() {
+        if probes.is_empty() {
             entry.next_failed_bytes = decided.saturating_add(1);
             return;
         }
         entry.out = Some(round);
-        let probes: Vec<String> = sample_indices(candidates.len(), round)
-            .into_iter()
-            .map(|index| candidates[index].clone())
-            .collect();
         info!(
             job_id = job_id.0,
             round,
             probes = probes.len(),
             candidates = candidates.len(),
+            known_lost_bytes = known,
             failing_files,
             failed_bytes = decided,
             "health probe armed: STAT sampling"
@@ -911,6 +986,7 @@ impl Pipeline {
             job_id,
             LaneRound {
                 round,
+                known,
                 tally: ProbeTally::default(),
                 left: batches.len(),
             },
@@ -1112,7 +1188,12 @@ impl Pipeline {
         if lane_round.left > 0 {
             return;
         }
-        let LaneRound { round, tally, .. } = *lane_round;
+        let LaneRound {
+            round,
+            known,
+            tally,
+            ..
+        } = *lane_round;
         self.post_probes.lane_rounds.remove(&job_id);
         info!(
             job_id = job_id.0,
@@ -1122,7 +1203,7 @@ impl Pipeline {
             unverified = tally.unverified,
             "health probe complete"
         );
-        self.post_probe_heard(tally.update(job_id, round));
+        self.post_probe_heard(tally.update(job_id, round, known));
     }
 
     // What a round said. Only the round the job waits on is heard: a job
@@ -1158,7 +1239,7 @@ impl Pipeline {
         };
         probe.out = None;
         if !update.inconclusive
-            && let Some(projected) = projected(tracked, update.total, update.missed)
+            && let Some(projected) = projected(tracked, update.known, update.total, update.missed)
             && projected > probe.projected
         {
             probe.projected = projected;

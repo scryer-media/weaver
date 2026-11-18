@@ -13,7 +13,9 @@
 // whose last member it continues. A number every set states alike joins a
 // set only where a held volume beside it judges it, or where the volume's
 // name is not another set's, and no set takes a volume past the one that
-// says no volume follows it. The
+// says no volume follows it. An archive whose headers say it is no
+// volume is a set of one, whatever its name numbers: it founds its own
+// store, and one held among a set's volumes goes back at its close. The
 // store's first volume is placed the same way, with nothing held yet, and a
 // front that places it nowhere founds the store with it first. That claim is
 // provisional: a volume whose own headers, read to its close, say it is not
@@ -148,11 +150,12 @@ impl Nameless<'_> {
     // main header, all but the first, which states no number; a RAR4
     // volume numbers itself only in its end record, and short of one is
     // its set's first when it opens on a member it does not continue, as
-    // RAR reads it.
+    // RAR reads it. A RAR5 archive that is no volume is its own set's
+    // first and only one, as a RAR4 one that continues nothing is.
     fn position(&self) -> Option<u32> {
         match (self.facts.volume_number, self.facts.archive_format()) {
             (Some(stated), _) => Some(stated),
-            (None, ArchiveFormat::Rar5) => self.facts.is_volume.then_some(0),
+            (None, ArchiveFormat::Rar5) => Some(0),
             (None, _) => self
                 .first_member()
                 .is_some_and(|member| !member.split_before)
@@ -328,10 +331,7 @@ impl RarStore {
 
     fn placing_front(&self, name: &str, front: &[u8], facts: Option<&RarVolumeFacts>) -> Placing {
         match facts {
-            Some(facts) if facts.is_volume => {
-                self.placing(name, Some(facts.archive_format()), Some(facts))
-            }
-            Some(_) => Placing::default(),
+            Some(facts) => self.placing(name, Some(facts.archive_format()), Some(facts)),
             None => self.placing_volume(name, front),
         }
     }
@@ -383,6 +383,18 @@ impl RarStore {
     ) -> Placing {
         if format.is_some_and(|format| self.holds_other_than(format)) {
             return Placing::default();
+        }
+        // An archive whose headers say it is no volume is a set of one,
+        // whatever its name numbers: it is the first and only volume of a
+        // store that holds nothing else, and no store holding a volume
+        // takes it.
+        if facts.is_some_and(|facts| !facts.is_volume) {
+            let alone = self.volumes.is_empty().then_some(VolumeIndex(0));
+            return Placing {
+                placed: alone,
+                stated: alone,
+                not_yet: false,
+            };
         }
         // The set's numbering is the one the bound names share; before any
         // is bound, the one this member's own name gives. Each bound name

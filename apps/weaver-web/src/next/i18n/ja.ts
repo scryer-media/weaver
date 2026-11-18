@@ -765,7 +765,7 @@ export const nextJa: LocaleDictionary = {
   "next.general.srrdb": "SRRDB リリース検索",
   "next.general.srrdbHelp": "難読化されたアーカイブメンバーについて、CRC32 チェックサムだけを公開 SRRDB インデックスに送り、リリース名を復元します。",
   "next.general.unacceptableExtensions": "許可しない拡張子",
-  "next.general.unacceptableExtensionsHelp": "カンマ区切り。これらのいずれかを含む完了済みダウンロードは拒否されます。",
+  "next.general.unacceptableExtensionsHelp": "カンマ区切り。これらのいずれかを含む完了済みダウンロードの扱いは、下の処理で決まります。",
   "next.general.unwantedExtensionAction": "許可しない拡張子の処理",
   "next.general.unwantedExtensionActionHelp":
     "一覧にあるファイルはアーカイブとして開かれません。「ジョブを失敗にする」はダウンロードを拒否し、「不要なファイルだけ削除」はそのファイルを削除して残りを一部完了として届けます。",

@@ -353,3 +353,69 @@ async fn a_batch_the_server_leaves_unanswered_costs_the_round_that_batch_alone()
     );
     assert_eq!(asked.len(), answered.len());
 }
+
+// A post nobody uploaded but each file's first article, whose first losses
+// fall where the round samples: the round steps over what every server
+// already said is gone and asks the next article of each window instead.
+// The post is still found dead on its first round, on as many samples as
+// before, and nothing known gone is asked again.
+#[tokio::test]
+async fn a_dead_post_whose_known_losses_fall_in_the_sample_is_dead_on_its_first_round() {
+    let server = stat_server();
+    let articles = 40u32;
+    let posts: Vec<Post> = (0..3u8)
+        .map(|at| {
+            Post::plain(
+                &format!("lantern{at:02}.bin"),
+                payload(articles as usize * ARTICLE, at),
+            )
+        })
+        .collect();
+    // A hundred and twenty articles sample one in twelve: these come first.
+    let picked = [(0, 12), (0, 24), (0, 36)];
+    let rest = (0..3u32)
+        .flat_map(|file| (1..articles).map(move |ordinal| (file, ordinal)))
+        .filter(|lost| !picked.contains(lost));
+    let scenario = picked
+        .into_iter()
+        .chain(rest)
+        .fold(Scenario::new(posts), |scenario, (file, ordinal)| {
+            scenario.lost(file, ordinal)
+        });
+    let (_temp_dir, mut pipeline) = armed(&scenario, server.listener.port).await;
+    let given_up = &pipeline.given_up[&JOB];
+    let known: BTreeSet<String> = scenario
+        .lost
+        .iter()
+        .filter(|(file, ordinal)| {
+            given_up.gone(crate::jobs::ids::SegmentId {
+                file_id: crate::jobs::ids::NzbFileId {
+                    job_id: JOB,
+                    file_index: *file,
+                },
+                segment_number: *ordinal,
+            })
+        })
+        .map(|(file, ordinal)| format!("lantern-{file}-{ordinal}@example.com"))
+        .collect();
+    assert!(known.contains("lantern-0-12@example.com"), "{known:?}");
+
+    hear_round(&mut pipeline).await;
+
+    let failure = pipeline
+        .post_probes
+        .dead
+        .get(&JOB)
+        .expect("the round rules the post dead");
+    assert!(
+        failure.starts_with("health probe: 9 of 10 samples missing; health "),
+        "{failure}"
+    );
+    assert_eq!(pipeline.post_probes.states[&JOB].rounds, 1);
+    let asked = server.asked.lock().unwrap();
+    assert_eq!(asked.len(), 10, "{asked:?}");
+    assert!(
+        asked.iter().all(|id| !known.contains(bare(id))),
+        "{asked:?} {known:?}"
+    );
+}

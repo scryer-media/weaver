@@ -35,7 +35,7 @@ fn one_unsettled_batch_costs_coverage_not_the_verdict() {
     third.extend_from_slice(&[false; 5]);
     tally.record_answered(&third);
 
-    let update = tally.update(JobId(30040), 0);
+    let update = tally.update(JobId(30040), 0, 0);
 
     assert!(!update.inconclusive);
     // The verdict is read over what answered, never over the sample the
@@ -53,7 +53,7 @@ fn a_probe_that_settled_nothing_is_inconclusive() {
     tally.record_unsettled(50);
     tally.record_unsettled(16);
 
-    let update = tally.update(JobId(30041), 0);
+    let update = tally.update(JobId(30041), 0, 0);
 
     assert!(update.inconclusive);
     assert_eq!(update.total, 0);
@@ -95,9 +95,56 @@ fn a_clean_round_waits_for_material_damage_but_never_past_critical() {
 
 #[test]
 fn a_projection_is_the_missed_share_of_the_payload() {
-    assert_eq!(projected(1_000, 10, 9), Some(900));
-    assert_eq!(projected(1_000, 10, 0), None);
-    assert_eq!(projected(1_000, 0, 0), None);
+    assert_eq!(projected(1_000, 0, 10, 9), Some(900));
+    assert_eq!(projected(1_000, 0, 10, 0), None);
+    assert_eq!(projected(1_000, 0, 0, 0), None);
+}
+
+// A hundred articles of ten thousand bytes, sampled one in ten.
+#[test]
+fn known_losses_are_counted_once_and_the_sample_projects_over_the_rest() {
+    let tracked = 1_000_000;
+    // None known: the projection is the sampled share, as before.
+    assert_eq!(projected(tracked, 0, 10, 1), Some(100_000));
+    // Two known, at the first two picks. Asked again, they made two of ten
+    // samples missing, a projection of a fifth of the post. Stepped over,
+    // the round asks the next article of each window, and the post is what
+    // it knows plus what the rest is sampled to lose.
+    let known = [0, 10];
+    let sampled = sample_unknown(100, 0, |at| known.contains(&at));
+    assert_eq!(sampled, [1, 11, 20, 30, 40, 50, 60, 70, 80, 90]);
+    assert_eq!(projected(tracked, 20_000, 10, 0), None);
+    assert_eq!(projected(tracked, 20_000, 10, 1), Some(118_000));
+    // Ninety known: the rest is a tenth of the post, so however much of it
+    // the round finds gone, the post projects between what it knows and
+    // all of it.
+    assert_eq!(projected(tracked, 900_000, 10, 5), Some(950_000));
+    assert_eq!(projected(tracked, 900_000, 10, 10), Some(tracked));
+    // Known losses past the tracked bytes, as a recovery file's are: the
+    // projection is what is known.
+    assert_eq!(projected(tracked, 1_200_000, 10, 3), Some(1_200_000));
+}
+
+#[test]
+fn a_round_steps_over_known_losses_within_its_window_only() {
+    // A window every article of which is known gone gives no sample; the
+    // next pick is not borrowed for it.
+    let sampled = sample_unknown(100, 0, |at| (10..20).contains(&at));
+    assert_eq!(sampled, [0, 20, 30, 40, 50, 60, 70, 80, 90]);
+    // A post every article of which is known gone asks nothing.
+    assert!(sample_unknown(100, 0, |_| true).is_empty());
+    // Nothing known: the sample is the stride's.
+    assert_eq!(sample_unknown(120, 1, |_| false), sample_indices(120, 1));
+    // Each article is looked at once at most.
+    // Ninety-five known: nine windows walked whole, the last to its first
+    // unknown article.
+    let mut looked = Vec::new();
+    let sampled = sample_unknown(100, 0, |at| {
+        looked.push(at);
+        at < 95
+    });
+    assert_eq!(sampled, [95]);
+    assert_eq!(looked, (0..96).collect::<Vec<_>>());
 }
 
 #[test]

@@ -765,7 +765,7 @@ export const nextFr: LocaleDictionary = {
   "next.general.srrdb": "Recherche de publication SRRDB",
   "next.general.srrdbHelp": "Pour les membres d'archive obfusqués, envoyer uniquement leur somme CRC32 à l'index public SRRDB afin de retrouver le nom de la publication.",
   "next.general.unacceptableExtensions": "Extensions refusées",
-  "next.general.unacceptableExtensionsHelp": "Séparées par des virgules. Un téléchargement terminé qui en contient une est refusé.",
+  "next.general.unacceptableExtensionsHelp": "Séparées par des virgules. L'action ci-dessous décide du sort d'un téléchargement terminé qui en contient une.",
   "next.general.unwantedExtensionAction": "Action sur les extensions refusées",
   "next.general.unwantedExtensionActionHelp":
     "Un fichier de la liste n’est jamais ouvert comme archive. « Faire échouer la tâche » refuse le téléchargement ; « Supprimer seulement les fichiers indésirables » retire ces fichiers et livre le reste comme partiel.",

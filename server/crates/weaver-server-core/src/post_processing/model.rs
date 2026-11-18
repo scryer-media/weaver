@@ -923,8 +923,8 @@ pub struct PostProcessingSettings {
     #[serde(default = "default_unacceptable_extensions")]
     pub unacceptable_extensions: Vec<String>,
     // What a job holding a file with one of those extensions comes to. A
-    // saved document without the field predates the choice and fails the
-    // job, as Weaver always did.
+    // saved document without the field predates the choice and takes the
+    // default, as a new install does: only those files are deleted.
     #[serde(default)]
     pub unwanted_extension_action: UnwantedExtensionAction,
     #[serde(default)]
@@ -937,10 +937,10 @@ pub struct PostProcessingSettings {
 #[serde(rename_all = "snake_case")]
 pub enum UnwantedExtensionAction {
     // The job fails on the first such file it places.
-    #[default]
     FailJob,
     // Each such file is left out of the delivery; the job delivers the
     // rest and ends partial, or failed when nothing usable is left.
+    #[default]
     DeleteFiles,
 }
 
