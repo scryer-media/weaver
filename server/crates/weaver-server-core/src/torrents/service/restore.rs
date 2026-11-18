@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use super::disk_room::PlaceBatch;
 use super::intake::{Fetched, Parsed, parse};
 use super::live::Live;
 use super::retire::{held_key, held_of, held_tops};
@@ -508,6 +509,16 @@ impl TorrentService {
     // The store joined to what feeds it: the intake the session hands its
     // pieces to.
     fn give_store(&self, torrent: &mut Live, store: TorrentStore) {
+        self.give_store_in(torrent, store, None);
+    }
+
+    // `give_store`, the look for its disk one of `batch`'s when it is one.
+    fn give_store_in(
+        &self,
+        torrent: &mut Live,
+        store: TorrentStore,
+        batch: Option<&Arc<PlaceBatch>>,
+    ) {
         let job_id = torrent.record.job_id;
         let env = &self.inner.env;
         let store = store.shared();
@@ -536,7 +547,7 @@ impl TorrentService {
             Box::new(move |heard| signal.heard(job_id, heard)),
         ));
         if env.capacity.is_some() && !torrent.complete() && intake.room().place().is_none() {
-            self.look_for_place(torrent.record.job_id, &intake, dir);
+            self.look_for_place_in(torrent.record.job_id, &intake, dir, batch);
         }
         torrent.hold(store.file_have());
         if let Some(tee) = store.tee() {
@@ -748,6 +759,8 @@ impl TorrentService {
             return;
         }
         let global = Some(self.global_passwords());
+        // The looks for their disks ask one pass between them.
+        let looks = PlaceBatch::new(self);
         let mut restoring = tokio::task::JoinSet::new();
         for job_id in waiting {
             if restoring.len() >= RESTORES_AT_ONCE {
@@ -755,13 +768,15 @@ impl TorrentService {
             }
             let service = self.clone();
             let global = global.clone();
+            let looks = Arc::clone(&looks);
             restoring.spawn(async move {
-                if service.restore_job_with(job_id, global).await {
+                if service.restore_job_with(job_id, global, Some(&looks)).await {
                     service.attach(job_id, None).await;
                 }
             });
         }
         while restoring.join_next().await.is_some() {}
+        drop(looks);
         // Those back read as their sessions have them now, not at the next
         // tick, as the tick reads them after a pass it waited on.
         self.read_sessions().await;
@@ -774,7 +789,7 @@ impl TorrentService {
     // restore that panics is a checkpoint that does not restore. Whether it
     // gave the torrent its job, unheld, so it may attach now.
     pub(super) async fn restore_job(&self, job_id: JobId) -> bool {
-        self.restore_job_with(job_id, None).await
+        self.restore_job_with(job_id, None, None).await
     }
 
     // [`Self::restore_job`] with the global archive passwords read for it,
@@ -783,6 +798,7 @@ impl TorrentService {
         &self,
         job_id: JobId,
         global: Option<Arc<[ArchivePasswordCandidate]>>,
+        looks: Option<&Arc<PlaceBatch>>,
     ) -> bool {
         self.ensure(&[job_id]).await;
         // However the restore ends, even cancelled or with the runtime, its
@@ -894,7 +910,7 @@ impl TorrentService {
             Some(torrent) => {
                 torrent.restore_held = None;
                 torrent.files_missing = missing;
-                self.give_store(torrent, store);
+                self.give_store_in(torrent, store, looks);
                 let copy = self.catch_up_levels(torrent);
                 (torrent.held.is_none() && !missing, copy)
             }

@@ -155,6 +155,10 @@ impl TorrentService {
     // A tee whose moves wait on a checkpoint has it written, and a torrent
     // whose pieces fell [`CHECKPOINT_PIECES`] behind has them written.
     pub(super) async fn settle(&self) {
+        #[cfg(test)]
+        self.inner
+            .settling
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let dirty = self.inner.signal.take();
         for &job_id in &dirty {
             let made_whole = self.inner.signal.take_whole(job_id);
@@ -250,7 +254,12 @@ impl TorrentService {
             }
         }
         #[cfg(test)]
-        self.inner.settled.send_modify(|settled| *settled += 1);
+        {
+            self.inner
+                .settling
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.inner.settled.send_modify(|settled| *settled += 1);
+        }
     }
 
     /// The torrent's own upload and download limits in bytes per second

@@ -1007,3 +1007,177 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     rig.service.stop().await;
     seeding.stop().await;
 }
+
+// The looks begun together for many torrents ask one pass between them: a
+// pass is a publish of every torrent, so a pass a look would build the
+// views of every torrent once for each. The looks are let go one at a
+// time, each with what it asked settled before the next, so a pass each
+// is seen as a pass each, whatever the machine's load.
+const LOOKS: usize = 20;
+
+// The disks: the roots under `dir`'s `roots`, the torrents under its
+// `complete`, both on the one device the test runs on.
+fn looked_disks(dir: &Path) -> Arc<StorageCapacity> {
+    let roots = dir.join("roots");
+    std::fs::create_dir_all(&roots).unwrap();
+    let probe = |_: &Path| {
+        Ok(DiskSpace {
+            total_bytes: 1 << 40,
+            available_bytes: RESERVE + PLENTY,
+        })
+    };
+    let capacity = Arc::new(StorageCapacity::with_probe(
+        [roots.clone(), roots.clone(), roots],
+        NEVER,
+        Arc::new(probe),
+    ));
+    for root in StorageRoot::ALL {
+        capacity.wait_for_probes(root, 1);
+    }
+    capacity
+}
+
+// `LOOKS` torrents added with their route down, each with its folder.
+async fn add_looked(service: &TorrentService) -> Vec<(JobId, PathBuf)> {
+    let mut added = Vec::new();
+    for n in 0..LOOKS {
+        let source = AddSource::Metainfo(plain(&format!("look{n}"), n as u8));
+        let job_id = service.add_opened(request(source)).await.unwrap();
+        let live = service.inner.live.lock().await;
+        added.push((job_id, files_dir(&live[&job_id])));
+    }
+    added
+}
+
+// Until no pass is asked for and no settle is under way: every pass asked
+// so far has published.
+async fn passes_settled(service: &TorrentService) {
+    let mut settled = service.inner.settled.subscribe();
+    settled
+        .wait_for(|_| {
+            !service.inner.signal.pass_wanted.load(Ordering::SeqCst)
+                && !service.inner.settling.load(Ordering::SeqCst)
+        })
+        .await
+        .unwrap();
+}
+
+// The looks of `added`, each held at its folder's device read: let go one
+// at a time, each settled before the next. The views built meanwhile.
+async fn views_of_looks(
+    service: &TorrentService,
+    added: &[(JobId, PathBuf)],
+    mut holds: Vec<(
+        crate::runtime::fs::test_devices::HeldDevice,
+        tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
+    )>,
+    views: usize,
+) -> usize {
+    for ((_, dir), (_, reads)) in added.iter().zip(&mut holds) {
+        assert_eq!(&reads.recv().await.unwrap(), dir);
+    }
+    let intakes: Vec<_> = {
+        let live = service.inner.live.lock().await;
+        added
+            .iter()
+            .map(|(job_id, _)| live[job_id].intake.clone().unwrap())
+            .collect()
+    };
+    let mut moved = service.inner.disk_waits_moved.subscribe();
+    for ((hold, _), intake) in holds.into_iter().zip(&intakes) {
+        let mark = *moved.borrow_and_update();
+        drop(hold);
+        moved
+            .wait_for(|seen| {
+                *seen > mark && intake.room().place().is_some() && !intake.room().placing()
+            })
+            .await
+            .unwrap();
+        passes_settled(service).await;
+    }
+    service.views_built() - views
+}
+
+// Many torrents whose disks could not be told are looked up again at one
+// reading: their looks ask one pass between them, not one each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_looks_of_one_reading_ask_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let capacity = looked_disks(dir.path());
+    let db = Database::open_in_memory().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.set_down(Some("the leg is down"));
+    let service = service_on(&db, dir.path(), &routes, disk_env(&capacity), set_clock());
+    service.open().await.unwrap();
+    // The folders' disks cannot be told: each look at the add fails, and
+    // its torrent waits for a reading to be looked up again.
+    let refused = crate::runtime::fs::test_devices::refuse(&dir.path().join("complete"));
+    let added = add_looked(&service).await;
+    let intakes: Vec<_> = {
+        let live = service.inner.live.lock().await;
+        added
+            .iter()
+            .map(|(job_id, _)| live[job_id].intake.clone().unwrap())
+            .collect()
+    };
+    let mut moved = service.inner.disk_waits_moved.subscribe();
+    moved
+        .wait_for(|_| {
+            locked(&service.inner.relook).jobs.len() == LOOKS
+                && intakes.iter().all(|intake| !intake.room().placing())
+        })
+        .await
+        .unwrap();
+    passes_settled(&service).await;
+
+    let holds: Vec<_> = added
+        .iter()
+        .map(|(_, dir)| crate::runtime::fs::test_devices::hold(dir))
+        .collect();
+    drop(refused);
+    let views = service.views_built();
+    capacity.request_refresh(StorageRoot::Complete);
+    let built = views_of_looks(&service, &added, holds, views).await;
+    assert!(
+        built <= 3 * LOOKS,
+        "{built} views built for {LOOKS} torrents looked up at one reading"
+    );
+    assert!(!locked(&service.inner.relook).waiting);
+    service.stop().await;
+}
+
+// Many torrents restored at a start each look their disk up as their job
+// is back: the looks of the restore pass ask one pass between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_looks_of_one_restore_pass_ask_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.set_down(Some("the leg is down"));
+    let added = {
+        let service = service_on(&db, dir.path(), &routes, job_env(), set_clock());
+        service.open().await.unwrap();
+        let added = add_looked(&service).await;
+        service.stop().await;
+        added
+    };
+
+    let capacity = looked_disks(dir.path());
+    let service = service_on(&db, dir.path(), &routes, disk_env(&capacity), set_clock());
+    service.open().await.unwrap();
+    let holds: Vec<_> = added
+        .iter()
+        .map(|(_, dir)| crate::runtime::fs::test_devices::hold(dir))
+        .collect();
+    // The tick restores their jobs, each store's look held at its read.
+    service.tick().await;
+    service.restored().await;
+    passes_settled(&service).await;
+    let views = service.views_built();
+    let built = views_of_looks(&service, &added, holds, views).await;
+    assert!(
+        built <= 3 * LOOKS,
+        "{built} views built for {LOOKS} torrents restored in one pass"
+    );
+    service.stop().await;
+}
