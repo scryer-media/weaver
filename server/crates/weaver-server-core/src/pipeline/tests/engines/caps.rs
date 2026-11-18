@@ -1000,7 +1000,7 @@ mod unwanted {
         assert_eq!(names(&graph), BTreeSet::from([delivered("lantern.mkv")]));
         assert_eq!(
             reason(&graph).as_deref(),
-            Some("removed for an unwanted extension: beacon.exe")
+            Some("delivered in part; removed for an unwanted extension: beacon.exe")
         );
     }
 
