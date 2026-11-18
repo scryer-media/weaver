@@ -404,6 +404,24 @@ pub trait TorrentStorage: Send + Sync {
         Ok(size)
     }
 
+    /// [`Self::pwrite_all_vectored`] into memory the storage holds, on a
+    /// thread that must not wait on a disk: true once written there; false,
+    /// having written nothing a file holds, when the bytes would go to a
+    /// file, for the caller to write them where it may wait. Default
+    /// implementation writes when [`Self::writes_to_memory`] says so.
+    fn pwrite_held(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<bool> {
+        if !self.writes_to_memory() {
+            return Ok(false);
+        }
+        self.pwrite_all_vectored(file_id, offset, bufs)?;
+        Ok(true)
+    }
+
     /// Remove a file from the storage. If not supported, or it doesn't matter, just return Ok(())
     fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()>;
 
@@ -522,6 +540,15 @@ pub trait TorrentStorage: Send + Sync {
     /// Default implementation does nothing.
     fn on_piece_requeued(&self, _piece_index: ValidPieceIndex) {}
 
+    /// Asked before a downloaded piece is checked, on a thread that may wait on a disk:
+    /// whether every block of it the storage took is where the check reads it. An error is a
+    /// write of a block taken earlier that failed, as of a piece given back whose blocks went
+    /// to its files: the piece is then not checked, and goes the way of a piece the storage
+    /// refused. Waits for such writes under way. Default implementation lost none.
+    fn piece_written(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Whether a block of the piece is copied into memory the storage holds, rather than
     /// written to a file: asked per block, so a lookup. Default implementation answers
     /// [`Self::writes_to_memory`].
@@ -552,6 +579,38 @@ pub trait TorrentStorage: Send + Sync {
     fn hold_whole_piece(&self, _bytes: u64) -> Option<HeldRoom> {
         None
     }
+
+    /// Room for one block of `bytes` of a piece a storage that holds pieces in memory writes
+    /// block by block ([`Self::writes_piece_to_memory`] says no for it), held for that block's
+    /// write alone: the block goes to the disk threads with it, and it goes back as the write
+    /// returns. Such a piece holds no room of its own. Refused when the budget has none: the
+    /// connection then stops reading and waits on `room`, which the storage rings once it has
+    /// room again. Asked on the connection's task; must not wait. Default implementation needs
+    /// no room.
+    fn hold_block(&self, _bytes: u64, _room: &Arc<Notify>) -> BlockRoom {
+        BlockRoom::Free
+    }
+
+    /// Asked by a connection stopped for room each time `room` rings, before it lands its
+    /// block again under the torrent's lock: whether `bytes` of room may be free now. False
+    /// keeps it waiting, and `room` is rung again once room comes back anywhere in the budget,
+    /// so a ring wakes each waiter for one cheap look, not a turn at the lock. A look that
+    /// holds nothing: true may still be refused. Must not wait. Default implementation says
+    /// there may be.
+    fn room_for(&self, _bytes: u64, _room: &Arc<Notify>) -> bool {
+        true
+    }
+}
+
+/// What [`TorrentStorage::hold_block`] has for a block's write.
+#[derive(Debug)]
+pub enum BlockRoom {
+    /// The write needs no room.
+    Free,
+    /// The room, held until this is dropped.
+    Held(HeldRoom),
+    /// No room now: the storage rings once it has some.
+    Refused,
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -583,6 +642,15 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
         bufs: [IoSlice<'_>; 2],
     ) -> anyhow::Result<usize> {
         (**self).pwrite_all_vectored(file_id, offset, bufs)
+    }
+
+    fn pwrite_held(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<bool> {
+        (**self).pwrite_held(file_id, offset, bufs)
     }
 
     fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
@@ -661,6 +729,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
         (**self).on_piece_requeued(piece_id)
     }
 
+    fn piece_written(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).piece_written(piece_id)
+    }
+
     fn writes_piece_to_memory(&self, piece_id: ValidPieceIndex) -> bool {
         (**self).writes_piece_to_memory(piece_id)
     }
@@ -675,6 +747,14 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn hold_whole_piece(&self, bytes: u64) -> Option<HeldRoom> {
         (**self).hold_whole_piece(bytes)
+    }
+
+    fn hold_block(&self, bytes: u64, room: &Arc<Notify>) -> BlockRoom {
+        (**self).hold_block(bytes, room)
+    }
+
+    fn room_for(&self, bytes: u64, room: &Arc<Notify>) -> bool {
+        (**self).room_for(bytes, room)
     }
 }
 

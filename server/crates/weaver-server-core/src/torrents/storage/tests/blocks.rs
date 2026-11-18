@@ -4,6 +4,7 @@
 // Pieces larger than the resident budget: written block by block as they
 // arrive, hashed from disk, had once the hash passed.
 
+use std::io::IoSlice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -228,9 +229,10 @@ fn a_restart_mid_piece_fetches_it_again_and_checks_its_files_kept_pieces() {
 const PIECE_AND_BLOCK: u64 = PIECE + BLOCK;
 
 // A piece whose owner left part way is given back: the blocks it holds in
-// memory go to its files, and its whole-piece room goes back but for one
-// block's, which another piece's first block then takes. The rest of it
-// arrives block by block, it is checked from its files, and it is had.
+// memory go to its files, and its whole-piece room goes back, all of it,
+// which another piece's first block then takes. The rest of it arrives
+// block by block, each block holding room for its write alone (taken by the
+// session, not here), it is checked from its files, and it is had.
 #[tokio::test]
 async fn a_piece_given_back_part_way_is_written_out_and_frees_its_room_and_verifies() {
     let budget = accountant(PIECE_AND_BLOCK);
@@ -245,22 +247,98 @@ async fn a_piece_given_back_part_way_is_written_out_and_frees_its_room_and_verif
     let rung = shim.room.notified();
     shim.storage.on_piece_requeued(shim.index(1));
     rung.await;
-    assert_eq!(budget.namespace_usage(NAMESPACE).resident, BLOCK);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
     assert!(!shim.storage.writes_piece_to_memory(shim.index(1)));
     let a = std::fs::read(shim.dir.path().join("a.bin")).unwrap();
     assert_eq!(&a[65_536..98_304], &torrent[65_536..98_304]);
     assert_eq!(shim.store.count(), 0);
     assert!(shim.storage.reserve_piece(shim.index(0), &shim.room));
-    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE_AND_BLOCK);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
 
     shim.write_blocks(1, &torrent, u64::MAX, None);
-    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE_AND_BLOCK);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
     assert!(!shim.storage.hash_held_piece(shim.index(1), &mut |_| {}));
     assert_eq!(shim.read(1), torrent[65_536..131_072]);
     shim.storage.on_piece_completed(shim.index(1)).unwrap();
     assert!(shim.store.has(1));
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
     assert!(shim.storage.resident_peak() <= PIECE_AND_BLOCK);
+}
+
+// The store, its disk full for every block written alone.
+struct FullForBlocks {
+    store: Arc<TorrentStore>,
+}
+
+impl Pieces for FullForBlocks {
+    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
+        self.store.verified(piece, held)
+    }
+
+    fn write_block(&self, _: u32, _: usize, _: u64, _: u64, _: &[u8]) -> anyhow::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into())
+    }
+
+    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
+        self.store.failed(piece)
+    }
+
+    fn checking(&self) -> anyhow::Result<bool> {
+        self.store.checking()
+    }
+
+    fn found(&self, piece: u32) -> anyhow::Result<bool> {
+        self.store.found(piece)
+    }
+
+    fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.store.read(file, offset, out)
+    }
+
+    fn grow(&self, file: usize, length: u64) -> std::io::Result<()> {
+        self.store.grow(file, length)
+    }
+}
+
+// A piece given back whose blocks fail to reach its files frees its room
+// all the same, and says so before it is checked: it is refused, with the
+// disk's error, for the session to fetch it again blaming no one. Its
+// later blocks go to its files too, never to memory on the runtime.
+#[test]
+fn a_piece_given_back_whose_blocks_fail_to_write_is_refused_and_frees_its_room() {
+    let budget = accountant(PIECE_AND_BLOCK);
+    let layout = two_files();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&layout, dir.path(), None);
+    let full = Arc::new(FullForBlocks {
+        store: Arc::clone(&store),
+    });
+    let shim = Shim {
+        store,
+        storage: PieceStorage::new(Arc::clone(&layout), full as Arc<dyn Pieces>, holds(&budget)),
+        layout,
+        dir,
+        room: Arc::default(),
+    };
+    let torrent = noise(160_000, 7);
+    shim.write_blocks(1, &torrent, 2, None);
+    shim.storage.piece_written(shim.index(1)).unwrap();
+
+    shim.storage.on_piece_requeued(shim.index(1));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+    let error = shim.storage.piece_written(shim.index(1)).unwrap_err();
+    assert!(weaver_torrent::storage::write_refused(&error), "{error:#}");
+    // A block landing on the runtime is left for a thread that may wait.
+    let block = &torrent[98_304..100_000];
+    let on_runtime = shim
+        .storage
+        .pwrite_held(0, 98_304, [IoSlice::new(block), IoSlice::new(&[])])
+        .unwrap();
+    assert!(!on_runtime);
+
+    shim.storage.on_piece_hash_failed(shim.index(1)).unwrap();
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+    assert!(!shim.store.has(1));
 }
 
 // A piece given back whole stays in memory, checked from there as before.
@@ -278,17 +356,18 @@ fn a_piece_given_back_whole_stays_in_memory() {
     assert!(shim.store.has(0));
 }
 
-// A block of a piece no peer owns takes one block's room, and its piece is
-// written block by block; a whole piece's room is left for an owner.
+// A block of a piece no peer owns holds no room for its piece, which is
+// written block by block, each block holding room for its write alone; a
+// whole piece's room is left for an owner.
 #[test]
-fn an_unowned_pieces_first_block_takes_one_blocks_room() {
+fn an_unowned_pieces_first_block_holds_no_room_for_its_piece() {
     let budget = accountant(PIECE_AND_BLOCK);
     let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
     assert!(
         shim.storage
             .reserve_unowned_piece(shim.index(1), &shim.room)
     );
-    assert_eq!(budget.namespace_usage(NAMESPACE).resident, BLOCK);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
     assert!(!shim.storage.writes_piece_to_memory(shim.index(1)));
     // Asked again, as each of its blocks asks, it holds no more.
     assert!(
@@ -296,10 +375,20 @@ fn an_unowned_pieces_first_block_takes_one_blocks_room() {
             .reserve_unowned_piece(shim.index(1), &shim.room)
     );
     assert!(shim.storage.reserve_piece(shim.index(1), &shim.room));
-    assert_eq!(budget.namespace_usage(NAMESPACE).resident, BLOCK);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
     assert!(shim.storage.reserve_piece(shim.index(0), &shim.room));
     assert!(shim.storage.writes_piece_to_memory(shim.index(0)));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
+    // A block of the piece given no room holds room for its write alone.
+    let room = shim.storage.hold_block(BLOCK, &shim.room);
+    assert!(matches!(room, weaver_torrent::storage::BlockRoom::Held(_)));
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE_AND_BLOCK);
+    assert!(matches!(
+        shim.storage.hold_block(BLOCK, &shim.room),
+        weaver_torrent::storage::BlockRoom::Refused
+    ));
+    drop(room);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
 }
 
 // The write path is chosen when the storage is made, from the piece length
@@ -358,4 +447,221 @@ async fn an_oversized_torrent_downloads_from_a_peer_within_its_budget() {
     assert!((BLOCK..=BUDGET).contains(&peak), "{peak}");
     leecher.stop().await;
     seeded.seeder.stop().await;
+}
+
+const OTHER: HoldsNamespace = HoldsNamespace {
+    scope: 2,
+    node: NodeId::ROOT,
+};
+
+// A session refused room another job of the budget holds is rung when that
+// job lets it go, not only when a piece of its own does, and its piece is
+// granted then.
+#[tokio::test]
+async fn room_another_holder_lets_go_rings_a_session_refused_it() {
+    let budget = accountant(PIECE);
+    let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
+    assert_eq!(
+        budget.reserve_resident(OTHER, BLOCK),
+        weaver_graph::holds::Reserve::Granted
+    );
+    assert!(!shim.storage.reserve_piece(shim.index(0), &shim.room));
+    let rung = shim.room.notified();
+    budget.release_resident(OTHER, BLOCK);
+    rung.await;
+    assert!(shim.storage.room_for(PIECE, &shim.room));
+    assert!(shim.storage.reserve_piece(shim.index(0), &shim.room));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
+}
+
+fn framed(out: &mut Vec<u8>, id: u8, payload: &[&[u8]]) {
+    let length = 1 + payload.iter().map(|part| part.len()).sum::<usize>();
+    out.extend_from_slice(&u32::try_from(length).unwrap().to_be_bytes());
+    out.push(id);
+    for part in payload {
+        out.extend_from_slice(part);
+    }
+}
+
+// A seeder of `content` that has every piece and answers each batch of
+// requests out of order: the blocks of the pieces asked for are interleaved,
+// the piece asked for last first. While one piece alone is asked for, the
+// last of its blocks asked for is held back until another piece is asked
+// for too, or every piece has been: a block of a second piece then always
+// arrives while the first is still open.
+async fn scrambled_seed(
+    listener: tokio::net::TcpListener,
+    info_hash: [u8; 20],
+    content: Vec<u8>,
+    pieces: u32,
+) {
+    use std::collections::VecDeque;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (stream, _) = listener.accept().await.unwrap();
+    stream.set_nodelay(true).unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut read = tokio::io::BufReader::new(read);
+    let mut theirs = [0u8; 68];
+    read.read_exact(&mut theirs).await.unwrap();
+    assert_eq!(&theirs[28..48], &info_hash);
+    let mut out = vec![19];
+    out.extend_from_slice(b"BitTorrent protocol");
+    out.extend_from_slice(&[0; 8]);
+    out.extend_from_slice(&info_hash);
+    out.extend_from_slice(b"-WB0001-scrambled-01");
+    let mut bits = vec![0xffu8; pieces.div_ceil(8) as usize];
+    let spare = u32::try_from(bits.len()).unwrap() * 8 - pieces;
+    if spare > 0 {
+        *bits.last_mut().unwrap() = 0xff << spare;
+    }
+    framed(&mut out, 5, &[&bits]);
+    framed(&mut out, 1, &[]);
+    write.write_all(&out).await.unwrap();
+
+    // Pieces in the order first asked for, and the requests unanswered.
+    let mut seen: Vec<u32> = Vec::new();
+    let mut pending: Vec<(u32, u32, u32)> = Vec::new();
+    let mut payload = Vec::new();
+    loop {
+        let Ok(length) = read.read_u32().await else {
+            return;
+        };
+        if length > 0 {
+            let Ok(id) = read.read_u8().await else {
+                return;
+            };
+            payload.resize(length as usize - 1, 0);
+            if read.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            let field = |at: usize| u32::from_be_bytes(payload[at..at + 4].try_into().unwrap());
+            match id {
+                6 => {
+                    let asked = (field(0), field(4), field(8));
+                    if !seen.contains(&asked.0) {
+                        seen.push(asked.0);
+                    }
+                    pending.push(asked);
+                }
+                8 => {
+                    let cancelled = (field(0), field(4), field(8));
+                    pending.retain(|asked| *asked != cancelled);
+                }
+                _ => {}
+            }
+        }
+        if !read.buffer().is_empty() || pending.is_empty() {
+            continue;
+        }
+        let mut queues: Vec<VecDeque<(u32, u32, u32)>> = seen
+            .iter()
+            .rev()
+            .map(|piece| {
+                pending
+                    .iter()
+                    .filter(|asked| asked.0 == *piece)
+                    .copied()
+                    .collect()
+            })
+            .filter(|queue: &VecDeque<_>| !queue.is_empty())
+            .collect();
+        let mut kept = Vec::new();
+        if queues.len() == 1 && u32::try_from(seen.len()).unwrap() < pieces {
+            kept.extend(queues[0].pop_back());
+        }
+        out.clear();
+        while queues.iter().any(|queue| !queue.is_empty()) {
+            for queue in &mut queues {
+                if let Some((piece, begin, length)) = queue.pop_front() {
+                    let at = (u64::from(piece) * PIECE + u64::from(begin)) as usize;
+                    framed(
+                        &mut out,
+                        7,
+                        &[
+                            &piece.to_be_bytes(),
+                            &begin.to_be_bytes(),
+                            &content[at..at + length as usize],
+                        ],
+                    );
+                }
+            }
+        }
+        pending = kept;
+        if write.write_all(&out).await.is_err() {
+            return;
+        }
+    }
+}
+
+// The jam end to end, on the server's storage with room for exactly one
+// piece: a peer that sends a second piece's blocks while the first is open
+// stops the session for room, which gives the first back, writes its blocks
+// out as they come, and finishes every piece; the files end as the seeder's
+// and the budget is whole again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_out_of_order_peer_finishes_every_piece_with_room_for_one() {
+    let seeded = seeded_sized(8, PIECE as u32, [100_000, 150_000, 40_000]).await;
+    seeded.seeder.stop().await;
+    let layout = &seeded.layout;
+    let content: Vec<u8> = seeded
+        .originals
+        .iter()
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect();
+    let fetch_dir = tempfile::tempdir().unwrap();
+    let disk = disk_off_runtime();
+    let store = store_on(&disk, 1, layout, &fetch_dir.path().join("job"));
+    let (watched, mut in_hand) = watched(Arc::clone(&store));
+    let budget = accountant(PIECE);
+    let factory = PieceStorageFactory::new(
+        Arc::clone(layout),
+        Arc::clone(&watched) as Arc<dyn Pieces>,
+        holds(&budget),
+    );
+    assert!(!factory.writes_blocks(), "a piece fits the budget whole");
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let peer = listener.local_addr().unwrap();
+    let info_hash = torrent_from_bytes(&seeded.bytes).unwrap().info_hash.0;
+    let seeder = tokio::spawn(scrambled_seed(
+        listener,
+        info_hash,
+        content,
+        layout.piece_count(),
+    ));
+    let leecher = session(&fetch_dir.path().join("session"), None).await;
+    leecher
+        .add_torrent(
+            AddTorrent::from_bytes(seeded.bytes.clone()),
+            Some(AddTorrentOptions {
+                output_folder: Some(
+                    fetch_dir
+                        .path()
+                        .join("unused")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                overwrite: true,
+                initial_peers: Some(vec![peer]),
+                storage_factory: Some(factory.boxed_factory()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    in_hand.wait_for(|whole| *whole).await.unwrap();
+    for (name, original) in &seeded.originals {
+        assert_eq!(
+            &std::fs::read(fetch_dir.path().join("job").join(name)).unwrap(),
+            original
+        );
+    }
+    let waits = leecher.stats_snapshot().swarm.request_events
+        [weaver_torrent::session_stats::swarm::RequestEvent::RoomWait as usize];
+    assert!(waits > 0, "the peer's order stopped the session for room");
+    leecher.stop().await;
+    seeder.abort();
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
 }

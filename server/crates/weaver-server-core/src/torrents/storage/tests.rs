@@ -2091,6 +2091,104 @@ impl TorrentStorage for Gated {
     fn on_piece_requeued(&self, piece: ValidPieceIndex) {
         self.storage.on_piece_requeued(piece);
     }
+
+    fn piece_written(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.storage.piece_written(piece)
+    }
+
+    // Everything else as the piece storage answers it, so the session
+    // drives it as it drives the storage itself.
+    fn will_read(&self, file_id: usize, offset: u64, len: u64) {
+        self.storage.will_read(file_id, offset, len);
+    }
+
+    fn preadv_exact(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> anyhow::Result<()> {
+        self.storage.preadv_exact(file_id, offset, bufs)
+    }
+
+    fn pwrite_all_vectored(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [std::io::IoSlice<'_>; 2],
+    ) -> anyhow::Result<usize> {
+        self.storage.pwrite_all_vectored(file_id, offset, bufs)
+    }
+
+    fn pwrite_held(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [std::io::IoSlice<'_>; 2],
+    ) -> anyhow::Result<bool> {
+        self.storage.pwrite_held(file_id, offset, bufs)
+    }
+
+    fn on_file_completed(&self, file_id: usize) {
+        self.storage.on_file_completed(file_id);
+    }
+
+    fn hash_held_piece(&self, piece: ValidPieceIndex, update: &mut dyn FnMut(&[u8])) -> bool {
+        self.storage.hash_held_piece(piece, update)
+    }
+
+    fn writes_to_memory(&self) -> bool {
+        self.storage.writes_to_memory()
+    }
+
+    fn writes_piece_to_memory(&self, piece: ValidPieceIndex) -> bool {
+        self.storage.writes_piece_to_memory(piece)
+    }
+
+    fn store_verified_piece(
+        &self,
+        piece: ValidPieceIndex,
+        stored: weaver_torrent::storage::StoredPiece,
+    ) {
+        // Held back as the write a verified piece goes through.
+        let gate = self.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.recv().unwrap();
+        }
+        self.storage.store_verified_piece(piece, stored);
+    }
+
+    fn wants_hashed_piece(&self, piece: ValidPieceIndex) -> bool {
+        self.storage.wants_hashed_piece(piece)
+    }
+
+    fn on_piece_hashed(&self, piece: ValidPieceIndex, bytes: Bytes) {
+        self.storage.on_piece_hashed(piece, bytes);
+    }
+
+    fn stamp(&self, file_id: usize) -> anyhow::Result<Option<weaver_torrent::storage::FileStamp>> {
+        self.storage.stamp(file_id)
+    }
+
+    fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
+        self.storage.read_turns()
+    }
+
+    fn hold_whole_piece(&self, bytes: u64) -> Option<weaver_torrent::storage::HeldRoom> {
+        self.storage.hold_whole_piece(bytes)
+    }
+
+    fn hold_block(&self, bytes: u64, room: &Arc<Notify>) -> weaver_torrent::storage::BlockRoom {
+        let held = self.storage.hold_block(bytes, room);
+        if matches!(held, weaver_torrent::storage::BlockRoom::Refused) {
+            self.refused.send_modify(|refused| *refused += 1);
+        }
+        held
+    }
+
+    fn room_for(&self, bytes: u64, room: &Arc<Notify>) -> bool {
+        self.storage.room_for(bytes, room)
+    }
 }
 
 #[derive(Clone)]

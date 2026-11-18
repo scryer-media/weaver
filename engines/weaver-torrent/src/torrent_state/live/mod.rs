@@ -911,7 +911,14 @@ pub(crate) struct WriteJob {
     chunk: ChunkInfo,
     // Before `written`: the buffer goes back before the peer is told.
     block: Block,
+    // The room the block holds for its write, given back as the write
+    // returns: a block of a piece written block by block where pieces are
+    // held in memory holds its own (`TorrentStorage::hold_block`).
+    room: Option<crate::storage::HeldRoom>,
     written: Written,
+    // Dropped once the block is written and, when it was its piece's last,
+    // the piece checked, for a connection that waits for that.
+    ended: Option<tokio::sync::oneshot::Sender<()>>,
     _run: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 

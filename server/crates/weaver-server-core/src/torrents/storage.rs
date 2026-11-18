@@ -21,7 +21,12 @@
 // A piece no peer owns, given back by one that left or stopped for room, or
 // of which a block arrives from a peer that does not own it, is written
 // block by block, as below: the blocks it holds in memory are written out,
-// and its whole-piece room goes back (`Inner::spill`).
+// and its whole-piece room goes back once they are (`Inner::spill`). Such a
+// piece holds no room of its own: each block of it holds one block's room
+// for its write alone, taken before it goes to the disk threads and given
+// back as the write returns (`hold_block`). So every room held for good is a
+// piece in memory that its owner, reading, fills; all else is a write under
+// way, which gives its room back as it ends.
 //
 // A torrent whose piece is larger than the whole resident budget could
 // never hold one, and is written block by block instead, as libtorrent
@@ -43,11 +48,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, bail};
 use bytes::Bytes;
 use tokio::sync::Notify;
-use weaver_graph::holds::Reserve;
+use weaver_graph::holds::{Reserve, ResidentWake};
 use weaver_torrent::core::lengths::ValidPieceIndex;
 use weaver_torrent::storage::{
-    BoxStorageFactory, GivesRoomBack, HeldRoom, ReadTurns, StorageFactory, StorageFactoryExt,
-    StoredPiece, TorrentStorage,
+    BlockRoom, BoxStorageFactory, GivesRoomBack, HeldRoom, ReadTurns, StorageFactory,
+    StorageFactoryExt, StoredPiece, TorrentStorage,
 };
 use weaver_torrent::{ManagedTorrentShared, TorrentMetadata};
 
@@ -163,8 +168,25 @@ enum Flight {
     Verified(Bytes),
     // A piece written block by block: its blocks are on disk as they land,
     // one at a time under its lock, and it holds the room it was started
-    // with until it verified or failed.
-    Blocks(Arc<Mutex<()>>, u64),
+    // with until it verified or failed: a block's where every piece is
+    // written so, none where pieces are held in memory. The lock holds what
+    // became of the blocks it held in memory when it was given back, written
+    // aside.
+    Blocks(Arc<Mutex<Lost>>, u64),
+}
+
+// A write of blocks a piece given back held that failed: the kind of its
+// error, when the disk named one, and the error. The piece is not on disk
+// whole, whatever else of it arrives.
+type Lost = Option<(Option<std::io::ErrorKind>, String)>;
+
+fn lost(error: &anyhow::Error) -> Lost {
+    let kind = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+    });
+    Some((kind, format!("{error:#}")))
 }
 
 // A piece being written: its blocks land here, and it is hashed here once
@@ -373,9 +395,39 @@ struct Inner {
     resident: Arc<ResidentPeak>,
 }
 
+// What the budget calls once room comes back anywhere, for the session
+// waiting on `room`: one wake a session, however often it asks.
+fn wake(room: &Arc<Notify>) -> (usize, ResidentWake) {
+    let key = Arc::as_ptr(room) as usize;
+    let room = Arc::clone(room);
+    (key, Arc::new(move || room.notify_waiters()))
+}
+
 impl Inner {
-    // `bytes` of resident room asked for: held when granted.
+    // `bytes` of resident room asked for: held when granted. Refused, the
+    // session waiting on its room is rung once room comes back, whoever
+    // gives it back: another torrent, or a job of any other kind.
     fn reserve(&self, bytes: u64) -> bool {
+        if self.try_reserve(bytes) {
+            return true;
+        }
+        let room = self
+            .room
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(room) = room else {
+            return false;
+        };
+        let (key, wake) = wake(&room);
+        self.holds
+            .accountant
+            .resident_fits_or_wake(bytes, key, wake)
+            && self.try_reserve(bytes)
+    }
+
+    // `bytes` of resident room asked for once: held when granted.
+    fn try_reserve(&self, bytes: u64) -> bool {
         let granted = matches!(
             self.holds
                 .accountant
@@ -421,14 +473,18 @@ impl Inner {
     // A piece no peer owns, `writing` in memory, is written block by block
     // from here: the blocks it holds go to its files, as each block of such
     // a piece does, and its whole-piece room goes back once they are
-    // written, all but the room of one block. Its other blocks, and a block
-    // that landed in `writing` as this ran, go to its files after these,
-    // under the same lock. A piece whole by now is left as it is: it is
+    // written; it keeps none. Its other blocks, and a block that landed in
+    // `writing` as this ran, go to its files after these, under the same
+    // lock, each holding its own block's room for its write. A piece whole by now is left as it is: it is
     // checked from memory. Its writes wait on the disk, so this runs aside.
+    //
+    // A write that fails is kept on the piece, which the session then does
+    // not check: it goes the way of a piece its store refused, fetched
+    // again, and no sender is blamed for the disk's error.
     fn spill(&self, index: u32, writing: &Arc<Writing>) {
-        let one = Arc::new(Mutex::new(()));
-        let written = one.lock().unwrap_or_else(PoisonError::into_inner);
-        let (held, landed, paid, kept) = {
+        let one = Arc::new(Mutex::new(None));
+        let mut written = one.lock().unwrap_or_else(PoisonError::into_inner);
+        let (held, landed, paid) = {
             let mut flight = self.flight();
             let Some(entry) = flight.get_mut(&index) else {
                 return;
@@ -443,17 +499,16 @@ impl Inner {
             let held = std::mem::take(&mut *bytes);
             let landed = std::mem::take(&mut *writing.landed());
             writing.spilled.store(true, Ordering::Release);
-            let kept = self.pieces.block_room(writing.len as u64);
-            let paid = match std::mem::replace(entry, Flight::Blocks(Arc::clone(&one), kept)) {
+            let paid = match std::mem::replace(entry, Flight::Blocks(Arc::clone(&one), 0)) {
                 Flight::Writing(_, paid) => paid,
                 _ => None,
             };
-            (held, landed, paid, kept)
+            (held, landed, paid)
         };
         // What its volume counted for the whole piece goes back first: its
         // blocks are counted as each one's write fits.
         drop(paid);
-        for span in self.layout.spans(index) {
+        'spans: for span in self.layout.spans(index) {
             let share = span.at..span.at + span.range.len();
             for run in &landed {
                 let from = share.start.max(u64::from(run.start));
@@ -467,18 +522,18 @@ impl Inner {
                     .pieces
                     .write_block(index, span.file, offset, from, bytes)
                 {
-                    // Not written: the piece fails its check, and is
-                    // fetched again.
                     tracing::warn!(
                         piece = index,
                         "a block of a piece given back was not written: {error:#}"
                     );
+                    *written = lost(&error);
+                    break 'spans;
                 }
             }
         }
         drop(held);
         drop(written);
-        self.release(writing.len as u64 - kept);
+        self.release(writing.len as u64);
     }
 }
 
@@ -594,14 +649,75 @@ impl PieceStorage {
         Ok((start, (piece == last).then_some(piece as u32)))
     }
 
+    // `buf` written at `offset` of the file: copied into the piece held for
+    // it, or for a piece written block by block, to its file when `may_wait`
+    // says the write may wait on a disk. False when it would have and may
+    // not, having written nothing.
+    fn write(
+        &self,
+        file_id: usize,
+        offset: u64,
+        buf: &[u8],
+        may_wait: bool,
+    ) -> anyhow::Result<bool> {
+        if buf.is_empty() {
+            return Ok(true);
+        }
+        let (start, piece) = self.place(file_id, offset, buf.len())?;
+        let Some(piece) = piece else {
+            bail!("a write of file {file_id} crosses a piece boundary");
+        };
+        let range = self.inner.layout.piece_range(piece);
+        let at = (start - range.start) as usize;
+        // Twice at most: a piece given back meanwhile is written block by
+        // block from then on.
+        loop {
+            let landing = match self.flight().get(&piece) {
+                Some(Flight::Writing(writing, _)) => Ok(Arc::clone(writing)),
+                Some(Flight::Blocks(one, _)) => Err(Arc::clone(one)),
+                _ => bail!("piece {piece} is written while the session holds no room for it"),
+            };
+            let held = match landing {
+                Ok(writing) => writing,
+                Err(_) if !may_wait => return Ok(false),
+                // Outside the map's lock, one block of the piece at a time,
+                // in the room the block holds for its write.
+                Err(one) => {
+                    let _one = one.lock().unwrap_or_else(PoisonError::into_inner);
+                    self.inner
+                        .pieces
+                        .write_block(piece, file_id, offset, at as u64, buf)?;
+                    return Ok(true);
+                }
+            };
+            // Outside the map's lock: another piece's blocks land meanwhile.
+            let mut bytes = held.write();
+            if held.spilled.load(Ordering::Acquire) {
+                continue;
+            }
+            let Some(to) = bytes.get_mut(at..at + buf.len()) else {
+                bail!("piece {piece} is written after it completed");
+            };
+            to.copy_from_slice(buf);
+            held.land(at as u32..(at + buf.len()) as u32);
+            return Ok(true);
+        }
+    }
+
     // Room for a piece not in memory: its resident room, then its volume's.
     // A piece written block by block, as every piece of a storage that
     // writes blocks and a piece `blocks` names are, holds its small room
-    // alone: its blocks are counted on the volume as each one's write fits.
+    // alone, or none where pieces are held in memory, its blocks holding
+    // theirs as they are written: its blocks are counted on the volume as
+    // each one's write fits.
     fn start_piece(&self, index: u32, length: u64, room: &Arc<Notify>, blocks: bool) -> bool {
         if self.inner.blocks || blocks {
-            let held = self.inner.pieces.block_room(length);
-            if !self.inner.reserve(held) {
+            let held = if self.inner.blocks {
+                self.inner.pieces.block_room(length)
+            } else {
+                0
+            };
+            if held > 0 && !self.inner.reserve(held) {
                 return false;
             }
             let mut flight = self.flight();
@@ -741,8 +857,37 @@ impl TorrentStorage for PieceStorage {
     // for room is rung when it goes back.
     fn hold_whole_piece(&self, bytes: u64) -> Option<HeldRoom> {
         self.inner
-            .reserve(bytes)
+            .try_reserve(bytes)
             .then(|| HeldRoom::new(bytes, Arc::clone(&self.inner) as _))
+    }
+
+    // A block of a piece given back, or started by a peer that does not own
+    // it, holds its own room while it is written; a piece of a storage that
+    // writes every piece so holds a block's room from its start instead.
+    fn hold_block(&self, bytes: u64, room: &Arc<Notify>) -> BlockRoom {
+        if self.inner.blocks {
+            return BlockRoom::Free;
+        }
+        *self
+            .inner
+            .room
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(room));
+        if self.inner.reserve(bytes) {
+            BlockRoom::Held(HeldRoom::new(bytes, Arc::clone(&self.inner) as _))
+        } else {
+            BlockRoom::Refused
+        }
+    }
+
+    // A look at the budget every job shares, the session rung once room
+    // comes back when there is none.
+    fn room_for(&self, bytes: u64, room: &Arc<Notify>) -> bool {
+        let (key, wake) = wake(room);
+        self.inner
+            .holds
+            .accountant
+            .resident_fits_or_wake(bytes, key, wake)
     }
 
     // A run of a file's bytes on disk is read in one go; one with any of
@@ -781,46 +926,44 @@ impl TorrentStorage for PieceStorage {
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        let (start, piece) = self.place(file_id, offset, buf.len())?;
-        let Some(piece) = piece else {
-            bail!("a write of file {file_id} crosses a piece boundary");
-        };
-        let range = self.inner.layout.piece_range(piece);
-        let at = (start - range.start) as usize;
-        // Twice at most: a piece given back meanwhile is written block by
-        // block from then on.
-        loop {
-            let landing = match self.flight().get(&piece) {
-                Some(Flight::Writing(writing, _)) => Ok(Arc::clone(writing)),
-                Some(Flight::Blocks(one, _)) => Err(Arc::clone(one)),
-                _ => bail!("piece {piece} is written while the session holds no room for it"),
-            };
-            let held = match landing {
-                Ok(writing) => writing,
-                // Outside the map's lock, one block of the piece at a time:
-                // the room it holds is one block's.
-                Err(one) => {
-                    let _one = one.lock().unwrap_or_else(PoisonError::into_inner);
-                    return self
-                        .inner
-                        .pieces
-                        .write_block(piece, file_id, offset, at as u64, buf);
-                }
-            };
-            // Outside the map's lock: another piece's blocks land meanwhile.
-            let mut bytes = held.write();
-            if held.spilled.load(Ordering::Acquire) {
-                continue;
+        self.write(file_id, offset, buf, true)?;
+        Ok(())
+    }
+
+    // A block is copied into the piece held for it on the runtime; one of
+    // a piece written block by block, as a piece given back or started by
+    // a peer that does not own it is, is left for its writer to land where
+    // it may wait.
+    fn pwrite_held(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<bool> {
+        let mut at = offset;
+        for buf in &bufs {
+            if !self.write(file_id, at, buf, false)? {
+                return Ok(false);
             }
-            let Some(to) = bytes.get_mut(at..at + buf.len()) else {
-                bail!("piece {piece} is written after it completed");
-            };
-            to.copy_from_slice(buf);
-            held.land(at as u32..(at + buf.len()) as u32);
-            return Ok(());
+            at += buf.len() as u64;
+        }
+        Ok(true)
+    }
+
+    // A piece given back whose blocks failed to reach its files is not
+    // checked: it is refused, for the session to fetch it again. Waits for
+    // the writes of the blocks it held, under way aside.
+    fn piece_written(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        let one = match self.flight().get(&piece.get()) {
+            Some(Flight::Blocks(one, _)) => Arc::clone(one),
+            _ => return Ok(()),
+        };
+        let lost = one.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        match lost {
+            None => Ok(()),
+            Some((Some(kind), error)) => Err(anyhow::Error::from(std::io::Error::new(kind, error))
+                .context(format!("piece {} lost blocks it held", piece.get()))),
+            Some((None, error)) => bail!("piece {} lost blocks it held: {error}", piece.get()),
         }
     }
 
