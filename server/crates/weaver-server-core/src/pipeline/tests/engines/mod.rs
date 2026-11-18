@@ -28,6 +28,9 @@
 //     .lost(file, ordinal)        every server lacks that article
 //     .corrupt_on_primary(file,   the primary serves that article damaged
 //          ordinal)               and a backup serves it whole
+//     .headerless_on(file,        that server serves the article with no
+//          ordinal, server)       `=ybegin` line
+//     .servers(n)                 the pipeline has at least `n` servers
 //     .framed(size)               articles of `size` bytes, not ARTICLE
 //     .backwards()                every batch the download queue hands
 //                                 out arrives last article first

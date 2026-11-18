@@ -555,6 +555,11 @@ pub(in crate::pipeline::tests) struct Scenario {
     // whole. A scenario with any has both servers, and an ask that excludes
     // the primary is the backup's.
     pub(in crate::pipeline::tests) corrupt_primary: Vec<(u32, u32)>,
+    // Articles a server answers with a body that has no `=ybegin` line, by
+    // file, ordinal and server. A scenario with any has every server named.
+    pub(in crate::pipeline::tests) headerless: Vec<(u32, u32, usize)>,
+    // How many servers the pipeline has, at least.
+    pub(in crate::pipeline::tests) servers: usize,
     // Articles that decode this many bytes short of the part end their
     // header declares, as a server that cut the body off serves them.
     pub(in crate::pipeline::tests) short: Vec<(u32, u32, usize)>,
@@ -622,6 +627,8 @@ impl Scenario {
             lost: Vec::new(),
             refused: Vec::new(),
             corrupt_primary: Vec::new(),
+            headerless: Vec::new(),
+            servers: 1,
             short: Vec::new(),
             crc_wrong: Vec::new(),
             declares: Vec::new(),
@@ -712,11 +719,20 @@ impl Scenario {
             .iter()
             .map(|(file, ordinal)| format!("lantern-{file}-{ordinal}@example.com"))
             .collect();
-        let servers = if self.corrupt_primary.is_empty() {
-            1
-        } else {
-            2
-        };
+        let servers = self
+            .headerless
+            .iter()
+            .map(|(.., server)| server + 1)
+            .chain([
+                self.servers,
+                if self.corrupt_primary.is_empty() {
+                    1
+                } else {
+                    2
+                },
+            ])
+            .max()
+            .unwrap_or(1);
         let server = stat_server(missing);
         pipeline.nntp = std::sync::Arc::new(scenario_client(servers, server.port));
         self.stat_servers.lock().unwrap().push(server);
@@ -879,6 +895,21 @@ impl Scenario {
         ordinal: u32,
     ) -> Self {
         self.corrupt_primary.push((file, ordinal));
+        self
+    }
+
+    pub(in crate::pipeline::tests) fn headerless_on(
+        mut self,
+        file: u32,
+        ordinal: u32,
+        server: usize,
+    ) -> Self {
+        self.headerless.push((file, ordinal, server));
+        self
+    }
+
+    pub(in crate::pipeline::tests) fn servers(mut self, servers: usize) -> Self {
+        self.servers = servers;
         self
     }
 
@@ -1577,6 +1608,29 @@ async fn serve_from(
     };
     if scenario.lost.contains(&(file, ordinal)) {
         pipeline.book_failed_segment(segment_id);
+        return;
+    }
+    if scenario.headerless.contains(&(file, ordinal, server)) {
+        // The body is the article's bytes as plain lines, with no `=ybegin`
+        // line: the decoder refuses it, and the worker hears its error as it
+        // hears a streamed decode's.
+        let post = &scenario.posts[file as usize];
+        let mut body: Vec<u8> = post
+            .articles(scenario.article)
+            .nth(ordinal as usize)
+            .unwrap()
+            .iter()
+            .map(|byte| b'a' + byte % 26)
+            .collect();
+        body.extend_from_slice(b"\r\n");
+        let mut output = vec![0u8; body.len()];
+        let error = weaver_yenc::decode(&body, &mut output)
+            .expect_err("a body with no =ybegin line does not decode");
+        pipeline.handle_decode_failure(
+            segment_id,
+            &error.to_string(),
+            crate::pipeline::PoolServers::stamped(pipeline.pool_generation, Some(server), exclude),
+        );
         return;
     }
     let intact = !scenario.spoils(server, (file, ordinal));
