@@ -32,9 +32,11 @@ impl Format for Rar {
     }
 
     // Headers enciphered under a password state nothing here: the engine
-    // is offered the password after it is bound.
+    // is offered the password after it is bound. An archive that is no
+    // volume is no front of a set the engine holds.
     fn front(first_bytes: &[u8]) -> Option<RarVolumeFacts> {
         claim::front_facts(first_bytes, None, Arc::new(KdfCache::new()))
+            .filter(|facts| facts.is_volume)
     }
 
     fn states_place(front: &RarVolumeFacts) -> bool {

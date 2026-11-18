@@ -182,9 +182,10 @@ fn a_volume_whose_header_and_name_disagree_with_its_neighbour_settles() {
 
 // An archive that is no volume, posted under the name of a set's second
 // volume, whose second file header never arrives: its walk stops short of
-// its end, so its headers have not yet said whether it is one of a set.
-// Its name places it second, and nothing it has stated says otherwise: it is
-// held there, read to its close, and never handed back and forth.
+// its end, but past its main header and first file header, so its headers
+// have said it is no volume. Its name places it nowhere: it is a set of its
+// own from those first bytes, held at the first place of a store apart from
+// the set's, read to its close, and never handed back and forth.
 #[test]
 fn an_archive_short_of_its_end_under_a_volume_name_is_handed_over_once() {
     let set = write(&items(), &split(Version::Rar4));
@@ -204,7 +205,13 @@ fn an_archive_short_of_its_end_under_a_volume_name_is_handed_over_once() {
     run.close(second);
     assert_eq!(run.handed, 2);
     assert_eq!(run.given_back(second), 0);
-    assert_eq!(run.at(second), Some(VolumeIndex(1)));
+    assert_eq!(run.at(second), Some(VolumeIndex(0)));
+    assert_ne!(
+        run.tree
+            .child_of(NodeId::ROOT, second)
+            .map(|(node, _)| node),
+        run.tree.child_of(NodeId::ROOT, first).map(|(node, _)| node)
+    );
 }
 
 // A RAR5 volume's main header with its number set to `number`.
@@ -475,5 +482,109 @@ fn a_long_set_refuting_a_volume_lays_it_again_once() {
             store.map(|node| (node, VolumeIndex(volume as u32))),
             "volume {volume}"
         );
+    }
+}
+
+// A pack of sets and whole archives posted under one shared `partNNN`
+// stem, in the order its posts came in, each post delivered in frames so
+// that every volume is held short of its end while the next ones arrive.
+// The posted numbers run on across sets; only the volumes' own headers set
+// them apart. A whole archive states at its main header that it is no
+// volume and founds a set of its own from its first bytes; a set's volumes
+// state their numbers (RAR5 in the main header, RAR4 in the end record, as
+// rar writes them) and sit at those places in their own set's store.
+#[test]
+fn a_pack_under_one_stem_is_placed_by_its_volume_headers() {
+    const FRAMED: usize = 32 * 1024;
+    let sets: &[(usize, usize)] = &[
+        (1, 1),
+        (2, 8),
+        (10, 2),
+        (12, 1),
+        (13, 2),
+        (15, 2),
+        (17, 1),
+        (18, 1),
+        (19, 1),
+        (20, 1),
+        (21, 12),
+        (33, 2),
+        (35, 1),
+        (36, 1),
+        (37, 1),
+        (38, 1),
+        (39, 1),
+        (40, 1),
+        (41, 1),
+        (42, 1),
+        (43, 1),
+        (44, 1),
+        (45, 1),
+        (46, 1),
+        (47, 1),
+        (48, 1),
+    ];
+    let arrival = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 41, 21, 42, 43, 44,
+        45, 22, 46, 47, 48, 23, 24, 31, 25, 32, 26, 33, 27, 34, 28, 35, 29, 30, 36, 37, 38, 39, 40,
+    ];
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut by_number = std::collections::BTreeMap::new();
+        let mut truth = Vec::new();
+        for (index, (first, volumes)) in sets.iter().enumerate() {
+            let name: &'static str = Box::leak(format!("clip{index:02}.mp4").into_boxed_str());
+            let mut options = Options::new(version);
+            options.numbered = true;
+            if *volumes > 1 {
+                options.split = Some(98 * 1024);
+            }
+            let size = match *volumes {
+                1 => 3 * 32 * 1024,
+                n => n * 98 * 1024 - 4096,
+            };
+            let set = write(
+                &[Item::File(name, payload(index as u64 + 3, size))],
+                &options,
+            );
+            assert_eq!(set.len(), *volumes, "{version:?} set {index}");
+            for (at, bytes) in set.into_iter().enumerate() {
+                by_number.insert(first + at, bytes);
+                truth.push((first + at, index, at));
+            }
+        }
+        let posted = |number: usize| match number < 10 {
+            true => format!("Karla.Pack.XXX-U4A.part{number:02}.rar"),
+            false => format!("Karla.Pack.XXX-U4A.part{number:03}.rar"),
+        };
+        let mut run = Run::new();
+        let mut members = std::collections::BTreeMap::new();
+        for number in arrival {
+            let bytes = &by_number[&number];
+            let member = run.announce(&posted(number), bytes.len());
+            for at in (0..bytes.len()).step_by(FRAMED) {
+                run.deliver(member, at, &bytes[at..(at + FRAMED).min(bytes.len())]);
+            }
+            run.close(member);
+            members.insert(number, member);
+        }
+        let mut stores = std::collections::BTreeMap::new();
+        for (number, set, at) in &truth {
+            let held = run.tree.child_of(NodeId::ROOT, members[number]);
+            let Some((node, index)) = held else {
+                panic!("{version:?} part{number:03} of set {set} is held by no store");
+            };
+            assert_eq!(
+                index,
+                VolumeIndex(*at as u32),
+                "{version:?} part{number:03} is volume {at} of set {set}"
+            );
+            assert_eq!(
+                *stores.entry(*set).or_insert(node),
+                node,
+                "{version:?} part{number:03}: set {set} is held by one store"
+            );
+        }
+        let nodes: std::collections::BTreeSet<_> = stores.values().collect();
+        assert_eq!(nodes.len(), sets.len(), "{version:?}: one store per set");
     }
 }

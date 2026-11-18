@@ -91,13 +91,24 @@ impl Holds for Bound<'_> {
 }
 
 // What a member's front states that places it in a set: its headers, when
-// they say it is a volume of one.
+// they say whether it is a volume of one. A clear volume flag says so only
+// past the main header (`read_main`): one an archive that is no volume
+// states places it a set of its own at once, so no store's numbering takes
+// it meanwhile, and none takes a volume beside it.
 pub(crate) fn front_facts(
     first_bytes: &[u8],
     password: Option<&str>,
     kdf: Arc<KdfCache>,
 ) -> Option<RarVolumeFacts> {
-    headers(first_bytes, password, kdf).filter(|facts| facts.is_volume)
+    headers(first_bytes, password, kdf).filter(|facts| facts.is_volume || read_main(facts))
+}
+
+// Whether headers read off a volume were read past its main header: they
+// list a file or service header, which in either format only follows the
+// main header. Short of it, a walk reports the volume flag clear, which
+// then says nothing.
+pub(crate) fn read_main(facts: &RarVolumeFacts) -> bool {
+    !facts.members.is_empty() || !facts.services.is_empty()
 }
 
 // The format whose signature a front opens on, at its first byte. A volume
