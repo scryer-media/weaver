@@ -1363,9 +1363,29 @@ fn wireguard_session(
     proxies: Vec<u32>,
     budget: usize,
 ) -> Arc<SessionHop> {
+    wireguard_session_sharing(
+        id,
+        provider,
+        resolver,
+        inner,
+        proxies,
+        Arc::new(tokio::sync::Semaphore::new(budget)),
+    )
+}
+
+// A WireGuard session over `inner` that draws on `budget`, shared as the
+// runtime shares the process's session budget.
+fn wireguard_session_sharing(
+    id: u32,
+    provider: Arc<dyn TunnelProvider>,
+    resolver: Arc<crate::WireGuardTunnelProvider>,
+    inner: Arc<dyn Dialer>,
+    proxies: Vec<u32>,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> Arc<SessionHop> {
     Arc::new(SessionHop {
         sockets: Default::default(),
-        capacity: SessionCapacity::new(Arc::new(tokio::sync::Semaphore::new(budget))),
+        capacity: SessionCapacity::new(budget),
         activity: Default::default(),
         id,
         provider,
@@ -2383,13 +2403,154 @@ async fn a_freed_slot_lets_the_waiting_usenet_dial_in_on_the_tunnel() {
     let woken = waits.waits[0].clone();
     let mut notified = std::pin::pin!(woken.notified());
     notified.as_mut().enable();
-    tunnel.full.store(false, std::sync::atomic::Ordering::SeqCst);
+    tunnel
+        .full
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     freed.notify().notify_waiters();
     notified.await;
     let dialed = ladder.dial(&target).await.unwrap();
     assert_eq!(dialed.path.rung, Some(0));
     assert_eq!(host.dials(), 0);
     listener.accept().await.unwrap();
+}
+
+// A usenet dial over a WireGuard rung whose session budget is spent leaves
+// by no rung below it, the saved direct fallback included. It waits for a
+// session to give its permit back, then goes out on the tunnel.
+#[tokio::test]
+async fn a_spent_session_budget_holds_a_usenet_dial_for_the_tunnel() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let budget = Arc::new(tokio::sync::Semaphore::new(1));
+    // Another session holds the only permit.
+    let other = SessionCapacity::new(budget.clone());
+    other.acquire().unwrap();
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let session = wireguard_session_sharing(
+        1,
+        provider.clone(),
+        provider,
+        bottom(),
+        vec![],
+        budget.clone(),
+    );
+    let host = Counting::new(bottom());
+    let ladder = Fallback::new(vec![session, host.clone()]);
+    let mut target = probe_target();
+    usenet(&mut target);
+
+    for purpose in [
+        target.purpose.clone(),
+        Purpose::NntpProbe { server: 1, leg: 0 },
+    ] {
+        let mut asked = target.clone();
+        asked.purpose = purpose;
+        let error = ladder.dial(&asked).await.err().expect("no budget, no dial");
+        assert!(matches!(error, DialError::SessionBudget), "{error:?}");
+        assert_eq!(host.dials(), 0, "nothing leaves by the host's own address");
+    }
+
+    // The route names the ring a freed permit sounds, and it sounds when
+    // the other session gives its permit back.
+    let slots = ladder.room(&target.purpose).expect_err("no room");
+    assert!(
+        slots
+            .iter()
+            .any(|slot| Arc::ptr_eq(slot, &session_budget_freed()))
+    );
+    let freed = session_budget_freed();
+    let mut notified = std::pin::pin!(freed.notified());
+    notified.as_mut().enable();
+    other.release();
+    notified.await;
+    assert!(ladder.room(&target.purpose).is_ok());
+
+    let dialed = ladder.dial(&target).await.unwrap();
+    assert_eq!(dialed.path.rung, Some(0));
+    assert_eq!(dialed.path.proxies, vec![1]);
+    assert_eq!(host.dials(), 0);
+    assert_eq!(budget.available_permits(), 0, "the tunnel holds the permit");
+}
+
+// A spent session budget changes the room answer of usenet purposes only:
+// every other purpose gets the answer the session's sockets give, as it did
+// before the budget was asked, and never the budget's ring.
+#[tokio::test]
+async fn a_spent_session_budget_changes_only_the_usenet_room_answer() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let session = wireguard_session(1, provider.clone(), provider, bottom(), vec![], 0);
+    let sockets_say = |purpose: &Purpose| {
+        session
+            .sockets
+            .room(
+                SocketClass::of(purpose),
+                SessionHop::purpose_bytes(&session.sockets, purpose),
+            )
+            .map_err(|freed| freed.notify())
+    };
+    let budget_ring = session_budget_freed();
+    for purpose in [
+        Purpose::Outbound,
+        Purpose::Torrent,
+        Purpose::TorrentHttp,
+        Purpose::TorrentWebSeed,
+        Purpose::Feed { feed: 1 },
+        Purpose::Probe,
+        Purpose::Dns,
+        Purpose::Datagram,
+    ] {
+        let room = session.room(&purpose);
+        let wait_room = session.wait_room(&purpose);
+        match sockets_say(&purpose) {
+            Ok(()) => {
+                assert!(room.is_ok(), "{purpose:?}");
+                assert!(wait_room.is_ok(), "{purpose:?}");
+            }
+            Err(freed) => {
+                let slots = room.expect_err("the sockets are full");
+                assert_eq!(slots.len(), 1, "{purpose:?}");
+                assert!(Arc::ptr_eq(&slots[0], &freed), "{purpose:?}");
+                let capacity = wait_room.expect_err("the sockets are full");
+                assert!(
+                    !capacity
+                        .waits
+                        .iter()
+                        .any(|slot| Arc::ptr_eq(slot, &budget_ring)),
+                    "{purpose:?}"
+                );
+            }
+        }
+    }
+    for purpose in [
+        Purpose::Nntp {
+            server: 1,
+            leg: 0,
+            probing: false,
+        },
+        Purpose::NntpProbe { server: 1, leg: 0 },
+    ] {
+        let slots = session.room(&purpose).expect_err("no budget, no room");
+        assert!(slots.iter().any(|slot| Arc::ptr_eq(slot, &budget_ring)));
+        let capacity = session.wait_room(&purpose).expect_err("no budget");
+        assert!(
+            capacity
+                .waits
+                .iter()
+                .any(|slot| Arc::ptr_eq(slot, &budget_ring))
+        );
+    }
 }
 
 // What a full rung does to a dial that is not usenet's is unchanged: a
