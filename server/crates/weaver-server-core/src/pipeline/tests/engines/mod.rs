@@ -106,6 +106,7 @@ mod lost_fronts;
 mod lost_index;
 mod nameless_recovery;
 mod nested_engine_fault;
+mod nested_rar4;
 mod nesting;
 mod obfuscated_revs;
 mod pairings;

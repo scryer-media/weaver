@@ -112,7 +112,11 @@ impl NamespaceWriter {
             self.apply_unnamed(tree, builder, segments, &mut batch.out)?;
         }
         let end = std::mem::take(&mut batch.end);
-        self.finish_batch(tree, builder, segments, end, &mut batch.out)?;
+        let depth = self.reached_now.len();
+        self.reached_now.extend(end.reached.iter().copied());
+        let finished = self.finish_batch(tree, builder, segments, end, &mut batch.out);
+        self.reached_now.truncate(depth);
+        finished?;
         self.release_held(tree, builder, segments, &mut batch.out)?;
         Ok(true)
     }
