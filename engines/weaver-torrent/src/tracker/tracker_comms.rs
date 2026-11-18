@@ -1384,6 +1384,33 @@ impl TrackerStatus {
         self.replace_tiers(&supported_tiers(tiers, &self.0.protocols));
     }
 
+    /// [`Self::replace`], made only when `tiers` name other trackers than
+    /// the task holds, or one in another tier or by someone else: a list
+    /// that holds them already keeps its shuffled order. For a run begun
+    /// with the trackers as they stood when its task was made, which an edit
+    /// since may have changed.
+    pub(crate) fn catch_up(&self, tiers: Vec<Vec<Tracker>>) {
+        let tiers = supported_tiers(tiers, &self.0.protocols);
+        let mut wanted = HashMap::new();
+        for (tier, trackers) in tiers.iter().enumerate() {
+            for tracker in trackers {
+                wanted
+                    .entry(tracker.url())
+                    .or_insert((tier, tracker.named_by));
+            }
+        }
+        let held = self.runs().iter().all(|comms| {
+            let list = comms.list.lock();
+            list.entries.len() == wanted.len()
+                && list.entries.iter().all(|e| {
+                    wanted.get(e.tracker.url()) == Some(&(e.tier, e.tracker.named_by))
+                })
+        });
+        if !held {
+            self.replace_tiers(&tiers);
+        }
+    }
+
     /// [`Self::replace`], with each running hash and the trackers gone from
     /// it that accepted `started`, with the legs that accepted it.
     fn replace_tiers(
