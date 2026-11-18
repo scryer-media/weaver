@@ -281,8 +281,15 @@ pub(super) fn inverted(index: u32, volumes: &BTreeMap<VolumeIndex, Volume>) -> b
 // last part states is what proves the member, and the layout checks it.
 // What keeps two sets posted under one stem apart is the name, a number a
 // volume's headers state, and a set's first volume opening on a new member.
+// The store orders volumes by the same name (`member`, `order`).
 fn continues(tail: &RarVolumeMemberFacts, head: &RarVolumeMemberFacts) -> bool {
-    head.name == tail.name
+    member(head) == member(tail)
+}
+
+// The name a part gives its member: what `continues` compares, and what
+// the store orders volumes by (`order`).
+pub(super) fn member(part: &RarVolumeMemberFacts) -> &str {
+    part.name.as_str()
 }
 
 // Where a volume's headers and name place it in a set: the place, the

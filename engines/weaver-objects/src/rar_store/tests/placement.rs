@@ -1172,20 +1172,35 @@ fn a_long_set_in_order_is_never_ordered() {
 // volume moves once at most, and is laid a few times at most, however
 // many volumes the set holds and however its bytes come in.
 fn ordered_once(volumes: usize, numbers: &[usize], moving: &[usize]) {
-    let set = long_set(volumes);
-    for whole in [false, true] {
-        let case = format!("{volumes} whole {whole}");
-        let posted = posted_unrenamed(&set, numbers, whole);
+    // Delivered whole, the misplaced volume is laid at its posted place
+    // before the set is seen out of order: the layout refutes that place
+    // once. In pieces every front is in first, and nothing is refuted.
+    let cut = |whole| usize::from(whole);
+    ordered_once_as(&long_set(volumes), numbers, moving, "", &[false, true], cut);
+}
+
+// [`ordered_once`] over `set` as given, `shape` naming it, its bytes coming
+// in each of the ways `wholes` names, the layout refuting a place as often
+// as `cut` says for each.
+fn ordered_once_as(
+    set: &[Vec<u8>],
+    numbers: &[usize],
+    moving: &[usize],
+    shape: &str,
+    wholes: &[bool],
+    cut: impl Fn(bool) -> usize,
+) {
+    let volumes = set.len();
+    for &whole in wholes {
+        let case = format!("{shape} {volumes} whole {whole}");
+        let posted = posted_unrenamed(set, numbers, whole);
         at_true_places(&posted.places, &case);
         for (volume, given) in posted.given.iter().enumerate() {
             let moves = usize::from(moving.contains(&volume));
             assert_eq!(*given, moves, "{case} volume {volume}");
         }
         let counted = &posted.counted;
-        // Delivered whole, the misplaced volume is laid at its posted place
-        // before the set is seen out of order: the layout refutes that place
-        // once. In pieces every front is in first, and nothing is refuted.
-        assert_eq!(counted.cut, usize::from(whole), "{case}");
+        assert_eq!(counted.cut, cut(whole), "{case}");
         assert_eq!(counted.orders, 1, "{case}");
         assert!(
             counted.asked.len() <= 3 * volumes,
@@ -1224,5 +1239,132 @@ fn a_last_volume_posted_second_is_ordered_once() {
             .collect();
         let moving: Vec<usize> = (1..volumes).collect();
         ordered_once(volumes, &numbers, &moving);
+    }
+}
+
+// The one file header of a RAR4 volume [`long_set`] writes, rewritten by
+// `change` over its body (packed size, unpacked size, host, CRC, time,
+// version, method, name length, attributes, name), its header CRC sealed
+// again. The header's size stays what it was.
+fn rewrite_rar4_part(volume: &mut [u8], change: impl FnOnce(&mut [u8])) {
+    // The signature, then the main header.
+    const AT: usize = 7 + 13;
+    assert_eq!(volume[AT + 2], 0x74, "a file header");
+    let size = u16::from_le_bytes([volume[AT + 5], volume[AT + 6]]) as usize;
+    change(&mut volume[AT + 7..AT + size]);
+    let crc = (crc32(&volume[AT + 2..AT + size]) as u16).to_le_bytes();
+    volume[AT..AT + 2].copy_from_slice(&crc);
+}
+
+// The 548b shape, as its post was: no volume has an end record, and every
+// part between the first and the last states a larger size for the member
+// than the two ends do.
+fn overstating(volumes: usize) -> Vec<Vec<u8>> {
+    let mut set = long_set(volumes);
+    for volume in &mut set {
+        // The end record the writer closes each volume with: seven bytes.
+        assert_eq!(volume[volume.len() - 5], 0x7b);
+        volume.truncate(volume.len() - 7);
+    }
+    for volume in &mut set[1..volumes - 1] {
+        rewrite_rar4_part(volume, |body| {
+            let size = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            body[4..8].copy_from_slice(&(size + 62_609_861).to_le_bytes());
+        });
+    }
+    set
+}
+
+// The 7e3f shape: every part past the first names the member otherwise, as
+// the packer wrote it.
+fn renamed_on(volumes: usize) -> Vec<Vec<u8>> {
+    let mut set = long_set(volumes);
+    for volume in &mut set[1..] {
+        rewrite_rar4_part(volume, |body| {
+            let at = body.len() - "track.flac".len();
+            assert_eq!(&body[at..], b"track.flac");
+            body[at..].copy_from_slice(b"TRACK.flac");
+        });
+    }
+    set
+}
+
+// Either shape with its last two volumes posted under each other's numbers
+// and nothing to rename them: the headers order the two once, at quiet,
+// with the same bounds a set naming its member alike keeps. The order
+// links parts by the name alone, as the claim does, so the 548b set is
+// ordered even where the run follows the first volume, whose part states
+// the true size and the next one a larger. The 7e3f set is ordered where
+// its fronts come before its rest and the run follows a volume past the
+// first: the claim holds a part named otherwise than the first part apart
+// from it (`claim::apart`), so a volume read whole beside the first one,
+// or a set of three, is not this order's to lay.
+#[test]
+fn a_set_misstating_its_member_with_its_last_two_swapped_is_ordered_once() {
+    for volumes in [3, 6, 40] {
+        let numbers: Vec<usize> = (0..volumes)
+            .map(|volume| match volume {
+                _ if volume == volumes - 2 => volumes,
+                _ if volume == volumes - 1 => volumes - 1,
+                _ => volume + 1,
+            })
+            .collect();
+        let moving = [volumes - 2, volumes - 1];
+        // With no end record, each front holds its volume's whole header,
+        // so the misplaced volume is laid at its posted place before the set
+        // is seen out of order, however its bytes come in: the layout
+        // refutes that place once.
+        let set = overstating(volumes);
+        ordered_once_as(&set, &numbers, &moving, "548b", &[false, true], |_| 1);
+        if volumes > 3 {
+            let set = renamed_on(volumes);
+            ordered_once_as(&set, &numbers, &moving, "7e3f", &[false], |_| 0);
+        }
+    }
+}
+
+// A RAR4 set with no end records, so its volumes state no number past the
+// first and each front holds its whole header: an end read that states no
+// number settles a volume only where its own name does not number it
+// elsewhere (`claim::settled`). Posted under its true numbers, every volume
+// is at its true place. Posted with every volume past the first one number
+// on, the names put each one place past its true one and leave the second
+// place empty; nothing in the headers states a number, so each is held
+// where its name puts it, none is given back, and the set waits on the
+// second place, as it did before `settled` read the name.
+#[test]
+fn a_set_named_one_place_on_is_held_where_its_names_put_it() {
+    for volumes in [3, 6] {
+        let set: Vec<Vec<u8>> = long_set(volumes)
+            .into_iter()
+            .map(|mut volume| {
+                // The end record the writer closes each volume with.
+                assert_eq!(volume[volume.len() - 5], 0x7b);
+                volume.truncate(volume.len() - 7);
+                volume
+            })
+            .collect();
+        for whole in [false, true] {
+            let case = format!("{volumes} whole {whole}");
+            let numbers: Vec<usize> = (1..=volumes).collect();
+            let posted = posted_unrenamed(&set, &numbers, whole);
+            at_true_places(&posted.places, &case);
+            assert_eq!(posted.given, vec![0; volumes], "{case}");
+
+            let numbers: Vec<usize> = (0..volumes)
+                .map(|volume| if volume == 0 { 1 } else { volume + 2 })
+                .collect();
+            let posted = posted_unrenamed(&set, &numbers, whole);
+            let store = posted.places[0].map(|(node, _)| node);
+            for (volume, place) in posted.places.iter().enumerate() {
+                let named = if volume == 0 { 0 } else { volume + 1 };
+                assert_eq!(
+                    *place,
+                    store.map(|node| (node, VolumeIndex(named as u32))),
+                    "{case} one on, volume {volume}"
+                );
+            }
+            assert_eq!(posted.given, vec![0; volumes], "{case} one on");
+        }
     }
 }

@@ -249,3 +249,34 @@ async fn a_set_whose_every_part_understates_its_size_fails() {
         describe(&outcome)
     );
 }
+
+// The 548b set with no recovery, its last two volumes posted under each
+// other's names, so nothing renames them: the store orders the two by
+// their headers once the job is quiet, linking the parts by the name they
+// give the member as the claim does, and the member is delivered whole.
+#[tokio::test]
+async fn a_set_whose_middle_parts_overstate_its_size_delivers_with_its_last_two_swapped() {
+    let body = body();
+    let set = set(&body, checksum::crc32(&body));
+    let posts = set
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            let posted = match index {
+                0 => return Post::plain("Final.Girl.x264-ULSHD.part01.rar", bytes.clone()),
+                last if last + 1 == VOLUMES => last - 1,
+                before_last if before_last + 2 == VOLUMES => before_last + 1,
+                middle => middle,
+            };
+            Post::plain(&format!("65606-1.r{:02}", posted - 1), bytes.clone())
+        })
+        .collect();
+    let outcome = run(&Scenario::new(posts).framed(FRAME)).await;
+    assert!(outcome.completed(), "{}", describe(&outcome));
+    assert_eq!(
+        outcome.files.get(&delivered(MEMBER)).map(Vec::as_slice),
+        Some(body.as_slice()),
+        "delivered {:?}",
+        outcome.files.keys().collect::<Vec<_>>()
+    );
+}

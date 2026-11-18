@@ -114,3 +114,25 @@ async fn a_set_whose_first_part_names_its_member_otherwise_delivers() {
         assert_delivers(&renamed, &body, &format!("{format} named otherwise"));
     }
 }
+
+// The set with no recovery, its last two volumes posted under each other's
+// names, so nothing renames them.
+#[tokio::test]
+async fn a_set_whose_first_part_names_its_member_otherwise_delivers_with_its_last_two_swapped() {
+    let body = body();
+    let set = set(single_member_rar4_store_set, &body, FIRST, LATER);
+    let posts = set
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let posted = match index {
+                last if last + 1 == VOLUMES => last - 1,
+                before_last if before_last + 2 == VOLUMES => before_last + 1,
+                other => other,
+            };
+            Post::plain(&format!("Pack.XXX-U4A.part{:02}.rar", posted + 1), bytes)
+        })
+        .collect();
+    let outcome = run(&Scenario::new(posts).framed(FRAME)).await;
+    assert_delivers(&outcome, &body, "rar4 named otherwise, last two swapped");
+}
