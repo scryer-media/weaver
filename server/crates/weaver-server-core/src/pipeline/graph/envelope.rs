@@ -51,14 +51,67 @@ pub(crate) struct Shelf {
     readers: Mutex<Vec<Weak<ReadFiles>>>,
 }
 
-pub(crate) type ReadFiles = Mutex<RunFiles>;
+// What a run reads its envelopes with, which a drain reaches.
+//
+// Lock order: `disk`, then `files`, then the shelf's state lock. `files` is
+// never held across a disk call, so a drain, which takes `files` alone, is
+// never held behind a read that hangs; `disk` keeps the run's reads one at a
+// time, as they were when they were made under `files`, and nothing that
+// drains takes it.
+#[derive(Debug, Default)]
+pub(crate) struct ReadFiles {
+    files: Mutex<RunFiles>,
+    pub(crate) disk: Mutex<()>,
+    // Raised when the run is stopped or drained: a wait for a read turn
+    // hears it and ends.
+    pub(crate) stop: crate::operations::disk::reader::TurnStop,
+    // A test's hold on the next read inside its disk call: the read says it
+    // entered, and returns once the test lets it.
+    #[cfg(test)]
+    hang: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+impl ReadFiles {
+    #[cfg(test)]
+    pub(crate) fn hang_next_read(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        *self.hang.lock().unwrap_or_else(PoisonError::into_inner) = Some((entered_tx, go_rx));
+        (entered, go)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_read(&self) {
+        let hang = self
+            .hang
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((entered, go)) = hang {
+            entered.send(()).unwrap();
+            go.recv().unwrap();
+        }
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, RunFiles>> {
+        self.files.lock()
+    }
+
+    pub(crate) fn try_lock(&self) -> std::sync::TryLockResult<MutexGuard<'_, RunFiles>> {
+        self.files.try_lock()
+    }
+}
 
 // A run's open envelope files, and the read turn it holds on their volume
 // (`Reading`): under one lock, which a read takes already, so a read in a
-// turn held costs nothing more. A drain lets both go.
+// turn held costs nothing more. A drain lets both go. A read in flight holds
+// its own handle to the file and its turn, so the drain does not wait for it
+// and the turn is not handed on before the read ends.
 #[derive(Debug, Default)]
 pub(crate) struct RunFiles {
-    pub(crate) open: BTreeMap<u32, std::fs::File>,
+    pub(crate) open: BTreeMap<u32, Arc<std::fs::File>>,
     pub(crate) reading: crate::operations::disk::reader::Reading,
 }
 
@@ -458,12 +511,15 @@ impl Shelf {
     // Invalidate the generation first, then drain every run, including
     // superseded ones still held by a worker. Never hold the state lock
     // here: readers check their generation under their file-cache lock.
+    // A run waiting for a read turn is woken and fails; one inside a read
+    // is not waited for, since no read holds the file-cache lock.
     fn release_readers(&self) {
         let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
         readers.retain(|reader| {
             let Some(files) = reader.upgrade() else {
                 return false;
             };
+            files.stop.raise();
             let mut files = files.lock().unwrap_or_else(PoisonError::into_inner);
             files.open.clear();
             files.reading.let_go();

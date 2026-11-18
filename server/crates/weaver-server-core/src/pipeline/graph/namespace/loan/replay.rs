@@ -5,8 +5,7 @@
 // worker. Only a current return may uncover and deliver them. The snapshot
 // is evidence to validate, not an immutable copy of the backing files.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
+use crate::operations::disk::reader::TurnStop;
 use weaver_graph::{Builder, Effect, Posted, Provenance};
 
 use super::super::{Segments, Write, WriteError};
@@ -14,7 +13,7 @@ use super::*;
 
 pub(crate) struct Replay {
     pub(crate) node: NodeId,
-    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) stop: Arc<TurnStop>,
     generation: u64,
     records: BTreeMap<NodeId, weaver_graph::records::NodeRecord>,
     ranges: Vec<(VolumeIndex, ByteRange)>,
@@ -87,7 +86,7 @@ impl Replay {
                 for (range, source) in runs {
                     let mut at = range.start;
                     while at < range.end {
-                        if self.stop.load(Ordering::Relaxed) || self.access.stopped() {
+                        if self.stop.raised() || self.access.stopped() {
                             break;
                         }
                         let piece = ByteRange::new(at, range.end.min(at.saturating_add(READ_BACK)));
@@ -117,7 +116,7 @@ impl Replay {
                 source: std::io::Error::other("posted-input reconstruction worker panicked"),
             });
         }
-        let stopped = self.stop.load(Ordering::Relaxed) || self.access.stopped();
+        let stopped = self.stop.raised() || self.access.stopped();
         let access = self.access;
         Replayed {
             node: self.node,
@@ -239,7 +238,7 @@ impl NamespaceWriter {
             }
             return Ok(Some(Replay {
                 node,
-                stop: Arc::new(AtomicBool::new(false)),
+                stop: Arc::default(),
                 generation: tree.generation(),
                 records: access
                     .postings

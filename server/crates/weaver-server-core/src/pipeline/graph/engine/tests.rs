@@ -151,6 +151,91 @@ fn a_run_reads_in_its_volumes_turns_what_it_reads_without_them() {
     }
 }
 
+// A read waiting for a turn its volume's other readers hold ends when its
+// run is stopped, on solid state and on a spinning volume alike: the stop
+// wakes the wait, and the read fails as a stopped run's reads do.
+#[test]
+fn a_read_waiting_for_a_turn_ends_when_its_run_is_stopped() {
+    use crate::operations::disk::StorageKind;
+    use crate::operations::disk::volume::Volume;
+    use crate::operations::disk::writer::VolumeWriters;
+
+    for kind in [StorageKind::Solid, StorageKind::Rotational] {
+        let dir = tempfile::tempdir().unwrap();
+        let writers = VolumeWriters::inline(|_| {});
+        let volume = Arc::new(Volume::new(None, "test".to_owned()));
+        let reads = volume.reads(|| kind);
+        let turns = Arc::clone(reads.turns());
+        let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+        envelopes.write_through(Some(writers.test_submitter(&volume, 1)));
+        let shelf = envelopes.shelf(NODE);
+        envelopes
+            .keep(NODE, 0, 0, b"held", Provenance::Fresh)
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let every = runtime
+            .block_on(Arc::clone(&turns).acquire_many_owned(reads.readers() as u32))
+            .unwrap();
+        let volumes = reader(&shelf);
+        let waiting = Arc::clone(&volumes);
+        let read = std::thread::spawn(move || read(&waiting, 0, 4));
+        volumes.await_turn_waiters(1);
+        volumes.stop();
+        let error = read.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{kind:?}");
+        assert!(!volumes.holds_turn(), "{kind:?}");
+        drop(every);
+        assert_eq!(turns.available_permits(), reads.readers(), "{kind:?}");
+    }
+}
+
+// A release of the job's envelopes goes on while one of its runs is inside
+// a read that does not return: it drains the run's handles without waiting
+// for the read, and the read's turn goes to no other reader until the read
+// ends, when it goes back to the volume rather than to the stopped run.
+#[test]
+fn a_release_goes_on_while_a_read_hangs_on_the_disk() {
+    use crate::operations::disk::StorageKind;
+    use crate::operations::disk::reader::SOLID_READERS;
+    use crate::operations::disk::volume::Volume;
+    use crate::operations::disk::writer::VolumeWriters;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writers = VolumeWriters::inline(|_| {});
+    let volume = Arc::new(Volume::new(None, "test".to_owned()));
+    let turns = Arc::clone(volume.reads(|| StorageKind::Solid).turns());
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    envelopes.write_through(Some(writers.test_submitter(&volume, 1)));
+    let shelf = envelopes.shelf(NODE);
+    envelopes
+        .keep(NODE, 0, 0, b"front", Provenance::Fresh)
+        .unwrap();
+    let volumes = reader(&shelf);
+    assert_eq!(read(&volumes, 0, 2).unwrap(), b"fr");
+    assert_eq!(volumes.open_files(), 1);
+    let (entered, go) = volumes.hang_next_read();
+    let hung = Arc::clone(&volumes);
+    let read_thread = std::thread::spawn(move || read(&hung, 2, 3));
+    entered.recv().unwrap();
+    // The release returns with the read still inside the disk call.
+    envelopes.release_handles();
+    assert!(envelopes.open_files().is_empty());
+    assert_eq!(volumes.open_files(), 0);
+    assert_eq!(turns.available_permits(), SOLID_READERS - 1);
+    go.send(()).unwrap();
+    // The read passed its check before the release, so its bytes stand.
+    assert_eq!(read_thread.join().unwrap().unwrap(), b"ont");
+    assert_eq!(volumes.open_files(), 0);
+    assert!(!volumes.holds_turn());
+    assert_eq!(turns.available_permits(), SOLID_READERS);
+    assert_eq!(
+        read(&volumes, 0, 2).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
 // Damaged bytes are read only once repaired: the read waits over them as it
 // waits for bytes still on their way, and the repair lands ahead of what the
 // run read, so the run goes on reading and is never stopped.
