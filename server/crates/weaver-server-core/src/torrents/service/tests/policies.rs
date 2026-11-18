@@ -919,3 +919,289 @@ async fn a_reopen_with_a_copy_that_cannot_be_stored_changes_nothing() {
     assert_ne!(view.state, TorrentState::Seeding);
     rig.service.stop().await;
 }
+
+// A paused torrent of two files that share no piece, complete with its
+// second set aside, and a second torrent added after it: the first, the
+// second, and the second file's bytes.
+async fn complete_with_one_aside(rig: &Rig) -> (JobId, JobId, Vec<u8>) {
+    use FilePriority::*;
+    rig.service.open().await.unwrap();
+    let bytes: Vec<u8> = (0..4096u32).map(|at| (at * 7 % 251) as u8).collect();
+    let meta = metainfo(
+        "two",
+        &[("two/a.bin", &bytes[..2048]), ("two/b.bin", &bytes[2048..])],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(meta))
+        })
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(1, Ignored)])
+        .await
+        .unwrap();
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    for piece in [0u32, 1] {
+        let at = piece as usize * 1024;
+        Pieces::verified(
+            &*store,
+            piece,
+            &bytes::Bytes::copy_from_slice(&bytes[at..at + 1024]),
+        )
+        .unwrap();
+    }
+    let mut settles = rig.service.inner.settled.subscribe();
+    rig.service.inner.signal.look(job_id);
+    settles
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let after = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("after", 9)))
+        })
+        .await
+        .unwrap();
+    rig.service.save_checkpoints([job_id].into()).await;
+    (job_id, after, bytes[2048..].to_vec())
+}
+
+// A torrent's completion and queue place, in memory and as stored.
+async fn place_of(
+    service: &TorrentService,
+    db: &Database,
+    job_id: JobId,
+) -> (Option<i64>, Option<i64>, i64, i64) {
+    let stored = db.get_torrent(job_id).unwrap().unwrap();
+    let live = service.inner.live.lock().await;
+    let torrent = &live[&job_id];
+    (
+        torrent.record.completed_at_ms,
+        stored.completed_at_ms,
+        torrent.record.queue_position,
+        stored.queue_position,
+    )
+}
+
+// The second file's pieces arrive in the restored torrent's store, and it
+// completes again.
+async fn completes_again(service: &TorrentService, db: &Database, job_id: JobId, b: &[u8]) {
+    let store = service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    for piece in [2u32, 3] {
+        let at = (piece as usize - 2) * 1024;
+        Pieces::verified(
+            &*store,
+            piece,
+            &bytes::Bytes::copy_from_slice(&b[at..at + 1024]),
+        )
+        .unwrap();
+    }
+    let mut settles = service.inner.settled.subscribe();
+    service.inner.signal.look(job_id);
+    settles
+        .wait_for(|_| {
+            db.get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    assert!(service.inner.live.lock().await[&job_id].complete());
+    // Kept with the pieces, as a stop after the session's word keeps them.
+    service.save_checkpoints([job_id].into()).await;
+}
+
+// A file of a complete torrent wanted again after a restart, before the
+// torrent's store is open (the tick begins that), reopens it all the same:
+// once, at the end of the queue, and it completes again once the file's
+// pieces arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_wanted_again_before_the_store_opens_reopens_the_torrent() {
+    use FilePriority::*;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    let (job_id, after, b) = complete_with_one_aside(&rig).await;
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let (completed, stored, _, _) = place_of(&again, &rig.db, job_id).await;
+    assert!(completed.is_some() && stored.is_some());
+    assert!(again.inner.live.lock().await[&job_id].store.is_none());
+    let next = again
+        .inner
+        .next_queue_position
+        .load(std::sync::atomic::Ordering::SeqCst);
+    again
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    assert!(again.inner.live.lock().await[&job_id].store.is_none());
+    assert_eq!(
+        place_of(&again, &rig.db, job_id).await,
+        (None, None, next, next)
+    );
+    assert!(next > place_of(&again, &rig.db, after).await.3);
+
+    again.tick().await;
+    again.restored().await;
+    // Once: the store's open takes the stored levels and moves nothing.
+    assert_eq!(
+        place_of(&again, &rig.db, job_id).await,
+        (None, None, next, next)
+    );
+    assert_eq!(
+        again.inner.live.lock().await[&job_id].levels,
+        [Normal, Normal]
+    );
+    completes_again(&again, &rig.db, job_id, &b).await;
+    again.stop().await;
+}
+
+// The same asked while the stored torrents are still being read: the
+// torrent goes past every stored one at the load's end, as one added then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_wanted_again_while_the_load_runs_reopens_the_torrent_last() {
+    use FilePriority::*;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    let (job_id, after, b) = complete_with_one_aside(&rig).await;
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.hold_load(true);
+    again.start_seated().await.unwrap();
+    again
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    assert!(again.inner.live.lock().await[&job_id].store.is_none());
+    let (completed, stored, _, _) = place_of(&again, &rig.db, job_id).await;
+    assert_eq!((completed, stored), (None, None));
+    again.hold_load(false);
+    again.loaded().await;
+    let reopened = place_of(&again, &rig.db, job_id).await;
+    let last = place_of(&again, &rig.db, after).await;
+    assert_eq!(reopened.2, reopened.3);
+    assert!(reopened.2 > last.2 && reopened.3 > last.3);
+
+    again.tick().await;
+    again.restored().await;
+    assert_eq!(place_of(&again, &rig.db, job_id).await, reopened);
+    completes_again(&again, &rig.db, job_id, &b).await;
+    again.stop().await;
+}
+
+// A torrent stored complete with levels that want a file it lacks, as a
+// change of levels whose copy landed leaves it when its reopen could not be
+// stored, is restored short of complete, past every stored torrent, and
+// completes again once the file's pieces arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_stored_complete_that_wants_a_missing_file_is_reopened_at_restore() {
+    use FilePriority::*;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    let (job_id, after, b) = complete_with_one_aside(&rig).await;
+    rig.service.stop().await;
+    // The levels landed; the completion and the place did not.
+    rig.db
+        .set_torrent_file_priorities(job_id, &[Normal, Normal])
+        .unwrap();
+    assert!(
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .completed_at_ms
+            .is_some()
+    );
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    let reopened = place_of(&again, &rig.db, job_id).await;
+    let last = place_of(&again, &rig.db, after).await;
+    assert_eq!((reopened.0, reopened.1), (None, None));
+    assert_eq!(reopened.2, reopened.3);
+    assert!(reopened.2 > last.2 && reopened.3 > last.3);
+    assert_ne!(
+        again.torrent(job_id).await.unwrap().state,
+        TorrentState::Seeding
+    );
+    completes_again(&again, &rig.db, job_id, &b).await;
+    again.stop().await;
+
+    // Complete as stored, it is not reopened again.
+    let third = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&third).await;
+    let (completed, stored, at, stored_at) = place_of(&third, &rig.db, job_id).await;
+    assert!(completed.is_some() && stored.is_some());
+    assert_eq!((at, stored_at), (reopened.2, reopened.3));
+    third.stop().await;
+}
+
+// A change of levels with no bytes to copy is stored before the store takes
+// it, so no file is written in place while its stored level still sets it
+// aside. One the store then refuses is stored back as memory holds it: the
+// call fails, the file is not made, and the torrent stays complete with its
+// levels, its place and the queue's next place as they were. Asked again,
+// it reopens once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_the_store_refuses_is_stored_back() {
+    use FilePriority::*;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    let (job_id, _, _) = complete_with_one_aside(&rig).await;
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    let b = store.files().path(1).unwrap();
+    assert!(!b.exists());
+    let before = completion_of(&rig, job_id).await;
+    assert_eq!(before.2, [Normal, Ignored]);
+    assert!(before.1.is_some());
+    let shown = shown_of(&rig, job_id).await;
+
+    crate::torrents::store::RELEVEL_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        rig.service
+            .set_file_priorities(job_id, &[(1, Normal)])
+            .await
+            .is_err()
+    );
+    assert!(!crate::torrents::store::RELEVEL_FAILS.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(completion_of(&rig, job_id).await, before);
+    assert_eq!(shown_of(&rig, job_id).await, shown);
+    assert!(!b.exists());
+
+    rig.service
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    let after = completion_of(&rig, job_id).await;
+    assert_eq!(
+        (after.0, after.1, after.2),
+        (None, None, vec![Normal, Normal])
+    );
+    assert_eq!((after.3, after.4), (before.5, before.5));
+    assert_eq!(after.5, before.5 + 1);
+    rig.service.stop().await;
+}

@@ -630,25 +630,25 @@ impl TorrentService {
                     return Ok(Some((store, asked)));
                 }
                 // No file's bytes to copy: only which files are set aside
-                // changes, in memory, and is set back if the levels cannot
-                // be stored, so a change that fails changes nothing.
-                let before = ignored_of(&torrent.levels);
-                if let Some(store) = &torrent.store {
-                    store
-                        .relevel(&ignored)
-                        .map_err(|error| ActionError::State(error.to_string()))?;
-                }
-                let reopened = match self.save_levels(torrent, &asked, &held) {
-                    Ok(reopened) => reopened,
-                    Err(error) => {
-                        if let Some(store) = &torrent.store
-                            && let Err(error) = store.relevel(&before)
-                        {
-                            tracing::warn!(job_id = job_id.0, error = %error, "could not set a torrent's files aside as they were");
-                        }
-                        return Err(ActionError::State(state_error(error)));
+                // changes, in memory. The levels are stored first, so no
+                // file is written in place before a level that wants it is
+                // stored; one the store cannot take is stored back as memory
+                // still holds it, so a change that fails changes nothing.
+                // Should that write fail too, the levels stored want what
+                // memory still sets aside: nothing is written for it in this
+                // run, and the next run downloads what was asked.
+                let reopened = self
+                    .save_levels(torrent, &asked, &held)
+                    .map_err(|error| ActionError::State(state_error(error)))?;
+                if let Some(store) = &torrent.store
+                    && let Err(error) = store.relevel(&ignored)
+                {
+                    self.store_back(torrent, reopened.is_some());
+                    if let Some(place) = reopened {
+                        self.give_back_place(place);
                     }
-                };
+                    return Err(ActionError::State(error.to_string()));
+                }
                 self.take_levels(torrent, held, reopened, self.inner.clock.unix_ms());
                 Ok(None)
             })
@@ -733,8 +733,9 @@ impl TorrentService {
                             // out of the side store whatever is stored, so
                             // the levels are taken all the same, and one
                             // that cannot be stored so is still reopened in
-                            // memory, its completion stored again at its
-                            // next.
+                            // memory: its completion is stored again at its
+                            // next, and a restart before that reopens it
+                            // from its stored levels (`Live::reopens`).
                             let reopened = match reopened {
                                 Some(place) => Some(place),
                                 None if torrent.reopens(&held) => {
@@ -823,23 +824,41 @@ impl TorrentService {
         asked: &[FilePriority],
         held: &[FilePriority],
     ) -> Result<Option<i64>, crate::StateError> {
-        use std::sync::atomic::Ordering::Relaxed;
         let job_id = torrent.record.job_id;
         if !torrent.reopens(held) {
             self.inner.db.set_torrent_file_priorities(job_id, asked)?;
             return Ok(None);
         }
-        let next = &self.inner.next_queue_position;
-        let place = next.fetch_add(1, Relaxed);
+        let place = self
+            .inner
+            .next_queue_position
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Err(error) = self
             .inner
             .db
             .set_torrent_levels_and_completion(job_id, asked, None, place)
         {
-            let _ = next.compare_exchange(place + 1, place, Relaxed, Relaxed);
+            self.give_back_place(place);
             return Err(error);
         }
+        // Reopened while the stored torrents are still being read, it goes
+        // past every one of them at the load's end, as a torrent added then
+        // does: the places past those read so far are not all known yet.
+        let mut marks = super::locked(&self.inner.load_marks);
+        if self.loading() {
+            marks.asked.push(super::Asked::Added(job_id));
+        }
         Ok(Some(place))
+    }
+
+    // Give back a place taken at the end of the download queue for a change
+    // that did not land, unless another torrent took the next one since.
+    fn give_back_place(&self, place: i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self
+            .inner
+            .next_queue_position
+            .compare_exchange(place + 1, place, Relaxed, Relaxed);
     }
 
     // Take `held`, stored by `save_levels`, in memory. One it stored short

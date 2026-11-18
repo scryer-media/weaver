@@ -261,24 +261,29 @@ impl Live {
             })
     }
 
-    // Whether taking `held` as its levels takes a complete torrent back to
-    // downloading: a file it ignored is wanted again and is not whole
-    // (qBittorrent `TorrentImpl::prioritizeFiles` clears
+    // Whether a complete torrent with `held` as its levels is short of
+    // complete: a file it wants is not whole, as when a file it ignored is
+    // wanted again (qBittorrent `TorrentImpl::prioritizeFiles` clears
     // `m_hasFinishedStatus`, torrentimpl.cpp:3045-3057; libtorrent
-    // `resume_download`, torrent.cpp:8653-8676 at v2.0.15). One whose
+    // `resume_download`, torrent.cpp:8653-8676 at v2.0.15), or when it was
+    // stored complete with levels a write after it changed. What it has is
+    // its store's, or, before its store is open, the pieces it kept; one
+    // that kept none, or is in seed mode, which has every piece as added,
+    // is taken as whole until its store says otherwise. One whose
     // unpacking runs over archives stays complete: whether its unpacking
     // runs again when it completes again is not settled.
     pub(super) fn reopens(&self, held: &[FilePriority]) -> bool {
-        let wanted_again = |file: usize| {
-            !self.levels.get(file).copied().unwrap_or_default().wanted()
-                && held.get(file).copied().unwrap_or_default().wanted()
+        let wanted = |file: usize| held.get(file).copied().unwrap_or_default().wanted();
+        let whole = match (&self.store, &self.layout) {
+            (Some(store), _) => store.has_files(wanted),
+            (None, Some(layout))
+                if !self.record.seed_mode && matches!(self.kept_at_boot, Some(Some(_))) =>
+            {
+                crate::torrents::store::has_files(layout, &self.file_have, wanted)
+            }
+            (None, _) => true,
         };
-        self.complete()
-            && !self.unpacks_archives()
-            && self
-                .store
-                .as_ref()
-                .is_some_and(|store| !store.has_files(wanted_again))
+        self.complete() && !self.unpacks_archives() && !whole
     }
 
     // Whether its unpacking is in force over archive files: a tee is made

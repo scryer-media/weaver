@@ -61,6 +61,27 @@ impl Kept {
     }
 }
 
+// Whether `file_have`, each file's bytes in the pieces had, holds every file
+// `wanted` names whole. Padding is on no disk and is never wanted; a file
+// past the end of `file_have` has none of its bytes.
+pub(crate) fn has_files(
+    layout: &PieceLayout,
+    file_have: &[u64],
+    wanted: impl Fn(usize) -> bool,
+) -> bool {
+    layout
+        .files()
+        .enumerate()
+        .filter(|(index, file)| !file.padding && wanted(*index))
+        .all(|(index, file)| file_have.get(index).copied().unwrap_or(0) >= file.length)
+}
+
+// Test seam: the next change of the files set aside fails before it changes
+// anything, as one that meets a piece on its way to the side store does.
+#[cfg(test)]
+pub(crate) static RELEVEL_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 struct Have {
     pieces: BitVec<u8, Msb0>,
     // The pieces a check of every piece has neither found nor failed yet:
@@ -516,6 +537,12 @@ impl TorrentStore {
     // v2.0.15). A copy that fails changes nothing: the bytes stay in the
     // side store, and the files set aside are as they were.
     pub(crate) fn relevel(&self, ignored: &[bool]) -> io::Result<()> {
+        #[cfg(test)]
+        if RELEVEL_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return Err(io::Error::other(
+                "a test failed the change of files set aside",
+            ));
+        }
         let mut aside = self.aside_mut();
         let wanted: Vec<bool> = self
             .layout
@@ -779,12 +806,7 @@ impl TorrentStore {
 
     // Whether every file `wanted` names is had whole.
     pub(crate) fn has_files(&self, wanted: impl Fn(usize) -> bool) -> bool {
-        let have = self.have();
-        self.layout
-            .files()
-            .enumerate()
-            .filter(|(index, file)| !file.padding && wanted(*index))
-            .all(|(index, file)| have.file_have[index] >= file.length)
+        has_files(&self.layout, &self.have().file_have, wanted)
     }
 
     // The names of the listed files it has whole.

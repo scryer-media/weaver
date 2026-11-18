@@ -2260,6 +2260,28 @@ impl Database {
         })
     }
 
+    // A batch of torrents short of complete again, that column alone, in one
+    // transaction of few statements: what a page of a start's load writes
+    // for the torrents stored complete that want a file they lack.
+    pub(crate) fn clear_torrents_completed(&self, job_ids: &[JobId]) -> Result<(), StateError> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let rows = job_ids
+            .iter()
+            .map(|job_id| Ok((stored(job_id.0)?, SqlArg::OptI64(None))))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "clear_torrents_completed", |tx| {
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "completed_at_ms", &rows).await })
+            })
+            .await
+        })
+    }
+
     // A magnet's metainfo once its peers sent it: the hashes and name it
     // carries, the file and whether it marks the torrent private, the
     // directory its files go to and the folder they
