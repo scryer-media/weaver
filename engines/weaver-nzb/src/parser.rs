@@ -2249,11 +2249,11 @@ mod tests {
     // An escape escaped twice parses to the text `&quot;`, which is not a
     // quote mark and stays in the word, as NZBGet's last-word rule keeps it.
     #[test]
-    fn a_twice_escaped_quote_is_text() {
+    fn a_twice_escaped_quote_is_text_in_the_subject_and_no_part_of_the_name() {
         let nzb = parse_nzb(&one_file("&amp;quot;show.rar&amp;quot; yEnc (1/1)")).unwrap();
         let file = &nzb.files[0];
         assert_eq!(file.subject, "&quot;show.rar&quot; yEnc (1/1)");
-        assert_eq!(file.filename(), Some("&quot;show.rar&quot;"));
+        assert_eq!(file.filename(), Some("show.rar"));
     }
 
     #[test]

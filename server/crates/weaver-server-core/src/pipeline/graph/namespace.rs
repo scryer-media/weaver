@@ -1266,6 +1266,38 @@ impl NamespaceWriter {
         self.deliver(tree, builder, segments, arrival, out)
     }
 
+    // A root member's article header named it before any of its bytes
+    // came: the tree's ledger moves its name, every file whose name changed
+    // follows, and the claims the name makes again bind through the tree as
+    // any claim does, as a recovery set's renames do (`bind_sets`).
+    pub(crate) fn header_named(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (member, name): (MemberId, &str),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let mut effects = Vec::new();
+        if tree
+            .rename(
+                NodeId::ROOT,
+                member,
+                name,
+                &mut self.placing(builder),
+                &mut effects,
+            )
+            .is_none()
+        {
+            return Ok(());
+        }
+        let (moves, claims): (Vec<Effect>, Vec<Effect>) = effects
+            .into_iter()
+            .partition(|effect| matches!(effect, Effect::Renamed { .. }));
+        self.moved(tree, &moves)?;
+        self.apply_all(tree, builder, segments, claims, out)
+    }
+
     // A recovery object recognised the member: the tree's ledger moves its
     // name, and every file whose name changed follows.
     #[cfg(test)]

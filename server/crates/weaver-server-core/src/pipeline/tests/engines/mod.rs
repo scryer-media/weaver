@@ -92,6 +92,7 @@ mod encrypted_hex;
 mod end_files;
 mod first_article_sample;
 pub(in crate::pipeline) mod harness;
+mod header_names;
 mod hold_breach;
 mod lent_handed;
 mod lent_windows;
