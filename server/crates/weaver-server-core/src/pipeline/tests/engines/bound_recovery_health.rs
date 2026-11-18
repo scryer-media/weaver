@@ -250,3 +250,184 @@ async fn a_normally_named_set_is_weighed_as_today() {
 const NAMED_ORDER_FORTY: &str = "[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (11, 1), (11, 2), (11, 3), (11, 4), (11, 5), (0, 6), (0, 7), (0, 8), (0, 9), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (12, 1), (12, 2), (12, 3), (12, 4), (12, 5), (1, 6), (1, 7), (1, 8), (1, 9), (2, 1), (13, 1), (13, 2), (13, 3), (13, 4), (13, 5), (14, 1), (14, 2), (14, 3), (14, 4), (14, 5), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1)]";
 
 const NAMED_ORDER_NINETY: &str = "[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6), (0, 7), (0, 8), (0, 9), (11, 1), (11, 2), (11, 3), (11, 4), (11, 5), (12, 1), (12, 2), (12, 3), (12, 4), (12, 5), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 8), (1, 9), (13, 1), (13, 2), (13, 3), (13, 4), (13, 5), (14, 1), (14, 2), (14, 3), (14, 4), (14, 5), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1)]";
+
+// Ten data files of one article each and a PAR2 set over them of `blocks`
+// blocks in five volumes, the set under names that say nothing, or under
+// the names the creator gave it.
+fn singles(blocks: u32, named: bool) -> Vec<Post> {
+    let files: Vec<(String, Vec<u8>)> = (0..FILES)
+        .map(|file| {
+            (
+                format!("lantern{file:02}.mkv"),
+                payload(ARTICLE, 40 + file as u8),
+            )
+        })
+        .collect();
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = files
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    let set = par2_volumes_sliced("lantern", &described, ARTICLE as u64, blocks, 5);
+    assert_eq!(set.len(), 6, "an index and five volumes");
+    for (at, post) in set.into_iter().enumerate() {
+        let name = if named {
+            post.name.clone()
+        } else {
+            format!("q8z{at}w.bin")
+        };
+        posts.push(Post {
+            bytes: post.bytes,
+            ..Post::plain(&name, Vec::new())
+        });
+    }
+    posts
+}
+
+// Every data file and the set's index lose their only or first article,
+// and so do the first two volumes. The other three volumes' first articles
+// are refused once, so they are still to come when the thirteenth loss is
+// heard, and each of them then loses every article past its third.
+fn fronts_lost(posts: Vec<Post>) -> Scenario {
+    let scenario = (0..FILES + 3).fold(Scenario::new(posts).framed(ARTICLE), |scenario, file| {
+        scenario.lost(file, 0)
+    });
+    let lengths: Vec<u32> = scenario.spec().files[FILES as usize + 3..]
+        .iter()
+        .map(|file| file.segments.len() as u32)
+        .collect();
+    (FILES + 3..FILES + 6)
+        .zip(lengths)
+        .fold(scenario, |scenario, (file, length)| {
+            (3..length).fold(scenario.refused_once(file, 0), |scenario, ordinal| {
+                scenario.lost(file, ordinal)
+            })
+        })
+}
+
+// Ten data files of ten articles and a listing of their checksums.
+fn listed() -> Vec<Post> {
+    let files: Vec<(String, Vec<u8>)> = (0..FILES)
+        .map(|file| (format!("lantern{file:02}.mkv"), data(file)))
+        .collect();
+    let entries: Vec<(&str, u32)> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), super::sfv::crc(bytes)))
+        .collect();
+    let mut posts: Vec<Post> = files
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    posts.push(super::sfv::listing("lantern.sfv", &entries));
+    posts
+}
+
+// The gate's worked case. The set is posted under names that say nothing,
+// and thirteen of the sixteen posted files lose their first article: every
+// data file, the index and two volumes. That is 81% of the files, past the
+// gate's 80%, and by the names nothing is recovery, so the 582 KB the lost
+// files hold outweigh no recovery at all: the gate gave the post up while
+// three volumes' first articles were still to come, and the two volumes
+// that lost theirs were never fetched past it. The three left lose all but
+// three articles each, so the repair needs the two that were dropped.
+//
+// Now the verdict waits for those three first articles: were they recovery,
+// their 623 KB would outweigh the lost files. They arrive and bind, the
+// gate weighs them as recovery, as it weighs the same set under its own
+// names, and the post is fetched and repaired.
+#[tokio::test]
+async fn obfuscated_recovery_still_to_come_holds_the_first_article_gate() {
+    let scenario = fronts_lost(singles(60, false));
+    let graph = run(&scenario).await;
+    let case = format!("{} {}", summary(&graph), asked(&graph));
+    assert_eq!(graph.status, Some(JobStatus::Complete), "{case}");
+    for file in 0..FILES {
+        let name = format!("lantern{file:02}.mkv");
+        let (_, delivered) = graph
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with(&name))
+            .unwrap_or_else(|| panic!("{name} delivered: {case}"));
+        assert!(
+            *delivered == payload(ARTICLE, 40 + file as u8),
+            "{name}: {case}"
+        );
+    }
+    // The two volumes whose first article was lost are fetched past it.
+    for file in [FILES + 1, FILES + 2] {
+        assert!(
+            graph
+                .order
+                .iter()
+                .any(|(index, ordinal)| *index == file && *ordinal > 0),
+            "volume {file} fetched past its lost front: {case}"
+        );
+    }
+}
+
+// The same post under the set's own names: the gate weighs it by the names
+// and lets it through, as before.
+#[tokio::test]
+async fn the_named_twin_of_the_gate_case_is_weighed_as_before() {
+    let graph = run(&fronts_lost(singles(60, true))).await;
+    let case = summary(&graph);
+    assert_eq!(graph.status, Some(JobStatus::Complete), "{case}");
+    assert_eq!(asked(&graph), NAMED_GATE_ORDER, "{case}");
+}
+
+const NAMED_GATE_ORDER: &str = "[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (13, 0), (14, 0), (15, 0), (11, 1), (11, 2), (11, 3), (11, 4), (11, 5), (11, 6), (11, 7), (11, 8), (11, 9), (11, 10), (11, 11), (11, 12), (12, 1), (12, 2), (12, 3), (12, 4), (12, 5), (12, 6), (12, 7), (12, 8), (12, 9), (12, 10), (12, 11), (12, 12), (13, 1), (13, 2), (13, 3), (13, 4), (13, 5), (13, 6), (13, 7), (13, 8), (13, 9), (13, 10), (13, 11), (13, 12), (14, 1), (14, 2), (14, 3), (14, 4), (14, 5), (14, 6), (14, 7), (14, 8), (14, 9), (14, 10), (14, 11), (14, 12), (15, 1), (15, 2), (15, 3), (15, 4), (15, 5), (15, 6), (15, 7), (15, 8), (15, 9), (15, 10), (15, 11), (15, 12)]";
+
+// The gate's case with a set of five blocks: the three volumes still to
+// come bring 57 KB, which cannot outweigh the 205 KB lost, so the gate does
+// not wait for them. Under names that say nothing and under the set's own,
+// the run asks the articles it asked before, in that order, and fails in
+// the same words.
+#[tokio::test]
+async fn a_set_too_small_to_save_the_gate_case_is_given_up_as_before() {
+    let rows = [
+        (
+            false,
+            "PAR2 recovery failed for 1 set(s): q8z3w.bin (lantern00.mkv, lantern01.mkv, lantern02.mkv, lantern03.mkv, lantern04.mkv, lantern05.mkv, lantern06.mkv, lantern07.mkv, lantern08.mkv, lantern09.mkv, q8z0w.bin, q8z1w.bin, q8z2w.bin): not repairable: 10 damaged slices, only 3 recovery blocks reachable",
+            "[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (13, 0), (14, 0), (15, 0), (15, 1), (13, 1), (14, 1)]",
+        ),
+        (
+            true,
+            "PAR2 recovery failed for 1 set(s): lantern.vol2+1.par2 (lantern00.mkv, lantern01.mkv, lantern02.mkv, lantern03.mkv, lantern04.mkv, lantern05.mkv, lantern06.mkv, lantern07.mkv, lantern08.mkv, lantern09.mkv, lantern.par2): not repairable: 10 damaged slices, only 3 recovery blocks reachable",
+            "[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (13, 0), (14, 0), (15, 0), (13, 1), (14, 1), (15, 1)]",
+        ),
+    ];
+    for (named, failure, order) in rows {
+        let graph = run(&fronts_lost(singles(5, named))).await;
+        let case = format!("named {named}: {}", summary(&graph));
+        assert_eq!(graph.failure.as_deref(), Some(failure), "{case}");
+        assert_eq!(asked(&graph), order, "{case}");
+    }
+}
+
+// A listing of checksums binds as a set, but carries nothing to repair
+// with: the feed does not count it as recovery. Every data file loses its
+// second article; with no recovery the line is the 85% the names draw, and
+// the run asks the articles it asked before the graph's bindings were
+// counted, and fails in the same words. Counted as recovery, the listing's
+// 250 bytes drew the line at 99.9%, and the post was given up at its first
+// loss.
+#[tokio::test]
+async fn a_checksum_listing_is_not_counted_as_recovery() {
+    let graph = run(&losing(Scenario::new(listed()).framed(ARTICLE), 1)).await;
+    let case = summary(&graph);
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some(
+            "SFV recovery failed for 1 set(s): lantern.sfv (lantern00.mkv, lantern01.mkv, lantern02.mkv, lantern03.mkv, lantern04.mkv, lantern05.mkv, lantern06.mkv, lantern07.mkv, lantern08.mkv, lantern09.mkv): not repairable: 10 damaged slices, only 0 recovery blocks reachable"
+        ),
+        "{case}"
+    );
+    assert_eq!(
+        asked(&graph),
+        "[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6), (0, 7), (0, 8), (0, 9), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 8), (1, 9), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5), (2, 6), (2, 7), (2, 8), (2, 9), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1)]",
+        "{case}"
+    );
+}

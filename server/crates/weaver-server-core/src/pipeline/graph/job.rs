@@ -861,12 +861,14 @@ impl GraphJob {
             || self.tree.judges_past_hole(NodeId::ROOT, member)
     }
 
-    // Seam for the feed: a recovery object holds the posted file at
-    // `file_index` as one of its volumes, whatever its posted name. The
-    // feed's critical line counts it from then on.
+    // Seam for the feed: a set that rebuilds what it covers holds the
+    // posted file at `file_index` as one of its volumes, whatever its posted
+    // name. The feed's critical line and its first-article gate count it
+    // from then on. A listing of checksums brings nothing to repair with,
+    // and is not counted.
     pub(crate) fn holds_as_recovery(&self, file_index: u32) -> bool {
         self.writer
-            .carries_recovery(&self.tree, NodeId::ROOT, MemberId(file_index))
+            .carries_parity(&self.tree, NodeId::ROOT, MemberId(file_index))
     }
 
     // Seam for status: the posted file at `file_index` has an article

@@ -159,6 +159,13 @@ impl NamespaceWriter {
             .is_some_and(|(child, _)| tree.recovers(child))
     }
 
+    // The member is a volume of a set that rebuilds what it covers: data
+    // to repair with, in its own file. An SFV is a set that only checks.
+    pub(crate) fn carries_parity(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+        tree.child_of(node, member)
+            .is_some_and(|(child, _)| tree.recovers(child) && tree.kind(child) != Some(Kind::Sfv))
+    }
+
     // Every set of the namespace has ruled on something other than waiting:
     // nothing a set of it will rebuild is still to come. A set whose repair
     // is out has its ruling still to come, and so has one whose own volume
