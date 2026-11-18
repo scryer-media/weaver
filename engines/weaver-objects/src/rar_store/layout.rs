@@ -103,13 +103,27 @@ fn on_trust(found: &Volume) -> bool {
         .is_none_or(|facts| !claim::states_position(facts))
 }
 
-// Whether a member's parts do not join into one member: what the volumes
-// laid say of it, in the places they are laid, disagrees.
-fn misjoined(member: &StoredMember) -> bool {
-    matches!(
-        member.eligibility,
-        MemberEligibility::Ineligible(IneligibilityReason::MalformedChain(_))
-    )
+// The volume at which a member's parts stop joining into one member, when
+// what the volumes laid say of it, in the places they are laid, disagrees:
+// the volume the layout names, else the one holding the last part it took,
+// where the chain closed or ran past the member's size.
+fn breaks_at(member: &StoredMember) -> Option<u32> {
+    use MalformedReason as Reason;
+    let MemberEligibility::Ineligible(IneligibilityReason::MalformedChain(reason)) =
+        &member.eligibility
+    else {
+        return None;
+    };
+    match reason {
+        Reason::DuplicatePartInVolume { volume }
+        | Reason::OverlappingParts { volume }
+        | Reason::UnexpectedChainStart { volume }
+        | Reason::UnexpectedChainEnd { volume }
+        | Reason::MissingPartInAddedVolume { volume }
+        | Reason::MixedEncryption { volume } => Some(*volume),
+        Reason::ContinuationInFirstVolume => Some(0),
+        _ => member.parts.last().map(|part| part.volume),
+    }
 }
 
 // A layout and, for each volume it holds, the facts it took it on: their
@@ -207,11 +221,13 @@ fn stands(
 
 // One past the volumes the layout takes past its tail, from `from`, or the
 // refusal one of them makes: found before any is added, so no layout the
-// set is given up over is ever extended.
+// set is given up over is ever extended. A volume it refuted on the headers
+// it holds now is not taken.
 fn reach(
     volumes: &BTreeMap<VolumeIndex, Volume>,
     layout: &StoredLayoutBuilder,
     from: u32,
+    refuted: Option<(VolumeIndex, u64)>,
 ) -> Result<u32, Emit> {
     let tail = from.checked_sub(1).map(VolumeIndex);
     if tail.is_some_and(|tail| {
@@ -224,7 +240,7 @@ fn reach(
     }
     let mut end = from;
     for (index, found) in volumes.range(VolumeIndex(from)..) {
-        if index.0 != end {
+        if index.0 != end || refuted == Some((*index, found.walk.stamp)) {
             break;
         }
         let Some((facts, on)) = lays(*index, found) else {
@@ -286,13 +302,16 @@ impl RarStore {
             .layout
             .take_if(|layout| layout.format() == format && stands(&self.volumes, layout, touched));
         let afresh = kept.is_none();
+        if afresh {
+            self.refuted = None;
+        }
         let mut layout = kept.unwrap_or_else(|| {
             #[cfg(test)]
             super::counts::bump(|counts| counts.layouts += 1);
             Laid::new(format)
         });
         let from = laid(&layout);
-        let mut end = match reach(&self.volumes, &layout, from) {
+        let mut end = match reach(&self.volumes, &layout, from, self.refuted) {
             Ok(end) => end,
             Err(emit) => {
                 if !afresh {
@@ -312,16 +331,24 @@ impl RarStore {
         // A volume only its name or its links hold where it is, its headers
         // stating no number, as a RAR4 volume's do short of a numbered end
         // record, is held there on trust. A layout that cannot take it there
-        // refutes that place, not the set: the layout stops before it, and
-        // the volume waits for its own headers or a new name to place it.
-        while end > from
+        // refutes that place, not the set: when every volume from the one it
+        // breaks at to its tail is held on trust, it is laid once more short
+        // of that volume, which waits for its own headers or a new name to
+        // place it, and is not laid there again on the same headers.
+        let broken = match refusal {
+            Some(_) => Some(end - 1),
+            None => layout.members().iter().filter_map(breaks_at).min(),
+        };
+        if let Some(at) = broken.filter(|at| (from..end).contains(at))
             && self
                 .volumes
-                .get(&VolumeIndex(end - 1))
-                .is_some_and(on_trust)
-            && (refusal.is_some() || layout.members().iter().any(misjoined))
+                .range(VolumeIndex(at)..VolumeIndex(end))
+                .all(|(_, found)| on_trust(found))
         {
-            end -= 1;
+            #[cfg(test)]
+            super::counts::bump(|counts| counts.cut += 1);
+            self.refuted = Some((VolumeIndex(at), self.volumes[&VolumeIndex(at)].walk.stamp));
+            end = at;
             refusal = None;
             layout = self.laid_afresh(format, end);
         }
