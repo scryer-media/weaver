@@ -72,6 +72,7 @@
 mod abandon_cost;
 mod accounting;
 mod binding_order;
+mod bound_recovery_health;
 mod caps;
 mod checkpoint_cost;
 mod classic_par2_index;

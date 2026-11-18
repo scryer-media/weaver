@@ -6,17 +6,29 @@
 // recovery are read from the post once; after that a first article that
 // changes costs one file's head, and reading the sample costs nothing of
 // the post's size.
+//
+// Beside the heads it keeps which files the graph holds as recovery that
+// the post's names do not declare: the graph's answer, read for the members
+// whose rows changed since it was last read, so a binding costs its member
+// and the critical line follows it without a walk of the post.
 
 use crate::jobs::model::JobSpec;
 
-use super::{Gate, Head, declared_recovery_bytes, declares_recovery, gate_of};
+use super::{Gate, Head, declared_recovery_bytes, declares_recovery, gate_of, names_recovery};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FirstFile {
     // The file's first ordinal, `None` for a file with no articles.
     first: Option<u32>,
     recovery: bool,
+    // The post's names count it in the critical line: a PAR2 or PAR3 file,
+    // its index among them, or a RAR recovery volume.
+    named: bool,
+    // The graph holds it as a recovery set's volume.
+    bound: bool,
     bytes: u64,
+    // The bytes of it every server said are gone.
+    lost: u64,
     head: Head,
     // Waiting to have its head read again.
     stale: bool,
@@ -37,14 +49,26 @@ pub(in crate::pipeline) struct FirstArticles {
     // The bytes of the recovery files whose first article was not lost.
     reachable_bytes: u64,
     declared_recovery: u64,
+    // The bytes of the files the graph holds as recovery that the names do
+    // not count.
+    bound_bytes: u64,
+    // The files whose first article is still to come and which nothing
+    // counts as recovery yet: each may still bind as a recovery volume,
+    // and bring what of it is not gone.
+    unresolved: usize,
+    unresolved_reach: u64,
+    // The generation of the root's members the bindings were read at.
+    bindings_at: Option<u64>,
 }
 
 impl FirstArticles {
     // The sample of the post `spec` names, each file's first article where
-    // `head` says it stands.
+    // `head` says it stands, and each file's bytes every server said are
+    // gone where `lost` says.
     pub(in crate::pipeline) fn new(
         spec: &JobSpec,
         mut head: impl FnMut(u32, Option<u32>) -> Head,
+        lost: impl Fn(u32) -> u64,
     ) -> Self {
         let mut sample = Self {
             files: Vec::with_capacity(spec.files.len()),
@@ -55,6 +79,10 @@ impl FirstArticles {
             lost_bytes: 0,
             reachable_bytes: 0,
             declared_recovery: declared_recovery_bytes(spec),
+            bound_bytes: 0,
+            unresolved: 0,
+            unresolved_reach: 0,
+            bindings_at: None,
         };
         for (file, index) in spec.files.iter().zip(0u32..) {
             let first = file.segments.iter().map(|segment| segment.ordinal).min();
@@ -62,11 +90,14 @@ impl FirstArticles {
             let entry = FirstFile {
                 first,
                 recovery,
+                named: names_recovery(file),
+                bound: false,
                 bytes: file
                     .segments
                     .iter()
                     .map(|segment| u64::from(segment.bytes))
                     .sum(),
+                lost: lost(index),
                 head: head(index, first),
                 stale: false,
             };
@@ -84,9 +115,59 @@ impl FirstArticles {
         self.files.len()
     }
 
-    // The bytes of every file the post names as recovery data.
-    pub(in crate::pipeline) fn declared_recovery(&self) -> u64 {
-        self.declared_recovery
+    // The recovery bytes the critical line is drawn from: what the post's
+    // names declare, and every file the graph holds as recovery besides.
+    pub(in crate::pipeline) fn recovery(&self) -> u64 {
+        self.declared_recovery.saturating_add(self.bound_bytes)
+    }
+
+    // How many files have a first article still to come that may yet bind
+    // as recovery.
+    pub(in crate::pipeline) fn unresolved(&self) -> usize {
+        self.unresolved
+    }
+
+    // What those files would bring were every one of them a recovery
+    // volume: what of each is not gone.
+    pub(in crate::pipeline) fn unresolved_reach(&self) -> u64 {
+        self.unresolved_reach
+    }
+
+    // Every server said `bytes` more of the file at `index` are gone.
+    pub(in crate::pipeline) fn lose(&mut self, index: u32, bytes: u64) {
+        let Some(file) = self.files.get(index as usize).copied() else {
+            return;
+        };
+        self.count(file, false);
+        let file = FirstFile {
+            lost: file.lost.saturating_add(bytes),
+            ..file
+        };
+        self.count(file, true);
+        self.files[index as usize] = file;
+    }
+
+    // The generation of the root's members the bindings were last read at.
+    pub(in crate::pipeline) fn bindings_at(&self) -> Option<u64> {
+        self.bindings_at
+    }
+
+    pub(in crate::pipeline) fn set_bindings_at(&mut self, at: u64) {
+        self.bindings_at = Some(at);
+    }
+
+    // Whether the graph holds the file at `index` as recovery now.
+    pub(in crate::pipeline) fn bind(&mut self, index: u32, bound: bool) {
+        let Some(file) = self.files.get(index as usize).copied() else {
+            return;
+        };
+        if file.bound == bound {
+            return;
+        }
+        self.count(file, false);
+        let file = FirstFile { bound, ..file };
+        self.count(file, true);
+        self.files[index as usize] = file;
     }
 
     // The file's first ordinal.
@@ -146,6 +227,18 @@ impl FirstArticles {
                 *sum - file.bytes
             };
         };
+        if file.bound && !file.named {
+            bytes(&mut self.bound_bytes);
+        }
+        if file.head == Head::Outstanding && !file.bound && !file.named {
+            step(&mut self.unresolved);
+            let reach = file.bytes.saturating_sub(file.lost);
+            self.unresolved_reach = if add {
+                self.unresolved_reach + reach
+            } else {
+                self.unresolved_reach - reach
+            };
+        }
         match (file.recovery, file.head) {
             (false, Head::Lost) => {
                 step(&mut self.lost);

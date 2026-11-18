@@ -21,9 +21,17 @@
 // touched while a round is out.
 //
 // The recovery a post declares is what its NZB names: PAR2 files, PAR3
-// files and RAR recovery volumes, each by its name. A RAR recovery record
-// inside a volume is invisible here; the 85% line is what leaves room for
-// it.
+// files and RAR recovery volumes, each by its name. To that the line adds
+// every file the graph holds as a recovery set's volume whatever its name,
+// as the graph binds it: a set posted under names that say nothing lowers
+// the line once its volumes bind, as a named set does from the start. So
+// that it can, a verdict the health would give waits while a file that
+// nothing counts as recovery yet still has its first article to come, and
+// those files binding as recovery, with what of them is not gone, would
+// lift the post above the line. The first articles lead the payload, so
+// the wait costs at most that one article per such file; a post those
+// files could not save is given up as it was. A RAR recovery record inside a volume is
+// invisible here; the 85% line is what leaves room for it.
 //
 // A round's STAT batches are work on the download lanes like an article.
 // Each batch waits for a free seat on a server it has not asked yet, the
@@ -314,6 +322,9 @@ pub(crate) struct Probes {
     pub(crate) states: HashMap<JobId, ProbeState>,
     // The posts the feed gave up, in its words.
     pub(crate) dead: HashMap<JobId, String>,
+    // The posts whose health would give them up, held until every file
+    // that may yet bind as recovery has its first article in or lost.
+    pub(crate) held: std::collections::HashSet<JobId>,
     pub(crate) verdicts: HashMap<JobId, crate::jobs::feed_verdict::FeedVerdict>,
     // The jobs whose dead files are being abandoned now, and whether one of
     // the refusals booked since asked for the post to be weighed again.
@@ -333,6 +344,7 @@ impl Default for Probes {
             receiver,
             states: HashMap::new(),
             dead: HashMap::new(),
+            held: std::collections::HashSet::new(),
             verdicts: HashMap::new(),
             abandoning: HashMap::new(),
             waiting: VecDeque::new(),
@@ -372,6 +384,7 @@ impl Probes {
     // goes, and the post's verdict, if the feed gave one, stays.
     pub(crate) fn retire(&mut self, job_id: JobId) {
         self.states.remove(&job_id);
+        self.held.remove(&job_id);
         self.lane_rounds.remove(&job_id);
         self.waiting.retain(|batch| batch.job_id != job_id);
     }
@@ -458,15 +471,18 @@ pub(crate) struct Place {
     number: u32,
 }
 
+// Whether the post's names count the file in the critical line: a PAR2 or
+// PAR3 file, its index among them, or a RAR recovery volume.
+pub(crate) fn names_recovery(file: &FileSpec) -> bool {
+    matches!(file.role, FileRole::Par2 { .. } | FileRole::Par3 { .. }) || declares_recovery(file)
+}
+
 // The bytes of every file the post names as recovery data, its indexes
-// among them: what the critical line is drawn from.
+// among them: the critical line until the graph binds more.
 pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
     spec.files
         .iter()
-        .filter(|file| {
-            matches!(file.role, FileRole::Par2 { .. } | FileRole::Par3 { .. })
-                || declares_recovery(file)
-        })
+        .filter(|file| names_recovery(file))
         .flat_map(|file| file.segments.iter())
         .map(|segment| u64::from(segment.bytes))
         .sum()
@@ -737,7 +753,11 @@ impl Pipeline {
     // sample lost; short of it with first articles still to come that could
     // take it there, the post has no verdict yet. Only a post the sample let
     // through is weighed by its health, at the failed bytes it lost or a
-    // round projected it will, against its critical line.
+    // round projected it will, against its critical line: the recovery the
+    // names declare and the graph binds. A health verdict is held while a
+    // file nothing counts as recovery yet still has its first article to
+    // come and those files could still lift the post above the line, and
+    // given once each has arrived or been lost.
     pub(in crate::pipeline) fn post_health_verdict(&mut self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) || !self.jobs.contains_key(&job_id) {
             return None;
@@ -752,9 +772,32 @@ impl Pipeline {
                 Some(Some(first_article_verdict_error(missing, total)))
             }
             Gate::Dead { .. } | Gate::Open => {
-                Some(self.health_verdict(job_id, spec, first_articles.declared_recovery()))
+                match self.health_verdict(job_id, spec, first_articles.recovery()) {
+                    Some(_)
+                        if first_articles.unresolved() > 0
+                            && self
+                                .health_verdict(
+                                    job_id,
+                                    spec,
+                                    self.reach(
+                                        job_id,
+                                        spec,
+                                        first_articles.recovery(),
+                                        first_articles.unresolved_reach(),
+                                    ),
+                                )
+                                .is_none() =>
+                    {
+                        self.post_probes.held.insert(job_id);
+                        None
+                    }
+                    verdict => Some(verdict),
+                }
             }
         };
+        if verdict.is_some() {
+            self.post_probes.held.remove(&job_id);
+        }
         // Kept only beside the graph it was read from: a sample read with no
         // graph in place holds nothing in hand, and is read again whole.
         if self.graph_jobs.contains_key(&job_id)
@@ -780,7 +823,7 @@ impl Pipeline {
             .get_mut(&job_id)
             .and_then(GivenUp::take_first_articles);
         let spec = &self.jobs.get(&job_id)?.spec;
-        Some(match (kept, changed) {
+        let mut sample = match (kept, changed) {
             (Some(mut kept), Some(Some(volumes))) if kept.files() == spec.files.len() => {
                 for volume in volumes {
                     kept.stale(volume.0);
@@ -791,10 +834,62 @@ impl Pipeline {
                 }
                 kept
             }
-            _ => FirstArticles::new(spec, |index, first| {
-                self.first_article_head(job_id, index, first)
-            }),
-        })
+            _ => FirstArticles::new(
+                spec,
+                |index, first| self.first_article_head(job_id, index, first),
+                |index| self.file_gone_bytes(job_id, index),
+            ),
+        };
+        self.read_bindings(job_id, &mut sample);
+        Some(sample)
+    }
+
+    // Which files the graph holds as recovery, brought up to date in the
+    // sample: the root's members whose rows changed since it last read
+    // them, or every posted file when it never has or the root was built
+    // again. A job with no graph has bound nothing.
+    fn read_bindings(&self, job_id: JobId, sample: &mut FirstArticles) {
+        let Some(graph) = self.graph_jobs.get(&job_id) else {
+            return;
+        };
+        let root = graph.namespace();
+        let generation = root.generation();
+        let files = sample.files() as u32;
+        match sample.bindings_at() {
+            Some(at) if at <= generation => {
+                let changed: Vec<u32> = root
+                    .changed_since(at)
+                    .map(|member| member.0)
+                    .filter(|index| *index < files)
+                    .collect();
+                for index in changed {
+                    sample.bind(index, graph.holds_as_recovery(index));
+                }
+            }
+            _ => {
+                for index in 0..files {
+                    sample.bind(index, graph.holds_as_recovery(index));
+                }
+            }
+        }
+        sample.set_bindings_at(generation);
+    }
+
+    // The most recovery the line could be drawn from once the files that may
+    // yet bind say what they are: `recovery`, and what those files would
+    // bring, `unresolved`, no more than the post's bytes not lost or
+    // projected lost.
+    fn reach(&self, job_id: JobId, spec: &JobSpec, recovery: u64, unresolved: u64) -> u64 {
+        let probe = self
+            .post_probes
+            .states
+            .get(&job_id)
+            .copied()
+            .unwrap_or_default();
+        let left = self
+            .post_bytes(job_id, spec)
+            .saturating_sub(probe.decided(self.missing_bytes(job_id)));
+        recovery.saturating_add(unresolved.min(left))
     }
 
     // The post's health against its critical line, once the sample has let
@@ -869,7 +964,46 @@ impl Pipeline {
                 }
             }
         }
-        self.health_verdict(job_id, spec, declared_recovery_bytes(spec))
+        let graph = self.graph_jobs.get(&job_id);
+        let recovery = self.recovery_walked(job_id, spec);
+        let unresolved: Vec<u64> = heads
+            .iter()
+            .filter(|(index, file, head)| {
+                *head == Head::Outstanding
+                    && !names_recovery(file)
+                    && !graph.is_some_and(|graph| graph.holds_as_recovery(*index))
+            })
+            .map(|(index, file, _)| {
+                file.segments
+                    .iter()
+                    .map(|segment| u64::from(segment.bytes))
+                    .sum::<u64>()
+                    .saturating_sub(self.file_gone_bytes(job_id, *index))
+            })
+            .collect();
+        let reach = self.reach(job_id, spec, recovery, unresolved.iter().sum());
+        let verdict = self.health_verdict(job_id, spec, recovery);
+        if verdict.is_some()
+            && !unresolved.is_empty()
+            && self.health_verdict(job_id, spec, reach).is_none()
+        {
+            return None;
+        }
+        verdict
+    }
+
+    // The recovery the line is drawn from, by a walk of every posted file.
+    #[cfg(test)]
+    fn recovery_walked(&self, job_id: JobId, spec: &JobSpec) -> u64 {
+        let graph = self.graph_jobs.get(&job_id);
+        (0u32..)
+            .zip(&spec.files)
+            .filter(|(index, file)| {
+                names_recovery(file) || graph.is_some_and(|graph| graph.holds_as_recovery(*index))
+            })
+            .flat_map(|(_, file)| file.segments.iter())
+            .map(|segment| u64::from(segment.bytes))
+            .sum()
     }
 
     // The job's sample as the feed keeps it, and as a whole read of the post
@@ -885,9 +1019,18 @@ impl Pipeline {
             .and_then(GivenUp::first_articles)
             .cloned();
         let read = self.jobs.get(&job_id).map(|state| {
-            FirstArticles::new(&state.spec, |index, first| {
-                self.first_article_head(job_id, index, first)
-            })
+            let mut read = FirstArticles::new(
+                &state.spec,
+                |index, first| self.first_article_head(job_id, index, first),
+                |index| self.file_gone_bytes(job_id, index),
+            );
+            // The bindings as a whole read finds them, read at the
+            // generation the kept sample was.
+            self.read_bindings(job_id, &mut read);
+            if let Some(at) = kept.as_ref().and_then(FirstArticles::bindings_at) {
+                read.set_bindings_at(at);
+            }
+            read
         });
         (kept, read)
     }
@@ -927,7 +1070,7 @@ impl Pipeline {
             .and_then(GivenUp::first_articles)
             .map_or_else(
                 || declared_recovery_bytes(&state.spec),
-                FirstArticles::declared_recovery,
+                FirstArticles::recovery,
             );
         let critical = Self::critical_health_milli(total, recovery);
         let critical_failed = critical_failed_bytes(total, critical);
@@ -1230,7 +1373,14 @@ impl Pipeline {
             return;
         };
         let total = self.post_bytes(job_id, &state.spec);
-        let recovery = declared_recovery_bytes(&state.spec);
+        let recovery = self
+            .given_up
+            .get(&job_id)
+            .and_then(GivenUp::first_articles)
+            .map_or_else(
+                || declared_recovery_bytes(&state.spec),
+                FirstArticles::recovery,
+            );
         let tracked = total.saturating_sub(recovery);
         let critical = Self::critical_health_milli(total, recovery);
         let failed = self.missing_bytes(job_id);
@@ -1279,6 +1429,40 @@ impl Pipeline {
         } else if !self.fail_graph_job_ruled_short(job_id) {
             self.arm_post_probe(job_id);
         }
+    }
+
+    // An article of the post arrived. When the post's health verdict is
+    // held and the article is its file's first, the post is weighed again:
+    // that file may have bound as recovery, or was the last the hold waited
+    // for. Any other article costs one lookup.
+    pub(in crate::pipeline) fn post_article_came(&mut self, segment: SegmentId) {
+        let job_id = segment.file_id.job_id;
+        if !self.post_probes.held.contains(&job_id)
+            || !self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.status.in_progress())
+        {
+            return;
+        }
+        let first = self
+            .given_up
+            .get(&job_id)
+            .and_then(GivenUp::first_articles)
+            .and_then(|sample| sample.first(segment.file_id.file_index));
+        if first != Some(segment.segment_number) {
+            return;
+        }
+        if let Some(error) = self.post_health_verdict(job_id) {
+            self.stop_feeding_post(job_id, error);
+        }
+    }
+
+    // The bytes of the file at `index` every server said are gone.
+    fn file_gone_bytes(&self, job_id: JobId, index: u32) -> u64 {
+        self.given_up
+            .get(&job_id)
+            .map_or(0, |given_up| given_up.file(index).missing_bytes)
     }
 
     // The bytes of the post the servers said are gone, in this run or one

@@ -158,6 +158,9 @@ impl GivenUp {
         if gone_at(end) {
             file.missing += 1;
             file.missing_bytes += bytes;
+            if let Some(first_articles) = self.first_articles.as_mut() {
+                first_articles.lose(index, bytes);
+            }
             let start = self
                 .starts
                 .get(index as usize)
