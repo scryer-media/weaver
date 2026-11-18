@@ -136,6 +136,9 @@ impl PostProcessingMutation {
                 batch_interpreter,
                 go_interpreter,
                 unacceptable_extensions,
+                // Saved on its own (`set_unwanted_extension_action`); the
+                // save keeps the stored one.
+                unwanted_extension_action: current.unwanted_extension_action,
                 global_scripts_run: global_scripts_run
                     .map(Into::into)
                     .unwrap_or(current.global_scripts_run),
@@ -174,6 +177,23 @@ impl PostProcessingMutation {
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         Ok(settings.unacceptable_extensions)
+    }
+
+    /// Choose what a download holding a file with an unwanted extension
+    /// comes to, and nothing else. Returns the choice as saved.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_unwanted_extension_action(
+        &self,
+        ctx: &Context<'_>,
+        action: UnwantedExtensionActionGql,
+    ) -> Result<UnwantedExtensionActionGql> {
+        let db = ctx.data::<Database>()?.clone();
+        let settings =
+            tokio::task::spawn_blocking(move || db.save_unwanted_extension_action(action.into()))
+                .await
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        Ok(settings.unwanted_extension_action.into())
     }
 
     /// Select the sole live source of scripts. Changing it turns every

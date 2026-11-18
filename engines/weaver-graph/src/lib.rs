@@ -71,6 +71,6 @@ pub use sniff::{
     HEAD_VERDICT_BYTES, Listed, Sniff, VERDICT_BYTES, listed, names_recovery, par2_index, signed,
     signs_a_head, sniff,
 };
-pub use tree::{AGAIN_PIECE, Builder, Disclaim, Effect, NodeId, Rewalk, Tree};
+pub use tree::{AGAIN_PIECE, Builder, Disclaim, Effect, NeverOpen, NodeId, Rewalk, Tree};
 pub use volume::{ByteRange, VolumeIndex};
 pub use window::{WindowLender, WindowMemory};

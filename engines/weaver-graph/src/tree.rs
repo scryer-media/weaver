@@ -494,7 +494,22 @@ pub struct Tree {
     // sibling later is offered to it at once. Never recorded: a restored
     // object walks its volumes again and says them again.
     wanting: BTreeSet<(NodeId, VolumeIndex, NodeId)>,
+    // Whether a member's name keeps it from ever being opened: the owner's
+    // word, asked of a member's name each time founding or an offer would
+    // bind it to an object. Such a member is a leaf whatever its bytes are.
+    // Never recorded: the owner sets it again on a restore.
+    never_open: NeverOpen,
+    // Members asked who owns them while the rule was not known: none was
+    // bound, offered or settled. Each is asked again, once, when the owner
+    // says the rule is known (`rule_known`). Never recorded: a restore asks
+    // its undecided members again as they come.
+    unruled: BTreeSet<(NodeId, MemberId)>,
 }
+
+// The owner's rule for names no object may open: `Some(true)` for a name
+// whose member is never bound to an object, `None` while the rule is not
+// known. The rule is known for every name or for none.
+pub type NeverOpen = std::sync::Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
 
 impl Default for Tree {
     fn default() -> Self {
@@ -523,7 +538,69 @@ impl Tree {
             rewalks: BTreeMap::new(),
             rewalking: BTreeSet::new(),
             wanting: BTreeSet::new(),
+            never_open: std::sync::Arc::new(|_| Some(false)),
+            unruled: BTreeSet::new(),
         }
+    }
+
+    // Members whose names `never_open` says are never opened: no object is
+    // founded on one, or offered one, whatever its bytes are. The owner sets
+    // it, as it sets the nesting; a tree it never set opens any member.
+    pub fn never_open(&mut self, never_open: NeverOpen) {
+        self.never_open = never_open;
+    }
+
+    // Whether a member named `name` is never opened. Not known yet counts as
+    // never opened: nothing is opened before the rule is known.
+    pub fn never_opens(&self, name: &str) -> bool {
+        (self.never_open)(name) != Some(false)
+    }
+
+    // Whether the owner's rule is not known yet. While it is not, no member
+    // is founded on, offered or settled: each asked waits, undecided, in
+    // `unruled`.
+    fn rule_unknown(&self) -> bool {
+        (self.never_open)("").is_none()
+    }
+
+    // The member was asked who owns it before the rule was known: whether
+    // it waits for it, recorded to be asked again.
+    fn waits_for_rule(&mut self, node: NodeId, member: MemberId) -> bool {
+        if !self.rule_unknown() {
+            return false;
+        }
+        self.unruled.insert((node, member));
+        true
+    }
+
+    // The owner's rule became known: every member asked while it was not is
+    // asked again, once, from the front it has now, and each namespace they
+    // stand in founds what its names say. A member decided since is passed
+    // over. The work is that of the members that waited, and none after.
+    pub fn rule_known(&mut self, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
+        if self.rule_unknown() {
+            return;
+        }
+        let unruled = std::mem::take(&mut self.unruled);
+        let mut nodes = BTreeSet::new();
+        for (node, member) in unruled {
+            if self.nodes.get(&node).is_none() {
+                continue;
+            }
+            nodes.insert(node);
+            self.identify_again(node, member, builder, effects);
+        }
+        for node in nodes {
+            if self.nodes.get(&node).is_some() {
+                self.found_by_name(node, builder, effects);
+            }
+        }
+    }
+
+    // Members waiting for the owner's rule.
+    #[cfg(test)]
+    pub(crate) fn unruled(&self) -> usize {
+        self.unruled.len()
     }
 
     pub fn namespace(&self, node: NodeId) -> Option<&Namespace> {
@@ -1730,6 +1807,11 @@ impl Tree {
             return;
         }
         let front = found.namespace.first_bytes(member).to_vec();
+        // Before the rule is known it waits, undecided, as it does behind a
+        // loan, and its bytes go to its own file meanwhile.
+        if self.waits_for_rule(node, member) {
+            return;
+        }
         let mut siblings = self.bound_below(node);
         siblings.extend(self.refused_below(node));
         if self.behind_a_loan(node, member, &siblings) {
@@ -1967,7 +2049,7 @@ impl Tree {
                     record.name.clone(),
                     record.length,
                     front.to_vec(),
-                    record.said(front, namespace),
+                    record.said(front, namespace, &*self.never_open),
                 )
             })
         }) else {
@@ -2570,6 +2652,12 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        // Before the rule is known every member asked waits in `unruled`,
+        // and is asked again once when it is: asking them all again for
+        // each front that comes would decide nothing.
+        if self.rule_unknown() {
+            return;
+        }
         let waiting: BTreeSet<MemberId> = self
             .nodes
             .get(&node)
@@ -2693,6 +2781,9 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        if self.waits_for_rule(node, member) {
+            return;
+        }
         let Some(namespace) = self.namespace(node) else {
             return;
         };
@@ -2701,7 +2792,7 @@ impl Tree {
             (
                 record.name.clone(),
                 record.length,
-                record.said(&front, namespace),
+                record.said(&front, namespace, &*self.never_open),
             )
         }) else {
             return;
@@ -2741,6 +2832,9 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        if self.waits_for_rule(node, member) {
+            return;
+        }
         let mut siblings = self.bound_below(node);
         siblings.extend(self.refused_below(node));
         if self.behind_a_loan(node, member, &siblings) {
@@ -2756,7 +2850,7 @@ impl Tree {
             (
                 record.name.clone(),
                 record.length,
-                record.said(prefix, members.namespace),
+                record.said(prefix, members.namespace, &*self.never_open),
             )
         }) else {
             return;
@@ -2930,6 +3024,7 @@ impl Tree {
                         #[cfg(test)]
                         NAMED_CANDIDATES.with(|seen| seen.set(seen.get() + 1));
                         self.undecided_recovery(node, record.id)
+                            && (self.never_open)(&record.name) == Some(false)
                     })
                     .filter_map(|record| {
                         Some((record.id, crate::sniff::recovery_by_name(&record.name)?))
@@ -3243,6 +3338,16 @@ impl Tree {
         else {
             return false;
         };
+        // A member whose name keeps it from being opened is no object's
+        // volume; nor is any before the rule is known, and it waits for it.
+        match (self.never_open)(&name) {
+            Some(false) => {}
+            Some(true) => return false,
+            None => {
+                self.unruled.insert((node, member));
+                return false;
+            }
+        }
         let mut waits = false;
         for child in objects {
             let Some(found) = self.nodes.get_mut(child).filter(|found| {
@@ -5339,6 +5444,7 @@ mod tests {
     mod candidates;
     mod handed;
     mod lift;
+    mod never_open;
     mod numbered;
     mod pieces;
     mod refuted;

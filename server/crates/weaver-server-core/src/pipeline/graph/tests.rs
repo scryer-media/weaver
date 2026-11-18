@@ -1473,6 +1473,7 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
             unnamed: Vec::new(),
             unrepaired: Vec::new(),
             withheld: Vec::new(),
+            removed: Vec::new(),
             files: vec![
                 delivered("echo-0.mkv", 1, true),
                 delivered("echo-1.mkv", 1, true),

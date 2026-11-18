@@ -11,7 +11,7 @@ use weaver_server_core::post_processing::listing::{
 };
 use weaver_server_core::post_processing::model::{
     GlobalScriptsRun, OptionValue, PostProcessingSettings, ScriptAdapter, ScriptName, ScriptOption,
-    ScriptOptionType, ScriptResult, ScriptSelectValue,
+    ScriptOptionType, ScriptResult, ScriptSelectValue, UnwantedExtensionAction,
 };
 use weaver_server_core::post_processing::output::ScriptRun;
 use weaver_server_core::post_processing::preset::ScriptPreset;
@@ -40,6 +40,8 @@ pub struct PostProcessingSettingsGql {
     pub batch_interpreter: Option<String>,
     pub go_interpreter: Option<String>,
     pub unacceptable_extensions: Vec<String>,
+    /// What a download holding a file with one of those extensions comes to.
+    pub unwanted_extension_action: UnwantedExtensionActionGql,
     /// True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
     pub strict_security_refuses_execution: bool,
     /// Whether script jobs for every category also run for a category that has
@@ -75,6 +77,36 @@ impl From<GlobalScriptsRunGql> for GlobalScriptsRun {
     }
 }
 
+/// What a download comes to when a file it would deliver has an unwanted
+/// extension. Either way no such file is opened as an archive.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
+#[graphql(name = "UnwantedExtensionAction")]
+pub enum UnwantedExtensionActionGql {
+    /// The download fails.
+    FailJob,
+    /// Only those files are deleted; the download ends partial, or failed
+    /// when no usable file is left.
+    DeleteFiles,
+}
+
+impl From<UnwantedExtensionAction> for UnwantedExtensionActionGql {
+    fn from(value: UnwantedExtensionAction) -> Self {
+        match value {
+            UnwantedExtensionAction::FailJob => Self::FailJob,
+            UnwantedExtensionAction::DeleteFiles => Self::DeleteFiles,
+        }
+    }
+}
+
+impl From<UnwantedExtensionActionGql> for UnwantedExtensionAction {
+    fn from(value: UnwantedExtensionActionGql) -> Self {
+        match value {
+            UnwantedExtensionActionGql::FailJob => Self::FailJob,
+            UnwantedExtensionActionGql::DeleteFiles => Self::DeleteFiles,
+        }
+    }
+}
+
 impl PostProcessingSettingsGql {
     pub fn from_settings(
         value: PostProcessingSettings,
@@ -97,6 +129,7 @@ impl PostProcessingSettingsGql {
             batch_interpreter: value.batch_interpreter,
             go_interpreter: value.go_interpreter,
             unacceptable_extensions: value.unacceptable_extensions,
+            unwanted_extension_action: value.unwanted_extension_action.into(),
             strict_security_refuses_execution: strict_security,
             global_scripts_run: value.global_scripts_run.into(),
         }

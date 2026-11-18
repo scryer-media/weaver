@@ -762,6 +762,11 @@ export const nextPt: LocaleDictionary = {
   "next.general.srrdbHelp": "Para membros de arquivo ofuscados, enviar apenas o checksum CRC32 ao índice público do SRRDB para recuperar o nome do lançamento.",
   "next.general.unacceptableExtensions": "Extensões não aceitas",
   "next.general.unacceptableExtensionsHelp": "Separadas por vírgula. Um download concluído que contenha uma delas é recusado.",
+  "next.general.unwantedExtensionAction": "Ação para extensões não aceitas",
+  "next.general.unwantedExtensionActionHelp":
+    "Um arquivo da lista nunca é aberto como arquivo compactado. \"Falhar o job\" recusa o download; \"Excluir só os arquivos indesejados\" remove esses arquivos e entrega o resto como parcial.",
+  "next.general.unwantedExtensionAction.fail": "Falhar o job",
+  "next.general.unwantedExtensionAction.delete": "Excluir só os arquivos indesejados",
   "next.archivePasswords.title": "Senhas de arquivos",
   "next.archivePasswords.list": "Senhas (uma por linha)",
   "next.archivePasswords.edit": "Editar senhas",

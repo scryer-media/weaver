@@ -48,6 +48,14 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     if pipeline.fail_graph_job_on_breach(job_id) {
         return;
     }
+    // The tree opened nothing while the policy was unread: what it held
+    // undecided is asked again, once, now that it is read.
+    if let Some(job) = pipeline.graph_jobs.get_mut(&job_id)
+        && let Err(error) = job.open_after_policy()
+    {
+        pipeline.after_graph_result(job_id, Err(error));
+        return;
+    }
     if pipeline.job_has_pending_download_pipeline_work(job_id)
         || pipeline.queue_script_completion_gate(job_id, true)
     {
@@ -616,6 +624,12 @@ impl Pipeline {
             },
             unarrived,
         );
+        // A file with an unwanted extension the policy deletes is no file
+        // of the delivery: the final move leaves it out.
+        let mut delivery = delivery;
+        if let Some(policy) = job.writer().removes() {
+            delivery.remove_unwanted(|name| policy.removes(name));
+        }
         Some((delivery, failure))
     }
 
@@ -693,9 +707,16 @@ impl Pipeline {
         Some(crate::post_processing::model::DeliveredVerdict {
             partial: delivery.status(failure.as_ref()) == JobStatus::Partial,
             shortfall_stage: delivery.shortfall_stage(failure.as_ref()),
-            shortfall_message: failure
-                .map(|failure| failure.message)
-                .or_else(|| delivery.withheld_error()),
+            // What the policy left out is said beside any other reason.
+            shortfall_message: match (
+                failure
+                    .map(|failure| failure.message)
+                    .or_else(|| delivery.withheld_error()),
+                delivery.removed_error(),
+            ) {
+                (Some(why), Some(removed)) => Some(format!("{why}; {removed}")),
+                (why, removed) => why.or(removed),
+            },
             recovery_verified: self.graph_recovery_verified(job_id),
             unpacked: self.graph_unpacked(job_id),
         })

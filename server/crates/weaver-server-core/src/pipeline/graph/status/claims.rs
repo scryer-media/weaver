@@ -155,6 +155,9 @@ pub(crate) struct Delivery {
     pub(crate) unrepaired: Vec<String>,
     // Given back withheld, with the reason its object refused it.
     pub(crate) withheld: Vec<(String, Why)>,
+    // Left out of the delivery for an unwanted extension
+    // (`remove_unwanted`): no file of it, whole or short.
+    pub(crate) removed: Vec<String>,
     // Every file delivered, whole or as it stands, as the walk met it.
     pub(crate) files: Vec<Delivered>,
 }
@@ -293,6 +296,7 @@ impl Delivery {
         let short = !(self.damaged.is_empty()
             && self.unrepaired.is_empty()
             && self.withheld.is_empty()
+            && self.removed.is_empty()
             && (self.unnamed.is_empty() || self.extracted()));
         if !self.whole.is_empty() && !short && failure.is_none_or(|failure| failure.from_feed) {
             return JobStatus::Complete;
@@ -324,7 +328,49 @@ impl Delivery {
                 }
             }
         };
+        // What the policy left out is said beside why nothing usable is left.
+        let error = match self.removed_error() {
+            Some(removed) => format!("{error}; {removed}"),
+            None => error,
+        };
         JobStatus::Failed { error }
+    }
+
+    // Leave out of the delivery every file whose name `removes` says has an
+    // unwanted extension the policy deletes: each is `removed`, whole or
+    // short, and no longer a file the delivery hands over. One pass over
+    // what the walk found, a name judged once.
+    pub(crate) fn remove_unwanted(&mut self, removes: impl Fn(&str) -> bool) {
+        let mut out: BTreeSet<String> = BTreeSet::new();
+        self.files.retain(|file| {
+            let removed = removes(&file.name);
+            if removed {
+                out.insert(file.name.clone());
+            }
+            !removed
+        });
+        // One a recovery object could not rebuild is no delivery, but it
+        // stands on disk and the policy removes it all the same.
+        self.unrepaired.retain(|name| {
+            let removed = removes(name);
+            if removed {
+                out.insert(name.clone());
+            }
+            !removed
+        });
+        if out.is_empty() {
+            return;
+        }
+        for list in [&mut self.whole, &mut self.damaged, &mut self.unnamed] {
+            list.retain(|name| !out.contains(name));
+        }
+        self.removed.extend(out);
+    }
+
+    // What the policy left out, worded as the job's reason. `None` when
+    // nothing was.
+    pub(crate) fn removed_error(&self) -> Option<String> {
+        crate::post_processing::model::unwanted_files_removed_reason(&self.removed)
     }
 
     // A set below the root extracted a file whole: an unnamed posted file
@@ -508,7 +554,9 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
     fn unopened(&self, node: NodeId, member: &Member) -> bool {
         self.tree.namespace(node).is_some_and(|namespace| {
             matches!(
-                member.said(namespace.first_bytes(member.id), namespace),
+                member.said(namespace.first_bytes(member.id), namespace, &|name| {
+                    Some(self.tree.never_opens(name))
+                }),
                 Sniff::Object(_)
             )
         })

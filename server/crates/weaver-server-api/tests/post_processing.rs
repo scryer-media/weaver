@@ -138,6 +138,60 @@ async fn the_extension_list_saves_on_its_own_and_leaves_the_script_settings_alon
 }
 
 #[tokio::test]
+async fn the_unwanted_extension_action_round_trips_and_is_kept_by_the_other_saves() {
+    let harness = TestHarness::new().await;
+    let read = "{ postProcessingSettings { unwantedExtensionAction } }";
+    let action = |response: &async_graphql::Response| {
+        response_data(response)["postProcessingSettings"]["unwantedExtensionAction"].clone()
+    };
+
+    // Never stored: fail job.
+    let response = harness.execute(read).await;
+    assert_no_errors(&response);
+    assert_eq!(action(&response), json!("FAIL_JOB"));
+
+    let denied = harness
+        .execute_as(
+            "mutation { setUnwantedExtensionAction(action: DELETE_FILES) }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&denied);
+    assert_eq!(action(&harness.execute(read).await), json!("FAIL_JOB"));
+
+    let response = harness
+        .execute("mutation { setUnwantedExtensionAction(action: DELETE_FILES) }")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["setUnwantedExtensionAction"],
+        json!("DELETE_FILES")
+    );
+    assert_eq!(action(&harness.execute(read).await), json!("DELETE_FILES"));
+
+    // Saving the script settings or the list leaves the action as it is.
+    assert_no_errors(
+        &harness
+            .execute(
+                "mutation { setPostProcessingSettings(input: { executionEnabled: false, concurrency: 3, terminationGraceSeconds: 20 }) { unwantedExtensionAction } }",
+            )
+            .await,
+    );
+    assert_no_errors(
+        &harness
+            .execute(r#"mutation { setUnacceptableExtensions(extensions: ["iso"]) }"#)
+            .await,
+    );
+    assert_eq!(action(&harness.execute(read).await), json!("DELETE_FILES"));
+
+    let response = harness
+        .execute("mutation { setUnwantedExtensionAction(action: FAIL_JOB) }")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(action(&harness.execute(read).await), json!("FAIL_JOB"));
+}
+
+#[tokio::test]
 async fn scripts_directory_is_admin_owned_and_turns_every_instance_off_when_changed() {
     let harness = TestHarness::new().await;
     let denied = harness

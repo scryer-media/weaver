@@ -600,6 +600,78 @@ fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
     assert_eq!(whole.status(None), JobStatus::Complete);
 }
 
+// The delete action leaves each file with an unwanted extension out of the
+// delivery, unpacked or posted, whole or not: what is left ends partial,
+// failed when nothing usable is left, and complete when nothing was removed.
+#[test]
+fn files_the_policy_removes_leave_the_delivery_partial_or_failed() {
+    let exe = |name: &str| name.ends_with(".exe");
+    let delivery = |files: &[(&str, bool)], unrepaired: &[&str]| {
+        let mut delivery = Delivery {
+            unrepaired: unrepaired.iter().map(ToString::to_string).collect(),
+            ..Delivery::default()
+        };
+        for (name, whole) in files {
+            let file = Delivered {
+                name: name.to_string(),
+                from: name.to_string(),
+                depth: 1,
+                whole: *whole,
+                crc32: None,
+            };
+            if *whole {
+                delivery.whole.push(file.name.clone());
+            } else {
+                delivery.damaged.push(file.name.clone());
+            }
+            delivery.files.push(file);
+        }
+        delivery
+    };
+
+    let mut mixed = delivery(
+        &[
+            ("show/ember.mkv", true),
+            ("show/setup.exe", true),
+            ("tool.exe", false),
+        ],
+        &["fix.exe"],
+    );
+    mixed.remove_unwanted(exe);
+    assert_eq!(mixed.whole, vec!["show/ember.mkv"]);
+    assert!(mixed.damaged.is_empty() && mixed.unrepaired.is_empty());
+    assert_eq!(
+        mixed
+            .files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["show/ember.mkv"]
+    );
+    assert_eq!(mixed.removed, vec!["fix.exe", "show/setup.exe", "tool.exe"]);
+    assert_eq!(mixed.status(None), JobStatus::Partial);
+    assert_eq!(
+        mixed.removed_error().as_deref(),
+        Some("removed for an unwanted extension: fix.exe, show/setup.exe, tool.exe")
+    );
+
+    let mut only = delivery(&[("show/setup.exe", true)], &[]);
+    only.remove_unwanted(exe);
+    assert_eq!(
+        only.status(None),
+        JobStatus::Failed {
+            error: "no file was delivered whole; removed for an unwanted extension: show/setup.exe"
+                .to_string()
+        }
+    );
+
+    let mut none = delivery(&[("show/ember.mkv", true)], &[]);
+    let before = none.clone();
+    none.remove_unwanted(exe);
+    assert_eq!(none, before);
+    assert_eq!(none.status(None), JobStatus::Complete);
+}
+
 #[test]
 fn an_empty_delivery_cannot_complete() {
     assert_eq!(

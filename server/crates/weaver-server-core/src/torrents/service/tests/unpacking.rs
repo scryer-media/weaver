@@ -297,6 +297,56 @@ async fn a_finished_torrent_unpacking_refused_beside_a_usable_file_is_partial() 
     rig.service.stop().await;
 }
 
+// Under the delete action, a file unpacking made with an unwanted extension
+// is deleted and never placed: the torrent's own files stay as they came,
+// it completes and seeds on, and its job ends partial beside a file people
+// open, naming what was removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_the_job_is_partial() {
+    use crate::post_processing::model::UnwantedExtensionAction;
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.db
+        .save_post_processing_settings(&PostProcessingSettings {
+            unacceptable_extensions: vec!["txt".into()],
+            unwanted_extension_action: UnwantedExtensionAction::DeleteFiles,
+            ..PostProcessingSettings::default()
+        })
+        .unwrap();
+    let sample = vec![0x5a_u8; 300];
+    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("sample.mkv", &sample)];
+    let bytes = metainfo("set", &files, 128, false);
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let work = rig.service.unpacking_dir(job_id);
+    let mut retired = rig.service.retired();
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    fetch_every_piece(&rig.service, job_id, &whole).await;
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "partial");
+    assert_eq!(
+        history.error_message.as_deref(),
+        Some("removed for an unwanted extension: small.txt")
+    );
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.completed_at_ms.is_some());
+    assert_ne!(view.state, TorrentState::Stopped);
+    let dir = PathBuf::from(view.storage_dir.unwrap());
+    assert_eq!(std::fs::read(dir.join("set.rar")).unwrap(), archive);
+    assert_eq!(std::fs::read(dir.join("sample.mkv")).unwrap(), sample);
+    assert!(!dir.join("small.txt").exists());
+    assert!(!work.join("small.txt").exists());
+    rig.service.stop().await;
+}
+
 // Unpacked files that cannot be placed beside the torrent's are never
 // removed for it: they stay in its unpacking directory, the torrent
 // completes and seeds on, and its job ends as what it delivered says,

@@ -922,8 +922,26 @@ pub struct PostProcessingSettings {
     // document without the field predates the default list and reads it.
     #[serde(default = "default_unacceptable_extensions")]
     pub unacceptable_extensions: Vec<String>,
+    // What a job holding a file with one of those extensions comes to. A
+    // saved document without the field predates the choice and fails the
+    // job, as Weaver always did.
+    #[serde(default)]
+    pub unwanted_extension_action: UnwantedExtensionAction,
     #[serde(default)]
     pub global_scripts_run: GlobalScriptsRun,
+}
+
+// What a job comes to when a file it would deliver has an unwanted
+// extension. Either way no such file is ever opened as an archive.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnwantedExtensionAction {
+    // The job fails on the first such file it places.
+    #[default]
+    FailJob,
+    // Each such file is left out of the delivery; the job delivers the
+    // rest and ends partial, or failed when nothing usable is left.
+    DeleteFiles,
 }
 
 impl Default for PostProcessingSettings {
@@ -938,6 +956,7 @@ impl Default for PostProcessingSettings {
             batch_interpreter: None,
             go_interpreter: None,
             unacceptable_extensions: default_unacceptable_extensions(),
+            unwanted_extension_action: UnwantedExtensionAction::default(),
             global_scripts_run: GlobalScriptsRun::default(),
         }
     }
@@ -990,6 +1009,13 @@ impl PostProcessingSettings {
             .find(|pattern| crate::runtime::glob::glob_match_ci(pattern, extension))
             .map(String::as_str)
     }
+
+    // Whether `filename` is a file the job leaves out of its delivery: it
+    // has an unwanted extension and the action deletes such files.
+    pub fn removes(&self, filename: &str) -> bool {
+        self.unwanted_extension_action == UnwantedExtensionAction::DeleteFiles
+            && self.unacceptable_extension_match(filename).is_some()
+    }
 }
 
 // The unwanted extension list a new install starts with, sorted as a saved
@@ -1017,6 +1043,32 @@ pub fn unwanted_extension_reason(relative_path: &str) -> String {
         .map(|(_, extension)| extension.to_ascii_lowercase())
         .unwrap_or_default();
     format!("unwanted extension '.{extension}' in '{relative_path}'")
+}
+
+// How many removed files a job's reason names before it counts the rest.
+const REMOVED_NAMED: usize = 20;
+
+// Why a job is short when the unwanted extension policy left `removed` out
+// of its delivery, each by the path it would have been delivered under.
+// `None` when nothing was removed.
+pub fn unwanted_files_removed_reason(removed: &[String]) -> Option<String> {
+    if removed.is_empty() {
+        return None;
+    }
+    // Sorted, so the words never follow the order the files were met in.
+    let mut paths: Vec<String> = removed.iter().map(|path| path.replace('\\', "/")).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let more = paths.len().saturating_sub(REMOVED_NAMED);
+    paths.truncate(REMOVED_NAMED);
+    let mut named = paths;
+    if more > 0 {
+        named.push(format!("and {more} more"));
+    }
+    Some(format!(
+        "removed for an unwanted extension: {}",
+        named.join(", ")
+    ))
 }
 
 fn normalize_unacceptable_extension(value: &str) -> Result<String, PostProcessingValidationError> {
