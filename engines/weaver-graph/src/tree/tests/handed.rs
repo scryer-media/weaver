@@ -108,6 +108,10 @@ impl Object for Reader {
 }
 
 impl Recovery for Reader {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         false
     }

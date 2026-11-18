@@ -1027,6 +1027,10 @@ impl Packets for SetPackets<'_> {
 }
 
 impl Recovery for Par2 {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
         if self.shown.bind(namespace, self.id) {
             self.damage_shown();

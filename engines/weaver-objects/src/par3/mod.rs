@@ -1090,6 +1090,10 @@ impl Object for Par3 {
 }
 
 impl Recovery for Par3 {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
     // By path or bare name, where only a unique match binds; or by content,
     // for a member no described name answers to, which takes the described
     // name.
