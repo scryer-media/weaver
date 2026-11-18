@@ -2931,6 +2931,7 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         "groupsetname" | "historysetname" if request.param.trim().is_empty() => {
             return Ok(json!(false));
         }
+        "historydelete" => return archive_history(ctx, &request).await,
         _ => {}
     }
 
@@ -2980,7 +2981,6 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             "groupsetdupemode" => {
                 set_job_parameter(ctx, job_id, "nzbget.dupe_mode", &request.param).await
             }
-            "historydelete" => hide_history(ctx, job_id).await,
             "historyfinaldelete" => ctx.handle.delete_history(job_id, false).await.map(|_| ()),
             "historyreturn" | "historyredownload" => ctx.handle.redownload_job(job_id).await,
             "historyprocess" => ctx.handle.reprocess_job(job_id).await,
@@ -3034,20 +3034,38 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     Ok(json!(applied > 0))
 }
 
-// HistoryDelete hides the row from the client's default history listing but
-// keeps it, so duplicate checks still see the release. HistoryFinalDelete
-// erases it.
-async fn hide_history(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(), SchedulerError> {
+// HistoryDelete archives the rows: each is hidden from the client's default
+// history listing but kept, so duplicate checks and Weaver's own history
+// still see the release, and the files Weaver manages for it are removed by
+// the archive worker. One write hides every row of the request, and one
+// archive operation takes them all. HistoryFinalDelete erases a row.
+//
+// Nothing here waits on the pipeline: both writes are the database's, and the
+// worker removes the files on its own turn.
+async fn archive_history(
+    ctx: &NzbgetFacadeContext,
+    request: &EditQueueRequest,
+) -> Result<Value, RpcError> {
+    let ids: Vec<u64> = request.ids.iter().map(|id| id.0).collect();
     let db = ctx.db.clone();
-    let found = tokio::task::spawn_blocking(move || db.set_nzbget_history_hidden(job_id.0, true))
-        .await
-        .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
-        .map_err(SchedulerError::from)?;
-    if found {
-        Ok(())
-    } else {
-        Err(SchedulerError::JobNotFound(job_id))
+    let hidden = tokio::task::spawn_blocking(move || {
+        let hidden = db.set_nzbget_history_rows_hidden(&ids, true)?;
+        if hidden > 0 {
+            db.accept_archive_history(&ids)?;
+        }
+        Ok::<_, weaver_server_core::StateError>(hidden)
+    })
+    .await
+    .map_err(|error| RpcError::invalid_parameter(format!("{} failed: {error}", request.command)))?
+    .map_err(|error| RpcError::invalid_parameter(format!("{} failed: {error}", request.command)))?;
+    if hidden < request.ids.len() as u64 {
+        tracing::debug!(
+            command = %request.command,
+            applied = hidden,
+            "editqueue named ids with no history row"
+        );
     }
+    Ok(json!(hidden > 0))
 }
 
 async fn group_final_delete(
