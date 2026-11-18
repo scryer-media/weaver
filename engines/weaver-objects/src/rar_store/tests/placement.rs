@@ -477,3 +477,67 @@ fn a_long_set_refuting_a_volume_lays_it_again_once() {
         );
     }
 }
+
+// A RAR4 set with no end records, so no header states a number past the
+// first, posted as a film's was: its first volume under the release's
+// `part01.rar`, the rest under the poster's `<stem>.rNN`. Every volume's
+// front holds its whole header, so each walk reads to its end at once.
+// The middle volumes each only carry the one member on, which links every
+// free place to all of them alike; only their names order them. Fronts come
+// in posted order, with a middle volume before the one before it, and last
+// volume first: each volume is one store's, at its true place.
+#[test]
+fn a_middle_volume_before_the_one_before_it_takes_its_named_place() {
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(5_000);
+    let set: Vec<Vec<u8>> = write(
+        &[Item::File("track.flac", payload(9, 6 * 5_000 - 700))],
+        &options,
+    )
+    .into_iter()
+    .map(|mut volume| {
+        // The end record the writer closes each volume with: seven bytes.
+        assert_eq!(volume[volume.len() - 5], 0x7b);
+        volume.truncate(volume.len() - 7);
+        volume
+    })
+    .collect();
+    assert_eq!(set.len(), 6);
+    for order in [
+        [0, 1, 2, 3, 4, 5],
+        [0, 2, 1, 3, 4, 5],
+        [0, 3, 2, 1, 4, 5],
+        [5, 4, 3, 2, 1, 0],
+    ] {
+        let mut run = Run::new();
+        let members: Vec<MemberId> = (0..set.len())
+            .map(|volume| {
+                let name = match volume {
+                    0 => "Release.part01.rar".to_owned(),
+                    _ => format!("65606-1.r{:02}", volume - 1),
+                };
+                run.announce(&name, set[volume].len())
+            })
+            .collect();
+        for volume in order {
+            run.deliver(members[volume], 0, front(&set[volume]));
+        }
+        for volume in order {
+            let at = front(&set[volume]).len();
+            run.deliver(members[volume], at, &set[volume][at..]);
+            run.close(members[volume]);
+        }
+        let store = run
+            .tree
+            .child_of(NodeId::ROOT, members[0])
+            .map(|(node, _)| node);
+        assert!(store.is_some(), "{order:?}");
+        for (volume, member) in members.iter().enumerate() {
+            assert_eq!(
+                run.tree.child_of(NodeId::ROOT, *member),
+                store.map(|node| (node, VolumeIndex(volume as u32))),
+                "{order:?} volume {volume}"
+            );
+        }
+    }
+}
