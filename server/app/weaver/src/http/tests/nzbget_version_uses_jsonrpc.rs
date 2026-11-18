@@ -2888,6 +2888,91 @@ async fn nzbget_status_reports_a_stopped_rate_as_paused_never_as_unlimited() {
     assert_eq!(db.network_bandwidth().unwrap().download_bps, None);
     let status = rpc_result(app, "status", serde_json::json!([])).await;
     assert_eq!(fields(&status), answer(0, false), "rate 0 after the stop");
+
+    // A schedule window that sets the limit to 0 stops downloads too, with
+    // no saved limit: paused and standing by. DownloadLimit stays the saved
+    // limit, none.
+    let queue = scheduler_handle_with_jobs(vec![]).await;
+    let state = queue.state.clone();
+    let app = nzbget_test_router(
+        db.clone(),
+        queue,
+        config.clone(),
+        api_key_cache("control-key", "control"),
+    );
+    state.set_download_block(weaver_server_core::DownloadBlockState {
+        scheduled_speed_limit: Some(0),
+        speed_limit_in_force: Some(0),
+        speed_limit_by_schedule: true,
+        ..weaver_server_core::DownloadBlockState::default()
+    });
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(0, true), "scheduled stop");
+}
+
+// With a job downloading, Weaver is not standing by, until a stop holds every
+// download back: then it stands by because of the stop, saved or scheduled.
+#[tokio::test]
+async fn nzbget_status_stands_by_for_a_stop_with_a_job_downloading() {
+    let db = Database::open_in_memory().unwrap();
+    let config = test_config();
+    let job = nzbget_test_job(
+        97,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        5_174_000_000,
+        815_000_000,
+        vec![],
+    );
+    let queue = scheduler_handle_with_jobs(vec![job]).await;
+    let state = queue.state.clone();
+    let app = nzbget_test_router(
+        db,
+        queue,
+        config.clone(),
+        api_key_cache("control-key", "control"),
+    );
+    let fields = |status: &serde_json::Value| {
+        (
+            status["DownloadPaused"].clone(),
+            status["ServerStandBy"].clone(),
+        )
+    };
+    let paused_and_standing_by = |both: bool| (serde_json::json!(both), serde_json::json!(both));
+
+    config.write().await.bandwidth.download_bps = None;
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(
+        fields(&status),
+        paused_and_standing_by(false),
+        "downloading"
+    );
+
+    config.write().await.bandwidth.download_bps = Some(0);
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), paused_and_standing_by(true), "saved stop");
+
+    config.write().await.bandwidth.download_bps = None;
+    state.set_download_block(weaver_server_core::DownloadBlockState {
+        scheduled_speed_limit: Some(0),
+        speed_limit_in_force: Some(0),
+        speed_limit_by_schedule: true,
+        ..weaver_server_core::DownloadBlockState::default()
+    });
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(
+        fields(&status),
+        paused_and_standing_by(true),
+        "scheduled stop"
+    );
+
+    state.set_download_block(weaver_server_core::DownloadBlockState::default());
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(
+        fields(&status),
+        paused_and_standing_by(false),
+        "window over"
+    );
 }
 
 #[tokio::test]
