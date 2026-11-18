@@ -313,6 +313,8 @@ struct Lent {
     // job's working directory was released under the repair.
     internal: PathBuf,
     members: BTreeMap<(NodeId, MemberId), Taken>,
+    // Members lifted out of their namespace, and where each lives now.
+    homes: BTreeMap<(NodeId, MemberId), (NodeId, MemberId)>,
     usage: RefCell<Usage>,
     postings: BTreeMap<NodeId, Box<dyn Posting>>,
     shelves: BTreeMap<NodeId, (Arc<Shelf>, u64)>,
@@ -563,6 +565,7 @@ impl NamespaceWriter {
             unwritten: false,
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
+            homes: BTreeMap::new(),
             usage: RefCell::default(),
             postings: BTreeMap::new(),
             shelves: BTreeMap::new(),
@@ -699,6 +702,13 @@ impl NamespaceWriter {
         access: &mut Lent,
         seen: &mut BTreeSet<NodeId>,
     ) {
+        // A member lives where `Tree::home` says: the loan takes it there,
+        // and answers reads of the member it was with it.
+        let home = tree.member_home((node, member));
+        if home != (node, member) {
+            access.homes.insert((node, member), home);
+            return self.take_member(tree, home.0, home.1, access, seen);
+        }
         if access.members.contains_key(&(node, member)) {
             return;
         }
@@ -878,6 +888,10 @@ impl Source for Lent {
     fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
         self.note((node, member), None);
         self.members.get(&(node, member))?.bound
+    }
+
+    fn member_home(&self, at: (NodeId, MemberId)) -> (NodeId, MemberId) {
+        self.homes.get(&at).copied().unwrap_or(at)
     }
 
     // The one recovery object a repair takes along is its set.

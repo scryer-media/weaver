@@ -327,7 +327,7 @@ fn may_come_whole_below(tree: &Tree, node: NodeId, member: MemberId) -> bool {
         }
         tree.namespace(object).is_some_and(|namespace| {
             namespace.members().any(|below| {
-                !tree.buried_member(object, below.id)
+                !tree.holds_no_file(object, below.id)
                     && match tree.child_of(object, below.id) {
                         Some((child, _)) if tree.recovers(child) => false,
                         Some(_) => may_come_whole_below(tree, object, below.id),

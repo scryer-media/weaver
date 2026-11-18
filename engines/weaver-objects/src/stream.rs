@@ -125,6 +125,9 @@ pub struct Stream<D> {
     // What a run of it is granted, which sizes its window.
     #[serde(skip)]
     budget: Budget,
+    // Its placement number, which never moves (`Object::placement`).
+    #[serde(skip)]
+    placed: crate::placed::Placed,
 }
 
 impl<D: Decoder> Default for Stream<D> {
@@ -136,6 +139,7 @@ impl<D: Decoder> Default for Stream<D> {
             closed: false,
             length: None,
             budget: Budget::default(),
+            placed: crate::placed::Placed::default(),
         }
     }
 }
@@ -231,6 +235,12 @@ impl<D: Decoder> Object for Stream<D> {
     // The front it copies out is in its facts, which a restart keeps, and its
     // run reads the volumes themselves: it says nothing of the posted bytes.
     fn unposted(&mut self, _volume: VolumeIndex, _range: ByteRange) {}
+
+    // Every range is its envelope, whatever arrived: `locate` reads
+    // nothing, so its number never moves.
+    fn placement(&self) -> Option<u64> {
+        Some(self.placed.number())
+    }
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {

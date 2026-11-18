@@ -631,17 +631,34 @@ impl GraphJob {
     // What the parent tells every engine bound in it. `coming` is what the
     // root still fetches unasked, asked once a step.
     fn facts(&self, parent: NodeId, coming: &mut Option<Coming>) -> Facts {
-        let ended = self.writer.ended(
-            &self.tree,
-            parent,
-            coming.get_or_insert_with(|| self.coming()),
-        );
+        let coming = coming.get_or_insert_with(|| self.coming());
+        let ended = self.writer.ended(&self.tree, parent, coming);
         // A volume can still join while a member's front has yet to decide
         // its owner, and while anything more can come: a recovery object yet
         // to rule may rebuild a volume never posted.
         Facts {
             ended,
             deciding: !ended || self.tree.deciding(parent),
+            held: ended
+                && self.still_above(parent)
+                && self.writer.lost_for_good(&self.tree, parent, coming),
+        }
+    }
+
+    // Nothing above the node's volumes can place another byte in them: no
+    // run reads the node or a namespace above it, and no object on the way
+    // up is out on loan. With the payload in and every set above ruled, the
+    // bytes an object above still holds stay held until the job is quiet.
+    fn still_above(&self, node: NodeId) -> bool {
+        let mut at = node;
+        loop {
+            if self.runs.reading(at) || self.tree.lent(at) {
+                return false;
+            }
+            match self.tree.volumes(at) {
+                Some((parent, _)) => at = parent,
+                None => return true,
+            }
         }
     }
 
@@ -658,7 +675,11 @@ impl GraphJob {
         let Some(namespace) = self.tree.namespace(parent) else {
             return Ok(());
         };
-        let Facts { ended, deciding } = facts;
+        let Facts {
+            ended,
+            deciding,
+            held,
+        } = facts;
         let complete = ended && !deciding;
         let bound = volumes.keys().map(|volume| volume.0);
         self.writer
@@ -674,8 +695,15 @@ impl GraphJob {
                     let Some(record) = namespace.get(*member) else {
                         continue;
                     };
-                    let closed = record.closed.then(|| record.length.unwrap_or(0));
-                    let settled = record.closed && ended;
+                    // A member open only for bytes lost for good above, or
+                    // held above by an object that places nothing more
+                    // before the job is quiet, holds all it will: the run
+                    // reads it as closed, ends on what it lacks, and lets
+                    // the job go quiet, where those objects hear their
+                    // losses.
+                    let shut = record.closed || held;
+                    let closed = shut.then(|| record.length.unwrap_or(0));
+                    let settled = shut && ended;
                     changed |= !state.kept.contains_key(&volume.0);
                     let kept = shelf.kept(state, volume.0)?;
                     changed |= kept.closed != closed
@@ -725,12 +753,14 @@ impl GraphJob {
 }
 
 // What a parent tells every engine bound in it of its volumes: whether
-// nothing more comes to them, not even a repair, and whether a volume may
-// still join.
+// nothing more comes to them, not even a repair, whether a volume may
+// still join, and whether what they lost is lost for good, so a volume
+// holding every byte it will reads as closed before its object closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Facts {
     ended: bool,
     deciding: bool,
+    held: bool,
 }
 
 // What the steps brought the engines up to: the generations of the tree,

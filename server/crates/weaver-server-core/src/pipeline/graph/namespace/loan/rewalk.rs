@@ -133,6 +133,7 @@ impl NamespaceWriter {
             unwritten: false,
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
+            homes: BTreeMap::new(),
             usage: RefCell::default(),
             postings: BTreeMap::new(),
             shelves: BTreeMap::new(),

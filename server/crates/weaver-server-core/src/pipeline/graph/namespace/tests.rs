@@ -3799,7 +3799,9 @@ fn a_member_given_back_logs_object_refused() {
 
 // Every reason an object can give a member back for reaches the job's
 // events, with the member and the archive that gave it back; the same
-// reason again says nothing new.
+// reason again says nothing new. A volume refused as scattered is not
+// given back: it moves to the namespace above (`Why::gives_back`), and
+// says nothing.
 #[test]
 fn every_reason_a_member_is_given_back_for_is_noted_once() {
     for why in crate::pipeline::graph::checkpoint::REASONS {
@@ -3818,13 +3820,14 @@ fn every_reason_a_member_is_given_back_for_is_noted_once() {
                 )
                 .expect("refuse");
         }
+        let noted: &[super::GivenBack] = &[super::GivenBack {
+            member: "pack.bin".to_string(),
+            container: "rar_store".to_string(),
+            why,
+        }];
         assert_eq!(
             job.writer.take_given_back(),
-            [super::GivenBack {
-                member: "pack.bin".to_string(),
-                container: "rar_store".to_string(),
-                why,
-            }],
+            if why.gives_back() { noted } else { &[] },
             "{why:?}"
         );
         assert!(job.writer.take_given_back().is_empty(), "{why:?}");

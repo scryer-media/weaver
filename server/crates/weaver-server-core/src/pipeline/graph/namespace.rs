@@ -813,7 +813,9 @@ impl NamespaceWriter {
                 continue;
             }
             let mut effects = Vec::new();
-            tree.refused_whole(node, member, &mut self.placing(builder), &mut effects);
+            tree.refused_written(node, member, &mut self.placing(builder), &mut effects);
+            #[cfg(test)]
+            tree.bound_kinds_recounted().unwrap();
             self.prune(tree)?;
             self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         }
@@ -1629,20 +1631,22 @@ impl NamespaceWriter {
                 self.materialise(tree, builder, segments, *node, *member, out)?;
                 let mut effects = Vec::new();
                 tree.bury(*node, *member, &mut effects);
-                // A refused member its recovery set proves whole may be the
-                // first piece of a file, now in its own file. One refused
-                // while a repair's return is applied is read once all of it
-                // is down.
+                // A refused member, now in its own file, is the tree's to
+                // place again (`Tree::refused_written`). One refused while a
+                // repair's return is applied is placed once all of it is
+                // down.
                 if matches!(effect, Effect::Refused { .. }) {
                     if self.acknowledging.is_some() {
                         self.refused_in_batch.insert((*node, *member));
                     } else {
-                        tree.refused_whole(
+                        tree.refused_written(
                             *node,
                             *member,
                             &mut self.placing(builder),
                             &mut effects,
                         );
+                        #[cfg(test)]
+                        tree.bound_kinds_recounted().unwrap();
                     }
                 }
                 self.prune(tree)?;
@@ -1743,6 +1747,12 @@ impl NamespaceWriter {
             Effect::NeedsPassword { .. } => {}
             // Answered above.
             Effect::Again { .. } => {}
+            Effect::Lifted {
+                node,
+                member,
+                to,
+                lifted,
+            } => self.lifted(tree, (*node, *member), (*to, *lifted))?,
         }
         out.push(effect);
         Ok(())
@@ -2047,6 +2057,39 @@ impl NamespaceWriter {
             }
         }
         self.release_to_leaf(tree, node, member)?;
+        Ok(())
+    }
+
+    // A member lifted into the namespace above takes its file with it:
+    // what it holds goes into the file first, and the file moves to the
+    // member it is now, under that member's name. The member it was has no
+    // file and no reason to be a leaf.
+    fn lifted(
+        &mut self,
+        tree: &mut Tree,
+        (node, member): (NodeId, MemberId),
+        (to, lifted): (NodeId, MemberId),
+    ) -> Result<(), WriteError> {
+        self.release_to_leaf(tree, node, member)?;
+        self.moves.drop_member(node, member);
+        let files = self.files_mut(node);
+        files.unrefuse(member);
+        let leaf = files.leaves.remove(&member);
+        self.caps.forget(tree, node, member);
+        if let Some(leaf) = leaf {
+            self.files_mut(to).leaves.insert(lifted, leaf);
+        }
+        let output_name = tree
+            .namespace(to)
+            .and_then(|namespace| namespace.get(lifted))
+            .map(|record| record.output_name.clone())
+            .ok_or(WriteError::UnknownMember {
+                node: to,
+                member: lifted,
+            })?;
+        self.intend(to, lifted, &output_name);
+        let kept = self.kept_device();
+        self.caps.restore(tree, to, lifted, kept);
         Ok(())
     }
 
@@ -3143,7 +3186,9 @@ impl NamespaceWriter {
     // reads back through, whether or not it ever wrote a file, and the file
     // of every member no namespace holds, with the namespace's own files
     // once the namespace is gone too. A namespace retired or gone holds no
-    // entries and keeps nothing resident.
+    // entries and keeps nothing resident. A member lifted away is not
+    // gone: its file is the member's it became, and goes there with it
+    // (`Effect::Lifted`).
     fn prune(&mut self, tree: &Tree) -> Result<(), WriteError> {
         self.caps.release_gone(tree);
         let shelved: Vec<NodeId> = self.envelopes.nodes().collect();
@@ -3228,7 +3273,7 @@ impl NamespaceWriter {
             Some(object) => (object, true),
             None => (node, false),
         };
-        if given_up && self.given_up.insert(archive) {
+        if given_up && why.gives_back() && self.given_up.insert(archive) {
             self.given_back.push(GivenBack {
                 member: name.clone(),
                 container: kind.clone(),
@@ -3357,6 +3402,9 @@ pub(crate) trait Source {
     // The data object the member is bound to, and the volume it is of it.
     // A recovery volume is in its own file, so it is bound to none.
     fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)>;
+    // Where the member lives now (`Tree::home`): itself, or the member it
+    // was lifted to, whose bytes are its at the same offsets.
+    fn member_home(&self, at: (NodeId, MemberId)) -> (NodeId, MemberId);
     // The bytes posted for a range of the object's volume, rebuilt as the
     // object says from what `read` hands back per placement.
     fn posted(
@@ -3403,6 +3451,7 @@ pub(crate) fn read_member(
     range: ByteRange,
     into: &mut Vec<u8>,
 ) -> bool {
+    let (node, member) = source.member_home((node, member));
     let Some((child, volume)) = source.bound(node, member) else {
         return read_own(source, node, member, range, into);
     };
@@ -3600,6 +3649,10 @@ impl Source for Probe<'_, '_> {
         self.0.bound(node, member)
     }
 
+    fn member_home(&self, at: (NodeId, MemberId)) -> (NodeId, MemberId) {
+        self.0.member_home(at)
+    }
+
     fn recovers(&self, child: NodeId) -> bool {
         self.0.recovers(child)
     }
@@ -3703,6 +3756,10 @@ impl Source for Access<'_> {
         self.tree
             .child_of(node, member)
             .filter(|(child, _)| !self.tree.recovers(*child))
+    }
+
+    fn member_home(&self, at: (NodeId, MemberId)) -> (NodeId, MemberId) {
+        self.tree.member_home(at)
     }
 
     fn recovers(&self, child: NodeId) -> bool {

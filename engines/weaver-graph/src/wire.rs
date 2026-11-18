@@ -67,6 +67,7 @@ enum WhyMirror {
     Unmapped,
     TooDeep,
     InvalidArchive,
+    Scattered,
     TooLarge {
         needed: Option<u64>,
         allowed: Option<u64>,

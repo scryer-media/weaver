@@ -291,15 +291,19 @@ impl GraphJob {
         if self.quieting.is_some() || !self.quiet() {
             return Ok(false);
         }
-        let told = self
-            .tree
-            .live()
-            .into_iter()
-            .rev()
-            .flat_map(|node| [(node, false), (node, true)])
-            .collect();
+        // The tree owns the order: deepest first, nodes that may still
+        // change the namespace above them first, the rest on a pass that
+        // changed nothing more.
+        let (first, rest) = self.tree.quiet_order();
+        let told = |nodes: Vec<NodeId>| {
+            nodes
+                .into_iter()
+                .flat_map(|node| [(node, false), (node, true)])
+                .collect()
+        };
         self.quieting = Some(Quieting {
-            told,
+            told: told(first),
+            rest: told(rest),
             batch: None,
             changed: false,
             rung: false,
@@ -394,6 +398,11 @@ impl GraphJob {
             let Some(quieting) = self.quieting.as_mut() else {
                 return Ok(Some(false));
             };
+            // The rest hear once the objects a lift may take from changed
+            // nothing; otherwise the next pass tells them.
+            if quieting.told.is_empty() && !quieting.changed {
+                quieting.told = std::mem::take(&mut quieting.rest);
+            }
             let Some((node, quiet)) = quieting.told.pop_front() else {
                 let changed = quieting.changed;
                 self.quieting = None;
@@ -496,6 +505,9 @@ pub(super) struct Sealed {
 // for the next volume, and the runs admitted meanwhile.
 pub(super) struct Quieting {
     told: std::collections::VecDeque<(NodeId, bool)>,
+    // The objects no lift takes a volume out of, told once those it may
+    // take from changed nothing.
+    rest: std::collections::VecDeque<(NodeId, bool)>,
     batch: Option<GivingUp>,
     changed: bool,
     rung: bool,

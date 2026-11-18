@@ -206,6 +206,12 @@ pub enum Why {
     // Recognised container rejected by structural or security validation.
     // Its posted bytes are not a usable substitute for its members.
     InvalidArchive,
+    // A volume of a set whose other volumes lie elsewhere: its namespace
+    // holds every member it will, its headers say the set has volumes it
+    // does not hold, and none of them is beside it. The tree lifts the
+    // volume, in its own file, into the namespace above, where the set's
+    // other volumes may be lifted too (`Tree::lift_scattered`).
+    Scattered,
     // Decoding it needs more memory than a decode may hold: `needed` bytes
     // against the `allowed` ceiling. Either is `None` where the decoder that
     // refused did not say it, as an allocator that failed names no ceiling.
@@ -233,6 +239,7 @@ impl Why {
             | Why::Compressed
             | Why::Unmapped
             | Why::InvalidArchive
+            | Why::Scattered
             | Why::TooLarge { .. }
             | Why::OverMachine { .. } => true,
             Why::TailUnreachable
@@ -244,6 +251,13 @@ impl Why {
             | Why::Unsupported
             | Why::TooDeep => false,
         }
+    }
+
+    // Whether a member refused for this reason is given back to its
+    // namespace as a file there. A scattered set's volume is not: it moves
+    // to the namespace above (`Tree::refused_written`).
+    pub fn gives_back(self) -> bool {
+        !matches!(self, Why::Scattered)
     }
 
     // Whether a store that hands its volumes to an engine for this reason
@@ -272,6 +286,7 @@ impl Why {
             | Why::HoldsBreached
             | Why::Unmapped
             | Why::InvalidArchive
+            | Why::Scattered
             | Why::TooLarge { .. }
             | Why::OverMachine { .. } => false,
         }
@@ -383,6 +398,7 @@ mod tests {
             Why::Compressed,
             Why::Unmapped,
             Why::InvalidArchive,
+            Why::Scattered,
             Why::TooLarge {
                 needed: Some(2 << 30),
                 allowed: Some(1 << 30),

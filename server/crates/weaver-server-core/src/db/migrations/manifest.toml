@@ -1850,3 +1850,20 @@ kind = "sql"
 file = "migrations/0129_torrent_file_stamps/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 130
+description = "a graph checkpoint keeps where a lifted member came from and the position its name ranks at"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0130_graph_member_lifted/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0130_graph_member_lifted/postgres.sql"
+engine = "postgres"
+scope = "all"

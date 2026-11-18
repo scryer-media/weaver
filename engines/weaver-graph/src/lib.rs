@@ -63,7 +63,8 @@ pub use object::{
     Posting, Standing,
 };
 pub use records::{
-    CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
+    CoverageRecord, CryptRecord, EnvelopeRecord, LiftRecord, MemberRecord, NodeRecord, NodeState,
+    TreeRecord,
 };
 pub use recovery::{Recovery, Segment, SliceVerdict};
 pub use seek::{Pull, Purpose, Seek, SeekUp, Weight, When};
