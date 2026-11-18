@@ -323,6 +323,10 @@ impl Object for RarRecord {
 }
 
 impl Recovery for RarRecord {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
     // The volume the record sits in, by the name it was bound under; once
     // found it stays the member while the namespace holds it, whatever it
     // is called since.

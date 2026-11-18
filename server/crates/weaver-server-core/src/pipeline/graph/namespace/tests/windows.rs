@@ -183,6 +183,10 @@ impl Object for Trail {
 }
 
 impl Recovery for Trail {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
     fn bind(&mut self, _: &mut weaver_graph::Namespace, _: &mut Vec<MemberId>) {
         self.tape.lock().unwrap().binds += 1;
     }

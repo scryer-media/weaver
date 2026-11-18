@@ -52,6 +52,10 @@ impl Object for Proven {
 }
 
 impl Recovery for Proven {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         true
     }

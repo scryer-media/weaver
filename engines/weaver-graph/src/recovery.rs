@@ -183,6 +183,11 @@ pub trait Recovery {
         false
     }
 
+    // Whether this object rebuilds what it covers, or only checks it. A set
+    // that only checks finds damage and repairs none of it, so its volumes
+    // are no data to repair with.
+    fn rebuilds(&self) -> bool;
+
     // Evidence as bytes pass: the namespace calls this for every covered
     // member on every delivery and every repair. It is where a ruling is
     // taken back for its input: bytes said again keep it when they are what
