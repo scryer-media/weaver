@@ -362,7 +362,7 @@ function listPhrase(t: Translate, list: Pick<DnsServerList, "name" | "servers">)
   return [list.name, ...wires.map((wire) => t(`next.dns.wireShort.${wire}`))].join(" ");
 }
 
-/** A profile in one line, such as "Weaver · Quad9 TLS · Via the proxy · Validate here". A proxy's name has no transit. */
+/** A profile in one line, such as "Weaver · Quad9 TLS · Via the proxy · DNSSEC on". A proxy's name has no transit. */
 export function profileSummary(
   t: Translate,
   profile: Pick<DnsProfile, "kind" | "who" | "trust" | "serverListId"> & Partial<Pick<DnsProfile, "transit" | "systemFallback">>,

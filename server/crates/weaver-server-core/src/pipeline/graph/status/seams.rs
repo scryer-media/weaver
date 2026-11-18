@@ -674,6 +674,7 @@ impl Pipeline {
         // A file with an unwanted extension the policy deletes is no file
         // of the delivery: the final move leaves it out.
         let mut delivery = delivery;
+        delivery.password_given = job.has_passwords();
         if let Some(policy) = job.writer().removes() {
             delivery.remove_unwanted(|name| policy.removes(name));
         }

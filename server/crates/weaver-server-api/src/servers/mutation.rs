@@ -259,22 +259,26 @@ impl ServersMutation {
             };
         {
             // No data-used batch is written while the rows move, and what the
-            // ledger still holds of this server follows them.
+            // ledger still holds of this server follows them. The hold, the
+            // delete and the retire run in one blocking task, which runs to
+            // its end even when this request goes away after the delete.
             let recorder = usage_recorder(ctx);
-            let _usage_writes = match &recorder {
-                Some(recorder) => Some(recorder.hold_writes().await),
-                None => None,
-            };
             let db = db.clone();
             let removal = spawn_blocking_db("servers.mutation.remove_server.persist", move || {
-                db.delete_server_at(id, chrono::Local::now())
+                let _usage_writes = recorder
+                    .as_deref()
+                    .map(weaver_server_core::operations::UsageRecorder::hold_writes_blocking);
+                let removal = db.delete_server_at(id, chrono::Local::now())?;
+                if removal.removed
+                    && let Some(recorder) = &recorder
+                {
+                    recorder.retire_server(id, removal.kept_usage.as_deref());
+                }
+                Ok::<_, weaver_server_core::StateError>(removal)
             })
             .await?;
             if !removal.removed {
                 return Err(async_graphql::Error::new(format!("server {id} not found")));
-            }
-            if let Some(recorder) = &recorder {
-                recorder.retire_server(id, removal.kept_usage.as_deref());
             }
         }
 

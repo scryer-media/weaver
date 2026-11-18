@@ -11,6 +11,7 @@
 use bytes::Bytes;
 use weaver_graph::{Effect, MemberId, NodeId, Posted, Provenance, Tree, VolumeIndex, Why};
 
+use super::super::counts;
 use super::writer::{Item, Options, Version, write};
 use super::{find, items, split};
 use crate::Objects;
@@ -27,6 +28,8 @@ struct Run {
     // Where the owner has handed over to: effects before it are done.
     done: usize,
     handed: usize,
+    // How many hand-overs the run may make before it counts as unsettled.
+    enough: usize,
 }
 
 impl Run {
@@ -36,6 +39,7 @@ impl Run {
             effects: Vec::new(),
             done: 0,
             handed: 0,
+            enough: ENOUGH,
         }
     }
 
@@ -72,7 +76,7 @@ impl Run {
     // The owner hands each member bound since over to its object, as the
     // server's namespace does on every `Bound`, until no new one comes.
     fn hand_over(&mut self) {
-        while self.handed < ENOUGH {
+        while self.handed < self.enough {
             let Some(member) = self.effects[self.done..]
                 .iter()
                 .find_map(|effect| match effect {
@@ -325,4 +329,151 @@ fn two_volumes_numbered_far_out_say_no_gap_for_every_number_before_them() {
             ..
         }
     )));
+}
+
+// A six-volume set posted under a release's `part01` to `part06`, its true
+// last volume as `part05` and its true fifth as `part06`, each renamed by
+// a recovery set to its true one-digit `<stem>.partN.rar` as soon as its
+// front is bound, as the bench post's PAR2 volumes renamed them. Fronts
+// come in posted order, the rest of each volume after. Every volume is one
+// store's, at its true place.
+#[test]
+fn a_set_renamed_from_swapped_posted_numbers_is_one_store() {
+    for (version, whole) in [
+        (Version::Rar4, false),
+        (Version::Rar5, false),
+        (Version::Rar4, true),
+        (Version::Rar5, true),
+    ] {
+        let mut options = super::split(version);
+        options.split = Some(10_000);
+        let set = write(&[Item::File("track.flac", payload(9, 57_000))], &options);
+        assert_eq!(set.len(), 6, "{version:?}");
+        let mut run = Run::new();
+        // Posted number, true volume.
+        let posted = [(1, 0), (2, 1), (3, 2), (4, 3), (5, 5), (6, 4)];
+        // The job lists every file before any byte arrives.
+        let mut members = [MemberId(0); 6];
+        for (number, volume) in posted {
+            members[volume] =
+                run.announce(&format!("Release.part{number:02}.rar"), set[volume].len());
+        }
+        let rest = |run: &mut Run, volume: usize| {
+            let at = front(&set[volume]).len();
+            run.deliver(members[volume], at, &set[volume][at..]);
+            run.close(members[volume]);
+        };
+        for (_, volume) in posted {
+            let member = members[volume];
+            run.deliver(member, 0, front(&set[volume]));
+            run.tree.rename(
+                NodeId::ROOT,
+                member,
+                &format!("5Kw2CyRs.part{}.rar", volume + 1),
+                &mut Objects::default(),
+                &mut run.effects,
+            );
+            run.hand_over();
+            if whole {
+                rest(&mut run, volume);
+            }
+        }
+        if !whole {
+            for (_, volume) in posted {
+                rest(&mut run, volume);
+            }
+        }
+        let places: Vec<_> = members
+            .iter()
+            .map(|member| run.tree.child_of(NodeId::ROOT, *member))
+            .collect();
+        let store = places[0].map(|(node, _)| node);
+        for (volume, place) in places.iter().enumerate() {
+            assert_eq!(
+                *place,
+                store.map(|node| (node, VolumeIndex(volume as u32))),
+                "{version:?} whole {whole} volume {volume}: {places:?}"
+            );
+        }
+    }
+}
+
+// A long RAR4 set whose end records state no number, its last two volumes
+// posted under each other's numbers: the layout refutes the one held where
+// it is not once, and lays the set again once, however many volumes it
+// holds and however its bytes come in after. Its rest comes in small pieces
+// with no new header among them, as articles do. Renamed to their true
+// names, the two take their places, in one store.
+#[test]
+fn a_long_set_refuting_a_volume_lays_it_again_once() {
+    const VOLUMES: usize = 300;
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(5_000);
+    let set = write(
+        &[Item::File("track.flac", payload(9, VOLUMES * 5_000 - 700))],
+        &options,
+    );
+    assert_eq!(set.len(), VOLUMES);
+    let mut run = Run::new();
+    run.enough = 4 * VOLUMES;
+    let posted: Vec<usize> = (0..VOLUMES)
+        .map(|volume| match volume {
+            _ if volume == VOLUMES - 2 => VOLUMES - 1,
+            _ if volume == VOLUMES - 1 => VOLUMES - 2,
+            _ => volume,
+        })
+        .collect();
+    let mut members = vec![MemberId(0); VOLUMES];
+    for (number, volume) in posted.iter().enumerate() {
+        members[*volume] = run.announce(
+            &format!("Release.part{:03}.rar", number + 1),
+            set[*volume].len(),
+        );
+    }
+    counts::take();
+    for volume in &posted {
+        run.deliver(members[*volume], 0, front(&set[*volume]));
+    }
+    for volume in &posted {
+        let bytes = &set[*volume];
+        let mut at = front(bytes).len();
+        while at < bytes.len() {
+            let to = (at + 256).min(bytes.len());
+            run.deliver(members[*volume], at, &bytes[at..to]);
+            at = to;
+        }
+        run.close(members[*volume]);
+    }
+    let counted = counts::take();
+    // Each volume is laid on what its front says, again on what its end
+    // says, and once more in the one layout laid again short of the refuted
+    // volume: three times, not once for every piece that came in after.
+    assert_eq!(counted.cut, 1, "{counted:?}");
+    assert!(
+        counted.asked.len() <= 3 * VOLUMES,
+        "{}",
+        counted.asked.len()
+    );
+    for volume in [VOLUMES - 2, VOLUMES - 1] {
+        run.tree.rename(
+            NodeId::ROOT,
+            members[volume],
+            &format!("5Kw2CyRs.part{}.rar", volume + 1),
+            &mut Objects::default(),
+            &mut run.effects,
+        );
+        run.hand_over();
+    }
+    let store = run
+        .tree
+        .child_of(NodeId::ROOT, members[0])
+        .map(|(node, _)| node);
+    assert!(store.is_some());
+    for (volume, member) in members.iter().enumerate() {
+        assert_eq!(
+            run.tree.child_of(NodeId::ROOT, *member),
+            store.map(|node| (node, VolumeIndex(volume as u32))),
+            "volume {volume}"
+        );
+    }
 }

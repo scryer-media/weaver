@@ -4,9 +4,7 @@
 use std::path::PathBuf;
 
 use crate::StateError;
-use crate::history::model::{
-    HistoryEditFields, HistoryFilter, HistoryOrder, HistoryOrderKey, HistoryRows,
-};
+use crate::history::model::{HistoryEditFields, HistoryFilter, HistoryOrder, HistoryOrderKey};
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, max_rows_for_engine};
@@ -427,7 +425,6 @@ impl Database {
     pub fn list_job_history(
         &self,
         filter: &HistoryFilter,
-        rows: HistoryRows,
     ) -> Result<Vec<JobHistoryRow>, StateError> {
         let datastore = self.datastore();
         let (base, ids) = split_history_ids(datastore.engine(), filter);
@@ -445,7 +442,7 @@ impl Database {
             };
             let mut page = match &ids {
                 HistoryIdSplit::Whole => {
-                    return fetch_history_rows(&datastore, &base, rows).await;
+                    return fetch_history_rows(&datastore, &base).await;
                 }
                 HistoryIdSplit::In(chunks) => {
                     let mut page = Vec::new();
@@ -454,14 +451,13 @@ impl Database {
                             item_ids: Some(chunk.clone()),
                             ..through(0)
                         };
-                        page.extend(fetch_history_rows(&datastore, &filter, rows).await?);
+                        page.extend(fetch_history_rows(&datastore, &filter).await?);
                     }
                     sort_history_rows(base.order, &mut page);
                     page
                 }
                 HistoryIdSplit::NotIn(excluded, _) => {
-                    let mut page =
-                        fetch_history_rows(&datastore, &through(excluded.len()), rows).await?;
+                    let mut page = fetch_history_rows(&datastore, &through(excluded.len())).await?;
                     page.retain(|row| excluded.binary_search(&row.job_id).is_err());
                     page
                 }
@@ -474,17 +470,13 @@ impl Database {
         })
     }
 
-    pub fn count_job_history(
-        &self,
-        filter: &HistoryFilter,
-        rows: HistoryRows,
-    ) -> Result<u32, StateError> {
+    pub fn count_job_history(&self, filter: &HistoryFilter) -> Result<u32, StateError> {
         let datastore = self.datastore();
         let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
             let mut count = 0i64;
             for (filter, sign) in ids.statements(&base) {
-                count += sign * count_history_rows(&datastore, &filter, rows).await?;
+                count += sign * count_history_rows(&datastore, &filter).await?;
             }
             Ok(count.max(0) as u32)
         })
@@ -500,15 +492,13 @@ impl Database {
     pub fn count_job_history_by_category(
         &self,
         filter: &HistoryFilter,
-        rows: HistoryRows,
     ) -> Result<Vec<(String, u32)>, StateError> {
         let datastore = self.datastore();
         let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
             let mut counts = std::collections::BTreeMap::<String, i64>::new();
             for (filter, sign) in ids.statements(&base) {
-                for (category, count) in
-                    count_history_rows_by_category(&datastore, &filter, rows).await?
+                for (category, count) in count_history_rows_by_category(&datastore, &filter).await?
                 {
                     *counts.entry(category).or_default() += sign * count;
                 }
@@ -815,6 +805,9 @@ fn append_history_row_filter_predicates(
             }
         }
     }
+    if filter.nzbget_shown_only {
+        sql.push_str(" AND h.nzbget_hidden = 0");
+    }
 }
 
 // The LIKE pattern that finds `needle` anywhere in a name.
@@ -1035,14 +1028,12 @@ fn split_history_ids(
 async fn fetch_history_rows(
     datastore: &crate::persistence::sql_runtime::StoreDatastore,
     filter: &HistoryFilter,
-    rows: HistoryRows,
 ) -> Result<Vec<JobHistoryRow>, StateError> {
     let mut sql = String::from(JOB_HISTORY_SELECT_ALIASED);
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
     append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
-    append_history_visibility(&mut sql, rows);
     sql.push_str(&history_order_sql(filter.order, datastore.engine()));
 
     append_history_pagination(&mut sql, &mut args, filter);
@@ -1054,14 +1045,12 @@ async fn fetch_history_rows(
 async fn count_history_rows(
     datastore: &crate::persistence::sql_runtime::StoreDatastore,
     filter: &HistoryFilter,
-    rows: HistoryRows,
 ) -> Result<i64, StateError> {
     let mut sql = String::from("SELECT COUNT(*) AS count FROM ");
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
     append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
-    append_history_visibility(&mut sql, rows);
 
     Ok(
         SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
@@ -1075,7 +1064,6 @@ async fn count_history_rows(
 async fn count_history_rows_by_category(
     datastore: &crate::persistence::sql_runtime::StoreDatastore,
     filter: &HistoryFilter,
-    rows: HistoryRows,
 ) -> Result<Vec<(String, i64)>, StateError> {
     let mut sql =
         String::from("SELECT COALESCE(h.category, '') AS category, COUNT(*) AS count FROM ");
@@ -1083,7 +1071,6 @@ async fn count_history_rows_by_category(
 
     append_history_from_clause(&mut sql, &mut args, filter);
     append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
-    append_history_visibility(&mut sql, rows);
 
     sql.push_str(" GROUP BY COALESCE(h.category, '')");
 
@@ -1091,13 +1078,6 @@ async fn count_history_rows_by_category(
     rows.into_iter()
         .map(|row| Ok((row.text("category")?, row.i64("count")?)))
         .collect()
-}
-
-// The one visibility predicate every history listing and count shares.
-fn append_history_visibility(sql: &mut String, rows: HistoryRows) {
-    if rows == HistoryRows::Shown {
-        sql.push_str(" AND h.nzbget_hidden = 0");
-    }
 }
 
 fn append_history_pagination(sql: &mut String, args: &mut Vec<SqlArg>, filter: &HistoryFilter) {
@@ -1362,13 +1342,10 @@ mod order_index_tests {
             vec!["failed", "partial", "complete", "cancelled"],
         ] {
             let full = db
-                .list_job_history(
-                    &HistoryFilter {
-                        statuses: Some(statuses.iter().map(|status| status.to_string()).collect()),
-                        ..Default::default()
-                    },
-                    HistoryRows::All,
-                )
+                .list_job_history(&HistoryFilter {
+                    statuses: Some(statuses.iter().map(|status| status.to_string()).collect()),
+                    ..Default::default()
+                })
                 .unwrap()
                 .into_iter()
                 .map(|row| row.job_id)
@@ -1392,15 +1369,19 @@ mod order_index_tests {
             HistoryOrderKey::Category,
         ];
         // A search is a substring of the name, which no index seeks, so a
-        // searched page walks its order's index and stops at the page.
-        for (key, search) in keys
+        // searched page walks its order's index and stops at the page. The
+        // same holds for Weaver's listing, which reads every row, and for the
+        // NZBGet facade's, which leaves out the rows it hid.
+        for ((key, search), nzbget_shown_only) in keys
             .into_iter()
             .flat_map(|key| [(key, None), (key, Some("release".to_string()))])
+            .flat_map(|pair| [(pair.clone(), false), (pair, true)])
         {
             for descending in [true, false] {
                 let order = HistoryOrder { key, descending };
                 let filter = HistoryFilter {
                     name_contains: search.clone(),
+                    nzbget_shown_only,
                     ..Default::default()
                 };
                 let mut sql =
@@ -1412,7 +1393,6 @@ mod order_index_tests {
                     &filter,
                     SqlEngine::Sqlite,
                 );
-                append_history_visibility(&mut sql, HistoryRows::Shown);
                 sql.push_str(&history_order_sql(order, SqlEngine::Sqlite));
                 sql.push_str(" LIMIT 25");
                 let datastore = db.datastore();
@@ -1428,11 +1408,11 @@ mod order_index_tests {
                     .join("; ");
                 assert!(
                     detail.contains("USING INDEX") || detail.contains("USING COVERING INDEX"),
-                    "{order:?} {search:?}: {detail}"
+                    "{order:?} {search:?} {nzbget_shown_only}: {detail}"
                 );
                 assert!(
                     !detail.contains("TEMP B-TREE"),
-                    "{order:?} {search:?}: {detail}"
+                    "{order:?} {search:?} {nzbget_shown_only}: {detail}"
                 );
             }
         }
@@ -1513,7 +1493,7 @@ mod order_index_tests {
                     order,
                     ..Default::default()
                 };
-                let read = db.list_job_history(&filter, HistoryRows::All).unwrap();
+                let read = db.list_job_history(&filter).unwrap();
                 let mut sorted = read.clone();
                 sort_history_rows(order, &mut sorted);
                 let ids =

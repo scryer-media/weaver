@@ -246,6 +246,83 @@ pub(super) fn format_yenc_layout_mismatch(
     )
 }
 
+// Both sides of a placement conflict: what this article's own headers claim,
+// what the NZB allows for its segment, and where the segment it runs into was
+// placed. Built only when an article is refused.
+#[cold]
+#[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one cold diagnostic names every compared value"
+)]
+pub(super) fn format_yenc_layout_conflict(
+    segment: u32,
+    offset: u64,
+    len: u32,
+    actual: YencLayoutAssertions,
+    name: &str,
+    expected: ExpectedSegmentLayout,
+    other: u32,
+    other_placement: Option<(u64, u32)>,
+) -> String {
+    let other_range = other_placement.map_or_else(
+        || "an unplaced range".to_string(),
+        |(other_offset, other_len)| {
+            format!(
+                "[{other_offset}, {})",
+                other_offset.saturating_add(u64::from(other_len))
+            )
+        },
+    );
+    format!(
+        "yEnc layout conflict: segment {segment} claims [{offset}, {}) which runs into segment {other} placed at {other_range}; its headers say name={name:?} size={} part={:?} total={:?} begin={:?} end={:?}; the NZB allows offset<={} size<={} part={}/{}",
+        offset.saturating_add(u64::from(len)),
+        actual.file_size,
+        actual.part,
+        actual.total,
+        actual.begin,
+        actual.end,
+        expected.max_file_offset,
+        expected.max_file_size,
+        expected.part,
+        expected.total,
+    )
+}
+
+// A placement withdrawn because a later article the NZB vouches for
+// contradicts it. The withdrawn article's own headers are not kept, so the
+// line names its placement and envelope, and the headers of the article that
+// contradicts it.
+#[cold]
+#[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one cold diagnostic names every compared value"
+)]
+pub(super) fn format_withdrawn_placement(
+    withdrawn: u32,
+    withdrawn_offset: u64,
+    withdrawn_len: u32,
+    withdrawn_expected: ExpectedSegmentLayout,
+    contradicting: u32,
+    contradicting_offset: u64,
+    contradicting_len: u32,
+    contradicting_actual: YencLayoutAssertions,
+) -> String {
+    format!(
+        "yEnc layout conflict: segment {withdrawn} claims [{withdrawn_offset}, {}) past what the NZB allows for it (offset<={} size<={}), which segment {contradicting} contradicts at [{contradicting_offset}, {}) with headers size={} part={:?} total={:?} begin={:?} end={:?}",
+        withdrawn_offset.saturating_add(u64::from(withdrawn_len)),
+        withdrawn_expected.max_file_offset,
+        withdrawn_expected.max_file_size,
+        contradicting_offset.saturating_add(u64::from(contradicting_len)),
+        contradicting_actual.file_size,
+        contradicting_actual.part,
+        contradicting_actual.total,
+        contradicting_actual.begin,
+        contradicting_actual.end,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +351,84 @@ mod tests {
             begin: Some(expected.max_file_offset + 1),
             end: Some(expected.max_file_offset + u64::from(expected.max_decoded_size)),
         }
+    }
+
+    // A refused article's line names what its headers claim, what the NZB
+    // allows for its segment, and where the segment it runs into sits. The
+    // header is shaped like an article another post carries under a reused
+    // message-id: its own size admits the far range, the NZB does not.
+    #[test]
+    fn a_refused_placement_names_both_sides() {
+        let actual = YencLayoutAssertions {
+            file_size: 181_790_224,
+            part: Some(555),
+            total: Some(556),
+            begin: Some(180_993_553),
+            end: Some(181_391_888),
+        };
+        let expected = ExpectedSegmentLayout {
+            max_file_offset: 793_082,
+            max_decoded_size: 793_082,
+            max_file_size: 3_111_976,
+            part: 2,
+            total: 4,
+        };
+        let line = format_yenc_layout_conflict(
+            1,
+            180_993_552,
+            398_336,
+            actual,
+            "3e4d16ff2f415130",
+            expected,
+            3,
+            Some((2_625_536, 398_336)),
+        );
+        assert_eq!(
+            line,
+            "yEnc layout conflict: segment 1 claims [180993552, 181391888) which runs into \
+             segment 3 placed at [2625536, 3023872); its headers say name=\"3e4d16ff2f415130\" \
+             size=181790224 part=Some(555) total=Some(556) begin=Some(180993553) \
+             end=Some(181391888); the NZB allows offset<=793082 size<=3111976 part=2/4"
+        );
+        let unplaced = format_yenc_layout_conflict(1, 0, 4, actual, "x", expected, 0, None);
+        assert!(unplaced.contains("segment 0 placed at an unplaced range"));
+    }
+
+    // A withdrawn placement's line names its range and envelope, and the
+    // headers of the article that contradicts it.
+    #[test]
+    fn a_withdrawn_placement_names_both_sides() {
+        let expected = ExpectedSegmentLayout {
+            max_file_offset: 0,
+            max_decoded_size: 793_082,
+            max_file_size: 25_769_203,
+            part: 1,
+            total: 33,
+        };
+        let contradicting = YencLayoutAssertions {
+            file_size: 25_000_000,
+            part: Some(2),
+            total: Some(33),
+            begin: Some(768_001),
+            end: Some(1_536_000),
+        };
+        let line = format_withdrawn_placement(
+            0,
+            3_023_872,
+            258_048,
+            expected,
+            1,
+            768_000,
+            768_000,
+            contradicting,
+        );
+        assert_eq!(
+            line,
+            "yEnc layout conflict: segment 0 claims [3023872, 3281920) past what the NZB \
+             allows for it (offset<=0 size<=25769203), which segment 1 contradicts at \
+             [768000, 1536000) with headers size=25000000 part=Some(2) total=Some(33) \
+             begin=Some(768001) end=Some(1536000)"
+        );
     }
 
     #[test]

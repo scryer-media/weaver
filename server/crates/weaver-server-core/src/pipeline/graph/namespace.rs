@@ -1032,11 +1032,19 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let end = BatchEnd::of(effects);
-        for effect in effects.drain(..) {
+        // What the delivery that bound a member gave its new object is in no
+        // file from the first effect of the batch on, not only once the
+        // batch ends: an object refused in the same batch hands those bytes
+        // on from itself, as the hand-over reads the file around them.
+        let depth = self.reached_now.len();
+        self.reached_now.extend(end.reached.iter().copied());
+        let applied = effects.drain(..).try_for_each(|effect| {
             self.apply(tree, builder, segments, effect, write, out)?;
-            self.apply_unnamed(tree, builder, segments, out)?;
-        }
-        self.finish_batch(tree, builder, segments, end, out)
+            self.apply_unnamed(tree, builder, segments, out)
+        });
+        let finished = applied.and_then(|()| self.finish_batch(tree, builder, segments, end, out));
+        self.reached_now.truncate(depth);
+        finished
     }
 
     // What a batch leaves to do once every effect of it is applied.
@@ -1049,24 +1057,16 @@ impl NamespaceWriter {
             bound,
             folded,
             given_back,
-            reached,
+            ..
         }: BatchEnd,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         if given_back {
             self.prune(tree)?;
         }
-        let depth = self.reached_now.len();
-        self.reached_now.extend(reached);
-        let mut handed = Ok(());
         for (node, member, child) in bound {
-            handed = self.hand_over(tree, builder, segments, (node, member), child, out);
-            if handed.is_err() {
-                break;
-            }
+            self.hand_over(tree, builder, segments, (node, member), child, out)?;
         }
-        self.reached_now.truncate(depth);
-        handed?;
         for (node, copy, held) in folded {
             self.fold_over(tree, builder, segments, (node, copy), &held, out)?;
         }

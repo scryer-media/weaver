@@ -799,7 +799,8 @@ fn a_posted_file_that_never_arrived_is_what_its_name_says() {
 
 // A member withheld by its object's refusal is neither whole nor short:
 // nothing whole beside it fails the job, worded by the refusal, one wording
-// for a password whether it shut the bytes or the headers, its names sorted
+// for a password whether it shut the bytes or the headers, and another for
+// a password given that opened nothing, its names sorted
 // whatever order the objects refused in.
 #[test]
 fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
@@ -812,11 +813,24 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
         ..Delivery::default()
     };
     let password = "WEAVER_PASSWORD_REQUIRED: lantern.rar needs a password and none was given";
+    // Given a password that opens nothing, the wording says so.
+    let wrong =
+        "WEAVER_PASSWORD_REQUIRED: lantern.rar needs a password and no password given opens it";
     for why in [Why::Encrypted, Why::EncryptedHeader] {
         assert_eq!(
             withheld(&[], &[("lantern.rar", why)]).status(None),
             JobStatus::Failed {
                 error: password.to_string()
+            }
+        );
+        let given = Delivery {
+            password_given: true,
+            ..withheld(&[], &[("lantern.rar", why)])
+        };
+        assert_eq!(
+            given.status(None),
+            JobStatus::Failed {
+                error: wrong.to_string()
             }
         );
     }

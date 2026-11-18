@@ -84,6 +84,10 @@ impl Object for Tape {
 }
 
 impl Recovery for Tape {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         false
     }

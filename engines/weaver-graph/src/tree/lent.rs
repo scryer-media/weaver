@@ -30,6 +30,8 @@ pub(super) struct Lent {
     covers: Vec<MemberId>,
     // Its `Recovery::precedence` when it left.
     precedence: u8,
+    // Its `Recovery::rebuilds` when it left.
+    rebuilds: bool,
     waiting: Vec<Waiting>,
     // Members that could not be asked whether they are its volumes, in the
     // order they asked.
@@ -115,7 +117,8 @@ impl Tree {
     // Lend the recovery object at `node` out of the tree. `None` when the
     // node holds no recovery object.
     pub fn lend(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
-        let precedence = self.recovery(node)?.precedence();
+        let recovery = self.recovery(node)?;
+        let (precedence, rebuilds) = (recovery.precedence(), recovery.rebuilds());
         let covers = self
             .consult_recovery(node, |recovery, namespace| {
                 namespace
@@ -132,6 +135,7 @@ impl Tree {
             facts: Some(object.facts()),
             covers,
             precedence,
+            rebuilds,
             waiting: Vec::new(),
             queued: Vec::new(),
             work: false,
@@ -180,9 +184,9 @@ impl Tree {
 
     // Out of its node as if for its work, whatever it holds.
     fn lend_out(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
-        let precedence = self
-            .recovery(node)
-            .map_or(0, |recovery| recovery.precedence());
+        let (precedence, rebuilds) = self.recovery(node).map_or((0, false), |recovery| {
+            (recovery.precedence(), recovery.rebuilds())
+        });
         let found = self.nodes.get_mut(&node)?;
         let object = found.object.take()?;
         found.lent = Some(Lent {
@@ -190,6 +194,7 @@ impl Tree {
             facts: None,
             covers: Vec::new(),
             precedence,
+            rebuilds,
             waiting: Vec::new(),
             queued: Vec::new(),
             work: true,
@@ -230,6 +235,20 @@ impl Tree {
             .get(&node)
             .and_then(|found| found.lent.as_ref())
             .is_some_and(|lent| !lent.covers.is_empty())
+    }
+
+    // Whether the object at `node` is a recovery object that rebuilds what
+    // it covers (`Recovery::rebuilds`), as it left when it is out for a
+    // repair. Wherever `recovers` answers no, so does this.
+    pub fn rebuilds(&self, node: NodeId) -> bool {
+        match self.recovery(node) {
+            Some(recovery) => recovery.rebuilds(),
+            None => self
+                .nodes
+                .get(&node)
+                .and_then(|found| found.lent.as_ref())
+                .is_some_and(|lent| !lent.work && lent.rebuilds),
+        }
     }
 
     // The set's `Recovery::precedence`, as it left when it is out.

@@ -754,24 +754,28 @@ impl Pipeline {
     // take it there, the post has no verdict yet. Only a post the sample let
     // through is weighed by its health, at the failed bytes it lost or a
     // round projected it will, against its critical line: the recovery the
-    // names declare and the graph binds. A health verdict is held while a
-    // file nothing counts as recovery yet still has its first article to
-    // come and those files could still lift the post above the line, and
-    // given once each has arrived or been lost.
+    // names declare and the graph binds. The sample counts the same
+    // recovery: a named file by its name, any other by what the graph has
+    // bound. Either verdict is held while a file nothing counts as recovery
+    // yet still has its first article to come and those files could still
+    // save the post, and given once each has arrived or been lost.
     pub(in crate::pipeline) fn post_health_verdict(&mut self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) || !self.jobs.contains_key(&job_id) {
             return None;
         }
         let first_articles = self.read_first_articles(job_id)?;
         let spec = &self.jobs.get(&job_id)?.spec;
-        let verdict = match first_articles.gate() {
-            Gate::Undecided => None,
-            Gate::Dead { missing, total }
-                if first_articles.weighed().0 > first_articles.weighed().1 =>
-            {
-                Some(Some(first_article_verdict_error(missing, total)))
+        let verdict = match (first_articles.gate(), first_articles.dead()) {
+            (Gate::Undecided, _) => None,
+            // The gate is held as the line is: while a file nothing counts
+            // as recovery yet has its first article to come, and those
+            // files, were they all recovery, would keep the post alive.
+            (_, Some(_)) if first_articles.unresolved() > 0 && !first_articles.dead_at_reach() => {
+                self.post_probes.held.insert(job_id);
+                None
             }
-            Gate::Dead { .. } | Gate::Open => {
+            (_, Some((missing, total))) => Some(Some(first_article_verdict_error(missing, total))),
+            (Gate::Dead { .. } | Gate::Open, None) => {
                 match self.health_verdict(job_id, spec, first_articles.recovery()) {
                     Some(_)
                         if first_articles.unresolved() > 0
@@ -939,7 +943,24 @@ impl Pipeline {
             .zip(0u32..)
             .map(|(file, index)| (index, file, self.first_article(job_id, index, file)))
             .collect();
-        let payload = heads.iter().filter(|(_, file, _)| !declares_recovery(file));
+        let graph = self.graph_jobs.get(&job_id);
+        // A file the names count is weighed by its name, any other by what
+        // the graph holds it as.
+        let gate_recovery = |index: u32, file: &FileSpec| {
+            if names_recovery(file) {
+                declares_recovery(file)
+            } else {
+                graph.is_some_and(|graph| graph.holds_as_recovery(index))
+            }
+        };
+        let unresolved_at = |index: u32, file: &FileSpec, head: Head| {
+            head == Head::Outstanding
+                && !names_recovery(file)
+                && !graph.is_some_and(|graph| graph.holds_as_recovery(index))
+        };
+        let payload = heads
+            .iter()
+            .filter(|(index, file, _)| !gate_recovery(*index, file));
         match first_article_gate(payload.clone().map(|head| head.2)) {
             Gate::Undecided => return None,
             Gate::Open => {}
@@ -951,28 +972,46 @@ impl Pipeline {
                         .sum()
                 };
                 let lost: u64 = payload
+                    .clone()
                     .filter(|(_, _, head)| *head == Head::Lost)
                     .map(|(_, file, _)| bytes(file))
                     .sum();
                 let reachable: u64 = heads
                     .iter()
-                    .filter(|(_, file, head)| declares_recovery(file) && *head != Head::Lost)
+                    .filter(|(index, file, head)| {
+                        gate_recovery(*index, file) && *head != Head::Lost
+                    })
                     .map(|(_, file, _)| bytes(file))
                     .sum();
                 if lost > reachable {
-                    return Some(first_article_verdict_error(missing, total));
+                    let unresolved: Vec<(u32, u64)> = heads
+                        .iter()
+                        .filter(|(index, file, head)| unresolved_at(*index, file, *head))
+                        .map(|(index, file, _)| {
+                            (
+                                *index,
+                                bytes(file).saturating_sub(self.file_gone_bytes(job_id, *index)),
+                            )
+                        })
+                        .collect();
+                    let rest = payload
+                        .clone()
+                        .filter(|(index, file, head)| !unresolved_at(*index, file, *head))
+                        .map(|head| head.2);
+                    let reach: u64 = unresolved.iter().map(|(_, reach)| reach).sum();
+                    let reaching = matches!(first_article_gate(rest), Gate::Dead { .. })
+                        && lost > reachable + reach;
+                    if unresolved.is_empty() || reaching {
+                        return Some(first_article_verdict_error(missing, total));
+                    }
+                    return None;
                 }
             }
         }
-        let graph = self.graph_jobs.get(&job_id);
         let recovery = self.recovery_walked(job_id, spec);
         let unresolved: Vec<u64> = heads
             .iter()
-            .filter(|(index, file, head)| {
-                *head == Head::Outstanding
-                    && !names_recovery(file)
-                    && !graph.is_some_and(|graph| graph.holds_as_recovery(*index))
-            })
+            .filter(|(index, file, head)| unresolved_at(*index, file, *head))
             .map(|(index, file, _)| {
                 file.segments
                     .iter()

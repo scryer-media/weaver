@@ -17,6 +17,8 @@
 // A turn is a permit of a `tokio::sync::Semaphore`: taken without waiting
 // when one is free, one compare-and-swap; waited for on the async runtime
 // by a caller that may not block, or on the calling thread by one that may.
+// A thread that waits hears its reader's stop (`TurnStop`): raising it ends
+// the wait at once, with no turn, and nothing polls for it.
 // The read itself runs on the thread that holds the turn: a turn hands
 // nothing to another thread. A torrent's reads take the same semaphore
 // through `weaver_torrent::storage::ReadTurns`, handed over once when the
@@ -25,8 +27,9 @@
 #[cfg(test)]
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
 use super::StorageKind;
 #[cfg(test)]
@@ -99,6 +102,17 @@ impl VolumeReads {
         }
     }
 
+    // As `owned_here`, or `None` once `stop` is raised: the wait ends then,
+    // with no turn. A free turn is taken as `owned_here` takes it.
+    pub(crate) fn owned_here_unless(&self, stop: &TurnStop) -> Option<OwnedSemaphorePermit> {
+        match Arc::clone(&self.turns).try_acquire_owned() {
+            Ok(turn) => Some(turn),
+            Err(_) => stop
+                .block_unless(Arc::clone(&self.turns).acquire_owned())
+                .map(|turn| turn.expect("a volume's read turns are never closed")),
+        }
+    }
+
     // A turn for one read, waited for on this thread. Never called on the
     // async runtime.
     pub(crate) fn one_here(&self) -> SemaphorePermit<'_> {
@@ -107,6 +121,16 @@ impl VolumeReads {
             Err(_) => {
                 block_here(self.turns.acquire()).expect("a volume's read turns are never closed")
             }
+        }
+    }
+
+    // As `one_here`, or `None` once `stop` is raised.
+    pub(crate) fn one_here_unless(&self, stop: &TurnStop) -> Option<SemaphorePermit<'_>> {
+        match self.turns.try_acquire() {
+            Ok(turn) => Some(turn),
+            Err(_) => stop
+                .block_unless(self.turns.acquire())
+                .map(|turn| turn.expect("a volume's read turns are never closed")),
         }
     }
 
@@ -151,6 +175,65 @@ fn block_here<F: Future>(future: F) -> F::Output {
     }
 }
 
+// A reader's stop, which a thread waiting for a turn hears: raising it wakes
+// every wait of the reader's at once, and a wait begun after it ends before
+// it starts. The path that stops the reader raises it, so nothing polls.
+#[derive(Debug, Default)]
+pub(crate) struct TurnStop {
+    raised: AtomicBool,
+    wake: Notify,
+    // How many waits have begun, for a test to wait on.
+    #[cfg(test)]
+    waits: (std::sync::Mutex<usize>, std::sync::Condvar),
+}
+
+impl TurnStop {
+    pub(crate) fn raise(&self) {
+        self.raised.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    pub(crate) fn raised(&self) -> bool {
+        self.raised.load(Ordering::Acquire)
+    }
+
+    // `future`, waited for on this thread, or `None` once the stop is
+    // raised. The wake is listened for before the flag is read, so a raise
+    // between the two is not missed.
+    fn block_unless<F: Future>(&self, future: F) -> Option<F::Output> {
+        block_here(async {
+            let mut raised = std::pin::pin!(self.wake.notified());
+            raised.as_mut().enable();
+            if self.raised() {
+                return None;
+            }
+            #[cfg(test)]
+            {
+                *self.waits.0.lock().unwrap() += 1;
+                self.waits.1.notify_all();
+            }
+            let mut future = std::pin::pin!(future);
+            std::future::poll_fn(|cx| {
+                if raised.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(None);
+                }
+                future.as_mut().poll(cx).map(Some)
+            })
+            .await
+        })
+    }
+
+    // Returns once `waits` waits have begun.
+    #[cfg(test)]
+    pub(crate) fn await_waiters(&self, waits: usize) {
+        let (begun, changed) = &self.waits;
+        let mut begun = begun.lock().unwrap();
+        while *begun < waits {
+            begun = changed.wait(begun).unwrap();
+        }
+    }
+}
+
 // One usenet reader's turns across a run of reads: a member's check, an
 // extraction's reads of its volumes, a repair's reads. On a volume with
 // more than one turn it takes one at its first read and keeps it, so a
@@ -180,6 +263,27 @@ impl Reading {
         read()
     }
 
+    // As `read`, or `None`, with nothing read, once `stop` is raised while
+    // the reader waits for a turn. A turn held or free is taken as `read`
+    // takes it.
+    pub(crate) fn read_unless<R>(
+        &mut self,
+        reads: &VolumeReads,
+        stop: &TurnStop,
+        read: impl FnOnce() -> R,
+    ) -> Option<R> {
+        if reads.spinning {
+            self.held = None;
+            let _turn = reads.one_here_unless(stop)?;
+            return Some(read());
+        }
+        if !self.holds(reads) {
+            self.held = None;
+            self.held = Some(reads.owned_here_unless(stop)?);
+        }
+        Some(read())
+    }
+
     // Whether a read of `reads` may go on in the turn held: one of a volume
     // with more than one turn, held already.
     pub(crate) fn holds(&self, reads: &VolumeReads) -> bool {
@@ -195,6 +299,12 @@ impl Reading {
     // before goes back.
     pub(crate) fn keep(&mut self, turn: OwnedSemaphorePermit) {
         self.held = Some(turn);
+    }
+
+    // The turn held, taken out for a read made away from the reader's lock,
+    // and kept again once it ends (`keep`).
+    pub(crate) fn lend(&mut self) -> Option<OwnedSemaphorePermit> {
+        self.held.take()
     }
 
     // The run waits on something other than the disk: the turn goes back
@@ -219,6 +329,37 @@ mod tests {
     use crate::operations::disk::StorageKind;
     use crate::operations::disk::volume::Volume;
     use crate::operations::disk::writer::{Create, OpenSteps, Opened, VolumeWriters};
+
+    // A thread waiting for a turn the volume's other readers hold returns
+    // with none once its stop is raised, and the turns stay with their
+    // holders. A wait begun after the raise ends before it waits.
+    #[test]
+    fn a_wait_for_a_turn_ends_when_its_stop_is_raised() {
+        for kind in [StorageKind::Solid, StorageKind::Rotational] {
+            let reads = Arc::new(VolumeReads::of(kind));
+            let held: Vec<_> = (0..reads.readers()).map(|_| reads.turn_here()).collect();
+            let stop = Arc::new(super::TurnStop::default());
+            let (owned, one) = {
+                let (reads, stop) = (Arc::clone(&reads), Arc::clone(&stop));
+                (
+                    std::thread::spawn({
+                        let (reads, stop) = (Arc::clone(&reads), Arc::clone(&stop));
+                        move || reads.owned_here_unless(&stop).is_none()
+                    }),
+                    std::thread::spawn(move || reads.one_here_unless(&stop).is_none()),
+                )
+            };
+            stop.await_waiters(2);
+            stop.raise();
+            assert!(owned.join().unwrap(), "{kind:?}");
+            assert!(one.join().unwrap(), "{kind:?}");
+            assert!(reads.owned_here_unless(&stop).is_none(), "{kind:?}");
+            assert_eq!(reads.turns().available_permits(), 0, "{kind:?}");
+            drop(held);
+            // A free turn is taken as before, stop or not.
+            assert!(reads.owned_here_unless(&stop).is_some(), "{kind:?}");
+        }
+    }
 
     // A spinning volume reads one at a time; any other, an unknown one
     // included, as many at once as a solid-state one.

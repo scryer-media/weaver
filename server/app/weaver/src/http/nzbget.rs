@@ -27,8 +27,8 @@ use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
-    Database, FieldUpdate, HistoryFilter, HistoryRows, JobId, JobStatus, JobUpdate,
-    RssSeenDecision, SchedulerError, SchedulerHandle,
+    Database, FieldUpdate, HistoryFilter, JobId, JobStatus, JobUpdate, RssSeenDecision,
+    SchedulerError, SchedulerHandle,
 };
 
 #[derive(Clone)]
@@ -1550,17 +1550,21 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let session_downloaded = metrics.bytes_downloaded;
     let average_rate = session_downloaded / uptime_secs.max(1);
     let arr_average_rate = average_rate.min(i32::MAX as u64);
+    let download_block = ctx.handle.get_download_block();
+    let config = ctx.config.read().await;
+    // Weaver's limit of 0 lets nothing through; NZBGet's 0 is no limit and it
+    // has no stopped rate, so a stop, saved or scheduled, reads as paused.
+    let download_stopped =
+        config.bandwidth.download_bps == Some(0) || download_block.speed_limit_in_force == Some(0);
     // NZBGet has no word for a speed test, so a speed test's hold reads as
     // DownloadPaused, the same as a manual pause.
-    let download_paused = ctx.handle.is_globally_paused();
-    let download_block = ctx.handle.get_download_block();
+    let download_paused = ctx.handle.is_globally_paused() || download_stopped;
     let quota_reached = matches!(
         download_block.kind,
         weaver_server_core::DownloadBlockKind::EgressQuota
             | weaver_server_core::DownloadBlockKind::ServerQuota
     );
-    let config = ctx.config.read().await;
-    // NZBGet reports no limit as 0.
+    // NZBGet reports no limit as 0; a stop is no limit beyond the pause.
     let download_limit = config.bandwidth.download_bps.unwrap_or(0);
     let arr_download_limit = download_limit.min(i32::MAX as u64);
     let scan_paused = config.watch_folder.scanning_paused;
@@ -1629,7 +1633,8 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "ServerPaused": download_paused,
         "DownloadPaused": download_paused,
         "Download2Paused": download_paused,
-        "ServerStandBy": !any_active,
+        // A stopped instance moves nothing, as a paused NZBGet stands by.
+        "ServerStandBy": !any_active || download_stopped,
         "PostPaused": ctx.handle.is_post_processing_paused(),
         "ScanPaused": scan_paused,
         "QuotaReached": quota_reached,
@@ -2180,17 +2185,13 @@ async fn history(
         .collect::<Vec<_>>();
     let db = ctx.db.clone();
     let (rows, facade_states) = tokio::task::spawn_blocking(move || {
-        let rows = db.list_job_history(
-            &HistoryFilter {
-                limit: Some(1000),
-                ..HistoryFilter::default()
-            },
-            if include_hidden {
-                HistoryRows::All
-            } else {
-                HistoryRows::Shown
-            },
-        )?;
+        // A row a HistoryDelete hid leaves this listing only; Weaver's own
+        // history still shows it.
+        let rows = db.list_job_history(&HistoryFilter {
+            limit: Some(1000),
+            nzbget_shown_only: !include_hidden,
+            ..HistoryFilter::default()
+        })?;
         let ids = rows
             .iter()
             .map(|row| row.job_id)
@@ -2926,6 +2927,7 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         "groupsetname" | "historysetname" if request.param.trim().is_empty() => {
             return Ok(json!(false));
         }
+        "historydelete" => return archive_history(ctx, &request).await,
         _ => {}
     }
 
@@ -2975,7 +2977,6 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             "groupsetdupemode" => {
                 set_job_parameter(ctx, job_id, "nzbget.dupe_mode", &request.param).await
             }
-            "historydelete" => hide_history(ctx, job_id).await,
             "historyfinaldelete" => ctx.handle.delete_history(job_id, false).await.map(|_| ()),
             "historyreturn" | "historyredownload" => ctx.handle.redownload_job(job_id).await,
             "historyprocess" => ctx.handle.reprocess_job(job_id).await,
@@ -3029,20 +3030,38 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     Ok(json!(applied > 0))
 }
 
-// HistoryDelete hides the row from the client's default history listing but
-// keeps it, so duplicate checks still see the release. HistoryFinalDelete
-// erases it.
-async fn hide_history(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(), SchedulerError> {
+// HistoryDelete archives the rows: each is hidden from the client's default
+// history listing but kept, so duplicate checks and Weaver's own history
+// still see the release, and the files Weaver manages for it are removed by
+// the archive worker. One write hides every row of the request, and one
+// archive operation takes them all. HistoryFinalDelete erases a row.
+//
+// Nothing here waits on the pipeline: both writes are the database's, and the
+// worker removes the files on its own turn.
+async fn archive_history(
+    ctx: &NzbgetFacadeContext,
+    request: &EditQueueRequest,
+) -> Result<Value, RpcError> {
+    let ids: Vec<u64> = request.ids.iter().map(|id| id.0).collect();
     let db = ctx.db.clone();
-    let found = tokio::task::spawn_blocking(move || db.set_nzbget_history_hidden(job_id.0, true))
-        .await
-        .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
-        .map_err(SchedulerError::from)?;
-    if found {
-        Ok(())
-    } else {
-        Err(SchedulerError::JobNotFound(job_id))
+    let hidden = tokio::task::spawn_blocking(move || {
+        let hidden = db.set_nzbget_history_rows_hidden(&ids, true)?;
+        if hidden > 0 {
+            db.accept_archive_history(&ids)?;
+        }
+        Ok::<_, weaver_server_core::StateError>(hidden)
+    })
+    .await
+    .map_err(|error| RpcError::invalid_parameter(format!("{} failed: {error}", request.command)))?
+    .map_err(|error| RpcError::invalid_parameter(format!("{} failed: {error}", request.command)))?;
+    if hidden < request.ids.len() as u64 {
+        tracing::debug!(
+            command = %request.command,
+            applied = hidden,
+            "editqueue named ids with no history row"
+        );
     }
+    Ok(json!(hidden > 0))
 }
 
 async fn group_final_delete(

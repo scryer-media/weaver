@@ -896,6 +896,65 @@ async fn remove_server() {
     assert!(remaining.is_empty());
 }
 
+// A removal whose request goes away once the delete has started still tells
+// the data used recorder: a server with a quota keeps its rows until the
+// reset, and the next batch asks when they go.
+#[tokio::test]
+async fn remove_server_dropped_mid_delete_still_retires_its_usage() {
+    use weaver_server_core::operations::UsageReading;
+
+    let h = TestHarness::new_with_usage_recorder().await;
+    let recorder = h.usage_recorder.clone().expect("harness has a recorder");
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false,
+                    downloadQuota: { enabled: true, limitBytes: 9000000, period: MONTHLY }
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addServer"]["id"].as_u64().unwrap();
+    let today = chrono::Local::now().date_naive();
+    recorder.prime(&UsageReading::default(), 1_000);
+    recorder.note_next_expiry(None);
+    assert_eq!(recorder.take(today).expire_removed_at, None);
+
+    let blocker = BlockingDbOperation::new("servers.mutation.remove_server.persist");
+    let schema = h.schema.clone();
+    let mutation = tokio::spawn(async move {
+        schema
+            .execute(local_request(format!(
+                r#"mutation {{ removeServer(id: {id}) {{ id }} }}"#
+            )))
+            .await
+    });
+    blocker.wait_until_started().await;
+    mutation.abort();
+    assert!(mutation.await.unwrap_err().is_cancelled());
+    blocker.release();
+
+    // The delete holds the writes until the retire is done: once the row is
+    // gone, the next hold comes after the retire.
+    while h
+        .db
+        .list_servers()
+        .unwrap()
+        .iter()
+        .any(|server| u64::from(server.id) == id)
+    {
+        tokio::task::yield_now().await;
+    }
+    drop(recorder.hold_writes().await);
+    assert_eq!(recorder.take(today).expire_removed_at, Some(1_000));
+}
+
 #[tokio::test]
 async fn remove_nonexistent_server() {
     let h = TestHarness::new().await;

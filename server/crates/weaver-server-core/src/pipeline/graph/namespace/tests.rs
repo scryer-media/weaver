@@ -467,6 +467,10 @@ impl Object for Par {
 }
 
 impl Recovery for Par {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
     fn bind(&mut self, namespace: &mut weaver_graph::Namespace, renamed: &mut Vec<MemberId>) {
         let covered = (self.volume, self.others.clone());
         self.volume = namespace.find_by_name("set.par2").map(|own| own.id);
