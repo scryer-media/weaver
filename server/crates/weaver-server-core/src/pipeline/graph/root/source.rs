@@ -210,11 +210,12 @@ struct Volume {
     // The ordinals of the articles arrived at each decoded start. The last
     // of them holds the segments from that start to the next one.
     starts: BTreeMap<u64, BTreeSet<u32>>,
-    // The articles that arrived short of where the bytes after them start,
-    // whose missing tail went to the tree as lost. Not kept: a restored
-    // root tells it again, as it tells every lost article again.
-    cut: BTreeSet<usize>,
-    // The tails found short since the damage was last taken.
+    // The boundaries where no listed article carries the bytes, by where
+    // what went to the tree as lost there ends. Not kept: a restored root
+    // tells it again, as it tells every lost article again.
+    cut: BTreeMap<usize, u64>,
+    // The bytes found carried by no article since the damage was last
+    // taken.
     cuts: Vec<ByteRange>,
     // The chunks of the volume's facts each change touched.
     marks: Marks<Chunk>,
@@ -257,7 +258,7 @@ impl Volume {
             parked_bytes: 0,
             ordered_only: false,
             starts: BTreeMap::new(),
-            cut: BTreeSet::new(),
+            cut: BTreeMap::new(),
             cuts: Vec::new(),
             marks: Marks::default(),
             changes: 0,
@@ -278,8 +279,6 @@ impl Volume {
             return;
         }
         self.changed();
-        // Another copy, or none: what its tail lacked is asked again.
-        self.cut.remove(&index);
         let size = self.encoded_at(index + 1) - self.encoded_at(index);
         if (was == State::Waiting) != (state == State::Waiting) {
             self.settled_bytes = match state {
@@ -625,30 +624,42 @@ impl Volume {
         Ok(())
     }
 
-    // The tail of an article that arrived short: one whose bytes end before
-    // the boundary after it, which its own header, the next article's
-    // begin or the file's declared end tells, lost the bytes between, and
-    // they are told as a lost article's are, for every recovery kind and
-    // every store alike. Told once both edges are in hand; a volume placed
-    // only in order has no edge but its order, so nothing there is short of
-    // anything.
-    fn cut_after(&mut self, open: &mut Open, index: usize) {
-        if self.ordered_only || self.cut.contains(&index) {
+    // The bytes no article carries at a boundary: from where the bytes
+    // before it end, the file's start before the first article, to where
+    // the bytes after it begin, the next article's own start once it
+    // arrived, else what the article before declares as its end or the
+    // file's declared end. They are lost, as a lost article's bytes are,
+    // for every recovery kind and every store alike, wherever they lie: an
+    // article that arrived short, or one the post lists no article for, at
+    // the file's start, between two articles or before its end. Told once
+    // both edges are in hand, and again as far as an edge moves on; a
+    // volume placed only in order has no edge but its order, so nothing
+    // there is short of anything.
+    fn cut_at(&mut self, open: &mut Open, boundary: usize) {
+        if self.ordered_only {
             return;
         }
-        let Some(State::Arrived(Some(range))) =
-            self.articles.get(index).map(|article| article.state)
+        let placed = |index: usize| match self.articles.get(index).map(|article| article.state) {
+            Some(State::Arrived(Some(range))) => Some(range),
+            _ => None,
+        };
+        let from = match boundary.checked_sub(1) {
+            None => 0,
+            Some(before) => match placed(before) {
+                Some(range) => range.end,
+                None => return,
+            },
+        };
+        let Some(to) = placed(boundary)
+            .map(|range| range.start)
+            .or_else(|| self.known.get(&boundary).copied())
         else {
             return;
         };
-        if let Some(end) = self
-            .known
-            .get(&(index + 1))
-            .copied()
-            .filter(|end| *end > range.end)
-        {
-            self.cuts.push(ByteRange::new(range.end, end));
-            self.cut.insert(index);
+        let from = self.cut.get(&boundary).map_or(from, |told| from.max(*told));
+        if to > from {
+            self.cuts.push(ByteRange::new(from, to));
+            self.cut.insert(boundary, to);
             open.untold.insert(self.at);
         }
     }
@@ -696,7 +707,8 @@ impl ArticleMap {
     // An article was decoded and placed at `range`, `intact` when it passed
     // its own checksum. Where the next one begins is what its header
     // declares, never where its bytes ended: a damaged body can decode
-    // longer or shorter than its part.
+    // longer or shorter than its part. A next one already placed says where
+    // it begins itself, and no declared end moves it.
     pub(crate) fn arrived(
         &mut self,
         volume: VolumeIndex,
@@ -714,13 +726,15 @@ impl ArticleMap {
         found.articles[index].intact = intact;
         found.set_state(&mut self.open, index, State::Arrived(Some(range)));
         found.know(index, range.start);
-        if let Some(end) = declared_end {
+        let next_placed = matches!(
+            found.articles.get(index + 1).map(|article| article.state),
+            Some(State::Arrived(Some(_)))
+        );
+        if let Some(end) = declared_end.filter(|_| !next_placed) {
             found.know(index + 1, end);
         }
-        if let Some(before) = index.checked_sub(1) {
-            found.cut_after(&mut self.open, before);
-        }
-        found.cut_after(&mut self.open, index);
+        found.cut_at(&mut self.open, index);
+        found.cut_at(&mut self.open, index + 1);
     }
 
     // The file lengths the volume's articles can reach, `part` being the
@@ -752,9 +766,7 @@ impl ArticleMap {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
             let end = found.articles.len();
             found.know(end, length);
-            if let Some(last) = end.checked_sub(1) {
-                found.cut_after(&mut self.open, last);
-            }
+            found.cut_at(&mut self.open, end);
         }
     }
 

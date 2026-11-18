@@ -21,7 +21,7 @@ fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
     ];
     let (facts, mut live, mut again) = restores_alike(engine, &steps, 3, &[]);
     assert!(!contains(&facts.bytes, PASSWORD.as_bytes()));
-    let claim = |object: &mut Box<dyn Object>| object.claim(names[1], &[], None);
+    let claim = |object: &mut Box<dyn Object>| object.claim(names[1], (&[]).into(), None);
     assert_eq!(claim(&mut live), claim(&mut again));
     assert_eq!(claim(&mut live), vec![VolumeIndex(1)]);
     let bids = |object: &mut Box<dyn Object>| {

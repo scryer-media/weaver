@@ -387,7 +387,7 @@ fn a_full_front_queued_behind_a_lent_window_waits_through_damage() {
         &mut effects,
     );
     if tree.is_undecided(NodeId::ROOT, member) && !tree.front_to_come(NodeId::ROOT, member) {
-        tree.settle_leaf(NodeId::ROOT, member, &mut effects);
+        tree.settle_leaf(NodeId::ROOT, member, None, &mut effects);
     }
     assert!(
         tree.is_undecided(NodeId::ROOT, member),
@@ -445,7 +445,7 @@ fn a_whole_member_shorter_than_a_verdict_founds_its_store_after_a_loan() {
     );
     assert!(!tree.front_to_come(NodeId::ROOT, member), "whole");
     if tree.is_undecided(NodeId::ROOT, member) {
-        tree.settle_leaf(NodeId::ROOT, member, &mut effects);
+        tree.settle_leaf(NodeId::ROOT, member, None, &mut effects);
     }
     assert!(
         tree.is_undecided(NodeId::ROOT, member),

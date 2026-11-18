@@ -1194,6 +1194,35 @@ impl NamespaceWriter {
         }
         self.replay_file(tree, builder, segments, node, member, None, out)?;
         let mut effects = Vec::new();
+        // A recovery volume hears a loss when it is marked, and one marked
+        // before the member was bound reached no object: it hears those
+        // now, with the bytes, before the close, or its walk would wait on
+        // bytes that never come.
+        if tree.recovers(child)
+            && let Some((_, volume)) = tree.child_of(node, member)
+        {
+            let lost: Vec<ByteRange> = tree
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .map(|record| {
+                    record
+                        .coverage
+                        .runs()
+                        .filter(|run| run.provenance == Provenance::Lost)
+                        .map(|run| run.range)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for range in lost {
+                tree.volume_lost(
+                    child,
+                    volume,
+                    range,
+                    &mut self.placing(builder),
+                    &mut effects,
+                );
+            }
+        }
         tree.handed_over(node, member, &mut self.placing(builder), &mut effects);
         self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         if tree.recovers(child) {
@@ -1571,6 +1600,23 @@ impl NamespaceWriter {
             }
             return self.answer_again(tree, builder, segments, effect, out);
         }
+        // Every effect before it is applied, so the bytes the objects are
+        // owed are where the member's records say; read back a piece at a
+        // time, as `Effect::Again` is.
+        if let Effect::ReadOn {
+            node,
+            member,
+            range,
+        } = effect
+        {
+            let mut bytes = Vec::new();
+            if !self.access(tree).read_at(node, member, range, &mut bytes) {
+                bytes.clear();
+            }
+            let mut effects = Vec::new();
+            tree.read_on(node, member, range.start, &bytes, &mut effects);
+            return self.apply_each(tree, builder, segments, effects, write, out);
+        }
         match &effect {
             Effect::WriteLeaf {
                 node,
@@ -1778,7 +1824,7 @@ impl NamespaceWriter {
             Effect::Renamed { .. } => self.moved(tree, std::slice::from_ref(&effect))?,
             Effect::NeedsPassword { .. } => {}
             // Answered above.
-            Effect::Again { .. } => {}
+            Effect::Again { .. } | Effect::ReadOn { .. } => {}
             Effect::Lifted {
                 node,
                 member,
@@ -2355,7 +2401,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<Option<(NodeId, VolumeIndex)>, WriteError> {
         let mut effects = Vec::new();
-        tree.settle_leaf(node, member, &mut effects);
+        tree.settle_leaf(node, member, None, &mut effects);
         self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         let owner = tree.child_of(node, member);
         if owner.is_none() {

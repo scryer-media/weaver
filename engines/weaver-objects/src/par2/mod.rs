@@ -38,6 +38,7 @@ use self::repair::{SetRepair, repair_set};
 use self::sets::{Length, Location, SetState, Volume};
 use self::walker::{Found, Meter};
 use crate::grid::{Grid, WHOLE};
+use crate::past_hole::{Packets, Searched, Searches};
 use crate::recovery_volume::{Refusal, Shown};
 
 // One job holds no more recovery sets than an NZB holds files.
@@ -74,6 +75,13 @@ pub struct Par2 {
     // Ranges of its volumes a walk read past as a packet that was none,
     // which it asks for again when it next speaks.
     rewalks: Vec<(VolumeIndex, ByteRange)>,
+    // A set was found since the object last spoke: a volume past a lost
+    // front that it could not place before may now hold that set's packets.
+    learned: bool,
+    // What each volume offered past a lost front has shown so far of a
+    // packet of these sets. Not kept across a restart: the bytes past the
+    // hole are offered again.
+    searches: Searches<par2_rs::FileHashState>,
     output_limit: u64,
     // The repair's workspace when the owner grants it none.
     memory_limit: usize,
@@ -146,6 +154,8 @@ impl Par2 {
             shown: Shown::default(),
             seeking: false,
             rewalks: Vec::new(),
+            learned: false,
+            searches: Searches::default(),
             output_limit: MAX_JOB_BYTES,
             memory_limit: REPAIR_MEMORY_LIMIT,
             fronts: Fronts::new(),
@@ -703,6 +713,7 @@ impl Par2 {
                 self.unmatched.clear();
                 return;
             }
+            self.learned |= new_set;
             match item {
                 Found::Unused | Found::Failed | Found::Again(_) => {}
                 Found::Metadata {
@@ -756,6 +767,9 @@ impl Par2 {
                 .drain(..)
                 .map(|(volume, range)| Emit::Again { volume, range }),
         );
+        if std::mem::take(&mut self.learned) {
+            out.push(Emit::Learned);
+        }
     }
 }
 
@@ -898,8 +912,27 @@ impl Object for Par2 {
     // Every PAR2 file is a volume of the one object, numbered as it comes.
     // By the magic its bytes open with, or, before any bytes, by a name
     // that continues the set's: the stem of a volume already held, then a
-    // `.vol` name ending in `.par2`.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    // `.vol` name ending in `.par2`. A member whose front will not come is
+    // one by a packet in its clean bytes past the hole, of a set this
+    // object holds, its hash passing: searched for as those bytes are
+    // handed over, not yet while the packet has not passed whole, and
+    // none once the search's bound is past (`past_hole`). Magic alone, or a
+    // packet of another set, claims nothing.
+    fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
+        let first_bytes = clean.front();
+        let place = VolumeIndex(self.volumes.len() as u32);
+        if clean.at > 0 {
+            if self.sets.is_empty() {
+                self.searches.end(name);
+                return Claim::default();
+            }
+            let format = SetPackets { sets: &self.sets };
+            return match self.searches.read(name, (clean.at, clean.bytes), &format) {
+                Searched::Found => Claim::Places(vec![place]),
+                Searched::More => Claim::NotYet(Vec::new()),
+                Searched::Never => Claim::default(),
+            };
+        }
         let ours = if first_bytes.is_empty() {
             self.volumes
                 .iter()
@@ -908,12 +941,11 @@ impl Object for Par2 {
         } else {
             first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
         };
-        ours.then_some(VolumeIndex(self.volumes.len() as u32))
-            .into_iter()
-            .collect()
+        ours.then_some(place).into_iter().collect()
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], length: Option<u64>) {
+        self.searches.end(name);
         let state = self.volume(volume);
         state.name(name);
         state.length = length.or(state.length);
@@ -934,6 +966,53 @@ impl Object for Par2 {
     // hold to ask for again: a range asked for again mid-replay waits.
     fn again_waits(&self) -> bool {
         true
+    }
+}
+
+// PAR2 packets as a search past a hole reads them: of a set the object
+// holds, and no longer than the longest such a set holds, a recovery
+// packet of its slice size or the longest metadata the walker reads.
+struct SetPackets<'a> {
+    sets: &'a BTreeMap<[u8; 16], SetState>,
+}
+
+impl Packets for SetPackets<'_> {
+    type Hasher = par2_rs::FileHashState;
+    const MAGIC: &'static [u8] = MAGIC;
+    const HEADER: usize = HEADER_SIZE;
+    // The packet hash covers the packet from its set id on.
+    const HASHED_FROM: usize = 32;
+
+    fn ours(&self, header: &[u8]) -> Option<u64> {
+        let header = par2_rs::packet::PacketHeader::parse(header, 0).ok()?;
+        self.sets
+            .contains_key(header.recovery_set_id.as_bytes())
+            .then_some(header.length)
+    }
+
+    fn longest(&self) -> u64 {
+        // A recovery packet holds its exponent and one slice.
+        let slices = self
+            .sets
+            .values()
+            .filter_map(|set| set.index.as_ref())
+            .map(|index| index.slice_size.saturating_add(4))
+            .max()
+            .unwrap_or(0);
+        (HEADER_SIZE as u64).saturating_add(slices.max(walker::LONGEST_METADATA_BODY))
+    }
+
+    fn hasher(&self) -> Self::Hasher {
+        par2_rs::FileHashState::new()
+    }
+
+    fn update(hasher: &mut Self::Hasher, bytes: &[u8]) {
+        hasher.update(bytes);
+    }
+
+    fn passes(hasher: Self::Hasher, header: &[u8]) -> bool {
+        par2_rs::packet::PacketHeader::parse(header, 0)
+            .is_ok_and(|header| hasher.finalize() == header.packet_hash)
     }
 }
 

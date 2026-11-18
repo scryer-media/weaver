@@ -75,7 +75,7 @@ fn a_canonical_name_places_a_volume_when_held_labels_cannot_number_the_set() {
             assert_eq!(
                 object.claim(
                     "archive.part02.rar",
-                    &foreign[1],
+                    (&foreign[1]).into(),
                     Some(foreign[1].len() as u64)
                 ),
                 Vec::<VolumeIndex>::new(),
@@ -89,7 +89,7 @@ fn a_canonical_name_places_a_volume_when_held_labels_cannot_number_the_set() {
             assert_eq!(
                 object.claim(
                     "archive.part03.rar",
-                    &volumes[2],
+                    (&volumes[2]).into(),
                     Some(volumes[2].len() as u64)
                 ),
                 vec![VolumeIndex(2)],
@@ -170,14 +170,18 @@ fn another_named_sets_ordinal_is_not_positive_membership_evidence() {
         assert_eq!(
             object.claim(
                 "second.part03.rar",
-                &other[2][..64],
+                (&other[2][..64]).into(),
                 Some(other[2].len() as u64)
             ),
             Vec::<VolumeIndex>::new(),
             "restored={restored}: a slot number cannot link different named sets"
         );
         assert_eq!(
-            object.claim("first.part03.rar", &one[2][..64], Some(one[2].len() as u64)),
+            object.claim(
+                "first.part03.rar",
+                (&one[2][..64]).into(),
+                Some(one[2].len() as u64)
+            ),
             vec![VolumeIndex(2)],
             "the same-name placement remains available"
         );

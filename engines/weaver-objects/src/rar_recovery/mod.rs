@@ -571,7 +571,8 @@ impl Object for RarRecovery {
     // names: a front that signs another kind is that kind's, whatever its
     // name; one that signs nothing, as a RAR3 volume's does, is claimed by
     // its name.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, length: Option<u64>) -> Claim {
+        let first_bytes = clean.front();
         if matches!(
             weaver_graph::signed(first_bytes, length),
             weaver_graph::Sniff::Object(kind) if kind != Kind::RarRecovery

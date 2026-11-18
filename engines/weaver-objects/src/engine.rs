@@ -446,7 +446,8 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
     // The place the volume's facts give it, held or not: whether it takes
     // it is the tree's to judge.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, length: Option<u64>) -> Claim {
+        let first_bytes = clean.front();
         self.placed(name, first_bytes, length).into_iter().collect()
     }
 

@@ -55,7 +55,7 @@ impl Object for Refuting {
     fn bound(&mut self, volume: VolumeIndex, _: &str, _: &[u8], _: Option<u64>) {
         self.0.push(volume);
     }
-    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, _: crate::object::Clean<'_>, _: Option<u64>) -> Claim {
         name.rsplit_once('.')
             .and_then(|(_, digits)| digits.parse::<u32>().ok())
             .and_then(|number| number.checked_sub(1))
@@ -106,7 +106,7 @@ impl Object for Signed {
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
-    fn claim(&mut self, _: &str, _: &[u8], _: Option<u64>) -> Claim {
+    fn claim(&mut self, _: &str, _: crate::object::Clean<'_>, _: Option<u64>) -> Claim {
         Vec::new().into()
     }
     fn facts(&self) -> Facts {

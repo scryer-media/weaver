@@ -292,7 +292,12 @@ impl Object for RarRecord {
         None
     }
 
-    fn claim(&mut self, _name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        _name: &str,
+        _first_bytes: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
         Claim::default()
     }
 

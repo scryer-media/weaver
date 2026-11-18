@@ -59,7 +59,7 @@ pub use marks::{Marked, Marks};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{
-    Beside, Carried, Claim, Extent, Kind, Located, Object, ObjectId, Placement, Placements,
+    Beside, Carried, Claim, Clean, Extent, Kind, Located, Object, ObjectId, Placement, Placements,
     Posting, Standing,
 };
 pub use records::{

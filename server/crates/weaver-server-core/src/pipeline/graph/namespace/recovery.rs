@@ -815,6 +815,9 @@ impl NamespaceWriter {
             for (parent, member) in volumes {
                 self.replay_file(tree, builder, segments, parent, member, None, out)?;
             }
+            let mut effects = Vec::new();
+            tree.heard_again(set, &mut effects);
+            self.apply_all(tree, builder, segments, effects, out)?;
             repaired.remove()?;
             return Ok(None);
         }

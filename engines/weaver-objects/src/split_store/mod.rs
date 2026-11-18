@@ -686,7 +686,12 @@ impl Object for SplitStore {
     // A piece of my set by its name, wherever its number places it: what
     // the first piece's bytes open is the joined file's to say, and a later
     // piece's front refutes the set when it reaches me (`refutes`).
-    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        name: &str,
+        _first_bytes: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
         self.place(name).into_iter().collect()
     }
 

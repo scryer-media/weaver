@@ -22,6 +22,7 @@ use super::{Builder, Effect, NodeId, Tree};
 use crate::deliver::{Provenance, Why};
 use crate::member::MemberId;
 use crate::names::Position;
+use crate::object::Clean;
 
 // Where a lifted member came from, and the position its name ranks at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,7 +155,14 @@ impl Tree {
         // its set may already be read by an object of another kind, as a
         // RAR set whose member is compressed is by its engine.
         let siblings = self.bound_below(parent);
-        if self.offer(parent, lifted, &front, &siblings, effects) {
+        if self.offer(
+            parent,
+            lifted,
+            Clean::start(&front),
+            &siblings,
+            None,
+            effects,
+        ) {
             return;
         }
         self.claim_as_said(parent, lifted, builder, effects);

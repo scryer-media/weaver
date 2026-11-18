@@ -278,7 +278,7 @@ fn a_spanned_set_streams_with_its_volumes_out_of_order() {
     }
     // The `.zip` said it is disk 2: nothing numbered follows it.
     assert_eq!(
-        weaver_graph::Object::claim(&mut owner.object, "alpha.z03", b"", None),
+        weaver_graph::Object::claim(&mut owner.object, "alpha.z03", b"".into(), None),
         Vec::<VolumeIndex>::new()
     );
     no_trouble(&owner);
@@ -297,21 +297,27 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     let mut zip = Zip::new();
     zip.bound(VolumeIndex(0), "Alpha.Z01", &[], None);
     use weaver_graph::Object;
-    assert_eq!(zip.claim("alpha.z02", b"", None), vec![VolumeIndex(1)]);
+    assert_eq!(
+        zip.claim("alpha.z02", (b"").into(), None),
+        vec![VolumeIndex(1)]
+    );
     zip.bound(VolumeIndex(1), "alpha.z02", &[], None);
     assert_eq!(
-        zip.claim("alpha.zip", b"", None),
+        zip.claim("alpha.zip", (b"").into(), None),
         vec![VolumeIndex(u32::MAX)]
     );
     zip.bound(VolumeIndex(u32::MAX), "alpha.zip", &[], None);
     assert_eq!(
-        zip.claim("alpha.z03", b"", None),
+        zip.claim("alpha.z03", (b"").into(), None),
         vec![VolumeIndex(2)],
         "a numbered volume takes its number until the last says its disk"
     );
-    assert_eq!(zip.claim("beta.z03", b"", None), Vec::<VolumeIndex>::new());
     assert_eq!(
-        zip.claim("alpha.z02", b"", None),
+        zip.claim("beta.z03", (b"").into(), None),
+        Vec::<VolumeIndex>::new()
+    );
+    assert_eq!(
+        zip.claim("alpha.z02", (b"").into(), None),
         vec![VolumeIndex(1)],
         "a volume posted again is that volume"
     );
@@ -319,7 +325,7 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     let mut lone = Zip::new();
     lone.bound(VolumeIndex(0), "alpha.zip", &[], None);
     assert_eq!(
-        lone.claim("alpha.z01", b"", None),
+        lone.claim("alpha.z01", (b"").into(), None),
         Vec::<VolumeIndex>::new(),
         "a lone zip has no siblings"
     );
