@@ -292,7 +292,7 @@ fn index_matches_walk(seed: u64) {
                             _ => {
                                 let needed = peer.connection_closing(
                                     at,
-                                    failed,
+                                    crate::torrent_state::peer::Close::Closed { failed },
                                     peers.is_finished(),
                                     &peers,
                                 );
