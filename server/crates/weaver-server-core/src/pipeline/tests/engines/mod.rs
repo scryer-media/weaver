@@ -151,6 +151,7 @@ mod size_bounds;
 mod solid_hex;
 mod spent;
 mod split;
+mod split_sets;
 mod srr;
 mod stage_events;
 mod status_rulings;

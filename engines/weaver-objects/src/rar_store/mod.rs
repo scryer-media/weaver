@@ -176,6 +176,8 @@ mod counts {
         // answer was known.
         pub(crate) asked: Vec<(u32, u64)>,
         pub(crate) known: usize,
+        // Layouts laid again short of a volume they refuted.
+        pub(crate) cut: usize,
     }
 
     thread_local! {
@@ -342,6 +344,11 @@ pub struct RarStore {
     // The layout kept: extended past its tail as volumes are read, laid
     // afresh only where a volume it holds changed what it said.
     layout: Option<layout::Laid>,
+    // The volume just past the kept layout that the layout refuted where it
+    // is held on trust, with the stamp of the headers it was refuted on: not
+    // laid there again until those headers change or the layout is laid
+    // afresh.
+    refuted: Option<(VolumeIndex, u64)>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
     // The candidate that opened the headers.
@@ -402,6 +409,7 @@ impl RarStore {
             wanted: BTreeSet::new(),
             formats: Default::default(),
             layout: None,
+            refuted: None,
             entries: Vec::new(),
             candidates: Vec::new(),
             headers_open: None,
