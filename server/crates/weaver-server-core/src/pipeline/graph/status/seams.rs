@@ -8,10 +8,10 @@ use weaver_graph::recovery::{RepairOutcome, SetRuling};
 use weaver_graph::slots::AskerId;
 use weaver_graph::{MemberId, NodeId};
 
-use super::claims::{self, Claim, ClaimedMember};
+use super::claims::{self, Claim, ClaimedMember, Described};
 use super::{
-    Delivery, Failure, RecoverySummary, RootJob, Step, Unarrived, drive, failure, metrics,
-    shown_status,
+    Delivery, Failure, RecoverySummary, RootJob, SetSummary, Step, Unarrived, drive, failure,
+    metrics, shown_status,
 };
 use crate::events::model::PipelineEvent;
 use crate::jobs::JobPhase;
@@ -224,6 +224,28 @@ fn is_payload(job: &GraphJob, files: &[crate::jobs::model::FileSpec], member: Me
     }
     tree.refused_by(NodeId::ROOT, member)
         .is_some_and(|owner| !tree.recovers(owner))
+}
+
+// Whether a posted file is a recovery volume, the job's optional recovery
+// bytes, by the rule `is_payload` reads: a file a recovery object holds is
+// recovery whatever its posted name, one another object holds or refused
+// is payload, and one no object holds yet is what its posted name says, so
+// the figure rises as a volume posted under another name binds. A set's
+// index is no volume, whoever holds it, when its name says it is one.
+pub(in crate::pipeline) fn recovery_volume(
+    job: &GraphJob,
+    file: &crate::jobs::model::FileSpec,
+    member: MemberId,
+) -> bool {
+    let tree = job.tree();
+    let index = !file.role.counts_toward_health() && !file.role.is_recovery();
+    if let Some((owner, _)) = tree.child_of(NodeId::ROOT, member) {
+        return tree.recovers(owner) && !index;
+    }
+    file.role.is_recovery()
+        && tree
+            .refused_by(NodeId::ROOT, member)
+            .is_none_or(|owner| tree.recovers(owner))
 }
 
 impl Pipeline {
@@ -563,11 +585,27 @@ impl Pipeline {
                             .is_some_and(|outcome| outcome != RepairOutcome::Unread)
                 })
         };
-        let unrepaired = |node: NodeId, member: MemberId| {
-            unruled(node)
-                || failed.iter().any(|(namespace, set)| {
-                    *namespace == node && job.writer().covers(job.tree(), *set, member)
-                })
+        // What the sets of a member's namespace say of it: unrepaired where
+        // a failed set covers it or the recovery carried for it went
+        // unused, and unchecked where a set of it vouched and none of its
+        // sets describes the member (SABnzbd's rule: only what a set
+        // describes is checked once one verified). The one place a member
+        // is asked whether a set describes it.
+        let described = |node: NodeId, member: MemberId| {
+            let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
+            if unruled(node)
+                || failed
+                    .iter()
+                    .any(|(namespace, set)| *namespace == node && covers(*set))
+            {
+                return Described::Unrepaired;
+            }
+            let mut sets = summary.sets.iter().filter(|set| set.namespace == node);
+            if sets.clone().any(SetSummary::vouched) && !sets.any(|set| covers(set.node)) {
+                Described::Unchecked
+            } else {
+                Described::Otherwise
+            }
         };
         // A posted file that is not whole, read by the name it was posted
         // under once the feed gave up every byte the post declared for it:
@@ -613,7 +651,7 @@ impl Pipeline {
             job.tree(),
             payload,
             |name| par2_damage_ignorable(name, &ignore),
-            unrepaired,
+            described,
             |node, member| job.writer().refused(node, member),
             // Read by the name the member is delivered under, so a file a
             // recovery set renamed to what it is counts as that. A piece is

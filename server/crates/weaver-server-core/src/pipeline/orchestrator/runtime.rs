@@ -728,19 +728,39 @@ impl Pipeline {
         ) as u32
     }
 
-    // The recovery volumes' size and what of them came: the graph's articles
-    // in hand for a graph job, the assembly's otherwise. The one figure the
-    // live report and the history row both read.
+    // The recovery volumes' size and what of them came: for a graph job,
+    // the files its graph holds as recovery (`recovery_volume`: the binding
+    // first, the posted name until a file binds) and their articles in
+    // hand; the assembly's by name otherwise. A job of recovery files alone
+    // has none optional. The one figure the live report and the history row
+    // both read, in one pass over the posted files.
     pub(crate) fn optional_recovery_bytes(&self, state: &JobState) -> (u64, u64) {
-        let (total, assembled) = state.optional_recovery_bytes();
         let Some(graph) = self.graph_jobs.get(&state.job_id) else {
-            return (total, assembled);
+            return state.optional_recovery_bytes();
         };
-        let arrived: u64 = (0u32..)
-            .zip(&state.spec.files)
-            .filter(|(_, file)| file.role.is_recovery())
-            .map(|(index, _)| graph.arrived_bytes(index))
-            .sum();
+        let (payload, total, arrived) = (0u32..).zip(&state.spec.files).fold(
+            (false, 0u64, 0u64),
+            |(payload, total, arrived), (index, file)| {
+                let recovery = crate::pipeline::graph::status::recovery_volume(
+                    graph,
+                    file,
+                    weaver_graph::MemberId(index),
+                );
+                let payload = payload || (!recovery && file.role.counts_toward_health());
+                if recovery {
+                    (
+                        payload,
+                        total.saturating_add(graph.posted_bytes(index)),
+                        arrived.saturating_add(graph.arrived_bytes(index)),
+                    )
+                } else {
+                    (payload, total, arrived)
+                }
+            },
+        );
+        if !payload {
+            return (0, 0);
+        }
         (total, arrived.min(total))
     }
 

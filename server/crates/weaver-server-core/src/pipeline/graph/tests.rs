@@ -1471,6 +1471,7 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
             whole: vec!["echo-0.mkv".to_string(), "echo-1.mkv".to_string()],
             damaged: vec!["lantern.dat".to_string()],
             unnamed: Vec::new(),
+            unchecked: Vec::new(),
             unrepaired: Vec::new(),
             withheld: Vec::new(),
             removed: Vec::new(),
