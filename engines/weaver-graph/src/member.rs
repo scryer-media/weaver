@@ -481,8 +481,14 @@ impl Namespace {
 
     // The member's rows changed by what the tree keeps of it beside its
     // record: its owner, whether it waits on one, what it was given up as.
+    // A further posting of it answers by it, so each is marked with it.
     pub fn mark(&mut self, member: MemberId) {
         self.members.mark(member);
+        if let Some(folded) = self.folded.get(&member) {
+            for copy in &folded.copies {
+                self.members.mark(*copy);
+            }
+        }
     }
 
     // The generation of the members' marks: a change to one marks it under

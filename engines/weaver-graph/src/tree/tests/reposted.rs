@@ -94,6 +94,38 @@ fn a_copy_of_a_held_volume_folds_into_it() {
     assert_eq!(tree.live().len(), 2, "one store");
 }
 
+// A copy answers who owns it by the member it folded into. When that
+// member's owner changes, the copy's answer changes with it, and the copy
+// is marked with it: a reader brought up to date by what changed since a
+// generation learns the copy's new owner too.
+#[test]
+fn a_copy_is_marked_when_the_member_it_folded_into_changes_owner() {
+    let (mut tree, child, second) = held(&[(0, b"world", Provenance::Fresh)]);
+    let (copy, effects) = post(&mut tree, "again.r00", &[(0, b"world", Provenance::Fresh)]);
+    assert!(folded(&effects, copy, second));
+    let at = tree.namespace(NodeId::ROOT).unwrap().generation();
+    tree.unbind(
+        child,
+        super::super::Unbinding::Engine(Why::Compressed),
+        &mut Build,
+        &mut Vec::new(),
+    );
+    let owner = tree.child_of(NodeId::ROOT, copy);
+    assert_ne!(
+        owner,
+        Some((child, VolumeIndex(1))),
+        "the copy's owner moved"
+    );
+    assert_eq!(owner, tree.child_of(NodeId::ROOT, second));
+    let changed: Vec<MemberId> = tree
+        .namespace(NodeId::ROOT)
+        .unwrap()
+        .changed_since(at)
+        .collect();
+    assert!(changed.contains(&second), "{changed:?}");
+    assert!(changed.contains(&copy), "{changed:?}");
+}
+
 #[test]
 fn clean_bytes_of_a_copy_replace_damaged_ones() {
     let (mut tree, child, second) = held(&[
