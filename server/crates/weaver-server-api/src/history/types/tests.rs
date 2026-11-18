@@ -442,3 +442,81 @@ async fn an_rss_link_and_id_are_answered_to_an_admin_only() {
     db.set_encryption_key(EncryptionKey::generate());
     assert_eq!(answer(db, CallerScope::Admin, false).await, public);
 }
+
+// A client that selects `outcome` sees a partial delivery as its own value;
+// `state` and `status` still read it as failed, for the clients that do not
+// model it. The words of what it lacks ride on `error`.
+#[tokio::test]
+async fn a_partial_job_is_partial_in_outcome_and_failed_in_state() {
+    use crate::jobs::types::{Job, QueueItem, queue_item_from_job};
+    const SAID: &str = "delivered in part; damaged: foo_dr.txt";
+    let row = JobHistoryRow {
+        job_id: 82,
+        job_hash: None,
+        name: "Lantern".to_string(),
+        status: "partial".to_string(),
+        error_message: Some(SAID.to_string()),
+        total_bytes: 2_000,
+        downloaded_bytes: 2_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 10,
+        health: 995,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: None,
+        server_attribution: None,
+        protocol: weaver_server_core::Protocol::Nzb,
+        archived_at: None,
+    };
+
+    struct Query(HistoryItem, QueueItem, Job);
+    #[async_graphql::Object]
+    impl Query {
+        async fn history(&self) -> HistoryItem {
+            self.0.clone()
+        }
+        async fn queue(&self) -> QueueItem {
+            self.1.clone()
+        }
+        async fn job(&self) -> Job {
+            self.2.clone()
+        }
+    }
+    let info = crate::history::query::job_info_from_history_row(&row);
+    assert_eq!(info.status, weaver_server_core::JobStatus::Partial);
+    let schema = async_graphql::Schema::new(
+        Query(
+            history_item_from_row(&row, None),
+            queue_item_from_job(&info),
+            Job::from(&info),
+        ),
+        async_graphql::EmptyMutation,
+        async_graphql::EmptySubscription,
+    );
+    let response = schema
+        .execute(
+            "{ history { state outcome error } queue { state outcome } \
+             job { status outcome } }",
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap(),
+        serde_json::json!({
+            "history": { "state": "FAILED", "outcome": "PARTIAL", "error": SAID },
+            "queue": { "state": "FAILED", "outcome": "PARTIAL" },
+            "job": { "status": "FAILED", "outcome": "PARTIAL" },
+        })
+    );
+
+    // A client that does not ask sees what it saw before.
+    let response = schema.execute("{ history { state } job { status } }").await;
+    assert_eq!(
+        response.data.into_json().unwrap(),
+        serde_json::json!({ "history": { "state": "FAILED" }, "job": { "status": "FAILED" } })
+    );
+}

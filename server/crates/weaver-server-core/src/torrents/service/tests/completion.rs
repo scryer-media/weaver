@@ -39,7 +39,7 @@ fn usenet_status(files: &[(&str, bool)], why: &str) -> JobStatus {
         &tree,
         |_| true,
         crate::pipeline::graph::status::root_furniture(),
-        |_, _| false,
+        |_, _| crate::pipeline::graph::status::Described::Otherwise,
         |_, _| None,
         piece,
         |_| Unarrived::Short,

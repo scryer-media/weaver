@@ -879,6 +879,12 @@ impl GraphJob {
         self.root.map.arrived_bytes(VolumeIndex(file_index))
     }
 
+    // Seam for status: the bytes the post declares for the posted file at
+    // `file_index`, every article counted.
+    pub(crate) fn posted_bytes(&self, file_index: u32) -> u64 {
+        self.root.map.posted_bytes(VolumeIndex(file_index))
+    }
+
     // Seam for status: the job is fetching repair data. Its payload is in,
     // no repair run is out, and a set waits on recovery volumes the root is
     // still fetching for it.

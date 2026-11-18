@@ -976,6 +976,13 @@ impl ArticleMap {
             .map_or(0, |found| found.arrived_decoded)
     }
 
+    // The volume's bytes as the post declares them, every article counted.
+    pub(crate) fn posted_bytes(&self, volume: VolumeIndex) -> u64 {
+        self.volumes
+            .get(volume.0 as usize)
+            .map_or(0, |found| found.encoded_len)
+    }
+
     // How many volumes have every article in hand.
     pub(crate) fn whole_count(&self) -> usize {
         (0..self.volumes.len())
