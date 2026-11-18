@@ -1,0 +1,99 @@
+name: weaver PR image publisher
+
+on: # zizmor: ignore[dangerous-triggers] Only current same-repo PR artifacts are used as data with a trusted Dockerfile.
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  eligible:
+    name: eligible-pr-image
+    if: ${{ github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.pull_requests[0].number != null }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - name: Check current PR and prepared context
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          ARTIFACT_NAME: weaver-pr-docker-context-${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" |
+            jq -e --arg sha "$HEAD_SHA" '.state == "open" and .head.sha == $sha' > /dev/null || exit 0
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" |
+            jq -e --arg name "$ARTIFACT_NAME" '.artifacts | any(.name == $name and .expired == false)' > /dev/null || exit 0
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+  docker-publish-pr-rc:
+    name: docker-publish-pr-rc
+    needs: [eligible]
+    if: ${{ needs.eligible.outputs.ready == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.workflow_run.pull_requests[0].base.sha }}
+          persist-credentials: false
+      - name: Download prepared PR build context
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: weaver-pr-docker-context-${{ github.event.workflow_run.id }}
+          path: docker-ctx
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve PR RC tags
+        id: pr_rc_tags
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${HEAD_SHA:0:7}"
+          echo "moving_tag=pr-${PR_NUMBER}-rc" >> "$GITHUB_OUTPUT"
+          echo "commit_tag=pr-${PR_NUMBER}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Docker meta
+        id: pr_meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/weaver
+          tags: |
+            type=raw,value=${{ steps.pr_rc_tags.outputs.moving_tag }}
+            type=raw,value=${{ steps.pr_rc_tags.outputs.commit_tag }}
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: docker-ctx
+          file: docker/weaver.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.pr_meta.outputs.tags }}
+          labels: ${{ steps.pr_meta.outputs.labels }}
+
+
+
