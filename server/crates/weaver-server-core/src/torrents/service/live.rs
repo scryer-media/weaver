@@ -247,6 +247,18 @@ impl Live {
         self.record.completed_at_ms.is_some()
     }
 
+    // Short of complete, wanting a file, with its store holding every file
+    // it wants whole: the next settle completes it. One that wants none
+    // seeds without completing, and fetches again once it wants a file.
+    pub(super) fn completes(&self) -> bool {
+        let levels = &self.levels;
+        !self.complete()
+            && levels.iter().any(|level| level.wanted())
+            && self.store.as_ref().is_some_and(|store| {
+                store.has_files(|file| levels.get(file).copied().unwrap_or_default().wanted())
+            })
+    }
+
     // Complete, or with every piece it wants had as the session last said.
     // A torrent in seed mode has every piece as added and seeds from the
     // start (libtorrent `torrent_flags::seed_mode`: the picker is created
