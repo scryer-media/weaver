@@ -176,6 +176,12 @@ impl PeerHandler {
         let state = &self.state;
         let mut waiting = false;
         let mut look = false;
+        // Tried first with no wait set up: nearly every attempt has room,
+        // and one set up takes the room signal's lock, which every
+        // connection of the torrent shares, twice a block.
+        if let Some(got) = attempt() {
+            return Some(got);
+        }
         let got = loop {
             let rung = state.room_notify.notified();
             let mut rung = std::pin::pin!(rung);

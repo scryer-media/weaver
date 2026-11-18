@@ -382,8 +382,9 @@ pub(crate) struct ResidentPeak {
 struct Inner {
     layout: Arc<PieceLayout>,
     pieces: Arc<dyn Pieces>,
-    // The pieces in flight, by index.
-    flight: Mutex<HashMap<u32, Flight>>,
+    // The pieces in flight, by index. Read for each block that lands, by
+    // every connection of the torrent at once; changed once a piece.
+    flight: std::sync::RwLock<HashMap<u32, Flight>>,
     holds: Holds,
     // What the session waits on for room, as it last asked.
     room: Mutex<Option<Arc<Notify>>>,
@@ -466,8 +467,12 @@ impl Inner {
         }
     }
 
-    fn flight(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Flight>> {
-        self.flight.lock().unwrap_or_else(PoisonError::into_inner)
+    fn flight(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<u32, Flight>> {
+        self.flight.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn flight_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<u32, Flight>> {
+        self.flight.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     // A piece no peer owns, `writing` in memory, is written block by block
@@ -595,7 +600,7 @@ impl PieceStorage {
             inner: Arc::new(Inner {
                 layout,
                 pieces,
-                flight: Mutex::new(HashMap::new()),
+                flight: std::sync::RwLock::new(HashMap::new()),
                 holds,
                 room: Mutex::new(None),
                 blocks,
@@ -626,8 +631,12 @@ impl PieceStorage {
         arriving.fold((0, 0), |(bytes, pieces), held| (bytes + held, pieces + 1))
     }
 
-    fn flight(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Flight>> {
+    fn flight(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<u32, Flight>> {
         self.inner.flight()
+    }
+
+    fn flight_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<u32, Flight>> {
+        self.inner.flight_read()
     }
 
     // A file's range in the torrent's coordinates, and the one piece it
@@ -672,7 +681,7 @@ impl PieceStorage {
         // Twice at most: a piece given back meanwhile is written block by
         // block from then on.
         loop {
-            let landing = match self.flight().get(&piece) {
+            let landing = match self.flight_read().get(&piece) {
                 Some(Flight::Writing(writing, _)) => Ok(Arc::clone(writing)),
                 Some(Flight::Blocks(one, _)) => Err(Arc::clone(one)),
                 _ => bail!("piece {piece} is written while the session holds no room for it"),
@@ -976,7 +985,11 @@ impl TorrentStorage for PieceStorage {
     // A piece given back, or started by a peer that did not own it, is
     // written block by block too.
     fn writes_piece_to_memory(&self, piece: ValidPieceIndex) -> bool {
-        !self.inner.blocks && !matches!(self.flight().get(&piece.get()), Some(Flight::Blocks(..)))
+        !self.inner.blocks
+            && !matches!(
+                self.flight_read().get(&piece.get()),
+                Some(Flight::Blocks(..))
+            )
     }
 
     fn pwrite_all_vectored(
@@ -1258,11 +1271,7 @@ impl Landed {
     }
 
     fn leave(&self) {
-        let mut flight = self
-            .inner
-            .flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut flight = self.inner.flight();
         if let Some(Flight::Verified(held)) = flight.get(&self.index)
             && held.as_ptr() as usize == self.at
         {
