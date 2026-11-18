@@ -159,16 +159,26 @@ impl RouteDialer {
     }
 }
 impl RouteDialer {
+    fn purpose(&self) -> Purpose {
+        Purpose::Nntp {
+            server: self.server,
+            leg: 0,
+            probing: false,
+        }
+    }
+
+    // Whether the route has room for a dial now, or the slots that ring as
+    // it frees. Asks only: nothing is reserved.
+    pub(crate) fn room(&self) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
+        self.inner.room(&self.purpose())
+    }
+
     pub async fn dial(&self, config: &ServerConfig) -> Result<Dialed, NntpError> {
         let target = Target {
             host: config.host.clone(),
             port: config.port,
             addresses: Vec::new(),
-            purpose: Purpose::Nntp {
-                server: self.server,
-                leg: 0,
-                probing: false,
-            },
+            purpose: self.purpose(),
         };
         // A dialer that enforces its own budget (a weighted route books a
         // timed-out leg) must see its deadline first; this one is a backstop.

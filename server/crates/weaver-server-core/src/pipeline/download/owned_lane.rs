@@ -1655,6 +1655,61 @@ fn lease_is_current(
     })
 }
 
+// The one server a lease may dial, when it may dial only one: a lease cut
+// by dispatch is pinned so.
+fn sole_dial_server(
+    nntp: &weaver_nntp::NntpClient,
+    lease: &DownloadBatchLease,
+) -> Option<weaver_nntp::ServerId> {
+    let mut servers = (0..nntp.pool().server_count())
+        .filter(|server| !lease.dial_exclude_servers.contains(*server));
+    let server = servers.next()?;
+    servers
+        .next()
+        .is_none()
+        .then_some(weaver_nntp::ServerId(server))
+}
+
+enum RouteWait {
+    // The line let the lane go: it dials again.
+    Go,
+    // The line closed: the lane takes its refusal.
+    Closed,
+    // The lease is no longer current: its work goes back.
+    Obsolete,
+}
+
+// Wait in a route's line until the lane may dial, the line closes, or the
+// lease stops being current. Currency is read again only when the queue or a
+// server's recovery changes: nothing is polled, and nothing is dialled.
+fn wait_for_route(
+    state: &crate::jobs::handle::SharedPipelineState,
+    nntp: &weaver_nntp::NntpClient,
+    lease: &DownloadBatchLease,
+    turn: &weaver_nntp::route_line::RouteTurn,
+) -> RouteWait {
+    let mut queue = state.subscribe_job_changes();
+    let mut health = nntp.pool().server_health_changes();
+    loop {
+        if !lease_is_current(state, nntp, lease, None) {
+            return RouteWait::Obsolete;
+        }
+        let changed = async {
+            tokio::select! {
+                changed = queue.changed() => changed.is_ok(),
+                () = health.changed() => true,
+            }
+        };
+        match turn.wait_blocking(changed) {
+            Ok(true) => return RouteWait::Go,
+            Ok(false) => return RouteWait::Closed,
+            Err(true) => {}
+            // The queue is gone with the pipeline.
+            Err(false) => return RouteWait::Obsolete,
+        }
+    }
+}
+
 // The connection a lane holds, as every recheck of work bound to it reads
 // the provider policy: see `NntpPool::provider_policy_on_connection`, where
 // the server's unanswered recovery probe is past its own server's hold.
@@ -1774,17 +1829,57 @@ fn run_owned_lane(
         // Every full route the dial was refused on: this lane presses on
         // each until its next dial resolves.
         let mut route_demand = Vec::new();
-        let dialled = acquire_owned_lane_through_contention(
-            || lease_is_current(&state, &nntp, &lease, None),
-            || {
-                nntp.try_acquire_blocking_body_lane_pressing(
-                    lease_groups(&lease),
-                    lease.dial_exclude_servers,
-                    initial_estimate,
-                    &mut route_demand,
+        // A lease pinned to one server whose route is up but full waits in
+        // that route's line, pressing, and dials again once it frees.
+        let sole_server = sole_dial_server(&nntp, &lease);
+        let mut turn: Option<weaver_nntp::route_line::RouteTurn> = None;
+        let dialled = loop {
+            // A turn from the line is given up once the route hands the dial
+            // its socket; one refused again comes back to keep its place.
+            let (dialled, kept) = weaver_nntp::route_line::held_until_routed(turn.take(), || {
+                acquire_owned_lane_through_contention(
+                    || lease_is_current(&state, &nntp, &lease, None),
+                    || {
+                        nntp.try_acquire_blocking_body_lane_pressing(
+                            lease_groups(&lease),
+                            lease.dial_exclude_servers,
+                            initial_estimate,
+                            &mut route_demand,
+                        )
+                    },
                 )
-            },
-        );
+            });
+            turn = kept;
+            let joined = match (&dialled, sole_server) {
+                (
+                    Err(weaver_nntp::client::BlockingBodyLaneAcquireError::RouteCapacity(error)),
+                    Some(server),
+                ) => nntp.pool().join_route_line(server, error, turn.is_some()),
+                _ => None,
+            };
+            let Some(joined) = joined else {
+                break dialled;
+            };
+            // Joined before the turn just given is let go, so a lane let go
+            // and refused again keeps the head of the line.
+            turn = Some(joined);
+            match wait_for_route(&state, &nntp, &lease, turn.as_ref().expect("joined")) {
+                RouteWait::Go => {}
+                RouteWait::Closed => break dialled,
+                RouteWait::Obsolete => {
+                    drop(turn);
+                    *press = None;
+                    let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::LeaseObsolete { lease });
+                    crate::runtime::perf_probe::record(
+                        "download.fetch_body.owned",
+                        fetch_started.elapsed(),
+                    );
+                    return;
+                }
+            }
+        };
+        // The dial ended: the line asks the route for the next lane.
+        drop(turn);
         match dialled {
             Ok(lane) => {
                 *press = None;
@@ -4313,6 +4408,167 @@ mod routing_tests {
             0,
             "a full route is no fault"
         );
+    }
+
+    // A route with `room` sockets free, which refuses a dial for room with
+    // the slot that rings as one frees, and the dials made on it. A dial it
+    // has room for takes the room and fails on the wire.
+    struct MeteredRoute {
+        room: std::sync::atomic::AtomicUsize,
+        freed: Arc<tokio::sync::Notify>,
+        dials: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl weaver_tunnel::pipe::Dialer for MeteredRoute {
+        async fn dial(
+            &self,
+            _: &weaver_tunnel::pipe::Target,
+        ) -> std::result::Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError>
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.dials.fetch_add(1, SeqCst);
+            if self
+                .room
+                .fetch_update(SeqCst, SeqCst, |room| room.checked_sub(1))
+                .is_err()
+            {
+                return Err(weaver_tunnel::pipe::DialError::AtCapacity(
+                    weaver_tunnel::pipe::Capacity {
+                        waits: vec![Arc::clone(&self.freed)],
+                        demand: Vec::new(),
+                    },
+                ));
+            }
+            Err(weaver_tunnel::pipe::DialError::Egress(
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            ))
+        }
+        fn room(
+            &self,
+            _: &weaver_tunnel::pipe::Purpose,
+        ) -> std::result::Result<(), Vec<Arc<tokio::sync::Notify>>> {
+            if self.room.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(vec![Arc::clone(&self.freed)])
+            } else {
+                Ok(())
+            }
+        }
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(3600)
+        }
+        fn describe(&self) -> String {
+            "metered route fixture".into()
+        }
+    }
+
+    // Lanes refused by a full route wait in its line and dial nothing until
+    // a socket frees; one freed socket lets exactly one of them dial, and the
+    // rest wait on. A shutdown sends every one of them back.
+    #[test]
+    fn lanes_behind_a_full_route_wait_for_a_freed_socket_and_one_dials_per_socket() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const LANES: usize = 3;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let route = Arc::new(MeteredRoute {
+            room: std::sync::atomic::AtomicUsize::new(0),
+            freed: Arc::new(tokio::sync::Notify::new()),
+            dials: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let dialer = Arc::new(weaver_nntp::route_dialer::RouteDialer {
+            inner: Arc::clone(&route) as Arc<dyn weaver_tunnel::pipe::Dialer>,
+            plan: None,
+            egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::new()),
+            runtime: runtime.handle().clone(),
+            server: 0,
+        });
+        let nntp = Arc::new(weaver_nntp::client::NntpClient::new(
+            weaver_nntp::client::NntpClientConfig::single(
+                weaver_nntp::ServerConfig {
+                    host: "nntp-metered-route.invalid".to_string(),
+                    port: 119,
+                    tls: false,
+                    dialer,
+                    ..Default::default()
+                },
+                8,
+            ),
+        ));
+        let state = test_admitted_state(JobId(42));
+        let (event_tx, mut events) = mpsc::channel(LANES * 2);
+        let (refill_tx, _refill_rx) = mpsc::channel(4);
+        let (parked_tx, _parked_rx) = mpsc::channel(4);
+        let mut waiting = nntp.pool().route_line_waiting(weaver_nntp::ServerId(0));
+        let lanes: Vec<_> = (0..LANES)
+            .map(|segment| {
+                let run = OwnedLaneRun {
+                    nntp: Arc::clone(&nntp),
+                    state: state.clone(),
+                    event_tx: event_tx.clone(),
+                    refill_tx: refill_tx.clone(),
+                    parked_tx: parked_tx.clone(),
+                    initial_lease: test_lease(
+                        JobId(42),
+                        0,
+                        weaver_nntp::ServerSet::EMPTY,
+                        vec![tail_work(u32::try_from(segment).unwrap(), 0)],
+                    ),
+                };
+                std::thread::spawn(move || run_owned_blocking_download_lane(&mut None, run))
+            })
+            .collect();
+        drop(event_tx);
+
+        runtime.block_on(async {
+            waiting.wait_for(|waiting| *waiting == LANES).await.unwrap();
+        });
+        assert_eq!(route.dials.load(SeqCst), LANES, "each lane dialled once");
+
+        route.room.store(1, SeqCst);
+        route.freed.notify_waiters();
+        let first = events.blocking_recv().expect("the lane let go reports");
+        assert!(
+            matches!(first, OwnedDownloadLaneEvent::AcquireFailed { .. }),
+            "the lane let go dialled and met the wire"
+        );
+        assert_eq!(
+            route.dials.load(SeqCst),
+            LANES + 1,
+            "one freed socket, one dial"
+        );
+        runtime.block_on(async {
+            waiting
+                .wait_for(|waiting| *waiting == LANES - 1)
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            route.dials.load(SeqCst),
+            LANES + 1,
+            "the full route is not redialled"
+        );
+
+        state.queue.write(|inner| {
+            inner.globals.shutting_down = true;
+            crate::pipeline::queue::Change::changed(())
+        });
+        for lane in lanes {
+            lane.join().unwrap();
+        }
+        let mut obsolete = 0;
+        while let Some(event) = events.blocking_recv() {
+            assert!(
+                matches!(event, OwnedDownloadLaneEvent::LeaseObsolete { .. }),
+                "a waiting lane gives its lease back"
+            );
+            obsolete += 1;
+        }
+        assert_eq!(obsolete, LANES - 1);
+        assert_eq!(route.dials.load(SeqCst), LANES + 1);
     }
 
     // The check just before a BODY is written reads the policy as the lane's

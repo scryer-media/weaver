@@ -38,6 +38,7 @@ pub mod recovery;
 pub mod response;
 pub mod revocation;
 pub mod route_dialer;
+pub mod route_line;
 mod route_stream;
 pub mod server_caps;
 pub mod server_set;
