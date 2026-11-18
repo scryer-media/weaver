@@ -152,7 +152,7 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.decode_threads, 16);
     assert_eq!(performance.extract_threads, 8);
     assert_eq!(performance.max_concurrent_downloads_cap, None);
-    assert_eq!(performance.wireguard_usenet_receive_bytes, 4 * 1024 * 1024);
+    assert_eq!(performance.wireguard_usenet_receive_bytes, 2 * 1024 * 1024);
 }
 
 // On every profile the tunnel gives a usenet socket the receive buffer the

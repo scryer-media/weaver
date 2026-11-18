@@ -247,13 +247,14 @@ fn a_tunnel_keeps_its_overhead_reserve_and_torrent_sessions() {
     }
 }
 
-// At the performance profile's 4 MiB usenet receive buffer, a usenet
-// connection is charged what the tunnel allocates for it, 4 MiB and the
+// At the performance profile's 2 MiB usenet receive buffer, a usenet
+// connection is charged what the tunnel allocates for it, 2 MiB and the
 // 64 KiB send buffer and its record, and the tunnel's bytes stay a hard
-// limit: 117 connections fit beside the reserve, and asking 118 is over.
+// limit: 231 connections fit beside the reserve, 185 beside one torrent
+// session too, and 138 beside two. Asking one past the fit is over.
 #[test]
-fn a_four_mib_usenet_buffer_is_charged_whole_within_the_tunnels_bytes() {
-    let receive = 4 * MIB as usize;
+fn a_two_mib_usenet_buffer_is_charged_whole_within_the_tunnels_bytes() {
+    let receive = 2 * MIB as usize;
     set_usenet_receive_bytes(receive, None);
     let buffers = socket_buffers(&Purpose::Nntp {
         server: 1,
@@ -263,28 +264,31 @@ fn a_four_mib_usenet_buffer_is_charged_whole_within_the_tunnels_bytes() {
     .expect("a usenet socket asks its own buffers");
     assert_eq!(buffers.receive(), receive);
     assert_eq!(buffers.send(), weaver_tunnel::pipe::USENET_SEND_BYTES);
-    assert_eq!(usenet_socket_bytes(), 4 * MIB + 68 * 1024);
+    assert_eq!(usenet_socket_bytes(), 2 * MIB + 68 * 1024);
     assert_eq!(usenet_socket_bytes(), stream_bytes(Some(buffers)));
 
-    for (asked, over) in [(117usize, false), (118, true)] {
-        let routes = vec![(
-            Consumer::Server(1),
-            route(vec![Rung::Proxy { id: 1 }], Failover::Redistribute),
-        )];
-        let ledger = socket_ledger(
-            &routes,
-            &profiles(&[1], &[5, 6]),
-            &HashMap::new(),
-            &HashMap::from([(1, u16::try_from(asked - 1).unwrap())]),
-        );
-        let tunnel = &ledger[&tunnel(1)];
-        assert_eq!(tunnel.nntp, asked);
-        assert_eq!(tunnel.over_budget(), over, "{asked}");
-        assert_eq!(tunnel.nntp_held(), 117, "{asked}");
-        assert!(
-            tunnel.nntp_held() as u64 * usenet_socket_bytes() + tunnel.kept()
-                <= WIREGUARD_INSTANCE_BYTES
-        );
+    for (sessions, fit) in [(0, 231usize), (1, 185), (2, 138)] {
+        for (asked, over) in [(fit, false), (fit + 1, true)] {
+            let mut routes = torrent_sessions(sessions);
+            routes.push((
+                Consumer::Server(1),
+                route(vec![Rung::Proxy { id: 1 }], Failover::Redistribute),
+            ));
+            let ledger = socket_ledger(
+                &routes,
+                &profiles(&[1], &[5, 6]),
+                &HashMap::new(),
+                &HashMap::from([(1, u16::try_from(asked - 1).unwrap())]),
+            );
+            let tunnel = &ledger[&tunnel(1)];
+            assert_eq!(tunnel.nntp, asked);
+            assert_eq!(tunnel.over_budget(), over, "{sessions} {asked}");
+            assert_eq!(tunnel.nntp_held(), fit, "{sessions} {asked}");
+            assert!(
+                tunnel.nntp_held() as u64 * usenet_socket_bytes() + tunnel.kept()
+                    <= WIREGUARD_INSTANCE_BYTES
+            );
+        }
     }
 }
 
@@ -412,11 +416,12 @@ fn pool_torrent_routes_charge_each_member_one_session() {
     }
 }
 
-// Usenet that asks more than a tunnel holds beside what it keeps is refused
-// with the totals in bytes. A torrent route on the tunnel keeps its
-// session's bytes, and leaves usenet less.
+// Usenet that asks more than a tunnel holds beside what it keeps is over its
+// budget, and its legs say so with the totals in bytes and what usenet is
+// held to. A torrent route on the tunnel keeps its session's bytes, and
+// leaves usenet less.
 #[test]
-fn usenet_over_a_tunnel_is_refused_with_its_totals() {
+fn usenet_over_a_tunnel_is_held_to_what_fits_and_warned_with_its_totals() {
     let routes = |torrents: bool| {
         let mut routes = vec![(
             Consumer::Server(1),
@@ -433,46 +438,28 @@ fn usenet_over_a_tunnel_is_refused_with_its_totals() {
             &profiles(&[3], &[]),
             &HashMap::new(),
             &HashMap::from([(1, connections)]),
-        )
-    };
-    let check = |torrents, connections| {
-        validate_socket_raise(&HashMap::new(), ledger(torrents, connections))
+        )[&tunnel(3)]
+            .clone()
     };
 
     // 449 usenet connections, one of them the replacement, fill the tunnel.
-    assert_eq!(check(false, 448), Ok(()));
+    assert!(!ledger(false, 448).over_budget());
+    let over = ledger(false, 449);
+    assert!(over.over_budget());
+    assert_eq!(over.nntp, 450);
+    assert_eq!(over.nntp_held(), 449);
     assert_eq!(
-        check(false, 449),
-        Err(NetworkRefusal::WireGuardSocketBudget {
-            proxy: 3,
-            egress: 0,
-            nntp: 450,
-            nntp_bytes: 450 * usenet_socket_bytes(),
-            kept_bytes: overhead_bytes(1420) + 12 * stream_bytes(None),
-            limit_bytes: 516 * MIB,
-        })
+        over.kept(),
+        overhead_bytes(1420) + 12 * stream_bytes(None)
     );
     assert_eq!(
-        check(false, 449).unwrap_err().to_string(),
-        "usenet servers ask 450 connections of WireGuard proxy 3 on egress 0, 480 MiB, and the tunnel keeps 37 MiB for itself, over the 516 MiB it holds"
+        over.over_budget_warning(),
+        "Usenet servers ask 450 connections of WireGuard proxy 3 on egress 0, 480 MiB, and the tunnel keeps 37 MiB for itself, over the 516 MiB it holds; usenet is held to 449."
     );
     // Beside a torrent session, 358.
-    assert_eq!(check(true, 357), Ok(()));
-    assert!(check(true, 358).is_err());
-
-    // Against what the servers asked before, only a raise on a tunnel left
-    // over budget is refused.
-    let asked = |connections| socket_asks(&ledger(true, connections));
-    assert!(validate_socket_raise(&asked(400), ledger(true, 400)).is_ok());
-    assert!(validate_socket_raise(&asked(400), ledger(true, 380)).is_ok());
-    assert!(validate_socket_raise(&asked(350), ledger(true, 357)).is_ok());
-    assert_eq!(
-        validate_socket_raise(&asked(400), ledger(true, 401)),
-        check(true, 401)
-    );
-
-    // Over budget, usenet is held to what fits.
-    assert_eq!(ledger(true, 400)[&tunnel(3)].nntp_held(), 358);
+    assert!(!ledger(true, 357).over_budget());
+    assert!(ledger(true, 358).over_budget());
+    assert_eq!(ledger(true, 400).nntp_held(), 358);
 }
 
 // The tunnel's sides are the job classes, in the protocol table's order.
@@ -1378,92 +1365,94 @@ fn server(id: u32, connections: u16, active: bool) -> crate::servers::ServerConf
     }
 }
 
-fn refused_code(result: Result<(), crate::StateError>) -> Option<&'static str> {
-    result
-        .err()
-        .and_then(|error| error.refusal().map(|refusal| refusal.code))
-}
-
-// A server save that would put more usenet on a WireGuard tunnel than it
-// holds is refused and changes nothing: adding the server, editing its
-// connections, and turning it on.
+// No save refuses usenet connections a WireGuard tunnel cannot hold: adding
+// a server past the fit, raising its connections, turning another on, a
+// torrent route that leaves the tunnel less, and an edit of the proxy all
+// save as asked. The tunnel holds usenet to its bytes as sockets open.
 #[test]
-fn usenet_overflow_is_refused_at_every_server_save() {
+fn every_save_past_a_tunnels_fit_succeeds() {
     let db = crate::Database::open_in_memory().unwrap();
     db.save_proxy_profile(&saved_wireguard(3)).unwrap();
     let through_tunnel = RoutingPolicy {
         legs: vec![leg(Rung::Proxy { id: 3 }, 100)],
         ..Default::default()
     };
-    const CODE: Option<&str> = Some("WIREGUARD_SOCKET_BUDGET");
-
-    assert_eq!(
-        refused_code(db.insert_server_with_routing(&server(1, 500, true), Some(&through_tunnel))),
-        CODE
-    );
-    assert!(db.list_servers().unwrap().is_empty());
-    db.insert_server_with_routing(&server(1, 400, true), Some(&through_tunnel))
+    // 449 fit beside the reserve.
+    db.insert_server_with_routing(&server(1, 500, true), Some(&through_tunnel))
         .unwrap();
-
-    assert_eq!(refused_code(db.update_server(&server(1, 500, true))), CODE);
-    assert_eq!(db.list_servers().unwrap()[0].connections, 400);
-
-    // An inactive server asks nothing until it is turned on.
+    db.update_server(&server(1, 1000, true)).unwrap();
     db.insert_server_with_routing(&server(2, 100, false), Some(&through_tunnel))
         .unwrap();
-    assert_eq!(refused_code(db.set_server_active(2, true)), CODE);
-    assert!(
-        !db.list_servers()
-            .unwrap()
-            .iter()
-            .any(|server| server.id == 2 && server.active)
-    );
-    db.set_server_active(1, false).unwrap();
     db.set_server_active(2, true).unwrap();
-
-    // A rollback restores the activation a failed change replaced, and is
-    // never budgeted again.
-    assert_eq!(refused_code(db.set_server_active(1, true)), CODE);
-    db.restore_server_active(1, true).unwrap();
-    assert!(
-        db.list_servers()
-            .unwrap()
-            .iter()
-            .all(|server| server.active)
-    );
-}
-
-// A tunnel over budget, as a torrent route added to a full one leaves it,
-// refuses only a save that raises what usenet asks of it. A feed's route
-// through it, an edit of its proxy, and a server that never reaches it all
-// save, and so does lowering the server that fills it.
-#[test]
-fn a_tunnel_over_budget_refuses_only_a_raise_of_its_usenet() {
-    let db = crate::Database::open_in_memory().unwrap();
-    db.save_proxy_profile(&saved_wireguard(3)).unwrap();
-    let through_tunnel = RoutingPolicy {
-        legs: vec![leg(Rung::Proxy { id: 3 }, 100)],
-        ..Default::default()
-    };
-    // 401 usenet connections fit beside the reserve, not beside a torrent
-    // session too.
-    db.insert_server_with_routing(&server(1, 400, true), Some(&through_tunnel))
-        .unwrap();
     db.save_proxy_routing_policy(Consumer::Torrent(TorrentScope::Default), &through_tunnel)
         .unwrap();
-
     db.save_proxy_routing_policy(Consumer::Rss(7), &through_tunnel)
         .unwrap();
     let mut edited = saved_wireguard(3);
     edited.revision = 2;
     edited.mtu = 1380;
     db.save_proxy_profile(&edited).unwrap();
-    db.insert_server(&server(2, 50, true)).unwrap();
-    db.update_server(&server(2, 60, true)).unwrap();
+    db.update_server(&server(1, 1001, true)).unwrap();
 
+    let servers = db.list_servers().unwrap();
+    assert_eq!(servers.len(), 2);
+    assert!(servers.iter().all(|server| server.active));
     assert_eq!(
-        refused_code(db.update_server(&server(1, 401, true))),
-        Some("WIREGUARD_SOCKET_BUDGET")
+        servers.iter().find(|server| server.id == 1).unwrap().connections,
+        1001
     );
-    db.update_server(&server(1, 380, true)).unwrap();
+}
+
+// Past the fit a save asked for, usenet sockets wait as they open: at the
+// performance profile's 2 MiB buffer a tunnel asked for 1000 connections
+// hands out no more than fit beside what it keeps, the bytes it holds never
+// pass its limit, the dial past them is refused with the signal it waits
+// on, and a freed socket wakes it and lets it in.
+#[tokio::test]
+async fn usenet_sockets_past_the_fit_wait_and_a_freed_one_lets_a_waiter_in() {
+    use weaver_tunnel::pipe::{Refused, SessionSockets, SocketClass};
+    set_usenet_receive_bytes(2 * MIB as usize, None);
+    let ledger = socket_ledger(
+        &[(
+            Consumer::Server(1),
+            route(vec![Rung::Proxy { id: 1 }], Failover::Redistribute),
+        )],
+        &profiles(&[1], &[]),
+        &HashMap::new(),
+        &HashMap::from([(1, 1000)]),
+    );
+    let tunnel = &ledger[&tunnel(1)];
+    assert!(tunnel.over_budget());
+    let sockets = SessionSockets::new(tunnel.budget(), std::sync::Arc::new(fixed_split(None)));
+    let bytes = usenet_socket_bytes();
+    let mut held: Vec<_> =
+        std::iter::from_fn(|| sockets.take(SocketClass::Nntp, bytes).ok().flatten()).collect();
+    assert!(held.len() <= tunnel.nntp_held(), "{}", held.len());
+    assert!(
+        held.len() as u64 * bytes + tunnel.kept() <= WIREGUARD_INSTANCE_BYTES,
+        "{}",
+        held.len()
+    );
+    assert_eq!(sockets.held(SocketClass::Nntp), held.len() as u64 * bytes);
+    let opened = held.len();
+
+    let Err(Refused { freed, .. }) = sockets.take(SocketClass::Nntp, bytes) else {
+        panic!("a full tunnel handed out a usenet socket");
+    };
+    assert_eq!(sockets.held(SocketClass::Nntp), opened as u64 * bytes);
+    let notify = freed.notify();
+    let woken = notify.notified();
+    tokio::pin!(woken);
+    woken.as_mut().enable();
+    drop(held.pop());
+    woken.await;
+    held.push(
+        sockets
+            .take(SocketClass::Nntp, bytes)
+            .ok()
+            .flatten()
+            .expect("the freed socket's bytes let the waiter in"),
+    );
+    assert_eq!(held.len(), opened);
+    assert!(sockets.take(SocketClass::Nntp, bytes).is_err());
 }

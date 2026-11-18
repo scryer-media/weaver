@@ -232,13 +232,7 @@ impl Configuration {
             let Some(tunnel) = self.socket_ledger.get(&path).filter(|t| t.over_budget()) else {
                 continue;
             };
-            let refusal = tunnel.refusal().to_string();
-            let mut text = refusal[..1].to_uppercase();
-            text.push_str(&refusal[1..]);
-            over.push((
-                slot,
-                format!("{text}; usenet is held to {}.", tunnel.nntp_held()),
-            ));
+            over.push((slot, tunnel.over_budget_warning()));
         }
         for (slot, warning) in over {
             self.warn(slot, warning);

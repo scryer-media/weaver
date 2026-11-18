@@ -9,10 +9,9 @@
 // repair came to returns through the run mail, numbered by the loan, and is
 // applied by the namespace as the set's ruling.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
+
+use crate::operations::disk::reader::TurnStop;
 
 use tokio::sync::mpsc;
 use weaver_graph::NodeId;
@@ -40,7 +39,7 @@ struct Out {
     set: NodeId,
     serial: u64,
     state: Option<SetState>,
-    stop: Option<Arc<AtomicBool>>,
+    stop: Option<Arc<TurnStop>>,
     kind: Work,
 }
 
@@ -77,7 +76,7 @@ impl Loans {
 
     pub(crate) fn request_stop(&self) {
         if let Some(stop) = self.out.as_ref().and_then(|out| out.stop.as_ref()) {
-            stop.store(true, Ordering::Relaxed);
+            stop.raise();
         }
     }
 

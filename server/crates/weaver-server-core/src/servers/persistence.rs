@@ -50,7 +50,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
                 let args = args.clone(); let routing = routing.clone();
                 Box::pin(async move {
-            let before = crate::proxies::lock_network_asks(tx).await?;
+            crate::proxies::lock_network(tx).await?;
             if within_limit {
                 refuse_past_server_limit(tx).await?;
             }
@@ -61,7 +61,7 @@ impl Database {
                 &args,
             )
             .await?;
-            crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref(), &before)
+            crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
                 .await?;
             Ok(())
                 })
@@ -94,7 +94,7 @@ impl Database {
                 let args = args.clone();
                 let routing = routing.clone();
                 Box::pin(async move {
-                    let before = crate::proxies::lock_network_asks(tx).await?;
+                    crate::proxies::lock_network(tx).await?;
                     tx.execute(
                         "UPDATE servers
                     SET host = {}, port = {}, tls = {}, username = {}, password = {},
@@ -114,7 +114,6 @@ impl Database {
                         tx,
                         consumer,
                         routing.as_ref(),
-                        &before,
                     )
                     .await?;
                     Ok(())

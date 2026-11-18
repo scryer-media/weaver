@@ -724,7 +724,7 @@ impl Database {
                 let mut list = list.clone();
                 let stored = stored.clone();
                 Box::pin(async move {
-                    let before = super::lock_network_asks(tx).await?;
+                    super::lock_network(tx).await?;
                     if create {
                         if count(tx, "dns_server_lists").await? >= super::MAX_DNS_LISTS {
                             return Err(NetworkRefusal::DnsListLimitReached.into());
@@ -746,7 +746,6 @@ impl Database {
                     // ask.
                     super::network_persistence::validate_stored_network(
                         tx,
-                        &before,
                         Touched::List(list.id),
                     )
                     .await?;
@@ -800,7 +799,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&store, "save_dns_profile", |tx| {
                 let mut profile = profile.clone();
                 Box::pin(async move {
-                    let before = super::lock_network_asks(tx).await?;
+                    super::lock_network(tx).await?;
                     if create {
                         if count(tx, "dns_profiles").await? >= super::MAX_DNS_PROFILES {
                             return Err(NetworkRefusal::DnsProfileLimitReached.into());
@@ -841,7 +840,6 @@ impl Database {
                     .await?;
                     super::network_persistence::validate_stored_network(
                         tx,
-                        &before,
                         Touched::Profile(profile.id),
                     )
                     .await?;
