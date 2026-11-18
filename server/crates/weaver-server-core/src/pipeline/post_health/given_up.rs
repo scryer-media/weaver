@@ -155,14 +155,7 @@ impl GivenUp {
         if end != Some(SegmentTerminalState::Abandoned) {
             file.lost += 1;
         }
-        if end.is_none_or(|end| {
-            matches!(
-                end,
-                SegmentTerminalState::Missing
-                    | SegmentTerminalState::Unservable
-                    | SegmentTerminalState::UnservableNotFound
-            )
-        }) {
+        if gone_at(end) {
             file.missing += 1;
             file.missing_bytes += bytes;
             let start = self
@@ -179,6 +172,12 @@ impl GivenUp {
 
     pub(in crate::pipeline) fn holds(&self, segment: SegmentId) -> bool {
         self.articles.contains_key(&segment)
+    }
+
+    // Whether every server said the article is gone: what `missing_bytes`
+    // already counts it in.
+    pub(in crate::pipeline) fn gone(&self, segment: SegmentId) -> bool {
+        self.articles.get(&segment).is_some_and(|end| gone_at(*end))
     }
 
     // The health-counted bytes of every article given up.
@@ -224,6 +223,19 @@ impl GivenUp {
             .filter(|(_, file)| file.missing > 0)
             .map(|(index, _)| *index)
     }
+}
+
+// Whether an article given up at `end` is one every server said is gone:
+// `None` is one lost before a restart, which every server had failed.
+fn gone_at(end: Option<SegmentTerminalState>) -> bool {
+    end.is_none_or(|end| {
+        matches!(
+            end,
+            SegmentTerminalState::Missing
+                | SegmentTerminalState::Unservable
+                | SegmentTerminalState::UnservableNotFound
+        )
+    })
 }
 
 // The parts of `range` the ranges in `gone` cover.

@@ -71,10 +71,12 @@ async fn a_metainfo_becomes_a_job_and_its_duplicate_is_refused() {
 
 // A file with an extension the operator does not want is left out of the
 // download, its level kept as `Ignored`, and the torrent completes on the
-// files it wants. One that leaves no file wanted is refused, and so is one
-// named after an executable.
+// files it wants. One whose every file is unwanted is added with nothing
+// wanted and completes at once, fetching nothing, as qBittorrent's filename
+// filter leaves such a torrent finished. One named after an executable is
+// refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_executables() {
+async fn admission_leaves_out_unwanted_files_even_all_of_them_and_refuses_executables() {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     rig.db
@@ -117,16 +119,30 @@ async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_exec
     assert!(view.completed_at_ms.is_some());
     assert_eq!(view.wanted_bytes, 128);
 
-    let unwanted = metainfo("set", &[("set/b.nfo", &[2; 10])], 64, false);
+    let unwanted = metainfo("notes", &[("set/b.nfo", &[2; 10])], 64, false);
+    let mut published = rig.service.inner.published.subscribe();
+    let nothing_wanted = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(unwanted)))
+        .await
+        .unwrap();
     assert_eq!(
-        rig.service
-            .add_opened(request(AddSource::Metainfo(unwanted)))
-            .await,
-        Err(AddError::Refused(Refusal::Unwanted {
-            path: "set/b.nfo".into(),
-            pattern: "nfo".into()
-        }))
+        rig.db.torrent_file_priorities(nothing_wanted).unwrap(),
+        [FilePriority::Ignored]
     );
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(nothing_wanted)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let view = rig.service.torrent(nothing_wanted).await.unwrap();
+    assert_eq!((view.wanted_bytes, view.downloaded_bytes), (0, 0));
     let executable = metainfo("setup.exe", &[("setup.exe", &[1; 100])], 64, false);
     assert_eq!(
         rig.service
@@ -134,7 +150,7 @@ async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_exec
             .await,
         Err(AddError::Refused(Refusal::Executable("setup.exe".into())))
     );
-    assert_eq!(rig.db.list_torrents().unwrap().len(), 1);
+    assert_eq!(rig.db.list_torrents().unwrap().len(), 2);
     rig.service.stop().await;
 }
 

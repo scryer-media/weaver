@@ -137,25 +137,38 @@ fn stored_file(bytes: &mut Vec<u8>, name: &str, file: &[u8]) {
 // `beacon.bin`, then `link.bin`: a file-system redirection (RAR5 extra
 // record 5, type 1: a Unix symlink) to it.
 fn symlink_rar() -> Volumes {
+    redirection_rar(1, false)
+}
+
+// `beacon.bin` and `link.bin`, a file-system redirection of type `kind` to
+// it, the link ahead of the file when `first`. unrar knows types 1 to 5
+// (headers.hpp FSREDIR_*).
+fn redirection_rar(kind: u64, first: bool) -> Volumes {
     let target = "beacon.bin";
     let mut record = Vec::new();
     record.extend_from_slice(&encode_test_rar_vint(5));
-    record.extend_from_slice(&encode_test_rar_vint(1));
+    record.extend_from_slice(&encode_test_rar_vint(kind));
     record.extend_from_slice(&encode_test_rar_vint(0));
     record.extend_from_slice(&encode_test_rar_vint(target.len() as u64));
     record.extend_from_slice(target.as_bytes());
     let mut extra = encode_test_rar_vint(record.len() as u64);
     extra.extend_from_slice(&record);
     rar5(|bytes| {
-        stored_file(bytes, "beacon.bin", &body());
-        bytes.extend_from_slice(&build_test_rar_file_header_with_extra(
+        let link = build_test_rar_file_header_with_extra(
             "link.bin",
             0,
             0,
             0,
             Some(par2_rs::checksum::crc32(&[])),
             &extra,
-        ));
+        );
+        if first {
+            bytes.extend_from_slice(&link);
+        }
+        stored_file(bytes, "beacon.bin", &body());
+        if !first {
+            bytes.extend_from_slice(&link);
+        }
     })
 }
 
@@ -686,6 +699,34 @@ async fn a_rar_holding_a_symlink_delivers_its_file_and_refuses_the_link_not_a_fi
     let scenario = Scenario::new(beside(posts(&symlink_rar())));
     run_expecting(
         &scenario,
+        Graph {
+            status: Some(Status::Complete),
+            kind: None,
+            files: with_quill(vec![file("beacon.bin", Some(body()))]),
+            whole: &["beacon.bin", "quill.mkv"],
+            damaged: &[],
+            unrepaired: &[],
+            withheld: &[],
+            refused: &["kind=rar_store member=silver.horizon.rar why=not_a_file"],
+            delivered: &["name=beacon.bin from=beacon.bin depth=1 whole=true", QUILL],
+        },
+    )
+    .await;
+}
+
+// A redirection of a type unrar does not know is no file body either: it is
+// passed over as a link is, and the file beside it is delivered.
+#[tokio::test]
+async fn a_rar_holding_a_redirection_of_an_unknown_type_delivers_its_file_as_beside_a_link() {
+    for first in [false, true] {
+        let scenario = Scenario::new(beside(posts(&redirection_rar(9, first))));
+        unknown_redirection(&scenario).await;
+    }
+}
+
+async fn unknown_redirection(scenario: &Scenario) {
+    run_expecting(
+        scenario,
         Graph {
             status: Some(Status::Complete),
             kind: None,

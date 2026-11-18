@@ -743,3 +743,97 @@ async fn a_set_numbered_at_mixed_widths_delivers_its_member() {
         );
     }
 }
+
+// A compressed set posted under dotted names beside a PAR2 set over its
+// true spaced names: `Set.Name-(2003-2022).part01.rar` is renamed
+// `Set Name - (2003 - 2022).part01.rar` by its content, each volume as it
+// is bound, while the engine reads the volumes before it. The set is one
+// engine run across the renames and every member is delivered, in every
+// order the PAR2 set and the volumes arrive in.
+#[tokio::test]
+async fn a_compressed_set_renamed_by_par2_while_it_extracts_delivers_every_member() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles"
+    );
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/expected.json"
+    )))
+    .unwrap();
+    for fixture in ["rar5_lz_four", "rar5_solid_four"] {
+        let truth: Vec<(String, Vec<u8>)> = (1..=4usize)
+            .map(|part| {
+                let bytes = std::fs::read(format!("{dir}/{fixture}.part0{part}.rar")).unwrap();
+                (
+                    format!("Casting Crowns - Collection (2003 - 2022).part0{part}.rar"),
+                    bytes,
+                )
+            })
+            .collect();
+        let files: Vec<(&str, &[u8])> = truth
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let volumes = || -> Vec<Post> {
+            truth
+                .iter()
+                .enumerate()
+                .map(|(index, (_, bytes))| {
+                    Post::plain(
+                        &format!(
+                            "Casting.Crowns-Collection.(2003-2022).part0{}.rar",
+                            index + 1
+                        ),
+                        bytes.clone(),
+                    )
+                })
+                .collect()
+        };
+        let set = || super::harness::par2_set("Casting.Crowns-Collection.(2003-2022)", &files, 2);
+        let orders: [(&str, Vec<Post>); 3] = [
+            ("par2 first", set().into_iter().chain(volumes()).collect()),
+            ("par2 last", volumes().into_iter().chain(set()).collect()),
+            ("par2 midway", {
+                let mut posts = volumes();
+                let rest = posts.split_off(1);
+                posts.extend(set());
+                posts.extend(rest);
+                posts
+            }),
+        ];
+        for (order, posts) in orders {
+            let case = format!("{fixture} {order}");
+            let graph = run(&Scenario::new(posts)).await;
+            assert!(
+                graph.completed(),
+                "{case}: {:?} {:?} kinds {:?} delivery {:?}",
+                graph.status,
+                graph.failure,
+                kinds(&graph),
+                graph.graph().delivery,
+            );
+            assert_engine_ran(&graph);
+            let expected = oracle["archives"][fixture].as_object().unwrap();
+            let mut names: Vec<String> = expected.keys().map(|name| delivered(name)).collect();
+            names.sort();
+            let mut got: Vec<String> = graph.files.keys().cloned().collect();
+            got.sort();
+            assert_eq!(got, names, "{case}");
+            for (name, facts) in expected {
+                assert_eq!(
+                    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                        &graph.files[&delivered(name)]
+                    )),
+                    facts["sha256"].as_str().unwrap(),
+                    "{case}: {name}"
+                );
+            }
+            assert!(
+                graph.graph().delivery.withheld.is_empty(),
+                "{case}: {:?}",
+                graph.graph().delivery
+            );
+        }
+    }
+}

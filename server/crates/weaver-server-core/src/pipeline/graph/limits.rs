@@ -691,6 +691,12 @@ impl Caps {
         self.known.get().is_some()
     }
 
+    // The policy the job is judged by, once read: the same copy from then
+    // on, its final move included, whatever the operator saves meanwhile.
+    pub(crate) fn policy(&self) -> Option<Arc<PostProcessingSettings>> {
+        self.known.get().cloned()
+    }
+
     // The policy when its action leaves files with an unwanted extension out
     // of the delivery; `None` when it fails the job instead, or is unread.
     pub(crate) fn removes(&self) -> Option<&PostProcessingSettings> {

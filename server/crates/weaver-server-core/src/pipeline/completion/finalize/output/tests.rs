@@ -321,7 +321,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         dest,
         Arc::new(PhaseCounters::default()),
         None,
-        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        DeliveryPolicySource::Job(Arc::new(PostProcessingSettings::default())),
         HashSet::new(),
         None,
     )
@@ -426,7 +426,7 @@ async fn final_move_refuses_symlink_entries_and_releases_its_empty_destination_c
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
-        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        DeliveryPolicySource::Job(Arc::new(PostProcessingSettings::default())),
         HashSet::new(),
         None,
     )
@@ -467,7 +467,7 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
             job_display_name: "Silver Horizon 2024".to_string(),
             srrdb: None,
         }),
-        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        DeliveryPolicySource::Job(Arc::new(PostProcessingSettings::default())),
         HashSet::new(),
         None,
     )
@@ -500,7 +500,7 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
-        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        DeliveryPolicySource::Job(Arc::new(PostProcessingSettings::default())),
         HashSet::new(),
         None,
     )
@@ -530,7 +530,7 @@ async fn final_move_removes_the_working_directory_with_its_chunk_workspace() {
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
-        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        DeliveryPolicySource::Job(Arc::new(PostProcessingSettings::default())),
         HashSet::new(),
         None,
     )
@@ -554,6 +554,7 @@ fn prepublication_scan_checks_both_delivery_roots() {
 
     let settings = PostProcessingSettings {
         unacceptable_extensions: vec!["EXE".into()],
+        unwanted_extension_action: crate::post_processing::model::UnwantedExtensionAction::FailJob,
         ..PostProcessingSettings::default()
     }
     .normalized()
@@ -771,7 +772,7 @@ async fn final_move_publishes_the_staged_delivery_without_its_marker_and_joins_s
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
-        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        DeliveryPolicySource::Job(Arc::new(PostProcessingSettings::default())),
         HashSet::new(),
         None,
     )
@@ -946,7 +947,7 @@ async fn deliver_one_file(pipeline: &Pipeline, job_id: JobId, category: Option<&
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
-        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        DeliveryPolicySource::Job(Arc::new(PostProcessingSettings::default())),
         HashSet::new(),
         None,
     )

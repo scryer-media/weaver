@@ -1012,6 +1012,7 @@ struct Heard {
     peer_id: String,
     downloaded: u64,
     uploaded: u64,
+    left: u64,
 }
 
 impl Heard {
@@ -1029,6 +1030,7 @@ impl Heard {
             peer_id: field("peer_id").unwrap(),
             downloaded: count("downloaded"),
             uploaded: count("uploaded"),
+            left: count("left"),
         }
     }
 
@@ -1042,21 +1044,23 @@ impl Heard {
 async fn heard_tracker(
     peers: &[std::net::SocketAddrV4],
 ) -> (String, tokio::sync::mpsc::UnboundedReceiver<Heard>) {
+    heard_tracker_naming(Arc::new(std::sync::Mutex::new(peers.to_vec()))).await
+}
+
+// As [`heard_tracker`], naming the peers `peers` holds when each announce
+// is read.
+async fn heard_tracker_naming(
+    peers: Arc<std::sync::Mutex<Vec<std::net::SocketAddrV4>>>,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<Heard>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/announce", listener.local_addr().unwrap());
-    let mut body = format!("d8:intervali1800e5:peers{}:", peers.len() * 6).into_bytes();
-    for peer in peers {
-        body.extend_from_slice(&peer.ip().octets());
-        body.extend_from_slice(&peer.port().to_be_bytes());
-    }
-    body.push(b'e');
     let (heard, announces) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let heard = heard.clone();
-            let body = body.clone();
+            let peers = Arc::clone(&peers);
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut buf = [0u8; 1024];
@@ -1070,6 +1074,13 @@ async fn heard_tracker(
                 let path = request.split(' ').nth(1).unwrap();
                 let (_, query) = path.split_once('?').unwrap();
                 let _ = heard.send(Heard::of(query));
+                let peers = locked(&peers).clone();
+                let mut body = format!("d8:intervali1800e5:peers{}:", peers.len() * 6).into_bytes();
+                for peer in peers {
+                    body.extend_from_slice(&peer.ip().octets());
+                    body.extend_from_slice(&peer.port().to_be_bytes());
+                }
+                body.push(b'e');
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -1213,6 +1224,284 @@ async fn a_paused_and_resumed_torrent_keeps_its_key_and_peer_id() {
     assert_eq!(stopped.identity(), started.identity());
     assert_eq!(again.identity(), started.identity());
     rig.service.stop().await;
+}
+
+// A private torrent whose every file is on the unwanted list is added with
+// nothing wanted, as qBittorrent adds it (`applyFilenameFilter`), and is
+// finished at once (libtorrent `piece_picker::is_finished` with every piece
+// filtered). Its tracker hears `started` with every byte left and nothing
+// moved, and then only the `stopped` of the shutdown: the torrent never
+// becomes a seed, so it never sends `completed` (libtorrent
+// `torrent::finished` calls `completed` only `if (is_seed())`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_with_every_file_unwanted_starts_and_stops_and_never_completes() {
+    let (url, mut announces) = heard_tracker(&[]).await;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    rig.db
+        .save_post_processing_settings(&PostProcessingSettings {
+            unacceptable_extensions: vec!["exe".into()],
+            ..PostProcessingSettings::default()
+        })
+        .unwrap();
+    let files: [(&str, &[u8]); 2] = [("pack/setup.exe", &[1; 100]), ("pack/readme.exe", &[2; 60])];
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(metainfo("pack", &files, 64, true)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.db.torrent_file_priorities(job_id).unwrap(),
+        [FilePriority::Ignored, FilePriority::Ignored]
+    );
+    tracked(&rig.service, job_id, &url).await;
+    let mut published = rig.service.inner.published.subscribe();
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+    assert_eq!(
+        (started.left, started.downloaded, started.uploaded),
+        (160, 0, 0)
+    );
+    started_accepted(&rig.service, job_id).await;
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!((view.wanted_bytes, view.downloaded_bytes), (0, 0));
+    announces_answered(&rig.service, job_id).await;
+
+    rig.service.stop().await;
+    let mut after = Vec::new();
+    while let Ok(heard) = announces.try_recv() {
+        after.push(heard);
+    }
+    let events: Vec<_> = after
+        .iter()
+        .filter_map(|heard| heard.event.as_deref())
+        .collect();
+    assert_eq!(events, ["stopped"], "{after:?}");
+    let stopped = after.iter().find(|heard| heard.event.is_some()).unwrap();
+    assert_eq!(
+        (stopped.left, stopped.downloaded, stopped.uploaded),
+        (160, 0, 0)
+    );
+    assert_eq!(stopped.identity(), started.identity());
+}
+
+// A private torrent of two files of whole pieces, `a` and `b`, run against
+// a sharer holding only `a`: once `a` is whole, `b` is set ignored, which
+// leaves nothing it wants missing. Returns once the torrent completed for
+// that, with what its tracker heard so far, the list of peers the tracker
+// names and the bytes of both files.
+struct FinishedByIgnoring {
+    rig: Rig,
+    job_id: JobId,
+    meta: Vec<u8>,
+    data: Vec<u8>,
+    peers: Arc<std::sync::Mutex<Vec<std::net::SocketAddrV4>>>,
+    announces: tokio::sync::mpsc::UnboundedReceiver<Heard>,
+    started: Heard,
+    sharer: Arc<Session>,
+    _seeds: tempfile::TempDir,
+}
+
+const IGNORED_PIECE: usize = 16_384;
+
+async fn finished_by_ignoring() -> FinishedByIgnoring {
+    let data: Vec<u8> = (0..4 * IGNORED_PIECE as u32)
+        .map(|at| (at * 7 % 251) as u8)
+        .collect();
+    let half = 2 * IGNORED_PIECE;
+    let files = [("set/a.bin", &data[..half]), ("set/b.bin", &data[half..])];
+    let meta = metainfo("set", &files, IGNORED_PIECE, true);
+    let seeds = tempfile::tempdir().unwrap();
+    let (sharer, shared) = sharing(seeds.path(), &meta, &files[..1]).await;
+    shared.wait_until_initialized().await.unwrap();
+    let std::net::SocketAddr::V4(peer) = sharer.listen_addr().unwrap() else {
+        panic!("the sharer listens on IPv4 loopback");
+    };
+    let peers = Arc::new(std::sync::Mutex::new(vec![peer]));
+    let (url, mut announces) = heard_tracker_naming(Arc::clone(&peers)).await;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(meta.clone()))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    let mut settled = rig.service.inner.settled.subscribe();
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+    assert_eq!(
+        (started.left, started.downloaded, started.uploaded),
+        (data.len() as u64, 0, 0)
+    );
+    started_accepted(&rig.service, job_id).await;
+    // `a` whole, as the settle after its last piece saw it.
+    settled
+        .wait_for(|_| store.has_files(|file| file == 0))
+        .await
+        .unwrap();
+    assert!(
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .completed_at_ms
+            .is_none()
+    );
+
+    rig.service
+        .set_file_priorities(job_id, &[(1, FilePriority::Ignored)])
+        .await
+        .unwrap();
+    settled
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    FinishedByIgnoring {
+        rig,
+        job_id,
+        meta,
+        data,
+        peers,
+        announces,
+        started,
+        sharer,
+        _seeds: seeds,
+    }
+}
+
+// A torrent left with nothing it wants missing because the operator set
+// its missing files ignored is finished at once: it completes and seeds
+// (libtorrent `torrent::prioritize_pieces` -> `update_peer_interest` ->
+// `finished()`; qBittorrent `handleTorrentFinished` on the
+// `torrent_finished_alert`). It is not a seed, so its tracker hears no
+// `completed` (libtorrent `finished()` calls `completed()` only
+// `if (is_seed())`), only the `stopped` of the shutdown, with `left` the
+// bytes of the ignored file (libtorrent `torrent::bytes_left`: the whole
+// torrent's size less the pieces had, whatever is wanted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_whose_missing_files_are_set_ignored_finishes_without_completed() {
+    let FinishedByIgnoring {
+        rig,
+        job_id,
+        data,
+        mut announces,
+        started,
+        sharer,
+        ..
+    } = finished_by_ignoring().await;
+    let half = data.len() as u64 / 2;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Seeding);
+    assert_eq!((view.wanted_bytes, view.downloaded_bytes), (half, half));
+    announces_answered(&rig.service, job_id).await;
+
+    rig.service.stop().await;
+    sharer.stop().await;
+    let mut after = Vec::new();
+    while let Ok(heard) = announces.try_recv() {
+        after.push(heard);
+    }
+    let events: Vec<_> = after
+        .iter()
+        .filter_map(|heard| heard.event.as_deref())
+        .collect();
+    assert_eq!(events, ["stopped"], "{after:?}");
+    let stopped = after.iter().find(|heard| heard.event.is_some()).unwrap();
+    assert_eq!((stopped.left, stopped.downloaded), (half, half));
+    assert_eq!(stopped.identity(), started.identity());
+}
+
+// A torrent finished by ignoring its missing files, the ignored file then
+// wanted again, downloads it: it is no longer finished (libtorrent
+// `update_peer_interest` -> `resume_download()`; qBittorrent
+// `prioritizeFiles` clears `m_hasFinishedStatus`). Its tracker hears no
+// second `started`, and `completed` once it becomes a seed, in this run,
+// which began short of one (libtorrent `torrent::completed` from
+// `finished()` once `is_seed()`; `announce_with_tracker` sends `completed`
+// while `!m_complete_sent && is_seed()`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ignored_file_wanted_again_downloads_and_completes_once() {
+    let FinishedByIgnoring {
+        rig,
+        job_id,
+        meta,
+        data,
+        peers,
+        mut announces,
+        started,
+        sharer,
+        ..
+    } = finished_by_ignoring().await;
+    let files = [
+        ("set/a.bin", &data[..data.len() / 2]),
+        ("set/b.bin", &data[data.len() / 2..]),
+    ];
+    let full = tempfile::tempdir().unwrap();
+    let seeding = seeder(full.path(), &meta, &files).await;
+    let std::net::SocketAddr::V4(seed) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    locked(&peers).push(seed);
+    announces_answered(&rig.service, job_id).await;
+
+    rig.service
+        .set_file_priorities(job_id, &[(1, FilePriority::Normal)])
+        .await
+        .unwrap();
+    rig.service.reannounce(job_id).await.unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_completed().await.unwrap();
+    let completed = next_event(&mut announces).await;
+    assert_eq!(completed.event.as_deref(), Some("completed"));
+    assert_eq!(
+        (completed.left, completed.downloaded),
+        (0, data.len() as u64)
+    );
+    assert_eq!(completed.identity(), started.identity());
+    announces_answered(&rig.service, job_id).await;
+
+    rig.service.stop().await;
+    sharer.stop().await;
+    seeding.stop().await;
+    let mut after = Vec::new();
+    while let Ok(heard) = announces.try_recv() {
+        after.extend(heard.event);
+    }
+    assert_eq!(after, ["stopped"], "only the shutdown's");
 }
 
 // A torrent whose route changes while its old leg stands goes on over the
