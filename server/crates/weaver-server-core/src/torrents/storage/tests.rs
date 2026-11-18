@@ -32,6 +32,8 @@ use weaver_torrent::storage::{
 #[cfg(unix)]
 mod bench;
 mod blocks;
+#[cfg(unix)]
+mod memory;
 
 fn accountant(resident_limit: u64) -> Arc<HoldsAccountant> {
     Arc::new(HoldsAccountant::new(HoldBudgets {

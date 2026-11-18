@@ -6675,6 +6675,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "lzma-turbo",
+ "memmap2",
  "notify",
  "par2-rs",
  "par3-rs",
