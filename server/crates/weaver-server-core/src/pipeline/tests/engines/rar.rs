@@ -879,18 +879,24 @@ async fn a_header_encrypted_rar5_set_without_a_password_check_goes_to_the_engine
 // lost inside the set reads back as damage, so the refusal reads the posted
 // volumes back as they were, short; a set with no volume past its last
 // ends its run silently, and once the job is quiet its object rules that
-// the member it named never closed, and withholds the volumes unmapped, as
-// a store's set missing its last volume does.
-async fn assert_missing_volume_fails(missing: &str, failure: impl Fn(&[&str]) -> String) {
+// the member it named never closed, and withholds the volumes short of the
+// volume after its last, which it names, as SABnzbd's "unable to find" does.
+const OLD_NAMES: [&str; 3] = [
+    "silver.horizon.rar",
+    "silver.horizon.r00",
+    "silver.horizon.r01",
+];
+
+async fn assert_missing_volume_fails(
+    names: [&str; 3],
+    missing: &str,
+    failure: impl Fn(&[&str]) -> String,
+) {
     let body = body();
     let volumes: Vec<(String, Vec<u8>)> =
         header_encrypted_store_set(MEMBER, &body, 3, SECRET, HeaderCheck::Absent)
             .into_iter()
-            .zip([
-                "silver.horizon.rar",
-                "silver.horizon.r00",
-                "silver.horizon.r01",
-            ])
+            .zip(names)
             .filter(|(_, name)| *name != missing)
             .map(|((_, bytes), name)| (name.to_owned(), bytes))
             .collect();
@@ -911,8 +917,27 @@ async fn assert_missing_volume_fails(missing: &str, failure: impl Fn(&[&str]) ->
 // Without `.r01`, the last: the engine finds no volume past `.r00`.
 #[tokio::test]
 async fn a_three_volume_set_the_engine_reads_posted_without_its_r01_fails() {
-    assert_missing_volume_fails("silver.horizon.r01", |_| {
-        "silver.horizon.r00, silver.horizon.rar never placed every member it named".to_owned()
+    assert_missing_volume_fails(OLD_NAMES, "silver.horizon.r01", |_| {
+        "silver.horizon.r00, silver.horizon.rar never placed every member it named: \
+         unable to find silver.horizon.r01"
+            .to_owned()
+    })
+    .await;
+}
+
+// Without `part3`, the last of a set numbered in parts, in their width and
+// case.
+#[tokio::test]
+async fn a_three_part_set_the_engine_reads_posted_without_its_last_part_names_it() {
+    let names = [
+        "Silver.Horizon.part01.rar",
+        "Silver.Horizon.part02.rar",
+        "Silver.Horizon.part03.rar",
+    ];
+    assert_missing_volume_fails(names, "Silver.Horizon.part03.rar", |_| {
+        "Silver.Horizon.part01.rar, Silver.Horizon.part02.rar never placed every member it \
+         named: unable to find Silver.Horizon.part03.rar"
+            .to_owned()
     })
     .await;
 }
@@ -920,7 +945,7 @@ async fn a_three_volume_set_the_engine_reads_posted_without_its_r01_fails() {
 // Without `.r00`, inside the set: the engine reads position 1 as lost.
 #[tokio::test]
 async fn a_three_volume_set_the_engine_reads_posted_without_its_r00_fails() {
-    assert_missing_volume_fails("silver.horizon.r00", |short| {
+    assert_missing_volume_fails(OLD_NAMES, "silver.horizon.r00", |short| {
         format!(
             "no file was delivered whole; {} short: {}",
             short.len(),

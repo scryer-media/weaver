@@ -848,7 +848,7 @@ impl Object for SevenZipStore {
         self.install(out);
         let why = crate::quiet::damaged(standing)
             .or_else(|| self.shut())
-            .or_else(|| crate::quiet::unplaced(standing));
+            .or_else(|| crate::quiet::unplaced(standing, None));
         if let Some(why) = why {
             self.give_up(Emit::Refuse(why), out);
         }

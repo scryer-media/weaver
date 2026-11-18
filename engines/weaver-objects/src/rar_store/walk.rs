@@ -316,6 +316,12 @@ impl Walk {
             .is_some_and(|member| member.split_after)
     }
 
+    // Whether a volume follows this one: its end record says so, or its
+    // last file header says the file goes on in the next.
+    pub(super) fn followed(&self) -> bool {
+        self.successor() == Some(true) || self.continues()
+    }
+
     // Whether no volume follows this one.
     pub(super) fn is_last(&self) -> bool {
         self.successor() == Some(false)

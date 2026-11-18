@@ -2033,6 +2033,8 @@ fn every_reason_a_row_keeps_reads_back_with_its_sizes() {
             needed: 1 << 41,
             memory: 8 << 30,
         },
+        Why::Unfound { volume: 2 },
+        Why::Unfound { volume: u32::MAX },
     ]);
     for why in reasons {
         assert_eq!(
@@ -2052,7 +2054,11 @@ fn every_reason_a_row_keeps_reads_back_with_its_sizes() {
         }),
         "over_machine:2199023255552:8589934592"
     );
+    assert_eq!(super::why_text(Why::Unfound { volume: 2 }), "unfound:2");
     for text in [
+        "unfound",
+        "unfound:-",
+        "unfound:1:2",
         "too_large",
         "too_large:1",
         "unsupported:1:2",

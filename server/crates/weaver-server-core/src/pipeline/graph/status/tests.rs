@@ -863,6 +863,65 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
     );
 }
 
+// A set short of the volume after its last names it, in the numbering, width
+// and case of its own volumes' names, once for the set however many of its
+// volumes were withheld; its number where no name numbers it.
+#[test]
+fn a_set_short_of_a_volume_names_the_volume_it_lacks() {
+    let withheld = |withheld: &[(&str, Why)]| Delivery {
+        withheld: withheld
+            .iter()
+            .map(|(name, why)| (name.to_string(), *why))
+            .collect(),
+        ..Delivery::default()
+    };
+    let unfound = |volume| Why::Unfound { volume };
+    let cases: &[(&[(&str, Why)], &str)] = &[
+        (
+            &[
+                ("silver.horizon.r00", unfound(2)),
+                ("silver.horizon.rar", unfound(2)),
+            ],
+            "silver.horizon.r00, silver.horizon.rar never placed every member it named: \
+             unable to find silver.horizon.r01",
+        ),
+        (
+            &[("Silver.part01.rar", unfound(1))],
+            "Silver.part01.rar never placed every member it named: unable to find Silver.part02.rar",
+        ),
+        (
+            &[("silver.horizon.rar", unfound(1))],
+            "silver.horizon.rar never placed every member it named: unable to find silver.horizon.r00",
+        ),
+        (
+            &[("silver.r99", unfound(101))],
+            "silver.r99 never placed every member it named: unable to find silver.s00",
+        ),
+        (
+            &[("silver.z99", unfound(901))],
+            "silver.z99 never placed every member it named: unable to find volume 902",
+        ),
+        (
+            &[("lantern.bin", unfound(u32::MAX))],
+            "lantern.bin never placed every member it named: unable to find volume 4294967296",
+        ),
+    ];
+    for (given, said) in cases {
+        assert_eq!(
+            withheld(given).withheld_error().as_deref(),
+            Some(*said),
+            "{given:?}"
+        );
+    }
+    assert_eq!(
+        withheld(&[("lantern.rar", unfound(1))]).status(None),
+        JobStatus::Failed {
+            error: "lantern.rar never placed every member it named: unable to find lantern.r00"
+                .to_string()
+        }
+    );
+}
+
 // An archive withheld too large is worded with the sizes its decoder said,
 // and only those: a size it did not say is never made up. Nothing whole
 // beside it fails the job; a whole file beside it leaves the job partial.

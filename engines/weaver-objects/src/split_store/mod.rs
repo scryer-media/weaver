@@ -535,7 +535,7 @@ impl Object for SplitStore {
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         let scattered = standing.liftable();
         if self.contiguous() && !(scattered && self.pieces.len() == 1) {
-            out.extend(crate::quiet::unplaced(standing).map(Emit::Refuse));
+            out.extend(crate::quiet::unplaced(standing, None).map(Emit::Refuse));
             return;
         }
         // A lifted piece is read back through the set, which still holds
