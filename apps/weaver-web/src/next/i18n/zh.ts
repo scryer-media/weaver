@@ -1019,7 +1019,6 @@ export const nextZh: LocaleDictionary = {
   "next.dns.profiles.proxies": "代理",
   "next.dns.test.action": "测试功能",
   "next.dns.test.title": "测试 DNS 服务器",
-  "next.dns.test.help": "通过所选路由得到的一次快照。保存不依赖于它。",
   "next.dns.test.dnssec": "DNSSEC",
   "next.dns.test.server": "服务器",
   "next.dns.test.caption": "经由 {{route}} 测试",

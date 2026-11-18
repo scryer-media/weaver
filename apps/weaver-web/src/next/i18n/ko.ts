@@ -1019,7 +1019,6 @@ export const nextKo: LocaleDictionary = {
   "next.dns.profiles.proxies": "프록시",
   "next.dns.test.action": "지원 기능 테스트",
   "next.dns.test.title": "DNS 서버 테스트",
-  "next.dns.test.help": "선택한 경로를 통한 시점의 결과입니다. 저장은 이 결과와 무관합니다.",
   "next.dns.test.dnssec": "DNSSEC",
   "next.dns.test.server": "서버",
   "next.dns.test.caption": "{{route}} 경유로 테스트함",

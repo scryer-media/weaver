@@ -479,7 +479,6 @@ function DnsCapabilityDialog({
         </>
       }
     >
-      <p className="flex-none px-4 pt-4 text-[12.5px] leading-[1.5] text-wv-muted sm:px-6">{t("next.dns.test.help")}</p>
       <DraftRouteEditor draft={draft} />
     </Dialog>
   );

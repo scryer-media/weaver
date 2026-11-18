@@ -1019,7 +1019,6 @@ export const nextJa: LocaleDictionary = {
   "next.dns.profiles.proxies": "プロキシ",
   "next.dns.test.action": "対応状況をテスト",
   "next.dns.test.title": "DNS サーバーをテスト",
-  "next.dns.test.help": "選んだルートを通した時点の結果です。保存はこの結果に左右されません。",
   "next.dns.test.dnssec": "DNSSEC",
   "next.dns.test.server": "サーバー",
   "next.dns.test.caption": "{{route}} 経由でテスト",

@@ -162,7 +162,6 @@ export function DnsCapabilityResults({ t, table }: { t: Translate; table: DnsCap
           })}
         </div>
       </div>
-      <p className="mt-2 text-[12px] leading-[1.5] text-wv-muted">{t("next.dns.test.help")}</p>
     </div>
   );
 }

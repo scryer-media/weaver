@@ -1026,7 +1026,6 @@ export const nextEn: LocaleDictionary = {
   "next.dns.profiles.proxies": "Proxies",
   "next.dns.test.action": "Test capabilities",
   "next.dns.test.title": "Test DNS servers",
-  "next.dns.test.help": "A snapshot through the chosen route. Saving does not depend on it.",
   "next.dns.test.dnssec": "DNSSEC",
   "next.dns.test.server": "Server",
   "next.dns.test.caption": "Tested through {{route}}",
