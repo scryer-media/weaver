@@ -38,7 +38,7 @@ const millis = (value: number) => `${Math.round(value)} ms`;
 const columnLabel = (t: Translate, probe: DnsProbeKind) =>
   probe === "dnssec" ? t("next.dns.test.dnssec") : t(dnsWireKey(probe.toUpperCase() as DnsWire));
 
-const CAPABILITY_COLUMNS = "minmax(140px,1fr) repeat(4, 84px)";
+const CAPABILITY_COLUMNS = "minmax(112px,1fr) repeat(4, minmax(72px,84px))";
 
 /** Why a probe did not answer, in the lookup-error wording. */
 const failure = (t: Translate, cell: DnsCapabilityCell) =>
@@ -119,11 +119,12 @@ export function DnsCapabilityResults({ t, table }: { t: Translate; table: DnsCap
         data-testid={networkIds.dnsCapabilities}
         className="min-w-0 overflow-x-auto"
       >
-        <div className="min-w-[560px]">
-          <div role="row" className="grid gap-3 border-b border-wv-hairline py-2" style={{ gridTemplateColumns: CAPABILITY_COLUMNS }}>
+        {/* The narrowest the columns go: 112 + 4 × 72 + 4 gaps of 12. Below it the table scrolls. */}
+        <div className="min-w-[448px]">
+          <div role="row" className="grid items-end gap-3 border-b border-wv-hairline py-2" style={{ gridTemplateColumns: CAPABILITY_COLUMNS }}>
             {[t("next.dns.test.server"), ...DNS_PROBE_KINDS.map((probe) => columnLabel(t, probe))].map((header) => (
               <div key={header} role="columnheader" className="min-w-0">
-                <Eyebrow tone="rail" className="truncate">
+                <Eyebrow tone="rail" className="leading-[1.35] break-words">
                   {header}
                 </Eyebrow>
               </div>
