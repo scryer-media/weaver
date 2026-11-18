@@ -434,9 +434,11 @@ pub(super) fn land_blocks(
 }
 
 // [`land_blocks`]. A block whose piece the storage has no room for sets
-// `no_room` when there is one, and is held by its connection; otherwise,
-// on a disk thread that cannot wait, it is discarded, counted redundant,
-// and fetched again.
+// `no_room` when there is one, and is held by its connection. On a disk
+// thread a piece a block starts is written block by block, so a storage
+// that holds pieces in memory never refuses it; a refusal there, as of a
+// storage that writes every piece block by block, is discarded, counted
+// redundant, and fetched again.
 fn land_blocks_or_hold(
     state: &Arc<TorrentStateLive>,
     blocks: &[(PeerHandle, &Piece<ByteBuf<'_>>, ChunkInfo)],
@@ -466,9 +468,12 @@ fn land_blocks_or_hold(
     let slots = &*state.slots;
     // Asked once a piece in flight, for its first block: its owner's takes
     // the whole piece's room, any other one block's. Neither waits: a
-    // refusal is an answer.
+    // refusal is an answer. A block on a disk thread holds the room of its
+    // own write already, so its piece starts as one written block by block,
+    // as a piece given back is: it is never dropped for want of room.
+    let on_task = no_room.is_some();
     let admit = |p, owned| {
-        if owned {
+        if owned && on_task {
             state.files.reserve_piece(p, &state.room_notify)
         } else {
             state.files.reserve_unowned_piece(p, &state.room_notify)

@@ -36,6 +36,10 @@ struct Budget {
     // and whether they did.
     lose: Option<u32>,
     lost: bool,
+    // Pieces given back whose room is not back yet: the storage gives it
+    // back aside, later, as a real one does once their blocks are written.
+    defer_spills: bool,
+    deferred: Vec<u32>,
 }
 
 impl Budget {
@@ -54,6 +58,19 @@ impl Budget {
     fn ring(&self) {
         if let Some(room) = &self.room {
             room.notify_waiters();
+        }
+    }
+
+    // A piece given back gives back its whole-piece room.
+    fn spill(&mut self, piece: u32) {
+        if let Some(room) = self.pieces.get_mut(&piece)
+            && *room == Room::Whole
+        {
+            *room = Room::Block;
+            if self.lose == Some(piece) {
+                self.lost = true;
+            }
+            self.ring();
         }
     }
 }
@@ -85,6 +102,15 @@ impl BudgetStorageFactory {
     /// The bytes held now, by whole pieces and blocks being written.
     fn used(&self) -> u64 {
         self.budget.lock().used()
+    }
+
+    /// The pieces given back meanwhile give their whole-piece room back,
+    /// as the storage's work aside does once their blocks are written.
+    fn spill_deferred(&self) {
+        let mut budget = self.budget.lock();
+        for piece in std::mem::take(&mut budget.deferred) {
+            budget.spill(piece);
+        }
     }
 
     /// Resolves at the next refusal of room, or at once for one since the
@@ -247,15 +273,11 @@ impl TorrentStorage for BudgetStorage {
 
     fn on_piece_requeued(&self, piece: ValidPieceIndex) {
         let mut budget = self.budget.lock();
-        if let Some(room) = budget.pieces.get_mut(&piece.get())
-            && *room == Room::Whole
-        {
-            *room = Room::Block;
-            if budget.lose == Some(piece.get()) {
-                budget.lost = true;
-            }
-            budget.ring();
+        if budget.defer_spills {
+            budget.deferred.push(piece.get());
+            return;
         }
+        budget.spill(piece.get());
     }
 
     fn piece_written(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
@@ -491,6 +513,43 @@ async fn an_unowned_pieces_first_block_takes_block_room() {
         0,
         "the block's room came back with its write"
     );
+}
+
+// A block a disk thread lands for a piece its peer owns, with no room for
+// the whole piece: a piece given back still holds its room, its blocks being
+// written aside. The block starts its piece as one written block by block,
+// in the room its own write holds, and is written: it is not dropped and
+// counted redundant, and only the blocks still missing are fetched.
+#[tokio::test]
+async fn a_block_on_a_disk_thread_without_room_for_its_piece_is_written() {
+    let (h, storage) = budgeted("room_disk_thread", 1).await;
+    storage.budget.lock().defer_spills = true;
+    let (gone, _gone_rx) = h.peer("127.0.0.1:6881");
+    let (owner, _owner_rx) = h.peer("127.0.0.2:6881");
+    let left = h.grab(&gone);
+    let wanted = h.grab(&owner);
+    h.send(&gone, (left, 0), false).await.unwrap();
+    gone.on_i_am_choked().unwrap();
+    // Given back, and its room not back yet.
+    assert_eq!(storage.room_of(left), Some(Room::Whole));
+    assert!(h.holds(&owner, wanted));
+
+    let info = h.chunk(wanted, 1);
+    let start = (wanted * PIECE_LENGTH + CHUNK_SIZE) as usize;
+    let block = Piece::from_data(
+        wanted,
+        CHUNK_SIZE,
+        &h.content[start..start + CHUNK_SIZE as usize],
+    );
+    let landed = land_block(&h.live, owner.addr, &block, &info).unwrap();
+    assert!(landed.is_none());
+    assert_eq!(storage.room_of(wanted), Some(Room::Block));
+    assert_eq!(h.missing_chunks(wanted), vec![0, 2, 3]);
+    assert_eq!(h.redundant(), 0);
+
+    storage.spill_deferred();
+    assert_eq!(storage.room_of(left), Some(Room::Block));
+    assert_eq!(storage.used(), 0);
 }
 
 // A piece given back is asked of its next owner too, while the peer that

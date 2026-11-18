@@ -377,6 +377,18 @@ impl Flight {
 pub(crate) struct ResidentPeak {
     pub(crate) now: std::sync::atomic::AtomicU64,
     pub(crate) peak: std::sync::atomic::AtomicU64,
+    // Run once, between a storage's first refusal and its last ask.
+    pub(crate) refused: Mutex<Option<Refused>>,
+}
+
+#[cfg(test)]
+pub(crate) struct Refused(pub(crate) Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Refused")
+    }
 }
 
 struct Inner {
@@ -408,9 +420,22 @@ impl Inner {
     // `bytes` of resident room asked for: held when granted. Refused, the
     // session waiting on its room is rung once room comes back, whoever
     // gives it back: another torrent, or a job of any other kind.
+    //
+    // The last ask and the keeping of the wake are one step of the budget,
+    // so room another holder gives back after it is always rung.
     fn reserve(&self, bytes: u64) -> bool {
         if self.try_reserve(bytes) {
             return true;
+        }
+        #[cfg(test)]
+        if let Some(Refused(between)) = self
+            .resident
+            .refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            between();
         }
         let room = self
             .room
@@ -421,20 +446,26 @@ impl Inner {
             return false;
         };
         let (key, wake) = wake(&room);
-        self.holds
-            .accountant
-            .resident_fits_or_wake(bytes, key, wake)
-            && self.try_reserve(bytes)
+        let reserve =
+            self.holds
+                .accountant
+                .reserve_resident_or_wake(self.holds.namespace, bytes, key, wake);
+        self.granted(bytes, reserve)
     }
 
     // `bytes` of resident room asked for once: held when granted.
     fn try_reserve(&self, bytes: u64) -> bool {
-        let granted = matches!(
-            self.holds
-                .accountant
-                .reserve_resident(self.holds.namespace, bytes),
-            Reserve::Granted
-        );
+        let reserve = self
+            .holds
+            .accountant
+            .reserve_resident(self.holds.namespace, bytes);
+        self.granted(bytes, reserve)
+    }
+
+    fn granted(&self, bytes: u64, reserve: Reserve) -> bool {
+        let granted = matches!(reserve, Reserve::Granted);
+        #[cfg(not(test))]
+        let _ = bytes;
         #[cfg(test)]
         if granted {
             use std::sync::atomic::Ordering;
@@ -489,7 +520,10 @@ impl Inner {
     fn spill(&self, index: u32, writing: &Arc<Writing>) {
         let one = Arc::new(Mutex::new(None));
         let mut written = one.lock().unwrap_or_else(PoisonError::into_inner);
-        let (held, landed, paid) = {
+        // The map's lock is never held while the piece's own lock is waited
+        // on: a whole piece is hashed under that lock, a hash long enough to
+        // hold up every other piece's blocks.
+        let (held, landed, paid) = loop {
             let mut flight = self.flight();
             let Some(entry) = flight.get_mut(&index) else {
                 return;
@@ -497,7 +531,20 @@ impl Inner {
             if !matches!(entry, Flight::Writing(now, _) if Arc::ptr_eq(now, writing)) {
                 return;
             }
-            let mut bytes = writing.write();
+            if writing.whole() {
+                return;
+            }
+            let mut bytes = match writing.bytes.try_write() {
+                Ok(bytes) => bytes,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                // A block landing, or the hash of the piece it made whole:
+                // waited out with the map free, and the piece looked at again.
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    drop(flight);
+                    drop(writing.write());
+                    continue;
+                }
+            };
             if writing.whole() {
                 return;
             }
@@ -508,7 +555,7 @@ impl Inner {
                 Flight::Writing(_, paid) => paid,
                 _ => None,
             };
-            (held, landed, paid)
+            break (held, landed, paid);
         };
         // What its volume counted for the whole piece goes back first: its
         // blocks are counted as each one's write fits.
@@ -608,6 +655,18 @@ impl PieceStorage {
                 resident,
             }),
         }
+    }
+
+    // `between` runs once, the next time a reservation of its resident
+    // room is first refused, before it asks the last time.
+    #[cfg(test)]
+    pub(crate) fn on_refusal(&self, between: impl FnOnce() + Send + 'static) {
+        *self
+            .inner
+            .resident
+            .refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Refused(Box::new(between)));
     }
 
     // The most resident room it held at once.

@@ -356,6 +356,29 @@ fn a_piece_given_back_whole_stays_in_memory() {
     assert!(shim.store.has(0));
 }
 
+// A whole piece is hashed under its own lock. Given back as it is hashed,
+// it is left in memory without its lock being waited on, and the map of
+// pieces in flight stays free for every other piece's blocks.
+#[test]
+fn a_piece_given_back_as_it_is_hashed_holds_up_no_other_piece() {
+    let budget = accountant(PIECE_AND_BLOCK);
+    let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
+    let torrent = noise(160_000, 3);
+    shim.write_blocks(0, &torrent, u64::MAX, None);
+    let writing = match shim.storage.inner.flight_read().get(&0) {
+        Some(crate::torrents::storage::Flight::Writing(writing, _)) => Arc::clone(writing),
+        _ => panic!("piece 0 is held in memory"),
+    };
+    let hashing = writing.read();
+    shim.storage.on_piece_requeued(shim.index(0));
+    assert!(shim.storage.inner.flight.try_write().is_ok());
+    drop(hashing);
+    assert!(shim.storage.writes_piece_to_memory(shim.index(0)));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
+    shim.storage.on_piece_completed(shim.index(0)).unwrap();
+    assert!(shim.store.has(0));
+}
+
 // A block of a piece no peer owns holds no room for its piece, which is
 // written block by block, each block holding room for its write alone; a
 // whole piece's room is left for an owner.
@@ -470,6 +493,49 @@ async fn room_another_holder_lets_go_rings_a_session_refused_it() {
     budget.release_resident(OTHER, BLOCK);
     rung.await;
     assert!(shim.storage.room_for(PIECE, &shim.room));
+    assert!(shim.storage.reserve_piece(shim.index(0), &shim.room));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
+}
+
+const THIRD: HoldsNamespace = HoldsNamespace {
+    scope: 3,
+    node: NodeId::ROOT,
+};
+
+// Whether `rung` is ready now, without waiting for it.
+fn rung_now(rung: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>) -> bool {
+    use std::future::Future;
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    rung.poll(&mut cx).is_ready()
+}
+
+// A session refused room keeps a wake behind the refusal, whatever happens
+// between its first ask and its last: here the holder that filled the
+// budget lets go and a third takes the room before the last ask. When the
+// third lets go, the session is rung.
+#[tokio::test]
+async fn room_taken_between_two_asks_still_rings_the_session_refused() {
+    let budget = accountant(PIECE);
+    let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
+    assert_eq!(
+        budget.reserve_resident(OTHER, PIECE),
+        weaver_graph::holds::Reserve::Granted
+    );
+    let third = Arc::clone(&budget);
+    shim.storage.on_refusal(move || {
+        third.release_resident(OTHER, PIECE);
+        assert_eq!(
+            third.reserve_resident(THIRD, PIECE),
+            weaver_graph::holds::Reserve::Granted
+        );
+    });
+    assert!(!shim.storage.reserve_piece(shim.index(0), &shim.room));
+    assert_eq!(budget.namespace_usage(THIRD).resident, PIECE);
+    let rung = shim.room.notified();
+    let mut rung = std::pin::pin!(rung);
+    assert!(!rung_now(rung.as_mut()), "nothing gave room back yet");
+    budget.release_resident(THIRD, PIECE);
+    assert!(rung_now(rung.as_mut()), "the refusal is rung");
     assert!(shim.storage.reserve_piece(shim.index(0), &shim.room));
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
 }
