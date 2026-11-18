@@ -108,6 +108,29 @@ impl Run {
         }
     }
 
+    // The job goes quiet over the store holding `member`, once: a store
+    // holding volumes the wrong way round lays them in their headers' order
+    // then. One with nothing to order refuses its set instead, here, since
+    // no writer placed its bytes: whether it did.
+    fn quiet(&mut self, member: MemberId) -> bool {
+        let (node, _) = self.tree.child_of(NodeId::ROOT, member).expect("held");
+        let before = self.effects.len();
+        self.tree
+            .quiet(node, &mut Objects::default(), &mut self.effects);
+        self.hand_over();
+        self.effects[before..]
+            .iter()
+            .any(|effect| matches!(effect, Effect::Refused { .. }))
+    }
+
+    // Where each member is held.
+    fn places(&self, members: &[MemberId]) -> Vec<Option<(NodeId, VolumeIndex)>> {
+        members
+            .iter()
+            .map(|member| self.tree.child_of(NodeId::ROOT, *member))
+            .collect()
+    }
+
     fn given_back(&self, member: MemberId) -> usize {
         self.effects
             .iter()
@@ -399,21 +422,14 @@ fn a_set_renamed_from_swapped_posted_numbers_is_one_store() {
 }
 
 // A long RAR4 set whose end records state no number, its last two volumes
-// posted under each other's numbers: the layout refutes the one held where
-// it is not once, and lays the set again once, however many volumes it
-// holds and however its bytes come in after. Its rest comes in small pieces
-// with no new header among them, as articles do. Renamed to their true
-// names, the two take their places, in one store.
+// posted under each other's numbers, renamed to their true names before the
+// job is quiet: the names place the two, and the set is never ordered by
+// its headers. Its rest comes in small pieces with no new header among
+// them, as articles do.
 #[test]
-fn a_long_set_refuting_a_volume_lays_it_again_once() {
+fn a_long_set_renamed_before_quiet_is_placed_by_its_names() {
     const VOLUMES: usize = 300;
-    let mut options = super::split(Version::Rar4);
-    options.split = Some(5_000);
-    let set = write(
-        &[Item::File("track.flac", payload(9, VOLUMES * 5_000 - 700))],
-        &options,
-    );
-    assert_eq!(set.len(), VOLUMES);
+    let set = long_set(VOLUMES);
     let mut run = Run::new();
     run.enough = 4 * VOLUMES;
     let posted: Vec<usize> = (0..VOLUMES)
@@ -435,25 +451,8 @@ fn a_long_set_refuting_a_volume_lays_it_again_once() {
         run.deliver(members[*volume], 0, front(&set[*volume]));
     }
     for volume in &posted {
-        let bytes = &set[*volume];
-        let mut at = front(bytes).len();
-        while at < bytes.len() {
-            let to = (at + 256).min(bytes.len());
-            run.deliver(members[*volume], at, &bytes[at..to]);
-            at = to;
-        }
-        run.close(members[*volume]);
+        rest_in_pieces(&mut run, members[*volume], &set[*volume]);
     }
-    let counted = counts::take();
-    // Each volume is laid on what its front says, again on what its end
-    // says, and once more in the one layout laid again short of the refuted
-    // volume: three times, not once for every piece that came in after.
-    assert_eq!(counted.cut, 1, "{counted:?}");
-    assert!(
-        counted.asked.len() <= 3 * VOLUMES,
-        "{}",
-        counted.asked.len()
-    );
     for volume in [VOLUMES - 2, VOLUMES - 1] {
         run.tree.rename(
             NodeId::ROOT,
@@ -464,16 +463,238 @@ fn a_long_set_refuting_a_volume_lays_it_again_once() {
         );
         run.hand_over();
     }
-    let store = run
-        .tree
-        .child_of(NodeId::ROOT, members[0])
-        .map(|(node, _)| node);
-    assert!(store.is_some());
-    for (volume, member) in members.iter().enumerate() {
+    let held = run.places(&members);
+    assert!(run.quiet(members[0]), "nothing to order");
+    let counted = counts::take();
+    assert_eq!(counted.orders, 0);
+    // The first rename gives the true second-to-last its place while the
+    // true last, held there on trust by its posted name, still sits in it:
+    // the layout refutes that place once and is laid again short of it.
+    assert_eq!(counted.cut, 1, "{counted:?}");
+    assert!(
+        counted.asked.len() <= 3 * VOLUMES,
+        "{}",
+        counted.asked.len()
+    );
+    at_true_places(&held, "renamed");
+    // Only the two renamed move: the first renamed waits for the second to
+    // leave its place, so it is handed on twice.
+    let given: Vec<usize> = members
+        .iter()
+        .map(|member| run.given_back(*member))
+        .collect();
+    assert!(given[..VOLUMES - 2].iter().all(|given| *given == 0));
+    assert_eq!(given[VOLUMES - 2..], [2, 1]);
+}
+
+// One track split over `volumes` RAR4 volumes whose end records state no
+// number.
+fn long_set(volumes: usize) -> Vec<Vec<u8>> {
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(5_000);
+    let set = write(
+        &[Item::File("track.flac", payload(9, volumes * 5_000 - 700))],
+        &options,
+    );
+    assert_eq!(set.len(), volumes);
+    set
+}
+
+// A volume's bytes past its front, in small pieces with no new header
+// among them, as articles bring them, then its close.
+fn rest_in_pieces(run: &mut Run, member: MemberId, bytes: &[u8]) {
+    let mut at = front(bytes).len();
+    while at < bytes.len() {
+        let to = (at + 256).min(bytes.len());
+        run.deliver(member, at, &bytes[at..to]);
+        at = to;
+    }
+    run.close(member);
+}
+
+// Where each volume of `set` ends up when posted under `numbers`, the
+// posted number of each true volume, with no name ever corrected: fronts in
+// posted order, each volume's rest after its front when `whole`, else every
+// rest after every front, then the job quiet. Each volume's place, how
+// often it was given back, and what the store counted.
+type Places = Vec<Option<(NodeId, VolumeIndex)>>;
+
+struct Laid {
+    places: Places,
+    given: Vec<usize>,
+    counted: counts::Counts,
+}
+
+fn posted_unrenamed(set: &[Vec<u8>], numbers: &[usize], whole: bool) -> Laid {
+    let mut run = Run::new();
+    run.enough = 4 * set.len();
+    let mut members = vec![MemberId(0); set.len()];
+    let mut posted: Vec<(usize, usize)> = numbers
+        .iter()
+        .enumerate()
+        .map(|(volume, number)| (*number, volume))
+        .collect();
+    posted.sort_unstable();
+    for (number, volume) in &posted {
+        members[*volume] =
+            run.announce(&format!("Release.part{number:03}.rar"), set[*volume].len());
+    }
+    counts::take();
+    for (_, volume) in &posted {
+        run.deliver(members[*volume], 0, front(&set[*volume]));
+        if whole {
+            rest_in_pieces(&mut run, members[*volume], &set[*volume]);
+        }
+    }
+    if !whole {
+        for (_, volume) in &posted {
+            rest_in_pieces(&mut run, members[*volume], &set[*volume]);
+        }
+    }
+    let held = run.places(&members);
+    let refused = run.quiet(members[0]);
+    let counted = counts::take();
+    Laid {
+        // A set with nothing to order is refused here at quiet, for want of
+        // a writer: it stood where it was held.
+        places: match refused {
+            true => held,
+            false => run.places(&members),
+        },
+        given: members
+            .iter()
+            .map(|member| run.given_back(*member))
+            .collect(),
+        counted,
+    }
+}
+
+// Every volume in one store, at its true place.
+fn at_true_places(places: &[Option<(NodeId, VolumeIndex)>], case: &str) {
+    let store = places[0].map(|(node, _)| node);
+    assert!(store.is_some(), "{case}");
+    for (volume, place) in places.iter().enumerate() {
         assert_eq!(
-            run.tree.child_of(NodeId::ROOT, *member),
+            *place,
             store.map(|node| (node, VolumeIndex(volume as u32))),
-            "volume {volume}"
+            "{case} volume {volume}: {places:?}"
         );
+    }
+}
+
+// A six-volume RAR4 set whose end records state no number, posted under a
+// release's `part001` to `part006` with its true last volume as `part005`
+// and its true fifth as `part006`, and no name ever corrected. The last
+// volume's header closes the track the fifth carries on, so the fifth comes
+// first: at quiet the two trade places once each, and the set is one store.
+#[test]
+fn a_set_posted_under_swapped_numbers_is_ordered_by_its_headers() {
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(10_000);
+    let set = write(&[Item::File("track.flac", payload(9, 57_000))], &options);
+    assert_eq!(set.len(), 6);
+    for whole in [false, true] {
+        let posted = posted_unrenamed(&set, &[1, 2, 3, 4, 6, 5], whole);
+        at_true_places(&posted.places, &format!("whole {whole}"));
+        assert_eq!(posted.given, [0, 0, 0, 0, 1, 1], "whole {whole}");
+        assert_eq!(posted.counted.orders, 1, "whole {whole}");
+    }
+}
+
+// The same set with two middle volumes posted under each other's numbers:
+// each only carries the track on, so their headers are alike and say
+// nothing of their order. The names stand, and neither moves.
+#[test]
+fn two_middle_volumes_alike_keep_their_posted_places() {
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(10_000);
+    let set = write(&[Item::File("track.flac", payload(9, 57_000))], &options);
+    for whole in [false, true] {
+        let posted = posted_unrenamed(&set, &[1, 3, 2, 4, 5, 6], whole);
+        let store = posted.places[0].map(|(node, _)| node);
+        let at =
+            |volume: usize| posted.places[volume].map(|(node, at)| (Some(node) == store, at.0));
+        assert_eq!(at(1), Some((true, 2)), "whole {whole}");
+        assert_eq!(at(2), Some((true, 1)), "whole {whole}");
+        assert_eq!(posted.given, [0; 6], "whole {whole}");
+        assert_eq!(posted.counted.orders, 0, "whole {whole}");
+    }
+}
+
+// A long set posted in its true order under its true numbers is mapped as
+// it arrives and never ordered: each volume is laid on what its front says
+// and again on what its end says, however its bytes come in.
+#[test]
+fn a_long_set_in_order_is_never_ordered() {
+    const VOLUMES: usize = 300;
+    let set = long_set(VOLUMES);
+    let numbers: Vec<usize> = (1..=VOLUMES).collect();
+    for whole in [false, true] {
+        let posted = posted_unrenamed(&set, &numbers, whole);
+        at_true_places(&posted.places, &format!("whole {whole}"));
+        assert_eq!(posted.given, vec![0; VOLUMES], "whole {whole}");
+        let counted = &posted.counted;
+        assert_eq!((counted.orders, counted.cut), (0, 0), "whole {whole}");
+        // The last volume's front holds its end record: it is laid once.
+        assert_eq!(counted.asked.len(), 2 * VOLUMES - 1, "whole {whole}");
+    }
+}
+
+// A long set held the wrong way round is ordered once, at quiet: each
+// volume moves once at most, and is laid a few times at most, however
+// many volumes the set holds and however its bytes come in.
+fn ordered_once(volumes: usize, numbers: &[usize], moving: &[usize]) {
+    let set = long_set(volumes);
+    for whole in [false, true] {
+        let case = format!("{volumes} whole {whole}");
+        let posted = posted_unrenamed(&set, numbers, whole);
+        at_true_places(&posted.places, &case);
+        for (volume, given) in posted.given.iter().enumerate() {
+            let moves = usize::from(moving.contains(&volume));
+            assert_eq!(*given, moves, "{case} volume {volume}");
+        }
+        let counted = &posted.counted;
+        // Delivered whole, the misplaced volume is laid at its posted place
+        // before the set is seen out of order: the layout refutes that place
+        // once. In pieces every front is in first, and nothing is refuted.
+        assert_eq!(counted.cut, usize::from(whole), "{case}");
+        assert_eq!(counted.orders, 1, "{case}");
+        assert!(
+            counted.asked.len() <= 3 * volumes,
+            "{case}: {}",
+            counted.asked.len()
+        );
+    }
+}
+
+// The last two volumes posted under each other's numbers: the two move.
+#[test]
+fn a_long_set_with_its_last_two_swapped_is_ordered_once() {
+    for volumes in [40, 300] {
+        let numbers: Vec<usize> = (0..volumes)
+            .map(|volume| match volume {
+                _ if volume == volumes - 2 => volumes,
+                _ if volume == volumes - 1 => volumes - 1,
+                _ => volume + 1,
+            })
+            .collect();
+        ordered_once(volumes, &numbers, &[volumes - 2, volumes - 1]);
+    }
+}
+
+// The true last volume posted under the second number, every volume after
+// it one number later: every volume but the first moves, once.
+#[test]
+fn a_last_volume_posted_second_is_ordered_once() {
+    for volumes in [40, 300] {
+        let numbers: Vec<usize> = (0..volumes)
+            .map(|volume| match volume {
+                0 => 1,
+                _ if volume == volumes - 1 => 2,
+                _ => volume + 2,
+            })
+            .collect();
+        let moving: Vec<usize> = (1..volumes).collect();
+        ordered_once(volumes, &numbers, &moving);
     }
 }
