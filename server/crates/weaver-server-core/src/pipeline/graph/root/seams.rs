@@ -192,7 +192,8 @@ impl Pipeline {
         }
     }
 
-    // A decoded article of a graph job, as the decoder placed it. True when
+    // A decoded article of a graph job, as the decoder placed it, and the
+    // name its header gave the file, empty when it gave none. True when
     // the job is a graph job: its bytes went through the graph, which is
     // the only writer of a graph job's files, so the caller writes nothing.
     #[allow(clippy::too_many_arguments)]
@@ -206,12 +207,21 @@ impl Pipeline {
         length: u64,
         declared_end: Option<u64>,
         segments: Vec<weaver_yenc::Segment>,
+        header_name: &str,
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
         let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return false;
         };
+        // The file is named before the article's bytes are written.
+        if !header_name.is_empty()
+            && let Err(error) =
+                graph.header_named(VolumeIndex(segment_id.file_id.file_index), header_name)
+        {
+            self.after_graph_result(job_id, Err(error));
+            return true;
+        }
         let decoded = decoded(
             segment_id,
             offset,

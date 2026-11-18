@@ -621,6 +621,9 @@ pub(in crate::pipeline::tests) struct Scenario {
     // What the scenario is told of everything a run says, as the run loop
     // hears it and before the job does.
     heard: Option<HeardHook>,
+    // The name an article's header gives its file, by file, and from the
+    // ordinal given on, when not the posted name.
+    headers: Vec<(u32, u32, String)>,
 }
 
 impl Scenario {
@@ -656,7 +659,34 @@ impl Scenario {
             stat_servers: std::sync::Mutex::new(Vec::new()),
             setup: None,
             heard: None,
+            headers: Vec::new(),
         }
+    }
+
+    // Every article of `file` names it `name` in its header.
+    pub(in crate::pipeline::tests) fn header(self, file: u32, name: &str) -> Self {
+        self.header_from(file, 0, name)
+    }
+
+    // The articles of `file` from `ordinal` on name it `name` in their
+    // header.
+    pub(in crate::pipeline::tests) fn header_from(
+        mut self,
+        file: u32,
+        ordinal: u32,
+        name: &str,
+    ) -> Self {
+        self.headers.push((file, ordinal, name.to_string()));
+        self
+    }
+
+    // The name the header of an article of `file` at `ordinal` gives it.
+    pub(in crate::pipeline::tests) fn header_of(&self, file: u32, ordinal: u32) -> &str {
+        self.headers
+            .iter()
+            .filter(|(at, from, _)| *at == file && *from <= ordinal)
+            .max_by_key(|(_, from, _)| *from)
+            .map_or(self.posts[file as usize].name.as_str(), |(.., name)| name)
     }
 
     // Everything a run says is told to `heard` first.
@@ -1068,6 +1098,8 @@ pub(in crate::pipeline::tests) struct GraphView {
     // The most the job's holds kept at any look, in memory, on scratch and
     // on file, over every namespace.
     pub(in crate::pipeline::tests) held: u64,
+    // Every name a root member carried at any look.
+    pub(in crate::pipeline::tests) names: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -1716,7 +1748,7 @@ async fn serve_from(
                     expected_file_crc: None,
                     data: DecodedChunk::from(body),
                     yenc_name: if ordinal == 0 {
-                        post.name.clone()
+                        scenario.header_of(file, ordinal).to_string()
                     } else {
                         String::new()
                     },
@@ -1779,7 +1811,7 @@ async fn serve_from(
                 truncation_suspected: truncated,
                 expected_file_crc: None,
                 data: DecodedChunk::from(body),
-                yenc_name: post.name.clone(),
+                yenc_name: scenario.header_of(file, ordinal).to_string(),
                 checkpoint_plan,
                 segments,
             },
@@ -1857,6 +1889,8 @@ pub(in crate::pipeline::tests) fn observe(
             })
             .collect();
         view.sealing.push(look);
+        view.names
+            .extend(namespace.members().map(|member| member.name.clone()));
     }
     view.kinds.extend(
         tree.live()

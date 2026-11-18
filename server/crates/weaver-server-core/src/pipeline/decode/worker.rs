@@ -882,6 +882,7 @@ impl Pipeline {
                 yenc_layout.file_size,
                 declared_part_end(expected_layout, yenc_layout),
                 segments,
+                &yenc_name,
             );
             // The write of it found the disk full: the job is held, and the
             // article is fetched and counted once the job runs on.
