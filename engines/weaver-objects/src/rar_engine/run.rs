@@ -372,7 +372,7 @@ impl Walk<'_, '_> {
         };
         // A link is not a file body, so it is no member and the files around
         // it stand.
-        if info.is_symlink || info.is_hardlink || info.is_file_copy {
+        if link(archive, index, &info) {
             return Ok(1);
         }
         // A directory is a member with nothing in it, named with a trailing
@@ -628,11 +628,8 @@ fn may_start(
 ) -> Option<u64> {
     let (info, after) = (archive.member_info(at)?, archive.member_info(at + 1)?);
     let span = info.volumes.first_volume..=info.volumes.last_volume;
-    let plain = !(info.is_symlink
-        || info.is_hardlink
-        || info.is_file_copy
-        || info.is_directory
-        || (info.is_encrypted && !has_password));
+    let plain =
+        !(link(archive, at, &info) || info.is_directory || (info.is_encrypted && !has_password));
     let whole = after.volumes.first_volume >= *span.end();
     let settled = span.clone().all(|volume| input.settled(volume));
     let length = info.unpacked_size.filter(|_| plain && whole && settled)?;
@@ -855,6 +852,15 @@ fn verdict(
         }
         Class::Terminal => vec![terminal(error, encrypted)],
     }
+}
+
+// A member that redirects elsewhere holds no file body. A redirection of a
+// type unrar does not know carries none of the three flags, and is one too.
+fn link(archive: &RarArchive, index: usize, info: &unrar_rs::MemberInfo) -> bool {
+    info.is_symlink
+        || info.is_hardlink
+        || info.is_file_copy
+        || matches!(archive.member_redirection(index), Ok(Some(_)))
 }
 
 fn terminal(error: &RarError, encrypted: bool) -> Emit {
