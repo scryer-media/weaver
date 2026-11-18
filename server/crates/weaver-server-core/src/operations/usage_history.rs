@@ -41,9 +41,6 @@ const DAY_FORMAT: &str = "%Y-%m-%d";
 /// The start of the server consumer id a removed server's kept rows move
 /// to. A live server's id is a number, so no live server ever has one.
 pub const REMOVED_SERVER_ID_PREFIX: &str = "removed-";
-/// How often a batch also drops the kept rows of removed servers whose
-/// time is up.
-pub const USAGE_EXPIRY_INTERVAL_SECS: i64 = 60;
 
 /// Who used the data a row counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -513,8 +510,20 @@ struct RecorderState {
     retired: HashMap<u32, Option<String>>,
     /// Ids a new server took that no reading has shown since.
     reused: HashSet<u32>,
-    /// The reading time the last batch asked for an expiry at.
-    expired_at: Option<i64>,
+    /// When the kept rows of a removed server are next due to go.
+    expiry: NextExpiry,
+}
+
+/// When a batch next has kept rows of removed servers to drop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum NextExpiry {
+    /// Not known, as before the saved removals are read or after a server is
+    /// removed: the next batch asks, and the time is read again after it.
+    #[default]
+    Unknown,
+    /// The earliest saved removal time, in epoch seconds, or `None` when no
+    /// removed server's rows are kept.
+    At(Option<i64>),
 }
 
 impl RecorderState {
@@ -542,8 +551,9 @@ impl RecorderState {
 }
 
 /// A batch ready to write: the rows to add, the cutoff to fold older days
-/// at when the date has moved since the last batch, and, about once a
-/// minute, the moment to drop removed servers' kept rows whose time is up.
+/// at when the date has moved since the last batch, and, once a removed
+/// server's kept rows are due or a server was removed, the moment to drop
+/// the kept rows whose time is up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageFlush {
     pub rows: Vec<UsageDayRow>,
@@ -616,6 +626,27 @@ impl UsageRecorder {
         }
         state.states.remove(&server_id);
         state.retired.insert(server_id, kept.map(str::to_string));
+        // Kept rows have a removal time of their own: ask with the next batch.
+        if kept.is_some() {
+            state.expiry = NextExpiry::Unknown;
+        }
+    }
+
+    /// Note when the kept rows of a removed server are next due to go, as
+    /// read from what is saved: at start-up, and after each batch that asked
+    /// for an expiry. `None` means no removed server's rows are kept, and no
+    /// batch asks until a server is removed. Call it with [`hold_writes`]
+    /// held, so no removal lands between the read and this.
+    ///
+    /// [`hold_writes`]: UsageRecorder::hold_writes
+    pub fn note_next_expiry(&self, remove_at_epoch_sec: Option<i64>) {
+        self.lock().expiry = NextExpiry::At(remove_at_epoch_sec);
+    }
+
+    /// Forget when kept rows are next due, so the next batch asks: a read of
+    /// that time failed.
+    pub fn forget_next_expiry(&self) {
+        self.lock().expiry = NextExpiry::Unknown;
     }
 
     /// Count `server_id` as a live server again, for a new server given
@@ -880,15 +911,13 @@ impl UsageRecorder {
             state.pruned_through = Some(today);
             Some(retention_cutoff(today))
         };
-        // Expiry goes by the last reading's time, so it needs one.
-        let expire_removed_at = state.last_tick_epoch_sec.filter(|now| {
-            state
-                .expired_at
-                .is_none_or(|last| now.saturating_sub(last) >= USAGE_EXPIRY_INTERVAL_SECS)
+        // Expiry goes by the last reading's time, so it needs one, and runs
+        // only when kept rows are due or their time is not known. The owner
+        // reads the next time after the write and notes it.
+        let expire_removed_at = state.last_tick_epoch_sec.filter(|now| match state.expiry {
+            NextExpiry::Unknown => true,
+            NextExpiry::At(due) => due.is_some_and(|due| due <= *now),
         });
-        if expire_removed_at.is_some() {
-            state.expired_at = expire_removed_at;
-        }
         UsageFlush {
             rows,
             fold_before,
@@ -922,9 +951,8 @@ impl UsageRecorder {
         if flush.fold_before.is_some() {
             state.pruned_through = None;
         }
-        if flush.expire_removed_at.is_some() {
-            state.expired_at = None;
-        }
+        // An expiry that was not written stays due: taking a batch does not
+        // move the next expiry time.
     }
 
     /// A server's state as last read and when it was first read so.
@@ -1230,6 +1258,24 @@ impl Database {
                 })
             })
             .collect()
+        })
+    }
+
+    /// The earliest time a removed server's kept rows are due to go, in
+    /// epoch seconds, or `None` when none are kept.
+    pub fn read_next_usage_expiry(&self) -> Result<Option<i64>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT MIN(remove_at) AS remove_at FROM usage_removed_servers",
+                &[],
+            )
+            .await?;
+            match rows.first() {
+                Some(row) => Ok(row.opt_i64("remove_at")?),
+                None => Ok(None),
+            }
         })
     }
 

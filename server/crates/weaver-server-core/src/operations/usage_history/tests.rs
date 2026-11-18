@@ -1384,22 +1384,116 @@ fn a_restored_batch_of_a_kept_server_goes_to_its_kept_rows() {
 }
 
 #[test]
-fn expiry_is_asked_for_about_once_a_minute_of_readings() {
+fn expiry_is_asked_for_only_when_kept_rows_are_due_or_unknown() {
     let today = date(2026, 11, 9);
     let recorder = UsageRecorder::new();
     // No reading yet, so no time to expire against.
     assert_eq!(recorder.take(today).expire_removed_at, None);
+    // Before the saved removals are read, the first batch asks.
     recorder.prime(&reading(vec![], &[]), 1_000);
     assert_eq!(recorder.take(today).expire_removed_at, Some(1_000));
-    recorder.observe(&reading(vec![], &[]), today, 1_030);
-    assert_eq!(recorder.take(today).expire_removed_at, None);
-    recorder.observe(&reading(vec![], &[]), today, 1_060);
+    // Kept rows due at 2_000: nothing is asked before then.
+    recorder.note_next_expiry(Some(2_000));
+    for now in [1_005, 1_060, 1_999] {
+        recorder.observe(&reading(vec![], &[]), today, now);
+        assert_eq!(recorder.take(today).expire_removed_at, None, "{now}");
+    }
+    recorder.observe(&reading(vec![], &[]), today, 2_000);
     let due = recorder.take(today);
-    assert_eq!(due.expire_removed_at, Some(1_060));
+    assert_eq!(due.expire_removed_at, Some(2_000));
     // A failed write asks again with the next batch.
     recorder.restore(due);
-    recorder.observe(&reading(vec![], &[]), today, 1_065);
-    assert_eq!(recorder.take(today).expire_removed_at, Some(1_065));
+    recorder.observe(&reading(vec![], &[]), today, 2_005);
+    assert_eq!(recorder.take(today).expire_removed_at, Some(2_005));
+    // Nothing kept: nothing asked, until a server is removed with kept rows.
+    recorder.note_next_expiry(None);
+    recorder.observe(&reading(vec![], &[]), today, 2_010);
+    assert_eq!(recorder.take(today).expire_removed_at, None);
+    recorder.retire_server(3, None);
+    recorder.observe(&reading(vec![], &[]), today, 2_015);
+    assert_eq!(recorder.take(today).expire_removed_at, None);
+    recorder.retire_server(4, Some("removed-4-1"));
+    recorder.observe(&reading(vec![], &[]), today, 2_020);
+    assert_eq!(recorder.take(today).expire_removed_at, Some(2_020));
+    // A read of the next time that failed leaves it unknown: the next asks.
+    recorder.note_next_expiry(None);
+    recorder.forget_next_expiry();
+    recorder.observe(&reading(vec![], &[]), today, 2_025);
+    assert_eq!(recorder.take(today).expire_removed_at, Some(2_025));
+}
+
+// An instance with nothing moving, and no removed server's rows due, hands
+// the writer nothing: an empty batch is never written. Hours of readings
+// with servers, categories and stages that do not move, past any expiry
+// interval, stay empty after the start-up batch.
+#[test]
+fn an_idle_recorder_writes_nothing() {
+    let today = date(2026, 11, 9);
+    let idle = || UsageReading {
+        jobs_finished: 4,
+        stages: vec![StageReading {
+            stage: "repair",
+            runs: 2,
+            total_ms: 900,
+        }],
+        ..reading(
+            vec![server(3, 1_000, 10, 9), server(4, 50, 1, 1)],
+            &[("tv", 700)],
+        )
+    };
+    for kept in [None, Some(1_000_000)] {
+        let recorder = UsageRecorder::new();
+        recorder.prime(&idle(), 0);
+        recorder.note_next_expiry(kept);
+        // The day's first batch folds old days; that one is due on a new date.
+        let first = recorder.take(today);
+        assert!(first.rows.is_empty() && first.expire_removed_at.is_none());
+        for tick in 1..=(4 * 3_600 / USAGE_FLUSH_INTERVAL_SECS as i64) {
+            recorder.observe(&idle(), today, tick * USAGE_FLUSH_INTERVAL_SECS as i64);
+            let flush = recorder.take(today);
+            assert!(flush.is_empty(), "{kept:?} at {tick}: {flush:?}");
+        }
+    }
+}
+
+// A removed server's kept rows still go at their time: the start-up read
+// finds when, nothing is asked before it, the batch at it drops the rows,
+// and the read after finds none left, so later batches stay empty.
+#[test]
+fn a_removed_server_s_kept_rows_still_expire_at_their_time() {
+    use crate::servers::ServerDownloadQuotaPeriod::Daily;
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&configured_server(3, "news.eweka.nl", true, Daily))
+        .unwrap();
+    seed_servers(&db, date(2026, 11, 9));
+    let kept = db
+        .delete_server_at(3, local(2026, 11, 9, 12))
+        .unwrap()
+        .kept_usage
+        .unwrap();
+    let reset = local(2026, 11, 10, 0).timestamp();
+    assert_eq!(db.read_next_usage_expiry().unwrap(), Some(reset));
+
+    let today = date(2026, 11, 9);
+    let recorder = UsageRecorder::new();
+    recorder.prime(&reading(vec![], &[]), reset - 60);
+    recorder.note_next_expiry(db.read_next_usage_expiry().unwrap());
+    let _ = recorder.take(today);
+    recorder.observe(&reading(vec![], &[]), today, reset - 5);
+    assert!(recorder.take(today).is_empty());
+    assert_eq!(server_totals(&db), vec![("4".to_string(), 20), (kept, 10)]);
+
+    let tomorrow = date(2026, 11, 10);
+    recorder.observe(&reading(vec![], &[]), tomorrow, reset);
+    let due = recorder.take(tomorrow);
+    assert_eq!(due.expire_removed_at, Some(reset));
+    db.write_usage_flush(&due).unwrap();
+    assert_eq!(server_totals(&db), vec![("4".to_string(), 20)]);
+    assert!(db.read_removed_servers().unwrap().is_empty());
+    assert_eq!(db.read_next_usage_expiry().unwrap(), None);
+    recorder.note_next_expiry(db.read_next_usage_expiry().unwrap());
+    recorder.observe(&reading(vec![], &[]), tomorrow, reset + 5);
+    assert!(recorder.take(tomorrow).is_empty());
 }
 
 #[test]

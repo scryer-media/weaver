@@ -209,14 +209,36 @@ pub(crate) async fn record_and_flush(
     };
     if failed {
         recorder.restore(flush);
+    } else if flush.expire_removed_at.is_some() {
+        note_next_expiry(recorder, db).await;
+    }
+}
+
+/// Read when a removed server's kept rows are next due to go, so a batch
+/// asks for an expiry only then. A failed read leaves the time unknown, and
+/// the next batch asks.
+async fn note_next_expiry(recorder: &UsageRecorder, db: &Database) {
+    let read_db = db.clone();
+    match tokio::task::spawn_blocking(move || read_db.read_next_usage_expiry()).await {
+        Ok(Ok(next)) => recorder.note_next_expiry(next),
+        Ok(Err(error)) => {
+            warn!(error = %error, "failed to read when kept data used rows expire");
+            recorder.forget_next_expiry();
+        }
+        Err(error) => {
+            warn!(error = %error, "kept data used expiry read task failed");
+            recorder.forget_next_expiry();
+        }
     }
 }
 
 /// Take the totals as they stand before any download, so a server's kept
-/// lifetime is not read as today's use.
-pub(crate) async fn prime(recorder: &UsageRecorder, sources: &UsageSources) {
+/// lifetime is not read as today's use, and read when kept rows next expire.
+pub(crate) async fn prime(recorder: &UsageRecorder, sources: &UsageSources, db: &Database) {
     let reading = sources.read().await;
     recorder.prime(&reading, epoch_sec_now());
+    let _writes = recorder.hold_writes().await;
+    note_next_expiry(recorder, db).await;
 }
 
 pub(crate) fn spawn_usage_history_task(
