@@ -15,6 +15,7 @@ mod peer_messages;
 mod pieces;
 mod requests;
 mod room;
+mod slots;
 mod swarm_tests;
 mod upload;
 mod v2;

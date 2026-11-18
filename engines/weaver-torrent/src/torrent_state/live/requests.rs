@@ -129,11 +129,9 @@ impl PeerHandler {
                                 .sequential
                                 .load(Ordering::Relaxed),
                         },
-                        can_steal: |p| {
-                            self.state.per_piece_locks[p.get_usize()]
-                                .try_write()
-                                .is_some()
-                        },
+                        // The tracker steals no piece a block of which is
+                        // being written.
+                        can_steal: |_| true,
                     },
                     // A storage that holds pieces in memory takes room as
                     // a piece's first block arrives, not here.

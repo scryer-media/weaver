@@ -22,14 +22,14 @@ use crate::core::constants::CHUNK_SIZE;
 use crate::core::lengths::Lengths;
 use crate::{bitv::BitV as _, type_aliases::BF};
 
-const PIECES: u32 = 10;
-const CHUNKS: u32 = 4;
+pub(super) const PIECES: u32 = 10;
+pub(super) const CHUNKS: u32 = 4;
 const PEERS: u8 = 4;
 const STEPS: usize = 500;
 const SEEDS: [u64; 4] = [1, 7, 42, 1009];
 const GOLDEN: &str = include_str!("golden_trace.txt");
 
-fn peer(id: u8) -> PeerHandle {
+pub(super) fn peer(id: u8) -> PeerHandle {
     (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, id)), 6881)).into()
 }
 
@@ -40,10 +40,14 @@ fn name(handle: PeerHandle) -> String {
 }
 
 fn names(handles: &[PeerHandle]) -> String {
-    handles.iter().map(|h| name(*h)).collect::<Vec<_>>().join(",")
+    handles
+        .iter()
+        .map(|h| name(*h))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
-fn tracker(seed: u64) -> PieceTracker {
+pub(super) fn tracker(seed: u64) -> PieceTracker {
     let total_length = u64::from(CHUNK_SIZE * CHUNKS) * u64::from(PIECES);
     let lengths = Lengths::new(total_length, CHUNK_SIZE * CHUNKS).unwrap();
     let have = BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice());
@@ -59,11 +63,14 @@ fn tracker(seed: u64) -> PieceTracker {
     PieceTracker::with_rng(chunks, StdRng::seed_from_u64(seed))
 }
 
-fn piece_of(t: &PieceTracker, index: u32) -> ValidPieceIndex {
-    t.chunks().get_lengths().validate_piece_index(index).unwrap()
+pub(super) fn piece_of(t: &PieceTracker, index: u32) -> ValidPieceIndex {
+    t.chunks()
+        .get_lengths()
+        .validate_piece_index(index)
+        .unwrap()
 }
 
-fn chunk_of(t: &PieceTracker, index: u32, chunk: u32) -> ChunkInfo {
+pub(super) fn chunk_of(t: &PieceTracker, index: u32, chunk: u32) -> ChunkInfo {
     let lengths = t.chunks().get_lengths();
     lengths
         .chunk_info_from_received_data(piece_of(t, index), chunk * CHUNK_SIZE, CHUNK_SIZE)
@@ -85,13 +92,23 @@ fn arrive(
     room: bool,
     asked: &mut Vec<(u32, bool)>,
 ) -> Arrival {
-    t.admitted_block_arrived(c, sender, |p, owned| {
+    // A piece in flight rules under its own lock, as the torrent does;
+    // any other, the tracker under the torrent's.
+    let mut admit = |p: ValidPieceIndex, owned| {
         asked.push((p.get(), owned));
         room
-    })
+    };
+    let slots = t.slots().clone();
+    match slots.arrive(c, sender, &mut admit) {
+        Some(arrival) => arrival,
+        None => t.admitted_block_arrived(c, sender, admit),
+    }
 }
 
 fn mark(t: &mut PieceTracker, c: &ChunkInfo, sender: PeerHandle) -> Option<ChunkMarkingResult> {
+    if t.slots().mark(c, sender) {
+        return Some(ChunkMarkingResult::NotCompleted);
+    }
     let data = vec![0u8; CHUNK_SIZE as usize];
     t.mark_chunk_downloaded(
         &Piece::from_data(c.piece_index.get(), c.offset, &data[..]),
@@ -100,7 +117,9 @@ fn mark(t: &mut PieceTracker, c: &ChunkInfo, sender: PeerHandle) -> Option<Chunk
 }
 
 fn write_failed(t: &mut PieceTracker, c: &ChunkInfo) {
-    t.write_failed(c);
+    if !t.slots().write_failed(c) {
+        t.write_failed(c);
+    }
 }
 
 fn take(t: &mut PieceTracker, p: ValidPieceIndex) -> (Option<Duration>, Senders) {
@@ -224,7 +243,8 @@ impl Swarm {
                 priority_pieces: std::iter::empty(),
                 peer_has_piece: |p: ValidPieceIndex| has[p.get_usize()],
                 availability: |p: ValidPieceIndex| {
-                    has_all.iter().filter(|h| h[p.get_usize()]).count() as u32
+                    u32::try_from(has_all.iter().filter(|h| h[p.get_usize()]).count())
+                        .expect("few peers")
                 },
                 moved: Moved {
                     pieces: Vec::new(),
@@ -257,9 +277,7 @@ impl Swarm {
             AcquireResult::Reserved(p) => format!("reserved {}", p.get()),
             AcquireResult::Stolen { piece, from_peer } => {
                 // The peer it was taken from stops waiting for its blocks.
-                let from = usize::from(
-                    (1..=PEERS).find(|id| peer(*id) == *from_peer).unwrap() - 1,
-                );
+                let from = usize::from((1..=PEERS).find(|id| peer(*id) == *from_peer).unwrap() - 1);
                 self.asked[from].retain(|c| c.piece_index != *piece);
                 format!("stolen {} from {}", piece.get(), name(*from_peer))
             }
@@ -376,7 +394,11 @@ impl Swarm {
         let mut line = format!("look {}", name(who));
         for p in 0..PIECES {
             let piece = piece_of(&self.t, p);
-            let to_ask: Vec<String> = self.t.chunks_to_request(piece, who).map(|c| block(&c)).collect();
+            let to_ask: Vec<String> = self
+                .t
+                .chunks_to_request(piece, who)
+                .map(|c| block(&c))
+                .collect();
             if self.t.may_request(piece, who) {
                 let _ = write!(line, " {p}:[{}]", to_ask.join(" "));
             }
@@ -402,7 +424,11 @@ impl Swarm {
             let _ = write!(
                 line,
                 " {p}:{}{owner}{missing:?}",
-                if t.chunks().is_piece_have(piece) { "H" } else { "" }
+                if t.chunks().is_piece_have(piece) {
+                    "H"
+                } else {
+                    ""
+                }
             );
         }
         self.log(line);
@@ -415,6 +441,8 @@ async fn replay(seed: u64) -> String {
     for step in 0..STEPS {
         tokio::time::advance(Duration::from_millis(1)).await;
         swarm.step();
+        // A piece holds a slot while in flight, and none otherwise.
+        assert_eq!(swarm.t.slots().held(), swarm.t.inflight_count());
         if step % 20 == 19 {
             swarm.state();
         }
@@ -430,7 +458,10 @@ async fn the_tracker_replays_its_recorded_swarms_exactly() {
         trace.push_str(&replay(seed).await);
     }
     if std::env::var_os("WEAVER_BLESS_GOLDEN").is_some() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/piece_tracker/golden_trace.txt");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/piece_tracker/golden_trace.txt"
+        );
         std::fs::write(path, &trace).unwrap();
         return;
     }

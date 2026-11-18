@@ -15,7 +15,6 @@ use crate::buffers::ByteBuf;
 use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
 use crate::peer_protocol::Piece;
 use anyhow::Context;
-use parking_lot::RwLockReadGuard;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
@@ -453,14 +452,55 @@ fn land_blocks_or_hold(
         state,
         chunks: Vec::new(),
     };
-    // A block we lack is written, whoever owns its piece now. While it is,
-    // no one steals the piece: its lock is held, read, until the block is
-    // marked, so that when it was the last block its piece is ours to
-    // check. Each piece's lock is taken once, however many of its blocks
-    // the batch holds.
-    let mut held: Vec<(u32, RwLockReadGuard<'_, ()>)> = Vec::new();
+    // A block we lack is written, whoever owns its piece now. A block of a
+    // piece in flight is ruled on under its piece's lock alone; one of a
+    // piece no peer owns, under the torrent's lock, once for the batch. While
+    // a block is being written, no one steals its piece, so that when it was
+    // the last block its piece is ours to check.
+    let slots = &*state.slots;
+    // Asked once a piece in flight, for its first block: its owner's takes
+    // the whole piece's room, any other one block's. Neither waits: a
+    // refusal is an answer.
+    let admit = |p, owned| {
+        if owned {
+            state.files.reserve_piece(p, &state.room_notify)
+        } else {
+            state.files.reserve_unowned_piece(p, &state.room_notify)
+        }
+    };
     let mut cancels: Vec<(usize, Vec<PeerHandle>)> = Vec::new();
-    {
+    let mut settle = |i: usize, arrival: Arrival| {
+        let (_, piece, chunk_info) = &blocks[i];
+        match arrival {
+            Arrival::Write { cancel } => {
+                admitted.chunks.push(*chunk_info);
+                cancels.push((i, cancel));
+            }
+            Arrival::NoRoom if no_room.is_some() => {
+                if let Some(no_room) = no_room.as_deref_mut() {
+                    *no_room = true;
+                }
+            }
+            Arrival::Discard | Arrival::NoRoom => {
+                state.add_redundant_bytes(piece.len() as u64);
+                state
+                    .session_stats
+                    .swarm
+                    .wasted(swarm::Waste::Redundant, piece.len() as u64);
+                debug!(
+                    "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
+                );
+            }
+        }
+    };
+    let mut unowned = Vec::new();
+    for (i, (addr, _, chunk_info)) in blocks.iter().enumerate() {
+        match slots.arrive(chunk_info, *addr, admit) {
+            Some(arrival) => settle(i, arrival),
+            None => unowned.push(i),
+        }
+    }
+    if !unowned.is_empty() {
         let mut g = state.lock_write("check_steal");
         let pieces = match g.get_pieces_mut() {
             Ok(pieces) => pieces,
@@ -472,45 +512,13 @@ fn land_blocks_or_hold(
                 return;
             }
         };
-        for (i, (addr, piece, chunk_info)) in blocks.iter().enumerate() {
-            if !held.iter().any(|(index, _)| *index == piece.index)
-                && let Some(lock) = state.per_piece_locks.get(piece.index as usize)
-            {
-                held.push((piece.index, lock.read()));
-            }
-            // Asked once a piece in flight, for its first block: its
-            // owner's takes the whole piece's room, any other one block's.
-            // Neither waits: a refusal is an answer.
-            let admit = |p, owned| {
-                if owned {
-                    state.files.reserve_piece(p, &state.room_notify)
-                } else {
-                    state.files.reserve_unowned_piece(p, &state.room_notify)
-                }
-            };
-            match pieces.admitted_block_arrived(chunk_info, *addr, admit) {
-                Arrival::Write { cancel } => {
-                    admitted.chunks.push(*chunk_info);
-                    cancels.push((i, cancel));
-                }
-                Arrival::NoRoom if no_room.is_some() => {
-                    if let Some(no_room) = no_room.as_deref_mut() {
-                        *no_room = true;
-                    }
-                }
-                Arrival::Discard | Arrival::NoRoom => {
-                    state.add_redundant_bytes(piece.len() as u64);
-                    state
-                        .session_stats
-                        .swarm
-                        .wasted(swarm::Waste::Redundant, piece.len() as u64);
-                    debug!(
-                        "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
-                    );
-                }
-            }
+        for i in unowned {
+            let (addr, _, chunk_info) = &blocks[i];
+            settle(i, pieces.admitted_block_arrived(chunk_info, *addr, admit));
         }
     }
+    // In the batch's order, whichever lock admitted them.
+    cancels.sort_unstable_by_key(|(i, _)| *i);
     // The block was asked of other peers too: they need not send it
     // (libtorrent `torrent::cancel_block`).
     let mut written = Vec::with_capacity(cancels.len());
@@ -541,14 +549,7 @@ fn land_blocks_or_hold(
                     admitted
                         .chunks
                         .retain(|c| c.absolute_index != chunk_info.absolute_index);
-                    landed[i] = state
-                        .lock_write("write_moved")
-                        .get_pieces_mut()
-                        .map(|pieces| {
-                            pieces.write_failed(chunk_info);
-                            None
-                        })
-                        .map_err(anyhow::Error::from);
+                    landed[i] = unwrite(state, chunk_info, "write_moved");
                     continue;
                 }
                 Err(e) => Err(e),
@@ -564,22 +565,33 @@ fn land_blocks_or_hold(
             }
         }
     }
-    if written.is_empty() {
+
+    // A block of a piece in flight that is not its last is marked under its
+    // piece's lock alone. The rest, under the torrent's lock, once for the
+    // batch: the last block of a piece takes it out of flight for its check.
+    let mut last = Vec::new();
+    for i in written {
+        let (addr, _, chunk_info) = &blocks[i];
+        if !slots.mark(chunk_info, *addr) {
+            last.push(i);
+        }
+    }
+    if last.is_empty() {
+        admitted.chunks.clear();
         return;
     }
-
     let mut g = state.lock_write("mark_chunk_downloaded");
     let pieces = match g.get_pieces_mut() {
         Ok(pieces) => pieces,
         Err(e) => {
             let e = anyhow::Error::from(e);
-            for i in written {
+            for i in last {
                 landed[i] = Err(anyhow::anyhow!("{e:#}"));
             }
             return;
         }
     };
-    for i in written {
+    for i in last {
         let (addr, piece, chunk_info) = &blocks[i];
         let chunk_marking_result = pieces.mark_chunk_downloaded(piece, *addr);
         trace!(?piece, chunk_marking_result=?chunk_marking_result);
@@ -611,10 +623,19 @@ fn land_blocks_or_hold(
         };
     }
     admitted.chunks.clear();
-    // The pieces' locks go once their blocks are marked: a completed one is
-    // out of flight now.
     drop(g);
-    drop(held);
+}
+
+// `chunk` is no longer being written, and a later copy of it is taken: under
+// its piece's lock when the piece is in flight, the torrent's otherwise.
+fn unwrite(state: &TorrentStateLive, chunk: &ChunkInfo, reason: &'static str) -> Landed {
+    if !state.slots.write_failed(chunk) {
+        state
+            .lock_write(reason)
+            .get_pieces_mut()?
+            .write_failed(chunk);
+    }
+    Ok(None)
 }
 
 impl Drop for Admitted<'_> {
@@ -622,8 +643,17 @@ impl Drop for Admitted<'_> {
         if self.chunks.is_empty() {
             return;
         }
+        let slots = &self.state.slots;
+        let unowned: Vec<&ChunkInfo> = self
+            .chunks
+            .iter()
+            .filter(|chunk| !slots.write_failed(chunk))
+            .collect();
+        if unowned.is_empty() {
+            return;
+        }
         if let Ok(pieces) = self.state.lock_write("write_failed").get_pieces_mut() {
-            for chunk in &self.chunks {
+            for chunk in unowned {
                 pieces.write_failed(chunk);
             }
         }
@@ -638,10 +668,7 @@ fn write_failed(
     e: anyhow::Error,
     epoch: u64,
 ) -> Landed {
-    state
-        .lock_write("write_failed")
-        .get_pieces_mut()?
-        .write_failed(chunk_info);
+    unwrite(state, chunk_info, "write_failed")?;
     if state.handle_disk_error(&e, epoch) {
         return Ok(None);
     }

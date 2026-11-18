@@ -19,6 +19,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 
@@ -45,17 +46,18 @@ const INITIAL_PICKER_THRESHOLD: usize = 4;
 /// started ones are finished first.
 const MAX_PARTIAL_CHUNKS: usize = 2048;
 
-/// Tracks a piece currently being downloaded.
+mod slots;
+use slots::PieceSlot;
+#[cfg(test)]
+pub(crate) use slots::torrent_takes;
+pub(crate) use slots::{PieceSlots, torrent_lock_taken};
+
+/// Tracks a piece currently being downloaded. What it holds of its blocks
+/// is in its slot ([`PieceSlots`]), under the piece's own lock.
 #[derive(Debug, Clone)]
 pub struct InflightPiece {
     pub peer: PeerHandle,
     pub started: Instant,
-    // The blocks of the piece asked of another peer as well, in the end
-    // game, one such peer a block: the block index and the peer.
-    duplicates: Vec<(u32, PeerHandle)>,
-    // The storage holds room for the piece: a block of it was admitted.
-    // Its later blocks are not asked again.
-    room: bool,
 }
 
 /// What becomes of a block that arrives (libtorrent
@@ -198,14 +200,22 @@ where
 pub struct PieceTracker {
     chunks: ChunkTracker,
     inflight: HashMap<ValidPieceIndex, InflightPiece>,
+    // The slot of each piece in flight, under the piece's lock: its blocks
+    // being written, doubled and sent, and its room.
+    slots: Arc<PieceSlots>,
+    // The pieces in flight whose slot may hold a doubled block: a block
+    // doubled puts its piece here, and the piece leaves when a look finds
+    // none, or leaves flight.
+    doubled: HashSet<ValidPieceIndex>,
     // Who sent each received block of the pieces not yet handed to their
-    // hash check. A record names only blocks its piece keeps: it outlives a
+    // hash check, but for those in flight, whose slot holds theirs. A record names only blocks its piece keeps: it outlives a
     // sender that goes away, as the blocks do, and leaves with them
     // (libtorrent keeps a block's downloader in the piece picker,
     // `block_info::peer`, read by `piece_picker::get_downloaders`).
     senders: HashMap<ValidPieceIndex, Senders>,
     // The blocks a copy of which arrived and is being written, by absolute
-    // index: any other copy is redundant (libtorrent
+    // index, of the pieces not in flight; a piece in flight holds its own in
+    // its slot. Any other copy is redundant (libtorrent
     // `piece_picker::mark_as_writing`).
     writing: HashSet<u32>,
     // The pieces queued again since the storage was last told: one that
@@ -226,14 +236,26 @@ impl PieceTracker {
 
     fn with_rng(mut chunks: ChunkTracker, mut rng: StdRng) -> Self {
         chunks.start_picking(StdRng::from_rng(&mut rng));
+        let slots = Arc::new(PieceSlots::new(
+            *chunks.get_lengths(),
+            chunks.received().clone(),
+        ));
         Self {
             chunks,
             inflight: HashMap::new(),
+            slots,
+            doubled: HashSet::new(),
             senders: HashMap::new(),
             writing: HashSet::new(),
             requeued: Vec::new(),
             rng,
         }
+    }
+
+    /// The slots of the pieces in flight, which admit and mark a block of
+    /// one without the torrent's lock.
+    pub(crate) fn slots(&self) -> &Arc<PieceSlots> {
+        &self.slots
     }
 
     /// Read-only access to the underlying ChunkTracker.
@@ -249,6 +271,11 @@ impl PieceTracker {
     /// resume. A check that finishes after the pause finds the torrent
     /// gone and changes nothing.
     pub fn into_chunks(mut self) -> ChunkTracker {
+        // No piece holds a slot past here: a block of it found later goes
+        // to the tracker, which is gone.
+        for piece in self.inflight.keys() {
+            self.slots.lock_also(*piece).take();
+        }
         self.chunks.release_taken();
         self.chunks
     }
@@ -369,36 +396,42 @@ impl PieceTracker {
         let Self {
             chunks,
             inflight,
-            writing,
+            slots,
+            doubled,
             rng,
             ..
         } = self;
-        let mut pieces: Vec<(ValidPieceIndex, Vec<ChunkInfo>)> = inflight
+        let slots: &PieceSlots = slots;
+        // Each candidate's lock is held across the pick, so no block of it
+        // starts being written or arrives between the look and the doubling.
+        let mut pieces: Vec<(ValidPieceIndex, slots::Slot<'_>, Vec<ChunkInfo>)> = inflight
             .iter()
             .filter(|(piece, info)| info.peer != req.peer && (req.peer_has_piece)(**piece))
-            .map(|(piece, info)| {
+            .filter_map(|(piece, _)| {
+                let slot = slots.lock_also(*piece);
+                let held = slot.as_deref()?;
                 let free: Vec<_> = chunks
                     .iter_missing_chunks(*piece)
                     .filter(|c| {
-                        !writing.contains(&c.absolute_index)
-                            && !info.duplicates.iter().any(|(b, _)| *b == c.chunk_index)
+                        !held.writing.contains(&c.chunk_index)
+                            && !held.duplicates.iter().any(|(b, _)| *b == c.chunk_index)
                     })
                     .collect();
-                (*piece, free)
+                Some((*piece, slot, free))
             })
-            .filter(|(_, free)| !free.is_empty())
+            .filter(|(_, _, free)| !free.is_empty())
             .collect();
         // In index order, so the pick follows the rng alone.
-        pieces.sort_unstable_by_key(|(piece, _)| piece.get());
+        pieces.sort_unstable_by_key(|(piece, _, _)| piece.get());
         if pieces.is_empty() {
             return None;
         }
-        let (piece, free) = pieces.swap_remove(rng.random_range(0..pieces.len()));
+        let (piece, mut slot, free) = pieces.swap_remove(rng.random_range(0..pieces.len()));
         let chunk = free[rng.random_range(0..free.len())];
-        inflight
-            .get_mut(&piece)?
+        slot.as_deref_mut()?
             .duplicates
             .push((chunk.chunk_index, req.peer));
+        doubled.insert(piece);
         Some(AcquireResult::EndGame { piece, chunk })
     }
 
@@ -516,10 +549,24 @@ impl PieceTracker {
             InflightPiece {
                 peer,
                 started: Instant::now(),
-                duplicates: Vec::new(),
-                room: false,
             },
         );
+        // The piece's blocks being written, and who sent those it has, go
+        // to its slot while it is in flight.
+        let writing = self
+            .chunks
+            .get_lengths()
+            .iter_chunk_infos(piece)
+            .filter(|c| self.writing.remove(&c.absolute_index))
+            .map(|c| c.chunk_index)
+            .collect();
+        *self.slots.lock_also(piece) = Some(Box::new(PieceSlot {
+            owner: peer,
+            duplicates: Vec::new(),
+            room: false,
+            writing,
+            senders: self.senders.remove(&piece),
+        }));
         AcquireResult::Reserved(piece)
     }
 
@@ -550,8 +597,14 @@ impl PieceTracker {
             .filter(|(_, _, elapsed)| *elapsed >= min_elapsed)
             .max_by_key(|(_, _, elapsed)| *elapsed)?;
 
-        // Check can_steal (e.g., per_piece_lock)
+        // Not while a block of it is being written: when that is its last,
+        // the piece is its writer's to check.
         if !(req.can_steal)(piece) {
+            return None;
+        }
+        let mut slot = self.slots.lock_also(piece);
+        let held = slot.as_deref_mut()?;
+        if !held.writing.is_empty() {
             return None;
         }
 
@@ -559,7 +612,8 @@ impl PieceTracker {
         let info = self.inflight.get_mut(&piece)?;
         info.peer = req.peer;
         info.started = Instant::now();
-        info.duplicates.retain(|(_, peer)| *peer != req.peer);
+        held.owner = req.peer;
+        held.duplicates.retain(|(_, peer)| *peer != req.peer);
 
         Some(AcquireResult::Stolen {
             piece,
@@ -578,9 +632,27 @@ impl PieceTracker {
     /// hash and calls `mark_piece_hash_ok` or `mark_piece_hash_failed`.
     pub fn take_inflight(&mut self, piece: ValidPieceIndex) -> (Option<Duration>, Senders) {
         self.chunks.reserve_needed_piece(piece);
-        let senders = self.senders.remove(&piece).unwrap_or_default();
+        let senders = match self.leave_flight(piece) {
+            Some(senders) => senders,
+            None => self.senders.remove(&piece),
+        };
         let started = self.inflight.remove(&piece).map(|i| i.started.elapsed());
-        (started, senders)
+        (started, senders.unwrap_or_default())
+    }
+
+    // `piece` leaves flight: its slot goes, the blocks it is writing go back
+    // to the torrent's, and who sent its blocks is handed back. None when it
+    // held no slot.
+    fn leave_flight(&mut self, piece: ValidPieceIndex) -> Option<Option<Senders>> {
+        self.doubled.remove(&piece);
+        let slot = self.slots.lock_also(piece).take()?;
+        let first = self.chunks.get_lengths().chunk_range(piece).start;
+        self.writing.extend(
+            slot.writing
+                .iter()
+                .map(|block| u32::try_from(first).expect("chunk indexes fit in u32") + block),
+        );
+        Some(slot.senders)
     }
 
     /// Mark piece as downloaded after successful hash verification.
@@ -608,9 +680,14 @@ impl PieceTracker {
             .collect();
         // The blocks it doubled in the end game are asked of their owners
         // alone again.
-        for info in self.inflight.values_mut() {
-            info.duplicates.retain(|(_, holder)| *holder != peer);
-        }
+        let slots = &self.slots;
+        self.doubled.retain(|piece| {
+            let mut slot = slots.lock_also(*piece);
+            slot.as_deref_mut().is_some_and(|held| {
+                held.duplicates.retain(|(_, holder)| *holder != peer);
+                !held.duplicates.is_empty()
+            })
+        });
         self.requeue(owned)
     }
 
@@ -633,11 +710,15 @@ impl PieceTracker {
             .inflight
             .iter()
             .filter(|(_, info)| info.peer == peer)
-            .filter(|(piece, info)| {
+            .filter(|(piece, _)| {
+                let slot = self.slots.lock_also(**piece);
+                let held = slot.as_deref();
                 self.chunks.iter_missing_chunks(**piece).all(|chunk| {
                     asked(&chunk)
-                        || self.writing.contains(&chunk.absolute_index)
-                        || info.duplicates.iter().any(|(b, _)| *b == chunk.chunk_index)
+                        || held.is_some_and(|held| {
+                            held.writing.contains(&chunk.chunk_index)
+                                || held.duplicates.iter().any(|(b, _)| *b == chunk.chunk_index)
+                        })
                 })
             })
             .max_by_key(|(piece, info)| (info.started, piece.get()))
@@ -666,13 +747,15 @@ impl PieceTracker {
 
     // Whether a block of `piece` was received or is being written.
     fn is_started(&self, piece: ValidPieceIndex) -> bool {
+        let slot = self.slots.lock_also(piece);
+        let writing = |chunk: &ChunkInfo| match slot.as_deref() {
+            Some(held) => held.writing.contains(&chunk.chunk_index),
+            None => self.writing.contains(&chunk.absolute_index),
+        };
         self.chunks
             .get_lengths()
             .iter_chunk_infos(piece)
-            .any(|chunk| {
-                self.writing.contains(&chunk.absolute_index)
-                    || self.chunks.is_chunk_received(&chunk)
-            })
+            .any(|chunk| writing(&chunk) || self.chunks.is_chunk_received(&chunk))
     }
 
     /// The pieces queued again since the last call, in the order they left
@@ -687,6 +770,10 @@ impl PieceTracker {
     fn requeue(&mut self, pieces: Vec<ValidPieceIndex>) -> usize {
         for piece in &pieces {
             self.inflight.remove(piece);
+            // Out of its slot first: the queue reads its received blocks.
+            if let Some(Some(senders)) = self.leave_flight(*piece) {
+                self.senders.insert(*piece, senders);
+            }
             self.chunks.requeue_piece_if_not_have(*piece);
         }
         let released = pieces.len();
@@ -720,43 +807,35 @@ impl PieceTracker {
         admit: impl FnOnce(ValidPieceIndex, bool) -> bool,
     ) -> Arrival {
         let piece = chunk.piece_index;
+        // A piece in flight rules under its own lock, as its slot does
+        // without the torrent's.
+        if let Some(held) = self.slots.lock_also(piece).as_deref_mut() {
+            return slots::arrive_in(held, self.slots.received(), chunk, peer, admit);
+        }
+        // No peer owns it: no room is held for it, and no one else asks
+        // for the block.
         if self.chunks.is_piece_have(piece)
             || self.chunks.is_chunk_received(chunk)
             || self.writing.contains(&chunk.absolute_index)
         {
             return Arrival::Discard;
         }
-        let info = self.inflight.get_mut(&piece);
-        let held = info.as_ref().is_some_and(|info| info.room);
-        if !held {
-            let owned = info.as_ref().is_some_and(|info| info.peer == peer);
-            if !admit(piece, owned) {
-                return Arrival::NoRoom;
-            }
-            if let Some(info) = info {
-                info.room = true;
-            }
+        if !admit(piece, false) {
+            return Arrival::NoRoom;
         }
         self.writing.insert(chunk.absolute_index);
-        let mut cancel = Vec::new();
-        if let Some(info) = self.inflight.get_mut(&chunk.piece_index) {
-            if let Some(at) = info
-                .duplicates
-                .iter()
-                .position(|(block, _)| *block == chunk.chunk_index)
-            {
-                cancel.push(info.duplicates.swap_remove(at).1);
-            }
-            cancel.push(info.peer);
-            cancel.retain(|other| *other != peer);
-        }
-        Arrival::Write { cancel }
+        Arrival::Write { cancel: Vec::new() }
     }
 
     /// The write of `chunk` failed: it is no longer being written, and a
     /// later copy is taken (libtorrent `piece_picker::write_failed`).
     pub fn write_failed(&mut self, chunk: &ChunkInfo) {
-        self.writing.remove(&chunk.absolute_index);
+        match self.slots.lock_also(chunk.piece_index).as_deref_mut() {
+            Some(held) => held.writing.retain(|block| *block != chunk.chunk_index),
+            None => {
+                self.writing.remove(&chunk.absolute_index);
+            }
+        }
     }
 
     // === QUERIES ===
@@ -779,11 +858,25 @@ impl PieceTracker {
     /// block of it in the end game that has not arrived. A peer whose piece
     /// was stolen stops requesting it.
     pub fn may_request(&self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
-        self.is_owned_by(piece, peer)
-            || self
-                .inflight
-                .get(&piece)
-                .is_some_and(|info| info.duplicates.iter().any(|(_, p)| *p == peer))
+        self.is_owned_by(piece, peer) || !self.doubled_by(piece, peer).is_empty()
+    }
+
+    // The blocks of `piece` `peer` doubles in the end game, by index.
+    fn doubled_by(&self, piece: ValidPieceIndex, peer: PeerHandle) -> Vec<u32> {
+        if !self.doubled.contains(&piece) {
+            return Vec::new();
+        }
+        self.slots
+            .lock(piece)
+            .as_deref()
+            .map(|held| {
+                held.duplicates
+                    .iter()
+                    .filter(|(_, p)| *p == peer)
+                    .map(|(block, _)| *block)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The chunks of `piece` not yet received. A peer that steals a
@@ -800,11 +893,14 @@ impl PieceTracker {
         piece: ValidPieceIndex,
         peer: PeerHandle,
     ) -> impl Iterator<Item = ChunkInfo> + '_ {
-        let info = self.inflight.get(&piece);
-        let owner = info.is_some_and(|info| info.peer == peer);
-        self.missing_chunks(piece).filter(move |chunk| {
-            owner || info.is_some_and(|info| info.duplicates.contains(&(chunk.chunk_index, peer)))
-        })
+        let owner = self.is_owned_by(piece, peer);
+        let doubled = if owner {
+            Vec::new()
+        } else {
+            self.doubled_by(piece, peer)
+        };
+        self.missing_chunks(piece)
+            .filter(move |chunk| owner || doubled.contains(&chunk.chunk_index))
     }
 
     /// Check if a piece is currently in-flight.
@@ -836,17 +932,29 @@ impl PieceTracker {
             piece.begin,
             piece.len().try_into().ok()?,
         )?;
-        self.writing.remove(&chunk.absolute_index);
+        // A piece in flight has its bits and senders written under its lock.
+        let mut slot = self.slots.lock_also(index);
+        match slot.as_deref_mut() {
+            Some(held) => held.writing.retain(|block| *block != chunk.chunk_index),
+            None => {
+                self.writing.remove(&chunk.absolute_index);
+            }
+        }
         let result = self.chunks.mark_chunk_downloaded(piece)?;
         if !matches!(result, ChunkMarkingResult::PreviouslyCompleted) {
             let lengths = self.chunks.get_lengths();
             let blocks = lengths.chunks_per_piece(index) as usize;
-            let record = self
-                .senders
-                .entry(index)
-                .or_insert_with(|| Senders(vec![None; blocks]));
-            if let Some(slot) = record.0.get_mut(chunk.chunk_index as usize) {
-                *slot = Some(sender);
+            match slot.as_deref_mut() {
+                Some(held) => slots::record(&mut held.senders, blocks, chunk.chunk_index, sender),
+                None => {
+                    let record = self
+                        .senders
+                        .entry(index)
+                        .or_insert_with(|| Senders(vec![None; blocks]));
+                    if let Some(at) = record.0.get_mut(chunk.chunk_index as usize) {
+                        *at = Some(sender);
+                    }
+                }
             }
         }
         Some(result)
@@ -901,6 +1009,9 @@ fn may_hand(
 
 #[cfg(test)]
 mod golden;
+
+#[cfg(test)]
+mod slot_tests;
 
 #[cfg(test)]
 mod tests {
@@ -991,10 +1102,13 @@ mod tests {
 
     /// Who the record of piece `i` names, block by block.
     fn record(tracker: &PieceTracker, i: u32) -> Option<Vec<Option<PeerHandle>>> {
-        tracker
-            .senders
-            .get(&index(tracker, i))
-            .map(|senders| senders.blocks().to_vec())
+        let piece = index(tracker, i);
+        let slot = tracker.slots.lock(piece);
+        match slot.as_deref() {
+            Some(held) => held.senders.as_ref(),
+            None => tracker.senders.get(&piece),
+        }
+        .map(|senders| senders.blocks().to_vec())
     }
 
     type NoStream = std::iter::Empty<ValidPieceIndex>;
@@ -1343,8 +1457,9 @@ mod tests {
                 || (p == doubled_rest && c.chunk_index < 3)
         };
         tracker
-            .inflight
-            .get_mut(&index(&tracker, doubled_rest))
+            .slots
+            .lock(index(&tracker, doubled_rest))
+            .as_deref_mut()
             .unwrap()
             .duplicates
             .push((3, other));

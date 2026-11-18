@@ -33,7 +33,9 @@ impl Watch {
         for (name, rx) in peers.iter_mut() {
             while let Ok(sent) = rx.try_recv() {
                 seen.push(match sent {
-                    WriterRequest::Message(Message::Cancel(r)) => Seen::Cancel(name, r.index, r.begin),
+                    WriterRequest::Message(Message::Cancel(r)) => {
+                        Seen::Cancel(name, r.index, r.begin)
+                    }
                     _ => Seen::Other(name),
                 });
             }
@@ -167,7 +169,11 @@ async fn a_block_asked_of_two_peers_is_cancelled_with_the_other_before_it_is_wri
     // With nothing outstanding and no piece time to take a piece over by,
     // the doubler is handed one block of the owner's piece to ask for too.
     assert_eq!(
-        doubler.acquire_next_piece().unwrap().piece().map(|p| p.get()),
+        doubler
+            .acquire_next_piece()
+            .unwrap()
+            .piece()
+            .map(|p| p.get()),
         Some(owned)
     );
     let doubled: Vec<ChunkInfo> = h
@@ -219,12 +225,14 @@ async fn a_block_asked_of_two_peers_is_cancelled_with_the_other_before_it_is_wri
     drop(watch);
     // Neither peer is asked to cancel what it sent, and each is waiting for
     // nothing it was told to cancel.
-    assert!(!h
-        .peers
-        .with_live(owner.addr, |live| live.has_inflight_request(&unasked))
-        .unwrap());
-    assert!(!h
-        .peers
-        .with_live(doubler.addr, |live| live.has_inflight_request(&doubled))
-        .unwrap());
+    assert!(
+        !h.peers
+            .with_live(owner.addr, |live| live.has_inflight_request(&unasked))
+            .unwrap()
+    );
+    assert!(
+        !h.peers
+            .with_live(doubler.addr, |live| live.has_inflight_request(&doubled))
+            .unwrap()
+    );
 }
