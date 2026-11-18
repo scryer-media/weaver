@@ -963,6 +963,10 @@ struct Inner {
     // what the intakes said before it.
     #[cfg(test)]
     settled: watch::Sender<u64>,
+    // A settle under way: set before it takes what it settles, cleared
+    // before `settled` counts it.
+    #[cfg(test)]
+    settling: AtomicBool,
     // How many magnets' fetches were shown ended: what a test waits on to
     // know every fetch a start began has said its end.
     #[cfg(any(test, feature = "test-support"))]
@@ -1049,6 +1053,8 @@ impl TorrentService {
                 disk_waits_moved: watch::channel(0).0,
                 #[cfg(test)]
                 settled: watch::channel(0).0,
+                #[cfg(test)]
+                settling: AtomicBool::new(false),
                 #[cfg(any(test, feature = "test-support"))]
                 fetches_ended: watch::channel(0).0,
                 #[cfg(test)]

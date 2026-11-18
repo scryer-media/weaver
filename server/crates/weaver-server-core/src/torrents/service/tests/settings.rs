@@ -739,10 +739,14 @@ async fn a_wound_down_seed_whose_goal_is_met_stays_stopped_when_torrents_are_on(
     let mut on = rig.service.settings();
     on.torrent.enabled = true;
     on.seeding = stops_once_done();
+    let mut ticks = rig.service.ticks();
+    let base = *ticks.borrow_and_update();
     rig.service.set_settings(on).await;
 
     assert_eq!(kept(met), (TorrentIntent::Stopped, false));
-    // Each reads as checking what was saved of it until its session has it.
+    // The tick that turning them on runs puts each in its session; each
+    // then reads as checking what was saved of it until its session has it.
+    ticks.wait_for(|ticks| *ticks > base).await.unwrap();
     super::listing::settled(&rig.service, 2).await;
     assert_eq!(
         rig.service.torrent(met).await.unwrap().state,
