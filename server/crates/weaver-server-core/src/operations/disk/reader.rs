@@ -94,6 +94,7 @@ impl VolumeReads {
     // A turn, waited for on this thread, kept until dropped: for a reader
     // that holds one across a run of reads (`Reading`). Never called on the
     // async runtime.
+    #[cfg(test)]
     pub(crate) fn owned_here(&self) -> OwnedSemaphorePermit {
         match Arc::clone(&self.turns).try_acquire_owned() {
             Ok(turn) => turn,
@@ -115,6 +116,7 @@ impl VolumeReads {
 
     // A turn for one read, waited for on this thread. Never called on the
     // async runtime.
+    #[cfg(test)]
     pub(crate) fn one_here(&self) -> SemaphorePermit<'_> {
         match self.turns.try_acquire() {
             Ok(turn) => turn,
@@ -250,6 +252,7 @@ pub(crate) struct Reading {
 
 impl Reading {
     // `read`, in a turn of `reads`.
+    #[cfg(test)]
     pub(crate) fn read<R>(&mut self, reads: &VolumeReads, read: impl FnOnce() -> R) -> R {
         if reads.spinning {
             self.held = None;

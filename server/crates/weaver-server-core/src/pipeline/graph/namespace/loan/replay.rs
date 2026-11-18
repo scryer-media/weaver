@@ -231,6 +231,7 @@ impl NamespaceWriter {
                 withheld: std::collections::BTreeSet::new(),
                 working: self.working_volume(),
                 reading: RefCell::default(),
+                stop: Arc::default(),
             };
             let mut seen = BTreeSet::new();
             for member in volumes.values() {
@@ -238,7 +239,7 @@ impl NamespaceWriter {
             }
             return Ok(Some(Replay {
                 node,
-                stop: Arc::default(),
+                stop: access.stop(),
                 generation: tree.generation(),
                 records: access
                     .postings
