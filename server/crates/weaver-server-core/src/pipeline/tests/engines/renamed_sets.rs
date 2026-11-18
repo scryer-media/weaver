@@ -437,22 +437,29 @@ async fn whole_archives_posted_as_volumes_of_one_stem_are_each_their_own_set() {
         whole_archive(&clips[3].0, &clips[3].1),
     ));
     // The posted numbering interleaves the sets, a whole archive between
-    // volumes of another set, as the pack's was.
-    let order = [5, 0, 6, 1, 2, 7, 8, 3, 9, 4];
-    let posted: Vec<(String, usize)> = order
+    // volumes of another set, as the pack's was, or a whole archive posted
+    // first of all, as `part01`.
+    let numberings = [
+        [5, 0, 6, 1, 2, 7, 8, 3, 9, 4],
+        [8, 0, 5, 1, 9, 2, 6, 3, 7, 4],
+    ];
+    for (numbering, order) in numberings
         .iter()
-        .enumerate()
-        .map(|(at, volume)| {
-            let number = at + 1;
-            let name = if number < 10 {
-                format!("Pack.XXX-Amateur-U4A.part{number:02}.rar")
-            } else {
-                format!("Pack.XXX-Amateur-U4A.part{number:03}.rar")
-            };
-            (name, *volume)
-        })
-        .collect();
-    for order in ORDERS {
+        .flat_map(|numbering| ORDERS.map(|order| (numbering, order)))
+    {
+        let posted: Vec<(String, usize)> = numbering
+            .iter()
+            .enumerate()
+            .map(|(at, volume)| {
+                let number = at + 1;
+                let name = if number < 10 {
+                    format!("Pack.XXX-Amateur-U4A.part{number:02}.rar")
+                } else {
+                    format!("Pack.XXX-Amateur-U4A.part{number:03}.rar")
+                };
+                (name, *volume)
+            })
+            .collect();
         let (posts, _) = arranged(&truth, &posted, 0, order);
         let scenario = match order {
             Order::Scattered => {
@@ -469,7 +476,7 @@ async fn whole_archives_posted_as_volumes_of_one_stem_are_each_their_own_set() {
             _ => Scenario::new(posts).framed(FRAME),
         };
         let graph = run(&scenario).await;
-        let case = format!("{order:?}");
+        let case = format!("{numbering:?} {order:?}");
         assert!(
             graph.completed(),
             "{case}: {:?} {:?} kinds {:?} delivery {:?}",
@@ -492,5 +499,187 @@ async fn whole_archives_posted_as_volumes_of_one_stem_are_each_their_own_set() {
             "{case}: {:?}",
             graph.graph().delivery
         );
+    }
+}
+
+// A set of sixty-two volumes posted under another stem, `part01` to
+// `part09` and then `part010` on, each posted number its true one, and a
+// PAR2 set over the true names `<stem>.partNN.rar`. The PAR2 set comes
+// first and the volumes in the order a pack's arrived: from a middle
+// volume on, the first volume among the last. The set is one store and
+// its member is delivered, with the holds unbounded and with a scratch
+// ceiling a third of the set reaches before the first volume arrives.
+#[tokio::test]
+async fn a_long_mixed_width_set_its_first_volume_late_delivers() {
+    const VOLUMES: usize = 62;
+    let body = payload(VOLUMES * 2 * FRAME + 101, 51);
+    let stem = "12_[sapphicerotica].francesca.dicaprio,.mia.cruise.double.date.21.02.2017";
+    let truth: Vec<(String, Vec<u8>)> =
+        multi_member_store_set(&[("double.date.mp4", body.clone())], VOLUMES)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, bytes))| (format!("{stem}.part{:02}.rar", index + 1), bytes))
+            .collect();
+    let posted = |number: usize| {
+        if number < 10 {
+            format!("Mia.Cruise.Pack.XXX-U4A.part{number:02}.rar")
+        } else {
+            format!("Mia.Cruise.Pack.XXX-U4A.part{number:03}.rar")
+        }
+    };
+    // The order the pack's volumes were bound in, by posted number.
+    let arrival = [
+        25, 26, 27, 28, 5, 29, 6, 15, 35, 30, 7, 31, 36, 16, 8, 32, 37, 33, 9, 17, 45, 34, 38, 10,
+        39, 18, 46, 11, 40, 55, 19, 41, 12, 47, 42, 13, 20, 56, 43, 48, 14, 44, 21, 57, 49, 22, 58,
+        50, 23, 59, 51, 1, 24, 60, 52, 2, 61, 3, 53, 54, 62, 4,
+    ];
+    let files: Vec<(&str, &[u8])> = truth
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let posts = || {
+        let mut posts = par2_volumes_sliced("Mia.Cruise.Pack.XXX-U4A", &files, FRAME as u64, 4, 1);
+        posts.extend(
+            arrival
+                .iter()
+                .map(|number| Post::plain(&posted(*number), truth[number - 1].1.clone())),
+        );
+        posts
+    };
+    let total: u64 = truth.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+    let unbounded = weaver_graph::holds::HoldBudgets {
+        resident_limit: u64::MAX,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    };
+    let spilling = weaver_graph::holds::HoldBudgets {
+        resident_limit: 4 * FRAME as u64,
+        scratch_total: total / 3,
+        scratch_ceiling: total / 3,
+        disk_reserve: 0,
+    };
+    let spills = |budgets: &weaver_graph::holds::HoldBudgets| budgets.scratch_ceiling < total;
+    // The PAR2 set's two posts, then the volumes in turn or side by side.
+    let side_by_side: Vec<u32> = (0..2 + VOLUMES as u32).collect();
+    for (case, budgets, together) in [
+        ("unbounded", unbounded, false),
+        ("spilling", spilling, false),
+        ("spilling side by side", spilling, true),
+    ] {
+        let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture();
+        let scenario = Scenario::new(posts()).framed(FRAME).holds(budgets);
+        let scenario = match together {
+            true => scenario.together(&side_by_side),
+            false => scenario,
+        };
+        let graph = run(&scenario).await;
+        assert_eq!(
+            !lines.of("holds spilled").is_empty(),
+            spills(&budgets),
+            "{case}"
+        );
+        assert!(
+            graph.completed(),
+            "{case}: {:?} {:?} kinds {:?} delivery {:?}",
+            graph.status,
+            graph.failure,
+            kinds(&graph),
+            graph.graph().delivery,
+        );
+        assert_eq!(
+            graph
+                .files
+                .get(&delivered("double.date.mp4"))
+                .map(Vec::as_slice),
+            Some(body.as_slice()),
+            "{case}: delivered {:?}",
+            graph.files.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            graph.graph().delivery.withheld.is_empty(),
+            "{case}: {:?}",
+            graph.graph().delivery
+        );
+    }
+}
+
+// A set of sixty-six stored volumes and its PAR2 set posted with no names
+// at all: every post is `unknown`, so the ledger names them `unknown`,
+// `unknown.duplicate1` and on, the PAR2 index first. The PAR2 set renames
+// each volume `<stem>.partNN.rar` by its content. Fetched side by side,
+// with or without two volumes' fronts ahead of the index, the set is one
+// store and its member is delivered, in RAR5 and in RAR4 with and without
+// numbered end records.
+#[tokio::test]
+async fn a_nameless_long_set_renamed_by_par2_is_one_store() {
+    const VOLUMES: usize = 66;
+    let body = payload(VOLUMES * 2 * FRAME + 77, 61);
+    let stem = "40_#[pornstarspunishment].pesky.piggy.punishment";
+    for (format, set) in [
+        ("rar5", single_member_store_set("pesky.mp4", &body, VOLUMES)),
+        (
+            "rar4",
+            single_member_rar4_store_set("pesky.mp4", &body, VOLUMES),
+        ),
+        (
+            "rar4 numbered",
+            single_member_rar4_store_set_numbered("pesky.mp4", &body, VOLUMES),
+        ),
+    ] {
+        let truth: Vec<(String, Vec<u8>)> = set
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, bytes))| (format!("{stem}.part{:02}.rar", index + 1), bytes))
+            .collect();
+        let files: Vec<(&str, &[u8])> = truth
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let recovery = par2_volumes_sliced(stem, &files, FRAME as u64, 8, 8);
+        // The index, then every volume, then the recovery volumes, each
+        // posted as `unknown`.
+        let posts = || -> Vec<Post> {
+            let mut posts = vec![Post::plain("unknown", recovery[0].bytes.clone())];
+            posts.extend(
+                truth
+                    .iter()
+                    .map(|(_, bytes)| Post::plain("unknown", bytes.clone())),
+            );
+            posts.extend(
+                recovery[1..]
+                    .iter()
+                    .map(|volume| Post::plain("unknown", volume.bytes.clone())),
+            );
+            posts
+        };
+        let total = posts().len() as u32;
+        // Side by side from the index on, or with the tenth and thirtieth
+        // volumes' fronts ahead of the index, as the pack's arrived.
+        for (order, ahead) in [("index first", vec![0]), ("index third", vec![10, 30, 0])] {
+            let case = format!("{format} {order}");
+            let mut together = ahead.clone();
+            together.extend((0..total).filter(|post| !ahead.contains(post)));
+            let graph = run(&Scenario::new(posts()).framed(FRAME).together(&together)).await;
+            assert!(
+                graph.completed(),
+                "{case}: {:?} {:?} kinds {:?} delivery {:?}",
+                graph.status,
+                graph.failure,
+                kinds(&graph),
+                graph.graph().delivery,
+            );
+            assert_eq!(
+                graph.files.get(&delivered("pesky.mp4")).map(Vec::as_slice),
+                Some(body.as_slice()),
+                "{case}: delivered {:?}",
+                graph.files.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                graph.graph().delivery.withheld.is_empty(),
+                "{case}: {:?}",
+                graph.graph().delivery
+            );
+        }
     }
 }
