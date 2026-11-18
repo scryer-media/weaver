@@ -465,8 +465,12 @@ async fn a_dead_post_on_the_field_layout_asks_first_articles_first_and_ends() {
 }
 
 // Fewer than ten files: the first-article sample does not rule, and the
-// post's health ends it on the ask that ends the fourth article's walk, 4
-// of 24 equal articles lost taking it to 83.3%, below its 85% line.
+// post's health ends it. Four of 24 equal articles lost take it to 83.3%,
+// below its 85% line, but two files still have their first article out,
+// and were they recovery volumes their eight articles would draw the line
+// at 50%: the verdict waits for them. On the ask that ends the fifth first
+// article's walk, 5 of 24 lost take it to 79.1%, below the 80% line even
+// the one file still out could draw, and the post is given up then.
 #[tokio::test]
 async fn a_small_dead_post_on_the_field_layout_ends_on_its_health() {
     let levels = field_levels();
@@ -480,7 +484,7 @@ async fn a_small_dead_post_on_the_field_layout_ends_on_its_health() {
         run.lost,
         run.reason
     );
-    assert_eq!(run.asks_at_give_up, Some(run.walked_out[3].0));
+    assert_eq!(run.asks_at_give_up, Some(run.walked_out[4].0));
     assert!(
         run.reason
             .as_deref()

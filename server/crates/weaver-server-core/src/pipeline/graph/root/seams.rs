@@ -245,6 +245,7 @@ impl Pipeline {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.after_graph_result(job_id, result.map(drop));
+        self.post_article_came(segment_id);
         true
     }
 

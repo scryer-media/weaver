@@ -861,6 +861,14 @@ impl GraphJob {
             || self.tree.judges_past_hole(NodeId::ROOT, member)
     }
 
+    // Seam for the feed: a recovery object holds the posted file at
+    // `file_index` as one of its volumes, whatever its posted name. The
+    // feed's critical line counts it from then on.
+    pub(crate) fn holds_as_recovery(&self, file_index: u32) -> bool {
+        self.writer
+            .carries_recovery(&self.tree, NodeId::ROOT, MemberId(file_index))
+    }
+
     // Seam for status: the posted file at `file_index` has an article
     // neither in hand nor lost for good, parked or not.
     pub(crate) fn file_waiting(&self, file_index: u32) -> bool {
