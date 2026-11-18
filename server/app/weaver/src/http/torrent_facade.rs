@@ -4536,11 +4536,17 @@ async fn set_location(
         return forbidden();
     }
     let views = found!(ctx.named(params.get(ids).unwrap_or_default()).await);
-    each_of(ctx, views, move |torrents, view| {
-        let location = location.clone();
-        async move { torrents.set_location_as(scope, view.job_id, location).await }
-    })
-    .await
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    // Moved one after another, then one pass and one publish for them all.
+    let job_ids: Vec<JobId> = views.iter().map(|view| view.job_id).collect();
+    answered(
+        &views,
+        torrents
+            .set_location_many_as(scope, &job_ids, &location)
+            .await,
+    )
 }
 
 // qBittorrent `exportAction`: the torrent's metainfo as it was added. A

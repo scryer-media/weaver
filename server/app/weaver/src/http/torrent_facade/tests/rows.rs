@@ -1044,6 +1044,12 @@ async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
         ),
         // In no session, each is refused, the first ending the request.
         ("recheck", format!("hashes={hashes}")),
+        // With no files to move yet, each is refused, the first ending the
+        // request.
+        (
+            "setLocation",
+            format!("hashes={hashes}&location=%2Fweaver-nowhere"),
+        ),
         ("delete", format!("hashes={hashes}&deleteFiles=false")),
     ] {
         let (views, takes) = (many.views_built(), rig.db.datastore_takes());
@@ -1071,6 +1077,11 @@ async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
                         .await
                 }
                 "recheck" => alone.recheck(job_id).await,
+                "setLocation" => {
+                    alone
+                        .set_location(job_id, "/weaver-nowhere".to_owned())
+                        .await
+                }
                 _ => alone.remove(job_id, false, true).await,
             };
             match done {

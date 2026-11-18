@@ -18,7 +18,7 @@ use crate::torrents::files::Files;
 use crate::torrents::metrics::{FetchOutcome, TorrentEvent};
 use crate::torrents::model::Adopted;
 use crate::torrents::model::HistoryEnd;
-use crate::torrents::persistence::HistoryFile;
+use crate::torrents::persistence::{HistoryFile, MadeRead};
 use crate::torrents::side::Side;
 use crate::torrents::store::TorrentStore;
 use crate::torrents::{TorrentRecord, files, status};
@@ -448,7 +448,7 @@ impl TorrentService {
             }
             Err(error) => return Err(self.mark_refused(job_id, &error).await),
         }
-        self.remove_marked(job_id, delete_files, ending, Shown::Now)
+        self.remove_marked(job_id, delete_files, ending, Shown::Now, None)
             .await
     }
 
@@ -512,11 +512,14 @@ impl TorrentService {
         delete_files: bool,
         ending: Ending,
         shown: Shown,
+        made: Option<MadeRead>,
     ) -> Result<(), ActionError> {
         let mut torrent = self
             .unlive(&mut *self.inner.live.lock().await, job_id)
             .ok_or(ActionError::NotFound(job_id))?;
-        let written = read_written(self.written_of(&torrent)).await;
+        let mut of = self.written_of(&torrent);
+        of.made = made;
+        let written = read_written(of).await;
         // The job's outcome: complete, short of what unpacking would
         // deliver, refused by unpacking, or cut short.
         let (status, error) = match (torrent.complete(), torrent.refusal()) {
@@ -609,6 +612,7 @@ impl TorrentService {
                 .and(torrent.record.storage_dir.as_deref())
                 .map(PathBuf::from),
             work: self.inner.env.work.clone(),
+            made: None,
         }
     }
 
@@ -704,6 +708,9 @@ pub(in crate::torrents) struct WrittenOf {
     store: Option<Arc<TorrentStore>>,
     claimed: Option<PathBuf>,
     work: PathBuf,
+    // What its row says it made, when its batch read that for all of them
+    // at once (`Database::torrents_made`); read here otherwise.
+    made: Option<MadeRead>,
 }
 
 // What a torrent wrote: what a deletion of its files takes, and the files
@@ -718,7 +725,7 @@ pub(in crate::torrents) struct Wrote {
 // read of its unpacking directory block.
 pub(in crate::torrents) async fn read_written(of: WrittenOf) -> Wrote {
     let job_id = of.job_id;
-    tokio::task::spawn_blocking(move || written_paths(&of))
+    tokio::task::spawn_blocking(move || written_paths(of))
         .await
         .unwrap_or_else(|error| {
             tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent wrote");
@@ -733,12 +740,16 @@ pub(in crate::torrents) async fn read_written(of: WrittenOf) -> Wrote {
 // that was. On a failed read of what was there, every listed file is; when
 // what was there was never written (a row from before it was kept), it is
 // not known, and no file goes, as at a start (`retiring_deletion`).
-fn written_paths(of: &WrittenOf) -> Wrote {
+fn written_paths(mut of: WrittenOf) -> Wrote {
     let job_id = of.job_id;
     let Some(store) = &of.store else {
         return Wrote::default();
     };
-    let adopted = of.db.torrent_adopted(job_id).unwrap_or_else(|error| {
+    let (adopted, outputs) = match of.made.take() {
+        Some(made) => made,
+        None => (of.db.torrent_adopted(job_id), of.db.torrent_outputs(job_id)),
+    };
+    let adopted = adopted.unwrap_or_else(|error| {
         tracing::warn!(job_id = job_id.0, error = %error, "could not read what was on disk before a torrent");
         Some(Adopted {
             all_files: true,
@@ -746,7 +757,7 @@ fn written_paths(of: &WrittenOf) -> Wrote {
             ..Adopted::default()
         })
     });
-    let outputs = of.db.torrent_outputs(job_id).unwrap_or_else(|error| {
+    let outputs = outputs.unwrap_or_else(|error| {
         tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
         Vec::new()
     });

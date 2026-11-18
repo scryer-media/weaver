@@ -36,6 +36,13 @@ const TRACKER_HOST_INSERT: &str = "INSERT INTO tracker_hosts (host) VALUES ";
 const TRACKER_HOST_ROW: &str = "({})";
 const TRACKER_HOST_CONFLICT: &str = " ON CONFLICT (host) DO NOTHING";
 
+/// One torrent's `torrent_adopted` and `torrent_outputs`, as
+/// [`Database::torrents_made`] reads them for many.
+pub(crate) type MadeRead = (
+    Result<Option<super::model::Adopted>, StateError>,
+    Result<Vec<String>, StateError>,
+);
+
 /// Seed mode as a pass over the torrents found it, written together by
 /// [`Database::write_torrent_seed_modes`].
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1936,6 +1943,88 @@ impl Database {
                 .map(Some)
                 .map_err(|error| StateError::Database(error.to_string()))
         })
+    }
+
+    // `torrent_adopted` and `torrent_outputs` of each of `job_ids`, read in
+    // as few statements as the bind limit allows, each torrent's answer as
+    // those two give it: a torrent with no row has nothing adopted known and
+    // no outputs, a value that does not decode is that torrent's error, and
+    // a read that fails is the error of every torrent it read.
+    pub(crate) fn torrents_made(&self, job_ids: &[JobId]) -> HashMap<JobId, MadeRead> {
+        let mut made = HashMap::with_capacity(job_ids.len());
+        let mut ids = Vec::with_capacity(job_ids.len());
+        for &job_id in job_ids {
+            match stored(job_id.0) {
+                Ok(id) => ids.push((job_id, id)),
+                Err(error) => {
+                    let again = StateError::Database(error.to_string());
+                    made.insert(job_id, (Err(error), Err(again)));
+                }
+            }
+        }
+        let datastore = self.datastore();
+        let chunk = crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+        for ids in ids.chunks(chunk.max(1)) {
+            let list = vec!["{}"; ids.len()].join(", ");
+            let args: Vec<SqlArg> = ids.iter().map(|(_, id)| SqlArg::I64(*id)).collect();
+            let datastore = self.datastore();
+            let rows = self.run_sql_blocking_read(async move {
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, adopted, outputs FROM torrents WHERE job_id IN ({list})"
+                    ),
+                    &args,
+                )
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok((
+                            row.i64("job_id")?,
+                            row.opt_text("adopted"),
+                            row.opt_text("outputs"),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, StateError>>()
+            });
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => {
+                    for (job_id, _) in ids {
+                        made.insert(
+                            *job_id,
+                            (
+                                Err(StateError::Database(error.to_string())),
+                                Err(StateError::Database(error.to_string())),
+                            ),
+                        );
+                    }
+                    continue;
+                }
+            };
+            let mut found: HashMap<i64, _> = rows
+                .into_iter()
+                .map(|(id, adopted, outputs)| (id, (adopted, outputs)))
+                .collect();
+            for (job_id, id) in ids {
+                let (adopted, outputs) = found.remove(id).unwrap_or((Ok(None), Ok(None)));
+                let adopted = adopted.and_then(|text| {
+                    text.map(|text| {
+                        serde_json::from_str(&text)
+                            .map_err(|error| StateError::Database(error.to_string()))
+                    })
+                    .transpose()
+                });
+                let outputs = outputs.and_then(|text| {
+                    text.map_or(Ok(Vec::new()), |text| {
+                        serde_json::from_str(&text)
+                            .map_err(|error| StateError::Database(error.to_string()))
+                    })
+                });
+                made.insert(*job_id, (adopted, outputs));
+            }
+        }
+        made
     }
 
     // Removes the torrent with its files, trackers, ledger and checkpoint.

@@ -600,6 +600,8 @@ impl TorrentService {
         let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         let mut begun = Vec::new();
+        // Those with files, whose rows say what they made.
+        let mut stored = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
             for (job_id, delete_files, _) in &gated {
@@ -607,8 +609,14 @@ impl TorrentService {
                     outcome.insert(*job_id, Err(ActionError::NotFound(*job_id)));
                     continue;
                 };
+                let has_store = torrent.store.is_some();
                 match self.begin_removal(torrent, &settings, now, confirm_unmet_goal) {
-                    Ok(()) => begun.push((*job_id, *delete_files)),
+                    Ok(()) => {
+                        begun.push((*job_id, *delete_files));
+                        if has_store {
+                            stored.push(*job_id);
+                        }
+                    }
                     Err(error) => {
                         outcome.insert(*job_id, Err(error));
                     }
@@ -636,12 +644,27 @@ impl TorrentService {
                 return outcome;
             }
         }
+        // What each made, read for all of them in a few statements, not two
+        // reads a torrent.
+        let db = self.inner.db.clone();
+        let mut made = match stored.is_empty() {
+            true => HashMap::new(),
+            false => tokio::task::spawn_blocking(move || db.torrents_made(&stored))
+                .await
+                .unwrap_or_default(),
+        };
         // Each shows its end, and gives up its slot and rank, by the one
         // publish and the one pass after the last.
         let any = !begun.is_empty();
         for (job_id, delete_files) in begun {
             let removed = self
-                .remove_marked(job_id, delete_files, Ending::Asked, Shown::ByBatch)
+                .remove_marked(
+                    job_id,
+                    delete_files,
+                    Ending::Asked,
+                    Shown::ByBatch,
+                    made.remove(&job_id),
+                )
                 .await;
             outcome.insert(job_id, removed);
         }
