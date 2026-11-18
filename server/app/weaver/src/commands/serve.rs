@@ -507,7 +507,7 @@ pub(crate) async fn run(
         transfer_policy: Arc::clone(&server_transfer_policy),
         torrents: torrents.clone(),
     };
-    usage::prime(&usage_recorder, &usage_sources).await;
+    usage::prime(&usage_recorder, &usage_sources, &db).await;
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::context::build_schema_with_backup(

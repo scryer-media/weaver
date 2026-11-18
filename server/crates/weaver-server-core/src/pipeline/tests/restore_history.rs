@@ -894,7 +894,7 @@ fn views_of(pipeline: &Pipeline, ids: &[JobId]) -> String {
     let db = &pipeline.db;
     let mut out = format!(
         "{:?}",
-        db.list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
+        db.list_job_history(&crate::HistoryFilter::default())
             .unwrap()
     );
     out.push_str(&format!(
@@ -1508,7 +1508,7 @@ async fn delete_history_batch_keeps_complete_output_dir() {
     assert!(
         pipeline
             .db
-            .list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
+            .list_job_history(&crate::HistoryFilter::default())
             .unwrap()
             .is_empty()
     );
@@ -1752,7 +1752,7 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
     );
     let listed = pipeline
         .db
-        .list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
+        .list_job_history(&crate::HistoryFilter::default())
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }
@@ -2190,7 +2190,7 @@ async fn job_completed_event_publishes_after_history_archive_commits() {
     );
     let listed = pipeline
         .db
-        .list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
+        .list_job_history(&crate::HistoryFilter::default())
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }

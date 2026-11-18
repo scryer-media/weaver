@@ -7,17 +7,6 @@ pub struct HistoryMetadataEquals {
     pub value: String,
 }
 
-// Which history rows a read sees. A row a client removed with NZBGet's
-// non-final `HistoryDelete` stays in the table, as NZBGet keeps it as a hidden
-// duplicate, but leaves every listing a user reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HistoryRows {
-    // The rows a user's history listing shows.
-    Shown,
-    // Every row, hidden ones included.
-    All,
-}
-
 // The column a history listing is ordered by. Ties go to the job id, in the
 // same direction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,6 +71,11 @@ pub struct HistoryFilter {
     // Keep rows completed at or after this time, in epoch seconds, a paused
     // row left out: what the Overview's finished count counts.
     pub completed_since: Option<i64>,
+    // Leave out rows a client removed with NZBGet's non-final
+    // `HistoryDelete`. Only the NZBGet facade's own `history` sets this:
+    // NZBGet keeps such a row as a hidden duplicate, and Weaver's history
+    // shows it like any other row.
+    pub nzbget_shown_only: bool,
     pub order: HistoryOrder,
     pub limit: Option<u32>,
     pub offset: Option<u32>,

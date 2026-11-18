@@ -453,13 +453,10 @@ pub async fn recover_server_state_with(
     }
 
     // Also load archived job history from SQLite so the UI can show completed/failed jobs.
-    match db.list_job_history(
-        &HistoryFilter {
-            limit: Some(FINISHED_JOBS_RUNTIME_CAP as u32),
-            ..HistoryFilter::default()
-        },
-        crate::HistoryRows::All,
-    ) {
+    match db.list_job_history(&HistoryFilter {
+        limit: Some(FINISHED_JOBS_RUNTIME_CAP as u32),
+        ..HistoryFilter::default()
+    }) {
         Ok(history_rows) => {
             // The jobs already held, built once: a job recovered from its
             // active row is not listed again from its history row.

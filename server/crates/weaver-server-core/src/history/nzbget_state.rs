@@ -11,7 +11,7 @@ use crate::StateError;
 use crate::history::HistoryFailureKind;
 use crate::jobs::{FieldUpdate, JobUpdate};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_tx};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NzbgetHistoryState {
@@ -53,19 +53,49 @@ impl Database {
     // Hide or unhide a history row from the NZBGet-compatible API. Returns
     // false when no history row exists for the job.
     pub fn set_nzbget_history_hidden(&self, job_id: u64, hidden: bool) -> Result<bool, StateError> {
-        let job_id = i64::try_from(job_id)
-            .map_err(|_| StateError::Database("job id is too large".into()))?;
+        Ok(self.set_nzbget_history_rows_hidden(&[job_id], hidden)? > 0)
+    }
+
+    // Hide or unhide the history rows of `job_ids` in one transaction, in
+    // statements of as many ids as the engine binds. Returns how many rows
+    // exist for the ids; an id with no row changes nothing.
+    pub fn set_nzbget_history_rows_hidden(
+        &self,
+        job_ids: &[u64],
+        hidden: bool,
+    ) -> Result<u64, StateError> {
+        let ids = job_ids
+            .iter()
+            .map(|id| {
+                i64::try_from(*id).map_err(|_| StateError::Database("job id is too large".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_nzbget_history_hidden", |tx| {
+                let ids = ids.clone();
                 Box::pin(async move {
-                    let changed = tx
-                        .execute(
-                            "UPDATE job_history SET nzbget_hidden = {} WHERE job_id = {}",
-                            &[SqlArg::I64(i64::from(hidden)), SqlArg::I64(job_id)],
-                        )
-                        .await?;
-                    Ok(changed > 0)
+                    let mut changed = 0;
+                    // One bind for `hidden`, one for each id.
+                    for chunk in ids.chunks(max_rows_for_tx(tx, 1) - 1) {
+                        let placeholders = vec!["{}"; chunk.len()].join(", ");
+                        let args = std::iter::once(SqlArg::I64(i64::from(hidden)))
+                            .chain(chunk.iter().copied().map(SqlArg::I64))
+                            .collect::<Vec<_>>();
+                        changed += tx
+                            .execute(
+                                &format!(
+                                    "UPDATE job_history SET nzbget_hidden = {{}} \
+                                     WHERE job_id IN ({placeholders})"
+                                ),
+                                &args,
+                            )
+                            .await?;
+                    }
+                    Ok(changed)
                 })
             })
             .await
@@ -301,6 +331,20 @@ mod tests {
         })
         .unwrap();
         db
+    }
+
+    // One request's ids past SQLite's 32,766 binds hide every row named, in
+    // one call, and count only the rows that exist.
+    #[test]
+    fn hiding_many_rows_is_bind_safe() {
+        let db = database_with_history();
+        let mut ids: Vec<u64> = (1_000..34_000).collect();
+        ids.push(41);
+        assert_eq!(db.set_nzbget_history_rows_hidden(&ids, true).unwrap(), 1);
+        assert!(db.nzbget_history_states(&[41]).unwrap()[&41].hidden);
+        assert_eq!(db.set_nzbget_history_rows_hidden(&[], true).unwrap(), 0);
+        assert_eq!(db.set_nzbget_history_rows_hidden(&[41], false).unwrap(), 1);
+        assert!(!db.nzbget_history_states(&[41]).unwrap()[&41].hidden);
     }
 
     #[test]
