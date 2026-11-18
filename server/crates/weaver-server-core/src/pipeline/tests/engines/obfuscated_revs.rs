@@ -156,6 +156,88 @@ async fn two_sets_keep_their_own_obfuscated_rar5_recovery_volumes() {
     );
 }
 
+// The volume sizes of `set`'s volumes over `body` stored as `member`.
+fn sizes(member: &str, body: &[u8]) -> Vec<usize> {
+    single_member_store_set(member, body, 4)
+        .iter()
+        .map(|(_, bytes)| bytes.len())
+        .collect()
+}
+
+// Two sets in one job whose volumes are the same sizes, each short of one
+// volume and each with one recovery volume under an obfuscated name. Both
+// tables fit both sets by size; their CRC32s say which set is whose, so
+// each recovery volume rebuilds its own set's volume.
+#[tokio::test]
+async fn two_sets_of_the_same_sizes_keep_their_own_obfuscated_rar5_recovery_volumes() {
+    let first = payload(11 * ARTICLE + 29, 61);
+    let second = payload(11 * ARTICLE + 29, 67);
+    assert_eq!(sizes(MEMBER, &first), sizes(OTHER, &second), "alike sizes");
+    let mut posts = set("silver.horizon", MEMBER, &first, &[1], 1, 0xa5e0_0000);
+    posts.extend(set("amber.coast", OTHER, &second, &[2], 1, 0xb7f0_0000));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_delivered(&graph, &[(MEMBER, &first), (OTHER, &second)]);
+    let outcomes = &graph.graph().outcomes;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|said| **said == Some(RepairOutcome::Repaired { slices: 1 }))
+            .count(),
+        2,
+        "{}",
+        summary(&graph)
+    );
+}
+
+// The same, with the set the first table fits ahead of the other in the
+// order the sets are tried: the recovery volume of the later set is
+// refuted by the earlier one's CRC32s before it binds its own.
+#[tokio::test]
+async fn an_obfuscated_rar5_recovery_volume_passes_over_a_set_of_the_same_sizes() {
+    let first = payload(11 * ARTICLE + 29, 61);
+    let second = payload(11 * ARTICLE + 29, 67);
+    let mut posts = set("amber.coast", OTHER, &second, &[], 0, 0);
+    posts.extend(set("silver.horizon", MEMBER, &first, &[2], 1, 0xa5e0_0000));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_delivered(&graph, &[(MEMBER, &first), (OTHER, &second)]);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })],
+        "{}",
+        summary(&graph)
+    );
+}
+
+// Two whole sets of the same sizes beside a recovery volume of neither:
+// its table fits both by size and its CRC32s refute both, so it binds
+// none and the job completes rather than waiting on it.
+#[tokio::test]
+async fn an_obfuscated_rar5_recovery_volume_that_fits_two_sets_by_size_alone_does_not_stall() {
+    let first = payload(11 * ARTICLE + 29, 61);
+    let second = payload(11 * ARTICLE + 29, 67);
+    let mut posts = set("silver.horizon", MEMBER, &first, &[], 0, 0);
+    posts.extend(set("amber.coast", OTHER, &second, &[], 0, 0));
+    posts.extend(set(
+        "silver.horizon",
+        MEMBER,
+        &payload(11 * ARTICLE + 29, 71),
+        &[0, 1, 2, 3],
+        1,
+        0xc3d0_0000,
+    ));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_delivered(&graph, &[(MEMBER, &first), (OTHER, &second)]);
+    assert!(
+        !graph
+            .graph()
+            .outcomes
+            .iter()
+            .any(|said| matches!(said, Some(RepairOutcome::Repaired { .. }))),
+        "{}",
+        summary(&graph)
+    );
+}
+
 // A set short of one volume, beside a recovery volume of another set under
 // an obfuscated name: it rebuilds nothing, and the job fails with nothing
 // delivered.
