@@ -92,6 +92,12 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Some(self.state.shared.spawner.pool().clone())
     }
 
+    fn expects_blocks(&self) -> bool {
+        self.requests
+            .get()
+            .is_some_and(|outstanding| outstanding.load(Ordering::Relaxed))
+    }
+
     async fn disk_room(&self) {
         if self.disk.blocked() {
             self.disk.room(self.waits_pool()).await;
@@ -242,7 +248,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         let supports_dht = handshake.supports_dht();
         if !self
             .state
-            .set_peer_live(self.addr, handshake, ckind, &self.upload)
+            .set_peer_live(self.addr, handshake, ckind, &self.upload, &self.requests)
         {
             return Err(crate::Error::Disconnect.into());
         }

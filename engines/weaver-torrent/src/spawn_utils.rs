@@ -108,6 +108,7 @@ impl BlockingSpawner {
         snapshot.permits_in_use = self.permits.saturating_sub(free) as u64;
         snapshot.write_jobs_queued = self.disk.waiting();
         snapshot.queued_write_bytes = self.pool.queued_bytes();
+        snapshot.receive_buffers = self.pool.receiving();
         snapshot.check_pieces_waiting = self.checks.spans();
         snapshot.check_bytes_waiting = self.checks.queued_bytes();
         snapshot

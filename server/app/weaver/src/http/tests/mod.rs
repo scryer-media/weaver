@@ -1913,6 +1913,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
                 hash_busy_nanos: 3_500_000_000,
                 read_buffer_growths: 6,
                 batch_buffers: 2,
+                receive_buffers: 3,
                 read_seeks: 12,
                 write_seeks: 5,
                 ..Default::default()
