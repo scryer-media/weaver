@@ -222,8 +222,8 @@ impl FileRole {
             FileRole::XzArchive => 3,
             FileRole::Standalone => 5,
             FileRole::RarVolume { volume_number } => 10 + *volume_number,
-            FileRole::SevenZipSplit { number } => 10 + *number,
-            FileRole::SplitFile { number } => 10 + *number,
+            FileRole::SevenZipSplit { number } => number.saturating_add(10),
+            FileRole::SplitFile { number } => number.saturating_add(10),
             FileRole::Unknown => 50,
             FileRole::Par2 {
                 is_index: false, ..
@@ -377,19 +377,28 @@ fn parse_7z_file(lower: &str) -> Option<FileRole> {
     None
 }
 
+// The digits a split piece's number has at the least: `.001`.
+const SPLIT_PIECE_DIGITS: usize = 3;
+
+// A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
+// a stem, then a last extension of three or more digits. `lower` has had
+// the quotes, underscores and dots a posted name trails taken off
+// (`role_filename_view`). The same rule as `split_piece` in
+// `engines/weaver-graph/src/sniff.rs`, which the graph founds its split
+// store by; the two cannot share code, since neither crate depends on the
+// other, so both tests pin one table of names.
 fn parse_split_file(lower: &str) -> Option<FileRole> {
-    if let Some(dot_pos) = lower.rfind('.') {
-        let ext = &lower[dot_pos + 1..];
-        if ext.len() == 3
-            && ext.bytes().all(|b| b.is_ascii_digit())
-            && let Ok(n) = ext.parse::<u32>()
-        {
-            return Some(FileRole::SplitFile {
-                number: n.saturating_sub(1),
-            });
-        }
+    let (stem, digits) = lower.rsplit_once('.')?;
+    if stem.is_empty()
+        || digits.len() < SPLIT_PIECE_DIGITS
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
     }
-    None
+    let number = digits
+        .parse::<u32>()
+        .map_or(u32::MAX, |n| n.saturating_sub(1));
+    Some(FileRole::SplitFile { number })
 }
 
 fn is_standalone_extension(lower: &str) -> bool {

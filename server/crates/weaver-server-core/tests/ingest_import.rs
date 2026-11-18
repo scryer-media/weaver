@@ -90,7 +90,7 @@ fn nzb_to_spec_leaves_password_empty_when_missing() {
 }
 
 #[test]
-fn nzb_to_spec_sanitizes_trailing_quote_filename() {
+fn nzb_to_spec_drops_an_unpaired_trailing_quote() {
     let path = Path::new("/downloads/Fixture.Release.nzb");
     let nzb = Nzb {
         meta: NzbMeta::default(),
@@ -109,7 +109,7 @@ fn nzb_to_spec_sanitizes_trailing_quote_filename() {
 
     let spec = nzb_to_spec(&nzb, path, None, vec![]);
 
-    assert_eq!(spec.files[0].filename, "Fixture.Payload.mkv_");
+    assert_eq!(spec.files[0].filename, "Fixture.Payload.mkv");
     assert_eq!(spec.files[0].role, FileRole::Unknown);
 }
 
@@ -185,9 +185,9 @@ fn nzb_to_spec_sanitizes_and_classifies_archive_roles() {
 
     let spec = nzb_to_spec(&nzb, path, None, vec![]);
 
-    assert_eq!(spec.files[0].filename, "Fixture.Payload.rar_");
+    assert_eq!(spec.files[0].filename, "Fixture.Payload.rar");
     assert_eq!(spec.files[0].role, FileRole::RarVolume { volume_number: 0 });
-    assert_eq!(spec.files[1].filename, "Fixture.Payload.vol00+01.par2_");
+    assert_eq!(spec.files[1].filename, "Fixture.Payload.vol00+01.par2");
     assert_eq!(
         spec.files[1].role,
         FileRole::Par2 {
