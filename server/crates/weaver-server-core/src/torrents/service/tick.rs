@@ -643,8 +643,11 @@ impl TorrentService {
                 if let Some(store) = &torrent.store
                     && let Err(error) = store.relevel(&ignored)
                 {
-                    self.store_back(torrent, reopened.is_some());
-                    if let Some(place) = reopened {
+                    // A place stored back out of reach of the database stays
+                    // stored there, so the counter does not hand it out again.
+                    if self.store_back(torrent, reopened.is_some())
+                        && let Some(place) = reopened
+                    {
                         self.give_back_place(place);
                     }
                     return Err(ActionError::State(error.to_string()));
@@ -890,7 +893,8 @@ impl TorrentService {
     // Store again what memory holds of a torrent whose change of levels,
     // stored before its copy, did not land: its levels, and, when that
     // change stored it short of complete, when it completed and its place.
-    fn store_back(&self, torrent: &super::live::Live, reopened: bool) {
+    // Whether it was stored.
+    fn store_back(&self, torrent: &super::live::Live, reopened: bool) -> bool {
         let job_id = torrent.record.job_id;
         let asked: Vec<FilePriority> = torrent
             .levels
@@ -919,7 +923,9 @@ impl TorrentService {
             // bytes out of the side store first when they want it
             // (`TorrentStore::with_side`).
             tracing::warn!(job_id = job_id.0, error = %error, "could not store a torrent's file levels back");
+            return false;
         }
+        true
     }
 
     /// Whether the torrent's pieces are fetched in order.

@@ -1204,3 +1204,82 @@ async fn a_change_the_store_refuses_is_stored_back() {
     assert_eq!(after.5, before.5 + 1);
     rig.service.stop().await;
 }
+
+// A database that refuses every write that stores a torrent complete with
+// its file levels, while `on`: what stores a reopen back, and not the reopen.
+fn refuse_complete_level_writes(db: &Database, on: bool) {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    let sql = if on {
+        "CREATE TRIGGER refuse_complete_levels BEFORE UPDATE OF file_priorities ON torrents \
+         WHEN NEW.completed_at_ms IS NOT NULL \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END"
+    } else {
+        "DROP TRIGGER refuse_complete_levels"
+    };
+    let store = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&store, "refuse_complete_level_writes_fixture", |tx| {
+            Box::pin(async move {
+                tx.execute(sql, &[]).await?;
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+// A reopen the store refuses whose storing back the database refuses too
+// keeps the place it stored: the queue does not hand that place out again.
+// Stored short of complete with the levels asked, the next run downloads
+// what was asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_place_stored_by_a_reopen_that_cannot_be_stored_back_is_not_handed_out_again() {
+    use FilePriority::*;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    let (job_id, _, _) = complete_with_one_aside(&rig).await;
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    let before = completion_of(&rig, job_id).await;
+
+    store.fail_next_relevel();
+    refuse_complete_level_writes(&rig.db, true);
+    assert!(
+        rig.service
+            .set_file_priorities(job_id, &[(1, Normal)])
+            .await
+            .is_err()
+    );
+    refuse_complete_level_writes(&rig.db, false);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        (stored.completed_at_ms, stored.queue_position),
+        (None, before.5)
+    );
+    let next = rig
+        .service
+        .inner
+        .next_queue_position
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(next, before.5 + 1);
+    let added = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("later", 7)))
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        rig.db.get_torrent(added).unwrap().unwrap().queue_position,
+        before.5
+    );
+    // Memory is as it was: complete, the file set aside.
+    let live = rig.service.inner.live.lock().await;
+    assert_eq!(live[&job_id].record.completed_at_ms, before.0);
+    assert_eq!(live[&job_id].levels, [Normal, Ignored]);
+    drop(live);
+    rig.service.stop().await;
+}
