@@ -76,12 +76,6 @@ pub(crate) fn has_files(
         .all(|(index, file)| file_have.get(index).copied().unwrap_or(0) >= file.length)
 }
 
-// Test seam: the next change of the files set aside fails before it changes
-// anything, as one that meets a piece on its way to the side store does.
-#[cfg(test)]
-pub(crate) static RELEVEL_FAILS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 struct Have {
     pieces: BitVec<u8, Msb0>,
     // The pieces a check of every piece has neither found nor failed yet:
@@ -266,6 +260,11 @@ pub(crate) struct TorrentStore {
     // made and given up once the files have been looked at
     // (`drop_unbacked`): a file whose time is not that one is checked again.
     stamps: Mutex<HashMap<u32, i64>>,
+    // Test seam: the next change of the files set aside fails before it
+    // changes anything, as one that meets a piece on its way to the side
+    // store does.
+    #[cfg(test)]
+    relevel_fails: std::sync::atomic::AtomicBool,
 }
 
 // A piece handed over while its files moved, queued for the files where
@@ -327,6 +326,8 @@ impl TorrentStore {
             writes,
             moves: Mutex::default(),
             stamps: Mutex::default(),
+            #[cfg(test)]
+            relevel_fails: std::sync::atomic::AtomicBool::new(false),
         };
         *store.saved() = Some(store.kept());
         store
@@ -528,6 +529,13 @@ impl TorrentStore {
         })
     }
 
+    // The next `relevel` of this store fails before it changes anything.
+    #[cfg(test)]
+    pub(crate) fn fail_next_relevel(&self) {
+        self.relevel_fails
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     // The files `ignored` names set aside from now on, and no other. A file
     // no longer set aside first takes its shares out of the side store,
     // written to it where they lie, and a slot no file set aside still has
@@ -538,7 +546,10 @@ impl TorrentStore {
     // side store, and the files set aside are as they were.
     pub(crate) fn relevel(&self, ignored: &[bool]) -> io::Result<()> {
         #[cfg(test)]
-        if RELEVEL_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        if self
+            .relevel_fails
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
             return Err(io::Error::other(
                 "a test failed the change of files set aside",
             ));

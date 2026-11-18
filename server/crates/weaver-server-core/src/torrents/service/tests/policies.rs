@@ -1180,14 +1180,13 @@ async fn a_change_the_store_refuses_is_stored_back() {
     assert!(before.1.is_some());
     let shown = shown_of(&rig, job_id).await;
 
-    crate::torrents::store::RELEVEL_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
+    store.fail_next_relevel();
     assert!(
         rig.service
             .set_file_priorities(job_id, &[(1, Normal)])
             .await
             .is_err()
     );
-    assert!(!crate::torrents::store::RELEVEL_FAILS.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(completion_of(&rig, job_id).await, before);
     assert_eq!(shown_of(&rig, job_id).await, shown);
     assert!(!b.exists());
