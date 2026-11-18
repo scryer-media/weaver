@@ -484,7 +484,7 @@ impl RarStore {
     // volume claimed past its hole holds none: no header says
     // where its record lies, and the record finds itself from the
     // volume's end, as RAR finds a record whose volume lost its headers.
-    // It is said there, over no bytes, once the volume's length is known;
+    // It is said there, over no bytes, once the volume is closed;
     // a volume said already is passed over, so the record its headers
     // name once it is rebuilt is not said again.
     pub(super) fn say_records_unheaded(
@@ -499,7 +499,9 @@ impl RarStore {
             let (Some(_), None, Some(length)) = (&found.name, found.stated(), found.length) else {
                 continue;
             };
-            if found.walk.hole(&found.kept, found.closed) > 0 {
+            // Only a closed volume has lost its front for good: before then
+            // its first bytes may still be on their way.
+            if !found.closed || found.walk.hole(&found.kept, found.closed) > 0 {
                 continue;
             }
             let said = self
