@@ -6672,3 +6672,33 @@ async fn nzbget_history_delete_queues_one_archive_for_the_whole_request() {
     assert!(states.values().all(|state| state.hidden));
     assert_eq!(states.len(), 3);
 }
+
+// An entry another operation holds is not archived by HistoryDelete, so it
+// stays in the client's history and the client's next remove tries again.
+// The answer is true when at least one entry was taken, as NZBGet answers
+// true when any id it named was acted on.
+#[tokio::test]
+async fn nzbget_history_delete_leaves_a_busy_entry_listed() {
+    let server = archive_server_with(false).await;
+    let held = server.owned_output(971, "complete");
+    let free = server.owned_output(972, "complete");
+    // Weaver's own archive holds 971 until the worker runs it.
+    server
+        .graphql("mutation { archiveHistory(ids: [971]) { __typename } }")
+        .await;
+
+    assert_eq!(server.history_delete(&[971]).await, false);
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    let mut listed = history_ids(&entries);
+    listed.sort_unstable();
+    assert_eq!(listed, vec![971, 972]);
+
+    assert_eq!(server.history_delete(&[971, 972]).await, true);
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    assert_eq!(history_ids(&entries), vec![971]);
+    let states = server.db.nzbget_history_states(&[971, 972]).unwrap();
+    assert!(!states[&971].hidden);
+    assert!(states[&972].hidden);
+    assert!(held.is_dir());
+    assert!(free.is_dir());
+}

@@ -220,104 +220,24 @@ impl ServersMutation {
     /// Remove an NNTP server by ID.
     #[graphql(guard = "AdminGuard")]
     async fn remove_server(&self, ctx: &Context<'_>, id: u32) -> Result<Vec<Server>> {
-        let config = ctx.data::<SharedConfig>()?;
-        let handle = ctx.data::<SchedulerHandle>()?;
-        let db = ctx.data::<Database>()?;
-        let policy = ctx.data::<std::sync::Arc<
-            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
-        >>()?;
-        let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
-        let proxy_runtime = handle.proxy_runtime();
-        let _proxy_guard = match &proxy_runtime {
-            Some(runtime) => Some(runtime.mutations.lock().await),
-            None => None,
+        let removal = ServerRemoval {
+            config: ctx.data::<SharedConfig>()?.clone(),
+            handle: ctx.data::<SchedulerHandle>()?.clone(),
+            db: ctx.data::<Database>()?.clone(),
+            policy: std::sync::Arc::clone(ctx.data::<std::sync::Arc<
+                weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
+            >>()?),
+            schedules: ctx
+                .data_opt::<weaver_server_core::bandwidth::schedule::SharedSchedules>()
+                .cloned(),
+            recorder: usage_recorder(ctx),
         };
-
-        with_timed_config_read(config, "servers.mutation.remove_server.validate", |cfg| {
-            if cfg.servers.iter().any(|server| server.id == id) {
-                Ok(())
-            } else {
-                Err(async_graphql::Error::new(format!("server {id} not found")))
-            }
-        })
-        .await?;
-
-        {
-            let policy = std::sync::Arc::clone(policy);
-            spawn_blocking_db("servers.mutation.remove_server.flush_usage", move || {
-                policy.flush_usage()
-            })
-            .await?;
-        }
-
-        // Serialize schedule persistence and publication with schedule CRUD, so
-        // an earlier save cannot republish rules for this deleted server.
-        let mut schedules_guard =
-            match ctx.data_opt::<weaver_server_core::bandwidth::schedule::SharedSchedules>() {
-                Some(schedules) => Some(schedules.write().await),
-                None => None,
-            };
-        {
-            // No data-used batch is written while the rows move, and what the
-            // ledger still holds of this server follows them. The hold, the
-            // delete and the retire run in one blocking task, which runs to
-            // its end even when this request goes away after the delete.
-            let recorder = usage_recorder(ctx);
-            let db = db.clone();
-            let removal = spawn_blocking_db("servers.mutation.remove_server.persist", move || {
-                let _usage_writes = recorder
-                    .as_deref()
-                    .map(weaver_server_core::operations::UsageRecorder::hold_writes_blocking);
-                let removal = db.delete_server_at(id, chrono::Local::now())?;
-                if removal.removed
-                    && let Some(recorder) = &recorder
-                {
-                    recorder.retire_server(id, removal.kept_usage.as_deref());
-                }
-                Ok::<_, weaver_server_core::StateError>(removal)
-            })
-            .await?;
-            if !removal.removed {
-                return Err(async_graphql::Error::new(format!("server {id} not found")));
-            }
-        }
-
-        // The delete took this server's rules and speed limits out of what is
-        // saved; publish that.
-        if let Some(schedules) = schedules_guard.as_mut() {
-            let db = db.clone();
-            **schedules =
-                spawn_blocking_db("servers.mutation.remove_server.schedules", move || {
-                    db.list_schedules()
-                })
-                .await?;
-        }
-        drop(schedules_guard);
-
-        let remaining =
-            with_timed_config_write(config, "servers.mutation.remove_server.apply", move |cfg| {
-                cfg.servers.retain(|server| server.id != id);
-                cfg.servers.clone()
-            })
-            .await;
-
-        info!(id, "server removed");
-
-        crate::proxies::refresh(ctx).await?;
-        activate_nntp_runtime("remove_server", id, config, handle).await?;
-        let snapshots = policy
-            .snapshots()
-            .into_iter()
-            .map(|snapshot| (snapshot.server_id, snapshot))
-            .collect::<std::collections::HashMap<_, _>>();
-        let tls_diagnostics = load_tls_diagnostics_by_server(db).await;
-        Ok(remaining
-            .iter()
-            .map(|server| {
-                Server::from_config(server, snapshots.get(&server.id))
-                    .with_tls_diagnostics(tls_diagnostics.get(&server.id))
-            })
-            .collect())
+        // The removal runs in its own task: a request that goes away part way
+        // leaves it to finish, so a server is never deleted with its config,
+        // schedules and connections left behind.
+        tokio::spawn(removal.run(id))
+            .await
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?
     }
     /// Reset this server's quota baseline without clearing lifetime usage.
     #[graphql(guard = "AdminGuard")]
@@ -567,6 +487,122 @@ fn usage_recorder(
 ) -> Option<std::sync::Arc<weaver_server_core::operations::UsageRecorder>> {
     ctx.data_opt::<Option<std::sync::Arc<weaver_server_core::operations::UsageRecorder>>>()
         .and_then(Clone::clone)
+}
+
+// What removing a server touches, owned, so the removal can run in a task of
+// its own.
+struct ServerRemoval {
+    config: SharedConfig,
+    handle: SchedulerHandle,
+    db: Database,
+    policy:
+        std::sync::Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
+    schedules: Option<weaver_server_core::bandwidth::schedule::SharedSchedules>,
+    recorder: Option<std::sync::Arc<weaver_server_core::operations::UsageRecorder>>,
+}
+
+impl ServerRemoval {
+    async fn run(self, id: u32) -> Result<Vec<Server>> {
+        let Self {
+            config,
+            handle,
+            db,
+            policy,
+            schedules,
+            recorder,
+        } = self;
+        let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
+        let proxy_runtime = handle.proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
+
+        with_timed_config_read(&config, "servers.mutation.remove_server.validate", |cfg| {
+            if cfg.servers.iter().any(|server| server.id == id) {
+                Ok(())
+            } else {
+                Err(async_graphql::Error::new(format!("server {id} not found")))
+            }
+        })
+        .await?;
+
+        {
+            let policy = std::sync::Arc::clone(&policy);
+            spawn_blocking_db("servers.mutation.remove_server.flush_usage", move || {
+                policy.flush_usage()
+            })
+            .await?;
+        }
+
+        // Serialize schedule persistence and publication with schedule CRUD, so
+        // an earlier save cannot republish rules for this deleted server.
+        let mut schedules_guard = match &schedules {
+            Some(schedules) => Some(schedules.write().await),
+            None => None,
+        };
+        {
+            // No data-used batch is written while the rows move, and what the
+            // ledger still holds of this server follows them.
+            let db = db.clone();
+            let removal = spawn_blocking_db("servers.mutation.remove_server.persist", move || {
+                let _usage_writes = recorder
+                    .as_deref()
+                    .map(weaver_server_core::operations::UsageRecorder::hold_writes_blocking);
+                let removal = db.delete_server_at(id, chrono::Local::now())?;
+                if removal.removed
+                    && let Some(recorder) = &recorder
+                {
+                    recorder.retire_server(id, removal.kept_usage.as_deref());
+                }
+                Ok::<_, weaver_server_core::StateError>(removal)
+            })
+            .await?;
+            if !removal.removed {
+                return Err(async_graphql::Error::new(format!("server {id} not found")));
+            }
+        }
+
+        // The delete took this server's rules and speed limits out of what is
+        // saved; publish that.
+        if let Some(schedules) = schedules_guard.as_mut() {
+            let db = db.clone();
+            **schedules =
+                spawn_blocking_db("servers.mutation.remove_server.schedules", move || {
+                    db.list_schedules()
+                })
+                .await?;
+        }
+        drop(schedules_guard);
+
+        let remaining = with_timed_config_write(
+            &config,
+            "servers.mutation.remove_server.apply",
+            move |cfg| {
+                cfg.servers.retain(|server| server.id != id);
+                cfg.servers.clone()
+            },
+        )
+        .await;
+
+        info!(id, "server removed");
+
+        crate::proxies::reload_routes(&handle).await?;
+        activate_nntp_runtime("remove_server", id, &config, &handle).await?;
+        let snapshots = policy
+            .snapshots()
+            .into_iter()
+            .map(|snapshot| (snapshot.server_id, snapshot))
+            .collect::<std::collections::HashMap<_, _>>();
+        let tls_diagnostics = load_tls_diagnostics_by_server(&db).await;
+        Ok(remaining
+            .iter()
+            .map(|server| {
+                Server::from_config(server, snapshots.get(&server.id))
+                    .with_tls_diagnostics(tls_diagnostics.get(&server.id))
+            })
+            .collect())
+    }
 }
 
 // Hand a successful probe's first-byte latency to the download runtime, so a

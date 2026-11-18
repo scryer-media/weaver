@@ -896,9 +896,10 @@ async fn remove_server() {
     assert!(remaining.is_empty());
 }
 
-// A removal whose request goes away once the delete has started still tells
-// the data used recorder: a server with a quota keeps its rows until the
-// reset, and the next batch asks when they go.
+// A removal whose request goes away once the delete has started, even while
+// the delete waits for a data-used batch, finishes whole: the row, the
+// settings and the data used recorder all follow, and a server with a quota
+// keeps its rows until the reset, the next batch asking when they go.
 #[tokio::test]
 async fn remove_server_dropped_mid_delete_still_retires_its_usage() {
     use weaver_server_core::operations::UsageReading;
@@ -936,21 +937,36 @@ async fn remove_server_dropped_mid_delete_still_retires_its_usage() {
             .await
     });
     blocker.wait_until_started().await;
+    // A data-used batch is being written, so the delete waits for it.
+    let batch = recorder.hold_writes().await;
     mutation.abort();
     assert!(mutation.await.unwrap_err().is_cancelled());
     blocker.release();
+    drop(batch);
 
-    // The delete holds the writes until the retire is done: once the row is
-    // gone, the next hold comes after the retire.
-    while h
-        .db
-        .list_servers()
-        .unwrap()
-        .iter()
-        .any(|server| u64::from(server.id) == id)
-    {
+    // The whole removal runs to its end: the row goes, and so does the
+    // server from the settings the running server reads.
+    let listed = || async {
+        let resp = h.execute("{ servers { id } }").await;
+        assert_no_errors(&resp);
+        response_data(&resp)["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|server| server["id"].as_u64() == Some(id))
+    };
+    while listed().await {
         tokio::task::yield_now().await;
     }
+    assert!(
+        !h.db
+            .list_servers()
+            .unwrap()
+            .iter()
+            .any(|server| u64::from(server.id) == id)
+    );
+    // The delete held the writes until the retire was done, so the next hold
+    // comes after the retire.
     drop(recorder.hold_writes().await);
     assert_eq!(recorder.take(today).expire_removed_at, Some(1_000));
 }

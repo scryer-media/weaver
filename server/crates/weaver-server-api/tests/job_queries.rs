@@ -2504,3 +2504,63 @@ async fn download_summary_reads_back_with_the_password_origin_and_never_the_pass
     let text = serde_json::to_string(&data).unwrap();
     assert!(!text.contains("hunter2"), "{text}");
 }
+
+// The delete mutations answer with the remaining history. A row's delete
+// state is read only when the caller selects `deleteOperation`, and the rows
+// are the same either way: the ones `historyItems` lists.
+#[tokio::test]
+async fn delete_mutations_read_delete_states_only_when_selected() {
+    let h = TestHarness::new().await;
+    for (id, name) in [
+        (1, "one"),
+        (2, "two"),
+        (3, "three"),
+        (4, "four"),
+        (5, "five"),
+    ] {
+        h.insert_history_row(&sample_history_row(id, name, "complete", 100 + id as i64));
+    }
+    let ids = |response: &async_graphql::Response, field: &str| -> Vec<u64> {
+        assert_no_errors(response);
+        response_data(response)[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_u64().unwrap())
+            .collect()
+    };
+    let listed = || async {
+        let response = h.execute("{ historyItems { id } }").await;
+        ids(&response, "historyItems")
+    };
+
+    {
+        // A delete state read now fails, so the mutations pass only if they
+        // make none.
+        let _no_delete_states =
+            common::FailingDbOperation::new("jobs.mutation.history_items.delete_states");
+        let response = h
+            .execute("mutation { deleteHistory(id: 1) { id name state } }")
+            .await;
+        assert_eq!(ids(&response, "deleteHistory"), vec![5, 4, 3, 2]);
+        let response = h
+            .execute("mutation { deleteHistoryBatch(ids: [2]) { id } }")
+            .await;
+        assert_eq!(ids(&response, "deleteHistoryBatch"), vec![5, 4, 3]);
+        // Selected, the read is made, and here it fails.
+        let response = h
+            .execute("mutation { deleteHistory(id: 3) { id deleteOperation { state } } }")
+            .await;
+        assert_has_errors(&response);
+    }
+
+    let response = h
+        .execute("mutation { deleteHistoryBatch(ids: [4]) { id deleteOperation { state } } }")
+        .await;
+    assert_eq!(ids(&response, "deleteHistoryBatch"), listed().await);
+    assert_eq!(listed().await, vec![5]);
+    let response = h
+        .execute("mutation { deleteAllHistory { id deleteOperation { state } } }")
+        .await;
+    assert!(ids(&response, "deleteAllHistory").is_empty());
+}
