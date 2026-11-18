@@ -17,7 +17,6 @@ import {
   DNS_TRANSITS,
   SYSTEM_DNS_PROFILE_ID,
   dnsTransitKey,
-  dnsTrustKey,
   dnsProfileName,
   dnsWhoKey,
   listForm,
@@ -543,12 +542,6 @@ function DnsProfileEditor({
   const proxyName = form.kind === "PROXY_NAME";
   const words = KIND_WORDS[form.kind];
   const trusts = trustChoices(form.who);
-  const trustHelp =
-    form.trust === "VALIDATE"
-      ? form.who === "PROXY"
-        ? t("next.dns.proxyValidateNote")
-        : t("next.dns.validateNote")
-      : undefined;
 
   return (
     <>
@@ -646,11 +639,10 @@ function DnsProfileEditor({
                     {
                       id: "dnsTrust",
                       label: t("next.dns.trust"),
-                      help: trustHelp,
                       control: {
                         kind: "segmented" as const,
                         value: form.trust,
-                        options: trusts.map((trust) => ({ value: trust, label: t(dnsTrustKey(trust)) })),
+                        options: trusts.map((trust) => ({ value: trust, label: t(trust === "VALIDATE" ? "next.common.on" : "next.common.off") })),
                         onChange: (trust: string) => patch({ trust: trust as DnsTrust }),
                       },
                     },
