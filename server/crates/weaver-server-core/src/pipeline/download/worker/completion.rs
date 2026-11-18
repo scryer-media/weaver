@@ -1581,6 +1581,11 @@ impl Pipeline {
                     // Every server is missing the id in use: the article moves
                     // to its next id, or with every id spent is booked missing.
                     if !self.spend_message_id(result.segment_id) {
+                        warn!(
+                            segment = %result.segment_id,
+                            error = %failure.message,
+                            "article missing on every server; segment lost"
+                        );
                         self.semantic_terminal_causes.insert(job_id, terminal_cause);
                         self.metrics
                             .articles_not_found
