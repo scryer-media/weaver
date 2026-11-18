@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::intake::OUTSIDE_SAVE_FOLDERS;
-use super::retire::{held_of, held_tops};
+use super::retire::{Shown, held_of, held_tops};
 use super::{ActionError, TorrentService, files_dir, give_back, locked, state_error};
 use crate::StateError;
 use crate::auth::CallerScope;
@@ -55,6 +55,40 @@ impl TorrentService {
         self.set_location(job_id, parent).await
     }
 
+    /// `set_location_as` for each torrent in turn, as one unit: each moved
+    /// whole before the next begins, as one at a time moved them, then one
+    /// pass of the queue and one publish for them all. One gone since it
+    /// was named is passed over; the first refused or failed ends them, as
+    /// it ended them one at a time: those before it moved and those after
+    /// it did not.
+    pub async fn set_location_many_as(
+        &self,
+        caller: CallerScope,
+        job_ids: &[JobId],
+        parent: &str,
+    ) -> super::batch::Outcome {
+        let mut outcome = super::batch::Outcome::new();
+        let mut owed = Owed::new(Shown::ByBatch);
+        for &job_id in job_ids {
+            let moved = if self.may_place(caller, Path::new(parent.trim())) {
+                let (moved, left) = self
+                    .move_storage_owing(job_id, parent.to_owned(), Existing::Keep, Shown::ByBatch)
+                    .await;
+                owed.take(left);
+                moved
+            } else {
+                Err(ActionError::Forbidden(OUTSIDE_SAVE_FOLDERS.to_owned()))
+            };
+            let ends = matches!(&moved, Err(error) if !matches!(error, ActionError::NotFound(_)));
+            outcome.insert(job_id, moved);
+            if ends {
+                break;
+            }
+        }
+        self.pay(owed).await;
+        outcome
+    }
+
     /// Whether `caller` may have a torrent saved or moved under `path`, by
     /// the settings in force (`categories::model::may_place`).
     pub fn may_place(&self, caller: CallerScope, path: &Path) -> bool {
@@ -77,14 +111,41 @@ impl TorrentService {
         parent: String,
         existing: Existing,
     ) -> Result<(), ActionError> {
+        self.move_storage_owing(job_id, parent, existing, Shown::Now)
+            .await
+            .0
+    }
+
+    // `move_storage`, with what it leaves owed to the queue and to its
+    // readers: nothing when `Shown::Now`, as it paid all of it itself.
+    async fn move_storage_owing(
+        &self,
+        job_id: JobId,
+        parent: String,
+        existing: Existing,
+        shown: Shown,
+    ) -> (Result<(), ActionError>, Owed) {
         // The move runs on its own task: a request dropped part way, as a
         // client that goes away drops it, cannot leave the torrent shown
         // moving. Once begun, the move ends there, as a removal does
         // (`remove_as`).
         let service = self.clone();
-        tokio::spawn(async move { service.move_storage_now(job_id, parent, existing).await })
-            .await
-            .map_err(|error| ActionError::State(format!("the move did not finish: {error}")))?
+        let moving = tokio::spawn(async move {
+            let mut owed = Owed::new(shown);
+            let moved = service
+                .move_storage_now(job_id, parent, existing, &mut owed)
+                .await;
+            (moved, owed)
+        });
+        match moving.await {
+            Ok(done) => done,
+            Err(error) => (
+                Err(ActionError::State(format!(
+                    "the move did not finish: {error}"
+                ))),
+                Owed::new(shown),
+            ),
+        }
     }
 
     // `move_storage`, on a task of its own.
@@ -93,6 +154,7 @@ impl TorrentService {
         job_id: JobId,
         parent: String,
         existing: Existing,
+        owed: &mut Owed,
     ) -> Result<(), ActionError> {
         let parent = PathBuf::from(parent.trim());
         if !parent.is_absolute() {
@@ -130,7 +192,7 @@ impl TorrentService {
             .await?;
         if let Some(placed) = placed {
             return self
-                .move_placed(job_id, store, &placed, parent, existing)
+                .move_placed(job_id, store, &placed, parent, existing, owed)
                 .await;
         }
         if from.parent() == Some(parent.as_path()) {
@@ -141,7 +203,9 @@ impl TorrentService {
             .and_then(|name| name.to_str())
             .ok_or_else(|| ActionError::State("the torrent's directory has no name".to_owned()))?;
         if held {
-            return self.place_held(job_id, &store, parent.join(name)).await;
+            return self
+                .place_held(job_id, &store, parent.join(name), owed)
+                .await;
         }
         // A location the torrent's directory cannot be made under is the
         // caller's to fix (qBittorrent `TorrentsController::setLocationAction`
@@ -177,7 +241,7 @@ impl TorrentService {
         self.publish_job(job_id).await;
         let destination = (Some(to.to_string_lossy().into_owned()), None);
         if let Err(error) = self.hold_destination(job_id, destination).await {
-            self.move_refused(job_id).await;
+            self.move_refused(job_id, owed).await;
             give_back(&to.to_string_lossy(), job_id).await;
             return Err(ActionError::State(format!(
                 "the torrent was not moved: what it holds there could not be recorded ({error})"
@@ -207,8 +271,8 @@ impl TorrentService {
             })
         })
         .map_err(NotMoved::from);
-        let moved = self.moved(job_id, outcome, false).await;
-        self.publish().await;
+        let moved = self.moved(job_id, outcome, false, owed).await;
+        self.owe_publish(owed).await;
         moved
     }
 
@@ -225,6 +289,7 @@ impl TorrentService {
         job_id: JobId,
         store: &Arc<TorrentStore>,
         to: PathBuf,
+        owed: &mut Owed,
     ) -> Result<(), ActionError> {
         let dir = to.to_string_lossy().into_owned();
         self.with_torrent(job_id, |torrent| {
@@ -259,10 +324,9 @@ impl TorrentService {
         .await?;
         self.sync_held(job_id).await;
         if self.look_again(job_id).await {
-            self.apply_queue().await;
-            self.spawn_attach(job_id).await;
+            self.owe_join(owed, job_id).await;
         }
-        self.publish().await;
+        self.owe_publish(owed).await;
         Ok(())
     }
 
@@ -279,6 +343,7 @@ impl TorrentService {
         from: &Path,
         to: PathBuf,
         existing: Existing,
+        owed: &mut Owed,
     ) -> Result<(), ActionError> {
         if from == to {
             return Ok(());
@@ -313,7 +378,7 @@ impl TorrentService {
         self.publish_job(job_id).await;
         let destination = (storage, Some(to.to_string_lossy().into_owned()));
         if let Err(error) = self.hold_destination(job_id, destination).await {
-            self.move_refused(job_id).await;
+            self.move_refused(job_id, owed).await;
             return Err(ActionError::State(format!(
                 "the torrent was not moved: what it holds there could not be recorded ({error})"
             )));
@@ -339,7 +404,7 @@ impl TorrentService {
             .unwrap_or(true)
         };
         if forgot && let Err(error) = self.forget_pieces(job_id).await {
-            self.move_refused(job_id).await;
+            self.move_refused(job_id, owed).await;
             // The new place, held for the move, is let go.
             self.sync_held(job_id).await;
             return Err(ActionError::State(format!(
@@ -513,8 +578,8 @@ impl TorrentService {
                 source: std::io::Error::other(error),
             }))
         });
-        let moved = self.moved(job_id, outcome, forgot).await;
-        self.publish().await;
+        let moved = self.moved(job_id, outcome, forgot, owed).await;
+        self.owe_publish(owed).await;
         moved
     }
 
@@ -544,6 +609,55 @@ impl TorrentService {
     /// `torrents/recheck`). A running torrent runs again once checked, a
     /// paused one stays paused, and one being checked is left to its check.
     pub async fn recheck(&self, job_id: JobId) -> Result<(), ActionError> {
+        if self.recheck_one(job_id).await? {
+            self.apply_queue().await;
+            self.spawn_attach(job_id).await;
+        }
+        self.publish().await;
+        Ok(())
+    }
+
+    /// `recheck` of each torrent in turn, as one unit: one pass of the
+    /// queue for those that join a session to be checked, then one publish.
+    /// The first refused ends them, as it ended them one at a time: those
+    /// before it are checked and those after it are not.
+    pub async fn recheck_many(&self, job_ids: &[JobId]) -> super::batch::Outcome {
+        let mut outcome = super::batch::Outcome::new();
+        let mut attach = Vec::new();
+        for &job_id in job_ids {
+            match self.recheck_one(job_id).await {
+                Ok(joins) => {
+                    if joins {
+                        attach.push(job_id);
+                    }
+                    outcome.insert(job_id, Ok(()));
+                }
+                // One gone since it was named is passed over.
+                Err(error @ ActionError::NotFound(_)) => {
+                    outcome.insert(job_id, Err(error));
+                }
+                Err(error) => {
+                    outcome.insert(job_id, Err(error));
+                    break;
+                }
+            }
+        }
+        if !attach.is_empty() {
+            self.apply_queue().await;
+            for &job_id in &attach {
+                self.spawn_attach(job_id).await;
+            }
+        }
+        if outcome.values().any(Result::is_ok) {
+            self.publish().await;
+        }
+        outcome
+    }
+
+    // The check of `recheck` begun on one torrent, nothing published, and
+    // whether it is one in no session that joins one to be checked: the
+    // queue is passed and its session asked for then.
+    async fn recheck_one(&self, job_id: JobId) -> Result<bool, ActionError> {
         // A move owns the torrent's files, and its own forgetting and
         // checking of them, until it ends: a recheck asked for meanwhile is
         // refused, seen under the live lock the move began under.
@@ -564,10 +678,7 @@ impl TorrentService {
             .await?;
             // Answered without waiting on its route, as the one held for
             // its files is below.
-            self.apply_queue().await;
-            self.spawn_attach(job_id).await;
-            self.publish().await;
-            return Ok(());
+            return Ok(true);
         }
         // One held for its files missing is in no session: it lets go of
         // the hold and of every piece, and the session it joins checks
@@ -591,10 +702,7 @@ impl TorrentService {
             })
             .await?;
         if held {
-            self.apply_queue().await;
-            self.spawn_attach(job_id).await;
-            self.publish().await;
-            return Ok(());
+            return Ok(true);
         }
         {
             // Held across the recheck, as the queue holds it across a pause
@@ -616,14 +724,13 @@ impl TorrentService {
             // it ends, and a write it refuses holds it anew.
             self.end_disk_room(torrent);
         }
-        self.publish().await;
-        Ok(())
+        Ok(false)
     }
 
     // A move refused before any file moved: the torrent is as it was, and
     // an unpacking that waited on the move goes on.
-    async fn move_refused(&self, job_id: JobId) {
-        self.end_moving(job_id, true).await;
+    async fn move_refused(&self, job_id: JobId, owed: &mut Owed) {
+        self.end_moving(job_id, true, owed).await;
         // It no longer shows moving.
         self.publish_job(job_id).await;
     }
@@ -632,7 +739,7 @@ impl TorrentService {
     // `settle`. A start of its run left for the end of the move
     // (`Live::start_waits_on_move`) is made now, by one pass over the
     // queue; a move that held none makes no pass.
-    async fn end_moving(&self, job_id: JobId, settle: bool) {
+    async fn end_moving(&self, job_id: JobId, settle: bool, owed: &mut Owed) {
         let held = self
             .with_torrent(job_id, |torrent| {
                 if settle {
@@ -645,7 +752,7 @@ impl TorrentService {
             .unwrap_or(false);
         self.inner.signal.mark(job_id);
         if held {
-            self.apply_queue().await;
+            self.owe_pass(owed).await;
         }
     }
 
@@ -660,6 +767,7 @@ impl TorrentService {
         job_id: JobId,
         outcome: Result<Moved, NotMoved>,
         forgot: bool,
+        owed: &mut Owed,
     ) -> Result<(), ActionError> {
         let (moving, store, handle) = self
             .with_torrent(job_id, |torrent| {
@@ -724,7 +832,7 @@ impl TorrentService {
                     .await;
                 let recorded = recorded.map(|(recorded, look)| {
                     if let Some((intake, dir)) = look {
-                        self.spawn_place(job_id, &intake, dir, false);
+                        self.owe_place(owed, job_id, intake, dir);
                     }
                     recorded
                 });
@@ -738,13 +846,12 @@ impl TorrentService {
                 {
                     self.check_kept(job_id, store).await;
                 }
-                self.move_over(job_id).await;
+                self.move_over(job_id, owed).await;
                 // A move looks again for files that were missing
                 // (qBittorrent `TorrentImpl::handleMoveStorageJobFinished`,
                 // torrentimpl.cpp:2140-2146).
                 if self.look_again(job_id).await {
-                    self.apply_queue().await;
-                    self.spawn_attach(job_id).await;
+                    self.owe_join(owed, job_id).await;
                 }
                 Ok(())
             }
@@ -777,7 +884,7 @@ impl TorrentService {
                 {
                     self.check_kept(job_id, store).await;
                 }
-                self.move_over(job_id).await;
+                self.move_over(job_id, owed).await;
                 Err(ActionError::State(format!(
                     "the torrent's move failed, and it stays where it was: {error}"
                 )))
@@ -788,8 +895,8 @@ impl TorrentService {
     // The move ended, its check begun where it owed one: the torrent is no
     // longer moving, and an unpacking that waited on the move places its
     // files now.
-    async fn move_over(&self, job_id: JobId) {
-        self.end_moving(job_id, false).await;
+    async fn move_over(&self, job_id: JobId, owed: &mut Owed) {
+        self.end_moving(job_id, false, owed).await;
     }
 
     // A move kept a file already at the torrent's new place, so its files
@@ -856,6 +963,104 @@ impl TorrentService {
         if let Err(error) = checked {
             tracing::warn!(job_id = job_id.0, error = %error, "could not check a torrent again after its move kept files there; its files stay unread until a recheck, a restart or a new session forgets its pieces and checks them");
         }
+    }
+
+    // A pass of the queue a move asks for: made now, or owed to the end of
+    // its batch.
+    async fn owe_pass(&self, owed: &mut Owed) {
+        match owed.shown {
+            Shown::Now => self.apply_queue().await,
+            Shown::ByBatch => owed.pass = true,
+        }
+    }
+
+    // A pass of the queue, and then the session joined, for a torrent a
+    // move let go: made now, or owed to the end of its batch.
+    async fn owe_join(&self, owed: &mut Owed, job_id: JobId) {
+        match owed.shown {
+            Shown::Now => {
+                self.apply_queue().await;
+                self.spawn_attach(job_id).await;
+            }
+            Shown::ByBatch => {
+                owed.pass = true;
+                owed.attach.push(job_id);
+            }
+        }
+    }
+
+    // The look for the disk of a moved torrent's new folder, which asks
+    // for a pass once it found it: begun now, or at the end of its batch,
+    // so that the moves of a batch ask for one pass, not one each. Its
+    // pieces wait for the look either way (`begin_placing`).
+    fn owe_place(
+        &self,
+        owed: &mut Owed,
+        job_id: JobId,
+        intake: Arc<crate::torrents::intake::Intake>,
+        dir: PathBuf,
+    ) {
+        match owed.shown {
+            Shown::Now => self.spawn_place(job_id, &intake, dir, false),
+            Shown::ByBatch => owed.places.push((job_id, intake, dir)),
+        }
+    }
+
+    // The publish a move ends with: made now, or owed to the end of its
+    // batch.
+    async fn owe_publish(&self, owed: &mut Owed) {
+        match owed.shown {
+            Shown::Now => self.publish().await,
+            Shown::ByBatch => owed.publish = true,
+        }
+    }
+
+    // What a batch of moves owes, paid once: the looks for their new disks,
+    // one pass, the sessions joined in the order the moves let them go, and
+    // one publish.
+    async fn pay(&self, owed: Owed) {
+        for (job_id, intake, dir) in owed.places {
+            self.spawn_place(job_id, &intake, dir, false);
+        }
+        if owed.pass {
+            self.apply_queue().await;
+        }
+        for job_id in owed.attach {
+            self.spawn_attach(job_id).await;
+        }
+        if owed.publish {
+            self.publish().await;
+        }
+    }
+}
+
+// What the moves of a batch leave owed to the queue and to its readers. A
+// move of one torrent (`Shown::Now`) owes nothing: it paid as it went.
+struct Owed {
+    shown: Shown,
+    pass: bool,
+    attach: Vec<JobId>,
+    places: Vec<(JobId, Arc<crate::torrents::intake::Intake>, PathBuf)>,
+    publish: bool,
+}
+
+impl Owed {
+    fn new(shown: Shown) -> Self {
+        Self {
+            shown,
+            pass: false,
+            attach: Vec::new(),
+            places: Vec::new(),
+            publish: false,
+        }
+    }
+
+    // What one more move of the batch left owed.
+    fn take(&mut self, other: Owed) {
+        self.pass |= other.pass;
+        self.attach.extend(other.attach);
+        self.places.extend(other.places);
+        self.publish |= other.publish;
     }
 }
 

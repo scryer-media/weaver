@@ -38,6 +38,25 @@ fn ban(torrent: &mut super::Live, ips: &[IpAddr]) {
     }
 }
 
+// The trackers `edit` makes of the torrent's list, as they are kept, or why
+// the edit is refused. One held because its stored secrets do not decrypt
+// lists no tracker it could not open: an edit would write the list back
+// without them, so none is taken until the key is back.
+fn edited(
+    torrent: &super::Live,
+    edit: impl FnOnce(Vec<TrackerEntry>) -> Result<Vec<TrackerEntry>, ActionError>,
+) -> Result<Vec<TrackerEntry>, ActionError> {
+    if let Some(why) = &torrent.sealed {
+        return Err(ActionError::Invalid(format!(
+            "the torrent's trackers are not changed while it is held: {why}"
+        )));
+    }
+    let listed = &torrent.trackers;
+    let trackers = edit(listed.to_vec())?;
+    tracker_urls(&trackers)?;
+    Ok(named_as_listed(listed, tidy_trackers(trackers)))
+}
+
 // `trackers` without those whose URL is one of `urls`, trimmed.
 pub(super) fn without_urls(mut trackers: Vec<TrackerEntry>, urls: &[String]) -> Vec<TrackerEntry> {
     let gone: HashSet<&str> = urls.iter().map(|url| url.trim()).collect();
@@ -191,18 +210,7 @@ impl TorrentService {
         {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
-            // One held because its stored secrets do not decrypt lists no
-            // tracker it could not open: an edit would write the list back
-            // without them, so none is taken until the key is back.
-            if let Some(why) = &torrent.sealed {
-                return Err(ActionError::Invalid(format!(
-                    "the torrent's trackers are not changed while it is held: {why}"
-                )));
-            }
-            let listed = &torrent.trackers;
-            let trackers = edit(listed.to_vec())?;
-            tracker_urls(&trackers)?;
-            let trackers = named_as_listed(listed, tidy_trackers(trackers));
+            let trackers = edited(torrent, edit)?;
             let stored = self
                 .inner
                 .db
@@ -211,15 +219,121 @@ impl TorrentService {
             if !stored {
                 return Err(ActionError::NotFound(job_id));
             }
-            torrent.rule_id = self.rule_id(&trackers);
-            if let Some(attached) = &torrent.attached {
-                attached.handle.replace_trackers(tracker_tiers(&trackers));
-            }
-            torrent.trackers = in_table_order(trackers);
+            self.take_trackers(torrent, trackers);
         }
         self.apply_queue().await;
         self.publish().await;
         Ok(())
+    }
+
+    /// `add_trackers` on each of `job_ids`, as one unit (`edit_trackers_many`).
+    pub async fn add_trackers_many(
+        &self,
+        job_ids: &[JobId],
+        tiers: &[Vec<String>],
+    ) -> super::batch::Outcome {
+        self.edit_trackers_many(job_ids, |mut trackers| {
+            let next = trackers
+                .iter()
+                .map(|tracker| tracker.tier + 1)
+                .max()
+                .unwrap_or(0);
+            let added = tiers.iter().filter(|tier| !tier.is_empty());
+            for (tier, urls) in (next..).zip(added) {
+                trackers.extend(urls.iter().map(|url| TrackerEntry {
+                    tier,
+                    url: url.clone(),
+                    named_by: NamedBy::Operator,
+                }));
+            }
+            Ok(trackers)
+        })
+        .await
+    }
+
+    /// `remove_trackers` on each of `job_ids`, as one unit
+    /// (`edit_trackers_many`).
+    pub async fn remove_trackers_many(
+        &self,
+        job_ids: &[JobId],
+        urls: &[String],
+    ) -> super::batch::Outcome {
+        self.edit_trackers_many(job_ids, |trackers| Ok(without_urls(trackers, urls)))
+            .await
+    }
+
+    // `edit_trackers` of each torrent in turn, as one unit: one write of
+    // their lists, then one pass of the queue and one publish. The first
+    // edit refused ends them, as it ended them one at a time: those before
+    // it are made and those after it are not. A torrent not here is passed
+    // over, and one named twice is edited once.
+    async fn edit_trackers_many(
+        &self,
+        job_ids: &[JobId],
+        edit: impl Fn(Vec<TrackerEntry>) -> Result<Vec<TrackerEntry>, ActionError>,
+    ) -> super::batch::Outcome {
+        self.ensure(job_ids).await;
+        let mut outcome = super::batch::Outcome::new();
+        {
+            let mut live = self.inner.live.lock().await;
+            let mut seen = HashSet::with_capacity(job_ids.len());
+            let mut edits = Vec::with_capacity(job_ids.len());
+            for &job_id in job_ids {
+                if !seen.insert(job_id) {
+                    continue;
+                }
+                let Some(torrent) = live.get(&job_id) else {
+                    outcome.insert(job_id, Err(ActionError::NotFound(job_id)));
+                    continue;
+                };
+                match edited(torrent, &edit) {
+                    Ok(trackers) => edits.push((job_id, trackers)),
+                    Err(error) => {
+                        outcome.insert(job_id, Err(error));
+                        break;
+                    }
+                }
+            }
+            if edits.is_empty() {
+                return outcome;
+            }
+            let stored = match self.inner.db.set_torrents_trackers(&edits) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    let error = state_error(error);
+                    for (job_id, _) in edits {
+                        outcome.insert(job_id, Err(ActionError::State(error.clone())));
+                    }
+                    return outcome;
+                }
+            };
+            for (job_id, trackers) in edits {
+                match live.get_mut(&job_id) {
+                    Some(torrent) if stored.contains(&job_id) => {
+                        self.take_trackers(torrent, trackers);
+                        outcome.insert(job_id, Ok(()));
+                    }
+                    _ => {
+                        outcome.insert(job_id, Err(ActionError::NotFound(job_id)));
+                    }
+                }
+            }
+        }
+        if outcome.values().any(Result::is_ok) {
+            self.apply_queue().await;
+            self.publish().await;
+        }
+        outcome
+    }
+
+    // The torrent lists `trackers`, as written: the rule they match is
+    // picked again, and its session announces to them.
+    fn take_trackers(&self, torrent: &mut super::Live, trackers: Vec<TrackerEntry>) {
+        torrent.rule_id = self.rule_id(&trackers);
+        if let Some(attached) = &torrent.attached {
+            attached.handle.replace_trackers(tracker_tiers(&trackers));
+        }
+        torrent.trackers = in_table_order(trackers);
     }
 
     /// Announce to every tracker now, past the floor each set (libtorrent

@@ -36,6 +36,13 @@ const TRACKER_HOST_INSERT: &str = "INSERT INTO tracker_hosts (host) VALUES ";
 const TRACKER_HOST_ROW: &str = "({})";
 const TRACKER_HOST_CONFLICT: &str = " ON CONFLICT (host) DO NOTHING";
 
+/// One torrent's `torrent_adopted` and `torrent_outputs`, as
+/// [`Database::torrents_made`] reads them for many.
+pub(crate) type MadeRead = (
+    Result<Option<super::model::Adopted>, StateError>,
+    Result<Vec<String>, StateError>,
+);
+
 /// Seed mode as a pass over the torrents found it, written together by
 /// [`Database::write_torrent_seed_modes`].
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -98,22 +105,34 @@ fn resume_update(
     Ok(Some((sql, args)))
 }
 
-// The one place a torrent's tracker rows are written: each row, and the
-// host of each, recorded as `tracker_host` spells it.
+// A torrent's tracker rows (`insert_tracker_rows`).
 async fn insert_trackers(
     tx: &mut SqlTx<'_>,
     job_id: i64,
     trackers: &[TrackerEntry],
     key: Option<&crate::persistence::encryption::EncryptionKey>,
 ) -> Result<(), StateError> {
+    let rows: Vec<(i64, &TrackerEntry)> =
+        trackers.iter().map(|tracker| (job_id, tracker)).collect();
+    insert_tracker_rows(tx, &rows, key).await
+}
+
+// The one place tracker rows are written, of one torrent or of many, each
+// row its torrent's id and the tracker: each row, and the host of each,
+// recorded as `tracker_host` spells it.
+async fn insert_tracker_rows(
+    tx: &mut SqlTx<'_>,
+    rows: &[(i64, &TrackerEntry)],
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+) -> Result<(), StateError> {
     // As many rows a statement as its binds allow.
-    for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 5)) {
+    for chunk in rows.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 5)) {
         let sql = format!(
             "{TRACKER_INSERT}{}{TRACKER_CONFLICT}",
             vec![TRACKER_ROW; chunk.len()].join(", ")
         );
         let mut args = Vec::with_capacity(chunk.len() * 5);
-        for tracker in chunk {
+        for &(job_id, tracker) in chunk {
             args.extend([
                 SqlArg::I64(job_id),
                 SqlArg::I64(i64::from(tracker.tier)),
@@ -125,9 +144,9 @@ async fn insert_trackers(
         }
         tx.execute(&sql, &args).await?;
     }
-    let hosts: Vec<String> = trackers
+    let hosts: Vec<String> = rows
         .iter()
-        .filter_map(|tracker| tracker_host(&tracker.url))
+        .filter_map(|(_, tracker)| tracker_host(&tracker.url))
         .collect::<std::collections::BTreeSet<String>>()
         .into_iter()
         .collect();
@@ -1926,6 +1945,88 @@ impl Database {
         })
     }
 
+    // `torrent_adopted` and `torrent_outputs` of each of `job_ids`, read in
+    // as few statements as the bind limit allows, each torrent's answer as
+    // those two give it: a torrent with no row has nothing adopted known and
+    // no outputs, a value that does not decode is that torrent's error, and
+    // a read that fails is the error of every torrent it read.
+    pub(crate) fn torrents_made(&self, job_ids: &[JobId]) -> HashMap<JobId, MadeRead> {
+        let mut made = HashMap::with_capacity(job_ids.len());
+        let mut ids = Vec::with_capacity(job_ids.len());
+        for &job_id in job_ids {
+            match stored(job_id.0) {
+                Ok(id) => ids.push((job_id, id)),
+                Err(error) => {
+                    let again = StateError::Database(error.to_string());
+                    made.insert(job_id, (Err(error), Err(again)));
+                }
+            }
+        }
+        let datastore = self.datastore();
+        let chunk = crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+        for ids in ids.chunks(chunk.max(1)) {
+            let list = vec!["{}"; ids.len()].join(", ");
+            let args: Vec<SqlArg> = ids.iter().map(|(_, id)| SqlArg::I64(*id)).collect();
+            let datastore = self.datastore();
+            let rows = self.run_sql_blocking_read(async move {
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, adopted, outputs FROM torrents WHERE job_id IN ({list})"
+                    ),
+                    &args,
+                )
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok((
+                            row.i64("job_id")?,
+                            row.opt_text("adopted"),
+                            row.opt_text("outputs"),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, StateError>>()
+            });
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => {
+                    for (job_id, _) in ids {
+                        made.insert(
+                            *job_id,
+                            (
+                                Err(StateError::Database(error.to_string())),
+                                Err(StateError::Database(error.to_string())),
+                            ),
+                        );
+                    }
+                    continue;
+                }
+            };
+            let mut found: HashMap<i64, _> = rows
+                .into_iter()
+                .map(|(id, adopted, outputs)| (id, (adopted, outputs)))
+                .collect();
+            for (job_id, id) in ids {
+                let (adopted, outputs) = found.remove(id).unwrap_or((Ok(None), Ok(None)));
+                let adopted = adopted.and_then(|text| {
+                    text.map(|text| {
+                        serde_json::from_str(&text)
+                            .map_err(|error| StateError::Database(error.to_string()))
+                    })
+                    .transpose()
+                });
+                let outputs = outputs.and_then(|text| {
+                    text.map_or(Ok(Vec::new()), |text| {
+                        serde_json::from_str(&text)
+                            .map_err(|error| StateError::Database(error.to_string()))
+                    })
+                });
+                made.insert(*job_id, (adopted, outputs));
+            }
+        }
+        made
+    }
+
     // Removes the torrent with its files, trackers, ledger and checkpoint.
     pub fn delete_torrent(&self, job_id: JobId) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
@@ -2013,6 +2114,74 @@ impl Database {
             })
             .await
         })
+    }
+
+    // The trackers of each torrent `edits` names, as `set_torrent_trackers`
+    // writes one torrent's, in one transaction of few statements. Returns
+    // the torrents that exist, which alone are written.
+    pub(crate) fn set_torrents_trackers(
+        &self,
+        edits: &[(JobId, Vec<TrackerEntry>)],
+    ) -> Result<std::collections::HashSet<JobId>, StateError> {
+        if edits.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<(JobId, i64)> = edits
+            .iter()
+            .map(|(job_id, _)| Ok((*job_id, stored(job_id.0)?)))
+            .collect::<Result<_, StateError>>()?;
+        let edits: Vec<(i64, Vec<TrackerEntry>)> = ids
+            .iter()
+            .zip(edits)
+            .map(|((_, id), (_, trackers))| (*id, trackers.clone()))
+            .collect();
+        let edits = std::sync::Arc::new(edits);
+        let key = self.encryption_key().cloned();
+        let datastore = self.datastore();
+        let known = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrents_trackers", |tx| {
+                let edits = std::sync::Arc::clone(&edits);
+                let key = key.clone();
+                Box::pin(async move {
+                    let ids: Vec<i64> = edits.iter().map(|(id, _)| *id).collect();
+                    let mut known = std::collections::HashSet::with_capacity(ids.len());
+                    for chunk in ids.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 1))
+                    {
+                        let list = vec!["{}"; chunk.len()].join(", ");
+                        let args: Vec<SqlArg> = chunk.iter().map(|id| SqlArg::I64(*id)).collect();
+                        let rows = tx
+                            .fetch_all(
+                                &format!("SELECT job_id FROM torrents WHERE job_id IN ({list})"),
+                                &args,
+                            )
+                            .await?;
+                        for row in rows {
+                            known.insert(row.i64("job_id")?);
+                        }
+                        tx.execute(
+                            &format!("DELETE FROM torrent_trackers WHERE job_id IN ({list})"),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    let rows: Vec<(i64, &TrackerEntry)> = edits
+                        .iter()
+                        .filter(|(id, _)| known.contains(id))
+                        .flat_map(|(id, trackers)| {
+                            trackers.iter().map(move |tracker| (*id, tracker))
+                        })
+                        .collect();
+                    insert_tracker_rows(tx, &rows, key.as_ref()).await?;
+                    Ok(known)
+                })
+            })
+            .await
+        })?;
+        Ok(ids
+            .into_iter()
+            .filter(|(_, id)| known.contains(id))
+            .map(|(job_id, _)| job_id)
+            .collect())
     }
 
     // Whether the torrent's archives are extracted, fixed when its job is

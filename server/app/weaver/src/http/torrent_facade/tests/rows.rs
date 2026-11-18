@@ -981,6 +981,175 @@ async fn actions_on_many_torrents_are_one_unit_each() {
     alone.stop().await;
 }
 
+// Each torrent's trackers, by tier and URL, by job.
+async fn trackers_of(torrents: &TorrentService) -> Vec<(JobId, Vec<(u32, String)>)> {
+    let ids: Vec<JobId> = shown(torrents).iter().map(|view| view.job_id).collect();
+    let mut trackers: Vec<_> = torrents
+        .row_parts(&ids, false, true)
+        .await
+        .into_iter()
+        .map(|(job_id, parts)| {
+            let listed = parts
+                .trackers
+                .into_iter()
+                .map(|tracker| (tracker.tier, tracker.url))
+                .collect();
+            (job_id, listed)
+        })
+        .collect();
+    trackers.sort_by_key(|(job_id, _)| *job_id);
+    trackers
+}
+
+// The tracker edits, rechecks, announces and removals of many torrents are
+// one unit of work each, as the other actions are: a request builds a
+// publish of the torrents, not one for each, and takes the database a few
+// times, not once for each, beside the history row each removal writes.
+// What it answers, stores and shows is what the same changes made one
+// torrent at a time answer, store and show.
+#[tokio::test]
+async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
+    const STORED: u64 = 300;
+    let (dir, db, many) = started_with(STORED).await;
+    let (_alone_dir, alone_db, alone) = started_with(STORED).await;
+    let rig = rig_around(
+        dir,
+        db,
+        Some(many.clone()),
+        RuntimeSecurityConfig::default(),
+        scheduler(),
+        Api::LATEST,
+    );
+    let hashes = (1..=STORED).map(stored_hash).collect::<Vec<_>>().join("|");
+    let tiers = vec![
+        vec!["http://one.example:80/announce".to_owned()],
+        vec!["http://two.example:80/announce".to_owned()],
+    ];
+    let one = "http://one.example:80/announce".to_owned();
+    for (action, form) in [
+        (
+            "addTrackers",
+            format!(
+                "hash={hashes}&urls=http%3A%2F%2Fone.example%3A80%2Fannounce%0A%0Ahttp%3A%2F%2Ftwo.example%3A80%2Fannounce"
+            ),
+        ),
+        (
+            "reannounce",
+            format!("hashes={hashes}&urls=http%3A%2F%2Fone.example%3A80%2Fannounce"),
+        ),
+        ("reannounce", format!("hashes={hashes}")),
+        (
+            "removeTrackers",
+            "hash=*&urls=http%3A%2F%2Fone.example%3A80%2Fannounce".to_owned(),
+        ),
+        // In no session, each is refused, the first ending the request.
+        ("recheck", format!("hashes={hashes}")),
+        // With no files to move yet, each is refused, the first ending the
+        // request.
+        (
+            "setLocation",
+            format!("hashes={hashes}&location=%2Fweaver-nowhere"),
+        ),
+        ("delete", format!("hashes={hashes}&deleteFiles=false")),
+    ] {
+        let (views, takes) = (many.views_built(), rig.db.datastore_takes());
+        let reply = rig.post(&format!("/api/v2/torrents/{action}"), &form).await;
+        let built = many.views_built() - views;
+        let took = rig.db.datastore_takes() - takes;
+        // The same request, one torrent at a time, in the request's order,
+        // answered by the first that failed.
+        let mut answer = (StatusCode::OK, String::new());
+        let before: Vec<TorrentView> = rig_order(&alone);
+        for view in &before {
+            let job_id = view.job_id;
+            let done = match action {
+                "addTrackers" => alone.add_trackers(job_id, tiers.clone()).await,
+                "reannounce" if form.contains("urls") => {
+                    alone.reannounce_tracker(job_id, &one).await
+                }
+                "reannounce" => match alone.reannounce(job_id).await {
+                    Ok(()) => alone.dht_announce(job_id).await,
+                    failed => failed,
+                },
+                "removeTrackers" => {
+                    alone
+                        .remove_trackers(job_id, std::slice::from_ref(&one))
+                        .await
+                }
+                "recheck" => alone.recheck(job_id).await,
+                "setLocation" => {
+                    alone
+                        .set_location(job_id, "/weaver-nowhere".to_owned())
+                        .await
+                }
+                _ => alone.remove(job_id, false, true).await,
+            };
+            match done {
+                Ok(()) | Err(ActionError::NotFound(_)) => {}
+                Err(error) => {
+                    answer = match (action, &error) {
+                        ("delete", _) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+                        (_, ActionError::Invalid(_)) => (StatusCode::CONFLICT, error.to_string()),
+                        _ => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+                    };
+                    break;
+                }
+            }
+        }
+        // A success is answered as the API version answers it.
+        if answer.0 == StatusCode::OK {
+            assert!(reply.status.is_success(), "{action}: {}", reply.body);
+        } else {
+            assert_eq!((reply.status, reply.body.clone()), answer, "{action}");
+        }
+        // A publish of every torrent at most, and the view of each removed
+        // torrent its history row reads, where one at a time built a
+        // publish of every torrent for each.
+        assert!(built <= 3 * STORED as usize, "{action}: {built} views");
+        // A few statements, and one history row a removal.
+        let bound = if action == "delete" {
+            16 + STORED as usize
+        } else {
+            16
+        };
+        assert!(took <= bound, "{action}: {took} takes");
+        assert_eq!(
+            rig.db.list_torrents().unwrap(),
+            alone_db.list_torrents().unwrap(),
+            "{action}"
+        );
+        let ids: Vec<u64> = (1..=STORED).collect();
+        assert_eq!(
+            rig.db.list_history_job_ids(&ids).unwrap(),
+            alone_db.list_history_job_ids(&ids).unwrap(),
+            "{action}"
+        );
+        fetches_shown_ended(&many).await;
+        fetches_shown_ended(&alone).await;
+        assert!(shown(&many) == shown(&alone), "{action}");
+        assert_eq!(
+            trackers_of(&many).await,
+            trackers_of(&alone).await,
+            "{action}"
+        );
+    }
+    assert_eq!(many.snapshot().len(), 0);
+    many.stop().await;
+    alone.stop().await;
+}
+
+// The torrents' views in the order a request naming them all takes them:
+// the order they were added.
+fn rig_order(torrents: &TorrentService) -> Vec<TorrentView> {
+    torrents
+        .snapshot()
+        .every()
+        .1
+        .iter()
+        .map(|row| row.view.clone())
+        .collect()
+}
+
 // With 10,000 torrents loaded and nothing changing, `torrents/info` polls,
 // across filters, sorts, pages, hashes, privacy and the trackers and files
 // listed, and the limit readings of every torrent, build no torrent's view

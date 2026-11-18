@@ -7,7 +7,7 @@
 
 use super::disk_room::DiskHeld;
 use super::intake::Resolving;
-use super::retire::mark_hold;
+use super::retire::{Shown, mark_hold};
 use super::scripts::{Ending, StoppedSeeding};
 use super::{ActionError, Asked, TorrentService, locked, state_error};
 use crate::StateError;
@@ -109,7 +109,7 @@ impl TorrentService {
                     {
                         removals.push((job_id, deletes_files(origin)));
                     }
-                    outcome.extend(self.remove_many(&removals).await);
+                    outcome.extend(self.remove_many(&removals, false).await);
                 }
                 QueueAction::Update(update) => {
                     let mut updates = vec![(job_id, update)];
@@ -513,9 +513,15 @@ impl TorrentService {
         outcome
     }
 
-    // `remove` for each torrent: their gates held, one write of their
-    // removal marks, then each removed as `remove_gated` removes one.
-    pub(super) async fn remove_many(&self, removals: &[(JobId, bool)]) -> Outcome {
+    /// `remove` for each torrent, `confirm_unmet_goal` for each as `remove`
+    /// takes it: their gates held, one write of their removal marks, then
+    /// each removed as `remove_gated` removes one, and one publish once
+    /// the last is out.
+    pub async fn remove_many(
+        &self,
+        removals: &[(JobId, bool)],
+        confirm_unmet_goal: bool,
+    ) -> Outcome {
         self.ensure(
             &removals
                 .iter()
@@ -551,15 +557,25 @@ impl TorrentService {
         if gates.is_empty() {
             return outcome;
         }
-        // Taken in job order, so two batches never hold each other's.
-        let mut gated = Vec::with_capacity(gates.len());
+        // Taken in job order, so two batches never hold each other's, and
+        // then removed in the order asked, as one at a time removed them.
+        let mut held = BTreeMap::new();
         for (job_id, (delete_files, gate)) in gates {
-            gated.push((job_id, delete_files, gate.lock_owned().await));
+            held.insert(job_id, (delete_files, gate.lock_owned().await));
         }
+        let gated: Vec<_> = removals
+            .iter()
+            .filter_map(|(job_id, _)| {
+                let (delete_files, guard) = held.remove(job_id)?;
+                Some((*job_id, delete_files, guard))
+            })
+            .collect();
         // The rest runs on its own task: a request dropped part way cannot
         // leave a torrent marked or flagged half removed.
         let service = self.clone();
-        let removed = tokio::spawn(async move { service.remove_gated_many(gated).await }).await;
+        let removed =
+            tokio::spawn(async move { service.remove_gated_many(gated, confirm_unmet_goal).await })
+                .await;
         match removed {
             Ok(removed) => outcome.extend(removed),
             Err(error) => {
@@ -578,11 +594,14 @@ impl TorrentService {
     async fn remove_gated_many(
         &self,
         gated: Vec<(JobId, bool, tokio::sync::OwnedMutexGuard<()>)>,
+        confirm_unmet_goal: bool,
     ) -> Outcome {
         let settings = self.settings();
         let now = self.inner.clock.unix_ms();
         let mut outcome = Outcome::new();
         let mut begun = Vec::new();
+        // Those with files, whose rows say what they made.
+        let mut stored = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
             for (job_id, delete_files, _) in &gated {
@@ -590,8 +609,14 @@ impl TorrentService {
                     outcome.insert(*job_id, Err(ActionError::NotFound(*job_id)));
                     continue;
                 };
-                match self.begin_removal(torrent, &settings, now, false) {
-                    Ok(()) => begun.push((*job_id, *delete_files)),
+                let has_store = torrent.store.is_some();
+                match self.begin_removal(torrent, &settings, now, confirm_unmet_goal) {
+                    Ok(()) => {
+                        begun.push((*job_id, *delete_files));
+                        if has_store {
+                            stored.push(*job_id);
+                        }
+                    }
                     Err(error) => {
                         outcome.insert(*job_id, Err(error));
                     }
@@ -619,11 +644,33 @@ impl TorrentService {
                 return outcome;
             }
         }
+        // What each made, read for all of them in a few statements, not two
+        // reads a torrent.
+        let db = self.inner.db.clone();
+        let mut made = match stored.is_empty() {
+            true => HashMap::new(),
+            false => tokio::task::spawn_blocking(move || db.torrents_made(&stored))
+                .await
+                .unwrap_or_default(),
+        };
+        // Each shows its end, and gives up its slot and rank, by the one
+        // publish and the one pass after the last.
+        let any = !begun.is_empty();
         for (job_id, delete_files) in begun {
             let removed = self
-                .remove_marked(job_id, delete_files, Ending::Asked)
+                .remove_marked(
+                    job_id,
+                    delete_files,
+                    Ending::Asked,
+                    Shown::ByBatch,
+                    made.remove(&job_id),
+                )
                 .await;
             outcome.insert(job_id, removed);
+        }
+        if any {
+            self.inner.signal.want_pass();
+            self.publish().await;
         }
         drop(gated);
         outcome

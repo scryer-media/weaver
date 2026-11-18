@@ -1524,3 +1524,296 @@ async fn a_start_with_torrents_off_builds_views_in_step_with_the_torrents() {
     assert_eq!(rows(&rig.service), shown);
     rig.service.stop().await;
 }
+
+// A recheck of many torrents whose jobs wait for the tick restores each and
+// sets every piece to be checked, as one unit: one pass of the queue and one
+// publish, not one of each a torrent. The rows it leaves, and what each
+// torrent then holds and is checked for, are those of the same rechecks
+// made one torrent at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recheck_of_many_torrents_is_one_unit() {
+    const STORED: u64 = 300;
+    let start = |rig: &Rig| {
+        rig.routes.set_down(Some("the leg is down"));
+        stored_resumed(&rig.db, rig.dir.path(), STORED)
+    };
+    let (many, alone) = (rig(set_clock()), rig(set_clock()));
+    let resumed = start(&many).len() as u64;
+    start(&alone);
+    for rig in [&many, &alone] {
+        rig.service.open().await.unwrap();
+        rig.service.fetches_ended(resumed).await;
+    }
+    // The torrents with their metainfo, whose jobs the tick has not yet
+    // restored.
+    let held: Vec<JobId> = (1..=STORED)
+        .filter(|job_id| job_id % 2 == 0)
+        .map(JobId)
+        .collect();
+
+    let views = many.service.views_built();
+    let outcome = many.service.recheck_many(&held).await;
+    let built = many.service.views_built() - views;
+    assert_eq!(outcome.len(), held.len());
+    assert!(outcome.values().all(Result::is_ok), "{outcome:?}");
+    // One publish of every torrent, where one at a time built one for each.
+    assert!(
+        built <= 2 * STORED as usize,
+        "{built} views built for {STORED} torrents"
+    );
+    for &job_id in &held {
+        alone.service.recheck(job_id).await.unwrap();
+    }
+    for rig in [&many, &alone] {
+        rig.service.restored().await;
+        rig.service.fetches_ended(resumed).await;
+    }
+    // Each rig's folders are its own: the rows are compared below them.
+    let below = |rig: &Rig, dir: &mut Option<String>| {
+        let root = rig.dir.path().to_string_lossy().into_owned();
+        if let Some(dir) = dir {
+            *dir = dir.replacen(&root, "", 1);
+        }
+    };
+    let shown = |rig: &Rig| {
+        let mut shown = rows(&rig.service);
+        for (view, _, _) in &mut shown {
+            below(rig, &mut view.storage_dir);
+        }
+        shown
+    };
+    let stored = |rig: &Rig| {
+        let mut stored = rig.db.list_torrents().unwrap();
+        for record in &mut stored {
+            below(rig, &mut record.storage_dir);
+        }
+        stored
+    };
+    assert_eq!(shown(&many), shown(&alone));
+    assert_eq!(stored(&many), stored(&alone));
+    many.service.stop().await;
+    alone.service.stop().await;
+}
+
+// A move of many torrents moves each whole, in the order asked, as one unit:
+// one pass of the queue and one publish once the last has moved, not one of
+// each a move. The first refused ends the request, those before it moved and
+// those after it not. What it answers, the rows and records it leaves and
+// the files where they went are those of the same moves made one torrent at
+// a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_of_many_torrents_is_one_unit() {
+    const ADDED: u64 = 120;
+    // A magnet, with no files to move, part way: the moves end there.
+    const REFUSED: u64 = ADDED / 2;
+    let add = async |rig: &Rig| {
+        rig.routes.set_down(Some("the leg is down"));
+        rig.service.open().await.unwrap();
+        let mut added = Vec::new();
+        for n in 1..=ADDED {
+            let source = if n == REFUSED {
+                AddSource::Magnet(format!("magnet:?xt=urn:btih:{}", "ab".repeat(20)))
+            } else {
+                AddSource::Metainfo(plain(&format!("t{n}"), (n % 251) as u8))
+            };
+            added.push(rig.service.add_opened(request(source)).await.unwrap());
+        }
+        added
+    };
+    let (many, alone) = (rig(set_clock()), rig(set_clock()));
+    let ids = add(&many).await;
+    assert_eq!(add(&alone).await, ids);
+    let location = |rig: &Rig| {
+        rig.dir
+            .path()
+            .join("elsewhere")
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    let views = many.service.views_built();
+    let outcome = many
+        .service
+        .set_location_many_as(crate::auth::CallerScope::Admin, &ids, &location(&many))
+        .await;
+    let built = many.service.views_built() - views;
+    // One publish of every torrent and the row of each shown moving, where
+    // one at a time built a publish of every torrent for each.
+    assert!(
+        built <= 3 * ADDED as usize,
+        "{built} views built for {ADDED} torrents"
+    );
+    let mut answered = Vec::new();
+    for &job_id in &ids {
+        let moved = alone
+            .service
+            .set_location_as(crate::auth::CallerScope::Admin, job_id, location(&alone))
+            .await;
+        let ends = moved.is_err();
+        answered.push((job_id, moved.map_err(|error| error.to_string())));
+        if ends {
+            break;
+        }
+    }
+    let outcome: Vec<_> = ids
+        .iter()
+        .filter_map(|job_id| {
+            let moved = outcome.get(job_id)?;
+            Some((
+                *job_id,
+                moved.as_ref().map(|_| ()).map_err(ToString::to_string),
+            ))
+        })
+        .collect();
+    assert_eq!(outcome, answered);
+    assert_eq!(outcome.len(), REFUSED as usize);
+    assert!(outcome.last().unwrap().1.is_err());
+
+    // Each rig's folders are its own: what is kept is compared below them.
+    let below = |rig: &Rig, dir: &mut Option<String>| {
+        let root = rig.dir.path().to_string_lossy().into_owned();
+        if let Some(dir) = dir {
+            *dir = dir.replacen(&root, "", 1);
+        }
+    };
+    let shown = |rig: &Rig| {
+        let mut shown = rows(&rig.service);
+        for (view, _, _) in &mut shown {
+            below(rig, &mut view.storage_dir);
+        }
+        shown
+    };
+    let stored = |rig: &Rig| {
+        let mut stored = rig.db.list_torrents().unwrap();
+        for record in &mut stored {
+            below(rig, &mut record.storage_dir);
+            below(rig, &mut record.files_dir);
+            below(rig, &mut record.save_path);
+        }
+        stored
+    };
+    // Every file and folder below the rig's folder, by its path there.
+    let on_disk = |rig: &Rig| {
+        let mut found = BTreeSet::new();
+        let mut dirs = vec![rig.dir.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path.clone());
+                }
+                found.insert(path.strip_prefix(rig.dir.path()).unwrap().to_path_buf());
+            }
+        }
+        found
+    };
+    for rig in [&many, &alone] {
+        rig.service.publish().await;
+    }
+    assert_eq!(shown(&many), shown(&alone));
+    assert_eq!(stored(&many), stored(&alone));
+    assert_eq!(on_disk(&many), on_disk(&alone));
+    // Those before the refused one moved.
+    let moved = std::path::Path::new("elsewhere").join("t1");
+    assert!(on_disk(&many).contains(&moved));
+    many.service.stop().await;
+    alone.service.stop().await;
+}
+
+// A removal of many torrents with their files reads what each made, and
+// what was there before it, for all of them in a few statements, not two
+// reads a torrent. What it deletes, keeps and stores is what the same
+// removals made one torrent at a time delete, keep and store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_of_many_torrents_reads_what_they_made_at_once() {
+    const ADDED: u64 = 120;
+    // Each with every piece on disk, to be deleted or kept.
+    let add = async |rig: &Rig| {
+        rig.service.open().await.unwrap();
+        let mut added = Vec::new();
+        for n in 1..=ADDED {
+            let (job_id, dir) = with_every_piece_of(rig, &format!("t{n}"), (n % 251) as u8).await;
+            // A third had every file there before them, a third never
+            // said, and a third had none there.
+            match n % 3 {
+                0 => {
+                    let every = crate::torrents::model::Adopted {
+                        all_files: true,
+                        ..Default::default()
+                    };
+                    rig.db.set_torrent_adopted(job_id, &every).unwrap();
+                }
+                1 => {
+                    rig.db.forget_torrent_adopted(job_id).unwrap();
+                }
+                _ => {
+                    let none = crate::torrents::model::Adopted::default();
+                    rig.db.set_torrent_adopted(job_id, &none).unwrap();
+                }
+            }
+            added.push((job_id, dir));
+        }
+        added
+    };
+    let (many, alone) = (rig(set_clock()), rig(set_clock()));
+    let added = add(&many).await;
+    let alone_added = add(&alone).await;
+    let ids: Vec<JobId> = added.iter().map(|(job_id, _)| *job_id).collect();
+    assert_eq!(
+        alone_added
+            .iter()
+            .map(|(job_id, _)| *job_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+
+    let removals: Vec<(JobId, bool)> = ids.iter().map(|job_id| (*job_id, true)).collect();
+    let takes = many.db.datastore_takes();
+    let outcome = many.service.remove_many(&removals, true).await;
+    let took = many.db.datastore_takes() - takes;
+    assert!(outcome.values().all(Result::is_ok), "{outcome:?}");
+    // The mark of every removal, the reads of what they made, and the
+    // history row each writes, where one at a time read twice a torrent
+    // beside them.
+    assert!(
+        took <= 16 + ADDED as usize,
+        "{took} takes for {ADDED} torrents"
+    );
+    for &job_id in &ids {
+        alone.service.remove(job_id, true, true).await.unwrap();
+    }
+    // Every file and folder below the rig's folder, by its path there.
+    let on_disk = |rig: &Rig| {
+        let mut found = BTreeSet::new();
+        let mut dirs = vec![rig.dir.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path.clone());
+                }
+                found.insert(path.strip_prefix(rig.dir.path()).unwrap().to_path_buf());
+            }
+        }
+        found
+    };
+    let kept = on_disk(&many);
+    assert_eq!(kept, on_disk(&alone));
+    // Those whose files were all there before them keep them, and so do
+    // those that never said; the others lose them.
+    for (n, (_, dir)) in (1..).zip(&added) {
+        let left = files_under(dir).is_empty();
+        assert_eq!(left, n % 3 == 2, "t{n}");
+    }
+    let raw: Vec<u64> = ids.iter().map(|job_id| job_id.0).collect();
+    assert_eq!(
+        many.db.list_history_job_ids(&raw).unwrap(),
+        alone.db.list_history_job_ids(&raw).unwrap()
+    );
+    assert_eq!(
+        many.db.list_torrents().unwrap(),
+        alone.db.list_torrents().unwrap()
+    );
+    many.service.stop().await;
+    alone.service.stop().await;
+}
