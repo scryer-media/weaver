@@ -762,6 +762,11 @@ export const nextDe: LocaleDictionary = {
   "next.general.srrdbHelp": "Für verschleierte Archivteile nur deren CRC32-Prüfsumme an den öffentlichen SRRDB-Index senden, um einen Release-Namen zu ermitteln.",
   "next.general.unacceptableExtensions": "Unzulässige Dateiendungen",
   "next.general.unacceptableExtensionsHelp": "Kommagetrennt. Ein fertiger Download mit einer dieser Endungen wird abgewiesen.",
+  "next.general.unwantedExtensionAction": "Aktion bei unzulässigen Endungen",
+  "next.general.unwantedExtensionActionHelp":
+    "Eine Datei mit einer dieser Endungen wird nie als Archiv geöffnet. „Job fehlschlagen lassen“ weist den Download ab; „Nur unzulässige Dateien löschen“ entfernt diese Dateien und liefert den Rest als teilweise aus.",
+  "next.general.unwantedExtensionAction.fail": "Job fehlschlagen lassen",
+  "next.general.unwantedExtensionAction.delete": "Nur unzulässige Dateien löschen",
   "next.archivePasswords.title": "Archivpasswörter",
   "next.archivePasswords.list": "Passwörter (eines pro Zeile)",
   "next.archivePasswords.edit": "Passwörter bearbeiten",

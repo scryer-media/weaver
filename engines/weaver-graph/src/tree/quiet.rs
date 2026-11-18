@@ -59,6 +59,37 @@ impl Tree {
         self.emits = emits;
     }
 
+    // The order live nodes hear that the job is quiet, deepest first, in
+    // two tiers: first the nodes whose ruling may still change the
+    // namespace above them (a data object alone of its kind in a namespace
+    // below the root, which a volume may be lifted out of:
+    // `Standing::liftable`), then the rest. The second tier is told only on
+    // a pass the first changed nothing on, as what rises from below must
+    // stand in a namespace before the objects of that namespace rule. One
+    // lookup per live node.
+    pub fn quiet_order(&self) -> (Vec<NodeId>, Vec<NodeId>) {
+        self.live()
+            .into_iter()
+            .rev()
+            .partition(|node| self.told_when_quiet(*node) && self.may_lift(*node))
+    }
+
+    // Whether the object at `node` is alone of its kind in a namespace below
+    // the root that came out of a container, so a volume of its set may lie
+    // one namespace up. Read from the namespace's count of what is bound in
+    // it, by the kind each object was bound as.
+    fn may_lift(&self, node: NodeId) -> bool {
+        let Some((parent, _)) = self.volumes(node) else {
+            return false;
+        };
+        parent != NodeId::ROOT
+            && self.volumes(parent).is_some()
+            && self
+                .nodes
+                .get(&parent)
+                .is_some_and(|found| found.bound.alone(node))
+    }
+
     // A live data object: bound in a namespace, standing, and no recovery
     // object.
     fn told_when_quiet(&self, node: NodeId) -> bool {
@@ -238,6 +269,10 @@ impl Standing for Stood<'_> {
                 carried: tree.given.get(&(parent, member.id)),
             })
             .collect()
+    }
+
+    fn liftable(&self) -> bool {
+        self.tree.may_lift(self.node)
     }
 }
 

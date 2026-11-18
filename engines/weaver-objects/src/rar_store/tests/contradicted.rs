@@ -74,7 +74,7 @@ fn a_volume_its_headers_misplace_first_never_takes_the_first_place() {
     held.bound(VolumeIndex(0), "c0ffee", &front(&one), None);
     assert!(!held.provisional(VolumeIndex(0), "d00d", &front(&two), None));
     assert_eq!(
-        held.claim("d00d", &front(&two), None),
+        held.claim("d00d", (&front(&two)).into(), None),
         Vec::<VolumeIndex>::new()
     );
 }

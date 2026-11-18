@@ -6,8 +6,9 @@ use std::time::Duration;
 use bytes::{Buf, BytesMut};
 use thiserror::Error;
 use weaver_yenc::{
-    CheckpointPlan, DecodeResult, DecodeState, RapidyencDecodeEnd, RapidyencDecodeProgress,
-    YencError, YencMetadata, decode_body_chunk_until_control, finish_streaming_result, header,
+    CheckpointPlan, DecodeResult, DecodeState, DroppedDot, RapidyencDecodeEnd,
+    RapidyencDecodeProgress, YencError, YencMetadata, decode_body_chunk_until_control,
+    finish_streaming_result, header,
 };
 
 use crate::error::NntpError;
@@ -146,9 +147,33 @@ pub struct FusedYencArticle {
     pub chunks: Vec<Box<[u8]>>,
     pub body: FusedArticleBody,
     pub stats: FusedYencArticleStats,
+    // A part one stuffing dot short, still to try keeping the dot once
+    // `chunks` holds all its bytes.
+    dropped_dot: Option<DroppedDot>,
 }
 
 impl FusedYencArticle {
+    // Keep a dot an unstuffed `..` line lost, where the part then matches its
+    // CRC (see [`DroppedDot`]), once `chunks` holds the whole part in order.
+    // Nothing to do for any other article, or a second time.
+    pub fn keep_dropped_dot(&mut self) -> Result<()> {
+        let FusedArticleBody::Yenc(result) = &mut self.body else {
+            return Ok(());
+        };
+        let held: usize = self.chunks.iter().map(|chunk| chunk.len()).sum();
+        if held != result.bytes_written {
+            return Ok(());
+        }
+        let Some(dropped) = self.dropped_dot.take() else {
+            return Ok(());
+        };
+        dropped.keep(result, &mut self.chunks)?;
+        self.stats.decoded_bytes_written = result.bytes_written as u64;
+        self.stats.yenc_size_actual = result.bytes_written as u64;
+        self.stats.crc_actual = result.part_crc;
+        Ok(())
+    }
+
     // The yEnc decode result, for callers that already know this article is
     // yEnc — the decoder's own tests, which post yEnc bodies by construction.
     //
@@ -710,6 +735,7 @@ impl FusedYencArticleDecoder {
 
         let result =
             finish_streaming_result(metadata, yend, std::mem::take(&mut self.decode_state))?;
+        let dropped_dot = DroppedDot::of(&result, yend);
         let chunks = std::mem::take(&mut self.output_chunks);
 
         let mut stats = self.stats.clone();
@@ -729,12 +755,17 @@ impl FusedYencArticleDecoder {
 
         self.state = FusedArticleState::Done;
 
-        Ok(FusedYencArticle {
+        let mut article = FusedYencArticle {
             response,
             chunks,
             body: FusedArticleBody::Yenc(Box::new(result)),
             stats,
-        })
+            dropped_dot,
+        };
+        // Chunks drained while the body decoded are not here; whoever holds
+        // them asks again once they are put back.
+        article.keep_dropped_dot()?;
+        Ok(article)
     }
 
     // Close out an article the uuencode decoder claimed.
@@ -779,6 +810,7 @@ impl FusedYencArticleDecoder {
             chunks,
             body: FusedArticleBody::Uu(outcome),
             stats,
+            dropped_dot: None,
         })
     }
 

@@ -163,8 +163,10 @@ pub(crate) fn drive(
         };
         let outcomes = job.repair();
         // The job ends at the first object that could not rebuild what it
-        // found, as it did when that failed it: blocks another object still
-        // waits on are not held for.
+        // found. Another set still waiting has nothing left that can arrive:
+        // the job gets here only with no work pending, and every set's asks
+        // reach the download queue on each step, so blocks it was asked for
+        // are already in or lost.
         let ruled_short = failure(&summary, &outcomes, &*job).is_some();
         if !ruled_short && outcomes.contains(&RepairOutcome::Waiting) {
             slots.yield_slot(ticket);
@@ -327,7 +329,7 @@ fn may_come_whole_below(tree: &Tree, node: NodeId, member: MemberId) -> bool {
         }
         tree.namespace(object).is_some_and(|namespace| {
             namespace.members().any(|below| {
-                !tree.buried_member(object, below.id)
+                !tree.holds_no_file(object, below.id)
                     && match tree.child_of(object, below.id) {
                         Some((child, _)) if tree.recovers(child) => false,
                         Some(_) => may_come_whole_below(tree, object, below.id),

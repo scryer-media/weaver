@@ -859,9 +859,14 @@ async fn a_rar_inside_a_stored_rar_whose_first_volume_never_arrives_delivers_the
             damaged: &["silver.horizon.part02.rar", "silver.horizon.part03.rar"],
             unrepaired: &[],
             withheld: &[],
+            // The inner set, alone in the outer one, gives its volumes up
+            // as scattered; they rise to the root, where the set is ruled
+            // on again and refused as it was.
             refused: &[
                 "kind=rar_store member=silver.horizon.part02.rar why=first_bytes_lost",
+                "kind=rar_store member=silver.horizon.part02.rar why=scattered",
                 "kind=rar_store member=silver.horizon.part03.rar why=first_bytes_lost",
+                "kind=rar_store member=silver.horizon.part03.rar why=scattered",
             ],
             delivered: &[
                 "name=silver.horizon.part02.rar from=silver.horizon.part02.rar depth=1 whole=false",
@@ -1203,9 +1208,14 @@ async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its
                 ("silver.horizon.part01.rar", Why::Unmapped),
                 ("silver.horizon.part02.rar", Why::Unmapped),
             ],
+            // The inner set, alone in the outer one, gives its volumes up
+            // as scattered; they rise to the root, where the set is ruled
+            // on again and refused as it was.
             refused: &[
                 "kind=rar_store member=silver.horizon.part01.rar why=unmapped",
+                "kind=rar_store member=silver.horizon.part01.rar why=scattered",
                 "kind=rar_store member=silver.horizon.part02.rar why=unmapped",
+                "kind=rar_store member=silver.horizon.part02.rar why=scattered",
             ],
             delivered: &[QUILL],
         },

@@ -427,41 +427,53 @@ fn a_member_spanning_two_volumes_extracts_whole() {
 fn claim_names_the_volumes_of_its_own_set_only() {
     let mut engine = named(&["Set.part1.rar"]);
     assert_eq!(
-        engine.claim("set.PART2.rar", b"", None),
+        engine.claim("set.PART2.rar", (b"").into(), None),
         vec![VolumeIndex(1)]
     );
     assert_eq!(
-        engine.claim("set.part10.rar", b"", None),
+        engine.claim("set.part10.rar", (b"").into(), None),
         vec![VolumeIndex(9)]
     );
     assert_eq!(
-        engine.claim("set.part01.rar", b"", None),
+        engine.claim("set.part01.rar", (b"").into(), None),
         vec![VolumeIndex(0)],
         "a volume posted again is that volume"
     );
     assert_eq!(
-        engine.claim("other.part2.rar", b"", None),
+        engine.claim("other.part2.rar", (b"").into(), None),
         Vec::<VolumeIndex>::new()
     );
     assert_eq!(
-        engine.claim("set.r00", b"", None),
+        engine.claim("set.r00", (b"").into(), None),
         Vec::<VolumeIndex>::new()
     );
     assert_eq!(
-        engine.claim("set.par2", b"", None),
+        engine.claim("set.par2", (b"").into(), None),
         Vec::<VolumeIndex>::new()
     );
 
     let mut old = named(&["set.rar"]);
-    assert_eq!(old.claim("set.r00", b"", None), vec![VolumeIndex(1)]);
-    assert_eq!(old.claim("SET.R41", b"", None), vec![VolumeIndex(42)]);
-    // `.sNN` follows `.r99`.
-    assert_eq!(old.claim("set.s00", b"", None), vec![VolumeIndex(101)]);
     assert_eq!(
-        old.claim("set.part2.rar", b"", None),
+        old.claim("set.r00", (b"").into(), None),
+        vec![VolumeIndex(1)]
+    );
+    assert_eq!(
+        old.claim("SET.R41", (b"").into(), None),
+        vec![VolumeIndex(42)]
+    );
+    // `.sNN` follows `.r99`.
+    assert_eq!(
+        old.claim("set.s00", (b"").into(), None),
+        vec![VolumeIndex(101)]
+    );
+    assert_eq!(
+        old.claim("set.part2.rar", (b"").into(), None),
         Vec::<VolumeIndex>::new()
     );
-    assert_eq!(old.claim("set.rar", b"", None), vec![VolumeIndex(0)]);
+    assert_eq!(
+        old.claim("set.rar", (b"").into(), None),
+        vec![VolumeIndex(0)]
+    );
 }
 
 #[test]
@@ -494,7 +506,7 @@ fn number_alone_does_not_join_different_named_rar_sets() {
     assert_eq!(
         store.claim(
             "second.part01.rar",
-            &candidate,
+            (&candidate).into(),
             Some(candidate.len() as u64)
         ),
         Vec::<VolumeIndex>::new(),
@@ -508,14 +520,18 @@ fn number_alone_does_not_join_different_named_rar_sets() {
         Some(held.len() as u64),
     );
     assert_eq!(
-        engine.claim("first.part01.rar", &candidate, Some(candidate.len() as u64)),
+        engine.claim(
+            "first.part01.rar",
+            (&candidate).into(),
+            Some(candidate.len() as u64)
+        ),
         vec![VolumeIndex(0)],
         "a matching set name places an earlier volume"
     );
     assert_eq!(
         engine.claim(
             "second.part01.rar",
-            &candidate,
+            (&candidate).into(),
             Some(candidate.len() as u64)
         ),
         Vec::<VolumeIndex>::new(),
@@ -529,7 +545,7 @@ fn linked_headers_can_join_different_posted_rar_names() {
     let mut engine = RarEngine::new();
     engine.bound(VolumeIndex(1), "first.part02.rar", &volumes[1], None);
     assert_eq!(
-        engine.claim("second.part01.rar", &volumes[0], None),
+        engine.claim("second.part01.rar", (&volumes[0]).into(), None),
         vec![VolumeIndex(0)],
         "the held continuation judges membership across posted labels"
     );
@@ -544,21 +560,21 @@ fn claim_places_a_nameless_volume_by_its_headers() {
     let mut engine = RarEngine::new();
     engine.bound(VolumeIndex(0), "a1b2.101", &volumes[0], None);
     assert_eq!(
-        engine.claim("a1b2.102", &volumes[1], None),
+        engine.claim("a1b2.102", (&volumes[1]).into(), None),
         vec![VolumeIndex(1)]
     );
     assert_eq!(
-        engine.claim("a1b2.103", &volumes[0], None),
+        engine.claim("a1b2.103", (&volumes[0]).into(), None),
         vec![VolumeIndex(0)],
         "a volume posted again is that volume"
     );
     assert_eq!(
-        engine.claim("a1b2.103", &one_volume(), None),
+        engine.claim("a1b2.103", (&one_volume()).into(), None),
         Vec::<VolumeIndex>::new(),
         "no volume of a set"
     );
     assert_eq!(
-        engine.claim("a1b2.103", b"", None),
+        engine.claim("a1b2.103", (b"").into(), None),
         Vec::<VolumeIndex>::new(),
         "a front that says nothing"
     );
@@ -568,7 +584,7 @@ fn claim_places_a_nameless_volume_by_its_headers() {
     ]
     .concat();
     assert_eq!(
-        engine.claim("a1b2.103", &stranger, None),
+        engine.claim("a1b2.103", (&stranger).into(), None),
         Vec::<VolumeIndex>::new(),
         "it continues no member of ours"
     );
@@ -593,7 +609,10 @@ fn a_stated_volume_is_placed_beside_a_bound_volume_whose_front_is_unread() {
         rar5::end(false),
     ]
     .concat();
-    assert_eq!(engine.claim("a1b2.103", &third, None), vec![VolumeIndex(2)]);
+    assert_eq!(
+        engine.claim("a1b2.103", (&third).into(), None),
+        vec![VolumeIndex(2)]
+    );
 }
 
 #[test]

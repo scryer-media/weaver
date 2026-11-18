@@ -28,6 +28,7 @@ impl Lines {
 
     // Hear the lines at `level` under `target` until the guard drops.
     pub(crate) fn capture_at(target: &'static str, level: tracing::Level) -> (Self, DefaultGuard) {
+        BESIDE.get_or_init(|| tracing::Dispatch::new(Beside));
         let lines = Self {
             heard: Arc::default(),
             target,
@@ -50,7 +51,46 @@ impl Lines {
     }
 }
 
+// A dispatcher alive for the whole run beside every capture. While only one
+// dispatcher is alive, tracing registers a callsite first hit on a thread
+// with the interest of that thread's own default alone (tracing-core
+// `Dispatchers::rebuilder`, `has_just_one`): a test with no capture would
+// cache `never` for a line a capture on another thread is waiting to hear.
+// With this one alive too, every live dispatcher is asked.
+static BESIDE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+
+struct Beside;
+
+impl tracing::Subscriber for Beside {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 impl tracing::Subscriber for Lines {
+    // Asked at every event, never cached for the callsite: tests on other
+    // threads hold subscribers of their own, and an interest one of them
+    // left cached would silence a line this one hears.
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
         metadata.target().starts_with(self.target) && *metadata.level() == self.level
     }

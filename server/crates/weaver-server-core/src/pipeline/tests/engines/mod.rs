@@ -28,6 +28,9 @@
 //     .lost(file, ordinal)        every server lacks that article
 //     .corrupt_on_primary(file,   the primary serves that article damaged
 //          ordinal)               and a backup serves it whole
+//     .headerless_on(file,        that server serves the article with no
+//          ordinal, server)       `=ybegin` line
+//     .servers(n)                 the pipeline has at least `n` servers
 //     .framed(size)               articles of `size` bytes, not ARTICLE
 //     .backwards()                every batch the download queue hands
 //                                 out arrives last article first
@@ -86,6 +89,7 @@ mod disk_wait;
 mod download_summary;
 mod embedded;
 mod encrypted_hex;
+mod end_files;
 mod first_article_sample;
 pub(in crate::pipeline) mod harness;
 mod hold_breach;
@@ -94,6 +98,8 @@ mod lent_windows;
 mod lifecycle;
 mod lines;
 pub(in crate::pipeline) mod loans;
+mod lost_fronts;
+mod nested_engine_fault;
 mod nesting;
 mod pairings;
 mod par3;
@@ -119,9 +125,11 @@ mod refused_then_repaired;
 mod remaining_par2;
 mod remaining_stalls;
 mod renamed_engine;
+mod renamed_sets;
 mod repaired_source;
 mod reposted;
 pub(in crate::pipeline::tests) mod restart;
+mod scene_zips;
 mod sealed;
 mod seek;
 mod sets;
@@ -133,11 +141,16 @@ mod size_bounds;
 mod solid_hex;
 mod spent;
 mod split;
+mod srr;
 mod stage_events;
 mod streams;
 mod too_large;
+mod unlisted_data;
+mod unlisted_par2;
 mod unnamed_index;
+mod unnamed_recovery;
 mod volume_order;
+mod waiting_sets;
 mod withheld_par2;
 mod zip;
 mod zip_par3;

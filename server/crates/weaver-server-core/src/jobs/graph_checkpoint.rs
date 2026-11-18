@@ -85,6 +85,16 @@ pub(crate) struct MemberRow {
     pub(crate) copy_of: Option<i64>,
     // The kind whose reading of the member its own bytes refuted.
     pub(crate) refuted_kind: Option<String>,
+    // The member was lifted here from the namespace below: which member it
+    // was there, and the position its name ranks at.
+    pub(crate) lifted: Option<Lifted>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Lifted {
+    pub(crate) node: i64,
+    pub(crate) member: i64,
+    pub(crate) position: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,7 +266,8 @@ impl Row for MemberRow {
     const KEY: &'static [&'static str] = &["node_id", "member_id"];
     const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, crc32, \
          length, closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
-         given_up_volume, buried, undecided, has_file, on_disk, refused, copy_of, refuted_kind";
+         given_up_volume, buried, undecided, has_file, on_disk, refused, copy_of, refuted_kind, \
+         lifted_node_id, lifted_member_id, lifted_position";
 
     fn key(&self) -> (i64, i64) {
         (self.node, self.member)
@@ -290,6 +301,9 @@ impl Row for MemberRow {
             SqlArg::OptText(self.refused.clone()),
             SqlArg::OptI64(self.copy_of),
             SqlArg::OptText(self.refuted_kind.clone()),
+            SqlArg::OptI64(self.lifted.as_ref().map(|lift| lift.node)),
+            SqlArg::OptI64(self.lifted.as_ref().map(|lift| lift.member)),
+            SqlArg::OptText(self.lifted.as_ref().map(|lift| lift.position.clone())),
         ]
     }
 }
@@ -815,7 +829,8 @@ async fn fetch_checkpoint(
             .fetch_all(
                 "SELECT node_id, member_id, name, output_name, crc32, length, closed, \
                  bound_node_id, owner_node_id, owner_volume, given_up_node_id, given_up_volume, \
-                 buried, undecided, has_file, on_disk, refused, copy_of, refuted_kind \
+                 buried, undecided, has_file, on_disk, refused, copy_of, refuted_kind, \
+                 lifted_node_id, lifted_member_id, lifted_position \
                  FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
                 &args,
             )
@@ -920,6 +935,18 @@ fn interpret(fetched: Fetched) -> Result<GraphCheckpoint, StateError> {
                 refused: row.opt_text("refused")?,
                 copy_of: row.opt_i64("copy_of")?,
                 refuted_kind: row.opt_text("refuted_kind")?,
+                lifted: match (
+                    row.opt_i64("lifted_node_id")?,
+                    row.opt_i64("lifted_member_id")?,
+                    row.opt_text("lifted_position")?,
+                ) {
+                    (Some(node), Some(member), Some(position)) => Some(Lifted {
+                        node,
+                        member,
+                        position,
+                    }),
+                    _ => None,
+                },
             })
         })
         .collect::<Result<_, StateError>>()?;

@@ -637,6 +637,48 @@ async fn a_nameless_four_volume_rar5_set_posted_backwards_delivers() {
     assert_reversed_delivers(&reversed(set), &body).await;
 }
 
+// Five nameless volumes and no recovery, fetched side by side in orders
+// that put later volumes' fronts first, so several found stores before the
+// first volume's headers are read. Only the headers place them, and the set
+// ends as one store that delivers its member.
+#[tokio::test]
+async fn five_nameless_volumes_fetched_side_by_side_are_one_store() {
+    let body = body();
+    let sets = [
+        (
+            "rar5",
+            obfuscate_volumes(&single_member_store_set(MEMBER, &body, 5)),
+        ),
+        (
+            "rar4",
+            obfuscate_volumes(&single_member_rar4_store_set_numbered(MEMBER, &body, 5)),
+        ),
+    ];
+    let orders: [[u32; 5]; 4] = [
+        [0, 1, 2, 3, 4],
+        [4, 3, 2, 1, 0],
+        [1, 3, 0, 4, 2],
+        [3, 4, 1, 2, 0],
+    ];
+    for (format, set) in &sets {
+        for order in orders {
+            let graph = run(&Scenario::new(posts(set.clone())).together(&order)).await;
+            assert!(
+                graph.completed(),
+                "{format} {order:?}: {:?} {:?} {:?}",
+                graph.status,
+                graph.failure,
+                graph.graph().delivery
+            );
+            assert_eq!(
+                graph.files.get(&delivered(MEMBER)),
+                Some(&body),
+                "{format} {order:?}"
+            );
+        }
+    }
+}
+
 // A nameless RAR4 volume's front states no position: its number is in its
 // end record. Posted backwards, each later volume arrives with no store
 // that can place it and founds one, first; read to its close, its headers
@@ -833,10 +875,13 @@ async fn a_header_encrypted_rar5_set_without_a_password_check_goes_to_the_engine
 
 // A three-volume set the RAR engine reads, posted without one volume. The
 // engine reads volume p as bound volume p, so the member cannot be read
-// whole: its object announced it and never closed it, so the refusal reads
-// the posted volumes back as they were, short, and with nothing whole the
-// job fails naming them.
-async fn assert_missing_volume_fails(missing: &str) {
+// whole, and with nothing whole the job fails as `failure` says: a volume
+// lost inside the set reads back as damage, so the refusal reads the posted
+// volumes back as they were, short; a set with no volume past its last
+// ends its run silently, and once the job is quiet its object rules that
+// the member it named never closed, and withholds the volumes unmapped, as
+// a store's set missing its last volume does.
+async fn assert_missing_volume_fails(missing: &str, failure: impl Fn(&[&str]) -> String) {
     let body = body();
     let volumes: Vec<(String, Vec<u8>)> =
         header_encrypted_store_set(MEMBER, &body, 3, SECRET, HeaderCheck::Absent)
@@ -857,15 +902,8 @@ async fn assert_missing_volume_fails(missing: &str) {
         "{:?}",
         graph.graph().kinds
     );
-    let short: Vec<&str> = posted.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(
-        graph.failure,
-        Some(format!(
-            "no file was delivered whole; {} short: {}",
-            short.len(),
-            short.join(", ")
-        ))
-    );
+    let posted: Vec<&str> = posted.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(graph.failure, Some(failure(&posted)));
     assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
@@ -873,13 +911,23 @@ async fn assert_missing_volume_fails(missing: &str) {
 // Without `.r01`, the last: the engine finds no volume past `.r00`.
 #[tokio::test]
 async fn a_three_volume_set_the_engine_reads_posted_without_its_r01_fails() {
-    assert_missing_volume_fails("silver.horizon.r01").await;
+    assert_missing_volume_fails("silver.horizon.r01", |_| {
+        "silver.horizon.r00, silver.horizon.rar never placed every member it named".to_owned()
+    })
+    .await;
 }
 
 // Without `.r00`, inside the set: the engine reads position 1 as lost.
 #[tokio::test]
 async fn a_three_volume_set_the_engine_reads_posted_without_its_r00_fails() {
-    assert_missing_volume_fails("silver.horizon.r00").await;
+    assert_missing_volume_fails("silver.horizon.r00", |short| {
+        format!(
+            "no file was delivered whole; {} short: {}",
+            short.len(),
+            short.join(", ")
+        )
+    })
+    .await;
 }
 
 #[tokio::test]

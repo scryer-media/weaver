@@ -6,7 +6,9 @@ use super::policy::goal_met;
 use super::retire::{held_tops, resolved};
 #[cfg(test)]
 use super::{KEEP_FAILS, OUTPUT_MEETS, PLACE_PANICS, locked};
-use super::{TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced};
+use super::{
+    MemoryRelease, TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced,
+};
 use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::model::JobStatus;
@@ -17,7 +19,7 @@ use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::model::HistoryEnd;
 use crate::torrents::relocate::Existing;
 use crate::torrents::store::TorrentStore;
-use crate::torrents::tee::{Tee, place_outputs};
+use crate::torrents::tee::{Tee, place_outputs, remove_unwanted_outputs};
 use crate::torrents::{KeptIntent, TorrentIntent};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -133,6 +135,8 @@ impl TorrentService {
         };
         tee.stop_checkpoints();
         tee.forget();
+        // The job's content policy, when it leaves unwanted files out.
+        let removes = tee.with(|job| job.writer().removes().cloned());
         let work = tee.work().to_path_buf();
         let (placing, tee, db) = (Arc::clone(store), Arc::clone(tee), self.inner.db.clone());
         let placed = tokio::task::spawn_blocking(move || {
@@ -146,6 +150,12 @@ impl TorrentService {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not read the files a torrent placed before");
                 Vec::new()
             });
+            // A file unpacking made with an extension the policy deletes is
+            // deleted before the rest are placed, and the job ends short.
+            let removed = match &removes {
+                Some(policy) => remove_unwanted_outputs(tee.work(), &listed, &spent, policy),
+                None => Ok(Vec::new()),
+            };
             let moves = JobMoves::of(job_id.0);
             let placed = place_outputs(tee.work(), &dir, &listed, &spent, &kept, |from, to| {
                 move_output(&moves, from, to)
@@ -159,10 +169,10 @@ impl TorrentService {
                 true => Vec::new(),
                 false => held_of(&dir, &placed.names),
             };
-            (placed, held)
+            (placed, held, removed)
         })
         .await;
-        let (placed, held) = match placed {
+        let (placed, held, removed) = match placed {
             Ok(placed) => placed,
             // Its end is not known, as a panic leaves it. The row was not
             // written for this placing and names none of its files: any it
@@ -207,10 +217,26 @@ impl TorrentService {
             return self.not_placed(job_id, &work, &error, gone, there).await;
         }
         self.unclaim_outputs(job_id).await;
+        // What the policy left out, worded as the job's reason; a file it
+        // could not remove stays where unpacking made it, and says why.
+        let removed = match removed {
+            Ok(removed) => crate::post_processing::model::unwanted_files_removed_reason(&removed),
+            Err(why) => Some(why),
+        };
         if let Some(error) = failed {
             tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not all move beside it");
+            let why = unplaced(&work, &error);
             return Placing::Short {
-                why: unplaced(&work, &error),
+                why: match removed {
+                    Some(removed) => format!("{why}; {removed}"),
+                    None => why,
+                },
+                placed: placed.names,
+            };
+        }
+        if let Some(why) = removed {
+            return Placing::Short {
+                why,
                 placed: placed.names,
             };
         }
@@ -364,6 +390,11 @@ impl TorrentService {
             )
         };
         let (landing, move_to) = landing;
+        // Its download in this run is over: what it held for that goes
+        // back, as a finished NZB job's does.
+        if downloaded {
+            self.release_memory(MemoryRelease::Ended);
+        }
         let _ = self.landed(landing).await;
         // Its files are all there now: what it holds is spelled as the
         // filesystem spells them.

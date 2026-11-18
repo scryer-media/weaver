@@ -277,6 +277,8 @@ impl GraphJob {
     ) -> Self {
         let mut tree = Tree::new();
         tree.nest_at_most(nesting);
+        // A member with an unwanted extension is never opened.
+        tree.never_open(writer.never_opens());
         let root = ArticleRoot::new(files);
         let mut out = Vec::new();
         for file in files {
@@ -711,6 +713,20 @@ impl GraphJob {
         self.writer.learn_policy()
     }
 
+    // Once the policy is read, the members the tree held undecided while it
+    // was not are asked again, once, so an archive whose name the policy
+    // does not list opens then. Nothing before the policy is read; nothing
+    // to do for a job whose tree held none.
+    pub(crate) fn open_after_policy(&mut self) -> Result<(), GraphError> {
+        if !self.writer.policy_known() {
+            return Ok(());
+        }
+        let mut out = Vec::new();
+        self.writer
+            .rule_known(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
+        self.heard(out)
+    }
+
     // Everything the job has submitted to its volumes' writers so far;
     // `None` for a job that writes its files itself.
     pub(crate) fn disk_barrier(&self) -> Option<super::disk::JobBarrier> {
@@ -831,6 +847,20 @@ impl GraphJob {
         self.root.map.undecided(VolumeIndex(file_index))
     }
 
+    // Seam for the feed: the posted file at `file_index` is a recovery
+    // set's volume, or one that may be: its front has yet to say what it
+    // is, or the graph is still judging it by its clean bytes past the hole
+    // where its first article was lost. With no object bound beside it,
+    // nothing can judge it, and it is lost as any other file.
+    pub(crate) fn may_bring_blocks(&self, file_index: u32) -> bool {
+        let member = MemberId(file_index);
+        self.writer
+            .carries_recovery(&self.tree, NodeId::ROOT, member)
+            || (self.tree.objects_beside(NodeId::ROOT)
+                && self.tree.is_undecided(NodeId::ROOT, member))
+            || self.tree.judges_past_hole(NodeId::ROOT, member)
+    }
+
     // Seam for status: the posted file at `file_index` has an article
     // neither in hand nor lost for good, parked or not.
     pub(crate) fn file_waiting(&self, file_index: u32) -> bool {
@@ -878,8 +908,9 @@ impl GraphJob {
     }
 
     // Every member of the root has said what it is: its first bytes came,
-    // or were lost, and decided who owns it. Until then a volume of a set
-    // may still join it and bring blocks the set lacks.
+    // or were lost, and decided who owns it, and one whose first bytes were
+    // lost has been judged by the clean bytes past that hole. Until then a
+    // volume of a set may still join it and bring blocks the set lacks.
     pub(crate) fn identified(&self) -> bool {
         !self.tree.deciding(NodeId::ROOT)
             && self.namespace().members().all(|member| {
@@ -889,6 +920,7 @@ impl GraphJob {
                     .next()
                     .is_some_and(|run| run.range.start == 0)
             })
+            && !self.tree.judging_past_hole(NodeId::ROOT)
     }
 
     // Seam for the article decoder: the block sizes the root namespace's

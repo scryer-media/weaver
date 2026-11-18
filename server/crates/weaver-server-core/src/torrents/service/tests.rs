@@ -47,6 +47,7 @@ mod completion;
 mod disk_room;
 mod intake;
 mod listing;
+mod memory;
 mod moves;
 mod old_tick;
 mod pass;

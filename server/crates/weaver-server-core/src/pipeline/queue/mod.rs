@@ -796,7 +796,7 @@ impl Queue {
         });
     }
 
-    #[cfg(test)]
+    // The actor's last answer: whether it has work to drive.
     pub(crate) fn driving(&self) -> bool {
         *self.drive.borrow()
     }

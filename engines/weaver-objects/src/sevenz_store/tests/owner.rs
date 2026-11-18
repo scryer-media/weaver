@@ -111,7 +111,7 @@ impl Owner {
         let (name, bytes) = &self.volumes[volume];
         let (first, length) = (&bytes[..bytes.len().min(32)], Some(bytes.len() as u64));
         let index = VolumeIndex(volume as u32);
-        assert_eq!(self.object.claim(name, first, length), vec![index]);
+        assert_eq!(self.object.claim(name, (first).into(), length), vec![index]);
         self.object.bound(index, name, first, length);
         self.bound[volume] = true;
         self.size(volume);

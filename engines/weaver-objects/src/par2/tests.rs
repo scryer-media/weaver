@@ -6,6 +6,7 @@ mod countless_names;
 mod cross_sets;
 mod early_refusals;
 mod facts;
+mod past_hole;
 mod per_call;
 mod range_names;
 mod recovery_contracts;
@@ -926,7 +927,7 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
     let (name, bytes) = &files[1];
     let volume = job
         .object
-        .claim(name, &bytes[..64], None)
+        .claim(name, (&bytes[..64]).into(), None)
         .last()
         .copied()
         .expect("a PAR2 volume");

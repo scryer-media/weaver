@@ -899,6 +899,12 @@ struct Inner {
     turning: tokio::sync::Mutex<()>,
     // Whether there are torrents, as last published.
     presence: watch::Sender<Presence>,
+    // Whether any torrent was downloading, as last published: memory goes
+    // back as that turns false.
+    downloading: AtomicBool,
+    // How many memory releases each ending asked for, as a test reads them.
+    #[cfg(test)]
+    releases: [std::sync::atomic::AtomicUsize; 2],
     // The torrents and their sessions as last published, for the exporter.
     published: watch::Sender<Arc<Published>>,
     // Each route's session as last read. The tick reads them, and turning
@@ -1014,6 +1020,9 @@ impl TorrentService {
                 wind_down: watch::channel(None).0,
                 turning: tokio::sync::Mutex::new(()),
                 presence: watch::channel(Presence::default()).0,
+                downloading: AtomicBool::new(false),
+                #[cfg(test)]
+                releases: Default::default(),
                 published: watch::channel(Arc::default()).0,
                 sessions_read: Mutex::default(),
                 counters: Counters::default(),
@@ -1431,6 +1440,37 @@ impl TorrentService {
         })
         .await
     }
+
+    // Give back the memory a download that ended left, by the release a
+    // finished NZB job asks for, off the runtime: once per `why`, never per
+    // piece or peer.
+    pub(super) fn release_memory(&self, why: MemoryRelease) {
+        #[cfg(test)]
+        self.inner.releases[why as usize].fetch_add(1, Ordering::Relaxed);
+        let _ = why;
+        crate::runtime::thread_release::release_job_completion_memory_off_runtime();
+    }
+
+    // Whether the torrents went from downloading to none downloading at the
+    // walk that found `downloading`: memory goes back then, as the pipeline
+    // gives it back as it settles. While the pipeline still drives its own
+    // downloads it does not, as the pipeline's settle does not: that settle
+    // gives it all back once it comes.
+    pub(super) fn note_downloading(&self, downloading: bool) {
+        let was = self.inner.downloading.swap(downloading, Ordering::AcqRel);
+        if was && !downloading && !self.queue().is_some_and(|queue| queue.pipeline_driving()) {
+            self.release_memory(MemoryRelease::Idle);
+        }
+    }
+}
+
+// Why a torrent's memory goes back.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum MemoryRelease {
+    // A torrent's download ended: it completed, or left short of complete.
+    Ended = 0,
+    // The last torrent downloading stopped downloading.
+    Idle = 1,
 }
 
 // Whether the torrent's files went where its client asked, where they may

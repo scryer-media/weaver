@@ -146,7 +146,7 @@ impl Moves {
     }
 
     // Every move of the member goes; the others keep their order.
-    fn drop_member(&mut self, node: NodeId, member: MemberId) {
+    pub(super) fn drop_member(&mut self, node: NodeId, member: MemberId) {
         let Some(places) = self.at.remove(&(node, member)) else {
             return;
         };

@@ -762,6 +762,11 @@ export const nextZh: LocaleDictionary = {
   "next.general.srrdbHelp": "对于混淆的归档成员,只将其 CRC32 校验和发送到公共 SRRDB 索引,以恢复发布名称。",
   "next.general.unacceptableExtensions": "不接受的扩展名",
   "next.general.unacceptableExtensionsHelp": "以逗号分隔。包含其中任一扩展名的已完成下载会被拒绝。",
+  "next.general.unwantedExtensionAction": "不接受扩展名的处理方式",
+  "next.general.unwantedExtensionActionHelp":
+    "列表中的文件绝不会作为压缩包打开。“使任务失败”会拒绝该下载；“只删除不需要的文件”会删除这些文件，并将其余文件作为部分完成交付。",
+  "next.general.unwantedExtensionAction.fail": "使任务失败",
+  "next.general.unwantedExtensionAction.delete": "只删除不需要的文件",
   "next.archivePasswords.title": "压缩包密码",
   "next.archivePasswords.list": "密码（每行一个）",
   "next.archivePasswords.edit": "编辑密码",

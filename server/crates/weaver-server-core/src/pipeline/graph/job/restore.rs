@@ -85,6 +85,8 @@ impl GraphJob {
         .writing_through(storage.disk.clone())
         .capped(storage.caps)
         .metered(storage.metrics);
+        // A member with an unwanted extension is never opened.
+        tree.never_open(writer.never_opens());
         writer.restore_verifications(&snapshot.root.pending_verifications);
         writer.restore_members(&tree);
         writer.note_recorded_holds(&tree, &snapshot.holds);
@@ -152,6 +154,8 @@ impl GraphJob {
         let mut effects = Vec::new();
         job.tree
             .restored(&mut job.writer.placing(&mut *job.builder), &mut effects);
+        #[cfg(test)]
+        job.tree.bound_kinds_recounted().unwrap();
         job.settle(effects)?;
         job.lift_hold_refusals()?;
         job.writer.queue_rechecks(rejected);

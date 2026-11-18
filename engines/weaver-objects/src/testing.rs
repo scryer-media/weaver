@@ -443,7 +443,7 @@ impl<O: Object> Job<O> {
     // it the first.
     pub(crate) fn name(&mut self, name: &str, bytes: &[u8]) -> VolumeIndex {
         let (front, length) = (&bytes[..bytes.len().min(64)], Some(bytes.len() as u64));
-        let claimed = self.object.claim(name, front, length);
+        let claimed = self.object.claim(name, (front).into(), length);
         let volume = match claimed[..] {
             [volume] => volume,
             [] if self.store.volumes.is_empty() => VolumeIndex(0),

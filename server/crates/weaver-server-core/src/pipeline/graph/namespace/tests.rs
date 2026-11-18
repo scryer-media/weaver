@@ -3799,7 +3799,9 @@ fn a_member_given_back_logs_object_refused() {
 
 // Every reason an object can give a member back for reaches the job's
 // events, with the member and the archive that gave it back; the same
-// reason again says nothing new.
+// reason again says nothing new. A volume refused as scattered is not
+// given back: it moves to the namespace above (`Why::gives_back`), and
+// says nothing.
 #[test]
 fn every_reason_a_member_is_given_back_for_is_noted_once() {
     for why in crate::pipeline::graph::checkpoint::REASONS {
@@ -3818,13 +3820,14 @@ fn every_reason_a_member_is_given_back_for_is_noted_once() {
                 )
                 .expect("refuse");
         }
+        let noted: &[super::GivenBack] = &[super::GivenBack {
+            member: "pack.bin".to_string(),
+            container: "rar_store".to_string(),
+            why,
+        }];
         assert_eq!(
             job.writer.take_given_back(),
-            [super::GivenBack {
-                member: "pack.bin".to_string(),
-                container: "rar_store".to_string(),
-                why,
-            }],
+            if why.gives_back() { noted } else { &[] },
             "{why:?}"
         );
         assert!(job.writer.take_given_back().is_empty(), "{why:?}");
@@ -4066,6 +4069,85 @@ fn names_placed_while_the_policy_is_unreadable_are_judged_once_it_reads() {
         refusal.job_failure_reason(),
         "unwanted extension '.exe' in 'beacon.exe'"
     );
+}
+
+// The tree opens nothing while the job's policy cannot be read: a member
+// whose bytes say it is a store waits, undecided, its bytes in its own file,
+// and is asked again once a read succeeds. Then a name the policy lists is
+// never opened, and one it does not list opens as its bytes say.
+#[test]
+fn nothing_opens_until_the_policy_reads_and_then_only_what_it_does_not_list() {
+    use crate::post_processing::model::{PostProcessingSettings, UnwantedExtensionAction};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for listed in [true, false] {
+        let readable = Arc::new(AtomicBool::new(false));
+        let read: crate::pipeline::graph::limits::PolicyRead = {
+            let readable = Arc::clone(&readable);
+            Arc::new(move || {
+                if readable.load(Ordering::SeqCst) {
+                    Ok(Arc::new(PostProcessingSettings {
+                        unacceptable_extensions: if listed {
+                            vec!["exe".into()]
+                        } else {
+                            Vec::new()
+                        },
+                        unwanted_extension_action: UnwantedExtensionAction::DeleteFiles,
+                        ..PostProcessingSettings::default()
+                    }))
+                } else {
+                    Err("database is locked".into())
+                }
+            })
+        };
+        let mut job = Job::new(PLENTY);
+        job.writer = job
+            .writer
+            .capped(Caps::new(Arc::new(reserve_limits(0)), read, Vec::new()));
+        job.tree.never_open(job.writer.never_opens());
+
+        let mut bytes = SIGNATURE.to_vec();
+        bytes.extend_from_slice(b"hello");
+        let setup = job.member("setup.exe", Some(bytes.len() as u64));
+        job.send(setup, 0, &bytes, Provenance::Fresh);
+        job.close(setup);
+        assert!(
+            job.tree.child_of(NodeId::ROOT, setup).is_none(),
+            "listed: {listed}"
+        );
+        assert!(
+            job.tree.is_undecided(NodeId::ROOT, setup),
+            "listed: {listed}"
+        );
+        assert_eq!(job.file("setup.exe"), bytes, "listed: {listed}");
+
+        // Still unread: asking again opens nothing.
+        assert!(job.writer.learn_policy().is_err());
+        let mut build = job.build();
+        job.writer
+            .rule_known(&mut job.tree, &mut build, &Source, &mut job.out)
+            .expect("nothing to ask");
+        assert!(
+            job.tree.child_of(NodeId::ROOT, setup).is_none(),
+            "listed: {listed}"
+        );
+
+        readable.store(true, Ordering::SeqCst);
+        assert_eq!(job.writer.learn_policy(), Ok(()));
+        let mut build = job.build();
+        job.writer
+            .rule_known(&mut job.tree, &mut build, &Source, &mut job.out)
+            .expect("asked again");
+        assert!(job.writer.refusal().is_none(), "listed: {listed}");
+        if listed {
+            assert!(job.tree.child_of(NodeId::ROOT, setup).is_none());
+            assert!(!job.tree.is_undecided(NodeId::ROOT, setup));
+            assert_eq!(job.file("setup.exe"), bytes);
+        } else {
+            assert!(job.tree.child_of(NodeId::ROOT, setup).is_some());
+            assert_eq!(job.file("inner.bin")[..5], *b"hello");
+        }
+    }
 }
 
 const MIB: u64 = 1024 * 1024;

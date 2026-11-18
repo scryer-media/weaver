@@ -85,6 +85,10 @@ pub(in crate::pipeline::tests) enum Down<'a> {
     // As a crash, once the object over the first root member that has one
     // refused it for its holds, as an older build's did.
     RefusingForHolds,
+    // As a crash, once, the first time the job holds a volume lifted out of
+    // its namespace and is not finished: between a lift and the read of the
+    // set the volume rose to. Only there, not after articles.
+    Lifting,
 }
 
 // As `run_restarting`, going down as `down` says and only after the articles
@@ -113,7 +117,22 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
     let mut quiet = 0;
     let mut graph = GraphView::default();
     let mut reads = 0;
+    let mut lifting = down == Down::Lifting;
     loop {
+        // Down between a lift and the read of the set it rose to, once.
+        if lifting
+            && !finished(&pipeline)
+            && pipeline
+                .graph_jobs
+                .get(&JOB)
+                .is_some_and(|job| job.tree().lifts() > 0)
+        {
+            lifting = false;
+            pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut *inspect).await;
+            crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
+            in_memory.extend(owed.iter().copied());
+            restarts += 1;
+        }
         while let Some(work) = next_work(&mut pipeline, scenario) {
             let article = (
                 work.segment_id.file_id.file_index,
@@ -145,7 +164,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
             // fetches again comes back before the next one, so the run moves.
             // A live run is no reason to wait: the checkpoint describes what
             // is on disk, never how far a run has read.
-            if first && at(requests.len()) {
+            if first && down != Down::Lifting && at(requests.len()) {
                 if down == Down::RefusingForHolds {
                     pipeline
                         .graph_jobs

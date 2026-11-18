@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::{
     PostProcessingFacts, PostProcessingResume, PostProcessingSettings, PostProcessingSummary,
-    ScriptResult, StartedScript,
+    ScriptResult, StartedScript, UnwantedExtensionAction,
 };
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_engine};
 use crate::persistence::{Database, StateError};
@@ -207,6 +207,8 @@ impl Database {
                 if preserve_extensions {
                     settings.unacceptable_extensions = stored.unacceptable_extensions.clone();
                 }
+                // The action is saved on its own, never with the rest.
+                settings.unwanted_extension_action = stored.unwanted_extension_action;
                 settings
             },
         )
@@ -222,6 +224,20 @@ impl Database {
         self.merge_post_processing_settings("save_unacceptable_extensions", move |stored| {
             PostProcessingSettings {
                 unacceptable_extensions: extensions.clone(),
+                ..stored.clone()
+            }
+        })
+    }
+
+    // Replace what a job holding an unwanted extension comes to and keep
+    // every other setting as stored, in the read's transaction.
+    pub fn save_unwanted_extension_action(
+        &self,
+        action: UnwantedExtensionAction,
+    ) -> Result<PostProcessingSettings, StateError> {
+        self.merge_post_processing_settings("save_unwanted_extension_action", move |stored| {
+            PostProcessingSettings {
+                unwanted_extension_action: action,
                 ..stored.clone()
             }
         })
@@ -860,6 +876,114 @@ mod tests {
                 .unwrap()
                 .unacceptable_extensions
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_unwanted_extension_action_is_fail_job_until_one_is_saved() {
+        let db = Database::open_in_memory().unwrap();
+        // Nothing stored at all.
+        assert_eq!(
+            db.post_processing_settings()
+                .unwrap()
+                .unwanted_extension_action,
+            UnwantedExtensionAction::FailJob
+        );
+        // Stored before the action existed.
+        db.set_setting(
+            SETTINGS_KEY,
+            r#"{"executionEnabled":false,"concurrency":2,"terminationGraceSeconds":10,"pythonInterpreter":null,"powershellInterpreter":null,"batchInterpreter":null,"unacceptableExtensions":["exe"]}"#,
+        )
+        .unwrap();
+        let settings = db.post_processing_settings().unwrap();
+        assert_eq!(
+            settings.unwanted_extension_action,
+            UnwantedExtensionAction::FailJob
+        );
+        assert_eq!(settings.unacceptable_extensions, vec!["exe"]);
+    }
+
+    #[test]
+    fn only_the_delete_action_removes_a_listed_name() {
+        let fail = PostProcessingSettings {
+            unacceptable_extensions: vec!["exe".into()],
+            ..PostProcessingSettings::default()
+        };
+        let delete = PostProcessingSettings {
+            unwanted_extension_action: UnwantedExtensionAction::DeleteFiles,
+            ..fail.clone()
+        };
+        assert!(!fail.removes("setup.exe"));
+        assert!(delete.removes("dir/SETUP.EXE"));
+        assert!(!delete.removes("movie.mkv"));
+        let off = PostProcessingSettings {
+            unacceptable_extensions: Vec::new(),
+            ..delete.clone()
+        };
+        assert!(!off.removes("setup.exe"));
+    }
+
+    #[test]
+    fn the_removed_reason_names_each_file_once_in_order() {
+        use crate::post_processing::model::unwanted_files_removed_reason;
+        assert_eq!(unwanted_files_removed_reason(&[]), None);
+        assert_eq!(
+            unwanted_files_removed_reason(&[
+                "b\\setup.exe".into(),
+                "a.scr".into(),
+                "b/setup.exe".into(),
+            ])
+            .as_deref(),
+            Some("removed for an unwanted extension: a.scr, b/setup.exe")
+        );
+        let many: Vec<String> = (0..25).map(|n| format!("f{n:02}.exe")).collect();
+        let reason = unwanted_files_removed_reason(&many).unwrap();
+        assert!(reason.ends_with("f19.exe, and 5 more"), "{reason}");
+    }
+
+    #[test]
+    fn saving_the_unwanted_extension_action_keeps_every_other_setting() {
+        let db = Database::open_in_memory().unwrap();
+        let settings = PostProcessingSettings {
+            concurrency: 3,
+            unacceptable_extensions: vec!["exe".into()],
+            ..PostProcessingSettings::default()
+        };
+        db.save_post_processing_settings(&settings).unwrap();
+
+        let saved = db
+            .save_unwanted_extension_action(UnwantedExtensionAction::DeleteFiles)
+            .unwrap();
+        assert_eq!(
+            saved.unwanted_extension_action,
+            UnwantedExtensionAction::DeleteFiles
+        );
+        let stored = db.post_processing_settings().unwrap();
+        assert_eq!(
+            stored.unwanted_extension_action,
+            UnwantedExtensionAction::DeleteFiles
+        );
+        assert_eq!(stored.concurrency, 3);
+        assert_eq!(stored.unacceptable_extensions, vec!["exe"]);
+        assert!(
+            db.get_setting(SETTINGS_KEY)
+                .unwrap()
+                .unwrap()
+                .contains(r#""unwantedExtensionAction":"delete_files""#)
+        );
+
+        // The script settings save and the list save keep the action.
+        db.save_post_processing_settings_preserving_extensions(
+            PostProcessingSettings::default(),
+            false,
+        )
+        .unwrap();
+        db.save_unacceptable_extensions(vec!["iso".into()]).unwrap();
+        assert_eq!(
+            db.post_processing_settings()
+                .unwrap()
+                .unwanted_extension_action,
+            UnwantedExtensionAction::DeleteFiles
         );
     }
 

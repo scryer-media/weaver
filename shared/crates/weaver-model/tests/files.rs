@@ -718,6 +718,52 @@ fn split_files() {
     );
 }
 
+// The names a split piece is told by. The same table pins `split_piece` in
+// `engines/weaver-graph/src/sniff.rs`; the two rules must agree, and a
+// change to one changes both tables.
+const SPLIT_PIECE_NAMES: &[(&str, bool)] = &[
+    ("a.001", true),
+    ("a.mkv.001", true),
+    ("a.mkv.002", true),
+    ("a.mkv.0001", true),
+    ("a.mkv.1000", true),
+    ("[71ECB6A7].mkv.001_", true),
+    ("a.mkv.002\"", true),
+    ("a.mkv.003.", true),
+    ("a.mkv.004 ", true),
+    ("a.mkv.01", false),
+    ("a.mkv.1", false),
+    ("c0ffee.99", false),
+    ("Release%211.4.0", false),
+    (".001", false),
+    ("a.mkv.00a", false),
+    ("a.001.mkv", false),
+    ("a.mkv", false),
+];
+
+#[test]
+fn split_pieces_follow_the_graph_rule() {
+    for &(name, piece) in SPLIT_PIECE_NAMES {
+        assert_eq!(
+            matches!(FileRole::from_filename(name), FileRole::SplitFile { .. }),
+            piece,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        FileRole::from_filename("a.mkv.1000"),
+        FileRole::SplitFile { number: 999 }
+    );
+    assert_eq!(
+        FileRole::from_filename("[71ECB6A7].mkv.001_"),
+        FileRole::SplitFile { number: 0 }
+    );
+    // A number past `u32` is still a piece, sorted last.
+    let huge = FileRole::from_filename("a.mkv.99999999999");
+    assert_eq!(huge, FileRole::SplitFile { number: u32::MAX });
+    assert_eq!(huge.download_priority(), u32::MAX);
+}
+
 #[test]
 fn archive_base_name_zip() {
     assert_eq!(

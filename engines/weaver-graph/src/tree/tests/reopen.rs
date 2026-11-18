@@ -50,7 +50,7 @@ impl Object for Based {
             self.base = name.strip_suffix(".rar").map(str::to_owned);
         }
     }
-    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, _: crate::object::Clean<'_>, _: Option<u64>) -> Claim {
         let Some((base, extension)) = name.rsplit_once('.') else {
             return Claim::default();
         };
@@ -175,7 +175,7 @@ impl Object for Handing {
     fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], length: Option<u64>) {
         self.0.bound(volume, name, front, length);
     }
-    fn claim(&mut self, name: &str, front: &[u8], length: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, front: crate::object::Clean<'_>, length: Option<u64>) -> Claim {
         self.0.claim(name, front, length)
     }
     fn engine_volume(&self, volume: VolumeIndex) -> Option<Carried> {

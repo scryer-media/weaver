@@ -515,6 +515,24 @@ impl RarStore {
             .collect();
     }
 
+    // The volumes held say others exist that the store was never given: the
+    // first is missing, a number between two held is missing, or the last
+    // held one's end record says a volume follows it, or its last file
+    // header says the file goes on in the next.
+    fn scattered(&self) -> bool {
+        let held: Vec<(&VolumeIndex, &Volume)> = self
+            .volumes
+            .iter()
+            .filter(|(_, volume)| volume.name.is_some())
+            .collect();
+        let Some((last, volume)) = held.last() else {
+            return false;
+        };
+        held.len() as u64 != u64::from(last.0) + 1
+            || volume.walk.successor() == Some(true)
+            || volume.walk.continues()
+    }
+
     fn give_up(&mut self, emit: Emit, out: &mut Vec<Emit>) {
         self.gone = true;
         out.push(emit);
@@ -933,8 +951,10 @@ impl Object for RarStore {
         self.give_up(Emit::Refuse(why), out);
     }
 
-    // Nothing more will arrive. A set whose first volume never came has
-    // lost its first bytes: no header says what any volume after it holds.
+    // Nothing more will arrive. A set below the root whose volumes say
+    // others exist, none of them beside it, gives its volumes up to be
+    // lifted to the namespace above (`Why::Scattered`). A set whose first
+    // volume never came has lost its first bytes: no header says what any volume after it holds.
     // Otherwise a member still damaged, a password still asked for, or a
     // member named and never placed leaves the set unread. A repair that
     // rewrote bytes a candidate was condemned over first has every candidate
@@ -944,6 +964,10 @@ impl Object for RarStore {
         if std::mem::take(&mut self.rewritten) {
             self.acquit(out);
             self.settle(None, out);
+            return;
+        }
+        if standing.liftable() && self.scattered() {
+            self.give_up(Emit::Refuse(Why::Scattered), out);
             return;
         }
         let first = self.volumes.get(&VolumeIndex(0));
@@ -1087,7 +1111,8 @@ impl Object for RarStore {
 
     // The place the volume's headers or name give it, held or not: whether
     // it takes it is the tree's to judge.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
+        let first_bytes = clean.front();
         self.claim_volume(name, first_bytes)
     }
 

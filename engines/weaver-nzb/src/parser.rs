@@ -2229,6 +2229,33 @@ mod tests {
         assert_eq!(nzb.files[0].filename(), Some("show.rar"));
     }
 
+    // `&quot;` in the XML is a quote mark once parsed, and an unpaired one
+    // is no part of the name, by either naming call.
+    #[test]
+    fn an_unpaired_escaped_quote_is_no_part_of_the_name() {
+        let nzb = parse_nzb(&one_file(
+            "Show.S01E01.[71ECB6A7].mkv.001&quot; yEnc (1/50)",
+        ))
+        .unwrap();
+        let file = &nzb.files[0];
+        assert_eq!(file.subject, "Show.S01E01.[71ECB6A7].mkv.001\" yEnc (1/50)");
+        assert_eq!(file.filename(), Some("Show.S01E01.[71ECB6A7].mkv.001"));
+        assert_eq!(
+            file.extract_filename(),
+            Some(("Show.S01E01.[71ECB6A7].mkv.001".to_string(), 0.5))
+        );
+    }
+
+    // An escape escaped twice parses to the text `&quot;`, which is not a
+    // quote mark and stays in the word, as NZBGet's last-word rule keeps it.
+    #[test]
+    fn a_twice_escaped_quote_is_text() {
+        let nzb = parse_nzb(&one_file("&amp;quot;show.rar&amp;quot; yEnc (1/1)")).unwrap();
+        let file = &nzb.files[0];
+        assert_eq!(file.subject, "&quot;show.rar&quot; yEnc (1/1)");
+        assert_eq!(file.filename(), Some("&quot;show.rar&quot;"));
+    }
+
     #[test]
     fn xml_entities_in_a_subject_stay_the_xml_ones() {
         let nzb = parse_nzb(&one_file("a &amp; b &lt;&gt;&apos;&#65; yEnc (1/1)")).unwrap();

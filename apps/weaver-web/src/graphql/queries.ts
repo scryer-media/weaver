@@ -3167,11 +3167,15 @@ export const UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION = gql`
   }
 `;
 
-/** The unwanted extension list, which General edits apart from the script settings it is stored with. */
+/**
+ * The unwanted extension list and what a download holding one comes to,
+ * which General edits apart from the script settings they are stored with.
+ */
 export const UNACCEPTABLE_EXTENSIONS_QUERY = gql`
   query UnacceptableExtensions {
     postProcessingSettings {
       unacceptableExtensions
+      unwantedExtensionAction
     }
   }
 `;
@@ -3179,6 +3183,12 @@ export const UNACCEPTABLE_EXTENSIONS_QUERY = gql`
 export const SET_UNACCEPTABLE_EXTENSIONS_MUTATION = gql`
   mutation SetUnacceptableExtensions($extensions: [String!]!) {
     setUnacceptableExtensions(extensions: $extensions)
+  }
+`;
+
+export const SET_UNWANTED_EXTENSION_ACTION_MUTATION = gql`
+  mutation SetUnwantedExtensionAction($action: UnwantedExtensionAction!) {
+    setUnwantedExtensionAction(action: $action)
   }
 `;
 
