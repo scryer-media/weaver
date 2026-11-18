@@ -328,6 +328,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         let why = crate::quiet::damaged(standing)
             .or_else(|| standing.asking().then_some(Why::EncryptedHeader))
+            // My run found bad what proof above found whole: I cannot read
+            // my volumes.
+            .or_else(|| (standing.refuted() && !standing.lost()).then_some(Why::InvalidArchive))
             .or_else(|| {
                 let short = self
                     .bound

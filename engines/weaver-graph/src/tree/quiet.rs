@@ -123,7 +123,7 @@ impl Tree {
     // Every member the namespace came out of, at some depth, holds no
     // damage a recovery object did not prove, and one of them was found
     // whole or made so.
-    fn vouched_above(&self, node: NodeId) -> bool {
+    pub(super) fn vouched_above(&self, node: NodeId) -> bool {
         let mut at = node;
         while let Some((parent, volumes)) = self.volumes(at) {
             let proven = |member: &MemberId| {
@@ -249,6 +249,10 @@ impl Standing for Stood<'_> {
 
     fn asking(&self) -> bool {
         self.tree.nodes.progress(self.node).asking
+    }
+
+    fn refuted(&self) -> bool {
+        self.tree.nodes.progress(self.node).refuted
     }
 
     fn beside(&self) -> Vec<Beside<'_>> {

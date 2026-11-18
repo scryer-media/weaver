@@ -235,6 +235,19 @@ impl GraphJob {
                 }
                 return Ok(());
             }
+            // The error that ended the run, said before what it means: the
+            // log keeps it, named by the archive the run read.
+            Heard::Emit(Emit::Failed(error)) => {
+                tracing::warn!(
+                    job_id = self.runs.scope(),
+                    node = node.0,
+                    kind = %self.tree.kind(node).map(|kind| kind.to_string()).unwrap_or_default(),
+                    archive = %self.archive_name(node),
+                    error = %error,
+                    "extraction failed"
+                );
+                return Ok(());
+            }
             Heard::Emit(emit) => {
                 // A window no folder had room for, asked by a run held to
                 // the ceiling: the job waits for that room as for any full
@@ -507,6 +520,19 @@ impl GraphJob {
             self.runs.start(node, extraction, shelf);
         }
         Ok(Vec::new())
+    }
+
+    // The archive the object at `node` reads, as the namespace it is bound
+    // in names its first volume.
+    fn archive_name(&self, node: NodeId) -> String {
+        self.tree
+            .volumes(node)
+            .and_then(|(parent, volumes)| {
+                let member = volumes.values().next()?;
+                let namespace = self.tree.namespace(parent)?;
+                Some(namespace.get(*member)?.name.clone())
+            })
+            .unwrap_or_default()
     }
 
     // Everything the run built was built on bytes a repair replaced, at a

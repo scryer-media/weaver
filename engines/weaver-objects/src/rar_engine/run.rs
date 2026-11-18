@@ -563,7 +563,32 @@ impl Walk<'_, '_> {
             .open
             .as_ref()
             .map_or((self.reading, self.reading), |open| (open.first, open.last));
-        Stop::Say(verdict(&error, encrypted, first..=last, &self.input))
+        let mut said = vec![Emit::Failed(crate::verdict::failed(&said_of(&error)))];
+        said.extend(verdict(&error, encrypted, first..=last, &self.input));
+        Stop::Say(said)
+    }
+}
+
+// The error as the job's log may show it. unrar-rs names members, offsets
+// and sizes, never a password; an I/O error is the owner's read of a volume
+// or the allocator's, and only its kind is told, or the RAR error it
+// carries.
+fn said_of(error: &RarError) -> String {
+    let carried = |error: &io::Error| {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<RarError>())
+            .map_or_else(|| error.kind().to_string(), said_of)
+    };
+    match error {
+        RarError::Io(error) => format!("I/O error: {}", carried(error)),
+        RarError::WindowAllocatorFailed { bytes, error } => {
+            format!(
+                "window allocator could not supply {bytes} bytes: {}",
+                carried(error)
+            )
+        }
+        error => error.to_string(),
     }
 }
 
