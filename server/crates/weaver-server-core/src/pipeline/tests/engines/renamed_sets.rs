@@ -683,3 +683,112 @@ async fn a_nameless_long_set_renamed_by_par2_is_one_store() {
         }
     }
 }
+
+// A pack posted as one stem's `partNN` and then `partNNN`, every archive
+// of it a set of its own, with no PAR2 set to rename them: sets of twelve,
+// eight and two volumes and whole archives of one, as a real pack of clips
+// posts them, in the order its posts came in. Every article's yEnc header
+// names its file by its own set, `<stem> (N).partM.rar`, and the posted
+// numbering places nothing once the header names found the sets again: the
+// second volume of a set of two is no store's first lost, and every clip is
+// delivered whole, whether the posts are taken in one by one or together.
+#[tokio::test]
+async fn a_pack_posted_under_one_stem_is_set_apart_by_its_header_names() {
+    const STEM: &str = "494949c9892d64daac5664541a4cdd5af912";
+    // (first posted number, volumes) of each set; a set of one is a whole
+    // archive.
+    let sets: &[(usize, usize)] = &[
+        (1, 1),
+        (2, 8),
+        (10, 2),
+        (12, 1),
+        (13, 2),
+        (15, 2),
+        (17, 1),
+        (18, 1),
+        (19, 1),
+        (20, 1),
+        (21, 12),
+        (33, 2),
+        (35, 1),
+        (36, 1),
+        (37, 1),
+        (38, 1),
+        (39, 1),
+        (40, 1),
+        (41, 1),
+        (42, 1),
+        (43, 1),
+        (44, 1),
+        (45, 1),
+        (46, 1),
+        (47, 1),
+        (48, 1),
+    ];
+    let mut by_number: std::collections::BTreeMap<usize, (String, Vec<u8>)> = Default::default();
+    let mut clips = Vec::new();
+    for (index, (first, volumes)) in sets.iter().enumerate() {
+        let name = format!("clip{index:02}.mp4");
+        let body = payload(volumes * 3 * FRAME + 11 * index + 1, index as u8 + 3);
+        let set = match *volumes {
+            1 => vec![(format!("{STEM} ({index}).rar"), whole_archive(&name, &body))],
+            _ => multi_member_store_set(&[(name.as_str(), body.clone())], *volumes)
+                .into_iter()
+                .enumerate()
+                .map(|(at, (_, bytes))| {
+                    let part = match *volumes >= 10 {
+                        true => format!("{:02}", at + 1),
+                        false => format!("{}", at + 1),
+                    };
+                    (format!("{STEM} ({index}).part{part}.rar"), bytes)
+                })
+                .collect(),
+        };
+        for (at, volume) in set.into_iter().enumerate() {
+            by_number.insert(first + at, volume);
+        }
+        clips.push((name, body));
+    }
+    let posted = |number: usize| match number < 10 {
+        true => format!("Karla.Pack.XXX-U4A.part{number:02}.rar"),
+        false => format!("Karla.Pack.XXX-U4A.part{number:03}.rar"),
+    };
+    let arrival = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 41, 21, 42, 43, 44,
+        45, 22, 46, 47, 48, 23, 24, 31, 25, 32, 26, 33, 27, 34, 28, 35, 29, 30, 36, 37, 38, 39, 40,
+    ];
+    for together in [false, true] {
+        let posts = arrival
+            .iter()
+            .map(|number| Post::plain(&posted(*number), by_number[number].1.clone()))
+            .collect();
+        let mut scenario = Scenario::new(posts).framed(FRAME);
+        for (file, number) in arrival.iter().enumerate() {
+            scenario = scenario.header(file as u32, &by_number[number].0);
+        }
+        let all: Vec<u32> = (0..arrival.len() as u32).collect();
+        let scenario = match together {
+            true => scenario.together(&all),
+            false => scenario,
+        };
+        let graph = run(&scenario).await;
+        for (name, body) in &clips {
+            assert!(
+                graph.files.get(&delivered(name)).map(Vec::as_slice) == Some(body.as_slice()),
+                "together={together}: {name} delivered whole; delivered {:?}",
+                graph.files.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            graph.graph().delivery.withheld.is_empty(),
+            "together={together}: {:?}",
+            graph.graph().delivery.withheld
+        );
+        assert!(
+            graph.completed(),
+            "together={together}: {:?} {:?}",
+            graph.status,
+            graph.failure
+        );
+    }
+}

@@ -108,6 +108,11 @@ impl GraphJob {
         &self.passwords.candidates
     }
 
+    // Whether the job has a password to offer an object that asks.
+    pub(crate) fn has_passwords(&self) -> bool {
+        !self.passwords.candidates.is_empty()
+    }
+
     // The candidate that opened an object: the one last offered to a node
     // that named its members under it and withheld none of its volumes for
     // want of a password. Read once the job is settled, when no object is
