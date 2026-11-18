@@ -160,6 +160,16 @@ pub struct RarRecovery {
     // early.
     #[serde(skip)]
     refused_bound: u64,
+    // The sets of the namespace, by stem, that a ruling of a set bound by
+    // its table alone could not prove, each with the volumes of it that were
+    // whole then: none had the CRC32 the table gives. The set is passed over
+    // until a volume of it is whole that is not among these. It records
+    // what the evidence said, not a verdict: no more than the namespace's
+    // members, and kept, so a restart passes over the same sets. Last, and
+    // empty when absent: a set kept before it restores having passed over
+    // none, as it had.
+    #[serde(default)]
+    passed: BTreeMap<String, BTreeSet<MemberId>>,
 }
 
 // The verdict a repair reached, or that it came up short of recovery
@@ -183,7 +193,9 @@ impl Durable for RarRecovery {
     // 3: the members the parent refused a range of.
     // 4: a ruling kept with the volumes it found whole by their checksums.
     // 5: the articles' CRC32s folded per volume; a ruling keeps every
-    //    volume it judged, whole or not.
+    //    volume it judged, whole or not. Since: the sets a table bound and
+    //    could not prove, with their volumes whole then, last and defaulted,
+    //    so a set kept before restores.
     const VERSION: u16 = 5;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
@@ -209,6 +221,7 @@ impl RarRecovery {
             last: None,
             refused: BTreeSet::new(),
             refused_bound: 0,
+            passed: BTreeMap::new(),
         }
     }
 
@@ -280,13 +293,20 @@ impl RarRecovery {
     // the one set of named volumes in the namespace every volume of which
     // the table gives a place, none of them at a size other than the one it
     // gives there, and at least one at that size. Sizes are what any set
-    // cut alike shares, so they only bind it: a ruling proves it
-    // (`proved`). Two sets that fit alike leave the volumes bound to
-    // neither. A RAR3 footer has no table, and binds none.
+    // cut alike shares, so they only bind it: a ruling proves it by the
+    // CRC32s the table gives (`proved`). A set the volumes are bound to and
+    // proved by stays bound. Of the others that fit, the first is bound that
+    // no ruling has passed over, or that has a whole volume more than when
+    // one did (`passed`): a ruling that could not prove a set passes over it
+    // only for the volumes then whole, so the next fitting set is tried, and
+    // a set whose volumes come whole later, by another recovery or a late
+    // article, is tried again on them. Once no fitting set is left to try,
+    // the volumes bind none. A RAR3 footer has no table, and binds none.
     fn described(&self, namespace: &Namespace) -> Option<String> {
         let table = self.header().and_then(Header::table)?;
-        // Per set: whether every volume fits, and whether one is sized.
-        let mut sets: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+        // Per set: whether every volume fits, whether one is sized, and
+        // whether one is whole that no ruling passing over the set saw.
+        let mut sets: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
         for member in namespace
             .members()
             .filter(|member| member.bound_to != Some(self.id))
@@ -295,22 +315,42 @@ impl RarRecovery {
                 continue;
             };
             let size = table.sizes.get(volume.index() as usize);
-            let set = sets
-                .entry(volume.stem().to_owned())
-                .or_insert((true, false));
+            let stem = volume.stem();
+            let set = sets.entry(stem.to_owned()).or_insert((true, false, false));
             match (size, member.length) {
                 (None, _) => set.0 = false,
                 (Some(size), Some(length)) if *size != length => set.0 = false,
                 (Some(_), Some(_)) => set.1 = true,
                 (Some(_), None) => {}
             }
+            if member.is_whole()
+                && !self
+                    .passed
+                    .get(stem)
+                    .is_some_and(|seen| seen.contains(&member.id))
+            {
+                set.2 = true;
+            }
         }
-        let mut fitting = sets
-            .into_iter()
-            .filter(|(_, (fits, sized))| *fits && *sized)
-            .map(|(stem, _)| stem);
-        let stem = fitting.next()?;
-        fitting.next().is_none().then_some(stem)
+        let fitting = |stem: &str| sets.get(stem).is_some_and(|set| set.0 && set.1);
+        if let Some(stem) = self.bound_stem()
+            && fitting(&stem)
+            && self.proved(self.judged())
+        {
+            return Some(stem);
+        }
+        sets.iter()
+            .filter(|(stem, (fits, sized, fresh))| {
+                *fits && *sized && (*fresh || !self.passed.contains_key(*stem))
+            })
+            .map(|(stem, _)| stem.clone())
+            .next()
+    }
+
+    // The set the volumes bound are of, by the set's naming.
+    fn bound_stem(&self) -> Option<String> {
+        let reference = naming::parse(self.reference.as_deref()?)?;
+        Some(reference.stem().to_owned())
     }
 
     // Whether the volumes bound are the set the recovery volumes rebuild.
@@ -813,6 +853,15 @@ impl Recovery for RarRecovery {
         if bound != self.bound || (whole != self.whole && !acknowledged_growth) {
             self.last = None;
         }
+        // A volume no longer bound is fed nothing while it is not, so what
+        // the grid holds of it would speak for bytes since replaced, a
+        // repair's among them: it is forgotten, and a later bind folds it
+        // from what is replayed then, reading back the rest.
+        for member in self.bound.values() {
+            if !bound.values().any(|kept| kept == member) {
+                self.grid.forget(*member);
+            }
+        }
         self.reference = names.values().next().cloned();
         self.refused_bound = names
             .keys()
@@ -964,6 +1013,20 @@ impl Recovery for RarRecovery {
             return short;
         }
         let (outcome, judged) = self.rule(access);
+        // A set its table bound that the ruling could not prove is passed
+        // over, on the volumes whole now, for the next the table fits.
+        if self.stem.is_none()
+            && !self.bound.is_empty()
+            && !self.proved(&judged)
+            && let Some(stem) = self.bound_stem()
+        {
+            let whole = self
+                .whole
+                .iter()
+                .filter_map(|index| self.bound.get(index).copied())
+                .collect();
+            self.passed.insert(stem, whole);
+        }
         let ruling = match outcome {
             RepairOutcome::Waiting => Ruling::Short {
                 needed: self.missing(&judged),
