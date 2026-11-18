@@ -326,3 +326,70 @@ fn two_volumes_numbered_far_out_say_no_gap_for_every_number_before_them() {
         }
     )));
 }
+
+// A six-volume set posted under a release's `part01` to `part06`, its true
+// last volume as `part05` and its true fifth as `part06`, each renamed by
+// a recovery set to its true one-digit `<stem>.partN.rar` as soon as its
+// front is bound, as the bench post's PAR2 volumes renamed them. Fronts
+// come in posted order, the rest of each volume after. Every volume is one
+// store's, at its true place.
+#[test]
+fn a_set_renamed_from_swapped_posted_numbers_is_one_store() {
+    for (version, whole) in [
+        (Version::Rar4, false),
+        (Version::Rar5, false),
+        (Version::Rar4, true),
+        (Version::Rar5, true),
+    ] {
+        let mut options = super::split(version);
+        options.split = Some(10_000);
+        let set = write(&[Item::File("track.flac", payload(9, 57_000))], &options);
+        assert_eq!(set.len(), 6, "{version:?}");
+        let mut run = Run::new();
+        // Posted number, true volume.
+        let posted = [(1, 0), (2, 1), (3, 2), (4, 3), (5, 5), (6, 4)];
+        // The job lists every file before any byte arrives.
+        let mut members = [MemberId(0); 6];
+        for (number, volume) in posted {
+            members[volume] =
+                run.announce(&format!("Release.part{number:02}.rar"), set[volume].len());
+        }
+        let rest = |run: &mut Run, volume: usize| {
+            let at = front(&set[volume]).len();
+            run.deliver(members[volume], at, &set[volume][at..]);
+            run.close(members[volume]);
+        };
+        for (_, volume) in posted {
+            let member = members[volume];
+            run.deliver(member, 0, front(&set[volume]));
+            run.tree.rename(
+                NodeId::ROOT,
+                member,
+                &format!("5Kw2CyRs.part{}.rar", volume + 1),
+                &mut Objects::default(),
+                &mut run.effects,
+            );
+            run.hand_over();
+            if whole {
+                rest(&mut run, volume);
+            }
+        }
+        if !whole {
+            for (_, volume) in posted {
+                rest(&mut run, volume);
+            }
+        }
+        let places: Vec<_> = members
+            .iter()
+            .map(|member| run.tree.child_of(NodeId::ROOT, *member))
+            .collect();
+        let store = places[0].map(|(node, _)| node);
+        for (volume, place) in places.iter().enumerate() {
+            assert_eq!(
+                *place,
+                store.map(|node| (node, VolumeIndex(volume as u32))),
+                "{version:?} whole {whole} volume {volume}: {places:?}"
+            );
+        }
+    }
+}

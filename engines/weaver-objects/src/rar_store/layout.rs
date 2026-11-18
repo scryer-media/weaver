@@ -95,6 +95,23 @@ fn lays(index: VolumeIndex, found: &Volume) -> Option<(&RarVolumeFacts, bool)> {
     Some((facts, found.walk.ended && !found.walk.is_last()))
 }
 
+// Whether a volume is held where it is on trust: its headers state no
+// position, so only its name or its links put it there.
+fn on_trust(found: &Volume) -> bool {
+    found
+        .stated()
+        .is_none_or(|facts| !claim::states_position(facts))
+}
+
+// Whether a member's parts do not join into one member: what the volumes
+// laid say of it, in the places they are laid, disagrees.
+fn misjoined(member: &StoredMember) -> bool {
+    matches!(
+        member.eligibility,
+        MemberEligibility::Ineligible(IneligibilityReason::MalformedChain(_))
+    )
+}
+
 // A layout and, for each volume it holds, the facts it took it on: their
 // stamp and how many members they list.
 pub(super) struct Laid {
@@ -275,7 +292,7 @@ impl RarStore {
             Laid::new(format)
         });
         let from = laid(&layout);
-        let end = match reach(&self.volumes, &layout, from) {
+        let mut end = match reach(&self.volumes, &layout, from) {
             Ok(end) => end,
             Err(emit) => {
                 if !afresh {
@@ -288,8 +305,25 @@ impl RarStore {
         for (index, found) in self.volumes.range(VolumeIndex(from)..VolumeIndex(end)) {
             if !layout.add(index.0, &found.walk) {
                 refusal = Some(Emit::Refuse(Why::Unsupported));
+                end = index.0 + 1;
                 break;
             }
+        }
+        // A volume only its name or its links hold where it is, its headers
+        // stating no number, as a RAR4 volume's do short of a numbered end
+        // record, is held there on trust. A layout that cannot take it there
+        // refutes that place, not the set: the layout stops before it, and
+        // the volume waits for its own headers or a new name to place it.
+        while end > from
+            && self
+                .volumes
+                .get(&VolumeIndex(end - 1))
+                .is_some_and(on_trust)
+            && (refusal.is_some() || layout.members().iter().any(misjoined))
+        {
+            end -= 1;
+            refusal = None;
+            layout = self.laid_afresh(format, end);
         }
         let members = layout.members();
         // An entry stands until the layout lists something else for it. A
