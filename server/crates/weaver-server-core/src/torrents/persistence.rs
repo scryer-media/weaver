@@ -142,10 +142,6 @@ async fn insert_trackers(
     Ok(())
 }
 
-// One column of each torrent `rows` names, each row its id and the value,
-// as `UPDATE ... CASE` statements of as many rows as their binds allow.
-// A torrent named twice takes the value named last, as one statement per
-// row in turn left it.
 /// A batch of torrents' own settings, by column: each column is written
 /// for the torrents it lists and no other (`Database::set_torrent_settings`).
 #[derive(Debug, Default)]
@@ -158,6 +154,10 @@ pub(crate) struct TorrentSettingRows {
     pub(crate) policy_override: Vec<(JobId, Option<SeedingPolicy>)>,
 }
 
+// One column of each torrent `rows` names, each row its id and the value,
+// as `UPDATE ... CASE` statements of as many rows as their binds allow.
+// A torrent named twice takes the value named last, as one statement per
+// row in turn left it.
 pub(crate) async fn update_column_tx(
     tx: &mut SqlTx<'_>,
     column: &str,
