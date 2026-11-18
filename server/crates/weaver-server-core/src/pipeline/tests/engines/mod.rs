@@ -103,6 +103,7 @@ mod lines;
 pub(in crate::pipeline) mod loans;
 mod lost_fronts;
 mod lost_index;
+mod nameless_recovery;
 mod nested_engine_fault;
 mod nesting;
 mod pairings;
