@@ -471,6 +471,14 @@ impl Recovery for Par {
         true
     }
 
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        self.seen.lock().unwrap().par3
+    }
+
     fn bind(&mut self, namespace: &mut weaver_graph::Namespace, renamed: &mut Vec<MemberId>) {
         let covered = (self.volume, self.others.clone());
         self.volume = namespace.find_by_name("set.par2").map(|own| own.id);

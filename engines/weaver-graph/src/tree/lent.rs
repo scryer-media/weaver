@@ -30,8 +30,9 @@ pub(super) struct Lent {
     covers: Vec<MemberId>,
     // Its `Recovery::precedence` when it left.
     precedence: u8,
-    // Its `Recovery::rebuilds` when it left.
+    // Its `Recovery::rebuilds` and `Recovery::carried_inside` when it left.
     rebuilds: bool,
+    carried_inside: bool,
     waiting: Vec<Waiting>,
     // Members that could not be asked whether they are its volumes, in the
     // order they asked.
@@ -118,7 +119,11 @@ impl Tree {
     // node holds no recovery object.
     pub fn lend(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
         let recovery = self.recovery(node)?;
-        let (precedence, rebuilds) = (recovery.precedence(), recovery.rebuilds());
+        let (precedence, rebuilds, carried_inside) = (
+            recovery.precedence(),
+            recovery.rebuilds(),
+            recovery.carried_inside(),
+        );
         let covers = self
             .consult_recovery(node, |recovery, namespace| {
                 namespace
@@ -136,6 +141,7 @@ impl Tree {
             covers,
             precedence,
             rebuilds,
+            carried_inside,
             waiting: Vec::new(),
             queued: Vec::new(),
             work: false,
@@ -184,9 +190,14 @@ impl Tree {
 
     // Out of its node as if for its work, whatever it holds.
     fn lend_out(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
-        let (precedence, rebuilds) = self.recovery(node).map_or((0, false), |recovery| {
-            (recovery.precedence(), recovery.rebuilds())
-        });
+        let (precedence, rebuilds, carried_inside) =
+            self.recovery(node).map_or((0, false, false), |recovery| {
+                (
+                    recovery.precedence(),
+                    recovery.rebuilds(),
+                    recovery.carried_inside(),
+                )
+            });
         let found = self.nodes.get_mut(&node)?;
         let object = found.object.take()?;
         found.lent = Some(Lent {
@@ -195,6 +206,7 @@ impl Tree {
             covers: Vec::new(),
             precedence,
             rebuilds,
+            carried_inside,
             waiting: Vec::new(),
             queued: Vec::new(),
             work: true,
@@ -248,6 +260,20 @@ impl Tree {
                 .get(&node)
                 .and_then(|found| found.lent.as_ref())
                 .is_some_and(|lent| !lent.work && lent.rebuilds),
+        }
+    }
+
+    // Whether the object at `node` is a recovery object carried inside the
+    // one member it covers (`Recovery::carried_inside`), as it left when it
+    // is out for a repair. Wherever `recovers` answers no, so does this.
+    pub fn carried_inside(&self, node: NodeId) -> bool {
+        match self.recovery(node) {
+            Some(recovery) => recovery.carried_inside(),
+            None => self
+                .nodes
+                .get(&node)
+                .and_then(|found| found.lent.as_ref())
+                .is_some_and(|lent| !lent.work && lent.carried_inside),
         }
     }
 

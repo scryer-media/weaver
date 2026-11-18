@@ -327,6 +327,15 @@ impl Recovery for RarRecord {
         true
     }
 
+    // It sits inside the volume it protects, and protects that volume only.
+    fn carried_inside(&self) -> bool {
+        true
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     // The volume the record sits in, by the name it was bound under; once
     // found it stays the member while the namespace holds it, whatever it
     // is called since.
