@@ -726,6 +726,7 @@ const SPLIT_PIECE_NAMES: &[(&str, bool)] = &[
     ("a.mkv.001", true),
     ("a.mkv.002", true),
     ("a.mkv.0001", true),
+    ("a.mkv.00001", true),
     ("a.mkv.1000", true),
     ("[71ECB6A7].mkv.001_", true),
     ("a.mkv.002\"", true),
@@ -740,6 +741,56 @@ const SPLIT_PIECE_NAMES: &[(&str, bool)] = &[
     ("a.001.mkv", false),
     ("a.mkv", false),
 ];
+
+// The posts whose two-digit names are pieces of a set, name by name. The
+// same table pins `split_piece_among` in `engines/weaver-graph/src/sniff.rs`.
+const SHORT_SET_POSTS: &[&[(&str, bool)]] = &[
+    &[("a.mkv.01", true), ("a.mkv.02", true), ("a.mkv.03", true)],
+    &[("a.mkv.00", true), ("a.mkv.01", true)],
+    &[("A.MKV.01", true), ("a.mkv.02_", true), ("a.mkv.07", true)],
+    &[("a.mkv.01", true), ("a.mkv.02", true), ("b.mkv.03", false)],
+    &[("a.mkv.01", false)],
+    &[("notes.10", false)],
+    &[("file.99", false)],
+    &[("Release.1.4.10", false)],
+    &[("notes.10", false), ("notes.11", false)],
+    &[("a.mkv.02", false), ("a.mkv.03", false)],
+    &[("a.mkv.01", false), ("b.mkv.02", false)],
+    &[
+        ("a.mkv.01", false),
+        ("a.mkv.002", true),
+        ("a.mkv.003", true),
+    ],
+    &[("notes.4.0", false), ("notes.4.1", false)],
+];
+
+#[test]
+fn short_split_sets_follow_the_graph_rule() {
+    for post in SHORT_SET_POSTS {
+        let roles = FileRole::of_post(post.iter().map(|(name, _)| Some(*name)));
+        for (&(name, piece), role) in post.iter().zip(&roles) {
+            assert_eq!(
+                matches!(role, FileRole::SplitFile { .. }),
+                piece,
+                "{name} in {post:?}: {role:?}"
+            );
+        }
+    }
+    assert_eq!(
+        FileRole::of_post([Some("a.mkv.01"), Some("a.mkv.02")]),
+        vec![
+            FileRole::SplitFile { number: 0 },
+            FileRole::SplitFile { number: 1 }
+        ]
+    );
+    assert_eq!(
+        FileRole::of_post([Some("a.mkv.00"), Some("a.mkv.01")]),
+        vec![
+            FileRole::SplitFile { number: 0 },
+            FileRole::SplitFile { number: 0 }
+        ]
+    );
+}
 
 #[test]
 fn split_pieces_follow_the_graph_rule() {

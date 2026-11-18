@@ -16,7 +16,8 @@
 // when its name and the signature its bytes open agree, it is delivered
 // whole, never opened. A name whose bytes open any other signature is lying,
 // and the bytes decide. The one name that outranks a signature is a
-// numbered piece's, `name.001` onward,
+// numbered piece's, `name.001` onward, or `name.01` onward of a set posted
+// beside it (`split_piece_among`),
 // whichever piece it is and whatever its bytes open: it founds the split
 // store first, whose pieces join into one file, and that file's own front
 // says what it is. The claim is the name's only until a piece other than
@@ -55,7 +56,14 @@ pub enum Sniff {
     Pending,
 }
 
+// What a member is by its name and its front alone, with no member beside
+// it: a two-digit piece is no piece by itself (`split_piece_among`).
 pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
+    judged(name, first_bytes, length, numbered_piece(name))
+}
+
+// `piece` says whether the name numbers a piece of a split set.
+fn judged(name: &str, first_bytes: &[u8], length: Option<u64>, piece: bool) -> Sniff {
     // A name never outvotes bytes that might still turn out to be a signature.
     // An end file's name and the signature its format is built on, together,
     // say the member is that end file. A numbered piece's name outvotes any
@@ -64,26 +72,29 @@ pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
     // own front refutes the set.
     match signed(first_bytes, length) {
         Sniff::Object(kind) if end_file_built_on(trimmed(name), kind) => Sniff::Leaf,
-        Sniff::Object(_) if numbered_piece(name) => Sniff::Object(Kind::Split),
-        Sniff::Leaf => named(name)
+        Sniff::Object(_) if piece => Sniff::Object(Kind::Split),
+        Sniff::Leaf => named(name, piece)
             .or_else(|| sevenz_by_name(name, first_bytes))
             .map_or(Sniff::Leaf, Sniff::Object),
         verdict => verdict,
     }
 }
 
-// What a member is among the members beside it: what `sniff` says, and an
-// SFV for a member it leaves a leaf whose front reads as a listing, when no
-// member beside it is named a listing or recovery data. A listing named as
-// one is the job's listing, and a recovery set outranks any listing, so a
-// nameless one is looked for only when neither is posted.
+// What a member is among the members beside it: what `sniff` says, with a
+// two-digit piece a piece when the names beside it make it one of a set
+// (`split_piece_among`), and an SFV for a member it leaves a leaf whose
+// front reads as a listing, when no member beside it is named a listing or
+// recovery data. A listing named as one is the job's listing, and a
+// recovery set outranks any listing, so a nameless one is looked for only
+// when neither is posted.
 pub fn sniff_among<'a>(
     name: &str,
     first_bytes: &[u8],
     length: Option<u64>,
-    mut beside: impl Iterator<Item = &'a str>,
+    mut beside: impl Iterator<Item = &'a str> + Clone,
 ) -> Sniff {
-    match sniff(name, first_bytes, length) {
+    let piece = split_piece_among(name, beside.clone());
+    match judged(name, first_bytes, length, piece) {
         Sniff::Leaf
             if listing_by_content(first_bytes, length)
                 && !beside.any(names_listing_or_recovery) =>
@@ -608,12 +619,12 @@ fn trimmed(name: &str) -> &str {
     })
 }
 
-fn named(name: &str) -> Option<Kind> {
+fn named(name: &str, piece: bool) -> Option<Kind> {
     let name = trimmed(name);
     kind_named(name)
         .filter(|(_, claims)| *claims == Claims::ByName)
         .map(|(kind, _)| kind)
-        .or_else(|| numbered_piece(name).then_some(Kind::Split))
+        .or_else(|| piece.then_some(Kind::Split))
 }
 
 // Whether a member's first bytes may still open a PAR2 or PAR3 volume:
@@ -651,14 +662,18 @@ pub fn names_recovery(name: &str) -> bool {
 // blocks, as RAR's `.rev` does. A PAR2 or PAR3 volume names no set it can
 // found: its index does.
 pub fn recovery_by_name(name: &str) -> Option<Kind> {
-    names_recovery(name).then(|| named(name)).flatten()
+    names_recovery(name)
+        .then(|| named(name, numbered_piece(name)))
+        .flatten()
 }
 
 // Whether an object may claim a member by its posted name before its bytes
 // say what it is, its first article lost or not yet come: a recovery
-// volume's name, or a numbered piece's.
+// volume's name, or a numbered piece's, two digits or more. Which set a
+// piece is of, and whether it is one, the split store a set founded says by
+// its claim.
 pub fn names_claimable(name: &str) -> bool {
-    names_recovery(name) || numbered_piece(trimmed(name))
+    names_recovery(name) || split_piece(name).is_some()
 }
 
 // What a file of a listing is, by the names beside it: a container volume
@@ -703,7 +718,7 @@ pub fn listed(names: &[&str]) -> Vec<Listed> {
             let numbered = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
             let container = matches!(extension, "rar" | "7z")
                 || names_container(name)
-                || numbered_piece(name)
+                || split_piece_among(name, lower.iter().map(String::as_str))
                 || (numbered
                     && digits.len() == 2
                     && matches!(letter, "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y")
@@ -728,29 +743,72 @@ pub fn listed(names: &[&str]) -> Vec<Listed> {
         .collect()
 }
 
-// The digits a piece's number has at the least: `.001`, as 7-Zip, HJSplit
-// and SABnzbd's joiner number pieces. A name ending in `.4` or `.0`, or in
-// `.10`, is a version or a repost, never a piece.
+// The digits a piece's number has at the least: two, as 7-Zip numbers a set
+// it is told to open at `.01`.
+const SET_DIGITS: usize = 2;
+
+// The digits a piece's number has to be a piece by its name alone: `.001`,
+// as 7-Zip, HJSplit and SABnzbd's joiner number pieces. A name ending in `.4`
+// or `.0` is a version, never a piece, and one ending in `.10` or `.99` is a
+// version or a repost unless its set stands beside it (`split_piece_among`).
 const PIECE_DIGITS: usize = 3;
 
-// A piece of a file split into numbered pieces, `name.001`, `name.002`, …,
-// told by its posted name: its last extension is three or more digits,
-// once the quotes, underscores or dots a posted name trails are off
-// (`trimmed`). It gives the name of the file the pieces were cut from, as it
-// was spelled, and the piece's number. The one owner of what a piece's name
-// is: the sniff founds the split store by it, and the store numbers its
-// pieces and names their file by it, so a name one founds a split store on
-// is always one the other numbers. Which piece it is, the object says.
+// The name of a piece of a file split into numbered pieces, `name.001`,
+// `name.002`, …, or `name.01`, `name.02`, …: its last extension is two or
+// more digits, once the quotes, underscores or dots a posted name trails are
+// off (`trimmed`). It gives the name of the file the pieces were cut from,
+// as it was spelled, and the piece's number. The split store numbers its
+// pieces and names their file by it; whether a name founds the store is
+// `split_piece_among`. Which piece it is, the object says.
 pub fn split_piece(name: &str) -> Option<(&str, &str)> {
     trimmed(name).rsplit_once('.').filter(|(stem, digits)| {
         !stem.is_empty()
-            && digits.len() >= PIECE_DIGITS
+            && digits.len() >= SET_DIGITS
             && digits.bytes().all(|byte| byte.is_ascii_digit())
     })
 }
 
+// Whether a name numbers a piece of a split set, among the names `beside`
+// it, its own among them: the one owner of what founds the split store, and
+// what the census reads as a split part (`FileRole::of_post` keeps the same
+// rule). Three digits or more are a piece by the name alone. Two digits are
+// a piece only of a set that stands beside it: the set's first piece, as
+// 7-Zip opens one (`SplitHandler.cpp`: an extension that ends in `00` or
+// `01`, every digit before it `0`), and the piece after that first, of the
+// same stem. So a lone `notes.10`, a `file.99`, a version `Release.1.4.10`
+// and a first piece `.01` with nothing after it are plain files, whatever
+// their bytes; a gap further on is the store's to rule.
+pub fn split_piece_among<'a>(name: &str, beside: impl IntoIterator<Item = &'a str>) -> bool {
+    let Some((stem, digits)) = split_piece(name) else {
+        return false;
+    };
+    if digits.len() >= PIECE_DIGITS {
+        return true;
+    }
+    // Which of `.00`, `.01` and `.02` of the stem stand beside it.
+    let mut held = [false; 3];
+    for other in beside {
+        let Some((other_stem, number)) = split_piece(other) else {
+            continue;
+        };
+        if number.len() != SET_DIGITS || !other_stem.eq_ignore_ascii_case(stem) {
+            continue;
+        }
+        if let Some(slot) = held.get_mut(usize::from(number.as_bytes()[1] - b'0'))
+            && number.as_bytes()[0] == b'0'
+        {
+            *slot = true;
+        }
+        if (held[0] && held[1]) || (held[1] && held[2]) {
+            return true;
+        }
+    }
+    false
+}
+
+// A piece by its name alone.
 fn numbered_piece(name: &str) -> bool {
-    split_piece(name).is_some()
+    split_piece(name).is_some_and(|(_, digits)| digits.len() >= PIECE_DIGITS)
 }
 
 fn has_extension(name: &str, extension: &str) -> bool {
@@ -1573,6 +1631,12 @@ mod tests {
                 object(Kind::Zip),
                 "{name}"
             );
+            assert!(!split_piece_among(name, [name]), "{name}");
+        }
+        for name in [
+            "Microsoft.WindowsAppRuntime.Release%211.4.0",
+            "silver.mkv.1",
+        ] {
             assert_eq!(split_piece(name), None, "{name}");
             assert!(!names_claimable(name), "{name}");
         }
@@ -1600,6 +1664,7 @@ mod tests {
         ("a.mkv.001", true),
         ("a.mkv.002", true),
         ("a.mkv.0001", true),
+        ("a.mkv.00001", true),
         ("a.mkv.1000", true),
         ("[71ECB6A7].mkv.001_", true),
         ("a.mkv.002\"", true),
@@ -1615,11 +1680,73 @@ mod tests {
         ("a.mkv", false),
     ];
 
+    // The posts whose two-digit names are pieces of a set, name by name. The
+    // same table pins `FileRole::of_post` in
+    // `shared/crates/weaver-model/tests/files.rs`.
+    const SHORT_SET_POSTS: &[&[(&str, bool)]] = &[
+        &[("a.mkv.01", true), ("a.mkv.02", true), ("a.mkv.03", true)],
+        &[("a.mkv.00", true), ("a.mkv.01", true)],
+        &[("A.MKV.01", true), ("a.mkv.02_", true), ("a.mkv.07", true)],
+        &[("a.mkv.01", true), ("a.mkv.02", true), ("b.mkv.03", false)],
+        &[("a.mkv.01", false)],
+        &[("notes.10", false)],
+        &[("file.99", false)],
+        &[("Release.1.4.10", false)],
+        &[("notes.10", false), ("notes.11", false)],
+        &[("a.mkv.02", false), ("a.mkv.03", false)],
+        &[("a.mkv.01", false), ("b.mkv.02", false)],
+        &[
+            ("a.mkv.01", false),
+            ("a.mkv.002", true),
+            ("a.mkv.003", true),
+        ],
+        &[("notes.4.0", false), ("notes.4.1", false)],
+    ];
+
     #[test]
     fn split_pieces_follow_the_model_rule() {
         for &(name, piece) in SPLIT_PIECE_NAMES {
-            assert_eq!(split_piece(name).is_some(), piece, "{name}");
+            assert_eq!(split_piece_among(name, [name]), piece, "{name}");
+            assert_eq!(numbered_piece(name), piece, "{name}");
         }
+        for post in SHORT_SET_POSTS {
+            for &(name, piece) in *post {
+                let beside = post.iter().map(|(name, _)| *name);
+                assert_eq!(split_piece_among(name, beside), piece, "{name} in {post:?}");
+            }
+        }
+    }
+
+    // A two-digit piece founds the split store among its set, whatever its
+    // bytes open, as a `.001` does alone; with no set beside it, its bytes
+    // say what it is.
+    #[test]
+    fn a_two_digit_piece_founds_the_split_store_among_its_set() {
+        let set = ["a.mkv.01", "a.mkv.02", "a.mkv.03"];
+        for name in set {
+            let beside = set.iter().copied();
+            assert_eq!(
+                sniff_among(name, &plain(600), None, beside.clone()),
+                object(Kind::Split),
+                "{name}"
+            );
+            assert_eq!(
+                sniff_among(name, b"PK\x03\x04", None, beside),
+                object(Kind::Split),
+                "{name}"
+            );
+            assert_eq!(sniff(name, &plain(600), None), Sniff::Leaf, "{name}");
+            assert!(names_claimable(name), "{name}");
+        }
+        let alone = ["notes.10"];
+        assert_eq!(
+            sniff_among("notes.10", &plain(600), Some(43), alone.iter().copied()),
+            Sniff::Leaf
+        );
+        assert_eq!(
+            listed(&["a.mkv.01", "a.mkv.02", "notes.10"]),
+            vec![Listed::Container, Listed::Container, Listed::Plain]
+        );
     }
 
     #[test]

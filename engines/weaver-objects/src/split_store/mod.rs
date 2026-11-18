@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A file posted in numbered pieces, `name.001`, `name.002`, …: a store whose
+// A file posted in numbered pieces, `name.001`, `name.002`, …, or a set
+// numbered `name.01`, `name.02`, … (`split_piece_among`): a store whose
 // one member is the file the pieces were cut from. Each piece's bytes are
 // placed in that member where the piece starts, which is the sum of the
 // lengths of the pieces before it, so a clean set is written once and never
@@ -426,7 +427,8 @@ impl Durable for SplitStore {
     // 9: that length gone again: a piece's length is the one it holds; and
     // what each piece holds unplaced, where it kept how far it was handed.
     // 10: how far each piece reached gone: its close says so.
-    const VERSION: u16 = 10;
+    // 11: whether the set is numbered in two digits.
+    const VERSION: u16 = 11;
 }
 
 impl Object for SplitStore {
