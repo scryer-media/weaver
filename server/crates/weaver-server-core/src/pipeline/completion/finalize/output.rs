@@ -147,6 +147,10 @@ fn scan_delivery_root(
         }
         let entry_name = entry.file_name();
         let mut entry_bytes = 0u64;
+        // Under the delete action, the folders of this entry in the order the
+        // walk met them, and those a removal emptied of something.
+        let mut folders = Vec::new();
+        let mut emptied = HashSet::new();
         let mut stack = vec![(entry_path.clone(), PathBuf::from(&entry_name))];
         while let Some((path, relative_path)) = stack.pop() {
             let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
@@ -163,6 +167,11 @@ fn scan_delivery_root(
                 ));
             }
             if metadata.is_dir() {
+                if settings.unwanted_extension_action
+                    == crate::post_processing::model::UnwantedExtensionAction::DeleteFiles
+                {
+                    folders.push((path.clone(), relative_path.clone()));
+                }
                 let children = std::fs::read_dir(&path).map_err(|error| {
                     format!(
                         "could not inspect delivery directory {}: {error}",
@@ -188,6 +197,21 @@ fn scan_delivery_root(
                 ));
             }
             let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            // The policy deletes such a file: it is left out of the delivery,
+            // which the job's ruling already counts short.
+            if settings.removes(&filename) {
+                std::fs::remove_file(&path).map_err(|error| {
+                    format!(
+                        "could not remove {}/{}, which has an unwanted extension: {error}",
+                        source_name,
+                        relative_path.display()
+                    )
+                })?;
+                if let Some(parent) = path.parent() {
+                    emptied.insert(parent.to_path_buf());
+                }
+                continue;
+            }
             if settings.unacceptable_extension_match(&filename).is_some() {
                 let rejection = UnacceptableExtensionMatch {
                     relative_path: relative_path.to_string_lossy().replace('\\', "/"),
@@ -199,9 +223,54 @@ fn scan_delivery_root(
             entry_bytes = entry_bytes.saturating_add(metadata.len());
             validation.total_bytes = validation.total_bytes.saturating_add(metadata.len());
         }
+        remove_emptied_folders(&folders, &mut emptied, source_name)?;
         validation.root_entry_bytes.insert(entry_path, entry_bytes);
     }
     Ok(true)
+}
+
+// A folder of a delivery entry that the delete action left empty goes too,
+// and then its parent may be empty in turn. `folders` are in the order the
+// walk met them, each after its parent, so they are judged deepest first. Only
+// a folder a removal emptied of something is judged: one that was empty
+// before stays. All of them lie inside the delivery root, below it, and the
+// walk that met them refused every link, so none is followed here.
+fn remove_emptied_folders(
+    folders: &[(PathBuf, PathBuf)],
+    emptied: &mut HashSet<PathBuf>,
+    source_name: &str,
+) -> Result<(), String> {
+    if emptied.is_empty() {
+        return Ok(());
+    }
+    for (folder, relative_path) in folders.iter().rev() {
+        if !emptied.contains(folder) {
+            continue;
+        }
+        let empty = std::fs::read_dir(folder)
+            .map_err(|error| {
+                format!(
+                    "could not inspect delivery directory {}: {error}",
+                    folder.display()
+                )
+            })?
+            .next()
+            .is_none();
+        if !empty {
+            continue;
+        }
+        std::fs::remove_dir(folder).map_err(|error| {
+            format!(
+                "could not remove {}/{}, which the unwanted files left empty: {error}",
+                source_name,
+                relative_path.display()
+            )
+        })?;
+        if let Some(parent) = folder.parent() {
+            emptied.insert(parent.to_path_buf());
+        }
+    }
+    Ok(())
 }
 
 // Rejects symlinks and, on Windows, every other reparse point: junctions and

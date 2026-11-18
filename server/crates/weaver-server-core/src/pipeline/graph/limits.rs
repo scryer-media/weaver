@@ -7,7 +7,7 @@
 // the same limits here.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tracing::warn;
@@ -233,11 +233,16 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //                      name a namespace places; a name placed while the
 //                      database could not be read waits, and is judged when
 //                      a read succeeds, before the job delivers; a stored
-//                      setting that does not parse is the default
+//                      setting that does not parse is the default. A name
+//                      the action deletes is no breach: the delivery
+//                      leaves its file out (`removes`)
 pub(crate) struct Caps {
     limits: Arc<ExtractionLimits>,
     read_policy: PolicyRead,
     policy: Policy,
+    // The policy once a read of it succeeded, shared with the job's tree,
+    // which never opens a member whose name it lists (`never_opens`).
+    known: Arc<OnceLock<Arc<PostProcessingSettings>>>,
     // Names placed and not judged yet: placed while the policy was unread,
     // or brought back by a restore.
     waiting: Vec<String>,
@@ -625,8 +630,12 @@ impl Caps {
         read_policy: PolicyRead,
         declared: Vec<u64>,
     ) -> Self {
+        let known = Arc::new(OnceLock::new());
         let policy = match read_policy() {
-            Ok(settings) => Policy::Known(settings),
+            Ok(settings) => {
+                let _ = known.set(Arc::clone(&settings));
+                Policy::Known(settings)
+            }
             Err(error) => {
                 warn!(%error, "{POLICY_UNREAD}; names wait to be judged until a read succeeds");
                 Policy::Unknown(error)
@@ -636,6 +645,7 @@ impl Caps {
             limits,
             read_policy,
             policy,
+            known,
             waiting: Vec::new(),
             declared,
             decoding: DecodeClock::default(),
@@ -661,6 +671,38 @@ impl Caps {
             ..PostProcessingSettings::default()
         };
         Self::new(Arc::new(limits), known_policy(policy), Vec::new())
+    }
+
+    // Whether a member named `name` is never opened as an archive: its
+    // extension is on the list. One read of the shared policy and the list's
+    // patterns per question; `None` while the policy is unread, so the tree
+    // opens nothing until it is read, and the answer is fixed from then on.
+    pub(crate) fn never_opens(&self) -> weaver_graph::NeverOpen {
+        let known = Arc::clone(&self.known);
+        Arc::new(move |name| {
+            known
+                .get()
+                .map(|policy| policy.unacceptable_extension_match(name).is_some())
+        })
+    }
+
+    // Whether the policy has been read.
+    pub(crate) fn policy_known(&self) -> bool {
+        self.known.get().is_some()
+    }
+
+    // The policy when its action leaves files with an unwanted extension out
+    // of the delivery; `None` when it fails the job instead, or is unread.
+    pub(crate) fn removes(&self) -> Option<&PostProcessingSettings> {
+        match &self.policy {
+            Policy::Known(policy)
+                if policy.unwanted_extension_action
+                    == crate::post_processing::model::UnwantedExtensionAction::DeleteFiles =>
+            {
+                Some(policy)
+            }
+            _ => None,
+        }
     }
 
     // The breach the job stopped on, if it did.
@@ -742,6 +784,8 @@ impl Caps {
             }
         };
         match policy.unacceptable_extension_match(name) {
+            // The delivery leaves the file out; the job goes on.
+            Some(_) if policy.removes(name) => Ok(()),
             Some(_) => Err(self.breach(
                 ExtractionRejectionReason::ContentPolicy,
                 unwanted_extension_reason(name),
@@ -756,7 +800,10 @@ impl Caps {
     pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
         if let Policy::Unknown(error) = &mut self.policy {
             match (self.read_policy)() {
-                Ok(settings) => self.policy = Policy::Known(settings),
+                Ok(settings) => {
+                    let _ = self.known.set(Arc::clone(&settings));
+                    self.policy = Policy::Known(settings);
+                }
                 Err(failed) => {
                     *error = failed;
                     return Err(format!("{POLICY_UNREAD}: {error}"));

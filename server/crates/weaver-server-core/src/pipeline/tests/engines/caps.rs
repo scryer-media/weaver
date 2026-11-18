@@ -858,3 +858,277 @@ async fn fifty_copies_of_one_archive_complete_under_the_default_limits() {
     assert_sevenz_members(&graph);
     assert_fetched_once(&graph);
 }
+
+// The unwanted extension action. Under "delete only unwanted files" a file
+// with a listed extension, posted or unpacked, is left out of the delivery
+// and the rest is delivered: the job ends partial, failed when nothing
+// usable is left. A member whose name is listed is never opened as an
+// archive, whatever its bytes, under either action.
+mod unwanted {
+    use super::super::harness::{Outcome, kinds};
+    use super::*;
+    use crate::post_processing::model::UnwantedExtensionAction;
+    use std::collections::BTreeSet;
+
+    const FOLDER: &str = "lantern beacon";
+
+    fn delivered(name: &str) -> String {
+        format!("{FOLDER}/{name}")
+    }
+
+    fn rar(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        multi_member_store_set(entries, 1).remove(0).1
+    }
+
+    fn deleting(posts: Vec<Post>) -> Scenario {
+        Scenario::new(posts)
+            .unacceptable(&["exe"])
+            .setup(|pipeline| {
+                pipeline
+                    .db
+                    .save_unwanted_extension_action(UnwantedExtensionAction::DeleteFiles)
+                    .unwrap();
+                // As after the list's save: the runtime works the scripts gate
+                // out at startup, so the job does not wait on it.
+                crate::post_processing::events::refresh_admission_hint(&pipeline.db).unwrap();
+            })
+    }
+
+    fn failing(posts: Vec<Post>) -> Scenario {
+        Scenario::new(posts).unacceptable(&["exe"])
+    }
+
+    fn names(graph: &Outcome) -> BTreeSet<String> {
+        graph.files.keys().cloned().collect()
+    }
+
+    fn reason(graph: &Outcome) -> Option<String> {
+        graph
+            .history
+            .as_ref()
+            .and_then(|row| row.error_message.clone())
+    }
+
+    fn candle() -> Vec<u8> {
+        payload(2 * ARTICLE + 3, 81)
+    }
+
+    fn lantern() -> Vec<u8> {
+        payload(2 * ARTICLE + 5, 82)
+    }
+
+    // `setup.exe` whose bytes are a stored RAR holding `candle.mkv`.
+    fn setup() -> Vec<u8> {
+        rar(&[("candle.mkv", candle())])
+    }
+
+    #[tokio::test]
+    async fn delete_leaves_out_unwanted_files_posted_and_unpacked_and_ends_partial() {
+        let posts = vec![
+            Post::plain("lantern.mkv", lantern()),
+            Post::plain("beacon.exe", payload(ARTICLE + 7, 83)),
+            Post::plain(
+                "ember.rar",
+                rar(&[
+                    ("ember.mkv", payload(2 * ARTICLE + 1, 84)),
+                    ("cinder.exe", payload(ARTICLE + 9, 85)),
+                ]),
+            ),
+        ];
+        let graph = run(&deleting(posts)).await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?} {:?}",
+            graph.failure,
+            graph.graph().delivery
+        );
+        assert_eq!(
+            names(&graph),
+            BTreeSet::from([delivered("ember.mkv"), delivered("lantern.mkv")])
+        );
+        assert_eq!(graph.files[&delivered("lantern.mkv")], lantern());
+        assert_eq!(
+            reason(&graph).as_deref(),
+            Some("removed for an unwanted extension: beacon.exe, cinder.exe")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_with_nothing_but_unwanted_files_fails() {
+        let graph = run(&deleting(vec![Post::plain(
+            "beacon.exe",
+            payload(ARTICLE + 7, 83),
+        )]))
+        .await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Failed {
+                error: "no file was delivered whole; removed for an unwanted extension: beacon.exe"
+                    .into()
+            })
+        );
+        assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    }
+
+    #[tokio::test]
+    async fn delete_with_no_unwanted_file_completes() {
+        let graph = run(&deleting(vec![Post::plain("lantern.mkv", lantern())])).await;
+        assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+        assert_eq!(names(&graph), BTreeSet::from([delivered("lantern.mkv")]));
+        assert_eq!(reason(&graph), None);
+    }
+
+    // `setup.exe` holds a RAR's bytes. Listed, it is never opened: the fail
+    // action fails the job by its name, and the delete action removes it
+    // whole, at the root and inside an outer RAR. Off the list it is
+    // unpacked as any RAR is.
+    #[tokio::test]
+    async fn a_listed_name_with_archive_bytes_is_never_opened() {
+        let at_root = || {
+            vec![
+                Post::plain("lantern.mkv", lantern()),
+                Post::plain("setup.exe", setup()),
+            ]
+        };
+        let inside = || {
+            vec![Post::plain(
+                "ember.rar",
+                rar(&[("lantern.mkv", lantern()), ("setup.exe", setup())]),
+            )]
+        };
+        for posts in [at_root(), inside()] {
+            let graph = run(&failing(posts)).await;
+            assert_eq!(
+                graph.failure.as_deref(),
+                Some("unwanted extension '.exe' in 'setup.exe'"),
+                "{:?}",
+                graph.status
+            );
+            assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+        }
+        for (posts, outer) in [(at_root(), false), (inside(), true)] {
+            let graph = run(&deleting(posts)).await;
+            assert_eq!(
+                graph.status,
+                Some(JobStatus::Partial),
+                "{:?} {:?}",
+                graph.failure,
+                graph.graph().delivery
+            );
+            assert_eq!(names(&graph), BTreeSet::from([delivered("lantern.mkv")]));
+            assert_eq!(
+                reason(&graph).as_deref(),
+                Some("removed for an unwanted extension: setup.exe")
+            );
+            // No RAR was opened at the root; inside, only the outer one:
+            // `candle.mkv`, which `setup.exe` holds, never came out.
+            assert_eq!(
+                kinds(&graph).contains(&"rar_store"),
+                outer,
+                "{:?}",
+                kinds(&graph)
+            );
+        }
+        for posts in [at_root(), inside()] {
+            let graph = run(&Scenario::new(posts).unacceptable(&["iso"])).await;
+            assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+            assert!(
+                graph
+                    .files
+                    .iter()
+                    .any(|(path, bytes)| path.ends_with("/candle.mkv") && *bytes == candle()),
+                "{:?}",
+                graph.files.keys()
+            );
+        }
+    }
+
+    // The list changes across a restart: the run before it saves `first`,
+    // every run after it `then`, each with `action`. The job goes down once,
+    // after the first article of `setup.exe`, whose bytes are a RAR holding
+    // `candle.mkv`, so its front has said what it is under `first`.
+    async fn relisted(
+        first: &'static [&'static str],
+        then: &'static [&'static str],
+        action: UnwantedExtensionAction,
+    ) -> super::super::restart::Restarted {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let scenario = Scenario::new(vec![
+            Post::plain("setup.exe", setup()),
+            Post::plain("lantern.mkv", lantern()),
+        ])
+        .setup(move |pipeline| {
+            let list = if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                first
+            } else {
+                then
+            };
+            pipeline
+                .db
+                .save_unacceptable_extensions(list.iter().map(|ext| ext.to_string()).collect())
+                .unwrap();
+            pipeline.db.save_unwanted_extension_action(action).unwrap();
+            crate::post_processing::events::refresh_admission_hint(&pipeline.db).unwrap();
+        });
+        super::super::restart::run_restarting_at(
+            &scenario,
+            &mut |_| {},
+            super::super::restart::Down::Crash,
+            &|nth| nth == 1,
+        )
+        .await
+    }
+
+    fn file_names(files: &std::collections::BTreeMap<String, Vec<u8>>) -> BTreeSet<String> {
+        files.keys().cloned().collect()
+    }
+
+    // What a restored job does today when the list changed while it was
+    // down, recorded as it stands for a ruling, not as a rule. The tree is
+    // rebuilt with the objects its checkpoint holds and the restored writer
+    // and tree read the new list; every restored name waits to be judged
+    // again at the first completion check.
+    #[tokio::test]
+    async fn a_list_changed_across_a_restart_as_it_stands_today() {
+        let both = BTreeSet::from([delivered("candle.mkv"), delivered("lantern.mkv")]);
+
+        // Opened before the restart, listed after it. The restored RAR stays
+        // open: what it holds is delivered and the job completes.
+        let restarted = relisted(&[], &["exe"], UnwantedExtensionAction::DeleteFiles).await;
+        assert_eq!(restarted.restarts, 1);
+        assert_eq!(restarted.status, Some(JobStatus::Complete));
+        assert_eq!(file_names(&restarted.files), both);
+        assert!(restarted.graph.kinds.contains("rar_store"));
+        // Under the fail action the restored name is judged again by the new
+        // list, and fails the job, though it was opened.
+        let restarted = relisted(&[], &["exe"], UnwantedExtensionAction::FailJob).await;
+        assert_eq!(restarted.restarts, 1);
+        assert_eq!(
+            restarted.status,
+            Some(JobStatus::Failed {
+                error: "unwanted extension '.exe' in 'setup.exe'".into()
+            })
+        );
+        assert!(restarted.files.is_empty());
+
+        // A leaf before the restart, off the list after it. The restore reads
+        // its front again and, unlisted now, it opens.
+        let restarted = relisted(&["exe"], &[], UnwantedExtensionAction::DeleteFiles).await;
+        assert_eq!(restarted.restarts, 1);
+        assert_eq!(restarted.status, Some(JobStatus::Complete));
+        assert_eq!(file_names(&restarted.files), both);
+        assert!(restarted.graph.kinds.contains("rar_store"));
+        // Under the fail action the job fails on the name before anything
+        // is fetched, so it never restarts.
+        let restarted = relisted(&["exe"], &[], UnwantedExtensionAction::FailJob).await;
+        assert_eq!(restarted.restarts, 0);
+        assert_eq!(
+            restarted.status,
+            Some(JobStatus::Failed {
+                error: "unwanted extension '.exe' in 'setup.exe'".into()
+            })
+        );
+    }
+}

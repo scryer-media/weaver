@@ -277,6 +277,8 @@ impl GraphJob {
     ) -> Self {
         let mut tree = Tree::new();
         tree.nest_at_most(nesting);
+        // A member with an unwanted extension is never opened.
+        tree.never_open(writer.never_opens());
         let root = ArticleRoot::new(files);
         let mut out = Vec::new();
         for file in files {
@@ -709,6 +711,20 @@ impl GraphJob {
     // names that waited for it.
     pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
         self.writer.learn_policy()
+    }
+
+    // Once the policy is read, the members the tree held undecided while it
+    // was not are asked again, once, so an archive whose name the policy
+    // does not list opens then. Nothing before the policy is read; nothing
+    // to do for a job whose tree held none.
+    pub(crate) fn open_after_policy(&mut self) -> Result<(), GraphError> {
+        if !self.writer.policy_known() {
+            return Ok(());
+        }
+        let mut out = Vec::new();
+        self.writer
+            .rule_known(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
+        self.heard(out)
     }
 
     // Everything the job has submitted to its volumes' writers so far;

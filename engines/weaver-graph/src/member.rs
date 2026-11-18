@@ -66,8 +66,20 @@ impl Member {
     // What the member is, as founding asks it: by its name and its front,
     // among the members of its namespace, except that the kind whose
     // reading of it was refuted is no answer, and then its bytes alone say.
-    // The one question every path asks that decides who owns a member.
-    pub fn said(&self, front: &[u8], namespace: &Namespace) -> Sniff {
+    // The one question every path asks that decides who owns a member. A
+    // member whose name `never_open` names is a leaf whatever its front is;
+    // while the rule is not known (`None`) nothing is said of it yet.
+    pub fn said(
+        &self,
+        front: &[u8],
+        namespace: &Namespace,
+        never_open: &dyn Fn(&str) -> Option<bool>,
+    ) -> Sniff {
+        match never_open(&self.name) {
+            Some(true) => return Sniff::Leaf,
+            None => return Sniff::Pending,
+            Some(false) => {}
+        }
         let beside = namespace.members().map(|member| member.name.as_str());
         match sniff_among(&self.name, front, self.length, beside) {
             Sniff::Object(kind) if Some(kind) == self.refuted => signed(front, self.length),

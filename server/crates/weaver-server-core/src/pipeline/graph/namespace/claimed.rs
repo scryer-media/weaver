@@ -234,7 +234,7 @@ impl NamespaceWriter {
 // system that gives a file no second name leaves nothing at `at`.
 fn second_name(from: &std::path::Path, at: &std::path::Path) -> bool {
     #[cfg(test)]
-    if refused::SECOND_NAMES.load(std::sync::atomic::Ordering::SeqCst) {
+    if refused::SECOND_NAMES.get() {
         return false;
     }
     at.parent()
@@ -262,11 +262,14 @@ fn second_name_or_empty(from: &std::path::Path, at: &std::path::Path) {
         });
 }
 
-// A test's file system that gives no file a second name.
+// A test's file system that gives no file a second name: on the test's own
+// thread only, so a test that sets it never reaches another running beside it.
 #[cfg(test)]
 pub(crate) mod refused {
-    pub(crate) static SECOND_NAMES: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    thread_local! {
+        pub(crate) static SECOND_NAMES: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 }
 
 #[cfg(test)]
@@ -279,7 +282,7 @@ mod tests {
     // measured before a byte is written to it.
     #[test]
     fn a_refused_second_name_still_leaves_a_file_the_leaf_can_move() {
-        refused::SECOND_NAMES.store(true, std::sync::atomic::Ordering::SeqCst);
+        refused::SECOND_NAMES.set(true);
         let dir = tempfile::tempdir().unwrap();
         let from = dir.path().join("lantern.part2.rar");
         std::fs::write(&from, b"volume").unwrap();

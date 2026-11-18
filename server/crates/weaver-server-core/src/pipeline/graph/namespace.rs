@@ -581,6 +581,38 @@ impl NamespaceWriter {
         self.caps.refusal()
     }
 
+    // The job's content policy, as the tree asks whether it may open a
+    // member (`Caps::never_opens`).
+    pub(crate) fn never_opens(&self) -> weaver_graph::NeverOpen {
+        self.caps.never_opens()
+    }
+
+    // Whether the job's content policy has been read.
+    pub(crate) fn policy_known(&self) -> bool {
+        self.caps.policy_known()
+    }
+
+    // The policy was read: the members the tree asked about before it was
+    // are asked again, once (`Tree::rule_known`), and what that binds is
+    // handed what its members received, as any bind is.
+    pub(crate) fn rule_known(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let mut effects = Vec::new();
+        tree.rule_known(&mut self.placing(builder), &mut effects);
+        self.apply_all(tree, builder, segments, effects, out)
+    }
+
+    // The job's content policy when it leaves files with an unwanted
+    // extension out of the delivery (`Caps::removes`).
+    pub(crate) fn removes(&self) -> Option<&crate::post_processing::model::PostProcessingSettings> {
+        self.caps.removes()
+    }
+
     // Read the job's content policy if it is still unread, and judge the
     // names that waited for it.
     pub(crate) fn learn_policy(&mut self) -> Result<(), String> {

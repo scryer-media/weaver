@@ -762,6 +762,11 @@ export const nextEs: LocaleDictionary = {
   "next.general.srrdbHelp": "Para miembros de archivo ofuscados, enviar solo su suma CRC32 al índice público de SRRDB para recuperar el nombre de la publicación.",
   "next.general.unacceptableExtensions": "Extensiones no aceptadas",
   "next.general.unacceptableExtensionsHelp": "Separadas por comas. Se rechaza una descarga terminada que contenga alguna de ellas.",
+  "next.general.unwantedExtensionAction": "Acción ante extensiones no aceptadas",
+  "next.general.unwantedExtensionActionHelp":
+    "Un archivo de la lista nunca se abre como archivo comprimido. «Fallar la tarea» rechaza la descarga; «Eliminar solo los archivos no deseados» quita esos archivos y entrega el resto como parcial.",
+  "next.general.unwantedExtensionAction.fail": "Fallar la tarea",
+  "next.general.unwantedExtensionAction.delete": "Eliminar solo los archivos no deseados",
   "next.archivePasswords.title": "Contraseñas de archivos",
   "next.archivePasswords.list": "Contraseñas (una por línea)",
   "next.archivePasswords.edit": "Editar contraseñas",
