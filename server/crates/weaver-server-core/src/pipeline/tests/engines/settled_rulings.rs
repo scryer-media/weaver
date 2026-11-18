@@ -472,3 +472,107 @@ async fn a_listing_rules_when_the_par2_index_never_arrives() {
         outcome.graph().rulings
     );
 }
+
+// RAR volumes beside a listing over them, the RAR volumes carrying the
+// recovery the case gives them: `.rev` files beside them, or a record
+// inside each. `damaged` are (volume, article) pairs.
+fn listed_rar(revs: bool, damaged: &[(u32, u32)]) -> Scenario {
+    let volumes = match revs {
+        true => crate::pipeline::tests::direct_store::single_member_store_set(
+            "beacon.bin",
+            &super::rar_rev::body(),
+            4,
+        ),
+        false => crate::pipeline::tests::direct_store::protected_store_set(
+            "beacon.bin",
+            &payload(11 * super::harness::ARTICLE + 33, 61),
+            4,
+            1,
+        ),
+    };
+    let named: Vec<(String, u32)> = volumes
+        .iter()
+        .map(|(name, bytes)| (name.clone(), crc(bytes)))
+        .collect();
+    let entries: Vec<(&str, u32)> = named
+        .iter()
+        .map(|(name, crc)| (name.as_str(), *crc))
+        .collect();
+    let mut posts = super::rar::posts(volumes.clone());
+    posts.push(listing("silver.horizon.sfv", &entries));
+    if revs {
+        let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        posts.extend(super::rar_rev::rar5_revs("silver.horizon", &bytes, 1));
+    }
+    damaged
+        .iter()
+        .fold(Scenario::new(posts), |scenario, &(file, ordinal)| {
+            scenario.damaged(file, ordinal)
+        })
+}
+
+// A listing beside RAR recovery volumes over the same volumes stands aside
+// as it does beside PAR2: the `.rev` set rules alone, repairs what it can,
+// and a job it cannot save fails on its ruling only.
+#[tokio::test]
+async fn a_listing_beside_rar_recovery_volumes_stands_aside() {
+    let outcome = try_run(&listed_rar(true, &[(1, 1)]))
+        .await
+        .unwrap_or_else(|stall| panic!("the job stalled at {:?}", stall.status));
+    assert!(outcome.completed(), "{:?}", outcome.status);
+    assert_eq!(
+        outcome.graph().rulings,
+        [(
+            "rar_recovery".to_string(),
+            Some(RepairOutcome::Repaired { slices: 1 })
+        )]
+    );
+
+    let outcome = try_run(&listed_rar(true, &[(1, 1), (2, 1)]))
+        .await
+        .unwrap_or_else(|stall| panic!("the job stalled at {:?}", stall.status));
+    assert!(failed(&outcome), "{:?}", outcome.status);
+    assert_eq!(
+        kinds(&outcome),
+        ["rar_recovery"],
+        "the listing stands aside"
+    );
+    assert_eq!(outcome.failure.as_deref(), Some(REV_SHORT));
+}
+
+const REV_SHORT: &str = "RAR_RECOVERY recovery failed for 1 set(s): silver.horizon.part1.rev \
+     (silver.horizon.part02.rar, silver.horizon.part03.rar): not repairable: 2 damaged slices, \
+     only 1 recovery blocks reachable";
+
+// A listing beside volumes that each carry their own record still rules:
+// a record repairs only the volume it sits in, so a volume whose record is
+// lost is judged by the listing alone, as before.
+#[tokio::test]
+async fn a_listing_beside_rar_records_still_rules() {
+    let outcome = try_run(&listed_rar(false, &[(1, 1)]))
+        .await
+        .unwrap_or_else(|stall| panic!("the job stalled at {:?}", stall.status));
+    assert!(outcome.completed(), "{:?}", outcome.status);
+    assert_eq!(
+        kinds(&outcome),
+        [
+            "sfv",
+            "rar_record",
+            "rar_record",
+            "rar_record",
+            "rar_record"
+        ]
+    );
+
+    let outcome = try_run(&listed_rar(false, &[(1, 1), (1, 2), (1, 3), (1, 4)]))
+        .await
+        .unwrap_or_else(|stall| panic!("the job stalled at {:?}", stall.status));
+    assert!(failed(&outcome), "{:?}", outcome.status);
+    assert_eq!(
+        outcome.failure.as_deref(),
+        Some(
+            "SFV recovery failed for 1 set(s): silver.horizon.sfv (silver.horizon.part02.rar): \
+             not repairable: 1 damaged slices, only 0 recovery blocks reachable"
+        )
+    );
+}

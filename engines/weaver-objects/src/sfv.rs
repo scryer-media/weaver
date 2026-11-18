@@ -297,6 +297,14 @@ impl Recovery for Sfv {
         false
     }
 
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     // By lower-cased basename. Two members whose names differ only by case
     // cannot be told apart by a listing that records neither reliably, so
     // neither binds.

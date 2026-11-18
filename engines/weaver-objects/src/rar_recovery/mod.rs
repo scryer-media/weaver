@@ -774,6 +774,14 @@ impl Recovery for RarRecovery {
         true
     }
 
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     // The data volumes the set's naming puts in the set, one member per
     // index; the first a name gives an index keeps it. The set is the one
     // with the longest name the first recovery volume's name covers: a set

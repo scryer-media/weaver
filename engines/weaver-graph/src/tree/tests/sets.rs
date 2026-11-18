@@ -71,6 +71,14 @@ impl Recovery for Set {
         self.rebuilds
     }
 
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         false
     }
