@@ -439,6 +439,9 @@ impl TorrentStore {
                 }
                 io::Result::Ok(batch.barrier())
             })?;
+            let Some(barrier) = barrier else {
+                return Err(unwritten());
+            };
             barrier.wait_aside();
             if barrier.unwritten() {
                 return Err(unwritten());
@@ -558,6 +561,9 @@ impl TorrentStore {
                 }
                 io::Result::Ok(batch.barrier())
             })?;
+            let Some(barrier) = barrier else {
+                return Err(unwritten());
+            };
             barrier.wait_aside();
             if barrier.unwritten() {
                 return Err(unwritten());
@@ -996,7 +1002,7 @@ impl TorrentStore {
     #[cfg(test)]
     pub(crate) fn forget_now(&self) {
         drop(self.unpark());
-        if let Some(barrier) = self.writes.abandon() {
+        if let Some(barrier) = self.writes.retire() {
             barrier.wait_aside();
         }
         self.files.release();
@@ -1447,6 +1453,10 @@ impl Pieces for TorrentStore {
     fn stop_writes(&self) {
         drop(self.unpark());
         drop(self.writes.abandon());
+    }
+
+    fn retired(&self) -> bool {
+        self.writes.retired()
     }
 
     // A piece the side store keeps is dropped from it with the piece.

@@ -84,6 +84,10 @@ pub(crate) trait Pieces: Send + Sync {
     }
     // The session's run ended: what is queued to be written is given up.
     fn stop_writes(&self) {}
+    // The torrent went away: nothing of it is written again.
+    fn retired(&self) -> bool {
+        false
+    }
     // A block of a piece too large to hold, written as it arrives: `bytes`
     // at `offset` of `file`, `at` bytes into piece `piece`. Written before
     // this returns, on a thread that may wait on a disk.
@@ -518,6 +522,11 @@ impl Inner {
     // not check: it goes the way of a piece its store refused, fetched
     // again, and no sender is blamed for the disk's error.
     fn spill(&self, index: u32, writing: &Arc<Writing>) {
+        // A torrent gone writes nothing: its pieces go with it, and their
+        // room with its storage.
+        if self.pieces.retired() {
+            return;
+        }
         let one = Arc::new(Mutex::new(None));
         let mut written = one.lock().unwrap_or_else(PoisonError::into_inner);
         // The map's lock is never held while the piece's own lock is waited

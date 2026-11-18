@@ -341,7 +341,146 @@ fn a_piece_given_back_whose_blocks_fail_to_write_is_refused_and_frees_its_room()
     assert!(!shim.store.has(1));
 }
 
-// A piece given back whole stays in memory, checked from there as before.
+// Nothing is left under the save folder, nor in a side store.
+fn nothing_under(shim: &Shim) {
+    let left: Vec<_> = std::fs::read_dir(shim.dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left under the save folder: {left:?}");
+    assert!(shim.store.side_path().is_none_or(|side| !side.exists()));
+}
+
+// A piece given back as its torrent is removed: its spill, queued aside
+// behind other work, runs after the torrent's writes were forgotten and its
+// files deleted. It writes nothing and makes no file, and the room of the
+// piece goes with the storage.
+#[test]
+fn a_spill_run_after_its_torrent_is_removed_writes_nothing() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let budget = accountant(PIECE_AND_BLOCK);
+        let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
+        let torrent = noise(160_000, 8);
+        shim.write_blocks(0, &torrent, u64::MAX, None);
+        shim.storage.on_piece_completed(shim.index(0)).unwrap();
+        assert!(shim.dir.path().join("a.bin").exists());
+        shim.write_blocks(1, &torrent, 3, None);
+
+        // The one blocking thread held: the spill queues behind it.
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let held = tokio::task::spawn_blocking(move || {
+            let _ = gate.recv();
+        });
+        shim.storage.on_piece_requeued(shim.index(1));
+        shim.store.forget().await;
+        std::fs::remove_file(shim.dir.path().join("a.bin")).unwrap();
+        open.send(()).unwrap();
+        held.await.unwrap();
+        // Run after the spill: one thread, in order.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+
+        nothing_under(&shim);
+        // The storage gone, the room of the piece it held is back.
+        drop(shim);
+        assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+    });
+}
+
+// The store, forgotten as the first block it is asked to write returns: the
+// torrent is removed while a spill writes its blocks.
+struct ForgetAfterFirst {
+    store: Arc<TorrentStore>,
+    first: std::sync::atomic::AtomicBool,
+}
+
+impl Pieces for ForgetAfterFirst {
+    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
+        self.store.verified(piece, held)
+    }
+
+    fn write_block(
+        &self,
+        piece: u32,
+        file: usize,
+        offset: u64,
+        at: u64,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let written = self.store.write_block(piece, file, offset, at, bytes);
+        if self.first.swap(false, Ordering::AcqRel) {
+            self.store.forget_now();
+        }
+        written
+    }
+
+    fn retired(&self) -> bool {
+        self.store.retired()
+    }
+
+    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
+        self.store.failed(piece)
+    }
+
+    fn checking(&self) -> anyhow::Result<bool> {
+        self.store.checking()
+    }
+
+    fn found(&self, piece: u32) -> anyhow::Result<bool> {
+        self.store.found(piece)
+    }
+
+    fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.store.read(file, offset, out)
+    }
+
+    fn grow(&self, file: usize, length: u64) -> std::io::Result<()> {
+        self.store.grow(file, length)
+    }
+}
+
+// A spill whose torrent is removed after its first block was written: that
+// block is on disk, written before the removal, and no later block is, nor
+// is the file it would go to made. The piece's room is back.
+#[test]
+fn a_spill_whose_torrent_is_removed_part_way_writes_nothing_after() {
+    let budget = accountant(PIECE_AND_BLOCK);
+    let layout = two_files();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&layout, dir.path(), None);
+    let forgets = Arc::new(ForgetAfterFirst {
+        store: Arc::clone(&store),
+        first: std::sync::atomic::AtomicBool::new(true),
+    });
+    let shim = Shim {
+        store,
+        storage: PieceStorage::new(
+            Arc::clone(&layout),
+            forgets as Arc<dyn Pieces>,
+            holds(&budget),
+        ),
+        layout,
+        dir,
+        room: Arc::default(),
+    };
+    let torrent = noise(160_000, 11);
+    // Three blocks of piece 1: the end of a.bin, then the start of b.bin.
+    shim.write_blocks(1, &torrent, 3, None);
+    shim.storage.on_piece_requeued(shim.index(1));
+
+    let a = std::fs::read(shim.dir.path().join("a.bin")).unwrap();
+    assert_eq!(&a[65_536..100_000], &torrent[65_536..100_000]);
+    assert!(!shim.dir.path().join("b.bin").exists());
+    assert!(shim.store.side_path().is_none_or(|side| !side.exists()));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+    // Removed, its files deleted: nothing comes back.
+    std::fs::remove_file(shim.dir.path().join("a.bin")).unwrap();
+    nothing_under(&shim);
+}
 #[test]
 fn a_piece_given_back_whole_stays_in_memory() {
     let budget = accountant(PIECE_AND_BLOCK);

@@ -443,6 +443,10 @@ impl Pieces for Intake {
         self.inner.stop_writes();
     }
 
+    fn retired(&self) -> bool {
+        self.inner.retired()
+    }
+
     // A block is booked on the disk's ledger as a piece is, and its write
     // heard the same way when it fails. One that landed changes nothing
     // the torrent has: the piece is had, and heard, once it is sealed.
