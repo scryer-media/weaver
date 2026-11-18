@@ -1576,17 +1576,19 @@ fn when(ms: Option<i64>) -> i64 {
     ms.map_or(-1, secs)
 }
 
-// The bytes of the files it fetches, and of those the bytes it lacks
-// (qBittorrent `wantedSize`, `remainingSize`).
 // qBittorrent's `progress`: while the torrent is checked, how far the check
 // has read; otherwise the wanted bytes in hand (qBittorrent
 // `TorrentImpl::progress`, torrentimpl.cpp:927-947, with `isChecking` at
 // :1181-1185; served in torrents/info, serialize_torrent.cpp:130, and in
-// torrents/properties, torrentscontroller.cpp:873).
+// torrents/properties, torrentscontroller.cpp:873). One departure: a
+// torrent that wants no file reads as the view has it, 1, all it wants in
+// hand, where qBittorrent sends 0 (torrentimpl.cpp:932-933).
 fn progress(view: &TorrentView) -> f64 {
     view.check_progress.unwrap_or(view.progress).clamp(0.0, 1.0)
 }
 
+// The bytes of the files it fetches, and of those the bytes it lacks
+// (qBittorrent `wantedSize`, `remainingSize`).
 fn wanted_and_left(view: &TorrentView, totals: FileTotals) -> (u64, u64) {
     if !totals.any {
         return (
