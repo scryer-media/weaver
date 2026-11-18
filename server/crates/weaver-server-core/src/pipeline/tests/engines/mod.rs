@@ -92,6 +92,7 @@ mod encrypted_hex;
 mod end_files;
 mod first_article_sample;
 mod frontless_rar;
+mod frontless_records;
 mod frontless_sets;
 pub(in crate::pipeline) mod harness;
 mod header_names;

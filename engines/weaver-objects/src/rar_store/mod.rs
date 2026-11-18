@@ -590,6 +590,7 @@ impl RarStore {
             // The layout holds to every volume touched so far, those the
             // walks gave back or touched again included.
             let touched: BTreeSet<VolumeIndex> = touched.union(&self.dirty).copied().collect();
+            self.say_records_unheaded(&touched, out);
             if !self.gone {
                 self.sync(&touched, out);
             }
@@ -1126,10 +1127,13 @@ impl Object for RarStore {
     }
 
     // The place the volume's headers or name give it, held or not: whether
-    // it takes it is the tree's to judge.
+    // it takes it is the tree's to judge. A member offered by the bytes
+    // past its hole has no headers to give one.
     fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
-        let first_bytes = clean.front();
-        self.claim_volume(name, first_bytes)
+        match clean.at {
+            0 => self.claim_volume(name, clean.front()),
+            _ => self.claim_past_hole(name),
+        }
     }
 
     // A volume contributes to no member yet and can travel with all the
