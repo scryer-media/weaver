@@ -624,6 +624,12 @@ impl TorrentService {
                         .map_err(|error| ActionError::State(error.to_string()))?;
                 }
                 torrent.levels = held;
+                // No piece comes for a change that leaves nothing it wants
+                // missing: the settle is told, as an add's is (libtorrent
+                // `update_peer_interest` calls `finished()`).
+                if torrent.completes() {
+                    self.inner.signal.look(job_id);
+                }
                 Ok(None)
             })
             .await?;
@@ -701,6 +707,9 @@ impl TorrentService {
                                 tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's file levels");
                             }
                             torrent.levels = held;
+                            if torrent.completes() {
+                                self.inner.signal.look(job_id);
+                            }
                             if let Some(leveling) = &mut torrent.leveling {
                                 next = leveling.next.take();
                                 if let Some(next) = &next {
