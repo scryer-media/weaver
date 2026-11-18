@@ -103,22 +103,26 @@ fn carried_on(facts: &RarVolumeFacts) -> Option<&RarVolumeMemberFacts> {
 }
 
 // Where among `facts`' members sits the one the volume opens on, when it
-// carries on `tail`, the member the volume before ends on, under another
-// name. Which set a volume is of, and where in it, is the claim's to say,
+// carries on `tail`, the member the volume before ends on, and says of it
+// otherwise than `tail` does: another name, or another size for the whole
+// member. Which set a volume is of, and where in it, is the claim's to say,
 // and a name is evidence there. Once the volume is laid after the one
 // before, RAR reads the part it opens on as the part that volume carries
-// on, by place alone: unrar's MergeArchive compares no names, and a packer
-// may name a member one way in its first part and another in the rest.
-// Both headers state the whole member's size, and the two parts are of one
-// member only when they state the same one.
-fn renamed_continuation(tail: &RarVolumeMemberFacts, facts: &RarVolumeFacts) -> Option<usize> {
+// on, by place alone: unrar's MergeArchive (volume.cpp) reads the next
+// volume's header in place of the last and compares neither name nor size,
+// and CmdExtract::UnstoreFile (extract.cpp) writes a stored member to the
+// size its first part states. Packers name a member one way in its first
+// part and another in the rest, and misstate its size in the middle parts.
+// The member is what its first part says, and the CRC its last part states
+// proves its bytes, as unrar's ValidCRC check does.
+fn continuation(tail: &RarVolumeMemberFacts, facts: &RarVolumeFacts) -> Option<usize> {
     let (at, head) = facts
         .members
         .iter()
         .enumerate()
         .min_by_key(|(_, member)| member.order)?;
-    let same_size = head.unpacked_size.is_some() && head.unpacked_size == tail.unpacked_size;
-    (head.split_before && head.name != tail.name && same_size).then_some(at)
+    let differs = head.name != tail.name || head.unpacked_size != tail.unpacked_size;
+    (head.split_before && differs).then_some(at)
 }
 
 // Whether a volume is held where it is on trust: its headers state no
@@ -179,21 +183,24 @@ impl Laid {
     }
 
     // A volume's facts as the layout takes them. The builder links a
-    // member's parts by name, so a volume that opens on the member the one
-    // before carries on, named otherwise, has it under the name the layout
-    // took that member by: the name its first part gives it, as unrar
-    // extracts it.
+    // member's parts by name and holds them to one stated size, so a volume
+    // that opens on the member the one before carries on, saying otherwise
+    // of it, has it as the layout took that member: the name and size its
+    // first part gives it, as unrar extracts it. The sum of the parts' bytes
+    // must still come to that size, and the last part's CRC proves them.
     fn joined<'a>(&self, index: u32, facts: &'a RarVolumeFacts) -> Cow<'a, RarVolumeFacts> {
-        let renamed = index
+        let carried = index
             .checked_sub(1)
             .and_then(|before| self.tails.get(&before))
-            .and_then(|tail| Some((tail, renamed_continuation(tail, facts)?)));
-        let Some((tail, at)) = renamed else {
+            .and_then(|tail| Some((tail, continuation(tail, facts)?)));
+        let Some((tail, at)) = carried else {
             return Cow::Borrowed(facts);
         };
         let mut joined = facts.clone();
-        joined.members[at].name.clone_from(&tail.name);
-        joined.members[at].name_raw.clone_from(&tail.name_raw);
+        let head = &mut joined.members[at];
+        head.name.clone_from(&tail.name);
+        head.name_raw.clone_from(&tail.name_raw);
+        head.unpacked_size = tail.unpacked_size;
         Cow::Owned(joined)
     }
 

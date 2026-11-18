@@ -65,12 +65,7 @@ type Build = fn(&str, &[u8], usize) -> Vec<(String, Vec<u8>)>;
 
 // The set `build` writes, its first volume naming the member `first` and
 // every later one `later`.
-fn set(
-    build: Build,
-    body: &[u8],
-    first: &str,
-    later: &str,
-) -> Vec<Vec<u8>> {
+fn set(build: Build, body: &[u8], first: &str, later: &str) -> Vec<Vec<u8>> {
     let head = build(first, body, VOLUMES).remove(0).1;
     std::iter::once(head)
         .chain(

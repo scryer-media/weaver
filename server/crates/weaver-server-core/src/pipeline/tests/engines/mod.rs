@@ -106,6 +106,7 @@ mod lines;
 pub(in crate::pipeline) mod loans;
 mod lost_fronts;
 mod lost_index;
+mod misstated_sizes;
 mod nameless_recovery;
 mod nested_engine_fault;
 mod nested_rar4;
