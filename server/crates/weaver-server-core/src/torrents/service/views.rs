@@ -437,11 +437,17 @@ impl TorrentService {
         // Whether every stored torrent is here, taken before they are read.
         let every = self.whole().is_ok();
         let stamp = self.inner.snapshot.stamp();
-        // Presence is counted in the walk that picks the torrents.
+        // Presence, and whether any torrent downloads, are counted in the
+        // walk that picks the torrents.
         let mut presence = Presence::default();
+        let mut downloading = false;
         let listed = self
-            .listed_noting(None, false, true, now, |torrent| presence.note(torrent))
+            .listed_noting(None, false, true, now, |torrent| {
+                presence.note(torrent);
+                downloading |= torrent.downloading();
+            })
             .await;
+        self.note_downloading(downloading);
         let sessions = self
             .inner
             .sessions_read

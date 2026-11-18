@@ -954,3 +954,124 @@ async fn pieces_posted_under_an_unpaired_closing_quote_are_named_clean_and_joine
     assert_joined(&graph);
     assert_eq!(kinds(&graph), vec!["split"]);
 }
+
+// The pieces of `joined()` under two-digit numbers, `lantern.bin.01` onward,
+// as 7-Zip numbers a set whose first piece it is told to call `.01`.
+fn short_pieces(bytes: &[u8], first: usize) -> Vec<Post> {
+    bytes
+        .chunks(PIECE)
+        .enumerate()
+        .map(|(index, piece)| Post::plain(&format!("{NAME}.{:02}", index + first), piece.to_vec()))
+        .collect()
+}
+
+// A set numbered `.01`, `.02`, `.03` is joined as a `.001` set is: its first
+// piece opens it as 7-Zip opens one (`SplitHandler.cpp`), and the pieces
+// after it make it a set. Before, two digits were never a piece, and the
+// three pieces were delivered as they were posted.
+#[tokio::test]
+async fn a_two_digit_set_is_delivered_joined() {
+    for scenario in [
+        Scenario::new(short_pieces(&joined(), 1)),
+        Scenario::new(short_pieces(&joined(), 1)).backwards(),
+        Scenario::new(short_pieces(&joined(), 0)),
+    ] {
+        let graph = run(&scenario).await;
+        assert_joined(&graph);
+        assert_eq!(kinds(&graph), vec!["split"]);
+    }
+}
+
+// A PAR2 set that describes the joined file, `lantern.bin`, beside its
+// two-digit pieces: the pieces join, and the set repairs the joined file
+// where the join writes it. Before, the pieces were three plain files, and
+// the set never named any of them.
+#[tokio::test]
+async fn a_two_digit_set_under_par2_over_the_joined_file_is_repaired_and_delivered_joined() {
+    let original = joined();
+    let mut posts = short_pieces(&original, 1);
+    posts[1].bytes[ARTICLE..3 * ARTICLE].fill(0);
+    posts.extend(par2_set("lantern", &[(NAME, &original)], 4));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_joined(&graph);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 2 })]
+    );
+}
+
+// The same set clean: the PAR2 set rules the joined file clean.
+#[tokio::test]
+async fn a_clean_two_digit_set_under_par2_over_the_joined_file_is_ruled_clean() {
+    let original = joined();
+    let mut posts = short_pieces(&original, 1);
+    posts.extend(par2_set("lantern", &[(NAME, &original)], 4));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_joined(&graph);
+    assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+}
+
+// A two-digit tail with no set behind it is a version's or a repost's, and
+// the file is delivered as it is, whole: a lone `.10` or `.99`, a version
+// `1.4.10`, a lone first piece `.01` with nothing after it, and `.10` and
+// `.11` with no first piece.
+#[tokio::test]
+async fn a_two_digit_tail_without_a_set_is_delivered_whole() {
+    let file = payload(2 * ARTICLE + 43, 79);
+    for names in [
+        &["notes.10"][..],
+        &["file.99"],
+        &["Release.1.4.10"],
+        &["notes.01"],
+        &["notes.10", "notes.11"],
+        &["Release.1.4.10", "Release.1.4.11", "Release.1.4.12"],
+    ] {
+        let posts: Vec<Post> = names
+            .iter()
+            .map(|name| Post::plain(name, file.clone()))
+            .collect();
+        let graph = run(&Scenario::new(posts)).await;
+        assert!(
+            graph.completed(),
+            "{names:?}: {:?} {:?} kinds {:?}",
+            graph.status,
+            graph.failure,
+            kinds(&graph)
+        );
+        let mut expected: Vec<String> = names
+            .iter()
+            .map(|name| format!("lantern beacon/{name}"))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            graph.files.keys().cloned().collect::<Vec<_>>(),
+            expected,
+            "{names:?}"
+        );
+        for name in &expected {
+            assert!(graph.files[name] == file, "{name} not whole");
+        }
+        assert!(!kinds(&graph).contains(&"split"), "{:?}", kinds(&graph));
+    }
+}
+
+// A joined file whose own name ends in a first piece's two digits is not
+// split again: `notes.4.01.001` and `.002` join into `notes.4.01`, which no
+// piece beside it continues.
+#[tokio::test]
+async fn a_joined_file_ending_in_a_first_pieces_two_digits_is_not_split_again() {
+    let original = joined();
+    let posts: Vec<Post> = original
+        .chunks(PIECE)
+        .enumerate()
+        .map(|(index, piece)| Post::plain(&format!("notes.4.01.{:03}", index + 1), piece.to_vec()))
+        .collect();
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec!["lantern beacon/notes.4.01".to_string()]
+    );
+    assert!(graph.files["lantern beacon/notes.4.01"] == original);
+    assert_eq!(kinds(&graph), vec!["split"]);
+}

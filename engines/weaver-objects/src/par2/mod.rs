@@ -47,6 +47,13 @@ const MAX_PAR2_RECOVERY_SETS: usize = 100_000;
 // owner grants it no memory of its own.
 const MAX_JOB_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
 const REPAIR_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
+// The longest slice a search past a hole reads a recovery packet of
+// before any packet has said what the set's slices are: a member whose
+// front will not come, with no set known, is read at most this far past
+// its hole, about once more than a recovery packet of this slice, for a
+// packet whose hash passes. A set of longer slices is found past a hole
+// only by a file of it that opens on its own packets.
+const UNKNOWN_SLICE: u64 = 16 * 1024 * 1024;
 
 pub struct Par2 {
     id: ObjectId,
@@ -917,15 +924,14 @@ impl Object for Par2 {
     // object holds, its hash passing: searched for as those bytes are
     // handed over, not yet while the packet has not passed whole, and
     // none once the search's bound is past (`past_hole`). Magic alone, or a
-    // packet of another set, claims nothing.
+    // packet of another set, claims nothing. An object that holds no set
+    // yet, built to judge such a member when no PAR2 file opened on its own
+    // packets, takes a packet of any set whose hash passes: that packet
+    // founds the set, whose other files are then claimed by theirs.
     fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
         let first_bytes = clean.front();
         let place = VolumeIndex(self.volumes.len() as u32);
         if clean.at > 0 {
-            if self.sets.is_empty() {
-                self.searches.end(name);
-                return Claim::default();
-            }
             let format = SetPackets { sets: &self.sets };
             return match self.searches.read(name, (clean.at, clean.bytes), &format) {
                 Searched::Found => Claim::Places(vec![place]),
@@ -971,7 +977,9 @@ impl Object for Par2 {
 
 // PAR2 packets as a search past a hole reads them: of a set the object
 // holds, and no longer than the longest such a set holds, a recovery
-// packet of its slice size or the longest metadata the walker reads.
+// packet of its slice size or the longest metadata the walker reads. An
+// object that holds no set reads a packet of any set, its slice size not
+// known: no longer than a recovery packet of UNKNOWN_SLICE bytes.
 struct SetPackets<'a> {
     sets: &'a BTreeMap<[u8; 16], SetState>,
 }
@@ -985,20 +993,22 @@ impl Packets for SetPackets<'_> {
 
     fn ours(&self, header: &[u8]) -> Option<u64> {
         let header = par2_rs::packet::PacketHeader::parse(header, 0).ok()?;
-        self.sets
-            .contains_key(header.recovery_set_id.as_bytes())
+        (self.sets.is_empty() || self.sets.contains_key(header.recovery_set_id.as_bytes()))
             .then_some(header.length)
     }
 
     fn longest(&self) -> u64 {
         // A recovery packet holds its exponent and one slice.
-        let slices = self
-            .sets
-            .values()
-            .filter_map(|set| set.index.as_ref())
-            .map(|index| index.slice_size.saturating_add(4))
-            .max()
-            .unwrap_or(0);
+        let slices = if self.sets.is_empty() {
+            UNKNOWN_SLICE.saturating_add(4)
+        } else {
+            self.sets
+                .values()
+                .filter_map(|set| set.index.as_ref())
+                .map(|index| index.slice_size.saturating_add(4))
+                .max()
+                .unwrap_or(0)
+        };
         (HEADER_SIZE as u64).saturating_add(slices.max(walker::LONGEST_METADATA_BODY))
     }
 

@@ -2196,7 +2196,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-pub(crate) const REASONS: [Why; 16] = [
+pub(crate) const REASONS: [Why; 17] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -2208,6 +2208,7 @@ pub(crate) const REASONS: [Why; 16] = [
     Why::HoldsBreached,
     Why::Unsupported,
     Why::Unmapped,
+    Why::Unfound { volume: 0 },
     Why::TooDeep,
     Why::InvalidArchive,
     Why::Scattered,
@@ -2234,6 +2235,7 @@ pub(crate) fn why_name(why: Why) -> &'static str {
         Why::HoldsBreached => "holds_breached",
         Why::Unsupported => "unsupported",
         Why::Unmapped => "unmapped",
+        Why::Unfound { .. } => "unfound",
         Why::TooDeep => "too_deep",
         Why::InvalidArchive => "invalid_archive",
         Why::Scattered => "scattered",
@@ -2245,10 +2247,12 @@ pub(crate) fn why_name(why: Why) -> &'static str {
 // A reason as a checkpoint row keeps it: its name, and for a decode too
 // large the sizes it carried, each `-` where it said none, as
 // `too_large:2147483648:-`; for a decode the machine cannot hold, what it
-// needed and the machine's memory, as `over_machine:68719476736:34359738368`.
+// needed and the machine's memory, as `over_machine:68719476736:34359738368`;
+// for a set short of a volume, the volume, as `unfound:2`.
 pub(crate) fn why_text(why: Why) -> String {
     let size = |size: Option<u64>| size.map_or_else(|| "-".to_owned(), |size| size.to_string());
     match why {
+        Why::Unfound { volume } => format!("{}:{volume}", why_name(why)),
         Why::TooLarge { needed, allowed } => {
             format!("{}:{}:{}", why_name(why), size(needed), size(allowed))
         }
@@ -2263,9 +2267,19 @@ fn why_named(text: &str) -> Option<Why> {
     let Some((name, sizes)) = text.split_once(':') else {
         return REASONS
             .into_iter()
-            .filter(|why| !matches!(why, Why::TooLarge { .. } | Why::OverMachine { .. }))
+            .filter(|why| {
+                !matches!(
+                    why,
+                    Why::TooLarge { .. } | Why::OverMachine { .. } | Why::Unfound { .. }
+                )
+            })
             .find(|why| why_name(*why) == text);
     };
+    if name == "unfound" {
+        return Some(Why::Unfound {
+            volume: sizes.parse().ok()?,
+        });
+    }
     let size = |size: &str| match size {
         "-" => Some(None),
         size => size.parse().ok().map(Some),

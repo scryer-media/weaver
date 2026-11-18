@@ -865,12 +865,14 @@ export const JOB_QUERY = gql`
     jobDetailSnapshot(jobId: $id) {
       queueItem {
         ...FacadeQueueItemFields
+        outcome
         error
         outputDir
         createdAt
       }
       historyItem {
         ...FacadeHistoryItemFields
+        outcome
         error
         failedForMemory
         archivedAt
@@ -963,12 +965,14 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
     jobDetailUpdates(jobId: $id) {
       queueItem {
         ...FacadeQueueItemFields
+        outcome
         error
         outputDir
         createdAt
       }
       historyItem {
         ...FacadeHistoryItemFields
+        outcome
         error
         failedForMemory
         archivedAt

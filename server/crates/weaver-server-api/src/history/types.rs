@@ -16,8 +16,9 @@ use crate::jobs::release_display::{
     ReleaseDisplayCache, ReleaseDisplayInput, release_display_info,
 };
 use crate::jobs::types::{
-    Attribute, DuplicateSummaryInfo, JobStatusGql, ParsedRelease, PreparedQueueFilter, ProtocolGql,
-    QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
+    Attribute, DuplicateSummaryInfo, JobOutcome, JobStatusGql, ParsedRelease, PreparedQueueFilter,
+    ProtocolGql, QueueAttention, QueueFilterInput, QueueItemState,
+    matches_attribute_filter_prepared,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -32,6 +33,9 @@ pub struct HistoryItem {
     pub original_title: String,
     pub parsed_release: ParsedRelease,
     pub state: QueueItemState,
+    /// How the job ended, a partial delivery as its own value.
+    #[serde(default)]
+    pub outcome: Option<JobOutcome>,
     pub error: Option<String>,
     pub progress_percent: f64,
     pub total_bytes: u64,
@@ -791,6 +795,7 @@ fn history_item_from_display(
         original_title,
         parsed_release,
         state,
+        outcome: JobOutcome::of_history(&row.status),
         error: row.error_message.clone(),
         progress_percent,
         total_bytes: row.total_bytes,

@@ -291,7 +291,9 @@ async fn a_finished_torrent_unpacking_refused_beside_a_usable_file_is_partial() 
     retired.wait_for(|retired| *retired >= 1).await.unwrap();
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
     assert_eq!(history.status, "partial");
-    assert!(history.error_message.unwrap().contains("txt"));
+    let error = history.error_message.unwrap();
+    assert!(error.starts_with("delivered in part; "), "{error}");
+    assert!(error.contains("txt"));
     let view = rig.service.torrent(job_id).await.unwrap();
     assert!(view.completed_at_ms.is_some());
     assert_ne!(view.state, TorrentState::Stopped);
@@ -340,7 +342,7 @@ async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_the_jo
     assert_eq!(history.status, "partial");
     assert_eq!(
         history.error_message.as_deref(),
-        Some("removed for an unwanted extension: small.txt")
+        Some("delivered in part; removed for an unwanted extension: small.txt")
     );
     let view = rig.service.torrent(job_id).await.unwrap();
     assert!(view.completed_at_ms.is_some());

@@ -5488,7 +5488,7 @@ fn a_refused_name_recognised_and_rebuilt_is_a_usable_file() {
         &job.tree,
         |member| member != other,
         |_| false,
-        |_, _| false,
+        |_, _| crate::pipeline::graph::status::Described::Otherwise,
         |node, member| job.writer.refused(node, member),
         |node, member| job.writer.unnamable(node, member),
         |_| crate::pipeline::graph::status::Unarrived::Short,

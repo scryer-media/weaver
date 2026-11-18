@@ -879,6 +879,12 @@ impl GraphJob {
         self.root.map.arrived_bytes(VolumeIndex(file_index))
     }
 
+    // Seam for status: the bytes the post declares for the posted file at
+    // `file_index`, every article counted.
+    pub(crate) fn posted_bytes(&self, file_index: u32) -> u64 {
+        self.root.map.posted_bytes(VolumeIndex(file_index))
+    }
+
     // Seam for status: the job is fetching repair data. Its payload is in,
     // no repair run is out, and a set waits on recovery volumes the root is
     // still fetching for it.
@@ -1247,6 +1253,65 @@ impl GraphJob {
     // What the job waits for room for, and the folder it waits on.
     pub(crate) fn disk_wait(&self) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
         self.writer.disk_wait()
+    }
+
+    // An article of a posted file named the file in its header (`=ybegin
+    // ... name=`, or a uuencode `begin` line), and is about to be taken in.
+    // The file takes that name, as SABnzbd's `verify_nzf_filename`
+    // (nzb/object.py) decides it, only while none of its bytes are in: the
+    // first article taken in decides, and its write is under the name it
+    // decided. A recovery set that already describes the file named it,
+    // and its name stands; one that recognises the file by its content
+    // later renames it as it renames any member. The rename is the tree's,
+    // as a recovery set's is: the ledger places the name, the file follows,
+    // and the name is a claim made again. The checkpoint that first records
+    // the file's bytes records its name with them.
+    pub(crate) fn header_named(
+        &mut self,
+        volume: VolumeIndex,
+        header: &str,
+    ) -> Result<(), GraphError> {
+        let member = MemberId(volume.0);
+        let Some(posted) = self
+            .tree
+            .namespace(NodeId::ROOT)
+            .and_then(|namespace| namespace.get(member))
+            .filter(|record| record.coverage.runs().next().is_none())
+            .map(|record| record.name.as_str())
+        else {
+            return Ok(());
+        };
+        let Some(name) = weaver_nzb::deobfuscate::header_name(posted, header) else {
+            return Ok(());
+        };
+        let described = self
+            .tree
+            .recovery_nodes(NodeId::ROOT)
+            .into_iter()
+            .any(|set| {
+                self.tree
+                    .consult_recovery(set, |recovery, _| recovery.covers(member))
+                    .unwrap_or(false)
+            });
+        if described {
+            return Ok(());
+        }
+        tracing::info!(
+            job_id = self.runs.scope(),
+            file = volume.0,
+            posted = %posted,
+            named = %name,
+            "file named by its article header"
+        );
+        let mut out = Vec::new();
+        self.writer.header_named(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            (member, &name),
+            &mut out,
+        )?;
+        self.heard(out)
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step

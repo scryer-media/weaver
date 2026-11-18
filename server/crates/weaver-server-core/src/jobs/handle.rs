@@ -1853,6 +1853,12 @@ impl SchedulerHandle {
         Ok(())
     }
 
+    // Whether the pipeline has work to drive, as it last said: while it
+    // does, it gives memory back itself as it settles.
+    pub(crate) fn pipeline_driving(&self) -> bool {
+        self.state.queue.driving()
+    }
+
     // Publish the jobs `protocol`'s class keeps beside the pipeline's. What
     // the publish changed goes out on the job events, as the pipeline's own
     // changes do: a job that appears is created, one that changes says so.

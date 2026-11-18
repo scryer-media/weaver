@@ -256,6 +256,15 @@ impl Live {
         status::seeding(self.complete(), &self.engine) || self.record.seed_mode
     }
 
+    // Whether it has download work in hand: running, not queued, short of a
+    // seed, and fetching its metadata or in its session.
+    pub(super) fn downloading(&self) -> bool {
+        self.resumed()
+            && !self.queued
+            && !self.seeding()
+            && (self.fetching.is_some() || self.attached.is_some())
+    }
+
     // What it shows until its store is back, from what was stored: the
     // pieces it kept, as the store restored from them will have, and the
     // failure its history keeps.

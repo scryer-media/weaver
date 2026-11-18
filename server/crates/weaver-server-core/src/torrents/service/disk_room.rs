@@ -129,6 +129,40 @@ struct PlaceLook {
     placed: bool,
     // A reading began this look.
     again: bool,
+    // The batch whose looks ask one pass between them, when it is one.
+    batch: Option<Arc<PlaceBatch>>,
+}
+
+// The looks of one batch of moves (`set_location_many_as`): the pass their
+// torrents wait for is asked once, as the last of them ends, not once a
+// look, so a batch of many is one pass and one publish of every torrent,
+// whenever its looks end (libtorrent `trigger_auto_manage`, posted once).
+pub(super) struct PlaceBatch {
+    service: TorrentService,
+    placed: std::sync::atomic::AtomicBool,
+}
+
+impl PlaceBatch {
+    pub(super) fn new(service: &TorrentService) -> Arc<Self> {
+        Arc::new(Self {
+            service: service.clone(),
+            placed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    // Every look ended: whether one placed its torrent, the pass it waits
+    // for then the caller's to make, and asked of no one else.
+    pub(super) fn take_placed(self) -> bool {
+        self.placed.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Drop for PlaceBatch {
+    fn drop(&mut self) {
+        if self.placed.load(Ordering::Acquire) {
+            self.service.inner.signal.want_pass();
+        }
+    }
 }
 
 impl PlaceLook {
@@ -143,8 +177,12 @@ impl Drop for PlaceLook {
         if self.placed {
             self.service.relooked(self.again);
             // A torrent kept for its disk to be known is judged at the next
-            // pass, and a piece that waited for it at the next wake.
-            self.service.inner.signal.want_pass();
+            // pass, and a piece that waited for it at the next wake. A
+            // batch's looks ask it once, as the last ends.
+            match &self.batch {
+                Some(batch) => batch.placed.store(true, Ordering::Release),
+                None => self.service.inner.signal.want_pass(),
+            }
         } else {
             self.intake.room().end_placing();
             // A look the stop ended is looked again by no one: no reading
@@ -303,12 +341,26 @@ impl TorrentService {
         dir: PathBuf,
         again: bool,
     ) {
+        self.spawn_place_in(job_id, intake, dir, again, None);
+    }
+
+    // `spawn_place`, as one of `batch`'s looks when it is one: the pass
+    // its torrent waits for is the batch's.
+    pub(super) fn spawn_place_in(
+        &self,
+        job_id: JobId,
+        intake: &Arc<Intake>,
+        dir: PathBuf,
+        again: bool,
+        batch: Option<&Arc<PlaceBatch>>,
+    ) {
         let mut placing = PlaceLook {
             service: self.clone(),
             job_id,
             intake: Arc::clone(intake),
             placed: false,
             again,
+            batch: batch.cloned(),
         };
         let Some(capacity) = self.inner.env.capacity.clone() else {
             // Nothing to look on: no look is left out.

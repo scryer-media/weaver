@@ -952,7 +952,7 @@ mod unwanted {
         assert_eq!(graph.files[&delivered("lantern.mkv")], lantern());
         assert_eq!(
             reason(&graph).as_deref(),
-            Some("removed for an unwanted extension: beacon.exe, cinder.exe")
+            Some("delivered in part; removed for an unwanted extension: beacon.exe, cinder.exe")
         );
     }
 
@@ -1069,7 +1069,7 @@ mod unwanted {
             assert_eq!(names(&graph), BTreeSet::from([delivered("lantern.mkv")]));
             assert_eq!(
                 reason(&graph).as_deref(),
-                Some("removed for an unwanted extension: setup.exe")
+                Some("delivered in part; removed for an unwanted extension: setup.exe")
             );
             // No RAR was opened at the root; inside, only the outer one:
             // `candle.mkv`, which `setup.exe` holds, never came out.

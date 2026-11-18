@@ -40,6 +40,12 @@ impl SetName for VolumeName {
     fn same_set(&self, other: &VolumeName) -> bool {
         self.stem == other.stem && self.scheme == other.scheme
     }
+
+    // A RAR volume's name never says it is the last: the next is named in
+    // the same numbering, as unrar names the volume it opens next.
+    fn after(&self) -> Option<u32> {
+        self.index.checked_add(1)
+    }
 }
 
 pub(crate) fn parse(name: &str) -> Option<VolumeName> {

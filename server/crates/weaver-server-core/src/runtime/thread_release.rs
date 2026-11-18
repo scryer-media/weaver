@@ -18,6 +18,7 @@
 // call is a no-op.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static IDLE_THREAD_RELEASE: OnceLock<fn()> = OnceLock::new();
 static JOB_COMPLETION_RELEASE: OnceLock<fn()> = OnceLock::new();
@@ -79,6 +80,37 @@ pub fn release_job_completion_memory() {
     if let Some(hook) = JOB_COMPLETION_RELEASE.get() {
         hook();
     }
+}
+
+// Whether a release asked for off the runtime is queued and not yet begun.
+static RELEASE_QUEUED: AtomicBool = AtomicBool::new(false);
+
+// The end-of-job release for a job class that ends its downloads on the
+// async runtime: the purge returns pages to the system one call at a time,
+// so it runs on a blocking thread. A release asked for while one is queued
+// and not yet begun is that one, so a burst of endings, such as a removal of
+// many jobs at once, costs one purge. With no hook installed nothing is
+// queued; outside a runtime it runs where it is asked.
+pub(crate) fn release_job_completion_memory_off_runtime() {
+    drop(queued_release());
+}
+
+// `release_job_completion_memory_off_runtime`, with the task it queued.
+fn queued_release() -> Option<tokio::task::JoinHandle<()>> {
+    let hook = *JOB_COMPLETION_RELEASE.get()?;
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        hook();
+        return None;
+    };
+    if RELEASE_QUEUED.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    Some(runtime.spawn_blocking(move || {
+        // Cleared before the purge: pages freed after this point are left
+        // to the next release asked for.
+        RELEASE_QUEUED.store(false, Ordering::Release);
+        hook();
+    }))
 }
 
 // Release what the process is holding for work that has stopped, if a hook is
@@ -159,5 +191,22 @@ mod tests {
         install_job_completion_release(other_job_hook);
         release_job_completion_memory();
         assert_eq!(JOB_CALLS.load(Ordering::Relaxed), 4);
+
+        // Off the runtime: the same hook, once, on a blocking thread.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            queued_release().expect("queued").await.unwrap();
+        });
+        assert_eq!(JOB_CALLS.load(Ordering::Relaxed), 5);
+        // One asked for while another is queued and not begun is that one.
+        RELEASE_QUEUED.store(true, Ordering::Release);
+        runtime.block_on(async { assert!(queued_release().is_none()) });
+        RELEASE_QUEUED.store(false, Ordering::Release);
+        assert_eq!(JOB_CALLS.load(Ordering::Relaxed), 5);
+        // Outside a runtime it runs where it is asked.
+        release_job_completion_memory_off_runtime();
+        assert_eq!(JOB_CALLS.load(Ordering::Relaxed), 6);
     }
 }

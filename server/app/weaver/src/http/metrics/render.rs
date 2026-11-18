@@ -3098,6 +3098,13 @@ fn render_torrent_disk(out: &mut Encoder, routes: &[SessionSeries]) {
             session.disk.batch_buffers,
         );
     }
+    for session in sessions() {
+        out.sample(
+            &f::TORRENT_PEER_RECEIVE_BUFFERS,
+            &[("route", session.route.as_str())],
+            session.disk.receive_buffers,
+        );
+    }
     // The files and their handles are shared by every route.
     let files = weaver_server_core::torrents::metrics::file_stats();
     let directions = [("read", files.reads), ("write", files.writes)];
