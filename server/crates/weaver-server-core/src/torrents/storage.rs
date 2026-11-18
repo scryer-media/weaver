@@ -14,7 +14,8 @@
 // written to, from the same moment until its writer has written them. A
 // piece the budget or the volume has no room for is refused, and the session
 // waits for the room this storage, or the volume's writer, rings when it
-// lets bytes go.
+// lets bytes go. The room is held from the grant; the memory is not: a
+// piece's pages are backed only as its blocks arrive (`PieceBuffer`).
 //
 // A torrent whose piece is larger than the whole resident budget could
 // never hold one, and is written block by block instead, as libtorrent
@@ -160,17 +161,105 @@ enum Flight {
 struct Writing {
     // The room it holds.
     len: usize,
-    bytes: std::sync::RwLock<Vec<u8>>,
+    bytes: std::sync::RwLock<PieceBuffer>,
 }
 
 impl Writing {
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, PieceBuffer> {
         self.bytes.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<u8>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, PieceBuffer> {
         self.bytes.write().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+// The memory of a piece in flight, the piece's length, one run of bytes.
+//
+// A piece longer than one block is an anonymous mapping: the OS gives it
+// address space at the grant and a page only once a block is written to
+// it, and takes the pages back when the last of its bytes is dropped,
+// whether it was written, failed or given up. A piece granted and not yet
+// arriving takes no memory: its room is held, its pages are not. A
+// buffer from the allocator, zeroed whole, is taken whole at the grant: a
+// recycled one is written over end to end before its first block arrives
+// (mimalloc `_mi_page_malloc_zero`, alloc.c:88-89 in v3).
+//
+// A piece of one block arrives whole at once, and the rare mapping the OS
+// refuses falls back to the allocator: that buffer is held whole from the
+// grant, as every piece's was.
+enum PieceBuffer {
+    Mapped(memmap2::MmapMut),
+    Heap(Vec<u8>),
+}
+
+impl Default for PieceBuffer {
+    fn default() -> Self {
+        Self::Heap(Vec::new())
+    }
+}
+
+impl PieceBuffer {
+    fn new(len: usize) -> Self {
+        if len > weaver_torrent::core::constants::CHUNK_SIZE as usize
+            && let Ok(mapped) = memmap2::MmapMut::map_anon(len)
+        {
+            return Self::Mapped(mapped);
+        }
+        Self::Heap(vec![0; len])
+    }
+
+    // The whole piece, handed on without a copy: the mapping goes with it.
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Mapped(mapped) => Bytes::from_owner(mapped),
+            Self::Heap(bytes) => Bytes::from(bytes),
+        }
+    }
+
+    // The bytes of it the OS backs with memory now.
+    #[cfg(all(test, unix))]
+    fn resident(&self) -> u64 {
+        match self {
+            Self::Mapped(mapped) => resident_of(mapped),
+            Self::Heap(bytes) => bytes.len() as u64,
+        }
+    }
+}
+
+impl std::ops::Deref for PieceBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mapped) => mapped,
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl std::ops::DerefMut for PieceBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Mapped(mapped) => mapped,
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+// The bytes of `region` the OS backs with memory now, a page at a time.
+#[cfg(all(test, unix))]
+pub(crate) fn resident_of(region: &[u8]) -> u64 {
+    // SAFETY: sysconf reads a constant of the system.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+    let start = region.as_ptr() as usize / page * page;
+    let end = (region.as_ptr() as usize + region.len()).div_ceil(page) * page;
+    let mut pages = vec![0u8; (end - start) / page];
+    // SAFETY: the range covers `region`, which is mapped while it is
+    // borrowed, and `pages` has one entry for each of its pages.
+    let read = unsafe { libc::mincore(start as _, end - start, pages.as_mut_ptr().cast()) };
+    assert_eq!(read, 0, "mincore failed");
+    pages.iter().filter(|&&state: &&u8| state & 1 != 0).count() as u64 * page as u64
 }
 
 impl Flight {
@@ -178,7 +267,7 @@ impl Flight {
         Self::Writing(
             Arc::new(Writing {
                 len,
-                bytes: std::sync::RwLock::new(vec![0; len]),
+                bytes: std::sync::RwLock::new(PieceBuffer::new(len)),
             }),
             paid,
         )
@@ -356,6 +445,18 @@ impl PieceStorage {
             .resident
             .peak
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    // The memory the OS backs the pieces still arriving with now, and how
+    // many such pieces there are.
+    #[cfg(all(test, unix))]
+    pub(crate) fn arriving_memory(&self) -> (u64, usize) {
+        let flight = self.flight();
+        let arriving = flight.values().filter_map(|entry| match entry {
+            Flight::Writing(writing, _) => Some(writing.read().resident()),
+            _ => None,
+        });
+        arriving.fold((0, 0), |(bytes, pieces), held| (bytes + held, pieces + 1))
     }
 
     fn flight(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Flight>> {
@@ -684,7 +785,7 @@ impl TorrentStorage for PieceStorage {
             };
             let released = entry.held();
             let held = match std::mem::replace(entry, Flight::Verified(Bytes::new())) {
-                Flight::Writing(writing, _) => Bytes::from(std::mem::take(&mut *writing.write())),
+                Flight::Writing(writing, _) => std::mem::take(&mut *writing.write()).into_bytes(),
                 Flight::Verified(bytes) => bytes,
                 Flight::Blocks(..) => Bytes::new(),
             };
@@ -712,7 +813,7 @@ impl TorrentStorage for PieceStorage {
                 let released = entry.held();
                 match std::mem::replace(entry, Flight::Verified(Bytes::new())) {
                     Flight::Writing(writing, paid) => {
-                        let held = Bytes::from(std::mem::take(&mut *writing.write()));
+                        let held = std::mem::take(&mut *writing.write()).into_bytes();
                         *entry = Flight::Verified(held.clone());
                         (held, paid, released)
                     }
