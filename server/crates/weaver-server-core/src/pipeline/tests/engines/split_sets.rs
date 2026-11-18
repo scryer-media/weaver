@@ -11,9 +11,11 @@
 
 use super::harness::{Outcome, Post, Scenario, kinds, par2_volumes_sliced, payload, run};
 use super::rar::delivered;
+use crate::pipeline::graph::lines::Lines;
 use crate::pipeline::tests::direct_store::{
     multi_member_store_set, single_member_rar4_store_set, single_member_rar4_store_set_numbered,
 };
+use weaver_graph::holds::HoldBudgets;
 
 const FRAME: usize = 32 * 1024;
 const VOLUMES: usize = 6;
@@ -260,15 +262,141 @@ async fn a_rar4_set_posted_with_its_last_volume_numbered_in_the_middle_is_one_st
         headers_order,
     )
     .await;
-    // Volumes whose end records state no number: their order is in the
-    // PAR2 names or in true header names, and nowhere else the store reads.
+    // Volumes whose end records state no number: with no PAR2 and no true
+    // header name, the headers order them, the last volume's closing the
+    // track the fifth carries on.
     every_shape(
         single_member_rar4_store_set(&members[0].0, &body, VOLUMES),
         &members,
         "rar4",
-        |headers, recovery| matches!(headers, Headers::True) || !matches!(recovery, Recovery::None),
+        headers_order,
     )
     .await;
+}
+
+// Two middle volumes of one track, posted under each other's numbers, in a
+// set whose end records state no number, with no PAR2 and no true header
+// name: each only carries the track on, so nothing in the headers orders
+// them and their names place them. The track's checksum fails, so the job
+// fails, every volume delivered as it came and none of them whole.
+#[tokio::test]
+async fn a_rar4_set_with_two_middle_volumes_swapped_ends_as_its_names_lay_it() {
+    let body = payload(VOLUMES * 4 * FRAME - 3 * FRAME + 41, 77);
+    let set = single_member_rar4_store_set("02-electric_red.flac", &body, VOLUMES);
+    let posts: Vec<Post> = [0, 2, 1, 3, 4, 5]
+        .into_iter()
+        .enumerate()
+        .map(|(posted, volume)| {
+            Post::plain(
+                &format!("{RELEASE}.part{:02}.rar", posted + 1),
+                set[volume].1.clone(),
+            )
+        })
+        .collect();
+    let graph = run(&Scenario::new(posts).framed(FRAME)).await;
+    let volumes: Vec<String> = (1..=VOLUMES)
+        .map(|posted| format!("{RELEASE}.part{posted:02}.rar"))
+        .collect();
+    let failure = format!(
+        "no file was delivered whole; {VOLUMES} short: {}",
+        volumes.join(", ")
+    );
+    assert!(!graph.completed(), "{:?}", graph.status);
+    assert_eq!(graph.failure.as_deref(), Some(failure.as_str()));
+    assert_eq!(kinds(&graph), ["rar_store"]);
+    let delivery = &graph.graph().delivery;
+    assert!(delivery.whole.is_empty(), "{delivery:?}");
+    assert_eq!(delivery.damaged, volumes);
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+}
+
+// A twelve-volume RAR4 set whose end records state no number, its true
+// last volume posted as `part02` and every volume after the first one
+// number later, with no PAR2 and no header name, arriving in `order`. The
+// last volume's header closes the track every other volume carries on, so
+// it goes last; the headers do not say how many volumes come before it, so
+// the set is ordered once, when the job is quiet, and its track is
+// delivered whole then.
+fn last_posted_second(order: &[usize]) -> (Scenario, Vec<u8>) {
+    const LONG: usize = 12;
+    let body = payload(LONG * 4 * FRAME - 3 * FRAME + 41, 91);
+    let set = single_member_rar4_store_set("02-electric_red.flac", &body, LONG);
+    // Posted number, less one, of each true volume.
+    let posted: Vec<usize> = (0..LONG)
+        .map(|volume| match volume {
+            0 => 0,
+            _ if volume == LONG - 1 => 1,
+            _ => volume + 1,
+        })
+        .collect();
+    let mut posts: Vec<(usize, Post)> = set
+        .iter()
+        .enumerate()
+        .map(|(volume, (_, bytes))| {
+            let name = format!("{RELEASE}.part{:02}.rar", posted[volume] + 1);
+            (posted[volume], Post::plain(&name, bytes.clone()))
+        })
+        .collect();
+    posts.sort_by_key(|(number, _)| *number);
+    let mut scenario =
+        Scenario::new(posts.into_iter().map(|(_, post)| post).collect()).framed(FRAME);
+    if !order.is_empty() {
+        scenario = scenario.together(&order.iter().map(|at| *at as u32).collect::<Vec<_>>());
+    }
+    (scenario, body)
+}
+
+fn whole_track(graph: &Outcome, body: &[u8], case: &str) {
+    assert!(
+        graph.completed(),
+        "{case}: {:?} {:?}",
+        graph.status,
+        graph.failure
+    );
+    let delivered = delivered("02-electric_red.flac");
+    assert_eq!(
+        graph.files.keys().collect::<Vec<_>>(),
+        [&delivered],
+        "{case}"
+    );
+    assert!(graph.files[&delivered] == body, "{case}: track bytes");
+}
+
+// One post after another, and every post side by side, fronts first. `run`
+// fails a job that stops moving, so the job going on past the order laid at
+// quiet is the job's own.
+#[tokio::test]
+async fn a_rar4_set_with_its_last_volume_posted_second_completes_once_in() {
+    let side_by_side: Vec<usize> = (0..12).collect();
+    for (case, order) in [("in turn", Vec::new()), ("side by side", side_by_side)] {
+        let (scenario, body) = last_posted_second(&order);
+        whole_track(&run(&scenario).await, &body, case);
+    }
+}
+
+// The same post under holds with room for a few articles in memory and as
+// many on scratch: what waits for the order spills, and the track is
+// delivered whole from what spilled.
+#[tokio::test]
+async fn a_rar4_set_with_its_last_volume_posted_second_completes_from_spilled_holds() {
+    let tight = HoldBudgets {
+        resident_limit: 4 * FRAME as u64,
+        scratch_total: 8 * FRAME as u64,
+        scratch_ceiling: 4 * FRAME as u64,
+        disk_reserve: 0,
+    };
+    let (lines, guard) = Lines::capture();
+    let (scenario, body) = last_posted_second(&[]);
+    let graph = run(&scenario.holds(tight)).await;
+    drop(guard);
+    whole_track(&graph, &body, "tight");
+    assert!(!lines.of("holds spilled").is_empty(), "holds spilled");
+    let breached: Vec<_> = lines
+        .of("object refused")
+        .into_iter()
+        .filter(|line| line.contains("why=holds_breached"))
+        .collect();
+    assert!(breached.is_empty(), "{breached:?}");
 }
 
 // The bench job's post as Weaver took it in: the PAR2 volumes posted as

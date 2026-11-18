@@ -97,7 +97,7 @@ fn lays(index: VolumeIndex, found: &Volume) -> Option<(&RarVolumeFacts, bool)> {
 
 // Whether a volume is held where it is on trust: its headers state no
 // position, so only its name or its links put it there.
-fn on_trust(found: &Volume) -> bool {
+pub(super) fn on_trust(found: &Volume) -> bool {
     found
         .stated()
         .is_none_or(|facts| !claim::states_position(facts))
@@ -228,6 +228,7 @@ fn reach(
     layout: &StoredLayoutBuilder,
     from: u32,
     refuted: Option<(VolumeIndex, u64)>,
+    held_out: Option<u32>,
 ) -> Result<u32, Emit> {
     let tail = from.checked_sub(1).map(VolumeIndex);
     if tail.is_some_and(|tail| {
@@ -240,7 +241,10 @@ fn reach(
     }
     let mut end = from;
     for (index, found) in volumes.range(VolumeIndex(from)..) {
-        if index.0 != end || refuted == Some((*index, found.walk.stamp)) {
+        if index.0 != end
+            || refuted == Some((*index, found.walk.stamp))
+            || held_out.is_some_and(|at| index.0 >= at)
+        {
             break;
         }
         let Some((facts, on)) = lays(*index, found) else {
@@ -281,6 +285,11 @@ impl RarStore {
         Some(format)
     }
 
+    // How many volumes the kept layout holds, from the first.
+    pub(super) fn laid_through(&self) -> Option<u32> {
+        self.layout.as_ref().map(|layout| laid(layout))
+    }
+
     // A layout laid afresh over the first `through` volumes, as one kept
     // over them was before anything was added past them.
     fn laid_afresh(&self, format: ArchiveFormat, through: u32) -> Laid {
@@ -310,8 +319,15 @@ impl RarStore {
             super::counts::bump(|counts| counts.layouts += 1);
             Laid::new(format)
         });
+        // Nothing is mapped from a volume held the wrong way round beside
+        // the next until the set is ordered: a layout already past it is
+        // laid again short of it.
+        let held_out = self.held_out();
+        if let Some(at) = held_out.filter(|at| *at < laid(&layout)) {
+            layout = self.laid_afresh(format, at);
+        }
         let from = laid(&layout);
-        let mut end = match reach(&self.volumes, &layout, from, self.refuted) {
+        let mut end = match reach(&self.volumes, &layout, from, self.refuted, held_out) {
             Ok(end) => end,
             Err(emit) => {
                 if !afresh {
@@ -404,7 +420,9 @@ impl RarStore {
                 }
                 self.give_up(emit, out);
             }
-            None => self.layout = Some(layout),
+            None => {
+                self.layout = Some(layout);
+            }
         }
     }
 
