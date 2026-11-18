@@ -977,6 +977,7 @@ impl TorrentService {
                 task: None,
                 asked: asked.clone(),
                 next: None,
+                reopened: None,
             });
             return Some((Arc::clone(store), asked));
         }

@@ -639,10 +639,12 @@ async fn a_level_asked_while_a_copy_is_out_is_taken_after_it() {
         assert_eq!(leveling.next.as_deref(), Some(&[High, Normal][..]));
         leveling.task.take().unwrap()
     };
-    assert_eq!(
-        rig.db.torrent_file_priorities(job_id).unwrap(),
-        [Normal, Ignored]
-    );
+    // The change under way is stored before its copy, the one asked
+    // meanwhile not yet; a store opened before the copy lands copies the
+    // bytes out first (`TorrentStore::with_side`).
+    let mut stored = rig.db.torrent_file_priorities(job_id).unwrap();
+    stored.resize(2, Normal);
+    assert_eq!(stored, [Normal, Normal]);
     assert!(!b.exists());
     release.send(()).unwrap();
     holder.join().unwrap();
@@ -662,5 +664,258 @@ async fn a_level_asked_while_a_copy_is_out_is_taken_after_it() {
     assert!(store.side_pieces().is_empty());
     rig.service.remove(job_id, false, true).await.unwrap();
     assert!(!side.exists());
+    rig.service.stop().await;
+}
+
+// A database that refuses every write of a torrent's file levels, while
+// `on`, as a full or broken disk would.
+fn refuse_level_writes(db: &Database, on: bool) {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    let sql = if on {
+        "CREATE TRIGGER refuse_levels BEFORE UPDATE OF file_priorities ON torrents \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END"
+    } else {
+        "DROP TRIGGER refuse_levels"
+    };
+    let store = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&store, "refuse_level_writes_fixture", |tx| {
+            Box::pin(async move {
+                tx.execute(sql, &[]).await?;
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+// What a complete torrent is, in memory and as stored: when it completed,
+// its levels, its place in the download queue, and the next place a torrent
+// takes.
+async fn completion_of(
+    rig: &Rig,
+    job_id: JobId,
+) -> (Option<i64>, Option<i64>, Vec<FilePriority>, i64, i64, i64) {
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    let live = rig.service.inner.live.lock().await;
+    let torrent = &live[&job_id];
+    // The levels are stored with the default ones after the last left out.
+    let mut levels = rig.db.torrent_file_priorities(job_id).unwrap();
+    levels.resize(torrent.levels.len(), FilePriority::Normal);
+    assert_eq!(levels, torrent.levels);
+    (
+        torrent.record.completed_at_ms,
+        stored.completed_at_ms,
+        torrent.levels.clone(),
+        torrent.record.queue_position,
+        stored.queue_position,
+        rig.service
+            .inner
+            .next_queue_position
+            .load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+// What an API caller is shown of a torrent: its state, job status, when it
+// completed and the bytes it wants.
+async fn shown_of(
+    rig: &Rig,
+    job_id: JobId,
+) -> (TorrentState, crate::jobs::JobStatus, Option<i64>, u64) {
+    let view = rig.service.torrent(job_id).await.unwrap();
+    (
+        view.state,
+        crate::torrents::service::views::job_status(&view),
+        view.completed_at_ms,
+        view.wanted_bytes,
+    )
+}
+
+// A complete torrent's file wanted again whose levels cannot be stored
+// changes nothing: the call fails, and the torrent stays complete with its
+// levels, its place and the queue's next place as they were, so no second
+// finish can run (`completed` returns for a complete torrent). The same
+// change stored afterwards reopens it once, at the end of the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopen_that_cannot_be_stored_changes_nothing() {
+    use FilePriority::*;
+    let clock = set_clock();
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let mut settles = rig.service.inner.settled.subscribe();
+    rig.service
+        .set_file_priorities(job_id, &[(0, Ignored)])
+        .await
+        .unwrap();
+    settles
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let before = completion_of(&rig, job_id).await;
+    assert_eq!(before.0, Some(EPOCH_MS));
+    assert_eq!(before.2, [Ignored]);
+    let shown = shown_of(&rig, job_id).await;
+
+    clock.shift_unix_ms(5_000);
+    refuse_level_writes(&rig.db, true);
+    assert!(
+        rig.service
+            .set_file_priorities(job_id, &[(0, Normal)])
+            .await
+            .is_err()
+    );
+    assert_eq!(completion_of(&rig, job_id).await, before);
+    assert_eq!(shown_of(&rig, job_id).await, shown);
+
+    refuse_level_writes(&rig.db, false);
+    rig.service
+        .set_file_priorities(job_id, &[(0, Normal)])
+        .await
+        .unwrap();
+    let after = completion_of(&rig, job_id).await;
+    assert_eq!((after.0, after.1, after.2), (None, None, vec![Normal]));
+    assert_eq!((after.3, after.4), (before.5, before.5));
+    assert_eq!(after.5, before.5 + 1);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_ne!(view.state, TorrentState::Seeding);
+    rig.service.stop().await;
+}
+
+// The same with a copy out of the side store: the levels are stored before
+// the copy, so one that cannot be stored fails the call, starts no copy and
+// leaves the bytes, the levels and the torrent's completion where they were.
+// Stored afterwards, the copy runs and the torrent is reopened once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopen_with_a_copy_that_cannot_be_stored_changes_nothing() {
+    use FilePriority::*;
+    let clock = set_clock();
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
+    rig.service.open().await.unwrap();
+    let bytes: Vec<u8> = (0..3584u32).map(|at| (at * 7 % 251) as u8).collect();
+    let meta = metainfo(
+        "side",
+        &[
+            ("side/a.bin", &bytes[..1536]),
+            ("side/b.bin", &bytes[1536..]),
+        ],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(meta))
+        })
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(1, Ignored)])
+        .await
+        .unwrap();
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    // a.bin is whole: piece 0, and piece 1, which is a's last 512 bytes and
+    // b's first 512, kept in the side store.
+    for piece in [0u32, 1] {
+        let at = piece as usize * 1024;
+        Pieces::verified(
+            &*store,
+            piece,
+            &bytes::Bytes::copy_from_slice(&bytes[at..at + 1024]),
+        )
+        .unwrap();
+    }
+    let mut settles = rig.service.inner.settled.subscribe();
+    rig.service.inner.signal.look(job_id);
+    settles
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let b = store.files().path(1).unwrap();
+    assert!(!b.exists());
+    assert_eq!(store.side_pieces(), [1]);
+    let before = completion_of(&rig, job_id).await;
+    assert_eq!(before.2, [Normal, Ignored]);
+    let shown = shown_of(&rig, job_id).await;
+
+    clock.shift_unix_ms(5_000);
+    refuse_level_writes(&rig.db, true);
+    assert!(
+        rig.service
+            .set_file_priorities(job_id, &[(1, Normal)])
+            .await
+            .is_err()
+    );
+    assert!(
+        rig.service.inner.live.lock().await[&job_id]
+            .leveling
+            .is_none()
+    );
+    assert_eq!(completion_of(&rig, job_id).await, before);
+    assert!(!b.exists());
+    assert_eq!(store.side_pieces(), [1]);
+    assert_eq!(shown_of(&rig, job_id).await, shown);
+
+    refuse_level_writes(&rig.db, false);
+    rig.service
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    let task = rig
+        .service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&job_id)
+        .unwrap()
+        .leveling
+        .as_mut()
+        .and_then(|leveling| leveling.task.take());
+    if let Some(task) = task {
+        task.await.unwrap();
+    }
+    assert!(
+        rig.service.inner.live.lock().await[&job_id]
+            .leveling
+            .is_none()
+    );
+    let after = completion_of(&rig, job_id).await;
+    assert_eq!(
+        (after.0, after.1, after.2),
+        (None, None, vec![Normal, Normal])
+    );
+    assert_eq!((after.3, after.4), (before.5, before.5));
+    assert_eq!(after.5, before.5 + 1);
+    assert_eq!(std::fs::read(&b).unwrap(), bytes[1536..2048]);
+    assert!(store.side_pieces().is_empty());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_ne!(view.state, TorrentState::Seeding);
     rig.service.stop().await;
 }

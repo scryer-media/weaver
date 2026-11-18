@@ -1049,7 +1049,7 @@ async fn a_restart_keeps_the_whole_and_starts_the_seeding_run_again() {
 // no peers, its seeding time running (libtorrent `update_peer_interest` ->
 // `finished()`; qBittorrent `handleTorrentFinished`). Wanting the file again
 // takes it back to fetching, short of complete (qBittorrent
-// `prioritizeFiles`), and its seeding time stops where it was.
+// `prioritizeFiles`), and its seeding time stops where it was at the change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_that_wants_nothing_completes_and_downloads_when_it_wants_a_file() {
     use FilePriority::*;
@@ -1112,11 +1112,34 @@ async fn a_torrent_that_wants_nothing_completes_and_downloads_when_it_wants_a_fi
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (5, 5));
 
+    // Wanted again between ticks: the seconds up to the change count as
+    // seeding, none after (libtorrent `update_state_timers` runs the
+    // finished timer only while finished).
+    clock.shift_unix_ms(3_000);
     rig.service
         .set_file_priorities(job_id, &[(0, Normal)])
         .await
         .unwrap();
+    let seeded = |live: &super::super::live::Live| {
+        rig.service
+            .settings()
+            .policy(&live.record, None)
+            .seeded_seconds(&live.counters)
+    };
+    {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert_eq!(
+            (
+                torrent.counters.active_duration_s,
+                torrent.counters.finished_duration_s,
+                seeded(torrent),
+            ),
+            (8, 8, 8)
+        );
+    }
     let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.seeding_seconds, 8);
     assert_eq!(
         (view.state, view.progress, view.completed_at_ms),
         (TorrentState::Stalled, 0.0, None)
@@ -1130,11 +1153,25 @@ async fn a_torrent_that_wants_nothing_completes_and_downloads_when_it_wants_a_fi
     let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
     assert_eq!(stored.completed_at_ms, None);
     assert!(stored.queue_position > place, "{stored:?}");
-    clock.shift_unix_ms(5_000);
+    clock.shift_unix_ms(4_000);
     rig.service.tick().await;
     rig.service.restored().await;
-    let kept = rig.service.inner.live.lock().await[&job_id].counters;
-    assert_eq!((kept.active_duration_s, kept.finished_duration_s), (10, 5));
+    {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert_eq!(
+            (
+                torrent.counters.active_duration_s,
+                torrent.counters.finished_duration_s,
+                seeded(torrent),
+            ),
+            (12, 8, 8)
+        );
+    }
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().seeding_seconds,
+        8
+    );
     rig.service.stop().await;
 }
 

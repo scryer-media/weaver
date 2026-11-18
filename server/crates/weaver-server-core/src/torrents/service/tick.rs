@@ -611,32 +611,45 @@ impl TorrentService {
                     .map(|(level, padding)| level.held_by(*padding))
                     .collect();
                 let ignored = ignored_of(&held);
-                if let Some(store) = &torrent.store
+                if let Some(store) = torrent.store.clone()
                     && store.needs_copy(&ignored)
                 {
+                    // Stored before the copy, so one that cannot be stored
+                    // changes nothing and is the caller's error. A store
+                    // opened with levels its copy did not reach copies the
+                    // bytes out first (`TorrentStore::with_side`).
+                    let reopened = self
+                        .save_levels(torrent, &asked, &held)
+                        .map_err(|error| ActionError::State(state_error(error)))?;
                     torrent.leveling = Some(Leveling {
                         task: None,
                         asked: asked.clone(),
                         next: None,
+                        reopened,
                     });
-                    return Ok(Some((Arc::clone(store), asked)));
+                    return Ok(Some((store, asked)));
                 }
-                self.keep_levels(torrent, &asked, &held)
-                    .map_err(|error| ActionError::State(state_error(error)))?;
                 // No file's bytes to copy: only which files are set aside
-                // changes, in memory.
+                // changes, in memory, and is set back if the levels cannot
+                // be stored, so a change that fails changes nothing.
+                let before = ignored_of(&torrent.levels);
                 if let Some(store) = &torrent.store {
                     store
                         .relevel(&ignored)
                         .map_err(|error| ActionError::State(error.to_string()))?;
                 }
-                torrent.levels = held;
-                // No piece comes for a change that leaves nothing it wants
-                // missing: the settle is told, as an add's is (libtorrent
-                // `update_peer_interest` calls `finished()`).
-                if torrent.completes() {
-                    self.inner.signal.look(job_id);
-                }
+                let reopened = match self.save_levels(torrent, &asked, &held) {
+                    Ok(reopened) => reopened,
+                    Err(error) => {
+                        if let Some(store) = &torrent.store
+                            && let Err(error) = store.relevel(&before)
+                        {
+                            tracing::warn!(job_id = job_id.0, error = %error, "could not set a torrent's files aside as they were");
+                        }
+                        return Err(ActionError::State(state_error(error)));
+                    }
+                };
+                self.take_levels(torrent, held, reopened, self.inner.clock.unix_ms());
                 Ok(None)
             })
             .await?;
@@ -672,13 +685,14 @@ impl TorrentService {
     }
 
     // The job of a change of levels that copies bytes out of the side store:
-    // the copy runs off the runtime, with every read and write of the
-    // torrent's pieces waiting on it, and only then are the levels stored,
-    // taken and pushed to the session; then the change asked meanwhile, if
-    // any, the same way. A copy that fails leaves the levels as they were
-    // and the bytes where they were, drops the changes after it, and puts
-    // the torrent in error, stopped (libtorrent `torrent::on_file_priority`,
-    // torrent.cpp:5695-5720 at v2.0.15).
+    // the levels are stored first, then the copy runs off the runtime, with
+    // every read and write of the torrent's pieces waiting on it, and only
+    // then are the levels taken and pushed to the session; then the change
+    // asked meanwhile, if any, the same way. A copy that fails leaves the
+    // levels as they were, stored back, and the bytes where they were,
+    // drops the changes after it, and puts the torrent in error, stopped
+    // (libtorrent `torrent::on_file_priority`, torrent.cpp:5695-5720 at
+    // v2.0.15).
     async fn copy_out(
         &self,
         job_id: JobId,
@@ -708,24 +722,65 @@ impl TorrentService {
                     }
                     let mut landing = None;
                     let mut next = None;
+                    let reopened = torrent
+                        .leveling
+                        .as_ref()
+                        .and_then(|leveling| leveling.reopened);
                     match copied {
                         Ok(()) => {
-                            if let Err(error) = self.keep_levels(torrent, &asked, &held) {
-                                tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's file levels");
-                            }
-                            torrent.levels = held;
-                            if torrent.completes() {
-                                self.inner.signal.look(job_id);
-                            }
-                            if let Some(leveling) = &mut torrent.leveling {
-                                next = leveling.next.take();
-                                if let Some(next) = &next {
-                                    leveling.asked = next.clone();
+                            // One that completed while its copy was out is
+                            // short of complete again now. The bytes are
+                            // out of the side store whatever is stored, so
+                            // the levels are taken all the same, and one
+                            // that cannot be stored so is still reopened in
+                            // memory, its completion stored again at its
+                            // next.
+                            let reopened = match reopened {
+                                Some(place) => Some(place),
+                                None if torrent.reopens(&held) => {
+                                    match self.save_levels(torrent, &asked, &held) {
+                                        Ok(reopened) => reopened,
+                                        Err(error) => {
+                                            tracing::warn!(job_id = job_id.0, error = %error, "could not store a torrent short of complete again");
+                                            Some(torrent.record.queue_position)
+                                        }
+                                    }
+                                }
+                                None => None,
+                            };
+                            self.take_levels(torrent, held, reopened, now);
+                            next = torrent
+                                .leveling
+                                .as_mut()
+                                .and_then(|leveling| leveling.next.take());
+                            // The change asked meanwhile is stored before its
+                            // copy, as the first was; one that cannot be is
+                            // dropped, and the levels stay as they are now.
+                            if let Some(asked) = &next {
+                                let held: Vec<FilePriority> = asked
+                                    .iter()
+                                    .zip(store.layout().files())
+                                    .map(|(level, file)| level.held_by(file.padding))
+                                    .collect();
+                                match self.save_levels(torrent, asked, &held) {
+                                    Ok(reopened) => {
+                                        if let Some(leveling) = &mut torrent.leveling {
+                                            leveling.asked = asked.clone();
+                                            leveling.reopened = reopened;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(job_id = job_id.0, error = %error, "could not store a torrent's file levels");
+                                        next = None;
+                                    }
                                 }
                             }
                         }
                         Err(error) => {
                             tracing::warn!(job_id = job_id.0, error = %error, "a file's bytes did not copy out of a torrent's side store");
+                            // The levels were stored before the copy; those
+                            // memory still holds are stored back.
+                            self.store_back(torrent, reopened.is_some());
                             landing = self.stop_torrent(torrent, now);
                             torrent.copy_error = Some(format!(
                                 "could not copy a file's bytes out of the side store: {error}"
@@ -752,35 +807,100 @@ impl TorrentService {
         }
     }
 
-    // Keep `asked` as the torrent's levels, which it takes as `held`. A
-    // complete torrent that now wants a file it lacks is short of complete
-    // again in the same write: it downloads, shows so, goes to the end of
-    // the download queue, and completes again once it has every file it
-    // wants (qBittorrent `TorrentImpl::prioritizeFiles`,
-    // torrentimpl.cpp:3045-3057; libtorrent `torrent::resume_download`
-    // clears `m_completed_time` and takes `last_pos`, torrent.cpp:8653-8676
-    // at v2.0.15).
-    fn keep_levels(
+    // Store `asked` as the torrent's levels, which it is to take as `held`,
+    // and change nothing in memory: `take_levels` does that once the change
+    // has landed. A complete torrent that is to want a file it lacks is
+    // stored short of complete again in the same write, at the end of the
+    // download queue, the place it is to take returned (qBittorrent
+    // `TorrentImpl::prioritizeFiles`, torrentimpl.cpp:3045-3057; libtorrent
+    // `torrent::resume_download` clears `m_completed_time` and takes
+    // `last_pos`, torrent.cpp:8653-8676 at v2.0.15). A write that fails
+    // stores nothing, and gives its place back unless another torrent took
+    // the next one since.
+    fn save_levels(
         &self,
-        torrent: &mut super::live::Live,
+        torrent: &super::live::Live,
         asked: &[FilePriority],
         held: &[FilePriority],
-    ) -> Result<(), crate::StateError> {
+    ) -> Result<Option<i64>, crate::StateError> {
+        use std::sync::atomic::Ordering::Relaxed;
         let job_id = torrent.record.job_id;
         if !torrent.reopens(held) {
             self.inner.db.set_torrent_file_priorities(job_id, asked)?;
-            return Ok(());
+            return Ok(None);
         }
-        let place = self
+        let next = &self.inner.next_queue_position;
+        let place = next.fetch_add(1, Relaxed);
+        if let Err(error) = self
             .inner
-            .next_queue_position
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.db.reopen_torrent(job_id, asked, place)?;
-        torrent.record.completed_at_ms = None;
-        torrent.record.queue_position = place;
-        // It takes a download slot and rank again.
-        self.inner.signal.want_pass();
-        Ok(())
+            .db
+            .set_torrent_levels_and_completion(job_id, asked, None, place)
+        {
+            let _ = next.compare_exchange(place + 1, place, Relaxed, Relaxed);
+            return Err(error);
+        }
+        Ok(Some(place))
+    }
+
+    // Take `held`, stored by `save_levels`, in memory. One it stored short
+    // of complete again is settled first, so the time up to `now` counts as
+    // what the torrent was doing then, seeding, and none after; it then
+    // downloads, shows so and takes a download slot and rank again.
+    fn take_levels(
+        &self,
+        torrent: &mut super::live::Live,
+        held: Vec<FilePriority>,
+        reopened: Option<i64>,
+        now: i64,
+    ) {
+        if let Some(place) = reopened {
+            torrent.settle(now);
+            torrent.record.completed_at_ms = None;
+            torrent.record.queue_position = place;
+            self.inner.signal.want_pass();
+        }
+        torrent.levels = held;
+        // No piece comes for a change that leaves nothing it wants
+        // missing: the settle is told, as an add's is (libtorrent
+        // `update_peer_interest` calls `finished()`).
+        if torrent.completes() {
+            self.inner.signal.look(torrent.record.job_id);
+        }
+    }
+
+    // Store again what memory holds of a torrent whose change of levels,
+    // stored before its copy, did not land: its levels, and, when that
+    // change stored it short of complete, when it completed and its place.
+    fn store_back(&self, torrent: &super::live::Live, reopened: bool) {
+        let job_id = torrent.record.job_id;
+        let asked: Vec<FilePriority> = torrent
+            .levels
+            .iter()
+            .zip(torrent.layout.iter().flat_map(|layout| layout.files()))
+            .map(|(level, file)| {
+                if file.padding {
+                    FilePriority::Normal
+                } else {
+                    *level
+                }
+            })
+            .collect();
+        let stored = if reopened {
+            self.inner.db.set_torrent_levels_and_completion(
+                job_id,
+                &asked,
+                torrent.record.completed_at_ms,
+                torrent.record.queue_position,
+            )
+        } else {
+            self.inner.db.set_torrent_file_priorities(job_id, &asked)
+        };
+        if let Err(error) = stored {
+            // The store opens with the levels stored, and copies a file's
+            // bytes out of the side store first when they want it
+            // (`TorrentStore::with_side`).
+            tracing::warn!(job_id = job_id.0, error = %error, "could not store a torrent's file levels back");
+        }
     }
 
     /// Whether the torrent's pieces are fetched in order.
@@ -965,4 +1085,7 @@ pub(super) struct Leveling {
     // The levels the job takes, as stored.
     pub(super) asked: Vec<FilePriority>,
     pub(super) next: Option<Vec<FilePriority>>,
+    // The place `asked`, stored before its copy, took at the end of the
+    // download queue when it stored the torrent short of complete again.
+    pub(super) reopened: Option<i64>,
 }
