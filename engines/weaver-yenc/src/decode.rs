@@ -274,6 +274,161 @@ fn finalize_decode(
     })
 }
 
+// The byte an encoded dot decodes to.
+const DOT: u8 = b'.'.wrapping_sub(42);
+
+// One place a kept dot is tried per this many decoded bytes, at most. A part
+// of random bytes holds a run of decoded dots in about one byte of 256, so a
+// real part stays well inside it at any size, and a part made of dots costs a
+// bounded share of one CRC pass to fail. A small part may try this many.
+const BYTES_PER_KEPT_DOT_TRY: usize = 64;
+const MIN_KEPT_DOT_TRIES: usize = 1024;
+
+// A line whose data begins with two encoded dots, sent by a poster that does
+// not stuff dots, goes out as `..` where stuffing makes it `...`. The server
+// takes the first dot as stuffing, and so does every reader after it
+// (rapidyenc, sabctools and this decoder), so the part decodes one byte short
+// of its declared length and fails its CRC. That part is retried keeping one
+// more dot, and the dot is kept only where the part then matches its CRC.
+//
+// The checksum the part must then match, for a part that failed its CRC and
+// decoded exactly one byte short of the length it declares.
+fn one_dot_short(result: &DecodeResult, yend_size: Option<u64>) -> Option<u32> {
+    if result.crc_status != CrcVerification::Mismatch {
+        return None;
+    }
+    let metadata = &result.metadata;
+    let declared = match (metadata.begin, metadata.end) {
+        (Some(begin), Some(end)) => end.checked_sub(begin).and_then(|n| n.checked_add(1)),
+        _ => yend_size.or_else(|| {
+            let single = metadata.part.is_none() && metadata.begin.is_none();
+            let sized = !metadata.defects.missing_size && !metadata.defects.invalid_size;
+            (single && sized).then_some(metadata.size)
+        }),
+    };
+    if declared != Some(result.bytes_written as u64 + 1) {
+        return None;
+    }
+    // `finalize_decode` keeps the checksum it checked: `pcrc32` for a part,
+    // `pcrc32` or else `crc32` for a single-part article.
+    result.expected_part_crc.or(result.expected_file_crc)
+}
+
+// Where one more dot makes the decoded bytes check to `expected`: at a dot
+// that begins a run of dots, the only bytes a dropped stuffing dot can sit
+// before. `crc` is the CRC32 of the `len` bytes `parts` holds in order.
+//
+// For bytes `P || S` and `P || DOT || S`, CRC linearity gives
+// `crc(P || DOT || S) ^ crc(P || S) = shift(crc(P || DOT) ^ crc(P), |S|)`, so
+// each place costs one combine, and the parts are read once.
+fn kept_dot_at<'a>(
+    parts: impl IntoIterator<Item = &'a [u8]>,
+    len: usize,
+    crc: u32,
+    expected: u32,
+) -> Option<usize> {
+    let target = crc ^ expected;
+    let mut hasher = Crc32::new();
+    let mut start = 0usize;
+    let mut previous = None;
+    let mut tries = 0usize;
+    let most = (len / BYTES_PER_KEPT_DOT_TRY).max(MIN_KEPT_DOT_TRIES);
+    for part in parts {
+        let mut fed = 0;
+        for index in memchr::memchr_iter(DOT, part) {
+            let before = match index {
+                0 => previous,
+                _ => Some(part[index - 1]),
+            };
+            if before == Some(DOT) {
+                continue;
+            }
+            tries += 1;
+            if tries > most {
+                return None;
+            }
+            hasher.update(&part[fed..index]);
+            fed = index;
+            let mut kept = hasher.clone();
+            kept.update(&[DOT]);
+            let at = start + index;
+            let shifted =
+                crate::crc::crc32_combine(hasher.current() ^ kept.current(), 0, (len - at) as u64);
+            if shifted == target {
+                return Some(at);
+            }
+        }
+        hasher.update(&part[fed..]);
+        start += part.len();
+        previous = part.last().copied().or(previous);
+    }
+    None
+}
+
+// The part's verdict and segments once a kept dot made it check: its bytes
+// are one longer and match the checksum they declare.
+fn with_kept_dot<'a>(
+    result: &DecodeResult,
+    yend: Option<header::YendFields>,
+    parts: impl IntoIterator<Item = &'a [u8]>,
+    plan: Option<CheckpointPlan>,
+) -> Result<DecodeResult, YencError> {
+    let bytes_written = result.bytes_written + 1;
+    let metadata = result.metadata.clone();
+    let (part_crc, segments, plan, reason) = match plan {
+        Some(plan) => {
+            let mut crc = SegmentedCrc32::new(
+                metadata.article_file_offset(),
+                collapse_plan_without_offset(&metadata, plan),
+            );
+            for part in parts {
+                crc.update(part);
+            }
+            crc.finish_article_with_reason_and_plan()
+        }
+        None => {
+            let mut crc = Crc32::new();
+            for part in parts {
+                crc.update(part);
+            }
+            let part_crc = crc.finalize();
+            let segments = whole_buffer_segments(&metadata, bytes_written, part_crc);
+            (part_crc, segments, CheckpointPlan::None, None)
+        }
+    };
+    finalize_decode(
+        metadata,
+        yend,
+        bytes_written,
+        part_crc,
+        segments,
+        plan,
+        reason,
+    )
+}
+
+// Finish a decode whose bytes sit in `output[..result.bytes_written]`, with
+// room for one more, keeping a dropped dot where that makes the part check.
+fn keep_dot_in_place(
+    result: DecodeResult,
+    yend: Option<header::YendFields>,
+    output: &mut [u8],
+) -> Result<DecodeResult, YencError> {
+    let written = result.bytes_written;
+    let Some(expected) = one_dot_short(&result, yend.as_ref().and_then(|yend| yend.size)) else {
+        return Ok(result);
+    };
+    if output.len() <= written {
+        return Ok(result);
+    }
+    let Some(at) = kept_dot_at([&output[..written]], written, result.part_crc, expected) else {
+        return Ok(result);
+    };
+    output.copy_within(at..written, at + 1);
+    output[at] = DOT;
+    with_kept_dot(&result, yend, [&output[..=written]], None)
+}
+
 // Decode a complete yEnc article with custom options.
 //
 // Rule: weaver never fails an article another tool would accept; where readings differ it decodes as rapidyenc and sabctools do.
@@ -340,7 +495,7 @@ fn decode_with_line_scan(
 
     let segments = whole_buffer_segments(&parsed.metadata, bytes_written, part_crc);
 
-    finalize_decode(
+    let result = finalize_decode(
         parsed.metadata,
         parsed.yend,
         bytes_written,
@@ -348,7 +503,8 @@ fn decode_with_line_scan(
         segments,
         CheckpointPlan::None,
         None,
-    )
+    )?;
+    keep_dot_in_place(result, parsed.yend, output)
 }
 
 // The whole-buffer entry has no chunk boundaries to checkpoint against and no
@@ -417,7 +573,7 @@ fn decode_raw_single_pass(
 
     let segments = whole_buffer_segments(&metadata, bytes_written, part_crc);
 
-    finalize_decode(
+    let result = finalize_decode(
         metadata,
         yend,
         bytes_written,
@@ -425,8 +581,8 @@ fn decode_raw_single_pass(
         segments,
         CheckpointPlan::None,
         None,
-    )
-    .map(Some)
+    )?;
+    keep_dot_in_place(result, yend, output).map(Some)
 }
 
 // True when `body` ends inside an escape: an odd run of trailing `=`, since
@@ -444,6 +600,9 @@ pub struct DecodedArticle {
 
 // Finalize a caller-owned streaming yEnc decode using the same validation
 // rules as [`StreamingArticleDecoder`].
+//
+// `output` holds the decoded bytes; a dot dropped from an unstuffed line is
+// kept where that makes the part check.
 pub fn finish_streaming_article(
     metadata: YencMetadata,
     yend: Option<header::YendFields>,
@@ -451,11 +610,81 @@ pub fn finish_streaming_article(
     output: Vec<u8>,
 ) -> Result<DecodedArticle, YencError> {
     let result = finish_streaming_result(metadata, yend, decode_state)?;
-
+    let Some(dropped) = DroppedDot::of(&result, yend) else {
+        return Ok(DecodedArticle {
+            data: output,
+            result,
+        });
+    };
+    let mut result = result;
+    let mut chunks = [output.into_boxed_slice()];
+    dropped.keep(&mut result, &mut chunks)?;
+    let [data] = chunks;
     Ok(DecodedArticle {
-        data: output,
+        data: data.into_vec(),
         result,
     })
+}
+
+// A part that failed its CRC exactly one byte short of the length it
+// declares: what trying a kept dot needs once all its bytes are in hand.
+#[derive(Debug, Clone)]
+pub struct DroppedDot {
+    yend: Option<header::YendFields>,
+    expected: u32,
+}
+
+impl DroppedDot {
+    // The retry a finished part calls for, if it calls for one. `yend` is the
+    // trailer the part was finished with.
+    pub fn of(result: &DecodeResult, yend: Option<header::YendFields>) -> Option<Self> {
+        let expected = one_dot_short(result, yend.and_then(|yend| yend.size))?;
+        Some(Self { yend, expected })
+    }
+
+    // Keep one more dot in `chunks`, the part's decoded bytes in order, where
+    // the part then matches its CRC, and make `result` the part's verdict and
+    // segments for those bytes. Only the chunk that takes the dot is rebuilt.
+    // Where no place matches, or `chunks` is not the whole part, `result` is
+    // left as it came.
+    pub fn keep(
+        self,
+        result: &mut DecodeResult,
+        chunks: &mut [Box<[u8]>],
+    ) -> Result<(), YencError> {
+        let written = result.bytes_written;
+        let held: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        if held != written {
+            return Ok(());
+        }
+        let Some(mut at) = kept_dot_at(
+            chunks.iter().map(|chunk| &chunk[..]),
+            written,
+            result.part_crc,
+            self.expected,
+        ) else {
+            return Ok(());
+        };
+        for chunk in chunks.iter_mut() {
+            if at < chunk.len() {
+                let mut grown = Vec::with_capacity(chunk.len() + 1);
+                grown.extend_from_slice(&chunk[..at]);
+                grown.push(DOT);
+                grown.extend_from_slice(&chunk[at..]);
+                *chunk = grown.into_boxed_slice();
+                break;
+            }
+            at -= chunk.len();
+        }
+        let plan = result.checkpoint_plan.clone();
+        *result = with_kept_dot(
+            result,
+            self.yend,
+            chunks.iter().map(|chunk| &chunk[..]),
+            Some(plan),
+        )?;
+        Ok(())
+    }
 }
 
 pub fn finish_streaming_result(
