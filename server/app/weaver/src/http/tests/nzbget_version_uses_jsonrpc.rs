@@ -4843,11 +4843,7 @@ async fn nzbget_hidden_history_does_not_consume_the_visible_page() {
     assert_eq!(all.as_array().unwrap().len(), 1000);
     assert!(!history_ids(&all).contains(&1));
     // Visibility changes neither retained history nor duplicate-check data.
-    assert_eq!(
-        db.count_job_history(&Default::default(), weaver_server_core::HistoryRows::All)
-            .unwrap(),
-        1001
-    );
+    assert_eq!(db.count_job_history(&Default::default()).unwrap(), 1001);
 }
 
 #[tokio::test]
@@ -4918,9 +4914,10 @@ async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
 
 // An Arr's "Remove Completed" sends a non-final HistoryDelete. NZBGet keeps
 // the entry as a hidden duplicate and its own history view stops showing it;
-// Weaver's history listings leave it out the same way.
+// the facade leaves it out of history the same way. Weaver keeps the job in
+// its own history: every listing and count still shows it.
 #[tokio::test]
-async fn nzbget_history_delete_takes_the_row_off_weavers_history_listings() {
+async fn nzbget_history_delete_keeps_the_row_on_weavers_history_listings() {
     let db = Database::open_in_memory().unwrap();
     db.insert_job_history(&nzbget_history_row(801, "complete", 1_700_000_100, None))
         .unwrap();
@@ -4969,8 +4966,8 @@ async fn nzbget_history_delete_takes_the_row_off_weavers_history_listings() {
     };
 
     let data = query("{ historyItems { id } historyItemsCount }").await;
-    assert_eq!(ids(&data["historyItems"]), vec![802]);
-    assert_eq!(data["historyItemsCount"], 1);
+    assert_eq!(ids(&data["historyItems"]), vec![802, 801]);
+    assert_eq!(data["historyItemsCount"], 2);
     // Both page paths: the SQL one, and the Rust one a category facet takes.
     for input in [
         "{ pageIndex: 0, pageSize: 25 }",
@@ -4982,21 +4979,24 @@ async fn nzbget_history_delete_takes_the_row_off_weavers_history_listings() {
         ))
         .await;
         let page = &data["historyPage"];
-        assert_eq!(ids(&page["items"]), vec![802], "{input}");
-        assert_eq!(page["totalCount"], 1, "{input}");
+        assert_eq!(ids(&page["items"]), vec![802, 801], "{input}");
+        assert_eq!(page["totalCount"], 2, "{input}");
         assert_eq!(
             page["counts"],
-            serde_json::json!({ "all": 1, "success": 1, "failure": 0 }),
+            serde_json::json!({ "all": 2, "success": 2, "failure": 0 }),
             "{input}"
         );
         assert_eq!(
             page["categoryCounts"],
-            serde_json::json!([{ "category": "tv", "count": 1 }]),
+            serde_json::json!([{ "category": "tv", "count": 2 }]),
             "{input}"
         );
     }
 
-    // The facade's history(true) still lists both, the hidden one as DUP.
+    // The facade's own poll leaves it out; history(true) lists both, the
+    // hidden one as DUP.
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([])).await;
+    assert_eq!(history_ids(&entries), vec![802]);
     let entries = rpc_result(app, "history", serde_json::json!([true])).await;
     let mut listed = history_ids(&entries);
     listed.sort_unstable();
@@ -5214,23 +5214,52 @@ impl ArchiveServer {
         .await
     }
 
-    // Wait for the worker to stamp `job_id` archived, on the job page's
-    // update stream, and return the stamp.
-    async fn archived(&self, job_id: u64) -> String {
+    // Wait until `job_id`'s history entry, on the job page's update stream,
+    // passes `done`, and return the entry.
+    async fn history_item_when(
+        &self,
+        job_id: u64,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
         use async_graphql::futures_util::StreamExt;
         let request = async_graphql::Request::new(format!(
-            "subscription {{ jobDetailUpdates(jobId: {job_id}) {{ historyItem {{ archivedAt }} }} }}"
+            "subscription {{ jobDetailUpdates(jobId: {job_id}) {{ historyItem {{ archivedAt \
+             deleteOperation {{ state action archiveOutcome }} }} }} }}"
         ))
         .data(CallerScope::Read);
         let mut stream = self.schema.execute_stream(request);
         loop {
             let next = stream.next().await.expect("the stream stays open");
             assert!(next.errors.is_empty(), "{:?}", next.errors);
-            let next = next.data.into_json().unwrap();
-            if let Some(at) = next["jobDetailUpdates"]["historyItem"]["archivedAt"].as_str() {
-                return at.to_string();
+            let item = next.data.into_json().unwrap()["jobDetailUpdates"]["historyItem"].take();
+            if done(&item) {
+                return item;
             }
         }
+    }
+
+    // Wait for the worker to stamp `job_id` archived, and return the stamp.
+    async fn archived(&self, job_id: u64) -> String {
+        let item = self
+            .history_item_when(job_id, |item| item["archivedAt"].is_string())
+            .await;
+        item["archivedAt"].as_str().unwrap().to_string()
+    }
+
+    // Weaver's History page as the web asks for it, and the plain listing.
+    async fn weaver_history(&self) -> WeaverHistory {
+        let data = self
+            .graphql(
+                "{ historyPage(input: { pageIndex: 0, pageSize: 25 }) { items { id name \
+                 protocol displayTitle originalTitle status: state error totalBytes \
+                 downloadedBytes health hasPassword category tags createdAt completedAt \
+                 archivedAt deleteOperation { state locked action errorMessage \
+                 archiveOutcome } } totalCount counts { all success failure } \
+                 categoryCounts { category count } } \
+                 historyItems { id archivedAt } historyItemsCount }",
+            )
+            .await;
+        WeaverHistory(data)
     }
 
     async fn graphql(&self, query: &str) -> serde_json::Value {
@@ -5243,9 +5272,41 @@ impl ArchiveServer {
     }
 }
 
+// Weaver's own history listings, as one GraphQL answer.
+struct WeaverHistory(serde_json::Value);
+
+impl WeaverHistory {
+    // The History page's entry for `id`, which both listings must hold.
+    fn entry(&self, id: u64) -> &serde_json::Value {
+        fn listed(items: &serde_json::Value, id: u64) -> Option<&serde_json::Value> {
+            items
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == id)
+        }
+        let plain = listed(&self.0["historyItems"], id)
+            .unwrap_or_else(|| panic!("historyItems lists {id}"));
+        let page = listed(&self.0["historyPage"]["items"], id)
+            .unwrap_or_else(|| panic!("historyPage lists {id}"));
+        assert_eq!(plain["archivedAt"], page["archivedAt"], "{id}");
+        page
+    }
+
+    fn total(&self) -> u64 {
+        let total = self.0["historyPage"]["totalCount"].as_u64().unwrap();
+        assert_eq!(self.0["historyItemsCount"].as_u64().unwrap(), total);
+        assert_eq!(
+            self.0["historyPage"]["counts"]["all"].as_u64().unwrap(),
+            total
+        );
+        total
+    }
+}
+
 // Every client's HistoryDelete archives the job: the row is kept, the files
 // Weaver made for it go, and neither listing a client polls shows it again,
-// while history(true) and Weaver's job page still do.
+// while history(true) and Weaver's own history still do.
 #[tokio::test]
 async fn nzbget_history_delete_archives_a_completed_job() {
     let server = archive_server().await;
@@ -5277,6 +5338,54 @@ async fn nzbget_history_delete_archives_a_completed_job() {
         .graphql("{ historyItem(id: 901) { id archivedAt } }")
         .await;
     assert!(item["historyItem"]["archivedAt"].is_string());
+    // Weaver's History lists both, the archived one stamped.
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 2);
+    assert!(history.entry(901)["archivedAt"].is_string());
+    assert!(history.entry(901)["deleteOperation"].is_null());
+    assert!(history.entry(902)["archivedAt"].is_null());
+}
+
+// An entry archived through the facade shows in Weaver's History exactly as
+// one archived with Weaver's own archive action.
+#[tokio::test]
+async fn nzbget_history_delete_shows_like_weavers_own_archive() {
+    let server = archive_server().await;
+    let through_facade = server.owned_output(951, "complete");
+    let through_weaver = server.owned_output(952, "complete");
+
+    assert_eq!(server.history_delete(&[951]).await, true);
+    server
+        .graphql("mutation { archiveHistory(ids: [952]) { __typename } }")
+        .await;
+    server.archived(951).await;
+    server.archived(952).await;
+
+    assert!(!through_facade.exists());
+    assert!(!through_weaver.exists());
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 2);
+    // Everything but the entry's own identity and times is the same.
+    let shown = |id: u64| {
+        let mut entry = history.entry(id).clone();
+        assert!(entry["archivedAt"].is_string(), "{id}");
+        for own in [
+            "id",
+            "name",
+            "displayTitle",
+            "originalTitle",
+            "createdAt",
+            "completedAt",
+            "archivedAt",
+        ] {
+            entry.as_object_mut().unwrap().remove(own);
+        }
+        entry
+    };
+    assert_eq!(shown(951), shown(952));
+    // Only the facade's own poll tells them apart.
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    assert_eq!(history_ids(&entries), vec![952]);
 }
 
 #[tokio::test]
@@ -5297,6 +5406,10 @@ async fn nzbget_history_delete_archives_a_failed_job() {
     assert!(history_ids(&entries).is_empty());
     let entries = rpc_result(server.app.clone(), "history", serde_json::json!([true])).await;
     assert_eq!(history_ids(&entries), vec![911]);
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 1);
+    assert!(history.entry(911)["archivedAt"].is_string());
+    assert_eq!(history.entry(911)["status"], "FAILED");
 }
 
 // Sonarr and Radarr delete the output folder themselves before they send
@@ -5324,6 +5437,39 @@ async fn nzbget_history_delete_archives_a_job_whose_folder_is_already_gone() {
     );
     assert!(neighbour.is_dir(), "a folder Weaver did not make stays");
     assert!(server.complete.join("tv").is_dir());
+    let history = server.weaver_history().await;
+    assert!(history.entry(921)["archivedAt"].is_string());
+}
+
+// When the folder that held the output is gone too, the drive may be
+// unmounted, so the archive fails rather than calling the files removed. The
+// row is kept, hidden from the client's poll, shown in Weaver unstamped with
+// the failed archive on it.
+#[tokio::test]
+async fn nzbget_history_delete_keeps_a_job_whose_parent_folder_is_gone() {
+    let server = archive_server().await;
+    let output = server.owned_output(941, "complete");
+    std::fs::remove_dir_all(output.parent().unwrap()).unwrap();
+
+    assert_eq!(server.history_delete(&[941]).await, true);
+    let item = server
+        .history_item_when(941, |item| item["deleteOperation"]["state"] == "FAILED")
+        .await;
+    assert!(item["archivedAt"].is_null());
+    assert_eq!(item["deleteOperation"]["action"], "ARCHIVE");
+
+    let row = server.db.get_job_history(941).unwrap().unwrap();
+    assert!(row.archived_at.is_none());
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    assert!(history_ids(&entries).is_empty());
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([true])).await;
+    assert_eq!(history_ids(&entries), vec![941]);
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 1);
+    let entry = history.entry(941);
+    assert!(entry["archivedAt"].is_null());
+    assert_eq!(entry["deleteOperation"]["state"], "FAILED");
+    assert_eq!(entry["deleteOperation"]["locked"], false);
 }
 
 // Several ids in one request: one archive operation takes them all, ids with
@@ -5373,6 +5519,14 @@ async fn nzbget_history_delete_archives_a_batch_in_one_operation() {
     let mut listed = history_ids(&entries);
     listed.sort_unstable();
     assert_eq!(listed, vec![931, 932, 933, 934]);
+    // Weaver's History shows all four: the archived ones stamped, the one
+    // whose folder was not Weaver's unstamped.
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 4);
+    for id in [931, 932, 933] {
+        assert!(history.entry(id)["archivedAt"].is_string(), "{id}");
+    }
+    assert!(history.entry(934)["archivedAt"].is_null());
 }
 
 #[tokio::test]

@@ -27,8 +27,8 @@ use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
-    Database, FieldUpdate, HistoryFilter, HistoryRows, JobId, JobStatus, JobUpdate,
-    RssSeenDecision, SchedulerError, SchedulerHandle,
+    Database, FieldUpdate, HistoryFilter, JobId, JobStatus, JobUpdate, RssSeenDecision,
+    SchedulerError, SchedulerHandle,
 };
 
 #[derive(Clone)]
@@ -2185,17 +2185,13 @@ async fn history(
         .collect::<Vec<_>>();
     let db = ctx.db.clone();
     let (rows, facade_states) = tokio::task::spawn_blocking(move || {
-        let rows = db.list_job_history(
-            &HistoryFilter {
-                limit: Some(1000),
-                ..HistoryFilter::default()
-            },
-            if include_hidden {
-                HistoryRows::All
-            } else {
-                HistoryRows::Shown
-            },
-        )?;
+        // A row a HistoryDelete hid leaves this listing only; Weaver's own
+        // history still shows it.
+        let rows = db.list_job_history(&HistoryFilter {
+            limit: Some(1000),
+            nzbget_shown_only: !include_hidden,
+            ..HistoryFilter::default()
+        })?;
         let ids = rows
             .iter()
             .map(|row| row.job_id)
