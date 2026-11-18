@@ -224,6 +224,84 @@ fn a_restart_mid_piece_fetches_it_again_and_checks_its_files_kept_pieces() {
     assert_eq!(again.files()[1], torrent[100_000..]);
 }
 
+// Room for one whole piece and one block.
+const PIECE_AND_BLOCK: u64 = PIECE + BLOCK;
+
+// A piece whose owner left part way is given back: the blocks it holds in
+// memory go to its files, and its whole-piece room goes back but for one
+// block's, which another piece's first block then takes. The rest of it
+// arrives block by block, it is checked from its files, and it is had.
+#[tokio::test]
+async fn a_piece_given_back_part_way_is_written_out_and_frees_its_room_and_verifies() {
+    let budget = accountant(PIECE_AND_BLOCK);
+    let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
+    let torrent = noise(160_000, 5);
+    assert!(shim.storage.writes_to_memory());
+    shim.write_blocks(1, &torrent, 2, None);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
+    assert!(!shim.storage.reserve_piece(shim.index(0), &shim.room));
+    assert!(!shim.dir.path().join("a.bin").exists());
+
+    let rung = shim.room.notified();
+    shim.storage.on_piece_requeued(shim.index(1));
+    rung.await;
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, BLOCK);
+    assert!(!shim.storage.writes_piece_to_memory(shim.index(1)));
+    let a = std::fs::read(shim.dir.path().join("a.bin")).unwrap();
+    assert_eq!(&a[65_536..98_304], &torrent[65_536..98_304]);
+    assert_eq!(shim.store.count(), 0);
+    assert!(shim.storage.reserve_piece(shim.index(0), &shim.room));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE_AND_BLOCK);
+
+    shim.write_blocks(1, &torrent, u64::MAX, None);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE_AND_BLOCK);
+    assert!(!shim.storage.hash_held_piece(shim.index(1), &mut |_| {}));
+    assert_eq!(shim.read(1), torrent[65_536..131_072]);
+    shim.storage.on_piece_completed(shim.index(1)).unwrap();
+    assert!(shim.store.has(1));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
+    assert!(shim.storage.resident_peak() <= PIECE_AND_BLOCK);
+}
+
+// A piece given back whole stays in memory, checked from there as before.
+#[test]
+fn a_piece_given_back_whole_stays_in_memory() {
+    let budget = accountant(PIECE_AND_BLOCK);
+    let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
+    let torrent = noise(160_000, 6);
+    shim.write_blocks(0, &torrent, u64::MAX, None);
+    shim.storage.on_piece_requeued(shim.index(0));
+    assert!(shim.storage.writes_piece_to_memory(shim.index(0)));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
+    assert!(!shim.dir.path().join("a.bin").exists());
+    shim.storage.on_piece_completed(shim.index(0)).unwrap();
+    assert!(shim.store.has(0));
+}
+
+// A block of a piece no peer owns takes one block's room, and its piece is
+// written block by block; a whole piece's room is left for an owner.
+#[test]
+fn an_unowned_pieces_first_block_takes_one_blocks_room() {
+    let budget = accountant(PIECE_AND_BLOCK);
+    let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
+    assert!(
+        shim.storage
+            .reserve_unowned_piece(shim.index(1), &shim.room)
+    );
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, BLOCK);
+    assert!(!shim.storage.writes_piece_to_memory(shim.index(1)));
+    // Asked again, as each of its blocks asks, it holds no more.
+    assert!(
+        shim.storage
+            .reserve_unowned_piece(shim.index(1), &shim.room)
+    );
+    assert!(shim.storage.reserve_piece(shim.index(1), &shim.room));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, BLOCK);
+    assert!(shim.storage.reserve_piece(shim.index(0), &shim.room));
+    assert!(shim.storage.writes_piece_to_memory(shim.index(0)));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE_AND_BLOCK);
+}
+
 // The write path is chosen when the storage is made, from the piece length
 // and the resident budget alone, so the same torrent under the same budget
 // takes the same path after a restart; nothing about it is stored.

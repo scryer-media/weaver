@@ -489,6 +489,10 @@ impl Pieces for Intake {
         self.inner.room_returned();
     }
 
+    fn aside(&self, run: Box<dyn FnOnce() + Send>) {
+        self.inner.aside(run);
+    }
+
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {
         self.heard(self.inner.failed(piece))
     }

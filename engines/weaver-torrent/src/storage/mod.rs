@@ -498,12 +498,35 @@ pub trait TorrentStorage: Send + Sync {
     /// implementation does nothing.
     fn on_piece_hashed(&self, _piece_index: ValidPieceIndex, _bytes: bytes::Bytes) {}
 
-    /// Asked before a queued piece is handed to a peer, or a block of one is written: whether
-    /// the storage has room for it. On false the piece stays queued, the block is discarded,
-    /// and the peer waits on `room`, which the storage rings once it has room again. Default
-    /// implementation always has room.
+    /// Asked when the first block of a piece arrives from the peer that owns it, before the
+    /// block is written, under the torrent's lock: whether the storage has room for the whole
+    /// piece. Must not wait. A storage that holds pieces in memory is asked nothing at the
+    /// grant; one that writes every piece block by block is asked at the grant too. On false
+    /// the connection stops reading and waits on `room`, which the storage rings once it has
+    /// room again; true for a piece that holds its room already. Default implementation
+    /// always has room.
     fn reserve_piece(&self, _piece_index: ValidPieceIndex, _room: &Arc<Notify>) -> bool {
         true
+    }
+
+    /// [`Self::reserve_piece`] for a block of a piece no peer owns, or another peer owns: the
+    /// storage may write such a piece block by block, holding room for one block only.
+    /// Default implementation asks [`Self::reserve_piece`].
+    fn reserve_unowned_piece(&self, piece_index: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        self.reserve_piece(piece_index, room)
+    }
+
+    /// A piece some of whose blocks arrived went back to the queue without its owner: the
+    /// storage may write what it holds of it to its files and give back the room it held for
+    /// the whole piece, taking the rest of it block by block. Must not wait for the disk.
+    /// Default implementation does nothing.
+    fn on_piece_requeued(&self, _piece_index: ValidPieceIndex) {}
+
+    /// Whether a block of the piece is copied into memory the storage holds, rather than
+    /// written to a file: asked per block, so a lookup. Default implementation answers
+    /// [`Self::writes_to_memory`].
+    fn writes_piece_to_memory(&self, _piece_index: ValidPieceIndex) -> bool {
+        self.writes_to_memory()
     }
 
     /// The stamp of file `file_id`, or None when the storage keeps no file
@@ -628,6 +651,18 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn reserve_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {
         (**self).reserve_piece(piece_id, room)
+    }
+
+    fn reserve_unowned_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        (**self).reserve_unowned_piece(piece_id, room)
+    }
+
+    fn on_piece_requeued(&self, piece_id: ValidPieceIndex) {
+        (**self).on_piece_requeued(piece_id)
+    }
+
+    fn writes_piece_to_memory(&self, piece_id: ValidPieceIndex) -> bool {
+        (**self).writes_piece_to_memory(piece_id)
     }
 
     fn stamp(&self, file_id: usize) -> anyhow::Result<Option<FileStamp>> {

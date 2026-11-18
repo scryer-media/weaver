@@ -164,6 +164,19 @@ impl TorrentStateLive {
         }
     }
 
+    /// The storage is told of every piece queued again since it was last
+    /// told: a piece that took room gives it back, and its blocks are
+    /// written block by block from then on.
+    pub(super) fn spill_requeued(&self) {
+        let requeued = match self.lock_write("requeued").get_pieces_mut() {
+            Ok(pieces) => pieces.take_requeued(),
+            Err(_) => return,
+        };
+        for piece in requeued {
+            self.files.on_piece_requeued(piece);
+        }
+    }
+
     /// The piece did not pass its hash check, or the storage refused it: it
     /// is downloaded again.
     pub(super) fn requeue_piece(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {

@@ -314,6 +314,10 @@ impl PeerHandler {
                     );
                 }
 
+                drop(g);
+                if released > 0 {
+                    self.state.spill_requeued();
+                }
                 if released > 0 || had_inflight {
                     self.state.new_pieces_notify.notify_waiters();
                 }

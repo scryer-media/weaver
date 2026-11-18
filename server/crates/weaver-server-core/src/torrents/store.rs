@@ -1373,6 +1373,11 @@ impl Pieces for TorrentStore {
         self.writes.reserve(bytes, room)
     }
 
+    // On a blocking thread of the disk's runtime.
+    fn aside(&self, run: Box<dyn FnOnce() + Send>) {
+        self.writes.aside(run);
+    }
+
     // A block goes the way a piece does, through the writer of its files'
     // volume, kept while the files move, and is counted on the volume as it
     // fits; this waits for it, on a thread that may wait on a disk. A file

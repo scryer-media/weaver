@@ -95,8 +95,9 @@ impl PeerHandler {
                 let bf = &live.bitfield;
                 let allowed_fast = &live.allowed_fast_from_peer;
                 let was_end_game = pieces.chunks().every_queued_piece_started();
-                // A piece the storage has no room for waits on room_notify,
-                // which the storage rings when it has room again.
+                // A piece a storage that writes block by block has no room
+                // for waits on room_notify, which the storage rings when it
+                // has room again.
                 let result = pieces.acquire_admitted_piece(
                     AcquireRequest {
                         peer: self.addr,
@@ -134,7 +135,12 @@ impl PeerHandler {
                                 .is_some()
                         },
                     },
-                    |p| self.state.files.reserve_piece(p, &self.state.room_notify),
+                    // A storage that holds pieces in memory takes room as
+                    // a piece's first block arrives, not here.
+                    |p| {
+                        self.state.files.writes_to_memory()
+                            || self.state.files.reserve_piece(p, &self.state.room_notify)
+                    },
                 );
                 end_game_began = !was_end_game && pieces.chunks().every_queued_piece_started();
 
@@ -369,6 +375,7 @@ impl PeerHandler {
             .flatten();
         debug!(?released, on_parole, "requests timed out");
         if released.is_some() {
+            self.state.spill_requeued();
             self.state.new_pieces_notify.notify_waiters();
         }
         Ok(())
@@ -643,6 +650,7 @@ impl PeerHandler {
             return Ok(Vec::new());
         };
         if released > 0 {
+            self.state.spill_requeued();
             self.state.new_pieces_notify.notify_waiters();
         }
         Ok(taken)

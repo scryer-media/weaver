@@ -1272,6 +1272,9 @@ pub(crate) struct LivePeerState {
     // The peer's reads wait on the download limits (libtorrent: the download
     // channel lacks `peer_info::bw_network`), and when they last resumed.
     waiting_for_download_quota: bool,
+    // Its reads wait for room for the piece of a block it sent, which the
+    // storage gives back as other pieces leave memory.
+    waiting_for_room: bool,
     reads_resumed: Instant,
 
     // How long the peer takes to deliver a block, which sets its request timeout.
@@ -1434,6 +1437,7 @@ impl LivePeerState {
             waiting_since: Instant::now(),
             last_piece: Instant::now(),
             waiting_for_download_quota: false,
+            waiting_for_room: false,
             reads_resumed: Instant::now(),
             block_time: BlockTime::default(),
             slow_start: Some(SlowStart::new(now)),
@@ -1723,9 +1727,12 @@ impl LivePeerState {
     /// none are outstanding, and while its reads wait on the download limits:
     /// a peer is held to its timeouts only while it is read, and time spent
     /// waiting on the limits does not count against it (`second_tick` checks
-    /// both only with `bw_network` set and download quota held).
+    /// both only with `bw_network` set and download quota held). A wait for
+    /// the storage's room is a wait of ours too, and does not count either
+    /// (libtorrent stops reading a peer the disk is behind, `bw_disk`, and
+    /// `second_tick` holds it to neither timeout then).
     pub fn request_deadline(&self) -> Option<Instant> {
-        if self.waiting_for_download_quota {
+        if self.waiting_for_download_quota || self.waiting_for_room {
             return None;
         }
         let read_from = |at: Instant| at.max(self.reads_resumed);
@@ -1738,6 +1745,15 @@ impl LivePeerState {
     /// The peer's reads wait on the download limits, or resume.
     pub fn set_waiting_for_download_quota(&mut self, waiting: bool) {
         self.waiting_for_download_quota = waiting;
+        if !waiting {
+            self.reads_resumed = Instant::now();
+        }
+        self.request_slots_changed.notify_waiters();
+    }
+
+    /// The peer's reads wait for the storage's room, or resume.
+    pub fn set_waiting_for_room(&mut self, waiting: bool) {
+        self.waiting_for_room = waiting;
         if !waiting {
             self.reads_resumed = Instant::now();
         }

@@ -121,6 +121,30 @@ impl PeerHandler {
         self.land_here(&piece, chunk_info).await
     }
 
+    // The connection's reads wait for room, or resume. Waiting, it gives
+    // back the pieces it owns that took a block.
+    fn wait_for_room(&self, waiting: bool) {
+        self.state
+            .peers
+            .with_live_mut(self.addr, "room", |live| live.set_waiting_for_room(waiting));
+        if !waiting {
+            return;
+        }
+        self.swarm().request_event(swarm::RequestEvent::RoomWait);
+        let released = self
+            .state
+            .lock_write("room_wait")
+            .get_pieces_mut()
+            .map_or(0, |pieces| {
+                pieces.release_started_pieces_owned_by(self.addr)
+            });
+        debug!(released, "waiting for room");
+        if released > 0 {
+            self.state.spill_requeued();
+            self.state.new_pieces_notify.notify_waiters();
+        }
+    }
+
     /// A block received into its own buffer moves to the disk threads, which
     /// write it, check its piece when it was the last, and hand the buffer
     /// back (libtorrent `peer_connection::incoming_piece` queues
@@ -172,17 +196,48 @@ impl PeerHandler {
     ) -> anyhow::Result<()> {
         let state = &self.state;
         let spawner = &state.shared.spawner;
-        let land = || land_block(state, self.addr, piece, &chunk_info);
-        // A block the storage copies into memory is copied here, on this
-        // thread: only a write that reaches a file, and the check of a
-        // piece, take a blocking thread.
-        let from_memory = state.files.writes_to_memory();
-        let landed = if from_memory {
-            land()
-        } else {
-            spawner.block_in_place_with_semaphore(land).await
+        // The piece's first block takes its room as it lands. Without room,
+        // the connection stops reading until the storage rings that it has
+        // some, its requests standing and their timers stopped, and gives
+        // back the pieces it owns that took a block, for any peer to
+        // finish: a connection that waits for room holds none. A peer that
+        // sends each piece's blocks in the order asked finishes the piece it
+        // holds room for before it sends another's, so it never waits
+        // holding room.
+        let mut waiting = false;
+        let (landed, from_memory) = loop {
+            let rung = state.room_notify.notified();
+            let mut rung = std::pin::pin!(rung);
+            rung.as_mut().enable();
+            let mut no_room = false;
+            let mut land =
+                || land_block_or_hold(state, self.addr, piece, &chunk_info, &mut no_room);
+            // A block the storage copies into memory is copied here, on this
+            // thread: only a write that reaches a file, and the check of a
+            // piece, take a blocking thread.
+            let from_memory = state.files.writes_piece_to_memory(chunk_info.piece_index);
+            let landed = if from_memory {
+                land()
+            } else {
+                spawner.block_in_place_with_semaphore(land).await
+            };
+            if !no_room {
+                break (landed, from_memory);
+            }
+            if !waiting {
+                waiting = true;
+                self.wait_for_room(true);
+            }
+            tokio::select! {
+                () = rung => {}
+                () = state.cancellation_token.cancelled() => {}
+            }
+        };
+        if waiting {
+            self.wait_for_room(false);
         }
-        .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        let landed =
+            landed.with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
         let Some((time, senders, piece_check)) = landed else {
             return Ok(());
         };
@@ -254,6 +309,7 @@ impl PeerHandler {
 
 // Writes the block, and when it was the piece's last, hands back the
 // piece's download time and senders for its check.
+#[cfg(test)]
 pub(super) fn land_block(
     state: &Arc<TorrentStateLive>,
     addr: PeerHandle,
@@ -262,6 +318,25 @@ pub(super) fn land_block(
 ) -> Landed {
     let mut landed = Vec::with_capacity(1);
     land_blocks(state, &[(addr, piece, *chunk_info)], &mut landed);
+    landed.pop().unwrap_or(Ok(None))
+}
+
+// [`land_block`], with a block whose piece has no room left unwritten and
+// `no_room` set, for its connection to land it again once there is room.
+fn land_block_or_hold(
+    state: &Arc<TorrentStateLive>,
+    addr: PeerHandle,
+    piece: &Piece<ByteBuf<'_>>,
+    chunk_info: &ChunkInfo,
+    no_room: &mut bool,
+) -> Landed {
+    let mut landed = Vec::with_capacity(1);
+    land_blocks_or_hold(
+        state,
+        &[(addr, piece, *chunk_info)],
+        &mut landed,
+        Some(no_room),
+    );
     landed.pop().unwrap_or(Ok(None))
 }
 
@@ -274,6 +349,19 @@ pub(super) fn land_blocks(
     state: &Arc<TorrentStateLive>,
     blocks: &[(PeerHandle, &Piece<ByteBuf<'_>>, ChunkInfo)],
     landed: &mut Vec<Landed>,
+) {
+    land_blocks_or_hold(state, blocks, landed, None);
+}
+
+// [`land_blocks`]. A block whose piece the storage has no room for sets
+// `no_room` when there is one, and is held by its connection; otherwise,
+// on a disk thread that cannot wait, it is discarded, counted redundant,
+// and fetched again.
+fn land_blocks_or_hold(
+    state: &Arc<TorrentStateLive>,
+    blocks: &[(PeerHandle, &Piece<ByteBuf<'_>>, ChunkInfo)],
+    landed: &mut Vec<Landed>,
+    mut no_room: Option<&mut bool>,
 ) {
     let first = landed.len();
     landed.extend(blocks.iter().map(|_| Ok(None)));
@@ -314,13 +402,27 @@ pub(super) fn land_blocks(
             {
                 held.push((piece.index, lock.read()));
             }
-            let admit = |p| state.files.reserve_piece(p, &state.room_notify);
+            // Asked once a piece in flight, for its first block: its
+            // owner's takes the whole piece's room, any other one block's.
+            // Neither waits: a refusal is an answer.
+            let admit = |p, owned| {
+                if owned {
+                    state.files.reserve_piece(p, &state.room_notify)
+                } else {
+                    state.files.reserve_unowned_piece(p, &state.room_notify)
+                }
+            };
             match pieces.admitted_block_arrived(chunk_info, *addr, admit) {
                 Arrival::Write { cancel } => {
                     admitted.chunks.push(*chunk_info);
                     cancels.push((i, cancel));
                 }
-                Arrival::Discard => {
+                Arrival::NoRoom if no_room.is_some() => {
+                    if let Some(no_room) = no_room.as_deref_mut() {
+                        *no_room = true;
+                    }
+                }
+                Arrival::Discard | Arrival::NoRoom => {
                     state.add_redundant_bytes(piece.len() as u64);
                     state
                         .session_stats
@@ -460,7 +562,7 @@ pub(super) fn hash_landed_piece(
     piece_index: ValidPieceIndex,
 ) -> anyhow::Result<Verdict> {
     let stats = state.shared.spawner.stats();
-    let from_memory = state.files.writes_to_memory();
+    let from_memory = state.files.writes_piece_to_memory(piece_index);
     let call = stats.call(if from_memory {
         DiskOp::HashMemory
     } else {

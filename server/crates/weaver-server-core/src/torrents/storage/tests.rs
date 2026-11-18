@@ -1506,6 +1506,10 @@ impl Pieces for Watched {
     fn room_returned(&self) {
         self.store.room_returned();
     }
+
+    fn aside(&self, run: Box<dyn FnOnce() + Send>) {
+        self.store.aside(run);
+    }
 }
 
 // A session on loopback alone: no DHT, no trackers, no discovery, and
@@ -2078,6 +2082,14 @@ impl TorrentStorage for Gated {
             self.refused.send_modify(|refused| *refused += 1);
         }
         granted
+    }
+
+    fn reserve_unowned_piece(&self, piece: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        self.storage.reserve_unowned_piece(piece, room)
+    }
+
+    fn on_piece_requeued(&self, piece: ValidPieceIndex) {
+        self.storage.on_piece_requeued(piece);
     }
 }
 

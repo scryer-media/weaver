@@ -13,6 +13,7 @@ mod mapped_filter_tests;
 mod peer_messages;
 mod pieces;
 mod requests;
+mod room;
 mod swarm_tests;
 mod upload;
 mod v2;

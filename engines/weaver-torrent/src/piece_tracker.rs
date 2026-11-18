@@ -53,6 +53,9 @@ pub struct InflightPiece {
     // The blocks of the piece asked of another peer as well, in the end
     // game, one such peer a block: the block index and the peer.
     duplicates: Vec<(u32, PeerHandle)>,
+    // The storage holds room for the piece: a block of it was admitted.
+    // Its later blocks are not asked again.
+    room: bool,
 }
 
 /// What becomes of a block that arrives (libtorrent
@@ -67,6 +70,9 @@ pub enum Arrival {
     /// We have the block, or another copy of it arrived first (libtorrent
     /// counts it as redundant bytes).
     Discard,
+    /// The storage has no room for the block's piece: the block is held
+    /// until it has.
+    NoRoom,
 }
 
 /// The sender of every block of one piece, by block index; None for a
@@ -202,6 +208,9 @@ pub struct PieceTracker {
     // index: any other copy is redundant (libtorrent
     // `piece_picker::mark_as_writing`).
     writing: HashSet<u32>,
+    // The pieces queued again since the storage was last told: one that
+    // took room gives it back.
+    requeued: Vec<ValidPieceIndex>,
     // Breaks ties between equally rare pieces, and starts the initial random
     // pick.
     rng: StdRng,
@@ -222,6 +231,7 @@ impl PieceTracker {
             inflight: HashMap::new(),
             senders: HashMap::new(),
             writing: HashSet::new(),
+            requeued: Vec::new(),
             rng,
         }
     }
@@ -278,7 +288,9 @@ impl PieceTracker {
     /// [`Self::acquire_piece`], with `admit` asked of the one piece step 1 would
     /// reserve. A piece it refuses stays queued and no other is reserved in its
     /// place: the refusal is a lack of room, not of that piece. A steal takes a
-    /// piece already in flight, so it is never asked.
+    /// piece already in flight, so it is never asked. Only a storage that
+    /// writes every piece block by block refuses here; one that holds pieces
+    /// in memory takes room as a piece's first block arrives.
     pub fn acquire_admitted_piece<I, P, A, S, F>(
         &mut self,
         mut req: AcquireRequest<'_, I, P, A, S>,
@@ -505,6 +517,7 @@ impl PieceTracker {
                 peer,
                 started: Instant::now(),
                 duplicates: Vec::new(),
+                room: false,
             },
         );
         AcquireResult::Reserved(piece)
@@ -633,6 +646,42 @@ impl PieceTracker {
         Some(blocked)
     }
 
+    /// The pieces `peer` owns that took a block, received or being
+    /// written, go back to the queue with the chunks they already
+    /// received: a connection that waits for room holds no piece's room
+    /// while it waits. Its requests stay outstanding and a block it still
+    /// sends is kept, as for [`Self::release_piece_blocked_by`]; the blocks
+    /// it doubled in the end game stay its own. Returns the number
+    /// released.
+    pub fn release_started_pieces_owned_by(&mut self, peer: PeerHandle) -> usize {
+        let started: Vec<_> = self
+            .inflight
+            .iter()
+            .filter(|(_, info)| info.peer == peer)
+            .map(|(p, _)| *p)
+            .filter(|piece| self.is_started(*piece))
+            .collect();
+        self.requeue(started)
+    }
+
+    // Whether a block of `piece` was received or is being written.
+    fn is_started(&self, piece: ValidPieceIndex) -> bool {
+        self.chunks
+            .get_lengths()
+            .iter_chunk_infos(piece)
+            .any(|chunk| {
+                self.writing.contains(&chunk.absolute_index)
+                    || self.chunks.is_chunk_received(&chunk)
+            })
+    }
+
+    /// The pieces queued again since the last call, in the order they left
+    /// flight: the storage is told of each, so a piece that took room
+    /// gives it back.
+    pub fn take_requeued(&mut self) -> Vec<ValidPieceIndex> {
+        std::mem::take(&mut self.requeued)
+    }
+
     // `pieces` leave flight and are queued again, with the chunks they
     // already received, so the next owner asks only for the rest.
     fn requeue(&mut self, pieces: Vec<ValidPieceIndex>) -> usize {
@@ -640,7 +689,9 @@ impl PieceTracker {
             self.inflight.remove(piece);
             self.chunks.requeue_piece_if_not_have(*piece);
         }
-        pieces.len()
+        let released = pieces.len();
+        self.requeued.extend(pieces);
+        released
     }
 
     /// `peer`'s copy of `chunk` arrived: whether it is the one written. A
@@ -652,27 +703,39 @@ impl PieceTracker {
     /// A later copy, or a block of a piece we have, is not.
     #[cfg(test)]
     pub fn block_arrived(&mut self, chunk: &ChunkInfo, peer: PeerHandle) -> Arrival {
-        self.admitted_block_arrived(chunk, peer, |_| true)
+        self.admitted_block_arrived(chunk, peer, |_, _| true)
     }
 
-    /// [`Self::block_arrived`], with the block's piece asked of `admit`, the
-    /// gate a piece passes to be handed out, when no peer owns it: a piece
-    /// in flight passed it when it was handed out, but one queued may hold
-    /// no room, as one that failed its hash while its block was owed. A
-    /// block of a piece `admit` refuses is discarded.
+    /// [`Self::block_arrived`], with the block's piece asked of `admit`
+    /// whether it has room, and told whether `peer` owns the piece: the
+    /// owner's block takes the whole piece's room, any other the block's.
+    /// A grant takes no room, so a piece in flight is asked once, for the
+    /// first block of it that arrives; a piece no peer owns, for every
+    /// block. A block of a piece `admit` refuses is not written:
+    /// [`Arrival::NoRoom`].
     pub fn admitted_block_arrived(
         &mut self,
         chunk: &ChunkInfo,
         peer: PeerHandle,
-        admit: impl FnOnce(ValidPieceIndex) -> bool,
+        admit: impl FnOnce(ValidPieceIndex, bool) -> bool,
     ) -> Arrival {
         let piece = chunk.piece_index;
         if self.chunks.is_piece_have(piece)
             || self.chunks.is_chunk_received(chunk)
             || self.writing.contains(&chunk.absolute_index)
-            || !(self.inflight.contains_key(&piece) || admit(piece))
         {
             return Arrival::Discard;
+        }
+        let info = self.inflight.get_mut(&piece);
+        let held = info.as_ref().is_some_and(|info| info.room);
+        if !held {
+            let owned = info.as_ref().is_some_and(|info| info.peer == peer);
+            if !admit(piece, owned) {
+                return Arrival::NoRoom;
+            }
+            if let Some(info) = info {
+                info.room = true;
+            }
         }
         self.writing.insert(chunk.absolute_index);
         let mut cancel = Vec::new();
