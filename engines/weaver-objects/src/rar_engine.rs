@@ -9,7 +9,6 @@
 pub mod naming;
 mod run;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(test)]
 use weaver_graph::{ByteRange, Emit, Engine, Object, Placement};
@@ -17,8 +16,8 @@ use weaver_graph::{ByteRange, Emit, Engine, Object, Placement};
 use unrar_rs::{KdfCache, RarVolumeFacts};
 use weaver_graph::{Extraction, Kind, VolumeIndex};
 
-use crate::engine::{EngineObject, Format, Holding};
-use crate::rar_store::claim::{self, Held};
+use crate::engine::{EngineObject, Format, Holdings};
+use crate::rar_store::claim::{self, Held, Holds};
 
 pub struct Rar;
 
@@ -48,19 +47,23 @@ impl Format for Rar {
     // A front states nothing of whether a volume follows it: that is in the
     // end record, past the front of all but the smallest volume.
     fn place(
-        bound: &BTreeMap<u32, Holding<'_, RarVolumeFacts>>,
+        bound: &Holdings<'_, RarVolumeFacts>,
         front: Option<&RarVolumeFacts>,
         _length: Option<u64>,
     ) -> Option<VolumeIndex> {
-        claim::place(front?, &held(bound))
+        claim::place(front?, &Kept(bound))
     }
 
     fn judged(
-        bound: &BTreeMap<u32, Holding<'_, RarVolumeFacts>>,
+        bound: &Holdings<'_, RarVolumeFacts>,
         front: Option<&RarVolumeFacts>,
         _length: Option<u64>,
     ) -> bool {
-        front.is_some_and(|front| claim::judged(front, &held(bound)))
+        front.is_some_and(|front| claim::judged(front, &Kept(bound)))
+    }
+
+    fn linked(bound: &Holdings<'_, RarVolumeFacts>, front: &RarVolumeFacts, index: u32) -> bool {
+        claim::linked(front, index, &Kept(bound))
     }
 
     fn run(password: Option<String>) -> Box<dyn Extraction> {
@@ -111,20 +114,29 @@ pub(crate) fn window(facts: &RarVolumeFacts) -> Option<u64> {
         .max()
 }
 
-fn held<'a>(bound: &BTreeMap<u32, Holding<'a, RarVolumeFacts>>) -> BTreeMap<u32, Held<'a>> {
-    bound
-        .iter()
-        .filter_map(|(index, holding)| {
-            let facts = holding.front;
-            (!facts.is_some_and(|facts| claim::misplaced(VolumeIndex(*index), facts))).then_some((
-                *index,
-                Held {
-                    facts,
-                    successor: None,
-                },
-            ))
+// The engine's volumes, as they place the next, read by index: a volume
+// held where its own headers do not place it places nothing beside it.
+struct Kept<'a>(&'a Holdings<'a, RarVolumeFacts>);
+
+fn held<'a>(index: u32, facts: Option<&'a RarVolumeFacts>) -> Option<Held<'a>> {
+    (!facts.is_some_and(|facts| claim::misplaced(VolumeIndex(index), facts))).then_some(Held {
+        facts,
+        successor: None,
+    })
+}
+
+impl Holds for Kept<'_> {
+    fn at(&self, index: u32) -> Option<Held<'_>> {
+        held(index, self.0.get(index)?.front)
+    }
+
+    fn indices(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.indices().filter(|index| {
+            self.0
+                .get(*index)
+                .is_some_and(|holding| held(*index, holding.front).is_some())
         })
-        .collect()
+    }
 }
 
 #[cfg(test)]

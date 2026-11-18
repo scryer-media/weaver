@@ -714,6 +714,12 @@ pub(super) fn tied(index: VolumeIndex, volumes: &BTreeMap<VolumeIndex, Volume>) 
     meets(facts, index.0, &held).contains(&Some(true))
 }
 
+// Whether a volume at `index` is tied to a held volume beside it: one
+// member runs across from the one before, or on into the one after.
+pub(crate) fn linked(facts: &RarVolumeFacts, index: u32, held: &impl Holds) -> bool {
+    meets(facts, index, held).contains(&Some(true))
+}
+
 // Whether a volume's headers state its position: a number, or the first
 // volume's mark. One that states none is placed by its name in the set's
 // numbering before it is placed by the members that link it to its

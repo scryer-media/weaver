@@ -368,3 +368,160 @@ async fn the_bench_post_with_its_last_volume_numbered_in_the_middle_is_one_store
     )
     .await;
 }
+
+// The compressed four-volume RAR4 set as RAR wrote it, but with its end
+// records stating no volume number, as an old writer's do: a set only its
+// names order, and one only the engine reads.
+fn lz_four_unnumbered() -> Vec<(String, Vec<u8>)> {
+    super::rar_rev::lz_four()
+        .into_iter()
+        .map(|(name, mut bytes)| {
+            // The end record is the volume's last header: its type, its
+            // flags with VOLUME_NUMBER (0x0008) cleared, and its CRC made
+            // whole again over what follows the CRC field.
+            let size = 20;
+            let at = bytes.len() - size;
+            assert_eq!(bytes[at + 2], 0x7b, "{name} ends on its end record");
+            bytes[at + 3] &= !0x08;
+            let crc = (par2_rs::checksum::crc32(&bytes[at + 2..]) & 0xffff) as u16;
+            bytes[at..at + 2].copy_from_slice(&crc.to_le_bytes());
+            (name, bytes)
+        })
+        .collect()
+}
+
+// The set posted under a release's names out of order, two volumes swapped
+// or every one backwards, then PAR2 recovery volumes, with or without the
+// index, naming each volume under its true one-digit name: the recovery
+// renames every volume, one at a time, to a stem none of the posted names
+// carries. Every volume arrives whole.
+#[tokio::test]
+async fn a_compressed_rar4_set_posted_swapped_and_renamed_by_par2_volumes_delivers() {
+    for index in [false, true] {
+        for posted in [[1, 2, 4, 3], [2, 1, 3, 4], [4, 3, 2, 1]] {
+            renamed_by_par2_delivers(index, posted).await;
+        }
+    }
+}
+
+const LZ_FRAME: usize = 2048;
+
+async fn renamed_by_par2_delivers(index: bool, posted: [u32; 4]) {
+    let posts = renamed_posts(index, posted);
+    let graph = run(&Scenario::new(posts).framed(LZ_FRAME)).await;
+    assert!(
+        graph.completed(),
+        "index {index} posted {posted:?}: {:?} {:?} kinds {:?} delivery {:?}",
+        graph.status,
+        graph.failure,
+        kinds(&graph),
+        graph.graph().delivery
+    );
+    assert_lz_four_delivered(&graph.files, &format!("index {index} posted {posted:?}"));
+}
+
+// The same set under the index and the recovery volumes, posted in order or
+// with its last two numbers swapped, its articles served in one order: the
+// front of the first volume, then the last volume whole, then the index,
+// so the recovery renames the last volume first while neither volume
+// beside it has come, and only then the two between, the rest of the first
+// and the recovery volumes. The set is one engine at its true places and
+// delivers its member as RAR wrote it.
+#[tokio::test]
+async fn a_compressed_rar4_volume_renamed_before_its_neighbours_come_delivers() {
+    use super::restart::{Down, run_restarting_at};
+    use crate::jobs::model::JobStatus;
+    for posted in [[1, 2, 3, 4], [1, 2, 4, 3]] {
+        let posts = renamed_posts(true, posted);
+        let articles: Vec<u32> = posts
+            .iter()
+            .map(|post| post.bytes.len().div_ceil(LZ_FRAME) as u32)
+            .collect();
+        let all = |file: u32| (0..articles[file as usize]).map(move |at| (file, at));
+        let order: Vec<(u32, u32)> = (0..2)
+            .map(|at| (0, at))
+            .chain(all(3))
+            .chain(all(4))
+            .chain(all(1))
+            .chain(all(2))
+            .chain((2..articles[0]).map(|at| (0, at)))
+            .chain((5..posts.len() as u32).flat_map(all))
+            .collect();
+        let scenario = Scenario::new(posts).framed(LZ_FRAME).first(&order);
+        let served = run_restarting_at(&scenario, &mut |_| {}, Down::Crash, &|_| false).await;
+        assert_eq!(served.restarts, 0);
+        assert_eq!(
+            served.order[..order.len().min(served.order.len())],
+            order[..order.len().min(served.order.len())],
+            "posted {posted:?}: served out of the order given"
+        );
+        assert_eq!(
+            served.status,
+            Some(JobStatus::Complete),
+            "posted {posted:?}: {:?}",
+            served.graph.delivery
+        );
+        assert_lz_four_delivered(&served.files, &format!("posted {posted:?}"));
+    }
+}
+
+// The set posted under a release's names, numbered as `posted` gives each
+// volume in true order, then PAR2 recovery volumes, after the index or
+// without it, naming each volume under its true one-digit name.
+fn renamed_posts(index: bool, posted: [u32; 4]) -> Vec<Post> {
+    let set = lz_four_unnumbered();
+    let truth: Vec<(String, &[u8])> = set
+        .iter()
+        .enumerate()
+        .map(|(volume, (_, bytes))| {
+            (
+                format!("{HEADER_STEM}.part{}.rar", volume + 1),
+                bytes.as_slice(),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, &[u8])> = truth
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), *bytes))
+        .collect();
+    let mut par2 = par2_volumes_sliced(HEADER_STEM, &files, LZ_FRAME as u64, 4, 4);
+    if !index {
+        par2.remove(0);
+    }
+    let mut posts: Vec<Post> = set
+        .iter()
+        .zip(posted)
+        .map(|((_, bytes), number)| {
+            Post::plain(&format!("{RELEASE}.part{number:02}.rar"), bytes.clone())
+        })
+        .collect();
+    posts.extend(par2);
+    posts
+}
+
+// The set's one member delivered, alone, as RAR wrote it.
+fn assert_lz_four_delivered(files: &std::collections::BTreeMap<String, Vec<u8>>, label: &str) {
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/expected.json"
+    )))
+    .unwrap();
+    let expected = &oracle["archives"]["rar4_lz_four"]["compressible.txt"];
+    let member = delivered("compressible.txt");
+    assert_eq!(
+        files.keys().cloned().collect::<Vec<_>>(),
+        vec![member.clone()],
+        "{label}"
+    );
+    assert_eq!(
+        files[&member].len() as u64,
+        expected["size"].as_u64().unwrap(),
+        "{label}"
+    );
+    use sha2::Digest;
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&files[&member])),
+        expected["sha256"].as_str().unwrap(),
+        "{label}"
+    );
+}
