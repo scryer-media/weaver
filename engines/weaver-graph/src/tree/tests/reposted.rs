@@ -679,7 +679,7 @@ fn a_member_its_store_cannot_judge_yet_is_a_leaf_once_its_front_is_lost() {
         "settled by its owner"
     );
     assert!(!tree.front_to_come(NodeId::ROOT, member));
-    tree.settle_leaf(NodeId::ROOT, member, None, &mut effects);
+    tree.settle_leaf(NodeId::ROOT, member, None, &mut Build, &mut effects);
     assert!(!tree.is_undecided(NodeId::ROOT, member));
     assert_eq!(tree.child_of(NodeId::ROOT, member), None, "a leaf");
     assert_eq!(tree.live().len(), 2, "no store of its own");
@@ -729,7 +729,7 @@ fn a_member_waits_on_a_holder_whatever_a_store_beside_cannot_judge() {
     let lost = ByteRange::new(SIGNED.len() as u64, 2 * SIGNED.len() as u64);
     tree.damage(NodeId::ROOT, VolumeIndex(copy.0), lost, &mut effects);
     assert!(!tree.front_to_come(NodeId::ROOT, copy));
-    tree.settle_leaf(NodeId::ROOT, copy, None, &mut effects);
+    tree.settle_leaf(NodeId::ROOT, copy, None, &mut Build, &mut effects);
     assert!(
         tree.is_undecided(NodeId::ROOT, copy),
         "it waits on the holder"
@@ -757,7 +757,7 @@ fn a_member_whose_front_was_lost_founds_nothing_when_its_holder_differs() {
     let mut effects = Vec::new();
     let lost = ByteRange::new(SIGNED.len() as u64, 2 * SIGNED.len() as u64);
     tree.damage(NodeId::ROOT, VolumeIndex(copy.0), lost, &mut effects);
-    tree.settle_leaf(NodeId::ROOT, copy, None, &mut effects);
+    tree.settle_leaf(NodeId::ROOT, copy, None, &mut Build, &mut effects);
     assert!(
         tree.is_undecided(NodeId::ROOT, copy),
         "it waits on the holder"

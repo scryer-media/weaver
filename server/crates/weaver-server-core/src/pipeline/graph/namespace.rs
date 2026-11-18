@@ -2433,7 +2433,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<Option<(NodeId, VolumeIndex)>, WriteError> {
         let mut effects = Vec::new();
-        tree.settle_leaf(node, member, None, &mut effects);
+        tree.settle_leaf(node, member, None, builder, &mut effects);
         self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         let owner = tree.child_of(node, member);
         if owner.is_none() {
