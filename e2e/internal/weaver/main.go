@@ -1532,6 +1532,11 @@ var canonicalFixtureSlugs = []string{
 	"rar5-solid-multi-member",
 	"rar5-solid-multivolume",
 	"rar5-wrong-password",
+	// Scene zip-with-diz releases: each volume of an inner RAR set alone in a
+	// stored zip beside a file_id.diz and an .nfo, the zips inside an outer
+	// RAR set or at the root of the posting.
+	"scene-zips-outer-rar",
+	"scene-zips-root",
 	"single-7z",
 	"single-7z-corrupted",
 	"single-mkv",
