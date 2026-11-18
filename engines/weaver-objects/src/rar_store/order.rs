@@ -42,11 +42,13 @@ use weaver_graph::{Emit, VolumeIndex};
 
 use super::{RarStore, Volume, claim, layout};
 
-// A member as the headers name it across volumes: its name and its size.
-type Key<'a> = (&'a str, Option<u64>);
+// A member as the claim tells its parts apart (`claim::member`): the size
+// a part states is no test of which member it is, as packers misstate it in
+// the middle parts.
+type Key<'a> = &'a str;
 
 fn key(member: &RarVolumeMemberFacts) -> Key<'_> {
-    (member.name.as_str(), member.unpacked_size)
+    claim::member(member)
 }
 
 // The member a volume opens on when it continues one begun before it, and

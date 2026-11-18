@@ -11,12 +11,13 @@
 // A layout the store gives the set up over never becomes its map: no byte
 // was placed by it, so the bytes go back from where the last one put them.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, RarVolumeFacts,
-    StoredLayoutBuilder, StoredMember,
+    RarVolumeMemberFacts, StoredLayoutBuilder, StoredMember,
 };
 use weaver_graph::{ByteRange, Coverage, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
@@ -95,6 +96,35 @@ fn lays(index: VolumeIndex, found: &Volume) -> Option<(&RarVolumeFacts, bool)> {
     Some((facts, found.walk.ended && !found.walk.is_last()))
 }
 
+// The member a volume ends on, when it carries on into the next one.
+fn carried_on(facts: &RarVolumeFacts) -> Option<&RarVolumeMemberFacts> {
+    let last = facts.members.iter().max_by_key(|member| member.order)?;
+    last.split_after.then_some(last)
+}
+
+// Where among `facts`' members sits the one the volume opens on, when it
+// carries on `tail`, the member the volume before ends on, and says of it
+// otherwise than `tail` does: another name, or another size for the whole
+// member. Which set a volume is of, and where in it, is the claim's to say,
+// and a name is evidence there. Once the volume is laid after the one
+// before, RAR reads the part it opens on as the part that volume carries
+// on, by place alone: unrar's MergeArchive (volume.cpp) reads the next
+// volume's header in place of the last and compares neither name nor size,
+// and CmdExtract::UnstoreFile (extract.cpp) writes a stored member to the
+// size its first part states. Packers name a member one way in its first
+// part and another in the rest, and misstate its size in the middle parts.
+// The member is what its first part says, and the CRC its last part states
+// proves its bytes, as unrar's ValidCRC check does.
+fn continuation(tail: &RarVolumeMemberFacts, facts: &RarVolumeFacts) -> Option<usize> {
+    let (at, head) = facts
+        .members
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, member)| member.order)?;
+    let differs = head.name != tail.name || head.unpacked_size != tail.unpacked_size;
+    (head.split_before && differs).then_some(at)
+}
+
 // Whether a volume is held where it is on trust: its headers state no
 // position, so only its name or its links put it there.
 pub(super) fn on_trust(found: &Volume) -> bool {
@@ -127,10 +157,12 @@ fn breaks_at(member: &StoredMember) -> Option<u32> {
 }
 
 // A layout and, for each volume it holds, the facts it took it on: their
-// stamp and how many members they list.
+// stamp and how many members they list, and the member it ends on when it
+// carries one on, as the layout took it.
 pub(super) struct Laid {
     builder: StoredLayoutBuilder,
     added: BTreeMap<u32, (u64, usize)>,
+    tails: BTreeMap<u32, RarVolumeMemberFacts>,
 }
 
 impl std::ops::Deref for Laid {
@@ -146,7 +178,30 @@ impl Laid {
         Self {
             builder: StoredLayoutBuilder::new(format),
             added: BTreeMap::new(),
+            tails: BTreeMap::new(),
         }
+    }
+
+    // A volume's facts as the layout takes them. The builder links a
+    // member's parts by name and holds them to one stated size, so a volume
+    // that opens on the member the one before carries on, saying otherwise
+    // of it, has it as the layout took that member: the name and size its
+    // first part gives it, as unrar extracts it. The sum of the parts' bytes
+    // must still come to that size, and the last part's CRC proves them.
+    fn joined<'a>(&self, index: u32, facts: &'a RarVolumeFacts) -> Cow<'a, RarVolumeFacts> {
+        let carried = index
+            .checked_sub(1)
+            .and_then(|before| self.tails.get(&before))
+            .and_then(|tail| Some((tail, continuation(tail, facts)?)));
+        let Some((tail, at)) = carried else {
+            return Cow::Borrowed(facts);
+        };
+        let mut joined = facts.clone();
+        let head = &mut joined.members[at];
+        head.name.clone_from(&tail.name);
+        head.name_raw.clone_from(&tail.name_raw);
+        head.unpacked_size = tail.unpacked_size;
+        Cow::Owned(joined)
     }
 
     // Add a volume on its walk's facts, or say the layout refuses them.
@@ -170,19 +225,28 @@ impl Laid {
                 {
                     // Taking a volume it holds again changes nothing either
                     // way, so asking costs the test only time.
+                    let joined = self.joined(index, facts);
                     assert_eq!(
                         added,
-                        self.builder.add_volume(index, facts).is_ok(),
+                        self.builder.add_volume(index, &joined).is_ok(),
                         "the layout answers as known"
                     );
                     super::counts::bump(|counts| counts.known += 1);
                 }
-                added
+                return added;
             }
             None => {
                 #[cfg(test)]
                 super::counts::bump(|counts| counts.asked.push((index, walk.stamp)));
-                self.builder.add_volume(index, facts).is_ok()
+                let joined = self.joined(index, facts);
+                let added = self.builder.add_volume(index, &joined).is_ok();
+                if added {
+                    match carried_on(&joined) {
+                        Some(tail) => self.tails.insert(index, tail.clone()),
+                        None => self.tails.remove(&index),
+                    };
+                }
+                added
             }
         };
         if added {

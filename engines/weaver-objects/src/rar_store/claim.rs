@@ -272,13 +272,24 @@ pub(super) fn inverted(index: u32, volumes: &BTreeMap<VolumeIndex, Volume>) -> b
 }
 
 // Whether `head`, the member a volume opens on, is `tail`, the member the
-// volume before it carries on.
+// volume before it carries on, as far as the claim judges which set a
+// volume is of: the two name the same member. The size each part states
+// is no test of it. unrar extracts a member to the size its first part
+// states and reads the later parts by place without looking at theirs
+// (CmdExtract::ExtractCurrentFile and MergeArchive), so packers that
+// misstate it in the middle parts make sets unrar reads whole; the CRC the
+// last part states is what proves the member, and the layout checks it.
+// What keeps two sets posted under one stem apart is the name, a number a
+// volume's headers state, and a set's first volume opening on a new member.
+// The store orders volumes by the same name (`member`, `order`).
 fn continues(tail: &RarVolumeMemberFacts, head: &RarVolumeMemberFacts) -> bool {
-    head.name == tail.name
-        && match (head.unpacked_size, tail.unpacked_size) {
-            (Some(head_size), Some(tail_size)) => head_size == tail_size,
-            _ => true,
-        }
+    member(head) == member(tail)
+}
+
+// The name a part gives its member: what `continues` compares, and what
+// the store orders volumes by (`order`).
+pub(super) fn member(part: &RarVolumeMemberFacts) -> &str {
+    part.name.as_str()
 }
 
 // Where a volume's headers and name place it in a set: the place, the
@@ -817,17 +828,21 @@ pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
 //
 // Whether a volume is settled at `index`: read to its end, or placed there
 // by a stated position or by its name. Nothing settles a volume where its
-// own headers say it is not, a name least of all.
+// own headers say it is not, a name least of all. An end read that states
+// no number, as a RAR4 volume's short of a numbered end record, says
+// nothing of where the volume is: one its own name numbers at another place
+// is held where links alone put it, and a claimant that states the place
+// takes it. Links do not order the middle volumes of one member, which each
+// carry it on alike, so the first of them to come takes the lowest free
+// place, whichever it is.
 pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
     let facts = volume.stated();
+    let named = volume.numbered.as_ref().map(|name| name.index() == index.0);
     !volume.misplaced(index)
-        && (volume.walk.ended
+        && ((volume.walk.ended && named != Some(false))
             || facts.is_some_and(states_position)
             || volume.ordered() == Some(index)
-            || volume
-                .numbered
-                .as_ref()
-                .is_some_and(|name| name.index() == index.0))
+            || named == Some(true))
 }
 
 // The position a volume's headers give it beside the volumes held, by
