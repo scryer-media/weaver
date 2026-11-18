@@ -5,6 +5,7 @@
 //! handler queues for the wire.
 
 mod admission;
+mod cancels;
 mod discovery;
 mod disk_jobs;
 mod lifecycle;

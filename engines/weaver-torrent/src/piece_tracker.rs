@@ -900,6 +900,9 @@ fn may_hand(
 }
 
 #[cfg(test)]
+mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::constants::CHUNK_SIZE;
