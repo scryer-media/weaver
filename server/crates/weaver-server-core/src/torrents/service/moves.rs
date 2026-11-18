@@ -544,6 +544,55 @@ impl TorrentService {
     /// `torrents/recheck`). A running torrent runs again once checked, a
     /// paused one stays paused, and one being checked is left to its check.
     pub async fn recheck(&self, job_id: JobId) -> Result<(), ActionError> {
+        if self.recheck_one(job_id).await? {
+            self.apply_queue().await;
+            self.spawn_attach(job_id).await;
+        }
+        self.publish().await;
+        Ok(())
+    }
+
+    /// `recheck` of each torrent in turn, as one unit: one pass of the
+    /// queue for those that join a session to be checked, then one publish.
+    /// The first refused ends them, as it ended them one at a time: those
+    /// before it are checked and those after it are not.
+    pub async fn recheck_many(&self, job_ids: &[JobId]) -> super::batch::Outcome {
+        let mut outcome = super::batch::Outcome::new();
+        let mut attach = Vec::new();
+        for &job_id in job_ids {
+            match self.recheck_one(job_id).await {
+                Ok(joins) => {
+                    if joins {
+                        attach.push(job_id);
+                    }
+                    outcome.insert(job_id, Ok(()));
+                }
+                // One gone since it was named is passed over.
+                Err(error @ ActionError::NotFound(_)) => {
+                    outcome.insert(job_id, Err(error));
+                }
+                Err(error) => {
+                    outcome.insert(job_id, Err(error));
+                    break;
+                }
+            }
+        }
+        if !attach.is_empty() {
+            self.apply_queue().await;
+            for &job_id in &attach {
+                self.spawn_attach(job_id).await;
+            }
+        }
+        if outcome.values().any(Result::is_ok) {
+            self.publish().await;
+        }
+        outcome
+    }
+
+    // The check of `recheck` begun on one torrent, nothing published, and
+    // whether it is one in no session that joins one to be checked: the
+    // queue is passed and its session asked for then.
+    async fn recheck_one(&self, job_id: JobId) -> Result<bool, ActionError> {
         // A move owns the torrent's files, and its own forgetting and
         // checking of them, until it ends: a recheck asked for meanwhile is
         // refused, seen under the live lock the move began under.
@@ -564,10 +613,7 @@ impl TorrentService {
             .await?;
             // Answered without waiting on its route, as the one held for
             // its files is below.
-            self.apply_queue().await;
-            self.spawn_attach(job_id).await;
-            self.publish().await;
-            return Ok(());
+            return Ok(true);
         }
         // One held for its files missing is in no session: it lets go of
         // the hold and of every piece, and the session it joins checks
@@ -591,10 +637,7 @@ impl TorrentService {
             })
             .await?;
         if held {
-            self.apply_queue().await;
-            self.spawn_attach(job_id).await;
-            self.publish().await;
-            return Ok(());
+            return Ok(true);
         }
         {
             // Held across the recheck, as the queue holds it across a pause
@@ -616,8 +659,7 @@ impl TorrentService {
             // it ends, and a write it refuses holds it anew.
             self.end_disk_room(torrent);
         }
-        self.publish().await;
-        Ok(())
+        Ok(false)
     }
 
     // A move refused before any file moved: the torrent is as it was, and

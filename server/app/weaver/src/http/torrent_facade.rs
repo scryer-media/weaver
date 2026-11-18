@@ -1274,12 +1274,7 @@ async fn torrents(
             })
             .await
         }
-        "recheck" => {
-            each(ctx, params, |torrents, view| async move {
-                torrents.recheck(view.job_id).await
-            })
-            .await
-        }
+        "recheck" => recheck(ctx, params).await,
         "reannounce" => reannounce(ctx, params).await,
         "categories" => axum::Json(categories(&*ctx.inner.config.read().await)).into_response(),
         "createCategory" => create_category(ctx, params, scope).await,
@@ -2669,11 +2664,12 @@ async fn add_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
             _ => tiers.push(Vec::new()),
         }
     }
-    each_of(ctx, found!(ctx.named(hash).await), move |torrents, view| {
-        let tiers = tiers.clone();
-        async move { torrents.add_trackers(view.job_id, tiers).await }
-    })
-    .await
+    let views = found!(ctx.named(hash).await);
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    let job_ids: Vec<JobId> = views.iter().map(|view| view.job_id).collect();
+    answered(&views, torrents.add_trackers_many(&job_ids, &tiers).await)
 }
 
 // `torrents/editTracker` (qBittorrent `editTrackerAction`): a new URL or
@@ -2756,11 +2752,12 @@ async fn remove_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Respons
     };
     let hash = if hash.trim() == "*" { "all" } else { hash };
     let urls = url_list(urls);
-    each_of(ctx, found!(ctx.named(hash).await), move |torrents, view| {
-        let urls = urls.clone();
-        async move { torrents.remove_trackers(view.job_id, &urls).await }
-    })
-    .await
+    let views = found!(ctx.named(hash).await);
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    let job_ids: Vec<JobId> = views.iter().map(|view| view.job_id).collect();
+    answered(&views, torrents.remove_trackers_many(&job_ids, &urls).await)
 }
 
 // `torrents/reannounce` (qBittorrent `reannounceAction`): the trackers
@@ -3176,11 +3173,19 @@ async fn delete(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let delete_files = params.flag("deleteFiles").unwrap_or(false);
     // qBittorrent's `torrents/delete` removes what it is asked to, a private
     // torrent short of its seeding goal too (torrentscontroller.cpp
-    // `deleteAction`): the client that asks decided.
-    for view in found!(ctx.targets(params).await) {
-        match torrents.remove(view.job_id, delete_files, true).await {
-            Ok(()) | Err(ActionError::NotFound(_)) => {}
-            Err(error) => return internal(error),
+    // `deleteAction`): the client that asks decided. The torrents go as one
+    // unit of work, and the first that failed, in the request's order,
+    // answers.
+    let views = found!(ctx.targets(params).await);
+    let removals: Vec<(JobId, bool)> = views
+        .iter()
+        .map(|view| (view.job_id, delete_files))
+        .collect();
+    let mut outcome = torrents.remove_many(&removals, true).await;
+    for view in &views {
+        match outcome.remove(&view.job_id) {
+            None | Some(Ok(()) | Err(ActionError::NotFound(_))) => {}
+            Some(Err(error)) => return internal(error),
         }
     }
     ok()
@@ -3282,14 +3287,15 @@ async fn make_tags(ctx: &TorrentFacadeContext, action: &str, params: &Params) ->
     }
 }
 
-// Runs one action on every torrent `hashes` names. Unknown hashes are
-// skipped, as the client does.
-async fn each<F, Fut>(ctx: &TorrentFacadeContext, params: &Params, action: F) -> Response
-where
-    F: Fn(TorrentService, TorrentView) -> Fut,
-    Fut: std::future::Future<Output = Result<(), ActionError>>,
-{
-    each_of(ctx, found!(ctx.targets(params).await), action).await
+// qBittorrent `recheckAction` on every torrent `hashes` names, unknown
+// hashes skipped, as one unit of work: one pass and one publish.
+async fn recheck(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let views = found!(ctx.targets(params).await);
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    let job_ids: Vec<JobId> = views.iter().map(|view| view.job_id).collect();
+    answered(&views, torrents.recheck_many(&job_ids).await)
 }
 
 // The torrents `hashes` names moved in the download queue together, as

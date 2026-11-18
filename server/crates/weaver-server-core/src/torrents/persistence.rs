@@ -98,22 +98,34 @@ fn resume_update(
     Ok(Some((sql, args)))
 }
 
-// The one place a torrent's tracker rows are written: each row, and the
-// host of each, recorded as `tracker_host` spells it.
+// A torrent's tracker rows (`insert_tracker_rows`).
 async fn insert_trackers(
     tx: &mut SqlTx<'_>,
     job_id: i64,
     trackers: &[TrackerEntry],
     key: Option<&crate::persistence::encryption::EncryptionKey>,
 ) -> Result<(), StateError> {
+    let rows: Vec<(i64, &TrackerEntry)> =
+        trackers.iter().map(|tracker| (job_id, tracker)).collect();
+    insert_tracker_rows(tx, &rows, key).await
+}
+
+// The one place tracker rows are written, of one torrent or of many, each
+// row its torrent's id and the tracker: each row, and the host of each,
+// recorded as `tracker_host` spells it.
+async fn insert_tracker_rows(
+    tx: &mut SqlTx<'_>,
+    rows: &[(i64, &TrackerEntry)],
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+) -> Result<(), StateError> {
     // As many rows a statement as its binds allow.
-    for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 5)) {
+    for chunk in rows.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 5)) {
         let sql = format!(
             "{TRACKER_INSERT}{}{TRACKER_CONFLICT}",
             vec![TRACKER_ROW; chunk.len()].join(", ")
         );
         let mut args = Vec::with_capacity(chunk.len() * 5);
-        for tracker in chunk {
+        for &(job_id, tracker) in chunk {
             args.extend([
                 SqlArg::I64(job_id),
                 SqlArg::I64(i64::from(tracker.tier)),
@@ -125,9 +137,9 @@ async fn insert_trackers(
         }
         tx.execute(&sql, &args).await?;
     }
-    let hosts: Vec<String> = trackers
+    let hosts: Vec<String> = rows
         .iter()
-        .filter_map(|tracker| tracker_host(&tracker.url))
+        .filter_map(|(_, tracker)| tracker_host(&tracker.url))
         .collect::<std::collections::BTreeSet<String>>()
         .into_iter()
         .collect();
@@ -2013,6 +2025,74 @@ impl Database {
             })
             .await
         })
+    }
+
+    // The trackers of each torrent `edits` names, as `set_torrent_trackers`
+    // writes one torrent's, in one transaction of few statements. Returns
+    // the torrents that exist, which alone are written.
+    pub(crate) fn set_torrents_trackers(
+        &self,
+        edits: &[(JobId, Vec<TrackerEntry>)],
+    ) -> Result<std::collections::HashSet<JobId>, StateError> {
+        if edits.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<(JobId, i64)> = edits
+            .iter()
+            .map(|(job_id, _)| Ok((*job_id, stored(job_id.0)?)))
+            .collect::<Result<_, StateError>>()?;
+        let edits: Vec<(i64, Vec<TrackerEntry>)> = ids
+            .iter()
+            .zip(edits)
+            .map(|((_, id), (_, trackers))| (*id, trackers.clone()))
+            .collect();
+        let edits = std::sync::Arc::new(edits);
+        let key = self.encryption_key().cloned();
+        let datastore = self.datastore();
+        let known = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrents_trackers", |tx| {
+                let edits = std::sync::Arc::clone(&edits);
+                let key = key.clone();
+                Box::pin(async move {
+                    let ids: Vec<i64> = edits.iter().map(|(id, _)| *id).collect();
+                    let mut known = std::collections::HashSet::with_capacity(ids.len());
+                    for chunk in ids.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 1))
+                    {
+                        let list = vec!["{}"; chunk.len()].join(", ");
+                        let args: Vec<SqlArg> = chunk.iter().map(|id| SqlArg::I64(*id)).collect();
+                        let rows = tx
+                            .fetch_all(
+                                &format!("SELECT job_id FROM torrents WHERE job_id IN ({list})"),
+                                &args,
+                            )
+                            .await?;
+                        for row in rows {
+                            known.insert(row.i64("job_id")?);
+                        }
+                        tx.execute(
+                            &format!("DELETE FROM torrent_trackers WHERE job_id IN ({list})"),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    let rows: Vec<(i64, &TrackerEntry)> = edits
+                        .iter()
+                        .filter(|(id, _)| known.contains(id))
+                        .flat_map(|(id, trackers)| {
+                            trackers.iter().map(move |tracker| (*id, tracker))
+                        })
+                        .collect();
+                    insert_tracker_rows(tx, &rows, key.as_ref()).await?;
+                    Ok(known)
+                })
+            })
+            .await
+        })?;
+        Ok(ids
+            .into_iter()
+            .filter(|(_, id)| known.contains(id))
+            .map(|(job_id, _)| job_id)
+            .collect())
     }
 
     // Whether the torrent's archives are extracted, fixed when its job is

@@ -1524,3 +1524,73 @@ async fn a_start_with_torrents_off_builds_views_in_step_with_the_torrents() {
     assert_eq!(rows(&rig.service), shown);
     rig.service.stop().await;
 }
+
+// A recheck of many torrents whose jobs wait for the tick restores each and
+// sets every piece to be checked, as one unit: one pass of the queue and one
+// publish, not one of each a torrent. The rows it leaves, and what each
+// torrent then holds and is checked for, are those of the same rechecks
+// made one torrent at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recheck_of_many_torrents_is_one_unit() {
+    const STORED: u64 = 300;
+    let start = |rig: &Rig| {
+        rig.routes.set_down(Some("the leg is down"));
+        stored_resumed(&rig.db, rig.dir.path(), STORED)
+    };
+    let (many, alone) = (rig(set_clock()), rig(set_clock()));
+    let resumed = start(&many).len() as u64;
+    start(&alone);
+    for rig in [&many, &alone] {
+        rig.service.open().await.unwrap();
+        rig.service.fetches_ended(resumed).await;
+    }
+    // The torrents with their metainfo, whose jobs the tick has not yet
+    // restored.
+    let held: Vec<JobId> = (1..=STORED)
+        .filter(|job_id| job_id % 2 == 0)
+        .map(JobId)
+        .collect();
+
+    let views = many.service.views_built();
+    let outcome = many.service.recheck_many(&held).await;
+    let built = many.service.views_built() - views;
+    assert_eq!(outcome.len(), held.len());
+    assert!(outcome.values().all(Result::is_ok), "{outcome:?}");
+    // One publish of every torrent, where one at a time built one for each.
+    assert!(
+        built <= 2 * STORED as usize,
+        "{built} views built for {STORED} torrents"
+    );
+    for &job_id in &held {
+        alone.service.recheck(job_id).await.unwrap();
+    }
+    for rig in [&many, &alone] {
+        rig.service.restored().await;
+        rig.service.fetches_ended(resumed).await;
+    }
+    // Each rig's folders are its own: the rows are compared below them.
+    let below = |rig: &Rig, dir: &mut Option<String>| {
+        let root = rig.dir.path().to_string_lossy().into_owned();
+        if let Some(dir) = dir {
+            *dir = dir.replacen(&root, "", 1);
+        }
+    };
+    let shown = |rig: &Rig| {
+        let mut shown = rows(&rig.service);
+        for (view, _, _) in &mut shown {
+            below(rig, &mut view.storage_dir);
+        }
+        shown
+    };
+    let stored = |rig: &Rig| {
+        let mut stored = rig.db.list_torrents().unwrap();
+        for record in &mut stored {
+            below(rig, &mut record.storage_dir);
+        }
+        stored
+    };
+    assert_eq!(shown(&many), shown(&alone));
+    assert_eq!(stored(&many), stored(&alone));
+    many.service.stop().await;
+    alone.service.stop().await;
+}

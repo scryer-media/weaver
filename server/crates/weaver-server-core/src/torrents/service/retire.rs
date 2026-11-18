@@ -76,8 +76,14 @@ impl TorrentService {
         self.inner.counters.event(TorrentEvent::Failed);
         self.detach(&mut torrent).await;
         let written = read_written(self.written_of(&torrent)).await;
-        self.retire(torrent, HistoryEnd::Failed, Some(error), written)
-            .await;
+        self.retire(
+            torrent,
+            HistoryEnd::Failed,
+            Some(error),
+            written,
+            Shown::Now,
+        )
+        .await;
         self.queue_script_event(stopped);
     }
 
@@ -124,6 +130,7 @@ impl TorrentService {
         status: HistoryEnd,
         error: Option<String>,
         written: Wrote,
+        shown: Shown,
     ) {
         let job_id = torrent.record.job_id;
         let files = history_files(written.deletion).await;
@@ -146,7 +153,7 @@ impl TorrentService {
         // Its history row and its removal are one write: the job is never
         // in neither, so an event raised while it was live, still being
         // queued, finds it.
-        self.write_history(row, true, report.job_info(), files)
+        self.write_history(row, true, report.job_info(), files, shown)
             .await;
     }
 
@@ -187,7 +194,7 @@ impl TorrentService {
             None => Vec::new(),
         };
         let row = report.history_row(status.as_str(), Some(hash.0.to_vec()), now);
-        self.write_history(row, false, report.job_info(), files)
+        self.write_history(row, false, report.job_info(), files, Shown::Now)
             .await;
     }
 
@@ -197,13 +204,16 @@ impl TorrentService {
     // the job goes to the queue's finished jobs. A row the database's disk
     // has no room for is kept there and written once its folder shows room;
     // the job reaches the finished jobs then, and this does not wait for
-    // it. A row lost any other way is said, and the job goes on.
+    // it. A row lost any other way is said, and the job goes on. A job
+    // whose row waited for room shows its end at once when it is written:
+    // the batch it ended in has published by then.
     async fn write_history(
         &self,
         row: crate::history::JobHistoryRow,
         retires: bool,
         job: JobInfo,
         files: Vec<HistoryFile>,
+        shown: Shown,
     ) {
         let job_id = job.job_id;
         let turn = self.history_turn(job_id);
@@ -216,7 +226,7 @@ impl TorrentService {
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's history");
                 if self.end_history_turn(job_id, turn) {
-                    self.finished(job).await;
+                    self.finished(job, shown).await;
                 }
                 return;
             }
@@ -237,7 +247,7 @@ impl TorrentService {
                 if !landed {
                     tracing::warn!(job_id = job_id.0, "could not record a torrent's history");
                 }
-                self.finished(job).await;
+                self.finished(job, shown).await;
             }
             None => {
                 tracing::info!(
@@ -259,7 +269,7 @@ impl TorrentService {
                                 "could not record a torrent's history"
                             );
                         }
-                        service.finished(job).await;
+                        service.finished(job, Shown::Now).await;
                     }
                     #[cfg(test)]
                     service.inner.history_waits.send_modify(|ended| *ended += 1);
@@ -316,15 +326,18 @@ impl TorrentService {
     }
 
     // A torrent's job, its history row written: out to the queue's
-    // finished jobs.
-    async fn finished(&self, job: JobInfo) {
+    // finished jobs, and out of the torrents shown, at once or by the
+    // publish its batch ends with.
+    async fn finished(&self, job: JobInfo, shown: Shown) {
         let job_id = job.job_id;
         self.inner
             .retiring
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&job_id);
-        self.publish().await;
+        if shown == Shown::Now {
+            self.publish().await;
+        }
         if let Some(queue) = self.queue()
             && let Err(error) = queue.retire_job(job).await
         {
@@ -354,7 +367,8 @@ impl TorrentService {
         for (_, history, files) in rows {
             let mut job = crate::operations::backup::job_info_from_history(history.clone());
             job.protocol = crate::jobs::Protocol::Torrent;
-            self.write_history(history, true, job, files).await;
+            self.write_history(history, true, job, files, Shown::Now)
+                .await;
         }
     }
 
@@ -434,7 +448,8 @@ impl TorrentService {
             }
             Err(error) => return Err(self.mark_refused(job_id, &error).await),
         }
-        self.remove_marked(job_id, delete_files, ending).await
+        self.remove_marked(job_id, delete_files, ending, Shown::Now)
+            .await
     }
 
     // Whether the torrent may be removed now, and if so its removal begun:
@@ -489,12 +504,14 @@ impl TorrentService {
     }
 
     // The rest of a removal once its mark is written: out of the live
-    // torrents, its files gone when they go, and into history.
+    // torrents, its files gone when they go, and into history, its end
+    // shown as `shown` says.
     pub(super) async fn remove_marked(
         &self,
         job_id: JobId,
         delete_files: bool,
         ending: Ending,
+        shown: Shown,
     ) -> Result<(), ActionError> {
         let mut torrent = self
             .unlive(&mut *self.inner.live.lock().await, job_id)
@@ -530,8 +547,11 @@ impl TorrentService {
             ),
             Ending::Asked => None,
         };
-        // Its slot and rank go to the torrents after it.
-        self.inner.signal.want_pass();
+        // Its slot and rank go to the torrents after it, by a pass asked for
+        // now, or by the one its batch asks for once its last is out.
+        if shown == Shown::Now {
+            self.inner.signal.want_pass();
+        }
         if let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
             fetch.abort();
             self.inner.counters.fetch(FetchOutcome::Cancelled);
@@ -558,7 +578,7 @@ impl TorrentService {
             written
         };
         self.inner.counters.event(TorrentEvent::Removed);
-        self.retire(torrent, status, error, written).await;
+        self.retire(torrent, status, error, written, shown).await;
         self.queue_script_event(ended);
         Ok(())
     }
@@ -665,6 +685,16 @@ impl TorrentService {
         .await
         .map_err(|error| StateError::Database(error.to_string()))?
     }
+}
+
+// When a torrent that ended shows its end: at once, by a publish of the
+// torrents, or by the one publish the batch it ended in makes once each of
+// its torrents has ended. A publish of every torrent for each of a batch
+// would cost the square of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Shown {
+    Now,
+    ByBatch,
 }
 
 // What reading a torrent's written files takes (`TorrentService::written_of`).
