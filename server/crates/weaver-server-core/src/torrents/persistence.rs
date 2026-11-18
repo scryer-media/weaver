@@ -1533,6 +1533,34 @@ impl Database {
         self.set_torrent_column("completed_at_ms", args)
     }
 
+    // The torrent's files' levels, with it short of complete again at the
+    // end of the download queue, in one write: a complete torrent that now
+    // wants a file it lacks downloads again. Returns whether the torrent
+    // exists.
+    pub fn reopen_torrent(
+        &self,
+        job_id: JobId,
+        levels: &[FilePriority],
+        queue_position: i64,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(file_priorities_str(levels)),
+            SqlArg::I64(queue_position),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET file_priorities = {}, completed_at_ms = NULL, \
+                 queue_position = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
     // The torrent's ledger. Returns whether the torrent exists.
     pub fn update_torrent_counters(
         &self,

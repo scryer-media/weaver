@@ -1658,10 +1658,15 @@ async fn a_duplicate_fails_and_a_refusal_conflicts() {
             ..PostProcessingSettings::default()
         })
         .unwrap();
-    let refused = rig.add_file(&metainfo("disc.iso", 2000, false), &[]).await;
+    // A torrent of only unwanted files is added with nothing wanted, as
+    // qBittorrent's filename filter skips every matching file
+    // (`applyFilenameFilter`); one named after an executable is refused.
+    let unwanted = rig.add_file(&metainfo("disc.iso", 2000, false), &[]).await;
+    assert_eq!(unwanted.json()["success_count"], 1, "{}", unwanted.body);
+    let refused = rig.add_file(&metainfo("setup.exe", 2000, false), &[]).await;
     assert_eq!(refused.status, StatusCode::CONFLICT);
     assert!(
-        refused.body.contains("unwanted extension"),
+        refused.body.contains("is an executable"),
         "{}",
         refused.body
     );
@@ -1684,7 +1689,7 @@ async fn a_duplicate_fails_and_a_refusal_conflicts() {
         .await;
     assert_eq!(base32.status, StatusCode::CONFLICT);
     assert!(base32.body.contains("already added"), "{}", base32.body);
-    assert_eq!(rig.torrents().await.len(), 2);
+    assert_eq!(rig.torrents().await.len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4017,6 +4022,65 @@ async fn file_levels_and_picking_toggles_are_set_and_reported() {
     )
     .await;
     assert_eq!(picking().await, (json!(false), json!(true)));
+}
+
+// A torrent whose every file is set to priority 0 has every piece it wants
+// and reads as finished, with a completion time; a file wanted again that it
+// lacks takes it back to a downloading state, its completion time gone
+// (qBittorrent `handleTorrentFinished` on the `torrent_finished_alert`;
+// `prioritizeFiles`, and libtorrent `resume_download` clearing
+// `m_completed_time`).
+#[tokio::test(start_paused = true)]
+async fn a_torrent_that_wants_nothing_reads_finished_until_it_wants_a_file() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let service = rig.context.inner.torrents.as_ref().unwrap();
+    let snapshot = service.snapshot();
+    let mut revision = snapshot.subscribe();
+    let set = |number: u8| {
+        let rig = &rig;
+        let hash = hash.clone();
+        async move {
+            let set = rig
+                .post(
+                    "/api/v2/torrents/filePrio",
+                    &format!("hash={hash}&id=0&priority={number}"),
+                )
+                .await;
+            assert_eq!(set.status, StatusCode::OK);
+        }
+    };
+    let row = async || rig.torrents().await[0].clone();
+    assert_eq!(row().await["completion_on"], -1);
+
+    set(0).await;
+    loop {
+        revision.borrow_and_update();
+        let (_, rows) = snapshot.every();
+        if rows[0].view.completed_at_ms.is_some() {
+            break;
+        }
+        revision.changed().await.unwrap();
+    }
+    let done = row().await;
+    assert!(done["completion_on"].as_i64().unwrap() > 0, "{done}");
+    assert!(done["state"].as_str().unwrap().ends_with("UP"), "{done}");
+    assert_eq!(done["amount_left"], 0, "{done}");
+
+    set(1).await;
+    loop {
+        revision.borrow_and_update();
+        let (_, rows) = snapshot.every();
+        if rows[0].view.completed_at_ms.is_none() && rows[0].view.wanted_bytes == 3000 {
+            break;
+        }
+        revision.changed().await.unwrap();
+    }
+    let again = row().await;
+    assert_eq!(again["completion_on"], -1, "{again}");
+    assert!(again["state"].as_str().unwrap().ends_with("DL"), "{again}");
+    assert_eq!(again["amount_left"], 3000, "{again}");
 }
 
 // Trackers are added by tier, edited, removed and reannounced to by hash,

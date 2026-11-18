@@ -247,16 +247,48 @@ impl Live {
         self.record.completed_at_ms.is_some()
     }
 
-    // Short of complete, wanting a file, with its store holding every file
-    // it wants whole: the next settle completes it. One that wants none
-    // seeds without completing, and fetches again once it wants a file.
+    // Short of complete, with its store holding every file it wants whole:
+    // the next settle completes it. One that wants none has every file it
+    // wants, and completes too (libtorrent `piece_picker::is_finished` with
+    // every piece filtered, `update_peer_interest` -> `finished()`,
+    // torrent.cpp:5880-5915 at v2.0.15; qBittorrent `handleTorrentFinished`
+    // on the `torrent_finished_alert`).
     pub(super) fn completes(&self) -> bool {
         let levels = &self.levels;
         !self.complete()
-            && levels.iter().any(|level| level.wanted())
             && self.store.as_ref().is_some_and(|store| {
                 store.has_files(|file| levels.get(file).copied().unwrap_or_default().wanted())
             })
+    }
+
+    // Whether taking `held` as its levels takes a complete torrent back to
+    // downloading: a file it ignored is wanted again and is not whole
+    // (qBittorrent `TorrentImpl::prioritizeFiles` clears
+    // `m_hasFinishedStatus`, torrentimpl.cpp:3045-3057; libtorrent
+    // `resume_download`, torrent.cpp:8653-8676 at v2.0.15). One whose
+    // unpacking runs over archives stays complete: whether its unpacking
+    // runs again when it completes again is not settled.
+    pub(super) fn reopens(&self, held: &[FilePriority]) -> bool {
+        let wanted_again = |file: usize| {
+            !self.levels.get(file).copied().unwrap_or_default().wanted()
+                && held.get(file).copied().unwrap_or_default().wanted()
+        };
+        self.complete()
+            && !self.unpacks_archives()
+            && self
+                .store
+                .as_ref()
+                .is_some_and(|store| !store.has_files(wanted_again))
+    }
+
+    // Whether its unpacking is in force over archive files: a tee is made
+    // for it whenever it is short of complete.
+    fn unpacks_archives(&self) -> bool {
+        self.record.unpack_in_force.unwrap_or_default()
+            && self
+                .layout
+                .as_deref()
+                .is_some_and(|layout| crate::torrents::tee::Plan::of(layout).is_some())
     }
 
     // Complete, or with every piece it wants had as the session last said.

@@ -1478,10 +1478,31 @@ async fn an_ignored_file_wanted_again_downloads_and_completes_once() {
     locked(&peers).push(seed);
     announces_answered(&rig.service, job_id).await;
 
+    let first = rig
+        .db
+        .get_torrent(job_id)
+        .unwrap()
+        .unwrap()
+        .completed_at_ms
+        .unwrap();
+    let mut settled = rig.service.inner.settled.subscribe();
     rig.service
         .set_file_priorities(job_id, &[(1, FilePriority::Normal)])
         .await
         .unwrap();
+    // Its job is short of complete again, as stored and as shown: it is
+    // downloading, not seeding.
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().completed_at_ms,
+        None
+    );
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.completed_at_ms, None);
+    assert_ne!(view.state, TorrentState::Seeding);
+    assert!(matches!(
+        job_status(&view),
+        JobStatus::Downloading | JobStatus::Stalled
+    ));
     rig.service.reannounce(job_id).await.unwrap();
     let handle = handle_of(&rig.service, job_id).await;
     handle.wait_until_completed().await.unwrap();
@@ -1493,6 +1514,22 @@ async fn an_ignored_file_wanted_again_downloads_and_completes_once() {
     );
     assert_eq!(completed.identity(), started.identity());
     announces_answered(&rig.service, job_id).await;
+    // It completes again once it has the file, and seeds.
+    settled
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.completed_at_ms.is_some_and(|at| at >= first));
+    assert_eq!(view.state, TorrentState::Seeding);
+    assert_eq!(job_status(&view), JobStatus::Seeding);
 
     rig.service.stop().await;
     sharer.stop().await;
@@ -1502,6 +1539,128 @@ async fn an_ignored_file_wanted_again_downloads_and_completes_once() {
         after.extend(heard.event);
     }
     assert_eq!(after, ["stopped"], "only the shutdown's");
+}
+
+// A private torrent with nothing in hand, every file then set ignored, has
+// every piece it wants: its job completes (libtorrent `prioritize_pieces`
+// -> `update_peer_interest` -> `finished()`; qBittorrent
+// `handleTorrentFinished`), and its tracker hears no `completed`, for it is
+// no seed (libtorrent `finished()` calls `completed()` only
+// `if (is_seed())`). Every file wanted again, it is short of complete and
+// downloads them; once a seed in this run, which began short of one, its
+// tracker hears `completed` once, its job completes again and raises
+// TORRENT_DOWNLOADED once, for the bytes it downloaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_that_wants_nothing_completes_without_completed_and_completes_again() {
+    let data: Vec<u8> = (0..4 * IGNORED_PIECE as u32)
+        .map(|at| (at * 11 % 251) as u8)
+        .collect();
+    let half = 2 * IGNORED_PIECE;
+    let files = [("set/a.bin", &data[..half]), ("set/b.bin", &data[half..])];
+    let meta = metainfo("set", &files, IGNORED_PIECE, true);
+    let peers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (url, mut announces) = heard_tracker_naming(Arc::clone(&peers)).await;
+
+    let rig = rig(set_clock());
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    on_loopback(&rig.routes);
+    rig.service.publish_to(queue());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(meta.clone()))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    let mut settled = rig.service.inner.settled.subscribe();
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+    assert_eq!((started.left, started.downloaded), (data.len() as u64, 0));
+    started_accepted(&rig.service, job_id).await;
+
+    rig.service
+        .set_file_priorities(
+            job_id,
+            &[(0, FilePriority::Ignored), (1, FilePriority::Ignored)],
+        )
+        .await
+        .unwrap();
+    let completed_at = |rig: &Rig| rig.db.get_torrent(job_id).unwrap().unwrap().completed_at_ms;
+    settled
+        .wait_for(|_| completed_at(&rig).is_some())
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.state, view.wanted_bytes, view.downloaded_bytes),
+        (TorrentState::Seeding, 0, 0)
+    );
+    assert_eq!(job_status(&view), JobStatus::Seeding);
+    announces_answered(&rig.service, job_id).await;
+
+    // Wanted again, with a seed to fetch from.
+    let full = tempfile::tempdir().unwrap();
+    let seeding = seeder(full.path(), &meta, &files).await;
+    let std::net::SocketAddr::V4(seed) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    locked(&peers).push(seed);
+    rig.service
+        .set_file_priorities(
+            job_id,
+            &[(0, FilePriority::Normal), (1, FilePriority::Normal)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed_at(&rig), None);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_ne!(view.state, TorrentState::Seeding);
+    rig.service.reannounce(job_id).await.unwrap();
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_completed()
+        .await
+        .unwrap();
+    let completed = next_event(&mut announces).await;
+    assert_eq!(completed.event.as_deref(), Some("completed"));
+    assert_eq!(
+        (completed.left, completed.downloaded),
+        (0, data.len() as u64)
+    );
+    assert_eq!(completed.identity(), started.identity());
+    announces_answered(&rig.service, job_id).await;
+    settled
+        .wait_for(|_| completed_at(&rig).is_some())
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Seeding);
+    assert_eq!(job_status(&view), JobStatus::Seeding);
+    rig.db
+        .queued_script_events_once(
+            crate::post_processing::model::QueueEvent::TorrentDownloaded,
+            1,
+        )
+        .await;
+
+    rig.service.stop().await;
+    seeding.stop().await;
+    let mut after = Vec::new();
+    while let Ok(heard) = announces.try_recv() {
+        after.extend(heard.event);
+    }
+    assert_eq!(after, ["stopped"], "only the shutdown's");
+    rig.db.admitted_so_far().await;
+    assert_eq!(
+        rig.db
+            .queued_script_events(crate::post_processing::model::QueueEvent::TorrentDownloaded)
+            .len(),
+        1
+    );
 }
 
 // A torrent whose route changes while its old leg stands goes on over the

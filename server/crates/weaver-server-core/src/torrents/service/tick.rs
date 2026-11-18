@@ -621,9 +621,7 @@ impl TorrentService {
                     });
                     return Ok(Some((Arc::clone(store), asked)));
                 }
-                self.inner
-                    .db
-                    .set_torrent_file_priorities(job_id, &asked)
+                self.keep_levels(torrent, &asked, &held)
                     .map_err(|error| ActionError::State(state_error(error)))?;
                 // No file's bytes to copy: only which files are set aside
                 // changes, in memory.
@@ -712,7 +710,7 @@ impl TorrentService {
                     let mut next = None;
                     match copied {
                         Ok(()) => {
-                            if let Err(error) = self.inner.db.set_torrent_file_priorities(job_id, &asked) {
+                            if let Err(error) = self.keep_levels(torrent, &asked, &held) {
                                 tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's file levels");
                             }
                             torrent.levels = held;
@@ -752,6 +750,37 @@ impl TorrentService {
                 None => return,
             }
         }
+    }
+
+    // Keep `asked` as the torrent's levels, which it takes as `held`. A
+    // complete torrent that now wants a file it lacks is short of complete
+    // again in the same write: it downloads, shows so, goes to the end of
+    // the download queue, and completes again once it has every file it
+    // wants (qBittorrent `TorrentImpl::prioritizeFiles`,
+    // torrentimpl.cpp:3045-3057; libtorrent `torrent::resume_download`
+    // clears `m_completed_time` and takes `last_pos`, torrent.cpp:8653-8676
+    // at v2.0.15).
+    fn keep_levels(
+        &self,
+        torrent: &mut super::live::Live,
+        asked: &[FilePriority],
+        held: &[FilePriority],
+    ) -> Result<(), crate::StateError> {
+        let job_id = torrent.record.job_id;
+        if !torrent.reopens(held) {
+            self.inner.db.set_torrent_file_priorities(job_id, asked)?;
+            return Ok(());
+        }
+        let place = self
+            .inner
+            .next_queue_position
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.db.reopen_torrent(job_id, asked, place)?;
+        torrent.record.completed_at_ms = None;
+        torrent.record.queue_position = place;
+        // It takes a download slot and rank again.
+        self.inner.signal.want_pass();
+        Ok(())
     }
 
     /// Whether the torrent's pieces are fetched in order.
