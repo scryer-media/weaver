@@ -11,7 +11,7 @@ use std::sync::Arc;
 use super::listing::{as_row, settled};
 use super::*;
 use crate::torrents::service::listing::FileTotals;
-use crate::torrents::service::snapshot::{Snapshot, TorrentRow};
+use crate::torrents::service::snapshot::{Snapshot, TorrentRow, TrackerSummary};
 use crate::torrents::service::updates::{Follow, TorrentChanges};
 
 const TORRENTS: u64 = 10_000;
@@ -1373,5 +1373,154 @@ async fn the_eta_counts_only_the_wanted_bytes_left() {
     drop(live);
     assert_eq!((view.wanted_bytes, view.wanted_have_bytes), (6_000, 2_000));
     assert_eq!(view.eta_seconds, Some(4));
+    rig.service.stop().await;
+}
+
+// Stored torrents, `count` of them, as a restart finds them: odd ones
+// magnets, even ones with their metainfo and their folder named, every
+// tenth paused and the rest resumed. The resumed magnets, by job.
+fn stored_resumed(db: &Database, dir: &Path, count: u64) -> Vec<JobId> {
+    let mut magnets = Vec::new();
+    for job_id in 1..=count {
+        let name = format!("t{job_id}");
+        let magnet = job_id % 2 == 1;
+        let paused = job_id % 10 == 0;
+        let (infohash_v1, metainfo, storage_dir) = if magnet {
+            (Some(Sha1::digest(job_id.to_le_bytes()).into()), None, None)
+        } else {
+            let bytes = plain(&name, (job_id % 251) as u8);
+            let parsed = parse(&bytes).unwrap();
+            (
+                parsed.hashes.v1.map(|hash| hash.0),
+                Some(Bytes::from(bytes)),
+                Some(
+                    dir.join("complete")
+                        .join(&name)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            )
+        };
+        let record = TorrentRecord {
+            job_id: JobId(job_id),
+            infohash_v1,
+            infohash_v2: None,
+            name,
+            source: if magnet {
+                TorrentSource::Magnet
+            } else {
+                TorrentSource::Metainfo
+            },
+            metainfo,
+            category_id: None,
+            added_at_ms: EPOCH_MS + job_id as i64,
+            kept: KeptIntent::Intent(if paused {
+                TorrentIntent::Paused
+            } else {
+                TorrentIntent::Resumed
+            }),
+            forced: false,
+            completed_at_ms: None,
+            storage_dir,
+            policy_override: None,
+            unpack: Some(false),
+            unpack_in_force: Some(false),
+            metadata: Vec::new(),
+            upload_limit: None,
+            download_limit: None,
+            sequential: false,
+            first_last_piece_first: false,
+            save_path: None,
+            content_layout: None,
+            files_dir: None,
+            seed_mode: false,
+            move_to: None,
+            queue_position: job_id as i64,
+            pool_member: None,
+            private: false,
+        };
+        db.insert_torrent(&record, &[]).unwrap();
+        if magnet && !paused {
+            magnets.push(JobId(job_id));
+        }
+    }
+    magnets
+}
+
+// Every torrent's row, its view, file totals and trackers, by job.
+fn rows(service: &TorrentService) -> Vec<(TorrentView, FileTotals, TrackerSummary)> {
+    let (_, mut rows) = service.snapshot().every();
+    rows.sort_by_key(|row| row.view.job_id);
+    rows.iter()
+        .map(|row| (row.view.clone(), row.totals, row.trackers.clone()))
+        .collect()
+}
+
+const RESTARTED: u64 = 2_000;
+
+// A start of many stored torrents, most of them resumed, on routes that do
+// not open: every resumed magnet's fetch ends at once, and every torrent
+// with its metainfo is held as its job comes back. The views the start
+// builds grow with the torrents, a few for each, not with the torrents
+// times the steps of each: each fetch that ends shows its torrent alone.
+// The rows it leaves are the rows a publish of every torrent makes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_on_held_routes_builds_views_in_step_with_the_torrents() {
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("the leg is down"));
+    let magnets = stored_resumed(&rig.db, rig.dir.path(), RESTARTED);
+    let resumed = magnets.len() as u64;
+
+    rig.service.open().await.unwrap();
+    // Each resumed magnet fetched once as it was read, and its fetch ended
+    // on its route held.
+    rig.service.fetches_ended(resumed).await;
+    // The tick restores the jobs, holds them on their routes, and fetches
+    // each held magnet again.
+    rig.service.tick().await;
+    rig.service.restored().await;
+    rig.service.fetches_ended(2 * resumed).await;
+    let built = rig.service.views_built();
+    assert_eq!(rig.service.snapshot().len(), RESTARTED as usize);
+    // Two publishes of every torrent (the load's end, the tick's), one
+    // after the restores, and a row for each fetch that ended: well under
+    // six views a torrent. One publish of every torrent for each fetch
+    // would build hundreds a torrent.
+    assert!(
+        built <= 6 * RESTARTED as usize,
+        "{built} views built for {RESTARTED} torrents"
+    );
+    // Each row as a publish of every torrent shows it.
+    let shown = rows(&rig.service);
+    for job_id in &magnets {
+        assert_eq!(shown[job_id.0 as usize - 1].0.job_id, *job_id);
+    }
+    rig.service.publish().await;
+    assert_eq!(rows(&rig.service), shown);
+    rig.service.stop().await;
+}
+
+// The same start with torrents off: no route opens, every resumed magnet's
+// fetch ends at once, and the views the start builds grow with the
+// torrents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_with_torrents_off_builds_views_in_step_with_the_torrents() {
+    let rig = rig(set_clock());
+    let magnets = stored_resumed(&rig.db, rig.dir.path(), RESTARTED);
+    let resumed = magnets.len() as u64;
+    rig.service.inner.sessions.turn(false).await;
+
+    rig.service.open().await.unwrap();
+    rig.service.run(false).await;
+    rig.service.fetches_ended(resumed).await;
+    let built = rig.service.views_built();
+    assert_eq!(rig.service.snapshot().len(), RESTARTED as usize);
+    assert!(
+        built <= 4 * RESTARTED as usize,
+        "{built} views built for {RESTARTED} torrents"
+    );
+    let shown = rows(&rig.service);
+    rig.service.publish().await;
+    assert_eq!(rows(&rig.service), shown);
     rig.service.stop().await;
 }

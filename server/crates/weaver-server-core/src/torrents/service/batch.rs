@@ -15,7 +15,9 @@ use crate::categories::model::resolve_category_config;
 use crate::jobs::JobId;
 use crate::jobs::handle::{CancellationOrigin, QueueAction, QueueMoveTarget};
 use crate::jobs::model::{FieldUpdate, JobUpdate, PRIORITY_ATTRIBUTE_KEY};
+use crate::settings::SeedingPolicy;
 use crate::torrents::metrics::FetchOutcome;
+use crate::torrents::persistence::TorrentSettingRows;
 use crate::torrents::{KeptIntent, TorrentIntent};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -24,11 +26,59 @@ use std::sync::atomic::Ordering;
 
 pub(super) type Outcome = BTreeMap<JobId, Result<(), ActionError>>;
 
+/// One change to a torrent's own settings, as its own action makes it.
+#[derive(Debug, Clone, Copy)]
+pub enum TorrentSetting {
+    /// As [`TorrentService::set_forced`].
+    Forced(bool),
+    /// As [`TorrentService::set_sequential`].
+    Sequential(bool),
+    /// As [`TorrentService::set_first_last_piece_first`].
+    FirstLastPieceFirst(bool),
+    /// As [`TorrentService::set_rate_limits`].
+    RateLimits {
+        upload: Option<Option<u64>>,
+        download: Option<Option<u64>>,
+    },
+    /// As [`TorrentService::set_policy_override`].
+    Policy(Option<SeedingPolicy>),
+}
+
+impl TorrentSetting {
+    // The change as it is kept, or why it is refused, as its own action
+    // refuses it before it changes anything.
+    fn checked(self) -> Result<Self, ActionError> {
+        match self {
+            Self::RateLimits { upload, download } => {
+                if let Some(limit) = [upload, download]
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .find(|limit| i64::try_from(*limit).is_err())
+                {
+                    return Err(ActionError::Invalid(format!(
+                        "a limit of {limit} bytes a second is past the largest, {}",
+                        i64::MAX
+                    )));
+                }
+                Ok(self)
+            }
+            Self::Policy(policy) => {
+                if let Some(policy) = &policy {
+                    policy.validate().map_err(ActionError::Invalid)?;
+                }
+                Ok(Self::Policy(SeedingPolicy::kept(policy)))
+            }
+            Self::Forced(_) | Self::Sequential(_) | Self::FirstLastPieceFirst(_) => Ok(self),
+        }
+    }
+}
+
 impl TorrentService {
     /// The actions of one request, each run of the same kind as one unit.
     /// The runs keep the request's order, and the moves end at the first
     /// that fails, as they did when each came on its own.
-    pub(super) async fn act_many(&self, actions: Vec<(JobId, QueueAction)>) -> Outcome {
+    pub async fn act_many(&self, actions: Vec<(JobId, QueueAction)>) -> Outcome {
         let mut outcome = Outcome::new();
         let mut moves_failed = false;
         let mut actions = actions.into_iter().peekable();
@@ -86,6 +136,108 @@ impl TorrentService {
                 }
             }
         }
+        outcome
+    }
+
+    /// Each change made to its torrent as its own action makes it, the
+    /// changes of one request as one unit: one write of what they change,
+    /// then a pass of what that moves, and one publish. They are made in
+    /// order, and one refused ends them, as it ended them one at a time:
+    /// those before it are made and those after it are not.
+    pub async fn set_many(&self, changes: Vec<(JobId, TorrentSetting)>) -> Outcome {
+        let mut outcome = Outcome::new();
+        let mut checked = Vec::with_capacity(changes.len());
+        for (job_id, change) in changes {
+            match change.checked() {
+                Ok(change) => checked.push((job_id, change)),
+                Err(error) => {
+                    outcome.insert(job_id, Err(error));
+                    break;
+                }
+            }
+        }
+        let ids: Vec<JobId> = checked.iter().map(|(job_id, _)| *job_id).collect();
+        self.ensure(&ids).await;
+        let (mut queue, mut limits, mut picking) = (false, false, false);
+        {
+            let mut live = self.inner.live.lock().await;
+            checked.retain(|(job_id, _)| {
+                let here = live.contains_key(job_id);
+                if !here {
+                    outcome.insert(*job_id, Err(ActionError::NotFound(*job_id)));
+                }
+                here
+            });
+            if checked.is_empty() {
+                return outcome;
+            }
+            let mut rows = TorrentSettingRows::default();
+            for &(job_id, change) in &checked {
+                match change {
+                    TorrentSetting::Forced(on) => rows.forced.push((job_id, on)),
+                    TorrentSetting::Sequential(on) => rows.sequential.push((job_id, on)),
+                    TorrentSetting::FirstLastPieceFirst(on) => {
+                        rows.first_last_piece_first.push((job_id, on));
+                    }
+                    TorrentSetting::RateLimits { upload, download } => {
+                        rows.upload_limit
+                            .extend(upload.map(|limit| (job_id, limit)));
+                        rows.download_limit
+                            .extend(download.map(|limit| (job_id, limit)));
+                    }
+                    TorrentSetting::Policy(policy) => rows.policy_override.push((job_id, policy)),
+                }
+            }
+            if let Err(error) = self.inner.db.set_torrent_settings(&rows) {
+                return failed(outcome, &ids_of(&checked), &error);
+            }
+            for (job_id, change) in checked {
+                let Some(torrent) = live.get_mut(&job_id) else {
+                    continue;
+                };
+                let record = &mut torrent.record;
+                match change {
+                    TorrentSetting::Forced(on) => {
+                        record.forced = on;
+                        queue = true;
+                    }
+                    TorrentSetting::Sequential(on) => {
+                        record.sequential = on;
+                        picking = true;
+                    }
+                    TorrentSetting::FirstLastPieceFirst(on) => {
+                        record.first_last_piece_first = on;
+                        picking = true;
+                    }
+                    TorrentSetting::RateLimits { upload, download } => {
+                        if let Some(upload) = upload {
+                            record.upload_limit = upload;
+                        }
+                        if let Some(download) = download {
+                            record.download_limit = download;
+                        }
+                        limits = true;
+                    }
+                    TorrentSetting::Policy(policy) => {
+                        record.policy_override = policy;
+                        queue = true;
+                    }
+                }
+                outcome.insert(job_id, Ok(()));
+            }
+        }
+        if limits {
+            self.apply_limits().await;
+        }
+        // New goals and forced flags move what the holds and the queue make
+        // of the torrents.
+        if queue {
+            self.apply_queue().await;
+        }
+        if picking {
+            self.apply_picking().await;
+        }
+        self.publish().await;
         outcome
     }
 
@@ -604,6 +756,10 @@ fn present_among<V>(
         }
     }
     present
+}
+
+fn ids_of<T>(changes: &[(JobId, T)]) -> Vec<JobId> {
+    changes.iter().map(|(job_id, _)| *job_id).collect()
 }
 
 // A write that failed fails every torrent it was for.

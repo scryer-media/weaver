@@ -1185,18 +1185,27 @@ impl TorrentService {
     // A magnet's metadata fetch becomes `fetch`. A fetch is the torrent's
     // only while it runs: one the pause ended still gives is not shown.
     // Published either way: a fetch begun shows its phase, and one ended
-    // what it ended in, the metainfo it gave among it.
+    // what it ended in, the metainfo it gave among it. Only this torrent
+    // changed, so only its row is published, as a settle publishes the
+    // torrents that spoke: every magnet a start resumes ends a fetch, and a
+    // publish of every torrent for each would cost the square of them.
     pub(super) async fn fetching(
         &self,
         job_id: JobId,
         fetch: Option<weaver_torrent::MetadataFetch>,
     ) {
+        #[cfg(any(test, feature = "test-support"))]
+        let ended = fetch.is_none();
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id)
             && (fetch.is_none() || matches!(torrent.resolving, Some(Resolving::Fetching(_))))
         {
             torrent.fetching = fetch;
         }
-        self.publish().await;
+        self.publish_job(job_id).await;
+        #[cfg(any(test, feature = "test-support"))]
+        if ended {
+            self.inner.fetches_ended.send_modify(|ended| *ended += 1);
+        }
     }
 
     // A magnet's metainfo is in hand: `selected` is each file's level as

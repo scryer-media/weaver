@@ -23,6 +23,21 @@ fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
         })
 }
 
+// Ban each of `ips` from the torrent, in its session and in the peers and
+// bans its next start begins with.
+fn ban(torrent: &mut super::Live, ips: &[IpAddr]) {
+    match torrent
+        .attached
+        .as_ref()
+        .and_then(|attached| attached.handle.ban_peers(ips))
+    {
+        Some(peers) => torrent.resume = peers,
+        // In no session, or stopped by an error: the bans join the list its
+        // next start begins with.
+        None => ips.iter().for_each(|ip| torrent.resume.ban(*ip)),
+    }
+}
+
 // `trackers` without those whose URL is one of `urls`, trimmed.
 pub(super) fn without_urls(mut trackers: Vec<TrackerEntry>, urls: &[String]) -> Vec<TrackerEntry> {
     let gone: HashSet<&str> = urls.iter().map(|url| url.trim()).collect();
@@ -71,20 +86,38 @@ impl TorrentService {
         let now = self.inner.clock.unix_ms();
         let landing = self
             .with_torrent(job_id, |torrent| {
-                match torrent
-                    .attached
-                    .as_ref()
-                    .and_then(|attached| attached.handle.ban_peers(ips))
-                {
-                    Some(peers) => torrent.resume = peers,
-                    // In no session, or stopped by an error: the bans join
-                    // the list its next start begins with.
-                    None => ips.iter().for_each(|ip| torrent.resume.ban(*ip)),
-                }
+                ban(torrent, ips);
                 Ok(self.queue_resume(torrent, now, true))
             })
             .await?;
         self.landed(landing).await.map_err(ActionError::State)
+    }
+
+    /// `ban_peers` on each of `job_ids` under one hold of the torrents, the
+    /// writes of their ledgers and peers queued together and then awaited.
+    /// A torrent not here is skipped; the first write that failed is the
+    /// error.
+    pub async fn ban_peers_many(&self, job_ids: &[JobId], ips: &[IpAddr]) -> Result<(), String> {
+        let now = self.inner.clock.unix_ms();
+        self.ensure(job_ids).await;
+        let landings: Vec<_> = {
+            let mut live = self.inner.live.lock().await;
+            job_ids
+                .iter()
+                .filter_map(|job_id| {
+                    let torrent = live.get_mut(job_id)?;
+                    ban(torrent, ips);
+                    self.queue_resume(torrent, now, true)
+                })
+                .collect()
+        };
+        let mut failed = Ok(());
+        for landing in landings {
+            if let Err(error) = self.landed(Some(landing)).await {
+                failed = failed.and(Err(error));
+            }
+        }
+        failed
     }
 
     /// The torrent's trackers, each with how announcing to it went.

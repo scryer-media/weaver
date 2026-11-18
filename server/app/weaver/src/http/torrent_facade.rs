@@ -4,8 +4,8 @@
 //! The torrent client compatibility facade: the WebUI API v2 shape that
 //! torrent automation drives, served beside the first-party GraphQL API.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
@@ -30,7 +30,9 @@ use weaver_server_core::categories::{
     validate_category_path_component,
 };
 use weaver_server_core::ingest::{Kind, classify};
+use weaver_server_core::jobs::handle::QueueAction;
 use weaver_server_core::jobs::ids::JobId;
+use weaver_server_core::jobs::model::{FieldUpdate, JobUpdate};
 use weaver_server_core::jobs::{HoldOrigin, HoldOwner, QueueMoveTarget};
 use weaver_server_core::operations::{OnDemandSpace, Reach, StorageCapacity};
 use weaver_server_core::proxies::{Bandwidth, ResolvedBy, TorrentScope};
@@ -53,7 +55,7 @@ use weaver_server_core::torrents::service::snapshot::{
 };
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, AddSource, ClockFields, ListError, NotReady, Placement,
-    RowParts, TorrentService, TorrentSettings, TorrentView,
+    RowParts, TorrentService, TorrentSetting, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{
     ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
@@ -1240,49 +1242,35 @@ async fn torrents(
                 .resume_class(weaver_server_core::torrents::CLASS)
                 .await,
         ),
-        "stop" => {
-            each(ctx, params, |torrents, view| async move {
-                torrents.pause(view.job_id).await
-            })
-            .await
-        }
-        "start" => {
-            each(ctx, params, |torrents, view| async move {
-                torrents.resume(view.job_id).await
-            })
-            .await
-        }
+        "stop" => act_each(ctx, params, |_| QueueAction::Pause).await,
+        "start" => act_each(ctx, params, |_| QueueAction::Resume).await,
         "setForceStart" => {
             let forced = params.flag("value").unwrap_or(false);
-            each(ctx, params, move |torrents, view| async move {
-                torrents.set_forced(view.job_id, forced).await
-            })
-            .await
+            set_each(ctx, params, |_| TorrentSetting::Forced(forced)).await
         }
         "filePrio" => file_prio(ctx, params).await,
         "toggleSequentialDownload" => {
-            each(ctx, params, |torrents, view| async move {
-                torrents.set_sequential(view.job_id, !view.sequential).await
+            set_each(ctx, params, |view| {
+                TorrentSetting::Sequential(!view.sequential)
             })
             .await
         }
         "toggleFirstLastPiecePrio" => {
-            each(ctx, params, |torrents, view| async move {
-                torrents
-                    .set_first_last_piece_first(view.job_id, !view.first_last_piece_first)
-                    .await
+            set_each(ctx, params, |view| {
+                TorrentSetting::FirstLastPieceFirst(!view.first_last_piece_first)
             })
             .await
         }
         "setCategory" => {
-            let category = params
-                .get("category")
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned);
-            each(ctx, params, move |torrents, view| {
-                let category = category.clone();
-                async move { torrents.set_category(view.job_id, category).await }
+            let category = match params.get("category").map(str::trim) {
+                Some(name) if !name.is_empty() => FieldUpdate::Set(name.to_owned()),
+                _ => FieldUpdate::Clear,
+            };
+            act_each(ctx, params, |_| {
+                QueueAction::Update(JobUpdate {
+                    category: category.clone(),
+                    ..JobUpdate::default()
+                })
             })
             .await
         }
@@ -3160,20 +3148,25 @@ async fn set_share_limits(ctx: &TorrentFacadeContext, params: &Params) -> Respon
     let Some(torrents) = &ctx.inner.torrents else {
         return ok();
     };
-    for view in found!(ctx.targets(params).await) {
-        let policy = match share_policy(params, view.seeding_override, false) {
-            Ok(policy) => policy,
-            Err(response) => return *response,
-        };
-        match torrents.set_policy_override(view.job_id, policy).await {
-            Ok(()) | Err(ActionError::NotFound(_)) => {}
-            Err(error @ ActionError::Invalid(_)) => {
-                return text(StatusCode::CONFLICT, error.to_string());
+    let views = found!(ctx.targets(params).await);
+    // Each torrent's goals read from the request and its own; one the
+    // request cannot set ends the request there, after those before it.
+    let mut changes = Vec::with_capacity(views.len());
+    let mut refused = None;
+    for view in &views {
+        match share_policy(params, view.seeding_override, false) {
+            Ok(policy) => changes.push((view.job_id, TorrentSetting::Policy(policy))),
+            Err(response) => {
+                refused = Some(*response);
+                break;
             }
-            Err(error) => return internal(error),
         }
     }
-    ok()
+    let answer = answered(&views, torrents.set_many(changes).await);
+    match refused {
+        Some(response) if answer.status() == StatusCode::OK => response,
+        _ => answer,
+    }
 }
 
 async fn delete(ctx: &TorrentFacadeContext, params: &Params) -> Response {
@@ -3318,6 +3311,59 @@ async fn move_in_queue(
         Err(error @ ActionError::Invalid(_)) => text(StatusCode::CONFLICT, error.to_string()),
         Err(error) => internal(error),
     }
+}
+
+// A queue action on each torrent `hashes` names, all of them one unit of
+// work: one write, one pass and one publish, not one of each a torrent.
+async fn act_each(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    action: impl Fn(&TorrentView) -> QueueAction,
+) -> Response {
+    let views = found!(ctx.targets(params).await);
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    let actions = views
+        .iter()
+        .map(|view| (view.job_id, action(view)))
+        .collect();
+    answered(&views, torrents.act_many(actions).await)
+}
+
+// A change to its own settings on each torrent `hashes` names, as one unit
+// of work as `act_each` makes its actions.
+async fn set_each(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    change: impl Fn(&TorrentView) -> TorrentSetting,
+) -> Response {
+    let views = found!(ctx.targets(params).await);
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    let changes = views
+        .iter()
+        .map(|view| (view.job_id, change(view)))
+        .collect();
+    answered(&views, torrents.set_many(changes).await)
+}
+
+// The answer to a request on `views` made as one unit: the first torrent in
+// their order that failed answers it, as it did when each was made alone.
+// A torrent gone since it was named is skipped.
+fn answered(views: &[TorrentView], outcome: BTreeMap<JobId, Result<(), ActionError>>) -> Response {
+    for view in views {
+        match outcome.get(&view.job_id) {
+            None | Some(Ok(()) | Err(ActionError::NotFound(_))) => {}
+            Some(Err(error @ ActionError::Invalid(_))) => {
+                return text(StatusCode::CONFLICT, error.to_string());
+            }
+            Some(Err(ActionError::Forbidden(_))) => return forbidden(),
+            Some(Err(error)) => return internal(error),
+        }
+    }
+    ok()
 }
 
 // `action` on each of `views`, as `each` does it.
@@ -3466,10 +3512,9 @@ async fn set_rate_limit(
         Direction::Upload => (limit, None),
         Direction::Download => (None, limit),
     };
-    each(ctx, params, move |torrents, view| async move {
-        torrents
-            .set_rate_limits(view.job_id, upload, download)
-            .await
+    set_each(ctx, params, |_| TorrentSetting::RateLimits {
+        upload,
+        download,
     })
     .await
 }
@@ -4304,14 +4349,12 @@ async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let Some(torrents) = &ctx.inner.torrents else {
         return ok();
     };
-    let mut failed = None;
-    for job_id in torrents.job_ids().await {
-        match torrents.ban_peers(job_id, &ips).await {
-            Ok(()) | Err(ActionError::NotFound(_)) => {}
-            Err(error) => failed = Some(internal(error)),
-        }
+    // Every torrent under one hold, their writes queued together.
+    let job_ids = torrents.job_ids().await;
+    match torrents.ban_peers_many(&job_ids, &ips).await {
+        Ok(()) => ok(),
+        Err(error) => internal(error),
     }
-    failed.unwrap_or_else(ok)
 }
 
 // qBittorrent `getFreeSpaceAtPathAction`: the bytes free on the filesystem
