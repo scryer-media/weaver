@@ -1363,9 +1363,29 @@ fn wireguard_session(
     proxies: Vec<u32>,
     budget: usize,
 ) -> Arc<SessionHop> {
+    wireguard_session_sharing(
+        id,
+        provider,
+        resolver,
+        inner,
+        proxies,
+        Arc::new(tokio::sync::Semaphore::new(budget)),
+    )
+}
+
+// A WireGuard session over `inner` that draws on `budget`, shared as the
+// runtime shares the process's session budget.
+fn wireguard_session_sharing(
+    id: u32,
+    provider: Arc<dyn TunnelProvider>,
+    resolver: Arc<crate::WireGuardTunnelProvider>,
+    inner: Arc<dyn Dialer>,
+    proxies: Vec<u32>,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> Arc<SessionHop> {
     Arc::new(SessionHop {
         sockets: Default::default(),
-        capacity: SessionCapacity::new(Arc::new(tokio::sync::Semaphore::new(budget))),
+        capacity: SessionCapacity::new(budget),
         activity: Default::default(),
         id,
         provider,
@@ -2214,30 +2234,342 @@ impl Dialer for Full {
     }
 }
 
-#[tokio::test]
-async fn a_full_tunnel_waits_for_room_without_cooling_its_rung() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut target = target(listener.local_addr().unwrap());
+// A rung that counts the dials it is asked for and hands them to `inner`.
+struct Counting {
+    inner: Arc<dyn Dialer>,
+    dials: std::sync::atomic::AtomicUsize,
+}
+impl Counting {
+    fn new(inner: Arc<dyn Dialer>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            dials: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn dials(&self) -> usize {
+        self.dials.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for Counting {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.dial(target).await
+    }
+    fn budget(&self) -> Duration {
+        self.inner.budget()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+// A tunnel that is full until the test frees a slot, then dials through
+// `inner`.
+struct Filling {
+    full: std::sync::atomic::AtomicBool,
+    freed: proxy_tunnels::SlotFreed,
+    inner: Arc<dyn Dialer>,
+}
+#[async_trait::async_trait]
+impl Dialer for Filling {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        if self.full.load(std::sync::atomic::Ordering::SeqCst) {
+            return Full(self.freed.clone()).dial(target).await;
+        }
+        self.inner.dial(target).await
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "filling".into()
+    }
+}
+
+// A tunnel whose path is down.
+struct Down;
+#[async_trait::async_trait]
+impl Dialer for Down {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        Err(DialError::Egress(io::Error::other("path down")))
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "down".into()
+    }
+}
+
+fn usenet(target: &mut Target) {
     target.purpose = Purpose::Nntp {
         server: 1,
         leg: 0,
         probing: false,
     };
+}
+
+// A usenet connection over a full tunnel waits for room and leaves by no
+// rung below it, the saved direct fallback included: the route falls back
+// only when the tunnel is down. The full rung is left standing.
+#[tokio::test]
+async fn a_full_tunnel_waits_for_room_without_cooling_its_rung() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut target = target(listener.local_addr().unwrap());
+    usenet(&mut target);
     let freed = proxy_tunnels::SlotFreed::default();
 
-    // The ladder goes on to the next rung and leaves the full one standing.
-    let ladder = Fallback::new(vec![Arc::new(Full(freed.clone())), bottom()]);
-    let dialed = ladder.dial(&target).await.unwrap();
-    assert_eq!(dialed.path.rung, Some(1));
+    let host = Counting::new(bottom());
+    let ladder = Fallback::new(vec![Arc::new(Full(freed.clone())), host.clone()]);
+    let Err(DialError::AtCapacity(waits)) = ladder.dial(&target).await else {
+        panic!("a full tunnel is at capacity");
+    };
+    assert!(Arc::ptr_eq(&waits.waits[0], &freed.notify()));
+    assert_eq!(host.dials(), 0, "nothing leaves by the host's own address");
     assert_eq!(ladder.rung_states()[0], "STANDBY");
 
+    // A probe of the leg waits as well.
+    target.purpose = Purpose::NntpProbe { server: 1, leg: 0 };
+    assert!(matches!(
+        ladder.dial(&target).await,
+        Err(DialError::AtCapacity(_))
+    ));
+    assert_eq!(host.dials(), 0);
+
     // With nowhere else to go, the dial waits on the tunnel freeing a slot.
+    usenet(&mut target);
     let ladder = Fallback::new(vec![Arc::new(Full(freed.clone()))]);
     let Err(DialError::AtCapacity(waits)) = ladder.dial(&target).await else {
         panic!("a full tunnel is at capacity");
     };
     assert!(Arc::ptr_eq(&waits.waits[0], &freed.notify()));
     assert_eq!(ladder.rung_states(), ["STANDBY"]);
+}
+
+// A full first proxy does not spill a usenet connection onto the second
+// proxy rung either.
+#[tokio::test]
+async fn a_usenet_dial_over_a_full_proxy_does_not_spill_onto_the_next_proxy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut target = target(listener.local_addr().unwrap());
+    usenet(&mut target);
+    let second = Counting::new(bottom());
+    let host = Counting::new(bottom());
+    let ladder = Fallback::new(vec![
+        Arc::new(Full(proxy_tunnels::SlotFreed::default())),
+        second.clone(),
+        host.clone(),
+    ]);
+    assert!(matches!(
+        ladder.dial(&target).await,
+        Err(DialError::AtCapacity(_))
+    ));
+    assert_eq!((second.dials(), host.dials()), (0, 0));
+}
+
+// A tunnel that is down falls back to the saved direct rung as before.
+#[tokio::test]
+async fn a_usenet_dial_over_a_tunnel_that_is_down_takes_the_saved_fallback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut target = target(listener.local_addr().unwrap());
+    usenet(&mut target);
+    let host = Counting::new(bottom());
+    let ladder = Fallback::new(vec![Arc::new(Down), host.clone()]);
+    let dialed = ladder.dial(&target).await.unwrap();
+    assert_eq!(dialed.path.rung, Some(1));
+    assert_eq!(host.dials(), 1);
+    listener.accept().await.unwrap();
+}
+
+// A socket freed in the tunnel wakes the usenet dial that waited, and it
+// leaves through the tunnel, never the fallback.
+#[tokio::test]
+async fn a_freed_slot_lets_the_waiting_usenet_dial_in_on_the_tunnel() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut target = target(listener.local_addr().unwrap());
+    usenet(&mut target);
+    let freed = proxy_tunnels::SlotFreed::default();
+    let tunnel = Arc::new(Filling {
+        full: std::sync::atomic::AtomicBool::new(true),
+        freed: freed.clone(),
+        inner: bottom(),
+    });
+    let host = Counting::new(bottom());
+    let ladder = Fallback::new(vec![tunnel.clone(), host.clone()]);
+    let Err(DialError::AtCapacity(waits)) = ladder.dial(&target).await else {
+        panic!("a full tunnel is at capacity");
+    };
+    let woken = waits.waits[0].clone();
+    let mut notified = std::pin::pin!(woken.notified());
+    notified.as_mut().enable();
+    tunnel
+        .full
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    freed.notify().notify_waiters();
+    notified.await;
+    let dialed = ladder.dial(&target).await.unwrap();
+    assert_eq!(dialed.path.rung, Some(0));
+    assert_eq!(host.dials(), 0);
+    listener.accept().await.unwrap();
+}
+
+// A usenet dial over a WireGuard rung whose session budget is spent leaves
+// by no rung below it, the saved direct fallback included. It waits for a
+// session to give its permit back, then goes out on the tunnel.
+#[tokio::test]
+async fn a_spent_session_budget_holds_a_usenet_dial_for_the_tunnel() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let budget = Arc::new(tokio::sync::Semaphore::new(1));
+    // Another session holds the only permit.
+    let other = SessionCapacity::new(budget.clone());
+    other.acquire().unwrap();
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let session = wireguard_session_sharing(
+        1,
+        provider.clone(),
+        provider,
+        bottom(),
+        vec![],
+        budget.clone(),
+    );
+    let host = Counting::new(bottom());
+    let ladder = Fallback::new(vec![session, host.clone()]);
+    let mut target = probe_target();
+    usenet(&mut target);
+
+    for purpose in [
+        target.purpose.clone(),
+        Purpose::NntpProbe { server: 1, leg: 0 },
+    ] {
+        let mut asked = target.clone();
+        asked.purpose = purpose;
+        let error = ladder.dial(&asked).await.err().expect("no budget, no dial");
+        assert!(matches!(error, DialError::SessionBudget), "{error:?}");
+        assert_eq!(host.dials(), 0, "nothing leaves by the host's own address");
+    }
+
+    // The route names the ring a freed permit sounds, and it sounds when
+    // the other session gives its permit back.
+    let slots = ladder.room(&target.purpose).expect_err("no room");
+    assert!(
+        slots
+            .iter()
+            .any(|slot| Arc::ptr_eq(slot, &session_budget_freed()))
+    );
+    let freed = session_budget_freed();
+    let mut notified = std::pin::pin!(freed.notified());
+    notified.as_mut().enable();
+    other.release();
+    notified.await;
+    assert!(ladder.room(&target.purpose).is_ok());
+
+    let dialed = ladder.dial(&target).await.unwrap();
+    assert_eq!(dialed.path.rung, Some(0));
+    assert_eq!(dialed.path.proxies, vec![1]);
+    assert_eq!(host.dials(), 0);
+    assert_eq!(budget.available_permits(), 0, "the tunnel holds the permit");
+}
+
+// A spent session budget changes the room answer of usenet purposes only:
+// every other purpose gets the answer the session's sockets give, as it did
+// before the budget was asked, and never the budget's ring.
+#[tokio::test]
+async fn a_spent_session_budget_changes_only_the_usenet_room_answer() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let session = wireguard_session(1, provider.clone(), provider, bottom(), vec![], 0);
+    let sockets_say = |purpose: &Purpose| {
+        session
+            .sockets
+            .room(
+                SocketClass::of(purpose),
+                SessionHop::purpose_bytes(&session.sockets, purpose),
+            )
+            .map_err(|freed| freed.notify())
+    };
+    let budget_ring = session_budget_freed();
+    for purpose in [
+        Purpose::Outbound,
+        Purpose::Torrent,
+        Purpose::TorrentHttp,
+        Purpose::TorrentWebSeed,
+        Purpose::Feed { feed: 1 },
+        Purpose::Probe,
+        Purpose::Dns,
+        Purpose::Datagram,
+    ] {
+        let room = session.room(&purpose);
+        let wait_room = session.wait_room(&purpose);
+        match sockets_say(&purpose) {
+            Ok(()) => {
+                assert!(room.is_ok(), "{purpose:?}");
+                assert!(wait_room.is_ok(), "{purpose:?}");
+            }
+            Err(freed) => {
+                let slots = room.expect_err("the sockets are full");
+                assert_eq!(slots.len(), 1, "{purpose:?}");
+                assert!(Arc::ptr_eq(&slots[0], &freed), "{purpose:?}");
+                let capacity = wait_room.expect_err("the sockets are full");
+                assert!(
+                    !capacity
+                        .waits
+                        .iter()
+                        .any(|slot| Arc::ptr_eq(slot, &budget_ring)),
+                    "{purpose:?}"
+                );
+            }
+        }
+    }
+    for purpose in [
+        Purpose::Nntp {
+            server: 1,
+            leg: 0,
+            probing: false,
+        },
+        Purpose::NntpProbe { server: 1, leg: 0 },
+    ] {
+        let slots = session.room(&purpose).expect_err("no budget, no room");
+        assert!(slots.iter().any(|slot| Arc::ptr_eq(slot, &budget_ring)));
+        let capacity = session.wait_room(&purpose).expect_err("no budget");
+        assert!(
+            capacity
+                .waits
+                .iter()
+                .any(|slot| Arc::ptr_eq(slot, &budget_ring))
+        );
+    }
+}
+
+// What a full rung does to a dial that is not usenet's is unchanged: a
+// torrent peer and an HTTP fetch go on to the next rung.
+#[tokio::test]
+async fn other_dials_over_a_full_tunnel_go_on_to_the_next_rung() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    for purpose in [Purpose::Torrent, Purpose::Outbound] {
+        let mut target = target(listener.local_addr().unwrap());
+        target.purpose = purpose;
+        let ladder = Fallback::new(vec![
+            Arc::new(Full(proxy_tunnels::SlotFreed::default())),
+            bottom(),
+        ]);
+        let dialed = ladder.dial(&target).await.unwrap();
+        assert_eq!(dialed.path.rung, Some(1));
+        assert_eq!(ladder.rung_states()[0], "STANDBY");
+        listener.accept().await.unwrap();
+    }
 }
 
 // A WireGuard session over the test peer, as the runtime builds one.

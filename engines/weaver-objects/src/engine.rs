@@ -58,7 +58,7 @@ pub trait Format: Send + Sync {
     // states one, and `length`, once known: each bound volume by index,
     // with its front and its length.
     fn place(
-        _bound: &BTreeMap<u32, Holding<'_, Self::Front>>,
+        _bound: &Holdings<'_, Self::Front>,
         _front: Option<&Self::Front>,
         _length: Option<u64>,
     ) -> Option<VolumeIndex> {
@@ -69,11 +69,20 @@ pub trait Format: Send + Sync {
     // names. Formats whose headers only state a position must distinguish
     // that from evidence linking the candidate to the bound volumes.
     fn judged(
-        _bound: &BTreeMap<u32, Holding<'_, Self::Front>>,
+        _bound: &Holdings<'_, Self::Front>,
         _front: Option<&Self::Front>,
         _length: Option<u64>,
     ) -> bool {
         true
+    }
+
+    // Whether the front held at `index` is tied to a volume bound beside
+    // it, the one before or the one after, by what both fronts state: for
+    // a RAR set, a member carried on from the one before or into the one
+    // after. A front that merely states nothing against its neighbours is
+    // not tied to them.
+    fn linked(_bound: &Holdings<'_, Self::Front>, _front: &Self::Front, _index: u32) -> bool {
+        false
     }
     fn run(password: Option<String>) -> Box<dyn Extraction>;
 
@@ -102,6 +111,67 @@ pub trait Format: Send + Sync {
 pub struct Holding<'a, T> {
     pub front: Option<&'a T>,
     pub length: Option<u64>,
+}
+
+// The volumes an engine has bound, but one it is placing again, read by
+// index from the facts it keeps as each volume comes and goes: a lookup is
+// a lookup, and nothing is copied out to answer one.
+pub struct Holdings<'a, T> {
+    bound: &'a BTreeSet<u32>,
+    fronts: &'a BTreeMap<u32, T>,
+    lengths: &'a BTreeMap<u32, u64>,
+    except: Option<u32>,
+}
+
+impl<'a, T> Holdings<'a, T> {
+    pub fn get(&self, index: u32) -> Option<Holding<'a, T>> {
+        #[cfg(test)]
+        counts::bump(|counts| counts.lookups += 1);
+        (Some(index) != self.except && self.bound.contains(&index)).then(|| Holding {
+            front: self.fronts.get(&index),
+            length: self.lengths.get(&index).copied(),
+        })
+    }
+
+    // Every volume bound, in order: a walk over the set, for a placement
+    // that orders a volume by links alone.
+    pub fn indices(&self) -> impl Iterator<Item = u32> + 'a {
+        let except = self.except;
+        self.bound
+            .iter()
+            .copied()
+            .filter(move |index| Some(*index) != except)
+            .inspect(|_| {
+                #[cfg(test)]
+                counts::bump(|counts| counts.walked += 1);
+            })
+    }
+}
+
+// What placing an engine's volumes read: volumes looked up by index, and
+// volumes walked over by a placement by links.
+#[cfg(test)]
+pub(crate) mod counts {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        pub(crate) lookups: usize,
+        pub(crate) walked: usize,
+    }
+
+    thread_local! {
+        static COUNTS: RefCell<Counts> = RefCell::default();
+    }
+
+    pub(crate) fn bump(count: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|cell| count(&mut cell.borrow_mut()));
+    }
+
+    // What was counted since the last take.
+    pub(crate) fn take() -> Counts {
+        COUNTS.with(RefCell::take)
+    }
 }
 
 // Engine volumes hold no parsed output. Only their existing placement
@@ -153,8 +223,20 @@ pub struct EngineObject<F: Format> {
     #[serde(skip)]
     format: PhantomData<F>,
     // The names of the volumes bound that name a volume of a set, which
-    // every other volume's must share.
+    // every other volume's must share: the set's posted numbering.
     names: BTreeMap<u32, F::Name>,
+    // The names a recovery set gave volumes bound in another set's
+    // numbering than the posted one. A recovery's name outranks a posted
+    // one, so a set its recovery renames is numbered by these from the
+    // first such name on, while volumes not renamed yet keep their posted
+    // names.
+    #[serde(default)]
+    recovered: BTreeMap<u32, F::Name>,
+    // The first of those names, which says the recovery's numbering is the
+    // set's from then on, whichever volumes hold its names: a volume the
+    // name moves leaves the object and comes back under it.
+    #[serde(default)]
+    recovery: Option<F::Name>,
     // What the fronts of the volumes bound state of their places.
     #[serde(default)]
     fronts: BTreeMap<u32, F::Front>,
@@ -185,6 +267,7 @@ impl<F: Format> Durable for EngineObject<F> {
         let known = self
             .names
             .keys()
+            .chain(self.recovered.keys())
             .chain(self.fronts.keys())
             .chain(self.lengths.keys())
             .chain(self.windows.keys());
@@ -198,6 +281,8 @@ impl<F: Format> Default for EngineObject<F> {
         Self {
             format: PhantomData,
             names: BTreeMap::new(),
+            recovered: BTreeMap::new(),
+            recovery: None,
             fronts: BTreeMap::new(),
             lengths: BTreeMap::new(),
             windows: BTreeMap::new(),
@@ -226,50 +311,102 @@ impl<F: Format> EngineObject<F> {
         self.placed_front(name, F::front(first_bytes).as_ref(), length)
     }
 
+    // Each volume bound, but `except`, with its front and its length.
+    fn holdings(&self, except: Option<u32>) -> Holdings<'_, F::Front> {
+        Holdings {
+            bound: &self.bound,
+            fronts: &self.fronts,
+            lengths: &self.lengths,
+            except,
+        }
+    }
+
+    // Which of the set's numberings a name is in: the one its recovery set
+    // gave, which outranks the posted one, or the posted one.
+    fn numbering(&self, candidate: &F::Name) -> Numbering {
+        let recovery = self.recovery.as_ref();
+        let posted = self.names.values().next();
+        match (
+            recovery.map(|first| first.same_set(candidate)),
+            posted.map(|first| first.same_set(candidate)),
+        ) {
+            (Some(true), _) => Numbering::Recovered,
+            (_, Some(true)) => Numbering::Posted,
+            (None, None) => Numbering::Unanchored,
+            _ => Numbering::Elsewhere,
+        }
+    }
+
+    // Whether the volume's front ties it to the volumes bound, whatever its
+    // name says: to a volume bound beside it, in two lookups. Where neither
+    // place beside it is bound yet, nothing there says either way, and it
+    // is tied where its links place it among the others, a front that does
+    // not state its place: that placement may walk the set, once per such
+    // rename. A volume bound beside it that its front does not link to says
+    // it is not this set's.
+    fn held_here(&self, volume: VolumeIndex) -> bool {
+        let Some(front) = self.fronts.get(&volume.0) else {
+            return false;
+        };
+        let others = self.holdings(Some(volume.0));
+        let alone = [volume.0.checked_sub(1), volume.0.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .all(|beside| others.get(beside).is_none());
+        F::linked(&others, front, volume.0)
+            || (alone
+                && !F::states_place(front)
+                && F::place(&others, Some(front), self.lengths.get(&volume.0).copied()).is_some())
+    }
+
+    fn names_in(&self, numbering: Numbering) -> &BTreeMap<u32, F::Name> {
+        match numbering {
+            Numbering::Recovered => &self.recovered,
+            _ => &self.names,
+        }
+    }
+
     fn placed_front(
         &self,
         name: &str,
         front: Option<&F::Front>,
         length: Option<u64>,
     ) -> Option<VolumeIndex> {
-        let bound = self
-            .bound
-            .iter()
-            .map(|volume| {
-                let holding = Holding {
-                    front: self.fronts.get(volume),
-                    length: self.lengths.get(volume).copied(),
-                };
-                (*volume, holding)
-            })
-            .collect();
+        let bound = self.holdings(None);
         let stated = front.is_some_and(F::states_place);
         let wanted = F::parse(name);
-        let elsewhere = wanted.as_ref().is_some_and(|candidate| {
-            self.names
-                .values()
-                .next()
-                .is_some_and(|first| !first.same_set(candidate))
-        });
-        let placed = F::place(&bound, front, length)
-            .filter(|_| !elsewhere || F::judged(&bound, front, length));
-        let named = wanted
-            .filter(|candidate| {
-                self.names
-                    .values()
-                    .next()
-                    // With no naming anchor, a name only refines a place
-                    // the format already establishes; it cannot introduce
-                    // unrelated siblings of a lone unnumbered archive.
-                    .map_or(placed.is_some(), |first| first.same_set(candidate))
+        let numbering = wanted.as_ref().map(|candidate| self.numbering(candidate));
+        let elsewhere = numbering == Some(Numbering::Elsewhere);
+        // Where links place it, asked only where the answer is used: a
+        // placement by links may walk the set.
+        let linked = std::cell::OnceCell::new();
+        let placed = || {
+            *linked.get_or_init(|| {
+                F::place(&bound, front, length)
+                    .filter(|_| !elsewhere || F::judged(&bound, front, length))
             })
-            .and_then(|candidate| candidate.slot(&self.names))
-            .filter(|index| !front.is_some_and(|front| F::misplaced(front, *index)));
-        match (placed, named) {
-            (Some(placed), _) if stated => Some(placed),
-            (_, Some(named)) => Some(VolumeIndex(named)),
-            (linked, None) => linked,
+        };
+        if stated && let Some(placed) = placed() {
+            return Some(placed);
         }
+        let named = wanted
+            .zip(numbering)
+            .filter(|(_, numbering)| match numbering {
+                // With no naming anchor, a name only refines a place the
+                // format already establishes; it cannot introduce
+                // unrelated siblings of a lone unnumbered archive.
+                Numbering::Unanchored => placed().is_some(),
+                Numbering::Elsewhere => false,
+                Numbering::Posted | Numbering::Recovered => true,
+            })
+            .and_then(|(candidate, numbering)| {
+                let slot = candidate.slot(self.names_in(numbering))?;
+                // A place a recovery's name holds is not a posted name's.
+                (numbering != Numbering::Posted || !self.recovered.contains_key(&slot))
+                    .then_some(slot)
+            })
+            .filter(|index| !front.is_some_and(|front| F::misplaced(front, *index)));
+        named.map(VolumeIndex).or_else(placed)
     }
 
     // The volume the set lacks, once nothing more reaches its run: with
@@ -281,8 +418,23 @@ impl<F: Format> EngineObject<F> {
     fn lacks(&self) -> Option<u32> {
         let last = self.bound.last()?;
         let from_first = self.bound.len() as u64 == u64::from(*last) + 1;
-        self.names.get(last)?.after().filter(|_| from_first)
+        self.recovered
+            .get(last)
+            .or_else(|| self.names.get(last))?
+            .after()
+            .filter(|_| from_first)
     }
+}
+
+// Which of a set's numberings a name is in (`EngineObject::numbering`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Numbering {
+    // The set has no name yet.
+    Unanchored,
+    Posted,
+    Recovered,
+    // Neither: the name is another set's.
+    Elsewhere,
 }
 
 impl<F: Format + 'static> Object for EngineObject<F> {
@@ -328,6 +480,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         let why = crate::quiet::damaged(standing)
             .or_else(|| standing.asking().then_some(Why::EncryptedHeader))
+            // My run found bad what proof above found whole: I cannot read
+            // my volumes.
+            .or_else(|| (standing.refuted() && !standing.lost()).then_some(Why::InvalidArchive))
             .or_else(|| {
                 let short = self
                     .bound
@@ -381,11 +536,16 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], length: Option<u64>) {
-        let first = self.names.values().next();
-        if let Some(parsed) = F::parse(name)
-            && first.is_none_or(|first| first.same_set(&parsed))
-        {
-            self.names.insert(volume.0, parsed);
+        if let Some(parsed) = F::parse(name) {
+            match self.numbering(&parsed) {
+                Numbering::Recovered => {
+                    self.recovered.insert(volume.0, parsed);
+                }
+                Numbering::Posted | Numbering::Unanchored => {
+                    self.names.insert(volume.0, parsed);
+                }
+                Numbering::Elsewhere => {}
+            }
         }
         if let Some(window) = F::window(front) {
             self.windows.insert(volume.0, window);
@@ -400,15 +560,35 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     // The name a recovery set gave the volume is the set's numbering now.
+    // A recovery set names a set's volumes one at a time, so a name of
+    // another set than the posted names is weighed against the names the
+    // recovery gave the others, never against posted names it has not
+    // replaced yet: the first such name starts the recovery's numbering
+    // where the volume's front holds it in this set by the volumes beside
+    // it, as a nameless RAR4 front always does. A name of another set than
+    // the recovery's numbering, or one no front holds here, is elsewhere.
     fn renamed(&mut self, volume: VolumeIndex, name: &str, out: &mut Vec<Emit>) {
         self.names.remove(&volume.0);
-        let first = self.names.values().next();
+        self.recovered.remove(&volume.0);
         let parsed = F::parse(name);
-        let elsewhere = parsed
-            .as_ref()
-            .is_some_and(|parsed| first.is_some_and(|first| !first.same_set(parsed)));
-        if !elsewhere && let Some(parsed) = parsed {
-            self.names.insert(volume.0, parsed);
+        let numbering = parsed.as_ref().map(|parsed| match self.numbering(parsed) {
+            Numbering::Elsewhere if self.recovery.is_none() && self.held_here(volume) => {
+                Numbering::Recovered
+            }
+            numbering => numbering,
+        });
+        let elsewhere = numbering == Some(Numbering::Elsewhere);
+        match (parsed, numbering) {
+            (Some(parsed), Some(Numbering::Recovered)) => {
+                if self.recovery.is_none() {
+                    self.recovery = F::parse(name);
+                }
+                self.recovered.insert(volume.0, parsed);
+            }
+            (Some(parsed), Some(Numbering::Posted | Numbering::Unanchored)) => {
+                self.names.insert(volume.0, parsed);
+            }
+            _ => {}
         }
         let corrected = self.placed_front(
             name,
@@ -423,6 +603,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
         self.bound.remove(&volume.0).then(|| {
             self.names.remove(&volume.0);
+            self.recovered.remove(&volume.0);
             Box::new(CarriedVolume {
                 front: self.fronts.remove(&volume.0),
                 length: self.lengths.remove(&volume.0),
@@ -471,6 +652,25 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         if let Some(window) = carried.window {
             self.windows.insert(volume.0, window);
         }
+    }
+
+    // A volume held by its posted name or its links alone, where the member
+    // claiming its place holds it by the recovery's numbering, which
+    // outranks both. A front that states the holder's place outranks names.
+    fn provisional(
+        &self,
+        volume: VolumeIndex,
+        name: &str,
+        _first_bytes: &[u8],
+        _carried: Option<&weaver_graph::Carried>,
+    ) -> bool {
+        self.bound.contains(&volume.0)
+            && !self.recovered.contains_key(&volume.0)
+            && !self.fronts.get(&volume.0).is_some_and(F::states_place)
+            && F::parse(name).is_some_and(|claimant| {
+                self.numbering(&claimant) == Numbering::Recovered
+                    && claimant.slot(&self.recovered) == Some(volume.0)
+            })
     }
 
     // The place the volume's facts give it, held or not: whether it takes

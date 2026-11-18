@@ -733,10 +733,9 @@ impl NamespaceWriter {
             let absent = posts.get(member).is_some_and(|record| {
                 absent_from_posts(record)
                     && due.iter().any(|&set| {
-                        tree.kind(set) == Some(Kind::Par3)
-                            && tree
-                                .recovery(set)
-                                .is_some_and(|recovery| recovery.covers(member))
+                        tree.recovery(set).is_some_and(|recovery| {
+                            recovery.outgrows_recovery() && recovery.covers(member)
+                        })
                     })
             });
             absent == held.absent.contains(&member)
@@ -852,12 +851,14 @@ impl NamespaceWriter {
             self.diagnostics.push(diagnostic);
         }
         self.read_backs += reads;
-        // What a PAR3 set wrote into a post none of whose bytes arrived is
-        // held to the disk reserve before any of it lands; what a repair
-        // wrote into an object's output is held to the job's limits as it
-        // lands, as that output always is.
+        // What a set that can outgrow its recovery wrote into a post none of
+        // whose bytes arrived is held to the disk reserve before any of it
+        // lands; what a repair wrote into an object's output is held to the
+        // job's limits as it lands, as that output always is.
         if node == NodeId::ROOT
-            && tree.kind(set) == Some(Kind::Par3)
+            && tree
+                .recovery(set)
+                .is_some_and(|recovery| recovery.outgrows_recovery())
             && let Err(error) = self.admit_repaired(tree, repaired.sizes())
         {
             let _ = repaired.remove();
@@ -1539,12 +1540,16 @@ fn pending_covers(
         .collect()
 }
 
-// An SFV listing stands aside while parity beside it can rule: a PAR2 or
-// PAR3 object among the namespace's `sets` that knows what each of its sets
-// describes, or, out on a repair, covered a member when it left. It does
-// not rule, is never lent, and no byte reaches it, so it takes back no
-// ruling and makes no other set rule again. With no such parity, as when
-// its index never came or does not read, the listing rules as before.
+// A set that only checks, as an SFV listing does, stands aside while a set
+// beside it that rebuilds can rule: one among the namespace's `sets` that
+// knows what each of its sets describes, or, out on a repair, covered a
+// member when it left. Each set says for itself whether it rebuilds. A set
+// carried inside the one member it covers, as a RAR volume's own record
+// is, repairs that member alone, and the listing still rules the others.
+// The listing does not rule, is never lent, and no byte reaches it, so it
+// takes back no ruling and makes no other set rule again. With no such
+// set, as when its index never came or does not read, the listing rules as
+// before.
 //
 // Whether such parity is there is one answer for the whole namespace: it is
 // found the first time a listing asks, and never again in the same pass,
@@ -1566,10 +1571,11 @@ impl<'t> Aside<'t> {
     }
 
     fn yields(&self, set: NodeId) -> bool {
-        self.tree.kind(set) == Some(Kind::Sfv)
+        !self.tree.rebuilds(set)
             && *self.parity.get_or_init(|| {
                 self.sets.iter().any(|&other| {
-                    matches!(self.tree.kind(other), Some(Kind::Par2 | Kind::Par3))
+                    self.tree.rebuilds(other)
+                        && !self.tree.carried_inside(other)
                         && match self.tree.recovery(other) {
                             Some(recovery) => !recovery.undescribed(),
                             None => self.tree.lent_covers_any(other),

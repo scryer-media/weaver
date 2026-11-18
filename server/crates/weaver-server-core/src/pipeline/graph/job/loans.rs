@@ -162,7 +162,7 @@ impl Lender for Lending<'_> {
             set,
             serial,
             state: loan.state,
-            stop: None,
+            stop: Some(loan.stop()),
             kind: Work::Repair,
         });
         let mail = loans.mail.clone();

@@ -355,6 +355,14 @@ pub trait Standing {
     // has answered it.
     fn asking(&self) -> bool;
 
+    // My run said bytes of my volumes were damaged, and a recovery object
+    // above had proved every byte my volumes came from: the bytes are whole,
+    // so it is I who cannot read them. No run started since has said
+    // otherwise.
+    fn refuted(&self) -> bool {
+        false
+    }
+
     // The members beside my volumes that no object owns, as a claim reads
     // them: what I can say of them is mine to say.
     fn beside(&self) -> Vec<Beside<'_>>;

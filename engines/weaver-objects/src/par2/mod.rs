@@ -1031,6 +1031,14 @@ impl Recovery for Par2 {
         true
     }
 
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
         if self.shown.bind(namespace, self.id) {
             self.damage_shown();

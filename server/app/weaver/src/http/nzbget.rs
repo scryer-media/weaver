@@ -3044,21 +3044,21 @@ async fn archive_history(
 ) -> Result<Value, RpcError> {
     let ids: Vec<u64> = request.ids.iter().map(|id| id.0).collect();
     let db = ctx.db.clone();
-    let hidden = tokio::task::spawn_blocking(move || {
-        let hidden = db.set_nzbget_history_rows_hidden(&ids, true)?;
-        if hidden > 0 {
-            db.accept_archive_history(&ids)?;
-        }
-        Ok::<_, weaver_server_core::StateError>(hidden)
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("{} failed: {error}", request.command)))?
-    .map_err(|error| RpcError::invalid_parameter(format!("{} failed: {error}", request.command)))?;
+    // Only an entry whose archive was taken leaves the client's history; a
+    // busy one stays listed for the client's next remove.
+    let hidden = tokio::task::spawn_blocking(move || db.archive_nzbget_history(&ids))
+        .await
+        .map_err(|error| {
+            RpcError::invalid_parameter(format!("{} failed: {error}", request.command))
+        })?
+        .map_err(|error| {
+            RpcError::invalid_parameter(format!("{} failed: {error}", request.command))
+        })?;
     if hidden < request.ids.len() as u64 {
         tracing::debug!(
             command = %request.command,
             applied = hidden,
-            "editqueue named ids with no history row"
+            "editqueue named ids with no history row, or that are busy"
         );
     }
     Ok(json!(hidden > 0))

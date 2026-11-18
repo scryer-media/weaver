@@ -1346,7 +1346,8 @@ impl Tree {
     }
 
     // A run of the engine at `node`, from its object's present state. A
-    // question an earlier run asked is the new run's to ask again.
+    // question an earlier run asked, and a claim it made, are the new run's
+    // to make again.
     pub fn start(&mut self, node: NodeId) -> Option<Box<dyn Extraction>> {
         let extraction = self
             .nodes
@@ -1357,6 +1358,7 @@ impl Tree {
             .start();
         if let Some(progress) = self.nodes.progress_mut(node) {
             progress.asking = false;
+            progress.refuted = false;
         }
         Some(extraction)
     }
@@ -4677,6 +4679,7 @@ impl Tree {
                 Emit::GiveBack(volume) => given.push(volume),
                 Emit::Wants(volume) => wanted.push(volume),
                 Emit::Learned => learned = true,
+                Emit::Failed(_) => {}
             }
             if self.nodes.get(&node).is_none_or(|found| found.retired) {
                 // Whatever the object said after giving its volumes up is
@@ -5511,7 +5514,11 @@ impl Tree {
     // bad: damage already marked in that range accounts for the failure,
     // at the bytes it reached, and marking the rest would only mark bytes
     // that arrived whole. A volume no member is has nothing in hand to
-    // judge: it is lost, as any range that never arrives.
+    // judge: it is lost, as any range that never arrives. Once a recovery
+    // object above has proved every byte the object's volumes came from,
+    // the claim is answered: the bytes are whole, so the object is what
+    // failed, and nothing is marked. Its run is not repeated over the
+    // proved bytes, and the object says why when the job is quiet.
     fn damaged(
         &mut self,
         node: NodeId,
@@ -5519,6 +5526,12 @@ impl Tree {
         range: ByteRange,
         effects: &mut Vec<Effect>,
     ) {
+        if self.vouched_above(node) {
+            if let Some(progress) = self.nodes.progress_mut(node) {
+                progress.refuted = true;
+            }
+            return;
+        }
         let parent = self
             .nodes
             .get(&node)

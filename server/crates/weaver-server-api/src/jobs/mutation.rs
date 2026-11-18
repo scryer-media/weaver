@@ -600,7 +600,7 @@ impl JobsMutation {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         let db = ctx.data::<Database>()?.clone();
         delete_history_ids(handle, replay, [id], delete_files).await?;
-        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
+        history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Explicitly forget durable duplicate identity for a job without deleting history or files.
     #[graphql(guard = "ControlGuard")]
@@ -724,7 +724,7 @@ impl JobsMutation {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         let db = ctx.data::<Database>()?.clone();
         delete_history_ids(handle, replay, ids, delete_files).await?;
-        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
+        history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Archive up to 100 history entries: remove their files and keep the
     /// entries and their stored NZBs. Only folders Weaver manages are
@@ -796,7 +796,7 @@ impl JobsMutation {
         // rest, and a job that reaches history after the listing stays.
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         delete_history_ids(handle, replay, ids, delete_files).await?;
-        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
+        history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Update category and/or priority for one or more jobs.
     #[graphql(guard = "ControlGuard")]
@@ -1806,30 +1806,43 @@ async fn submit_uploaded_nzb(
 //
 // This is the same read surface as the `historyItems` query, so it applies the
 // same exclusion: a job the scheduler still owns is not history, however it
-// came to have a row.
-async fn history_items_from_db(db: Database, live_jobs: HashSet<u64>) -> Result<Vec<HistoryItem>> {
-    tokio::task::spawn_blocking(move || {
-        let rows = crate::history::query::exclude_live_rows(
-            db.list_job_history(&weaver_server_core::HistoryFilter::default())?,
-            &live_jobs,
-        );
-        let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
-        let delete_states = db.list_history_delete_row_states(&ids)?;
-        Ok::<_, weaver_server_core::StateError>(
-            rows.into_iter()
-                .map(|row| {
-                    let delete_state = delete_states
-                        .get(&row.job_id)
-                        .cloned()
-                        .map(history_delete_row_state_from_core);
-                    history_item_from_row(&row, delete_state)
-                })
-                .collect(),
-        )
+// came to have a row. Each row's delete state is read only when the caller
+// selects `deleteOperation`.
+async fn history_items_from_db(
+    ctx: &Context<'_>,
+    db: Database,
+    live_jobs: HashSet<u64>,
+) -> Result<Vec<HistoryItem>> {
+    let want_delete_states = ctx.look_ahead().field("deleteOperation").exists();
+    let internal = |error: async_graphql::Error| graphql_error("INTERNAL", error.message);
+    let rows = crate::observability::spawn_blocking_db("jobs.mutation.history_items.list", {
+        let db = db.clone();
+        move || {
+            db.list_job_history(&weaver_server_core::HistoryFilter::default())
+                .map(|rows| crate::history::query::exclude_live_rows(rows, &live_jobs))
+        }
     })
     .await
-    .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-    .map_err(|e| graphql_error("INTERNAL", e.to_string()))
+    .map_err(internal)?;
+    let mut delete_states = HashMap::new();
+    if want_delete_states && !rows.is_empty() {
+        let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
+        delete_states = crate::observability::spawn_blocking_db(
+            "jobs.mutation.history_items.delete_states",
+            move || db.list_history_delete_row_states(&ids),
+        )
+        .await
+        .map_err(internal)?;
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let delete_state = delete_states
+                .remove(&row.job_id)
+                .map(history_delete_row_state_from_core);
+            history_item_from_row(&row, delete_state)
+        })
+        .collect())
 }
 
 // The operator's speed limit is the saved global limit from now on: the queue

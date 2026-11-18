@@ -187,6 +187,14 @@ impl Recovery for Trail {
         true
     }
 
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        true
+    }
+
     fn bind(&mut self, _: &mut weaver_graph::Namespace, _: &mut Vec<MemberId>) {
         self.tape.lock().unwrap().binds += 1;
     }

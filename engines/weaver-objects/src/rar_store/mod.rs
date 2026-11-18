@@ -18,6 +18,7 @@ mod gaps;
 mod image;
 mod layout;
 mod lock;
+mod order;
 mod place;
 mod record;
 mod walk;
@@ -64,6 +65,10 @@ pub(crate) struct Volume {
     // same numbering are this set's all the same.
     posted: Option<String>,
     posted_numbered: Option<naming::VolumeName>,
+    // Where the set's headers put a volume held on trust, against what its
+    // name says, with the stamp of the headers that put it there: it
+    // outranks the name while those headers stand (`order`).
+    ordered: Option<(VolumeIndex, u64)>,
     length: Option<u64>,
     closed: bool,
     kept: Kept,
@@ -83,6 +88,7 @@ impl Volume {
             numbered: None,
             posted: None,
             posted_numbered: None,
+            ordered: None,
             length: None,
             closed: false,
             kept: Kept::default(),
@@ -118,6 +124,14 @@ impl Volume {
     fn misplaced(&self, index: VolumeIndex) -> bool {
         self.stated()
             .is_some_and(|facts| claim::misplaced(index, facts))
+    }
+
+    // The place the set's headers put this volume, while the headers they
+    // read stand.
+    fn ordered(&self) -> Option<VolumeIndex> {
+        self.ordered
+            .filter(|(_, stamp)| *stamp == self.walk.stamp)
+            .map(|(at, _)| at)
     }
 
     fn name_as(&mut self, name: &str) {
@@ -178,6 +192,8 @@ mod counts {
         pub(crate) known: usize,
         // Layouts laid again short of a volume they refuted.
         pub(crate) cut: usize,
+        // Runs of volumes held on trust laid in their headers' order.
+        pub(crate) orders: usize,
     }
 
     thread_local! {
@@ -349,6 +365,10 @@ pub struct RarStore {
     // laid there again until those headers change or the layout is laid
     // afresh.
     refuted: Option<(VolumeIndex, u64)>,
+    // Each place whose volume and the one after it are held the wrong way
+    // round by their headers, filed as volumes are touched: nothing is
+    // mapped from the first until the job is quiet and the set is ordered.
+    inversions: BTreeSet<u32>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
     // The candidate that opened the headers.
@@ -410,6 +430,7 @@ impl RarStore {
             formats: Default::default(),
             layout: None,
             refuted: None,
+            inversions: BTreeSet::new(),
             entries: Vec::new(),
             candidates: Vec::new(),
             headers_open: None,
@@ -598,6 +619,7 @@ impl RarStore {
             // The layout holds to every volume touched so far, those the
             // walks gave back or touched again included.
             let touched: BTreeSet<VolumeIndex> = touched.union(&self.dirty).copied().collect();
+            self.file_inversions(&touched);
             self.say_records_unheaded(&touched, out);
             if !self.gone {
                 self.sync(&touched, out);
@@ -747,7 +769,9 @@ impl RarStore {
     // A set ends at the volume whose headers say no volume follows it. A
     // volume held past it was claimed on a number every set states alike:
     // it goes back at its close, as a misplaced one does, for the store
-    // whose set it is to claim.
+    // whose set it is to claim. One whose headers put it before that volume,
+    // held there on trust, is the set's, and is placed when the set is
+    // ordered at quiet.
     fn give_back_past_last(&mut self, out: &mut Vec<Emit>) {
         let Some(last) = self.last() else {
             return;
@@ -755,7 +779,9 @@ impl RarStore {
         let going: Vec<VolumeIndex> = self
             .volumes
             .range((Bound::Excluded(last), Bound::Unbounded))
-            .filter(|(_, found)| found.closed)
+            .filter(|(_, found)| {
+                found.closed && !found.stated().is_some_and(|facts| self.before_last(facts))
+            })
             .map(|(index, _)| *index)
             .collect();
         if !going.is_empty() {
@@ -989,6 +1015,11 @@ impl Object for RarStore {
         if std::mem::take(&mut self.rewritten) {
             self.acquit(out);
             self.settle(None, out);
+            return;
+        }
+        // Volumes held the wrong way round take their places now, and the
+        // set is judged once they are claimed there.
+        if self.order_at_quiet(out) {
             return;
         }
         if standing.liftable() && self.scattered() {
@@ -1253,7 +1284,8 @@ impl Object for RarStore {
             .numbered
             .as_ref()
             .is_some_and(|named| named.index() != volume.0)
-            && !stated;
+            && !stated
+            && found.ordered() != Some(volume);
         // The name is what settles a volume its headers do not place, and
         // what it settles is said now, as a length said anew is: a
         // checkpoint before the next delivery records the name, and a
