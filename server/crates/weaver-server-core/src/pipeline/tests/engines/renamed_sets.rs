@@ -694,6 +694,22 @@ async fn a_nameless_long_set_renamed_by_par2_is_one_store() {
 // delivered whole, whether the posts are taken in one by one or together.
 #[tokio::test]
 async fn a_pack_posted_under_one_stem_is_set_apart_by_its_header_names() {
+    shared_stem_pack(true).await;
+}
+
+// The same pack with no header name to set its archives apart: every
+// article's yEnc header carries the shared posted name, so only the
+// volumes' own headers say which belong together. A whole archive states
+// at its main header that it is no volume, and is a set of its own from its
+// first bytes, while it is still held short of its end; a set's volumes
+// state their numbers and join the set that numbering continues. Every clip
+// is delivered whole, one by one or together.
+#[tokio::test]
+async fn a_pack_posted_under_one_stem_is_set_apart_by_its_volume_headers() {
+    shared_stem_pack(false).await;
+}
+
+async fn shared_stem_pack(named: bool) {
     const STEM: &str = "494949c9892d64daac5664541a4cdd5af912";
     // (first posted number, volumes) of each set; a set of one is a whole
     // archive.
@@ -763,8 +779,10 @@ async fn a_pack_posted_under_one_stem_is_set_apart_by_its_header_names() {
             .map(|number| Post::plain(&posted(*number), by_number[number].1.clone()))
             .collect();
         let mut scenario = Scenario::new(posts).framed(FRAME);
-        for (file, number) in arrival.iter().enumerate() {
-            scenario = scenario.header(file as u32, &by_number[number].0);
+        if named {
+            for (file, number) in arrival.iter().enumerate() {
+                scenario = scenario.header(file as u32, &by_number[number].0);
+            }
         }
         let all: Vec<u32> = (0..arrival.len() as u32).collect();
         let scenario = match together {
