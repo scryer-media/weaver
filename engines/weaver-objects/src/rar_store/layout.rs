@@ -478,4 +478,49 @@ impl RarStore {
             });
         }
     }
+
+    // The record of each volume in `changed` held by its name alone, its
+    // headers stating nothing and no byte of its front in hand, as a
+    // volume claimed past its hole holds none: no header says
+    // where its record lies, and the record finds itself from the
+    // volume's end, as RAR finds a record whose volume lost its headers.
+    // It is said there, over no bytes, once the volume is closed;
+    // a volume said already is passed over, so the record its headers
+    // name once it is rebuilt is not said again.
+    pub(super) fn say_records_unheaded(
+        &mut self,
+        changed: &BTreeSet<VolumeIndex>,
+        out: &mut Vec<Emit>,
+    ) {
+        for volume in changed {
+            let Some(found) = self.volumes.get(volume) else {
+                continue;
+            };
+            let (Some(_), None, Some(length)) = (&found.name, found.stated(), found.length) else {
+                continue;
+            };
+            // Only a closed volume has lost its front for good: before then
+            // its first bytes may still be on their way.
+            if !found.closed || found.walk.hole(&found.kept, found.closed) > 0 {
+                continue;
+            }
+            let said = self
+                .recovery_said
+                .range((*volume, 0)..=(*volume, u64::MAX))
+                .next()
+                .is_some();
+            if said {
+                continue;
+            }
+            self.recovery_said.insert((*volume, length));
+            out.push(Emit::RecoveryAt {
+                volume: *volume,
+                range: ByteRange::new(length, length),
+                kind: RecoveryKind::Rar,
+                handed: self
+                    .header_password()
+                    .map_or_else(Handed::default, Handed::new),
+            });
+        }
+    }
 }

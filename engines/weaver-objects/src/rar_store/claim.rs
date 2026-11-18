@@ -3,8 +3,9 @@
 
 // Which sibling members are this set's volumes, and where in the set each
 // one is: the position the set gives it, never the order it arrived in.
-// Every volume of a RAR set starts with the signature, so a member without
-// one is never claimed. A volume is placed by what states its position: the
+// Every volume of a RAR set starts with the signature, so a member whose
+// front lacks one is never claimed; one whose front will never come is
+// claimed by its name alone. A volume is placed by what states its position: the
 // position its own headers give, else its name in the set's numbering, as in
 // a set numbered by its names alone. A posted name is a label a recovery set
 // may change later, so the headers outrank it, and a name they contradict
@@ -270,11 +271,20 @@ impl RarStore {
         self.placing_volume(name, first_bytes).claim(self)
     }
 
+    // A member offered by the bytes past its hole, its front never to
+    // come: nothing of it says it is a volume but its name, so only its
+    // name in the set's numbering places it, as in a set numbered by its
+    // names alone. A name no set's numbering places, or one the bound
+    // names do not share, places nothing.
+    pub(super) fn claim_past_hole(&self, name: &str) -> Claim {
+        self.placing(name, None, None).claim(self)
+    }
+
     fn placing_volume(&self, name: &str, first_bytes: &[u8]) -> Placing {
         let Some(format) = opens_rar(first_bytes) else {
             return Placing::default();
         };
-        self.placing(name, format, self.front_facts(first_bytes).as_ref())
+        self.placing(name, Some(format), self.front_facts(first_bytes).as_ref())
     }
 
     // A transferable volume is judged by its parsed headers, or by the
@@ -321,7 +331,7 @@ impl RarStore {
 
     fn placing_front(&self, name: &str, front: &[u8], facts: Option<&RarVolumeFacts>) -> Placing {
         match facts {
-            Some(facts) => self.placing(name, facts.archive_format(), Some(facts)),
+            Some(facts) => self.placing(name, Some(facts.archive_format()), Some(facts)),
             None => self.placing_volume(name, front),
         }
     }
@@ -363,14 +373,15 @@ impl RarStore {
     // The place a volume's headers and name give it in this set. Headers
     // that give it a place its name gives another set are judged by the
     // volumes beside it, by its file headers; a front that has none of
-    // those yet is not yet judged, and its place is what it gives now.
+    // those yet is not yet judged, and its place is what it gives now. A
+    // member with no front states no format.
     fn placing(
         &self,
         name: &str,
-        format: ArchiveFormat,
+        format: Option<ArchiveFormat>,
         facts: Option<&RarVolumeFacts>,
     ) -> Placing {
-        if self.holds_other_than(format) {
+        if format.is_some_and(|format| self.holds_other_than(format)) {
             return Placing::default();
         }
         // An archive whose headers say it is no volume is a set of one,
