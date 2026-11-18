@@ -196,6 +196,84 @@ async fn a_piece_with_a_block_being_written_is_not_taken_over() {
     );
 }
 
+// A piece taken over, given a failed write, given back, failed at its check
+// and fetched again: each time it is in flight, every block but its last is
+// marked under its lock, and only the last goes to the tracker and
+// completes it. A count of its received blocks out of step with its bits
+// would mark the last under the piece's lock, or send an earlier one to the
+// tracker.
+#[tokio::test(start_paused = true)]
+async fn a_piece_counts_its_received_blocks_through_a_steal_a_requeue_and_a_failed_check() {
+    let mut t = tracker(7);
+    let (slow, fast) = (peer(1), peer(2));
+    let piece = piece_of(&t, 0);
+    t.reserve_piece(piece, slow);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for i in 1..PIECES {
+        t.reserve_piece(piece_of(&t, i), slow);
+    }
+    let block = |t: &PieceTracker, i| chunk_of(t, 0, i);
+    let land = |t: &PieceTracker, i, who| {
+        let c = block(t, i);
+        assert!(matches!(
+            t.slots().arrive(&c, who, |_, _| true),
+            Some(Arrival::Write { .. })
+        ));
+        t.slots().mark(&c, who)
+    };
+    assert!(land(&t, 0, slow));
+    assert_eq!(t.chunks().received_chunks(piece), 1);
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    // Taken over.
+    match t.acquire_piece(ask(fast, Some(Duration::from_millis(1)))) {
+        AcquireResult::Stolen { piece: stolen, .. } => assert_eq!(stolen, piece),
+        other => panic!("expected the first piece taken over, got {other:?}"),
+    }
+    // A write that fails leaves the count as it was.
+    let c = block(&t, 1);
+    assert!(matches!(
+        t.slots().arrive(&c, fast, |_, _| true),
+        Some(Arrival::Write { .. })
+    ));
+    assert!(t.slots().write_failed(&c));
+    assert_eq!(t.chunks().received_chunks(piece), 1);
+
+    // Given back with its block, and granted again.
+    assert_eq!(t.release_pieces_owned_by(fast), 1);
+    t.reserve_piece(piece, fast);
+    assert!(land(&t, 1, fast));
+    assert!(land(&t, 2, fast));
+    assert!(!land(&t, 3, fast));
+    assert!(matches!(
+        {
+            let c = block(&t, 3);
+            mark_slow(&mut t, &c, fast)
+        },
+        ChunkMarkingResult::Completed
+    ));
+    t.take_inflight(piece);
+
+    // Its check fails: every block goes, and it is fetched whole again.
+    t.mark_piece_hash_failed(piece);
+    assert_eq!(t.chunks().received_chunks(piece), 0);
+    t.reserve_piece(piece, slow);
+    for i in 0..CHUNKS - 1 {
+        assert!(land(&t, i, slow), "block {i} is not the last");
+    }
+    assert!(!land(&t, CHUNKS - 1, slow));
+    assert!(matches!(
+        {
+            let c = block(&t, CHUNKS - 1);
+            mark_slow(&mut t, &c, slow)
+        },
+        ChunkMarkingResult::Completed
+    ));
+    t.take_inflight(piece);
+    t.mark_piece_hash_ok(piece);
+    assert!(t.chunks().is_piece_have(piece));
+}
+
 // Peers write their pieces' blocks on their own threads, the last of each
 // under the torrent's lock, while another thread picks, doubles, snubs and
 // looks under it: every block is marked once, every piece completes once,

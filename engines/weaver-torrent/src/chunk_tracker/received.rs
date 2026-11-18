@@ -73,29 +73,52 @@ impl Received {
         (range.start <= range.end && range.end <= self.len).then_some(range)
     }
 
+    // Each byte `range` touches, with the mask of its bits in `range`: one
+    // load a byte, not one a bit.
+    fn bytes_of(&self, range: Range<usize>) -> impl Iterator<Item = (&AtomicU8, u8)> {
+        let bytes = if range.is_empty() {
+            0..0
+        } else {
+            range.start / 8..(range.end - 1) / 8 + 1
+        };
+        bytes.map(move |byte| {
+            let lo = range.start.saturating_sub(byte * 8).min(8);
+            let hi = (range.end - byte * 8).min(8);
+            let mask = u8::try_from((0xffu16 >> lo) & !(0xffu16 >> hi)).expect("eight bits");
+            (&self.bytes[byte], mask)
+        })
+    }
+
     /// How many blocks of `range` were received; 0 for a range past the end.
     pub(crate) fn count(&self, range: Range<usize>) -> usize {
-        self.within(range)
-            .map_or(0, |range| range.filter(|at| self.get(*at)).count())
+        self.within(range).map_or(0, |range| {
+            self.bytes_of(range)
+                .map(|(byte, mask)| (byte.load(Ordering::Acquire) & mask).count_ones() as usize)
+                .sum()
+        })
     }
 
     /// Whether any block of `range` was received.
     pub(crate) fn any(&self, range: Range<usize>) -> Option<bool> {
-        self.within(range)
-            .map(|mut range| range.any(|at| self.get(at)))
+        self.within(range).map(|range| {
+            self.bytes_of(range)
+                .any(|(byte, mask)| byte.load(Ordering::Acquire) & mask != 0)
+        })
     }
 
     /// Whether every block of `range` was received.
     pub(crate) fn all(&self, range: Range<usize>) -> Option<bool> {
-        self.within(range)
-            .map(|mut range| range.all(|at| self.get(at)))
+        self.within(range).map(|range| {
+            self.bytes_of(range)
+                .all(|(byte, mask)| byte.load(Ordering::Acquire) & mask == mask)
+        })
     }
 
     /// No block of `range` is received any more.
     pub(crate) fn clear(&self, range: Range<usize>) {
         if let Some(range) = self.within(range) {
-            for at in range {
-                self.set(at, false);
+            for (byte, mask) in self.bytes_of(range) {
+                byte.fetch_and(!mask, Ordering::AcqRel);
             }
         }
     }
@@ -141,5 +164,34 @@ mod tests {
         want.set(9, false);
         want.set(12, false);
         assert_eq!(received.to_bits(), want.into_boxed_bitslice());
+    }
+
+    // Every range of every bit pattern up to three bytes and a bit reads,
+    // and clears, as the bitfield's slice of it does, across byte edges.
+    #[test]
+    fn a_range_read_a_byte_at_a_time_matches_the_bitfield_bit_by_bit() {
+        for len in 0..=25usize {
+            for seed in [0u32, 0x5a5a_5a5a, 0xffff_ffff, 0x0123_4567, 0x8000_0001] {
+                let mut bits: BitVec<u8, Msb0> = BitVec::repeat(false, len);
+                for at in 0..len {
+                    bits.set(at, seed.rotate_left(u32::try_from(at).unwrap()) & 1 == 1);
+                }
+                let bits = bits.into_boxed_bitslice();
+                let received = Received::from_bits(&bits);
+                for start in 0..=len {
+                    for end in start..=len {
+                        let slice = &bits[start..end];
+                        assert_eq!(received.count(start..end), slice.count_ones());
+                        assert_eq!(received.any(start..end), Some(slice.any()));
+                        assert_eq!(received.all(start..end), Some(slice.all()));
+                        let cleared = Received::from_bits(&bits);
+                        cleared.clear(start..end);
+                        let mut want = bits.to_bitvec();
+                        want[start..end].fill(false);
+                        assert_eq!(cleared.to_bits(), want.into_boxed_bitslice());
+                    }
+                }
+            }
+        }
     }
 }
