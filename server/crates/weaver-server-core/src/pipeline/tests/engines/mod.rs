@@ -105,6 +105,7 @@ pub(in crate::pipeline) mod loans;
 mod lost_fronts;
 mod nested_engine_fault;
 mod nesting;
+mod obfuscated_revs;
 mod pairings;
 mod par3;
 mod partial;

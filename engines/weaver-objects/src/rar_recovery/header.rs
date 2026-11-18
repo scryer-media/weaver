@@ -43,6 +43,16 @@ pub(super) struct Header {
     pub(super) last_described: bool,
 }
 
+impl Header {
+    // The header as far as it ties a recovery volume to one set: a RAR5
+    // table, signed and checksummed, giving each data volume's size and
+    // CRC32. Every recovery volume of a set carries the same; a RAR3
+    // footer gives counts alone, which any set of that shape shares.
+    pub(super) fn table(self) -> Option<Header> {
+        (!self.crcs.is_empty()).then_some(self)
+    }
+}
+
 pub(super) enum Read {
     Header(Header),
     // The front holds no complete header yet: this many bytes would.
