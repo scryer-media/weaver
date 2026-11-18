@@ -11,12 +11,13 @@
 // A layout the store gives the set up over never becomes its map: no byte
 // was placed by it, so the bytes go back from where the last one put them.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, RarVolumeFacts,
-    StoredLayoutBuilder, StoredMember,
+    RarVolumeMemberFacts, StoredLayoutBuilder, StoredMember,
 };
 use weaver_graph::{ByteRange, Coverage, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
@@ -95,11 +96,38 @@ fn lays(index: VolumeIndex, found: &Volume) -> Option<(&RarVolumeFacts, bool)> {
     Some((facts, found.walk.ended && !found.walk.is_last()))
 }
 
+// The member a volume ends on, when it carries on into the next one.
+fn carried_on(facts: &RarVolumeFacts) -> Option<&RarVolumeMemberFacts> {
+    let last = facts.members.iter().max_by_key(|member| member.order)?;
+    last.split_after.then_some(last)
+}
+
+// Where among `facts`' members sits the one the volume opens on, when it
+// carries on `tail`, the member the volume before ends on, under another
+// name. Which set a volume is of, and where in it, is the claim's to say,
+// and a name is evidence there. Once the volume is laid after the one
+// before, RAR reads the part it opens on as the part that volume carries
+// on, by place alone: unrar's MergeArchive compares no names, and a packer
+// may name a member one way in its first part and another in the rest.
+// Both headers state the whole member's size, and the two parts are of one
+// member only when they state the same one.
+fn renamed_continuation(tail: &RarVolumeMemberFacts, facts: &RarVolumeFacts) -> Option<usize> {
+    let (at, head) = facts
+        .members
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, member)| member.order)?;
+    let same_size = head.unpacked_size.is_some() && head.unpacked_size == tail.unpacked_size;
+    (head.split_before && head.name != tail.name && same_size).then_some(at)
+}
+
 // A layout and, for each volume it holds, the facts it took it on: their
-// stamp and how many members they list.
+// stamp and how many members they list, and the member it ends on when it
+// carries one on, as the layout took it.
 pub(super) struct Laid {
     builder: StoredLayoutBuilder,
     added: BTreeMap<u32, (u64, usize)>,
+    tails: BTreeMap<u32, RarVolumeMemberFacts>,
 }
 
 impl std::ops::Deref for Laid {
@@ -115,7 +143,27 @@ impl Laid {
         Self {
             builder: StoredLayoutBuilder::new(format),
             added: BTreeMap::new(),
+            tails: BTreeMap::new(),
         }
+    }
+
+    // A volume's facts as the layout takes them. The builder links a
+    // member's parts by name, so a volume that opens on the member the one
+    // before carries on, named otherwise, has it under the name the layout
+    // took that member by: the name its first part gives it, as unrar
+    // extracts it.
+    fn joined<'a>(&self, index: u32, facts: &'a RarVolumeFacts) -> Cow<'a, RarVolumeFacts> {
+        let renamed = index
+            .checked_sub(1)
+            .and_then(|before| self.tails.get(&before))
+            .and_then(|tail| Some((tail, renamed_continuation(tail, facts)?)));
+        let Some((tail, at)) = renamed else {
+            return Cow::Borrowed(facts);
+        };
+        let mut joined = facts.clone();
+        joined.members[at].name.clone_from(&tail.name);
+        joined.members[at].name_raw.clone_from(&tail.name_raw);
+        Cow::Owned(joined)
     }
 
     // Add a volume on its walk's facts, or say the layout refuses them.
@@ -139,19 +187,28 @@ impl Laid {
                 {
                     // Taking a volume it holds again changes nothing either
                     // way, so asking costs the test only time.
+                    let joined = self.joined(index, facts);
                     assert_eq!(
                         added,
-                        self.builder.add_volume(index, facts).is_ok(),
+                        self.builder.add_volume(index, &joined).is_ok(),
                         "the layout answers as known"
                     );
                     super::counts::bump(|counts| counts.known += 1);
                 }
-                added
+                return added;
             }
             None => {
                 #[cfg(test)]
                 super::counts::bump(|counts| counts.asked.push((index, walk.stamp)));
-                self.builder.add_volume(index, facts).is_ok()
+                let joined = self.joined(index, facts);
+                let added = self.builder.add_volume(index, &joined).is_ok();
+                if added {
+                    match carried_on(&joined) {
+                        Some(tail) => self.tails.insert(index, tail.clone()),
+                        None => self.tails.remove(&index),
+                    };
+                }
+                added
             }
         };
         if added {
