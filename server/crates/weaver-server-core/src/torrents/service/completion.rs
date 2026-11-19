@@ -12,6 +12,7 @@ use super::{
 use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::graph::status::{Delivery, Failure, shortfall_message};
 use crate::post_processing::model::QueueEvent;
 use crate::runtime::fs::JobMoves;
 use crate::runtime::panic_trap::JobScope;
@@ -99,7 +100,23 @@ impl TorrentService {
         job_id: JobId,
         store: &Arc<TorrentStore>,
         tee: &Arc<Tee>,
+        (delivery, failure): (Delivery, Option<Failure>),
     ) -> Placing {
+        // What the job delivered rules the unpacking as it rules a post's:
+        // short of whole, it ends short with the reason a post's would give,
+        // and with nothing whole delivered it places nothing.
+        let (nothing, part) = match delivery.status(failure.as_ref()) {
+            JobStatus::Complete => (None, None),
+            // Why, as a post's job words it: the failure, what was withheld
+            // or removed. Only when none says why, the delivery's own words
+            // that nothing it made was whole: the torrent's own files may
+            // be (`short_status`).
+            JobStatus::Failed { error } => (
+                Some(shortfall_message(&delivery, failure.as_ref()).unwrap_or(error)),
+                None,
+            ),
+            _ => (None, shortfall_message(&delivery, failure.as_ref())),
+        };
         let claimed = self
             .with_torrent(job_id, |torrent| {
                 if torrent.moving.is_some() || torrent.removing {
@@ -137,6 +154,11 @@ impl TorrentService {
         tee.forget();
         // The job's content policy, when it leaves unwanted files out.
         let removes = tee.with(|job| job.writer().removes().cloned());
+        if let Some(why) = nothing {
+            return self
+                .delivered_nothing(job_id, store, tee, spent, removes, why)
+                .await;
+        }
         let work = tee.work().to_path_buf();
         let (placing, tee, db) = (Arc::clone(store), Arc::clone(tee), self.inner.db.clone());
         let placed = tokio::task::spawn_blocking(move || {
@@ -235,7 +257,9 @@ impl TorrentService {
                 placed: placed.names,
             };
         }
-        if let Some(why) = removed {
+        // A delivery in part says what it lacks, what the policy left out
+        // among it.
+        if let Some(why) = part.or(removed) {
             return Placing::Short {
                 why,
                 placed: placed.names,
@@ -277,6 +301,48 @@ impl TorrentService {
         Placing::Short {
             why: unplaced(work, &error),
             placed: there,
+        }
+    }
+
+    // Unpacking delivered no usable file whole: nothing it made is placed,
+    // as a failed post's job publishes nothing, and what it made stays in
+    // its unpacking folder, but for a file with an extension the policy
+    // deletes, which goes as it does from any unpacking. The row is written
+    // as a placing of nothing, and the torrent ends short for `why`.
+    async fn delivered_nothing(
+        &self,
+        job_id: JobId,
+        store: &Arc<TorrentStore>,
+        tee: &Arc<Tee>,
+        spent: Vec<PathBuf>,
+        removes: Option<crate::post_processing::model::PostProcessingSettings>,
+        why: String,
+    ) -> Placing {
+        if let Some(policy) = removes {
+            let (store, tee) = (Arc::clone(store), Arc::clone(tee));
+            let removed = tokio::task::spawn_blocking(move || {
+                let _job = JobScope::enter(job_id);
+                let files = store.files();
+                let listed: HashSet<PathBuf> =
+                    files.names().flatten().map(Path::to_path_buf).collect();
+                let spent: HashSet<PathBuf> = spent.into_iter().collect();
+                remove_unwanted_outputs(tee.work(), &listed, &spent, &policy)
+            })
+            .await;
+            if let Ok(Err(error)) = removed {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unwanted unpacked files were not all removed");
+            }
+        }
+        let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
+            db.finish_torrent_unpack(job_id, &[], &[], &[])
+        });
+        if self.recorded(job_id, recorded.await) {
+            self.unpack_over(job_id).await;
+        }
+        self.unclaim_outputs(job_id).await;
+        Placing::Short {
+            why,
+            placed: Vec::new(),
         }
     }
 
@@ -561,12 +627,16 @@ impl TorrentService {
             };
             torrent.failed = Some(why.clone());
             let mut report = report(self.view(&settings, torrent, now), status.clone(), now);
-            // A partial delivery says so before why, as an NZB job's does.
-            report.shortfall = Some(if status == JobStatus::Partial {
-                format!("delivered in part; {why}")
-            } else {
-                why
-            });
+            // A partial delivery says so before why, as an NZB job's does;
+            // a reason its delivery worded (`shortfall_message`) already
+            // says so.
+            report.shortfall = Some(
+                if status == JobStatus::Partial && !why.contains("delivered in part") {
+                    format!("delivered in part; {why}")
+                } else {
+                    why
+                },
+            );
             (report, hashes_of(&torrent.record).best())
         };
         if matches!(status, JobStatus::Failed { .. }) {

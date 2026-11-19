@@ -39,7 +39,9 @@ use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::namespace::WriteError;
 use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::graph::status::RepairSlots;
+use crate::pipeline::graph::status::{
+    Delivery, Failure, Posted, RepairSlots, configured_par2_ignore_extensions, delivery_of,
+};
 use crate::runtime::panic_trap::JobScope;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -1353,6 +1355,42 @@ impl Tee {
     pub(crate) fn done(&self) -> bool {
         let job = self.locked();
         job.phase() == RootPhase::Done && !job.moves_waiting()
+    }
+
+    // What the job hands over, read as a post's job's delivery is: its
+    // root members are the torrent's files that went to it, in torrent
+    // order; one is recovery as its name lists it, and lost whole when the
+    // torrent does not want it, as no share of it ever comes. No post was
+    // given up, as a feed gives one up.
+    pub(crate) fn delivery(&self, wanted: impl Fn(usize) -> bool) -> (Delivery, Option<Failure>) {
+        let files: Vec<(usize, &str)> = self
+            .layout
+            .files()
+            .enumerate()
+            .filter(|(index, _)| self.plan.volume(*index).is_some())
+            .map(|(index, file)| (index, file.name.as_str()))
+            .collect();
+        let names: Vec<&str> = files.iter().map(|(_, name)| *name).collect();
+        let listed = weaver_graph::listed(&names);
+        let ignore = configured_par2_ignore_extensions();
+        let job = self.locked();
+        delivery_of(
+            &job,
+            Posted {
+                files: files.len() as u32,
+                payload: &|member| {
+                    listed
+                        .get(member.0 as usize)
+                        .is_none_or(|listed| *listed != Listed::Recovery)
+                },
+                lost: &|member| {
+                    let (file, name) = files.get(member.0 as usize)?;
+                    (!wanted(*file)).then_some(*name)
+                },
+                ignore: &ignore,
+                given_up: None,
+            },
+        )
     }
 
     // Checkpoint the job as it stands, its change queued for the database

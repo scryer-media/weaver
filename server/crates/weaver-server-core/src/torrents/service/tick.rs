@@ -233,7 +233,8 @@ impl TorrentService {
                 self.checkpoint_tee(job_id, Arc::clone(&tee), false).await;
             }
             if whole && tee.done() {
-                match self.unpacked(job_id, &store, &tee).await {
+                let delivered = tee.delivery(wanted);
+                match self.unpacked(job_id, &store, &tee, delivered).await {
                     Placing::Waits => {}
                     Placing::Placed => self.completed(job_id).await,
                     Placing::Short { why, placed } => {

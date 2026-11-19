@@ -1160,3 +1160,98 @@ async fn lose_unwanted_rules_every_share_of_an_unwanted_volume_lost() {
     assert!(lost.iter().all(|&index| settled(&tee, index)));
     tee.stop().await;
 }
+
+// A tee over the five volumes with the third unwanted, every other piece
+// delivered and the unwanted shares ruled lost: its give-up has volumes
+// left to read back. What its runs say is taken here, as the torrent's
+// task takes it, until the give-up is seen with volumes left; its own
+// wakes are taken on its own task.
+async fn mid_give_up(dir: &Path, mail: &mut RunMail) -> Arc<Tee> {
+    let volumes = volumes();
+    let layout = Arc::new(
+        PieceLayout::new(
+            16384,
+            volumes
+                .iter()
+                .map(|(name, bytes)| file(name, bytes.len() as u64))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let torrent: Vec<u8> = volumes
+        .iter()
+        .flat_map(|(_, bytes)| bytes.clone())
+        .collect();
+    let mut kept = storage(&dir.join("work"), mail, CapacityReader::unknown());
+    kept.passwords = vec![crate::jobs::ArchivePasswordCandidate::new(
+        crate::jobs::ArchivePasswordSource::Explicit,
+        "testpass123".to_owned(),
+    )];
+    let tee = Tee::fresh(
+        parts(&layout, &dir.join("work"), mail, Arc::default()),
+        kept,
+    );
+    let wanted = |file: usize| file != 2;
+    for index in 0..layout.piece_count() {
+        if layout.spans(index).iter().any(|span| wanted(span.file)) {
+            tee.deliver(index, &piece(&layout, &torrent, index));
+        }
+    }
+    tee.lose_unwanted(wanted).unwrap();
+    while !tee.with(|job| job.giving_up()) {
+        let said = mail.recv().await.unwrap();
+        tee.take(super::Word::Said(said, 1), (false, false));
+    }
+    tee
+}
+
+// What the tee's runs say is taken, as the torrent's task takes it, until
+// `until` ends; then its result.
+async fn taking_until<T>(
+    tee: &Tee,
+    mail: &mut RunMail,
+    until: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(until);
+    loop {
+        tokio::select! {
+            done = &mut until => return done,
+            said = mail.recv() => {
+                tee.take(super::Word::Said(said.unwrap(), 1), (false, false));
+            }
+        }
+    }
+}
+
+// A stop's checkpoint taken while a give-up has volumes left returns: the
+// give-up goes on, a volume a turn, on the job's own task, and the
+// checkpoint is taken once it is over.
+#[tokio::test]
+async fn a_stop_checkpoint_during_a_give_up_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mail = RunMail::default();
+    let tee = mid_give_up(dir.path(), &mut mail).await;
+    let stop = tokio::task::spawn_blocking({
+        let tee = Arc::clone(&tee);
+        move || tee.checkpoint_stopped()
+    });
+    taking_until(&tee, &mut mail, stop).await.unwrap().unwrap();
+    assert!(
+        !tee.with(|job| job.giving_up()),
+        "the give-up ran to its end"
+    );
+    taking_until(&tee, &mut mail, tee.stop()).await;
+    tee.forget();
+}
+
+// A tee stopped, as a removal stops it, while a give-up has volumes left
+// returns: it waits for runs and repairs out on their threads alone.
+#[tokio::test]
+async fn a_tee_stopped_during_a_give_up_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mail = RunMail::default();
+    let tee = mid_give_up(dir.path(), &mut mail).await;
+    taking_until(&tee, &mut mail, tee.stop()).await;
+    tee.stop_checkpoints();
+    tee.forget();
+}

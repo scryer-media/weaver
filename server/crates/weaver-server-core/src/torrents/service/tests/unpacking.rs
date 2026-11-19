@@ -1460,6 +1460,28 @@ async fn made_complete_and_reopened(restart: bool) {
     service.stop().await;
 }
 
+// The five volumes of the encrypted RAR set, by name, with their bytes.
+fn rar_set() -> Vec<(String, Vec<u8>)> {
+    fixtures(
+        "rar5",
+        (1..=5).map(|n| format!("rar5_enc_mv_video.part{n}.rar")),
+    )
+}
+
+// The named fixtures of `dir`, with their bytes.
+fn fixtures(dir: &str, names: impl Iterator<Item = String>) -> Vec<(String, Vec<u8>)> {
+    names
+        .map(|name| {
+            let path = format!(
+                "{}/tests/fixtures/{dir}/{name}",
+                std::env!("CARGO_MANIFEST_DIR")
+            );
+            let bytes = std::fs::read(path).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
 // A torrent unpacking the five volumes of a RAR set, `ignored` among them
 // left out, done: it completes, the set's give-up run to its end, a volume
 // a turn. Returns the rig, the job, every volume's bytes end to end, and the
@@ -1467,17 +1489,19 @@ async fn made_complete_and_reopened(restart: bool) {
 async fn ignoring_a_volume(
     ignored: usize,
 ) -> (Rig, JobId, Vec<u8>, Arc<crate::torrents::tee::Tee>) {
+    ignoring(rar_set(), &[ignored], 16384).await
+}
+
+// A torrent of `parts` unpacking, the files at `ignored` left out, done: it
+// completes, any give-up run to its end. Returns the rig, the job, every
+// file's bytes end to end, and the tee its store held, which it holds no
+// more: its unpacking is over.
+async fn ignoring(
+    parts: Vec<(String, Vec<u8>)>,
+    ignored: &[usize],
+    piece: usize,
+) -> (Rig, JobId, Vec<u8>, Arc<crate::torrents::tee::Tee>) {
     use FilePriority::*;
-    let parts: Vec<(String, Vec<u8>)> = (1..=5)
-        .map(|n| {
-            let name = format!("rar5_enc_mv_video.part{n}.rar");
-            let path = format!(
-                "{}/tests/fixtures/rar5/{name}",
-                std::env!("CARGO_MANIFEST_DIR")
-            );
-            (name, std::fs::read(path).unwrap())
-        })
-        .collect();
     let files: Vec<(&str, &[u8])> = parts
         .iter()
         .map(|(name, bytes)| (name.as_str(), &bytes[..]))
@@ -1491,12 +1515,14 @@ async fn ignoring_a_volume(
     let job_id = rig
         .service
         .add_opened(request(AddSource::Metainfo(metainfo(
-            "set", &files, 16384, false,
+            "set", &files, piece, false,
         ))))
         .await
         .unwrap();
+    let left_out: Vec<(u32, FilePriority)> =
+        ignored.iter().map(|&file| (file as u32, Ignored)).collect();
     rig.service
-        .set_file_priorities(job_id, &[(ignored as u32, Ignored)])
+        .set_file_priorities(job_id, &left_out)
         .await
         .unwrap();
     let tee = rig.service.inner.live.lock().await[&job_id]
@@ -1505,7 +1531,7 @@ async fn ignoring_a_volume(
         .unwrap()
         .tee()
         .unwrap();
-    let wanted = pieces_of(&rig.service, job_id, |file| file != ignored).await;
+    let wanted = pieces_of(&rig.service, job_id, |file| !ignored.contains(&file)).await;
     fetch_pieces(&rig.service, job_id, &whole, Some(&wanted), |_| {}).await;
     stored_complete(&rig.service, &rig.db, job_id).await;
     assert!(!tee.with(|job| job.giving_up()));
@@ -1519,6 +1545,185 @@ async fn ignoring_a_volume(
             .is_none()
     );
     (rig, job_id, whole, tee)
+}
+
+// How a torrent's unpacking ended, as its history row keeps it (none when
+// it completed: it seeds on, with no row), and what it placed beside its
+// files: its row's outputs and the names in its directory that are none of
+// its own files nor the directory's hidden marker.
+async fn ended(
+    rig: &Rig,
+    job_id: JobId,
+    own: &[(String, Vec<u8>)],
+) -> (String, Option<String>, Vec<String>, Vec<String>) {
+    let history = rig.db.get_job_history(job_id.0).unwrap();
+    let dir = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
+    let beside = contents(&dir)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !name.starts_with('.') && !own.iter().any(|(own, _)| own == name))
+        .collect();
+    let (status, error) = history.map_or(("none".to_owned(), None), |history| {
+        (history.status, history.error_message)
+    });
+    (
+        status,
+        error,
+        rig.db.torrent_outputs(job_id).unwrap(),
+        beside,
+    )
+}
+
+// A torrent of the five-volume RAR set that leaves out its first, a middle
+// or its last volume delivers nothing whole: its unpacking fails, as a post
+// missing that volume does, it places nothing, and it seeds on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacking_torrent_without_its_first_volume_places_nothing_and_fails() {
+    ignored_volume_fails(0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacking_torrent_without_a_middle_volume_places_nothing_and_fails() {
+    ignored_volume_fails(2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacking_torrent_without_its_last_volume_places_nothing_and_fails() {
+    ignored_volume_fails(4).await;
+}
+
+async fn ignored_volume_fails(ignored: usize) {
+    let (rig, job_id, _, _) = ignoring_a_volume(ignored).await;
+    let (status, error, outputs, beside) = ended(&rig, job_id, &rar_set()).await;
+    eprintln!("ignored {ignored}: {status} {error:?}");
+    assert_eq!(status, "failed");
+    assert!(error.is_some());
+    assert!(outputs.is_empty(), "{outputs:?}");
+    assert!(beside.is_empty(), "{beside:?}");
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().state,
+        TorrentState::Seeding
+    );
+    rig.service.stop().await;
+}
+
+// The set, nothing left out, unpacks whole and places what it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacking_torrent_that_leaves_nothing_out_completes() {
+    let (rig, job_id, _, _) = ignoring(rar_set(), &[], 16384).await;
+    let (status, error, outputs, beside) = ended(&rig, job_id, &rar_set()).await;
+    assert_eq!((status.as_str(), error), ("none", None));
+    assert_eq!(outputs, vec!["test_clip.mkv".to_owned()]);
+    assert_eq!(beside, outputs);
+    rig.service.stop().await;
+}
+
+// Two sets, one whole and the other short of a middle volume: the whole
+// set's file is delivered and placed, so the unpacking ends in part, as a
+// post with the same two sets does, saying what it lacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_of_two_sets_one_short_of_a_volume_ends_in_part() {
+    let mut parts = fixtures("rar5", std::iter::once("rar5_store.rar".to_owned()));
+    parts.extend(rar_set());
+    let (rig, job_id, _, _) = ignoring(parts.clone(), &[3], 16384).await;
+    let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
+    eprintln!("two sets: {status} {error:?} {outputs:?}");
+    assert_eq!(status, "partial");
+    assert!(error.unwrap().contains("delivered in part"));
+    assert!(!outputs.is_empty());
+    assert!(!outputs.iter().any(|name| name == "test_clip.mkv"));
+    assert_eq!(beside, outputs);
+    rig.service.stop().await;
+}
+
+// A set whose data comes whole and whose recovery files the torrent left
+// out unpacks whole: nothing needed the recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_that_leaves_out_its_recovery_with_its_data_whole_completes() {
+    let mut parts = fixtures("rar5", std::iter::once("rar5_store.rar".to_owned()));
+    let parity = torrent_parity(&[("rar5_store.rar", &parts[0].1)], 2);
+    let ignored: Vec<usize> = (1..=parity.len()).collect();
+    parts.extend(parity);
+    let (rig, job_id, _, _) = ignoring(parts.clone(), &ignored, 256).await;
+    let (status, error, outputs, _) = ended(&rig, job_id, &parts).await;
+    assert_eq!((status.as_str(), error), ("none", None));
+    assert!(!outputs.is_empty());
+    rig.service.stop().await;
+}
+
+// An archive and a plain file under one recovery set, the plain file left
+// out: the torrent never holds it, and the graph's ruling over the set
+// stands as it falls. Pinned as it is, for the operator's ruling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_beside_an_ignored_plain_file_under_one_recovery_set_ends_as_the_graph_rules() {
+    let archive = fixtures("rar5", std::iter::once("rar5_store.rar".to_owned()))
+        .remove(0)
+        .1;
+    let notes: Vec<u8> = (0..1500u32).map(|at| (at * 7 % 251) as u8).collect();
+    let mut parts = vec![
+        ("set.rar".to_owned(), archive.clone()),
+        ("notes.txt".to_owned(), notes.clone()),
+    ];
+    parts.extend(torrent_parity(
+        &[("set.rar", &archive), ("notes.txt", &notes)],
+        2,
+    ));
+    let (rig, job_id, _, _) = ignoring(parts.clone(), &[1], 256).await;
+    let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
+    assert_eq!(status, "partial");
+    assert_eq!(
+        error.as_deref(),
+        Some("delivered in part; unrepaired: notes.txt")
+    );
+    assert_eq!(outputs, vec!["small.txt".to_owned()]);
+    assert_eq!(beside, outputs);
+    rig.service.stop().await;
+}
+
+// A split 7z set short of a middle volume, and a file split in three short
+// of its middle part: each give-up runs to its end, and the unpacking fails
+// with nothing placed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_split_7z_set_short_of_a_volume_ends_and_fails() {
+    let parts = fixtures(
+        "sevenz",
+        (1..=7).map(|n| format!("generated_split_store_plain.7z.{n:03}")),
+    );
+    let (rig, job_id, _, _) = ignoring(parts.clone(), &[3], 16384).await;
+    let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
+    eprintln!("7z: {status} {error:?}");
+    assert_eq!(status, "failed");
+    assert!(
+        outputs.is_empty() && beside.is_empty(),
+        "{outputs:?} {beside:?}"
+    );
+    rig.service.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_split_file_short_of_a_part_ends_and_fails() {
+    let joined: Vec<u8> = (0..3 * 40_000u32).map(|at| (at * 13 % 251) as u8).collect();
+    let parts: Vec<(String, Vec<u8>)> = joined
+        .chunks(40_000)
+        .zip(1..)
+        .map(|(chunk, n)| (format!("clip.mkv.{n:03}"), chunk.to_vec()))
+        .collect();
+    let (rig, job_id, _, _) = ignoring(parts.clone(), &[1], 16384).await;
+    let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
+    eprintln!("split: {status} {error:?}");
+    assert_eq!(status, "failed");
+    assert!(
+        outputs.is_empty() && beside.is_empty(),
+        "{outputs:?} {beside:?}"
+    );
+    rig.service.stop().await;
 }
 
 // A torrent unpacking a five-volume RAR set whose third volume it does not
@@ -1537,7 +1742,8 @@ async fn an_unpacking_torrent_that_ignores_a_volume_of_its_set_completes() {
 // The volume it ignored, wanted again once its unpacking is over, is
 // fetched and the torrent completes again with no tee: the store let go
 // of the one it held, so nothing it fetches goes to the job, nothing is
-// written to its unpacking directory and nothing is placed.
+// written to its unpacking directory, which its failed unpacking kept as a
+// failed post's job keeps its own, and nothing is placed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_volume_wanted_again_after_unpacking_is_over_goes_to_no_tee() {
     use FilePriority::*;
@@ -1552,6 +1758,8 @@ async fn a_volume_wanted_again_after_unpacking_is_over_goes_to_no_tee() {
     );
     let outputs = rig.db.torrent_outputs(job_id).unwrap();
     let placed = contents(&dir);
+    let unpacking = rig.service.unpacking_dir(job_id);
+    let kept = contents(&unpacking);
     rig.service
         .set_file_priorities(job_id, &[(2, Normal)])
         .await
@@ -1567,7 +1775,7 @@ async fn a_volume_wanted_again_after_unpacking_is_over_goes_to_no_tee() {
     );
     // Nothing but this test holds the tee the store let go of.
     assert_eq!(Arc::strong_count(&tee), 1);
-    assert!(!rig.service.unpacking_dir(job_id).exists());
+    assert_eq!(contents(&unpacking), kept);
     assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), outputs);
     let names = |found: Vec<(String, Vec<u8>)>| -> Vec<String> {
         found.into_iter().map(|(name, _)| name).collect()

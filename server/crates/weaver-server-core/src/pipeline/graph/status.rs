@@ -33,6 +33,7 @@ use super::root::phase::RootPhase;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::extraction::ExtractionFailure;
 
+pub(crate) use crate::pipeline::completion::finalize::check::configured_par2_ignore_extensions;
 #[cfg(test)]
 pub(crate) use claims::Claim;
 pub(crate) use claims::Delivered;
@@ -41,6 +42,7 @@ pub(crate) use claims::Described;
 #[cfg(test)]
 pub(crate) use claims::root_furniture;
 pub(crate) use claims::{Delivery, Unarrived};
+pub(crate) use seams::{Posted, delivery_of, shortfall_message};
 pub(in crate::pipeline) use seams::{advance, recovery_volume};
 pub(crate) use slots::RepairSlots;
 pub(crate) use summary::{RecoverySummary, SetSummary};
