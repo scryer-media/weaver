@@ -627,9 +627,10 @@ impl Pipeline {
         };
         // What the sets of a member's namespace say of it: unrepaired where
         // a failed set covers it or the recovery carried for it went
-        // unused, and unchecked where a set of it vouched and none of its
-        // sets describes the member (SABnzbd's rule: only what a set
-        // describes is checked once one verified). The one place a member
+        // unused, vouched where a set that vouched covers it, and unchecked
+        // where a set of it vouched and none of its sets describes the
+        // member (SABnzbd's rule: only what a set describes is checked once
+        // one verified). The one place a member
         // is asked whether a set describes it.
         let described = |node: NodeId, member: MemberId| {
             let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
@@ -641,7 +642,9 @@ impl Pipeline {
                 return Described::Unrepaired;
             }
             let mut sets = summary.sets.iter().filter(|set| set.namespace == node);
-            if sets.clone().any(SetSummary::vouched) && !sets.any(|set| covers(set.node)) {
+            if sets.clone().any(|set| set.vouched() && covers(set.node)) {
+                Described::Vouched
+            } else if sets.clone().any(SetSummary::vouched) && !sets.any(|set| covers(set.node)) {
                 Described::Unchecked
             } else {
                 Described::Otherwise

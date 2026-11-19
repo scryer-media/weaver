@@ -1253,6 +1253,42 @@ async fn a_rar_whose_last_volume_never_arrives_fails_naming_it() {
     );
 }
 
+// The same set posted with no recovery beside a release's furniture, an
+// `.nfo` and a `file_id.diz`, that arrived whole: furniture never stands
+// for a delivery, and the job fails as the set alone does.
+#[tokio::test]
+async fn a_rar_short_of_a_volume_beside_whole_furniture_alone_fails() {
+    let mut volumes = store(3);
+    volumes.pop();
+    let mut posted = posts(&volumes);
+    posted.push(Post::plain(
+        "silver.horizon.nfo",
+        b"silver horizon\r\n".to_vec(),
+    ));
+    posted.push(Post::plain(
+        "file_id.diz",
+        b"silver horizon [1/3]\r\n".to_vec(),
+    ));
+    let outcome = try_run(&Scenario::new(posted))
+        .await
+        .unwrap_or_else(|stall| panic!("stalled at {:?}: {}", stall.status, stall.state));
+    assert_eq!(
+        outcome.graph().delivery.whole,
+        vec!["file_id.diz".to_string()],
+        "the root .nfo is dropped and the diz is delivered whole"
+    );
+    let error = "silver.horizon.part01.rar, silver.horizon.part02.rar never placed every member \
+                 it named: unable to find silver.horizon.part03.rar";
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Failed {
+            error: error.to_string()
+        }),
+        "{:?}",
+        outcome.failure
+    );
+}
+
 #[tokio::test]
 async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped()
 {

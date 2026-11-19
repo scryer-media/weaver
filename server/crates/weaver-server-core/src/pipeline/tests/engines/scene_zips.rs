@@ -908,3 +908,120 @@ async fn a_core_release_with_an_archive_inside_its_set_ends_complete() {
         );
     }
 }
+
+// The Badrock comic post as it was released: an outer stored RAR, its
+// volumes vouched clean by a PAR2 set at the root, holding scene zips. The
+// zips of one inner set hold all its volumes; one more zip holds the second
+// volume of another set whose first volume the release never carried
+// (`avecd0q.r00`, its `avecd0qa.zip` absent from the outer RAR). Nothing is
+// lost: the book is delivered whole and the lone volume as posted, and
+// SABnzbd ends the same files Completed, and so does Weaver: the set that
+// vouched for the outer volumes proved the bytes unpacked from them, the
+// lone volume among them, and nothing can open a set without its first
+// volume.
+#[tokio::test]
+async fn a_lone_tail_volume_the_release_never_carried_the_head_of_leaves_a_clean_job_complete() {
+    let posts = lone_tail_release(true);
+    let (lines, guard) = Lines::capture();
+    let outcome = run(&Scenario::new(posts)).await;
+    drop(guard);
+    let delivery = &outcome.graph().delivery;
+    assert_eq!(
+        outcome.files.get(&delivered(BOOK)),
+        Some(&book()),
+        "the book is delivered whole: {:?}",
+        outcome.files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        outcome
+            .files
+            .keys()
+            .any(|name| name.ends_with("avecd0q.r00")),
+        "the lone volume is delivered as posted: {:?}",
+        outcome.files.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        outcome.graph().outcomes,
+        vec![Some(weaver_graph::recovery::RepairOutcome::Clean)],
+        "the root set vouched clean"
+    );
+    assert!(
+        outcome.completed(),
+        "{:?} {:?} damaged {:?} unchecked {:?} refused {:#?} ruled {:#?}",
+        outcome.status,
+        outcome.failure,
+        delivery.damaged,
+        delivery.unchecked,
+        lines.of("object refused"),
+        lines.of("recovery set ruled"),
+    );
+}
+
+// The same release with no recovery set over it: nothing proves the lone
+// volume's bytes, and it is delivered damaged beside the whole book, so the
+// job ends Partial as it did.
+#[tokio::test]
+async fn a_lone_tail_volume_no_set_vouched_for_leaves_the_job_partial() {
+    let outcome = run(&Scenario::new(lone_tail_release(false))).await;
+    let delivery = &outcome.graph().delivery;
+    assert_eq!(
+        outcome.files.get(&delivered(BOOK)),
+        Some(&book()),
+        "the book is delivered whole: {:?}",
+        outcome.files.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Partial),
+        "{:?} damaged {:?} unchecked {:?}",
+        outcome.failure,
+        delivery.damaged,
+        delivery.unchecked
+    );
+    assert!(
+        delivery
+            .damaged
+            .iter()
+            .any(|name| name.ends_with("avecd0q.r00")),
+        "the lone volume is damaged: {:?}",
+        delivery.damaged
+    );
+}
+
+// The Badrock comic post's shape: an outer stored RAR of scene zips, one
+// zip holding the second volume of a set whose first volume it never
+// carried, with a PAR2 set over the outer volumes when `recovery` says so.
+fn lone_tail_release(recovery: bool) -> Vec<Post> {
+    let mut zips = zipped(&old_style(4));
+    let (lone, bytes) =
+        single_member_rar4_old_numbering_set("avecd0q", "quill.pdf", &book(), 3).remove(1);
+    zips.push((
+        "avecd0qb.zip".to_owned(),
+        zip(&[
+            ("file_id.diz", diz('b')),
+            ("avecd0q.nfo", nfo()),
+            (lone.as_str(), bytes),
+        ]),
+    ));
+    let entries: Vec<(&str, Vec<u8>)> = zips
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    let outer: Vec<(String, Vec<u8>)> = multi_member_store_set(&entries, 3)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| (format!("Duck.Tales.part{:02}.rar", index + 1), bytes))
+        .collect();
+    let described: Vec<(&str, &[u8])> = outer
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = outer
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    if recovery {
+        posts.extend(super::harness::par2_set("Duck.Tales", &described, 2));
+    }
+    posts
+}
