@@ -5,8 +5,8 @@
 // what its last repair came to. The repair decision and the script-facing PAR
 // status both read this one record, so they cannot disagree.
 
-use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{Kind, NodeId};
+use weaver_graph::recovery::{RepairOutcome, ShortSets};
+use weaver_graph::{Kind, MemberId, NodeId};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RecoverySummary {
@@ -25,9 +25,23 @@ pub(crate) struct SetSummary {
     pub(crate) name: String,
     // `None` before it ran a repair.
     pub(crate) outcome: Option<RepairOutcome>,
+    // Its sets that cannot rebuild what they bind, set by set, read only
+    // when the object rules impossible and can say so set by set. `None`
+    // otherwise: then its outcome rules every member it covers.
+    pub(crate) short: Option<ShortSets>,
 }
 
 impl SetSummary {
+    // Whether the object's ruling leaves the member short: every member it
+    // covers when it cannot say set by set, and otherwise those its short
+    // sets bind. `covers` says whether the object covers the member.
+    pub(crate) fn leaves_short(&self, member: MemberId, covers: impl FnOnce() -> bool) -> bool {
+        match &self.short {
+            Some(short) => short.sets.iter().any(|set| set.members.contains(&member)),
+            None => covers(),
+        }
+    }
+
     // Its last repair found the members whole or made them so.
     pub(crate) fn vouched(&self) -> bool {
         vouches(self.outcome)

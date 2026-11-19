@@ -352,16 +352,16 @@ pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Opti
         // filename. A misleading recovery suffix cannot hide an archive's
         // outputs, including those kept when the archive refused.
         let payload = |member: MemberId| is_payload(job, posted.payload, member);
-        // A set whose repair failed covers the member: each failed set with
-        // the namespace it lives in, as the summary read them once.
-        let failed: Vec<(NodeId, NodeId)> = failure
+        // A set whose repair failed covers the member: each failed object,
+        // with the namespace it lives in and its short sets, as the summary
+        // read them once.
+        let failed: Vec<&SetSummary> = failure
             .as_ref()
             .map(|failure| {
                 summary
                     .sets
                     .iter()
                     .filter(|set| failure.objects.contains(&set.node))
-                    .map(|set| (set.namespace, set.node))
                     .collect()
             })
             .unwrap_or_default();
@@ -392,9 +392,9 @@ pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Opti
         let described = |node: NodeId, member: MemberId| {
             let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
             if unruled(node)
-                || failed
-                    .iter()
-                    .any(|(namespace, set)| *namespace == node && covers(*set))
+                || failed.iter().any(|set| {
+                    set.namespace == node && set.leaves_short(member, || covers(set.node))
+                })
             {
                 return Described::Unrepaired;
             }

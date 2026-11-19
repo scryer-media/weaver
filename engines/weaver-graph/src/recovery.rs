@@ -6,6 +6,8 @@
 // beside it; it verifies them from evidence the namespace hands it as bytes
 // pass, and repairs them by asking up for its recovery data.
 
+use std::collections::BTreeSet;
+
 use crate::engine::Budget;
 use crate::member::{MemberId, Namespace};
 use crate::seek::Seek;
@@ -61,6 +63,29 @@ pub struct SetRuling {
     // The ruling read member bytes back; a clean one that did not was
     // vouched for by the evidence fed as bytes passed.
     pub read: bool,
+    // What the set is called where it was posted, when its object can say:
+    // the file that carries it.
+    pub name: Option<String>,
+}
+
+// The sets of one object that cannot rebuild what they bind, set by set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShortSets {
+    pub sets: Vec<ShortSet>,
+    // Another set of the object bound members and found them whole or
+    // made them so.
+    pub vouched: bool,
+}
+
+// One set that ruled it cannot rebuild what it binds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortSet {
+    // What the set is called where it was posted, when its object can say.
+    pub name: Option<String>,
+    pub damaged: u64,
+    pub reachable: u64,
+    // The members it binds, which its ruling leaves short.
+    pub members: BTreeSet<MemberId>,
 }
 
 // Why a recovery set bound no member at all, as the object that holds it
@@ -293,6 +318,13 @@ pub trait Recovery {
     // Each set the object holds, in the order it repairs them. An object
     // with no sets of its own to name says nothing.
     fn sets(&self, _out: &mut Vec<SetRuling>) {}
+
+    // What each set of this object that stands ruled it cannot rebuild what
+    // it binds leaves short, when the object can say it set by set. `None`
+    // when it cannot: then its own outcome rules every member it covers.
+    fn short_sets(&self) -> Option<ShortSets> {
+        None
+    }
 
     // Each set the object holds that bound no member, with why, and one
     // with no identifier when it holds no set at all. Asked once, when the

@@ -30,6 +30,10 @@ pub(super) struct Catalogue {
     usable: usize,
     // Each entry counts the set's files under it.
     fronts: BTreeMap<(Front, Place), u32>,
+    // How many sets describe each front, and how many fronts more than one
+    // set describes: only then can a member move from one set to another.
+    sharing: BTreeMap<Front, u32>,
+    shared: usize,
     names: BTreeMap<(u64, Place), u32>,
     lengths: BTreeMap<(u64, Place), u32>,
     // Folded names are filed by a keyed hash, so posted names cannot be
@@ -43,7 +47,13 @@ impl Catalogue {
         self.usable += 1;
         for description in index.files.values() {
             let front = Front::described(description.length, description.hash_16k);
-            *self.fronts.entry((front, place)).or_default() += 1;
+            let count = self.fronts.entry((front, place)).or_default();
+            *count += 1;
+            if *count == 1 {
+                let sets = self.sharing.entry(front).or_default();
+                *sets += 1;
+                self.shared += usize::from(*sets == 2);
+            }
             let name = self.folded(&description.filename);
             *self.names.entry((name, place)).or_default() += 1;
         }
@@ -61,7 +71,15 @@ impl Catalogue {
         self.usable = self.usable.saturating_sub(1);
         for description in index.files.values() {
             let front = Front::described(description.length, description.hash_16k);
-            release(&mut self.fronts, (front, place));
+            if release(&mut self.fronts, (front, place))
+                && let Some(sets) = self.sharing.get_mut(&front)
+            {
+                self.shared -= usize::from(*sets == 2);
+                *sets -= 1;
+                if *sets == 0 {
+                    self.sharing.remove(&front);
+                }
+            }
             let name = self.folded(&description.filename);
             release(&mut self.names, (name, place));
         }
@@ -77,8 +95,15 @@ impl Catalogue {
     pub(super) fn clear(&mut self) {
         self.usable = 0;
         self.fronts.clear();
+        self.sharing.clear();
+        self.shared = 0;
         self.names.clear();
         self.lengths.clear();
+    }
+
+    // Whether two usable sets describe a file of one front.
+    pub(super) fn shares(&self) -> bool {
+        self.shared > 0
     }
 
     // Whether any usable set is filed.
@@ -117,6 +142,14 @@ impl Catalogue {
         })
     }
 
+    // The sets that describe a file whose front is `front`, each once, in
+    // order.
+    pub(super) fn fronted(&self, front: Front) -> impl Iterator<Item = Place> + '_ {
+        self.fronts
+            .range((front, FIRST)..=(front, LAST))
+            .map(|((_, place), _)| *place)
+    }
+
     // Every set with a protected file an unnamed member of `length` could
     // be, once or more each.
     pub(super) fn fitting(&self, length: Length, mut each: impl FnMut(Place)) {
@@ -134,13 +167,17 @@ impl Catalogue {
     }
 }
 
-fn release<K: Ord>(entries: &mut BTreeMap<K, u32>, key: K) {
-    if let Some(count) = entries.get_mut(&key) {
-        *count -= 1;
-        if *count == 0 {
-            entries.remove(&key);
-        }
+// Count one fewer under `key`; whether that was its last.
+fn release<K: Ord>(entries: &mut BTreeMap<K, u32>, key: K) -> bool {
+    let Some(count) = entries.get_mut(&key) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        entries.remove(&key);
+        return true;
     }
+    false
 }
 
 // A name as `eq_ignore_ascii_case` compares it.

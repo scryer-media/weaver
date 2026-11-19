@@ -125,6 +125,7 @@ fn set(kind: Kind, name: &str) -> SetSummary {
         namespace: NodeId::ROOT,
         name: name.to_string(),
         outcome: None,
+        short: None,
     }
 }
 
