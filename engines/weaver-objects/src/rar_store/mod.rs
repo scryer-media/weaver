@@ -47,11 +47,13 @@ use crate::keys::Keys;
 use crate::placed::Placed;
 use crate::rar_engine::naming;
 use crate::runs::CrcRuns;
+pub(crate) use walk::data_end;
 use walk::{Step, Walk};
 
 // How many volumes past the one being read are bid for. A solid set never
-// streams here, so only the non-solid window applies.
-const WINDOW: u32 = 8;
+// streams here, so only the non-solid window applies. The RAR engine bids
+// as far ahead for the tails that state its volumes' places.
+pub(crate) const WINDOW: u32 = 8;
 
 // One volume as the store holds it: everything it read of it, the headers
 // walked and the bytes kept for that, which is what travels with the member

@@ -147,17 +147,13 @@ fn orders(n: usize) -> Vec<Vec<usize>> {
 // the stored set's 6 and the compressed set's 24, each served forward and
 // backwards.
 //
-// Run on 2026-11-18, the compressed set fails in six orders served forward,
-// those with its third volume posted before its second: [2, 1, 0, 3],
-// [2, 3, 0, 1], [2, 0, 3, 1], [2, 0, 1, 3], [0, 2, 3, 1], [0, 2, 1, 3]. The
-// two middle volumes each only carry the member on, so their links place
-// them in the order they come; the store asks for an engine at the first
-// volume's front and hands them over so, and the engine places by fronts
-// that stop short of the end records, which state each one's number. Its
-// run reads them out of order, the member's checksum is wrong, and every
-// volume is said damaged, whole as each arrived.
+// The two middle volumes each only carry the member on, so their links
+// place them in the order they come, and the store hands them to an engine
+// with fronts that stop short of their end records: [0, 2, 1, 3] is held as
+// it came. The engine reads each one's tail, whose end record states its
+// number, and a volume its tail puts elsewhere goes back to be claimed
+// there, before its run reads the member's checksum.
 #[tokio::test]
-#[ignore = "a compressed nameless RAR4 set whose middle volumes come out of order: no owner reads the end records' numbers before the engine's run"]
 async fn a_nameless_rar_set_posted_in_any_order_completes() {
     let mut failures = Vec::new();
     for set in sets() {

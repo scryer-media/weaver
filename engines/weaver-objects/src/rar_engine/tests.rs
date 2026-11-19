@@ -30,6 +30,8 @@ const ENCRYPTED_LZ: &[u8] = include_bytes!(
 );
 const ENCRYPTED_LZ_MEMBER_LEN: u64 = 226_943;
 
+mod tails;
+
 // RAR5 store volumes, written here the way the format lays them out.
 mod rar5 {
     use super::crc32;

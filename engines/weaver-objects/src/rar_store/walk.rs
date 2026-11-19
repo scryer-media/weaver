@@ -131,7 +131,7 @@ fn signature_len(facts: &RarVolumeFacts) -> u64 {
 
 // Where the last data area the headers name ends: every byte before it is
 // a header or data the headers place.
-fn data_end(facts: &RarVolumeFacts) -> u64 {
+pub(crate) fn data_end(facts: &RarVolumeFacts) -> u64 {
     let members = facts
         .members
         .iter()
