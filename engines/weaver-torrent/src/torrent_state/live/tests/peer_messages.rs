@@ -595,6 +595,68 @@ async fn a_peer_whose_pieces_we_come_to_have_stops_being_interesting() {
     assert!(waiting(&mut requester, &mut rx));
 }
 
+// A piece that passes asks the torrent once what its seeders still have
+// for us, not once a seeder: they all have the same pieces.
+#[tokio::test]
+async fn a_passed_piece_asks_the_torrent_once_for_all_its_seeders() {
+    let h = Harness::new("once_for_all_seeders").await;
+    let peers: Vec<_> = (0..4)
+        .map(|i| h.new_peer(&format!("127.0.0.{}:6881", 1 + i)))
+        .collect();
+    for (peer, _rx) in &peers {
+        peer.on_bitfield(&bitfield_of(&[0, 1])).unwrap();
+        h.peers
+            .with_live_mut(peer.addr, "test", |live| {
+                assert!(live.seeder);
+                assert!(h.update_interest(live));
+            })
+            .unwrap();
+    }
+
+    let before = crate::piece_tracker::torrent_takes();
+    h.update_interest_of_holders(h.piece(0));
+    assert_eq!(crate::piece_tracker::torrent_takes() - before, 1);
+    for (peer, _rx) in &peers {
+        assert!(h.interesting(peer));
+    }
+}
+
+// The last wanted piece: every seeder stops being interesting, not only
+// the first one asked about.
+#[tokio::test]
+async fn every_seeder_stops_being_interesting_at_the_last_piece() {
+    let h = Harness::new("every_seeder_at_the_last").await;
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    let others: Vec<_> = (1..4)
+        .map(|i| h.new_peer(&format!("127.0.0.{}:6881", 1 + i)))
+        .collect();
+    peer.on_bitfield(&bitfield_of(&[0, 1])).unwrap();
+    for (other, _rx) in &others {
+        other.on_bitfield(&bitfield_of(&[0, 1])).unwrap();
+        h.peers
+            .with_live_mut(other.addr, "test", |live| assert!(h.update_interest(live)))
+            .unwrap();
+    }
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    peer.on_i_am_unchoked();
+    // Whichever piece the picker asks for first.
+    for _ in 0..PIECES {
+        let asked = next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await;
+        for (other, _rx) in &others {
+            assert!(h.interesting(other));
+        }
+        for request in asked {
+            h.deliver(&peer, request).await;
+        }
+    }
+    assert!(h.is_finished());
+    assert!(!h.interesting(&peer));
+    for (other, _rx) in &others {
+        assert!(!h.interesting(other));
+    }
+}
+
 // libtorrent `peer_connection::second_tick`: a connection neither side is
 // interested in ends after the inactivity timeout when connections run
 // short, while the torrent still downloads.
