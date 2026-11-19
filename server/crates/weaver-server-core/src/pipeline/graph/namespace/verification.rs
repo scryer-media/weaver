@@ -124,9 +124,9 @@ impl Verification {
                 // A wait for a turn ends when the job stops the check.
                 match reads {
                     Some(reads) => {
-                        match reading.read_unless(reads, &self.stop, || {
-                            read_exact_at(&file, at, into)
-                        }) {
+                        match reading
+                            .read_unless(reads, &self.stop, || read_exact_at(&file, at, into))
+                        {
                             Some(read) => read,
                             None => return Ok(None),
                         }
@@ -415,7 +415,11 @@ mod turns {
             stop.raise();
             assert_eq!(waiting.join().unwrap(), (Some(None), 0), "{kind:?}");
             drop(every);
-            assert_eq!(reads.turns().available_permits(), reads.readers(), "{kind:?}");
+            assert_eq!(
+                reads.turns().available_permits(),
+                reads.readers(),
+                "{kind:?}"
+            );
         }
     }
 }
