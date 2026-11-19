@@ -17,7 +17,7 @@ use unrar_rs::{KdfCache, RarVolumeFacts};
 use weaver_graph::{Extraction, Kind, VolumeIndex};
 
 use crate::engine::{EngineObject, Format, Holdings};
-use crate::rar_store::claim::{self, Held, Holds};
+use crate::rar_store::claim::{self, Held, Holds, Places};
 
 pub struct Rar;
 
@@ -131,13 +131,17 @@ impl Holds for Kept<'_> {
     fn at(&self, index: u32) -> Option<Held<'_>> {
         held(index, self.0.get(index)?.front)
     }
+}
 
-    fn indices(&self) -> impl Iterator<Item = u32> + '_ {
-        self.0.indices().filter(|index| {
-            self.0
-                .get(*index)
-                .is_some_and(|holding| held(*index, holding.front).is_some())
-        })
+// The engine files a volume as held where `held` holds it: bound, and not
+// where its front says it is not (`EngineObject::held`).
+impl Places for Kept<'_> {
+    fn beside(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.beside()
+    }
+
+    fn held(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.held()
     }
 }
 

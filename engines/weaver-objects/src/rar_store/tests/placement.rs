@@ -11,7 +11,7 @@
 use bytes::Bytes;
 use weaver_graph::{Effect, Kind, MemberId, NodeId, Posted, Provenance, Tree, VolumeIndex, Why};
 
-use super::super::counts;
+use super::super::{claim, counts};
 use super::writer::{Item, Options, Version, write};
 use super::{find, items, split};
 use crate::Objects;
@@ -1375,11 +1375,11 @@ fn a_set_named_one_place_on_is_held_where_its_names_put_it() {
 // index: the set is walked a bounded number of times, however long it is,
 // not once per volume placed.
 //
-// Measured on 2026-11-18: 4,950 volumes walked and 14,949 looked up for 100
-// volumes, 44,850 and 134,849 for 300, which is N(N-1)/2 walked, nine times
-// the work for three times the set.
+// Measured on 2026-11-18 before the engine filed the places beside its
+// volumes: 4,950 volumes walked and 14,949 looked up for 100 volumes, 44,850
+// and 134,849 for 300, which is N(N-1)/2 walked, nine times the work for
+// three times the set.
 #[test]
-#[ignore = "claim::place walks every bound volume once per volume placed by links (quadratic)"]
 fn a_long_nameless_compressed_set_walks_its_volumes_a_bounded_number_of_times() {
     for volumes in [100, 300] {
         let mut options = super::split(Version::Rar4);
@@ -1428,77 +1428,213 @@ fn a_long_nameless_compressed_set_walks_its_volumes_a_bounded_number_of_times() 
     }
 }
 
-// The held volumes of a stored set as `claim::place` reads them on the
-// store path, counting each index its walk over them yields.
-struct Walked<'a> {
-    held: &'a std::collections::BTreeMap<u32, super::super::claim::Held<'a>>,
-    walked: &'a std::cell::Cell<usize>,
-}
-
-impl super::super::claim::Holds for Walked<'_> {
-    fn at(&self, index: u32) -> Option<super::super::claim::Held<'_>> {
-        self.held.get(&index).copied()
-    }
-
-    fn indices(&self) -> impl Iterator<Item = u32> + '_ {
-        self.held
-            .keys()
-            .copied()
-            .inspect(|_| self.walked.set(self.walked.get() + 1))
-    }
-}
-
-// A long stored RAR4 set, its end records stating no number, its fronts
-// placed by their headers alone, in order, as a store claims each one under
-// a name that numbers nothing (`RarStore::claim_by_headers` asks
-// `claim::place` once per claim, over every volume bound). The walks over
-// the held volumes stay bounded, however long the set.
+// A long stored RAR4 set, its end records stating no number, posted in
+// order under names that number nothing. The store places each volume by
+// its headers' links alone (`RarStore::claim_by_headers` asks
+// `claim::place` once per claim): the places it reads of those it filed
+// beside the volumes held stay bounded, however long the set.
 //
-// Measured on 2026-11-18: 4,950 indices walked for 100 volumes, 44,850 for
-// 300: once over every held volume per volume placed.
+// Measured on 2026-11-18 before the store filed them: 4,950 held indices
+// walked for 100 volumes, 44,850 for 300, once over every held volume per
+// volume placed.
 #[test]
-#[ignore = "claim::place walks every held volume once per volume placed by links (quadratic)"]
 fn a_long_nameless_stored_set_placed_by_headers_walks_its_volumes_a_bounded_number_of_times() {
     for volumes in [100, 300] {
         let set = long_set(volumes);
-        let fronts: Vec<unrar_rs::RarVolumeFacts> = set
+        let mut run = Run::new();
+        run.enough = 4 * volumes;
+        let members: Vec<MemberId> = set
             .iter()
-            .map(|bytes| {
-                super::super::claim::front_facts(
-                    front(bytes),
-                    None,
-                    std::sync::Arc::new(unrar_rs::KdfCache::new()),
+            .enumerate()
+            .map(|(volume, bytes)| {
+                run.announce(
+                    &format!("{:032x}", 0x5707_0000 + volume as u64),
+                    bytes.len(),
                 )
-                .expect("a volume's front")
             })
             .collect();
-        let walked = std::cell::Cell::new(0);
-        let mut held = std::collections::BTreeMap::new();
-        for (volume, facts) in fronts.iter().enumerate() {
-            let placed = if held.is_empty() {
-                Some(VolumeIndex(0))
-            } else {
-                super::super::claim::place(
-                    facts,
-                    &Walked {
-                        held: &held,
-                        walked: &walked,
-                    },
-                )
-            };
-            assert_eq!(placed, Some(VolumeIndex(volume as u32)), "volume {volume}");
-            held.insert(
-                volume as u32,
-                super::super::claim::Held {
-                    facts: Some(facts),
-                    successor: None,
-                },
+        counts::take();
+        for (member, bytes) in members.iter().zip(&set) {
+            run.deliver(*member, 0, bytes);
+            run.close(*member);
+        }
+        let counted = counts::take();
+        let places = run.places(&members);
+        let store = places[0].map(|(node, _)| node);
+        assert_eq!(
+            store.and_then(|node| run.tree.kind(node)),
+            Some(Kind::RarStore)
+        );
+        for (volume, place) in places.iter().enumerate() {
+            assert_eq!(
+                *place,
+                store.map(|node| (node, VolumeIndex(volume as u32))),
+                "volume {volume}"
             );
         }
         assert!(
-            walked.get() <= 4 * volumes,
-            "{volumes} volumes: {} walked",
-            walked.get()
+            counted.beside <= 4 * volumes,
+            "{volumes} volumes: {} places read",
+            counted.beside
         );
+    }
+}
+
+// The held volumes with the places filed beside them, as an owner keeps
+// them, counting each place a placement reads.
+struct Filed<'a> {
+    held: std::collections::BTreeMap<u32, claim::Held<'a>>,
+    beside: crate::beside::Beside,
+    read: std::cell::Cell<usize>,
+}
+
+impl<'a> Filed<'a> {
+    fn new() -> Self {
+        Self {
+            held: std::collections::BTreeMap::new(),
+            beside: crate::beside::Beside::default(),
+            read: std::cell::Cell::new(0),
+        }
+    }
+
+    fn hold(&mut self, at: u32, facts: &'a unrar_rs::RarVolumeFacts) {
+        let held = claim::Held {
+            facts: Some(facts),
+            successor: None,
+        };
+        self.held.insert(at, held);
+        self.beside.file(at, true);
+    }
+
+    fn release(&mut self, at: u32) {
+        self.held.remove(&at);
+        self.beside.file(at, false);
+    }
+}
+
+impl claim::Holds for Filed<'_> {
+    fn at(&self, index: u32) -> Option<claim::Held<'_>> {
+        self.held.get(&index).copied()
+    }
+}
+
+impl claim::Places for Filed<'_> {
+    fn beside(&self) -> impl Iterator<Item = u32> + '_ {
+        self.beside
+            .free()
+            .inspect(|_| self.read.set(self.read.get() + 1))
+    }
+
+    fn held(&self) -> impl Iterator<Item = u32> + '_ {
+        self.beside
+            .held()
+            .inspect(|_| self.read.set(self.read.get() + 1))
+    }
+}
+
+// What a volume's front states, as the store reads it.
+fn facts(volume: &[u8]) -> unrar_rs::RarVolumeFacts {
+    claim::front_facts(
+        front(volume),
+        None,
+        std::sync::Arc::new(unrar_rs::KdfCache::new()),
+    )
+    .expect("a volume's front")
+}
+
+// Each volume of `fronts` arrives in `order` and is placed both by the
+// places filed beside the held ones and by a walk over every held volume, as
+// `place` read them before; held where the two place it, the first at the
+// first place, as a store founded on it holds it. Then each volume held in
+// `released` goes and comes back. The two agree on every placement: where
+// each one ends.
+fn placed_both_ways(
+    fronts: &[unrar_rs::RarVolumeFacts],
+    order: &[usize],
+    released: &[usize],
+) -> Vec<Option<u32>> {
+    let mut walked = std::collections::BTreeMap::new();
+    let mut filed = Filed::new();
+    let mut at = vec![None; fronts.len()];
+    for &volume in order {
+        at[volume] = place_both_ways(&fronts[volume], &mut walked, &mut filed);
+    }
+    for &volume in released {
+        let Some(held) = at[volume] else {
+            continue;
+        };
+        walked.remove(&held);
+        filed.release(held);
+        at[volume] = place_both_ways(&fronts[volume], &mut walked, &mut filed);
+    }
+    at
+}
+
+// One volume placed both ways, held where they place it.
+fn place_both_ways<'a>(
+    facts: &'a unrar_rs::RarVolumeFacts,
+    walked: &mut std::collections::BTreeMap<u32, claim::Held<'a>>,
+    filed: &mut Filed<'a>,
+) -> Option<u32> {
+    let old = claim::place(facts, &*walked);
+    let new = claim::place(facts, &*filed);
+    assert_eq!(new, old, "held {:?}", walked.keys().collect::<Vec<_>>());
+    let placed = match walked.is_empty() {
+        true => Some(VolumeIndex(0)),
+        false => new,
+    };
+    let placed = placed.filter(|placed| !walked.contains_key(&placed.0))?;
+    walked.insert(
+        placed.0,
+        claim::Held {
+            facts: Some(facts),
+            successor: None,
+        },
+    );
+    filed.hold(placed.0, facts);
+    Some(placed.0)
+}
+
+// The places filed beside the held volumes place every volume where the
+// walk over all of them placed it: a set in order, reversed, shuffled, two
+// sets under one stem interleaved, and a set with volumes missing, each
+// with volumes given back and claimed again.
+#[test]
+fn placing_by_the_places_filed_beside_held_volumes_matches_the_walk_over_them() {
+    let one: Vec<_> = long_set(12).iter().map(|volume| facts(volume)).collect();
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(5_000);
+    let other: Vec<_> = write(
+        &[Item::File("track.flac", payload(4, 8 * 5_000 - 1_100))],
+        &options,
+    )
+    .iter()
+    .map(|volume| facts(volume))
+    .collect();
+    assert_eq!(other.len(), 8);
+    let both: Vec<_> = one.iter().chain(&other).cloned().collect();
+    let in_order: Vec<usize> = (0..12).collect();
+    let reversed: Vec<usize> = (0..12).rev().collect();
+    let shuffled = vec![5, 0, 11, 3, 1, 8, 2, 10, 4, 9, 6, 7];
+    let interleaved: Vec<usize> = (0..12)
+        .flat_map(|volume| [Some(volume), (volume < 8).then_some(12 + volume)])
+        .flatten()
+        .collect();
+    let gaps: Vec<usize> = (0..12)
+        .filter(|volume| ![3, 7, 8].contains(volume))
+        .collect();
+    let cases: [(&[_], &[usize], &[usize]); 6] = [
+        (&one, &in_order, &[11, 5, 0]),
+        (&one, &reversed, &[11, 10]),
+        (&one, &shuffled, &[2, 3, 11]),
+        (&both, &interleaved, &[13, 4, 19]),
+        (&both, &(12..20).chain(0..12).collect::<Vec<_>>(), &[0, 12]),
+        (&one, &gaps, &[4, 9, 0]),
+    ];
+    for (fronts, order, released) in cases {
+        let at = placed_both_ways(fronts, order, released);
+        if std::ptr::eq(order, in_order.as_slice()) {
+            assert_eq!(at, (0..12).map(Some).collect::<Vec<_>>());
+        }
     }
 }

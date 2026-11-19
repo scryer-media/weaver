@@ -20,6 +20,7 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::ops::Bound;
+use std::sync::OnceLock;
 
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -28,6 +29,8 @@ use weaver_graph::{
     ByteRange, Claim, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, Located,
     MemberId, Object, Placement, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
+
+use crate::beside::Beside;
 
 pub(crate) use joined::Joined;
 
@@ -120,6 +123,7 @@ pub struct Holdings<'a, T> {
     bound: &'a BTreeSet<u32>,
     fronts: &'a BTreeMap<u32, T>,
     lengths: &'a BTreeMap<u32, u64>,
+    beside: &'a Beside,
     except: Option<u32>,
 }
 
@@ -133,13 +137,25 @@ impl<'a, T> Holdings<'a, T> {
         })
     }
 
-    // Every volume bound, in order: a walk over the set, for a placement
-    // that orders a volume by links alone.
-    pub fn indices(&self) -> impl Iterator<Item = u32> + 'a {
+    // The free places beside a volume held where its front does not say it
+    // is not, for a placement that orders a volume by links alone: the
+    // places filed beside them, and the one set aside, which is free here.
+    // More than the free places beside the others, never fewer.
+    pub(crate) fn beside(&self) -> impl Iterator<Item = u32> + 'a {
+        let except = self.except.filter(|index| self.beside.holds(*index));
+        self.beside.free().chain(except).inspect(|_| {
+            #[cfg(test)]
+            counts::bump(|counts| counts.walked += 1);
+        })
+    }
+
+    // Every volume held where its front does not say it is not, in order,
+    // but the one set aside: a walk over the set, asked only once no free
+    // place takes a volume.
+    pub(crate) fn held(&self) -> impl Iterator<Item = u32> + 'a {
         let except = self.except;
-        self.bound
-            .iter()
-            .copied()
+        self.beside
+            .held()
             .filter(move |index| Some(*index) != except)
             .inspect(|_| {
                 #[cfg(test)]
@@ -249,6 +265,12 @@ pub struct EngineObject<F: Format> {
     #[serde(default)]
     windows: BTreeMap<u32, u64>,
     bound: BTreeSet<u32>,
+    // The places held where a front does not say its volume is not, and
+    // the free places beside them (`Beside`), filed as a volume is bound,
+    // its front comes, or it goes. Built from `bound` and `fronts` at the
+    // first placement after a restore.
+    #[serde(skip)]
+    beside: OnceLock<Beside>,
     #[serde(skip)]
     password: Option<String>,
     // Its placement number, which never moves (`Object::placement`).
@@ -287,6 +309,7 @@ impl<F: Format> Default for EngineObject<F> {
             lengths: BTreeMap::new(),
             windows: BTreeMap::new(),
             bound: BTreeSet::new(),
+            beside: OnceLock::new(),
             password: None,
             placed: crate::placed::Placed::default(),
         }
@@ -317,7 +340,33 @@ impl<F: Format> EngineObject<F> {
             bound: &self.bound,
             fronts: &self.fronts,
             lengths: &self.lengths,
+            beside: self.beside.get_or_init(|| {
+                let mut beside = Beside::default();
+                for volume in &self.bound {
+                    beside.file(*volume, self.held(*volume));
+                }
+                beside
+            }),
             except,
+        }
+    }
+
+    // Whether a volume is held at `volume` as it places the others: bound,
+    // and not where its front says it is not.
+    fn held(&self, volume: u32) -> bool {
+        self.bound.contains(&volume)
+            && !self
+                .fronts
+                .get(&volume)
+                .is_some_and(|front| F::misplaced(front, volume))
+    }
+
+    // File where `volume` stands, as its binding or front changed, once
+    // the places are filed at all.
+    fn file(&mut self, volume: u32) {
+        let held = self.held(volume);
+        if let Some(beside) = self.beside.get_mut() {
+            beside.file(volume, held);
         }
     }
 
@@ -459,6 +508,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         }
         if let Some(front) = F::front(delivery.bytes) {
             self.fronts.entry(volume).or_insert(front);
+            self.file(volume);
         }
         if let Some(window) = F::window(delivery.bytes) {
             self.windows.entry(volume).or_insert(window);
@@ -557,6 +607,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             self.lengths.insert(volume.0, length);
         }
         self.bound.insert(volume.0);
+        self.file(volume.0);
     }
 
     // The name a recovery set gave the volume is the set's numbering now.
@@ -601,7 +652,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
-        self.bound.remove(&volume.0).then(|| {
+        let given = self.bound.remove(&volume.0).then(|| {
             self.names.remove(&volume.0);
             self.recovered.remove(&volume.0);
             Box::new(CarriedVolume {
@@ -609,7 +660,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
                 length: self.lengths.remove(&volume.0),
                 window: self.windows.remove(&volume.0),
             }) as weaver_graph::Carried
-        })
+        });
+        self.file(volume.0);
+        given
     }
 
     fn reclaim(
@@ -648,6 +701,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         self.bound(volume, name, front, carried.length.or(length));
         if let Some(front) = carried.front {
             self.fronts.insert(volume.0, front);
+            self.file(volume.0);
         }
         if let Some(window) = carried.window {
             self.windows.insert(volume.0, window);

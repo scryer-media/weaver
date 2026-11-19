@@ -32,6 +32,7 @@ use unrar_rs::{ArchiveFormat, KdfCache, RarArchive, RarVolumeFacts, RarVolumeMem
 use weaver_graph::{Claim, VolumeIndex};
 
 use super::{RarStore, Volume};
+use crate::beside::Beside;
 use crate::engine::SetName;
 use crate::rar_engine::naming;
 
@@ -48,15 +49,37 @@ pub(crate) struct Held<'a> {
 // where they are kept, never gathered for one claim.
 pub(crate) trait Holds {
     fn at(&self, index: u32) -> Option<Held<'_>>;
-    fn indices(&self) -> impl Iterator<Item = u32> + '_;
+}
+
+// The places a volume ordered by its links alone may take, as the owner of
+// the volumes held files them (`Beside`): never a walk over every volume
+// held for one placement.
+pub(crate) trait Places: Holds {
+    // The free places beside a held volume, or more: `place` keeps only a
+    // free one that fits.
+    fn beside(&self) -> impl Iterator<Item = u32> + '_;
+    // Every place held.
+    fn held(&self) -> impl Iterator<Item = u32> + '_;
 }
 
 impl Holds for BTreeMap<u32, Held<'_>> {
     fn at(&self, index: u32) -> Option<Held<'_>> {
         self.get(&index).copied()
     }
+}
 
-    fn indices(&self) -> impl Iterator<Item = u32> + '_ {
+// A walk over every volume held, for each placement: what `place` read
+// before the owners filed the places beside the held ones. Kept for the test
+// that compares the two.
+#[cfg(test)]
+impl Places for BTreeMap<u32, Held<'_>> {
+    fn beside(&self) -> impl Iterator<Item = u32> + '_ {
+        self.keys()
+            .flat_map(|index| [index.checked_sub(1), index.checked_add(1)])
+            .flatten()
+    }
+
+    fn held(&self) -> impl Iterator<Item = u32> + '_ {
         self.keys().copied()
     }
 }
@@ -76,17 +99,45 @@ fn held(index: VolumeIndex, volume: &Volume) -> Option<Held<'_>> {
     })
 }
 
+// Whether the store holds a volume at `index` as it places the next: what
+// the store files in its `Beside` wherever that may change.
+pub(super) fn holds(index: VolumeIndex, volume: &Volume) -> bool {
+    held(index, volume).is_some()
+}
+
 impl Holds for Bound<'_> {
     fn at(&self, index: u32) -> Option<Held<'_>> {
         let index = VolumeIndex(index);
         self.0.get(&index).and_then(|volume| held(index, volume))
     }
+}
 
-    fn indices(&self) -> impl Iterator<Item = u32> + '_ {
-        self.0
-            .iter()
-            .filter(|(index, volume)| held(**index, volume).is_some())
-            .map(|(index, _)| index.0)
+// The store's volumes with the places it filed beside them, for a
+// placement by links.
+struct Filed<'a> {
+    bound: Bound<'a>,
+    beside: &'a Beside,
+}
+
+impl Holds for Filed<'_> {
+    fn at(&self, index: u32) -> Option<Held<'_>> {
+        self.bound.at(index)
+    }
+}
+
+impl Places for Filed<'_> {
+    fn beside(&self) -> impl Iterator<Item = u32> + '_ {
+        self.beside.free().inspect(|_| {
+            #[cfg(test)]
+            super::counts::bump(|counts| counts.beside += 1);
+        })
+    }
+
+    fn held(&self) -> impl Iterator<Item = u32> + '_ {
+        self.beside.held().inspect(|_| {
+            #[cfg(test)]
+            super::counts::bump(|counts| counts.beside += 1);
+        })
     }
 }
 
@@ -472,15 +523,8 @@ impl RarStore {
         // is bound, the one this member's own name gives. Each bound name
         // was read once, when it was bound.
         let wanted = naming::parse(name);
-        let mut numbered = self
-            .volumes
-            .values()
-            .flat_map(Volume::numberings)
-            .peekable();
-        let bound = numbered.peek().is_some();
-        let ours = wanted
-            .as_ref()
-            .map(|wanted| numbered.any(|bound| bound.same_set(wanted)));
+        let bound = self.numberings.any();
+        let ours = wanted.as_ref().map(|wanted| self.numberings.holds(wanted));
         let named = wanted.is_some() && (!bound || ours == Some(true));
         // The name gives the volume to another set: it and the bound names
         // number sets, and not the same one.
@@ -573,7 +617,10 @@ impl RarStore {
     // The position this volume's headers give it beside the volumes held,
     // and whether a held volume beside it judged that position.
     fn claim_by_headers(&self, facts: &RarVolumeFacts) -> (Option<VolumeIndex>, bool) {
-        let held = Bound(&self.volumes);
+        let held = Filed {
+            bound: Bound(&self.volumes),
+            beside: &self.beside,
+        };
         (place(facts, &held), judged(facts, &held))
     }
 }
@@ -859,7 +906,7 @@ pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
 // where a RAR4 volume states its number. Where no free place takes it, it
 // is the one held place its neighbours link it to, posted again; whether it
 // is that volume its bytes say, which the tree compares.
-pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Holds) -> Option<VolumeIndex> {
+pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Places) -> Option<VolumeIndex> {
     let this = Nameless { facts };
     let joins = |previous: &Held<'_>, index: u32| {
         previous.successor != Some(false)
@@ -909,16 +956,17 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Holds) -> Option<VolumeI
             && before.is_none_or(|previous| joins(&previous, slot))
             && after.is_none_or(|(next, index)| precedes(&next, index))
     };
+    // A free place fits only beside a held volume, so the places the owner
+    // filed beside the held ones are every candidate. A held place is asked
+    // only once no free one fits.
     let lowest = held
-        .indices()
-        .flat_map(|index| [index.checked_sub(1), index.checked_add(1)])
-        .flatten()
+        .beside()
         .filter(|slot| held.at(*slot).is_none() && fits(*slot))
         .min();
     if let Some(lowest) = lowest {
         return Some(VolumeIndex(lowest));
     }
-    let mut again = held.indices().filter(|slot| fits(*slot));
+    let mut again = held.held().filter(|slot| fits(*slot));
     match (again.next(), again.next()) {
         (Some(only), None) => Some(VolumeIndex(only)),
         _ => None,
