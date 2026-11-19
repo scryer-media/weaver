@@ -618,6 +618,16 @@ impl Signal {
         self.marked(job_id, CHECKPOINT_PIECES);
     }
 
+    // Its checkpoint due at the settle, with nothing for it to look at: a
+    // torrent that completed keeps every piece it has at once, so a crash
+    // while it seeds fetches none again (qBittorrent asks for its resume
+    // data at finish, `TorrentImpl::handleTorrentFinished`,
+    // torrentimpl.cpp:2205).
+    pub(super) fn checkpoint_due(&self, job_id: JobId) {
+        *locked(&self.unsaved).entry(job_id).or_default() += CHECKPOINT_PIECES;
+        self.wake.notify_one();
+    }
+
     fn marked(&self, job_id: JobId, pieces: u32) {
         locked(&self.dirty).insert(job_id);
         *locked(&self.unsaved).entry(job_id).or_default() += pieces;

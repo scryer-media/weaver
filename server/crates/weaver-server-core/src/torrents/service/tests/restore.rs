@@ -2687,3 +2687,87 @@ async fn a_file_with_no_usable_time_is_judged_by_its_size() {
     assert_eq!((have, read), (2 * PIECES as u32, 0));
     again.stop().await;
 }
+
+// A torrent's checkpoint is written as it completes, however few pieces it
+// had unsaved, so a crash while it seeds restores every piece it had: the
+// restart fetches nothing, is not reopened, and its tracker hears no second
+// `completed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_after_completing_restores_every_piece() {
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let private = metainfo("set", &files, 16_384, true);
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &private, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let (url, mut answered) = answering_tracker(peer).await;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(private.to_vec())))
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    // Complete, and no settle under way after that was read: the one that
+    // completed it is over.
+    let mut settles = rig.service.inner.settled.subscribe();
+    settles
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+                && !rig
+                    .service
+                    .inner
+                    .settling
+                    .load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await
+        .unwrap();
+    // Four pieces, fewer than the CHECKPOINT_PIECES a checkpoint waits for,
+    // all kept by the settle that completed it.
+    assert_eq!(kept_pieces(&rig.db, job_id), 4);
+    answered
+        .wait_for(|events| events.iter().any(|(event, _)| event == "completed"))
+        .await
+        .unwrap();
+    // The process ends here: its sessions go with it, and nothing else is
+    // written.
+    rig.service.inner.sessions.stop_all().await;
+    seeding.stop().await;
+    let before = answered.borrow().len();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    {
+        let live = again.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert!(torrent.complete());
+        assert_eq!(torrent.store.as_ref().unwrap().count(), 4);
+    }
+    answered
+        .wait_for(|events| events.len() > before)
+        .await
+        .unwrap();
+    again.pause(job_id).await.unwrap();
+    let heard = answered
+        .wait_for(|events| events.len() > before + 1)
+        .await
+        .unwrap()[before..]
+        .iter()
+        .map(|(event, _)| event.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(heard, ["started", "stopped"]);
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.run_downloaded_bytes, 0);
+    assert!(view.completed_at_ms.is_some());
+    again.stop().await;
+}

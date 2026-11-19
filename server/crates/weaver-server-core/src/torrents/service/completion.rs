@@ -392,6 +392,7 @@ impl TorrentService {
             if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
             }
+            self.inner.signal.checkpoint_due(job_id);
             (
                 (
                     self.queue_resume(torrent, now, true),
