@@ -75,6 +75,11 @@ impl RootJob for Prepared {
         self.summary.clone()
     }
 
+    // Every set over every member: the whole namespace answers for each.
+    fn covers(&self, _: NodeId, _: MemberId) -> bool {
+        true
+    }
+
     fn repair(&mut self) -> Vec<RepairOutcome> {
         let outcomes = self.outcomes.get(self.repairs).cloned().unwrap_or_default();
         self.repairs += 1;

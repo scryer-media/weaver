@@ -22,7 +22,7 @@ mod summary;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
@@ -59,6 +59,8 @@ pub(crate) trait RootJob {
     fn namespace(&self, node: NodeId) -> Option<&Namespace>;
     // In the order `repair` reports outcomes.
     fn recovery_summary(&self) -> RecoverySummary;
+    // Whether the recovery object at `set` covers `member` of its namespace.
+    fn covers(&self, set: NodeId, member: MemberId) -> bool;
     // Run every recovery object of the root namespace.
     fn repair(&mut self) -> Vec<RepairOutcome>;
     // An object below the root produced members.
@@ -104,6 +106,12 @@ impl RootJob for GraphJob {
             })
             .collect();
         RecoverySummary { sets }
+    }
+
+    fn covers(&self, set: NodeId, member: MemberId) -> bool {
+        self.tree()
+            .recovery(set)
+            .is_some_and(|recovery| recovery.covers(member))
     }
 
     fn repair(&mut self) -> Vec<RepairOutcome> {
@@ -187,9 +195,11 @@ pub(crate) fn drive(
 
 // The objects that could not rebuild what they found, and that failure
 // worded as a recovery failure reads today, unless another object of its
-// namespace vouched for that namespace and left no damage in it: an object
-// that only checks never overrules one that repaired, but a repair of one
-// set never excuses another's. Each set is judged in the namespace it lives
+// namespace vouched for that namespace and left no damage in what the set
+// covers: an object that only checks never overrules one that repaired, but
+// a repair of one set never excuses another's, and damage the set does not
+// cover, a recovery volume nothing rebuilds, keeps no set's ruling standing.
+// Each set is judged in the namespace it lives
 // in, at whatever depth. A breach of the job's extraction budget fails the
 // job before any of that: it carries the budget's refusal, worded as the
 // job's failure reason, and names no object. When no set failed and the
@@ -230,10 +240,28 @@ pub(crate) fn failure(
     }
     let ruled: Vec<(&SetSummary, RepairOutcome)> =
         summary.sets.iter().zip(outcomes.iter().copied()).collect();
+    // The members not clean in each namespace a set ruled impossible in,
+    // read once: a set is excused when none of them is one it covers.
+    let unclean: BTreeMap<NodeId, Vec<MemberId>> = ruled
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, RepairOutcome::Impossible { .. }))
+        .map(|(set, _)| set.namespace)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|node| Some((node, job.namespace(node)?)))
+        .map(|(node, namespace)| {
+            let members = namespace
+                .members()
+                .filter(|member| !member.coverage.is_clean());
+            (node, members.map(|member| member.id).collect())
+        })
+        .collect();
     let excused = |set: &SetSummary| {
         ruled.iter().any(|(other, outcome)| {
             other.namespace == set.namespace && summary::vouches(Some(*outcome))
-        }) && job.namespace(set.namespace).is_none_or(Namespace::is_clean)
+        }) && unclean
+            .get(&set.namespace)
+            .is_none_or(|members| members.iter().all(|member| !job.covers(set.node, *member)))
     };
     let failed: Vec<(&SetSummary, u64, u64)> = ruled
         .iter()
