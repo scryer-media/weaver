@@ -481,3 +481,31 @@ async fn a_read_back_refused_for_room_another_job_holds_goes_again_once_that_roo
     assert_eq!(accountant.namespace_usage(rig.holds.namespace).resident, 0);
     rig.tee.forget();
 }
+
+// A piece that lands after its torrent's unpacking was stopped for a
+// removal, as one queued off the writer before the removal may, is taken
+// by no one: the job takes none of its shares, and nothing appears in the
+// job's directory.
+#[tokio::test]
+async fn a_piece_landing_after_its_unpacking_stopped_writes_nothing_in_the_jobs_directory() {
+    let rig = rig(false);
+    let store = rig.store(None);
+    rig.tee.stop().await;
+    let storage = rig.fetch_reading(&store, None, false);
+    drop(storage);
+    let mut left = Vec::new();
+    let mut dirs = vec![rig.tee.work().to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                left.push(path);
+            }
+        }
+    }
+    assert!(left.is_empty(), "{left:?}");
+    assert!(!rig.tee.done());
+    rig.tee.forget();
+}

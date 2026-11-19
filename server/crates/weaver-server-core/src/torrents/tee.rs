@@ -251,6 +251,10 @@ pub(crate) struct Tee {
     owes_lend: std::sync::atomic::AtomicBool,
     // The torrent is paused on its own: the job takes no slot.
     paused: std::sync::atomic::AtomicBool,
+    // The job's runs were stopped for the torrent going away: it takes no
+    // share in after, so nothing of it writes in its directory again. Set
+    // and read under the job's lock.
+    stopped: std::sync::atomic::AtomicBool,
     // The ticket the job took from the disk ledger as it began to wait for
     // room, `NO_TICKET` while it does not wait: the pipeline orders it by
     // this among the jobs it wakes, without the job's lock.
@@ -577,6 +581,7 @@ impl Tee {
             heard: tokio::sync::watch::Sender::new(0),
             owes_lend: std::sync::atomic::AtomicBool::new(false),
             paused: std::sync::atomic::AtomicBool::new(false),
+            stopped: std::sync::atomic::AtomicBool::new(false),
             disk_ticket: std::sync::atomic::AtomicU64::new(NO_TICKET),
             disk_wait: Mutex::new(None),
             #[cfg(test)]
@@ -980,6 +985,12 @@ impl Tee {
             return false;
         }
         let took = self.kept(self.with(|job| {
+            // A share that landed before its torrent went away, taken after
+            // the job's runs stopped, would write in a directory being
+            // deleted.
+            if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(false);
+            }
             let mut took = false;
             for (share, bytes) in select(job) {
                 if job.article_settled(share.volume, share.ordinal) {
@@ -1422,10 +1433,16 @@ impl Tee {
     }
 
     // The job's runs and repairs stopped, and waited on until each has said
-    // it ended: nothing of the job's writes in its directory after.
+    // it ended, and no share taken in after: nothing of the job's writes in
+    // its directory after.
     pub(crate) async fn stop(&self) {
         let mut heard = self.heard.subscribe();
-        self.locked().stop_runs(self.limit);
+        {
+            let mut job = self.locked();
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Release);
+            job.stop_runs(self.limit);
+        }
         loop {
             let out = self.locked().workers_out();
             if !out || heard.changed().await.is_err() {
