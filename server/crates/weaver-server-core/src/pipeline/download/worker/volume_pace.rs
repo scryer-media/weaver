@@ -17,10 +17,12 @@
 // no pipeline state. Each limit is a cap on what may wait, not memory taken
 // up front.
 
-use crate::operations::disk::volume::Volume;
-use crate::operations::disk::volume_buffers::{VOLUME_BUFFER_MEMORY_DIVISOR, VolumeLimits};
 use crate::pipeline::graph::disk::VolumeLeases;
 use crate::runtime::HardwareProfile;
+use weaver_server_disk::operations::disk::volume::Volume;
+use weaver_server_disk::operations::disk::volume_buffers::{
+    VOLUME_BUFFER_MEMORY_DIVISOR, VolumeLimits,
+};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -116,7 +118,7 @@ pub(in crate::pipeline) fn intake_of(volume: &Volume) -> VolumeIntake {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::disk::volume_buffers::volume_limits;
+    use weaver_server_disk::operations::disk::volume_buffers::volume_limits;
 
     const GIB: u64 = 1024 * MIB;
     // The reference load: 70 connections of 800,000 B articles.

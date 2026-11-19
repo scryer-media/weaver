@@ -30,7 +30,6 @@ use super::layout::{PieceLayout, Span};
 use super::relocate::MoveError;
 use super::service::Signal;
 use crate::jobs::graph_checkpoint::GraphCheckpoint;
-use crate::jobs::ids::JobId;
 use crate::persistence::checkpoint_write::CheckpointControl;
 use crate::pipeline::graph::checkpoint::{self, checkpoint_job};
 use crate::pipeline::graph::engine::{Heard, Hears, Outside, Said};
@@ -42,8 +41,9 @@ use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::{
     Delivery, Failure, Posted, RepairSlots, configured_par2_ignore_extensions, delivery_of,
 };
-use crate::runtime::panic_trap::JobScope;
 use tokio::sync::mpsc::UnboundedSender;
+use weaver_server_base::jobs::ids::JobId;
+use weaver_server_base::runtime::panic_trap::JobScope;
 
 #[cfg(test)]
 mod outputs_tests;
@@ -303,7 +303,7 @@ struct Share {
 }
 
 // What a torrent whose pieces are written block by block reads its shares
-// back from disk into: first a lease of scratch memory (`crate::scratch`)
+// back from disk into: first a lease of scratch memory (`weaver_server_disk::scratch`)
 // for the piece's shares at once, charged to the disk ledgers every job
 // shares, as a decode window is; where scratch refuses, one share at a time
 // in resident memory, each charged to the holds' resident budget before it
@@ -312,7 +312,7 @@ struct Share {
 // A share the budget has no room for waits, never over it: the piece is
 // kept on the bell, and read back again once room returns.
 pub(crate) struct Reading {
-    pub(crate) scratch: Arc<crate::scratch::Scratch>,
+    pub(crate) scratch: Arc<weaver_server_disk::scratch::Scratch>,
     pub(crate) holds: super::intake::Holds,
     bell: Arc<RoomBell>,
     // The most resident and scratch memory read-backs held at once.
@@ -321,7 +321,10 @@ pub(crate) struct Reading {
 }
 
 impl Reading {
-    pub(crate) fn new(scratch: Arc<crate::scratch::Scratch>, holds: super::intake::Holds) -> Self {
+    pub(crate) fn new(
+        scratch: Arc<weaver_server_disk::scratch::Scratch>,
+        holds: super::intake::Holds,
+    ) -> Self {
         Self {
             scratch,
             holds,
@@ -460,7 +463,7 @@ impl AsRef<[u8]> for Charged {
 // holds any of them. Let go, it rings the bell once the lease is gone.
 struct Leased {
     // Always there until dropped.
-    lease: Option<crate::scratch::Lease>,
+    lease: Option<weaver_server_disk::scratch::Lease>,
     bell: Arc<RoomBell>,
     #[cfg(test)]
     peaks: Arc<Peaks>,

@@ -4,8 +4,8 @@
 use super::*;
 use std::time::Duration;
 
-use crate::clock::{ManualClock, RuntimeClock};
 use crate::proxies::{ProxySecrets, RouteLeg};
+use weaver_server_base::clock::{ManualClock, RuntimeClock};
 
 fn interface(id: u32) -> EgressInterface {
     EgressInterface {

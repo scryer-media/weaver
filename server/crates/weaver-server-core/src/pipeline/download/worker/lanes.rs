@@ -808,7 +808,8 @@ impl Pipeline {
         event: OwnedDownloadLaneEvent,
         pending: &mut VecDeque<DownloadResult>,
     ) {
-        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.owned_lane.event");
+        let _cpu_scope =
+            weaver_server_base::runtime::perf_probe::cpu_scope("download.owned_lane.event");
         match event {
             OwnedDownloadLaneEvent::LeaseObsolete { lease } => {
                 self.restore_stopped_owned_lane_lease(lease);
@@ -848,7 +849,7 @@ impl Pipeline {
                         error = %error,
                         "owned blocking lane unavailable now; returning work to scheduler"
                     );
-                    crate::runtime::perf_probe::record_value(
+                    weaver_server_base::runtime::perf_probe::record_value(
                         "download.owned_lane.acquire_failed_capacity_requeue",
                         1,
                     );
@@ -879,7 +880,7 @@ impl Pipeline {
                         error = %error,
                         "owned blocking lane not opened: the server's network route is full; requeueing the leased articles after the lane-unavailable delay"
                     );
-                    crate::runtime::perf_probe::record_value(
+                    weaver_server_base::runtime::perf_probe::record_value(
                         "download.owned_lane.acquire_failed_route_capacity_requeue",
                         1,
                     );
@@ -890,7 +891,7 @@ impl Pipeline {
                         error = %error,
                         "owned blocking lane unavailable; failing the leased articles"
                     );
-                    crate::runtime::perf_probe::record_value(
+                    weaver_server_base::runtime::perf_probe::record_value(
                         "download.owned_lane.acquire_failed_lease_failed",
                         1,
                     );
@@ -992,35 +993,35 @@ impl Pipeline {
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.owned_lane.batch.results",
                     results.len() as u64,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.owned_lane.batch.unrequested_requeued",
                     unrequested_works.len() as u64,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.owned_lane.socket.reads",
                     stats.socket_reads,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.owned_lane.socket.writes",
                     stats.socket_writes,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.owned_lane.tls.recv_calls",
                     stats.tls_recv_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.owned_lane.tls.send_calls",
                     stats.tls_send_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.owned_lane.body_responses",
                     stats.body_responses,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.owned_lane.decoded_articles",
                     stats.decoded_articles,
                 );
@@ -1068,7 +1069,7 @@ impl Pipeline {
             "selection_contended" => "download.owned_lane.acquire_failed.selection_contended",
             _ => "download.owned_lane.acquire_failed.other",
         };
-        crate::runtime::perf_probe::record_value(metric, 1);
+        weaver_server_base::runtime::perf_probe::record_value(metric, 1);
         self.last_owned_lane_acquire_failure_at = Some(Instant::now());
 
         let Some(suppressed_since_last) = self

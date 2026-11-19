@@ -11,7 +11,6 @@ use super::{
     Delivery, RecoverySummary, RepairSlots, RootJob, SetSummary, Step, drive, failure, shown_status,
 };
 use crate::history::HistoryFailureKind;
-use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::{
     DownloadState, JobStatus, PostState, RunState, runtime_lanes_from_status_snapshot,
 };
@@ -23,6 +22,7 @@ use crate::pipeline::tests::{
     hear_graph_mail, insert_active_job, job_status_for_assert, new_direct_pipeline,
     standalone_job_spec, submit_decoded_segment,
 };
+use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
 // A graph job's reads, prepared by the test: a namespace, a summary, and the
 // outcomes each repair pass reports. Its phase derives from what the last

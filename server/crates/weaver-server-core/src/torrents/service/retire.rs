@@ -1327,7 +1327,7 @@ pub(crate) fn remove_history_files(
             && !swept.contains(folder)
         {
             swept.insert(folder.to_path_buf());
-            crate::runtime::fs::sweep_move_copies(job_id.0, folder);
+            weaver_server_disk::runtime::fs::sweep_move_copies(job_id.0, folder);
         }
         let found = match std::fs::symlink_metadata(&path) {
             Ok(found) => found,
@@ -1404,7 +1404,7 @@ pub(in crate::torrents) fn delete_written(deletion: &Deletion) {
         if let (true, Some(owner), Some(folder)) = (made, deletion.owner, path.parent())
             && swept.insert(folder)
         {
-            crate::runtime::fs::sweep_move_copies(owner.0, folder);
+            weaver_server_disk::runtime::fs::sweep_move_copies(owner.0, folder);
         }
         let removed = match std::fs::symlink_metadata(path) {
             Ok(found) if found.is_dir() => {

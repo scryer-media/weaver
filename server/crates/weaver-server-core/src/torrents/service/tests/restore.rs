@@ -348,7 +348,7 @@ async fn a_torrent_held_for_its_files_moved_to_an_empty_place_stays_held() {
 // takes it, and the resume restores it.
 #[tokio::test(start_paused = true)]
 async fn a_torrent_that_crashed_the_daemon_stays_paused_until_resumed() {
-    use crate::runtime::panic_trap::{Trap, boot_marks, read_marks, trapped};
+    use weaver_server_base::runtime::panic_trap::{Trap, boot_marks, read_marks, trapped};
     let archive = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar5/rar5_store.rar"
@@ -425,7 +425,7 @@ async fn a_torrent_that_crashed_the_daemon_stays_paused_until_resumed() {
 // runtime meets as its job joins the runs' mail.
 #[tokio::test(start_paused = true)]
 async fn a_panic_in_a_torrents_restore_leaves_its_marker_and_parks_it() {
-    use crate::runtime::panic_trap::{Trap, boot_marks, read_marks, trapped};
+    use weaver_server_base::runtime::panic_trap::{Trap, boot_marks, read_marks, trapped};
     let archive = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar5/rar5_store.rar"
@@ -518,7 +518,7 @@ async fn a_panic_in_a_torrents_restore_leaves_its_marker_and_parks_it() {
 // the torrent restores; parked first, the resume lets it go.
 #[tokio::test(start_paused = true)]
 async fn a_resume_racing_the_restore_pass_is_never_undone() {
-    use crate::runtime::panic_trap::{Trap, boot_marks, read_marks};
+    use weaver_server_base::runtime::panic_trap::{Trap, boot_marks, read_marks};
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
@@ -567,7 +567,7 @@ async fn a_resume_racing_the_restore_pass_is_never_undone() {
 // why until a resume.
 #[tokio::test(start_paused = true)]
 async fn a_stopped_torrent_that_crashed_the_daemon_says_why() {
-    use crate::runtime::panic_trap::{Trap, boot_marks};
+    use weaver_server_base::runtime::panic_trap::{Trap, boot_marks};
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();

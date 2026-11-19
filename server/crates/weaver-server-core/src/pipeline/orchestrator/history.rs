@@ -11,7 +11,7 @@ impl Pipeline {
         self.jobs.remove(&job_id);
         self.post_probes.forget(job_id);
         self.pipeline_failure_stages.remove(&job_id);
-        crate::runtime::job_debug_ring::forget(job_id.0);
+        weaver_server_base::runtime::job_debug_ring::forget(job_id.0);
         self.retire_stalled_download_lanes(job_id);
         self.job_order.retain(|id| *id != job_id);
         self.remove_pending_completion_check(job_id);
@@ -128,9 +128,9 @@ impl Pipeline {
         // `SystemTime::now()` and nothing on an article path.
         self.metrics.job_lifecycle.note_finished(
             if completed {
-                crate::operations::instrumentation::JobResultKind::Complete
+                weaver_server_base::operations::instrumentation::JobResultKind::Complete
             } else {
-                crate::operations::instrumentation::JobResultKind::Failed
+                weaver_server_base::operations::instrumentation::JobResultKind::Failed
             },
             state.spec.category.as_deref().unwrap_or(""),
             Some(state.created_at.elapsed()),
@@ -143,7 +143,7 @@ impl Pipeline {
         // still holding their pages because it was told to recycle them within
         // a job. Nothing will ask for them again, so give them back here
         // instead of leaving a job-sized working set resident.
-        crate::runtime::thread_release::release_job_completion_memory();
+        weaver_server_base::runtime::thread_release::release_job_completion_memory();
 
         let now = timestamp_secs() as i64;
         let elapsed_secs = state.created_at.elapsed().as_secs() as i64;

@@ -1224,7 +1224,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
                 work: DownloadWork {
                     counters: None,
                     segment_id,
-                    message_id: crate::jobs::ids::MessageId::new(&format!(
+                    message_id: weaver_server_base::jobs::ids::MessageId::new(&format!(
                         "<batch-{segment_number}>"
                     )),
                     groups: std::sync::Arc::from(Vec::<String>::new()),
@@ -2544,7 +2544,7 @@ async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
     pipeline.enqueue_download_work(DownloadWork {
         counters: None,
         segment_id,
-        message_id: crate::jobs::ids::MessageId::new("unservable@example.com"),
+        message_id: weaver_server_base::jobs::ids::MessageId::new("unservable@example.com"),
         groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority: 100,
         byte_estimate: 128,

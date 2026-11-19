@@ -237,10 +237,10 @@ mod tests {
     use tokio::sync::{RwLock, broadcast};
 
     use super::*;
-    use crate::events::model::PipelineEvent;
     use crate::persistence::sql_runtime::SqlRuntime;
     use crate::servers::{ServerConfig, ServerDownloadQuotaConfig};
     use crate::{PipelineMetrics, SharedPipelineState};
+    use weaver_server_base::events::model::PipelineEvent;
 
     fn server(id: u32) -> ServerConfig {
         ServerConfig {

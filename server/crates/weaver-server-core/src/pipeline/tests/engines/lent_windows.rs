@@ -35,7 +35,7 @@ use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
 use crate::pipeline::Pipeline;
 use crate::pipeline::graph::engine::{DecodePool, Heard};
 use crate::runtime::{HardwareProfile, OverLimit};
-use crate::scratch::{SPARE_DIR, Scratch};
+use weaver_server_disk::scratch::{SPARE_DIR, Scratch};
 
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;

@@ -362,7 +362,7 @@ fn intake_store(layout: &Arc<PieceLayout>, dir: &Path) -> (Arc<dyn Pieces>, watc
         store as Arc<dyn Pieces>,
         Room::new(
             Arc::new(crate::pipeline::ExtractionLimits::unbounded()),
-            crate::operations::disk::CapacityReader::unknown(),
+            weaver_server_disk::operations::disk::CapacityReader::unknown(),
         ),
         Box::new(move |heard| {
             if heard == Heard::Changed {

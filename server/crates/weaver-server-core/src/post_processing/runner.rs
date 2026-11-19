@@ -1464,7 +1464,10 @@ async fn execute_supervised(
     let spawn_started = Instant::now();
     let mut child = command.spawn()?;
     let supervisor_pid = child.id();
-    crate::runtime::perf_probe::record("pp.runner.spawn_supervisor", spawn_started.elapsed());
+    weaver_server_base::runtime::perf_probe::record(
+        "pp.runner.spawn_supervisor",
+        spawn_started.elapsed(),
+    );
     let request_json = serde_json::to_vec(&prepared.supervisor)
         .map_err(|error| RunnerError::SupervisorProtocol(error.to_string()))?;
     let request_length = u64::try_from(request_json.len())

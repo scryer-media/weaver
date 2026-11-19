@@ -195,7 +195,11 @@ impl SqlRuntime {
         let started = Instant::now();
         let _guard = writer_gate.lock().await;
         let result = run_with_sqlite_busy_retries(op_name, || op(pool.clone())).await;
-        crate::runtime::perf_probe::record_sql_op("sqlite", op_name, started.elapsed());
+        weaver_server_base::runtime::perf_probe::record_sql_op(
+            "sqlite",
+            op_name,
+            started.elapsed(),
+        );
         result
     }
 
@@ -222,7 +226,11 @@ impl SqlRuntime {
         let _guard = writer_gate.lock().await;
         let conn = pool.acquire().await.map_err(db_err)?;
         let result = op(conn).await;
-        crate::runtime::perf_probe::record_sql_op("sqlite", op_name, started.elapsed());
+        weaver_server_base::runtime::perf_probe::record_sql_op(
+            "sqlite",
+            op_name,
+            started.elapsed(),
+        );
         result
     }
 
@@ -242,7 +250,7 @@ impl SqlRuntime {
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query.execute(pool).await.map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "execute",
                     template,
@@ -257,7 +265,7 @@ impl SqlRuntime {
                     let started = Instant::now();
                     let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                     let outcome = query.execute(pool).await.map_err(db_err);
-                    crate::runtime::perf_probe::record_sql_statement(
+                    weaver_server_base::runtime::perf_probe::record_sql_statement(
                         "sqlite",
                         "execute",
                         template,
@@ -278,7 +286,7 @@ impl SqlRuntime {
                     let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                     let outcome = query.execute(pool).await.map_err(pg_db_err);
                     // Record each attempt's real query time, excluding retry sleeps.
-                    crate::runtime::perf_probe::record_sql_statement(
+                    weaver_server_base::runtime::perf_probe::record_sql_statement(
                         "postgres",
                         "execute",
                         template,
@@ -314,7 +322,7 @@ impl SqlRuntime {
                     .await
                     .map(|row| row.map(SqlRow::Sqlite))
                     .map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "execute_returning",
                     template,
@@ -332,7 +340,7 @@ impl SqlRuntime {
                         .await
                         .map(|row| row.map(SqlRow::Sqlite))
                         .map_err(db_err);
-                    crate::runtime::perf_probe::record_sql_statement(
+                    weaver_server_base::runtime::perf_probe::record_sql_statement(
                         "sqlite",
                         "execute_returning",
                         template,
@@ -356,7 +364,7 @@ impl SqlRuntime {
                         .map(|row| row.map(SqlRow::Postgres))
                         .map_err(pg_db_err);
                     // Record each attempt's real query time, excluding retry sleeps.
-                    crate::runtime::perf_probe::record_sql_statement(
+                    weaver_server_base::runtime::perf_probe::record_sql_statement(
                         "postgres",
                         "execute_returning",
                         template,
@@ -386,7 +394,7 @@ impl SqlRuntime {
                     .await
                     .map(|row| row.map(SqlRow::Sqlite))
                     .map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "fetch_optional",
                     template,
@@ -404,7 +412,7 @@ impl SqlRuntime {
                         .await
                         .map(|row| row.map(SqlRow::Sqlite))
                         .map_err(db_err);
-                    crate::runtime::perf_probe::record_sql_statement(
+                    weaver_server_base::runtime::perf_probe::record_sql_statement(
                         "sqlite",
                         "fetch_optional",
                         template,
@@ -425,7 +433,7 @@ impl SqlRuntime {
                         .await
                         .map(|row| row.map(SqlRow::Postgres))
                         .map_err(pg_db_err);
-                    crate::runtime::perf_probe::record_sql_statement(
+                    weaver_server_base::runtime::perf_probe::record_sql_statement(
                         "postgres",
                         "fetch_optional",
                         template,
@@ -455,7 +463,7 @@ impl SqlRuntime {
                     .await
                     .map(|rows| rows.into_iter().map(SqlRow::Sqlite).collect())
                     .map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "fetch_all",
                     template,
@@ -473,7 +481,7 @@ impl SqlRuntime {
                         .await
                         .map(|rows| rows.into_iter().map(SqlRow::Sqlite).collect())
                         .map_err(db_err);
-                    crate::runtime::perf_probe::record_sql_statement(
+                    weaver_server_base::runtime::perf_probe::record_sql_statement(
                         "sqlite",
                         "fetch_all",
                         template,
@@ -494,7 +502,7 @@ impl SqlRuntime {
                         .await
                         .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
                         .map_err(pg_db_err);
-                    crate::runtime::perf_probe::record_sql_statement(
+                    weaver_server_base::runtime::perf_probe::record_sql_statement(
                         "postgres",
                         "fetch_all",
                         template,
@@ -540,7 +548,11 @@ impl SqlRuntime {
                     }
                 })
                 .await;
-                crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+                weaver_server_base::runtime::perf_probe::record_sql_op(
+                    engine,
+                    op_name,
+                    started.elapsed(),
+                );
                 result
             }
             StoreDatastore::Postgres { pool } => {
@@ -569,7 +581,11 @@ impl SqlRuntime {
                         .map_err(|e| PostgresTxError::new(TxPhase::Commit, e))?;
                     // Record the successful attempt's real duration only (retry
                     // sleeps and failed attempts are excluded).
-                    crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
+                        engine,
+                        op_name,
+                        started.elapsed(),
+                    );
                     Ok(result)
                 })
                 .await
@@ -627,7 +643,7 @@ impl SqlRuntime {
                 .await
             }
         };
-        crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+        weaver_server_base::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
         result
     }
 }
@@ -653,7 +669,7 @@ impl<'db> SqlTx<'db> {
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query.execute(&mut **tx).await.map_err(sqlite_write_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "tx_execute",
                     template,
@@ -667,7 +683,7 @@ impl<'db> SqlTx<'db> {
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query.execute(&mut **tx).await.map_err(pg_db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "postgres",
                     "tx_execute",
                     template,
@@ -694,7 +710,7 @@ impl<'db> SqlTx<'db> {
                     .await
                     .map(|row| row.map(SqlRow::Sqlite))
                     .map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "tx_fetch_optional",
                     template,
@@ -711,7 +727,7 @@ impl<'db> SqlTx<'db> {
                     .await
                     .map(|row| row.map(SqlRow::Postgres))
                     .map_err(pg_db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "postgres",
                     "tx_fetch_optional",
                     template,
@@ -737,7 +753,7 @@ impl<'db> SqlTx<'db> {
                     .await
                     .map(|rows| rows.into_iter().map(SqlRow::Sqlite).collect())
                     .map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "tx_fetch_all",
                     template,
@@ -754,7 +770,7 @@ impl<'db> SqlTx<'db> {
                     .await
                     .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
                     .map_err(pg_db_err);
-                crate::runtime::perf_probe::record_sql_statement(
+                weaver_server_base::runtime::perf_probe::record_sql_statement(
                     "postgres",
                     "tx_fetch_all",
                     template,

@@ -101,7 +101,7 @@ impl Grant {
     // The pool's thread works for the job this one does.
     pub(crate) fn install<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
         match &self.pool {
-            Some(pool) => pool.install(crate::runtime::panic_trap::carried(work)),
+            Some(pool) => pool.install(weaver_server_base::runtime::panic_trap::carried(work)),
             None => work(),
         }
     }
@@ -110,7 +110,7 @@ impl Grant {
     // The pool's thread works for the job this one does.
     pub(crate) fn install_repair<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
         match &self.repair_pool {
-            Some(pool) => pool.install(crate::runtime::panic_trap::carried(work)),
+            Some(pool) => pool.install(weaver_server_base::runtime::panic_trap::carried(work)),
             None => work(),
         }
     }
@@ -141,7 +141,9 @@ impl Grant {
             .find(|held| held.current_num_threads() == repair_threads)
             .cloned()
             .unwrap_or_else(|| {
-                crate::runtime::postprocess_pool::build_postprocess_pool(repair_threads)
+                weaver_server_base::runtime::postprocess_pool::build_postprocess_pool(
+                    repair_threads,
+                )
             });
         let lent: Arc<dyn Pool> = Arc::new(Lent(Arc::clone(&pool)));
         Self {
@@ -183,11 +185,11 @@ struct Lent(Arc<rayon::ThreadPool>);
 impl Pool for Lent {
     // Each worker works for the job the run does.
     fn spread(&self, workers: usize, work: &(dyn Fn() + Sync)) {
-        let job = crate::runtime::panic_trap::current_job();
+        let job = weaver_server_base::runtime::panic_trap::current_job();
         self.0.in_place_scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(move |_| {
-                    let _job = crate::runtime::panic_trap::JobScope::carry(job);
+                    let _job = weaver_server_base::runtime::panic_trap::JobScope::carry(job);
                     work()
                 });
             }
@@ -195,11 +197,11 @@ impl Pool for Lent {
     }
 
     fn spread_beside(&self, work: &(dyn Fn() + Sync), caller: &mut dyn FnMut(&dyn Fn())) {
-        let job = crate::runtime::panic_trap::current_job();
+        let job = weaver_server_base::runtime::panic_trap::current_job();
         self.0.in_place_scope(|scope| {
             caller(&|| {
                 scope.spawn(move |_| {
-                    let _job = crate::runtime::panic_trap::JobScope::carry(job);
+                    let _job = weaver_server_base::runtime::panic_trap::JobScope::carry(job);
                     work()
                 });
             });
@@ -210,7 +212,7 @@ impl Pool for Lent {
 impl Hardware {
     // What the profile the tuner holds grants, on a pool of its own.
     pub(crate) fn of(tuner: &RuntimeTuner) -> Self {
-        let pool = crate::runtime::postprocess_pool::build_postprocess_pool(
+        let pool = weaver_server_base::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
         );
         Self {
@@ -267,7 +269,7 @@ impl Hardware {
         let threads = tuner.params().extract_thread_count;
         let pool = match &grant.pool {
             Some(pool) if pool.current_num_threads() == threads => Arc::clone(pool),
-            _ => crate::runtime::postprocess_pool::build_postprocess_pool(threads),
+            _ => weaver_server_base::runtime::postprocess_pool::build_postprocess_pool(threads),
         };
         *grant = Grant::of(tuner, pool, grant.repair_pool.as_ref());
     }

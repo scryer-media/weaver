@@ -15,13 +15,13 @@ use weaver_graph::{
 use super::echo::{Echoes, HEADER, SIGNATURE};
 use super::volumes::RunVolumes;
 use super::{DecodePool, Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::envelope::{Envelopes, Shelf, envelope_name};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::RepairSlots;
+use weaver_server_disk::operations::disk::CapacityReader;
 
 const NODE: NodeId = NodeId(7);
 const FIRST: VolumeIndex = VolumeIndex(0);
@@ -76,10 +76,10 @@ fn a_read_waits_for_its_bytes() {
 // and gives it back. Letting go at the end gives back the last.
 #[test]
 fn a_run_reads_in_its_volumes_turns_what_it_reads_without_them() {
-    use crate::operations::disk::StorageKind;
-    use crate::operations::disk::reader::{SOLID_READERS, SPINNING_READERS};
-    use crate::operations::disk::volume::Volume;
-    use crate::operations::disk::writer::VolumeWriters;
+    use weaver_server_disk::operations::disk::StorageKind;
+    use weaver_server_disk::operations::disk::reader::{SOLID_READERS, SPINNING_READERS};
+    use weaver_server_disk::operations::disk::volume::Volume;
+    use weaver_server_disk::operations::disk::writer::VolumeWriters;
 
     let body: Vec<u8> = (0..64u8).collect();
     let reads = [(0, 16), (16, 16), (40, 24)];
@@ -156,9 +156,9 @@ fn a_run_reads_in_its_volumes_turns_what_it_reads_without_them() {
 // wakes the wait, and the read fails as a stopped run's reads do.
 #[test]
 fn a_read_waiting_for_a_turn_ends_when_its_run_is_stopped() {
-    use crate::operations::disk::StorageKind;
-    use crate::operations::disk::volume::Volume;
-    use crate::operations::disk::writer::VolumeWriters;
+    use weaver_server_disk::operations::disk::StorageKind;
+    use weaver_server_disk::operations::disk::volume::Volume;
+    use weaver_server_disk::operations::disk::writer::VolumeWriters;
 
     for kind in [StorageKind::Solid, StorageKind::Rotational] {
         let dir = tempfile::tempdir().unwrap();
@@ -197,10 +197,10 @@ fn a_read_waiting_for_a_turn_ends_when_its_run_is_stopped() {
 // ends, when it goes back to the volume rather than to the stopped run.
 #[test]
 fn a_release_goes_on_while_a_read_hangs_on_the_disk() {
-    use crate::operations::disk::StorageKind;
-    use crate::operations::disk::reader::SOLID_READERS;
-    use crate::operations::disk::volume::Volume;
-    use crate::operations::disk::writer::VolumeWriters;
+    use weaver_server_disk::operations::disk::StorageKind;
+    use weaver_server_disk::operations::disk::reader::SOLID_READERS;
+    use weaver_server_disk::operations::disk::volume::Volume;
+    use weaver_server_disk::operations::disk::writer::VolumeWriters;
 
     let dir = tempfile::tempdir().unwrap();
     let writers = VolumeWriters::inline(|_| {});
@@ -1508,10 +1508,10 @@ async fn a_volume_its_engine_takes_from_its_file_is_on_disk_once() {
 // down to it as every envelope's are.
 #[tokio::test]
 async fn a_volume_whose_file_takes_no_second_name_is_written_afresh() {
-    use crate::operations::disk::volume::Volume;
-    use crate::operations::disk::writer::VolumeWriters;
     use crate::pipeline::graph::disk::JobDisk;
     use crate::pipeline::graph::namespace::claimed::refused::SECOND_NAMES;
+    use weaver_server_disk::operations::disk::volume::Volume;
+    use weaver_server_disk::operations::disk::writer::VolumeWriters;
     SECOND_NAMES.set(true);
     let writers = VolumeWriters::inline(|_| {});
     let volume = Arc::new(Volume::new(None, "test".to_owned()));
@@ -2345,7 +2345,7 @@ fn an_inner_run_reserved_first_never_holds_back_the_outer_run_it_waits_on() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scratch(dir: &Path) -> Arc<crate::pipeline::graph::window::Windows> {
     Arc::new(crate::pipeline::graph::window::Windows::new(Arc::new(
-        crate::scratch::Scratch::new(
+        weaver_server_disk::scratch::Scratch::new(
             dir.to_path_buf(),
             CapacityReader::unknown(),
             Default::default(),
@@ -2383,7 +2383,7 @@ fn scratch_up_to(
         disk_reserve: 1,
     }));
     Arc::new(crate::pipeline::graph::window::Windows::new(Arc::new(
-        crate::scratch::Scratch::new(
+        weaver_server_disk::scratch::Scratch::new(
             dir.to_path_buf(),
             free,
             Default::default(),
@@ -2806,8 +2806,8 @@ async fn a_run_the_scratch_has_no_room_for_that_ram_could_never_hold_waits_for_t
 }
 
 // A machine of 32 cores and 64 GiB, which every stock profile is offered.
-fn stock_machine() -> crate::runtime::system_profile::SystemProfile {
-    use crate::runtime::system_profile::*;
+fn stock_machine() -> weaver_server_base::runtime::system_profile::SystemProfile {
+    use weaver_server_base::runtime::system_profile::*;
     const GIB: u64 = 1 << 30;
     SystemProfile {
         cpu: CpuProfile {
@@ -2984,7 +2984,7 @@ async fn a_lending_run_the_scratch_never_refused_is_allowed_no_window() {
 // pool beside the RAR's window.
 #[tokio::test]
 async fn a_7z_run_reserves_its_overhead_and_shares_the_pool_on_every_profile() {
-    use crate::runtime::hardware_profile::HardwareProfile;
+    use weaver_server_base::runtime::hardware_profile::HardwareProfile;
     let machine = stock_machine();
     for (profile, lifted) in HardwareProfile::ALL
         .into_iter()
@@ -3049,7 +3049,11 @@ async fn a_7z_run_reserves_its_overhead_and_shares_the_pool_on_every_profile() {
         let found = saw.recv().unwrap();
         assert_eq!(found.memory_bytes, Some(memory), "{name}");
         assert_eq!(found.window_bytes, Some(window), "{name}");
-        assert_eq!(found.lent.is_some(), crate::scratch::MAPS, "{name}");
+        assert_eq!(
+            found.lent.is_some(),
+            weaver_server_disk::scratch::MAPS,
+            "{name}"
+        );
         runs.ended(first, said.generation, 3);
         runs.ended(second, 0, 3);
         runs.ended(rar, 0, 3);

@@ -17,8 +17,8 @@ use weaver_tunnel::pipe::Dialer;
 use super::http::TestArticle;
 use super::progress::{LegRecorder, Progress, RecordingDialer};
 use super::runner::Stop;
-use crate::operations::metrics::PipelineMetrics;
 use crate::pipeline::download::acquire_owned_lane_through_contention;
+use weaver_server_base::operations::metrics::PipelineMetrics;
 
 // One leg of a Usenet run.
 pub(crate) struct UsenetLeg {
@@ -147,8 +147,9 @@ pub(crate) async fn run(
             let spawned = std::thread::Builder::new()
                 .name(format!("weaver-speed-test-{}-{connection}", leg.position))
                 .spawn(move || {
-                    crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-                    crate::runtime::thread_release::start_lane_thread();
+                    weaver_server_base::runtime::affinity::pin_current_thread_for_hot_download_path(
+                    );
+                    weaver_server_base::runtime::thread_release::start_lane_thread();
                     worker.run();
                 });
             if let Err(error) = spawned {
@@ -257,7 +258,7 @@ impl Worker {
                 }
             }
             progress.counted();
-            if crate::e2e_clock::hold_speed_test_after_article() {
+            if weaver_server_base::e2e_clock::hold_speed_test_after_article() {
                 self.runtime.block_on(self.stop.stopped());
                 return;
             }

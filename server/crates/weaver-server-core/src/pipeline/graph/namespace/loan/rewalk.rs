@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::operations::disk::reader::TurnStop;
+use weaver_server_disk::operations::disk::reader::TurnStop;
 
 use weaver_graph::{ByteRange, NodeId, Placement, Posted, Rewalk, Tree, VolumeIndex};
 

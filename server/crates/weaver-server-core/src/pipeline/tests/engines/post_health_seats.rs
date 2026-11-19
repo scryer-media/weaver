@@ -388,8 +388,8 @@ async fn a_dead_post_whose_known_losses_fall_in_the_sample_is_dead_on_its_first_
         .lost
         .iter()
         .filter(|(file, ordinal)| {
-            given_up.gone(crate::jobs::ids::SegmentId {
-                file_id: crate::jobs::ids::NzbFileId {
+            given_up.gone(weaver_server_base::jobs::ids::SegmentId {
+                file_id: weaver_server_base::jobs::ids::NzbFileId {
                     job_id: JOB,
                     file_index: *file,
                 },

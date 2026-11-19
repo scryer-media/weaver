@@ -9,8 +9,8 @@ use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
 use crate::pipeline::full_disk::{Stage, Wants};
 use crate::post_processing::model::PostProcessingSettings;
-use crate::runtime::fs::Placement;
 use crate::runtime::{file_cache, fs as runtime_fs};
+use weaver_server_disk::runtime::fs::Placement;
 
 #[derive(Debug)]
 struct UnacceptableExtensionMatch {
@@ -417,10 +417,12 @@ fn move_path_with_safe_rename_or_copy_fallback(
 // a mount without links, comes back to the mover, which copies it on its
 // own thread, never the volume's.
 #[derive(Clone)]
-pub(crate) struct Renames(Arc<crate::operations::disk::writer::Submitter>);
+pub(crate) struct Renames(Arc<weaver_server_disk::operations::disk::writer::Submitter>);
 
 impl Renames {
-    pub(crate) fn through(to: Arc<crate::operations::disk::writer::Submitter>) -> Self {
+    pub(crate) fn through(
+        to: Arc<weaver_server_disk::operations::disk::writer::Submitter>,
+    ) -> Self {
         Self(to)
     }
 
@@ -696,7 +698,7 @@ async fn left_to_copy(src: &std::path::Path, copy_err: &std::io::Error) -> u64 {
         })
     }
     let src = src.to_path_buf();
-    crate::runtime::panic_trap::spawn_blocking(move || under(&src))
+    weaver_server_base::runtime::panic_trap::spawn_blocking(move || under(&src))
         .await
         .unwrap_or(0)
 }
@@ -788,7 +790,7 @@ async fn validate_script_move_destination(
         )));
     }
     let path = expected.to_path_buf();
-    let validated = crate::runtime::panic_trap::spawn_blocking(move || {
+    let validated = weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
         crate::post_processing::effects::validate_directory(&db, &context, &path)
     })
     .await
@@ -991,18 +993,20 @@ async fn run_move_to_claimed_destination(
     let policy = match policy_source {
         DeliveryPolicySource::Job(policy) => policy,
         DeliveryPolicySource::Persisted(database) => Arc::new(
-            crate::runtime::panic_trap::spawn_blocking(move || database.post_processing_settings())
-                .await
-                .map_err(|error| {
-                    MoveToCompleteFailure::Operational(format!(
-                        "could not load unacceptable extension policy: {error}"
-                    ))
-                })?
-                .map_err(|error| {
-                    MoveToCompleteFailure::Operational(format!(
-                        "could not load unacceptable extension policy: {error}"
-                    ))
-                })?,
+            weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
+                database.post_processing_settings()
+            })
+            .await
+            .map_err(|error| {
+                MoveToCompleteFailure::Operational(format!(
+                    "could not load unacceptable extension policy: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                MoveToCompleteFailure::Operational(format!(
+                    "could not load unacceptable extension policy: {error}"
+                ))
+            })?,
         ),
     };
     let validation = {
@@ -1010,7 +1014,7 @@ async fn run_move_to_claimed_destination(
         let staging_dir = staging_dir.clone();
         let policy = Arc::clone(&policy);
         let left_behind = left_behind.clone();
-        crate::runtime::panic_trap::spawn_blocking(move || {
+        weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
             validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy, &left_behind)
         })
         .await
@@ -1100,7 +1104,7 @@ async fn run_move_to_claimed_destination(
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
             let through = renames.clone();
-            match crate::runtime::panic_trap::spawn_blocking(move || {
+            match weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
                 move_delivered_entry(
                     through.as_ref(),
                     &src_fb,
@@ -1170,7 +1174,7 @@ async fn run_move_to_claimed_destination(
                 let (src_fb, dst_fb) = (src.clone(), dst.clone());
                 let through = renames.clone();
                 let again = Arc::clone(&again);
-                let joined = crate::runtime::panic_trap::spawn_blocking(move || {
+                let joined = weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
                     let mut cut_short = Vec::new();
                     let joined = merge_delivered_dir(
                         through.as_ref(),
@@ -1216,7 +1220,7 @@ async fn run_move_to_claimed_destination(
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
             let through = renames.clone();
-            match crate::runtime::panic_trap::spawn_blocking(move || {
+            match weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
                 move_delivered_entry(
                     through.as_ref(),
                     &src_fb,
@@ -1301,7 +1305,7 @@ async fn run_move_to_claimed_destination(
     // The delivered tree is the user's Weaver runs as, with the modes its
     // umask gives, whatever the archives it came out of said.
     let delivered = dest.clone();
-    match crate::runtime::panic_trap::spawn_blocking(move || {
+    match weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
         runtime_fs::normalize_extracted_tree(&delivered)
     })
     .await
@@ -1322,7 +1326,7 @@ async fn run_move_to_claimed_destination(
     }
 
     let output_dir = dest.clone();
-    match crate::runtime::panic_trap::spawn_blocking(move || {
+    match weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
         mark_weaver_owned_output_dir(&output_dir, job_id)
     })
     .await
@@ -2260,105 +2264,109 @@ impl Pipeline {
         );
         // The move is the job's work, and so is every blocking thread it
         // hands work to.
-        tokio::spawn(crate::runtime::panic_trap::in_job(job_id, async move {
-            if let Some(hook) = hold {
-                // The hook sleeps its thread, so it is given one of its own.
-                let _ = crate::runtime::panic_trap::spawn_blocking(move || {
-                    crate::e2e_failpoint::maybe_delay(hook);
-                })
-                .await;
-            }
-            let move_started = Instant::now();
-            let result = async {
-                let into = match durable {
-                    Some(durable) => {
-                        moving_row_committed(durable, &dest).await?;
-                        MoveInto::Claimed(dest.clone())
-                    }
-                    None => match held {
-                        Some(again) => MoveInto::Held(dest.clone(), again),
-                        None => MoveInto::Resumed(dest.clone()),
-                    },
-                };
-                #[cfg(test)]
-                {
-                    let hook = BEFORE_FIRST_MOVE.lock().unwrap().take();
-                    if let Some(hook) = hook {
-                        let _ = tokio::task::spawn_blocking(move || hook(job_id)).await;
-                    }
+        tokio::spawn(weaver_server_base::runtime::panic_trap::in_job(
+            job_id,
+            async move {
+                if let Some(hook) = hold {
+                    // The hook sleeps its thread, so it is given one of its own.
+                    let _ = weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
+                        weaver_server_base::e2e_failpoint::maybe_delay(hook);
+                    })
+                    .await;
                 }
-                if let Some((db, context)) = script_validation {
-                    validate_script_move_destination(db, context, &dest).await?;
-                }
-                // The destination's volume is found off the loop, and its
-                // writer makes the renames into it. With none found the
-                // mover makes them itself.
-                // The volume is asked by the directory the destination is
-                // made in, one of a few, so the volumes remember no path
-                // per job.
-                let landing = dest.parent().unwrap_or(&dest).to_path_buf();
-                let renames = crate::runtime::panic_trap::spawn_blocking(move || {
-                    let volume = capacity.read_volume(&landing);
-                    Renames::through(writers.submitter(&volume, job_id.0))
-                })
-                .await
-                .ok();
-                match into {
-                    MoveInto::Claimed(dest) => {
-                        run_move_to_complete(
-                            job_id,
-                            working_dir,
-                            staging_dir,
-                            dest,
-                            phase_counters,
-                            naming,
-                            policy_source,
-                            left_behind,
-                            renames,
-                        )
+                let move_started = Instant::now();
+                let result = async {
+                    let into = match durable {
+                        Some(durable) => {
+                            moving_row_committed(durable, &dest).await?;
+                            MoveInto::Claimed(dest.clone())
+                        }
+                        None => match held {
+                            Some(again) => MoveInto::Held(dest.clone(), again),
+                            None => MoveInto::Resumed(dest.clone()),
+                        },
+                    };
+                    #[cfg(test)]
+                    {
+                        let hook = BEFORE_FIRST_MOVE.lock().unwrap().take();
+                        if let Some(hook) = hook {
+                            let _ = tokio::task::spawn_blocking(move || hook(job_id)).await;
+                        }
+                    }
+                    if let Some((db, context)) = script_validation {
+                        validate_script_move_destination(db, context, &dest).await?;
+                    }
+                    // The destination's volume is found off the loop, and its
+                    // writer makes the renames into it. With none found the
+                    // mover makes them itself.
+                    // The volume is asked by the directory the destination is
+                    // made in, one of a few, so the volumes remember no path
+                    // per job.
+                    let landing = dest.parent().unwrap_or(&dest).to_path_buf();
+                    let renames =
+                        weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
+                            let volume = capacity.read_volume(&landing);
+                            Renames::through(writers.submitter(&volume, job_id.0))
+                        })
                         .await
-                    }
-                    resumed => {
-                        run_move_to_claimed_destination(
-                            job_id,
-                            working_dir,
-                            staging_dir,
-                            resumed,
-                            phase_counters,
-                            naming,
-                            policy_source,
-                            left_behind,
-                            renames,
-                        )
-                        .await
+                        .ok();
+                    match into {
+                        MoveInto::Claimed(dest) => {
+                            run_move_to_complete(
+                                job_id,
+                                working_dir,
+                                staging_dir,
+                                dest,
+                                phase_counters,
+                                naming,
+                                policy_source,
+                                left_behind,
+                                renames,
+                            )
+                            .await
+                        }
+                        resumed => {
+                            run_move_to_claimed_destination(
+                                job_id,
+                                working_dir,
+                                staging_dir,
+                                resumed,
+                                phase_counters,
+                                naming,
+                                policy_source,
+                                left_behind,
+                                renames,
+                            )
+                            .await
+                        }
                     }
                 }
-            }
-            .await;
-            match &result {
-                Ok(outcome) => info!(
-                    job_id = job_id.0,
-                    moved = outcome.moved_entries,
-                    dest = %dest.display(),
-                    elapsed_ms = move_started.elapsed().as_millis(),
-                    "final move finished"
-                ),
-                Err(error) => warn!(
-                    job_id = job_id.0,
-                    dest = %dest.display(),
-                    elapsed_ms = move_started.elapsed().as_millis(),
-                    error = %error,
-                    "final move failed"
-                ),
-            }
-            let _ = move_done_tx
-                .send(MoveToCompleteDone {
-                    job_id,
-                    dest,
-                    result,
-                })
                 .await;
-        }));
+                match &result {
+                    Ok(outcome) => info!(
+                        job_id = job_id.0,
+                        moved = outcome.moved_entries,
+                        dest = %dest.display(),
+                        elapsed_ms = move_started.elapsed().as_millis(),
+                        "final move finished"
+                    ),
+                    Err(error) => warn!(
+                        job_id = job_id.0,
+                        dest = %dest.display(),
+                        elapsed_ms = move_started.elapsed().as_millis(),
+                        error = %error,
+                        "final move failed"
+                    ),
+                }
+                let _ = move_done_tx
+                    .send(MoveToCompleteDone {
+                        job_id,
+                        dest,
+                        result,
+                    })
+                    .await;
+            },
+        ));
     }
 
     pub(crate) async fn handle_move_to_complete_done(&mut self, done: MoveToCompleteDone) {
@@ -2582,7 +2590,7 @@ impl Pipeline {
         // Low-frequency: at most one terminal post-processing pass per job.
         self.note_stage_started(
             job_id,
-            crate::operations::instrumentation::JobStageKind::PostProcess,
+            weaver_server_base::operations::instrumentation::JobStageKind::PostProcess,
         );
         self.launch_terminal_post_processing_run(job_id, admission, facts, primary_failure, None);
     }
@@ -3049,7 +3057,7 @@ impl Pipeline {
         );
         self.note_stage_started(
             job_id,
-            crate::operations::instrumentation::JobStageKind::PostProcess,
+            weaver_server_base::operations::instrumentation::JobStageKind::PostProcess,
         );
         self.launch_terminal_post_processing_run(
             job_id,
@@ -3083,7 +3091,7 @@ impl Pipeline {
         // Low-frequency: closes the timer armed when the run was launched.
         self.note_stage_finished(
             done.job_id,
-            crate::operations::instrumentation::JobStageKind::PostProcess,
+            weaver_server_base::operations::instrumentation::JobStageKind::PostProcess,
         );
         self.terminal_post_processing_cancellations
             .remove(&done.job_id);

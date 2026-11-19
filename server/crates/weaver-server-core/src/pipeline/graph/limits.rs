@@ -15,7 +15,6 @@ use weaver_graph::holds::HoldBudgets;
 use weaver_graph::{MemberId, NodeId, Tree};
 
 use crate::RuntimeTuner;
-use crate::operations::disk::{CapacityReader, DiskLedger};
 use crate::pipeline::completion::finalize::MAX_GRAPH_NESTING_DEPTH;
 pub(crate) use crate::pipeline::extraction::ExtractionLimits;
 use crate::pipeline::extraction::{ExtractionFailure, ExtractionRejectionReason};
@@ -23,6 +22,7 @@ use crate::pipeline::graph::decoding::DecodeClock;
 use crate::pipeline::graph::job::RootFile;
 use crate::pipeline::graph::leaf::Leaf;
 use crate::post_processing::model::{PostProcessingSettings, unwanted_extension_reason};
+use weaver_server_disk::operations::disk::{CapacityReader, DiskLedger};
 
 // The hold settings, resolved once at pipeline construction. Each value is
 // read from the environment, then from the `[direct_store]` settings table,
@@ -114,7 +114,8 @@ impl HostFacts {
             }
         };
         Self {
-            total_memory_bytes: crate::runtime::system_probe::detect_total_memory_bytes(),
+            total_memory_bytes:
+                weaver_server_disk::runtime::system_probe::detect_total_memory_bytes(),
             working_fs_total_bytes,
             resident_default_cap_bytes,
         }
@@ -1368,7 +1369,7 @@ impl crate::pipeline::Pipeline {
             limits: Arc::clone(&self.extraction_limits),
             free_disk: self
                 .storage_capacity()
-                .reader(crate::operations::disk::StorageRoot::Complete),
+                .reader(weaver_server_disk::operations::disk::StorageRoot::Complete),
             mail: self.graph_runs.sender(),
             written: self.graph_runs.written(),
             outside: Arc::clone(&self.graph_outside),
@@ -1386,7 +1387,7 @@ pub(crate) struct GraphBudget {
     pub(crate) accountant: Arc<weaver_graph::holds::HoldsAccountant>,
     pub(crate) slots: usize,
     pub(crate) limits: Arc<ExtractionLimits>,
-    pub(crate) free_disk: crate::operations::disk::CapacityReader,
+    pub(crate) free_disk: weaver_server_disk::operations::disk::CapacityReader,
     // Where the job's runs speak, and where it joins to hear them.
     pub(crate) mail: tokio::sync::mpsc::Sender<super::engine::Said>,
     // Where the database's word on the job's checkpoints is said.
@@ -1397,13 +1398,13 @@ pub(crate) struct GraphBudget {
     // The decode pool every job shares.
     pub(crate) decode: Arc<super::engine::DecodePool>,
     // What decode windows took from the disk `work` is on.
-    pub(crate) window_ledger: crate::scratch::ScratchLedger,
+    pub(crate) window_ledger: weaver_server_disk::scratch::ScratchLedger,
     // Weaver's data folder, the free space of its disk, and what decode
     // windows took from it.
     pub(crate) data_dir: (
         std::path::PathBuf,
-        crate::operations::disk::CapacityReader,
-        crate::scratch::ScratchLedger,
+        weaver_server_disk::operations::disk::CapacityReader,
+        weaver_server_disk::scratch::ScratchLedger,
     ),
 }
 
@@ -1440,7 +1441,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::operations::disk::{Capacity, CapacityReading};
+    use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
 
     const MIB: u64 = 1024 * 1024;
 

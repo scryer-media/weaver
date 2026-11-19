@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
 
 use crate::ingest::{append_original_title_metadata, derive_release_name};
-use crate::jobs::ids::JobId;
 use crate::jobs::{
     ArchivePasswordCandidate, ArchivePasswordSource, FileSpec, JobSpec, MessageIds, SegmentSpec,
 };
 use crate::settings::archive_passwords;
 use weaver_model::files::{FileRole, unique_download_filenames};
 use weaver_nzb::{Nzb, NzbFile, parse_nzb};
+use weaver_server_base::jobs::ids::JobId;
 
 // Global counter for generating unique job IDs.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);

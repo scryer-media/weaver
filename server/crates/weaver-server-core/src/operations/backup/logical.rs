@@ -25,8 +25,8 @@ use crate::schema_migrations::{
     proxy_dns_v125, proxy_resolver_v64, script_concurrency_v58, script_instances_v55,
     server_limit_v92, unwanted_extensions_v56,
 };
-use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
+use weaver_server_base::security::RuntimeSecurityConfig;
 
 pub(crate) const EXPORT_BATCH_SIZE: i64 = 1_000;
 const BLOB_MARKER_TYPE: &str = "__weaver_type";

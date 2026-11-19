@@ -8,8 +8,8 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, watch};
 
 use crate::jobs::graph_checkpoint::Delta;
-use crate::jobs::ids::JobId;
 use crate::{Database, StateError};
+use weaver_server_base::jobs::ids::JobId;
 
 use super::sql_runtime::{
     is_postgres_connection_error, is_postgres_rolled_back_transient, is_transient_sqlite_busy,

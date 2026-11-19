@@ -8,7 +8,6 @@ use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{MemberId, NodeId};
 
 use super::super::GraphJob;
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::engine::echo::{Echoes, SIGNATURE};
 use crate::pipeline::graph::engine::{RunMail, Runs};
 use crate::pipeline::graph::hardware::Hardware;
@@ -20,6 +19,7 @@ use crate::pipeline::tests::engines::harness::{ARTICLE, par2_set, payload};
 use crate::pipeline::tests::engines::loans::{
     FRAME, Kind, SECRET, body, stored_zip, volumes, zipcrypto_descriptor,
 };
+use weaver_server_disk::operations::disk::CapacityReader;
 
 thread_local! {
     // The namespaces the walk asked to rule, in the order it asked.

@@ -2,12 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::operations::disk::volume::Reservation;
-use crate::operations::disk::writer::Prepaid;
 use crate::pipeline::download::scheduler::Handout;
 use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use crate::pipeline::graph::disk::VolumeLeases;
 use weaver_nntp::client::FetchAttemptOutcome;
+use weaver_server_disk::operations::disk::volume::Reservation;
+use weaver_server_disk::operations::disk::writer::Prepaid;
 
 mod completion;
 mod eligibility;

@@ -15,8 +15,10 @@ pub(crate) struct JobPhaseRuntime {
 // The metric stage label for a user-visible job phase. Verification and
 // post-processing are not phases, so they arm their timers from their own
 // start/finish points.
-const fn stage_kind_for_phase(phase: JobPhase) -> crate::operations::instrumentation::JobStageKind {
-    use crate::operations::instrumentation::JobStageKind;
+const fn stage_kind_for_phase(
+    phase: JobPhase,
+) -> weaver_server_base::operations::instrumentation::JobStageKind {
+    use weaver_server_base::operations::instrumentation::JobStageKind;
     match phase {
         JobPhase::Downloading => JobStageKind::Download,
         JobPhase::Repairing => JobStageKind::Repair,
@@ -102,7 +104,7 @@ impl Pipeline {
     pub(crate) fn note_stage_started(
         &mut self,
         job_id: JobId,
-        stage: crate::operations::instrumentation::JobStageKind,
+        stage: weaver_server_base::operations::instrumentation::JobStageKind,
     ) {
         self.job_stage_started_at
             .entry((job_id, stage))
@@ -115,7 +117,7 @@ impl Pipeline {
     pub(crate) fn note_stage_finished(
         &mut self,
         job_id: JobId,
-        stage: crate::operations::instrumentation::JobStageKind,
+        stage: weaver_server_base::operations::instrumentation::JobStageKind,
     ) {
         if let Some(started) = self.job_stage_started_at.remove(&(job_id, stage)) {
             self.metrics
@@ -152,7 +154,7 @@ impl Pipeline {
             .jobs
             .get(&job_id)
             .map_or(0, |state| state.downloaded_wire_bytes);
-        crate::runtime::job_debug_ring::dump(job_id.0, progress, reason);
+        weaver_server_base::runtime::job_debug_ring::dump(job_id.0, progress, reason);
     }
 
     pub(crate) fn note_job_wire_bytes(

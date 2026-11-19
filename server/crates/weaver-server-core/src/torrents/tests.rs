@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::settings::{Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
     FilePriority, Infohash, KeptIntent, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent,
     TorrentRecord, TorrentSource, TrackerEntry,
 };
+use weaver_server_base::jobs::ids::JobId;
 
 pub(crate) fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
     TorrentRecord {

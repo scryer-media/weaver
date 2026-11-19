@@ -23,7 +23,6 @@ use crate::pipeline::graph::limits::Caps;
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, SessionTraffic, TorrentScope,
 };
-use crate::runtime::panic_trap::JobScope;
 use crate::settings::model::{TrackerCertificate, TrackerRule};
 use crate::torrents::files::Files;
 use crate::torrents::intake::{Holds, Intake, Room};
@@ -41,6 +40,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use weaver_server_base::runtime::panic_trap::JobScope;
 use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::limits::LimitsConfig;
 use weaver_torrent::{

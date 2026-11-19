@@ -23,7 +23,7 @@ pub fn max_wireguard_instances() -> usize {
     // Keep the process's admission limit stable across unrelated memory pressure.
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let memory = crate::runtime::system_probe::detect_memory();
+        let memory = weaver_server_disk::runtime::system_probe::detect_memory();
         wireguard_instance_limit(
             memory
                 .available_bytes

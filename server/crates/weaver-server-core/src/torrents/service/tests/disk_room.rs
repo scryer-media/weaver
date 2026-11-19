@@ -13,9 +13,11 @@ use std::sync::atomic::AtomicU64;
 
 use super::*;
 use crate::jobs::handle::DISK_SPACE_WAIT_REASON;
-use crate::operations::disk::{DiskProbeError, DiskSpace, StorageCapacity, StorageRoot};
-use crate::operations::room_wait::Disk;
 use crate::torrents::status::Stated;
+use weaver_server_disk::operations::disk::{
+    DiskProbeError, DiskSpace, StorageCapacity, StorageRoot,
+};
+use weaver_server_disk::operations::room_wait::Disk;
 
 // What the disk keeps free, the room it reads over that, and a sampler
 // that reads only when asked.
@@ -325,8 +327,8 @@ async fn a_torrent_saved_on_another_disk_waits_on_that_disk() {
     let working = tempfile::tempdir().unwrap();
     let save = working.path().join("saved");
     std::fs::create_dir_all(&save).unwrap();
-    crate::runtime::fs::test_devices::assign(complete.path(), 71_001);
-    crate::runtime::fs::test_devices::assign(working.path(), 71_002);
+    weaver_server_disk::runtime::fs::test_devices::assign(complete.path(), 71_001);
+    weaver_server_disk::runtime::fs::test_devices::assign(working.path(), 71_002);
     // Room to start over the reserve on the working disk, none for a piece.
     let room = Arc::new(AtomicU64::new(1));
     let read = Arc::clone(&room);
@@ -808,9 +810,9 @@ async fn a_torrent_whose_disk_cannot_be_told_waits_unplaced_and_a_later_look_pla
     let working = tempfile::tempdir().unwrap();
     let save = working.path().join("saved");
     std::fs::create_dir_all(&save).unwrap();
-    crate::runtime::fs::test_devices::assign(complete.path(), 73_001);
-    crate::runtime::fs::test_devices::assign(working.path(), 73_002);
-    let refused = crate::runtime::fs::test_devices::refuse(&save);
+    weaver_server_disk::runtime::fs::test_devices::assign(complete.path(), 73_001);
+    weaver_server_disk::runtime::fs::test_devices::assign(working.path(), 73_002);
+    let refused = weaver_server_disk::runtime::fs::test_devices::refuse(&save);
     let disk = on_disks(
         |_: &Path| {
             Ok(DiskSpace {
@@ -884,7 +886,7 @@ async fn a_folder_named_during_a_look_is_placed_by_that_look() {
     );
     std::fs::create_dir_all(&before).unwrap();
     std::fs::create_dir_all(&after).unwrap();
-    let (hold, mut reads) = crate::runtime::fs::test_devices::hold(&before);
+    let (hold, mut reads) = weaver_server_disk::runtime::fs::test_devices::hold(&before);
     let intake = {
         let live = service.inner.live.lock().await;
         live[&job_id].intake.clone().unwrap()
@@ -923,8 +925,8 @@ fn the_disk_warning_names_the_volume_and_the_waiting() {
 // priorities alone).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_disk_leaves_the_selection_as_it_was() {
-    use crate::operations::disk::{Capacity, CapacityReading};
     use crate::torrents::net::{LegKind, LegSockets};
+    use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
 
     let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
     let files = [("set/a.bin", data.as_slice())];
@@ -1065,7 +1067,7 @@ async fn views_of_looks(
     service: &TorrentService,
     added: &[(JobId, PathBuf)],
     mut holds: Vec<(
-        crate::runtime::fs::test_devices::HeldDevice,
+        weaver_server_disk::runtime::fs::test_devices::HeldDevice,
         tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
     )>,
     views: usize,
@@ -1108,7 +1110,8 @@ async fn the_looks_of_one_reading_ask_one_pass() {
     service.open().await.unwrap();
     // The folders' disks cannot be told: each look at the add fails, and
     // its torrent waits for a reading to be looked up again.
-    let refused = crate::runtime::fs::test_devices::refuse(&dir.path().join("complete"));
+    let refused =
+        weaver_server_disk::runtime::fs::test_devices::refuse(&dir.path().join("complete"));
     let added = add_looked(&service).await;
     let intakes: Vec<_> = {
         let live = service.inner.live.lock().await;
@@ -1129,7 +1132,7 @@ async fn the_looks_of_one_reading_ask_one_pass() {
 
     let holds: Vec<_> = added
         .iter()
-        .map(|(_, dir)| crate::runtime::fs::test_devices::hold(dir))
+        .map(|(_, dir)| weaver_server_disk::runtime::fs::test_devices::hold(dir))
         .collect();
     drop(refused);
     let views = service.views_built();
@@ -1164,7 +1167,7 @@ async fn the_looks_of_one_restore_pass_ask_one_pass() {
     service.open().await.unwrap();
     let holds: Vec<_> = added
         .iter()
-        .map(|(_, dir)| crate::runtime::fs::test_devices::hold(dir))
+        .map(|(_, dir)| weaver_server_disk::runtime::fs::test_devices::hold(dir))
         .collect();
     // The tick restores their jobs, each store's look held at its read.
     service.tick().await;

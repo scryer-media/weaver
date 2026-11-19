@@ -14,13 +14,13 @@
 
 use super::pass::{add, done_then, events, written};
 use super::*;
-use crate::operations::disk::{DiskSpace, StorageCapacity, StorageRoot};
 use crate::persistence::sql_runtime::SqlRuntime;
 use crate::post_processing::model::QueueEvent;
 use crate::torrents::KeptIntent;
 use crate::torrents::service::disk_room::DiskHeld;
 use std::sync::PoisonError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use weaver_server_disk::operations::disk::{DiskSpace, StorageCapacity, StorageRoot};
 
 // Trackers on loopback, one a torrent (a loopback tracker is asked only at
 // `/announce`), answering every announce with no peers. They keep, in the

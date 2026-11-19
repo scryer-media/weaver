@@ -19,7 +19,6 @@ pub(crate) mod metadata;
 pub(crate) mod namespace;
 pub(crate) mod restore;
 pub(crate) mod root;
-pub(crate) mod sparse;
 pub(crate) mod status;
 pub(crate) mod summary;
 pub(crate) mod window;

@@ -1764,7 +1764,7 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
 // the release reports an hour of virtual time after shutdown began.
 #[tokio::test(start_paused = true)]
 async fn a_failed_job_whose_folder_release_outlasts_the_shutdown_bound_is_still_recorded() {
-    use crate::runtime::shutdown_steps::SHUTDOWN_STEP_BOUND;
+    use weaver_server_base::runtime::shutdown_steps::SHUTDOWN_STEP_BOUND;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -2292,9 +2292,9 @@ async fn a_restart_finds_the_staging_directory_the_job_chose() {
     let backlog_base_bytes = || 16 * 1024 * 1024;
     let movies = temp_dir.path().join("movies");
     let (data, intermediate, complete, db) = roots();
-    crate::runtime::fs::test_devices::assign(&intermediate, 1);
-    crate::runtime::fs::test_devices::assign(&complete, 2);
-    crate::runtime::fs::test_devices::assign(&movies, 3);
+    weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
     let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
         data,
         intermediate,

@@ -30,7 +30,7 @@ pub(crate) struct Envelopes {
     working_dir: PathBuf,
     // The writer of the working directory's volume, when the job's files
     // are written through one.
-    to: Option<Arc<crate::operations::disk::writer::Submitter>>,
+    to: Option<Arc<weaver_server_disk::operations::disk::writer::Submitter>>,
     given: Given,
     shelves: BTreeMap<NodeId, Arc<Shelf>>,
     // The nodes whose kept envelopes changed, under the generation of the
@@ -46,7 +46,7 @@ pub(crate) struct Envelopes {
 #[derive(Debug)]
 pub(crate) struct Shelf {
     dir: PathBuf,
-    to: Option<Arc<crate::operations::disk::writer::Submitter>>,
+    to: Option<Arc<weaver_server_disk::operations::disk::writer::Submitter>>,
     given: Given,
     node: NodeId,
     state: Mutex<Shelved>,
@@ -69,7 +69,7 @@ pub(crate) struct ReadFiles {
     pub(crate) disk: Mutex<()>,
     // Raised when the run is stopped or drained: a wait for a read turn
     // hears it and ends.
-    pub(crate) stop: crate::operations::disk::reader::TurnStop,
+    pub(crate) stop: weaver_server_disk::operations::disk::reader::TurnStop,
     // A test's hold on the next read inside its disk call: the read says it
     // entered, and returns once the test lets it.
     #[cfg(test)]
@@ -117,7 +117,7 @@ impl ReadFiles {
 #[derive(Debug, Default)]
 pub(crate) struct RunFiles {
     pub(crate) open: BTreeMap<u32, Arc<std::fs::File>>,
-    pub(crate) reading: crate::operations::disk::reader::Reading,
+    pub(crate) reading: weaver_server_disk::operations::disk::reader::Reading,
 }
 
 #[derive(Debug, Default)]
@@ -196,7 +196,7 @@ impl Kept {
 
     // Everything submitted for the envelope's file so far, when it is
     // written through a volume's writer.
-    pub(crate) fn settled(&self) -> Option<crate::operations::disk::writer::Barrier> {
+    pub(crate) fn settled(&self) -> Option<weaver_server_disk::operations::disk::writer::Barrier> {
         self.leaf.settled()
     }
 
@@ -228,7 +228,7 @@ impl Envelopes {
     // anything is kept.
     pub(crate) fn write_through(
         &mut self,
-        to: Option<Arc<crate::operations::disk::writer::Submitter>>,
+        to: Option<Arc<weaver_server_disk::operations::disk::writer::Submitter>>,
     ) {
         debug_assert!(self.shelves.is_empty());
         self.to = to;
@@ -523,7 +523,9 @@ thread_local! {
 impl Shelf {
     // The volume the shelf's envelopes are written to, whose read turns a
     // run reading them takes. `None` when the job writes through no writer.
-    pub(crate) fn volume(&self) -> Option<&Arc<crate::operations::disk::volume::Volume>> {
+    pub(crate) fn volume(
+        &self,
+    ) -> Option<&Arc<weaver_server_disk::operations::disk::volume::Volume>> {
         self.to.as_ref().map(|to| to.volume())
     }
 
@@ -750,7 +752,7 @@ impl Given {
     // With no writer the disk says it all, and nothing is kept.
     pub(crate) fn free(
         &self,
-        to: Option<&Arc<crate::operations::disk::writer::Submitter>>,
+        to: Option<&Arc<weaver_server_disk::operations::disk::writer::Submitter>>,
         dir: &Path,
         name: &str,
     ) -> String {

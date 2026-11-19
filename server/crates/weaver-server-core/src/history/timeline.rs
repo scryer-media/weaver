@@ -167,7 +167,7 @@ async fn insert_job_events_sql(
                 }
                 SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
             }
-            crate::runtime::perf_probe::record_sql_op(
+            weaver_server_base::runtime::perf_probe::record_sql_op(
                 "postgres",
                 "insert_job_events",
                 started.elapsed(),

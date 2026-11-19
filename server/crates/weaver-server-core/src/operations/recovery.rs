@@ -22,10 +22,10 @@ pub struct RecoveredServerState {
     pub initial_holds: crate::jobs::HoldSet,
     // The jobs that crashed the daemon on its last run, each parked paused
     // as it installs.
-    pub crashed: crate::runtime::panic_trap::CrashMarks,
+    pub crashed: weaver_server_base::runtime::panic_trap::CrashMarks,
     // The torrents that crashed it, each kept paused, its job not restored,
     // until it is resumed.
-    pub crashed_torrents: crate::runtime::panic_trap::CrashMarks,
+    pub crashed_torrents: weaver_server_base::runtime::panic_trap::CrashMarks,
     // What recovery leaves until the server answers; `spawn` runs it once.
     pub after_boot: AfterBoot,
 }
@@ -36,7 +36,7 @@ pub struct RecoveredServerState {
 // job created while it runs is never one it removes rows of.
 pub struct AfterBoot {
     db: Database,
-    below: crate::jobs::ids::JobId,
+    below: weaver_server_base::jobs::ids::JobId,
 }
 
 impl AfterBoot {
@@ -81,7 +81,7 @@ impl AfterBoot {
 // the outer error; a missing or unreadable NZB is the inner one.
 pub(crate) fn read_stored_files(
     db: &Database,
-    job_id: crate::jobs::ids::JobId,
+    job_id: weaver_server_base::jobs::ids::JobId,
     recovered: &crate::RecoveredJob,
     outline: Option<ingest::outline::NzbOutline>,
 ) -> Result<
@@ -152,7 +152,7 @@ pub(crate) fn apply_password_override(spec: &mut crate::JobSpec, password_overri
 
 // The restore of a job from its active row and the files of its stored NZB.
 pub(crate) fn restore_request(
-    job_id: crate::jobs::ids::JobId,
+    job_id: weaver_server_base::jobs::ids::JobId,
     recovered: crate::RecoveredJob,
     mut spec: crate::JobSpec,
     summaries: crate::jobs::model::FileSummaries,
@@ -206,7 +206,7 @@ pub(crate) fn restore_request(
 }
 
 pub struct RestoreCandidate {
-    pub job_id: crate::jobs::ids::JobId,
+    pub job_id: weaver_server_base::jobs::ids::JobId,
     // Manual queue-order position persisted at reorder time; `None` sorts by
     // job id (creation order).
     pub queue_position: Option<i64>,
@@ -266,7 +266,8 @@ pub async fn recover_server_state_with(
     // A live job's row may name its destination, not the working directory
     // it is moving out of or that holds what its move left: a directory
     // carrying a live job's marker is that job's all the same.
-    let mut live_jobs: HashSet<crate::jobs::ids::JobId> = active_jobs.keys().copied().collect();
+    let mut live_jobs: HashSet<weaver_server_base::jobs::ids::JobId> =
+        active_jobs.keys().copied().collect();
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
     let mut initial_history = Vec::new();
@@ -387,15 +388,15 @@ pub async fn recover_server_state_with(
     // The torrents come back too, each with its own job; those still
     // retiring do not.
     let (torrents, retiring) = db.torrent_rows()?;
-    let torrents: HashSet<crate::jobs::ids::JobId> = torrents.into_iter().collect();
+    let torrents: HashSet<weaver_server_base::jobs::ids::JobId> = torrents.into_iter().collect();
     // A torrent's unpacking directory carries its marker as a job's does:
     // it is live while the torrent's row is, retiring or not, read after
     // the archive whatever it came to.
     live_jobs.extend(torrents.iter().copied());
     live_jobs.extend(retiring);
-    let restoring: HashSet<crate::jobs::ids::JobId> =
+    let restoring: HashSet<weaver_server_base::jobs::ids::JobId> =
         in_progress.iter().map(|(job_id, _)| *job_id).collect();
-    let mut crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| {
+    let mut crashed = weaver_server_base::runtime::panic_trap::boot_marks(data_dir, |job| {
         restoring.contains(&job) || torrents.contains(&job)
     });
     let crashed_torrents = crashed.split_off(|job| torrents.contains(&job));
@@ -460,7 +461,7 @@ pub async fn recover_server_state_with(
         Ok(history_rows) => {
             // The jobs already held, built once: a job recovered from its
             // active row is not listed again from its history row.
-            let mut held: HashSet<crate::jobs::ids::JobId> =
+            let mut held: HashSet<weaver_server_base::jobs::ids::JobId> =
                 initial_history.iter().map(|job| job.job_id).collect();
             for row in history_rows {
                 if let Some(output_dir) = row.output_dir.as_ref() {
@@ -469,7 +470,7 @@ pub async fn recover_server_state_with(
                         referenced_intermediate_dirs.insert(output_dir);
                     }
                 }
-                let job_id = crate::jobs::ids::JobId(row.job_id);
+                let job_id = weaver_server_base::jobs::ids::JobId(row.job_id);
                 // Skip if we already have this job from active_jobs recovery.
                 if !held.insert(job_id) {
                     continue;
@@ -597,7 +598,7 @@ pub async fn recover_server_state_with(
         crashed_torrents,
         after_boot: AfterBoot {
             db: db.clone(),
-            below: crate::jobs::ids::JobId(next_job_id),
+            below: weaver_server_base::jobs::ids::JobId(next_job_id),
         },
     })
 }
@@ -620,7 +621,7 @@ pub async fn recover_server_state_with(
 // the row stays active, and the next start tries it again.
 fn archive_unfinished_terminal_job(
     db: &Database,
-    job_id: crate::jobs::ids::JobId,
+    job_id: weaver_server_base::jobs::ids::JobId,
     recovered: &crate::jobs::record::RecoveredJob,
     name: &str,
     status: &JobStatus,
@@ -636,7 +637,7 @@ fn archive_unfinished_terminal_job(
 
 fn try_archive_unfinished_terminal_job(
     db: &Database,
-    job_id: crate::jobs::ids::JobId,
+    job_id: weaver_server_base::jobs::ids::JobId,
     recovered: &crate::jobs::record::RecoveredJob,
     name: &str,
     status: &JobStatus,
@@ -694,7 +695,7 @@ fn try_archive_unfinished_terminal_job(
 fn cleanup_unreferenced_intermediate_dirs(
     intermediate_dir: &Path,
     referenced_dirs: &HashSet<PathBuf>,
-    live_jobs: &HashSet<crate::jobs::ids::JobId>,
+    live_jobs: &HashSet<weaver_server_base::jobs::ids::JobId>,
 ) -> Result<usize, std::io::Error> {
     cleanup_unlisted_intermediate_dirs(intermediate_dir, referenced_dirs, live_jobs, |_| {
         Ok(HashSet::new())
@@ -709,9 +710,9 @@ fn cleanup_unreferenced_intermediate_dirs(
 fn cleanup_unlisted_intermediate_dirs(
     intermediate_dir: &Path,
     referenced_dirs: &HashSet<PathBuf>,
-    live_jobs: &HashSet<crate::jobs::ids::JobId>,
+    live_jobs: &HashSet<weaver_server_base::jobs::ids::JobId>,
     listed: impl FnOnce(
-        &[(crate::jobs::ids::JobId, PathBuf)],
+        &[(weaver_server_base::jobs::ids::JobId, PathBuf)],
     ) -> Result<HashSet<PathBuf>, std::io::Error>,
 ) -> Result<usize, std::io::Error> {
     use crate::jobs::working_dir::{remove_unclaimed_working_dir, unclaimed_working_dirs};
@@ -812,7 +813,7 @@ mod tests {
         let nzb_path = temp.path().join("job-1.nzb");
         db.create_active_job(&sample_active_job(1, nzb_path, temp.path().join("job-1")))
             .unwrap();
-        let trap = crate::runtime::panic_trap::Trap::new(temp.path(), "test");
+        let trap = weaver_server_base::runtime::panic_trap::Trap::new(temp.path(), "test");
         let restored = trap.write(Some(JobId(1)), "in its work", None).unwrap();
         let gone = trap.write(Some(JobId(9)), "long gone", None).unwrap();
         let daemon = trap.write(None, "outside", None).unwrap();

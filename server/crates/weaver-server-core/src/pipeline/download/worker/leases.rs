@@ -3,7 +3,7 @@
 
 use super::pressure::{CheckpointAdmission, CheckpointLease};
 use super::*;
-use crate::operations::metrics::SchedulerBlockClause;
+use weaver_server_base::operations::metrics::SchedulerBlockClause;
 
 // The clauses that refused a job's articles during one scan, so the
 // scheduler can say what kept a blocked job from the asking server.

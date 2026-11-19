@@ -389,7 +389,7 @@ async fn a_parking_lane_releases_its_idle_thread_memory_once() {
 
     // The hook is process-wide and installed once, so this test owns it for
     // the whole binary; each test runs in its own process.
-    crate::runtime::thread_release::install_idle_thread_release(count_release);
+    weaver_server_base::runtime::thread_release::install_idle_thread_release(count_release);
     let before = RELEASES.load(Ordering::SeqCst);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

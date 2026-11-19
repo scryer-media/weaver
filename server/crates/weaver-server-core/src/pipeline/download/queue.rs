@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::JobSpec;
+use weaver_server_base::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 
 // A work item representing a segment to download.
 #[derive(Clone)]

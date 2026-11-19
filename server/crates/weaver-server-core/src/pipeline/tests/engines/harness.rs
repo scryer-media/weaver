@@ -21,7 +21,6 @@ use super::super::{
     pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::history::HistoryFailureKind;
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::pipeline::download::DownloadWork;
 use crate::pipeline::extraction::ExtractionLimits;
@@ -30,6 +29,7 @@ use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, PipelineEvent, SegmentEncoding, SegmentSource,
     YencLayoutAssertions,
 };
+use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 pub(in crate::pipeline) const ARTICLE: usize = 64;
 
@@ -1160,7 +1160,8 @@ pub(in crate::pipeline::tests) struct Outcome {
     // The extraction refusals the run counted, in the metric's reason order.
     pub(in crate::pipeline::tests) rejections: [u64; 9],
     // The pipeline's metrics as the run left them.
-    pub(in crate::pipeline::tests) metrics: crate::operations::metrics::MetricsSnapshot,
+    pub(in crate::pipeline::tests) metrics:
+        weaver_server_base::operations::metrics::MetricsSnapshot,
     // The password the job's history says an archive opened with.
     pub(in crate::pipeline::tests) validated_password: Option<String>,
     // The metadata the job's history row keeps, as stored.

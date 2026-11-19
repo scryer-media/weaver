@@ -78,7 +78,9 @@ pub(crate) fn resolve_category_config<'a>(
     for cat in categories {
         for alias in cat.aliases.split(',') {
             let alias = alias.trim();
-            if !alias.is_empty() && crate::runtime::glob::glob_match_ci(alias, input_lower) {
+            if !alias.is_empty()
+                && weaver_server_base::runtime::glob::glob_match_ci(alias, input_lower)
+            {
                 return Some(cat);
             }
         }

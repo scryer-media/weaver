@@ -29,9 +29,9 @@ use tokio::sync::Notify;
 
 use crate::operations::StorageCapacity;
 use crate::operations::VolumeBuffers;
-use crate::operations::disk::beneath::{self, Access};
-use crate::operations::disk::volume::{Reservation, Volume};
-use crate::operations::disk::writer::{
+use weaver_server_disk::operations::disk::beneath::{self, Access};
+use weaver_server_disk::operations::disk::volume::{Reservation, Volume};
+use weaver_server_disk::operations::disk::writer::{
     Barrier, Create, DiskOwner, Failure, OpenSteps, Opened, Owner, Submitter, VolumeWriters,
 };
 
@@ -557,7 +557,7 @@ impl Writes {
         let volume = disk.volume(&dir);
         let reads = match &disk.capacity {
             Some(capacity) => capacity.volume_reads(&volume),
-            None => volume.reads(|| crate::operations::disk::StorageKind::Unknown),
+            None => volume.reads(|| weaver_server_disk::operations::disk::StorageKind::Unknown),
         };
         weaver_torrent::storage::ReadTurns::new(Arc::clone(reads.turns()), reads.whole_pieces())
     }

@@ -17,9 +17,7 @@ use super::harness::{
     ARTICLE, Claim, GraphView, JOB, Outcome, Post, Scenario, admit, assert_fetched_once, kinds,
     par2_set, payload, run, run_unprompted, serve_job,
 };
-use crate::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY;
 use crate::history::HistoryFailureKind;
-use crate::jobs::ids::JobId;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::Pipeline;
 use crate::pipeline::tests::direct_store::scenarios::{
@@ -32,6 +30,8 @@ use crate::pipeline::tests::direct_store::{
     single_member_store_set,
 };
 use crate::pipeline::tests::{insert_active_job, job_status_for_assert, retire_pipeline_database};
+use weaver_server_base::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY;
+use weaver_server_base::jobs::ids::JobId;
 
 const MEMBER: &str = "beacon.bin";
 const SECRET: &str = "quill-ember-secret";
@@ -2024,8 +2024,8 @@ async fn sent_back_once(
     std::collections::BTreeMap<String, Vec<u8>>,
 ) {
     use super::refused_then_repaired::{drive_to_finish, serve_queued};
-    use crate::jobs::ids::{NzbFileId, SegmentId};
     use crate::pipeline::tests::pump_pipeline_runtime_queues;
+    use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
     let body = body();
     let (posted, password) = match sealing {

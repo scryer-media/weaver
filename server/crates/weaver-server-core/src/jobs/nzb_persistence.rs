@@ -9,8 +9,8 @@
 // removes the last of those rows.
 
 use crate::StateError;
-use crate::jobs::ids::JobId;
 use crate::persistence::sql_runtime::{SqlArg, SqlTx, max_rows_for_tx};
+use weaver_server_base::jobs::ids::JobId;
 
 // Store a job's NZB in the caller's transaction, beside the active row it
 // writes. Bytes an earlier job of the same id left are replaced.

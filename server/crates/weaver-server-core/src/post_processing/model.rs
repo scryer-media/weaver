@@ -1006,7 +1006,7 @@ impl PostProcessingSettings {
         }
         self.unacceptable_extensions
             .iter()
-            .find(|pattern| crate::runtime::glob::glob_match_ci(pattern, extension))
+            .find(|pattern| weaver_server_base::runtime::glob::glob_match_ci(pattern, extension))
             .map(String::as_str)
     }
 

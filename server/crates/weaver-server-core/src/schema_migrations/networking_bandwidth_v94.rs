@@ -160,7 +160,7 @@ pub(crate) fn upgrade_egress_row(row: &mut Map<String, Value>) {
 // The bandwidth cap of a backup taken below 53, moved onto the System egress
 // in the columns 69 keeps its quota in.
 pub(crate) async fn move_older_cap(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
-    let now = crate::e2e_clock::local_now();
+    let now = weaver_server_base::e2e_clock::local_now();
     let Some(carried) = super::egress_quotas_v53::take_cap(conn, now).await? else {
         return Ok(());
     };

@@ -1361,11 +1361,11 @@ mod disk_room {
 
     // Counted on every thread but a sampler's.
     fn disk_looks() -> u64 {
-        crate::operations::disk::DISK_LOOKS.load(Ordering::Relaxed)
+        weaver_server_disk::operations::disk::DISK_LOOKS.load(Ordering::Relaxed)
     }
 
     fn refresh_asks() -> u64 {
-        crate::operations::disk::REFRESH_ASKS.load(Ordering::Relaxed)
+        weaver_server_disk::operations::disk::REFRESH_ASKS.load(Ordering::Relaxed)
     }
 
     fn visits() -> u64 {

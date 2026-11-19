@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::jobs::assembly::DetectedArchiveIdentity;
-use crate::jobs::ids::{JobId, NzbFileId};
+use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
 #[derive(Debug, Clone)]
 pub struct ActiveJob {

@@ -9,10 +9,10 @@
 use std::collections::BTreeSet;
 
 use super::harness::{ARTICLE, JOB, Post, Scenario, admit, par2_set, payload};
-use crate::jobs::ids::{NzbFileId, SegmentId};
 use crate::pipeline::SegmentTerminalState;
 use crate::pipeline::post_health::{AbandonWork, abandon_work, keep_booked};
 use crate::pipeline::tests::retire_pipeline_database;
+use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
 fn segment(file_index: u32, segment_number: u32) -> SegmentId {
     SegmentId {

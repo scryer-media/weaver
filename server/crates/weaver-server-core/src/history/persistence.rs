@@ -5,12 +5,12 @@ use crate::StateError;
 use crate::history::output_files::OutputFileListing;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::history::{parse_history_metadata, public_history_attributes};
-use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{
     POSTGRES_BATCH_BIND_LIMIT, SqlArg, SqlEngine, SqlRuntime, SqlTx, max_rows_for_tx,
 };
 use sqlx::{Postgres, QueryBuilder, Sqlite};
+use weaver_server_base::jobs::ids::JobId;
 
 fn build_integration_events_pg_sql(row_count: usize) -> String {
     let mut values = String::new();
@@ -355,7 +355,7 @@ impl Database {
                         }
                         SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
                     }
-                    crate::runtime::perf_probe::record_sql_op(
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
                         "postgres",
                         "insert_integration_events",
                         started.elapsed(),

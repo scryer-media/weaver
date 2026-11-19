@@ -219,7 +219,7 @@ impl Pipeline {
                     && let Some(active) = state.articles.active_mut()
                 {
                     let in_use = segment.message_ids.in_use();
-                    let pin = || crate::jobs::ids::MessageId::new(in_use);
+                    let pin = || weaver_server_base::jobs::ids::MessageId::new(in_use);
                     active.download_queue.pin_message_id(segment_id, pin);
                     active.recovery_queue.pin_message_id(segment_id, pin);
                 }
@@ -315,7 +315,9 @@ impl Pipeline {
         Some(DownloadWork {
             counters: None,
             segment_id,
-            message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
+            message_id: weaver_server_base::jobs::ids::MessageId::new(
+                seg_spec.message_ids.in_use(),
+            ),
             groups: state
                 .articles
                 .file_groups(segment_id.file_id, &file_spec.groups),
@@ -536,7 +538,8 @@ impl Pipeline {
                 self.download_lane_owners.remove(&result.lane_id);
             }
         }
-        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.release_result");
+        let _cpu_scope =
+            weaver_server_base::runtime::perf_probe::cpu_scope("download.release_result");
         let stale_generation = result.runtime_generation != self.pool_generation;
         // The same list the lanes mark a refused lease clean by: none of
         // these says anything of the server's connection.
@@ -910,8 +913,9 @@ impl Pipeline {
         }
 
         let (excluded_servers, source_server_idx) = {
-            let _cpu_scope =
-                crate::runtime::perf_probe::cpu_scope("download.process_done.pre_match");
+            let _cpu_scope = weaver_server_base::runtime::perf_probe::cpu_scope(
+                "download.process_done.pre_match",
+            );
             let excluded_servers = result.exclude_servers;
             let source_server_idx = result.source_server_idx;
 
@@ -935,23 +939,23 @@ impl Pipeline {
                 // lock, no clock read, no map lookup.
                 let metric_outcome = match attempt.outcome {
                     FetchAttemptOutcome::Success => {
-                        crate::operations::instrumentation::ServerAttemptOutcomeKind::Success
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::Success
                     }
                     FetchAttemptOutcome::NotFound => {
-                        crate::operations::instrumentation::ServerAttemptOutcomeKind::NotFound
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::NotFound
                     }
                     FetchAttemptOutcome::AuthenticationFailure => {
-                        crate::operations::instrumentation::ServerAttemptOutcomeKind::AuthFailure
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::AuthFailure
                     }
                     FetchAttemptOutcome::TransientFailure
                     | FetchAttemptOutcome::GroupSelectionRequired => {
-                        crate::operations::instrumentation::ServerAttemptOutcomeKind::TransientFailure
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::TransientFailure
                     }
                     FetchAttemptOutcome::PermanentFailure => {
-                        crate::operations::instrumentation::ServerAttemptOutcomeKind::PermanentFailure
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::PermanentFailure
                     }
                     FetchAttemptOutcome::QuotaBlocked | FetchAttemptOutcome::QuotaUnrequested => {
-                        crate::operations::instrumentation::ServerAttemptOutcomeKind::QuotaBlocked
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::QuotaBlocked
                     }
                 };
                 if let Some(counters) = attribute_to_servers
@@ -971,20 +975,20 @@ impl Pipeline {
                         continue;
                     }
                     FetchAttemptOutcome::Success => {
-                        crate::events::model::ServerAttemptOutcome::Success
+                        weaver_server_base::events::model::ServerAttemptOutcome::Success
                     }
                     FetchAttemptOutcome::NotFound => {
-                        crate::events::model::ServerAttemptOutcome::NotFound
+                        weaver_server_base::events::model::ServerAttemptOutcome::NotFound
                     }
                     FetchAttemptOutcome::AuthenticationFailure => {
-                        crate::events::model::ServerAttemptOutcome::AuthenticationFailure
+                        weaver_server_base::events::model::ServerAttemptOutcome::AuthenticationFailure
                     }
                     FetchAttemptOutcome::TransientFailure
                     | FetchAttemptOutcome::GroupSelectionRequired => {
-                        crate::events::model::ServerAttemptOutcome::TransientFailure
+                        weaver_server_base::events::model::ServerAttemptOutcome::TransientFailure
                     }
                     FetchAttemptOutcome::PermanentFailure => {
-                        crate::events::model::ServerAttemptOutcome::PermanentFailure
+                        weaver_server_base::events::model::ServerAttemptOutcome::PermanentFailure
                     }
                 };
                 self.send_segment_event(|| PipelineEvent::ServerAttempt {
@@ -1058,7 +1062,7 @@ impl Pipeline {
                 let raw_size_bytes = decoded.raw_size;
                 let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
                 {
-                    let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
+                    let _cpu_scope = weaver_server_base::runtime::perf_probe::cpu_scope(
                         "download.process_done.decoded_pre_success",
                     );
                     self.metrics
@@ -1721,7 +1725,7 @@ impl Pipeline {
                             let work = DownloadWork {
                                 counters: None,
                                 segment_id: seg_id,
-                                message_id: crate::jobs::ids::MessageId::new(
+                                message_id: weaver_server_base::jobs::ids::MessageId::new(
                                     seg_spec.message_ids.in_use(),
                                 ),
                                 groups: state

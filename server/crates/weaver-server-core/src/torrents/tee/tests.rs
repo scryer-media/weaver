@@ -9,8 +9,6 @@ use weaver_graph::VolumeIndex;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 
 use super::{Parts, Plan, Tee};
-use crate::jobs::ids::JobId;
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::engine::{Outside, RunMail};
 use crate::pipeline::graph::job::Storage;
 use crate::pipeline::graph::limits::Caps;
@@ -19,6 +17,8 @@ use crate::torrents::files::Files;
 use crate::torrents::layout::{PieceFile, PieceLayout};
 use crate::torrents::storage::Pieces;
 use crate::torrents::store::{Kept, TorrentStore};
+use weaver_server_base::jobs::ids::JobId;
+use weaver_server_disk::operations::disk::CapacityReader;
 
 const ARCHIVE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -424,7 +424,7 @@ fn armed_tee(
     Arc<PieceLayout>,
     Arc<Tee>,
     Arc<std::sync::atomic::AtomicBool>,
-    Arc<crate::runtime::panic_trap::Trap>,
+    Arc<weaver_server_base::runtime::panic_trap::Trap>,
 ) {
     let layout = Arc::new(PieceLayout::new(64, vec![file("set.rar", LZ.len() as u64)]).unwrap());
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -436,12 +436,14 @@ fn armed_tee(
                 !armed.load(std::sync::atomic::Ordering::Acquire),
                 "the disk could not be read"
             );
-            crate::operations::disk::Capacity::Known(crate::operations::disk::CapacityReading {
-                available_bytes: 1 + 1024,
-                total_bytes: 1 << 40,
-                sampled_at: read_at,
-                stale: false,
-            })
+            weaver_server_disk::operations::disk::Capacity::Known(
+                weaver_server_disk::operations::disk::CapacityReading {
+                    available_bytes: 1 + 1024,
+                    total_bytes: 1 << 40,
+                    sampled_at: read_at,
+                    stale: false,
+                },
+            )
         })
     };
     let work = dir.join("work");
@@ -460,7 +462,7 @@ fn armed_tee(
         Vec::new(),
     );
     let tee = Tee::fresh(parts(&layout, &work, mail, Arc::default()), storage);
-    let trap = Arc::new(crate::runtime::panic_trap::Trap::new(
+    let trap = Arc::new(weaver_server_base::runtime::panic_trap::Trap::new(
         &dir.join("marks"),
         "test",
     ));
@@ -468,8 +470,8 @@ fn armed_tee(
 }
 
 // The one marker the trap wrote, naming the tee's job.
-fn marked(dir: &Path) -> crate::runtime::panic_trap::Mark {
-    let mut marks = crate::runtime::panic_trap::read_marks(&dir.join("marks"));
+fn marked(dir: &Path) -> weaver_server_base::runtime::panic_trap::Mark {
+    let mut marks = weaver_server_base::runtime::panic_trap::read_marks(&dir.join("marks"));
     assert_eq!(marks.len(), 1);
     let mark = marks.pop().unwrap();
     assert_eq!(mark.job, Some(JobId(1)));
@@ -484,7 +486,7 @@ async fn a_panic_delivering_a_piece_leaves_the_torrents_marker() {
     let (layout, tee, armed, trap) = armed_tee(dir.path(), &mail);
     assert!(tee.deliver(0, &piece(&layout, LZ, 0)));
     armed.store(true, std::sync::atomic::Ordering::Release);
-    let caught = crate::runtime::panic_trap::trapped(
+    let caught = weaver_server_base::runtime::panic_trap::trapped(
         &trap,
         std::panic::AssertUnwindSafe(|| tee.deliver(1, &piece(&layout, LZ, 1))),
     );
@@ -505,7 +507,7 @@ async fn a_panic_taking_a_word_leaves_the_torrents_marker() {
     armed.store(true, std::sync::atomic::Ordering::Release);
     loop {
         let said = mail.recv().await.unwrap();
-        let caught = crate::runtime::panic_trap::trapped(
+        let caught = weaver_server_base::runtime::panic_trap::trapped(
             &trap,
             std::panic::AssertUnwindSafe(|| {
                 tee.take(super::Word::Said(said, 1), (false, false));
@@ -535,12 +537,14 @@ async fn a_torrent_unpack_held_for_room_is_woken_when_room_returns() {
     let reader = {
         let room = Arc::clone(&room);
         CapacityReader::from_fn(move || {
-            crate::operations::disk::Capacity::Known(crate::operations::disk::CapacityReading {
-                available_bytes: 1 + room.load(Ordering::Acquire),
-                total_bytes: 1 << 40,
-                sampled_at: std::time::Instant::now(),
-                stale: false,
-            })
+            weaver_server_disk::operations::disk::Capacity::Known(
+                weaver_server_disk::operations::disk::CapacityReading {
+                    available_bytes: 1 + room.load(Ordering::Acquire),
+                    total_bytes: 1 << 40,
+                    sampled_at: std::time::Instant::now(),
+                    stale: false,
+                },
+            )
         })
     };
     let work = dir.path().join("work");
@@ -719,7 +723,7 @@ mod numbered_outputs {
 
     // The product's move, as one job's.
     fn move_file_exclusive(from: &Path, to: &Path) -> io::Result<()> {
-        crate::runtime::fs::JobMoves::of(1).move_file(from, to)
+        weaver_server_disk::runtime::fs::JobMoves::of(1).move_file(from, to)
     }
 
     fn place(work: &Path, dir: &Path, kept: &[&str]) -> Placed {

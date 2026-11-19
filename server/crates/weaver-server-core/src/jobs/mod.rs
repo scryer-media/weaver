@@ -14,7 +14,6 @@ pub mod error;
 pub(crate) mod feed_verdict;
 pub(crate) mod graph_checkpoint;
 pub mod handle;
-pub mod ids;
 pub mod model;
 pub(crate) mod nzb_persistence;
 pub(crate) mod outline_persistence;
@@ -30,6 +29,8 @@ pub mod service;
 pub mod support_facts;
 mod support_facts_persistence;
 pub mod working_dir;
+
+pub use weaver_server_base::jobs::ids;
 
 pub use class::{
     AddRefusal, ByProtocol, ClassIntake, ClassRate, ClassRates, JobClass, JobClasses, Owed,

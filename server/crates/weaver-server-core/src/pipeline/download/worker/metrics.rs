@@ -8,7 +8,7 @@ use super::*;
 // enable check and the decoder's cut loop stays free of locks, clocks, and
 // metric allocations.
 fn record_checkpoint_observability(result: &weaver_yenc::DecodeResult) {
-    if !crate::runtime::perf_probe::enabled() {
+    if !weaver_server_base::runtime::perf_probe::enabled() {
         return;
     }
 
@@ -17,12 +17,12 @@ fn record_checkpoint_observability(result: &weaver_yenc::DecodeResult) {
         weaver_yenc::CheckpointPlan::Single(_) => "download.checkpoint_plan.single",
         weaver_yenc::CheckpointPlan::Multi(_) => "download.checkpoint_plan.multi",
     };
-    crate::runtime::perf_probe::record_value(shape, 1);
-    crate::runtime::perf_probe::record_value(
+    weaver_server_base::runtime::perf_probe::record_value(shape, 1);
+    weaver_server_base::runtime::perf_probe::record_value(
         "download.checkpoint_plan.grid_count",
         result.checkpoint_plan.grid_count() as u64,
     );
-    crate::runtime::perf_probe::record_value(
+    weaver_server_base::runtime::perf_probe::record_value(
         "download.checkpoint_segments.emitted",
         result.segments.len() as u64,
     );
@@ -53,7 +53,7 @@ fn record_checkpoint_observability(result: &weaver_yenc::DecodeResult) {
             "download.checkpoint_collapse.offset_overflow"
         }
     };
-    crate::runtime::perf_probe::record_value(label, 1);
+    weaver_server_base::runtime::perf_probe::record_value(label, 1);
 }
 
 impl Pipeline {
@@ -858,7 +858,8 @@ impl Pipeline {
         Vec<weaver_nntp::client::FetchAttemptTrace>,
         Option<usize>,
     ) {
-        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.result.translate");
+        let _cpu_scope =
+            weaver_server_base::runtime::perf_probe::cpu_scope("download.result.translate");
         let successful_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
             matches!(
                 attempt.outcome,
@@ -882,159 +883,169 @@ impl Pipeline {
                     cpu,
                     io,
                 } = decoded;
-                crate::runtime::perf_probe::record_cpu_sample(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
                     "download.fused.parse_decode",
                     cpu.raw_decode,
                 );
-                crate::runtime::perf_probe::record_cpu_sample(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
                     "download.fused.response_line",
                     cpu.response_line,
                 );
-                crate::runtime::perf_probe::record_cpu_sample(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
                     "download.fused.yenc_header",
                     cpu.yenc_header,
                 );
-                crate::runtime::perf_probe::record_cpu_sample(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
                     "download.fused.body_decode",
                     cpu.body_decode,
                 );
-                crate::runtime::perf_probe::record_cpu_sample(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
                     "download.fused.yend_line",
                     cpu.yend_line,
                 );
-                crate::runtime::perf_probe::record_cpu_sample(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
                     "download.fused.nntp_terminator",
                     cpu.nntp_terminator,
                 );
-                crate::runtime::perf_probe::record_cpu_sample(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
                     "download.nntp.read_poll",
                     cpu.read_poll,
                 );
-                crate::runtime::perf_probe::record_cpu_sample(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
                     "download.fused.output_callback",
                     cpu.feed,
                 );
-                crate::runtime::perf_probe::record_cpu_sample("download.fused.finish", cpu.finish);
-                crate::runtime::perf_probe::record_value("download.nntp.read.bytes", io.read_bytes);
-                crate::runtime::perf_probe::record_value("download.nntp.read.calls", io.read_calls);
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_cpu_sample(
+                    "download.fused.finish",
+                    cpu.finish,
+                );
+                weaver_server_base::runtime::perf_probe::record_value(
+                    "download.nntp.read.bytes",
+                    io.read_bytes,
+                );
+                weaver_server_base::runtime::perf_probe::record_value(
+                    "download.nntp.read.calls",
+                    io.read_calls,
+                );
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.readiness_waits",
                     io.transport_read.readiness_waits,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.empty_readiness_wakes",
                     io.transport_read.empty_readiness_wakes,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.try_read.calls",
                     io.transport_read.try_read_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.try_read.would_block",
                     io.transport_read.try_read_would_block,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.try_read.bytes",
                     io.transport_read.try_read_bytes,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.tls.read_calls",
                     io.transport_read.tls_read_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.tls.process_packets_calls",
                     io.transport_read.tls_process_packets_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.plaintext.drain_calls",
                     io.transport_read.plaintext_drain_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.plaintext.reader_calls",
                     io.transport_read.plaintext_reader_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.plaintext.reader_would_block",
                     io.transport_read.plaintext_reader_would_block,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.plaintext.bytes",
                     io.transport_read.plaintext_bytes,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.plaintext.cached_returns",
                     io.transport_read.cached_plaintext_returns,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.backend.recv_calls",
                     io.transport_read.backend_recv_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.backend.recv_bytes",
                     io.transport_read.backend_recv_bytes,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.backend.target_full_returns",
                     io.transport_read.backend_target_full_returns,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.backend.pending_empty_returns",
                     io.transport_read.backend_pending_empty_returns,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.backend.pending_after_bytes_returns",
                     io.transport_read.backend_pending_after_bytes_returns,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.backend.zero_returns",
                     io.transport_read.backend_zero_returns,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.transport.backend.bytes_per_recv_call",
                     io.transport_read
                         .backend_recv_bytes
                         .checked_div(io.transport_read.backend_recv_calls)
                         .unwrap_or(0),
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.read.bytes_per_call",
                     io.read_bytes.checked_div(io.read_calls).unwrap_or(0),
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.buffer.leftover_after_terminator",
                     io.leftover_bytes_after_terminator,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.nntp.buffer.compactions",
                     io.buffer_compactions,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.fused.decode.calls",
                     io.decode_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.fused.input.chunks",
                     io.input_chunks,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.fused.crc.update_calls",
                     io.crc_update_calls,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.fused.output.batches",
                     io.output_batches,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.fused.encoded.bytes",
                     io.encoded_bytes_consumed,
                 );
-                crate::runtime::perf_probe::record_value(
+                weaver_server_base::runtime::perf_probe::record_value(
                     "download.fused.decoded.bytes",
                     io.decoded_bytes_written,
                 );
                 let data = {
-                    let _cpu =
-                        crate::runtime::perf_probe::cpu_scope("download.inline_decode.into_chunk");
+                    let _cpu = weaver_server_base::runtime::perf_probe::cpu_scope(
+                        "download.inline_decode.into_chunk",
+                    );
                     DecodedChunk::from(decoded)
                 };
 

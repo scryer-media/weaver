@@ -19,13 +19,13 @@ use super::harness::{
     ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, par2_set, payload, serve_job,
 };
 use super::streams::xz;
-use crate::jobs::ids::JobId;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::{
     DownloadBatchLease, DownloadLaneMode, DownloadResult, OwnedDownloadLaneEvent, Pipeline,
     PipelineEvent, TerminalPostProcessingEvent, is_terminal_status,
 };
 use crate::{SchedulerError, SchedulerHandle};
+use weaver_server_base::jobs::ids::JobId;
 
 fn handle(pipeline: &Pipeline) -> SchedulerHandle {
     SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
@@ -1207,7 +1207,7 @@ async fn with_an_article_lost_by(
     // The payload's second article is taken off the queue and answered "not
     // found" by server 0, the way a lane answers it.
     let lost = crate::pipeline::SegmentId {
-        file_id: crate::jobs::ids::NzbFileId {
+        file_id: weaver_server_base::jobs::ids::NzbFileId {
             job_id: job,
             file_index: 0,
         },

@@ -17,15 +17,15 @@ use weaver_torrent::storage::TorrentStorage;
 
 use super::super::{READ_BACK_BYTES, Reading, Word};
 use super::{file, parts, storage};
-use crate::operations::disk::{Capacity, CapacityReader, CapacityReading};
 use crate::pipeline::graph::engine::RunMail;
-use crate::scratch::{CEILING_BYTES, Scratch, ScratchLedger};
 use crate::torrents::files::Files;
 use crate::torrents::intake::Holds;
 use crate::torrents::layout::PieceLayout;
 use crate::torrents::storage::{PieceStorage, Pieces};
 use crate::torrents::store::{Kept, TorrentStore};
 use crate::torrents::tee::{Plan, Tee};
+use weaver_server_disk::operations::disk::{Capacity, CapacityReader, CapacityReading};
+use weaver_server_disk::scratch::{CEILING_BYTES, Scratch, ScratchLedger};
 
 const MIB: u64 = 1 << 20;
 const PIECE: u64 = 2 * MIB;

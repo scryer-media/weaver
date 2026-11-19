@@ -1706,7 +1706,7 @@ async fn plain_files_under_par3_restarted_after_every_article_are_repaired_with_
 // leave holes of zeros where they lay, more than the set's blocks mend.
 #[tokio::test]
 async fn articles_held_in_memory_over_a_sized_file_are_fetched_again_after_every_restart() {
-    let _sized = crate::pipeline::graph::sparse::sizing::always();
+    let _sized = weaver_server_disk::pipeline::graph::sparse::sizing::always();
     let files = [
         ("lantern.bin", payload(6 * ARTICLE, 83)),
         ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
@@ -1724,7 +1724,7 @@ async fn articles_held_in_memory_over_a_sized_file_are_fetched_again_after_every
 // file's length covers them, and the checkpoint does not.
 #[tokio::test]
 async fn articles_held_in_memory_below_a_files_length_are_fetched_again_after_every_restart() {
-    let _grown = crate::pipeline::graph::sparse::sizing::never();
+    let _grown = weaver_server_disk::pipeline::graph::sparse::sizing::never();
     let files = [
         ("lantern.bin", payload(6 * ARTICLE, 83)),
         ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
@@ -2644,8 +2644,8 @@ async fn a_job_with_no_password_candidates_stored_is_restored_from_its_checkpoin
 #[tokio::test]
 async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resumed() {
     use crate::pipeline::graph::restore::RESTORES;
-    use crate::runtime::panic_trap::{Trap, boot_marks};
     use std::sync::atomic::Ordering::Relaxed;
+    use weaver_server_base::runtime::panic_trap::{Trap, boot_marks};
     let mut job = reopened().await;
     let restores = RESTORES.load(Relaxed);
     let data = tempfile::tempdir().unwrap();
@@ -2699,7 +2699,7 @@ async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resume
 // restored from its checkpoint, and the marker waits for its own job.
 #[tokio::test]
 async fn another_jobs_crash_marker_leaves_the_restore_alone() {
-    use crate::runtime::panic_trap::{Trap, boot_marks};
+    use weaver_server_base::runtime::panic_trap::{Trap, boot_marks};
     let mut job = reopened().await;
     let other = crate::JobId(JOB.0 + 1);
     let data = tempfile::tempdir().unwrap();
@@ -3051,7 +3051,7 @@ async fn a_job_restored_from_its_checkpoint_asks_nothing_of_the_disk() {
             .expect("the stopped run ends");
         pipeline.graph_run_said(said);
     }
-    let asks = crate::operations::disk::same_filesystem_asks();
+    let asks = weaver_server_disk::operations::disk::same_filesystem_asks();
     pipeline.request_job_activation(JOB);
     let read = pipeline
         .job_activated_rx
@@ -3062,7 +3062,10 @@ async fn a_job_restored_from_its_checkpoint_asks_nothing_of_the_disk() {
         read.result.as_ref().is_ok_and(|read| read.restored()),
         "built from its checkpoint"
     );
-    assert_eq!(crate::operations::disk::same_filesystem_asks(), asks);
+    assert_eq!(
+        weaver_server_disk::operations::disk::same_filesystem_asks(),
+        asks
+    );
     pipeline.hear_graph_runs();
     pipeline.handle_job_activated(read);
     retire_pipeline_database(pipeline).await;

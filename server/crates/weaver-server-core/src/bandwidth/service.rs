@@ -123,7 +123,7 @@ impl BandwidthLedgerRuntime {
             let bytes = total.saturating_sub(self.sampled[index]);
             if bytes > 0 {
                 self.record_pending_usage(
-                    crate::e2e_clock::unix_seconds().div_euclid(60),
+                    weaver_server_base::e2e_clock::unix_seconds().div_euclid(60),
                     bytes,
                     index == 1,
                 );
@@ -141,7 +141,7 @@ impl BandwidthLedgerRuntime {
     // crash is redone by the next one, and nothing reads the ledger back
     // before the writer has run it.
     pub(crate) fn prune_if_due(&mut self, db: &crate::Database) -> Result<(), crate::StateError> {
-        let now_secs = crate::e2e_clock::unix_seconds();
+        let now_secs = weaver_server_base::e2e_clock::unix_seconds();
         let prune_cutoff = now_secs.div_euclid(60) - BANDWIDTH_LEDGER_RETENTION_DAYS * 24 * 60;
         if self.last_pruned_bucket_epoch_minute != Some(prune_cutoff) {
             db.try_queue_write("bandwidth_usage_prune", move |db| {
@@ -176,7 +176,10 @@ impl BandwidthLedgerRuntime {
         db.try_queue_write("bandwidth_usage_flush", move |db| {
             let started = std::time::Instant::now();
             let result = db.add_metered_bandwidth_usage_minutes(&written);
-            crate::runtime::perf_probe::record("bandwidth.flush_pending_usage", started.elapsed());
+            weaver_server_base::runtime::perf_probe::record(
+                "bandwidth.flush_pending_usage",
+                started.elapsed(),
+            );
             let _ = committed_tx.send(result.is_ok());
             result
         })?;
@@ -588,9 +591,9 @@ impl Pipeline {
         };
         if held_over_all(&before) != held_over_all(&self.applied_holds) {
             self.emit_job_event(if paused {
-                crate::events::model::PipelineEvent::GlobalPaused
+                weaver_server_base::events::model::PipelineEvent::GlobalPaused
             } else {
-                crate::events::model::PipelineEvent::GlobalResumed
+                weaver_server_base::events::model::PipelineEvent::GlobalResumed
             });
         }
         self.hold_extraction_clocks();

@@ -62,7 +62,7 @@ impl Database {
                 Box::pin(async move {
                     for (key, value) in [
                         (SETUP_PENDING_SETTING_KEY, "pending"),
-                        (crate::security::SETTING_SECURITY_POLICY_REVISION, crate::security::AUTHENTICATED_POLICY_REVISION),
+                        (weaver_server_base::security::SETTING_SECURITY_POLICY_REVISION, weaver_server_base::security::AUTHENTICATED_POLICY_REVISION),
                     ] {
                         tx.execute(
                             "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -123,22 +123,22 @@ impl Database {
                     if let Some(bind_address) = setup.bind_address {
                         tx.execute(
                             "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            &[SqlArg::Text(crate::security::SETTING_HTTP_BIND_ADDRESS.to_string()), SqlArg::Text(bind_address)],
+                            &[SqlArg::Text(weaver_server_base::security::SETTING_HTTP_BIND_ADDRESS.to_string()), SqlArg::Text(bind_address)],
                         ).await?;
                     }
                     if let Some(trusted_networks) = setup.trusted_networks {
                         tx.execute(
                             "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            &[SqlArg::Text(crate::security::SETTING_TRUSTED_NETWORKS.to_string()), SqlArg::Text(trusted_networks)],
+                            &[SqlArg::Text(weaver_server_base::security::SETTING_TRUSTED_NETWORKS.to_string()), SqlArg::Text(trusted_networks)],
                         ).await?;
                     }
                     tx.execute(
                         "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        &[SqlArg::Text(crate::security::SETTING_ACCESS_MODE.to_string()), SqlArg::Text("login_required".to_string())],
+                        &[SqlArg::Text(weaver_server_base::security::SETTING_ACCESS_MODE.to_string()), SqlArg::Text("login_required".to_string())],
                     ).await?;
                     tx.execute(
                         "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        &[SqlArg::Text(crate::security::SETTING_SECURITY_POLICY_REVISION.to_string()), SqlArg::Text(crate::security::AUTHENTICATED_POLICY_REVISION.to_string())],
+                        &[SqlArg::Text(weaver_server_base::security::SETTING_SECURITY_POLICY_REVISION.to_string()), SqlArg::Text(weaver_server_base::security::AUTHENTICATED_POLICY_REVISION.to_string())],
                     ).await?;
                     let session = setup.browser_session;
                     tx.execute(

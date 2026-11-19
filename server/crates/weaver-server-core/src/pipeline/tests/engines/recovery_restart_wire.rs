@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::harness::{self, JOB, Post};
-use crate::jobs::ids::{NzbFileId, SegmentId};
 use crate::jobs::model::{DownloadState, JobStatus, PostState, RunState};
 use crate::pipeline::Pipeline;
 use crate::pipeline::tests::direct_store::{
@@ -14,6 +13,7 @@ use crate::pipeline::tests::{
     retire_pipeline_database, submit_decoded_segment_declaring,
 };
 use weaver_graph::{ByteRange, MemberId, NodeId};
+use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
 async fn turn(pipeline: &mut Pipeline) {
     pipeline.hear_graph_runs();

@@ -7,11 +7,11 @@
 use std::fs::File;
 
 use super::*;
-use crate::operations::disk::reader::{Reading, TurnStop};
-use crate::operations::disk::volume::Volume;
 use crate::pipeline::graph::hardware::Shutdown;
 use crate::pipeline::graph::leaf::read_exact_at;
 use weaver_graph::Digest;
+use weaver_server_disk::operations::disk::reader::{Reading, TurnStop};
+use weaver_server_disk::operations::disk::volume::Volume;
 
 #[derive(Debug)]
 pub(crate) struct Verification {
@@ -25,7 +25,7 @@ pub(crate) struct Verification {
     folded: Option<u32>,
     // Everything submitted for the file when the check was lent: the
     // worker reads once it has returned.
-    settled: Option<crate::operations::disk::writer::Barrier>,
+    settled: Option<weaver_server_disk::operations::disk::writer::Barrier>,
     // The volume the file lies on: the check reads in its turns.
     volume: Option<Arc<Volume>>,
     pub(crate) stop: Arc<TurnStop>,
@@ -309,10 +309,10 @@ mod turns {
     use weaver_graph::{Coverage, MemberId, NodeId};
 
     use super::{READ_BACK, Verification};
-    use crate::operations::disk::StorageKind;
-    use crate::operations::disk::reader::{SOLID_READERS, SPINNING_READERS};
-    use crate::operations::disk::volume::Volume;
     use crate::pipeline::graph::hardware::Shutdown;
+    use weaver_server_disk::operations::disk::StorageKind;
+    use weaver_server_disk::operations::disk::reader::{SOLID_READERS, SPINNING_READERS};
+    use weaver_server_disk::operations::disk::volume::Volume;
 
     fn check(path: std::path::PathBuf, length: u64, volume: Option<Arc<Volume>>) -> Verification {
         Verification {

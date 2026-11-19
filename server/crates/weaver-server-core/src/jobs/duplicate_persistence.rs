@@ -13,10 +13,10 @@ use crate::jobs::duplicate::{
     SemanticTerminalCause, SubmissionOrigin, classify_semantic_terminal_cause,
     record_semantic_duplicate_lifecycle_metric,
 };
-use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_tx};
 use crate::settings::persistence::reserve_next_job_id_tx;
+use weaver_server_base::jobs::ids::JobId;
 
 const RESERVATION_TTL_SECONDS: i64 = 5 * 60;
 const PROMOTION_LEASE_SECONDS: i64 = 30;

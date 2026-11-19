@@ -1091,8 +1091,8 @@ async fn a_retry_keeps_its_folder_when_the_move_gives_its_own_up() {
 async fn a_staging_folder_made_for_a_job_cancelled_meanwhile_goes() {
     let temp = tempfile::tempdir().unwrap();
     // The roots new_direct_pipeline uses, on two devices before it opens.
-    crate::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
-    crate::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
     let (mut pipeline, _, complete) = new_direct_pipeline(&temp).await;
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
     let mut events = handle.subscribe_events();
@@ -1131,8 +1131,8 @@ async fn a_staging_folder_made_for_a_job_cancelled_meanwhile_goes() {
 async fn a_restart_waits_for_the_staging_removal_of_a_job_that_left() {
     use crate::pipeline::activation::move_seams;
     let temp = tempfile::tempdir().unwrap();
-    crate::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
-    crate::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
     let (mut pipeline, _, complete) = new_direct_pipeline(&temp).await;
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
     let mut events = handle.subscribe_events();
@@ -1205,8 +1205,8 @@ async fn a_restart_waits_for_the_staging_removal_of_a_job_that_left() {
 #[tokio::test]
 async fn a_left_job_reply_keeps_a_staging_folder_holding_files() {
     let temp = tempfile::tempdir().unwrap();
-    crate::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
-    crate::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
     let (mut pipeline, _, complete) = new_direct_pipeline(&temp).await;
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
     let id = JobId(1);

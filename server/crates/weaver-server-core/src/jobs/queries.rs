@@ -6,10 +6,10 @@ use std::path::PathBuf;
 
 use crate::StateError;
 use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind, FileCoverage};
-use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource, RecoveredJob};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
 type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
 

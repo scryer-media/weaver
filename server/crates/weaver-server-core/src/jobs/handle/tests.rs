@@ -4,12 +4,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::events::model::PipelineEvent;
-use crate::jobs::ids::JobId;
+use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_base::jobs::ids::JobId;
 
 use super::*;
 use crate::jobs::model::{FieldUpdate, JobSpec, JobStatus, JobUpdate};
-use crate::operations::metrics::PipelineMetrics;
+use weaver_server_base::operations::metrics::PipelineMetrics;
 
 #[test]
 fn shared_pipeline_metrics_snapshot_reads_do_not_resample_speed() {
@@ -145,7 +145,7 @@ async fn update_random_read_iops_reaches_scheduler() {
 
 #[tokio::test]
 async fn update_storage_classification_reaches_scheduler() {
-    use crate::runtime::system_profile::{FilesystemType, StorageClass};
+    use weaver_server_base::runtime::system_profile::{FilesystemType, StorageClass};
     let (handle, task) = test_scheduler().await;
 
     handle.update_storage_classification(StorageClass::Hdd, FilesystemType::Ext4);

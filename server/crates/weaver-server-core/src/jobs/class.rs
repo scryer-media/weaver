@@ -14,10 +14,10 @@ use crate::ingest::Kind;
 use crate::jobs::error::SchedulerError;
 use crate::jobs::handle::JobInfo;
 use crate::jobs::handle::{CancellationOrigin, QueueAction};
-use crate::jobs::ids::JobId;
 use crate::jobs::model::Protocol;
 use crate::pipeline::queue::Queue;
 use crate::settings::SeedingPolicy;
+use weaver_server_base::jobs::ids::JobId;
 
 /// One `T` for each protocol, indexed by protocol: a protocol added to the
 /// table adds its entry here with no site of its own.

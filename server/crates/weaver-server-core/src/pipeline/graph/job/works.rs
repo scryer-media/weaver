@@ -59,7 +59,7 @@ struct Rewalking {
     serial: u64,
     heard: std::sync::mpsc::SyncSender<()>,
     // Raised when the job stops: a read waiting for its turn ends.
-    stop: Arc<crate::operations::disk::reader::TurnStop>,
+    stop: Arc<weaver_server_disk::operations::disk::reader::TurnStop>,
 }
 
 // An object back from its work, with what it said.
@@ -234,7 +234,8 @@ impl Works {
         let mail = self.mail.clone();
         let shutdown = self.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
-            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             let tell = |piece, whole, scratch| {
                 mail.blocking_send(Said {
                     scope,
@@ -275,7 +276,8 @@ impl Works {
         let grant = self.hardware.grant();
         let clock = self.clock.clone();
         tokio::task::spawn_blocking(move || {
-            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             let mut said = Vec::new();
             // Executing once a thread of the pool takes it, until it is done.
             grant.install(|| {

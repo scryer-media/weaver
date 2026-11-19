@@ -17,14 +17,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use bytes::Bytes;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace};
 
-use crate::operations::disk::{
-    CapacityReader, DiskLedger, StorageRoot, is_out_of_space, is_quota_exceeded,
-};
-use crate::operations::room_wait::{Disk, Wants};
 use crate::pipeline::ExtractionLimits;
 use crate::torrents::storage::Pieces;
 use crate::torrents::writes::{Done, Paid, VolumeRoom};
 use tokio::sync::Notify;
+use weaver_server_disk::operations::disk::{
+    CapacityReader, DiskLedger, StorageRoot, is_out_of_space, is_quota_exceeded,
+};
+use weaver_server_disk::operations::room_wait::{Disk, Wants};
 use weaver_torrent::storage::HeldRoom;
 
 // Where a torrent's pieces land: the disk the folder they are written to
@@ -724,7 +724,7 @@ mod tests {
     // against it.
     #[test]
     fn the_disk_budget_refuses_what_would_eat_into_the_reserve() {
-        use crate::operations::disk::{Capacity, CapacityReading};
+        use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
 
         let sampled_at = std::time::Instant::now();
         let reading = Arc::new(Mutex::new(CapacityReading {
@@ -768,7 +768,7 @@ mod tests {
     // promise back, and one that landed counts against the reading.
     #[test]
     fn writers_on_one_volume_share_the_ledger() {
-        use crate::operations::disk::{Capacity, CapacityReading};
+        use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
 
         let reading = CapacityReading {
             available_bytes: 110,
@@ -798,7 +798,7 @@ mod tests {
     // A piece the store could not write gives back what it was promised.
     #[test]
     fn a_refused_write_gives_its_promise_back() {
-        use crate::operations::disk::{Capacity, CapacityReading};
+        use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
 
         let reading = CapacityReading {
             available_bytes: 1000,
@@ -823,7 +823,7 @@ mod tests {
     }
 
     fn known(available_bytes: u64) -> CapacityReader {
-        use crate::operations::disk::{Capacity, CapacityReading};
+        use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
 
         let reading = CapacityReading {
             available_bytes,
@@ -930,7 +930,7 @@ mod tests {
         assert_eq!(*said.lock().unwrap(), [Heard::NotBooked(4)]);
         let off = |dir: &str| {
             Place::new(
-                crate::operations::room_wait::Disk::Path(PathBuf::from(dir)),
+                weaver_server_disk::operations::room_wait::Disk::Path(PathBuf::from(dir)),
                 PathBuf::from(dir),
                 None,
             )

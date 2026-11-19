@@ -102,8 +102,8 @@ active = true
     let mut db = Database::open_in_memory().unwrap();
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     db.set_setting(
-        crate::security::SETTING_INSTALL_GENERATION,
-        crate::security::AUTHENTICATED_INSTALL_GENERATION,
+        weaver_server_base::security::SETTING_INSTALL_GENERATION,
+        weaver_server_base::security::AUTHENTICATED_INSTALL_GENERATION,
     )
     .unwrap();
     assert!(db.is_empty().unwrap());
@@ -146,8 +146,8 @@ active = true
     let mut db = Database::open_in_memory().unwrap();
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     db.set_setting(
-        crate::security::SETTING_INSTALL_GENERATION,
-        crate::security::AUTHENTICATED_INSTALL_GENERATION,
+        weaver_server_base::security::SETTING_INSTALL_GENERATION,
+        weaver_server_base::security::AUTHENTICATED_INSTALL_GENERATION,
     )
     .unwrap();
     crate::operations::backup::record_started_version(&db).unwrap();
@@ -191,8 +191,8 @@ fn write_journal_entry(buf: &mut Vec<u8>, entry: &JournalEntry) {
 
 #[test]
 fn migrate_journal_to_sqlite() {
-    use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
     use std::path::PathBuf;
+    use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
     let dir = std::env::temp_dir().join(format!(
         "weaver_journal_migration_test_{}",

@@ -12,7 +12,6 @@ use weaver_graph::{ByteRange, Kind, MemberId, Provenance};
 
 use super::*;
 use crate::history::HistoryFailureKind;
-use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::PipelineEvent;
 use crate::pipeline::download::queue::DownloadQueue;
@@ -30,6 +29,7 @@ use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
     YencLayoutAssertions,
 };
+use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
 // A file delivered under the name it wanted.
 fn delivered(name: &str, depth: u32, whole: bool) -> Delivered {

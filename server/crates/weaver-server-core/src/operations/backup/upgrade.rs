@@ -358,7 +358,11 @@ mod tests {
         prepare_upgrade_backup_for_target(&target, root.path(), "0.14.2", |_| Ok(key))
             .await
             .unwrap();
-        let rows = list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now()).unwrap();
+        let rows = list_backups(
+            &root.path().join("backups"),
+            weaver_server_base::e2e_clock::utc_now(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source_weaver_version, "0.14.2");
         assert_eq!(
@@ -494,7 +498,11 @@ mod tests {
         prepare_upgrade_backup_for_target(&target, root.path(), "0.14.2", |_| Ok(key.clone()))
             .await
             .unwrap();
-        let rows = list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now()).unwrap();
+        let rows = list_backups(
+            &root.path().join("backups"),
+            weaver_server_base::e2e_clock::utc_now(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, BackupArtifactStatus::Ready);
         assert_eq!(rows[0].source_weaver_version, "0.14.1");
@@ -530,9 +538,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now())
-                .unwrap()
-                .len(),
+            list_backups(
+                &root.path().join("backups"),
+                weaver_server_base::e2e_clock::utc_now()
+            )
+            .unwrap()
+            .len(),
             1
         );
     }
@@ -560,7 +571,11 @@ mod tests {
         prepare_upgrade_backup_for_target(&target, root.path(), "0.14.2", |_| Ok(key))
             .await
             .unwrap();
-        let rows = list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now()).unwrap();
+        let rows = list_backups(
+            &root.path().join("backups"),
+            weaver_server_base::e2e_clock::utc_now(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, BackupArtifactStatus::Ready);
         assert_eq!(rows[0].source_weaver_version, "unknown");

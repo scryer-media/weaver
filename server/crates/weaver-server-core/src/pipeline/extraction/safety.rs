@@ -95,7 +95,7 @@ impl ExtractionLimits {
         // without the runtime's — half the machine's memory stands in.
         let default_memory = profile_ceiling_bytes
             .unwrap_or_else(|| {
-                crate::runtime::system_probe::detect_total_memory_bytes()
+                weaver_server_disk::runtime::system_probe::detect_total_memory_bytes()
                     .unwrap_or(2 * MAX_MEMORY_LIMIT)
                     / 2
             })

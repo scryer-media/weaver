@@ -13,7 +13,7 @@ use weaver_tunnel::{
 };
 
 use super::{Consumer, FetchAttempt, ProxyRuntime};
-use crate::security::is_blocked_egress_ip;
+use weaver_server_base::security::is_blocked_egress_ip;
 
 // One concrete path an HTTP fetch can take: it resolves names the way its
 // exit does, and dials the addresses the fetch pinned for a name.

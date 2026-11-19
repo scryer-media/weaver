@@ -15,11 +15,11 @@ use crate::jobs::download_summary::{
     DOWNLOAD_SUMMARY_VERSION, DownloadSummary, Layout, NODES_KEPT, NodeMode, RECOVERY_KEPT,
     SETS_KEPT, SummaryNode, SummaryPost, SummaryRecovery, SummarySet, bounded_name,
 };
-use crate::jobs::ids::JobId;
 use crate::jobs::model::JobState;
 use crate::pipeline::Pipeline;
 use crate::pipeline::graph::checkpoint::{Generations, why_name};
 use crate::pipeline::graph::job::GraphJob;
+use weaver_server_base::jobs::ids::JobId;
 
 fn recovers(kind: Kind) -> bool {
     matches!(

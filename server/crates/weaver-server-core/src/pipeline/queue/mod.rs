@@ -134,7 +134,7 @@ pub struct QueueInner {
     // with the request count it answers.
     pub(crate) diagnostics_requested: u64,
     pub(crate) diagnostics: Option<(u64, crate::pipeline::diagnostics::PipelineDiagnostics)>,
-    pub(crate) metrics: Option<crate::operations::metrics::MetricsSnapshot>,
+    pub(crate) metrics: Option<weaver_server_base::operations::metrics::MetricsSnapshot>,
     // Bumped by every intent write, so the actor can tell a turn with no new
     // intent from one that needs a walk over the rows.
     intent_epoch: u64,
@@ -228,8 +228,8 @@ pub struct Globals {
     pub scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub random_read_iops: Option<f64>,
     pub storage_classification: Option<(
-        crate::runtime::system_profile::StorageClass,
-        crate::runtime::system_profile::FilesystemType,
+        weaver_server_base::runtime::system_profile::StorageClass,
+        weaver_server_base::runtime::system_profile::FilesystemType,
     )>,
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
@@ -265,7 +265,7 @@ pub struct JobRow {
     pub(crate) sampled_phases: Vec<crate::jobs::phase_progress::JobPhaseProgress>,
     // The download rate over `counters.downloaded`, advanced on every metrics
     // tick for as long as the row lives, on the global gauge's sample instants.
-    pub(crate) download_rate: Option<crate::operations::metrics::RateSeries>,
+    pub(crate) download_rate: Option<weaver_server_base::operations::metrics::RateSeries>,
     pub(crate) admission: Option<PreparedAdd>,
 }
 

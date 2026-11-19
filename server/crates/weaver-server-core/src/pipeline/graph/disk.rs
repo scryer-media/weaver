@@ -14,16 +14,16 @@ use crate::JobId;
 use crate::jobs::model::JobStatus;
 use crate::operations::StorageCapacity;
 use crate::operations::VolumeBuffers;
-use crate::operations::disk::volume::{Reservation, Volume};
-use crate::operations::disk::writer::{
-    Barrier, DiskOwner, Failure, Owner, Prepaid, Submitter, VolumeWriters,
-};
 use crate::pipeline::Pipeline;
 use crate::pipeline::download::volume_pace::{VolumeIntake, intake_of};
 use crate::pipeline::graph::job::GraphError;
 use crate::pipeline::graph::job::GraphJob;
 use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::namespace::WriteError;
+use weaver_server_disk::operations::disk::volume::{Reservation, Volume};
+use weaver_server_disk::operations::disk::writer::{
+    Barrier, DiskOwner, Failure, Owner, Prepaid, Submitter, VolumeWriters,
+};
 
 // The volumes' writers as the pipeline writes through them: the writers
 // the process shares, and the pipeline's place among their owners. Every
@@ -237,9 +237,9 @@ pub(crate) struct VolumeProbes {
 
 impl VolumeProbes {
     // Probes that read and keep their figures in `store`.
-    pub(crate) fn stored(store: Arc<crate::operations::disk::ProbeStore>) -> Self {
+    pub(crate) fn stored(store: Arc<weaver_server_disk::operations::disk::ProbeStore>) -> Self {
         Self::with(move |volume, dir| {
-            Box::new(crate::operations::disk::probe_once(
+            Box::new(weaver_server_disk::operations::disk::probe_once(
                 volume,
                 dir,
                 Arc::clone(&store),

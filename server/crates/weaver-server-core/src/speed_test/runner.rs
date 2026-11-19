@@ -21,8 +21,8 @@ impl RunClock {
                 at: *moved.borrow() + after,
                 moved: moved.clone(),
             },
-            None if crate::e2e_clock::override_enabled() => Deadline::E2e(
-                crate::e2e_clock::utc_now()
+            None if weaver_server_base::e2e_clock::override_enabled() => Deadline::E2e(
+                weaver_server_base::e2e_clock::utc_now()
                     + chrono::TimeDelta::from_std(after).expect("bounded speed-test wait"),
             ),
             None => Deadline::Monotonic(tokio::time::Instant::now() + after),
@@ -73,7 +73,7 @@ impl Deadline {
     pub(crate) fn expired(&self) -> bool {
         match self {
             Self::Monotonic(at) => *at <= tokio::time::Instant::now(),
-            Self::E2e(at) => *at <= crate::e2e_clock::utc_now(),
+            Self::E2e(at) => *at <= weaver_server_base::e2e_clock::utc_now(),
             Self::Moved { at, moved } => *moved.borrow() >= *at,
         }
     }
@@ -83,7 +83,8 @@ impl Deadline {
             Self::Monotonic(at) => tokio::time::sleep_until(*at).await,
             Self::E2e(_) => {
                 while !self.expired() {
-                    tokio::time::sleep(crate::e2e_clock::schedule_poll_interval()).await;
+                    tokio::time::sleep(weaver_server_base::e2e_clock::schedule_poll_interval())
+                        .await;
                 }
             }
             Self::Moved { at, moved } => {

@@ -19,11 +19,6 @@ pub mod application_upgrade;
 pub mod auth;
 pub mod bandwidth;
 pub mod categories;
-pub mod clock;
-pub mod e2e_clock;
-pub mod e2e_failpoint;
-pub mod error;
-pub mod events;
 pub mod history;
 pub mod ingest;
 pub mod jobs;
@@ -38,8 +33,6 @@ pub mod rss;
 pub mod runtime;
 pub mod schema_migrations;
 pub mod schema_upgrade;
-pub(crate) mod scratch;
-pub mod security;
 pub mod servers;
 pub mod settings;
 pub mod speed_test;
@@ -50,6 +43,8 @@ pub mod update_check;
 // Transitional, removed in 0.9.1. See the module docs.
 pub mod upgrade_compat;
 pub mod watch_folder;
+
+pub use weaver_server_base::{clock, e2e_clock, e2e_failpoint, error, events, security};
 
 pub use auth::{ApiKeyRow, AuthCredentials};
 pub use bandwidth::rate_limiter::TokenBucket;

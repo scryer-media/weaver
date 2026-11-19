@@ -2,9 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
-use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
+use weaver_server_base::jobs::ids::JobId;
 
 const NEXT_JOB_ID_SETTING_KEY: &str = "next_job_id";
 
@@ -46,7 +46,7 @@ impl Database {
                         tx.execute(
                             "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                             &[
-                                SqlArg::Text(crate::security::SETTING_TRUSTED_NETWORKS.to_string()),
+                                SqlArg::Text(weaver_server_base::security::SETTING_TRUSTED_NETWORKS.to_string()),
                                 SqlArg::Text(networks),
                             ],
                         ).await?;
@@ -55,7 +55,7 @@ impl Database {
                         tx.execute(
                             "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                             &[
-                                SqlArg::Text(crate::security::SETTING_TRUSTED_PROXIES.to_string()),
+                                SqlArg::Text(weaver_server_base::security::SETTING_TRUSTED_PROXIES.to_string()),
                                 SqlArg::Text(proxies),
                             ],
                         ).await?;
@@ -65,14 +65,14 @@ impl Database {
                         NetworkBindAddressUpdate::Clear => {
                             tx.execute(
                                 "DELETE FROM settings WHERE key = {}",
-                                &[SqlArg::Text(crate::security::SETTING_HTTP_BIND_ADDRESS.to_string())],
+                                &[SqlArg::Text(weaver_server_base::security::SETTING_HTTP_BIND_ADDRESS.to_string())],
                             ).await?;
                         }
                         NetworkBindAddressUpdate::Set(address) => {
                             tx.execute(
                                 "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                                 &[
-                                    SqlArg::Text(crate::security::SETTING_HTTP_BIND_ADDRESS.to_string()),
+                                    SqlArg::Text(weaver_server_base::security::SETTING_HTTP_BIND_ADDRESS.to_string()),
                                     SqlArg::Text(address),
                                 ],
                             ).await?;
@@ -81,8 +81,8 @@ impl Database {
                     tx.execute(
                         "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                         &[
-                            SqlArg::Text(crate::security::SETTING_SECURITY_POLICY_REVISION.to_string()),
-                            SqlArg::Text(crate::security::AUTHENTICATED_POLICY_REVISION.to_string()),
+                            SqlArg::Text(weaver_server_base::security::SETTING_SECURITY_POLICY_REVISION.to_string()),
+                            SqlArg::Text(weaver_server_base::security::AUTHENTICATED_POLICY_REVISION.to_string()),
                         ],
                     ).await?;
                     Ok(())

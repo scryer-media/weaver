@@ -2,8 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::operations::instrumentation::PipelinePhase;
-use crate::runtime::shutdown_steps::{
+use weaver_server_base::operations::instrumentation::PipelinePhase;
+use weaver_server_base::runtime::shutdown_steps::{
     bounded_shutdown_step, waited_shutdown_step, waited_shutdown_write,
 };
 
@@ -190,7 +190,7 @@ impl Pipeline {
         tokio::fs::create_dir_all(&data_dir).await?;
         // No job lends a decode window yet: any in the data folder is a past
         // process's.
-        crate::scratch::sweep_spare(&data_dir);
+        weaver_server_disk::scratch::sweep_spare(&data_dir);
         // A download folder on a drive that is gone must not stop Weaver from
         // starting, or it could never be pointed at another one.
         for dir in [&intermediate_dir, &complete_dir] {
@@ -218,12 +218,12 @@ impl Pipeline {
         // runtime. A pipeline under test probes nothing, nor does one run
         // with `WEAVER_VOLUME_WRITE_PROBE=off`.
         let volume_probes = Arc::new(
-            if cfg!(test) || crate::operations::disk::volume_write_probe_disabled() {
+            if cfg!(test) || weaver_server_disk::operations::disk::volume_write_probe_disabled() {
                 crate::pipeline::graph::disk::VolumeProbes::none()
             } else {
                 let data_dir = data_dir.clone();
                 let store = tokio::task::spawn_blocking(move || {
-                    crate::operations::disk::ProbeStore::open(&data_dir)
+                    weaver_server_disk::operations::disk::ProbeStore::open(&data_dir)
                 })
                 .await?;
                 crate::pipeline::graph::disk::VolumeProbes::stored(store)
@@ -537,7 +537,7 @@ impl Pipeline {
             volume_writers,
             volume_rooms,
             volume_budget_held: std::sync::atomic::AtomicBool::new(false),
-            shutdown_settle: crate::operations::disk::writer::SettleBound::wall(
+            shutdown_settle: weaver_server_disk::operations::disk::writer::SettleBound::wall(
                 Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT,
             ),
             volume_probes,
@@ -614,7 +614,7 @@ impl Pipeline {
             let result = tokio::task::spawn_blocking(move || {
                 let task_started = Instant::now();
                 let result = f(&db);
-                crate::runtime::perf_probe::record(
+                weaver_server_base::runtime::perf_probe::record(
                     "pipeline.db_blocking.task",
                     task_started.elapsed(),
                 );
@@ -622,7 +622,10 @@ impl Pipeline {
             })
             .await
             .expect("db task panicked");
-            crate::runtime::perf_probe::record("pipeline.db_blocking.await", started.elapsed());
+            weaver_server_base::runtime::perf_probe::record(
+                "pipeline.db_blocking.await",
+                started.elapsed(),
+            );
             result
         }
     }
@@ -645,13 +648,16 @@ impl Pipeline {
             tasks.spawn_blocking(move || {
                 let task_started = Instant::now();
                 f(&db);
-                crate::runtime::perf_probe::record(
+                weaver_server_base::runtime::perf_probe::record(
                     "pipeline.db_fire_and_forget.task",
                     task_started.elapsed(),
                 );
             });
         }
-        crate::runtime::perf_probe::record("pipeline.db_fire_and_forget.submit", started.elapsed());
+        weaver_server_base::runtime::perf_probe::record(
+            "pipeline.db_fire_and_forget.submit",
+            started.elapsed(),
+        );
     }
 
     // Join all outstanding [`Self::db_fire_and_forget`] writes so shutdown
@@ -697,7 +703,7 @@ impl Pipeline {
     pub(in crate::pipeline) fn activate_server_counters(
         metrics: &PipelineMetrics,
         nntp: &NntpClient,
-    ) -> Vec<Arc<crate::operations::instrumentation::ServerCounters>> {
+    ) -> Vec<Arc<weaver_server_base::operations::instrumentation::ServerCounters>> {
         let pool = nntp.pool();
         let stable_ids = (0..pool.server_count())
             .map(|index| {
@@ -1081,7 +1087,7 @@ impl Pipeline {
     // Give back the memory a pipeline with no work is holding for work that
     // has stopped: every page the allocator is keeping freed.
     pub(in crate::pipeline) fn release_idle_memory(&self) {
-        crate::runtime::thread_release::release_idle_process_memory();
+        weaver_server_base::runtime::thread_release::release_idle_process_memory();
     }
 
     // Leave the gauges the parked drivers would publish saying what the
@@ -1168,7 +1174,7 @@ impl Pipeline {
         // another arm, wakes the next wait.
         let mut server_health = self.nntp.pool().server_health_changes();
         'turn: loop {
-            let mut turn_timer = crate::operations::instrumentation::TurnTimer::new(
+            let mut turn_timer = weaver_server_base::operations::instrumentation::TurnTimer::new(
                 &turn_metrics.pipeline_histograms.turn_duration,
                 &turn_metrics.pipeline_turn,
             );
@@ -1474,7 +1480,7 @@ impl Pipeline {
                                 if restoring {
                                     DECODES_HEARD_RESTORING.fetch_add(1, Ordering::Relaxed);
                                 }
-                                crate::runtime::perf_probe::record(
+                                weaver_server_base::runtime::perf_probe::record(
                                     "download.decode.done_rx.received",
                                     std::time::Duration::from_nanos(1),
                                 );
@@ -2424,7 +2430,7 @@ pub(crate) fn compute_write_backlog_budget_bytes(
     profile: &SystemProfile,
     backlog_base_bytes: usize,
 ) -> usize {
-    use crate::runtime::system_profile::StorageClass;
+    use weaver_server_base::runtime::system_profile::StorageClass;
 
     // The write backlog stays anchored to the tier's base size: growing it
     // with memory only defers flushing into a larger end-of-job drain tail

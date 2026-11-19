@@ -17,7 +17,6 @@ use weaver_graph::{ByteRange, Segment, VolumeIndex};
 
 use super::intake::Decoded;
 use super::source::{Class, Move};
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::JobState;
 use crate::pipeline::download::queue::{DownloadWork, QueueItem};
 use crate::pipeline::graph::engine::{Heard, Hears, Said};
@@ -25,6 +24,7 @@ use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
 use crate::pipeline::post_health::GivenUp;
 use crate::pipeline::{DecodedChunk, Pipeline};
+use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 // The priority a window volume is raised to: ahead of every article at the
 // neutral priority.
@@ -50,7 +50,7 @@ impl Pipeline {
         job_id: JobId,
         volumes: &[(
             std::path::PathBuf,
-            Arc<crate::operations::disk::volume::Volume>,
+            Arc<weaver_server_disk::operations::disk::volume::Volume>,
         )],
     ) {
         // Read before the job is borrowed, in the order they are tried, each

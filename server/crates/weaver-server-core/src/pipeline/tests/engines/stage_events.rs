@@ -9,8 +9,8 @@ use sevenz_turbo::encoder_options::Lzma2Options;
 
 use super::harness::{ARTICLE, JOB, Outcome, Post, Scenario, par2_set, payload, run};
 use super::rar::posts;
-use crate::events::model::PipelineEvent;
 use crate::pipeline::tests::direct_store::single_member_store_set;
+use weaver_server_base::events::model::PipelineEvent;
 
 // The run's stage events as words a row can compare.
 fn stages(outcome: &Outcome) -> Vec<String> {

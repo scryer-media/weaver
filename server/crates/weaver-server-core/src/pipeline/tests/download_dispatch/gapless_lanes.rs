@@ -871,7 +871,7 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
 fn fill_to_room_short(
     pipeline: &mut Pipeline,
     job_id: JobId,
-    volume: &crate::operations::disk::volume::Volume,
+    volume: &weaver_server_disk::operations::disk::volume::Volume,
 ) {
     let limit = volume.lease_limit();
     while volume.unwritten_bytes() + 512 < limit {
@@ -909,7 +909,7 @@ async fn room_held_idle_lane(
 ) -> (
     u64,
     oneshot::Receiver<DownloadLaneRefillResponse>,
-    std::sync::Arc<crate::operations::disk::volume::Volume>,
+    std::sync::Arc<weaver_server_disk::operations::disk::volume::Volume>,
 ) {
     insert_active_job(
         pipeline,
@@ -965,7 +965,7 @@ async fn a_lane_held_for_room_is_served_once_a_job_on_a_volume_with_room_has_wor
     // The second job's folder lies on a device of its own.
     let elsewhere = temp_dir.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    crate::runtime::fs::test_devices::assign(&elsewhere, 41_404);
+    weaver_server_disk::runtime::fs::test_devices::assign(&elsewhere, 41_404);
     let intermediate = std::mem::replace(&mut pipeline.intermediate_dir, elsewhere);
     insert_active_job(
         &mut pipeline,

@@ -56,7 +56,7 @@ fn current_schema_version() -> i64 {
         .unwrap()
 }
 
-fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
+fn postgres_sample_job(job_id: weaver_server_base::jobs::ids::JobId) -> ActiveJob {
     ActiveJob {
         job_id,
         nzb_hash: [0xA5; 32],
@@ -81,7 +81,7 @@ fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
     }
 }
 
-fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
+fn postgres_sample_history(job_id: weaver_server_base::jobs::ids::JobId) -> JobHistoryRow {
     JobHistoryRow {
         protocol: crate::jobs::Protocol::Nzb,
         job_id: job_id.0,
@@ -1202,7 +1202,7 @@ async fn try_queue_write_full_queue_resend_is_covered_by_flush() {
 async fn a_write_never_overtakes_the_writes_waiting_for_room_in_a_full_queue() {
     let db = Database::open_in_memory().unwrap();
     let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let job_id = crate::jobs::ids::JobId(7171);
+    let job_id = weaver_server_base::jobs::ids::JobId(7171);
     // What the last waiting write saw of the job's archive and events.
     let seen_by_last = std::sync::Arc::new(std::sync::Mutex::new(None));
 
@@ -1450,7 +1450,7 @@ async fn postgres_lanes_commit_an_archive_after_its_jobs_earlier_writes() {
     let (tx, worker) = spawn_lane_writer(&db, 4);
     let log = LaneLog::default();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let job_id = crate::jobs::ids::JobId(903);
+    let job_id = weaver_server_base::jobs::ids::JobId(903);
 
     send_lane_write(
         &tx,
@@ -1635,7 +1635,7 @@ async fn postgres_lanes_run_attribution_alongside_job_writes_but_before_the_arch
     let (tx, worker) = spawn_lane_writer(&db, 4);
     let log = LaneLog::default();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let job_id = crate::jobs::ids::JobId(905);
+    let job_id = weaver_server_base::jobs::ids::JobId(905);
 
     tx.send(lane_write(
         Some(WriteLane::ServerAttribution),
@@ -1692,7 +1692,7 @@ fn stale_generation_insert_does_not_resurrect_deleted_job() {
     // the reader inserts. The generation-guarded insert must be a no-op so the
     // deleted job is not served from the cache indefinitely.
     let db = Database::open_in_memory().unwrap();
-    let job_id = crate::jobs::ids::JobId(4242);
+    let job_id = weaver_server_base::jobs::ids::JobId(4242);
     let row = postgres_sample_history(job_id);
 
     // Reader path: seed the cache (simulates an earlier populate) and capture
@@ -1728,7 +1728,7 @@ fn public_delete_api_wins_race_against_stale_reader_insert() {
     // rather than the low-level invalidate, to confirm the committed delete's
     // invalidation defeats a stale reader re-cache captured before it.
     let db = Database::open_in_memory().unwrap();
-    let job_id = crate::jobs::ids::JobId(9191);
+    let job_id = weaver_server_base::jobs::ids::JobId(9191);
     let row = postgres_sample_history(job_id);
 
     // Persist and cache the row so the delete has something to remove.
@@ -1787,7 +1787,7 @@ async fn postgres_bulk_hot_paths_when_configured() {
     };
 
     let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
-    let job_id = crate::jobs::ids::JobId(314);
+    let job_id = weaver_server_base::jobs::ids::JobId(314);
     let file_identities = vec![
         crate::jobs::record::ActiveFileIdentity {
             file_index: 0,
@@ -1871,7 +1871,7 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
     let mut db = Database::open_target(DatabaseTarget::PostgresUrl(target_url.clone())).unwrap();
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
 
-    let job_id = crate::jobs::ids::JobId(720);
+    let job_id = weaver_server_base::jobs::ids::JobId(720);
 
     // --- create_active_job_with_file_identities ---------------------------
     let identities = vec![
@@ -2001,9 +2001,9 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
     const TARGET_COUNT: u64 = 1500;
     let target_ids: Vec<u64> = (1..=TARGET_COUNT).collect();
     for &history_id in &target_ids {
-        db.insert_job_history(&postgres_sample_history(crate::jobs::ids::JobId(
-            history_id,
-        )))
+        db.insert_job_history(&postgres_sample_history(
+            weaver_server_base::jobs::ids::JobId(history_id),
+        ))
         .unwrap();
     }
     let operation_id = db
@@ -2055,7 +2055,7 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
         "vol1.part02.rar"
     );
     // Absent job: the shared FOR KEY SHARE guard no-ops both halves.
-    let folded_absent_job = crate::jobs::ids::JobId(999_721);
+    let folded_absent_job = weaver_server_base::jobs::ids::JobId(999_721);
     db.save_file_identity(folded_absent_job, &folded_identity)
         .unwrap();
     assert_eq!(
@@ -2083,8 +2083,8 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
     let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url.clone())).unwrap();
 
     for (job_id, operation) in [
-        (crate::jobs::ids::JobId(601), "archive"),
-        (crate::jobs::ids::JobId(602), "delete"),
+        (weaver_server_base::jobs::ids::JobId(601), "archive"),
+        (weaver_server_base::jobs::ids::JobId(602), "delete"),
     ] {
         db.create_active_job(&postgres_sample_job(job_id)).unwrap();
         db.complete_file(job_id, 0, "f.rar", &[0; 16]).unwrap();
@@ -2157,20 +2157,24 @@ async fn postgres_job_lane_writes_keep_order_and_archive_last_when_configured() 
     let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
     let jobs = [701_u64, 702, 703, 704];
     for job_id in jobs {
-        db.create_active_job(&postgres_sample_job(crate::jobs::ids::JobId(job_id)))
-            .unwrap();
+        db.create_active_job(&postgres_sample_job(weaver_server_base::jobs::ids::JobId(
+            job_id,
+        )))
+        .unwrap();
     }
     // Interleaved across jobs, as the pipeline queues them; each job's own
     // events must still land in the order they were queued.
     for step in 0..25_i64 {
         for job_id in jobs {
-            db.try_queue_job_write(crate::jobs::ids::JobId(job_id), "lane_order", move |db| {
-                db.insert_job_event(job_id, step, &format!("S{step:02}"), "lane", None)
-            })
+            db.try_queue_job_write(
+                weaver_server_base::jobs::ids::JobId(job_id),
+                "lane_order",
+                move |db| db.insert_job_event(job_id, step, &format!("S{step:02}"), "lane", None),
+            )
             .unwrap();
         }
     }
-    let job_id = crate::jobs::ids::JobId(jobs[0]);
+    let job_id = weaver_server_base::jobs::ids::JobId(jobs[0]);
     let committed = db
         .try_queue_archive_job_with_terminal_cause(
             job_id,
@@ -2226,7 +2230,7 @@ async fn kept_archives_are_tried_again_in_order_a_capped_pass_at_a_time() {
         move |said| news.lock().unwrap().push(said)
     });
     let told = || std::mem::take(&mut *news.lock().unwrap());
-    let jobs = [801_u64, 802, 803, 804, 805].map(crate::jobs::ids::JobId);
+    let jobs = [801_u64, 802, 803, 804, 805].map(weaver_server_base::jobs::ids::JobId);
     let mut committed = std::collections::VecDeque::new();
     for job_id in jobs {
         db.create_active_job(&postgres_sample_job(job_id)).unwrap();
@@ -2710,7 +2714,7 @@ async fn postgres_runtime_smoke_when_configured() {
         .unwrap();
     assert!(api_key_id > 0);
 
-    let job_id = crate::jobs::ids::JobId(42);
+    let job_id = weaver_server_base::jobs::ids::JobId(42);
     db.create_active_job(&ActiveJob {
         job_id,
         nzb_hash: [0xA5; 32],
@@ -3150,8 +3154,8 @@ async fn a_torrent_history_row_is_kept_and_written_as_an_nzb_archive_is() {
         move |said| news.lock().unwrap().push(said)
     });
     let told = || std::mem::take(&mut *news.lock().unwrap());
-    let nzb = crate::jobs::ids::JobId(811);
-    let torrent = crate::jobs::ids::JobId(812);
+    let nzb = weaver_server_base::jobs::ids::JobId(811);
+    let torrent = weaver_server_base::jobs::ids::JobId(812);
     db.create_active_job(&postgres_sample_job(nzb)).unwrap();
     refuse(no_room());
     let mut nzb_written = db
@@ -3204,8 +3208,8 @@ async fn a_newer_torrent_history_row_lets_go_the_one_kept() {
         move |said| news.lock().unwrap().push(said)
     });
     let told = || std::mem::take(&mut *news.lock().unwrap());
-    let nzb = crate::jobs::ids::JobId(821);
-    let torrent = crate::jobs::ids::JobId(822);
+    let nzb = weaver_server_base::jobs::ids::JobId(821);
+    let torrent = weaver_server_base::jobs::ids::JobId(822);
     db.create_active_job(&postgres_sample_job(nzb)).unwrap();
     refuse(no_room());
     let _nzb_written = db

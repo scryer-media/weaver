@@ -22,7 +22,8 @@ impl GraphJob {
     // acknowledgments arrive. Late output and checkpoint acknowledgments
     // must not publish more files or start another step of the failed job.
     pub(crate) fn drain_failed_run(&mut self, said: Said) -> Result<(), GraphError> {
-        let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(said.scope));
+        let _job =
+            weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(said.scope));
         match said.heard {
             Heard::Ended if self.runs.current(said.node, said.generation) => {
                 self.runs.ended(said.node, said.generation, 0);
@@ -70,7 +71,8 @@ impl GraphJob {
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
-        let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(said.scope));
+        let _job =
+            weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(said.scope));
         let node = said.node;
         let admitted = match said.heard {
             Heard::Repaired(returned) => {

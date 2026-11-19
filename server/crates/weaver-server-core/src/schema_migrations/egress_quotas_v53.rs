@@ -47,7 +47,7 @@ const SYSTEM_EGRESS_ID: i64 = 0;
 pub(crate) async fn move_isp_cap_to_system_egress(
     conn: &mut SqlConn<'_>,
 ) -> Result<(), StateError> {
-    move_at(conn, crate::e2e_clock::local_now()).await
+    move_at(conn, weaver_server_base::e2e_clock::local_now()).await
 }
 
 async fn move_at(conn: &mut SqlConn<'_>, now: DateTime<Local>) -> Result<(), StateError> {

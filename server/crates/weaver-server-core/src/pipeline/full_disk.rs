@@ -39,11 +39,11 @@ use tracing::{info, warn};
 
 use super::graph::limits::Device;
 use super::{ParkedBytes, Pipeline};
-use crate::jobs::ids::JobId;
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, RunState};
 use crate::operations::StorageRoot;
-pub(crate) use crate::operations::room_wait::Wants;
-use crate::operations::room_wait::{Disk, Promised, RoomWait, Waiter};
+use weaver_server_base::jobs::ids::JobId;
+pub(crate) use weaver_server_disk::operations::room_wait::Wants;
+use weaver_server_disk::operations::room_wait::{Disk, Promised, RoomWait, Waiter};
 
 // The wait of the kept history archives: the folder read, how many
 // archives the writer said it keeps, the probe count as the wait began, and

@@ -583,7 +583,7 @@ async fn only_a_failed_pause_or_server_disable_holds_admission() {
 
     // A server that failed to go offline holds new downloads, and says why.
     *schedules.write().await = vec![rule(false)];
-    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    tokio::time::advance(weaver_server_base::e2e_clock::schedule_poll_interval()).await;
     while !pipeline.shared_state.schedule_replay_paused() {
         tokio::task::yield_now().await;
     }
@@ -605,7 +605,7 @@ async fn only_a_failed_pause_or_server_disable_holds_admission() {
 
     // Removing the rule releases the hold.
     schedules.write().await.clear();
-    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    tokio::time::advance(weaver_server_base::e2e_clock::schedule_poll_interval()).await;
     while pipeline.shared_state.schedule_replay_paused() {
         tokio::task::yield_now().await;
     }

@@ -4,8 +4,8 @@
 use super::*;
 use crate::jobs::feed_verdict::FeedVerdict;
 use crate::jobs::graph_checkpoint::{Delta, NodeRow};
-use crate::jobs::ids::JobId;
 use crate::persistence::checkpoint_write::{CheckpointControl, CheckpointWrite};
+use weaver_server_base::jobs::ids::JobId;
 
 fn checkpoint() -> Delta {
     let mut verdict = FeedVerdict::new("post cannot complete".into());

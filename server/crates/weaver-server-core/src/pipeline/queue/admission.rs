@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{Change, JobRow, Queue};
-use crate::events::model::PipelineEvent;
 use crate::jobs::AddJobOptions;
 use crate::jobs::model::{DownloadState, PostState, RunState};
 use crate::{JobId, JobInfo, JobSpec, JobStatus, SchedulerError};
+use weaver_server_base::events::model::PipelineEvent;
 
 #[derive(Clone)]
 pub(crate) struct AdmissionResources {
@@ -358,7 +358,7 @@ pub(crate) fn delivery_staging_dir(
     job_id: JobId,
 ) -> Option<PathBuf> {
     staging_dir_on(
-        crate::runtime::fs::same_device(intermediate_dir, destination_root),
+        weaver_server_disk::runtime::fs::same_device(intermediate_dir, destination_root),
         destination_root,
         job_id,
     )
@@ -416,8 +416,8 @@ mod staging_tests {
         let root = tempfile::tempdir().expect("temp dir");
         let intermediate = root.path().join("intermediate");
         let complete = root.path().join("complete");
-        crate::runtime::fs::test_devices::assign(&intermediate, 1);
-        crate::runtime::fs::test_devices::assign(&complete, 2);
+        weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+        weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
         assert_eq!(
             delivery_staging_dir(&intermediate, &complete, JobId(7)),
             Some(complete.join(".weaver-staging").join("7"))
@@ -447,10 +447,10 @@ mod staging_tests {
         let complete = root.path().join("complete");
         let movies = root.path().join("movies");
         let beside = root.path().join("beside");
-        crate::runtime::fs::test_devices::assign(&intermediate, 1);
-        crate::runtime::fs::test_devices::assign(&complete, 2);
-        crate::runtime::fs::test_devices::assign(&movies, 3);
-        crate::runtime::fs::test_devices::assign(&beside, 1);
+        weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+        weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+        weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
+        weaver_server_disk::runtime::fs::test_devices::assign(&beside, 1);
         let categories = vec![
             category("movies", Some(&movies)),
             category("beside", Some(&beside)),

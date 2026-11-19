@@ -4,9 +4,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::settings::Config;
 use serde::{Deserialize, Serialize};
+use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 use crate::StateError;
 

@@ -53,10 +53,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 use sqlx::{ConnectOptions, Connection};
 use tokio::sync::{Notify, watch};
 
-use crate::operations::instrumentation::{
+use crate::persistence::StateError;
+use weaver_server_base::operations::instrumentation::{
     AtomicHistogram, DB_OP_DURATION_BOUNDS, HistogramSnapshot,
 };
-use crate::persistence::StateError;
 
 // SQLite's own default is 1000 frames; 4000 (16 MB at 4 KiB pages) turns
 // many small commits into fewer, longer checkpoint writes.

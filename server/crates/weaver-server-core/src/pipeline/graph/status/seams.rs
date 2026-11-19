@@ -13,11 +13,8 @@ use super::{
     Delivery, Failure, RecoverySummary, RootJob, SetSummary, Step, Unarrived, drive, failure,
     metrics, shown_status,
 };
-use crate::events::model::PipelineEvent;
 use crate::jobs::JobPhase;
-use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::JobStatus;
-use crate::operations::instrumentation::{JobStageKind, StageOutcomeKind};
 use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 use crate::pipeline::extraction::ExtractionError;
 use crate::pipeline::graph::job::{GraphJob, Note};
@@ -25,6 +22,9 @@ use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::post_health::{names_a_place, names_nothing};
 use crate::pipeline::{Pipeline, TerminalReconciliation, health_milli};
 use crate::post_processing::model::PipelineFailureStage;
+use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_base::jobs::ids::{JobId, NzbFileId};
+use weaver_server_base::operations::instrumentation::{JobStageKind, StageOutcomeKind};
 
 // The completion gate hands the job here: there is no whole-file
 // verification, no listing check and no re-scan of the output, since the
@@ -157,7 +157,7 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
                 let hold = pipeline
                     .graph_recovery_summary(job_id)
                     .is_some_and(|summary| summary.repaired())
-                    .then_some(crate::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY);
+                    .then_some(weaver_server_base::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY);
                 if let Err(error) = pipeline.start_move_to_complete_held(job_id, hold).await {
                     pipeline.fail_job(job_id, error);
                 }
@@ -261,7 +261,7 @@ fn unused_sets(job_id: JobId, job: &GraphJob) -> Vec<PipelineEvent> {
                 recovery_set_id = unbound.id.as_deref().unwrap_or(""),
                 reason = reason,
                 "{}",
-                crate::events::model::recovery_set_unused_message(&set, reason)
+                weaver_server_base::events::model::recovery_set_unused_message(&set, reason)
             );
             PipelineEvent::RecoverySetUnused {
                 job_id,
@@ -974,13 +974,17 @@ impl Pipeline {
         // phase it shows is queued for the database. Extracting is held on
         // the engine run that does it, off this loop.
         let hook = match entered {
-            Some(JobStatus::Verifying) => Some(crate::e2e_failpoint::STATUS_ENTER_VERIFYING),
-            Some(JobStatus::Repairing) => Some(crate::e2e_failpoint::STATUS_ENTER_REPAIRING),
+            Some(JobStatus::Verifying) => {
+                Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_VERIFYING)
+            }
+            Some(JobStatus::Repairing) => {
+                Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_REPAIRING)
+            }
             _ => None,
         };
         if let Some(hook) = hook {
-            crate::e2e_failpoint::maybe_delay(hook);
-            crate::e2e_failpoint::maybe_trip(hook);
+            weaver_server_base::e2e_failpoint::maybe_delay(hook);
+            weaver_server_base::e2e_failpoint::maybe_trip(hook);
         }
     }
 
@@ -1074,7 +1078,7 @@ impl Pipeline {
                 }
                 // The queue fetches it again as first dispatched.
                 Note::Unread(volume, ordinal) => {
-                    let segment_id = crate::jobs::ids::SegmentId {
+                    let segment_id = weaver_server_base::jobs::ids::SegmentId {
                         file_id: NzbFileId {
                             job_id,
                             file_index: volume.0,

@@ -557,7 +557,7 @@ fn a_member_held_undecided_is_not_held_to_the_member_limit() {
 // wakes.
 #[test]
 fn what_waits_in_the_working_folder_is_held_to_the_reserve_of_its_device() {
-    use crate::operations::disk::{Capacity, CapacityReading};
+    use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
 
     const RESERVE: u64 = 1024;
     const ROOM: u64 = 64;

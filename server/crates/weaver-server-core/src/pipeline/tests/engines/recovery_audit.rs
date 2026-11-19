@@ -727,9 +727,9 @@ async fn explicit_article_body(
     corrupt: bool,
 ) {
     use super::harness::JOB;
-    use crate::jobs::ids::{NzbFileId, SegmentId};
     use crate::pipeline::{DecodeDone, DownloadPayload, Pipeline, SegmentSource};
     use weaver_nntp::client::{DecodedBody, DecodedBodyTrace};
+    use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
     if super::harness::finished(pipeline) {
         return;
     }

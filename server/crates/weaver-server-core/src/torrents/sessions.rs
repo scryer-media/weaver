@@ -648,8 +648,9 @@ impl Routes for NetworkRoutes {
         if !response.status().is_success() {
             return Err(format!("HTTP {}", response.status()));
         }
-        let limit = crate::security::RuntimeSecurityConfig::from_env_or_default_for_tests()
-            .nzb_decompressed_limit_bytes;
+        let limit =
+            weaver_server_base::security::RuntimeSecurityConfig::from_env_or_default_for_tests()
+                .nzb_decompressed_limit_bytes;
         let body = crate::proxies::read_body(response, limit).await?;
         IpRanges::create_from_stream(&mut std::io::Cursor::new(body))
             .await
@@ -799,7 +800,7 @@ pub fn session_limits(torrent: &TorrentConfig) -> SessionLimits {
     SessionLimits {
         connections_limit: count(
             torrent.connections_limit,
-            connections_within(crate::runtime::resource_limits::open_file_limit()),
+            connections_within(weaver_server_base::runtime::resource_limits::open_file_limit()),
         ),
         unchoke_slots_limit: count(torrent.unchoke_slots_limit, usize::MAX),
         connection_speed: torrent.connection_speed,

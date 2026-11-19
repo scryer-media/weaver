@@ -149,7 +149,8 @@ impl Pipeline {
 
     // Handle a completed decode — persist the segment, update assembly, journal.
     pub(crate) async fn handle_decode_done(&mut self, result: DecodeDone) {
-        let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_done");
+        let _profile_scope =
+            weaver_server_base::runtime::perf_probe::scope("download.handle_decode_done");
 
         let (segment_id, raw_size) = match &result {
             DecodeDone::Success { result, .. } => (result.segment_id, result.raw_size),
@@ -172,7 +173,9 @@ impl Pipeline {
                 error,
                 servers,
             } => {
-                let _job = crate::runtime::panic_trap::JobScope::enter(segment_id.file_id.job_id);
+                let _job = weaver_server_base::runtime::panic_trap::JobScope::enter(
+                    segment_id.file_id.job_id,
+                );
                 self.handle_decode_failure(segment_id, &error, servers);
             }
         }
@@ -338,7 +341,9 @@ impl Pipeline {
                 let work = DownloadWork {
                     counters: None,
                     segment_id,
-                    message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
+                    message_id: weaver_server_base::jobs::ids::MessageId::new(
+                        seg_spec.message_ids.in_use(),
+                    ),
                     groups: state
                         .articles
                         .file_groups(segment_id.file_id, &file_spec.groups),
@@ -527,11 +532,13 @@ impl Pipeline {
     // the job's.
     async fn handle_decode_success_inner(&mut self, result: DecodeResult, source: SegmentSource) {
         let job_id = result.segment_id.file_id.job_id;
-        crate::runtime::panic_trap::in_job(job_id, self.place_decoded(result, source)).await;
+        weaver_server_base::runtime::panic_trap::in_job(job_id, self.place_decoded(result, source))
+            .await;
     }
 
     async fn place_decoded(&mut self, result: DecodeResult, source: SegmentSource) {
-        let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_success");
+        let _profile_scope =
+            weaver_server_base::runtime::perf_probe::scope("download.handle_decode_success");
         let DecodeResult {
             segment_id,
             raw_size,
@@ -552,8 +559,9 @@ impl Pipeline {
         let file_id = segment_id.file_id;
 
         {
-            let _cpu_scope =
-                crate::runtime::perf_probe::cpu_scope("download.handle_decode_success.pre_persist");
+            let _cpu_scope = weaver_server_base::runtime::perf_probe::cpu_scope(
+                "download.handle_decode_success.pre_persist",
+            );
             if !self.job_takes_results(job_id) {
                 debug!(
                     job_id = job_id.0,
@@ -657,7 +665,7 @@ impl Pipeline {
                         // a re-fetch would only produce the same homeless
                         // article again. Drop it terminally.
                         drop(_cpu_scope);
-                        crate::runtime::perf_probe::record(
+                        weaver_server_base::runtime::perf_probe::record(
                             "download.uu.stale_arrival_dropped",
                             std::time::Duration::from_nanos(1),
                         );
@@ -1598,7 +1606,7 @@ impl Pipeline {
         if !self.push_requeued_segment(segment_id) {
             return false;
         }
-        crate::runtime::perf_probe::record(
+        weaver_server_base::runtime::perf_probe::record(
             "download.uu.park_requeue",
             std::time::Duration::from_nanos(1),
         );

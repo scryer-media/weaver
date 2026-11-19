@@ -467,7 +467,7 @@ impl ServerTransferPolicyRegistry {
             .lock()
             .expect("server policy maintenance gate poisoned");
         let book = self.book(scope);
-        let now = crate::e2e_clock::local_now();
+        let now = weaver_server_base::e2e_clock::local_now();
         let configured_ids = holders
             .iter()
             .map(|holder| holder.id)
@@ -574,7 +574,7 @@ impl ServerTransferPolicyRegistry {
                         quota_baseline_bytes: baseline,
                         window_start: window.map(|value| value.start),
                         window_end: window.map(|value| value.end),
-                        updated_at: crate::e2e_clock::utc_now(),
+                        updated_at: weaver_server_base::e2e_clock::utc_now(),
                     },
                     upload,
                 ));
@@ -597,12 +597,12 @@ impl ServerTransferPolicyRegistry {
             id,
             &snapshot,
             policy,
-            crate::e2e_clock::local_now(),
+            weaver_server_base::e2e_clock::local_now(),
         ))
     }
 
     fn snapshots_in(&self, scope: TransferScope) -> Vec<ServerDownloadQuotaSnapshot> {
-        let now = crate::e2e_clock::local_now();
+        let now = weaver_server_base::e2e_clock::local_now();
         let book = self.book(scope);
         let policies = book.policies();
         let mut snapshots = policies
@@ -740,7 +740,7 @@ impl ServerTransferPolicyRegistry {
             },
             window_start: policy.window.map(|value| value.start),
             window_end: policy.window.map(|value| value.end),
-            timezone: local_timezone_label(crate::e2e_clock::local_now()),
+            timezone: local_timezone_label(weaver_server_base::e2e_clock::local_now()),
         })
     }
 
@@ -764,7 +764,7 @@ impl ServerTransferPolicyRegistry {
             .maintenance_gate
             .lock()
             .expect("server policy maintenance gate poisoned");
-        let now = crate::e2e_clock::local_now();
+        let now = weaver_server_base::e2e_clock::local_now();
         let book = self.book(scope);
         let (usage, upload, result) = {
             let mut policies = book.policies();
@@ -788,7 +788,7 @@ impl ServerTransferPolicyRegistry {
                 quota_baseline_bytes: after.lifetime_body_bytes,
                 window_start: policy.window.map(|value| value.start),
                 window_end: policy.window.map(|value| value.end),
-                updated_at: crate::e2e_clock::utc_now(),
+                updated_at: weaver_server_base::e2e_clock::utc_now(),
             };
             let result = snapshot_for_policy(server_id, &after, policy, now);
             (usage, policy.upload, result)
@@ -812,7 +812,7 @@ impl ServerTransferPolicyRegistry {
     // elapsed, which is nearly every call; the returned resets still have to
     // be written with [`persist_window_resets`](Self::persist_window_resets).
     fn advance_windows(&self) -> Vec<WindowReset> {
-        let now = crate::e2e_clock::local_now();
+        let now = weaver_server_base::e2e_clock::local_now();
         let now_utc = now.with_timezone(&Utc);
         let mut resets = Vec::new();
         for book in self.books() {
@@ -855,7 +855,7 @@ impl ServerTransferPolicyRegistry {
                 quota_baseline_bytes: reset.lifetime_bytes,
                 window_start: reset.policy.window.map(|value| value.start),
                 window_end: reset.policy.window.map(|value| value.end),
-                updated_at: crate::e2e_clock::utc_now(),
+                updated_at: weaver_server_base::e2e_clock::utc_now(),
             };
             self.store_usage(reset.scope, &usage, reset.policy.upload)?;
             self.record_flushed(reset.scope, &usage, reset.policy.upload);
@@ -903,7 +903,7 @@ impl ServerTransferPolicyRegistry {
                         .saturating_sub(snapshot.quota_used_bytes),
                     window_start: policy.window.map(|value| value.start),
                     window_end: policy.window.map(|value| value.end),
-                    updated_at: crate::e2e_clock::utc_now(),
+                    updated_at: weaver_server_base::e2e_clock::utc_now(),
                 };
                 let changed = flushed.get(&(book.scope, id))
                     != Some(&FlushedUsage::of(&usage, policy.upload));
@@ -1085,7 +1085,9 @@ fn quota_blocked(
 }
 
 fn monotonic_deadline(window: ServerQuotaWindow) -> Option<Instant> {
-    let delay = (window.end - crate::e2e_clock::utc_now()).to_std().ok()?;
+    let delay = (window.end - weaver_server_base::e2e_clock::utc_now())
+        .to_std()
+        .ok()?;
     Some(Instant::now() + delay)
 }
 

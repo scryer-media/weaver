@@ -85,7 +85,7 @@ impl Database {
                     )
                     .await
                     .map(|_| ());
-                    crate::runtime::perf_probe::record_sql_op(
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
                         "postgres",
                         "add_bandwidth_usage_minutes",
                         started.elapsed(),

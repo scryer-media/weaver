@@ -3,16 +3,20 @@
 
 pub mod async_ops;
 pub mod backup;
-pub mod disk;
+pub mod disk {
+    pub use weaver_server_disk::operations::disk::*;
+
+    #[cfg(test)]
+    mod tests;
+}
 pub mod health;
-pub mod instrumentation;
 pub mod logs;
 pub mod maintenance;
-pub mod metrics;
 pub mod metrics_store;
 pub mod recovery;
-pub(crate) mod room_wait;
 pub mod usage_history;
+
+pub use weaver_server_base::operations::{instrumentation, metrics};
 
 pub use async_ops::{
     ArchiveHistoryAcceptOutcome, ArchiveHistoryAcceptance, ArchiveHistorySettlement,

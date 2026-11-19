@@ -12,8 +12,6 @@ use crate::jobs::JobId;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::status::{Delivery, Failure, shortfall_message};
 use crate::post_processing::model::QueueEvent;
-use crate::runtime::fs::JobMoves;
-use crate::runtime::panic_trap::JobScope;
 use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::model::UnpackEnd;
 use crate::torrents::relocate::Existing;
@@ -24,6 +22,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use weaver_server_base::runtime::panic_trap::JobScope;
+use weaver_server_disk::runtime::fs::JobMoves;
 
 impl TorrentService {
     // Torrents a wind-down to the downloads alone stopped resume, now that

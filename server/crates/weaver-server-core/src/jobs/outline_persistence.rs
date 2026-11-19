@@ -18,9 +18,9 @@ use rayon::prelude::*;
 
 use crate::StateError;
 use crate::ingest::outline::{NzbOutline, OutlineFile};
-use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, db_err, max_rows_for_engine};
+use weaver_server_base::jobs::ids::JobId;
 
 // The one format this build writes and reads.
 const OUTLINE_FORMAT: u8 = 1;

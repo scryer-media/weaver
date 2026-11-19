@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
-use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::encryption::EncryptionKey;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx, max_rows_for_engine};
@@ -12,6 +11,7 @@ use crate::torrents::{
     ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentRecord,
     TorrentSource, TrackerEntry, UnpackEnd, UnpackResult,
 };
+use weaver_server_base::jobs::ids::JobId;
 
 pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
      category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \

@@ -1021,7 +1021,7 @@ async fn failed_initial_hold_reports_readiness_and_retries_after_repair() {
         Ok(())
     })
     .unwrap();
-    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    tokio::time::advance(weaver_server_base::e2e_clock::schedule_poll_interval()).await;
     while db
         .get_setting("watch_folder.scanning_paused")
         .unwrap()
@@ -1157,7 +1157,7 @@ async fn initial_metadata_failure_pauses_intake_until_recovery() {
         Ok(())
     })
     .unwrap();
-    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    tokio::time::advance(weaver_server_base::e2e_clock::schedule_poll_interval()).await;
     while rss.is_scheduled_paused() {
         tokio::task::yield_now().await;
     }

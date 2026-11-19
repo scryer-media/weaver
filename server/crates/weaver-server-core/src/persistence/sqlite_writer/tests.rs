@@ -2,8 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::Database;
-use crate::jobs::ids::JobId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, StoreDatastore, sql_writes};
+use weaver_server_base::jobs::ids::JobId;
 
 async fn open() -> Database {
     tokio::task::spawn_blocking(Database::open_in_memory)

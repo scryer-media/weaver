@@ -21,11 +21,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
 
-use crate::operations::disk::volume::Volume;
-use crate::operations::disk::writer::Barrier;
 use crate::pipeline::graph::decoding::Decoding;
 use crate::pipeline::graph::envelope::{ReadFiles, Shelf, Shelved};
 use crate::pipeline::graph::leaf::read_exact_at;
+use weaver_server_disk::operations::disk::volume::Volume;
+use weaver_server_disk::operations::disk::writer::Barrier;
 
 // The file a read is in, and the barrier its bytes wait on, if any.
 type ReadAt = (std::path::PathBuf, Option<Barrier>);

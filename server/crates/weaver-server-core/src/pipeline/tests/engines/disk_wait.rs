@@ -19,12 +19,12 @@ use super::harness::{ARTICLE, JOB, Post, Scenario, admit, payload, serve_job};
 use super::lifecycle::drive;
 use super::streams::xz;
 use crate::jobs::model::{JobArticles, JobStatus, RunState};
-use crate::operations::disk::DiskLedger;
 use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
 use crate::pipeline::graph::leaf::counting::fill_after;
 use crate::pipeline::tests::job_status_for_assert;
 use crate::pipeline::{Pipeline, PipelineEvent};
 use crate::{JobId, SchedulerHandle};
+use weaver_server_disk::operations::disk::DiskLedger;
 
 const RESERVE: u64 = 1 << 30;
 const PLENTY: u64 = 1 << 30;
@@ -68,7 +68,9 @@ fn on_disk_keeping(room: &Arc<AtomicU64>, posts: Vec<Post>, reserve: u64) -> Sce
             ];
             let room = Arc::clone(&room);
             let probe = Arc::new(move |_: &Path| match room.load(Ordering::Acquire) {
-                UNREADABLE => Err(crate::operations::disk::DiskProbeError::InvalidPath),
+                UNREADABLE => {
+                    Err(weaver_server_disk::operations::disk::DiskProbeError::InvalidPath)
+                }
                 room => Ok(DiskSpace {
                     total_bytes: RESERVE * 8,
                     available_bytes: reserve + room,
@@ -1096,7 +1098,7 @@ async fn results_that_come_back_for_a_job_held_for_a_full_disk_are_not_counted()
         .articles
         .assembly()
         .and_then(|assembly| {
-            assembly.file(crate::jobs::ids::NzbFileId {
+            assembly.file(weaver_server_base::jobs::ids::NzbFileId {
                 job_id: JOB,
                 file_index: 0,
             })
@@ -1130,8 +1132,8 @@ async fn results_that_come_back_for_a_job_held_for_a_full_disk_are_not_counted()
 // which nothing would read again, is removed from the full disk.
 #[tokio::test]
 async fn a_job_held_for_a_full_disk_keeps_only_the_spooled_parts_its_checkpoint_names() {
-    use crate::jobs::ids::{NzbFileId, SegmentId};
     use crate::pipeline::held::HeldPart;
+    use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
     let room = Arc::new(AtomicU64::new(PLENTY));
     let scenario = on_disk_posting(
@@ -2088,7 +2090,7 @@ async fn a_final_move_whose_destination_fills_waits_for_room_and_delivers_every_
     // A part of the job finds no room in the spool: nothing reads it now.
     pipeline.fail_job_for_disk_write(
         crate::pipeline::decode::SegmentWriteError::new(
-            crate::jobs::ids::NzbFileId {
+            weaver_server_base::jobs::ids::NzbFileId {
                 job_id: JOB,
                 file_index: 0,
             },
@@ -2125,9 +2127,9 @@ async fn a_final_move_to_a_folder_on_its_own_disk_waits_on_that_disk() {
         super::harness::admit_with(&scenario, move |pipeline, temp| {
             let library = temp.join("library-disk");
             std::fs::create_dir_all(&library).unwrap();
-            crate::runtime::fs::test_devices::assign(&pipeline.intermediate_dir, 1);
-            crate::runtime::fs::test_devices::assign(&pipeline.complete_dir, 2);
-            crate::runtime::fs::test_devices::assign(&library, 3);
+            weaver_server_disk::runtime::fs::test_devices::assign(&pipeline.intermediate_dir, 1);
+            weaver_server_disk::runtime::fs::test_devices::assign(&pipeline.complete_dir, 2);
+            weaver_server_disk::runtime::fs::test_devices::assign(&library, 3);
             pipeline.config.try_write().unwrap().categories =
                 vec![crate::categories::CategoryConfig {
                     id: 0,
@@ -2494,8 +2496,8 @@ async fn a_failing_path_on_a_disk_not_known_is_waited_on_as_itself() {
     let (temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
     let capacity = Arc::clone(&pipeline.storage_capacity);
     let unseen = temp_dir.path().join("never-read").join("folder");
-    crate::runtime::fs::test_devices::assign(&pipeline.intermediate_dir, 1);
-    crate::runtime::fs::test_devices::assign(&pipeline.complete_dir, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&pipeline.intermediate_dir, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&pipeline.complete_dir, 2);
     for root in StorageRoot::ALL {
         let begun = capacity.probes_begun(root);
         capacity.request_refresh(root);
@@ -2517,7 +2519,7 @@ async fn a_failing_path_on_a_disk_not_known_is_waited_on_as_itself() {
     );
     assert_eq!(capacity.known_root_of(&unseen), None);
 
-    let asks = crate::operations::disk::same_filesystem_asks();
+    let asks = weaver_server_disk::operations::disk::same_filesystem_asks();
     pipeline.hold_move_for_full_disk(
         JOB,
         crate::pipeline::full_disk::Stage::Restored,
@@ -2542,7 +2544,7 @@ async fn a_failing_path_on_a_disk_not_known_is_waited_on_as_itself() {
     assert!(pipeline.full_disk_on_path(JOB), "the path is waited on");
     assert_eq!(capacity.waited_paths(), 1);
     assert_eq!(
-        crate::operations::disk::same_filesystem_asks(),
+        weaver_server_disk::operations::disk::same_filesystem_asks(),
         asks,
         "no device was asked after"
     );
@@ -3419,9 +3421,9 @@ async fn a_moving_row_refused_for_another_reason_fails_the_job() {
 // bytes freed let nothing go.
 #[tokio::test]
 async fn a_hold_with_no_figure_is_not_let_go_by_a_few_bytes() {
-    use crate::jobs::ids::NzbFileId;
     use crate::pipeline::decode::SegmentWriteError;
     use crate::pipeline::full_disk::Wants;
+    use weaver_server_base::jobs::ids::NzbFileId;
     let room = Arc::new(AtomicU64::new(PLENTY));
     let scenario = on_disk_posting(
         &room,
@@ -3511,8 +3513,8 @@ async fn a_job_held_on_a_root_and_one_on_a_path_of_its_disk_are_promised_the_sam
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
     add_second(&mut pipeline).await;
     let below = complete_dir.join("ember");
-    crate::runtime::fs::test_devices::assign(&complete_dir, 7);
-    crate::runtime::fs::test_devices::assign(&below, 7);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete_dir, 7);
+    weaver_server_disk::runtime::fs::test_devices::assign(&below, 7);
     let capacity = Arc::clone(&pipeline.storage_capacity);
     for root in StorageRoot::ALL {
         let begun = capacity.probes_begun(root);
@@ -3558,8 +3560,8 @@ async fn a_job_held_on_a_root_and_one_on_a_path_of_its_disk_are_promised_the_sam
 // and the next lets it go.
 #[tokio::test]
 async fn a_usenet_job_and_a_torrent_held_on_one_disk_are_promised_the_same_room_once() {
-    use crate::operations::room_wait::{Disk, Promised, RoomWait, Waiter, Wants};
     use crate::pipeline::full_disk::Stage;
+    use weaver_server_disk::operations::room_wait::{Disk, Promised, RoomWait, Waiter, Wants};
     const UNIT: u64 = 1 << 20;
     const TORRENT: JobId = JobId(93_013);
     let room = Arc::new(AtomicU64::new(0));

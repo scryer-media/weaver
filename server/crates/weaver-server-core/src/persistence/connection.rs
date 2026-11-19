@@ -13,10 +13,10 @@ use std::time::Instant;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
 use crate::StateError;
-use crate::operations::instrumentation::{DbRuntimeMetrics, DbRuntimeMetricsSnapshot};
 use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{StoreDatastore, db_err};
 use crate::persistence::sql_services::DatabaseServices;
+use weaver_server_base::operations::instrumentation::{DbRuntimeMetrics, DbRuntimeMetricsSnapshot};
 
 pub use crate::auth::{ApiKeyRow, AuthCredentials};
 pub use crate::history::{HistoryFilter, IntegrationEventRow, JobEvent, JobHistoryRow};
@@ -213,7 +213,10 @@ impl SqliteSubmission {
         caller: &'static std::panic::Location<'static>,
     ) -> Self {
         let depth = worker.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
-        crate::runtime::perf_probe::record_value("db.sqlite.queue.depth_at_submit", depth as u64);
+        weaver_server_base::runtime::perf_probe::record_value(
+            "db.sqlite.queue.depth_at_submit",
+            depth as u64,
+        );
         Self {
             queued_at: Instant::now(),
             queue_depth: worker.queue_depth.clone(),
@@ -228,9 +231,9 @@ impl SqliteSubmission {
         // Guarded: building the per-caller label allocates, and this runs on
         // every database call in the process. Nothing here may cost anything
         // when profiling is off.
-        if crate::runtime::perf_probe::enabled() {
-            crate::runtime::perf_probe::record("db.sqlite.queue.wait", waited);
-            crate::runtime::perf_probe::record_owned(
+        if weaver_server_base::runtime::perf_probe::enabled() {
+            weaver_server_base::runtime::perf_probe::record("db.sqlite.queue.wait", waited);
+            weaver_server_base::runtime::perf_probe::record_owned(
                 format!("db.sqlite.caller.{}.wait", caller_label(self.caller)),
                 waited,
             );
@@ -249,12 +252,12 @@ struct SqliteExecution {
 
 impl Drop for SqliteExecution {
     fn drop(&mut self) {
-        if !crate::runtime::perf_probe::enabled() {
+        if !weaver_server_base::runtime::perf_probe::enabled() {
             return;
         }
         let elapsed = self.started.elapsed();
-        crate::runtime::perf_probe::record("db.sqlite.queue.exec", elapsed);
-        crate::runtime::perf_probe::record_owned(
+        weaver_server_base::runtime::perf_probe::record("db.sqlite.queue.exec", elapsed);
+        weaver_server_base::runtime::perf_probe::record_owned(
             format!("db.sqlite.caller.{}.exec", caller_label(self.caller)),
             elapsed,
         );
@@ -344,7 +347,7 @@ impl SqliteDatabaseRuntimeWorker {
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
         let elapsed = started.elapsed();
-        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on", elapsed);
+        weaver_server_base::runtime::perf_probe::record("db.runtime.sqlite.block_on", elapsed);
         self.metrics.note_submission_finished(elapsed);
         result
     }
@@ -373,7 +376,10 @@ impl SqliteDatabaseRuntimeWorker {
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
         let elapsed = started.elapsed();
-        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_local", elapsed);
+        weaver_server_base::runtime::perf_probe::record(
+            "db.runtime.sqlite.block_on_local",
+            elapsed,
+        );
         self.metrics.note_submission_finished(elapsed);
         result
     }
@@ -497,7 +503,7 @@ impl PostgresDatabaseRuntimeWorker {
                 self.tx.send(job).map_err(|_| {
                     StateError::Database("database runtime worker stopped".to_string())
                 })?;
-                crate::runtime::perf_probe::record(
+                weaver_server_base::runtime::perf_probe::record(
                     "db.runtime.postgres.submit_blocked",
                     blocked_started.elapsed(),
                 );
@@ -519,7 +525,7 @@ impl PostgresDatabaseRuntimeWorker {
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
         let elapsed = started.elapsed();
-        crate::runtime::perf_probe::record("db.runtime.postgres.block_on", elapsed);
+        weaver_server_base::runtime::perf_probe::record("db.runtime.postgres.block_on", elapsed);
         self.metrics.note_submission_finished(elapsed);
         result
     }
@@ -553,7 +559,7 @@ impl PostgresDatabaseRuntimeWorker {
                 self.tx.send(job).map_err(|_| {
                     StateError::Database("database runtime worker stopped".to_string())
                 })?;
-                crate::runtime::perf_probe::record(
+                weaver_server_base::runtime::perf_probe::record(
                     "db.runtime.postgres.submit_blocked_local",
                     blocked_started.elapsed(),
                 );
@@ -569,7 +575,10 @@ impl PostgresDatabaseRuntimeWorker {
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
         let elapsed = started.elapsed();
-        crate::runtime::perf_probe::record("db.runtime.postgres.block_on_local", elapsed);
+        weaver_server_base::runtime::perf_probe::record(
+            "db.runtime.postgres.block_on_local",
+            elapsed,
+        );
         self.metrics.note_submission_finished(elapsed);
         result
     }
@@ -656,7 +665,10 @@ impl SqliteReadRuntimeWorker {
         let started = Instant::now();
         let queued_at = Instant::now();
         let depth = self.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
-        crate::runtime::perf_probe::record_value("db.sqlite.read.depth_at_submit", depth as u64);
+        weaver_server_base::runtime::perf_probe::record_value(
+            "db.sqlite.read.depth_at_submit",
+            depth as u64,
+        );
         let queue_depth = self.queue_depth.clone();
         let in_flight = self.in_flight.clone();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
@@ -666,9 +678,12 @@ impl SqliteReadRuntimeWorker {
                     let waited = queued_at.elapsed();
                     queue_depth.fetch_sub(1, Ordering::AcqRel);
                     let active = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
-                    if crate::runtime::perf_probe::enabled() {
-                        crate::runtime::perf_probe::record("db.sqlite.read.wait", waited);
-                        crate::runtime::perf_probe::record_value(
+                    if weaver_server_base::runtime::perf_probe::enabled() {
+                        weaver_server_base::runtime::perf_probe::record(
+                            "db.sqlite.read.wait",
+                            waited,
+                        );
+                        weaver_server_base::runtime::perf_probe::record_value(
                             "db.sqlite.read.in_flight",
                             active as u64,
                         );
@@ -676,10 +691,13 @@ impl SqliteReadRuntimeWorker {
                     let exec_started = Instant::now();
                     let result = future.await;
                     in_flight.fetch_sub(1, Ordering::AcqRel);
-                    if crate::runtime::perf_probe::enabled() {
+                    if weaver_server_base::runtime::perf_probe::enabled() {
                         let elapsed = exec_started.elapsed();
-                        crate::runtime::perf_probe::record("db.sqlite.read.exec", elapsed);
-                        crate::runtime::perf_probe::record_owned(
+                        weaver_server_base::runtime::perf_probe::record(
+                            "db.sqlite.read.exec",
+                            elapsed,
+                        );
+                        weaver_server_base::runtime::perf_probe::record_owned(
                             format!("db.sqlite.read.caller.{}.exec", caller_label(caller)),
                             elapsed,
                         );
@@ -691,7 +709,10 @@ impl SqliteReadRuntimeWorker {
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database read worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_read", started.elapsed());
+        weaver_server_base::runtime::perf_probe::record(
+            "db.runtime.sqlite.block_on_read",
+            started.elapsed(),
+        );
         result
     }
 }
@@ -800,7 +821,7 @@ struct QueuedWrite {
 
 enum DbWriteCommand {
     ArchiveJob {
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         history: Box<crate::history::JobHistoryRow>,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
         failure_kind: Option<crate::history::HistoryFailureKind>,
@@ -813,15 +834,18 @@ enum DbWriteCommand {
     // transaction; `committed` fires once every one has run, naming the jobs
     // whose archive failed and why.
     ArchiveJobs {
-        jobs: Vec<(crate::jobs::ids::JobId, crate::history::JobHistoryRow)>,
+        jobs: Vec<(
+            weaver_server_base::jobs::ids::JobId,
+            crate::history::JobHistoryRow,
+        )>,
         failure_kind: Option<crate::history::HistoryFailureKind>,
-        committed: oneshot::Sender<BTreeMap<crate::jobs::ids::JobId, String>>,
+        committed: oneshot::Sender<BTreeMap<weaver_server_base::jobs::ids::JobId, String>>,
     },
     // A torrent's job's history row, kept and tried again for want of room
     // as an NZB job's archive is. `retires` removes the torrent in the same
     // transaction. `kept` fires if the row is kept to be tried again.
     ArchiveTorrent {
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         history: Box<crate::history::JobHistoryRow>,
         retires: bool,
         // The files the torrent's job wrote, listed with its row.
@@ -857,7 +881,7 @@ enum DbWriteCommand {
         committed: Option<oneshot::Sender<Result<(), super::error::WriteFailed>>>,
     },
     GraphCheckpoint {
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         prepare: Box<dyn FnOnce() -> super::checkpoint_write::CheckpointWrite + Send>,
     },
     Flush {
@@ -872,7 +896,7 @@ enum DbWriteCommand {
 
 // What an `ArchiveTorrent` carries: one torrent's job's history row.
 struct TorrentArchive {
-    job_id: crate::jobs::ids::JobId,
+    job_id: weaver_server_base::jobs::ids::JobId,
     history: Box<crate::history::JobHistoryRow>,
     retires: bool,
     files: Arc<[crate::torrents::persistence::HistoryFile]>,
@@ -894,7 +918,7 @@ const KEPT_ARCHIVE_PASS: usize = 2;
 // One job's archive the database had no room for, kept whole: what its
 // command held, its `committed` sender with it, and nothing more.
 struct KeptArchive {
-    job_id: crate::jobs::ids::JobId,
+    job_id: weaver_server_base::jobs::ids::JobId,
     history: Box<crate::history::JobHistoryRow>,
     typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
     failure_kind: Option<crate::history::HistoryFailureKind>,
@@ -920,11 +944,11 @@ enum ArchiveOf {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ArchiveNews {
     // The job's archive found no room and is kept.
-    Kept(crate::jobs::ids::JobId),
+    Kept(weaver_server_base::jobs::ids::JobId),
     // A kept archive is kept no longer: it was written, or it failed for
     // another reason and is lost as any archive that fails so is.
     LetGo {
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         written: bool,
     },
     // A pass wrote at least one archive and stopped at its cap with more
@@ -1107,13 +1131,18 @@ impl DbWriteCommand {
 fn writer_command_scope(
     command: &DbWriteCommand,
     queued_at: Instant,
-) -> Option<crate::runtime::perf_probe::OwnedScope> {
-    crate::runtime::perf_probe::enabled().then(|| {
+) -> Option<weaver_server_base::runtime::perf_probe::OwnedScope> {
+    weaver_server_base::runtime::perf_probe::enabled().then(|| {
         let label = command.label();
         let waited = queued_at.elapsed();
-        crate::runtime::perf_probe::record("db.writer_queue.wait", waited);
-        crate::runtime::perf_probe::record_owned(format!("db.writer_queue.{label}.wait"), waited);
-        crate::runtime::perf_probe::owned_scope(format!("db.writer_queue.{label}.exec"))
+        weaver_server_base::runtime::perf_probe::record("db.writer_queue.wait", waited);
+        weaver_server_base::runtime::perf_probe::record_owned(
+            format!("db.writer_queue.{label}.wait"),
+            waited,
+        );
+        weaver_server_base::runtime::perf_probe::owned_scope(format!(
+            "db.writer_queue.{label}.exec"
+        ))
     })
 }
 
@@ -1328,7 +1357,7 @@ async fn execute_write_command(
 // A newer row for the torrent's job takes the place of one kept: the kept
 // one is let go unwritten, so it is never written over the newer one when
 // room comes.
-fn supersede_kept_torrent(writer_db: &Database, job_id: crate::jobs::ids::JobId) {
+fn supersede_kept_torrent(writer_db: &Database, job_id: weaver_server_base::jobs::ids::JobId) {
     let superseded: VecDeque<KeptArchive> = {
         let mut list = writer_db.kept_archives.list();
         let (gone, stay) = std::mem::take(&mut *list).into_iter().partition(|archive| {
@@ -1396,7 +1425,7 @@ async fn archive_torrent(
 // the blocking pool.
 fn archive_torrents_at_once(
     writer: &DatabaseWriterExecutor,
-    failures: &watch::Sender<BTreeMap<crate::jobs::ids::JobId, String>>,
+    failures: &watch::Sender<BTreeMap<weaver_server_base::jobs::ids::JobId, String>>,
     archives: Vec<TorrentArchive>,
 ) -> Vec<TorrentArchive> {
     // The test seam refuses archives one at a time: with any refusal
@@ -1446,7 +1475,7 @@ fn archive_torrents_at_once(
 // Runs on the blocking pool.
 fn archive_kept(
     writer: &DatabaseWriterExecutor,
-    failures: &watch::Sender<BTreeMap<crate::jobs::ids::JobId, String>>,
+    failures: &watch::Sender<BTreeMap<weaver_server_base::jobs::ids::JobId, String>>,
     archive: &mut KeptArchive,
     retry: bool,
 ) -> Result<(), StateError> {
@@ -1761,7 +1790,7 @@ pub struct Database {
     sql_worker: DatabaseRuntimeWorker,
     writer_tx: mpsc::Sender<QueuedWrite>,
     checkpoint_shutdown: watch::Sender<bool>,
-    checkpoint_failures: Arc<watch::Sender<BTreeMap<crate::jobs::ids::JobId, String>>>,
+    checkpoint_failures: Arc<watch::Sender<BTreeMap<weaver_server_base::jobs::ids::JobId, String>>>,
     kept_archives: Arc<KeptArchives>,
     // Count of in-flight background re-sends into the bounded writer queue
     // (archive jobs and generic ordered writes) spawned when `try_send` hit a
@@ -2121,7 +2150,9 @@ impl Database {
                 datastore.read_exec(),
                 "SELECT COUNT(*) AS count FROM settings WHERE key NOT IN ({}, {})",
                 &[
-                    SqlArg::Text(crate::security::SETTING_INSTALL_GENERATION.to_string()),
+                    SqlArg::Text(
+                        weaver_server_base::security::SETTING_INSTALL_GENERATION.to_string(),
+                    ),
                     SqlArg::Text(crate::operations::backup::LAST_VERSION.to_string()),
                 ],
             )
@@ -2212,7 +2243,7 @@ impl Database {
 
     pub fn try_queue_archive_job(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
     ) -> Result<(), StateError> {
         let command = DbWriteCommand::ArchiveJob {
@@ -2231,7 +2262,7 @@ impl Database {
     // back through the history facade instead of racing the write queue.
     pub fn try_queue_archive_job_with_terminal_cause(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
         failure_kind: Option<crate::history::HistoryFailureKind>,
@@ -2257,7 +2288,7 @@ impl Database {
     // the second once it is kept. A row lost any other way drops both.
     pub(crate) fn queue_torrent_history(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
         retires: bool,
         files: Vec<crate::torrents::persistence::HistoryFile>,
@@ -2284,7 +2315,7 @@ impl Database {
     pub(crate) fn queue_torrent_histories(
         &self,
         rows: Vec<(
-            crate::jobs::ids::JobId,
+            weaver_server_base::jobs::ids::JobId,
             crate::history::JobHistoryRow,
             bool,
             Vec<crate::torrents::persistence::HistoryFile>,
@@ -2322,7 +2353,7 @@ impl Database {
     // The jobs whose archive is kept for want of room, in the order kept:
     // for the shutdown warning and for tests. An archive a pass is trying
     // is not among them while the pass runs.
-    pub(crate) fn kept_archive_jobs(&self) -> Vec<crate::jobs::ids::JobId> {
+    pub(crate) fn kept_archive_jobs(&self) -> Vec<weaver_server_base::jobs::ids::JobId> {
         let list = self.kept_archives.list();
         list.iter().map(|kept| kept.job_id).collect()
     }
@@ -2343,9 +2374,13 @@ impl Database {
     // whose archive failed. A dropped signal means the writer closed first.
     pub(crate) fn try_queue_archive_jobs(
         &self,
-        jobs: Vec<(crate::jobs::ids::JobId, crate::history::JobHistoryRow)>,
+        jobs: Vec<(
+            weaver_server_base::jobs::ids::JobId,
+            crate::history::JobHistoryRow,
+        )>,
         failure_kind: Option<crate::history::HistoryFailureKind>,
-    ) -> Result<oneshot::Receiver<BTreeMap<crate::jobs::ids::JobId, String>>, StateError> {
+    ) -> Result<oneshot::Receiver<BTreeMap<weaver_server_base::jobs::ids::JobId, String>>, StateError>
+    {
         let (committed_tx, committed_rx) = oneshot::channel();
         self.try_send_with_retry(
             DbWriteCommand::ArchiveJobs {
@@ -2385,7 +2420,7 @@ impl Database {
     // Other jobs can advance while this job's checkpoint awaits resume.
     pub fn try_queue_job_write(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         label: &'static str,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
     ) -> Result<(), StateError> {
@@ -2397,7 +2432,7 @@ impl Database {
     // lane closed, answers with an error or not at all.
     pub(crate) fn try_queue_job_write_committed(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         label: &'static str,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
     ) -> Result<oneshot::Receiver<Result<(), super::error::WriteFailed>>, StateError> {
@@ -2408,7 +2443,7 @@ impl Database {
 
     fn queue_job_write(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         label: &'static str,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
         committed: Option<oneshot::Sender<Result<(), super::error::WriteFailed>>>,
@@ -2428,7 +2463,7 @@ impl Database {
     // awaiting any, and their lanes are passed once.
     pub(crate) fn queue_job_writes_marker(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
     ) -> Result<oneshot::Receiver<()>, StateError> {
         let (reached, rx) = oneshot::channel();
         self.try_queue_job_write(job_id, "job_writes_committed", move |_| {
@@ -2442,7 +2477,7 @@ impl Database {
 
     pub(crate) fn try_queue_graph_checkpoint(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         prepare: impl FnOnce() -> super::checkpoint_write::CheckpointWrite + Send + 'static,
     ) -> Result<(), StateError> {
         self.try_send_with_retry(
@@ -2457,7 +2492,7 @@ impl Database {
     // A job outside the pipeline let its blocked checkpoint go: the failure
     // no longer stands in a flush's way. Run on the job's lane behind that
     // checkpoint, so it comes after the write that recorded the failure.
-    pub(crate) fn forget_checkpoint_failure(&self, job_id: crate::jobs::ids::JobId) {
+    pub(crate) fn forget_checkpoint_failure(&self, job_id: weaver_server_base::jobs::ids::JobId) {
         self.checkpoint_failures.send_modify(|failures| {
             failures.remove(&job_id);
         });
@@ -2579,7 +2614,10 @@ impl Database {
     // writer queue already is.
     fn enqueue_write(&self, command: DbWriteCommand) -> QueuedWrite {
         let depth = self.queued_writes();
-        crate::runtime::perf_probe::record_value("db.writer_queue.depth_at_submit", depth as u64);
+        weaver_server_base::runtime::perf_probe::record_value(
+            "db.writer_queue.depth_at_submit",
+            depth as u64,
+        );
         QueuedWrite {
             queued_at: Instant::now(),
             command,
@@ -2591,7 +2629,7 @@ impl Database {
     // for room itself.
     pub async fn queue_archive_job(
         &self,
-        job_id: crate::jobs::ids::JobId,
+        job_id: weaver_server_base::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
     ) -> Result<(), StateError> {
         self.try_queue_archive_job(job_id, history)

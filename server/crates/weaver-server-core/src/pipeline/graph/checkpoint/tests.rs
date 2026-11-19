@@ -458,7 +458,7 @@ fn a_snapshot_comes_back_from_its_rows() {
 #[test]
 fn a_snapshot_comes_back_from_the_database() {
     let db = crate::persistence::Database::open_in_memory().unwrap();
-    let job = crate::jobs::ids::JobId(4281);
+    let job = weaver_server_base::jobs::ids::JobId(4281);
     db.create_active_job(&crate::ActiveJob {
         job_id: job,
         nzb_hash: [0xA5; 32],
@@ -551,7 +551,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/graph-recovery-0-3.repaired"),
         format!("{INTERNAL_DIR}/graph-recovery-0-3/set.par2"),
         format!("{INTERNAL_DIR}/graph-waiting-0-2"),
-        crate::scratch::file_name(1, 0),
+        weaver_server_disk::scratch::file_name(1, 0),
         "inner/stray.bin".to_owned(),
         "set.par2".to_owned(),
         "set.part1.rar".to_owned(),
@@ -598,7 +598,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
 // the job's.
 #[test]
 fn a_restore_removes_leftover_decode_windows_only_in_its_own_folder() {
-    use crate::scratch::file_name;
+    use weaver_server_disk::scratch::file_name;
     let dir = tempfile::tempdir().unwrap();
     let job = dir.path().join("job");
     let other = dir.path().join("other");
@@ -1275,10 +1275,10 @@ fn restored(
 ) {
     use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 
-    use crate::operations::disk::CapacityReader;
     use crate::pipeline::graph::engine::RunMail;
     use crate::pipeline::graph::job::Storage;
     use crate::pipeline::graph::limits::Caps;
+    use weaver_server_disk::operations::disk::CapacityReader;
 
     let mail = RunMail::default();
     let restored = GraphJob::restore(
@@ -1379,9 +1379,9 @@ impl Drop for ClockHeld {
     }
 }
 
-fn checkpoint_database() -> (crate::Database, crate::jobs::ids::JobId) {
+fn checkpoint_database() -> (crate::Database, weaver_server_base::jobs::ids::JobId) {
     let db = crate::Database::open_in_memory().unwrap();
-    let job = crate::jobs::ids::JobId(4282);
+    let job = weaver_server_base::jobs::ids::JobId(4282);
     db.create_active_job(&crate::ActiveJob {
         job_id: job,
         nzb_hash: [0xA6; 32],
@@ -1553,10 +1553,10 @@ async fn age_and_force_share_one_write_behind_an_in_flight_checkpoint() {
 // later step comes, and the stop would wait on the word for ever.
 #[tokio::test(start_paused = true)]
 async fn a_change_held_behind_a_queued_write_is_written_once_its_writes_return() {
-    use crate::operations::disk::volume::Volume;
-    use crate::operations::disk::writer::VolumeWriters;
     use crate::pipeline::graph::disk::JobDisk;
     use crate::pipeline::graph::root::tests::job_through;
+    use weaver_server_disk::operations::disk::volume::Volume;
+    use weaver_server_disk::operations::disk::writer::VolumeWriters;
 
     const PIECE: u32 = 4 * 1024;
     let _clock = ClockHeld::new();
@@ -1811,7 +1811,7 @@ async fn a_step_that_reaches_the_byte_threshold_is_due_at_once() {
     let (mut job, _dir) = long_post(1);
     let pending = Pending::default();
     let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
-    let id = crate::jobs::ids::JobId(0);
+    let id = weaver_server_base::jobs::ids::JobId(0);
     pending.put(&job, Vec::new());
     pending.take();
     intake(&mut job, 1);

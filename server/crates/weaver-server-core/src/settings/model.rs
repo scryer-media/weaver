@@ -11,11 +11,11 @@ use tokio::sync::RwLock;
 
 use crate::categories::CategoryConfig;
 use crate::jobs::DuplicatePolicy;
-use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
 pub use crate::settings::levels::{Leaf, Level, Levels};
 use crate::torrents::identity::{ClientIdentity, IDENTITY};
 use crate::watch_folder::WatchFolderConfig;
+use weaver_server_base::runtime::hardware_profile::HardwareProfile;
 use weaver_torrent::tracker::qbittorrent;
 
 // The NZB admission limit when none is saved, for new and upgraded installations.

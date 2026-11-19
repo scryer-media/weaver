@@ -181,7 +181,7 @@ async fn idle_pipeline_records_production_turn_histogram() {
 // to close counted the jobs it had installed.
 #[tokio::test(start_paused = true)]
 async fn idle_pipeline_stamps_its_turns_where_the_handle_reads_them() {
-    use crate::operations::instrumentation::PipelinePhase;
+    use weaver_server_base::operations::instrumentation::PipelinePhase;
 
     let pipeline = idle_pipeline(2, Vec::new(), |_| {}).await;
     let handle = pipeline.handle.clone();
@@ -205,8 +205,8 @@ async fn idle_pipeline_stamps_its_turns_where_the_handle_reads_them() {
 // turn busy under its own phase, as every other event does.
 #[tokio::test(start_paused = true)]
 async fn a_turn_woken_by_graph_mail_is_stamped_busy_with_graph_run() {
-    use crate::operations::instrumentation::PipelinePhase;
     use crate::pipeline::graph::engine::{Heard, Said};
+    use weaver_server_base::operations::instrumentation::PipelinePhase;
 
     let (stamps_tx, mut stamps) = tokio::sync::mpsc::unbounded_channel();
     let mut mail = None;

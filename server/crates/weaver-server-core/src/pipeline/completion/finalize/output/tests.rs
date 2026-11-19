@@ -20,7 +20,7 @@ fn safe_move_uses_rename_without_copy_on_the_same_filesystem() {
         Arc::clone(&counters),
         |src, dst| {
             rename_calls.set(rename_calls.get() + 1);
-            crate::runtime::fs::place_no_overwrite(src, dst)
+            weaver_server_disk::runtime::fs::place_no_overwrite(src, dst)
         },
         |_, _, _| {
             copy_calls.set(copy_calls.get() + 1);
@@ -86,10 +86,9 @@ fn safe_move_uses_exactly_one_copy_after_cross_device_rename_failure() {
         Arc::clone(&counters),
         |_, _| {
             rename_calls.set(rename_calls.get() + 1);
-            Ok(crate::runtime::fs::Placement::Copy(std::io::Error::new(
-                std::io::ErrorKind::CrossesDevices,
-                "simulated EXDEV",
-            )))
+            Ok(weaver_server_disk::runtime::fs::Placement::Copy(
+                std::io::Error::new(std::io::ErrorKind::CrossesDevices, "simulated EXDEV"),
+            ))
         },
         |src, dst, counters| {
             copy_calls.set(copy_calls.get() + 1);
@@ -972,10 +971,10 @@ async fn a_job_stages_on_the_device_its_category_delivers_to() {
         crate::pipeline::tests::new_direct_pipeline(&temp).await;
     let movies = temp.path().join("movies");
     let beside = temp.path().join("beside");
-    crate::runtime::fs::test_devices::assign(&intermediate, 1);
-    crate::runtime::fs::test_devices::assign(&complete, 2);
-    crate::runtime::fs::test_devices::assign(&movies, 3);
-    crate::runtime::fs::test_devices::assign(&beside, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
+    weaver_server_disk::runtime::fs::test_devices::assign(&beside, 1);
     // The roots read their devices at each look; the pipeline's first looks
     // came before the devices above were assigned.
     pipeline.storage_capacity.reread_roots();
@@ -1020,7 +1019,7 @@ async fn a_job_stages_on_the_device_its_category_delivers_to() {
             .clone()
             .unwrap_or_else(|| pipeline.jobs.get(&job_id).unwrap().working_dir.clone());
         assert!(
-            crate::runtime::fs::same_device(&source, &dest_parent),
+            weaver_server_disk::runtime::fs::same_device(&source, &dest_parent),
             "{job_id:?}"
         );
         let dest = deliver_one_file(&pipeline, job_id, category).await;
@@ -1028,7 +1027,9 @@ async fn a_job_stages_on_the_device_its_category_delivers_to() {
     }
     // The movies folder is on another device from the complete folder, so a
     // job staged under the complete folder would have been copied there.
-    assert!(!crate::runtime::fs::same_device(&complete, &movies));
+    assert!(!weaver_server_disk::runtime::fs::same_device(
+        &complete, &movies
+    ));
 }
 
 // A category changed while the job waits stages the job on the new folder's
@@ -1043,10 +1044,10 @@ async fn a_category_change_still_delivers_into_the_new_folder() {
         crate::pipeline::tests::new_direct_pipeline(&temp).await;
     let movies = temp.path().join("movies");
     let shows = temp.path().join("shows");
-    crate::runtime::fs::test_devices::assign(&intermediate, 1);
-    crate::runtime::fs::test_devices::assign(&complete, 2);
-    crate::runtime::fs::test_devices::assign(&movies, 3);
-    crate::runtime::fs::test_devices::assign(&shows, 4);
+    weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
+    weaver_server_disk::runtime::fs::test_devices::assign(&shows, 4);
     // The roots read their devices at each look; the pipeline's first looks
     // came before the devices above were assigned.
     pipeline.storage_capacity.reread_roots();
@@ -1113,7 +1114,9 @@ async fn a_category_change_still_delivers_into_the_new_folder() {
             .as_deref(),
         Some("shows")
     );
-    assert!(!crate::runtime::fs::same_device(&staging, &shows));
+    assert!(!weaver_server_disk::runtime::fs::same_device(
+        &staging, &shows
+    ));
     let dest = deliver_one_file(&pipeline, started, Some("shows")).await;
     assert_eq!(dest.parent(), Some(shows.as_path()));
     assert!(!staging.exists());
@@ -1154,13 +1157,13 @@ fn links_refused(src: &Path, dst: &Path) -> std::io::Result<Placement> {
 // The destination volume's writer, on its own thread as outside tests, and
 // a second caller of it.
 fn destination_writer() -> (
-    crate::operations::disk::writer::VolumeWriters,
-    Arc<crate::operations::disk::volume::Volume>,
+    weaver_server_disk::operations::disk::writer::VolumeWriters,
+    Arc<weaver_server_disk::operations::disk::volume::Volume>,
     Renames,
-    Arc<crate::operations::disk::writer::Submitter>,
+    Arc<weaver_server_disk::operations::disk::writer::Submitter>,
 ) {
-    let writers = crate::operations::disk::writer::VolumeWriters::reporting(|_| {});
-    let volume = Arc::new(crate::operations::disk::volume::Volume::new(
+    let writers = weaver_server_disk::operations::disk::writer::VolumeWriters::reporting(|_| {});
+    let volume = Arc::new(weaver_server_disk::operations::disk::volume::Volume::new(
         None,
         "complete".into(),
     ));
@@ -1170,7 +1173,7 @@ fn destination_writer() -> (
 }
 
 // What the writer runs for `other` has run.
-fn writer_runs(other: &crate::operations::disk::writer::Submitter) {
+fn writer_runs(other: &weaver_server_disk::operations::disk::writer::Submitter) {
     let (ran, heard) = std::sync::mpsc::channel();
     other.ask(PathBuf::from("other"), move || {
         let _ = ran.send(());

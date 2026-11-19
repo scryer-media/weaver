@@ -9,7 +9,6 @@ use crate::auth::CallerScope;
 use crate::categories::model;
 use crate::jobs::JobId;
 use crate::pipeline::claim_complete_destination_path;
-use crate::runtime::fs::JobMoves;
 use crate::torrents::files;
 use crate::torrents::model::Adopted;
 use crate::torrents::relocate;
@@ -20,6 +19,7 @@ use crate::torrents::tee::Placed;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use weaver_server_disk::runtime::fs::JobMoves;
 
 impl TorrentService {
     /// Move the torrent's directory under `parent`, where it goes on

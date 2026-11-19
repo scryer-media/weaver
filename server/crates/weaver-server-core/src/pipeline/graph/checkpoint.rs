@@ -52,9 +52,9 @@ use crate::jobs::graph_checkpoint::{
     Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, HeldPartRow, HoldRow,
     Lifted, MemberRow, NodeRow, PartRow, Row,
 };
-use crate::jobs::ids::JobId;
 use crate::persistence::checkpoint_write::{CheckpointControl, CheckpointWrite};
 use crate::pipeline::Pipeline;
+use weaver_server_base::jobs::ids::JobId;
 
 // The root row's kind: the root is the article object, not one the builder
 // makes.

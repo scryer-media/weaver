@@ -104,7 +104,7 @@ pub(crate) enum Heard {
     DiskReturned,
     // A volume's writer could not complete an operation on one of the
     // job's files. Addressed to the root, under no run's generation.
-    DiskFailed(Box<crate::operations::disk::writer::Failure>),
+    DiskFailed(Box<weaver_server_disk::operations::disk::writer::Failure>),
     // The job's give-up has another volume to read back, on a turn of its
     // own. Addressed to the root, under no run's generation.
     GivingUp,
@@ -423,9 +423,9 @@ enum Placed {
 // every volume the run reads in, it still has members to say or its end to
 // report, so a hold here keeps the job from finishing and stops nothing else.
 fn extracting_hook(volumes: &RunVolumes) {
-    let hook = crate::e2e_failpoint::STATUS_ENTER_EXTRACTING;
-    if crate::e2e_failpoint::armed(hook) && volumes.all_in() {
-        crate::e2e_failpoint::fire(hook);
+    let hook = weaver_server_base::e2e_failpoint::STATUS_ENTER_EXTRACTING;
+    if weaver_server_base::e2e_failpoint::armed(hook) && volumes.all_in() {
+        weaver_server_base::e2e_failpoint::fire(hook);
     }
 }
 
@@ -707,7 +707,7 @@ impl Runs {
     // run was widened to above it is dropped: the run is held to the
     // ceiling, and its decoder refuses with the sizes.
     //
-    // Where no window can be mapped (`crate::scratch::MAPS`), no run is lent: one
+    // Where no window can be mapped (`weaver_server_disk::scratch::MAPS`), no run is lent: one
     // whose window is over the ceiling is placed in RAM from the start where
     // the policy lets it go above, and is refused where it does not.
     pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
@@ -721,7 +721,8 @@ impl Runs {
         }
         let ceiling = grant.ceiling();
         let above = grant.over_limit == OverLimit::ScratchThenRam;
-        run.lends = lends && !run.in_ram && self.windows.is_some() && crate::scratch::MAPS;
+        run.lends =
+            lends && !run.in_ram && self.windows.is_some() && weaver_server_disk::scratch::MAPS;
         if above && !run.lends && window > ceiling {
             run.wide = run.wide.max(Some(window));
         }
@@ -839,8 +840,9 @@ impl Runs {
             heard,
         };
         tokio::task::spawn_blocking(move || {
-            let _affinity = crate::runtime::affinity::PostprocessAffinity::enter();
-            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            let _affinity = weaver_server_base::runtime::affinity::PostprocessAffinity::enter();
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             // Said as the run returns, and as a run that panics unwinds, so
             // a run always ends: its slot, its memory and a stopped job's
             // graph are waiting on it. A closed channel means the pipeline is
@@ -859,7 +861,9 @@ impl Runs {
             let reader = Arc::clone(&volumes);
             let mut sink = |emit: Emit| {
                 if matches!(emit, Emit::Member { .. }) {
-                    crate::e2e_failpoint::fire(crate::e2e_failpoint::EXTRACT_MEMBER_START);
+                    weaver_server_base::e2e_failpoint::fire(
+                        weaver_server_base::e2e_failpoint::EXTRACT_MEMBER_START,
+                    );
                 }
                 let _waiting = decoding.wait();
                 extracting_hook(&volumes);

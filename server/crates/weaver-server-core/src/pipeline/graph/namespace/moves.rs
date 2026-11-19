@@ -917,7 +917,7 @@ fn above(name: &str) -> impl Iterator<Item = String> + '_ {
 // the member's last. A directory member waits as a directory.
 fn waiting_name(
     given: &crate::pipeline::graph::envelope::Given,
-    to: Option<&std::sync::Arc<crate::operations::disk::writer::Submitter>>,
+    to: Option<&std::sync::Arc<weaver_server_disk::operations::disk::writer::Submitter>>,
     dir: &std::path::Path,
     node: NodeId,
     member: MemberId,
@@ -939,7 +939,7 @@ mod tests {
     use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 
     use super::*;
-    use crate::operations::disk::CapacityReader;
+    use weaver_server_disk::operations::disk::CapacityReader;
 
     // Names that meet as one path in another case, as a file and a
     // directory of one path, and as a directory another name runs through.

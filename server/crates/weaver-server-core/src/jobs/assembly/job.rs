@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-use crate::jobs::ids::{JobId, NzbFileId};
 use weaver_model::files::FileRole;
+use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
 use super::file::FileAssembly;
 

@@ -13,9 +13,9 @@ use super::rar::with_par2;
 use super::restart::{Down, run_restarting_at};
 use crate::JobHistoryRow;
 use crate::jobs::JobPhase;
-use crate::jobs::ids::JobId;
 use crate::pipeline::health_milli;
 use crate::pipeline::tests::direct_store::single_member_store_set;
+use weaver_server_base::jobs::ids::JobId;
 
 // A plain file and a PAR2 set of two blocks over it: the file is post 0,
 // the index post 1, the volume post 2.

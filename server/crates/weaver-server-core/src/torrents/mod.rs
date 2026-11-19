@@ -48,8 +48,8 @@ pub const CLASS: crate::jobs::HeldClass =
 // not the client runs, so a history row never takes their folders.
 pub(crate) fn live_among(
     db: &crate::Database,
-    job_ids: &[crate::jobs::ids::JobId],
-) -> Result<std::collections::BTreeSet<crate::jobs::ids::JobId>, crate::StateError> {
+    job_ids: &[weaver_server_base::jobs::ids::JobId],
+) -> Result<std::collections::BTreeSet<weaver_server_base::jobs::ids::JobId>, crate::StateError> {
     db.torrent_job_ids_among(job_ids)
 }
 

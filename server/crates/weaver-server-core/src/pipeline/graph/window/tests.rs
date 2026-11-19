@@ -12,7 +12,7 @@ use weaver_graph::names::INTERNAL_DIR;
 
 use super::Windows;
 use crate::operations::{Capacity, CapacityReader, CapacityReading};
-use crate::scratch::{CEILING_BYTES, Scratch, ScratchLedger};
+use weaver_server_disk::scratch::{CEILING_BYTES, Scratch, ScratchLedger};
 
 const MIB: u64 = 1 << 20;
 

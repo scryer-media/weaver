@@ -5,13 +5,13 @@ use super::*;
 use std::path::Path;
 
 use crate::categories::CategoryConfig;
-use crate::operations::metrics::PipelineMetrics;
 use crate::servers::{ServerConfig, ServerDownloadUsage};
 use crate::settings::{Config, RetryOverrides};
 use crate::{
     HistoryFilter, JobEvent, JobHistoryRow, RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use weaver_server_base::operations::metrics::PipelineMetrics;
 
 async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
     SqlitePoolOptions::new()

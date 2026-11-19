@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::jobs::ids::JobId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use weaver_server_base::jobs::ids::JobId;
 
 fn sample_history() -> JobHistoryRow {
     JobHistoryRow {

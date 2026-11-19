@@ -4,10 +4,10 @@
 use crate::StateError;
 use crate::history;
 use crate::history::persistence::replace_job_history_attributes_tx;
-use crate::jobs::ids::JobId;
 use crate::jobs::persistence::lock_active_job_for_delete_tx;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
 use crate::persistence::{Database, DatabaseWriterExecutor};
+use weaver_server_base::jobs::ids::JobId;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OrphanActiveStateCounts {

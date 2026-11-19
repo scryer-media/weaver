@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 
-use crate::jobs::ids::JobId;
+use weaver_server_base::jobs::ids::JobId;
 
 pub const WORKING_DIR_MARKER: &str = ".weaver-job-dir";
 pub const OUTPUT_DIR_MARKER: &str = ".weaver-output-dir";
@@ -448,7 +448,7 @@ pub(crate) fn recover_working_dir_rename_from(
                 return Err(std::io::Error::other("rename source belongs to another job").into());
             }
         }
-        if let Err(error) = crate::runtime::fs::rename_path_exclusive(&old, &new) {
+        if let Err(error) = weaver_server_disk::runtime::fs::rename_path_exclusive(&old, &new) {
             db.delete_setting(&key)?;
             return Err(error.into());
         }
@@ -1835,7 +1835,7 @@ mod tests {
             )
             .unwrap();
             if moved {
-                crate::runtime::fs::rename_path_exclusive(&old, &new).unwrap();
+                weaver_server_disk::runtime::fs::rename_path_exclusive(&old, &new).unwrap();
             }
             assert_eq!(
                 recover_working_dir_rename(&db, root, &old, id).unwrap(),

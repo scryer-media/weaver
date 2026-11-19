@@ -9,8 +9,8 @@
 // grants one article, whatever its size.
 
 use super::*;
-use crate::operations::disk::volume::Volume;
 use crate::pipeline::graph::disk::VolumeLeases;
+use weaver_server_disk::operations::disk::volume::Volume;
 
 const ARTICLE: u32 = 512;
 

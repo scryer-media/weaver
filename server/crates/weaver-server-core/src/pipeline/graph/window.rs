@@ -4,7 +4,7 @@
 // Decode windows on scratch memory. A member whose decoder window (a RAR,
 // LZMA, LZMA2 or xz dictionary, a 7z coder's) is larger than the profile
 // lets a decoder hold in RAM is lent a lease of the job's scratch
-// (`crate::scratch`), so it decodes instead of being refused. No window over
+// (`weaver_server_disk::scratch`), so it decodes instead of being refused. No window over
 // the scratch's ceiling is lent. A window no folder has room for is refused,
 // and the profile's policy decides what follows: scratch-then-fail fails the
 // job with the sizes, scratch-then-RAM starts the run again in RAM.
@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use weaver_graph::{NodeId, WindowLender, WindowMemory};
 
 use crate::operations::CapacityReader;
-use crate::scratch::{Lease, Scratch, ScratchLedger};
+use weaver_server_disk::scratch::{Scratch, ScratchLedger};
 
 impl crate::pipeline::Pipeline {
     // Weaver's data folder, the one holding its database, and the free
@@ -179,20 +179,6 @@ impl WindowLender for NodeWindows {
 
     fn room(&self) -> Option<u64> {
         self.windows.scratch.room()
-    }
-}
-
-// SAFETY: `as_mut_ptr` is the start of a shared mapping of `len` bytes of
-// a file this lease alone created and alone maps; the address is fixed
-// until `Drop` unmaps it, and nothing else in the process reads or writes
-// it.
-unsafe impl WindowMemory for Lease {
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        Lease::as_mut_ptr(self)
-    }
-
-    fn len(&self) -> usize {
-        Lease::len(self)
     }
 }
 

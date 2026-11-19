@@ -24,7 +24,7 @@ pub enum Refusal {
     /// The same torrent is still being removed, as this job: it may be
     /// added again once that removal ends.
     #[error("the torrent is still being removed as job {}; add it again once its removal ends", .0.0)]
-    Removing(crate::jobs::ids::JobId),
+    Removing(weaver_server_base::jobs::ids::JobId),
 }
 
 fn extension(name: &str) -> Option<&str> {

@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
-use crate::jobs::ids::JobId;
 use crate::jobs::model::{FieldUpdate, JobUpdate};
 use crate::jobs::record::{ActiveFileIdentity, ActiveJob};
 use crate::persistence::Database;
@@ -11,6 +10,7 @@ use crate::persistence::sql_runtime::{
     max_rows_for_tx,
 };
 use sqlx::{Postgres, QueryBuilder, Sqlite};
+use weaver_server_base::jobs::ids::JobId;
 
 // Submission values are always plaintext, even when they resemble our stored
 // envelope prefix. Encrypt them once at the database boundary.
@@ -1296,7 +1296,7 @@ impl Database {
                     )
                     .await
                     .map(|_| ());
-                    crate::runtime::perf_probe::record_sql_op(
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
                         "postgres",
                         "complete_file",
                         started.elapsed(),
@@ -1393,7 +1393,7 @@ impl Database {
                         }
                         SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
                     }
-                    crate::runtime::perf_probe::record_sql_op(
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
                         "postgres",
                         "complete_files",
                         started.elapsed(),
@@ -1534,7 +1534,7 @@ impl Database {
                     )
                     .await
                     .map(|_| ());
-                    crate::runtime::perf_probe::record_sql_op(
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
                         "postgres",
                         "save_file_identity",
                         started.elapsed(),
@@ -1977,8 +1977,8 @@ mod tests {
 
     #[test]
     fn par3_content_identity_and_completed_name_survive_reopen() {
-        use crate::jobs::ids::NzbFileId;
         use crate::jobs::record::FileIdentitySource;
+        use weaver_server_base::jobs::ids::NzbFileId;
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("content-identity.db");
         let job = sample_active_job(1);

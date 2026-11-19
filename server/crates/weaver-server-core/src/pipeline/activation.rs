@@ -192,8 +192,8 @@ struct StagingDestination {
     one_device: bool,
     // The kind of storage under the destination and under the intermediate
     // directory, as the disk owner holds them, for the log.
-    root_kind: crate::operations::disk::StorageKind,
-    intermediate_kind: crate::operations::disk::StorageKind,
+    root_kind: weaver_server_disk::operations::disk::StorageKind,
+    intermediate_kind: weaver_server_disk::operations::disk::StorageKind,
 }
 
 impl StagingChoice {
@@ -781,7 +781,10 @@ impl Pipeline {
         graph: Option<crate::pipeline::graph::job::GraphJob>,
         repeated: Option<Arc<RepeatedArticles>>,
         held_parts: Vec<HeldPart>,
-        volumes: &[(PathBuf, Arc<crate::operations::disk::volume::Volume>)],
+        volumes: &[(
+            PathBuf,
+            Arc<weaver_server_disk::operations::disk::volume::Volume>,
+        )],
     ) {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;

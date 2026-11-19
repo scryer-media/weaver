@@ -3,6 +3,8 @@ members = [
     "xtask",
     "shared/crates/weaver-model",
     "server/app/weaver",
+    "server/crates/weaver-server-base",
+    "server/crates/weaver-server-disk",
     "server/crates/weaver-server-core",
     "server/crates/weaver-server-api",
     "engines/weaver-nntp",

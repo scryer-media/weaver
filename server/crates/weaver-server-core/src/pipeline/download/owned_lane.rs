@@ -873,8 +873,8 @@ fn spawn_owned_lane_worker(
     let spawned = std::thread::Builder::new()
         .name(format!("weaver-nntp-lane-{index}"))
         .spawn(move || {
-            crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-            crate::runtime::thread_release::start_lane_thread();
+            weaver_server_base::runtime::affinity::pin_current_thread_for_hot_download_path();
+            weaver_server_base::runtime::thread_release::start_lane_thread();
             run_owned_lane_worker(seat, rx, &thread_owner, start, intervals);
         });
     if let Err(error) = spawned {
@@ -1390,7 +1390,7 @@ fn discard_closed_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) -> bool
         return false;
     }
     cached_lane.take();
-    crate::runtime::perf_probe::record(
+    weaver_server_base::runtime::perf_probe::record(
         "download.owned_lane.peer_closed",
         std::time::Duration::from_nanos(1),
     );
@@ -1870,7 +1870,7 @@ fn run_owned_lane(
                     drop(turn);
                     *press = None;
                     let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::LeaseObsolete { lease });
-                    crate::runtime::perf_probe::record(
+                    weaver_server_base::runtime::perf_probe::record(
                         "download.fetch_body.owned",
                         fetch_started.elapsed(),
                     );
@@ -1903,7 +1903,7 @@ fn run_owned_lane(
                 });
                 let _ =
                     event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed { lease, error });
-                crate::runtime::perf_probe::record(
+                weaver_server_base::runtime::perf_probe::record(
                     "download.fetch_body.owned",
                     fetch_started.elapsed(),
                 );
@@ -2292,9 +2292,9 @@ fn run_owned_lane(
         // The head response is decoded as it is read: a panic decoding it
         // is its job's.
         let read = {
-            let _job = inflight
-                .front()
-                .map(|(_, head)| crate::runtime::panic_trap::JobScope::enter(head.job_id));
+            let _job = inflight.front().map(|(_, head)| {
+                weaver_server_base::runtime::panic_trap::JobScope::enter(head.job_id)
+            });
             lane.ring_read_next()
         };
         let Some((trace, meta)) = read else {
@@ -2448,7 +2448,7 @@ fn run_owned_lane(
     // this lane's heap until it allocates again. A parked lane never does, so
     // the release has to happen here, on the lane thread, once per park —
     // never per article or per refill, where it would cost throughput.
-    crate::runtime::thread_release::release_idle_thread_memory();
+    weaver_server_base::runtime::thread_release::release_idle_thread_memory();
     let _ = parked_tx.blocking_send(DownloadLaneParked {
         lane_id: park_context.lane_id,
         job_id: park_context.job_id,
@@ -2457,7 +2457,10 @@ fn run_owned_lane(
         reason: park_reason,
         release_connection_slot: true,
     });
-    crate::runtime::perf_probe::record("download.fetch_body.owned", fetch_started.elapsed());
+    weaver_server_base::runtime::perf_probe::record(
+        "download.fetch_body.owned",
+        fetch_started.elapsed(),
+    );
 }
 
 // Consume a prefetched refill response on a park/error path so its leased
@@ -2775,7 +2778,7 @@ fn unresolved_result(
 }
 
 #[cfg(test)]
-use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
+use weaver_server_base::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 
 #[cfg(test)]
 fn tail_work(segment_number: u32, retry_count: u32) -> DownloadWork {
@@ -2803,7 +2806,7 @@ fn tail_work(segment_number: u32, retry_count: u32) -> DownloadWork {
 #[cfg(test)]
 fn test_admitted_state(job_id: JobId) -> crate::jobs::handle::SharedPipelineState {
     let state = crate::jobs::handle::SharedPipelineState::new(
-        crate::operations::metrics::PipelineMetrics::new(),
+        weaver_server_base::operations::metrics::PipelineMetrics::new(),
         vec![crate::jobs::handle::JobInfo {
             protocol: crate::jobs::Protocol::Nzb,
             job_id,
@@ -3650,7 +3653,7 @@ mod tests {
 mod routing_tests {
     use super::*;
 
-    use crate::jobs::ids::JobId;
+    use weaver_server_base::jobs::ids::JobId;
 
     fn test_client() -> Arc<weaver_nntp::NntpClient> {
         Arc::new(weaver_nntp::client::NntpClient::new(
@@ -3797,7 +3800,7 @@ mod routing_tests {
         Box::new(OwnedLaneRun {
             nntp: Arc::clone(nntp),
             state: crate::jobs::handle::SharedPipelineState::new(
-                crate::operations::metrics::PipelineMetrics::new(),
+                weaver_server_base::operations::metrics::PipelineMetrics::new(),
                 Vec::new(),
             ),
             event_tx,
@@ -4757,7 +4760,7 @@ mod routing_tests {
         pool.submit(
             Arc::clone(nntp),
             crate::jobs::handle::SharedPipelineState::new(
-                crate::operations::metrics::PipelineMetrics::new(),
+                weaver_server_base::operations::metrics::PipelineMetrics::new(),
                 Vec::new(),
             ),
             events.clone(),

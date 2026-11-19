@@ -9,12 +9,7 @@ use std::time::Duration;
 
 use crate::Database;
 use crate::ingest::submit_nzb_bytes;
-use crate::jobs::ids::MessageId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-use crate::runtime::system_profile::{
-    CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
-    SystemProfile,
-};
 use crate::settings::{Config, SharedConfig};
 use crate::{
     FileSpec, JobInfo, PipelineMetrics, SchedulerHandle, SegmentSpec, SharedPipelineState,
@@ -23,6 +18,11 @@ use tempfile::TempDir;
 use tokio::sync::{RwLock, oneshot};
 use weaver_model::files::FileRole;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
+use weaver_server_base::jobs::ids::MessageId;
+use weaver_server_base::runtime::system_profile::{
+    CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
+    SystemProfile,
+};
 
 macro_rules! segment_spec {
     (number: $number:expr, bytes: $bytes:expr, message_id: $message_id:expr $(,)?) => {
@@ -725,7 +725,7 @@ async fn new_direct_pipeline_on_machine(
     // Each root's volume is known once its first reading returns, as a
     // running server's is soon after start-up: a test starts from there,
     // not racing the reading of the disk's kind and name.
-    for root in crate::operations::disk::StorageRoot::ALL {
+    for root in weaver_server_disk::operations::disk::StorageRoot::ALL {
         pipeline.storage_capacity.wait_for_probes(root, 1);
     }
 
@@ -2240,7 +2240,7 @@ fn drain_job_events(
 ) -> Vec<PipelineEvent> {
     let mut drained = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if crate::events::publish::pipeline_job_id(&event) == Some(job_id.0) {
+        if weaver_server_base::events::publish::pipeline_job_id(&event) == Some(job_id.0) {
             drained.push(event);
         }
     }

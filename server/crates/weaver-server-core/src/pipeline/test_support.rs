@@ -9,7 +9,7 @@ pub async fn idle_pipeline(
     db: crate::Database,
     config: crate::settings::SharedConfig,
 ) -> (Pipeline, crate::SchedulerHandle, crate::SharedPipelineState) {
-    use crate::runtime::system_profile::{
+    use weaver_server_base::runtime::system_profile::{
         CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     };
     let settings = config.read().await.clone();

@@ -23,11 +23,11 @@ use super::harness::{
     par2_set, par2_volumes_sliced, payload, run, run_unprompted,
 };
 use super::refused_then_repaired::{drive_to_finish, serve_posts, serve_queued};
-use crate::jobs::ids::{NzbFileId, SegmentId};
 use crate::pipeline::Pipeline;
 use crate::pipeline::tests::{
     job_status_for_assert, pump_pipeline_runtime_queues, retire_pipeline_database,
 };
+use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
 pub(super) const SECRET: &str = "quill-ember-secret";
 

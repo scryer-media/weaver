@@ -42,8 +42,8 @@ use super::manifest::{UpgradeArtifact, UpgradeManifest};
 use super::product::{JOURNAL_SCHEMA, WEAVER_PRODUCT};
 use crate::persistence::Database;
 use crate::proxies::{Consumer, ProxyRuntime, with_routed_client};
-use crate::runtime::restart::RestartController;
 use crate::update_check::{UpdateCheckService, release_tag_for_version};
+use weaver_server_base::runtime::restart::RestartController;
 
 // Stable progress phase names the upgrade UI reads.
 pub use application_updater::phases;
@@ -2008,7 +2008,7 @@ mod tests {
         // A portable promotion re-execs in place; it is not a bundle relaunch.
         assert_eq!(
             restart.requested().await,
-            crate::runtime::restart::RestartAction::Restart
+            weaver_server_base::runtime::restart::RestartAction::Restart
         );
     }
 

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Pipeline;
 use crate::jobs::JobStatus;
-use crate::runtime::tuning::TunedParameters;
+use weaver_server_base::runtime::tuning::TunedParameters;
 
 // Everything the diagnostics package records about the running pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,8 +205,8 @@ pub struct VolumeDiagnostics {
     pub write_seeks_total: u64,
 }
 
-impl From<crate::operations::instrumentation::VolumeSnapshot> for VolumeDiagnostics {
-    fn from(volume: crate::operations::instrumentation::VolumeSnapshot) -> Self {
+impl From<weaver_server_base::operations::instrumentation::VolumeSnapshot> for VolumeDiagnostics {
+    fn from(volume: weaver_server_base::operations::instrumentation::VolumeSnapshot) -> Self {
         Self {
             label: volume.label,
             storage_kind: volume.kind.to_string(),
@@ -528,7 +528,8 @@ impl Pipeline {
                 recovering: metrics.download_lanes_recovering_active,
             },
             memory: MemoryDiagnostics {
-                process_resident_bytes: crate::runtime::process_metrics::resident_memory_bytes(),
+                process_resident_bytes:
+                    weaver_server_base::runtime::process_metrics::resident_memory_bytes(),
                 lane_inflight_bytes: metrics.download_lane_inflight_bytes,
                 jobs_eligible: metrics.download_jobs_eligible,
                 jobs_hot: metrics.download_jobs_hot,
@@ -546,7 +547,7 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::instrumentation::VolumeSnapshot;
+    use weaver_server_base::operations::instrumentation::VolumeSnapshot;
 
     // A volume's row in the packet carries every figure the disk owner
     // holds for it, and reads back as written.

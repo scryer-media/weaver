@@ -91,7 +91,7 @@ impl Pipeline {
         if old_run_state != new_run_state
             && matches!(new_run_state, crate::jobs::model::RunState::Paused)
         {
-            return Some(crate::e2e_failpoint::STATUS_ENTER_PAUSED);
+            return Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_PAUSED);
         }
         if old_post_state == new_post_state {
             return None;
@@ -101,20 +101,20 @@ impl Pipeline {
                 Some(Self::par2_verification_started_failpoint_name())
             }
             crate::jobs::model::PostState::Repairing => {
-                Some(crate::e2e_failpoint::STATUS_ENTER_REPAIRING)
+                Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_REPAIRING)
             }
             crate::jobs::model::PostState::QueuedRepair => {
-                Some(crate::e2e_failpoint::STATUS_ENTER_QUEUED_REPAIR)
+                Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_QUEUED_REPAIR)
             }
             crate::jobs::model::PostState::QueuedExtract => {
-                Some(crate::e2e_failpoint::STATUS_ENTER_QUEUED_EXTRACT)
+                Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_QUEUED_EXTRACT)
             }
             _ => None,
         }
     }
 
     pub(crate) fn par2_verification_started_failpoint_name() -> &'static str {
-        crate::e2e_failpoint::STATUS_ENTER_VERIFYING
+        weaver_server_base::e2e_failpoint::STATUS_ENTER_VERIFYING
     }
 
     pub(crate) fn persist_active_runtime(&self, job_id: JobId) {
@@ -393,7 +393,7 @@ impl Pipeline {
             if state.run_state != new_run_state
                 && matches!(new_run_state, crate::jobs::model::RunState::Paused)
             {
-                Some(crate::e2e_failpoint::STATUS_ENTER_PAUSED)
+                Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_PAUSED)
             } else if state.post_state == new_post_state {
                 None
             } else {
@@ -402,13 +402,13 @@ impl Pipeline {
                         Some(Self::par2_verification_started_failpoint_name())
                     }
                     crate::jobs::model::PostState::Repairing => {
-                        Some(crate::e2e_failpoint::STATUS_ENTER_REPAIRING)
+                        Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_REPAIRING)
                     }
                     crate::jobs::model::PostState::QueuedRepair => {
-                        Some(crate::e2e_failpoint::STATUS_ENTER_QUEUED_REPAIR)
+                        Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_QUEUED_REPAIR)
                     }
                     crate::jobs::model::PostState::QueuedExtract => {
-                        Some(crate::e2e_failpoint::STATUS_ENTER_QUEUED_EXTRACT)
+                        Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_QUEUED_EXTRACT)
                     }
                     _ => None,
                 }
@@ -502,7 +502,7 @@ impl Pipeline {
             } else {
                 "unchanged"
             };
-            crate::runtime::perf_probe::record_owned(
+            weaver_server_base::runtime::perf_probe::record_owned(
                 format!(
                     "pipeline.persist_active_runtime.requested.{changed_label}.{persist_status}"
                 ),
@@ -511,15 +511,15 @@ impl Pipeline {
             if persist_runtime_to_db {
                 committed = self.persist_active_runtime_at(job_id, None);
             } else {
-                crate::runtime::perf_probe::record_owned(
+                weaver_server_base::runtime::perf_probe::record_owned(
                     format!("pipeline.persist_active_runtime.skipped.transient.{persist_status}"),
                     std::time::Duration::ZERO,
                 );
             }
         }
         if let (true, Some(name)) = (transitioned, failpoint_name) {
-            crate::e2e_failpoint::maybe_delay(name);
-            crate::e2e_failpoint::maybe_trip(name);
+            weaver_server_base::e2e_failpoint::maybe_delay(name);
+            weaver_server_base::e2e_failpoint::maybe_trip(name);
         }
         committed
     }

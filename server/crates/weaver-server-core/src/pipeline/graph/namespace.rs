@@ -41,8 +41,8 @@ use super::checkpoint::why_name;
 use super::envelope::{Envelopes, Shelf, Shelved};
 use super::leaf::{Leaf, LeafError};
 use super::limits::{Caps, Device, Output};
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::extraction::ExtractionFailure;
+use weaver_server_disk::operations::disk::CapacityReader;
 
 // The block-aligned segment checksums of a delivered range, which the source
 // computed while it had the bytes. Asked in the namespace's own coordinates,
@@ -326,7 +326,7 @@ pub(crate) struct NamespaceWriter {
     asked: BTreeMap<(NodeId, VolumeIndex), (NodeId, VolumeIndex, u64)>,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
-    metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    metrics: Option<Arc<weaver_server_base::operations::metrics::PipelineMetrics>>,
     // The volume writers the job's files are written through; `None` for a
     // job whose leaves run their own file operations as they are asked.
     disk: Option<crate::pipeline::graph::disk::JobDisk>,
@@ -495,13 +495,15 @@ impl NamespaceWriter {
     pub(super) fn disk_under(
         &self,
         root: &Path,
-    ) -> Option<Arc<crate::operations::disk::writer::Submitter>> {
+    ) -> Option<Arc<weaver_server_disk::operations::disk::writer::Submitter>> {
         self.disk.as_ref().map(|disk| Arc::clone(disk.under(root)))
     }
 
     // The volume of the working directory, whose read turns a loan's reads
     // of the job's scratch and spill files take.
-    pub(super) fn working_volume(&self) -> Option<Arc<crate::operations::disk::volume::Volume>> {
+    pub(super) fn working_volume(
+        &self,
+    ) -> Option<Arc<weaver_server_disk::operations::disk::volume::Volume>> {
         self.disk
             .as_ref()
             .map(|disk| Arc::clone(disk.working().volume()))
@@ -559,7 +561,7 @@ impl NamespaceWriter {
     // Publish the time each member write takes on disk.
     pub(crate) fn metered(
         mut self,
-        metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+        metrics: Option<Arc<weaver_server_base::operations::metrics::PipelineMetrics>>,
     ) -> Self {
         self.metrics = metrics;
         self

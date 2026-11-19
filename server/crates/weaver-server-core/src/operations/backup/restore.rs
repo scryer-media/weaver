@@ -770,7 +770,7 @@ pub(crate) fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
 
     JobInfo {
         protocol: crate::jobs::Protocol::Nzb,
-        job_id: crate::jobs::ids::JobId(row.job_id),
+        job_id: weaver_server_base::jobs::ids::JobId(row.job_id),
         job_hash: row.job_hash.as_ref().and_then(|value| {
             (value.len() == 32).then(|| {
                 let mut hash = [0u8; 32];

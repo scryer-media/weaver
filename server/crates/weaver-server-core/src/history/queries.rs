@@ -56,19 +56,19 @@ impl Database {
         job_id: u64,
         label: &'static str,
     ) -> Result<Option<JobHistoryRow>, StateError> {
-        let _probe = crate::runtime::perf_probe::scope(label);
+        let _probe = weaver_server_base::runtime::perf_probe::scope(label);
         self.get_job_history_inner(job_id)
     }
 
     fn get_job_history_inner(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
         if let Some(row) = self.get_cached_job_history(job_id) {
-            crate::runtime::perf_probe::record(
+            weaver_server_base::runtime::perf_probe::record(
                 "db.get_job_history.cache_hit",
                 std::time::Duration::ZERO,
             );
             return Ok(Some(row));
         }
-        crate::runtime::perf_probe::record(
+        weaver_server_base::runtime::perf_probe::record(
             "db.get_job_history.cache_miss",
             std::time::Duration::ZERO,
         );

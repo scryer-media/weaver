@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 
 use super::harness::{self, JOB, Post, Scenario};
-use crate::jobs::ids::{NzbFileId, SegmentId};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
     Entry, build_7z_shaped, split_volumes,
@@ -14,6 +13,7 @@ use crate::pipeline::tests::{
     pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::pipeline::{DecodeDone, DownloadPayload, Pipeline, SegmentSource};
+use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
 const ARTICLE: usize = 768;
 const SLICE: usize = 1048;

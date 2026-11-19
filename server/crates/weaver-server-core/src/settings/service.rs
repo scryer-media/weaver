@@ -4,7 +4,6 @@
 use crate::StateError;
 use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
-use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     Config, DeliveryNamingOverrides, DirectStoreOverrides, Leaf, MetricsConfig, PeerTransport,
@@ -12,6 +11,7 @@ use crate::settings::{
     SeedingPolicy, TorrentConfig, TorrentEncryption,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
+use weaver_server_base::runtime::hardware_profile::HardwareProfile;
 
 // The key the chosen hardware profile is stored under. Absent until an
 // operator picks one.

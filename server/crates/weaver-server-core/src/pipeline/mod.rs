@@ -50,13 +50,10 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
 use crate::RestoreJobRequest;
-use crate::events::model::PipelineEvent;
 #[cfg(test)]
 use crate::jobs::assembly::JobAssembly;
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::jobs::{JobPhase, PhaseCounters};
-use crate::runtime::system_profile::SystemProfile;
 use crate::{
     DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork, JobInfo, JobSpec,
     JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner, SharedPipelineState,
@@ -65,6 +62,9 @@ use crate::{
 #[cfg(test)]
 use par2_rs::checksum;
 use weaver_nntp::NntpClient;
+use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
+use weaver_server_base::runtime::system_profile::SystemProfile;
 
 use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 pub(crate) use self::extraction::ExtractionError;
@@ -1695,7 +1695,9 @@ pub struct Pipeline {
     // left it, so the stamp of a turn woken by that mail can be pinned.
     #[cfg(test)]
     pub(super) graph_mail_stamps: Option<
-        tokio::sync::mpsc::UnboundedSender<crate::operations::instrumentation::PipelineTurnReading>,
+        tokio::sync::mpsc::UnboundedSender<
+            weaver_server_base::operations::instrumentation::PipelineTurnReading,
+        >,
     >,
     // Each graph job's health probe, and where its rounds say what they
     // found.
@@ -1918,7 +1920,7 @@ pub struct Pipeline {
     pub(crate) blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
     // The jobs whose work crashed the daemon on its last run, each parked
     // paused as it installs instead of being restored into the same panic.
-    pub(crate) crash_marks: crate::runtime::panic_trap::CrashMarks,
+    pub(crate) crash_marks: weaver_server_base::runtime::panic_trap::CrashMarks,
     // Jobs installed mid-move, whose move resumes once their install batch
     // is in place.
     pub(crate) moves_to_resume: Vec<JobId>,
@@ -1965,14 +1967,20 @@ pub struct Pipeline {
     // server id it has already seen so lifetime totals survive a config
     // reload. A stale generation may hand us an out-of-range index; the
     // completion path bounds-checks and skips.
-    pub(super) server_counters: Vec<Arc<crate::operations::instrumentation::ServerCounters>>,
+    pub(super) server_counters:
+        Vec<Arc<weaver_server_base::operations::instrumentation::ServerCounters>>,
     // Wall-clock start of each in-flight job stage, keyed by `(job, stage)`.
     //
     // Per-job, not per-segment: a job passes through each stage at most a
     // handful of times, so a `HashMap` here costs nothing measurable and never
     // appears on an article path.
-    pub(super) job_stage_started_at:
-        HashMap<(JobId, crate::operations::instrumentation::JobStageKind), Instant>,
+    pub(super) job_stage_started_at: HashMap<
+        (
+            JobId,
+            weaver_server_base::operations::instrumentation::JobStageKind,
+        ),
+        Instant,
+    >,
     // The generation whose predecessor pool finished draining; see
     // `nntp_handoff_draining`.
     pub(super) nntp_handoff_drained_tx: mpsc::Sender<u64>,
@@ -2008,8 +2016,8 @@ pub struct Pipeline {
     pub(super) applied_random_read_iops: Option<f64>,
     pub(super) applied_sequential_write_mbps: Option<f64>,
     pub(super) applied_storage_classification: Option<(
-        crate::runtime::system_profile::StorageClass,
-        crate::runtime::system_profile::FilesystemType,
+        weaver_server_base::runtime::system_profile::StorageClass,
+        weaver_server_base::runtime::system_profile::FilesystemType,
     )>,
     // The memory tier's base size the backlog limits are sized on, kept to
     // size them again when the storage class is learned after start-up.
@@ -2211,22 +2219,24 @@ pub struct Pipeline {
     // The clock the shutdown settle of the volume writers goes by, and how
     // long a volume may stand still before it is left behind. The machine's
     // clock outside tests; a test may put one it moves by hand here.
-    pub(super) shutdown_settle: crate::operations::disk::writer::SettleBound,
+    pub(super) shutdown_settle: weaver_server_disk::operations::disk::writer::SettleBound,
     // What queues each volume's first write-rate probe on its writer, once.
     pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
     // The keeper of every volume's buffer limits.
     pub(super) volume_buffers: Arc<crate::operations::VolumeBuffers>,
     // For each job with released results waiting for the loop: their bytes,
     // counted as arrived on the one volume they are held on.
-    pub(super) volume_arrived_by_job: HashMap<JobId, crate::operations::disk::volume::Reservation>,
+    pub(super) volume_arrived_by_job:
+        HashMap<JobId, weaver_server_disk::operations::disk::volume::Reservation>,
     // For each job with articles leased to lanes: their bytes, reserved on
     // the volume the job writes to (`Reservation::reserve`). Each article
     // is reserved once, as it is leased, and given back once, as it leaves
     // its lane's record however it ends (`note_lane_work_left`).
-    pub(super) volume_reserved_by_job: HashMap<JobId, crate::operations::disk::volume::Reservation>,
+    pub(super) volume_reserved_by_job:
+        HashMap<JobId, weaver_server_disk::operations::disk::volume::Reservation>,
     // What decode windows took from each disk they go on, for every graph
     // job together.
-    pub(super) window_ledgers: crate::scratch::ScratchLedgers,
+    pub(super) window_ledgers: weaver_server_disk::scratch::ScratchLedgers,
     // Largest refused UU spill. Dispatch preserves cursor progress until
     // this many bytes can be parked in memory or admitted to the spool.
     pub(super) uu_spool_blocked_spill_bytes: Option<usize>,

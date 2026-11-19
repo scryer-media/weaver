@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::harness::{self, JOB, Post};
-use crate::jobs::ids::{NzbFileId, SegmentId};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
     Entry, build_7z_shaped, split_volumes,
@@ -19,6 +18,7 @@ use crate::pipeline::tests::{
     pump_pipeline_runtime_queues, refusing_harness_server_port, retire_pipeline_database,
 };
 use crate::pipeline::{DecodeDone, DownloadError, DownloadPayload, Pipeline, SegmentSource};
+use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
 const ARTICLE: usize = 768;
 

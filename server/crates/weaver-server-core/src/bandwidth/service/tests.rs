@@ -76,7 +76,7 @@ async fn bandwidth_ledger_flushes_lazily() {
     let db = crate::Database::open_in_memory().unwrap();
     let mut runtime = BandwidthLedgerRuntime::default();
 
-    let now_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
+    let now_minute = weaver_server_base::e2e_clock::unix_seconds().div_euclid(60);
     let counters = BandwidthCounters::default();
     counters.record(512);
     runtime.sample(&db, &counters, false).unwrap();
@@ -114,7 +114,7 @@ fn rename_usage_table(db: &crate::Database, from: &'static str, to: &'static str
 async fn a_usage_batch_whose_write_fails_is_written_once_by_the_next_flush() {
     let db = crate::Database::open_in_memory().unwrap();
     let mut runtime = BandwidthLedgerRuntime::default();
-    let now_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
+    let now_minute = weaver_server_base::e2e_clock::unix_seconds().div_euclid(60);
     let counters = BandwidthCounters::default();
     counters.record(512);
     runtime.sample(&db, &counters, false).unwrap();
@@ -171,7 +171,7 @@ async fn bandwidth_ledger_flushes_once_the_byte_threshold_is_reached() {
     let db = crate::Database::open_in_memory().unwrap();
     let mut runtime = BandwidthLedgerRuntime::default();
 
-    let now_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
+    let now_minute = weaver_server_base::e2e_clock::unix_seconds().div_euclid(60);
     let counters = BandwidthCounters::default();
     counters.record(BANDWIDTH_USAGE_FLUSH_BYTES - 1);
     runtime.sample(&db, &counters, false).unwrap();

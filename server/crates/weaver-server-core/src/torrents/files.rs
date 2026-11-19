@@ -27,7 +27,7 @@ use tokio::time::Instant;
 use weaver_torrent::session_stats::disk::FileEnds;
 
 use super::layout::PieceLayout;
-use crate::operations::disk::beneath::{self, Access};
+use weaver_server_disk::operations::disk::beneath::{self, Access};
 
 // What every torrent's file calls and the handle pool did since the process
 // started: one relaxed add per call, read by a scrape without a lock. The

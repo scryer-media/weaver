@@ -15,7 +15,6 @@ use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{MemberId, NodeId, VolumeIndex, Why};
 
 use self::fakes::{Fakes, Mode, OPENS};
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::engine::echo::{HEADER, SIGNATURE};
 use crate::pipeline::graph::engine::{Heard, RunMail, Runs, Said};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
@@ -25,6 +24,7 @@ use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::Delivery;
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::graph::status::Unarrived;
+use weaver_server_disk::operations::disk::CapacityReader;
 
 const CANDIDATES: [&str; 4] = ["lantern-one", "lantern-two", OPENS, "lantern-four"];
 const WRONG: [&str; 4] = ["lantern-one", "lantern-two", "lantern-four", "lantern-five"];

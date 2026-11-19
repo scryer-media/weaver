@@ -5,7 +5,7 @@
 // job event naming the set and the reason.
 
 use super::harness::{ARTICLE, JOB, Post, Scenario, par2_set, par2_volumes, payload, try_run};
-use crate::events::model::{PipelineEvent, recovery_set_unused_message};
+use weaver_server_base::events::model::{PipelineEvent, recovery_set_unused_message};
 
 // The messages of every unused-set event the run sent for the job.
 fn unused(events: &[PipelineEvent]) -> Vec<String> {

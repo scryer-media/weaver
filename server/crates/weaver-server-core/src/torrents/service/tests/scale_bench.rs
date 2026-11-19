@@ -211,7 +211,7 @@ async fn run(count: usize, archive: bool) {
     let at = Instant::now();
     service.stop().await;
     let stopped = ms(at);
-    db.prune_orphan_active_state(crate::jobs::ids::JobId(u64::MAX))
+    db.prune_orphan_active_state(weaver_server_base::jobs::ids::JobId(u64::MAX))
         .unwrap();
 
     let again = bench_service(&db, dir.path(), &routes);

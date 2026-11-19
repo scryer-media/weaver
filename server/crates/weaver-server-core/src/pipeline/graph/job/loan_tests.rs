@@ -12,7 +12,6 @@ use std::sync::Arc;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 
 use super::GraphJob;
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::engine::{RunMail, Runs};
 use crate::pipeline::graph::hardware::Hardware;
 use crate::pipeline::graph::namespace::NamespaceWriter;
@@ -20,6 +19,7 @@ use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::tests::{decoded, file};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::engines::loans::{FRAME, Kind, SECRET, body, stored_zip, volumes};
+use weaver_server_disk::operations::disk::CapacityReader;
 
 type Loan = super::works::HeldLoan;
 

@@ -51,10 +51,10 @@ use weaver_model::files::{FileRole, archive_base_name};
 use weaver_nntp::client::ProbeBatchResult;
 use weaver_nntp::pool::ServerId;
 
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
 use crate::pipeline::download::queue::QueuedWork;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
+use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 mod first_articles;
 mod given_up;

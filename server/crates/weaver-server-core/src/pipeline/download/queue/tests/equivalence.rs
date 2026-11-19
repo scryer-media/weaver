@@ -8,9 +8,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, MessageIds, SegmentSpec};
 use weaver_model::files::FileRole;
+use weaver_server_base::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 
 use super::super::reference::ReferenceQueue;
 use super::super::*;

@@ -15,9 +15,9 @@ use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_volumes, payload, run};
 use super::sfv::{crc, listing};
-use crate::events::model::PipelineEvent;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::protected_store_set;
+use weaver_server_base::events::model::PipelineEvent;
 
 const MEMBER: &str = "fixture.release.mkv";
 

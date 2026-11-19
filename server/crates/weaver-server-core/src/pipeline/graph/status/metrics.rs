@@ -8,7 +8,7 @@ use weaver_graph::recovery::RepairOutcome;
 use super::claims::{Claim, ClaimedMember};
 use super::summary::RecoverySummary;
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::runtime::perf_probe::record_value_owned;
+use weaver_server_base::runtime::perf_probe::record_value_owned;
 
 pub(super) fn phase(phase: RootPhase) {
     record_value_owned(format!("graph.phase.{}", phase.as_str()), 1);

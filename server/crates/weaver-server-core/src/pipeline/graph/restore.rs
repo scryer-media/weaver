@@ -23,16 +23,16 @@ use super::job::restore::{RestoreFailure, Restored};
 use super::job::{GraphError, GraphJob, RootFile, Storage};
 use super::limits::caps_for;
 use crate::LoadError;
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::JobSpec;
-use crate::operations::disk::CapacityReader;
-use crate::operations::metrics::PipelineMetrics;
 use crate::pipeline::extraction::ExtractionLimits;
 use crate::pipeline::held::{HeldPart, held_parts_from_rows};
 use crate::pipeline::{
     Pipeline, assemble_archive_password_candidates, read_job_password_candidates,
 };
 use weaver_graph::names::{INTERNAL_DIR, key};
+use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
+use weaver_server_base::operations::metrics::PipelineMetrics;
+use weaver_server_disk::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraphRestoreError {
@@ -121,8 +121,12 @@ pub(crate) struct RestoreSeat {
     metrics: Arc<PipelineMetrics>,
     extraction_limits: Arc<ExtractionLimits>,
     spec_password: Option<String>,
-    data_dir: Option<(PathBuf, CapacityReader, crate::scratch::ScratchLedger)>,
-    window_ledger: crate::scratch::ScratchLedger,
+    data_dir: Option<(
+        PathBuf,
+        CapacityReader,
+        weaver_server_disk::scratch::ScratchLedger,
+    )>,
+    window_ledger: weaver_server_disk::scratch::ScratchLedger,
     // The volume writers and the disk owner the restored job's files are
     // written through.
     volumes: (
@@ -249,7 +253,7 @@ impl RestoreSeat {
         #[cfg(test)]
         RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A restore replays the job's own facts: a panic in it is the job's.
-        let _job = crate::runtime::panic_trap::JobScope::enter(job_id);
+        let _job = weaver_server_base::runtime::panic_trap::JobScope::enter(job_id);
         let roots: Vec<PathBuf> = std::iter::once(self.working_dir.clone())
             .chain(self.output.as_ref().map(|(dir, _)| dir.clone()))
             .collect();

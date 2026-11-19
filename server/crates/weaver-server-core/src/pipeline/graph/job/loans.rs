@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::operations::disk::reader::TurnStop;
+use weaver_server_disk::operations::disk::reader::TurnStop;
 
 use tokio::sync::mpsc;
 use weaver_graph::NodeId;
@@ -171,15 +171,20 @@ impl Lender for Lending<'_> {
         let grant = loans.hardware.grant();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
-            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             tracing::info!(
                 job_id = scope,
                 node = set.0,
                 generation = serial,
                 "graph repair worker started"
             );
-            crate::e2e_failpoint::maybe_delay(crate::e2e_failpoint::REPAIR_TASK_START);
-            crate::e2e_failpoint::maybe_trip(crate::e2e_failpoint::REPAIR_TASK_START);
+            weaver_server_base::e2e_failpoint::maybe_delay(
+                weaver_server_base::e2e_failpoint::REPAIR_TASK_START,
+            );
+            weaver_server_base::e2e_failpoint::maybe_trip(
+                weaver_server_base::e2e_failpoint::REPAIR_TASK_START,
+            );
             let returned = grant.install_repair(|| loan.run(grant.repair.clone(), &shutdown));
             tracing::info!(
                 job_id = scope,
@@ -215,7 +220,8 @@ impl Lending<'_> {
         let mail = loans.mail.clone();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
-            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             let checked = check.run(&shutdown);
             let _ = mail.blocking_send(Said {
                 scope,
@@ -242,7 +248,8 @@ impl Lending<'_> {
         let mail = loans.mail.clone();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
-            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             let replayed = replay.run(&shutdown);
             if let Err(error) = mail.blocking_send(Said {
                 scope,

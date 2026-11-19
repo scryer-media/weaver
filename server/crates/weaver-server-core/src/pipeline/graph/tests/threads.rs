@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::*;
-use crate::operations::disk::volume::Volume;
-use crate::operations::disk::writer::Hold;
 use crate::pipeline::graph::disk::VolumeLeases;
 use crate::pipeline::graph::disk::threads;
 use crate::pipeline::tests::{job_status_for_assert, settle_failed_releases};
+use weaver_server_disk::operations::disk::volume::Volume;
+use weaver_server_disk::operations::disk::writer::Hold;
 
 // The volume the job writes to and a hold on its thread.
 fn held(pipeline: &Pipeline, job_id: JobId) -> (Arc<Volume>, Hold) {
@@ -352,9 +352,9 @@ async fn a_job_on_two_volumes_is_written_by_each_volumes_own_thread() {
         temp_dir.path().join("complete"),
         temp_dir.path().join("movies"),
     );
-    crate::runtime::fs::test_devices::assign(&intermediate, 1);
-    crate::runtime::fs::test_devices::assign(&complete, 2);
-    crate::runtime::fs::test_devices::assign(&movies, 3);
+    weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
     let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
         temp_dir.path().join("data"),
         intermediate,
@@ -971,7 +971,7 @@ async fn a_graceful_stop_drains_the_volumes_and_then_checkpoints() {
 // bytes it never saw put down, and the restarted job fetches them again.
 #[tokio::test]
 async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
-    use crate::operations::disk::writer::SettleBound;
+    use weaver_server_disk::operations::disk::writer::SettleBound;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_413);
@@ -985,7 +985,7 @@ async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
         // A clock a minute later at each look: the volume's span is over
         // the first time the stop finds it standing still.
         pipeline.shutdown_settle = SettleBound {
-            clock: Arc::new(crate::clock::ManualClock::stepping(
+            clock: Arc::new(weaver_server_base::clock::ManualClock::stepping(
                 std::time::Duration::from_secs(60),
             )),
             span: std::time::Duration::from_secs(30),
@@ -1056,9 +1056,9 @@ async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
 // Stop the pipeline with a clock a minute later at each look, so a volume
 // that stands still is given up the first time the stop finds it so.
 async fn stop_past_a_still_volume(pipeline: &mut Pipeline) {
-    use crate::operations::disk::writer::SettleBound;
+    use weaver_server_disk::operations::disk::writer::SettleBound;
     pipeline.shutdown_settle = SettleBound {
-        clock: Arc::new(crate::clock::ManualClock::stepping(
+        clock: Arc::new(weaver_server_base::clock::ManualClock::stepping(
             std::time::Duration::from_secs(60),
         )),
         span: std::time::Duration::from_secs(30),
@@ -1162,8 +1162,8 @@ async fn a_stop_does_not_wait_for_a_repair_held_by_a_still_volume() {
 // checkpointed as any other, not left at an older checkpoint.
 #[tokio::test]
 async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
-    use crate::clock::ManualClock;
-    use crate::operations::disk::writer::SettleBound;
+    use weaver_server_base::clock::ManualClock;
+    use weaver_server_disk::operations::disk::writer::SettleBound;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_418);
@@ -1228,7 +1228,7 @@ async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
 // not fail, and it is left at its last written checkpoint.
 #[tokio::test]
 async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_end() {
-    use crate::clock::ManualClock;
+    use weaver_server_base::clock::ManualClock;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_419);
@@ -1324,9 +1324,9 @@ async fn a_job_on_a_full_volume_stops_while_a_job_on_another_volume_is_dispatche
         temp_dir.path().join("complete"),
         temp_dir.path().join("movies"),
     );
-    crate::runtime::fs::test_devices::assign(&intermediate, 1);
-    crate::runtime::fs::test_devices::assign(&complete, 2);
-    crate::runtime::fs::test_devices::assign(&movies, 3);
+    weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
     let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
         temp_dir.path().join("data"),
         intermediate,
@@ -1422,9 +1422,9 @@ async fn a_volume_shares_the_buffer_pool_only_while_a_job_writes_to_it() {
         temp_dir.path().join("complete"),
         temp_dir.path().join("movies"),
     );
-    crate::runtime::fs::test_devices::assign(&intermediate, 1);
-    crate::runtime::fs::test_devices::assign(&complete, 2);
-    crate::runtime::fs::test_devices::assign(&movies, 3);
+    weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
     let (pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
         temp_dir.path().join("data"),
         intermediate.clone(),
@@ -1515,8 +1515,8 @@ async fn a_volume_shares_the_buffer_pool_only_while_a_job_writes_to_it() {
 // A directory that was not read is asked after from memory, as before.
 #[tokio::test]
 async fn a_job_writes_through_the_volumes_read_for_its_directories() {
-    use crate::operations::disk::volume::Volume;
     use crate::pipeline::graph::disk::job_disk;
+    use weaver_server_disk::operations::disk::volume::Volume;
     let temp_dir = tempfile::tempdir().unwrap();
     let (pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
         temp_dir.path().join("data"),
@@ -1530,7 +1530,7 @@ async fn a_job_writes_through_the_volumes_read_for_its_directories() {
     .await;
     let elsewhere = temp_dir.path().join("elsewhere");
     let (working, output) = (elsewhere.join("work"), elsewhere.join("out"));
-    crate::runtime::fs::test_devices::assign(&elsewhere, 9);
+    weaver_server_disk::runtime::fs::test_devices::assign(&elsewhere, 9);
     // Nothing has read either path: memory answers the stand-in.
     let stand_in = pipeline.storage_capacity.volume(&working);
     assert!(
@@ -1702,9 +1702,9 @@ async fn a_volume_short_of_room_leaves_the_lanes_room_to_jobs_on_other_volumes()
         temp_dir.path().join("complete"),
         temp_dir.path().join("movies"),
     );
-    crate::runtime::fs::test_devices::assign(&intermediate, 1);
-    crate::runtime::fs::test_devices::assign(&complete, 2);
-    crate::runtime::fs::test_devices::assign(&movies, 3);
+    weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
     let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
         temp_dir.path().join("data"),
         intermediate,
@@ -1962,19 +1962,21 @@ async fn a_probe_holding_its_scratch_file_leaves_the_jobs_folder_and_delivery_al
     let (made, scratch) = mpsc::channel::<PathBuf>();
     let (release, released) = mpsc::channel::<()>();
     let (made, released) = (Mutex::new(made), Mutex::new(released));
-    let store = crate::operations::disk::ProbeStore::writing_with(data.path(), move |path| {
-        made.lock().unwrap().send(path.to_path_buf()).unwrap();
-        released.lock().unwrap().recv().unwrap();
-        Some(crate::runtime::system_probe::ProbeWrite {
-            bytes: 1_000_000,
-            elapsed: Duration::from_millis(10),
-        })
-    });
+    let store =
+        weaver_server_disk::operations::disk::ProbeStore::writing_with(data.path(), move |path| {
+            made.lock().unwrap().send(path.to_path_buf()).unwrap();
+            released.lock().unwrap().recv().unwrap();
+            Some(weaver_server_disk::runtime::system_probe::ProbeWrite {
+                bytes: 1_000_000,
+                elapsed: Duration::from_millis(10),
+            })
+        });
     let (ended, probe_ended) = mpsc::channel::<()>();
     let ended = Mutex::new(ended);
     pipeline.volume_probes = Arc::new(crate::pipeline::graph::disk::VolumeProbes::with(
         move |volume, dir| {
-            let probe = crate::operations::disk::probe_once(volume, dir, Arc::clone(&store));
+            let probe =
+                weaver_server_disk::operations::disk::probe_once(volume, dir, Arc::clone(&store));
             let ended = ended.lock().unwrap().clone();
             Box::new(move || {
                 let probed = probe();

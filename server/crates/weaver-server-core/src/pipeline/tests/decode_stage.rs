@@ -1259,7 +1259,7 @@ fn backlog_budgets_share_one_memory_ceiling() {
 // the reference, so any drift in the tier table or the limit formulas fails.
 #[test]
 fn backlog_sizing_matches_the_former_pool_sized_limits_on_every_host() {
-    use crate::runtime::backlog_sizing::BacklogSizing;
+    use weaver_server_base::runtime::backlog_sizing::BacklogSizing;
 
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;

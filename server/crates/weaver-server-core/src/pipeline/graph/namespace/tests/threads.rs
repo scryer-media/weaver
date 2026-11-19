@@ -11,9 +11,9 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use super::*;
-use crate::operations::disk::volume::Volume;
-use crate::operations::disk::writer::{Failure, Hold, Report, VolumeWriters};
 use crate::pipeline::graph::disk::JobDisk;
+use weaver_server_disk::operations::disk::volume::Volume;
+use weaver_server_disk::operations::disk::writer::{Failure, Hold, Report, VolumeWriters};
 
 // One volume's writer thread, and every failure it reports.
 struct Disk {

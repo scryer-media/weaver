@@ -9,16 +9,16 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::class::{ByProtocol, JobClasses, PipelineClass};
-use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
+use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_base::jobs::ids::JobId;
 
 use crate::jobs::error::SchedulerError;
 use crate::jobs::model::{HeldClass, JobSpec, JobStatus, JobUpdate, Protocol};
-use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 use crate::pipeline::queue::{Change, Queue};
+use weaver_server_base::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 
 pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
 pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
@@ -2192,7 +2192,7 @@ impl SchedulerHandle {
     // per-article path that increments the counters.
     pub fn server_metrics_snapshot(
         &self,
-    ) -> Vec<crate::operations::instrumentation::ServerMetricsSnapshot> {
+    ) -> Vec<weaver_server_base::operations::instrumentation::ServerMetricsSnapshot> {
         self.state.metrics().server_metrics.snapshot()
     }
 
@@ -2201,7 +2201,7 @@ impl SchedulerHandle {
     pub fn server_article_outcomes(
         &self,
         stable_server_id: u32,
-    ) -> Option<crate::operations::instrumentation::ServerArticleOutcomes> {
+    ) -> Option<weaver_server_base::operations::instrumentation::ServerArticleOutcomes> {
         self.state
             .metrics()
             .server_metrics
@@ -2212,7 +2212,7 @@ impl SchedulerHandle {
     // [`Self::server_metrics_snapshot`] for why this is not in the tick.
     pub fn job_lifecycle_metrics_snapshot(
         &self,
-    ) -> crate::operations::instrumentation::JobLifecycleMetricsSnapshot {
+    ) -> weaver_server_base::operations::instrumentation::JobLifecycleMetricsSnapshot {
         self.state.metrics().job_lifecycle.snapshot()
     }
 
@@ -2220,7 +2220,7 @@ impl SchedulerHandle {
     // [`Self::server_metrics_snapshot`] for why this is not in the tick.
     pub fn pipeline_histograms_snapshot(
         &self,
-    ) -> crate::operations::instrumentation::PipelineHistogramsSnapshot {
+    ) -> weaver_server_base::operations::instrumentation::PipelineHistogramsSnapshot {
         self.state.metrics().pipeline_histograms.snapshot()
     }
 
@@ -2704,8 +2704,8 @@ impl SchedulerHandle {
     // known when start-up could not learn them in time.
     pub fn update_storage_classification(
         &self,
-        storage_class: crate::runtime::system_profile::StorageClass,
-        filesystem: crate::runtime::system_profile::FilesystemType,
+        storage_class: weaver_server_base::runtime::system_profile::StorageClass,
+        filesystem: weaver_server_base::runtime::system_profile::FilesystemType,
     ) {
         self.state.queue.write_intent(|inner| {
             inner.globals.storage_classification = Some((storage_class, filesystem));
@@ -2754,7 +2754,7 @@ impl SchedulerHandle {
         self.state.shutdown_started.store(true, Ordering::Release);
         // An e2e hook held until shutdown is released by the same signal
         // the pipeline reads.
-        crate::e2e_failpoint::release_shutdown_holds();
+        weaver_server_base::e2e_failpoint::release_shutdown_holds();
         Ok(())
     }
 
@@ -2766,7 +2766,7 @@ impl SchedulerHandle {
         now: std::time::Instant,
     ) -> (
         crate::pipeline::diagnostics::QueueStateCounts,
-        crate::operations::instrumentation::PipelineTurnReading,
+        weaver_server_base::operations::instrumentation::PipelineTurnReading,
     ) {
         let queue = self
             .state
@@ -2780,7 +2780,7 @@ impl SchedulerHandle {
     pub fn pipeline_turn(
         &self,
         now: std::time::Instant,
-    ) -> crate::operations::instrumentation::PipelineTurnReading {
+    ) -> weaver_server_base::operations::instrumentation::PipelineTurnReading {
         self.state.metrics().pipeline_turn.read(now)
     }
 }

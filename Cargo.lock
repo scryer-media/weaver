@@ -6639,6 +6639,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-server-base"
+version = "0.16.17"
+dependencies = [
+ "chrono",
+ "crc-turbo",
+ "flate2",
+ "http",
+ "ipnet",
+ "libc",
+ "par2-rs",
+ "par3-rs",
+ "rayon",
+ "reedsolomon-rs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "weaver-model",
+ "weaver-tunnel",
+ "weaver-yenc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "weaver-server-disk"
+version = "0.16.17"
+dependencies = [
+ "bytes",
+ "cap-std",
+ "getrandom 0.4.3",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-graph",
+ "weaver-server-base",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "weaver-server-core"
 version = "0.16.17"
 dependencies = [
@@ -6712,6 +6758,8 @@ dependencies = [
  "weaver-nntp",
  "weaver-nzb",
  "weaver-objects",
+ "weaver-server-base",
+ "weaver-server-disk",
  "weaver-torrent",
  "weaver-tunnel",
  "weaver-yenc",

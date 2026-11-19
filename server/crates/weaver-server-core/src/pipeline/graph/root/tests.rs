@@ -19,9 +19,7 @@ use super::seams::apply_moves;
 use super::source::{Class, Move};
 use super::window::{WINDOW_IN_ORDER_VOLUMES, WINDOW_VOLUMES};
 use super::{ArticleRoot, Ask};
-use crate::jobs::ids::{JobId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{RunMail, Runs};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
@@ -36,6 +34,8 @@ use crate::pipeline::{
     YencLayoutAssertions,
 };
 use weaver_graph::recovery::RepairOutcome;
+use weaver_server_base::jobs::ids::{JobId, SegmentId};
+use weaver_server_disk::operations::disk::CapacityReader;
 
 const ZIP_FRONT: &[u8] = b"PK\x03\x04";
 
@@ -762,7 +762,7 @@ async fn moves_by_segment_leave_the_queues_as_walks_of_them_do() {
                 assert_eq!(one.recovery_work_count(), other.recovery_work_count());
                 assert_eq!(one.excluded_work_count(), other.excluded_work_count());
                 for file_index in 0..12 {
-                    let file = crate::jobs::ids::NzbFileId { job_id, file_index };
+                    let file = weaver_server_base::jobs::ids::NzbFileId { job_id, file_index };
                     assert_eq!(
                         one.queued_count_for_file(file),
                         other.queued_count_for_file(file)
@@ -1618,7 +1618,9 @@ async fn a_file_landed_by_a_step_that_errs_is_still_said() {
     pipeline.after_graph_result(job_id, Err(failed));
     let mut landed = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if let crate::events::model::PipelineEvent::FileComplete { filename, .. } = event {
+        if let weaver_server_base::events::model::PipelineEvent::FileComplete { filename, .. } =
+            event
+        {
             landed.push(filename);
         }
     }
@@ -2552,7 +2554,7 @@ fn an_exchanged_first_part_lands_at_the_same_place_after_a_restore() {
         assert_eq!(result.crc_status, weaver_yenc::CrcVerification::Verified);
         super::seams::decoded(
             SegmentId {
-                file_id: crate::jobs::ids::NzbFileId {
+                file_id: weaver_server_base::jobs::ids::NzbFileId {
                     job_id: JobId(1),
                     file_index: 0,
                 },

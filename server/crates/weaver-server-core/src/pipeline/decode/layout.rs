@@ -326,8 +326,8 @@ pub(super) fn format_withdrawn_placement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::ids::{JobId, NzbFileId};
     use weaver_model::files::FileRole;
+    use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
     fn assembly(segment_sizes: &[u32]) -> crate::jobs::assembly::FileAssembly {
         crate::jobs::assembly::FileAssembly::new(

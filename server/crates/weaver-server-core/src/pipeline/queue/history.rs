@@ -337,7 +337,7 @@ impl Queue {
         password: Option<String>,
         reprocess: bool,
         no_memory_limit: bool,
-        events: tokio::sync::broadcast::Sender<crate::events::model::PipelineEvent>,
+        events: tokio::sync::broadcast::Sender<weaver_server_base::events::model::PipelineEvent>,
     ) -> Result<(), SchedulerError> {
         let mut resources = self
             .resources
@@ -488,7 +488,9 @@ impl Queue {
                 let mut row = super::JobRow::new(info);
                 row.admission = Some(prepared);
                 inner.push_job(row);
-                let _ = events.send(crate::events::model::PipelineEvent::JobResumed { job_id: id });
+                let _ = events.send(
+                    weaver_server_base::events::model::PipelineEvent::JobResumed { job_id: id },
+                );
                 Change::changed(())
             });
             Ok(())
@@ -1235,7 +1237,7 @@ async fn settle_archive_history(
 pub(crate) mod between_sweeps {
     use std::cell::RefCell;
 
-    use crate::jobs::ids::JobId;
+    use weaver_server_base::jobs::ids::JobId;
 
     type Hook = Box<dyn FnMut(JobId)>;
 

@@ -168,7 +168,7 @@ impl BackupService {
         let _guard = self.inner.settings_lock.lock().await;
         let next = compute_next_auto_backup_run_at(
             &input.daily_time_local,
-            crate::e2e_clock::local_now(),
+            weaver_server_base::e2e_clock::local_now(),
         )?;
         let mut settings = self.stored_auto_settings().await?;
         if input.clear_auto_backup_key && input.set_auto_backup_key.is_some() {
@@ -246,7 +246,7 @@ impl BackupService {
     }
 
     pub fn start_background_auto_backup_scheduler(&self) -> tokio::task::JoinHandle<()> {
-        self.start_auto_backup_scheduler_with_clock(crate::e2e_clock::local_now)
+        self.start_auto_backup_scheduler_with_clock(weaver_server_base::e2e_clock::local_now)
     }
 
     pub(super) fn start_auto_backup_scheduler_with_clock(
@@ -309,7 +309,7 @@ impl BackupService {
                 let delay = (next - now)
                     .to_std()
                     .unwrap_or_default()
-                    .min(crate::e2e_clock::schedule_poll_interval());
+                    .min(weaver_server_base::e2e_clock::schedule_poll_interval());
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {
                         if clock() < next { continue; }

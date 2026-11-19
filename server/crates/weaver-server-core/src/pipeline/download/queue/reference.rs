@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::jobs::ids::{NzbFileId, SegmentId};
+use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
 use super::DownloadWork;
 

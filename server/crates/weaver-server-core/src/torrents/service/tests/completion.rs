@@ -1407,7 +1407,7 @@ fn a_history_removal_sweeps_the_copies_its_jobs_moves_left() {
     std::fs::create_dir_all(dir.join("a")).unwrap();
     std::fs::write(dir.join("a/own.bin"), b"o").unwrap();
     std::fs::write(dir.join("top.bin"), b"t").unwrap();
-    let copy = |job, n| crate::runtime::fs::move_copy_name(job, n);
+    let copy = |job, n| weaver_server_disk::runtime::fs::move_copy_name(job, n);
     std::fs::write(dir.join("a").join(copy(1, 0)), b"left").unwrap();
     std::fs::write(dir.join(copy(1, 3)), b"left").unwrap();
     std::fs::write(dir.join(copy(2, 0)), b"another job's").unwrap();

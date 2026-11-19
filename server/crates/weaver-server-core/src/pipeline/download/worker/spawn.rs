@@ -30,12 +30,12 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
 #[cfg(test)]
 struct DecodeTaskTimer {
     started: Instant,
-    metrics: Arc<crate::operations::metrics::PipelineMetrics>,
+    metrics: Arc<weaver_server_base::operations::metrics::PipelineMetrics>,
 }
 
 #[cfg(test)]
 impl DecodeTaskTimer {
-    fn start(metrics: Arc<crate::operations::metrics::PipelineMetrics>) -> Self {
+    fn start(metrics: Arc<weaver_server_base::operations::metrics::PipelineMetrics>) -> Self {
         Self {
             started: Instant::now(),
             metrics,
@@ -47,7 +47,7 @@ impl DecodeTaskTimer {
 impl Drop for DecodeTaskTimer {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
-        crate::runtime::perf_probe::record("download.decode.task", elapsed);
+        weaver_server_base::runtime::perf_probe::record("download.decode.task", elapsed);
         self.metrics
             .pipeline_histograms
             .observe_decode_task(elapsed);
@@ -62,8 +62,10 @@ fn send_blocking_decode_failure(
     servers: PoolServers,
     error: String,
 ) {
-    let _profile_scope = crate::runtime::perf_probe::scope("download.decode.send_failure");
-    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.send_failure");
+    let _profile_scope =
+        weaver_server_base::runtime::perf_probe::scope("download.decode.send_failure");
+    let _cpu_scope =
+        weaver_server_base::runtime::perf_probe::cpu_scope("download.decode.send_failure");
     let send_started = Instant::now();
     let _ = tx.blocking_send(DecodeDone::Failed {
         segment_id,
@@ -71,7 +73,7 @@ fn send_blocking_decode_failure(
         error,
         servers,
     });
-    crate::runtime::perf_probe::record(
+    weaver_server_base::runtime::perf_probe::record(
         "download.decode.done_channel.blocking_send",
         send_started.elapsed(),
     );
@@ -106,32 +108,38 @@ impl Pipeline {
         let metrics = Arc::clone(&self.metrics);
         metrics.note_decode_task_started(raw_size);
         let queued_at = Instant::now();
-        crate::runtime::perf_probe::record_value("download.decode.spawn_blocking.submitted", 1);
-        crate::runtime::perf_probe::record_value(
+        weaver_server_base::runtime::perf_probe::record_value(
+            "download.decode.spawn_blocking.submitted",
+            1,
+        );
+        weaver_server_base::runtime::perf_probe::record_value(
             "download.decode.spawn_blocking.raw_bytes",
             raw_size,
         );
 
         tokio::task::spawn_blocking(move || {
             let task_entered = Instant::now();
-            crate::runtime::perf_probe::record(
+            weaver_server_base::runtime::perf_probe::record(
                 "download.decode.spawn_blocking.queue_wait",
                 task_entered.duration_since(queued_at),
             );
-            crate::runtime::perf_probe::record(
+            weaver_server_base::runtime::perf_probe::record(
                 "download.decode.task.enter",
                 Duration::from_nanos(1),
             );
             let _decode_task_timer = DecodeTaskTimer::start(Arc::clone(&metrics));
-            let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.task");
-            crate::runtime::affinity::pin_current_thread_for_hot_download_path();
+            let _cpu_scope =
+                weaver_server_base::runtime::perf_probe::cpu_scope("download.decode.task");
+            weaver_server_base::runtime::affinity::pin_current_thread_for_hot_download_path();
 
             let mut output = {
-                let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.alloc_vec");
+                let _cpu_scope =
+                    weaver_server_base::runtime::perf_probe::cpu_scope("download.decode.alloc_vec");
                 Vec::with_capacity(raw.len())
             };
             let decode_result = {
-                let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.yenc");
+                let _cpu_scope =
+                    weaver_server_base::runtime::perf_probe::cpu_scope("download.decode.yenc");
                 weaver_yenc::decode_nntp_append(&raw, &mut output)
             };
             match decode_result {
@@ -144,10 +152,12 @@ impl Pipeline {
                         end: decode_result.metadata.end,
                     };
 
-                    let _profile_scope =
-                        crate::runtime::perf_probe::scope("download.decode.send_success");
-                    let _cpu_scope =
-                        crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
+                    let _profile_scope = weaver_server_base::runtime::perf_probe::scope(
+                        "download.decode.send_success",
+                    );
+                    let _cpu_scope = weaver_server_base::runtime::perf_probe::cpu_scope(
+                        "download.decode.send_success",
+                    );
                     let send_started = Instant::now();
                     let crc_valid = crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                     let part_crc_verified =
@@ -184,7 +194,7 @@ impl Pipeline {
                         },
                         source: SegmentSource { servers },
                     });
-                    crate::runtime::perf_probe::record(
+                    weaver_server_base::runtime::perf_probe::record(
                         "download.decode.done_channel.blocking_send",
                         send_started.elapsed(),
                     );

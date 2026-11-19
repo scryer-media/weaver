@@ -7,15 +7,15 @@ use std::sync::atomic::Ordering;
 
 use tracing::{debug, error, info, warn};
 
-use crate::events::model::PipelineEvent;
 use crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::jobs::working_dir::{claim_named_working_dir, claim_working_dir, stamp_working_dir};
 use crate::pipeline::Pipeline;
 use crate::{DownloadQueue, RestoreJobRequest};
+use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 // A row whose delivery began: every article is in hand and the job goes on
 // from its row, never from a checkpoint.
@@ -408,7 +408,7 @@ impl Pipeline {
             };
         // Either way the directory was marked in the step that made it, so
         // it was never there unmarked for anything else to take.
-        crate::runtime::perf_probe::record(
+        weaver_server_base::runtime::perf_probe::record(
             "pipeline.add_job.working_dir_ready",
             stage_start.elapsed(),
         );
@@ -451,7 +451,7 @@ impl Pipeline {
                     crate::jobs::model::RunState::Active,
                 )
             };
-        crate::runtime::perf_probe::record(
+        weaver_server_base::runtime::perf_probe::record(
             "pipeline.add_job.build_runtime_inputs",
             stage_start.elapsed(),
         );
@@ -554,7 +554,7 @@ impl Pipeline {
             }
             Ok(true) => {}
         }
-        crate::runtime::perf_probe::record(
+        weaver_server_base::runtime::perf_probe::record(
             "pipeline.add_job.persist_active_job",
             stage_start.elapsed(),
         );
@@ -679,7 +679,7 @@ impl Pipeline {
             self.job_order.push(job_id);
         }
 
-        crate::runtime::perf_probe::record(
+        weaver_server_base::runtime::perf_probe::record(
             "pipeline.add_job.runtime_state_inserted",
             stage_start.elapsed(),
         );
@@ -983,7 +983,10 @@ impl Pipeline {
 
     // The jobs that crashed the daemon on its last run, read at start before
     // any job is restored: each is parked paused as it installs.
-    pub fn park_crashed_jobs(&mut self, marks: crate::runtime::panic_trap::CrashMarks) {
+    pub fn park_crashed_jobs(
+        &mut self,
+        marks: weaver_server_base::runtime::panic_trap::CrashMarks,
+    ) {
         self.crash_marks = marks;
     }
 
@@ -2111,9 +2114,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::jobs::ids::{JobId, NzbFileId};
     use crate::jobs::{FileSpec, JobSpec, SegmentSpec};
     use weaver_model::files::FileRole;
+    use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
     fn sorted_debug<K: std::fmt::Debug, V: std::fmt::Debug>(map: &HashMap<K, V>) -> Vec<String> {
         let mut entries = map

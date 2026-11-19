@@ -542,8 +542,9 @@ pub(crate) async fn delete_history_rows(
     let ids = job_ids.iter().copied().collect::<Vec<_>>();
     let lookup_db = db.clone();
     let rows = match tokio::task::spawn_blocking(move || {
-        let _probe =
-            crate::runtime::perf_probe::scope("db.list_job_history_output_dirs.history_delete");
+        let _probe = weaver_server_base::runtime::perf_probe::scope(
+            "db.list_job_history_output_dirs.history_delete",
+        );
         lookup_db.list_job_history_output_dirs(&ids)
     })
     .await
@@ -1182,7 +1183,7 @@ pub(crate) async fn archive_history(
 pub(crate) mod archive_removals {
     use std::cell::RefCell;
 
-    use crate::jobs::ids::JobId;
+    use weaver_server_base::jobs::ids::JobId;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Step {

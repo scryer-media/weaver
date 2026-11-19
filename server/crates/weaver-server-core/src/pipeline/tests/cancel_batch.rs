@@ -346,7 +346,9 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
 async fn cancelling_a_job_takes_it_off_its_lane_gauge(
     job_id: JobId,
     status: JobStatus,
-    gauge: fn(&crate::operations::metrics::PipelineMetrics) -> &std::sync::atomic::AtomicUsize,
+    gauge: fn(
+        &weaver_server_base::operations::metrics::PipelineMetrics,
+    ) -> &std::sync::atomic::AtomicUsize,
 ) {
     use std::sync::atomic::Ordering;
 

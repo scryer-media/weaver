@@ -6,10 +6,10 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use super::{Change, Queue};
-use crate::events::model::PipelineEvent;
 use crate::jobs::JobId;
 use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress, PhaseCounters};
-use crate::operations::metrics::{PipelineMetrics, RateSeries};
+use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_base::operations::metrics::{PipelineMetrics, RateSeries};
 
 // Counts the ticker's samples, so a test can pin that a parked ticker takes
 // none.

@@ -1972,7 +1972,7 @@ async fn the_torrent_settings_reach_the_sessions() {
         session.limits(),
         SessionLimits {
             connections_limit: super::connections_within(
-                crate::runtime::resource_limits::open_file_limit()
+                weaver_server_base::runtime::resource_limits::open_file_limit()
             ),
             unchoke_slots_limit: 3,
             connection_speed: speed(40),

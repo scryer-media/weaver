@@ -9,11 +9,11 @@ use super::super::{
     pump_pipeline_runtime_queues, retire_pipeline_database, submit_decoded_segment_declaring,
 };
 use super::harness::{JOB, collect, finished};
-use crate::jobs::ids::{NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::pipeline::Pipeline;
 use weaver_graph::NodeId;
 use weaver_model::files::FileRole;
+use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
 
 const PASSWORD: &str = "moonlit-harbour";
 

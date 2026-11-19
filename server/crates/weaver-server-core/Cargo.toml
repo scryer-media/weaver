@@ -12,11 +12,18 @@ slow-tests = []
 # waiting on the wall clock. Never enabled outside dev-dependencies. The
 # tunnel's loopback certificate backs the speed test's HTTPS fixture, and
 # NNTP's direct test route serves servers built with no route of their own.
-test-support = ["weaver-tunnel/test-support", "weaver-nntp/test-support"]
+test-support = [
+    "weaver-tunnel/test-support",
+    "weaver-nntp/test-support",
+    "weaver-server-base/test-support",
+    "weaver-server-disk/test-support",
+]
 # e2e builds only; see weaver-torrent's feature of the same name.
 e2e-local-trackers = ["weaver-torrent/e2e-local-trackers"]
 
 [dependencies]
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-disk = { path = "../weaver-server-disk" }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
 async-trait = "0.1"
 # The in-application upgrade core: manifest validation, installation
@@ -118,6 +125,8 @@ keyring-core = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
+weaver-server-base = { path = "../weaver-server-base", features = ["test-support"] }
+weaver-server-disk = { path = "../weaver-server-disk", features = ["test-support"] }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false, features = ["test-support"] }
 weaver-graph = { path = "../../../engines/weaver-graph", features = ["test-support"] }
 weaver-objects = { path = "../../../engines/weaver-objects", features = ["test-support"] }

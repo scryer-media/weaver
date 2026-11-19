@@ -19,9 +19,9 @@ use crate::proxies::{Consumer, FetchOptions, read_body, routed_fetch};
 use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata, unix_now_secs};
 #[cfg(test)]
 use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items};
-use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenDecision, RssSeenItemRow};
+use weaver_server_base::security::RuntimeSecurityConfig;
 
 const MAX_RSS_REDIRECTS: usize = 10;
 pub(super) const MAX_RSS_FEED_BODY_BYTES: u64 = 16 * 1024 * 1024;

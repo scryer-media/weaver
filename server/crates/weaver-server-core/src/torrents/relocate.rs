@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::operations::disk::beneath;
+use weaver_server_disk::operations::disk::beneath;
 
 // What a move of placed files does with a file already at its destination
 // (libtorrent `move_flags_t`).
@@ -99,7 +99,7 @@ pub(crate) fn move_files(
             from,
             moves,
             existing,
-            crate::runtime::fs::rename_path_exclusive_in_place,
+            weaver_server_disk::runtime::fs::rename_path_exclusive_in_place,
         ),
         Existing::Replace => {
             move_files_using(from, moves, existing, |from, to| std::fs::rename(from, to))
@@ -209,11 +209,11 @@ fn move_exclusive(from: &Path, to: &Path) -> io::Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    match crate::runtime::fs::rename_path_exclusive_in_place(from, to) {
+    match weaver_server_disk::runtime::fs::rename_path_exclusive_in_place(from, to) {
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
         moved => return moved,
     }
-    crate::runtime::file_cache::copy_large_file(from, to)?;
+    weaver_server_disk::runtime::file_cache::copy_large_file(from, to)?;
     left_behind(from, std::fs::remove_file(from));
     Ok(())
 }
@@ -328,7 +328,8 @@ fn move_files_using(
                     // Into a file made new: a copy that fails removes what
                     // it made, and nothing else.
                     Existing::Keep => {
-                        crate::runtime::file_cache::copy_large_file(source, target).map(drop)
+                        weaver_server_disk::runtime::file_cache::copy_large_file(source, target)
+                            .map(drop)
                     }
                     // Over what is there. A copy that fails removes only a
                     // file it made: one that was there is not this move's
@@ -717,7 +718,7 @@ mod tests {
             if source.ends_with("b.bin") {
                 std::fs::write(target, b"theirs").unwrap();
             }
-            crate::runtime::fs::rename_path_exclusive(source, target)
+            weaver_server_disk::runtime::fs::rename_path_exclusive(source, target)
         })
         .unwrap();
         assert_eq!((moved.kept, moved.moved), (vec![1], vec![0]));

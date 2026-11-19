@@ -23,9 +23,9 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-use crate::security::RuntimeSecurityConfig;
 use crate::settings::Config;
 use crate::{PipelineMetrics, SharedPipelineState};
+use weaver_server_base::security::RuntimeSecurityConfig;
 
 #[derive(Clone)]
 struct TestHttpState {

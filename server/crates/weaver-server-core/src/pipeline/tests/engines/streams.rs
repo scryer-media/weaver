@@ -11,10 +11,10 @@ use super::harness::{
     ARTICLE, Claim, JOB, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload,
     repair_and_terminal_events, run,
 };
-use crate::events::model::PipelineEvent;
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::lines::Lines;
+use weaver_server_base::events::model::PipelineEvent;
 
 fn ember() -> Vec<u8> {
     payload(9 * ARTICLE + 21, 61)

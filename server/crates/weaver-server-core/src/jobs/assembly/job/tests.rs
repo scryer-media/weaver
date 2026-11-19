@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::jobs::ids::NzbFileId;
+use weaver_server_base::jobs::ids::NzbFileId;
 
 fn add_file(
     assembly: &mut JobAssembly,

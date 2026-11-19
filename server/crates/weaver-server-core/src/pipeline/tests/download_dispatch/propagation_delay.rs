@@ -1673,7 +1673,7 @@ fn runtime_transition_failpoint_mapping_uses_lane_transitions() {
             crate::jobs::model::PostState::Verifying,
             crate::jobs::model::RunState::Active,
         ),
-        Some(crate::e2e_failpoint::STATUS_ENTER_VERIFYING)
+        Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_VERIFYING)
     );
     assert_eq!(
         Pipeline::status_enter_failpoint_for_transition(
@@ -1682,7 +1682,7 @@ fn runtime_transition_failpoint_mapping_uses_lane_transitions() {
             crate::jobs::model::PostState::Repairing,
             crate::jobs::model::RunState::Active,
         ),
-        Some(crate::e2e_failpoint::STATUS_ENTER_REPAIRING)
+        Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_REPAIRING)
     );
     assert_eq!(
         Pipeline::status_enter_failpoint_for_transition(
@@ -1691,7 +1691,7 @@ fn runtime_transition_failpoint_mapping_uses_lane_transitions() {
             crate::jobs::model::PostState::Idle,
             crate::jobs::model::RunState::Paused,
         ),
-        Some(crate::e2e_failpoint::STATUS_ENTER_PAUSED)
+        Some(weaver_server_base::e2e_failpoint::STATUS_ENTER_PAUSED)
     );
     assert_eq!(
         Pipeline::status_enter_failpoint_for_transition(
@@ -1938,7 +1938,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
                 DownloadWork {
                     counters: None,
                     segment_id,
-                    message_id: crate::jobs::ids::MessageId::new("stalled-article"),
+                    message_id: weaver_server_base::jobs::ids::MessageId::new("stalled-article"),
                     groups: Arc::from(vec![]),
                     priority: 0,
                     byte_estimate: 256,

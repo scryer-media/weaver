@@ -25,9 +25,9 @@ use std::time::Instant;
 use bytes::Bytes;
 use weaver_graph::{Algorithm, ByteRange, Digest, Evidenced};
 
-use crate::operations::disk::writer::{Barrier, Create, Opened, Submitter};
 use crate::pipeline::graph::limits::Device;
-use crate::pipeline::graph::sparse::{
+use weaver_server_disk::operations::disk::writer::{Barrier, Create, Opened, Submitter};
+use weaver_server_disk::pipeline::graph::sparse::{
     PlatformMarker, create_sized, create_sized_known, create_sparse,
 };
 
@@ -411,7 +411,9 @@ impl Leaf {
 
     // The volume the file's writer writes to, whose read turns a reader of
     // the file takes. `None` for a leaf that runs its own operations.
-    pub(crate) fn volume(&self) -> Option<&Arc<crate::operations::disk::volume::Volume>> {
+    pub(crate) fn volume(
+        &self,
+    ) -> Option<&Arc<weaver_server_disk::operations::disk::volume::Volume>> {
         self.queued.as_ref().map(|queued| queued.to.volume())
     }
 
@@ -1115,9 +1117,9 @@ impl Leaf {
                 if let Some(parent) = to.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                crate::runtime::fs::rename_path_exclusive(&from, &to)?;
+                weaver_server_disk::runtime::fs::rename_path_exclusive(&from, &to)?;
                 // The file sits at its new name and nothing records that yet.
-                crate::e2e_failpoint::fire_rename(&wanted);
+                weaver_server_base::e2e_failpoint::fire_rename(&wanted);
                 Ok(())
             });
             queued.shape(moved);
@@ -1129,9 +1131,9 @@ impl Leaf {
             remove_directory(&self.path)?;
         } else if had_file && path != self.path {
             create_parent(&path, self.device)?;
-            crate::runtime::fs::rename_path_exclusive(&self.path, &path)
+            weaver_server_disk::runtime::fs::rename_path_exclusive(&self.path, &path)
                 .map_err(LeafError::on(&self.path, self.device))?;
-            crate::e2e_failpoint::fire_rename(&wants);
+            weaver_server_base::e2e_failpoint::fire_rename(&wants);
         }
         self.path = path;
         self.wants = None;
@@ -1477,7 +1479,7 @@ mod tests {
     #[test]
     fn a_write_does_not_preallocate_the_declared_unwritten_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let sized = crate::pipeline::graph::sparse::sizes_files_in(dir.path());
+        let sized = weaver_server_disk::pipeline::graph::sparse::sizes_files_in(dir.path());
         let mut leaf = Leaf::at(dir.path(), "payload.bin");
         leaf.write(0, b"a", Some(1 << 30)).unwrap();
         let length = leaf.len().unwrap();
@@ -1579,14 +1581,15 @@ mod tests {
     }
 
     struct Through {
-        writers: crate::operations::disk::writer::VolumeWriters,
-        volume: Arc<crate::operations::disk::volume::Volume>,
+        writers: weaver_server_disk::operations::disk::writer::VolumeWriters,
+        volume: Arc<weaver_server_disk::operations::disk::volume::Volume>,
         to: Arc<Submitter>,
     }
 
     fn through() -> Through {
-        let writers = crate::operations::disk::writer::VolumeWriters::reporting(|_| {});
-        let volume = Arc::new(crate::operations::disk::volume::Volume::new(
+        let writers =
+            weaver_server_disk::operations::disk::writer::VolumeWriters::reporting(|_| {});
+        let volume = Arc::new(weaver_server_disk::operations::disk::volume::Volume::new(
             None,
             "test".to_owned(),
         ));
@@ -1602,7 +1605,7 @@ mod tests {
         // How many times, and for how long in all, the loop stood for the
         // writer before a read.
         fn read_waits(&self) -> u64 {
-            use crate::operations::disk::volume::LoopWait;
+            use weaver_server_disk::operations::disk::volume::LoopWait;
             self.volume.writer.loop_waits_by_kind[LoopWait::Read as usize]
                 .load(std::sync::atomic::Ordering::Relaxed)
         }

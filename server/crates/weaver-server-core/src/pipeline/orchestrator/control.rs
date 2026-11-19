@@ -836,8 +836,8 @@ impl Pipeline {
     // sized on the storage class are sized again.
     pub(in crate::pipeline) fn apply_storage_classification(
         &mut self,
-        storage_class: crate::runtime::system_profile::StorageClass,
-        filesystem: crate::runtime::system_profile::FilesystemType,
+        storage_class: weaver_server_base::runtime::system_profile::StorageClass,
+        filesystem: weaver_server_base::runtime::system_profile::FilesystemType,
     ) {
         self.applied_storage_classification = Some((storage_class.clone(), filesystem.clone()));
         self.tuner.set_storage(storage_class, filesystem);

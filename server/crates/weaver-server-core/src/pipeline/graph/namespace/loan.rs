@@ -31,8 +31,8 @@ use weaver_graph::{
     VolumeIndex,
 };
 
-use crate::operations::disk::reader::{Reading, TurnStop};
-use crate::operations::disk::volume::Volume;
+use weaver_server_disk::operations::disk::reader::{Reading, TurnStop};
+use weaver_server_disk::operations::disk::volume::Volume;
 
 use super::super::envelope::Shelf;
 use super::super::hardware::Shutdown;
@@ -1236,7 +1236,7 @@ mod tests {
     // state and on a spinning volume alike.
     #[test]
     fn a_loan_waiting_for_a_turn_ends_when_its_job_stops_it() {
-        use crate::operations::disk::StorageKind;
+        use weaver_server_disk::operations::disk::StorageKind;
         for kind in [StorageKind::Solid, StorageKind::Rotational] {
             let dir = tempfile::tempdir().expect("a working directory");
             let volume = Arc::new(Volume::new(None, "test".to_owned()));

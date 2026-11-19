@@ -17,9 +17,9 @@ use std::collections::hash_map::{Entry, HashMap};
 
 use super::first_articles::FirstArticles;
 use super::names_a_place;
-use crate::jobs::ids::SegmentId;
 use crate::jobs::model::JobSpec;
 use crate::pipeline::SegmentTerminalState;
+use weaver_server_base::jobs::ids::SegmentId;
 
 // What one file of the post lost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -260,7 +260,7 @@ fn overlaps(gone: Option<&BTreeMap<u64, u64>>, (start, end): (u64, u64)) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::ids::{JobId, NzbFileId};
+    use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
     fn segment(file_index: u32, segment_number: u32) -> SegmentId {
         SegmentId {

@@ -1037,7 +1037,11 @@ pub(crate) fn execution_refusal(
 }
 
 pub fn strict_security_enabled() -> bool {
-    crate::security::parse_bool_env(crate::security::ENV_STRICT_SECURITY, false).unwrap_or(false)
+    weaver_server_base::security::parse_bool_env(
+        weaver_server_base::security::ENV_STRICT_SECURITY,
+        false,
+    )
+    .unwrap_or(false)
 }
 
 fn unavailable_result(

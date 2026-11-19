@@ -7,14 +7,14 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 
 use super::JobDisk;
-use crate::operations::disk::volume::{Reservation, Volume};
-use crate::operations::disk::writer::{Hold, Report, VolumeWriters};
 use crate::pipeline::graph::checkpoint::Pending;
 use crate::pipeline::graph::disk::VolumeLeases;
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::leaf::Leaf;
 use crate::pipeline::graph::root::tests::{decoded, file, job_through, job_with};
 use crate::pipeline::graph::status::RepairSlots;
+use weaver_server_disk::operations::disk::volume::{Reservation, Volume};
+use weaver_server_disk::operations::disk::writer::{Hold, Report, VolumeWriters};
 
 // A plain file's article, 8 KiB of bytes its file and ordinal say.
 const PIECE: u32 = 8 * 1024;
@@ -616,8 +616,8 @@ fn a_volume_is_probed_once_when_a_job_first_writes_to_it() {
 // under a destination's `.weaver-staging`.
 #[test]
 fn the_probe_writes_outside_every_job_folder() {
-    use crate::jobs::ids::JobId;
     use crate::jobs::working_dir::{claim_working_dir, compute_working_dir, make_job_staging_dir};
+    use weaver_server_base::jobs::ids::JobId;
     let dir = tempfile::tempdir().unwrap();
     let intermediate = dir.path().join("intermediate");
     let complete = dir.path().join("complete");
@@ -829,8 +829,8 @@ fn a_released_file_is_released_again_only_after_another_operation() {
 // loop never waited for the volume.
 #[test]
 fn a_fold_never_waits_for_the_file_s_operations() {
-    use crate::operations::disk::volume::LoopWait;
     use weaver_graph::Algorithm;
+    use weaver_server_disk::operations::disk::volume::LoopWait;
 
     let dir = tempfile::tempdir().unwrap();
     let through = writers();

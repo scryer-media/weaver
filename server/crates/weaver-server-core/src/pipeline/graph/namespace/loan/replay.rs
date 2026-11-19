@@ -5,8 +5,8 @@
 // worker. Only a current return may uncover and deliver them. The snapshot
 // is evidence to validate, not an immutable copy of the backing files.
 
-use crate::operations::disk::reader::TurnStop;
 use weaver_graph::{Builder, Effect, Posted, Provenance};
+use weaver_server_disk::operations::disk::reader::TurnStop;
 
 use super::super::{Segments, Write, WriteError};
 use super::*;

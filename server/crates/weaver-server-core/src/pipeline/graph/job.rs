@@ -41,8 +41,8 @@ use super::root::sample;
 use super::root::source::{Class, Inconsistent, Move};
 use super::root::{ArticleRoot, Ask};
 use super::status::RepairSlots;
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::ExtractionError;
+use weaver_server_disk::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraphError {
@@ -132,29 +132,33 @@ pub(crate) struct Storage {
     // What the job's runs and repairs are granted as each starts.
     pub(crate) hardware: super::hardware::Hardware,
     // Where the job's writes publish what they take, in a pipeline.
-    pub(crate) metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    pub(crate) metrics: Option<Arc<weaver_server_base::operations::metrics::PipelineMetrics>>,
     // The volume writers the job's files are written through; `None` for a
     // job that writes its files itself as each byte is placed.
     pub(crate) disk: Option<super::disk::JobDisk>,
     // Weaver's data folder and the free space of its disk: where a decode
     // window goes when the working directory cannot hold it.
-    pub(crate) data_dir: Option<(PathBuf, CapacityReader, crate::scratch::ScratchLedger)>,
+    pub(crate) data_dir: Option<(
+        PathBuf,
+        CapacityReader,
+        weaver_server_disk::scratch::ScratchLedger,
+    )>,
     // What decode windows took from the working directory's disk, for
     // every job that lends on it.
-    pub(crate) window_ledger: crate::scratch::ScratchLedger,
+    pub(crate) window_ledger: weaver_server_disk::scratch::ScratchLedger,
 }
 
 impl Storage {
     // The scratch memory job `scope` may borrow: scratch files in its
     // working directory, else in the data folder, out of the free space the
     // holds keep.
-    pub(crate) fn scratch(&self, scope: u64) -> crate::scratch::Scratch {
-        let scratch = crate::scratch::Scratch::new(
+    pub(crate) fn scratch(&self, scope: u64) -> weaver_server_disk::scratch::Scratch {
+        let scratch = weaver_server_disk::scratch::Scratch::new(
             self.working_dir.clone(),
             self.free_disk.clone(),
             self.window_ledger.clone(),
             Arc::clone(&self.accountant),
-            crate::scratch::CEILING_BYTES,
+            weaver_server_disk::scratch::CEILING_BYTES,
         );
         match &self.data_dir {
             Some((dir, free_disk, ledger)) => {
@@ -1267,7 +1271,10 @@ impl GraphJob {
 
     // The ledger of the disk `device` is to this job: the one its writes
     // there spend from.
-    pub(crate) fn disk_ledger(&self, device: Device) -> &crate::operations::disk::DiskLedger {
+    pub(crate) fn disk_ledger(
+        &self,
+        device: Device,
+    ) -> &weaver_server_disk::operations::disk::DiskLedger {
         self.writer.capacity(device).ledger()
     }
 

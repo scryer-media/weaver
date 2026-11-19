@@ -174,7 +174,7 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_job_event(&self, event: PipelineEvent) {
-        if let Some(id) = crate::events::publish::pipeline_job_id(&event) {
+        if let Some(id) = weaver_server_base::events::publish::pipeline_job_id(&event) {
             self.report_job_event(JobId(id), Some(event));
         } else {
             self.shared_state.queue.write(|_| {

@@ -1942,7 +1942,7 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
     let length = std::fs::metadata(job.dir.path().join("video.mkv"))
         .unwrap()
         .len();
-    let sized = crate::pipeline::graph::sparse::sizes_files_in(job.dir.path());
+    let sized = weaver_server_disk::pipeline::graph::sparse::sizes_files_in(job.dir.path());
     assert_eq!(length, if sized { 9 } else { 3 });
     job.send(member, 6, b"end", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
@@ -4183,7 +4183,7 @@ fn disk(
     size: u64,
     stale: &Arc<std::sync::atomic::AtomicBool>,
 ) -> CapacityReader {
-    use crate::operations::disk::{Capacity, CapacityReading};
+    use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
 
     let (free, stale) = (Arc::clone(free), Arc::clone(stale));
     CapacityReader::from_fn(move || {

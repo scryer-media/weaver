@@ -100,7 +100,7 @@ use super::worker::DownloadPressure;
 use super::worker::{BlockedBy, ServableWork, ServableWorkFilter};
 use super::*;
 use crate::jobs::model::JobArticles;
-use crate::operations::metrics::SchedulerBlockClause;
+use weaver_server_base::operations::metrics::SchedulerBlockClause;
 
 // Whether a walk may start at a server's floor. Always, except in a test
 // that walks every queue whole to hold the floors' answers to it.

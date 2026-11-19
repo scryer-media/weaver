@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use crate::StateError;
 use crate::history::record::JobHistoryRow;
-use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::settings::SeedingPolicy;
@@ -18,6 +17,7 @@ use crate::torrents::{
     FilePriority, KeptIntent, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
     TrackerEntry,
 };
+use weaver_server_base::jobs::ids::JobId;
 use weaver_torrent::ResumePeers;
 
 // A tracker row holds where the tracker sits in the announce list and who

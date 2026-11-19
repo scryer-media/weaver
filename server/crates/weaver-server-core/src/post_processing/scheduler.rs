@@ -137,7 +137,8 @@ pub fn spawn_script_evaluator(db: Database, config: SharedConfig) {
         let mut occurrences = Occurrences::default();
         let mut next_trim = tokio::time::Instant::now();
         let mut running = std::collections::BTreeMap::<String, tokio::task::JoinHandle<()>>::new();
-        let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
+        let mut interval =
+            tokio::time::interval(weaver_server_base::e2e_clock::schedule_poll_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -162,7 +163,10 @@ pub fn spawn_script_evaluator(db: Database, config: SharedConfig) {
                     continue;
                 }
             };
-            for id in occurrences.advance(&jobs, crate::e2e_clock::local_now().naive_local()) {
+            for id in occurrences.advance(
+                &jobs,
+                weaver_server_base::e2e_clock::local_now().naive_local(),
+            ) {
                 if running.contains_key(&id) {
                     tracing::debug!(instance = %id, "skipping an overlapping scheduled script");
                     continue;

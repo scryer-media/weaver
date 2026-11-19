@@ -394,7 +394,7 @@ impl Pipeline {
         // Same boundary as a job that completed or failed: the cancelled
         // jobs' article pages are free and unwanted, so hand them back rather
         // than holding a job-sized working set until the purge clock runs out.
-        crate::runtime::thread_release::release_job_completion_memory();
+        weaver_server_base::runtime::thread_release::release_job_completion_memory();
         let queue = self.shared_state.queue.clone();
         let delete_history = queue.write(|inner| {
             let delete_history = inner
@@ -721,7 +721,7 @@ impl Pipeline {
         // already carries, so no extra wall-clock source is
         // introduced.
         self.metrics.job_lifecycle.note_finished(
-            crate::operations::instrumentation::JobResultKind::Cancelled,
+            weaver_server_base::operations::instrumentation::JobResultKind::Cancelled,
             state.spec.category.as_deref().unwrap_or(""),
             Some(state.created_at.elapsed()),
         );

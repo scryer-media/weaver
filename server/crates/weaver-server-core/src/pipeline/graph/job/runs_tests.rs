@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::engine::{RunMail, Runs, echo::Echoes};
 use crate::pipeline::graph::envelope::Shelf;
 use crate::pipeline::graph::namespace::NamespaceWriter;
@@ -10,6 +9,7 @@ use crate::pipeline::graph::root::tests::{decoded, file};
 use crate::pipeline::graph::status::RepairSlots;
 use std::sync::Arc;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+use weaver_server_disk::operations::disk::CapacityReader;
 
 // What a run's read of volume 1's length leaves on the shelf: the closed
 // length, when there is one.

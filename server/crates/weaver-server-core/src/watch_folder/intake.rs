@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 use weaver_model::files::{FileRole, archive_base_name};
 
-use crate::security::RuntimeSecurityConfig;
+use weaver_server_base::security::RuntimeSecurityConfig;
 
 // Files read whole, as they are; their bytes say what they hold. A `.magnet`
 // file holds one magnet URI.

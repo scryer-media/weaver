@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::UuFileAssembly;
 use super::graph::job::GraphJob;
 use super::graph::metadata::RecoveryFormat;
-use crate::jobs::ids::{JobId, NzbFileId};
+use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 
 // The graph runtime of each job. Reading goes straight to the map; every
 // mutable borrow of a job's graph moves that graph's counter first, since

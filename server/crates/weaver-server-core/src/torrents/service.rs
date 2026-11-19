@@ -20,18 +20,15 @@ use weaver_torrent::{
 };
 
 use crate::StateError;
-use crate::clock::{Clock, SystemClock};
 use crate::jobs::JobId;
 use crate::jobs::handle::{HoldSet, JobInfo, QueueMoveTarget, SchedulerHandle};
 use crate::jobs::model::{JobStatus, Protocol};
 use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress};
 use crate::jobs::report::JobReport;
-use crate::operations::disk::{CapacityReader, StorageCapacity};
 use crate::persistence::Database;
 use crate::pipeline::ExtractionLimits;
 use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::status::RepairSlots;
-use crate::scratch::ScratchLedger;
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{Config, TorrentEncryption, TransportRule};
 use crate::torrents::identity::TorrentIdentity;
@@ -48,6 +45,9 @@ use crate::torrents::{
     FilePriority, KeptIntent, NamedBy, TorrentCounters, TorrentFile, TorrentIntent, TorrentRecord,
     TorrentState, TrackerEntry,
 };
+use weaver_server_base::clock::{Clock, SystemClock};
+use weaver_server_disk::operations::disk::{CapacityReader, StorageCapacity};
+use weaver_server_disk::scratch::ScratchLedger;
 
 pub mod fingerprint;
 pub mod listing;
@@ -369,7 +369,7 @@ impl TorrentService {
         writers: Arc<crate::operations::VolumeWriters>,
         buffers: Arc<crate::operations::VolumeBuffers>,
         queue: SchedulerHandle,
-        crashed: crate::runtime::panic_trap::CrashMarks,
+        crashed: weaver_server_base::runtime::panic_trap::CrashMarks,
     ) -> Result<Self, String> {
         let routes = NetworkRoutes::new(Arc::clone(proxies), ROUTE_TIMEOUT);
         let sessions = Sessions::new(Arc::new(routes), SessionEnv::of(config), db.clone());
@@ -917,7 +917,7 @@ struct Inner {
     load_seam: LoadSeam,
     // The torrents whose work crashed the daemon on its last run: each is
     // kept paused, its job not restored, until a resume takes its marker.
-    crash_marks: Mutex<crate::runtime::panic_trap::CrashMarks>,
+    crash_marks: Mutex<weaver_server_base::runtime::panic_trap::CrashMarks>,
     signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
     // Counts the waits for a route's session to open, begun off an add or
@@ -1127,7 +1127,7 @@ impl TorrentService {
 
     // The torrents that crashed the daemon on its last run, read at start
     // before any torrent's job is restored.
-    pub(crate) fn park_crashed(&self, marks: crate::runtime::panic_trap::CrashMarks) {
+    pub(crate) fn park_crashed(&self, marks: weaver_server_base::runtime::panic_trap::CrashMarks) {
         *self
             .inner
             .crash_marks
@@ -1515,7 +1515,7 @@ impl TorrentService {
         #[cfg(test)]
         self.inner.releases[why as usize].fetch_add(1, Ordering::Relaxed);
         let _ = why;
-        crate::runtime::thread_release::release_job_completion_memory_off_runtime();
+        weaver_server_base::runtime::thread_release::release_job_completion_memory_off_runtime();
     }
 
     // Whether the torrents went from downloading to none downloading at the

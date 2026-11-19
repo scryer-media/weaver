@@ -4,15 +4,15 @@
 use super::live::Live;
 use super::{TorrentService, files_dir, locked};
 use crate::jobs::JobId;
-use crate::operations::disk::{CapacityReader, StorageCapacity, StorageRoot};
-use crate::operations::room_wait::{
-    Disk, LedgerWait, Promised, RoomWait, StartCheck, Waiter, Wants, ever_downloaded,
-};
 use crate::torrents::intake::Intake;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use weaver_server_disk::operations::disk::{CapacityReader, StorageCapacity, StorageRoot};
+use weaver_server_disk::operations::room_wait::{
+    Disk, LedgerWait, Promised, RoomWait, StartCheck, Waiter, Wants, ever_downloaded,
+};
 
 // How a torrent waits for room on the disk its folder lies on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

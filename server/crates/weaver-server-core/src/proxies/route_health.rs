@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc};
 
-use crate::clock::{Clock, SystemClock};
+use weaver_server_base::clock::{Clock, SystemClock};
 use weaver_tunnel::pipe::HopWatcher;
 
 use super::{

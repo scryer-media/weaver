@@ -269,9 +269,9 @@ mod tests {
     use super::super::{embedded_catalog, embedded_payload_bytes, replay_catalog_into_fresh_db};
     use super::{NZB_BATCH, NzbSource, OUTLINE_BATCH, SqlitePool, move_nzb_batch};
     use crate::ingest::outline::{NzbOutline, OutlineFile};
-    use crate::jobs::ids::JobId;
     use crate::persistence::Database;
     use crate::persistence::sql_runtime::SqlConn;
+    use weaver_server_base::jobs::ids::JobId;
 
     // The schema the step upgrades from.
     const BELOW: i64 = 84;

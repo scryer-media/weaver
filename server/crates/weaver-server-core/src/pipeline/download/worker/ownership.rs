@@ -184,7 +184,7 @@ impl Pipeline {
     fn article_volume(
         &self,
         job_id: JobId,
-    ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
+    ) -> Option<Arc<weaver_server_disk::operations::disk::volume::Volume>> {
         if let Some(reserved) = self.volume_reserved_by_job.get(&job_id) {
             return Some(Arc::clone(reserved.volume()));
         }

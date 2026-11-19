@@ -11,8 +11,8 @@
 
 use tracing::warn;
 
-use crate::security::{SETTING_ACCESS_MODE, SETTING_HTTP_BIND_ADDRESS};
 use crate::{Database, StateError};
+use weaver_server_base::security::{SETTING_ACCESS_MODE, SETTING_HTTP_BIND_ADDRESS};
 
 // First migration of the 0.9.0 line. A ledger that stops below this was last
 // written by a pre-0.9.0 binary: 0.7.8 shipped through migration 0037 and
@@ -102,7 +102,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
-    use crate::security::{BindAddressSource, RuntimeSecurityConfig, resolve_bind_address};
+    use weaver_server_base::security::{
+        BindAddressSource, RuntimeSecurityConfig, resolve_bind_address,
+    };
 
     // 0.8.3's last migration, the common upgrade case.
     const LEDGER_0_8_3: i64 = 39;

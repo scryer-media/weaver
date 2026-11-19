@@ -10,11 +10,11 @@ use tracing::{info, warn};
 
 use crate::Database;
 use crate::jobs::JobSpec;
-use crate::jobs::ids::JobId;
-use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
 use crate::{SchedulerError, SchedulerHandle};
 use weaver_nzb::Nzb;
+use weaver_server_base::jobs::ids::JobId;
+use weaver_server_base::security::RuntimeSecurityConfig;
 
 use super::persisted_nzb;
 use crate::ingest::{

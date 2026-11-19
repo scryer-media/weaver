@@ -2,9 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::operations::room_wait::ever_downloaded;
 use crate::pipeline::download::LoginRefusalView;
 use crate::pipeline::queue::Change;
+use weaver_server_disk::operations::room_wait::ever_downloaded;
 
 pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
 
@@ -116,8 +116,8 @@ impl Pipeline {
 
     // The start check on the working disk, for a job that never downloaded:
     // the owner every kind of job starts by.
-    fn working_disk_check(&self) -> crate::operations::room_wait::StartCheck {
-        crate::operations::room_wait::StartCheck {
+    fn working_disk_check(&self) -> weaver_server_disk::operations::room_wait::StartCheck {
+        weaver_server_disk::operations::room_wait::StartCheck {
             root: crate::operations::StorageRoot::Intermediate,
             reserve: self.extraction_limits.min_free_bytes,
         }

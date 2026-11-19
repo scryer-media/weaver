@@ -130,7 +130,8 @@ pub fn spawn_evaluator_with_services(
         let mut one_shots = OneShotEvaluator::default();
         let mut watermark_loaded = services.db.is_none();
         let mut dispatcher = OneShotDispatcher::default();
-        let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
+        let mut interval =
+            tokio::time::interval(weaver_server_base::e2e_clock::schedule_poll_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -159,7 +160,7 @@ pub fn spawn_evaluator_with_services(
                                 Ok(()) => ActionOutcome::Applied,
                                 Err(ScheduleApplyError::Pending) => ActionOutcome::Skipped,
                                 Err(ScheduleApplyError::Failed(_)) => ActionOutcome::Failed,
-                            }, crate::e2e_clock::local_now().naive_utc(), None);
+                            }, weaver_server_base::e2e_clock::local_now().naive_utc(), None);
                             if let Err(error) = result {
                                 warn!(%error, id = %entry.id, "scheduled one-shot failed");
                             }
@@ -239,7 +240,7 @@ pub fn spawn_evaluator_with_services(
                     ),
                 }
             }
-            let clock = crate::e2e_clock::local_now();
+            let clock = weaver_server_base::e2e_clock::local_now();
             schedule_metrics::record_evaluation();
             let now = clock.naive_local();
             let utc = clock.naive_utc();

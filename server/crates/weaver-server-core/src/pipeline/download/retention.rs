@@ -101,7 +101,7 @@ impl Pipeline {
             delay_secs = delay.as_secs(),
             "deferring download start: the post is still propagating"
         );
-        crate::runtime::perf_probe::record(
+        weaver_server_base::runtime::perf_probe::record(
             "download.propagation.deferred",
             std::time::Duration::from_nanos(1),
         );

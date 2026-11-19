@@ -1480,9 +1480,11 @@ async fn execute(
                 tls: server.tls,
                 tls_cipher_suite,
             });
-            let memory = tokio::task::spawn_blocking(crate::runtime::system_probe::detect_memory)
-                .await
-                .ok();
+            let memory = tokio::task::spawn_blocking(
+                weaver_server_disk::runtime::system_probe::detect_memory,
+            )
+            .await
+            .ok();
             let buffer_profile = weaver_nntp::connection::NntpBufferProfile::adaptive(
                 memory
                     .map(|memory| memory.cgroup_limit.unwrap_or(memory.available_bytes))

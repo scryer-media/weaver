@@ -13,7 +13,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 
 use super::manifest::{BackupManifest, BackupServiceError, io_err, validate_manifest_structure};
 use super::permissions::set_file_owner_only;
-use crate::security::RuntimeSecurityConfig;
+use weaver_server_base::security::RuntimeSecurityConfig;
 
 #[cfg(test)]
 pub(crate) fn write_plain_archive(
