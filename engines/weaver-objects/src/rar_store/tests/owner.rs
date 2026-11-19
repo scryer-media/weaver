@@ -40,6 +40,8 @@ pub(super) struct Owner {
     pub members: BTreeMap<u32, Got>,
     // Everything said but members and their bytes.
     pub said: Vec<Emit>,
+    // Everything said, in the order it was said.
+    pub log: Vec<Emit>,
     // What the object wants as of the last round.
     pub seeks: Vec<Seek>,
     // How seeks are answered; a range moved ahead is delivered at once.
@@ -85,6 +87,7 @@ impl Owner {
             volumes,
             members: BTreeMap::new(),
             said: Vec::new(),
+            log: Vec::new(),
             seeks: Vec::new(),
             // Seeks are answered by the normal order unless a test says.
             pull: Pull::Moved(0),
@@ -408,6 +411,7 @@ impl Owner {
     }
 
     fn apply(&mut self, out: Vec<Emit>) {
+        self.log.extend(out.iter().cloned());
         let mut again = Vec::new();
         for emit in out {
             match emit {

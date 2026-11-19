@@ -252,10 +252,35 @@ mod counts {
         // Places a placement by links read of those filed beside the
         // volumes held.
         pub(crate) beside: usize,
+        // What one look costs: layouts synced, entries compared with the
+        // layout's members, members visited for their verdict, rebuilds of
+        // the piece map, entries looked at for a key, members in the facts
+        // each walk read, members a layout was handed, and volumes looked
+        // at for a recovery record.
+        pub(crate) syncs: usize,
+        pub(crate) compared: usize,
+        pub(crate) visited: usize,
+        pub(crate) remaps: usize,
+        pub(crate) keyed: usize,
+        pub(crate) read_members: usize,
+        pub(crate) laid_members: usize,
+        pub(crate) recovery_looked: usize,
     }
 
     thread_local! {
         static COUNTS: RefCell<Counts> = RefCell::default();
+        static OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    // Whether the store looks again the way it did before it kept track of
+    // what changed: every member from the first, every entry for a key. A
+    // test runs the same events both ways and compares what was said.
+    pub(crate) fn old() -> bool {
+        OLD.with(std::cell::Cell::get)
+    }
+
+    pub(crate) fn set_old(old: bool) {
+        OLD.with(|cell| cell.set(old));
     }
 
     pub(crate) fn bump(count: impl FnOnce(&mut Counts)) {
@@ -424,6 +449,9 @@ pub struct RarStore {
     // filed where `unmapped` is, so finding a volume's parts scans no other
     // volume's pieces.
     pieces_in: BTreeMap<VolumeIndex, Vec<(usize, usize)>>,
+    // The entries locked or sealed, filed wherever an entry's lock changes
+    // and where `pieces_in` is, so opening files scans no open or plain one.
+    locked: BTreeSet<usize>,
     // The volumes to look at again: walk their headers, hold them to the
     // layout, say their recovery records. Filed wherever something a walk
     // or the layout reads of a volume changes, so a look visits only them.
@@ -514,6 +542,7 @@ impl RarStore {
             unmapped: BTreeSet::new(),
             open: BTreeSet::new(),
             pieces_in: BTreeMap::new(),
+            locked: BTreeSet::new(),
             dirty: BTreeSet::new(),
             lasts: BTreeSet::new(),
             wanted: BTreeSet::new(),
@@ -627,11 +656,17 @@ impl RarStore {
             .any(|(at, held)| at != ours && !held.is_empty())
     }
 
-    // The volumes no piece lies in, from every entry again: where pieces
-    // went, at a retraction or a restore.
+    // The volumes no piece lies in, and the entries locked, from every entry
+    // again: where pieces went, at a retraction or a restore.
     fn remap(&mut self) {
+        #[cfg(test)]
+        counts::bump(|counts| counts.remaps += 1);
         self.pieces_in.clear();
+        self.locked.clear();
         for (id, entry) in self.entries.iter().enumerate() {
+            if matches!(entry.lock, Lock::Locked | Lock::Sealed(_)) {
+                self.locked.insert(id);
+            }
             for (at, piece) in entry.pieces.iter().enumerate() {
                 self.pieces_in
                     .entry(piece.volume)
