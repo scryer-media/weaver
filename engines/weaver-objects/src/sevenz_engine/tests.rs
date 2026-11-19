@@ -209,6 +209,8 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::Refuse(why) => out.push(Said::Refuse(*why)),
             // Said beside the walk; `checksums` reads them.
             Emit::Checksum { .. } => {}
+            // Text for the log, which changes nothing.
+            Emit::Failed(_) => {}
             other => panic!("an engine run does not say {other:?}"),
         }
     }

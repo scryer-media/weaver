@@ -285,12 +285,16 @@ impl Walk {
 
     // Whether the volume is one of a set. Only the main header sets the
     // volume flag, so a set flag is its word at once; a clear one is its
-    // word only once the walk has ended, since a walk short of the main
-    // header reports the flag clear. Enciphered headers make that walk
-    // common.
+    // word once the walk is known to have read the main header: it has
+    // ended, or it read a file or service header, which only follow the
+    // main header in either format. A walk short of the main header
+    // reports the flag clear; enciphered headers make that walk common.
     pub(super) fn in_set(&self) -> Option<bool> {
         let facts = self.facts.as_ref()?;
-        match (facts.is_volume, self.ended) {
+        match (
+            facts.is_volume,
+            self.ended || super::claim::read_main(facts),
+        ) {
             (true, _) => Some(true),
             (false, true) => Some(false),
             (false, false) => None,

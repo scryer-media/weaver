@@ -523,6 +523,7 @@ fn scenario_client(servers: usize, port: u16) -> weaver_nntp::client::NntpClient
 pub(super) async fn hear_probe(pipeline: &mut Pipeline) {
     loop {
         pipeline.seat_waiting_probes(
+            std::time::Instant::now(),
             &mut std::collections::HashMap::new(),
             &mut std::collections::HashMap::new(),
         );

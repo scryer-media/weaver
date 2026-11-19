@@ -88,6 +88,8 @@ pub struct NntpPool {
     blocking_connect_failures_since_warning: Vec<AtomicU64>,
     // Cold connection admission only; established BODY lanes never touch it.
     auth_admission: Vec<AuthAdmission>,
+    // Per server, the lanes waiting for room on its full route.
+    route_lines: Vec<Arc<crate::route_line::RouteLine>>,
 }
 
 struct AuthAdmission {
@@ -502,6 +504,11 @@ impl NntpPool {
         let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
         let mut socket_budgets = Vec::with_capacity(server_count);
         let shutdown = CancellationToken::new();
+        let route_lines = config
+            .servers
+            .iter()
+            .map(|spc| crate::route_line::RouteLine::new(Arc::clone(&spc.server.dialer)))
+            .collect();
 
         // A config where every server is backfill has no fill tier to
         // exhaust; treat it as an all-fill config so downloads can proceed.
@@ -640,7 +647,30 @@ impl NntpPool {
                     epoch: Instant::now(),
                 })
                 .collect(),
+            route_lines,
         }
+    }
+
+    // Join the line of lanes waiting for room on server `server`'s route,
+    // after its dial was refused for room with `error`. `first` when the
+    // lane was let go from the line and refused again. `None` when the
+    // refusal names nothing that rings as the route frees, or the pool is
+    // going: the lane takes the refusal.
+    pub fn join_route_line(
+        &self,
+        server: ServerId,
+        error: &NntpError,
+        first: bool,
+    ) -> Option<crate::route_line::RouteTurn> {
+        let slots = error.route_room_slots()?;
+        self.route_lines.get(server.0)?.join(slots, first)
+    }
+
+    // How many lanes wait for room on server `server`'s route, as it
+    // changes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route_line_waiting(&self, server: ServerId) -> tokio::sync::watch::Receiver<usize> {
+        self.route_lines[server.0].subscribe()
     }
 
     // How a new connection to this server picks its address.
@@ -669,9 +699,22 @@ impl NntpPool {
                 let mut wait_permit = false;
                 let mut wait_sockets = false;
                 let mut wait_recovery = false;
+                // A probe refused by a full route waits for what rings as it
+                // gets room, heard before the route is asked again. Each slot
+                // is kept with what hears it.
+                let mut room_waits: Vec<(
+                    Arc<tokio::sync::Notify>,
+                    std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>,
+                )> = Vec::new();
+                let armed = |slot: &Arc<tokio::sync::Notify>| {
+                    let mut notified = Box::pin(Arc::clone(slot).notified_owned());
+                    notified.as_mut().enable();
+                    notified
+                };
+                let mut room_now = false;
                 let mut first = true;
                 loop {
-                    if !first {
+                    if !first && !room_now {
                         #[cfg(test)]
                         if let Some(pool) = weak.upgrade() {
                             pool.probe_waits[idx].send_modify(|state| {
@@ -687,6 +730,13 @@ impl NntpPool {
                             result = semaphore.clone().acquire_owned(), if wait_permit => {
                                 if result.is_err() { break; }
                             },
+                            () = std::future::poll_fn(|cx| {
+                                if room_waits.iter_mut().any(|(_, slot)| slot.as_mut().poll(cx).is_ready()) {
+                                    std::task::Poll::Ready(())
+                                } else {
+                                    std::task::Poll::Pending
+                                }
+                            }), if !room_waits.is_empty() => {},
                             () = async {
                                 match retry_at {
                                     Some(at) => tokio::time::sleep_until(at).await,
@@ -696,6 +746,13 @@ impl NntpPool {
                         }
                     }
                     first = false;
+                    // A dial made on the route's word that it had room keeps
+                    // hearing the slots heard before it, so a socket freed
+                    // after its refusal is not missed; a pass that waited
+                    // starts hearing afresh.
+                    if !std::mem::take(&mut room_now) {
+                        room_waits.clear();
+                    }
                     retry_at = None;
                     wait_permit = false;
                     wait_sockets = false;
@@ -748,6 +805,35 @@ impl NntpPool {
                         _ = stopped.cancelled() => break,
                         joined = dial => joined.unwrap_or(Err(NntpError::PoolShutdown)),
                     };
+                    if let Some(slots) = result.as_ref().err().and_then(NntpError::route_room_slots)
+                        && !slots.is_empty()
+                    {
+                        // A slot already heard that rang since is a socket
+                        // freed: the route is dialled again, and the slot is
+                        // heard afresh.
+                        let mut rang = false;
+                        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                        for (slot, notified) in &mut room_waits {
+                            if notified.as_mut().poll(&mut cx).is_ready() {
+                                rang = true;
+                                *notified = armed(slot);
+                            }
+                        }
+                        // A slot not heard before may have rung before it
+                        // was: if the route has room, it is dialled again.
+                        // A refusal on slots already heard is not, so a route
+                        // that says it has room and refuses does not spin.
+                        let mut unheard = false;
+                        for slot in slots {
+                            if room_waits.iter().any(|(seen, _)| Arc::ptr_eq(seen, &slot)) {
+                                continue;
+                            }
+                            let notified = armed(&slot);
+                            room_waits.push((slot, notified));
+                            unheard = true;
+                        }
+                        room_now = rang || (unheard && pool.configs[idx].dialer.room().is_ok());
+                    }
                     if let Err(error) = &result {
                         let provider_evidence = !matches!(error, NntpError::Route(route) if route.is_path_evidence() || !route.is_evidence());
                         if provider_evidence && !dial_declined_over_limit(error) && !matches!(error, NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::AcquireTimeout(_)) {
@@ -867,6 +953,9 @@ impl NntpPool {
     // Shut down the pool and wait for active leases to drain.
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
+        for line in &self.route_lines {
+            line.close();
+        }
 
         // Generation replacement must not let the new client race the old
         // client's still-live BODY sockets for the same provider allowance.
@@ -2057,6 +2146,159 @@ mod tests {
         waits.wait_for(|state| state.0 >= 3).await.unwrap();
         assert!(waits.borrow().1.is_none());
         assert_eq!(route.dials.load(Ordering::Acquire), 2);
+        pool.shutdown().await;
+    }
+
+    // A probe refused by a full route waits for the route's freed-socket
+    // ring, not only for its targets to change: the socket freed lets it
+    // dial again, once, with the targets left as they were.
+    #[tokio::test(start_paused = true)]
+    async fn route_probe_refused_by_a_full_route_dials_again_when_a_socket_frees() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use weaver_tunnel::pipe::{Capacity, DialError, Dialed, Dialer, Purpose, Target};
+        struct Full {
+            full: AtomicBool,
+            freed: Arc<tokio::sync::Notify>,
+            dials: AtomicUsize,
+            targets: tokio::sync::watch::Sender<Vec<u16>>,
+            dialed: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+        #[async_trait::async_trait]
+        impl Dialer for Full {
+            fn leg_targets(&self) -> Option<tokio::sync::watch::Receiver<Vec<u16>>> {
+                Some(self.targets.subscribe())
+            }
+            fn needs_probe(&self) -> bool {
+                true
+            }
+            fn room(&self, _: &Purpose) -> std::result::Result<(), Vec<Arc<tokio::sync::Notify>>> {
+                if self.full.load(Ordering::Acquire) {
+                    Err(vec![Arc::clone(&self.freed)])
+                } else {
+                    Ok(())
+                }
+            }
+            async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
+                self.dials.fetch_add(1, Ordering::AcqRel);
+                self.dialed.send(()).ok();
+                if self.full.load(Ordering::Acquire) {
+                    return Err(DialError::AtCapacity(Capacity {
+                        waits: vec![Arc::clone(&self.freed)],
+                        demand: Vec::new(),
+                    }));
+                }
+                Err(DialError::Egress(std::io::Error::other("fixture leg down")))
+            }
+            fn budget(&self) -> Duration {
+                Duration::from_secs(30)
+            }
+            fn describe(&self) -> String {
+                "full fixture".into()
+            }
+        }
+        let (dialed, mut dials) = tokio::sync::mpsc::unbounded_channel();
+        let route = Arc::new(Full {
+            full: AtomicBool::new(true),
+            freed: Arc::default(),
+            dials: AtomicUsize::new(0),
+            targets: tokio::sync::watch::channel(vec![4]).0,
+            dialed,
+        });
+        let mut config = test_pool_config(4);
+        config.servers[0].server.tls = false;
+        config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+            inner: route.clone(),
+            plan: None,
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        });
+        let pool = Arc::new(NntpPool::new(config));
+        pool.start_route_probes();
+
+        // Refused by the full route, the probe parks with no timer and no
+        // second dial.
+        dials.recv().await.unwrap();
+        let mut waits = pool.probe_waits[0].subscribe();
+        waits.wait_for(|state| state.0 >= 1).await.unwrap();
+        assert!(waits.borrow().1.is_none());
+        assert_eq!(route.dials.load(Ordering::Acquire), 1);
+
+        // A socket frees: one dial, and the probe parks again.
+        route.full.store(false, Ordering::Release);
+        route.freed.notify_waiters();
+        dials.recv().await.unwrap();
+        waits.wait_for(|state| state.0 >= 2).await.unwrap();
+        assert!(waits.borrow().1.is_none());
+        assert_eq!(route.dials.load(Ordering::Acquire), 2);
+        pool.shutdown().await;
+    }
+
+    // A route that says it has room and refuses the probe again: a socket
+    // freed between that refusal and the probe hearing it is not lost, and
+    // a refusal with no ring since does not spin the probe.
+    #[tokio::test(start_paused = true)]
+    async fn route_probe_hears_a_socket_freed_after_a_refusal_it_dialled_on_room() {
+        use std::sync::atomic::AtomicUsize;
+        use weaver_tunnel::pipe::{Capacity, DialError, Dialed, Dialer, Purpose, Target};
+        struct Refusing {
+            freed: Arc<tokio::sync::Notify>,
+            dials: AtomicUsize,
+            targets: tokio::sync::watch::Sender<Vec<u16>>,
+        }
+        #[async_trait::async_trait]
+        impl Dialer for Refusing {
+            fn leg_targets(&self) -> Option<tokio::sync::watch::Receiver<Vec<u16>>> {
+                Some(self.targets.subscribe())
+            }
+            fn needs_probe(&self) -> bool {
+                true
+            }
+            fn room(&self, _: &Purpose) -> std::result::Result<(), Vec<Arc<tokio::sync::Notify>>> {
+                Ok(())
+            }
+            async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
+                // The second refusal is followed by a socket freeing before
+                // the probe hears the slot again.
+                if self.dials.fetch_add(1, Ordering::AcqRel) == 1 {
+                    self.freed.notify_waiters();
+                }
+                Err(DialError::AtCapacity(Capacity {
+                    waits: vec![Arc::clone(&self.freed)],
+                    demand: Vec::new(),
+                }))
+            }
+            fn budget(&self) -> Duration {
+                Duration::from_secs(30)
+            }
+            fn describe(&self) -> String {
+                "refusing fixture".into()
+            }
+        }
+        let route = Arc::new(Refusing {
+            freed: Arc::default(),
+            dials: AtomicUsize::new(0),
+            targets: tokio::sync::watch::channel(vec![4]).0,
+        });
+        let mut config = test_pool_config(4);
+        config.servers[0].server.tls = false;
+        config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+            inner: route.clone(),
+            plan: None,
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        });
+        let pool = Arc::new(NntpPool::new(config));
+        let mut waits = pool.probe_waits[0].subscribe();
+        pool.start_route_probes();
+
+        // The first refusal names a slot not heard before and the route says
+        // it has room: a second dial. The slot rings after its refusal: a
+        // third. The third is refused with no ring since: the probe parks.
+        waits.wait_for(|state| state.0 >= 1).await.unwrap();
+        assert!(waits.borrow().1.is_none());
+        assert_eq!(route.dials.load(Ordering::Acquire), 3);
         pool.shutdown().await;
     }
 

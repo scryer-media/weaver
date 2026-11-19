@@ -1867,3 +1867,20 @@ kind = "sql"
 file = "migrations/0130_graph_member_lifted/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 131
+description = "data used per day indexes for a consumer's rows and for removals that are due"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0131_usage_expiry_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0131_usage_expiry_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"

@@ -84,6 +84,18 @@ impl Object for Tape {
 }
 
 impl Recovery for Tape {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         false
     }

@@ -1407,3 +1407,30 @@ fn a_rar3_footer_counts_the_volumes_of_a_set_that_covers_one() {
     bind(&mut job);
     assert_eq!(job.object.slots(), 3);
 }
+
+// A set kept before the sets passed over were kept restores as passing over
+// none: its encoding is the same array without the last field.
+#[test]
+fn a_set_kept_without_the_sets_passed_over_restores_passing_over_none() {
+    let fresh = rmp_serde::to_vec(&RarRecovery::new(OWN)).unwrap();
+    let fields = fresh[0] & 0x0f;
+    assert_eq!(fresh[0] & 0xf0, 0x90, "a fixed array of fields");
+    assert_eq!(
+        fresh.last(),
+        Some(&0x80),
+        "the empty map of sets passed over"
+    );
+    let mut kept = vec![0x90 | (fields - 1)];
+    kept.extend_from_slice(&fresh[1..fresh.len() - 1]);
+
+    let restored: RarRecovery = rmp_serde::from_slice(&kept).unwrap();
+    assert!(restored.passed.is_empty());
+    assert_eq!(restored.id, OWN);
+
+    let mut passing = RarRecovery::new(OWN);
+    passing
+        .passed
+        .insert("amber.coast".to_owned(), BTreeSet::from([MemberId(3)]));
+    let again: RarRecovery = rmp_serde::from_slice(&rmp_serde::to_vec(&passing).unwrap()).unwrap();
+    assert_eq!(again.passed, passing.passed);
+}

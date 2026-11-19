@@ -2229,3 +2229,142 @@ async fn a_timed_retry_explains_its_jobs_stall_and_a_probe_hold_does_not() {
         );
     }
 }
+
+fn queued(pipeline: &Pipeline, job_id: JobId) -> usize {
+    pipeline.jobs[&job_id]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len()
+}
+
+fn not_found(pipeline: &Pipeline) -> u64 {
+    pipeline.metrics.articles_not_found.load(Ordering::Relaxed)
+}
+
+// A health probe round answering on the lanes it was yielded holds every
+// stalled job's dispatch on purpose, its own job's and the job beside it.
+// Here it answers batch after batch, two on the lanes, one seated every
+// forty seconds, for longer than the kick and release windows together, as
+// a large post's round does on two connections. Nothing is logged as a
+// stall, nothing is kicked, and no queued article of either job is booked
+// missing. Before the probe explained the wait, this round was kicked at
+// the kick window and both jobs were released at the release window.
+#[tokio::test]
+async fn a_probe_round_answering_on_the_lanes_is_never_reported_kicked_or_released() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    assert!(pipeline.download_stall_recovery);
+    let probing = JobId(40030);
+    let beside = JobId(40031);
+    insert_stalled_job(&mut pipeline, probing, 3).await;
+    insert_stalled_job(&mut pipeline, beside, 2).await;
+    let not_found_before = not_found(&pipeline);
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+
+    let t0 = Instant::now();
+    let round_ends = t0
+        + DOWNLOAD_DISPATCH_STALL_KICK_AFTER
+        + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER
+        + 2 * DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
+    let mut at = t0;
+    while at <= round_ends {
+        pipeline.post_probes.seat_round_for_test(probing, 0, 2, at);
+        pipeline.dispatch_downloads_at(at);
+        at += Duration::from_secs(40);
+    }
+
+    // Booked missing first, the bug this guards; the rest after.
+    assert_eq!(
+        not_found(&pipeline),
+        not_found_before,
+        "no article booked missing"
+    );
+    assert_eq!(queued(&pipeline, probing), 3);
+    assert_eq!(queued(&pipeline, beside), 2);
+    assert_eq!(releases(&pipeline), 0);
+    assert_eq!(kicks(&pipeline), 0);
+    assert!(lines.take().is_empty(), "no stall is reported");
+    assert_eq!(pipeline.jobs[&probing].failed_bytes, 0);
+    assert_eq!(pipeline.jobs[&beside].failed_bytes, 0);
+    assert!(!pipeline.pending_completion_checks.contains(&probing));
+    assert!(!pipeline.pending_completion_checks.contains(&beside));
+}
+
+// A round whose batches wait for a seat and have none on the lanes runs no
+// probe: the stall is logged after a whole interval, kicked at the kick
+// window and released at the release window, as any stall nothing explains.
+#[tokio::test]
+async fn a_round_with_no_batch_on_the_lanes_explains_no_stall() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40032);
+    insert_stalled_job(&mut pipeline, job_id, 3).await;
+    let not_found_before = not_found(&pipeline);
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+
+    let t0 = Instant::now();
+    pipeline.post_probes.seat_round_for_test(job_id, 0, 0, t0);
+    assert!(!pipeline.post_probes.answering(t0));
+    assert_eq!(pipeline.earliest_explained_dispatch_wait(t0), None);
+    pipeline.dispatch_downloads_at(t0);
+    assert!(lines.take().is_empty());
+
+    pipeline.dispatch_downloads_at(t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40032"), "{}", heard[0]);
+    assert_eq!(
+        field(&heard[0], "explained_wait_ms"),
+        Some("0"),
+        "{}",
+        heard[0]
+    );
+
+    let kicked_at = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
+    pipeline.dispatch_downloads_at(kicked_at);
+    assert_eq!(kicks(&pipeline), 1);
+    pipeline.dispatch_downloads_at(kicked_at + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER);
+    assert_eq!(releases(&pipeline), 1);
+    assert_eq!(queued(&pipeline, job_id), 0);
+    assert_eq!(not_found(&pipeline) - not_found_before, 3);
+}
+
+// A batch seated on a lane that never comes back answers only within its
+// window: once that has passed with no batch seated since, the stall it
+// leaves is reported a whole interval after the last pass the batch
+// explained, and kicked as any other.
+#[tokio::test]
+async fn a_seated_batch_that_never_answers_stops_explaining_the_stall() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40033);
+    insert_stalled_job(&mut pipeline, job_id, 3).await;
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+
+    let t0 = Instant::now();
+    pipeline.post_probes.seat_round_for_test(job_id, 0, 1, t0);
+    let window_ends = t0 + crate::pipeline::post_health::SEATED_BATCH_ANSWERS_WITHIN;
+    let step = DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    let mut at = t0;
+    while at < window_ends {
+        assert!(pipeline.post_probes.answering(at));
+        pipeline.dispatch_downloads_at(at);
+        at += step;
+    }
+    assert!(lines.take().is_empty(), "the batch explains the stall");
+    assert_eq!(kicks(&pipeline), 0);
+
+    assert!(!pipeline.post_probes.answering(window_ends));
+    assert_eq!(pipeline.earliest_explained_dispatch_wait(window_ends), None);
+    let after = window_ends.max(t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER);
+    pipeline.dispatch_downloads_at(after);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40033"), "{}", heard[0]);
+    assert_eq!(kicks(&pipeline), 1);
+}

@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit};
+use tokio::sync::OwnedRwLockReadGuard;
 
 use super::{
     DialError, Dialer, Resolution, SessionHop, SessionSockets, SocketClass, SocketPermit,
@@ -123,7 +123,7 @@ impl DatagramTransport for SessionDatagrams {
 struct HeldSocket {
     socket: Arc<dyn DatagramSocket>,
     _activity: OwnedRwLockReadGuard<()>,
-    _capacity: Option<Arc<OwnedSemaphorePermit>>,
+    _capacity: Option<Arc<super::SessionPermit>>,
     _share: Option<SocketPermit>,
 }
 

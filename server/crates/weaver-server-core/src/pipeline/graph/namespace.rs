@@ -3177,7 +3177,8 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    // Before a PAR3 set over the posts goes out: the files it describes
+    // Before a set over the posts that can outgrow its recovery goes out,
+    // as a PAR3 set can: the files it describes
     // none of whose bytes arrived, at the lengths they declare, are what its
     // rebuild would add to the disk, as the file under the post's directory
     // and as the repair's staged output under the working directory. Taken
@@ -3187,9 +3188,8 @@ impl NamespaceWriter {
     // into it. The rest are rebuilt however the set describes them,
     // once the disks have room for them all above the reserve: until then
     // the set does not go out, and the job waits for room, as it does for a
-    // write. `None` while it waits. Only a PAR3 set can name one block in
-    // many places of a file; any other set writes no more than the recovery
-    // it received, and is not judged here.
+    // write. `None` while it waits. The set says whether it can: any other
+    // writes no more than the recovery it received, and is not judged here.
     // `noted`, when given, gains each file found absent.
     pub(super) fn withheld(
         &mut self,
@@ -3198,13 +3198,13 @@ impl NamespaceWriter {
         noted: Option<&mut BTreeSet<MemberId>>,
     ) -> Option<BTreeSet<MemberId>> {
         let mut withheld = BTreeSet::new();
-        if tree.kind(set) != Some(Kind::Par3) {
-            return Some(withheld);
-        }
         let (Some(recovery), Some(posts)) = (tree.recovery(set), tree.namespace(NodeId::ROOT))
         else {
             return Some(withheld);
         };
+        if !recovery.outgrows_recovery() {
+            return Some(withheld);
+        }
         let mut absent: Vec<(u64, MemberId)> = posts
             .members()
             .filter(|record| absent_from_posts(record) && recovery.covers(record.id))

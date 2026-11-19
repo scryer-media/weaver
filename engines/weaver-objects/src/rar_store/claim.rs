@@ -91,13 +91,24 @@ impl Holds for Bound<'_> {
 }
 
 // What a member's front states that places it in a set: its headers, when
-// they say it is a volume of one.
+// they say whether it is a volume of one. A clear volume flag says so only
+// past the main header (`read_main`): one an archive that is no volume
+// states places it a set of its own at once, so no store's numbering takes
+// it meanwhile, and none takes a volume beside it.
 pub(crate) fn front_facts(
     first_bytes: &[u8],
     password: Option<&str>,
     kdf: Arc<KdfCache>,
 ) -> Option<RarVolumeFacts> {
-    headers(first_bytes, password, kdf).filter(|facts| facts.is_volume)
+    headers(first_bytes, password, kdf).filter(|facts| facts.is_volume || read_main(facts))
+}
+
+// Whether headers read off a volume were read past its main header: they
+// list a file or service header, which in either format only follows the
+// main header. Short of it, a walk reports the volume flag clear, which
+// then says nothing.
+pub(crate) fn read_main(facts: &RarVolumeFacts) -> bool {
+    !facts.members.is_empty() || !facts.services.is_empty()
 }
 
 // The format whose signature a front opens on, at its first byte. A volume
@@ -228,14 +239,57 @@ impl Nameless<'_> {
     }
 }
 
+// Whether the headers put `first` before `then`, wherever either is held: a
+// member `first` carries on is one `then` continues, and one of the two holds
+// an end of it, its first part or its last. Two volumes that each only carry
+// that member on are alike by their headers, and this says nothing of them
+// (`order`).
+pub(super) fn before(first: &RarVolumeFacts, then: &RarVolumeFacts) -> bool {
+    let (first, then) = (Nameless { facts: first }, Nameless { facts: then });
+    first.kin(&then)
+        && first
+            .continuing_member()
+            .zip(then.continued_member())
+            .is_some_and(|(tail, head)| {
+                continues(tail, head) && !(tail.split_before && head.split_after)
+            })
+}
+
+// Whether the headers put the volume held at `index + 1` before the one held
+// at `index`, both held on trust: their names swapped the two, and the store
+// orders them by their headers rather than give either back.
+pub(super) fn inverted(index: u32, volumes: &BTreeMap<VolumeIndex, Volume>) -> bool {
+    let trusted = |at: u32| {
+        volumes
+            .get(&VolumeIndex(at))
+            .and_then(Volume::stated)
+            .filter(|facts| !states_position(facts))
+    };
+    index
+        .checked_add(1)
+        .and_then(|next| trusted(index).zip(trusted(next)))
+        .is_some_and(|(left, right)| before(right, left))
+}
+
 // Whether `head`, the member a volume opens on, is `tail`, the member the
-// volume before it carries on.
+// volume before it carries on, as far as the claim judges which set a
+// volume is of: the two name the same member. The size each part states
+// is no test of it. unrar extracts a member to the size its first part
+// states and reads the later parts by place without looking at theirs
+// (CmdExtract::ExtractCurrentFile and MergeArchive), so packers that
+// misstate it in the middle parts make sets unrar reads whole; the CRC the
+// last part states is what proves the member, and the layout checks it.
+// What keeps two sets posted under one stem apart is the name, a number a
+// volume's headers state, and a set's first volume opening on a new member.
+// The store orders volumes by the same name (`member`, `order`).
 fn continues(tail: &RarVolumeMemberFacts, head: &RarVolumeMemberFacts) -> bool {
-    head.name == tail.name
-        && match (head.unpacked_size, tail.unpacked_size) {
-            (Some(head_size), Some(tail_size)) => head_size == tail_size,
-            _ => true,
-        }
+    member(head) == member(tail)
+}
+
+// The name a part gives its member: what `continues` compares, and what
+// the store orders volumes by (`order`).
+pub(super) fn member(part: &RarVolumeMemberFacts) -> &str {
+    part.name.as_str()
 }
 
 // Where a volume's headers and name place it in a set: the place, the
@@ -247,6 +301,10 @@ pub(super) struct Placing {
     placed: Option<VolumeIndex>,
     stated: Option<VolumeIndex>,
     not_yet: bool,
+    // The headers put the volume before the one that says no volume follows
+    // it, which is held on trust: that volume's place does not end the set
+    // ahead of it.
+    before_last: bool,
 }
 
 impl Placing {
@@ -255,7 +313,7 @@ impl Placing {
     fn claim(self, store: &RarStore) -> Claim {
         let places: Vec<VolumeIndex> = self
             .placed
-            .filter(|at| store.last().is_none_or(|last| *at <= last))
+            .filter(|at| self.before_last || store.last().is_none_or(|last| *at <= last))
             .into_iter()
             .collect();
         if self.not_yet {
@@ -296,7 +354,21 @@ impl RarStore {
     // the last does, only to be taken again.
     pub(super) fn reclaim_volume(&self, name: &str, front: &[u8], given: &Volume) -> Claim {
         let ends = given.walk.is_last();
-        let mut placing = self.reclaim_placing(name, front, given.stated());
+        // A volume the set's headers put somewhere its name does not is
+        // claimed there, while nothing held beside it says otherwise.
+        let ordered = given.ordered().filter(|at| {
+            given
+                .stated()
+                .is_some_and(|facts| !breaks(facts, at.0, &Bound(&self.volumes)))
+        });
+        let mut placing = match ordered {
+            Some(at) => Placing {
+                placed: Some(at),
+                stated: Some(at),
+                ..Placing::default()
+            },
+            None => self.reclaim_placing(name, front, given.stated()),
+        };
         placing.placed = placing.placed.filter(|at| {
             !ends
                 || self
@@ -393,7 +465,7 @@ impl RarStore {
             return Placing {
                 placed: alone,
                 stated: alone,
-                not_yet: false,
+                ..Placing::default()
             };
         }
         // The set's numbering is the one the bound names share; before any
@@ -463,7 +535,17 @@ impl RarStore {
             placed,
             stated,
             not_yet,
+            before_last: facts.is_some_and(|facts| self.before_last(facts)),
         }
+    }
+
+    // Whether the headers put a volume before the one held on trust that
+    // says no volume follows it.
+    pub(super) fn before_last(&self, facts: &RarVolumeFacts) -> bool {
+        self.last()
+            .and_then(|last| self.volumes.get(&last))
+            .and_then(Volume::stated)
+            .is_some_and(|last| !states_position(last) && before(facts, last))
     }
 
     // What a front states, read with the store's own keys.
@@ -668,6 +750,11 @@ pub(super) fn misfits(
         let Some(theirs) = other.facts else {
             continue;
         };
+        // Two held on trust in the order opposite to the one their headers
+        // prove are the store's to order, not to give back.
+        if inverted(at.min(index.0), volumes) {
+            continue;
+        }
         let broken = if at < index.0 {
             apart(
                 &Nameless { facts: theirs },
@@ -704,14 +791,23 @@ pub(super) fn tied(index: VolumeIndex, volumes: &BTreeMap<VolumeIndex, Volume>) 
     let Some(facts) = held.at(index.0).and_then(|this| this.facts) else {
         return false;
     };
-    let numbered = volumes
-        .get(&index)
-        .and_then(|volume| volume.numbered.as_ref())
-        .is_some_and(|name| name.index() == index.0);
+    let numbered = volumes.get(&index).is_some_and(|volume| {
+        volume.ordered() == Some(index)
+            || volume
+                .numbered
+                .as_ref()
+                .is_some_and(|name| name.index() == index.0)
+    });
     if !numbered && (Nameless { facts }).position() != Some(index.0) {
         return false;
     }
     meets(facts, index.0, &held).contains(&Some(true))
+}
+
+// Whether a volume at `index` is tied to a held volume beside it: one
+// member runs across from the one before, or on into the one after.
+pub(crate) fn linked(facts: &RarVolumeFacts, index: u32, held: &impl Holds) -> bool {
+    meets(facts, index, held).contains(&Some(true))
 }
 
 // Whether a volume's headers state its position: a number, or the first
@@ -732,16 +828,21 @@ pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
 //
 // Whether a volume is settled at `index`: read to its end, or placed there
 // by a stated position or by its name. Nothing settles a volume where its
-// own headers say it is not, a name least of all.
+// own headers say it is not, a name least of all. An end read that states
+// no number, as a RAR4 volume's short of a numbered end record, says
+// nothing of where the volume is: one its own name numbers at another place
+// is held where links alone put it, and a claimant that states the place
+// takes it. Links do not order the middle volumes of one member, which each
+// carry it on alike, so the first of them to come takes the lowest free
+// place, whichever it is.
 pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
     let facts = volume.stated();
+    let named = volume.numbered.as_ref().map(|name| name.index() == index.0);
     !volume.misplaced(index)
-        && (volume.walk.ended
+        && ((volume.walk.ended && named != Some(false))
             || facts.is_some_and(states_position)
-            || volume
-                .numbered
-                .as_ref()
-                .is_some_and(|name| name.index() == index.0))
+            || volume.ordered() == Some(index)
+            || named == Some(true))
 }
 
 // The position a volume's headers give it beside the volumes held, by

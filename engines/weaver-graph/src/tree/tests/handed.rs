@@ -108,6 +108,18 @@ impl Object for Reader {
 }
 
 impl Recovery for Reader {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         false
     }

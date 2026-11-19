@@ -146,10 +146,12 @@ impl BlockingBodyLaneAcquireError {
         )
     }
 
-    // Whether the server's network route was full. Its work is asked again
-    // after the lane-unavailable delay rather than at once: nothing tells the
-    // scheduler when the tunnel frees, and handing the work straight back
-    // would redial the full tunnel on every dispatch pass.
+    // Whether the server's network route was full. A lane pinned to that
+    // server waits in the route's line (`NntpPool::join_route_line`) and
+    // dials again when it frees; a refusal that still comes back (the line
+    // closed, or the refusal named nothing that rings) is asked again after
+    // the lane-unavailable delay, so the full tunnel is not redialled on
+    // every dispatch pass.
     pub fn is_route_capacity(&self) -> bool {
         matches!(self, Self::RouteCapacity(_))
     }

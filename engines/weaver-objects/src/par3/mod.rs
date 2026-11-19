@@ -1090,6 +1090,19 @@ impl Object for Par3 {
 }
 
 impl Recovery for Par3 {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    // PAR3 may name one block in many places of a file.
+    fn outgrows_recovery(&self) -> bool {
+        true
+    }
+
     // By path or bare name, where only a unique match binds; or by content,
     // for a member no described name answers to, which takes the described
     // name.

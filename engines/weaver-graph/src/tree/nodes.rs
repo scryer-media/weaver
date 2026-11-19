@@ -36,13 +36,15 @@ pub enum Mark {
 // node, and which of its volumes; `None` once the owner buried it.
 pub(super) type GivenUp = Option<(NodeId, VolumeIndex)>;
 
-// How far a node's run has gone: the furthest volume it reached, and
-// whether it asked for a password that no offer, and no run started since,
-// has answered.
+// How far a node's run has gone: the furthest volume it reached, whether
+// it asked for a password that no offer, and no run started since, has
+// answered, and whether it said bytes of its volumes were damaged that a
+// recovery object above had proved whole.
 #[derive(Clone, Copy, Default)]
 pub(super) struct Progress {
     pub(super) reached: Option<VolumeIndex>,
     pub(super) asking: bool,
+    pub(super) refuted: bool,
 }
 
 #[derive(Default)]

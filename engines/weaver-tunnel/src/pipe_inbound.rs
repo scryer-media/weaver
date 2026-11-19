@@ -23,7 +23,7 @@ use std::{
     sync::{Arc, Mutex as SyncMutex, PoisonError},
 };
 
-use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedSemaphorePermit, watch};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, watch};
 
 use super::natpmp::{self, NATPMP_PORT};
 pub use super::natpmp::{PortMapping, gateway_of};
@@ -238,7 +238,7 @@ struct SessionListener {
     mapping: Option<watch::Receiver<PortMapping>>,
     _keeper: Option<Abort>,
     _activity: OwnedRwLockReadGuard<()>,
-    _capacity: Option<Arc<OwnedSemaphorePermit>>,
+    _capacity: Option<Arc<super::SessionPermit>>,
 }
 
 struct Listening {

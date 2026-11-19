@@ -301,13 +301,15 @@ pub(crate) fn draft_route(
 pub(crate) fn refresh<'a>(
     ctx: &'a Context<'_>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        if let Some(runtime) = handle.proxy_runtime() {
-            runtime.reload().await.map_err(async_graphql::Error::new)?;
-        }
-        Ok(())
-    })
+    Box::pin(async move { reload_routes(ctx.data::<SchedulerHandle>()?).await })
+}
+
+// Reload the routes from what is saved, when the server runs them.
+pub(crate) async fn reload_routes(handle: &SchedulerHandle) -> Result<()> {
+    if let Some(runtime) = handle.proxy_runtime() {
+        runtime.reload().await.map_err(async_graphql::Error::new)?;
+    }
+    Ok(())
 }
 // Take a saved change to proxy `profile`: the routes reload, and the usenet
 // servers' connections are rebuilt only when a server's route goes through

@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::pipeline::graph::status::Claim;
-use std::sync::atomic::Ordering;
 
 fn pending() -> (Job, MemberId, Vec<u8>) {
     let mut job = Job::new(PLENTY);
@@ -357,7 +356,7 @@ fn cancellation_between_chunks_keeps_the_durable_obligation() {
     let mut reads = 0;
     let verified = check.run_with(&Default::default(), |_| {
         reads += 1;
-        stop.store(true, Ordering::Relaxed);
+        stop.raise();
     });
     assert_eq!(reads, 1);
     apply(&mut job, verified).unwrap();
@@ -371,7 +370,7 @@ fn cancellation_between_chunks_keeps_the_durable_obligation() {
 fn cancellation_before_start_reads_nothing() {
     let (mut job, _, _) = pending();
     let check = job.writer.take_verification(&job.tree).unwrap();
-    check.stop.store(true, Ordering::Relaxed);
+    check.stop.raise();
     let verified = check.run_with(&Default::default(), |_| {
         panic!("cancelled check read bytes")
     });
@@ -385,7 +384,7 @@ fn cancellation_after_read_before_acknowledgment_keeps_the_obligation() {
     let check = job.writer.take_verification(&job.tree).unwrap();
     let stop = Arc::clone(&check.stop);
     let verified = check.run(&Default::default());
-    stop.store(true, Ordering::Relaxed);
+    stop.raise();
     apply(&mut job, verified).unwrap();
     assert_eq!(job.writer.pending_verifications(), vec![(0, member.0)]);
     assert_eq!(

@@ -1212,6 +1212,111 @@ pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
         .collect()
 }
 
+// A single stored member over an old-numbering RAR4 set as one packer
+// writes it: every main header marks its volume the set's first, no volume
+// has an end record, and each part's header states the unpacked size
+// `stated` gives for that volume. The last part states `member_crc` as the
+// whole member's CRC.
+pub(in crate::pipeline::tests) fn rar4_misstated_set(
+    base: &str,
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    stated: impl Fn(usize) -> u32,
+    member_crc: u32,
+) -> Vec<(String, Vec<u8>)> {
+    let chunk = payload.len().div_ceil(volume_count);
+    (0..volume_count)
+        .map(|volume| {
+            let start = (volume * chunk).min(payload.len());
+            let end = ((volume + 1) * chunk).min(payload.len());
+            let part = &payload[start..end];
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+            let mut split_flags = 0u16;
+            if !is_first {
+                split_flags |= 0x0001;
+            }
+            if !is_last {
+                split_flags |= 0x0002;
+            }
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR4_SIG);
+            // VOLUME | FIRST_VOLUME on every volume, no NEW_NUMBERING.
+            bytes.extend_from_slice(&build_test_rar4_block(0x73, 0x0101, &[0u8; 6]));
+            bytes.extend_from_slice(&build_test_rar4_file_header(
+                member_name,
+                split_flags,
+                part.len() as u32,
+                stated(volume),
+                if is_last {
+                    member_crc
+                } else {
+                    checksum::crc32(part)
+                },
+            ));
+            bytes.extend_from_slice(part);
+            let filename = if is_first {
+                format!("{base}.rar")
+            } else {
+                format!("{base}.r{:02}", volume - 1)
+            };
+            (filename, bytes)
+        })
+        .collect()
+}
+
+// A single stored member over a RAR5 set, numbered and closed by end records
+// as RAR5 writes it, each part's header naming the member and stating its
+// unpacked size as `stated` gives them for that volume. The last part states
+// `member_crc` as the whole member's CRC.
+pub(in crate::pipeline::tests) fn rar5_misstated_set(
+    base: &str,
+    payload: &[u8],
+    volume_count: usize,
+    stated: impl Fn(usize) -> (&'static str, u64),
+    member_crc: u32,
+) -> Vec<(String, Vec<u8>)> {
+    let chunk = payload.len().div_ceil(volume_count);
+    (0..volume_count)
+        .map(|volume| {
+            let start = (volume * chunk).min(payload.len());
+            let end = ((volume + 1) * chunk).min(payload.len());
+            let part = &payload[start..end];
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+            let mut split_flags = 0u64;
+            if !is_first {
+                split_flags |= 0x0008;
+            }
+            if !is_last {
+                split_flags |= 0x0010;
+            }
+            let (name, size) = stated(volume);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR5_SIG);
+            bytes.extend_from_slice(&build_test_rar_main_header(
+                if is_first { 0x0001 } else { 0x0001 | 0x0002 },
+                (!is_first).then_some(volume as u64),
+            ));
+            bytes.extend_from_slice(&build_test_rar_file_header(
+                name,
+                split_flags,
+                part.len() as u64,
+                size,
+                Some(if is_last {
+                    member_crc
+                } else {
+                    checksum::crc32(part)
+                }),
+            ));
+            bytes.extend_from_slice(part);
+            bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
+            (format!("{base}.part{:02}.rar", volume + 1), bytes)
+        })
+        .collect()
+}
+
 // [`single_member_rar4_old_numbering_set`], its end records as the RAR
 // versions that wrote such sets wrote them, and every header's CRC16 filled
 // in. Each end record states the CRC32 of the volume's bytes before it and

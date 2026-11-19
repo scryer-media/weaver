@@ -58,6 +58,8 @@ pub(crate) type HeldLoan = (NodeId, u64, Box<dyn Object>, Arc<AtomicBool>);
 struct Rewalking {
     serial: u64,
     heard: std::sync::mpsc::SyncSender<()>,
+    // Raised when the job stops: a read waiting for its turn ends.
+    stop: Arc<crate::operations::disk::reader::TurnStop>,
 }
 
 // An object back from its work, with what it said.
@@ -188,6 +190,9 @@ impl Works {
         for (_, stop) in self.out.values() {
             stop.store(true, Ordering::Relaxed);
         }
+        for rewalking in self.rewalks.values() {
+            rewalking.stop.raise();
+        }
     }
 
     // Whether the rewalk numbered `serial` still reads for `node`.
@@ -218,7 +223,14 @@ impl Works {
         self.serial += 1;
         let (scope, serial, node) = (self.scope, self.serial, loan.node());
         let (heard, hearing) = std::sync::mpsc::sync_channel(1);
-        self.rewalks.insert(node, Rewalking { serial, heard });
+        self.rewalks.insert(
+            node,
+            Rewalking {
+                serial,
+                heard,
+                stop: loan.stop(),
+            },
+        );
         let mail = self.mail.clone();
         let shutdown = self.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {

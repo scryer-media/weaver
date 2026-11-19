@@ -9,6 +9,9 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use crate::operations::disk::reader::TurnStop;
 
 use weaver_graph::{ByteRange, NodeId, Placement, Posted, Rewalk, Tree, VolumeIndex};
 
@@ -51,6 +54,12 @@ impl std::fmt::Debug for Rewalked {
 impl RewalkLoan {
     pub(crate) fn node(&self) -> NodeId {
         self.rewalk.node
+    }
+
+    // What the job raises to stop the reads: a read waiting for its turn
+    // ends, and the walk stops at its next piece.
+    pub(crate) fn stop(&self) -> Arc<TurnStop> {
+        self.access.stop()
     }
 
     // Read each piece and hand it to `said`, or the range of one that did
@@ -149,6 +158,7 @@ impl NamespaceWriter {
             withheld: BTreeSet::new(),
             working: self.working_volume(),
             reading: RefCell::default(),
+            stop: Arc::default(),
         };
         let mut seen = BTreeSet::new();
         for (volume, member) in volumes {

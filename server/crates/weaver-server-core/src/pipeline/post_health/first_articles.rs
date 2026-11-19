@@ -10,16 +10,27 @@
 // Beside the heads it keeps which files the graph holds as recovery that
 // the post's names do not declare: the graph's answer, read for the members
 // whose rows changed since it was last read, so a binding costs its member
-// and the critical line follows it without a walk of the post.
+// and the critical line follows it without a walk of the post. The gate
+// weighs a file the names do not count by the same answer: one the graph
+// holds as recovery is recovery to it, as a named volume is.
 
 use crate::jobs::model::JobSpec;
 
 use super::{Gate, Head, declared_recovery_bytes, declares_recovery, gate_of, names_recovery};
 
+fn dead_of(gate: Gate, lost: u64, reachable: u64) -> Option<(usize, usize)> {
+    match gate {
+        Gate::Dead { missing, total } if lost > reachable => Some((missing, total)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FirstFile {
     // The file's first ordinal, `None` for a file with no articles.
     first: Option<u32>,
+    // The post's names declare it recovery data: a PAR2 or PAR3 volume, or
+    // a RAR recovery volume. A PAR2 or PAR3 index is not.
     recovery: bool,
     // The post's names count it in the critical line: a PAR2 or PAR3 file,
     // its index among them, or a RAR recovery volume.
@@ -34,19 +45,34 @@ struct FirstFile {
     stale: bool,
 }
 
+impl FirstFile {
+    // Whether the first-article gate weighs the file as recovery: a file
+    // the names count, by what its name declares; any other, by what the
+    // graph holds it as.
+    fn gate_recovery(&self) -> bool {
+        if self.named {
+            self.recovery
+        } else {
+            self.bound
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::pipeline) struct FirstArticles {
     files: Vec<FirstFile>,
     // The files waiting to have their heads read again, each once.
     stale: Vec<u32>,
-    // Of the payload files: how many, how many lost their first article,
-    // and how many first articles are still to come.
+    // Of the payload files, every file the gate does not weigh as
+    // recovery: how many, how many lost their first article, and how many
+    // first articles are still to come.
     payload: usize,
     lost: usize,
     outstanding: usize,
     // The bytes of the payload files that lost their first article.
     lost_bytes: u64,
-    // The bytes of the recovery files whose first article was not lost.
+    // The bytes of the files the gate weighs as recovery whose first
+    // article was not lost.
     reachable_bytes: u64,
     declared_recovery: u64,
     // The bytes of the files the graph holds as recovery that the names do
@@ -86,10 +112,9 @@ impl FirstArticles {
         };
         for (file, index) in spec.files.iter().zip(0u32..) {
             let first = file.segments.iter().map(|segment| segment.ordinal).min();
-            let recovery = declares_recovery(file);
             let entry = FirstFile {
                 first,
-                recovery,
+                recovery: declares_recovery(file),
                 named: names_recovery(file),
                 bound: false,
                 bytes: file
@@ -101,9 +126,6 @@ impl FirstArticles {
                 head: head(index, first),
                 stale: false,
             };
-            if !recovery {
-                sample.payload += 1;
-            }
             sample.count(entry, true);
             sample.files.push(entry);
         }
@@ -239,7 +261,11 @@ impl FirstArticles {
                 self.unresolved_reach - reach
             };
         }
-        match (file.recovery, file.head) {
+        let recovery = file.gate_recovery();
+        if !recovery {
+            step(&mut self.payload);
+        }
+        match (recovery, file.head) {
             (false, Head::Lost) => {
                 step(&mut self.lost);
                 bytes(&mut self.lost_bytes);
@@ -256,9 +282,29 @@ impl FirstArticles {
         gate_of(self.payload, self.lost, self.outstanding)
     }
 
-    // The bytes of the payload files that lost their first article, and of
-    // the recovery files whose first article was not lost.
-    pub(in crate::pipeline) fn weighed(&self) -> (u64, u64) {
-        (self.lost_bytes, self.reachable_bytes)
+    // The gate's word that the post is dead, as how many of how many payload
+    // files lost their first article: they reach the share, and the bytes
+    // of those files outweigh the recovery whose first article was not lost.
+    pub(in crate::pipeline) fn dead(&self) -> Option<(usize, usize)> {
+        dead_of(
+            gate_of(self.payload, self.lost, self.outstanding),
+            self.lost_bytes,
+            self.reachable_bytes,
+        )
+    }
+
+    // The same word were every file that may yet bind a recovery volume:
+    // each leaves the payload and brings what of it is not gone.
+    pub(in crate::pipeline) fn dead_at_reach(&self) -> bool {
+        dead_of(
+            gate_of(
+                self.payload - self.unresolved,
+                self.lost,
+                self.outstanding - self.unresolved,
+            ),
+            self.lost_bytes,
+            self.reachable_bytes + self.unresolved_reach,
+        )
+        .is_some()
     }
 }
