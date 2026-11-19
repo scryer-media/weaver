@@ -437,7 +437,9 @@ impl NamespaceWriter {
     // namespace at or below it: at `origin` it is. Below, the run above
     // refuses what its damaged volumes cannot produce, which is everything
     // they lost unless a set beside them that has not ruled impossible
-    // covers one: that set may yet rebuild what the run reads.
+    // covers one: that set may yet rebuild what the run reads. A volume
+    // that holds every byte, each one good, lost nothing for a set to
+    // rebuild, whatever covers it.
     fn refused_above(&self, tree: &Tree, origin: NodeId, node: NodeId) -> bool {
         let mut at = node;
         while at != origin {
@@ -445,12 +447,17 @@ impl NamespaceWriter {
                 return false;
             };
             let sets = tree.recovery_nodes(parent);
+            let namespace = tree.namespace(parent);
             let rebuilt = volumes.values().any(|member| {
-                self.covering(tree, &sets, *member).any(|set| {
-                    tree.recovery(set).is_none_or(|recovery| {
-                        !matches!(recovery.outcome(), Some(RepairOutcome::Impossible { .. }))
+                let good = namespace
+                    .and_then(|namespace| namespace.get(*member))
+                    .is_some_and(|record| record.is_complete() && record.coverage.is_clean());
+                !good
+                    && self.covering(tree, &sets, *member).any(|set| {
+                        tree.recovery(set).is_none_or(|recovery| {
+                            !matches!(recovery.outcome(), Some(RepairOutcome::Impossible { .. }))
+                        })
                     })
-                })
             });
             if rebuilt {
                 return false;
