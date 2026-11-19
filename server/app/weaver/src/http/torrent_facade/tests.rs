@@ -1658,13 +1658,10 @@ async fn a_duplicate_fails_and_a_refusal_conflicts() {
             ..PostProcessingSettings::default()
         })
         .unwrap();
-    let refused = rig.add_file(&metainfo("disc.iso", 2000, false), &[]).await;
-    assert_eq!(refused.status, StatusCode::CONFLICT);
-    assert!(
-        refused.body.contains("unwanted extension"),
-        "{}",
-        refused.body
-    );
+    // A torrent of only unwanted files is added with every file left out,
+    // as qBittorrent adds it, not refused.
+    let unwanted = rig.add_file(&metainfo("disc.iso", 2000, false), &[]).await;
+    assert_eq!(unwanted.json()["success_count"], 1, "{}", unwanted.body);
 
     // A magnet is added whatever its route's state, as qBittorrent adds one
     // at once (the rig's route is down, so it is held), and the same hash
@@ -1684,7 +1681,7 @@ async fn a_duplicate_fails_and_a_refusal_conflicts() {
         .await;
     assert_eq!(base32.status, StatusCode::CONFLICT);
     assert!(base32.body.contains("already added"), "{}", base32.body);
-    assert_eq!(rig.torrents().await.len(), 2);
+    assert_eq!(rig.torrents().await.len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

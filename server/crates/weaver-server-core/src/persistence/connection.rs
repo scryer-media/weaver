@@ -734,6 +734,8 @@ pub(crate) struct DatabaseWriterExecutor {
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     job_history_cache: Arc<Mutex<JobHistoryCache>>,
+    #[cfg(any(test, feature = "test-support"))]
+    torrent_history_writes: Arc<AtomicUsize>,
 }
 
 impl DatabaseWriterExecutor {
@@ -742,7 +744,16 @@ impl DatabaseWriterExecutor {
             sql_services: db.sql_services.clone(),
             sql_worker: db.sql_worker.clone(),
             job_history_cache: db.job_history_cache.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            torrent_history_writes: db.torrent_history_writes.clone(),
         }
+    }
+
+    // One more transaction wrote torrents' jobs' history rows.
+    pub(crate) fn count_history_write(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.torrent_history_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn datastore(&self) -> StoreDatastore {
@@ -818,6 +829,12 @@ enum DbWriteCommand {
         committed: oneshot::Sender<()>,
         kept: oneshot::Sender<()>,
     },
+    // Several torrents' jobs' history rows, of distinct jobs, in one
+    // transaction. Any the transaction cannot take goes on as its own
+    // `ArchiveTorrent`, in order, kept for want of room as that one is.
+    ArchiveTorrents {
+        archives: Vec<TorrentArchive>,
+    },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
     },
@@ -852,6 +869,20 @@ enum DbWriteCommand {
         from: usize,
     },
 }
+
+// What an `ArchiveTorrent` carries: one torrent's job's history row.
+struct TorrentArchive {
+    job_id: crate::jobs::ids::JobId,
+    history: Box<crate::history::JobHistoryRow>,
+    retires: bool,
+    files: Arc<[crate::torrents::persistence::HistoryFile]>,
+    committed: oneshot::Sender<()>,
+    kept: oneshot::Sender<()>,
+}
+
+// What a torrent's history row's waiter hears: written, or kept for room
+// (`Database::queue_torrent_history`).
+pub(crate) type HistoryWaits = (oneshot::Receiver<()>, oneshot::Receiver<()>);
 
 // The most kept archives one pass tries, so one pass does not hold the
 // serial writer for the whole list.
@@ -1063,6 +1094,7 @@ impl DbWriteCommand {
             // for any of its jobs (a support facts save among them), every
             // event batch and every attribution checkpoint lands first.
             Self::ArchiveJobs { .. }
+            | Self::ArchiveTorrents { .. }
             | Self::Write { lane: None, .. }
             | Self::Flush { .. }
             | Self::RetryKeptArchives { .. } => None,
@@ -1146,49 +1178,32 @@ async fn execute_write_command(
             committed,
             kept,
         } => {
-            // A newer row for the torrent's job takes the place of one kept:
-            // the kept one is let go unwritten, so it is never written over
-            // the newer one when room comes.
-            let superseded: VecDeque<KeptArchive> = {
-                let mut list = writer_db.kept_archives.list();
-                let (gone, stay) = std::mem::take(&mut *list).into_iter().partition(|archive| {
-                    archive.job_id == job_id && matches!(archive.of, ArchiveOf::Torrent { .. })
-                });
-                *list = stay;
-                gone
+            let archive = TorrentArchive {
+                job_id,
+                history,
+                retires,
+                files,
+                committed,
+                kept,
             };
-            for archive in superseded {
-                writer_db.kept_archives.tell(ArchiveNews::LetGo {
-                    job_id: archive.job_id,
-                    written: false,
-                });
+            supersede_kept_torrent(writer_db, job_id);
+            archive_torrent(archive, writer, writer_db).await;
+        }
+        DbWriteCommand::ArchiveTorrents { archives } => {
+            // Each job's kept row is let go before its newer one is
+            // written, as one at a time lets it go.
+            for archive in &archives {
+                supersede_kept_torrent(writer_db, archive.job_id);
             }
             let blocking = writer.clone();
             let failures = Arc::clone(&writer_db.checkpoint_failures);
             let refused = tokio::task::spawn_blocking(move || {
-                let mut archive = KeptArchive {
-                    job_id,
-                    history,
-                    typed_terminal_cause: None,
-                    failure_kind: None,
-                    committed: Some(committed),
-                    of: ArchiveOf::Torrent { retires, files },
-                };
-                archive_kept(&blocking, &failures, &mut archive, false)
-                    .err()
-                    .map(|error| (archive, error))
+                archive_torrents_at_once(&blocking, &failures, archives)
             })
             .await
-            .ok()
-            .flatten();
-            if let Some((archive, error)) = refused
-                && keeps_archive(&writer_db.target, &error)
-            {
-                // Told before its waiter hears it is kept, so whoever counts
-                // the kept archives has counted it by then.
-                writer_db.kept_archives.list().push_back(archive);
-                writer_db.kept_archives.tell(ArchiveNews::Kept(job_id));
-                let _ = kept.send(());
+            .unwrap_or_default();
+            for archive in refused {
+                archive_torrent(archive, writer, writer_db).await;
             }
         }
         DbWriteCommand::RetryKeptArchives { from } => {
@@ -1308,6 +1323,119 @@ async fn execute_write_command(
             let _ = reply.send(());
         }
     }
+}
+
+// A newer row for the torrent's job takes the place of one kept: the kept
+// one is let go unwritten, so it is never written over the newer one when
+// room comes.
+fn supersede_kept_torrent(writer_db: &Database, job_id: crate::jobs::ids::JobId) {
+    let superseded: VecDeque<KeptArchive> = {
+        let mut list = writer_db.kept_archives.list();
+        let (gone, stay) = std::mem::take(&mut *list).into_iter().partition(|archive| {
+            archive.job_id == job_id && matches!(archive.of, ArchiveOf::Torrent { .. })
+        });
+        *list = stay;
+        gone
+    };
+    for archive in superseded {
+        writer_db.kept_archives.tell(ArchiveNews::LetGo {
+            job_id: archive.job_id,
+            written: false,
+        });
+    }
+}
+
+// One torrent's job's history row in its own transaction: written, or,
+// refused for want of room, kept, its job named to the listener before its
+// waiter hears it is kept. One lost any other way drops both senders.
+async fn archive_torrent(
+    archive: TorrentArchive,
+    writer: &DatabaseWriterExecutor,
+    writer_db: &Database,
+) {
+    let TorrentArchive {
+        job_id,
+        history,
+        retires,
+        files,
+        committed,
+        kept,
+    } = archive;
+    let blocking = writer.clone();
+    let failures = Arc::clone(&writer_db.checkpoint_failures);
+    let refused = tokio::task::spawn_blocking(move || {
+        let mut archive = KeptArchive {
+            job_id,
+            history,
+            typed_terminal_cause: None,
+            failure_kind: None,
+            committed: Some(committed),
+            of: ArchiveOf::Torrent { retires, files },
+        };
+        archive_kept(&blocking, &failures, &mut archive, false)
+            .err()
+            .map(|error| (archive, error))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some((archive, error)) = refused
+        && keeps_archive(&writer_db.target, &error)
+    {
+        // Told before its waiter hears it is kept, so whoever counts
+        // the kept archives has counted it by then.
+        writer_db.kept_archives.list().push_back(archive);
+        writer_db.kept_archives.tell(ArchiveNews::Kept(job_id));
+        let _ = kept.send(());
+    }
+}
+
+// The torrents' jobs' history rows in one transaction, each cached and its
+// waiter told once it commits, as `archive_kept` does for one. A refused
+// transaction hands every archive back, unwritten, to go on alone. Runs on
+// the blocking pool.
+fn archive_torrents_at_once(
+    writer: &DatabaseWriterExecutor,
+    failures: &watch::Sender<BTreeMap<crate::jobs::ids::JobId, String>>,
+    archives: Vec<TorrentArchive>,
+) -> Vec<TorrentArchive> {
+    // The test seam refuses archives one at a time: with any refusal
+    // waiting, each goes on alone to meet it in its turn.
+    #[cfg(test)]
+    if !ARCHIVE_REFUSED.lock().unwrap().is_empty() {
+        return archives;
+    }
+    let observed_generation = writer.job_history_cache_generation();
+    let rows = archives
+        .iter()
+        .map(|archive| {
+            (
+                (*archive.history).clone(),
+                archive.retires,
+                Arc::clone(&archive.files),
+            )
+        })
+        .collect();
+    if let Err(error) = writer.write_torrent_histories(rows) {
+        tracing::debug!(
+            torrents = archives.len(),
+            error = %error,
+            "a batch's torrent history rows did not write at once; each goes on its own"
+        );
+        return archives;
+    }
+    failures.send_modify(|failures| {
+        for archive in &archives {
+            failures.remove(&archive.job_id);
+        }
+    });
+    for archive in archives {
+        writer.cache_job_history_at(*archive.history, observed_generation);
+        #[cfg(test)]
+        ARCHIVES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+        let _ = archive.committed.send(());
+    }
+    Vec::new()
 }
 
 // Archive one job, and say it committed through its `committed` sender.
@@ -1542,6 +1670,7 @@ impl DbWriteCommand {
         match self {
             Self::ArchiveJob { .. } => "archive_job",
             Self::ArchiveTorrent { .. } => "archive_torrent",
+            Self::ArchiveTorrents { .. } => "archive_torrents",
             Self::ArchiveJobs { .. } => "archive_jobs",
             Self::InsertJobEvents { .. } => "insert_job_events",
             Self::Write { label, .. } => label,
@@ -1618,6 +1747,9 @@ pub struct Database {
     // How many times the datastore was taken for a statement, read or write.
     #[cfg(any(test, feature = "test-support"))]
     datastore_takes: Arc<AtomicUsize>,
+    // How many transactions wrote torrents' jobs' history rows.
+    #[cfg(any(test, feature = "test-support"))]
+    torrent_history_writes: Arc<AtomicUsize>,
     pub(crate) rss_schedule_cache: Arc<crate::rss::ScheduleCache>,
     pub(crate) script_runtime: Arc<crate::post_processing::events::ScriptRuntime>,
     target: DatabaseTarget,
@@ -1712,6 +1844,8 @@ impl Database {
             proxy_route_reads: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             datastore_takes: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            torrent_history_writes: Arc::default(),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             target,
             sql_services,
@@ -1754,6 +1888,8 @@ impl Database {
             proxy_route_reads: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             datastore_takes: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            torrent_history_writes: Arc::default(),
             sql_services,
             sql_worker,
             writer_tx,
@@ -1788,6 +1924,13 @@ impl Database {
     #[cfg(any(test, feature = "test-support"))]
     pub fn datastore_takes(&self) -> usize {
         self.datastore_takes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many transactions wrote torrents' jobs' history rows.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn torrent_history_writes(&self) -> usize {
+        self.torrent_history_writes
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -2007,6 +2150,8 @@ impl Database {
             proxy_route_reads: self.proxy_route_reads.clone(),
             #[cfg(any(test, feature = "test-support"))]
             datastore_takes: self.datastore_takes.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            torrent_history_writes: self.torrent_history_writes.clone(),
             sql_services: self.sql_services.clone(),
             sql_worker: self.sql_worker.clone(),
             writer_tx: detached_tx,
@@ -2127,6 +2272,37 @@ impl Database {
             "archive",
         )?;
         Ok((written, held))
+    }
+
+    // `queue_torrent_history` of each of `rows`, of distinct jobs, as one
+    // ordered write and, while the database takes them, one transaction:
+    // each row's receivers fire as that one's do.
+    pub(crate) fn queue_torrent_histories(
+        &self,
+        rows: Vec<(
+            crate::jobs::ids::JobId,
+            crate::history::JobHistoryRow,
+            bool,
+            Vec<crate::torrents::persistence::HistoryFile>,
+        )>,
+    ) -> Result<Vec<HistoryWaits>, StateError> {
+        let mut archives = Vec::with_capacity(rows.len());
+        let mut waits = Vec::with_capacity(rows.len());
+        for (job_id, history, retires, files) in rows {
+            let (committed, written) = oneshot::channel();
+            let (kept, held) = oneshot::channel();
+            archives.push(TorrentArchive {
+                job_id,
+                history: Box::new(history),
+                retires,
+                files: files.into(),
+                committed,
+                kept,
+            });
+            waits.push((written, held));
+        }
+        self.try_send_with_retry(DbWriteCommand::ArchiveTorrents { archives }, "archive")?;
+        Ok(waits)
     }
 
     // Name the one listener the writer tells of the archives it keeps. It is

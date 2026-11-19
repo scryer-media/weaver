@@ -654,11 +654,13 @@ impl TorrentService {
                 .unwrap_or_default(),
         };
         // Each shows its end, and gives up its slot and rank, by the one
-        // publish and the one pass after the last.
+        // publish and the one pass after the last. Their history rows are
+        // one write once the last is out.
         let any = !begun.is_empty();
+        let mut retired = Vec::with_capacity(begun.len());
         for (job_id, delete_files) in begun {
-            let removed = self
-                .remove_marked(
+            let taken = self
+                .take_out(
                     job_id,
                     delete_files,
                     Ending::Asked,
@@ -666,8 +668,17 @@ impl TorrentService {
                     made.remove(&job_id),
                 )
                 .await;
-            outcome.insert(job_id, removed);
+            match taken {
+                Ok(one) => {
+                    retired.push(one);
+                    outcome.insert(job_id, Ok(()));
+                }
+                Err(error) => {
+                    outcome.insert(job_id, Err(error));
+                }
+            }
         }
+        self.to_history(retired).await;
         if any {
             self.inner.signal.want_pass();
             self.publish().await;

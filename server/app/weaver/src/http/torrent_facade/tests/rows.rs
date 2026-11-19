@@ -1053,9 +1053,14 @@ async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
         ("delete", format!("hashes={hashes}&deleteFiles=false")),
     ] {
         let (views, takes) = (many.views_built(), rig.db.datastore_takes());
+        let (writes, alone_writes) = (
+            rig.db.torrent_history_writes(),
+            alone_db.torrent_history_writes(),
+        );
         let reply = rig.post(&format!("/api/v2/torrents/{action}"), &form).await;
         let built = many.views_built() - views;
         let took = rig.db.datastore_takes() - takes;
+        let wrote = rig.db.torrent_history_writes() - writes;
         // The same request, one torrent at a time, in the request's order,
         // answered by the first that failed.
         let mut answer = (StatusCode::OK, String::new());
@@ -1113,6 +1118,14 @@ async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
             16
         };
         assert!(took <= bound, "{action}: {took} takes");
+        // The removals' history rows in one transaction, where one at a
+        // time wrote one a torrent.
+        let alone_wrote = alone_db.torrent_history_writes() - alone_writes;
+        if action == "delete" {
+            assert_eq!((wrote, alone_wrote), (1, STORED as usize), "{action}");
+        } else {
+            assert_eq!((wrote, alone_wrote), (0, 0), "{action}");
+        }
         assert_eq!(
             rig.db.list_torrents().unwrap(),
             alone_db.list_torrents().unwrap(),
