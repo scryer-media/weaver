@@ -327,6 +327,13 @@ pub enum Emit {
         member: MemberId,
         crc32: u32,
     },
+    // "Member M ends at `length`, short of the length I announced it with:
+    // its checksum proved its bytes whole there." Said just before its
+    // close, which takes it as the member's length.
+    Ends {
+        member: MemberId,
+        length: u64,
+    },
     // "Member M is complete."
     MemberClosed(MemberId),
     // "What I said about member M was built on bytes that were wrong; forget
