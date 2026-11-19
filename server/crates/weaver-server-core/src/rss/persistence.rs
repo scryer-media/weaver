@@ -415,12 +415,8 @@ impl Database {
                     .await?;
                     crate::post_processing::instances::set_feed_scripts_tx(tx, feed_id, &scripts)
                         .await?;
-                    crate::proxies::persistence::write_routing(
-                        tx,
-                        consumer,
-                        routing.as_ref(),
-                    )
-                    .await?;
+                    crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
+                        .await?;
                     Ok(())
                 })
             })

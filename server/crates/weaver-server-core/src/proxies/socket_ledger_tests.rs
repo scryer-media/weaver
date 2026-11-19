@@ -448,10 +448,7 @@ fn usenet_over_a_tunnel_is_held_to_what_fits_and_warned_with_its_totals() {
     assert!(over.over_budget());
     assert_eq!(over.nntp, 450);
     assert_eq!(over.nntp_held(), 449);
-    assert_eq!(
-        over.kept(),
-        overhead_bytes(1420) + 12 * stream_bytes(None)
-    );
+    assert_eq!(over.kept(), overhead_bytes(1420) + 12 * stream_bytes(None));
     assert_eq!(
         over.over_budget_warning(),
         "Usenet servers ask 450 connections of WireGuard proxy 3 on egress 0, 480 MiB, and the tunnel keeps 37 MiB for itself, over the 516 MiB it holds; usenet is held to 449."
@@ -1398,7 +1395,11 @@ fn every_save_past_a_tunnels_fit_succeeds() {
     assert_eq!(servers.len(), 2);
     assert!(servers.iter().all(|server| server.active));
     assert_eq!(
-        servers.iter().find(|server| server.id == 1).unwrap().connections,
+        servers
+            .iter()
+            .find(|server| server.id == 1)
+            .unwrap()
+            .connections,
         1001
     );
 }
