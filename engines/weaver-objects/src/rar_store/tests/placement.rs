@@ -1396,7 +1396,10 @@ fn a_long_nameless_compressed_set_walks_its_volumes_a_bounded_number_of_times() 
             .iter()
             .enumerate()
             .map(|(volume, bytes)| {
-                run.announce(&format!("{:032x}", 0x5eed_0000 + volume as u64), bytes.len())
+                run.announce(
+                    &format!("{:032x}", 0x5eed_0000 + volume as u64),
+                    bytes.len(),
+                )
             })
             .collect();
         crate::engine::counts::take();
