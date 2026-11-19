@@ -239,7 +239,9 @@ impl TorrentService {
                 }
             }
         }
-        self.save_checkpoints(self.inner.signal.take_due()).await;
+        let due = self.inner.signal.take_due();
+        self.save_checkpoints(due.jobs().clone()).await;
+        due.queued();
         // A pass can move any torrent, so every one is picked and shown
         // again; otherwise only the torrents that spoke changed, and only
         // they are (libtorrent posts a state update for the torrents that

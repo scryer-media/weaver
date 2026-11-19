@@ -526,7 +526,7 @@ impl TorrentService {
         let unsaved = self.inner.signal.take_unsaved();
         let cx = Context {
             downloads_only: self.downloads_only(&settings),
-            unsaved: &unsaved,
+            unsaved: unsaved.jobs(),
             ..Self::context(&settings, &rules, &holds, now)
         };
         let mut gathered = Gathered::default();
@@ -550,6 +550,8 @@ impl TorrentService {
                     .await;
             }
         }
+        // Their checkpoints were queued with the walk's.
+        unsaved.queued();
         let removals = std::mem::take(&mut gathered.removals);
         #[cfg(test)]
         let (mut walks, writes) = (gathered.walks, gathered.writes);

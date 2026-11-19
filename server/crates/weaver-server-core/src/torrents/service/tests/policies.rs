@@ -1283,3 +1283,73 @@ async fn a_place_stored_by_a_reopen_that_cannot_be_stored_back_is_not_handed_out
     drop(live);
     rig.service.stop().await;
 }
+
+// A checkpoint taken off the unsaved for a write that never comes, as when a
+// stop ends the task that took it part way, stays owed: the stop writes it,
+// pieces and file times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_its_taker_dropped_before_writing_is_written_at_stop() {
+    use std::future::Future;
+    use std::sync::atomic::Ordering::SeqCst;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    rig.service.open().await.unwrap();
+    let bytes: Vec<u8> = (0..4096u32).map(|at| (at * 7 % 251) as u8).collect();
+    let meta = metainfo(
+        "two",
+        &[("two/a.bin", &bytes[..2048]), ("two/b.bin", &bytes[2048..])],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(meta))
+        })
+        .await
+        .unwrap();
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    for piece in [0u32, 1] {
+        let at = piece as usize * 1024;
+        Pieces::verified(
+            &*store,
+            piece,
+            &bytes::Bytes::copy_from_slice(&bytes[at..at + 1024]),
+        )
+        .unwrap();
+    }
+    // The settles the pieces asked for are over: none is under way, and
+    // none is asked for.
+    let signal = &rig.service.inner.signal;
+    let mut settles = rig.service.inner.settled.subscribe();
+    signal.look(job_id);
+    settles
+        .wait_for(|_| locked(&signal.dirty).is_empty() && !rig.service.inner.settling.load(SeqCst))
+        .await
+        .unwrap();
+    assert_eq!(
+        kept_pieces(&rig.db, job_id),
+        0,
+        "two pieces wait for no checkpoint"
+    );
+    {
+        // The settle takes the checkpoint as due, and waits on `live` to
+        // write it; it is dropped there, as an aborted task is.
+        let live = rig.service.inner.live.lock().await;
+        *locked(&signal.unsaved).entry(job_id).or_default() += CHECKPOINT_PIECES;
+        let mut settle = Box::pin(rig.service.settle());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(settle.as_mut().poll(&mut cx).is_pending());
+        drop(settle);
+        drop(live);
+    }
+    rig.service.stop().await;
+    assert_eq!(kept_pieces(&rig.db, job_id), 2);
+    assert!(
+        rig.db.torrent_file_stamps(job_id).unwrap().contains_key(&0),
+        "the first file's time went with its pieces"
+    );
+}

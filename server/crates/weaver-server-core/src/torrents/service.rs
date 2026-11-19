@@ -720,10 +720,11 @@ impl Signal {
         locked(&self.whole).remove(&job_id).unwrap_or_default()
     }
 
-    fn take_unsaved(&self) -> BTreeSet<JobId> {
-        std::mem::take(&mut *locked(&self.unsaved))
+    fn take_unsaved(&self) -> Owed<'_> {
+        let jobs = std::mem::take(&mut *locked(&self.unsaved))
             .into_keys()
-            .collect()
+            .collect();
+        Owed { signal: self, jobs }
     }
 
     fn take_unsaved_one(&self, job_id: JobId) -> bool {
@@ -731,7 +732,7 @@ impl Signal {
     }
 
     // The jobs whose checkpoint is [`CHECKPOINT_PIECES`] pieces behind.
-    fn take_due(&self) -> BTreeSet<JobId> {
+    fn take_due(&self) -> Owed<'_> {
         let mut unsaved = locked(&self.unsaved);
         let due: BTreeSet<JobId> = unsaved
             .iter()
@@ -739,7 +740,42 @@ impl Signal {
             .map(|(job_id, _)| *job_id)
             .collect();
         unsaved.retain(|job_id, _| !due.contains(job_id));
-        due
+        Owed {
+            signal: self,
+            jobs: due,
+        }
+    }
+}
+
+// Checkpoints taken off the unsaved, owed until [`Owed::queued`]: dropped
+// before, as a task a stop aborts drops them part way, they are due
+// again, so the next settle or the stop's own checkpoint writes them. One queued twice writes
+// nothing the second time.
+pub(super) struct Owed<'a> {
+    signal: &'a Signal,
+    jobs: BTreeSet<JobId>,
+}
+
+impl Owed<'_> {
+    pub(super) fn jobs(&self) -> &BTreeSet<JobId> {
+        &self.jobs
+    }
+
+    // Every checkpoint taken is queued.
+    pub(super) fn queued(mut self) {
+        self.jobs.clear();
+    }
+}
+
+impl Drop for Owed<'_> {
+    fn drop(&mut self) {
+        if self.jobs.is_empty() {
+            return;
+        }
+        let mut unsaved = locked(&self.signal.unsaved);
+        for &job_id in &self.jobs {
+            *unsaved.entry(job_id).or_default() += CHECKPOINT_PIECES;
+        }
     }
 }
 
@@ -1205,8 +1241,9 @@ impl TorrentService {
         if let Some(hearing) = locked(&self.inner.hearing).take() {
             hearing.abort();
         }
-        self.save_checkpoints(self.inner.signal.take_unsaved())
-            .await;
+        let unsaved = self.inner.signal.take_unsaved();
+        self.save_checkpoints(unsaved.jobs().clone()).await;
+        unsaved.queued();
         // libtorrent `torrent::abort` waits out the disk jobs outstanding:
         // every save queued before here, a stopped task's among them, has
         // landed when stop returns.

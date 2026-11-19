@@ -44,8 +44,9 @@ impl TorrentService {
         self.follow_routes().await;
         let now = self.inner.clock.unix_ms();
         self.old_read(now, false).await;
-        self.save_checkpoints(self.inner.signal.take_unsaved())
-            .await;
+        let unsaved = self.inner.signal.take_unsaved();
+        self.save_checkpoints(unsaved.jobs().clone()).await;
+        unsaved.queued();
         self.old_apply_goals(now).await;
         self.old_apply_queue().await;
         self.old_pick(None).await;
