@@ -109,6 +109,7 @@ mod lost_fronts;
 mod lost_index;
 mod misstated_sizes;
 mod nameless_recovery;
+mod nameless_reversed;
 mod nested_engine_fault;
 mod nested_rar4;
 mod nesting;
