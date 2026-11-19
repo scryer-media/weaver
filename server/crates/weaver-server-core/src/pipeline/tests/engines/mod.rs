@@ -136,6 +136,7 @@ mod recovery_geometry;
 mod recovery_geometry_wire;
 mod recovery_restart_wire;
 mod refused_then_repaired;
+mod release_layers;
 mod remaining_par2;
 mod remaining_stalls;
 mod renamed_engine;

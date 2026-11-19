@@ -291,6 +291,16 @@ impl GraphJob {
         if self.quieting.is_some() || !self.quiet() {
             return Ok(false);
         }
+        // Nothing more comes into any namespace: the containers below the
+        // root no name opened learn whether their folders make them layers,
+        // before any object hears quiet, since what opens may hold more.
+        if self.tree.layers_pending() {
+            let mut out = Vec::new();
+            self.writer
+                .decide_layers(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
+            self.heard(out)?;
+            return Ok(true);
+        }
         // The tree owns the order: deepest first, nodes that may still
         // change the namespace above them first, the rest on a pass that
         // changed nothing more.

@@ -614,6 +614,22 @@ impl NamespaceWriter {
         self.apply_all(tree, builder, segments, effects, out)
     }
 
+    // The job went quiet: the containers below the root that waited for it
+    // are told whether they are layers of the release (`Tree::decide_layers`),
+    // and what that binds is handed what its members received, as any bind
+    // is.
+    pub(crate) fn decide_layers(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let mut effects = Vec::new();
+        tree.decide_layers(&mut self.placing(builder), &mut effects);
+        self.apply_all(tree, builder, segments, effects, out)
+    }
+
     // The job's content policy when it leaves files with an unwanted
     // extension out of the delivery (`Caps::removes`).
     pub(crate) fn removes(&self) -> Option<&crate::post_processing::model::PostProcessingSettings> {

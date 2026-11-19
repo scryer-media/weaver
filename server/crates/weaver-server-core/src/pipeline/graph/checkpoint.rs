@@ -2203,7 +2203,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-pub(crate) const REASONS: [Why; 17] = [
+pub(crate) const REASONS: [Why; 18] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -2227,6 +2227,7 @@ pub(crate) const REASONS: [Why; 17] = [
         needed: 0,
         memory: 0,
     },
+    Why::Packed,
 ];
 
 pub(crate) fn why_name(why: Why) -> &'static str {
@@ -2248,6 +2249,7 @@ pub(crate) fn why_name(why: Why) -> &'static str {
         Why::Scattered => "scattered",
         Why::TooLarge { .. } => "too_large",
         Why::OverMachine { .. } => "over_machine",
+        Why::Packed => "packed",
     }
 }
 

@@ -79,6 +79,7 @@ enum WhyMirror {
         needed: u64,
         memory: u64,
     },
+    Packed,
 }
 through!(Why, WhyMirror);
 

@@ -29,6 +29,7 @@ use crate::sniff::{Sniff, VERDICT_BYTES, signed};
 use crate::volume::{ByteRange, VolumeIndex};
 
 mod bound_kinds;
+mod layers;
 mod lent;
 mod lift;
 mod nodes;
@@ -613,6 +614,12 @@ pub struct Tree {
     // order, as those bytes go on (`read_on`). Never recorded: a restart
     // offers the bytes past the hole again.
     reading_on: BTreeMap<(NodeId, MemberId), ReadingOn>,
+    // Containers below the root no name opens, waiting for the job's quiet
+    // to say whether their folder makes them a layer (`layers`), and the
+    // folders of each namespace told then that hold a file of their own.
+    // Never recorded: a restart notes them again, and decides the same.
+    unlayered: BTreeSet<(NodeId, MemberId)>,
+    layers: BTreeMap<NodeId, layers::Packed>,
 }
 
 // The clean bytes a delivery is handing a member, at their offset in it: a
@@ -677,6 +684,8 @@ impl Tree {
             lifted: BTreeMap::new(),
             lifted_away: BTreeMap::new(),
             reading_on: BTreeMap::new(),
+            unlayered: BTreeSet::new(),
+            layers: BTreeMap::new(),
         }
     }
 
@@ -2575,7 +2584,7 @@ impl Tree {
                 members.push((
                     self.position(*node, record.id),
                     (*node, record.id),
-                    record.name.clone(),
+                    self.landing(*node, record.id).unwrap_or_default(),
                     record.output_name.clone(),
                 ));
             }
@@ -2640,11 +2649,7 @@ impl Tree {
     // Give the member the output name the ledger allocates for the name it
     // wants, and move whichever members that displaced.
     fn place(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
-        let Some(wanted) = self
-            .namespace(node)
-            .and_then(|namespace| namespace.get(member))
-            .map(|record| record.name.clone())
-        else {
+        let Some(wanted) = self.landing(node, member) else {
             return;
         };
         let position = self.position(node, member);
@@ -2716,6 +2721,7 @@ impl Tree {
     // moved into its namespace is homed where it was posted again.
     fn remove_node(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
+        self.layers.remove(&node);
         self.held_lost.remove(&node);
         self.held_located.remove(&node);
         self.forget_lifts(node);
@@ -3308,6 +3314,9 @@ impl Tree {
         }
         if self.refuted_with_its_set(node, member, kind, (name, prefix, length), builder) {
             self.claim_as_said(node, member, builder, effects);
+            return false;
+        }
+        if !self.opens_as_layer(node, member, (kind, name), effects) {
             return false;
         }
         let volumes = |object: &mut dyn Object, given: &Given| {
