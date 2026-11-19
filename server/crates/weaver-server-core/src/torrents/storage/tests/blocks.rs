@@ -486,6 +486,8 @@ fn a_spill_whose_torrent_is_removed_part_way_writes_nothing_after() {
     std::fs::remove_file(shim.dir.path().join("a.bin")).unwrap();
     nothing_under(&shim);
 }
+
+// A piece given back whole stays in memory, checked from there as before.
 #[test]
 fn a_piece_given_back_whole_stays_in_memory() {
     let budget = accountant(PIECE_AND_BLOCK);
