@@ -1400,9 +1400,13 @@ fn archive_torrents_at_once(
     archives: Vec<TorrentArchive>,
 ) -> Vec<TorrentArchive> {
     // The test seam refuses archives one at a time: with any refusal
-    // waiting, each goes on alone to meet it in its turn.
+    // waiting, each goes on alone to meet it in its turn, unless the
+    // batch's own transaction is to be refused first.
     #[cfg(test)]
-    if !ARCHIVE_REFUSED.lock().unwrap().is_empty() {
+    if !ARCHIVE_REFUSED.lock().unwrap().is_empty()
+        && !crate::torrents::persistence::HISTORIES_REFUSED
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
         return archives;
     }
     let observed_generation = writer.job_history_cache_generation();

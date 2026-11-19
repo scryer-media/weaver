@@ -256,6 +256,12 @@ impl crate::persistence::DatabaseWriterExecutor {
                         let id = stored(entry.job_id)?;
                         torrent_history_tx(tx, id, entry, *retires, files).await?;
                     }
+                    // The seam refuses the whole transaction once its rows
+                    // are in it, so none of them may be left.
+                    #[cfg(test)]
+                    if HISTORIES_REFUSED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return Err(StateError::OutOfSpace("database or disk is full".into()));
+                    }
                     Ok(())
                 })
             })
@@ -478,6 +484,12 @@ impl Database {
 #[cfg(test)]
 pub(crate) static RETIRING_REFUSED: std::sync::Mutex<Vec<JobId>> =
     std::sync::Mutex::new(Vec::new());
+
+// Test seam: the next batch of torrent history rows is refused for want of
+// room, as one transaction, after its rows are written in it.
+#[cfg(test)]
+pub(crate) static HISTORIES_REFUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: a removal's mark is refused, 1 for want of room, 2 otherwise.
 #[cfg(test)]

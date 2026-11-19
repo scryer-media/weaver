@@ -1012,6 +1012,10 @@ async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
     const STORED: u64 = 300;
     let (dir, db, many) = started_with(STORED).await;
     let (_alone_dir, alone_db, alone) = started_with(STORED).await;
+    // The views counted are the requests' own: a tick, which runs every ten
+    // seconds of real time and publishes every torrent, does not run
+    // between them.
+    let held = (many.hold_tick().await, alone.hold_tick().await);
     let rig = rig_around(
         dir,
         db,
@@ -1111,18 +1115,21 @@ async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
         // torrent its history row reads, where one at a time built a
         // publish of every torrent for each.
         assert!(built <= 3 * STORED as usize, "{action}: {built} views");
-        // A few statements, and one history row a removal.
+        // A few statements, one history row a removal, and a few for each
+        // chunk of removals whose history rows are written together.
+        let chunks =
+            (STORED as usize).div_ceil(weaver_server_core::torrents::service::HISTORY_CHUNK);
         let bound = if action == "delete" {
-            16 + STORED as usize
+            16 + STORED as usize + 8 * chunks
         } else {
             16
         };
         assert!(took <= bound, "{action}: {took} takes");
-        // The removals' history rows in one transaction, where one at a
-        // time wrote one a torrent.
+        // The removals' history rows in one transaction a chunk, where one
+        // at a time wrote one a torrent.
         let alone_wrote = alone_db.torrent_history_writes() - alone_writes;
         if action == "delete" {
-            assert_eq!((wrote, alone_wrote), (1, STORED as usize), "{action}");
+            assert_eq!((wrote, alone_wrote), (chunks, STORED as usize), "{action}");
         } else {
             assert_eq!((wrote, alone_wrote), (0, 0), "{action}");
         }
@@ -1147,6 +1154,7 @@ async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
         );
     }
     assert_eq!(many.snapshot().len(), 0);
+    drop(held);
     many.stop().await;
     alone.stop().await;
 }

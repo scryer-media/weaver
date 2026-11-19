@@ -1874,7 +1874,20 @@ async fn removal_left(
 // outcome, where one at a time wrote one transaction a torrent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_of_many_torrents_writes_their_history_rows_at_once() {
-    const ADDED: u64 = 24;
+    removed_as_one_at_a_time(24).await;
+}
+
+// One more than a chunk of removals writes their history rows in two
+// transactions, the chunk's and the last one's, and leaves what the same
+// removals one at a time leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_of_one_more_than_a_chunk_writes_two_transactions() {
+    removed_as_one_at_a_time(super::super::batch::HISTORY_CHUNK as u64 + 1).await;
+}
+
+// `added` torrents removed by one batch and, in a twin rig, one at a time:
+// one history transaction a chunk against one a torrent, and the same left.
+async fn removed_as_one_at_a_time(added: u64) {
     let add = async |rig: &Rig| {
         rig.db.enable_queue_scripts_for_test(rig.dir.path());
         let queue = queue();
@@ -1884,12 +1897,12 @@ async fn a_removal_of_many_torrents_writes_their_history_rows_at_once() {
         // Every other one complete, the rest short of any piece: the
         // complete ones added first, so none waits on a short one's slot.
         let mut complete = Vec::new();
-        for n in (2..=ADDED).step_by(2) {
+        for n in (2..=added).step_by(2) {
             let (job_id, _) = with_every_piece_of(rig, &format!("t{n}"), n as u8).await;
             complete.push(job_id);
         }
         let mut short = Vec::new();
-        for n in (1..=ADDED).step_by(2) {
+        for n in (1..=added).step_by(2) {
             let job_id = rig
                 .service
                 .add_opened(request(AddSource::Metainfo(plain(
@@ -1901,13 +1914,14 @@ async fn a_removal_of_many_torrents_writes_their_history_rows_at_once() {
             short.push(job_id);
         }
         // Removed in turn, short and complete, a third with their files.
+        let mut complete = complete.into_iter();
         let removals: Vec<(JobId, bool)> = short
             .into_iter()
-            .zip(complete)
-            .flat_map(|(short, complete)| [short, complete])
+            .flat_map(|short| std::iter::once(short).chain(complete.next()))
             .zip(1..)
             .map(|(job_id, n)| (job_id, n % 3 == 0))
             .collect();
+        assert_eq!(removals.len(), added as usize);
         (removals, state)
     };
     let (many, alone) = (rig(set_clock()), rig(set_clock()));
@@ -1926,8 +1940,12 @@ async fn a_removal_of_many_torrents_writes_their_history_rows_at_once() {
         alone_outcome.insert(job_id, removed);
     }
     let alone_writes = alone.db.torrent_history_writes() - writes;
-    assert_eq!(many_writes, 1, "one transaction for the batch");
-    assert_eq!(alone_writes, ADDED as usize, "one a torrent, one at a time");
+    assert_eq!(
+        many_writes,
+        (added as usize).div_ceil(super::super::batch::HISTORY_CHUNK),
+        "one transaction a chunk"
+    );
+    assert_eq!(alone_writes, added as usize, "one a torrent, one at a time");
     assert!(outcome.values().all(Result::is_ok), "{outcome:?}");
     assert_eq!(format!("{outcome:?}"), format!("{alone_outcome:?}"));
     let left = removal_left(&many, &many_state, &ids).await;
@@ -1938,7 +1956,7 @@ async fn a_removal_of_many_torrents_writes_their_history_rows_at_once() {
         .iter()
         .map(|job_id| many.db.get_job_history(job_id.0).unwrap().unwrap().status)
         .collect();
-    let expected: Vec<&str> = (1..=ADDED)
+    let expected: Vec<&str> = (1..=added)
         .map(|n| if n % 2 == 0 { "complete" } else { "cancelled" })
         .collect();
     assert!(removals.iter().any(|(_, files)| *files));
@@ -1951,7 +1969,9 @@ async fn a_removal_of_many_torrents_writes_their_history_rows_at_once() {
 // A removal of many torrents while the database's disk has no room for one
 // of their history rows: that one is kept by the owner that keeps a single
 // removal's row, shown waiting for disk space, and written once a pass finds
-// room; the others are written with the batch.
+// room. The refusal the test sets makes the batch step aside from its one
+// transaction, so the others are written one at a time, as a single
+// removal's is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_batch_history_row_the_disk_has_no_room_for_waits_and_is_written() {
     use crate::persistence::ArchiveNews;
@@ -2025,4 +2045,122 @@ async fn a_batch_history_row_the_disk_has_no_room_for_waits_and_is_written() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].download_wait_reason, None);
     rig.service.stop().await;
+}
+
+// A removal of many torrents whose one history transaction the disk has no
+// room for: nothing of it is left, and each row goes on its own, as a single
+// removal's does. The one the disk then has no room for alone is kept and
+// written once a pass finds room; the others are written once each. Every
+// removal ends, and leaves what the same removals one at a time leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_history_transaction_refused_for_room_goes_on_row_by_row() {
+    use crate::persistence::ArchiveNews;
+    use crate::persistence::connection::{ARCHIVE_REFUSED, ARCHIVES_WRITTEN};
+    use crate::torrents::persistence::HISTORIES_REFUSED;
+    const ADDED: u8 = 4;
+    let full = || crate::StateError::OutOfSpace("database or disk is full".into());
+    let written = || ARCHIVES_WRITTEN.load(std::sync::atomic::Ordering::SeqCst);
+    let add = async |rig: &Rig| {
+        let queue = queue();
+        let state = queue.state().clone();
+        rig.service.publish_to(queue);
+        rig.service.open().await.unwrap();
+        let (news, heard) = tokio::sync::mpsc::unbounded_channel();
+        rig.db.hear_archive_news(move |said| {
+            let _ = news.send(said);
+        });
+        let mut ids = Vec::new();
+        for n in 1..=ADDED {
+            let job_id = rig
+                .service
+                .add_opened(request(AddSource::Metainfo(plain(&format!("t{n}"), n))))
+                .await
+                .unwrap();
+            ids.push(job_id);
+        }
+        (ids, state, heard)
+    };
+    let (many, alone) = (rig(set_clock()), rig(set_clock()));
+    let (ids, many_state, mut many_heard) = add(&many).await;
+    let (alone_ids, alone_state, mut alone_heard) = add(&alone).await;
+    assert_eq!(ids, alone_ids);
+    let first = ids[0];
+    let removals: Vec<(JobId, bool)> = ids.iter().map(|job_id| (*job_id, false)).collect();
+
+    let mut retired = many.service.retired();
+    let (writes, archived) = (many.db.torrent_history_writes(), written());
+    HISTORIES_REFUSED.store(true, std::sync::atomic::Ordering::SeqCst);
+    ARCHIVE_REFUSED.lock().unwrap().push_back(full());
+    let outcome = many.service.remove_many(&removals, true).await;
+    assert!(outcome.values().all(Result::is_ok), "{outcome:?}");
+    assert_eq!(many_heard.recv().await, Some(ArchiveNews::Kept(first)));
+    // The transaction was met and refused, and each row then went alone.
+    assert!(!HISTORIES_REFUSED.load(std::sync::atomic::Ordering::SeqCst));
+    retired
+        .wait_for(|retired| *retired >= u64::from(ADDED) - 1)
+        .await
+        .unwrap();
+    assert_eq!(many.db.kept_archive_jobs(), [first]);
+    assert!(many.db.get_job_history(first.0).unwrap().is_none());
+    assert!(
+        many.db.get_torrent(first).unwrap().is_some(),
+        "kept with it"
+    );
+    assert_eq!(
+        many.db.torrent_history_writes() - writes,
+        ADDED as usize - 1
+    );
+    assert_eq!(written() - archived, u64::from(ADDED) - 1);
+    many.db.retry_kept_archives(0);
+    assert_eq!(
+        many_heard.recv().await,
+        Some(ArchiveNews::LetGo {
+            job_id: first,
+            written: true
+        })
+    );
+    retired
+        .wait_for(|retired| *retired >= u64::from(ADDED))
+        .await
+        .unwrap();
+    // One write a row, none twice.
+    assert_eq!(many.db.torrent_history_writes() - writes, ADDED as usize);
+    assert_eq!(written() - archived, u64::from(ADDED));
+
+    // The same removals one at a time, the first's row refused alone.
+    let mut alone_retired = alone.service.retired();
+    ARCHIVE_REFUSED.lock().unwrap().push_back(full());
+    let mut alone_outcome = std::collections::BTreeMap::new();
+    for &(job_id, delete_files) in &removals {
+        let removed = alone.service.remove(job_id, delete_files, true).await;
+        alone_outcome.insert(job_id, removed);
+    }
+    assert_eq!(alone_heard.recv().await, Some(ArchiveNews::Kept(first)));
+    alone.db.retry_kept_archives(0);
+    assert_eq!(
+        alone_heard.recv().await,
+        Some(ArchiveNews::LetGo {
+            job_id: first,
+            written: true
+        })
+    );
+    alone_retired
+        .wait_for(|retired| *retired >= u64::from(ADDED))
+        .await
+        .unwrap();
+    assert_eq!(format!("{outcome:?}"), format!("{alone_outcome:?}"));
+    assert_eq!(
+        removal_left(&many, &many_state, &ids).await,
+        removal_left(&alone, &alone_state, &ids).await
+    );
+    for job_id in &ids {
+        assert_eq!(
+            many.db.get_job_history(job_id.0).unwrap().unwrap().status,
+            "cancelled"
+        );
+    }
+    assert!(many.db.list_torrents().unwrap().is_empty());
+    assert!(many.db.kept_archive_jobs().is_empty());
+    many.service.stop().await;
+    alone.service.stop().await;
 }

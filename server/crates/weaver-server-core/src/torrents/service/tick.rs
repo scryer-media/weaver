@@ -68,6 +68,8 @@ impl TorrentService {
                     _ = interval.tick() => {}
                     () = service.woken(&mut reloads) => {}
                 }
+                #[cfg(any(test, feature = "test-support"))]
+                let _held = service.inner.tick_hold.lock().await;
                 service.tick().await;
             }
         });
