@@ -172,8 +172,20 @@ impl Rig {
     }
 
     // Every piece but `skipped` fetched as the session fetches one too large
-    // to hold: block by block, then verified.
+    // to hold: block by block, then verified, and read back where it
+    // completed.
     fn fetch(&self, store: &Arc<TorrentStore>, skipped: Option<u32>) -> PieceStorage {
+        self.fetch_reading(store, skipped, true)
+    }
+
+    // As `fetch`, each piece taken by the job where it completed when
+    // `taken`, else left waiting for it.
+    fn fetch_reading(
+        &self,
+        store: &Arc<TorrentStore>,
+        skipped: Option<u32>,
+        taken: bool,
+    ) -> PieceStorage {
         let storage = PieceStorage::new(
             Arc::clone(&self.layout),
             Arc::clone(store) as Arc<dyn Pieces>,
@@ -198,8 +210,7 @@ impl Rig {
                 }
             }
             storage.on_piece_completed(index).unwrap();
-            // Read back where it completed, and taken.
-            assert!(!self.tee.wants(piece), "piece {piece} went to the job");
+            assert_eq!(!self.tee.wants(piece), taken, "piece {piece}");
         }
         storage
     }
@@ -281,7 +292,8 @@ fn a_read_back_torrents_shares_are_cut_into_articles_of_one_layout() {
 // The pieces read back through one scratch lease each, which the graph
 // holds until it let go of the last byte of it: the archive unpacks whole,
 // no lease is left, scratch never held more than one piece, and the read-
-// backs took no resident room beside each piece's own block room.
+// backs took no resident room, nor did the pieces, which hold none of their
+// own while they arrive.
 #[tokio::test]
 async fn an_oversized_archive_piece_reads_back_through_scratch_and_unpacks() {
     let mut rig = rig(false);
@@ -293,8 +305,7 @@ async fn an_oversized_archive_piece_reads_back_through_scratch_and_unpacks() {
     assert!((1..=PIECE).contains(&peak), "{peak}");
     assert_eq!(rig.scratch.live(), (0, 0));
     assert_eq!(rig.resident_peak(), 0);
-    assert!(storage.resident_peak() <= BUDGET);
-    assert_eq!(storage.resident_peak(), READ_BACK_BYTES);
+    assert_eq!(storage.resident_peak(), 0);
     assert_eq!(
         rig.holds
             .accountant
@@ -366,10 +377,10 @@ async fn a_restart_reads_a_lacking_piece_back_by_the_same_rule() {
 }
 
 // A read-back the budget has no room for waits for room, not for a
-// restart: with scratch refused and the budget held by a piece in flight,
-// the lacking piece's read-back is refused and waits; the piece's room let
-// go rings it, and it is read back and the archive unpacks, in the same
-// run. The budget is never passed.
+// restart: with scratch refused and the budget held by a block being
+// written, the lacking piece's read-back is refused and waits; the block's
+// room let go rings it, and it is read back and the archive unpacks, in the
+// same run. The budget is never passed.
 #[tokio::test]
 async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
     let mut rig = rig(true);
@@ -388,15 +399,23 @@ async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
         checking: false,
     };
     let again = rig.store(Some(&kept));
-    // A piece in flight holds the room the read-back would need.
+    // A block being written holds the room the read-back would need.
     let storage = PieceStorage::new(
         Arc::clone(&rig.layout),
         Arc::clone(&again) as Arc<dyn Pieces>,
         rig.holds.clone(),
     );
-    let lengths = Lengths::new(rig.layout.total(), PIECE as u32).unwrap();
-    let flying = lengths.try_validate_piece_index(0).unwrap();
-    assert!(storage.reserve_piece(flying, &Arc::default()));
+    let usage = |rig: &Rig| {
+        rig.holds
+            .accountant
+            .namespace_usage(rig.holds.namespace)
+            .resident
+    };
+    let weaver_torrent::storage::BlockRoom::Held(block) =
+        storage.hold_block(BUDGET - usage(&rig), &Arc::default())
+    else {
+        panic!("the block's room was refused");
+    };
     let held = rig
         .holds
         .accountant
@@ -412,8 +431,8 @@ async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
     assert!(rig.tee.wants(lacked));
     assert_eq!(rig.resident_peak(), resident_before);
 
-    // The piece fails its hash: its room goes back, and rings the wait.
-    storage.on_piece_hash_failed(flying).unwrap();
+    // The block is written: its room goes back, and rings the wait.
+    drop(block);
     assert_eq!(rig.unpacked().await, rig.member);
     assert!(!rig.tee.wants(lacked));
     assert!(!rig.tee.waits_for_room());
@@ -426,5 +445,67 @@ async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
             .resident,
         0
     );
+    rig.tee.forget();
+}
+
+// A read-back refused for room while room is held by another job, and the
+// torrent has nothing left in flight to give room back, is woken by that
+// job's room coming back: with scratch refused and another namespace
+// holding the whole budget, every piece is fetched and sealed, and each
+// read-back waits; the other namespace lets its room go, and the archive
+// unpacks in the same run.
+#[tokio::test]
+async fn a_read_back_refused_for_room_another_job_holds_goes_again_once_that_room_returns() {
+    let mut rig = rig(true);
+    let other = HoldsNamespace {
+        scope: 2,
+        node: NodeId::ROOT,
+    };
+    let accountant = Arc::clone(&rig.holds.accountant);
+    assert_eq!(
+        accountant.reserve_resident(other, BUDGET),
+        weaver_graph::holds::Reserve::Granted
+    );
+    let store = rig.store(None);
+    // The last piece sealed too: the torrent has nothing in flight.
+    let storage = rig.fetch_reading(&store, None, false);
+    assert!(rig.tee.waits_for_room());
+    assert_eq!(rig.resident_peak(), 0);
+    assert_eq!(accountant.namespace_usage(rig.holds.namespace).resident, 0);
+
+    accountant.release_resident(other, BUDGET);
+    assert_eq!(rig.unpacked().await, rig.member);
+    assert!(!rig.tee.waits_for_room());
+    assert!(rig.resident_peak() <= BUDGET);
+    assert_eq!(storage.resident_peak(), 0);
+    assert_eq!(accountant.namespace_usage(rig.holds.namespace).resident, 0);
+    rig.tee.forget();
+}
+
+// A piece that lands after its torrent's unpacking was stopped for a
+// removal, as one queued off the writer before the removal may, is taken
+// by no one: the job takes none of its shares, and nothing appears in the
+// job's directory.
+#[tokio::test]
+async fn a_piece_landing_after_its_unpacking_stopped_writes_nothing_in_the_jobs_directory() {
+    let rig = rig(false);
+    let store = rig.store(None);
+    rig.tee.stop().await;
+    let storage = rig.fetch_reading(&store, None, false);
+    drop(storage);
+    let mut left = Vec::new();
+    let mut dirs = vec![rig.tee.work().to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                left.push(path);
+            }
+        }
+    }
+    assert!(left.is_empty(), "{left:?}");
+    assert!(!rig.tee.done());
     rig.tee.forget();
 }

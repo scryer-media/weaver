@@ -61,6 +61,9 @@ impl TorrentStateLive {
 
         let (upload_turns, upload_turns_rx) = unbounded_channel::<PeerHandle>();
 
+        let finished = paused.chunk_tracker.is_finished();
+        let pieces = PieceTracker::new(paused.chunk_tracker);
+        let slots = pieces.slots().clone();
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
             metadata: paused.metadata.clone(),
@@ -75,8 +78,8 @@ impl TorrentStateLive {
             .sharing_session_bans(Arc::clone(&session.bad_data_bans))
             .ordering_connects_by(session.connect_order()),
             _locked: RwLock::new(TorrentStateLocked {
-                finished: paused.chunk_tracker.is_finished(),
-                pieces: Some(PieceTracker::new(paused.chunk_tracker)),
+                finished,
+                pieces: Some(pieces),
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
             }),
@@ -106,9 +109,7 @@ impl TorrentStateLive {
             tasks: TaskTracker::new(),
             session_stats,
             streams: paused.streams,
-            per_piece_locks: (0..lengths.total_pieces())
-                .map(|_| RwLock::new(()))
-                .collect(),
+            slots,
             upload_turns,
             pex: crate::session::speaks_pex(
                 !session.disable_pex,

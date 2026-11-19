@@ -265,7 +265,10 @@ pub struct TorrentStateLive {
     // starts, and is handed the new one when the files move.
     pub(crate) reads: arc_swap::ArcSwap<crate::storage::ReadTurns>,
 
-    per_piece_locks: Vec<RwLock<()>>,
+    // The slots of the pieces in flight, each under its piece's lock: the
+    // piece tracker's, shared, so a block of one is admitted and marked
+    // without the torrent's lock.
+    slots: Arc<crate::piece_tracker::PieceSlots>,
 
     stats: AtomicStats,
     // The run ended and its counts went into what the torrent moved: what a
@@ -541,12 +544,14 @@ impl TorrentStateLive {
         &self,
         reason: &'static str,
     ) -> TimedExistence<RwLockReadGuard<'_, TorrentStateLocked>> {
+        crate::piece_tracker::torrent_lock_taken();
         TimedExistence::new(timeit(reason, || self._locked.read()), reason)
     }
     pub(crate) fn lock_write(
         &self,
         reason: &'static str,
     ) -> TimedExistence<RwLockWriteGuard<'_, TorrentStateLocked>> {
+        crate::piece_tracker::torrent_lock_taken();
         TimedExistence::new(timeit(reason, || self._locked.write()), reason)
     }
 
@@ -911,7 +916,14 @@ pub(crate) struct WriteJob {
     chunk: ChunkInfo,
     // Before `written`: the buffer goes back before the peer is told.
     block: Block,
+    // The room the block holds for its write, given back as the write
+    // returns: a block of a piece written block by block where pieces are
+    // held in memory holds its own (`TorrentStorage::hold_block`).
+    room: Option<crate::storage::HeldRoom>,
     written: Written,
+    // Dropped once the block is written and, when it was its piece's last,
+    // the piece checked, for a connection that waits for that.
+    ended: Option<tokio::sync::oneshot::Sender<()>>,
     _run: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 

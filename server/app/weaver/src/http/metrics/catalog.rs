@@ -784,7 +784,7 @@ metric_families! {
         "Bytes that crossed the session's peer connections since the session opened, by transport, direction and kind: payload is block data, protocol everything else, the bytes of the handshakes included. A connection's bytes are counted once its handshake is done, so those of a connection that never completes it are not here.");
     TORRENT_PEER_REQUEST_EVENTS = ("weaver_torrent_peer_request_events_total", Counter,
         ["route", "event"],
-        "Block requests that were not simply served, since the session opened: ours timed_out (the peer is snubbed) or asked_already (not sent again); the peer's invalid, while_choked or queue_full (dropped).");
+        "Block requests that were not simply served, since the session opened: ours timed_out (the peer is snubbed), asked_already (not sent again) or room_wait (the piece of a block that arrived had no room: the connection gave back its started pieces and stopped reading until room came back); the peer's invalid, while_choked or queue_full (dropped).");
     TORRENT_PEER_BLOCKS_RECEIVED = ("weaver_torrent_peer_blocks_received_total", Counter,
         ["route", "request"],
         "Blocks peers sent since the session opened, by the request they answer: requested, cancelled (it came after we cancelled) or unrequested.");

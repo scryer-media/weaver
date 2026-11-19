@@ -404,6 +404,24 @@ pub trait TorrentStorage: Send + Sync {
         Ok(size)
     }
 
+    /// [`Self::pwrite_all_vectored`] into memory the storage holds, on a
+    /// thread that must not wait on a disk: true once written there; false,
+    /// having written nothing a file holds, when the bytes would go to a
+    /// file, for the caller to write them where it may wait. Default
+    /// implementation writes when [`Self::writes_to_memory`] says so.
+    fn pwrite_held(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<bool> {
+        if !self.writes_to_memory() {
+            return Ok(false);
+        }
+        self.pwrite_all_vectored(file_id, offset, bufs)?;
+        Ok(true)
+    }
+
     /// Remove a file from the storage. If not supported, or it doesn't matter, just return Ok(())
     fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()>;
 
@@ -498,12 +516,53 @@ pub trait TorrentStorage: Send + Sync {
     /// implementation does nothing.
     fn on_piece_hashed(&self, _piece_index: ValidPieceIndex, _bytes: bytes::Bytes) {}
 
-    /// Asked before a queued piece is handed to a peer, or a block of one is written: whether
-    /// the storage has room for it. On false the piece stays queued, the block is discarded,
-    /// and the peer waits on `room`, which the storage rings once it has room again. Default
-    /// implementation always has room.
+    /// Asked when the first block of a piece arrives from the peer that owns it, before the
+    /// block is written, under the torrent's lock: whether the storage has room for the whole
+    /// piece. Must not wait. A storage that holds pieces in memory is asked nothing at the
+    /// grant; one that writes every piece block by block is asked at the grant too. On false
+    /// the connection stops reading and waits on `room`, which the storage rings once it has
+    /// room again; true for a piece that holds its room already. Default implementation
+    /// always has room.
     fn reserve_piece(&self, _piece_index: ValidPieceIndex, _room: &Arc<Notify>) -> bool {
         true
+    }
+
+    /// [`Self::reserve_piece`] for a block of a piece no peer owns, or another peer owns: the
+    /// storage may write such a piece block by block, holding room for one block only.
+    /// Default implementation asks [`Self::reserve_piece`].
+    fn reserve_unowned_piece(&self, piece_index: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        self.reserve_piece(piece_index, room)
+    }
+
+    /// A piece some of whose blocks arrived went back to the queue without its owner: the
+    /// storage may write what it holds of it to its files and give back the room it held for
+    /// the whole piece, taking the rest of it block by block. Must not wait for the disk.
+    /// Default implementation does nothing.
+    fn on_piece_requeued(&self, _piece_index: ValidPieceIndex) {}
+
+    /// The operator paused the torrent: its run has ended, and it keeps the blocks it received.
+    /// The storage writes the pieces it holds in memory unfinished to their files, as it does a
+    /// piece given back, and gives back the room they held; one it held whole for a check
+    /// that will not run is fetched again, and gives back its room too. Not told when the
+    /// torrent is removed or the session stops. Must not wait for the disk (libtorrent
+    /// `torrent::do_pause` flushes the torrent's write cache, `async_stop_torrent`). Default
+    /// implementation does nothing.
+    fn on_paused(&self) {}
+
+    /// Asked before a downloaded piece is checked, on a thread that may wait on a disk:
+    /// whether every block of it the storage took is where the check reads it. An error is a
+    /// write of a block taken earlier that failed, as of a piece given back whose blocks went
+    /// to its files: the piece is then not checked, and goes the way of a piece the storage
+    /// refused. Waits for such writes under way. Default implementation lost none.
+    fn piece_written(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether a block of the piece is copied into memory the storage holds, rather than
+    /// written to a file: asked per block, so a lookup. Default implementation answers
+    /// [`Self::writes_to_memory`].
+    fn writes_piece_to_memory(&self, _piece_index: ValidPieceIndex) -> bool {
+        self.writes_to_memory()
     }
 
     /// The stamp of file `file_id`, or None when the storage keeps no file
@@ -529,6 +588,38 @@ pub trait TorrentStorage: Send + Sync {
     fn hold_whole_piece(&self, _bytes: u64) -> Option<HeldRoom> {
         None
     }
+
+    /// Room for one block of `bytes` of a piece a storage that holds pieces in memory writes
+    /// block by block ([`Self::writes_piece_to_memory`] says no for it), held for that block's
+    /// write alone: the block goes to the disk threads with it, and it goes back as the write
+    /// returns. Such a piece holds no room of its own. Refused when the budget has none: the
+    /// connection then stops reading and waits on `room`, which the storage rings once it has
+    /// room again. Asked on the connection's task; must not wait. Default implementation needs
+    /// no room.
+    fn hold_block(&self, _bytes: u64, _room: &Arc<Notify>) -> BlockRoom {
+        BlockRoom::Free
+    }
+
+    /// Asked by a connection stopped for room each time `room` rings, before it lands its
+    /// block again under the torrent's lock: whether `bytes` of room may be free now. False
+    /// keeps it waiting, and `room` is rung again once room comes back anywhere in the budget,
+    /// so a ring wakes each waiter for one cheap look, not a turn at the lock. A look that
+    /// holds nothing: true may still be refused. Must not wait. Default implementation says
+    /// there may be.
+    fn room_for(&self, _bytes: u64, _room: &Arc<Notify>) -> bool {
+        true
+    }
+}
+
+/// What [`TorrentStorage::hold_block`] has for a block's write.
+#[derive(Debug)]
+pub enum BlockRoom {
+    /// The write needs no room.
+    Free,
+    /// The room, held until this is dropped.
+    Held(HeldRoom),
+    /// No room now: the storage rings once it has some.
+    Refused,
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -560,6 +651,15 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
         bufs: [IoSlice<'_>; 2],
     ) -> anyhow::Result<usize> {
         (**self).pwrite_all_vectored(file_id, offset, bufs)
+    }
+
+    fn pwrite_held(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<bool> {
+        (**self).pwrite_held(file_id, offset, bufs)
     }
 
     fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
@@ -630,6 +730,26 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
         (**self).reserve_piece(piece_id, room)
     }
 
+    fn reserve_unowned_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        (**self).reserve_unowned_piece(piece_id, room)
+    }
+
+    fn on_piece_requeued(&self, piece_id: ValidPieceIndex) {
+        (**self).on_piece_requeued(piece_id)
+    }
+
+    fn on_paused(&self) {
+        (**self).on_paused()
+    }
+
+    fn piece_written(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).piece_written(piece_id)
+    }
+
+    fn writes_piece_to_memory(&self, piece_id: ValidPieceIndex) -> bool {
+        (**self).writes_piece_to_memory(piece_id)
+    }
+
     fn stamp(&self, file_id: usize) -> anyhow::Result<Option<FileStamp>> {
         (**self).stamp(file_id)
     }
@@ -640,6 +760,14 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn hold_whole_piece(&self, bytes: u64) -> Option<HeldRoom> {
         (**self).hold_whole_piece(bytes)
+    }
+
+    fn hold_block(&self, bytes: u64, room: &Arc<Notify>) -> BlockRoom {
+        (**self).hold_block(bytes, room)
+    }
+
+    fn room_for(&self, bytes: u64, room: &Arc<Notify>) -> bool {
+        (**self).room_for(bytes, room)
     }
 }
 

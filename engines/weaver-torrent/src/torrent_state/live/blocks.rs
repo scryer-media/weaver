@@ -15,7 +15,6 @@ use crate::buffers::ByteBuf;
 use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
 use crate::peer_protocol::Piece;
 use anyhow::Context;
-use parking_lot::RwLockReadGuard;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
@@ -27,6 +26,7 @@ use crate::{
         disk::DiskOp,
         swarm::{self, Direction},
     },
+    storage::BlockRoom,
     type_aliases::PeerHandle,
 };
 
@@ -118,7 +118,100 @@ impl PeerHandler {
 
     pub(super) async fn on_received_piece(&self, piece: Piece<ByteBuf<'_>>) -> anyhow::Result<()> {
         let chunk_info = self.received_block(piece.index, piece.begin, piece.len())?;
-        self.land_here(&piece, chunk_info).await
+        if self
+            .state
+            .files
+            .writes_piece_to_memory(chunk_info.piece_index)
+            && self.land_here(&piece, chunk_info).await?
+        {
+            return Ok(());
+        }
+        // Copied into a buffer of its own, for the disk threads to write,
+        // and waited for: a message read in place holds its connection's
+        // read buffer, so the connection reads on once the block is
+        // written and, when it was its piece's last, the piece checked.
+        let (first, second) = piece.data();
+        let mut buf = self.state.shared.spawner.pool().take();
+        let into = buf.as_mut_slice();
+        into[..first.len()].copy_from_slice(first);
+        into[first.len()..piece.len()].copy_from_slice(second);
+        let block = Block::new(piece.index, piece.begin, piece.len(), buf);
+        self.write_aside(block, chunk_info, true).await
+    }
+
+    // The connection's reads wait for room, or resume. Waiting, it gives
+    // back the pieces it owns that took a block, and the room they hold, where
+    // pieces are held in memory. Where every piece is written block by block,
+    // a piece holds no room, so it is kept: given back, the blocks the
+    // connection holds or the disk threads have queued would be neither
+    // asked, being written nor received, and asked of the peer again.
+    fn wait_for_room(&self, waiting: bool) {
+        self.state
+            .peers
+            .with_live_mut(self.addr, "room", |live| live.set_waiting_for_room(waiting));
+        if !waiting {
+            return;
+        }
+        self.swarm().request_event(swarm::RequestEvent::RoomWait);
+        if !self.state.files.writes_to_memory() {
+            return;
+        }
+        let released = self
+            .state
+            .lock_write("room_wait")
+            .get_pieces_mut()
+            .map_or(0, |pieces| {
+                pieces.release_started_pieces_owned_by(self.addr)
+            });
+        debug!(released, "waiting for room");
+        if released > 0 {
+            self.state.spill_requeued();
+            self.state.new_pieces_notify.notify_waiters();
+        }
+    }
+
+    // `attempt` until it has room, None while it has not. Refused, the
+    // connection stops reading until the storage rings that it has room
+    // again, its requests standing and their timers stopped, and, where
+    // pieces are held in memory, gives back the pieces it owns that took a
+    // block, for any peer to finish: a connection that waits for room holds
+    // none. Each ring is answered by a
+    // look at the budget for `bytes` first, so the connections waiting on
+    // one torrent go back to waiting when there is too little, and only
+    // those that may fit go through the torrent's lock again. None when the
+    // run ends meanwhile.
+    async fn with_room<T>(&self, bytes: u64, mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+        let state = &self.state;
+        let mut waiting = false;
+        let mut look = false;
+        // Tried first with no wait set up: nearly every attempt has room,
+        // and one set up takes the room signal's lock, which every
+        // connection of the torrent shares, twice a block.
+        if let Some(got) = attempt() {
+            return Some(got);
+        }
+        let got = loop {
+            let rung = state.room_notify.notified();
+            let mut rung = std::pin::pin!(rung);
+            rung.as_mut().enable();
+            if !look || state.files.room_for(bytes, &state.room_notify) {
+                if let Some(got) = attempt() {
+                    break Some(got);
+                }
+                if !waiting {
+                    waiting = true;
+                    self.wait_for_room(true);
+                }
+            }
+            tokio::select! {
+                () = rung => look = true,
+                () = state.cancellation_token.cancelled() => break None,
+            }
+        };
+        if waiting {
+            self.wait_for_room(false);
+        }
+        got
     }
 
     /// A block received into its own buffer moves to the disk threads, which
@@ -127,25 +220,76 @@ impl PeerHandler {
     /// `disk_interface::async_write`, and the torrent takes the completion,
     /// `peer_connection::on_disk_write_complete`). A block the storage keeps
     /// in memory is copied there here.
-    pub(super) async fn queue_block(&self, mut block: Block) -> anyhow::Result<()> {
+    pub(super) async fn queue_block(&self, block: Block) -> anyhow::Result<()> {
         let chunk_info = self.received_block(block.index, block.begin, block.len())?;
-        if self.state.files.writes_to_memory() {
-            return self.land_here(&block.piece(), chunk_info).await;
+        if self
+            .state
+            .files
+            .writes_piece_to_memory(chunk_info.piece_index)
+            && self.land_here(&block.piece(), chunk_info).await?
+        {
+            return Ok(());
         }
+        self.write_aside(block, chunk_info, false).await
+    }
+
+    // The block goes to the disk threads, never written on this thread,
+    // whatever thread it is: a uTP connection's task runs on a thread every
+    // stream of its shard shares. A block of a storage that holds pieces in
+    // memory holds its own room for its write first: its piece holds none.
+    // With `wait`, the connection waits until the block is written and,
+    // when it was its piece's last, the piece checked.
+    async fn write_aside(
+        &self,
+        mut block: Block,
+        chunk_info: ChunkInfo,
+        wait: bool,
+    ) -> anyhow::Result<()> {
+        let state = &self.state;
+        let bytes = block.len() as u64;
+        let room = self
+            .with_room(bytes, || {
+                match state.files.hold_block(bytes, &state.room_notify) {
+                    BlockRoom::Free => Some(None),
+                    BlockRoom::Held(room) => Some(Some(room)),
+                    BlockRoom::Refused => None,
+                }
+            })
+            .await;
+        // The run ended while it waited: the block is fetched again in a
+        // later run.
+        let Some(room) = room else {
+            return Ok(());
+        };
         let pool = block.buf_mut().pool().clone();
         if self.disk.queued(pool.charge(block.buf_mut())) {
-            self.state.shared.spawner.stats().peer_stopped();
+            state.shared.spawner.stats().peer_stopped();
         }
-        self.state.shared.spawner.disk().push(WriteJob {
-            state: self.state.clone(),
+        let (ended, end) = if wait {
+            let (ended, end) = tokio::sync::oneshot::channel();
+            (Some(ended), Some(end))
+        } else {
+            (None, None)
+        };
+        state.shared.spawner.disk().push(WriteJob {
+            state: state.clone(),
             tx: self.tx.clone(),
             addr: self.addr,
             counters: self.counters.clone(),
             chunk: chunk_info,
             block,
+            room,
             written: Written(Some(self.disk.clone())),
-            _run: self.state.tasks.token(),
+            ended,
+            _run: state.tasks.token(),
         });
+        if let Some(end) = end {
+            let since = std::time::Instant::now();
+            // Dropped unsent once the write, and any check, is over,
+            // however it ended.
+            let _ = end.await;
+            state.shared.spawner.stats().check_waited(since);
+        }
         Ok(())
     }
 
@@ -161,30 +305,52 @@ impl PeerHandler {
         }
     }
 
-    /// Writes the block on this connection's turn. When it was its piece's
-    /// last, the piece is checked on the hashing thread, never here: with
-    /// this connection back at its socket where the storage holds the piece
-    /// in memory, and with it waiting for the check otherwise.
+    /// Copies the block into the piece its storage holds in memory, on this
+    /// connection's turn: a copy takes no blocking thread. When it was its
+    /// piece's last, the piece is checked on the hashing thread, never here,
+    /// with this connection back at its socket. False, the block unwritten,
+    /// when its piece turns out to go to its files, its first block from a
+    /// peer that does not own it or one of a piece given back meanwhile: it
+    /// then goes to the disk threads.
     async fn land_here(
         &self,
         piece: &Piece<ByteBuf<'_>>,
         chunk_info: ChunkInfo,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let state = &self.state;
         let spawner = &state.shared.spawner;
-        let land = || land_block(state, self.addr, piece, &chunk_info);
-        // A block the storage copies into memory is copied here, on this
-        // thread: only a write that reaches a file, and the check of a
-        // piece, take a blocking thread.
-        let from_memory = state.files.writes_to_memory();
-        let landed = if from_memory {
-            land()
-        } else {
-            spawner.block_in_place_with_semaphore(land).await
+        // The piece's first block takes its room as it lands. A peer that
+        // sends each piece's blocks in the order asked finishes the piece it
+        // holds room for before it sends another's, so it never waits
+        // holding room.
+        let piece_len = u64::from(state.lengths.piece_length(chunk_info.piece_index));
+        let landed = self
+            .with_room(piece_len, || {
+                let mut no_room = false;
+                let mut moved = false;
+                let landed = land_block_or_hold(
+                    state,
+                    self.addr,
+                    piece,
+                    &chunk_info,
+                    &mut no_room,
+                    &mut moved,
+                );
+                (!no_room).then_some((landed, moved))
+            })
+            .await;
+        // The run ended while it waited: the block is fetched again in a
+        // later run.
+        let Some((landed, moved)) = landed else {
+            return Ok(true);
+        };
+        if moved {
+            return Ok(false);
         }
-        .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        let landed =
+            landed.with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
         let Some((time, senders, piece_check)) = landed else {
-            return Ok(());
+            return Ok(true);
         };
         // The piece is out of flight and out of the queue from here until its
         // verdict, so its check belongs to the torrent, not to this
@@ -192,43 +358,18 @@ impl PeerHandler {
         // `torrent::verify_piece` posts the hash job bound to the torrent,
         // `shared_from_this()`, and `torrent::on_piece_verified` takes its
         // verdict whatever became of the sender).
-        if from_memory {
-            // The whole piece waits in the storage's memory for the hashing
-            // thread and then for its write: it is counted until both are
-            // done, and the connection stops reading with the piece that
-            // leaves the count past its high mark (libtorrent
-            // `peer_connection::incoming_piece`, `m_outstanding_writing_bytes`
-            // against `max_queued_disk_bytes`, allows each connection one
-            // block more; a whole piece more is not allowed here).
-            let piece_len = u64::from(state.lengths.piece_length(chunk_info.piece_index));
-            let (charge, waiting) = spawner.checks().charge_bytes(piece_len);
-            if self.disk.queued_piece(charge) {
-                spawner.stats().peer_stopped();
-            }
-            spawner.hash().push(HashJob {
-                check: piece_check,
-                state: self.state.clone(),
-                tx: self.tx.clone(),
-                addr: self.addr,
-                counters: self.counters.clone(),
-                chunk: chunk_info,
-                time,
-                senders,
-                waiting: Some(waiting),
-                written: Written(Some(self.disk.clone())),
-                queued: Some(spawner.check_queued()),
-                ended: None,
-                stored: None,
-                _run: self.state.tasks.token(),
-            });
-            return Ok(());
+        //
+        // The whole piece waits in the storage's memory for the hashing
+        // thread and then for its write: it is counted until both are
+        // done, and the connection stops reading with the piece that
+        // leaves the count past its high mark (libtorrent
+        // `peer_connection::incoming_piece`, `m_outstanding_writing_bytes`
+        // against `max_queued_disk_bytes`, allows each connection one
+        // block more; a whole piece more is not allowed here).
+        let (charge, waiting) = spawner.checks().charge_bytes(piece_len);
+        if self.disk.queued_piece(charge) {
+            spawner.stats().peer_stopped();
         }
-        // The piece is in its files: it is read back and checked on the
-        // hashing thread like any other, and this connection waits for the
-        // check's end, which a check that fails tells it of as an error of
-        // its own.
-        let (ended, end) = tokio::sync::oneshot::channel();
-        let since = std::time::Instant::now();
         spawner.hash().push(HashJob {
             check: piece_check,
             state: self.state.clone(),
@@ -238,22 +379,20 @@ impl PeerHandler {
             chunk: chunk_info,
             time,
             senders,
-            waiting: None,
-            written: Written(None),
+            waiting: Some(waiting),
+            written: Written(Some(self.disk.clone())),
             queued: Some(spawner.check_queued()),
-            ended: Some(ended),
+            ended: None,
             stored: None,
             _run: self.state.tasks.token(),
         });
-        // Dropped unsent when the check is over, however it ended.
-        let _ = end.await;
-        spawner.stats().check_waited(since);
-        Ok(())
+        Ok(true)
     }
 }
 
 // Writes the block, and when it was the piece's last, hands back the
 // piece's download time and senders for its check.
+#[cfg(test)]
 pub(super) fn land_block(
     state: &Arc<TorrentStateLive>,
     addr: PeerHandle,
@@ -262,6 +401,30 @@ pub(super) fn land_block(
 ) -> Landed {
     let mut landed = Vec::with_capacity(1);
     land_blocks(state, &[(addr, piece, *chunk_info)], &mut landed);
+    landed.pop().unwrap_or(Ok(None))
+}
+
+// [`land_block`] on the connection's task, into memory only: a block whose
+// piece has no room is left unwritten and `no_room` set, for its connection
+// to land it again once there is room, and one its storage would write to a
+// file is left unwritten and `moved` set, for its connection to hand it to
+// the disk threads.
+fn land_block_or_hold(
+    state: &Arc<TorrentStateLive>,
+    addr: PeerHandle,
+    piece: &Piece<ByteBuf<'_>>,
+    chunk_info: &ChunkInfo,
+    no_room: &mut bool,
+    moved: &mut bool,
+) -> Landed {
+    let mut landed = Vec::with_capacity(1);
+    land_blocks_or_hold(
+        state,
+        &[(addr, piece, *chunk_info)],
+        &mut landed,
+        Some(no_room),
+        Some(moved),
+    );
     landed.pop().unwrap_or(Ok(None))
 }
 
@@ -274,6 +437,22 @@ pub(super) fn land_blocks(
     state: &Arc<TorrentStateLive>,
     blocks: &[(PeerHandle, &Piece<ByteBuf<'_>>, ChunkInfo)],
     landed: &mut Vec<Landed>,
+) {
+    land_blocks_or_hold(state, blocks, landed, None, None);
+}
+
+// [`land_blocks`]. A block whose piece the storage has no room for sets
+// `no_room` when there is one, and is held by its connection. On a disk
+// thread a piece a block starts is written block by block, holding no room
+// of its own, its block holding the room of its write already: no storage
+// refuses it there. A refusal there all the same is discarded, counted
+// redundant, and fetched again.
+fn land_blocks_or_hold(
+    state: &Arc<TorrentStateLive>,
+    blocks: &[(PeerHandle, &Piece<ByteBuf<'_>>, ChunkInfo)],
+    landed: &mut Vec<Landed>,
+    mut no_room: Option<&mut bool>,
+    mut moved: Option<&mut bool>,
 ) {
     let first = landed.len();
     landed.extend(blocks.iter().map(|_| Ok(None)));
@@ -289,14 +468,58 @@ pub(super) fn land_blocks(
         state,
         chunks: Vec::new(),
     };
-    // A block we lack is written, whoever owns its piece now. While it is,
-    // no one steals the piece: its lock is held, read, until the block is
-    // marked, so that when it was the last block its piece is ours to
-    // check. Each piece's lock is taken once, however many of its blocks
-    // the batch holds.
-    let mut held: Vec<(u32, RwLockReadGuard<'_, ()>)> = Vec::new();
+    // A block we lack is written, whoever owns its piece now. A block of a
+    // piece in flight is ruled on under its piece's lock alone; one of a
+    // piece no peer owns, under the torrent's lock, once for the batch. While
+    // a block is being written, no one steals its piece, so that when it was
+    // the last block its piece is ours to check.
+    let slots = &*state.slots;
+    // Asked once a piece in flight, for its first block: its owner's takes
+    // the whole piece's room, any other one block's. Neither waits: a
+    // refusal is an answer. A block on a disk thread holds the room of its
+    // own write already, so its piece starts as one written block by block,
+    // as a piece given back is: it is never dropped for want of room.
+    let on_task = no_room.is_some();
+    let admit = |p, owned| {
+        if owned && on_task {
+            state.files.reserve_piece(p, &state.room_notify)
+        } else {
+            state.files.reserve_unowned_piece(p, &state.room_notify)
+        }
+    };
     let mut cancels: Vec<(usize, Vec<PeerHandle>)> = Vec::new();
-    {
+    let mut settle = |i: usize, arrival: Arrival| {
+        let (_, piece, chunk_info) = &blocks[i];
+        match arrival {
+            Arrival::Write { cancel } => {
+                admitted.chunks.push(*chunk_info);
+                cancels.push((i, cancel));
+            }
+            Arrival::NoRoom if no_room.is_some() => {
+                if let Some(no_room) = no_room.as_deref_mut() {
+                    *no_room = true;
+                }
+            }
+            Arrival::Discard | Arrival::NoRoom => {
+                state.add_redundant_bytes(piece.len() as u64);
+                state
+                    .session_stats
+                    .swarm
+                    .wasted(swarm::Waste::Redundant, piece.len() as u64);
+                debug!(
+                    "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
+                );
+            }
+        }
+    };
+    let mut unowned = Vec::new();
+    for (i, (addr, _, chunk_info)) in blocks.iter().enumerate() {
+        match slots.arrive(chunk_info, *addr, admit) {
+            Some(arrival) => settle(i, arrival),
+            None => unowned.push(i),
+        }
+    }
+    if !unowned.is_empty() {
         let mut g = state.lock_write("check_steal");
         let pieces = match g.get_pieces_mut() {
             Ok(pieces) => pieces,
@@ -308,31 +531,13 @@ pub(super) fn land_blocks(
                 return;
             }
         };
-        for (i, (addr, piece, chunk_info)) in blocks.iter().enumerate() {
-            if !held.iter().any(|(index, _)| *index == piece.index)
-                && let Some(lock) = state.per_piece_locks.get(piece.index as usize)
-            {
-                held.push((piece.index, lock.read()));
-            }
-            let admit = |p| state.files.reserve_piece(p, &state.room_notify);
-            match pieces.admitted_block_arrived(chunk_info, *addr, admit) {
-                Arrival::Write { cancel } => {
-                    admitted.chunks.push(*chunk_info);
-                    cancels.push((i, cancel));
-                }
-                Arrival::Discard => {
-                    state.add_redundant_bytes(piece.len() as u64);
-                    state
-                        .session_stats
-                        .swarm
-                        .wasted(swarm::Waste::Redundant, piece.len() as u64);
-                    debug!(
-                        "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
-                    );
-                }
-            }
+        for i in unowned {
+            let (addr, _, chunk_info) = &blocks[i];
+            settle(i, pieces.admitted_block_arrived(chunk_info, *addr, admit));
         }
     }
+    // In the batch's order, whichever lock admitted them.
+    cancels.sort_unstable_by_key(|(i, _)| *i);
     // The block was asked of other peers too: they need not send it
     // (libtorrent `torrent::cancel_block`).
     let mut written = Vec::with_capacity(cancels.len());
@@ -351,7 +556,25 @@ pub(super) fn land_blocks(
         // calls `piece_picker::write_failed`, then
         // `torrent::handle_disk_error`).
         let epoch = state.upload_epoch();
-        match state.file_ops().write_chunk(*addr, piece, chunk_info) {
+        // Landed on the runtime, a block goes to memory only: one its
+        // storage would write to a file is given back unwritten, for its
+        // connection to land it again where a write may wait.
+        let write = match moved.as_deref_mut() {
+            None => state.file_ops().write_chunk(*addr, piece, chunk_info),
+            Some(moved) => match state.file_ops().write_chunk_held(*addr, piece, chunk_info) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    *moved = true;
+                    admitted
+                        .chunks
+                        .retain(|c| c.absolute_index != chunk_info.absolute_index);
+                    landed[i] = unwrite(state, chunk_info, "write_moved");
+                    continue;
+                }
+                Err(e) => Err(e),
+            },
+        };
+        match write {
             Ok(()) => written.push(i),
             Err(e) => {
                 admitted
@@ -361,22 +584,33 @@ pub(super) fn land_blocks(
             }
         }
     }
-    if written.is_empty() {
+
+    // A block of a piece in flight that is not its last is marked under its
+    // piece's lock alone. The rest, under the torrent's lock, once for the
+    // batch: the last block of a piece takes it out of flight for its check.
+    let mut last = Vec::new();
+    for i in written {
+        let (addr, _, chunk_info) = &blocks[i];
+        if !slots.mark(chunk_info, *addr) {
+            last.push(i);
+        }
+    }
+    if last.is_empty() {
+        admitted.chunks.clear();
         return;
     }
-
     let mut g = state.lock_write("mark_chunk_downloaded");
     let pieces = match g.get_pieces_mut() {
         Ok(pieces) => pieces,
         Err(e) => {
             let e = anyhow::Error::from(e);
-            for i in written {
+            for i in last {
                 landed[i] = Err(anyhow::anyhow!("{e:#}"));
             }
             return;
         }
     };
-    for i in written {
+    for i in last {
         let (addr, piece, chunk_info) = &blocks[i];
         let chunk_marking_result = pieces.mark_chunk_downloaded(piece, *addr);
         trace!(?piece, chunk_marking_result=?chunk_marking_result);
@@ -408,10 +642,19 @@ pub(super) fn land_blocks(
         };
     }
     admitted.chunks.clear();
-    // The pieces' locks go once their blocks are marked: a completed one is
-    // out of flight now.
     drop(g);
-    drop(held);
+}
+
+// `chunk` is no longer being written, and a later copy of it is taken: under
+// its piece's lock when the piece is in flight, the torrent's otherwise.
+fn unwrite(state: &TorrentStateLive, chunk: &ChunkInfo, reason: &'static str) -> Landed {
+    if !state.slots.write_failed(chunk) {
+        state
+            .lock_write(reason)
+            .get_pieces_mut()?
+            .write_failed(chunk);
+    }
+    Ok(None)
 }
 
 impl Drop for Admitted<'_> {
@@ -419,8 +662,17 @@ impl Drop for Admitted<'_> {
         if self.chunks.is_empty() {
             return;
         }
+        let slots = &self.state.slots;
+        let unowned: Vec<&ChunkInfo> = self
+            .chunks
+            .iter()
+            .filter(|chunk| !slots.write_failed(chunk))
+            .collect();
+        if unowned.is_empty() {
+            return;
+        }
         if let Ok(pieces) = self.state.lock_write("write_failed").get_pieces_mut() {
-            for chunk in &self.chunks {
+            for chunk in unowned {
                 pieces.write_failed(chunk);
             }
         }
@@ -435,10 +687,7 @@ fn write_failed(
     e: anyhow::Error,
     epoch: u64,
 ) -> Landed {
-    state
-        .lock_write("write_failed")
-        .get_pieces_mut()?
-        .write_failed(chunk_info);
+    unwrite(state, chunk_info, "write_failed")?;
     if state.handle_disk_error(&e, epoch) {
         return Ok(None);
     }
@@ -460,7 +709,7 @@ pub(super) fn hash_landed_piece(
     piece_index: ValidPieceIndex,
 ) -> anyhow::Result<Verdict> {
     let stats = state.shared.spawner.stats();
-    let from_memory = state.files.writes_to_memory();
+    let from_memory = state.files.writes_piece_to_memory(piece_index);
     let call = stats.call(if from_memory {
         DiskOp::HashMemory
     } else {
