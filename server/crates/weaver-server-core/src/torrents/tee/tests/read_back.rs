@@ -172,8 +172,20 @@ impl Rig {
     }
 
     // Every piece but `skipped` fetched as the session fetches one too large
-    // to hold: block by block, then verified.
+    // to hold: block by block, then verified, and read back where it
+    // completed.
     fn fetch(&self, store: &Arc<TorrentStore>, skipped: Option<u32>) -> PieceStorage {
+        self.fetch_reading(store, skipped, true)
+    }
+
+    // As `fetch`, each piece taken by the job where it completed when
+    // `taken`, else left waiting for it.
+    fn fetch_reading(
+        &self,
+        store: &Arc<TorrentStore>,
+        skipped: Option<u32>,
+        taken: bool,
+    ) -> PieceStorage {
         let storage = PieceStorage::new(
             Arc::clone(&self.layout),
             Arc::clone(store) as Arc<dyn Pieces>,
@@ -198,8 +210,7 @@ impl Rig {
                 }
             }
             storage.on_piece_completed(index).unwrap();
-            // Read back where it completed, and taken.
-            assert!(!self.tee.wants(piece), "piece {piece} went to the job");
+            assert_eq!(!self.tee.wants(piece), taken, "piece {piece}");
         }
         storage
     }
@@ -434,5 +445,39 @@ async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
             .resident,
         0
     );
+    rig.tee.forget();
+}
+
+// A read-back refused for room while room is held by another job, and the
+// torrent has nothing left in flight to give room back, is woken by that
+// job's room coming back: with scratch refused and another namespace
+// holding the whole budget, every piece is fetched and sealed, and each
+// read-back waits; the other namespace lets its room go, and the archive
+// unpacks in the same run.
+#[tokio::test]
+async fn a_read_back_refused_for_room_another_job_holds_goes_again_once_that_room_returns() {
+    let mut rig = rig(true);
+    let other = HoldsNamespace {
+        scope: 2,
+        node: NodeId::ROOT,
+    };
+    let accountant = Arc::clone(&rig.holds.accountant);
+    assert_eq!(
+        accountant.reserve_resident(other, BUDGET),
+        weaver_graph::holds::Reserve::Granted
+    );
+    let store = rig.store(None);
+    // The last piece sealed too: the torrent has nothing in flight.
+    let storage = rig.fetch_reading(&store, None, false);
+    assert!(rig.tee.waits_for_room());
+    assert_eq!(rig.resident_peak(), 0);
+    assert_eq!(accountant.namespace_usage(rig.holds.namespace).resident, 0);
+
+    accountant.release_resident(other, BUDGET);
+    assert_eq!(rig.unpacked().await, rig.member);
+    assert!(!rig.tee.waits_for_room());
+    assert!(rig.resident_peak() <= BUDGET);
+    assert_eq!(storage.resident_peak(), 0);
+    assert_eq!(accountant.namespace_usage(rig.holds.namespace).resident, 0);
     rig.tee.forget();
 }

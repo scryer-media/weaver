@@ -1105,23 +1105,42 @@ impl Tee {
 
     // `bytes` of the holds' resident budget, for one share of `piece` read
     // back; when the budget has no room for them, the piece waits on the
-    // bell and none is returned. Asked again once it waits, so room let go
-    // between the two asks is not missed.
+    // bell and none is returned. Asked again once it waits, and that last
+    // ask, refused, leaves the bell's wake with the budget: room any holder
+    // gives back after it rings the bell, another torrent's or a job of any
+    // other kind, though this torrent has nothing left in flight to.
     fn reserve_or_wait(&self, reading: &Reading, piece: u32, bytes: u64) -> Option<HeldRoom> {
-        if let Some(room) = self.reserve(reading, bytes) {
+        if let Some(room) = self.reserve(reading, bytes, false) {
             return Some(room);
         }
         reading.bell.wait(piece);
-        let room = self.reserve(reading, bytes)?;
+        let room = self.reserve(reading, bytes, true)?;
         reading.bell.unwait(piece);
         Some(room)
     }
 
     // `bytes` of the holds' resident budget, or none when it has no room
-    // for them: never over it.
-    fn reserve(&self, reading: &Reading, bytes: u64) -> Option<HeldRoom> {
+    // for them: never over it. Refused with `wake`, the budget rings the
+    // bell the next time room comes back.
+    fn reserve(&self, reading: &Reading, bytes: u64, wake: bool) -> Option<HeldRoom> {
         let holds = &reading.holds;
-        match holds.accountant.reserve_resident(holds.namespace, bytes) {
+        let reserve = if wake {
+            let key = Arc::as_ptr(&reading.bell) as usize;
+            let bell = Arc::downgrade(&reading.bell);
+            holds.accountant.reserve_resident_or_wake(
+                holds.namespace,
+                bytes,
+                key,
+                Arc::new(move || {
+                    if let Some(bell) = bell.upgrade() {
+                        bell.ring();
+                    }
+                }),
+            )
+        } else {
+            holds.accountant.reserve_resident(holds.namespace, bytes)
+        };
+        match reserve {
             Reserve::Granted => {}
             Reserve::Breached(_) => return None,
         }
