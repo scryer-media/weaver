@@ -1438,18 +1438,6 @@ impl Pieces for TorrentStore {
         Ok(())
     }
 
-    // A piece the tee reads back holds room for one of its articles while it
-    // arrives, which its read-back is made in once it verified; any other
-    // holds room for one block.
-    fn block_room(&self, piece_length: u64) -> u64 {
-        let block = u64::from(weaver_torrent::core::constants::CHUNK_SIZE);
-        let room = match &self.tee {
-            Some(tee) if tee.writes_blocks() => super::tee::READ_BACK_BYTES.max(block),
-            _ => block,
-        };
-        room.min(piece_length)
-    }
-
     fn stop_writes(&self) {
         drop(self.unpark());
         drop(self.writes.abandon());

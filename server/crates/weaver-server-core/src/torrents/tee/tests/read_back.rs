@@ -281,7 +281,8 @@ fn a_read_back_torrents_shares_are_cut_into_articles_of_one_layout() {
 // The pieces read back through one scratch lease each, which the graph
 // holds until it let go of the last byte of it: the archive unpacks whole,
 // no lease is left, scratch never held more than one piece, and the read-
-// backs took no resident room beside each piece's own block room.
+// backs took no resident room, nor did the pieces, which hold none of their
+// own while they arrive.
 #[tokio::test]
 async fn an_oversized_archive_piece_reads_back_through_scratch_and_unpacks() {
     let mut rig = rig(false);
@@ -293,8 +294,7 @@ async fn an_oversized_archive_piece_reads_back_through_scratch_and_unpacks() {
     assert!((1..=PIECE).contains(&peak), "{peak}");
     assert_eq!(rig.scratch.live(), (0, 0));
     assert_eq!(rig.resident_peak(), 0);
-    assert!(storage.resident_peak() <= BUDGET);
-    assert_eq!(storage.resident_peak(), READ_BACK_BYTES);
+    assert_eq!(storage.resident_peak(), 0);
     assert_eq!(
         rig.holds
             .accountant
@@ -366,10 +366,10 @@ async fn a_restart_reads_a_lacking_piece_back_by_the_same_rule() {
 }
 
 // A read-back the budget has no room for waits for room, not for a
-// restart: with scratch refused and the budget held by a piece in flight,
-// the lacking piece's read-back is refused and waits; the piece's room let
-// go rings it, and it is read back and the archive unpacks, in the same
-// run. The budget is never passed.
+// restart: with scratch refused and the budget held by a block being
+// written, the lacking piece's read-back is refused and waits; the block's
+// room let go rings it, and it is read back and the archive unpacks, in the
+// same run. The budget is never passed.
 #[tokio::test]
 async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
     let mut rig = rig(true);
@@ -388,15 +388,23 @@ async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
         checking: false,
     };
     let again = rig.store(Some(&kept));
-    // A piece in flight holds the room the read-back would need.
+    // A block being written holds the room the read-back would need.
     let storage = PieceStorage::new(
         Arc::clone(&rig.layout),
         Arc::clone(&again) as Arc<dyn Pieces>,
         rig.holds.clone(),
     );
-    let lengths = Lengths::new(rig.layout.total(), PIECE as u32).unwrap();
-    let flying = lengths.try_validate_piece_index(0).unwrap();
-    assert!(storage.reserve_piece(flying, &Arc::default()));
+    let usage = |rig: &Rig| {
+        rig.holds
+            .accountant
+            .namespace_usage(rig.holds.namespace)
+            .resident
+    };
+    let weaver_torrent::storage::BlockRoom::Held(block) =
+        storage.hold_block(BUDGET - usage(&rig), &Arc::default())
+    else {
+        panic!("the block's room was refused");
+    };
     let held = rig
         .holds
         .accountant
@@ -412,8 +420,8 @@ async fn a_read_back_refused_for_room_goes_again_once_room_returns() {
     assert!(rig.tee.wants(lacked));
     assert_eq!(rig.resident_peak(), resident_before);
 
-    // The piece fails its hash: its room goes back, and rings the wait.
-    storage.on_piece_hash_failed(flying).unwrap();
+    // The block is written: its room goes back, and rings the wait.
+    drop(block);
     assert_eq!(rig.unpacked().await, rig.member);
     assert!(!rig.tee.wants(lacked));
     assert!(!rig.tee.waits_for_room());

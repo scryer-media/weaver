@@ -140,7 +140,11 @@ impl PeerHandler {
     }
 
     // The connection's reads wait for room, or resume. Waiting, it gives
-    // back the pieces it owns that took a block.
+    // back the pieces it owns that took a block, and the room they hold, where
+    // pieces are held in memory. Where every piece is written block by block,
+    // a piece holds no room, so it is kept: given back, the blocks the
+    // connection holds or the disk threads have queued would be neither
+    // asked, being written nor received, and asked of the peer again.
     fn wait_for_room(&self, waiting: bool) {
         self.state
             .peers
@@ -149,6 +153,9 @@ impl PeerHandler {
             return;
         }
         self.swarm().request_event(swarm::RequestEvent::RoomWait);
+        if !self.state.files.writes_to_memory() {
+            return;
+        }
         let released = self
             .state
             .lock_write("room_wait")
@@ -165,9 +172,10 @@ impl PeerHandler {
 
     // `attempt` until it has room, None while it has not. Refused, the
     // connection stops reading until the storage rings that it has room
-    // again, its requests standing and their timers stopped, and gives back
-    // the pieces it owns that took a block, for any peer to finish: a
-    // connection that waits for room holds none. Each ring is answered by a
+    // again, its requests standing and their timers stopped, and, where
+    // pieces are held in memory, gives back the pieces it owns that took a
+    // block, for any peer to finish: a connection that waits for room holds
+    // none. Each ring is answered by a
     // look at the budget for `bytes` first, so the connections waiting on
     // one torrent go back to waiting when there is too little, and only
     // those that may fit go through the torrent's lock again. None when the
@@ -435,9 +443,9 @@ pub(super) fn land_blocks(
 
 // [`land_blocks`]. A block whose piece the storage has no room for sets
 // `no_room` when there is one, and is held by its connection. On a disk
-// thread a piece a block starts is written block by block, so a storage
-// that holds pieces in memory never refuses it; a refusal there, as of a
-// storage that writes every piece block by block, is discarded, counted
+// thread a piece a block starts is written block by block, holding no room
+// of its own, its block holding the room of its write already: no storage
+// refuses it there. A refusal there all the same is discarded, counted
 // redundant, and fetched again.
 fn land_blocks_or_hold(
     state: &Arc<TorrentStateLive>,

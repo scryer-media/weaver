@@ -42,8 +42,9 @@ fn shim_over(dir: tempfile::TempDir, holds: Holds, kept: Option<&Kept>) -> Shim 
 
 impl Shim {
     // The piece's first `upto` blocks written as the session writes them:
-    // room for the piece, then a block at a time, each cut at a file's end.
-    // Block `bad` is written with its first byte wrong.
+    // room for the piece, then a block at a time, each holding the room of
+    // its own write while it is written, each cut at a file's end. Block
+    // `bad` is written with its first byte wrong.
     fn write_blocks(&self, piece: u32, torrent: &[u8], upto: u64, bad: Option<u64>) {
         assert!(self.storage.reserve_piece(self.index(piece), &self.room));
         let start = self.layout.piece_range(piece).start;
@@ -60,9 +61,12 @@ impl Shim {
                 if bad == Some(block) {
                     bytes[0] ^= 0xff;
                 }
+                let room = self.storage.hold_block(bytes.len() as u64, &self.room);
+                assert!(!matches!(room, weaver_torrent::storage::BlockRoom::Refused));
                 self.storage
                     .pwrite_all(span.file, span.range.start + (at - span.at), &bytes)
                     .unwrap();
+                drop(room);
                 at = stop;
             }
         }
@@ -73,8 +77,9 @@ impl Shim {
     }
 }
 
-// A piece larger than the budget holds one block's room while it arrives,
-// and each block is on disk as it arrives, before the piece verifies: the
+// A piece larger than the budget holds no room of its own while it arrives,
+// each block one block's while it is written, and each block is on disk as
+// it arrives, before the piece verifies: the
 // piece is read from there, as its hash is. Not had until it verified;
 // once it did, it is had and its room is back.
 #[test]
@@ -85,7 +90,7 @@ fn an_oversized_piece_is_written_block_by_block_and_had_once_it_verified() {
     assert!(!shim.storage.writes_to_memory());
 
     shim.write_blocks(1, &torrent, u64::MAX, None);
-    assert_eq!(budget.namespace_usage(NAMESPACE).resident, BLOCK);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
     assert_eq!(shim.store.count(), 0);
     assert!(!shim.store.has(1));
     let [a, b] = shim.files();
@@ -132,7 +137,7 @@ fn a_fitting_piece_is_held_whole_as_before_and_ends_as_a_block_written_one_does(
     assert_eq!(fitting.store.count(), 3);
     assert_eq!(oversized.store.count(), 3);
     assert_eq!(fitting.store.file_have(), oversized.store.file_have());
-    // The fitting torrent held a whole piece; the other one block.
+    // The fitting torrent held a whole piece; the other one block at a time.
     assert_eq!(fitting.storage.resident_peak(), PIECE);
     assert_eq!(oversized.storage.resident_peak(), BLOCK);
 }
@@ -615,6 +620,56 @@ const OTHER: HoldsNamespace = HoldsNamespace {
     scope: 2,
     node: NodeId::ROOT,
 };
+
+// A torrent of pieces over the budget, fetched while another job holds the
+// whole budget: its first block's room is refused where its connection can
+// wait, and the connection stops. Once the other job lets the room go, it is
+// rung, every block is written, none is thrown away for want of room, and
+// the files end as the seeder's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_written_block_by_block_waits_for_room_and_is_never_thrown_away() {
+    let seeded = seeded_sized(6, PIECE as u32, [100_000, 150_000, 40_000]).await;
+    let layout = &seeded.layout;
+    let fetch_dir = tempfile::tempdir().unwrap();
+    let disk = disk_off_runtime();
+    let store = store_on(&disk, 1, layout, &fetch_dir.path().join("job"));
+    let (watched, mut in_hand) = watched(Arc::clone(&store));
+    let budget = accountant(BUDGET);
+    assert_eq!(
+        budget.reserve_resident(OTHER, BUDGET),
+        weaver_graph::holds::Reserve::Granted
+    );
+    let (refused, mut refusals) = watch::channel(0);
+    let factory = GatedFactory {
+        factory: PieceStorageFactory::new(
+            Arc::clone(layout),
+            Arc::clone(&watched) as Arc<dyn Pieces>,
+            holds(&budget),
+        ),
+        gate: Arc::default(),
+        refused: Arc::new(refused),
+        granted: Arc::default(),
+    };
+    assert!(factory.factory.writes_blocks());
+    let leecher = session(&fetch_dir.path().join("session"), None).await;
+    let torrent = fetch_into(&leecher, &seeded, fetch_dir.path(), factory.boxed(), false).await;
+
+    refusals.wait_for(|refused| *refused > 0).await.unwrap();
+    assert_eq!(watched.store.count(), 0);
+    budget.release_resident(OTHER, BUDGET);
+    in_hand.wait_for(|whole| *whole).await.unwrap();
+    for (name, original) in &seeded.originals {
+        assert_eq!(
+            &std::fs::read(fetch_dir.path().join("job").join(name)).unwrap(),
+            original
+        );
+    }
+    eprintln!("DBG {:?} refusals {}", torrent.totals(), *refusals.borrow());
+    assert_eq!(torrent.totals().redundant_bytes, 0);
+    leecher.stop().await;
+    seeded.seeder.stop().await;
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+}
 
 // A session refused room another job of the budget holds is rung when that
 // job lets it go, not only when a piece of its own does, and its piece is

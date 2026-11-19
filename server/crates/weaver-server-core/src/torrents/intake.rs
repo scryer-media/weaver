@@ -481,10 +481,6 @@ impl Pieces for Intake {
         self.inner.writes_blocks()
     }
 
-    fn block_room(&self, piece_length: u64) -> u64 {
-        self.inner.block_room(piece_length)
-    }
-
     fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
         self.inner.read_turns()
     }

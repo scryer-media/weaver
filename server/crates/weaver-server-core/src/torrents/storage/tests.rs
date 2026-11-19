@@ -1495,10 +1495,6 @@ impl Pieces for Watched {
         self.store.writes_blocks()
     }
 
-    fn block_room(&self, piece_length: u64) -> u64 {
-        self.store.block_room(piece_length)
-    }
-
     fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
         self.store.read_turns()
     }

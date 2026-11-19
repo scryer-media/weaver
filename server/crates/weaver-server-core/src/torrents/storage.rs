@@ -34,9 +34,10 @@
 // arrives, the piece is hashed back from its files on the volume's read
 // turns, and a piece that fails is fetched again. The choice is made once,
 // as the storage's maker is made, from the piece's length and the budget
-// then; nothing records it. Such a piece holds a small, fixed room while it
-// arrives (`Pieces::block_room`), its blocks are written one at a time, and
-// its bytes are counted on its volume as each block's write fits.
+// then; nothing records it. Such a piece holds no room of its own while it
+// arrives: each block holds the room of its own write, taken where its
+// connection can wait for it, its blocks are written one at a time, and its
+// bytes are counted on its volume as each block's write fits.
 
 use std::collections::HashMap;
 use std::io::IoSlice;
@@ -112,11 +113,6 @@ pub(crate) trait Pieces: Send + Sync {
     // itself as it was made: none leaves it to the storage.
     fn writes_blocks(&self) -> Option<bool> {
         None
-    }
-    // The resident room a piece written block by block holds while it
-    // arrives.
-    fn block_room(&self, piece_length: u64) -> u64 {
-        u64::from(weaver_torrent::core::constants::CHUNK_SIZE).min(piece_length)
     }
     // A piece failed its hash, fetched or checked on disk: it is not had.
     // True when it was.
@@ -783,31 +779,22 @@ impl PieceStorage {
 
     // Room for a piece not in memory: its resident room, then its volume's.
     // A piece written block by block, as every piece of a storage that
-    // writes blocks and a piece `blocks` names are, holds its small room
-    // alone, or none where pieces are held in memory, its blocks holding
-    // theirs as they are written: its blocks are counted on the volume as
-    // each one's write fits.
+    // writes blocks and a piece `blocks` names are, holds none, its blocks
+    // holding theirs as they are written: its blocks are counted on the
+    // volume as each one's write fits.
     fn start_piece(&self, index: u32, length: u64, room: &Arc<Notify>, blocks: bool) -> bool {
         if self.inner.blocks || blocks {
-            let held = if self.inner.blocks {
-                self.inner.pieces.block_room(length)
-            } else {
-                0
-            };
-            if held > 0 && !self.inner.reserve(held) {
-                return false;
-            }
-            let mut flight = self.flight();
-            if flight.contains_key(&index) {
-                drop(flight);
-                self.inner.release(held);
-                return true;
-            }
-            flight.insert(index, Flight::Blocks(Arc::default(), held));
+            // It holds no room of its own: each of its blocks holds the room
+            // of its own write, taken where its connection can wait, so it
+            // is never refused on a disk thread, where its block cannot.
+            // What reads it back for the tee asks the budget itself.
+            self.flight().entry(index).or_insert_with(|| Flight::Blocks(Arc::default(), 0));
             return true;
         }
+        // Refused, it may have started meanwhile, from a block on a disk
+        // thread: it holds its room, and nothing waits for a ring.
         if !self.inner.reserve(length) {
-            return false;
+            return self.flight_read().contains_key(&index);
         }
         // Then its volume, outside the map's lock: the volume's room is
         // rung by its writer, which takes no lock of the session's.
@@ -939,12 +926,10 @@ impl TorrentStorage for PieceStorage {
     }
 
     // A block of a piece given back, or started by a peer that does not own
-    // it, holds its own room while it is written; a piece of a storage that
-    // writes every piece so holds a block's room from its start instead.
+    // it, or of a storage that writes every piece block by block, holds its
+    // own room while it is written: taken here, where its connection can
+    // wait for it, so no disk thread drops a block for want of room.
     fn hold_block(&self, bytes: u64, room: &Arc<Notify>) -> BlockRoom {
-        if self.inner.blocks {
-            return BlockRoom::Free;
-        }
         *self
             .inner
             .room
