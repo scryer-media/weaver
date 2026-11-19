@@ -79,6 +79,7 @@ impl Settled {
             damaged_slices: self.damaged_slices,
             outcome: Some(self.outcome),
             read: true,
+            name: None,
         }
     }
 }

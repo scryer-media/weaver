@@ -25,7 +25,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use par2_rs::FileId;
 use par2_rs::packet::{HEADER_SIZE, MAGIC};
-use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling, Unbound, UnboundReason};
+use weaver_graph::recovery::{
+    MemberAccess, RepairOutcome, SetRuling, ShortSet, ShortSets, Unbound, UnboundReason,
+};
 use weaver_graph::{
     ByteRange, Claim, Delivery, Emit, Extent, Kind, Located, MemberId, Namespace, Object, ObjectId,
     Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
@@ -111,6 +113,10 @@ pub struct Par2 {
     rebound: BTreeSet<[u8; 16]>,
     // The complete members the last binding matched to no set.
     unmatched: Vec<(MemberId, Length)>,
+    // Each member a set gave up, under that set: binding passes over the
+    // set for it while another set's content answers for it. Not kept
+    // across a restart: the set rules again and gives it up again.
+    given_up: BTreeSet<([u8; 16], MemberId)>,
     // Room a feed lists its grids in: each feed empties it and lists them
     // afresh, so nothing in it outlives the feed that wrote it.
     grids: Vec<u64>,
@@ -172,6 +178,7 @@ impl Par2 {
             holding: BTreeSet::new(),
             rebound: BTreeSet::new(),
             unmatched: Vec::new(),
+            given_up: BTreeSet::new(),
             grids: Vec::new(),
             #[cfg(test)]
             digests: 0,
@@ -587,6 +594,96 @@ impl Par2 {
         self.mark_set_refused(key);
     }
 
+    // Whether the set stands ruled that it cannot rebuild what it binds: by
+    // its last repair, or by what was refused of its members.
+    fn short(&self, key: &[u8; 16]) -> bool {
+        matches!(
+            self.sets.get(key).and_then(SetState::concluded),
+            Some(RepairOutcome::Impossible { .. })
+        ) || self.refused_short(key).is_some()
+    }
+
+    // The sets among `keys` that bind a member and stand short give their
+    // members up. Asked only while two usable sets describe a file of one
+    // front: otherwise no member has another set to move to, and nothing
+    // is weighed. Whether any member moved.
+    fn settle_short(&mut self, keys: impl IntoIterator<Item = [u8; 16]>) -> bool {
+        if !self.catalogue.shares() {
+            return false;
+        }
+        let mut moved = false;
+        for key in keys {
+            if self.binding.contains(&key) && self.short(&key) {
+                moved |= self.give_up(key);
+            }
+        }
+        moved
+    }
+
+    // The set ruled it cannot rebuild what it binds: it gives each member
+    // up, and each moves to the set binding names next for it
+    // (`bind::next_holder`), whose file for it is free. The set gave up
+    // nothing it wrote: a set that rules so writes nothing. Each set that
+    // lost or gained a member rules again, over what it binds now, and the
+    // next binding keeps the move, since it passes over the set for the
+    // member too. Whether any member moved.
+    fn give_up(&mut self, key: [u8; 16]) -> bool {
+        let Some(state) = self.sets.get(&key) else {
+            return false;
+        };
+        let members: Vec<(FileId, MemberId)> = state
+            .members()
+            .iter()
+            .map(|(file, member)| (*file, *member))
+            .collect();
+        let mut changed: BTreeMap<[u8; 16], Bindings> = BTreeMap::new();
+        for (file, member) in members {
+            self.given_up.insert((key, member));
+            let Some((to, at)) = bind::next_holder(
+                &self.sets,
+                &self.catalogue,
+                (key, file),
+                member,
+                &self.given_up,
+            ) else {
+                continue;
+            };
+            if to == key {
+                continue;
+            }
+            let sets = &self.sets;
+            let taken = changed
+                .entry(to)
+                .or_insert_with(|| sets[&to].members().clone());
+            if taken.contains_key(&at) {
+                continue;
+            }
+            taken.insert(at, member);
+            changed
+                .entry(key)
+                .or_insert_with(|| sets[&key].members().clone())
+                .remove(&file);
+        }
+        let mut moved = BTreeSet::new();
+        for (set, given) in changed {
+            rebind(
+                &mut self.sets,
+                &mut self.covered,
+                set,
+                given,
+                &self.unmatched,
+                &mut moved,
+            );
+        }
+        for set in &moved {
+            self.held(*set);
+            self.fold_set(*set);
+        }
+        #[cfg(test)]
+        self.assert_filed();
+        !moved.is_empty()
+    }
+
     // The volume a described set waits on for the slice checksums it lacks:
     // the one to read for them, while one that may carry them is still open.
     fn awaiting_checksums(&self, key: &[u8; 16]) -> Option<usize> {
@@ -650,7 +747,10 @@ impl Par2 {
                 .map(|key| (*key, &self.sets[key]))
                 .filter(|(_, state)| state.usable().is_some())
                 .unzip();
-            let found = bind::bind_sets(&usable, namespace, self.id, &mut self.fronts);
+            let given_up = &self.given_up;
+            let found = bind::bind_sets(&usable, namespace, self.id, &mut self.fronts, |at, m| {
+                given_up.contains(&(keys[at], m))
+            });
             return Bound {
                 sets: keys.into_iter().zip(found.sets).collect(),
                 unnamed: found.unnamed,
@@ -664,6 +764,7 @@ impl Par2 {
             namespace,
             self.id,
             &mut self.fronts,
+            &self.given_up,
         )
     }
 
@@ -718,6 +819,7 @@ impl Par2 {
                 self.holding.clear();
                 self.rebound.clear();
                 self.unmatched.clear();
+                self.given_up.clear();
                 return;
             }
             self.learned |= new_set;
@@ -752,18 +854,45 @@ impl Par2 {
                 }
             }
         }
+        // The sets whose index became usable now.
+        let mut usable = BTreeSet::new();
         for set in changed_sets {
             let state = self.sets.get_mut(&set).expect("changed set");
             let place = (state.first_seen, set);
+            let was = state.usable().is_some();
             if let Some(index) = state.usable() {
                 self.catalogue.unfile(place, index);
             }
             state.rebuild(self.output_limit);
             if let Some(index) = state.usable() {
                 self.catalogue.file(place, index);
+                if !was {
+                    usable.insert(set);
+                }
             }
             self.rebound.insert(set);
             self.fold_set(set);
+        }
+        // A set that came to describe a front another set binds may take
+        // what that set, standing short, gives up: only the sets describing
+        // one of its fronts are weighed.
+        if self.catalogue.shares() {
+            let mut sharing = BTreeSet::new();
+            for set in &usable {
+                let Some(index) = self.sets.get(set).and_then(SetState::usable) else {
+                    continue;
+                };
+                for description in index.files.values() {
+                    let front = sets::Front::described(description.length, description.hash_16k);
+                    sharing.extend(
+                        self.catalogue
+                            .fronted(front)
+                            .map(|(_, key)| key)
+                            .filter(|key| !usable.contains(key)),
+                    );
+                }
+            }
+            self.settle_short(sharing);
         }
     }
 
@@ -839,6 +968,16 @@ impl Object for Par2 {
                 .retain(|_, at| at.volume != volume || at.range.intersect(range).is_none());
         }
         self.take(volume, found);
+        // A loss lowers what the sets the volume serves can reach: one it
+        // leaves short gives its members up.
+        if self.catalogue.shares() {
+            let served: Vec<[u8; 16]> = self.volumes[volume.0 as usize]
+                .sets
+                .iter()
+                .copied()
+                .collect();
+            self.settle_short(served);
+        }
         self.ask_again(out);
     }
 
@@ -1173,9 +1312,12 @@ impl Recovery for Par2 {
                 self.length_lists += 1;
             }
         }
-        for key in moved {
-            self.fold_set(key);
+        for key in &moved {
+            self.fold_set(*key);
         }
+        // A set whose binding changed may bind a member it stands short of,
+        // as after a restart, which keeps no member given up.
+        self.settle_short(moved);
         #[cfg(test)]
         self.assert_filed();
     }
@@ -1269,9 +1411,12 @@ impl Recovery for Par2 {
             .iter()
             .filter_map(|(key, state)| Some((*key, state.bound(member)?)))
             .collect();
-        for (key, file) in binding {
-            self.mark_refused(key, file, member, range);
+        for (key, file) in &binding {
+            self.mark_refused(*key, *file, member, range);
         }
+        // A set the refusal leaves short gives the member up now, before the
+        // job weighs its rulings, when another set may take it.
+        self.settle_short(binding.into_iter().map(|(key, _)| key));
     }
 
     // A slice is proven by checksums cut at its boundaries; the whole
@@ -1401,6 +1546,67 @@ impl Recovery for Par2 {
                 RepairOutcome::Unread
             };
         }
+        // A set that rules short gives its members up, and those that move
+        // are ruled again by the sets they moved to, in a further pass. Each
+        // move passes a set that gave the member up, or returns it to the
+        // first once every set has, so the passes end.
+        loop {
+            let outcome = self.repair_pass(access, memory_limit);
+            if !self.settle_short(self.order.clone()) {
+                #[cfg(test)]
+                self.assert_filed();
+                return outcome;
+            }
+        }
+    }
+
+    fn outcome(&self) -> Option<RepairOutcome> {
+        self.outcome_of_sets()
+    }
+
+    // PAR2 ranks above every other format, for now: where a PAR2 set and
+    // another set disagree on a member, the PAR2 set's bytes are kept.
+    fn precedence(&self) -> u8 {
+        1
+    }
+
+    fn sets(&self, out: &mut Vec<SetRuling>) {
+        self.rulings(out);
+    }
+
+    fn unbound(&self, out: &mut Vec<Unbound>) {
+        self.unbound_sets(out);
+    }
+
+    fn short_sets(&self) -> Option<ShortSets> {
+        let mut short = ShortSets::default();
+        for &key in self.ordered() {
+            let state = &self.sets[&key];
+            let ruled = self.refused_short(&key).or(state.concluded());
+            match ruled {
+                Some(RepairOutcome::Impossible { damaged, reachable }) => {
+                    short.sets.push(ShortSet {
+                        name: self.set_name(&key),
+                        damaged,
+                        reachable,
+                        members: state.members().values().copied().collect(),
+                    });
+                }
+                Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
+                    if !state.members().is_empty() =>
+                {
+                    short.vouched = true;
+                }
+                _ => {}
+            }
+        }
+        Some(short)
+    }
+}
+
+impl Par2 {
+    // One ruling of every set, in order, folded as `repair` reports it.
+    fn repair_pass(&mut self, access: &mut dyn MemberAccess, memory_limit: usize) -> RepairOutcome {
         let damage = self.undescribed_damage();
         let mut outcome = RepairOutcome::Unread;
         for at in 0..self.order.len() {
@@ -1464,7 +1670,7 @@ impl Recovery for Par2 {
     // so it is tried again. With no set found once a volume of its own is
     // read through, nothing was checked: Unread. Before that a set may
     // still be found in the bytes to come, and it has not ruled.
-    fn outcome(&self) -> Option<RepairOutcome> {
+    fn outcome_of_sets(&self) -> Option<RepairOutcome> {
         if self.sets.is_empty() {
             if !self.unread_through() {
                 return Some(RepairOutcome::Unread);
@@ -1494,13 +1700,7 @@ impl Recovery for Par2 {
         Some(outcome)
     }
 
-    // PAR2 ranks above every other format, for now: where a PAR2 set and
-    // another set disagree on a member, the PAR2 set's bytes are kept.
-    fn precedence(&self) -> u8 {
-        1
-    }
-
-    fn sets(&self, out: &mut Vec<SetRuling>) {
+    fn rulings(&self, out: &mut Vec<SetRuling>) {
         for &key in self.ordered() {
             let state = &self.sets[&key];
             let last = state.last;
@@ -1516,6 +1716,7 @@ impl Recovery for Par2 {
                 damaged_slices: damaged,
                 outcome: short.or(last.map(|last| last.outcome)),
                 read: short.is_none() && last.is_some_and(|last| last.read),
+                name: self.set_name(&key),
             });
         }
     }
@@ -1524,7 +1725,7 @@ impl Recovery for Par2 {
     // its packet or set limits, it read a volume through and found no set in
     // it, or no volume arrived whole to carry an index. Each set it keeps
     // says why it bound nothing.
-    fn unbound(&self, out: &mut Vec<Unbound>) {
+    fn unbound_sets(&self, out: &mut Vec<Unbound>) {
         if self.sets.is_empty() {
             let reason = match self.refused {
                 true => UnboundReason::TooLarge,
@@ -1542,6 +1743,18 @@ impl Recovery for Par2 {
                 });
             }
         }
+    }
+
+    // What the set is called: the volume carrying its packets that names
+    // the fewest blocks, its index (which names none) before its recovery
+    // volumes, as `describing` orders them.
+    fn set_name(&self, key: &[u8; 16]) -> Option<String> {
+        self.volumes
+            .iter()
+            .enumerate()
+            .filter(|(_, volume)| volume.sets.contains(key) && volume.name.is_some())
+            .min_by_key(|(index, volume)| (volume.named_blocks, *index))
+            .and_then(|(_, volume)| volume.name.clone())
     }
 }
 
