@@ -283,14 +283,35 @@ impl Entry {
         (stream.end <= found.at + found.data.len()).then_some(piece)
     }
 
+    // The bytes the parts taken so far carry: the pieces run on from the
+    // member's start, each where the one before ends, so the last ends
+    // where they all do.
     fn packed(&self) -> u64 {
-        self.pieces.iter().map(|piece| piece.data.len()).sum()
+        self.pieces
+            .last()
+            .map_or(0, |piece| piece.at + piece.data.len())
     }
 
-    // The member's length: what the header said, or, for a size it left
-    // unknown, what the parts add up to once the last is in.
+    // The member's length: what the header said, or, once the last part is
+    // in, what the parts add up to when the header left the size unknown or
+    // stated more. unrar writes a stored member until its last part ends
+    // (CmdExtract::UnstoreFile, extract.cpp), so a member whose first part
+    // overstates its size is the bytes its parts carry, which its CRC must
+    // prove before the store closes it there. An enciphered member's parts
+    // carry its padding past the size, which is the member's.
     fn plain_len(&self) -> Option<u64> {
-        self.length.or_else(|| self.complete.then(|| self.packed()))
+        match (self.length, self.complete) {
+            (Some(length), true) => Some(length.min(self.packed())),
+            (length, complete) => length.or_else(|| complete.then(|| self.packed())),
+        }
+    }
+
+    // Whether the member's parts, all in, carry fewer bytes than the size
+    // its header states: it ends where they do only once its CRC proves it.
+    fn short(&self) -> bool {
+        self.length
+            .zip(self.plain_len())
+            .is_some_and(|(stated, carried)| carried < stated)
     }
 
     // Whether the store is the one to judge the member's whole checksum: a
@@ -365,6 +386,12 @@ pub struct RarStore {
     // laid there again until those headers change or the layout is laid
     // afresh.
     refuted: Option<(VolumeIndex, u64)>,
+    // The job went quiet with a place refuted and nothing to order the
+    // volumes otherwise: the volumes held on trust stand where they are
+    // held, and a chain closing there short of its member's size is laid
+    // at the bytes its parts carry. Not kept: a restore reads it again
+    // from a member laid whole short of its size (`facts::restored`).
+    trusting: bool,
     // Each place whose volume and the one after it are held the wrong way
     // round by their headers, filed as volumes are touched: nothing is
     // mapped from the first until the job is quiet and the set is ordered.
@@ -430,6 +457,7 @@ impl RarStore {
             formats: Default::default(),
             layout: None,
             refuted: None,
+            trusting: false,
             inversions: BTreeSet::new(),
             entries: Vec::new(),
             candidates: Vec::new(),
@@ -1021,6 +1049,26 @@ impl Object for RarStore {
         // set is judged once they are claimed there.
         if self.order_at_quiet(out) {
             return;
+        }
+        // Nothing orders the volumes otherwise: those held on trust stand
+        // where they are held. A place the layout stops at, refuted only
+        // for a chain closing there short of its member's size, is laid
+        // now; one refuted again is judged as it was.
+        let stops = self.refuted.is_some_and(|(at, stamp)| {
+            self.laid_through() == Some(at.0)
+                && self
+                    .volumes
+                    .get(&at)
+                    .is_some_and(|found| found.walk.stamp == stamp)
+        });
+        if !self.trusting && stops {
+            self.trusting = true;
+            let refuted = self.refuted.take();
+            self.stale = true;
+            self.settle(None, out);
+            if self.refuted != refuted {
+                return;
+            }
         }
         if standing.liftable() && self.scattered() {
             self.give_up(Emit::Refuse(Why::Scattered), out);

@@ -716,15 +716,19 @@ impl GraphJob {
     // Once the policy is read, the members the tree held undecided while it
     // was not are asked again, once, so an archive whose name the policy
     // does not list opens then. Nothing before the policy is read; nothing
-    // to do for a job whose tree held none.
-    pub(crate) fn open_after_policy(&mut self) -> Result<(), GraphError> {
+    // to do for a job whose tree held none. True when what it applied made
+    // work due that was not, as a check of a file it closed: the caller
+    // lends it, as every step lends what it made due.
+    pub(crate) fn open_after_policy(&mut self) -> Result<bool, GraphError> {
         if !self.writer.policy_known() {
-            return Ok(());
+            return Ok(false);
         }
+        let pending = self.work_pending();
         let mut out = Vec::new();
         self.writer
             .rule_known(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
-        self.heard(out)
+        self.heard(out)?;
+        Ok(!pending && self.work_pending())
     }
 
     // Everything the job has submitted to its volumes' writers so far;

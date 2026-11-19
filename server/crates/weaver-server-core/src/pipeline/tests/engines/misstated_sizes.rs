@@ -280,3 +280,144 @@ async fn a_set_whose_middle_parts_overstate_its_size_delivers_with_its_last_two_
         outcome.files.keys().collect::<Vec<_>>()
     );
 }
+
+// A set whose first part states more than its parts carry, every part
+// alike or the first alone. unrar writes a stored member until its parts
+// end, never past the size the first part states (CmdExtract::UnstoreFile,
+// extract.cpp), so it writes every byte the parts carry and checks them
+// against the CRC the last part states: the member is whole at that sum.
+const SHAPES: [&str; 2] = ["every part", "the first part"];
+
+fn rar4_overstating(body: &[u8], shape: &str, crc: u32) -> Scenario {
+    let size = body.len() as u32;
+    posted(rar4_misstated_set(
+        TRUE_BASE,
+        MEMBER,
+        body,
+        VOLUMES,
+        |volume| match (shape, volume) {
+            ("every part", _) | (_, 0) => size + OVERSTATED,
+            _ => size,
+        },
+        crc,
+    ))
+}
+
+fn rar5_overstating(body: &[u8], shape: &str, crc: u32) -> Scenario {
+    let size = body.len() as u64;
+    let over = size + u64::from(OVERSTATED);
+    rar5_posted(rar5_misstated_set(
+        RAR5_BASE,
+        body,
+        VOLUMES,
+        |volume| match (shape, volume) {
+            ("every part", _) | (_, 0) => (MEMBER, over),
+            _ => (MEMBER, size),
+        },
+        crc,
+    ))
+}
+
+fn assert_whole(outcome: &Outcome, body: &[u8], case: &str) {
+    assert!(outcome.completed(), "{case}: {}", describe(outcome));
+    assert_eq!(
+        outcome.files.get(&delivered(MEMBER)).map(Vec::as_slice),
+        Some(body),
+        "{case}: delivered {:?}",
+        outcome.files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        outcome.graph().delivery.withheld.is_empty(),
+        "{case}: {}",
+        describe(outcome)
+    );
+}
+
+fn assert_failed(outcome: &Outcome, case: &str) {
+    assert!(
+        matches!(outcome.status, Some(JobStatus::Failed { .. })),
+        "{case}: {}",
+        describe(outcome)
+    );
+    assert!(
+        outcome
+            .graph()
+            .delivery
+            .whole
+            .iter()
+            .all(|name| name != MEMBER),
+        "{case}: {}",
+        describe(outcome)
+    );
+}
+
+#[tokio::test]
+async fn a_set_whose_first_part_overstates_its_size_delivers_the_bytes_its_parts_carry() {
+    let body = body();
+    let crc = checksum::crc32(&body);
+    for shape in SHAPES {
+        assert_whole(
+            &run(&rar4_overstating(&body, shape, crc)).await,
+            &body,
+            shape,
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rar5_set_whose_first_part_overstates_its_size_delivers_the_bytes_its_parts_carry() {
+    let body = body();
+    let crc = checksum::crc32(&body);
+    for shape in SHAPES {
+        assert_whole(
+            &run(&rar5_overstating(&body, shape, crc)).await,
+            &body,
+            shape,
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_set_whose_first_part_overstates_its_size_and_whose_bytes_fail_its_crc_fails() {
+    let body = body();
+    let crc = checksum::crc32(&body) ^ 1;
+    for shape in SHAPES {
+        assert_failed(&run(&rar4_overstating(&body, shape, crc)).await, shape);
+        let rar5 = format!("RAR5 {shape}");
+        assert_failed(&run(&rar5_overstating(&body, shape, crc)).await, &rar5);
+    }
+}
+
+// A restart after every article ends the job as a run without one does.
+async fn delivers_restarted(scenario: Scenario, body: &[u8]) {
+    let restarted = super::restart::run_restarting(&scenario, &mut |_| {}).await;
+    assert!(restarted.restarts > 0);
+    assert_eq!(restarted.status, Some(JobStatus::Complete));
+    assert_eq!(
+        restarted.files.get(&delivered(MEMBER)).map(Vec::as_slice),
+        Some(body),
+        "delivered {:?}",
+        restarted.files.keys().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn a_set_whose_every_part_overstates_its_size_restarted_midway_delivers_the_same() {
+    let body = body();
+    let crc = checksum::crc32(&body);
+    delivers_restarted(rar4_overstating(&body, "every part", crc), &body).await;
+}
+
+#[tokio::test]
+async fn a_rar5_set_whose_first_part_overstates_its_size_restarted_midway_delivers_the_same() {
+    let body = body();
+    let crc = checksum::crc32(&body);
+    delivers_restarted(rar5_overstating(&body, "the first part", crc), &body).await;
+}
+
+// A set stating its member truly is delivered at that size, as before.
+#[tokio::test]
+async fn a_set_stating_its_size_truly_delivers_it_unchanged() {
+    let body = body();
+    assert_whole(&run(&stating(&body, |_, size| size)).await, &body, "true");
+}

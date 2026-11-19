@@ -49,12 +49,19 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
         return;
     }
     // The tree opened nothing while the policy was unread: what it held
-    // undecided is asked again, once, now that it is read.
-    if let Some(job) = pipeline.graph_jobs.get_mut(&job_id)
-        && let Err(error) = job.open_after_policy()
+    // undecided is asked again, once, now that it is read. What that made
+    // due is lent, as a step's is.
+    match pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .map(GraphJob::open_after_policy)
     {
-        pipeline.after_graph_result(job_id, Err(error));
-        return;
+        Some(Err(error)) => {
+            pipeline.after_graph_result(job_id, Err(error));
+            return;
+        }
+        Some(Ok(true)) => pipeline.lend_graph_repairs(job_id),
+        Some(Ok(false)) | None => {}
     }
     if pipeline.job_has_pending_download_pipeline_work(job_id)
         || pipeline.queue_script_completion_gate(job_id, true)

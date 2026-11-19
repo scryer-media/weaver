@@ -145,6 +145,67 @@ fn mapped(
 }
 
 impl RarStore {
+    // A volume range as the layout maps it, save the parts of a member the
+    // store takes at the bytes its parts carry, short of the size its
+    // header states: the layout routes no member whose parts do not add up
+    // to that size, and lays such a member's bytes in the envelope, so they
+    // are the member's where its parts placed them. One look at the pieces
+    // the volume holds, and none past it while no such member is there.
+    fn mapped(
+        &self,
+        layout: &StoredLayoutBuilder,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<(ByteRange, Run)> {
+        let runs = mapped(layout, volume, range);
+        let holds_short = self.pieces_in.get(&volume).is_some_and(|pieces| {
+            pieces
+                .iter()
+                .any(|&(id, _)| self.entries.get(id).is_some_and(|entry| entry.short()))
+        });
+        if !holds_short {
+            return runs.collect();
+        }
+        let short: Vec<_> = self
+            .parts_in(volume, range)
+            .into_iter()
+            .filter(|&(id, _, _)| self.entries[id].short())
+            .collect();
+        let mut short = short.into_iter().peekable();
+        let mut out = Vec::new();
+        for (part, run) in runs {
+            if !matches!(run, Run::Envelope) {
+                out.push((part, run));
+                continue;
+            }
+            let mut at = part.start;
+            while let Some(&(id, data, stream)) = short.peek() {
+                let Some(within) = data.intersect(ByteRange::new(at, part.end)) else {
+                    if data.start >= part.end {
+                        break;
+                    }
+                    short.next();
+                    continue;
+                };
+                if within.start > at {
+                    out.push((ByteRange::new(at, within.start), Run::Envelope));
+                }
+                let stream =
+                    ByteRange::at(stream.start + (within.start - data.start), within.len());
+                out.push((within, Run::Member { id, stream }));
+                at = within.end;
+                if within.end < data.end {
+                    break;
+                }
+                short.next();
+            }
+            if at < part.end {
+                out.push((ByteRange::new(at, part.end), Run::Envelope));
+            }
+        }
+        out
+    }
+
     pub(super) fn place(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         let envelope = volume.0;
         let Some(found) = self.volumes.get(&volume) else {
@@ -296,7 +357,7 @@ impl RarStore {
         range: ByteRange,
         out: &mut Vec<Placement>,
     ) {
-        for (part, run) in mapped(layout, volume, range) {
+        for (part, run) in self.mapped(layout, volume, range) {
             match run {
                 Run::Member { id, stream } => {
                     self.place_member(volume, id, stream, part.start, out)
@@ -335,7 +396,9 @@ impl RarStore {
             .as_ref()
             .filter(|layout| layout.has_volume(volume.0))
         {
-            Some(layout) => mapped(layout, volume, below)
+            Some(layout) => self
+                .mapped(layout, volume, below)
+                .into_iter()
                 .filter_map(|(part, run)| match run {
                     Run::Member { id, stream } => Some((id, part, stream)),
                     Run::Envelope | Run::Held => None,

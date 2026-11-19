@@ -9,11 +9,14 @@
 // without end.
 
 use bytes::Bytes;
-use weaver_graph::{Effect, Kind, MemberId, NodeId, Posted, Provenance, Tree, VolumeIndex, Why};
+use weaver_graph::{
+    Effect, Kind, MemberId, NodeId, Object, Posted, Provenance, Tree, VolumeIndex, Why,
+};
 
 use super::super::counts;
+use super::owner::Owner;
 use super::writer::{Item, Options, Version, write};
-use super::{find, items, split};
+use super::{find, items, split, store};
 use crate::Objects;
 use crate::grid::crc32;
 use crate::testing::payload;
@@ -1366,5 +1369,211 @@ fn a_set_named_one_place_on_is_held_where_its_names_put_it() {
             }
             assert_eq!(posted.given, vec![0; volumes], "{case} one on");
         }
+    }
+}
+
+// The track [`long_set`] packs over `volumes` volumes.
+fn track(volumes: usize) -> Vec<u8> {
+    payload(9, volumes * 5_000 - 700)
+}
+
+// The RAR4 set [`long_set`] writes, each volume's part stating the size
+// `stated` gives it from the true one, the last part stating `crc` as the
+// member's CRC when one is given.
+fn restated(volumes: usize, stated: impl Fn(usize, u32) -> u32, crc: Option<u32>) -> Vec<Vec<u8>> {
+    let mut set = long_set(volumes);
+    for (volume, bytes) in set.iter_mut().enumerate() {
+        rewrite_rar4_part(bytes, |body| {
+            let size = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            body[4..8].copy_from_slice(&stated(volume, size).to_le_bytes());
+            if let Some(crc) = crc.filter(|_| volume + 1 == volumes) {
+                body[9..13].copy_from_slice(&crc.to_le_bytes());
+            }
+        });
+    }
+    set
+}
+
+// Every part overstating the member's size, and only the first doing so:
+// unrar writes the member until its last part ends and judges those bytes
+// by the CRC its last part states, so the store ends it there.
+type Stated = fn(usize, u32) -> u32;
+
+fn overstated_shapes() -> [(&'static str, Stated); 2] {
+    [
+        ("every part", |_, size| size + 62_609_861),
+        ("the first part", |volume, size| match volume {
+            0 => size + 62_609_861,
+            _ => size,
+        }),
+    ]
+}
+
+fn ends(owner: &Owner) -> Vec<(MemberId, u64)> {
+    owner
+        .said
+        .iter()
+        .filter_map(|emit| match emit {
+            weaver_graph::Emit::Ends { member, length } => {
+                Some((member.to_owned(), length.to_owned()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn refused(owner: &Owner) -> bool {
+    owner.said.iter().any(|emit| {
+        matches!(
+            emit,
+            weaver_graph::Emit::Refuse(_)
+                | weaver_graph::Emit::NeedsEngine(_)
+                | weaver_graph::Emit::Retract(_)
+        )
+    })
+}
+
+#[test]
+fn a_set_overstating_its_member_ends_it_where_its_crc_proves_the_bytes_its_parts_carry() {
+    for (shape, stated) in overstated_shapes() {
+        for volumes in [3, 6] {
+            let body = track(volumes);
+            let mut owner = Owner::named(store(), restated(volumes, stated, None));
+            owner.whole(1_000);
+            owner.quiet();
+            owner.settle();
+            let got = owner.member("track.flac");
+            let case = format!("{shape} over {volumes}");
+            assert!(!refused(&owner), "{case}: {:?}", owner.said);
+            assert_eq!(
+                got.length,
+                Some(u64::from(stated(0, body.len() as u32))),
+                "{case}: announced at the size its first part states"
+            );
+            assert!(got.closed, "{case} closed: {:?}", owner.said);
+            assert!(got.bytes == body, "{case} bytes");
+            assert_eq!(
+                ends(&owner),
+                vec![(MemberId(0), body.len() as u64)],
+                "{case}: ends once, at the bytes its parts carry"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_set_overstating_its_member_with_a_wrong_crc_closes_it_at_its_stated_size() {
+    for (shape, stated) in overstated_shapes() {
+        let body = track(6);
+        let wrong = crc32(&body) ^ 1;
+        let mut owner = Owner::named(store(), restated(6, stated, Some(wrong)));
+        owner.whole(1_000);
+        owner.quiet();
+        owner.settle();
+        let got = owner.member("track.flac");
+        assert!(got.closed, "{shape}: closed, to fail its checksum");
+        assert_eq!(
+            got.length,
+            Some(stated(0, body.len() as u32) as u64),
+            "{shape}"
+        );
+        assert!(ends(&owner).is_empty(), "{shape}: {:?}", owner.said);
+    }
+}
+
+#[test]
+fn a_set_stating_its_member_truly_or_understating_it_is_unchanged() {
+    let body = track(6);
+    let mut owner = Owner::named(store(), long_set(6));
+    owner.whole(1_000);
+    let got = owner.member("track.flac");
+    assert_eq!(got.length, Some(body.len() as u64));
+    assert!(got.closed && got.bytes == body);
+    assert!(
+        ends(&owner).is_empty() && !refused(&owner),
+        "{:?}",
+        owner.said
+    );
+
+    // Parts carrying more than every part states break the chain where
+    // the last one joins it: nothing ends or closes the member.
+    let mut owner = Owner::named(store(), restated(6, |_, size| size - 4_096, None));
+    owner.whole(1_000);
+    assert!(ends(&owner).is_empty(), "{:?}", owner.said);
+    assert!(!owner.member("track.flac").closed, "{:?}", owner.said);
+}
+
+// A restart at each volume's start, before the job is quiet, and once
+// after the member ended at quiet: the store restored from its facts ends
+// the member once, where a run with no restart does.
+#[test]
+fn a_set_overstating_its_member_restored_midway_ends_it_where_it_does_unrestored() {
+    for (shape, stated) in overstated_shapes() {
+        let volumes = 4;
+        let body = track(volumes);
+        for cut in 0..=volumes {
+            let mut owner = Owner::named(store(), restated(volumes, stated, None));
+            for volume in 0..volumes {
+                if volume == cut {
+                    owner.object =
+                        crate::rar_store::facts::restored(&owner.object.facts()).expect("restores");
+                }
+                owner.frames(volume, 1_000);
+            }
+            if cut == volumes {
+                owner.object =
+                    crate::rar_store::facts::restored(&owner.object.facts()).expect("restores");
+            }
+            for volume in 0..volumes {
+                owner.close(volume);
+            }
+            owner.quiet();
+            owner.settle();
+            let case = format!("{shape} restored at {cut}");
+            let got = owner.member("track.flac");
+            assert!(!refused(&owner), "{case}: {:?}", owner.said);
+            assert!(got.closed && got.bytes == body, "{case}");
+            assert_eq!(
+                ends(&owner),
+                vec![(MemberId(0), body.len() as u64)],
+                "{case}"
+            );
+            owner.object =
+                crate::rar_store::facts::restored(&owner.object.facts()).expect("restores");
+            owner.quiet();
+            owner.settle();
+            assert!(!refused(&owner), "{case} after: {:?}", owner.said);
+            assert_eq!(ends(&owner).len(), 1, "{case}: ended once");
+        }
+    }
+}
+
+// A store restored after every volume's bytes and every close lays the
+// overstated member whole at the bytes its parts carry, as one never
+// restored does.
+#[test]
+fn a_set_overstating_its_member_restored_after_every_step_ends_it_whole() {
+    for (shape, stated) in overstated_shapes() {
+        let volumes = 6;
+        let body = track(volumes);
+        let mut owner = Owner::named(store(), restated(volumes, stated, None));
+        for volume in 0..volumes {
+            owner.frames(volume, 1_000);
+            owner.object =
+                crate::rar_store::facts::restored(&owner.object.facts()).expect("restores");
+            owner.close(volume);
+            owner.object =
+                crate::rar_store::facts::restored(&owner.object.facts()).expect("restores");
+        }
+        owner.quiet();
+        owner.settle();
+        let got = owner.member("track.flac");
+        assert!(!refused(&owner), "{shape}: {:?}", owner.said);
+        assert!(got.closed && got.bytes == body, "{shape}: {:?}", owner.said);
+        assert_eq!(
+            ends(&owner),
+            vec![(MemberId(0), body.len() as u64)],
+            "{shape}"
+        );
     }
 }

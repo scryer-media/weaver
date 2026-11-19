@@ -35,10 +35,34 @@ fn member_name(raw: &str, dir: bool) -> String {
     name
 }
 
+// Whether a member streams here at the bytes its parts carry, short of the
+// size its first part states: a stored member in the clear whose parts, all
+// in, carry fewer bytes than that. unrar writes such a member until its
+// last part ends (CmdExtract::UnstoreFile, extract.cpp) and judges those
+// bytes by the CRC its last part states (ValidCRC), so a CRC32 is required,
+// and the store closes it there only once that CRC proves them. Parts
+// carrying more than it states are not: unrar writes only the stated size,
+// and the CRC fails. `in_clear` reads its first part's headers.
+fn carried_short(member: &StoredMember, in_clear: impl FnOnce() -> bool) -> bool {
+    matches!(
+        member.eligibility,
+        MemberEligibility::Ineligible(IneligibilityReason::MalformedChain(
+            MalformedReason::SizeMismatch {
+                packed_total,
+                unpacked_size,
+            },
+        )) if packed_total < unpacked_size
+    ) && member.data_crc32.is_some()
+        && in_clear()
+}
+
 // What a member's eligibility leaves the store to say: nothing while it
 // streams here, else why an engine or nobody takes the set.
-fn verdict(member: &StoredMember) -> Option<Emit> {
+fn verdict(member: &StoredMember, in_clear: impl FnOnce() -> bool) -> Option<Emit> {
     use IneligibilityReason as Reason;
+    if carried_short(member, in_clear) {
+        return None;
+    }
     let reason = match &member.eligibility {
         MemberEligibility::DirectEligible | MemberEligibility::ProvisionallyDirect => return None,
         MemberEligibility::EncryptedStore(store) => {
@@ -68,6 +92,23 @@ fn verdict(member: &StoredMember) -> Option<Emit> {
         | Reason::Blake2OnlyNoCrc32 => Emit::NeedsEngine(Why::Unsupported),
         Reason::MalformedChain(_) => Emit::Refuse(Why::Unsupported),
     })
+}
+
+// Whether a member's first part is stored in the clear, as the headers of
+// the volume it starts in state it.
+fn in_clear(volumes: &BTreeMap<VolumeIndex, Volume>, member: &StoredMember) -> bool {
+    let Some(facts) = volumes
+        .get(&VolumeIndex(member.first_volume))
+        .and_then(|found| found.walk.facts.as_ref())
+    else {
+        return false;
+    };
+    let mut parts = facts
+        .members
+        .iter()
+        .filter(|part| part.name == member.name)
+        .peekable();
+    parts.peek().is_some() && parts.all(|part| !part.is_encrypted)
 }
 
 // Whether an announced entry is still the member the layout lists: every
@@ -417,7 +458,19 @@ impl RarStore {
         // place it, and is not laid there again on the same headers.
         let broken = match refusal {
             Some(_) => Some(end - 1),
-            None => layout.members().iter().filter_map(breaks_at).min(),
+            // A chain that closes short of its member's size where a volume
+            // is held on trust breaks there too, until the job is quiet with
+            // nothing to order the volumes otherwise: the places they are
+            // held at stand then, as unrar reads volumes in the order it
+            // is given them.
+            None => layout
+                .members()
+                .iter()
+                .filter(|member| {
+                    !(self.trusting && carried_short(member, || in_clear(&self.volumes, member)))
+                })
+                .filter_map(breaks_at)
+                .min(),
         };
         if let Some(at) = broken.filter(|at| (from..end).contains(at))
             && self
@@ -455,7 +508,7 @@ impl RarStore {
             if refusal.is_some() {
                 break;
             }
-            if let Some(emit) = verdict(member) {
+            if let Some(emit) = verdict(member, || in_clear(&self.volumes, member)) {
                 refusal = Some(emit);
                 break;
             }
@@ -566,9 +619,17 @@ impl RarStore {
                 crc32,
             });
         }
-        if entry.plain_len() == Some(0) && !entry.out.closed {
+        // No bytes have the CRC32 zero: a member whose parts carry none,
+        // short of its stated size, ends there only when that is its CRC.
+        let short = entry.short();
+        let proved = !short || (!entry.uses_mac && entry.crc == Some(0));
+        if entry.plain_len() == Some(0) && !entry.out.closed && proved {
             Arc::make_mut(&mut entry.out).closed = true;
-            out.push(Emit::MemberClosed(MemberId(id as u32)));
+            let member = MemberId(id as u32);
+            if short {
+                out.push(Emit::Ends { member, length: 0 });
+            }
+            out.push(Emit::MemberClosed(member));
         }
     }
 

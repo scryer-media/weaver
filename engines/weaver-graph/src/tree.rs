@@ -4642,6 +4642,16 @@ impl Tree {
                         record.crc32 = Some(crc32);
                     }
                 }
+                // The producer's proof of where the member ends replaces
+                // the length it announced; the close that follows keeps it.
+                Emit::Ends { member, length } => {
+                    if let Some(record) = self
+                        .namespace_mut(node)
+                        .and_then(|namespace| namespace.get_mut(member))
+                    {
+                        record.length = Some(length);
+                    }
+                }
                 Emit::MemberClosed(member) => self.close(node, member, builder, effects),
                 Emit::Retract(member) => self.retract(node, member, effects),
                 Emit::RecoveryAt {
@@ -6653,6 +6663,42 @@ mod tests {
         );
         let child = tree.child_of(NodeId::ROOT, first).expect("bound").0;
         (tree, first, child, effects)
+    }
+
+    // A member announced longer than its bytes closes at the length it
+    // announced, or reached, unless its object says it ends short of it:
+    // a close lengthens, never shortens, and only the object's word does.
+    #[test]
+    fn a_member_its_object_says_ends_short_closes_there_and_one_unsaid_keeps_its_length() {
+        for said in [false, true] {
+            let (mut tree, _, child, _) = bound_tree();
+            tree.namespace_mut(child)
+                .unwrap()
+                .get_mut(MemberId(0))
+                .unwrap()
+                .length = Some(100);
+            let mut emits = Vec::new();
+            if said {
+                emits.push(Emit::Ends {
+                    member: MemberId(0),
+                    length: 5,
+                });
+            }
+            emits.push(Emit::MemberClosed(MemberId(0)));
+            let mut effects = Vec::new();
+            tree.apply(child, &mut emits, &mut Build, &mut effects);
+            let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+            assert!(inner.closed, "said {said}");
+            assert_eq!(
+                inner.length,
+                Some(if said { 5 } else { 100 }),
+                "said {said}"
+            );
+            assert!(effects.contains(&Effect::Closed {
+                node: child,
+                member: MemberId(0)
+            }));
+        }
     }
 
     #[test]
