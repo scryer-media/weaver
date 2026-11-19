@@ -141,6 +141,9 @@ impl Coverage {
         self.runs.values().map(|run| run.range.len()).sum()
     }
 
+    // Whether runs tile every byte of `range`, whatever their provenance:
+    // a lost run counts, so this says the range is accounted for, not that
+    // its bytes arrived (`Provenance::arrived`).
     pub fn covered(&self, range: ByteRange) -> bool {
         if range.is_empty() {
             return true;
