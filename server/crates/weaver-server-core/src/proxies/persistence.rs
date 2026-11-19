@@ -13,28 +13,21 @@ fn error(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
 }
 
-// Write `consumer`'s route after its own row. `before` is what the servers
-// asked of each tunnel when the transaction took the network lock, before
-// either write.
+// Write `consumer`'s route after its own row, in a transaction that holds
+// the network lock. A server's connection count is never refused here: the
+// tunnels hold usenet to their bytes as its sockets open.
 pub(crate) async fn write_routing(
     tx: &mut crate::persistence::sql_runtime::SqlTx<'_>,
     consumer: Consumer,
     policy: Option<&RoutingPolicy>,
-    before: &super::SocketAsks,
 ) -> Result<(), StateError> {
     let Some(policy) = policy else {
-        // The server's own connections may have changed what it asks of
-        // the tunnels its saved route reaches.
-        if matches!(consumer, Consumer::Server(_)) {
-            super::network_persistence::validate_stored_sockets(tx, before).await?;
-        }
         return Ok(());
     };
     let policy = super::network_persistence::validate_policy(tx, consumer, policy).await?;
     insert_route(tx, consumer.key(), &policy).await?;
     super::network_persistence::validate_stored_network(
         tx,
-        before,
         super::dns_persistence::Touched::Route(consumer),
     )
     .await?;
@@ -140,7 +133,7 @@ impl Database {
                 let mut profile = profile.clone();
                 let password = password.clone();
                 Box::pin(async move {
-                    let before = super::network_persistence::lock_network_asks(tx).await?;
+                    super::network_persistence::lock_network(tx).await?;
                     for row in tx.fetch_all("SELECT kind, member_ids FROM proxy_pools", &[]).await? {
                         let members: Vec<u32> = serde_json::from_str(&row.text("member_ids")?).map_err(error)?;
                         let kind: super::ProxyKind = serde_json::from_str(&row.text("kind")?).map_err(error)?;
@@ -172,7 +165,7 @@ impl Database {
                         SqlArg::Text(password),
                         SqlArg::I64(i64::from(profile.dns_profile_id)),
                     ]).await?;
-                    super::network_persistence::validate_stored_network(tx, &before, super::dns_persistence::Touched::Proxy(profile.id)).await?;
+                    super::network_persistence::validate_stored_network(tx, super::dns_persistence::Touched::Proxy(profile.id)).await?;
                     Ok(profile)
                 })
             }).await
@@ -270,13 +263,12 @@ impl Database {
                 let key = key.clone();
                 let policy = policy.clone();
                 Box::pin(async move {
-                    let before = super::network_persistence::lock_network_asks(tx).await?;
+                    super::network_persistence::lock_network(tx).await?;
                     let policy =
                         super::network_persistence::validate_policy(tx, consumer, &policy).await?;
                     insert_route(tx, key, &policy).await?;
                     super::network_persistence::validate_stored_network(
                         tx,
-                        &before,
                         super::dns_persistence::Touched::Route(consumer),
                     )
                     .await?;

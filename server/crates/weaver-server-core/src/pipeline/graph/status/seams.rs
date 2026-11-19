@@ -49,12 +49,19 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
         return;
     }
     // The tree opened nothing while the policy was unread: what it held
-    // undecided is asked again, once, now that it is read.
-    if let Some(job) = pipeline.graph_jobs.get_mut(&job_id)
-        && let Err(error) = job.open_after_policy()
+    // undecided is asked again, once, now that it is read. What that made
+    // due is lent, as a step's is.
+    match pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .map(GraphJob::open_after_policy)
     {
-        pipeline.after_graph_result(job_id, Err(error));
-        return;
+        Some(Err(error)) => {
+            pipeline.after_graph_result(job_id, Err(error));
+            return;
+        }
+        Some(Ok(true)) => pipeline.lend_graph_repairs(job_id),
+        Some(Ok(false)) | None => {}
     }
     if pipeline.job_has_pending_download_pipeline_work(job_id)
         || pipeline.queue_script_completion_gate(job_id, true)
@@ -197,6 +204,39 @@ fn log_set_rulings(job_id: JobId, job: &GraphJob) {
             );
         }
     }
+}
+
+// Every recovery set the job ends with that bound no file, said once, when
+// the root is done, as its object gives the reason: a line of the log and
+// an event of the job's each.
+fn unused_sets(job_id: JobId, job: &GraphJob) -> Vec<PipelineEvent> {
+    let tree = job.tree();
+    job.writer()
+        .unbound(tree)
+        .into_iter()
+        .map(|(node, kind, unbound)| {
+            let set = job
+                .writer()
+                .set_name(tree, node)
+                .map_or_else(|| kind.to_string(), str::to_owned);
+            let reason = unbound.reason.label();
+            info!(
+                job_id = job_id.0,
+                node = node.0,
+                kind = %kind,
+                set = %set,
+                recovery_set_id = unbound.id.as_deref().unwrap_or(""),
+                reason = reason,
+                "{}",
+                crate::events::model::recovery_set_unused_message(&set, reason)
+            );
+            PipelineEvent::RecoverySetUnused {
+                job_id,
+                set,
+                reason: reason.to_owned(),
+            }
+        })
+        .collect()
 }
 
 fn asker(job_id: JobId) -> AskerId {
@@ -388,6 +428,7 @@ pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Opti
         // A file with an unwanted extension the policy deletes is no file
         // of the delivery: the final move leaves it out.
         let mut delivery = delivery;
+        delivery.password_given = job.has_passwords();
         if let Some(policy) = job.writer().removes() {
             delivery.remove_unwanted(|name| policy.removes(name));
         }
@@ -863,10 +904,11 @@ impl Pipeline {
             return;
         };
         metrics::phase(phase);
-        let stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
+        let mut stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
         if phase == RootPhase::Done {
             self.post_probes.retire(job_id);
             log_set_rulings(job_id, graph);
+            stage.extend(unused_sets(job_id, graph));
             let summary = RootJob::recovery_summary(&*graph);
             metrics::repaired(&summary, &summary.outcomes());
         }

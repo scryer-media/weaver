@@ -409,6 +409,41 @@ impl GraphJob {
         &self.runs
     }
 
+    // Whether mail is still owed by anything but runs that each wait on
+    // their shelf for a change that has not come, and what rings as a run
+    // begins to wait.
+    #[cfg(test)]
+    pub(crate) fn awaits_mail_unless_blocked(&self) -> bool {
+        self.loans.out()
+            || self.works.out()
+            || self.mail_owed.is_some()
+            || self.runs.running().any(|node| {
+                self.writer
+                    .shelf_of(node)
+                    .is_none_or(|shelf| !shelf.blocked())
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocked(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.writer.blocked()
+    }
+
+    // How far the node's run read into each of its volumes, by index.
+    #[cfg(test)]
+    pub(crate) fn run_reached(&self, node: NodeId) -> BTreeMap<u32, u64> {
+        self.writer
+            .shelf_of(node)
+            .map_or_else(BTreeMap::new, |shelf| {
+                shelf
+                    .lock()
+                    .kept
+                    .iter()
+                    .map(|(volume, kept)| (*volume, kept.reached))
+                    .collect()
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn current_repair(&self, said: &Said) -> bool {
         said.scope == self.runs.scope() && self.loans.current_repair(said.node, said.generation)
@@ -716,15 +751,19 @@ impl GraphJob {
     // Once the policy is read, the members the tree held undecided while it
     // was not are asked again, once, so an archive whose name the policy
     // does not list opens then. Nothing before the policy is read; nothing
-    // to do for a job whose tree held none.
-    pub(crate) fn open_after_policy(&mut self) -> Result<(), GraphError> {
+    // to do for a job whose tree held none. True when what it applied made
+    // work due that was not, as a check of a file it closed: the caller
+    // lends it, as every step lends what it made due.
+    pub(crate) fn open_after_policy(&mut self) -> Result<bool, GraphError> {
         if !self.writer.policy_known() {
-            return Ok(());
+            return Ok(false);
         }
+        let pending = self.work_pending();
         let mut out = Vec::new();
         self.writer
             .rule_known(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
-        self.heard(out)
+        self.heard(out)?;
+        Ok(!pending && self.work_pending())
     }
 
     // Everything the job has submitted to its volumes' writers so far;
@@ -861,12 +900,14 @@ impl GraphJob {
             || self.tree.judges_past_hole(NodeId::ROOT, member)
     }
 
-    // Seam for the feed: a recovery object holds the posted file at
-    // `file_index` as one of its volumes, whatever its posted name. The
-    // feed's critical line counts it from then on.
+    // Seam for the feed: a set that rebuilds what it covers holds the
+    // posted file at `file_index` as one of its volumes, whatever its posted
+    // name. The feed's critical line and its first-article gate count it
+    // from then on. A listing of checksums brings nothing to repair with,
+    // and is not counted.
     pub(crate) fn holds_as_recovery(&self, file_index: u32) -> bool {
         self.writer
-            .carries_recovery(&self.tree, NodeId::ROOT, MemberId(file_index))
+            .carries_parity(&self.tree, NodeId::ROOT, MemberId(file_index))
     }
 
     // Seam for status: the posted file at `file_index` has an article
@@ -1491,10 +1532,14 @@ impl GraphJob {
         }
         let answers = self.root.answer(&asks, queued);
         let mut effects = Vec::new();
+        let mut settled = Vec::new();
         for (node, seek, pull, span) in lifted {
             let pull = answers[span]
                 .iter()
                 .fold(pull, |pull, answer| pull.fold(*answer));
+            // A pull of a byte nothing will bring may settle the place of
+            // the volume it was for, which a run may wait on.
+            let open = !self.placed(node, seek.volume);
             self.tree.pulled(
                 node,
                 seek,
@@ -1502,8 +1547,14 @@ impl GraphJob {
                 &mut self.writer.placing(&mut *self.builder),
                 &mut effects,
             );
+            if open && self.placed(node, seek.volume) {
+                settled.push((node, seek.volume));
+            }
         }
         self.settle(effects)?;
+        for (node, volume) in settled {
+            self.place_settled(node, volume)?;
+        }
         if self.root.map.parked_since(from) {
             self.step_runs(Vec::new(), limit)?;
             self.lend(slots, limit)?;

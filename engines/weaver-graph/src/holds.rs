@@ -108,6 +108,24 @@ impl Accounts {
         }
     }
 
+    fn fits_resident(&self, len: u64) -> bool {
+        self.resident
+            .checked_add(len)
+            .is_some_and(|sum| sum <= self.budgets.resident_limit)
+    }
+
+    // Room `len` new bytes of RAM, or say which ceiling they would cross.
+    fn reserve_resident(&mut self, namespace: HoldsNamespace, len: u64) -> Reserve {
+        if !self.fits_resident(len) {
+            return Reserve::Breached(Budget::ResidentLimit);
+        }
+        let mut usage = self.usage(namespace);
+        usage.resident += len;
+        self.resident += len;
+        self.store(namespace, usage);
+        Reserve::Granted
+    }
+
     // The scratch checks shared by a page-out and a direct spill. The
     // namespace's own ceiling is named first because it is the breach the
     // caller can pin on this one set; the process-wide ones follow.
@@ -137,9 +155,61 @@ fn released(held: u64, len: u64, what: &str) -> u64 {
     }
 }
 
+// A wake for resident room, by the key its caller names it with.
+pub type ResidentWake = Arc<dyn Fn() + Send + Sync>;
+
+// Who waits for resident room to come back, each told once, the next time
+// any namespace gives some back. The count lets a release with no one
+// waiting, as nearly every release is, pass with one load.
+#[derive(Default)]
+struct Waiters {
+    count: std::sync::atomic::AtomicUsize,
+    wakes: Mutex<HashMap<usize, ResidentWake>>,
+}
+
+impl std::fmt::Debug for Waiters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waiters")
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Waiters {
+    fn wakes(&self) -> MutexGuard<'_, HashMap<usize, ResidentWake>> {
+        self.wakes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Called with the accounts locked, by a caller they just refused: a
+    // release that gives room back takes that lock after this, and rings
+    // after it lets go, so it finds this wake kept.
+    fn add(&self, key: usize, wake: ResidentWake) {
+        let mut wakes = self.wakes();
+        wakes.entry(key).or_insert(wake);
+        self.count
+            .store(wakes.len(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // Called with no lock of the accounts held: a wake may ask for room.
+    fn ring(&self) {
+        if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        let rung = {
+            let mut wakes = self.wakes();
+            self.count.store(0, std::sync::atomic::Ordering::SeqCst);
+            std::mem::take(&mut *wakes)
+        };
+        for wake in rung.into_values() {
+            wake();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HoldsAccountant {
     accounts: Mutex<Accounts>,
+    waiters: Waiters,
 }
 
 impl HoldsAccountant {
@@ -151,7 +221,41 @@ impl HoldsAccountant {
                 scratch: 0,
                 namespaces: HashMap::new(),
             }),
+            waiters: Waiters::default(),
         }
+    }
+
+    // Whether `len` more resident bytes fit now. When they do not, `wake`
+    // is kept under `key`, one wake a key, and called once the next time
+    // any namespace gives resident room back. The look and the keeping are
+    // one step under the accounts' lock, so room given back after the look
+    // always finds the wake kept. A caller that waits on a no asks this, or
+    // [`Self::reserve_resident_or_wake`], last.
+    pub fn resident_fits_or_wake(&self, len: u64, key: usize, wake: ResidentWake) -> bool {
+        let accounts = self.lock();
+        if accounts.fits_resident(len) {
+            return true;
+        }
+        self.waiters.add(key, wake);
+        false
+    }
+
+    // [`Self::reserve_resident`], with `wake` kept as
+    // [`Self::resident_fits_or_wake`] keeps it when the room is refused:
+    // a refusal always leaves a wake behind it.
+    pub fn reserve_resident_or_wake(
+        &self,
+        namespace: HoldsNamespace,
+        len: u64,
+        key: usize,
+        wake: ResidentWake,
+    ) -> Reserve {
+        let mut accounts = self.lock();
+        let reserve = accounts.reserve_resident(namespace, len);
+        if reserve != Reserve::Granted {
+            self.waiters.add(key, wake);
+        }
+        reserve
     }
 
     // Every mutation checks before it writes, so a panic under the lock
@@ -205,19 +309,7 @@ impl HoldsAccountant {
 
     // Room `len` new bytes of RAM, or say which ceiling they would cross.
     pub fn reserve_resident(&self, namespace: HoldsNamespace, len: u64) -> Reserve {
-        let mut accounts = self.lock();
-        let Some(resident) = accounts
-            .resident
-            .checked_add(len)
-            .filter(|&sum| sum <= accounts.budgets.resident_limit)
-        else {
-            return Reserve::Breached(Budget::ResidentLimit);
-        };
-        let mut usage = accounts.usage(namespace);
-        usage.resident += len;
-        accounts.resident = resident;
-        accounts.store(namespace, usage);
-        Reserve::Granted
+        self.lock().reserve_resident(namespace, len)
     }
 
     // Move `len` resident bytes of this namespace to scratch. The bytes stay
@@ -234,6 +326,8 @@ impl HoldsAccountant {
         accounts.resident = released(accounts.resident, len, "resident");
         accounts.scratch += len;
         accounts.store(namespace, usage);
+        drop(accounts);
+        self.waiters.ring();
         Reserve::Granted
     }
 
@@ -270,6 +364,10 @@ impl HoldsAccountant {
         usage.resident = released(usage.resident, len, "resident");
         accounts.resident = total;
         accounts.store(namespace, usage);
+        drop(accounts);
+        if len > 0 {
+            self.waiters.ring();
+        }
     }
 
     pub fn release_scratch(&self, namespace: HoldsNamespace, len: u64) {
@@ -1307,6 +1405,72 @@ mod tests {
 
     fn bytes(fill: u8, len: usize) -> Bytes {
         Bytes::from(vec![fill; len])
+    }
+
+    // A caller refused resident room is told once when any namespace gives
+    // room back, by a release or a page-out, and never again unless it asks
+    // again; one wake a key, however often it asks; and room given back
+    // before it asked is answered at once, with nothing kept.
+    #[test]
+    fn a_wait_for_resident_room_is_rung_once_by_any_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let accountant = HoldsAccountant::new(budgets(10));
+        let rung = Arc::new(AtomicUsize::new(0));
+        let wake = || -> ResidentWake {
+            let rung = Arc::clone(&rung);
+            Arc::new(move || {
+                rung.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        assert_eq!(accountant.reserve_resident(OTHER, 10), Reserve::Granted);
+        assert!(!accountant.resident_fits_or_wake(4, 7, wake()));
+        assert!(!accountant.resident_fits_or_wake(4, 7, wake()));
+        accountant.release_resident(OTHER, 2);
+        assert_eq!(rung.load(Ordering::SeqCst), 1, "one wake for the key");
+        accountant.release_resident(OTHER, 2);
+        assert_eq!(rung.load(Ordering::SeqCst), 1, "told once");
+
+        assert!(!accountant.resident_fits_or_wake(8, 7, wake()));
+        assert_eq!(accountant.page_out(OTHER, 1, PLENTY), Reserve::Granted);
+        assert_eq!(rung.load(Ordering::SeqCst), 2, "a page-out gives room back");
+
+        assert!(accountant.resident_fits_or_wake(5, 7, wake()));
+        accountant.release_resident(OTHER, 5);
+        assert_eq!(
+            rung.load(Ordering::SeqCst),
+            2,
+            "nothing kept for room that fit"
+        );
+        accountant.release_scratch(OTHER, 1);
+        assert_idle(&accountant);
+    }
+
+    // A reservation refused keeps its wake in the same step: the release
+    // that follows rings it, and a reservation granted keeps nothing.
+    #[test]
+    fn a_reservation_refused_is_rung_by_the_next_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let accountant = HoldsAccountant::new(budgets(10));
+        let rung = Arc::new(AtomicUsize::new(0));
+        let wake = || -> ResidentWake {
+            let rung = Arc::clone(&rung);
+            Arc::new(move || {
+                rung.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        assert_eq!(
+            accountant.reserve_resident_or_wake(OTHER, 6, 7, wake()),
+            Reserve::Granted
+        );
+        accountant.release_resident(OTHER, 1);
+        assert_eq!(rung.load(Ordering::SeqCst), 0, "nothing kept for a grant");
+        assert_eq!(
+            accountant.reserve_resident_or_wake(OTHER, 6, 7, wake()),
+            Reserve::Breached(Budget::ResidentLimit)
+        );
+        accountant.release_resident(OTHER, 5);
+        assert_eq!(rung.load(Ordering::SeqCst), 1, "the refusal is rung");
+        assert_idle(&accountant);
     }
 
     fn assert_idle(accountant: &HoldsAccountant) {

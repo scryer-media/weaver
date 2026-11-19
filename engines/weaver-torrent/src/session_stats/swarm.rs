@@ -275,6 +275,10 @@ counted! {
         QueueFull => "queue_full",
         /// Ours: not sent, the peer was asked for the block already.
         AskedAlready => "asked_already",
+        /// Ours: a block arrived for a piece the storage had no room for;
+        /// the connection gave back its started pieces and stopped reading
+        /// until room came back.
+        RoomWait => "room_wait",
     }
 }
 

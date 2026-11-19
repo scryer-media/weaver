@@ -102,10 +102,13 @@ impl WriteJob {
             counters,
             chunk,
             block,
+            room,
             written,
+            ended,
             _run,
         } = self;
         drop(block);
+        drop(room);
         drop(written);
         match landed {
             Ok(None) => {}
@@ -123,7 +126,7 @@ impl WriteJob {
                     waiting: None,
                     written: Written(None),
                     queued: Some(spawner.check_queued()),
-                    ended: None,
+                    ended,
                     stored: None,
                     _run,
                 });
@@ -189,6 +192,16 @@ impl DiskJob for HashJob {
                 // (`PieceCheck`).
                 Stored::Dropped => drop(self),
             }
+            stats.hash_thread_worked(since);
+            return;
+        }
+        // A block of the piece its storage took and then failed to write,
+        // as when a piece given back went to its files, is a disk's error,
+        // not a sender's: the piece is not checked, and goes the way of one
+        // the storage refused, its senders neither credited nor blamed.
+        if let Err(e) = state.files.piece_written(self.chunk.piece_index) {
+            let epoch = state.upload_epoch();
+            self.stored(Err(e), epoch);
             stats.hash_thread_worked(since);
             return;
         }

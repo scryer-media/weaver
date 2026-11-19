@@ -523,6 +523,7 @@ fn scenario_client(servers: usize, port: u16) -> weaver_nntp::client::NntpClient
 pub(super) async fn hear_probe(pipeline: &mut Pipeline) {
     loop {
         pipeline.seat_waiting_probes(
+            std::time::Instant::now(),
             &mut std::collections::HashMap::new(),
             &mut std::collections::HashMap::new(),
         );
@@ -2101,12 +2102,22 @@ pub(in crate::pipeline::tests) struct Held {
 // Once nothing moves the job is looked at; then the held articles are
 // answered and the job runs to its end.
 pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u32) -> Held {
-    // Every article the queue hands out is served but the held post's, and
+    run_holding_where(scenario, |article| article.0 == held, |_| {}).await
+}
+
+// [`run_holding`], holding every article `held` names, and showing
+// `at_hold` the pipeline once nothing moves while they are held.
+pub(in crate::pipeline::tests) async fn run_holding_where(
+    scenario: &Scenario,
+    held: impl Fn((u32, u32)) -> bool,
+    at_hold: impl FnOnce(&Pipeline),
+) -> Held {
+    // Every article the queue hands out is served but the held ones, and
     // the job's checks, steps and mail run, until nothing is left to serve.
     async fn settle(
         pipeline: &mut Pipeline,
         scenario: &Scenario,
-        held: u32,
+        held: &dyn Fn((u32, u32)) -> bool,
         out: &mut Vec<DownloadWork>,
     ) {
         loop {
@@ -2118,7 +2129,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
                     work.segment_id.file_id.file_index,
                     work.segment_id.segment_number,
                 );
-                if article.0 == held {
+                if held(article) {
                     *pipeline.articles_in_flight_by_job.entry(JOB).or_insert(0) += 1;
                     out.push(work);
                     continue;
@@ -2133,13 +2144,25 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
             }
             pipeline.check_job_completion(JOB).await;
             pump_pipeline_runtime_queues(pipeline).await;
-            if pipeline
+            // A run that waits on its shelf for what is held says nothing
+            // until it is let go: mail is awaited only from the rest, or
+            // until every run waits so.
+            if let Some(blocked) = pipeline
                 .graph_jobs
                 .get(&JOB)
-                .is_some_and(|graph| graph.awaits_mail())
+                .filter(|graph| graph.awaits_mail_unless_blocked())
+                .map(crate::pipeline::graph::job::GraphJob::blocked)
             {
-                let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
-                pipeline.graph_run_said(said);
+                tokio::select! {
+                    said = pipeline.graph_runs.recv() => {
+                        let said = said.expect("a live run speaks");
+                        if let Some(heard) = &scenario.heard {
+                            heard(&said);
+                        }
+                        pipeline.graph_run_said(said);
+                    }
+                    () = blocked.notified() => {}
+                }
                 continue;
             }
             if pipeline.jobs.get(&JOB).is_none_or(|state| {
@@ -2169,8 +2192,9 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
 
     let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
     let mut out = Vec::new();
-    settle(&mut pipeline, scenario, held, &mut out).await;
+    settle(&mut pipeline, scenario, &held, &mut out).await;
     assert!(!out.is_empty(), "the held post was never asked for");
+    at_hold(&pipeline);
     let report = pipeline
         .job_report(JOB)
         .expect("the job waits on the held post");
@@ -2198,7 +2222,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
             after.push((report.status.clone(), report.fetching_repair_data));
         }
         let before = look(&pipeline);
-        settle(&mut pipeline, scenario, held, &mut out).await;
+        settle(&mut pipeline, scenario, &held, &mut out).await;
         let now = look(&pipeline);
         if before == now && stalled.replace(now.clone()) == Some(now.clone()) {
             panic!("the job stalled: {now}");

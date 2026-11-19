@@ -49,6 +49,45 @@ pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
+
+/// How a connection's close settles on its peer
+/// ([`Peer::connection_closing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Close {
+    /// The run's end let the connection go, not the peer: the next run may
+    /// dial the peer at once (Weaver's departure from libtorrent, whose
+    /// `peer_list::connection_closed` starts the wait for every close).
+    LetGo,
+    /// It closed, in an error when `failed`.
+    Closed { failed: bool },
+}
+
+impl Close {
+    /// How a connection that ended with `error` closes, the run `ended` or
+    /// not. Once the run's end has begun, a close our side made (its task
+    /// dropped as the run was cancelled, or closed by us: see
+    /// [`swarm::CloseReason::Closed`]) is the end's, whether it settles
+    /// before the end lets every connection go
+    /// ([`super::PeerStates::close_all`]) or after. A failure, or a close
+    /// the peer made, keeps what it counts whenever it settles.
+    ///
+    /// [`swarm::CloseReason::Closed`]: crate::session_stats::swarm::CloseReason::Closed
+    pub(crate) fn of(ended: bool, error: Option<&crate::Error>) -> Self {
+        use crate::session_stats::swarm::CloseReason;
+        if ended && CloseReason::of(error) == CloseReason::Closed {
+            Self::LetGo
+        } else {
+            Self::Closed {
+                failed: error.is_some_and(crate::Error::is_failure),
+            }
+        }
+    }
+
+    /// Whether the close was a failure.
+    pub(crate) fn failed(self) -> bool {
+        matches!(self, Self::Closed { failed: true })
+    }
+}
 // libtorrent `peer_connection::fast_reconnect`: the most connections to one
 // peer that may follow a failed encrypted handshake at once, without the
 // wait to reconnect.
@@ -568,32 +607,34 @@ impl Peer {
         self.set_state(next, peers);
     }
 
-    /// The peer's connection closes at `closed_at`, in an error when
-    /// `failed`, while we are `finished` or not; see [`Peer::closed`].
-    /// Whether the connection showed the peer only uploads is kept past
-    /// it. Returns whether we still want the peer ([`Peer::needed`]).
+    /// The peer's connection closes at `closed_at` as `close` says, while
+    /// we are `finished` or not; see [`Peer::closed`]. Whether the
+    /// connection showed the peer only uploads is kept past it. Returns
+    /// whether we still want the peer ([`Peer::needed`]).
     pub(crate) fn connection_closing(
         &mut self,
         closed_at: Instant,
-        failed: bool,
+        close: Close,
         finished: bool,
         peers: &PeerStates,
     ) -> bool {
         self.keep_what_it_showed();
         let needed = self.needed(finished);
-        self.closed(closed_at, failed, needed);
+        match close {
+            // The run's end let it go, not the peer: the close starts no
+            // wait to reconnect, so the next run may connect at once,
+            // waiting only for the failures in a row the peer had.
+            Close::LetGo => self.closed(closed_at, false, false),
+            Close::Closed { failed } => self.closed(closed_at, failed, needed),
+        }
         peers.reindex(self);
         needed
     }
 
     /// The connection ends at `closed_at` because the run ends, not because
-    /// of the peer: what it showed of its peer is kept, and the close starts
-    /// no wait to reconnect, so the next run may connect at once, waiting
-    /// only for the failures in a row the peer had.
+    /// of the peer ([`Close::LetGo`]).
     pub(crate) fn connection_let_go(&mut self, closed_at: Instant, peers: &PeerStates) {
-        self.keep_what_it_showed();
-        self.closed(closed_at, false, false);
-        peers.reindex(self);
+        self.connection_closing(closed_at, Close::LetGo, false, peers);
     }
 
     fn keep_what_it_showed(&mut self) {
@@ -846,7 +887,8 @@ impl Peer {
         finished: bool,
         counters: &PeerStates,
     ) {
-        let needed = self.connection_closing(closed_at, failed, finished, counters);
+        let needed =
+            self.connection_closing(closed_at, Close::Closed { failed }, finished, counters);
         self.settle_closed(needed, counters);
     }
 
@@ -1272,6 +1314,9 @@ pub(crate) struct LivePeerState {
     // The peer's reads wait on the download limits (libtorrent: the download
     // channel lacks `peer_info::bw_network`), and when they last resumed.
     waiting_for_download_quota: bool,
+    // Its reads wait for room for the piece of a block it sent, which the
+    // storage gives back as other pieces leave memory.
+    waiting_for_room: bool,
     reads_resumed: Instant,
 
     // How long the peer takes to deliver a block, which sets its request timeout.
@@ -1434,6 +1479,7 @@ impl LivePeerState {
             waiting_since: Instant::now(),
             last_piece: Instant::now(),
             waiting_for_download_quota: false,
+            waiting_for_room: false,
             reads_resumed: Instant::now(),
             block_time: BlockTime::default(),
             slow_start: Some(SlowStart::new(now)),
@@ -1723,9 +1769,12 @@ impl LivePeerState {
     /// none are outstanding, and while its reads wait on the download limits:
     /// a peer is held to its timeouts only while it is read, and time spent
     /// waiting on the limits does not count against it (`second_tick` checks
-    /// both only with `bw_network` set and download quota held).
+    /// both only with `bw_network` set and download quota held). A wait for
+    /// the storage's room is a wait of ours too, and does not count either
+    /// (libtorrent stops reading a peer the disk is behind, `bw_disk`, and
+    /// `second_tick` holds it to neither timeout then).
     pub fn request_deadline(&self) -> Option<Instant> {
-        if self.waiting_for_download_quota {
+        if self.waiting_for_download_quota || self.waiting_for_room {
             return None;
         }
         let read_from = |at: Instant| at.max(self.reads_resumed);
@@ -1738,6 +1787,15 @@ impl LivePeerState {
     /// The peer's reads wait on the download limits, or resume.
     pub fn set_waiting_for_download_quota(&mut self, waiting: bool) {
         self.waiting_for_download_quota = waiting;
+        if !waiting {
+            self.reads_resumed = Instant::now();
+        }
+        self.request_slots_changed.notify_waiters();
+    }
+
+    /// The peer's reads wait for the storage's room, or resume.
+    pub fn set_waiting_for_room(&mut self, waiting: bool) {
+        self.waiting_for_room = waiting;
         if !waiting {
             self.reads_resumed = Instant::now();
         }

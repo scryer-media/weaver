@@ -469,6 +469,9 @@ impl TorrentStore {
                 }
                 io::Result::Ok(batch.barrier())
             })?;
+            let Some(barrier) = barrier else {
+                return Err(unwritten());
+            };
             barrier.wait_aside();
             if barrier.unwritten() {
                 return Err(unwritten());
@@ -604,6 +607,9 @@ impl TorrentStore {
                 }
                 io::Result::Ok(batch.barrier())
             })?;
+            let Some(barrier) = barrier else {
+                return Err(unwritten());
+            };
             barrier.wait_aside();
             if barrier.unwritten() {
                 return Err(unwritten());
@@ -1036,8 +1042,10 @@ impl TorrentStore {
     // are let go, and its tee hears nothing more and gives back what it
     // holds of the repair slots.
     pub(crate) async fn forget(&self) {
-        drop(self.unpark());
         self.writes.forget().await;
+        // Kept for a move before the writes were given up; none is kept
+        // after.
+        drop(self.unpark());
         self.files.release();
         if let Some(tee) = self.tee() {
             tee.forget();
@@ -1048,7 +1056,7 @@ impl TorrentStore {
     #[cfg(test)]
     pub(crate) fn forget_now(&self) {
         drop(self.unpark());
-        if let Some(barrier) = self.writes.abandon() {
+        if let Some(barrier) = self.writes.retire() {
             barrier.wait_aside();
         }
         self.files.release();
@@ -1199,7 +1207,10 @@ impl TorrentStore {
     fn hand_over(&self, parked: Parked) -> Option<Parked> {
         let mut moves = lock(&self.moves);
         if moves.moving {
-            moves.parked.push_back(parked);
+            // A torrent gone keeps nothing for its move to queue.
+            if !self.writes.retired() {
+                moves.parked.push_back(parked);
+            }
             return None;
         }
         // Not waited for: a move says it begins before it takes the files.
@@ -1427,6 +1438,11 @@ impl Pieces for TorrentStore {
         self.writes.reserve(bytes, room)
     }
 
+    // On a blocking thread of the disk's runtime.
+    fn aside(&self, run: Box<dyn FnOnce() + Send>) {
+        self.writes.aside(run);
+    }
+
     // A block goes the way a piece does, through the writer of its files'
     // volume, kept while the files move, and is counted on the volume as it
     // fits; this waits for it, on a thread that may wait on a disk. A file
@@ -1481,21 +1497,13 @@ impl Pieces for TorrentStore {
         Ok(())
     }
 
-    // A piece the tee reads back holds room for one of its articles while it
-    // arrives, which its read-back is made in once it verified; any other
-    // holds room for one block.
-    fn block_room(&self, piece_length: u64) -> u64 {
-        let block = u64::from(weaver_torrent::core::constants::CHUNK_SIZE);
-        let room = match self.tee() {
-            Some(tee) if tee.writes_blocks() => super::tee::READ_BACK_BYTES.max(block),
-            _ => block,
-        };
-        room.min(piece_length)
-    }
-
     fn stop_writes(&self) {
         drop(self.unpark());
         drop(self.writes.abandon());
+    }
+
+    fn retired(&self) -> bool {
+        self.writes.retired()
     }
 
     // A piece the side store keeps is dropped from it with the piece.

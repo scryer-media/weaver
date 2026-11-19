@@ -731,7 +731,10 @@ impl Pipeline {
         // nothing dispatch would serve, or a pass that leaves a connection
         // running. A gate that only holds this pass back (the rate limit,
         // byte pressure, a yield) leaves it running, so a stall behind such
-        // a gate is still reported once it has held a whole interval.
+        // a gate is still reported once it has held a whole interval. A
+        // lane yielded to a health probe batch is the exception: while the
+        // batch answers on it, the connection is busy, and the clock starts
+        // over (see `log_download_dispatch_liveness_stall`).
         if self.articles_in_flight != 0 || self.active_download_connections != 0 {
             self.download_dispatch_liveness_since = None;
         }
@@ -766,7 +769,7 @@ impl Pipeline {
         // below may take as well.
         let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
         let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
-        self.seat_waiting_probes(&mut sent_this_pass, &mut headroom_at_pass_start);
+        self.seat_waiting_probes(now, &mut sent_this_pass, &mut headroom_at_pass_start);
         let pressure = self.refresh_download_pressure();
         if pressure.is_hard() {
             self.update_queue_metrics();

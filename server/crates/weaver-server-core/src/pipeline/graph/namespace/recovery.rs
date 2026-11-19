@@ -16,7 +16,7 @@ use std::collections::binary_heap::{BinaryHeap, PeekMut};
 use std::collections::{BTreeSet, HashSet};
 
 use bytes::Bytes;
-use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
+use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling, Unbound};
 use weaver_graph::{
     Algorithm, Builder, ByteRange, Effect, Handed, Kind, MemberId, Namespace, NodeId, Provenance,
     RecoveryKind, Restore, Segment, Tree, VolumeIndex,
@@ -159,6 +159,14 @@ impl NamespaceWriter {
             .is_some_and(|(child, _)| tree.recovers(child))
     }
 
+    // The member is a volume of a set that rebuilds what it covers: data
+    // to repair with, in its own file. The set says whether it rebuilds; a
+    // set that only checks carries none.
+    pub(crate) fn carries_parity(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+        tree.child_of(node, member)
+            .is_some_and(|(child, _)| tree.rebuilds(child))
+    }
+
     // Every set of the namespace has ruled on something other than waiting:
     // nothing a set of it will rebuild is still to come. A set whose repair
     // is out has its ruling still to come, and so has one whose own volume
@@ -243,10 +251,66 @@ impl NamespaceWriter {
 
     // Every set of every namespace has ruled on something other than
     // waiting.
+    #[cfg(test)]
     pub(crate) fn all_ruled(&self, tree: &Tree, coming: &Coming) -> bool {
         tree.live()
             .into_iter()
             .all(|node| self.ruled(tree, node, coming))
+    }
+
+    // Every set of every namespace has ruled, as `all_ruled` asks, or waits
+    // only on the job's quiet: what the job waits for before its data
+    // objects hear it. `reading` says which namespaces' sources may still
+    // announce members.
+    pub(crate) fn ruled_but_for_quiet(
+        &self,
+        tree: &Tree,
+        coming: &Coming,
+        reading: &dyn Fn(NodeId) -> bool,
+    ) -> bool {
+        tree.live().into_iter().all(|node| {
+            self.ruled(tree, node, coming) || self.waits_on_quiet(tree, node, coming, reading(node))
+        })
+    }
+
+    // Below the root, a set that has yet to rule may wait on nothing but
+    // the quiet. Its namespace has every member it will get, nothing above
+    // can bring back what those members lost, and every set above has
+    // ruled; it is not due, as a member it covers is open short of bytes.
+    // Its object holds the rest of that member until it hears the losses of
+    // its volumes, which it hears only once the job is quiet, and the member
+    // closes only then. Waiting for such a set before the quiet waits for
+    // ever: once its object has heard, the member closes and the set rules.
+    fn waits_on_quiet(&self, tree: &Tree, node: NodeId, coming: &Coming, reading: bool) -> bool {
+        if node == NodeId::ROOT
+            || !members_known(tree, node, reading)
+            || !self.lost_for_good(tree, node, coming)
+        {
+            return false;
+        }
+        let Some(namespace) = tree.namespace(node) else {
+            return false;
+        };
+        let sets = tree.recovery_nodes(node);
+        let aside = Aside::of(tree, &sets);
+        let due = self.due(tree, node, reading);
+        sets.iter().copied().all(|set| {
+            if aside.yields(set) {
+                return true;
+            }
+            if tree.lent(set) || coming.sets.contains(&set) || due.contains(&set) {
+                return false;
+            }
+            let Some(recovery) = tree.recovery(set) else {
+                return true;
+            };
+            match recovery.outcome() {
+                Some(outcome) => outcome != RepairOutcome::Waiting,
+                None => namespace.members().any(|member| {
+                    recovery.covers(member.id) && !member.closed && !member.is_complete()
+                }),
+            }
+        })
     }
 
     // What each set last ruled, parents first; `None` for one that has not.
@@ -292,6 +356,23 @@ impl NamespaceWriter {
         if let Some(recovery) = tree.recovery(set) {
             recovery.sets(out);
         }
+    }
+
+    // Each standing set of every namespace that bound no member, with its
+    // object's node and kind and why, as its object says. Asked once, when
+    // the job is done.
+    pub(crate) fn unbound(&self, tree: &Tree) -> Vec<(NodeId, Kind, Unbound)> {
+        let mut found = Vec::new();
+        let mut said = Vec::new();
+        for (_, set) in self.sets(tree) {
+            let (Some(kind), Some(recovery)) = (tree.kind(set), tree.recovery(set)) else {
+                continue;
+            };
+            said.clear();
+            recovery.unbound(&mut said);
+            found.extend(said.drain(..).map(|unbound| (set, kind, unbound)));
+        }
+        found
     }
 
     // What a set is called: what the file that carries it is.
@@ -412,7 +493,9 @@ impl NamespaceWriter {
     // namespace at or below it: at `origin` it is. Below, the run above
     // refuses what its damaged volumes cannot produce, which is everything
     // they lost unless a set beside them that has not ruled impossible
-    // covers one: that set may yet rebuild what the run reads.
+    // covers one: that set may yet rebuild what the run reads. A volume
+    // that holds every byte, each one good, lost nothing for a set to
+    // rebuild, whatever covers it.
     fn refused_above(&self, tree: &Tree, origin: NodeId, node: NodeId) -> bool {
         let mut at = node;
         while at != origin {
@@ -420,12 +503,17 @@ impl NamespaceWriter {
                 return false;
             };
             let sets = tree.recovery_nodes(parent);
+            let namespace = tree.namespace(parent);
             let rebuilt = volumes.values().any(|member| {
-                self.covering(tree, &sets, *member).any(|set| {
-                    tree.recovery(set).is_none_or(|recovery| {
-                        !matches!(recovery.outcome(), Some(RepairOutcome::Impossible { .. }))
+                let good = namespace
+                    .and_then(|namespace| namespace.get(*member))
+                    .is_some_and(|record| record.is_complete() && record.coverage.is_clean());
+                !good
+                    && self.covering(tree, &sets, *member).any(|set| {
+                        tree.recovery(set).is_none_or(|recovery| {
+                            !matches!(recovery.outcome(), Some(RepairOutcome::Impossible { .. }))
+                        })
                     })
-                })
             });
             if rebuilt {
                 return false;
@@ -725,10 +813,9 @@ impl NamespaceWriter {
             let absent = posts.get(member).is_some_and(|record| {
                 absent_from_posts(record)
                     && due.iter().any(|&set| {
-                        tree.kind(set) == Some(Kind::Par3)
-                            && tree
-                                .recovery(set)
-                                .is_some_and(|recovery| recovery.covers(member))
+                        tree.recovery(set).is_some_and(|recovery| {
+                            recovery.outgrows_recovery() && recovery.covers(member)
+                        })
                     })
             });
             absent == held.absent.contains(&member)
@@ -844,12 +931,14 @@ impl NamespaceWriter {
             self.diagnostics.push(diagnostic);
         }
         self.read_backs += reads;
-        // What a PAR3 set wrote into a post none of whose bytes arrived is
-        // held to the disk reserve before any of it lands; what a repair
-        // wrote into an object's output is held to the job's limits as it
-        // lands, as that output always is.
+        // What a set that can outgrow its recovery wrote into a post none of
+        // whose bytes arrived is held to the disk reserve before any of it
+        // lands; what a repair wrote into an object's output is held to the
+        // job's limits as it lands, as that output always is.
         if node == NodeId::ROOT
-            && tree.kind(set) == Some(Kind::Par3)
+            && tree
+                .recovery(set)
+                .is_some_and(|recovery| recovery.outgrows_recovery())
             && let Err(error) = self.admit_repaired(tree, repaired.sizes())
         {
             let _ = repaired.remove();
@@ -1531,12 +1620,16 @@ fn pending_covers(
         .collect()
 }
 
-// An SFV listing stands aside while parity beside it can rule: a PAR2 or
-// PAR3 object among the namespace's `sets` that knows what each of its sets
-// describes, or, out on a repair, covered a member when it left. It does
-// not rule, is never lent, and no byte reaches it, so it takes back no
-// ruling and makes no other set rule again. With no such parity, as when
-// its index never came or does not read, the listing rules as before.
+// A set that only checks, as an SFV listing does, stands aside while a set
+// beside it that rebuilds can rule: one among the namespace's `sets` that
+// knows what each of its sets describes, or, out on a repair, covered a
+// member when it left. Each set says for itself whether it rebuilds. A set
+// carried inside the one member it covers, as a RAR volume's own record
+// is, repairs that member alone, and the listing still rules the others.
+// The listing does not rule, is never lent, and no byte reaches it, so it
+// takes back no ruling and makes no other set rule again. With no such
+// set, as when its index never came or does not read, the listing rules as
+// before.
 //
 // Whether such parity is there is one answer for the whole namespace: it is
 // found the first time a listing asks, and never again in the same pass,
@@ -1558,10 +1651,11 @@ impl<'t> Aside<'t> {
     }
 
     fn yields(&self, set: NodeId) -> bool {
-        self.tree.kind(set) == Some(Kind::Sfv)
+        !self.tree.rebuilds(set)
             && *self.parity.get_or_init(|| {
                 self.sets.iter().any(|&other| {
-                    matches!(self.tree.kind(other), Some(Kind::Par2 | Kind::Par3))
+                    self.tree.rebuilds(other)
+                        && !self.tree.carried_inside(other)
                         && match self.tree.recovery(other) {
                             Some(recovery) => !recovery.undescribed(),
                             None => self.tree.lent_covers_any(other),

@@ -15,6 +15,7 @@ use crate::jobs::handle::JobInfo;
 use crate::jobs::model::{JobStatus, job_status_from_persisted_str};
 use crate::jobs::report::JobReport;
 use crate::persistence::Database;
+use crate::post_processing::events::EventContext;
 use crate::post_processing::model::QueueEvent;
 use crate::torrents::files::Files;
 use crate::torrents::metrics::{FetchOutcome, TorrentEvent};
@@ -78,15 +79,17 @@ impl TorrentService {
         self.inner.counters.event(TorrentEvent::Failed);
         self.detach(&mut torrent).await;
         let written = read_written(self.written_of(&torrent)).await;
-        self.retire(
-            torrent,
-            HistoryEnd::Failed,
-            Some(error),
-            written,
-            Shown::Now,
-        )
-        .await;
-        self.queue_script_event(stopped);
+        let retired = self
+            .ready_history(
+                torrent,
+                HistoryEnd::Failed,
+                Some(error),
+                written,
+                Shown::Now,
+                stopped,
+            )
+            .await;
+        self.to_history(vec![retired]).await;
     }
 
     // Unpacking refused the torrent's output. Its job goes to history as
@@ -123,17 +126,19 @@ impl TorrentService {
         self.finish(report, HistoryEnd::Failed, hash, now).await;
     }
 
-    // A torrent that left the live ones goes to history: its row, then out
-    // of the torrents and into the finished jobs, listing of what it
-    // `written` what is still there once its removal is done with it.
-    async fn retire(
+    // A torrent that left the live ones, readied for history: its row, to
+    // go out of the torrents and into the finished jobs (`to_history`), listing
+    // of what it `written` what is still there once its removal is done
+    // with it, and the script event its end raises, `ended`.
+    async fn ready_history(
         &self,
         mut torrent: Live,
         status: HistoryEnd,
         error: Option<String>,
         written: Wrote,
         shown: Shown,
-    ) {
+        ended: Option<EventContext>,
+    ) -> Retired {
         let job_id = torrent.record.job_id;
         let files = history_files(written.deletion).await;
         self.inner.env.outside.leave(job_id.0);
@@ -152,17 +157,84 @@ impl TorrentService {
             }
         }
         let (report, row) = self.history_of(&torrent, status, error);
-        let short = !torrent.complete();
-        // Its history row and its removal are one write: the job is never
-        // in neither, so an event raised while it was live, still being
-        // queued, finds it.
-        self.write_history(row, true, report.job_info(), files, shown)
-            .await;
-        // One that left short of complete ended its download here, out of
-        // its session: what it held for that goes back, as a cancelled or
-        // failed NZB job's does. A seed's download ended as it completed.
+        Retired {
+            row,
+            job: report.job_info(),
+            files,
+            shown,
+            short: !torrent.complete(),
+            ended,
+        }
+    }
+
+    // Torrents that left the live ones, to history, in order: their history
+    // rows and their removals, one write for one torrent and one for a
+    // batch's (`write_histories`); then for each, the memory a download cut
+    // short held given back, and its script event queued. The job is never
+    // in neither, so an event raised while it was live, still being queued,
+    // finds it.
+    pub(super) async fn to_history(&self, retired: Vec<Retired>) {
+        let mut retired = retired;
+        match retired.len() {
+            0 => {}
+            1 => {
+                let Some(one) = retired.pop() else { return };
+                let Retired {
+                    row,
+                    job,
+                    files,
+                    shown,
+                    short,
+                    ended,
+                } = one;
+                self.write_history(row, true, job, files, shown).await;
+                self.after_history(short, ended);
+            }
+            _ => self.write_histories(retired).await,
+        }
+    }
+
+    // What follows a retired torrent's history row: one that left short of
+    // complete ended its download here, out of its session, and what it
+    // held for that goes back, as a cancelled or failed NZB job's does (a
+    // seed's download ended as it completed); then its script event.
+    fn after_history(&self, short: bool, ended: Option<EventContext>) {
         if short {
             self.release_memory(MemoryRelease::Ended);
+        }
+        self.queue_script_event(ended);
+    }
+
+    // `write_history` of each of a batch's retired torrents, their rows
+    // queued as one write the writer takes in one transaction, and each
+    // then awaited in turn as one torrent's is.
+    async fn write_histories(&self, retired: Vec<Retired>) {
+        let mut rows = Vec::with_capacity(retired.len());
+        let mut after = Vec::with_capacity(retired.len());
+        for one in retired {
+            let Retired {
+                row,
+                job,
+                files,
+                shown,
+                short,
+                ended,
+            } = one;
+            let turn = self.history_turn(job.job_id);
+            rows.push((job.job_id, row, true, files));
+            after.push((turn, job, shown, short, ended));
+        }
+        let mut queued = match self.inner.db.queue_torrent_histories(rows) {
+            Ok(waits) => Ok(waits.into_iter()),
+            Err(error) => Err(error.to_string()),
+        };
+        for (turn, job, shown, short, ended) in after {
+            let waits = match &mut queued {
+                Ok(waits) => waits.next().ok_or("the writer answered for fewer rows"),
+                Err(error) => Err(error.as_str()),
+            };
+            self.land_history(waits, turn, true, job, shown).await;
+            self.after_history(short, ended);
         }
     }
 
@@ -224,12 +296,31 @@ impl TorrentService {
         files: Vec<HistoryFile>,
         shown: Shown,
     ) {
-        let job_id = job.job_id;
-        let turn = self.history_turn(job_id);
+        let turn = self.history_turn(job.job_id);
         let queued = self
             .inner
             .db
-            .queue_torrent_history(job_id, row, retires, files);
+            .queue_torrent_history(job.job_id, row, retires, files);
+        self.land_history(queued, turn, retires, job, shown).await;
+    }
+
+    // A history row queued for the job in its `turn` (`write_history`),
+    // awaited: written, kept for room, or lost.
+    async fn land_history(
+        &self,
+        queued: Result<
+            (
+                tokio::sync::oneshot::Receiver<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            ),
+            impl std::fmt::Display,
+        >,
+        turn: u64,
+        retires: bool,
+        job: JobInfo,
+        shown: Shown,
+    ) {
+        let job_id = job.job_id;
         let (mut written, kept) = match queued {
             Ok(both) => both,
             Err(error) => {
@@ -523,6 +614,23 @@ impl TorrentService {
         shown: Shown,
         made: Option<MadeRead>,
     ) -> Result<(), ActionError> {
+        let retired = self
+            .take_out(job_id, delete_files, ending, shown, made)
+            .await?;
+        self.to_history(vec![retired]).await;
+        Ok(())
+    }
+
+    // `remove_marked` up to its history row: out of the live torrents, its
+    // files gone when they go, and readied for history (`to_history`).
+    pub(super) async fn take_out(
+        &self,
+        job_id: JobId,
+        delete_files: bool,
+        ending: Ending,
+        shown: Shown,
+        made: Option<MadeRead>,
+    ) -> Result<Retired, ActionError> {
         let mut torrent = self
             .unlive(&mut *self.inner.live.lock().await, job_id)
             .ok_or(ActionError::NotFound(job_id))?;
@@ -590,9 +698,9 @@ impl TorrentService {
             written
         };
         self.inner.counters.event(TorrentEvent::Removed);
-        self.retire(torrent, status, error, written, shown).await;
-        self.queue_script_event(ended);
-        Ok(())
+        Ok(self
+            .ready_history(torrent, status, error, written, shown, ended)
+            .await)
     }
 
     // A removal's mark on the torrent's row, written off the runtime.
@@ -698,6 +806,19 @@ impl TorrentService {
         .await
         .map_err(|error| StateError::Database(error.to_string()))?
     }
+}
+
+// A torrent that left the live ones, its history row not yet written
+// (`TorrentService::ready_history`, `TorrentService::to_history`).
+pub(super) struct Retired {
+    row: crate::history::JobHistoryRow,
+    job: JobInfo,
+    files: Vec<HistoryFile>,
+    shown: Shown,
+    // Whether it left short of complete, its download cut short.
+    short: bool,
+    // The script event its end raises, queued once its row is.
+    ended: Option<EventContext>,
 }
 
 // When a torrent that ended shows its end: at once, by a publish of the

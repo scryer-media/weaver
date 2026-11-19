@@ -6,7 +6,9 @@
 // is on and, for a local disk, from what the OS says of the disk behind it:
 // on Linux whether its block device rotates, on macOS whether the disk is
 // solid state, on Windows whether it incurs a seek penalty. What cannot be
-// read is unknown, and is written to as a spinning disk would be.
+// read is unknown. An unknown volume's reads take turns as a solid-state
+// one's do (`reader::VolumeReads::of`); only a volume known to spin reads
+// one at a time. No write looks at the kind.
 //
 // This file is the one place that reads it. The disk owner,
 // [`super::StorageCapacity`], reads a root's kind on its own thread and a

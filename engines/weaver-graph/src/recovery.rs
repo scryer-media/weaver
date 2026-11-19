@@ -63,6 +63,45 @@ pub struct SetRuling {
     pub read: bool,
 }
 
+// Why a recovery set bound no member at all, as the object that holds it
+// says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnboundReason {
+    // No set was found in the object's volumes.
+    NoSet,
+    // What the set describes never arrived whole: its index, or the
+    // description of a file it covers, is missing.
+    Undescribed,
+    // Its index arrived and could not be used: it does not read as one, or
+    // it describes more than a job may hold.
+    Unreadable,
+    // The object found more packets or sets than it reads, and keeps none.
+    TooLarge,
+    // Its descriptions are whole and no member fits one.
+    Unmatched,
+}
+
+impl UnboundReason {
+    // The reason's stable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoSet => "no_set",
+            Self::Undescribed => "undescribed",
+            Self::Unreadable => "unreadable",
+            Self::TooLarge => "too_large",
+            Self::Unmatched => "unmatched",
+        }
+    }
+}
+
+// One set an object holds that bound no member, by its own identifier when
+// it has one: an object that holds no set names none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unbound {
+    pub id: Option<String>,
+    pub reason: UnboundReason,
+}
+
 // A worker's ephemeral operation failure, separate from its durable ruling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepairDiagnostic {
@@ -183,6 +222,22 @@ pub trait Recovery {
         false
     }
 
+    // Whether this object rebuilds what it covers, or only checks it. A set
+    // that only checks finds damage and repairs none of it, so its volumes
+    // are no data to repair with.
+    fn rebuilds(&self) -> bool;
+
+    // Whether this object's recovery is carried inside the one member it
+    // covers, as a RAR volume's own record is: it repairs that member and
+    // nothing beside it, so a listing over other members still rules them.
+    fn carried_inside(&self) -> bool;
+
+    // Whether a rebuild can write more than the recovery data it received:
+    // a format that may name one block in many places of a file can fill a
+    // missing file far larger than its recovery. The owner holds such a set
+    // to the disk reserve before it goes out.
+    fn outgrows_recovery(&self) -> bool;
+
     // Evidence as bytes pass: the namespace calls this for every covered
     // member on every delivery and every repair. It is where a ruling is
     // taken back for its input: bytes said again keep it when they are what
@@ -238,6 +293,11 @@ pub trait Recovery {
     // Each set the object holds, in the order it repairs them. An object
     // with no sets of its own to name says nothing.
     fn sets(&self, _out: &mut Vec<SetRuling>) {}
+
+    // Each set the object holds that bound no member, with why, and one
+    // with no identifier when it holds no set at all. Asked once, when the
+    // job is done. An object that binds what it is handed says nothing.
+    fn unbound(&self, _out: &mut Vec<Unbound>) {}
 
     // How this object's repair ranks against another's over the same
     // bytes. A returned repair rewrites bytes an earlier repair wrote only

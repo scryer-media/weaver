@@ -929,9 +929,8 @@ async fn a_seed_mode_add_of_an_archive_unpacks_it_and_completes() {
     let save = rig.dir.path().join("seeded");
     std::fs::create_dir_all(save.join("placed")).unwrap();
     std::fs::write(save.join("placed/set.rar"), archive).unwrap();
-    let handle = queue();
-    let mut changes = handle.state().subscribe_job_changes();
-    rig.service.publish_to(handle);
+    rig.service.publish_to(queue());
+    let mut changes = completions(&rig.service);
     let job_id = rig
         .service
         .add_opened(AddRequest {
@@ -966,6 +965,14 @@ async fn a_seed_mode_add_of_an_archive_unpacks_it_and_completes() {
     rig.service.stop().await;
 }
 
+// What a wait for a torrent's completion wakes on: the service's rows. A
+// seed-mode torrent's queue row reads the same before and after it
+// completes (seeding, every byte in), so the queue says nothing of the
+// completion; its row here carries it, and moves once it is written.
+fn completions(service: &TorrentService) -> tokio::sync::watch::Receiver<u64> {
+    service.snapshot().subscribe()
+}
+
 // A seed-mode add whose archive file is damaged gives the graph none of
 // it: the piece's seed-mode check fails, seed mode ends, every piece is
 // checked again, and the piece fetched from a peer is the one the graph
@@ -998,9 +1005,8 @@ async fn a_seed_mode_archive_with_a_bad_file_is_fetched_again_and_unpacks_whole(
     let middle = damaged.len() / 2;
     damaged[middle] ^= 0xff;
     std::fs::write(save.join("placed/set.rar"), &damaged).unwrap();
-    let handle = queue();
-    let mut changes = handle.state().subscribe_job_changes();
-    rig.service.publish_to(handle);
+    rig.service.publish_to(queue());
+    let mut changes = completions(&rig.service);
     let job_id = rig
         .service
         .add_opened(AddRequest {

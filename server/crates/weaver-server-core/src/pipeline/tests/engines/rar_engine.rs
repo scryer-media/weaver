@@ -170,12 +170,16 @@ async fn the_encrypted_five_volume_set_tries_a_wrong_candidate_once_then_the_rig
 // volumes and the password they need, so its history says a password
 // failed it, with nothing whole, nothing short and nothing in the complete
 // directory.
-fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)]) {
+fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)], given: bool) {
+    let said = match given {
+        true => "no password given opens it",
+        false => "none was given",
+    };
     let names: Vec<String> = volumes.iter().map(|(name, _)| name.clone()).collect();
     assert_eq!(
         graph.failure,
         Some(format!(
-            "WEAVER_PASSWORD_REQUIRED: {} needs a password and none was given",
+            "WEAVER_PASSWORD_REQUIRED: {} needs a password and {said}",
             names.join(", ")
         )),
         "{:?}",
@@ -207,7 +211,7 @@ fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)]) {
 async fn the_encrypted_five_volume_set_with_no_password_fails_naming_the_password() {
     let scenario = video(posts(video_set()));
     let graph = run(&scenario).await;
-    assert_needs_password(&graph, &video_set());
+    assert_needs_password(&graph, &video_set(), false);
     assert_eq!(kinds(&graph), ["rar_store"]);
 }
 
@@ -224,19 +228,19 @@ async fn a_header_encrypted_set_with_no_password_fails_naming_the_password() {
         let volumes = header_encrypted_store_set("beacon.bin", &body, 2, VIDEO_SECRET, check);
         let scenario = Scenario::new(posts(volumes.clone()));
         let graph = run(&scenario).await;
-        assert_needs_password(&graph, &volumes);
+        assert_needs_password(&graph, &volumes, false);
         assert!(kinds(&graph).contains(&kind), "{:?}", kinds(&graph));
     }
 }
 
 // A wrong candidate only: offered once, refuted by the member's password
-// check, and with none left the store gives the volumes back withheld, in
-// the same words.
+// check, and with none left the store gives the volumes back withheld,
+// saying the password given opens nothing.
 #[tokio::test]
 async fn the_encrypted_five_volume_set_with_only_a_wrong_candidate_fails_naming_the_password() {
     let scenario = video(posts(video_set())).global_password("cinder-wrong-guess");
     let graph = run(&scenario).await;
-    assert_needs_password(&graph, &video_set());
+    assert_needs_password(&graph, &video_set(), true);
     let offered: Vec<_> = graph.graph().offered.values().copied().collect();
     assert_eq!(offered, [1], "one try for the one candidate");
 }

@@ -33,7 +33,7 @@ use crate::{
 
 use super::{
     choker::CHOKED_REQUEST_GRACE,
-    peer::{PeerState, PeerTx, Refused, UploadLedger, empty_bitfield, ingest_bitfield},
+    peer::{Close, PeerState, PeerTx, Refused, UploadLedger, empty_bitfield, ingest_bitfield},
     peers::holepunch::is_local,
 };
 
@@ -251,8 +251,10 @@ impl PeerHandler {
         // the peer closed or left silent once open did not, so an encrypted
         // handshake it closed leaves no failure for the plaintext connection
         // that follows to wait behind. A connection to ourselves did not
-        // either; it is banned below instead.
-        let failed = error.as_ref().is_some_and(crate::Error::is_failure);
+        // either; it is banned below instead. A close the run's end made is
+        // the end's, however it settles against the end ([`Close::of`]).
+        let close = Close::of(self.state.ended(), error.as_ref());
+        let failed = close.failed();
         // A connect to a peer that speaks the holepunch extension failed,
         // and no holepunch asked for it: a peer that can introduce us is
         // asked to (libtorrent `peer_connection::connect_failed`). A
@@ -264,7 +266,7 @@ impl PeerHandler {
             && !pe.value().holepunched();
         let needed = pe.value_mut().connection_closing(
             tokio::time::Instant::now(),
-            failed,
+            close,
             self.state.is_finished_and_no_active_streams(),
             peers,
         );
@@ -314,6 +316,10 @@ impl PeerHandler {
                     );
                 }
 
+                drop(g);
+                if released > 0 {
+                    self.state.spill_requeued();
+                }
                 if released > 0 || had_inflight {
                     self.state.new_pieces_notify.notify_waiters();
                 }

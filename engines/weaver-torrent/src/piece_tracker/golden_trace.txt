@@ -1,0 +1,2108 @@
+seed 1
+idle
+look p2
+snub p3 released=None requeued=[]
+idle
+acquire p1 avg=None rev=false parole=false out=0 admit=[5] -> no_room
+idle
+arrive p4 7.0 room=true asked=[(7, false)] -> write cancel=[]
+acquire p1 avg=None rev=true parole=false out=0 admit=[0] -> reserved 0 ask=[0.0 0.1 0.2 0.3]
+acquire p4 avg=None rev=false parole=false out=0 admit=[8] -> reserved 8 ask=[8.0 8.1 8.2 8.3]
+mark p4 7.0 -> Some(NotCompleted)
+acquire p3 avg=None rev=false parole=false out=0 admit=[7] -> reserved 7 ask=[7.1 7.2 7.3]
+arrive p2 5.2 room=true asked=[(5, false)] -> write cancel=[]
+arrive p1 0.0 room=false asked=[(0, true)] -> no_room
+snub p1 released=None requeued=[]
+look p4 8:[8.0 8.1 8.2 8.3]
+look p3 7:[7.1 7.2 7.3]
+arrive p1 0.1 room=false asked=[(0, true)] -> no_room
+mark p2 5.2 -> Some(NotCompleted)
+look p4 8:[8.0 8.1 8.2 8.3]
+look p1 0:[0.0 0.1 0.2 0.3]
+state queued=[1, 2, 3, 4, 5, 6, 9] end_game=false 0:p1[0, 1, 2, 3] 1:-[0, 1, 2, 3] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 3] 6:-[0, 1, 2, 3] 7:p3[1, 2, 3] 8:p4[0, 1, 2, 3] 9:-[0, 1, 2, 3]
+idle
+arrive p4 8.0 room=true asked=[(8, true)] -> write cancel=[]
+idle
+arrive p4 8.3 room=true asked=[] -> write cancel=[]
+arrive p3 7.3 room=true asked=[(7, true)] -> write cancel=[]
+mark p3 7.3 -> Some(NotCompleted)
+look p4 8:[8.0 8.1 8.2 8.3]
+arrive p3 5.3 room=true asked=[(5, false)] -> write cancel=[]
+mark p4 8.0 -> Some(NotCompleted)
+arrive p2 8.2 room=true asked=[] -> write cancel=[p4]
+look p1 0:[0.0 0.1 0.2 0.3]
+snub p2 released=None requeued=[]
+arrive p1 1.0 room=true asked=[(1, false)] -> write cancel=[]
+snub p4 released=Some(8) requeued=[8]
+arrive p1 0.2 room=true asked=[(0, true)] -> write cancel=[]
+look p2
+look p1 0:[0.0 0.1 0.2 0.3]
+mark p3 5.3 -> Some(NotCompleted)
+acquire p4 avg=None rev=false parole=false out=1 admit=[5] -> no_room
+look p2
+state queued=[1, 2, 3, 4, 5, 6, 8, 9] end_game=false 0:p1[0, 1, 2, 3] 1:-[0, 1, 2, 3] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1] 6:-[0, 1, 2, 3] 7:p3[1, 2] 8:-[1, 2, 3] 9:-[0, 1, 2, 3]
+mark p1 0.2 -> Some(NotCompleted)
+mark p4 8.3 -> Some(NotCompleted)
+arrive p3 7.1 room=true asked=[] -> write cancel=[]
+snub p2 released=None requeued=[]
+mark p2 8.2 -> Some(NotCompleted)
+gone p4 released=0 requeued=[]
+arrive p4 0.0 room=true asked=[] -> write cancel=[p1]
+acquire p2 avg=Some(2ms) rev=false parole=false out=0 admit=[5] -> no_room
+acquire p2 avg=None rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.0 5.1]
+mark p3 7.1 -> Some(NotCompleted)
+look p3 7:[7.2]
+look p1 0:[0.0 0.1 0.3]
+look p1 0:[0.0 0.1 0.3]
+mark p1 1.0 -> Some(NotCompleted)
+arrive p3 3.0 room=true asked=[(3, false)] -> write cancel=[]
+snub p4 released=None requeued=[]
+look p1 0:[0.0 0.1 0.3]
+mark p4 0.0 -> Some(NotCompleted)
+arrive p2 5.0 room=true asked=[(5, true)] -> write cancel=[]
+arrive p3 7.2 room=true asked=[] -> write cancel=[]
+state queued=[1, 2, 3, 4, 6, 8, 9] end_game=false 0:p1[1, 3] 1:-[1, 2, 3] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:p2[0, 1] 6:-[0, 1, 2, 3] 7:p3[2] 8:-[1] 9:-[0, 1, 2, 3]
+snub p3 released=Some(7) requeued=[7]
+acquire p4 avg=Some(1ms) rev=false parole=false out=0 admit=[1] -> reserved 1 ask=[1.1 1.2 1.3]
+room_wait p3 released=0 requeued=[]
+arrive p4 1.1 room=true asked=[(1, true)] -> write cancel=[]
+snub p2 released=Some(5) requeued=[5]
+arrive p1 0.3 room=true asked=[] -> write cancel=[]
+acquire p2 avg=None rev=false parole=true out=1 admit=[3] -> reserved 3 ask=[3.0 3.1 3.2 3.3]
+acquire p3 avg=None rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.0 5.1]
+idle
+look p3 5:[5.0 5.1]
+look p1 0:[0.1 0.3]
+idle
+look p2 3:[3.0 3.1 3.2 3.3]
+look p2 3:[3.0 3.1 3.2 3.3]
+mark p3 7.2 -> Some(Completed) take time=None senders=[p4,p3,p3,p3]
+mark p4 1.1 -> Some(NotCompleted)
+arrive p4 1.2 room=true asked=[] -> write cancel=[]
+mark p2 5.0 -> Some(NotCompleted)
+look p2 3:[3.0 3.1 3.2 3.3]
+mark p1 0.3 -> Some(NotCompleted)
+state queued=[2, 4, 6, 8, 9] end_game=false 0:p1[1] 1:p4[2, 3] 2:-[0, 1, 2, 3] 3:p2[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:p3[1] 6:-[0, 1, 2, 3] 7:-[] 8:-[1] 9:-[0, 1, 2, 3]
+check 7 passed=true
+arrive p2 3.2 room=true asked=[(3, true)] -> write cancel=[]
+look p3 5:[5.1]
+look p3 5:[5.1]
+room_wait p1 released=1 requeued=[0]
+arrive p1 0.1 room=true asked=[(0, false)] -> write cancel=[]
+look p4 1:[1.2 1.3]
+mark p3 3.0 -> Some(NotCompleted)
+mark p4 1.2 -> Some(NotCompleted)
+room_wait p1 released=0 requeued=[]
+look p4 1:[1.3]
+look p3 5:[5.1]
+idle
+look p3 5:[5.1]
+mark p2 3.2 -> Some(NotCompleted)
+mark p1 0.1 -> Some(Completed) take time=None senders=[p4,p1,p1,p1]
+look p2 3:[3.1 3.3]
+snub p3 released=Some(5) requeued=[5]
+arrive p2 5.2 room=false asked=[] -> discard
+acquire p1 avg=Some(2ms) rev=true parole=false out=0 admit=[5] -> reserved 5 ask=[5.1]
+state queued=[2, 4, 6, 8, 9] end_game=false 0:-[] 1:p4[3] 2:-[0, 1, 2, 3] 3:p2[1, 3] 4:-[0, 1, 2, 3] 5:p1[1] 6:-[0, 1, 2, 3] 7:H-[] 8:-[1] 9:-[0, 1, 2, 3]
+arrive p2 0.1 room=true asked=[] -> discard
+arrive p4 1.3 room=true asked=[] -> write cancel=[]
+mark p4 1.3 -> Some(Completed) take time=Some(41ms) senders=[p1,p4,p4,p4]
+look p1 5:[5.1]
+acquire p4 avg=Some(1ms) rev=false parole=false out=0 admit=[8] -> reserved 8 ask=[8.1]
+snub p2 released=Some(3) requeued=[3]
+arrive p3 5.0 room=true asked=[] -> discard
+room_wait p2 released=0 requeued=[]
+idle
+arrive p2 3.3 room=true asked=[(3, false)] -> write cancel=[]
+mark p2 3.3 -> Some(NotCompleted)
+idle
+idle
+acquire p3 avg=None rev=true parole=true out=1 admit=[9] -> reserved 9 ask=[9.0 9.1 9.2 9.3]
+arrive p2 3.0 room=true asked=[] -> discard
+check 0 passed=true
+arrive p4 8.1 room=true asked=[(8, true)] -> write cancel=[]
+arrive p2 5.1 room=false asked=[(5, false)] -> no_room
+arrive p2 3.1 room=true asked=[(3, false)] -> write cancel=[]
+look p1 5:[5.1]
+state queued=[2, 3, 4, 6] end_game=false 0:H-[] 1:-[] 2:-[0, 1, 2, 3] 3:-[1] 4:-[0, 1, 2, 3] 5:p1[1] 6:-[0, 1, 2, 3] 7:H-[] 8:p4[1] 9:p3[0, 1, 2, 3]
+look p3 9:[9.0 9.1 9.2 9.3]
+look p3 9:[9.0 9.1 9.2 9.3]
+look p3 9:[9.0 9.1 9.2 9.3]
+arrive p2 2.1 room=false asked=[(2, false)] -> no_room
+check 1 passed=true
+idle
+arrive p4 9.2 room=true asked=[(9, false)] -> write cancel=[p3]
+mark p4 9.2 -> Some(NotCompleted)
+arrive p1 5.1 room=true asked=[(5, true)] -> write cancel=[]
+mark p1 5.1 -> Some(Completed) take time=Some(30ms) senders=[p2,p1,p2,p3]
+look p3 9:[9.0 9.1 9.3]
+mark p2 3.1 -> Some(Completed) take time=None senders=[p3,p2,p2,p2]
+acquire p1 avg=None rev=false parole=false out=0 admit=[2] -> reserved 2 ask=[2.0 2.1 2.2 2.3]
+snub p4 released=Some(8) requeued=[8]
+look p3 9:[9.0 9.1 9.3]
+arrive p4 3.3 room=true asked=[] -> discard
+look p1 2:[2.0 2.1 2.2 2.3]
+arrive p4 3.0 room=true asked=[] -> discard
+look p1 2:[2.0 2.1 2.2 2.3]
+arrive p2 8.3 room=true asked=[] -> discard
+state queued=[4, 6, 8] end_game=false 0:H-[] 1:H-[] 2:p1[0, 1, 2, 3] 3:-[] 4:-[0, 1, 2, 3] 5:-[] 6:-[0, 1, 2, 3] 7:H-[] 8:-[1] 9:p3[0, 1, 3]
+mark p4 8.1 -> Some(Completed) take time=None senders=[p4,p4,p2,p4]
+snub p3 released=Some(9) requeued=[9]
+idle
+snub p1 released=Some(2) requeued=[2]
+arrive p4 2.2 room=true asked=[(2, false)] -> write cancel=[]
+mark p4 2.2 -> Some(NotCompleted)
+arrive p1 2.1 room=true asked=[(2, false)] -> write cancel=[]
+acquire p1 avg=None rev=false parole=false out=3 admit=[2] -> reserved 2 ask=[2.0 2.1 2.3]
+arrive p1 2.2 room=true asked=[] -> discard
+acquire p2 avg=None rev=true parole=true out=0 admit=[4] -> reserved 4 ask=[4.0 4.1 4.2 4.3]
+arrive p3 9.0 room=true asked=[(9, false)] -> write cancel=[]
+look p1 2:[2.0 2.1 2.3]
+snub p1 released=Some(2) requeued=[2]
+write_failed p1 2.1
+arrive p1 2.3 room=true asked=[(2, false)] -> write cancel=[]
+mark p3 9.0 -> Some(NotCompleted)
+arrive p4 1.1 room=true asked=[] -> discard
+snub p1 released=None requeued=[]
+acquire p1 avg=None rev=false parole=false out=2 admit=[2] -> no_room
+look p2 4:[4.0 4.1 4.2 4.3]
+state queued=[2, 6, 9] end_game=false 0:H-[] 1:H-[] 2:-[0, 1, 3] 3:-[] 4:p2[0, 1, 2, 3] 5:-[] 6:-[0, 1, 2, 3] 7:H-[] 8:-[] 9:-[1, 3]
+arrive p3 9.1 room=true asked=[(9, false)] -> write cancel=[]
+look p2 4:[4.0 4.1 4.2 4.3]
+arrive p1 9.3 room=false asked=[(9, false)] -> no_room
+arrive p4 2.1 room=true asked=[(2, false)] -> write cancel=[]
+mark p4 2.1 -> Some(NotCompleted)
+room_wait p3 released=0 requeued=[]
+acquire p4 avg=Some(1ms) rev=true parole=false out=0 admit=[2] -> reserved 2 ask=[2.0 2.3]
+arrive p1 2.1 room=false asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=1 admit=[9] -> no_room
+mark p3 9.1 -> Some(NotCompleted)
+check 5 passed=true
+mark p1 2.3 -> Some(NotCompleted)
+room_wait p3 released=0 requeued=[]
+arrive p2 4.1 room=true asked=[(4, true)] -> write cancel=[]
+arrive p2 8.1 room=false asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=1 admit=[9] -> reserved 9 ask=[9.3]
+mark p2 4.1 -> Some(NotCompleted)
+look p2 4:[4.0 4.2 4.3]
+acquire p3 avg=None rev=false parole=false out=2 admit=[6] -> reserved 6 ask=[6.0 6.1 6.2 6.3]
+idle
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:p4[0] 3:-[] 4:p2[0, 2, 3] 5:H-[] 6:p3[0, 1, 2, 3] 7:H-[] 8:-[] 9:p1[3]
+look p4 2:[2.0]
+arrive p4 5.3 room=true asked=[] -> discard
+arrive p2 4.3 room=true asked=[] -> write cancel=[]
+look p2 4:[4.0 4.2 4.3]
+arrive p4 2.3 room=true asked=[] -> discard
+snub p2 released=Some(4) requeued=[4]
+look p1 9:[9.3]
+arrive p2 0.3 room=true asked=[] -> discard
+mark p2 4.3 -> Some(NotCompleted)
+arrive p2 4.2 room=true asked=[(4, false)] -> write cancel=[]
+look p1 9:[9.3]
+mark p2 4.2 -> Some(NotCompleted)
+idle
+idle
+idle
+room_wait p1 released=1 requeued=[9]
+idle
+acquire p1 avg=None rev=true parole=false out=2 admit=[4] -> reserved 4 ask=[4.0]
+look p4 2:[2.0]
+look p4 2:[2.0]
+state queued=[9] end_game=true 0:H-[] 1:H-[] 2:p4[0] 3:-[] 4:p1[0] 5:H-[] 6:p3[0, 1, 2, 3] 7:H-[] 8:-[] 9:-[3]
+arrive p3 6.2 room=true asked=[(6, true)] -> write cancel=[]
+look p3 6:[6.0 6.1 6.2 6.3]
+check 3 passed=true
+look p1 4:[4.0]
+mark p3 6.2 -> Some(NotCompleted)
+arrive p2 4.0 room=true asked=[(4, false)] -> write cancel=[p1]
+look p2
+write_failed p2 4.0
+idle
+look p3 6:[6.0 6.1 6.3]
+arrive p2 3.3 room=false asked=[] -> discard
+look p1 4:[4.0]
+look p1 4:[4.0]
+idle
+check 8 passed=true
+idle
+look p3 6:[6.0 6.1 6.3]
+idle
+arrive p3 6.2 room=false asked=[] -> discard
+idle
+state queued=[9] end_game=true 0:H-[] 1:H-[] 2:p4[0] 3:H-[] 4:p1[0] 5:H-[] 6:p3[0, 1, 3] 7:H-[] 8:H-[] 9:-[3]
+snub p4 released=Some(2) requeued=[2]
+room_wait p2 released=0 requeued=[]
+idle
+look p1 4:[4.0]
+arrive p2 5.1 room=true asked=[] -> discard
+arrive p3 6.1 room=true asked=[] -> write cancel=[]
+arrive p1 9.3 room=true asked=[(9, false)] -> write cancel=[]
+arrive p1 2.0 room=true asked=[(2, false)] -> write cancel=[]
+arrive p2 5.0 room=true asked=[] -> discard
+arrive p4 2.0 room=true asked=[] -> discard
+idle
+room_wait p3 released=1 requeued=[6]
+mark p3 6.1 -> Some(NotCompleted)
+acquire p2 avg=None rev=true parole=true out=0 admit=[] -> none
+acquire p4 avg=None rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.0 6.3]
+arrive p3 9.3 room=true asked=[] -> discard
+acquire p3 avg=Some(1ms) rev=false parole=false out=3 admit=[9] -> no_room
+look p4 6:[6.0 6.3]
+arrive p2 2.2 room=true asked=[] -> discard
+acquire p3 avg=None rev=false parole=false out=3 admit=[2] -> no_room
+state queued=[2, 9] end_game=true 0:H-[] 1:H-[] 2:-[0] 3:H-[] 4:p1[0] 5:H-[] 6:p4[0, 3] 7:H-[] 8:H-[] 9:-[3]
+arrive p3 6.3 room=true asked=[(6, false)] -> write cancel=[p4]
+acquire p2 avg=Some(1ms) rev=false parole=true out=0 admit=[] -> none
+gone p2 released=0 requeued=[]
+snub p3 released=None requeued=[]
+write_failed p1 9.3
+arrive p2 3.3 room=true asked=[] -> discard
+write_failed p3 6.3
+acquire p2 avg=Some(2ms) rev=false parole=false out=0 admit=[2] -> reserved 2 ask=[2.0]
+look p2 2:[2.0]
+arrive p1 0.2 room=true asked=[] -> discard
+arrive p4 6.0 room=true asked=[] -> write cancel=[]
+mark p1 2.0 -> Some(Completed) take time=Some(4ms) senders=[p1,p4,p4,p1]
+arrive p4 7.0 room=true asked=[] -> discard
+look p4 6:[6.0 6.3]
+look p4 6:[6.0 6.3]
+look p1 4:[4.0]
+mark p4 6.0 -> Some(NotCompleted)
+arrive p4 1.0 room=true asked=[] -> discard
+idle
+acquire p2 avg=Some(1ms) rev=true parole=false out=1 admit=[9] -> reserved 9 ask=[9.3]
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:-[] 3:H-[] 4:p1[0] 5:H-[] 6:p4[3] 7:H-[] 8:H-[] 9:p2[3]
+idle
+arrive p3 5.1 room=true asked=[] -> discard
+look p1 4:[4.0]
+look p2 9:[9.3]
+idle
+arrive p1 9.2 room=true asked=[] -> discard
+snub p3 released=None requeued=[]
+look p1 4:[4.0]
+arrive p1 5.0 room=true asked=[] -> discard
+idle
+arrive p1 0.2 room=true asked=[] -> discard
+idle
+idle
+look p4 6:[6.3]
+look p2 9:[9.3]
+look p4 6:[6.3]
+look p1 4:[4.0]
+idle
+look p1 4:[4.0]
+check 2 passed=true
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:p1[0] 5:H-[] 6:p4[3] 7:H-[] 8:H-[] 9:p2[3]
+snub p3 released=None requeued=[]
+look p2 9:[9.3]
+arrive p1 0.1 room=false asked=[] -> discard
+idle
+idle
+idle
+look p1 4:[4.0]
+look p2 9:[9.3]
+idle
+room_wait p3 released=0 requeued=[]
+look p1 4:[4.0]
+idle
+arrive p3 6.0 room=true asked=[] -> discard
+idle
+idle
+look p4 6:[6.3]
+arrive p2 2.0 room=false asked=[] -> discard
+look p1 4:[4.0]
+look p1 4:[4.0]
+look p1 4:[4.0]
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:p1[0] 5:H-[] 6:p4[3] 7:H-[] 8:H-[] 9:p2[3]
+arrive p4 9.2 room=true asked=[] -> discard
+look p2 9:[9.3]
+look p1 4:[4.0]
+look p1 4:[4.0]
+look p1 4:[4.0]
+look p2 9:[9.3]
+snub p2 released=Some(9) requeued=[9]
+idle
+idle
+idle
+idle
+arrive p2 9.3 room=true asked=[(9, false)] -> write cancel=[]
+mark p2 9.3 -> Some(Completed) take time=None senders=[p3,p3,p4,p2]
+arrive p3 9.3 room=true asked=[] -> discard
+acquire p3 avg=Some(2ms) rev=true parole=false out=0 admit=[] -> stolen 4 from p1 ask=[4.0]
+snub p3 released=Some(4) requeued=[4]
+arrive p4 5.1 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=0 admit=[4] -> reserved 4 ask=[4.0]
+arrive p2 8.1 room=true asked=[] -> discard
+arrive p3 4.0 room=true asked=[(4, false)] -> write cancel=[p1]
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:p1[0] 5:H-[] 6:p4[3] 7:H-[] 8:H-[] 9:-[]
+look p4 6:[6.3]
+check 9 passed=false
+snub p4 released=None requeued=[]
+arrive p1 0.3 room=true asked=[] -> discard
+idle
+arrive p3 4.3 room=true asked=[] -> discard
+mark p3 4.0 -> Some(Completed) take time=Some(9ms) senders=[p3,p2,p2,p2]
+acquire p2 avg=Some(2ms) rev=false parole=false out=0 admit=[9] -> reserved 9 ask=[9.0 9.1 9.2 9.3]
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> doubled 6 6.3 ask=[6.3]
+look p2 9:[9.0 9.1 9.2 9.3]
+arrive p3 6.3 room=true asked=[] -> write cancel=[p4]
+gone p3 released=0 requeued=[]
+look p1
+arrive p3 7.1 room=true asked=[] -> discard
+mark p3 6.3 -> Some(Completed) take time=Some(100ms) senders=[p4,p3,p3,p3]
+look p2 9:[9.0 9.1 9.2 9.3]
+arrive p4 6.0 room=true asked=[] -> discard
+arrive p4 8.2 room=true asked=[] -> discard
+acquire p3 avg=None rev=true parole=false out=0 admit=[] -> doubled 9 9.1 ask=[9.1]
+look p1
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:-[] 5:H-[] 6:-[] 7:H-[] 8:H-[] 9:p2[0, 1, 2, 3]
+idle
+acquire p4 avg=None rev=false parole=true out=0 admit=[] -> none
+idle
+acquire p4 avg=None rev=true parole=false out=0 admit=[] -> doubled 9 9.0 ask=[9.0]
+arrive p1 4.1 room=true asked=[] -> discard
+idle
+snub p3 released=None requeued=[]
+idle
+idle
+arrive p2 9.2 room=false asked=[(9, true)] -> no_room
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> doubled 9 9.2 ask=[9.2]
+gone p3 released=0 requeued=[]
+acquire p4 avg=None rev=false parole=false out=1 admit=[] -> none
+idle
+look p2 9:[9.0 9.1 9.2 9.3]
+idle
+look p2 9:[9.0 9.1 9.2 9.3]
+arrive p4 8.3 room=true asked=[] -> discard
+arrive p1 4.1 room=true asked=[] -> discard
+idle
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:-[] 5:H-[] 6:-[] 7:H-[] 8:H-[] 9:p2[0, 1, 2, 3]
+acquire p1 avg=Some(1ms) rev=false parole=false out=1 admit=[] -> none
+arrive p1 9.2 room=true asked=[(9, false)] -> write cancel=[p2]
+acquire p4 avg=None rev=true parole=false out=1 admit=[] -> none
+snub p1 released=None requeued=[]
+arrive p3 9.2 room=true asked=[] -> discard
+mark p1 9.2 -> Some(NotCompleted)
+arrive p3 2.3 room=true asked=[] -> discard
+arrive p2 9.0 room=true asked=[] -> write cancel=[p4]
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> doubled 9 9.1 ask=[9.1]
+arrive p3 2.3 room=true asked=[] -> discard
+gone p1 released=0 requeued=[]
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> doubled 9 9.1 ask=[9.1]
+acquire p3 avg=None rev=false parole=true out=0 admit=[] -> none
+look p2 9:[9.0 9.1 9.3]
+arrive p4 5.1 room=true asked=[] -> discard
+arrive p2 9.1 room=true asked=[] -> write cancel=[p1]
+mark p2 9.1 -> Some(NotCompleted)
+arrive p4 0.1 room=true asked=[] -> discard
+arrive p1 5.1 room=true asked=[] -> discard
+mark p2 9.0 -> Some(NotCompleted)
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:-[] 5:H-[] 6:-[] 7:H-[] 8:H-[] 9:p2[3]
+arrive p3 6.1 room=true asked=[] -> discard
+arrive p1 1.0 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> doubled 9 9.3 ask=[9.3]
+idle
+arrive p3 9.3 room=true asked=[] -> write cancel=[p1,p2]
+mark p3 9.3 -> Some(Completed) take time=Some(58ms) senders=[p2,p2,p1,p3]
+room_wait p2 released=0 requeued=[]
+arrive p3 5.1 room=false asked=[] -> discard
+arrive p1 1.3 room=true asked=[] -> discard
+arrive p1 1.3 room=true asked=[] -> discard
+idle
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p3 8.2 room=true asked=[] -> discard
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+check 4 passed=true
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+idle
+look p1
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:-[] 7:H-[] 8:H-[] 9:-[]
+gone p2 released=0 requeued=[]
+idle
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+idle
+arrive p1 5.3 room=true asked=[] -> discard
+gone p1 released=0 requeued=[]
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+idle
+arrive p2 3.1 room=false asked=[] -> discard
+arrive p2 8.2 room=true asked=[] -> discard
+idle
+acquire p1 avg=Some(1ms) rev=false parole=true out=0 admit=[] -> none
+look p1
+gone p1 released=0 requeued=[]
+acquire p2 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+idle
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p4 5.2 room=true asked=[] -> discard
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:-[] 7:H-[] 8:H-[] 9:-[]
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+gone p1 released=0 requeued=[]
+arrive p3 8.2 room=true asked=[] -> discard
+room_wait p2 released=0 requeued=[]
+look p1
+idle
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p4 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+idle
+acquire p2 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+arrive p4 2.3 room=false asked=[] -> discard
+snub p3 released=None requeued=[]
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=Some(2ms) rev=true parole=false out=0 admit=[] -> none
+arrive p3 2.2 room=true asked=[] -> discard
+arrive p2 1.1 room=true asked=[] -> discard
+acquire p4 avg=Some(2ms) rev=true parole=false out=0 admit=[] -> none
+check 6 passed=true
+acquire p3 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:-[]
+arrive p3 2.1 room=false asked=[] -> discard
+arrive p4 2.0 room=true asked=[] -> discard
+room_wait p3 released=0 requeued=[]
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+idle
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+arrive p1 2.1 room=true asked=[] -> discard
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p4 6.1 room=true asked=[] -> discard
+arrive p1 7.3 room=true asked=[] -> discard
+idle
+idle
+arrive p1 0.0 room=true asked=[] -> discard
+arrive p3 8.0 room=true asked=[] -> discard
+arrive p3 2.1 room=true asked=[] -> discard
+idle
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:-[]
+arrive p4 5.2 room=true asked=[] -> discard
+idle
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+look p2
+idle
+acquire p2 avg=Some(1ms) rev=true parole=true out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p1 2.1 room=true asked=[] -> discard
+arrive p2 2.0 room=true asked=[] -> discard
+gone p2 released=0 requeued=[]
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p2 4.1 room=true asked=[] -> discard
+arrive p2 3.1 room=true asked=[] -> discard
+arrive p3 3.1 room=true asked=[] -> discard
+gone p1 released=0 requeued=[]
+idle
+gone p4 released=0 requeued=[]
+arrive p1 1.3 room=true asked=[] -> discard
+idle
+check 9 passed=true
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+room_wait p4 released=0 requeued=[]
+idle
+idle
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p4 1.1 room=false asked=[] -> discard
+arrive p1 7.3 room=true asked=[] -> discard
+idle
+acquire p2 avg=None rev=true parole=false out=0 admit=[] -> none
+idle
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+idle
+look p1
+idle
+acquire p3 avg=None rev=true parole=false out=0 admit=[] -> none
+idle
+arrive p2 3.3 room=true asked=[] -> discard
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p1 2.2 room=true asked=[] -> discard
+idle
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+seed 7
+idle
+acquire p2 avg=None rev=false parole=false out=0 admit=[1] -> no_room
+arrive p2 9.1 room=true asked=[(9, false)] -> write cancel=[]
+arrive p3 3.0 room=false asked=[(3, false)] -> no_room
+acquire p4 avg=Some(1ms) rev=false parole=true out=0 admit=[0] -> no_room
+snub p1 released=None requeued=[]
+look p4
+room_wait p3 released=0 requeued=[]
+idle
+room_wait p3 released=0 requeued=[]
+gone p2 released=0 requeued=[]
+arrive p3 3.1 room=true asked=[(3, false)] -> write cancel=[]
+arrive p1 1.0 room=true asked=[(1, false)] -> write cancel=[]
+mark p1 1.0 -> Some(NotCompleted)
+gone p1 released=0 requeued=[]
+acquire p4 avg=Some(1ms) rev=false parole=false out=0 admit=[1] -> reserved 1 ask=[1.1 1.2 1.3]
+snub p4 released=Some(1) requeued=[1]
+acquire p3 avg=Some(1ms) rev=true parole=true out=0 admit=[9] -> reserved 9 ask=[9.0 9.1 9.2 9.3]
+look p2
+arrive p4 1.3 room=false asked=[(1, false)] -> no_room
+state queued=[0, 1, 2, 3, 4, 5, 6, 7, 8] end_game=false 0:-[0, 1, 2, 3] 1:-[1, 2, 3] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:-[0, 1, 2, 3] 7:-[0, 1, 2, 3] 8:-[0, 1, 2, 3] 9:p3[0, 1, 2, 3]
+arrive p3 9.0 room=true asked=[(9, true)] -> write cancel=[]
+mark p3 3.1 -> Some(NotCompleted)
+look p2
+arrive p3 9.2 room=true asked=[] -> write cancel=[]
+snub p2 released=None requeued=[]
+look p1
+acquire p4 avg=None rev=false parole=false out=2 admit=[1] -> reserved 1 ask=[1.1 1.2 1.3]
+arrive p4 8.3 room=true asked=[(8, false)] -> write cancel=[]
+look p4 1:[1.1 1.2 1.3]
+room_wait p3 released=1 requeued=[9]
+mark p4 8.3 -> Some(NotCompleted)
+acquire p2 avg=None rev=false parole=false out=0 admit=[3] -> reserved 3 ask=[3.0 3.2 3.3]
+acquire p1 avg=None rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.0 6.1 6.2 6.3]
+idle
+look p4 1:[1.1 1.2 1.3]
+look p1 6:[6.0 6.1 6.2 6.3]
+look p1 6:[6.0 6.1 6.2 6.3]
+arrive p4 1.3 room=true asked=[(1, true)] -> write cancel=[]
+acquire p3 avg=None rev=false parole=false out=2 admit=[8] -> reserved 8 ask=[8.0 8.1 8.2]
+arrive p4 9.3 room=true asked=[(9, false)] -> write cancel=[]
+state queued=[0, 2, 4, 5, 7, 9] end_game=false 0:-[0, 1, 2, 3] 1:p4[1, 2, 3] 2:-[0, 1, 2, 3] 3:p2[0, 2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:p1[0, 1, 2, 3] 7:-[0, 1, 2, 3] 8:p3[0, 1, 2] 9:-[0, 1, 2, 3]
+look p4 1:[1.1 1.2 1.3]
+idle
+arrive p1 6.3 room=true asked=[(6, true)] -> write cancel=[]
+look p4 1:[1.1 1.2 1.3]
+arrive p2 3.2 room=true asked=[(3, true)] -> write cancel=[]
+idle
+arrive p3 9.3 room=true asked=[] -> discard
+arrive p1 6.1 room=true asked=[] -> write cancel=[]
+arrive p2 3.0 room=true asked=[] -> write cancel=[]
+look p3 8:[8.0 8.1 8.2]
+mark p2 3.0 -> Some(NotCompleted)
+arrive p1 6.0 room=true asked=[] -> write cancel=[]
+gone p3 released=1 requeued=[8]
+mark p1 6.1 -> Some(NotCompleted)
+arrive p2 3.3 room=true asked=[] -> write cancel=[]
+look p4 1:[1.1 1.2 1.3]
+look p4 1:[1.1 1.2 1.3]
+look p4 1:[1.1 1.2 1.3]
+arrive p2 9.1 room=true asked=[] -> discard
+arrive p2 7.2 room=true asked=[(7, false)] -> write cancel=[]
+state queued=[0, 2, 4, 5, 7, 8, 9] end_game=false 0:-[0, 1, 2, 3] 1:p4[1, 2, 3] 2:-[0, 1, 2, 3] 3:p2[2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:p1[0, 2, 3] 7:-[0, 1, 2, 3] 8:-[0, 1, 2] 9:-[0, 1, 2, 3]
+look p2 3:[3.2 3.3]
+look p2 3:[3.2 3.3]
+arrive p2 9.3 room=true asked=[] -> discard
+arrive p4 1.1 room=false asked=[] -> write cancel=[]
+arrive p2 8.3 room=true asked=[] -> discard
+look p4 1:[1.1 1.2 1.3]
+look p1 6:[6.0 6.2 6.3]
+arrive p1 6.2 room=false asked=[] -> write cancel=[]
+acquire p3 avg=Some(2ms) rev=false parole=false out=0 admit=[8] -> no_room
+acquire p3 avg=None rev=false parole=false out=0 admit=[8] -> reserved 8 ask=[8.0 8.1 8.2]
+look p4 1:[1.1 1.2 1.3]
+look p4 1:[1.1 1.2 1.3]
+room_wait p1 released=1 requeued=[6]
+look p3 8:[8.0 8.1 8.2]
+look p1
+look p4 1:[1.1 1.2 1.3]
+idle
+mark p2 7.2 -> Some(NotCompleted)
+look p4 1:[1.1 1.2 1.3]
+mark p4 1.1 -> Some(NotCompleted)
+state queued=[0, 2, 4, 5, 6, 7, 9] end_game=false 0:-[0, 1, 2, 3] 1:p4[2, 3] 2:-[0, 1, 2, 3] 3:p2[2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:-[0, 2, 3] 7:-[0, 1, 3] 8:p3[0, 1, 2] 9:-[0, 1, 2, 3]
+idle
+snub p3 released=Some(8) requeued=[8]
+room_wait p1 released=0 requeued=[]
+arrive p4 1.2 room=false asked=[] -> write cancel=[]
+look p1
+mark p1 6.2 -> Some(NotCompleted)
+look p2 3:[3.2 3.3]
+look p2 3:[3.2 3.3]
+acquire p1 avg=None rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.0 6.3]
+arrive p3 0.1 room=true asked=[(0, false)] -> write cancel=[]
+arrive p1 6.0 room=true asked=[] -> discard
+look p2 3:[3.2 3.3]
+arrive p4 4.1 room=true asked=[(4, false)] -> write cancel=[]
+look p4 1:[1.2 1.3]
+look p1 6:[6.0 6.3]
+idle
+gone p4 released=1 requeued=[1]
+arrive p1 1.2 room=true asked=[] -> discard
+arrive p4 4.0 room=true asked=[(4, false)] -> write cancel=[]
+look p4
+state queued=[0, 1, 2, 4, 5, 7, 8, 9] end_game=false 0:-[0, 1, 2, 3] 1:-[2, 3] 2:-[0, 1, 2, 3] 3:p2[2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:p1[0, 3] 7:-[0, 1, 3] 8:-[0, 1, 2] 9:-[0, 1, 2, 3]
+mark p2 9.1 -> Some(NotCompleted)
+arrive p3 8.2 room=true asked=[(8, false)] -> write cancel=[]
+acquire p4 avg=None rev=false parole=false out=0 admit=[1] -> reserved 1 ask=[1.2 1.3]
+gone p1 released=1 requeued=[6]
+look p3
+look p2 3:[3.2 3.3]
+acquire p3 avg=Some(2ms) rev=false parole=false out=2 admit=[6] -> reserved 6 ask=[6.0 6.3]
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[9] -> reserved 9 ask=[9.0 9.2 9.3]
+arrive p3 8.1 room=true asked=[(8, false)] -> write cancel=[]
+snub p1 released=Some(9) requeued=[9]
+mark p3 9.2 -> Some(NotCompleted)
+look p3 6:[6.0 6.3]
+acquire p1 avg=None rev=false parole=false out=3 admit=[9] -> reserved 9 ask=[9.0 9.3]
+look p1 9:[9.0 9.3]
+arrive p4 1.3 room=true asked=[] -> discard
+look p1 9:[9.0 9.3]
+look p3 6:[6.0 6.3]
+arrive p1 9.2 room=true asked=[] -> discard
+look p1 9:[9.0 9.3]
+mark p4 1.3 -> Some(NotCompleted)
+state queued=[0, 2, 4, 5, 7, 8] end_game=false 0:-[0, 1, 2, 3] 1:p4[2] 2:-[0, 1, 2, 3] 3:p2[2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:p3[0, 3] 7:-[0, 1, 3] 8:-[0, 1, 2] 9:p1[0, 3]
+mark p4 4.0 -> Some(NotCompleted)
+arrive p3 8.0 room=true asked=[(8, false)] -> write cancel=[]
+arrive p1 9.3 room=true asked=[] -> discard
+look p4 1:[1.2]
+look p2 3:[3.2 3.3]
+arrive p1 9.0 room=true asked=[] -> discard
+snub p1 released=Some(9) requeued=[9]
+snub p4 released=Some(1) requeued=[1]
+look p1
+look p2 3:[3.2 3.3]
+look p2 3:[3.2 3.3]
+room_wait p1 released=0 requeued=[]
+look p1
+look p3 6:[6.0 6.3]
+idle
+look p3 6:[6.0 6.3]
+look p2 3:[3.2 3.3]
+arrive p4 1.2 room=true asked=[] -> discard
+mark p2 3.2 -> Some(NotCompleted)
+snub p1 released=None requeued=[]
+state queued=[0, 1, 2, 4, 5, 7, 8, 9] end_game=false 0:-[0, 1, 2, 3] 1:-[2] 2:-[0, 1, 2, 3] 3:p2[3] 4:-[1, 2, 3] 5:-[0, 1, 2, 3] 6:p3[0, 3] 7:-[0, 1, 3] 8:-[0, 1, 2] 9:-[0, 3]
+mark p4 9.3 -> Some(NotCompleted)
+acquire p1 avg=None rev=true parole=false out=0 admit=[1] -> reserved 1 ask=[1.2]
+look p4
+look p3 6:[6.0 6.3]
+look p3 6:[6.0 6.3]
+mark p2 3.3 -> Some(Completed) take time=Some(114ms) senders=[p2,p3,p2,p2]
+acquire p4 avg=None rev=true parole=true out=0 admit=[5] -> reserved 5 ask=[5.0 5.1 5.2 5.3]
+gone p3 released=1 requeued=[6]
+mark p3 0.1 -> Some(NotCompleted)
+arrive p3 7.0 room=true asked=[(7, false)] -> write cancel=[]
+look p1 1:[1.2]
+arrive p4 5.2 room=true asked=[(5, true)] -> write cancel=[]
+acquire p2 avg=None rev=false parole=true out=0 admit=[2] -> reserved 2 ask=[2.0 2.1 2.2 2.3]
+look p4 5:[5.0 5.1 5.2 5.3]
+arrive p3 6.0 room=true asked=[] -> discard
+mark p3 7.0 -> Some(NotCompleted)
+look p1 1:[1.2]
+mark p3 8.1 -> Some(NotCompleted)
+mark p4 4.1 -> Some(NotCompleted)
+arrive p4 5.0 room=true asked=[] -> write cancel=[]
+state queued=[0, 4, 6, 7, 8, 9] end_game=true 0:-[0, 2, 3] 1:p1[2] 2:p2[0, 1, 2, 3] 3:-[] 4:-[2, 3] 5:p4[0, 1, 2, 3] 6:-[0, 3] 7:-[1, 3] 8:-[0, 2] 9:-[0]
+arrive p4 5.3 room=true asked=[] -> write cancel=[]
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[0] -> doubled 5 5.1 ask=[5.1]
+arrive p4 5.1 room=false asked=[] -> write cancel=[p3]
+acquire p3 avg=Some(2ms) rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.0 0.2 0.3]
+arrive p3 0.2 room=true asked=[(0, true)] -> write cancel=[]
+snub p2 released=Some(2) requeued=[2]
+look p4 5:[5.0 5.1 5.2 5.3]
+mark p4 5.2 -> Some(NotCompleted)
+look p4 5:[5.0 5.1 5.3]
+look p4 5:[5.0 5.1 5.3]
+check 3 passed=true
+acquire p2 avg=None rev=false parole=false out=4 admit=[7] -> reserved 7 ask=[7.1 7.3]
+room_wait p1 released=1 requeued=[1]
+look p4 5:[5.0 5.1 5.3]
+acquire p1 avg=None rev=false parole=true out=1 admit=[] -> none
+mark p3 9.0 -> Some(Completed) take time=None senders=[p3,p2,p3,p4]
+arrive p4 0.2 room=true asked=[] -> discard
+room_wait p3 released=1 requeued=[0]
+arrive p3 0.3 room=true asked=[(0, false)] -> write cancel=[]
+acquire p1 avg=Some(1ms) rev=false parole=false out=1 admit=[1] -> reserved 1 ask=[1.2]
+state queued=[0, 2, 4, 6, 8] end_game=false 0:-[0, 2, 3] 1:p1[2] 2:-[0, 1, 2, 3] 3:H-[] 4:-[2, 3] 5:p4[0, 1, 3] 6:-[0, 3] 7:p2[1, 3] 8:-[0, 2] 9:-[]
+snub p3 released=None requeued=[]
+arrive p1 1.2 room=true asked=[] -> discard
+arrive p3 0.0 room=false asked=[(0, false)] -> no_room
+look p4 5:[5.0 5.1 5.3]
+gone p3 released=0 requeued=[]
+arrive p2 7.1 room=true asked=[(7, true)] -> write cancel=[]
+look p1 1:[1.2]
+look p4 5:[5.0 5.1 5.3]
+arrive p3 6.3 room=true asked=[] -> discard
+look p4 5:[5.0 5.1 5.3]
+acquire p3 avg=None rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.0 0.2 0.3]
+arrive p4 6.1 room=true asked=[] -> discard
+look p4 5:[5.0 5.1 5.3]
+look p1 1:[1.2]
+look p4 5:[5.0 5.1 5.3]
+mark p1 6.0 -> Some(NotCompleted)
+look p1 1:[1.2]
+look p1 1:[1.2]
+arrive p4 1.1 room=true asked=[] -> discard
+check 9 passed=true
+state queued=[2, 4, 6, 8] end_game=false 0:p3[0, 2, 3] 1:p1[2] 2:-[0, 1, 2, 3] 3:H-[] 4:-[2, 3] 5:p4[0, 1, 3] 6:-[3] 7:p2[1, 3] 8:-[0, 2] 9:H-[]
+look p1 1:[1.2]
+look p1 1:[1.2]
+room_wait p1 released=1 requeued=[1]
+arrive p4 1.1 room=true asked=[] -> discard
+look p4 5:[5.0 5.1 5.3]
+acquire p1 avg=None rev=false parole=false out=0 admit=[1] -> reserved 1 ask=[1.2]
+look p4 5:[5.0 5.1 5.3]
+look p3 0:[0.0 0.2 0.3]
+look p4 5:[5.0 5.1 5.3]
+arrive p2 7.3 room=true asked=[] -> write cancel=[]
+look p4 5:[5.0 5.1 5.3]
+look p1 1:[1.2]
+snub p2 released=Some(7) requeued=[7]
+acquire p2 avg=Some(2ms) rev=false parole=true out=4 admit=[2] -> reserved 2 ask=[2.0 2.1 2.2 2.3]
+look p2 2:[2.0 2.1 2.2 2.3]
+look p4 5:[5.0 5.1 5.3]
+look p1 1:[1.2]
+arrive p4 6.2 room=true asked=[] -> discard
+arrive p1 1.2 room=true asked=[] -> discard
+look p1 1:[1.2]
+state queued=[4, 6, 7, 8] end_game=true 0:p3[0, 2, 3] 1:p1[2] 2:p2[0, 1, 2, 3] 3:H-[] 4:-[2, 3] 5:p4[0, 1, 3] 6:-[3] 7:-[1, 3] 8:-[0, 2] 9:H-[]
+look p2 2:[2.0 2.1 2.2 2.3]
+look p3 0:[0.0 0.2 0.3]
+idle
+look p1 1:[1.2]
+look p3 0:[0.0 0.2 0.3]
+gone p1 released=1 requeued=[1]
+look p2 2:[2.0 2.1 2.2 2.3]
+look p4 5:[5.0 5.1 5.3]
+mark p4 5.0 -> Some(NotCompleted)
+room_wait p3 released=1 requeued=[0]
+arrive p3 5.3 room=true asked=[] -> discard
+gone p4 released=1 requeued=[5]
+acquire p1 avg=None rev=false parole=false out=0 admit=[1] -> reserved 1 ask=[1.2]
+mark p2 7.3 -> Some(NotCompleted)
+look p2 2:[2.0 2.1 2.2 2.3]
+look p1 1:[1.2]
+acquire p4 avg=Some(1ms) rev=false parole=false out=0 admit=[0] -> no_room
+arrive p2 2.3 room=true asked=[(2, true)] -> write cancel=[]
+look p2 2:[2.0 2.1 2.2 2.3]
+arrive p3 0.0 room=true asked=[(0, false)] -> write cancel=[]
+state queued=[0, 4, 5, 6, 7, 8] end_game=true 0:-[0, 2, 3] 1:p1[2] 2:p2[0, 1, 2, 3] 3:H-[] 4:-[2, 3] 5:-[1, 3] 6:-[3] 7:-[1] 8:-[0, 2] 9:H-[]
+mark p3 0.0 -> Some(NotCompleted)
+arrive p3 0.2 room=true asked=[] -> discard
+mark p3 0.2 -> Some(NotCompleted)
+look p1 1:[1.2]
+arrive p2 2.0 room=true asked=[] -> write cancel=[]
+arrive p1 1.2 room=false asked=[] -> discard
+idle
+idle
+look p2 2:[2.0 2.1 2.2 2.3]
+arrive p3 0.3 room=true asked=[] -> discard
+room_wait p2 released=1 requeued=[2]
+acquire p4 avg=None rev=false parole=false out=0 admit=[0] -> no_room
+arrive p3 6.2 room=true asked=[] -> discard
+look p1 1:[1.2]
+look p3
+gone p1 released=1 requeued=[1]
+snub p2 released=None requeued=[]
+arrive p4 4.3 room=false asked=[(4, false)] -> no_room
+look p4
+look p4
+state queued=[0, 1, 2, 4, 5, 6, 7, 8] end_game=false 0:-[3] 1:-[2] 2:-[0, 1, 2, 3] 3:H-[] 4:-[2, 3] 5:-[1, 3] 6:-[3] 7:-[1] 8:-[0, 2] 9:H-[]
+look p4
+room_wait p3 released=0 requeued=[]
+arrive p4 1.2 room=true asked=[] -> discard
+acquire p4 avg=Some(2ms) rev=false parole=true out=0 admit=[] -> none
+arrive p3 9.3 room=true asked=[] -> discard
+arrive p3 8.3 room=true asked=[] -> discard
+acquire p3 avg=Some(2ms) rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.3]
+acquire p4 avg=Some(1ms) rev=false parole=false out=0 admit=[1] -> reserved 1 ask=[1.2]
+idle
+arrive p2 2.0 room=true asked=[] -> discard
+mark p1 6.3 -> Some(Completed) take time=None senders=[p1,p1,p1,p1]
+arrive p2 3.3 room=true asked=[] -> discard
+mark p3 8.2 -> Some(NotCompleted)
+mark p4 1.2 -> Some(Completed) take time=Some(6ms) senders=[p1,p4,p4,p4]
+acquire p2 avg=None rev=true parole=false out=2 admit=[7] -> reserved 7 ask=[7.1]
+look p1
+room_wait p1 released=0 requeued=[]
+mark p2 2.0 -> Some(NotCompleted)
+snub p1 released=None requeued=[]
+acquire p4 avg=Some(2ms) rev=false parole=false out=1 admit=[4] -> reserved 4 ask=[4.2 4.3]
+state queued=[2, 5, 8] end_game=true 0:p3[3] 1:-[] 2:-[1, 2, 3] 3:H-[] 4:p4[2, 3] 5:-[1, 3] 6:-[] 7:p2[1] 8:-[0] 9:H-[]
+look p4 4:[4.2 4.3]
+look p3 0:[0.3]
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> doubled 4 4.2 ask=[4.2]
+acquire p1 avg=None rev=true parole=false out=1 admit=[] -> none
+look p3 0:[0.3]
+acquire p1 avg=Some(1ms) rev=false parole=false out=1 admit=[] -> none
+acquire p1 avg=Some(1ms) rev=false parole=false out=1 admit=[] -> none
+look p4 4:[4.2 4.3]
+arrive p1 4.2 room=true asked=[(4, false)] -> write cancel=[p4]
+arrive p2 2.2 room=true asked=[(2, false)] -> write cancel=[]
+look p2 7:[7.1]
+mark p2 7.1 -> Some(Completed) take time=Some(17ms) senders=[p3,p2,p2,p2]
+check 6 passed=true
+mark p2 2.2 -> Some(NotCompleted)
+look p3 0:[0.3]
+mark p4 5.3 -> Some(NotCompleted)
+look p3 0:[0.3]
+mark p3 8.0 -> Some(Completed) take time=None senders=[p3,p3,p3,p4]
+arrive p4 1.2 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=true out=0 admit=[] -> none
+state queued=[2, 5] end_game=true 0:p3[3] 1:-[] 2:-[1, 3] 3:H-[] 4:p4[2, 3] 5:-[1] 6:H-[] 7:-[] 8:-[] 9:H-[]
+look p1
+check 1 passed=true
+gone p1 released=0 requeued=[]
+mark p2 2.3 -> Some(NotCompleted)
+snub p3 released=Some(0) requeued=[0]
+mark p4 5.1 -> Some(Completed) take time=None senders=[p4,p4,p4,p4]
+look p4 4:[4.2 4.3]
+arrive p2 2.1 room=true asked=[(2, false)] -> write cancel=[]
+acquire p2 avg=None rev=true parole=true out=1 admit=[] -> none
+mark p3 0.3 -> Some(Completed) take time=None senders=[p3,p3,p3,p3]
+mark p2 2.1 -> Some(Completed) take time=None senders=[p2,p2,p2,p2]
+mark p1 4.2 -> Some(NotCompleted)
+arrive p2 3.3 room=true asked=[] -> discard
+arrive p4 4.3 room=true asked=[] -> write cancel=[]
+acquire p3 avg=None rev=false parole=false out=1 admit=[] -> none
+acquire p3 avg=None rev=false parole=false out=1 admit=[] -> none
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+mark p4 4.3 -> Some(Completed) take time=Some(38ms) senders=[p4,p4,p1,p4]
+arrive p2 7.1 room=false asked=[] -> discard
+idle
+state queued=[] end_game=true 0:-[] 1:H-[] 2:-[] 3:H-[] 4:-[] 5:-[] 6:H-[] 7:-[] 8:-[] 9:H-[]
+arrive p4 5.3 room=false asked=[] -> discard
+acquire p3 avg=None rev=true parole=false out=1 admit=[] -> none
+look p4
+idle
+acquire p3 avg=Some(1ms) rev=false parole=false out=1 admit=[] -> none
+arrive p3 0.3 room=true asked=[] -> discard
+check 7 passed=true
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=Some(1ms) rev=true parole=false out=0 admit=[] -> none
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+idle
+look p1
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+look p2
+idle
+idle
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+look p4
+state queued=[] end_game=true 0:-[] 1:H-[] 2:-[] 3:H-[] 4:-[] 5:-[] 6:H-[] 7:H-[] 8:-[] 9:H-[]
+idle
+check 8 passed=true
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+idle
+look p4
+idle
+look p3
+arrive p2 1.2 room=false asked=[] -> discard
+arrive p2 1.2 room=true asked=[] -> discard
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+room_wait p4 released=0 requeued=[]
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+look p2
+gone p3 released=0 requeued=[]
+idle
+idle
+check 5 passed=true
+idle
+gone p4 released=0 requeued=[]
+state queued=[] end_game=true 0:-[] 1:H-[] 2:-[] 3:H-[] 4:-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=None rev=false parole=true out=0 admit=[] -> none
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+idle
+acquire p4 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+arrive p4 4.3 room=true asked=[] -> discard
+check 0 passed=false
+gone p1 released=0 requeued=[]
+check 2 passed=true
+look p3
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+look p1
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+gone p3 released=0 requeued=[]
+gone p4 released=0 requeued=[]
+look p4
+look p4
+arrive p1 1.2 room=true asked=[] -> discard
+idle
+state queued=[0] end_game=false 0:-[0, 1, 2, 3] 1:H-[] 2:H-[] 3:H-[] 4:-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+check 4 passed=true
+acquire p3 avg=Some(1ms) rev=true parole=false out=0 admit=[0] -> reserved 0 ask=[0.0 0.1 0.2 0.3]
+idle
+acquire p1 avg=Some(2ms) rev=true parole=false out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+acquire p4 avg=None rev=false parole=true out=0 admit=[] -> none
+idle
+acquire p4 avg=Some(1ms) rev=true parole=false out=0 admit=[] -> stolen 0 from p3 ask=[0.0 0.1 0.2 0.3]
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+look p2
+arrive p4 0.2 room=true asked=[(0, true)] -> write cancel=[]
+acquire p2 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+look p1
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+look p2
+acquire p1 avg=Some(1ms) rev=true parole=false out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+state queued=[] end_game=true 0:p4[0, 1, 2, 3] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+arrive p2 3.2 room=true asked=[] -> discard
+arrive p4 0.0 room=true asked=[] -> write cancel=[]
+look p3
+idle
+arrive p3 0.1 room=true asked=[] -> write cancel=[p4]
+write_failed p4 0.0
+acquire p3 avg=None rev=true parole=false out=0 admit=[] -> doubled 0 0.3 ask=[0.3]
+mark p4 0.2 -> Some(NotCompleted)
+acquire p3 avg=Some(2ms) rev=true parole=true out=1 admit=[] -> none
+arrive p3 0.3 room=false asked=[] -> write cancel=[p4]
+look p4 0:[0.0 0.1 0.3]
+look p4 0:[0.0 0.1 0.3]
+acquire p3 avg=Some(2ms) rev=true parole=true out=0 admit=[] -> none
+look p4 0:[0.0 0.1 0.3]
+mark p3 0.3 -> Some(NotCompleted)
+arrive p2 3.1 room=true asked=[] -> discard
+snub p2 released=None requeued=[]
+look p1
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> doubled 0 0.0 ask=[0.0]
+look p1
+state queued=[] end_game=true 0:p4[0, 1] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+arrive p3 9.1 room=true asked=[] -> discard
+snub p4 released=Some(0) requeued=[0]
+acquire p3 avg=None rev=true parole=false out=1 admit=[0] -> reserved 0 ask=[0.0 0.1]
+mark p3 0.1 -> Some(NotCompleted)
+idle
+snub p4 released=None requeued=[]
+arrive p2 2.1 room=true asked=[] -> discard
+look p1
+idle
+idle
+idle
+acquire p1 avg=None rev=true parole=false out=0 admit=[] -> none
+look p2
+acquire p4 avg=None rev=true parole=false out=0 admit=[] -> doubled 0 0.0 ask=[0.0]
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+snub p3 released=Some(0) requeued=[0]
+idle
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+look p2
+state queued=[0] end_game=true 0:-[0] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+look p1
+arrive p3 0.1 room=true asked=[] -> discard
+arrive p4 0.0 room=true asked=[(0, false)] -> write cancel=[]
+arrive p3 0.0 room=true asked=[] -> discard
+mark p4 0.0 -> Some(Completed) take time=None senders=[p4,p3,p4,p3]
+gone p2 released=0 requeued=[]
+arrive p2 8.1 room=true asked=[] -> discard
+acquire p3 avg=None rev=false parole=true out=0 admit=[] -> none
+idle
+idle
+look p1
+arrive p2 7.2 room=true asked=[] -> discard
+snub p3 released=None requeued=[]
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p4 4.1 room=true asked=[] -> discard
+look p4
+idle
+look p1
+state queued=[] end_game=true 0:-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+idle
+arrive p3 6.0 room=true asked=[] -> discard
+arrive p3 5.2 room=true asked=[] -> discard
+snub p2 released=None requeued=[]
+arrive p2 3.0 room=true asked=[] -> discard
+snub p4 released=None requeued=[]
+arrive p1 4.1 room=true asked=[] -> discard
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+arrive p4 5.0 room=true asked=[] -> discard
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+arrive p2 7.0 room=true asked=[] -> discard
+arrive p4 0.0 room=true asked=[] -> discard
+idle
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+look p4
+snub p2 released=None requeued=[]
+idle
+acquire p3 avg=Some(1ms) rev=false parole=true out=0 admit=[] -> none
+look p2
+idle
+state queued=[] end_game=true 0:-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+arrive p3 7.1 room=true asked=[] -> discard
+acquire p3 avg=Some(2ms) rev=true parole=false out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+look p1
+arrive p3 9.0 room=true asked=[] -> discard
+idle
+arrive p4 8.3 room=true asked=[] -> discard
+look p1
+check 0 passed=true
+idle
+look p4
+look p2
+gone p1 released=0 requeued=[]
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+idle
+idle
+arrive p2 7.3 room=true asked=[] -> discard
+arrive p1 4.3 room=true asked=[] -> discard
+idle
+look p4
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+seed 42
+acquire p3 avg=None rev=false parole=false out=0 admit=[9] -> reserved 9 ask=[9.0 9.1 9.2 9.3]
+idle
+acquire p4 avg=None rev=false parole=false out=0 admit=[2] -> no_room
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[8] -> reserved 8 ask=[8.0 8.1 8.2 8.3]
+idle
+acquire p2 avg=None rev=false parole=false out=0 admit=[7] -> reserved 7 ask=[7.0 7.1 7.2 7.3]
+arrive p2 7.3 room=true asked=[(7, true)] -> write cancel=[]
+idle
+arrive p2 7.2 room=true asked=[] -> write cancel=[]
+acquire p1 avg=Some(2ms) rev=true parole=false out=0 admit=[1] -> reserved 1 ask=[1.0 1.1 1.2 1.3]
+arrive p1 1.2 room=false asked=[(1, true)] -> no_room
+arrive p3 9.3 room=true asked=[(9, true)] -> write cancel=[]
+look p2 7:[7.0 7.1 7.2 7.3]
+snub p1 released=None requeued=[]
+arrive p1 1.1 room=true asked=[(1, true)] -> write cancel=[]
+look p3 9:[9.0 9.1 9.2 9.3]
+arrive p1 1.3 room=true asked=[] -> write cancel=[]
+look p2 7:[7.0 7.1 7.2 7.3]
+look p3 9:[9.0 9.1 9.2 9.3]
+arrive p2 7.1 room=true asked=[] -> write cancel=[]
+state queued=[0, 2, 3, 4, 5, 6] end_game=false 0:-[0, 1, 2, 3] 1:p1[0, 1, 2, 3] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:-[0, 1, 2, 3] 7:p2[0, 1, 2, 3] 8:p4[0, 1, 2, 3] 9:p3[0, 1, 2, 3]
+arrive p4 8.2 room=true asked=[(8, true)] -> write cancel=[]
+write_failed p3 9.3
+look p4 8:[8.0 8.1 8.2 8.3]
+snub p1 released=None requeued=[]
+mark p4 8.2 -> Some(NotCompleted)
+look p2 7:[7.0 7.1 7.2 7.3]
+look p3 9:[9.0 9.1 9.2 9.3]
+mark p1 1.3 -> Some(NotCompleted)
+mark p2 7.3 -> Some(NotCompleted)
+mark p2 7.1 -> Some(NotCompleted)
+look p4 8:[8.0 8.1 8.3]
+look p4 8:[8.0 8.1 8.3]
+arrive p4 8.0 room=true asked=[] -> write cancel=[]
+look p1 1:[1.0 1.1 1.2]
+arrive p2 7.0 room=true asked=[] -> write cancel=[]
+look p1 1:[1.0 1.1 1.2]
+mark p4 8.0 -> Some(NotCompleted)
+look p3 9:[9.0 9.1 9.2 9.3]
+arrive p3 9.1 room=true asked=[] -> write cancel=[]
+idle
+state queued=[0, 2, 3, 4, 5, 6] end_game=false 0:-[0, 1, 2, 3] 1:p1[0, 1, 2] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:-[0, 1, 2, 3] 7:p2[0, 2] 8:p4[1, 3] 9:p3[0, 1, 2, 3]
+look p2 7:[7.0 7.2]
+look p2 7:[7.0 7.2]
+look p2 7:[7.0 7.2]
+arrive p1 1.0 room=true asked=[] -> write cancel=[]
+look p1 1:[1.0 1.1 1.2]
+arrive p3 9.0 room=true asked=[] -> write cancel=[]
+look p3 9:[9.0 9.1 9.2 9.3]
+look p1 1:[1.0 1.1 1.2]
+look p4 8:[8.1 8.3]
+idle
+mark p2 7.2 -> Some(NotCompleted)
+room_wait p4 released=1 requeued=[8]
+mark p2 7.0 -> Some(Completed) take time=Some(47ms) senders=[p2,p2,p2,p2]
+look p1 1:[1.0 1.1 1.2]
+mark p3 9.1 -> Some(NotCompleted)
+arrive p3 9.2 room=true asked=[] -> write cancel=[]
+mark p1 1.0 -> Some(NotCompleted)
+mark p3 9.0 -> Some(NotCompleted)
+arrive p2 1.3 room=true asked=[] -> discard
+mark p3 9.2 -> Some(NotCompleted)
+state queued=[0, 2, 3, 4, 5, 6, 8] end_game=false 0:-[0, 1, 2, 3] 1:p1[1, 2] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:-[0, 1, 2, 3] 7:-[] 8:-[1, 3] 9:p3[3]
+look p3 9:[9.3]
+look p1 1:[1.1 1.2]
+look p1 1:[1.1 1.2]
+mark p1 1.1 -> Some(NotCompleted)
+look p1 1:[1.2]
+acquire p4 avg=None rev=false parole=false out=2 admit=[8] -> reserved 8 ask=[8.1 8.3]
+gone p1 released=1 requeued=[1]
+snub p3 released=None requeued=[]
+look p4 8:[8.1 8.3]
+gone p4 released=1 requeued=[8]
+check 7 passed=true
+arrive p2 5.1 room=false asked=[(5, false)] -> no_room
+look p3 9:[9.3]
+look p3 9:[9.3]
+acquire p4 avg=None rev=true parole=false out=0 admit=[8] -> no_room
+acquire p4 avg=Some(1ms) rev=true parole=false out=0 admit=[8] -> no_room
+acquire p2 avg=None rev=false parole=false out=0 admit=[1] -> reserved 1 ask=[1.2]
+arrive p2 1.2 room=true asked=[(1, true)] -> write cancel=[]
+idle
+gone p1 released=0 requeued=[]
+state queued=[0, 2, 3, 4, 5, 6, 8] end_game=false 0:-[0, 1, 2, 3] 1:p2[2] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:-[0, 1, 2, 3] 7:H-[] 8:-[1, 3] 9:p3[3]
+look p1
+look p3 9:[9.3]
+gone p4 released=0 requeued=[]
+mark p2 1.2 -> Some(Completed) take time=Some(7ms) senders=[p1,p1,p2,p1]
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[8] -> reserved 8 ask=[8.1 8.3]
+look p4
+arrive p2 7.1 room=true asked=[] -> discard
+look p2
+idle
+idle
+gone p3 released=1 requeued=[9]
+arrive p4 3.2 room=true asked=[(3, false)] -> write cancel=[]
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[9] -> reserved 9 ask=[9.3]
+look p3 9:[9.3]
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[5] -> no_room
+look p3 9:[9.3]
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.0 5.1 5.2 5.3]
+arrive p1 9.0 room=true asked=[] -> discard
+arrive p3 9.3 room=true asked=[(9, true)] -> write cancel=[]
+mark p3 9.3 -> Some(Completed) take time=Some(7ms) senders=[p3,p3,p3,p3]
+state queued=[0, 2, 3, 4, 6] end_game=false 0:-[0, 1, 2, 3] 1:-[] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:p4[0, 1, 2, 3] 6:-[0, 1, 2, 3] 7:H-[] 8:p1[1, 3] 9:-[]
+look p3
+look p4 5:[5.0 5.1 5.2 5.3]
+look p3
+gone p2 released=0 requeued=[]
+check 1 passed=true
+snub p4 released=Some(5) requeued=[5]
+gone p4 released=0 requeued=[]
+acquire p2 avg=None rev=false parole=false out=0 admit=[2] -> reserved 2 ask=[2.0 2.1 2.2 2.3]
+acquire p3 avg=None rev=true parole=false out=0 admit=[3] -> reserved 3 ask=[3.0 3.1 3.2 3.3]
+mark p4 3.2 -> Some(NotCompleted)
+look p2 2:[2.0 2.1 2.2 2.3]
+arrive p1 8.1 room=true asked=[(8, true)] -> write cancel=[]
+arrive p1 8.3 room=true asked=[] -> write cancel=[]
+look p4
+mark p1 8.1 -> Some(NotCompleted)
+mark p1 8.3 -> Some(Completed) take time=Some(31ms) senders=[p4,p1,p4,p1]
+look p3 3:[3.0 3.1 3.3]
+idle
+snub p2 released=Some(2) requeued=[2]
+idle
+state queued=[0, 2, 4, 5, 6] end_game=false 0:-[0, 1, 2, 3] 1:H-[] 2:-[0, 1, 2, 3] 3:p3[0, 1, 3] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:-[0, 1, 2, 3] 7:H-[] 8:-[] 9:-[]
+check 9 passed=false
+snub p2 released=None requeued=[]
+gone p2 released=0 requeued=[]
+arrive p1 9.1 room=true asked=[(9, false)] -> write cancel=[]
+mark p1 9.1 -> Some(NotCompleted)
+arrive p3 3.3 room=true asked=[(3, true)] -> write cancel=[]
+mark p3 3.3 -> Some(NotCompleted)
+room_wait p2 released=0 requeued=[]
+acquire p1 avg=Some(2ms) rev=true parole=false out=0 admit=[9] -> no_room
+arrive p2 2.3 room=true asked=[(2, false)] -> write cancel=[]
+mark p2 2.3 -> Some(NotCompleted)
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[2] -> reserved 2 ask=[2.0 2.1 2.2]
+arrive p2 6.0 room=true asked=[(6, false)] -> write cancel=[]
+look p4 2:[2.0 2.1 2.2]
+look p3 3:[3.0 3.1]
+arrive p1 0.3 room=true asked=[(0, false)] -> write cancel=[]
+look p3 3:[3.0 3.1]
+mark p2 6.0 -> Some(NotCompleted)
+mark p1 0.3 -> Some(NotCompleted)
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.1 6.2 6.3]
+state queued=[0, 4, 5, 9] end_game=false 0:-[0, 1, 2] 1:H-[] 2:p4[0, 1, 2] 3:p3[0, 1] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:p2[1, 2, 3] 7:H-[] 8:-[] 9:-[0, 2, 3]
+look p1
+arrive p4 2.1 room=true asked=[(2, true)] -> write cancel=[]
+snub p2 released=Some(6) requeued=[6]
+arrive p1 8.3 room=true asked=[] -> discard
+gone p4 released=1 requeued=[2]
+arrive p3 3.2 room=false asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.0 0.1 0.2]
+acquire p2 avg=None rev=false parole=false out=3 admit=[2] -> reserved 2 ask=[2.0 2.1 2.2]
+mark p4 2.1 -> Some(NotCompleted)
+idle
+look p3 3:[3.0 3.1]
+look p3 3:[3.0 3.1]
+look p3 3:[3.0 3.1]
+arrive p2 6.2 room=true asked=[(6, false)] -> write cancel=[]
+look p4
+arrive p2 6.3 room=true asked=[(6, false)] -> write cancel=[]
+mark p2 6.2 -> Some(NotCompleted)
+arrive p4 5.2 room=true asked=[(5, false)] -> write cancel=[]
+arrive p4 4.2 room=false asked=[(4, false)] -> no_room
+mark p2 6.3 -> Some(NotCompleted)
+state queued=[4, 5, 6, 9] end_game=false 0:p1[0, 1, 2] 1:H-[] 2:p2[0, 2] 3:p3[0, 1] 4:-[0, 1, 2, 3] 5:-[0, 1, 2, 3] 6:-[1] 7:H-[] 8:-[] 9:-[0, 2, 3]
+arrive p2 2.1 room=true asked=[] -> discard
+arrive p4 9.2 room=true asked=[(9, false)] -> write cancel=[]
+arrive p1 0.2 room=true asked=[(0, true)] -> write cancel=[]
+check 8 passed=true
+arrive p4 8.3 room=false asked=[] -> discard
+snub p3 released=Some(3) requeued=[3]
+acquire p3 avg=None rev=true parole=true out=2 admit=[4] -> reserved 4 ask=[4.0 4.1 4.2 4.3]
+write_failed p4 5.2
+write_failed p1 0.2
+acquire p4 avg=None rev=false parole=false out=0 admit=[3] -> reserved 3 ask=[3.0 3.1]
+arrive p3 4.3 room=true asked=[(4, true)] -> write cancel=[]
+snub p3 released=Some(4) requeued=[4]
+acquire p3 avg=None rev=false parole=true out=5 admit=[4] -> reserved 4 ask=[4.0 4.1 4.2 4.3]
+look p2 2:[2.0 2.2]
+arrive p2 2.0 room=true asked=[(2, true)] -> write cancel=[]
+look p1 0:[0.0 0.1 0.2]
+mark p3 4.3 -> Some(NotCompleted)
+arrive p4 3.1 room=true asked=[(3, true)] -> write cancel=[]
+arrive p1 0.1 room=true asked=[] -> write cancel=[]
+write_failed p4 9.2
+state queued=[5, 6, 9] end_game=false 0:p1[0, 1, 2] 1:H-[] 2:p2[0, 2] 3:p4[0, 1] 4:p3[0, 1, 2] 5:-[0, 1, 2, 3] 6:-[1] 7:H-[] 8:H-[] 9:-[0, 2, 3]
+look p3 4:[4.0 4.1 4.2]
+look p4 3:[3.0 3.1]
+arrive p2 6.1 room=true asked=[(6, false)] -> write cancel=[]
+mark p2 2.0 -> Some(NotCompleted)
+arrive p1 0.0 room=false asked=[] -> write cancel=[]
+snub p4 released=Some(3) requeued=[3]
+acquire p4 avg=Some(1ms) rev=false parole=false out=1 admit=[3] -> no_room
+arrive p4 3.0 room=true asked=[(3, false)] -> write cancel=[]
+mark p1 0.0 -> Some(NotCompleted)
+idle
+mark p4 3.1 -> Some(NotCompleted)
+arrive p3 4.1 room=false asked=[(4, true)] -> no_room
+mark p4 3.0 -> Some(Completed) take time=None senders=[p4,p4,p4,p3]
+arrive p3 4.0 room=true asked=[(4, true)] -> write cancel=[]
+acquire p4 avg=None rev=false parole=false out=0 admit=[9] -> no_room
+look p2 2:[2.2]
+arrive p1 8.0 room=false asked=[] -> discard
+mark p2 6.1 -> Some(Completed) take time=None senders=[p2,p2,p2,p2]
+look p1 0:[0.1 0.2]
+look p1 0:[0.1 0.2]
+state queued=[5, 9] end_game=false 0:p1[1, 2] 1:H-[] 2:p2[2] 3:-[] 4:p3[0, 1, 2] 5:-[0, 1, 2, 3] 6:-[] 7:H-[] 8:H-[] 9:-[0, 2, 3]
+gone p4 released=0 requeued=[]
+gone p3 released=1 requeued=[4]
+look p2 2:[2.2]
+look p1 0:[0.1 0.2]
+arrive p2 2.2 room=true asked=[] -> write cancel=[]
+mark p3 4.0 -> Some(NotCompleted)
+look p4
+check 3 passed=true
+mark p2 2.2 -> Some(Completed) take time=Some(61ms) senders=[p2,p4,p2,p2]
+mark p1 0.1 -> Some(NotCompleted)
+idle
+room_wait p1 released=1 requeued=[0]
+arrive p4 2.1 room=true asked=[] -> discard
+idle
+arrive p1 8.3 room=true asked=[] -> discard
+arrive p1 1.2 room=true asked=[] -> discard
+arrive p3 4.1 room=true asked=[(4, false)] -> write cancel=[]
+acquire p3 avg=None rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.2]
+look p4
+mark p3 4.1 -> Some(NotCompleted)
+state queued=[4, 5, 9] end_game=false 0:p3[2] 1:H-[] 2:-[] 3:H-[] 4:-[2] 5:-[0, 1, 2, 3] 6:-[] 7:H-[] 8:H-[] 9:-[0, 2, 3]
+snub p2 released=None requeued=[]
+snub p2 released=None requeued=[]
+arrive p2 6.0 room=false asked=[] -> discard
+arrive p4 8.0 room=true asked=[] -> discard
+idle
+arrive p1 5.2 room=true asked=[(5, false)] -> write cancel=[]
+snub p1 released=None requeued=[]
+check 6 passed=false
+check 2 passed=true
+look p3 0:[0.2]
+mark p1 5.2 -> Some(NotCompleted)
+idle
+idle
+look p3 0:[0.2]
+idle
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.0 5.1 5.3]
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[4] -> reserved 4 ask=[4.2]
+look p3 0:[0.2]
+look p4 4:[4.2]
+snub p2 released=None requeued=[]
+state queued=[6, 9] end_game=false 0:p3[2] 1:H-[] 2:H-[] 3:H-[] 4:p4[2] 5:p1[0, 1, 3] 6:-[0, 1, 2, 3] 7:H-[] 8:H-[] 9:-[0, 2, 3]
+look p1 5:[5.0 5.1 5.3]
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.0 6.1 6.2 6.3]
+arrive p4 4.2 room=true asked=[(4, true)] -> write cancel=[]
+room_wait p4 released=1 requeued=[4]
+look p4
+look p3 0:[0.2]
+arrive p4 8.2 room=true asked=[] -> discard
+mark p4 4.2 -> Some(Completed) take time=None senders=[p3,p3,p4,p3]
+look p3 0:[0.2]
+arrive p2 6.0 room=true asked=[(6, true)] -> write cancel=[]
+look p2 6:[6.0 6.1 6.2 6.3]
+look p1 5:[5.0 5.1 5.3]
+acquire p4 avg=None rev=true parole=false out=0 admit=[9] -> reserved 9 ask=[9.0 9.2 9.3]
+mark p2 6.0 -> Some(NotCompleted)
+look p3 0:[0.2]
+gone p1 released=1 requeued=[5]
+snub p2 released=Some(6) requeued=[6]
+acquire p2 avg=None rev=true parole=false out=3 admit=[5] -> no_room
+room_wait p3 released=1 requeued=[0]
+gone p1 released=0 requeued=[]
+state queued=[0, 5, 6] end_game=true 0:-[2] 1:H-[] 2:H-[] 3:H-[] 4:-[] 5:-[0, 1, 3] 6:-[1, 2, 3] 7:H-[] 8:H-[] 9:p4[0, 2, 3]
+arrive p3 4.3 room=true asked=[] -> discard
+idle
+gone p3 released=0 requeued=[]
+look p4 9:[9.0 9.2 9.3]
+look p2
+acquire p3 avg=None rev=true parole=false out=0 admit=[0] -> reserved 0 ask=[0.2]
+arrive p3 0.2 room=true asked=[(0, true)] -> write cancel=[]
+arrive p2 6.1 room=true asked=[(6, false)] -> write cancel=[]
+mark p2 6.1 -> Some(NotCompleted)
+look p3 0:[0.2]
+mark p3 0.2 -> Some(Completed) take time=Some(5ms) senders=[p1,p1,p3,p1]
+arrive p1 5.3 room=false asked=[(5, false)] -> no_room
+arrive p2 6.2 room=true asked=[(6, false)] -> write cancel=[]
+arrive p2 6.3 room=true asked=[(6, false)] -> write cancel=[]
+snub p4 released=Some(9) requeued=[9]
+arrive p1 4.3 room=true asked=[] -> discard
+acquire p4 avg=Some(2ms) rev=true parole=false out=3 admit=[9] -> no_room
+acquire p4 avg=None rev=false parole=false out=3 admit=[5] -> reserved 5 ask=[5.0 5.1 5.3]
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[9] -> reserved 9 ask=[9.0 9.2 9.3]
+snub p1 released=Some(9) requeued=[9]
+state queued=[6, 9] end_game=true 0:-[] 1:H-[] 2:H-[] 3:H-[] 4:-[] 5:p4[0, 1, 3] 6:-[2, 3] 7:H-[] 8:H-[] 9:-[0, 2, 3]
+acquire p3 avg=None rev=false parole=false out=0 admit=[9] -> reserved 9 ask=[9.0 9.2 9.3]
+acquire p1 avg=None rev=true parole=false out=3 admit=[] -> none
+look p4 5:[5.0 5.1 5.3]
+room_wait p1 released=0 requeued=[]
+look p2
+arrive p3 9.0 room=true asked=[(9, true)] -> write cancel=[]
+acquire p1 avg=None rev=false parole=false out=3 admit=[] -> none
+mark p3 9.0 -> Some(NotCompleted)
+arrive p3 9.2 room=true asked=[] -> write cancel=[]
+write_failed p2 6.3
+arrive p2 2.1 room=true asked=[] -> discard
+arrive p3 9.3 room=true asked=[] -> write cancel=[]
+arrive p2 3.2 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=3 admit=[] -> none
+look p2
+arrive p4 9.3 room=true asked=[] -> discard
+arrive p1 9.2 room=true asked=[] -> discard
+check 4 passed=true
+gone p2 released=0 requeued=[]
+mark p2 6.2 -> Some(NotCompleted)
+state queued=[6] end_game=true 0:-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:p4[0, 1, 3] 6:-[3] 7:H-[] 8:H-[] 9:p3[2, 3]
+snub p2 released=None requeued=[]
+arrive p1 9.0 room=true asked=[] -> discard
+arrive p1 9.3 room=true asked=[] -> discard
+arrive p2 6.1 room=true asked=[] -> discard
+write_failed p3 9.3
+look p2
+arrive p3 0.1 room=true asked=[] -> discard
+snub p3 released=None requeued=[]
+look p4 5:[5.0 5.1 5.3]
+check 0 passed=true
+mark p3 9.2 -> Some(NotCompleted)
+arrive p2 1.0 room=true asked=[] -> discard
+look p4 5:[5.0 5.1 5.3]
+look p4 5:[5.0 5.1 5.3]
+idle
+arrive p1 1.1 room=true asked=[] -> discard
+snub p1 released=None requeued=[]
+room_wait p4 released=1 requeued=[5]
+acquire p1 avg=None rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.0 5.1 5.3]
+look p3 9:[9.3]
+state queued=[6] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:p1[0, 1, 3] 6:-[3] 7:H-[] 8:H-[] 9:p3[3]
+arrive p4 5.1 room=true asked=[(5, false)] -> write cancel=[p1]
+look p1 5:[5.0 5.1 5.3]
+look p2
+gone p1 released=1 requeued=[5]
+look p2
+gone p4 released=0 requeued=[]
+mark p4 5.1 -> Some(NotCompleted)
+acquire p4 avg=None rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.0 5.3]
+arrive p4 5.0 room=true asked=[(5, true)] -> write cancel=[]
+arrive p3 9.0 room=true asked=[] -> discard
+acquire p2 avg=None rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.3]
+look p2 6:[6.3]
+gone p1 released=0 requeued=[]
+arrive p2 6.3 room=true asked=[(6, true)] -> write cancel=[]
+idle
+snub p1 released=None requeued=[]
+room_wait p2 released=1 requeued=[6]
+look p3 9:[9.3]
+arrive p2 8.1 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> doubled 5 5.3 ask=[5.3]
+state queued=[6] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:p4[0, 3] 6:-[3] 7:H-[] 8:H-[] 9:p3[3]
+acquire p2 avg=None rev=false parole=true out=0 admit=[] -> none
+write_failed p4 5.0
+look p3 9:[9.3]
+arrive p1 9.1 room=true asked=[] -> discard
+write_failed p2 6.3
+acquire p1 avg=None rev=false parole=false out=1 admit=[] -> none
+idle
+arrive p3 4.3 room=false asked=[] -> discard
+idle
+arrive p3 0.3 room=true asked=[] -> discard
+idle
+arrive p4 5.3 room=true asked=[] -> write cancel=[p1]
+mark p4 5.3 -> Some(NotCompleted)
+look p4 5:[5.0]
+idle
+arrive p3 3.3 room=true asked=[] -> discard
+look p4 5:[5.0]
+gone p3 released=1 requeued=[9]
+gone p2 released=0 requeued=[]
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[9] -> reserved 9 ask=[9.3]
+state queued=[6] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:p4[0] 6:-[3] 7:H-[] 8:H-[] 9:p1[3]
+snub p4 released=None requeued=[]
+idle
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.3]
+look p2 6:[6.3]
+idle
+idle
+snub p2 released=Some(6) requeued=[6]
+arrive p1 9.3 room=true asked=[(9, true)] -> write cancel=[]
+arrive p1 2.2 room=true asked=[] -> discard
+arrive p4 2.0 room=true asked=[] -> discard
+arrive p3 9.3 room=true asked=[] -> discard
+mark p1 9.3 -> Some(Completed) take time=Some(12ms) senders=[p3,p1,p3,p1]
+look p3
+idle
+idle
+look p2
+idle
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p4 5.3 room=true asked=[] -> discard
+arrive p3 9.0 room=true asked=[] -> discard
+state queued=[6] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:p4[0] 6:-[3] 7:H-[] 8:H-[] 9:-[]
+look p4 5:[5.0]
+look p1
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> stolen 5 from p4 ask=[5.0]
+snub p1 released=Some(5) requeued=[5]
+gone p3 released=0 requeued=[]
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=None rev=false parole=false out=1 admit=[5] -> no_room
+acquire p2 avg=Some(2ms) rev=false parole=false out=1 admit=[6] -> reserved 6 ask=[6.3]
+acquire p4 avg=Some(1ms) rev=false parole=true out=0 admit=[] -> none
+idle
+gone p3 released=0 requeued=[]
+arrive p4 2.0 room=true asked=[] -> discard
+check 9 passed=true
+arrive p1 5.0 room=false asked=[(5, false)] -> no_room
+arrive p2 6.3 room=true asked=[(6, true)] -> write cancel=[]
+look p2 6:[6.3]
+mark p2 6.3 -> Some(Completed) take time=Some(9ms) senders=[p2,p2,p2,p2]
+idle
+look p4
+arrive p1 4.3 room=true asked=[] -> discard
+state queued=[5] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:-[0] 6:-[] 7:H-[] 8:H-[] 9:H-[]
+arrive p3 7.0 room=true asked=[] -> discard
+look p2
+idle
+arrive p3 9.3 room=true asked=[] -> discard
+look p4
+look p2
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.0]
+check 6 passed=false
+idle
+arrive p1 8.0 room=true asked=[] -> discard
+arrive p2 5.0 room=true asked=[(5, true)] -> write cancel=[]
+gone p4 released=0 requeued=[]
+look p4
+mark p2 5.0 -> Some(Completed) take time=Some(7ms) senders=[p2,p4,p1,p4]
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p2 2.3 room=true asked=[] -> discard
+arrive p2 6.3 room=true asked=[(6, false)] -> write cancel=[]
+write_failed p2 6.3
+acquire p2 avg=None rev=false parole=false out=0 admit=[6] -> no_room
+arrive p1 8.3 room=true asked=[] -> discard
+state queued=[6] end_game=false 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:-[] 6:-[0, 1, 2, 3] 7:H-[] 8:H-[] 9:H-[]
+acquire p2 avg=None rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.0 6.1 6.2 6.3]
+snub p2 released=Some(6) requeued=[6]
+look p4
+acquire p1 avg=Some(1ms) rev=true parole=false out=0 admit=[] -> none
+idle
+arrive p3 9.2 room=true asked=[] -> discard
+check 5 passed=false
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.0 5.1 5.2 5.3]
+idle
+arrive p2 6.3 room=true asked=[(6, false)] -> write cancel=[]
+arrive p2 6.0 room=true asked=[(6, false)] -> write cancel=[]
+arrive p1 5.0 room=true asked=[(5, true)] -> write cancel=[]
+arrive p2 6.1 room=true asked=[(6, false)] -> write cancel=[]
+look p3
+look p1 5:[5.0 5.1 5.2 5.3]
+mark p2 6.3 -> Some(NotCompleted)
+look p4
+acquire p2 avg=None rev=false parole=false out=1 admit=[6] -> reserved 6 ask=[6.0 6.1 6.2]
+arrive p1 5.1 room=true asked=[] -> write cancel=[]
+arrive p2 6.1 room=true asked=[] -> discard
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:p1[0, 1, 2, 3] 6:p2[0, 1, 2] 7:H-[] 8:H-[] 9:H-[]
+look p4
+gone p1 released=1 requeued=[5]
+acquire p3 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+acquire p4 avg=None rev=false parole=true out=0 admit=[5] -> reserved 5 ask=[5.0 5.1 5.2 5.3]
+mark p2 6.1 -> Some(NotCompleted)
+mark p1 5.0 -> Some(NotCompleted)
+arrive p2 6.2 room=true asked=[(6, true)] -> write cancel=[]
+arrive p1 2.2 room=true asked=[] -> discard
+look p4 5:[5.1 5.2 5.3]
+look p2 6:[6.0 6.2]
+look p2 6:[6.0 6.2]
+room_wait p3 released=0 requeued=[]
+snub p2 released=Some(6) requeued=[6]
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+look p4 5:[5.1 5.2 5.3]
+arrive p3 7.0 room=true asked=[] -> discard
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> doubled 5 5.2 ask=[5.2]
+snub p2 released=None requeued=[]
+mark p2 6.0 -> Some(NotCompleted)
+arrive p1 8.3 room=true asked=[] -> discard
+state queued=[6] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:p4[1, 2, 3] 6:-[2] 7:H-[] 8:H-[] 9:H-[]
+snub p4 released=Some(5) requeued=[5]
+snub p2 released=None requeued=[]
+arrive p2 6.0 room=true asked=[] -> discard
+gone p1 released=0 requeued=[]
+arrive p4 5.0 room=true asked=[] -> discard
+gone p3 released=0 requeued=[]
+look p1
+idle
+arrive p1 2.3 room=true asked=[] -> discard
+arrive p4 5.1 room=true asked=[] -> discard
+snub p2 released=None requeued=[]
+acquire p4 avg=None rev=false parole=false out=2 admit=[5] -> no_room
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+mark p1 5.1 -> Some(NotCompleted)
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[6] -> reserved 6 ask=[6.2]
+look p2 6:[6.2]
+mark p2 6.2 -> Some(Completed) take time=Some(2ms) senders=[p2,p2,p2,p2]
+gone p2 released=0 requeued=[]
+snub p2 released=None requeued=[]
+acquire p2 avg=None rev=false parole=false out=0 admit=[5] -> reserved 5 ask=[5.2 5.3]
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:p2[2, 3] 6:-[] 7:H-[] 8:H-[] 9:H-[]
+room_wait p1 released=0 requeued=[]
+arrive p4 2.2 room=true asked=[] -> discard
+arrive p4 5.2 room=true asked=[(5, false)] -> write cancel=[p2]
+arrive p2 5.3 room=true asked=[] -> write cancel=[]
+look p2 5:[5.2 5.3]
+look p2 5:[5.2 5.3]
+write_failed p4 5.2
+look p2 5:[5.2 5.3]
+acquire p4 avg=None rev=false parole=false out=1 admit=[] -> none
+gone p3 released=0 requeued=[]
+mark p2 5.3 -> Some(NotCompleted)
+idle
+acquire p1 avg=Some(1ms) rev=true parole=false out=0 admit=[] -> stolen 5 from p2 ask=[5.2]
+arrive p2 7.2 room=true asked=[] -> discard
+idle
+acquire p2 avg=None rev=true parole=false out=0 admit=[] -> doubled 5 5.2 ask=[5.2]
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p1 5.2 room=true asked=[] -> write cancel=[p2]
+room_wait p1 released=1 requeued=[5]
+state queued=[5] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:-[2] 6:-[] 7:H-[] 8:H-[] 9:H-[]
+state queued=[5] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:-[2] 6:-[] 7:H-[] 8:H-[] 9:H-[]
+seed 1009
+acquire p1 avg=None rev=true parole=false out=0 admit=[5] -> reserved 5 ask=[5.0 5.1 5.2 5.3]
+arrive p3 0.2 room=true asked=[(0, false)] -> write cancel=[]
+look p1 5:[5.0 5.1 5.2 5.3]
+arrive p3 6.1 room=true asked=[(6, false)] -> write cancel=[]
+look p1 5:[5.0 5.1 5.2 5.3]
+look p1 5:[5.0 5.1 5.2 5.3]
+acquire p2 avg=None rev=true parole=false out=0 admit=[7] -> reserved 7 ask=[7.0 7.1 7.2 7.3]
+look p2 7:[7.0 7.1 7.2 7.3]
+mark p3 6.1 -> Some(NotCompleted)
+arrive p3 5.0 room=true asked=[(5, false)] -> write cancel=[p1]
+arrive p2 7.3 room=true asked=[(7, true)] -> write cancel=[]
+arrive p3 5.1 room=true asked=[] -> write cancel=[p1]
+look p1 5:[5.0 5.1 5.2 5.3]
+snub p4 released=None requeued=[]
+mark p3 5.0 -> Some(NotCompleted)
+look p2 7:[7.0 7.1 7.2 7.3]
+arrive p4 6.0 room=true asked=[(6, false)] -> write cancel=[]
+room_wait p1 released=1 requeued=[5]
+snub p2 released=Some(7) requeued=[7]
+acquire p1 avg=None rev=false parole=false out=2 admit=[5] -> reserved 5 ask=[5.1 5.2 5.3]
+state queued=[0, 1, 2, 3, 4, 6, 7, 8, 9] end_game=false 0:-[0, 1, 2, 3] 1:-[0, 1, 2, 3] 2:-[0, 1, 2, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:p1[1, 2, 3] 6:-[0, 2, 3] 7:-[0, 1, 2, 3] 8:-[0, 1, 2, 3] 9:-[0, 1, 2, 3]
+acquire p4 avg=Some(1ms) rev=false parole=false out=0 admit=[6] -> no_room
+look p3
+look p1 5:[5.1 5.2 5.3]
+mark p3 0.2 -> Some(NotCompleted)
+arrive p3 2.2 room=true asked=[(2, false)] -> write cancel=[]
+mark p2 7.3 -> Some(NotCompleted)
+idle
+mark p3 2.2 -> Some(NotCompleted)
+arrive p1 5.3 room=true asked=[(5, true)] -> write cancel=[]
+snub p1 released=Some(5) requeued=[5]
+arrive p3 0.3 room=true asked=[(0, false)] -> write cancel=[]
+acquire p2 avg=None rev=false parole=false out=3 admit=[0] -> no_room
+mark p4 6.0 -> Some(NotCompleted)
+arrive p2 7.0 room=true asked=[(7, false)] -> write cancel=[]
+look p3
+arrive p2 7.1 room=true asked=[(7, false)] -> write cancel=[]
+idle
+look p2
+idle
+arrive p4 3.0 room=true asked=[(3, false)] -> write cancel=[]
+state queued=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] end_game=false 0:-[0, 1, 3] 1:-[0, 1, 2, 3] 2:-[0, 1, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[1, 2, 3] 6:-[2, 3] 7:-[0, 1, 2] 8:-[0, 1, 2, 3] 9:-[0, 1, 2, 3]
+arrive p3 6.0 room=true asked=[] -> discard
+arrive p1 5.1 room=true asked=[] -> discard
+look p3
+arrive p3 6.2 room=true asked=[(6, false)] -> write cancel=[]
+look p3
+idle
+mark p2 7.1 -> Some(NotCompleted)
+arrive p4 7.1 room=true asked=[] -> discard
+acquire p1 avg=Some(2ms) rev=false parole=false out=1 admit=[0] -> reserved 0 ask=[0.0 0.1 0.3]
+arrive p1 5.2 room=true asked=[(5, false)] -> write cancel=[]
+arrive p2 5.1 room=true asked=[] -> discard
+arrive p2 7.2 room=true asked=[(7, false)] -> write cancel=[]
+arrive p2 4.3 room=true asked=[(4, false)] -> write cancel=[]
+look p1 0:[0.0 0.1 0.3]
+arrive p1 0.0 room=true asked=[(0, true)] -> write cancel=[]
+look p1 0:[0.0 0.1 0.3]
+mark p3 5.1 -> Some(NotCompleted)
+gone p1 released=1 requeued=[0]
+room_wait p2 released=0 requeued=[]
+arrive p2 9.0 room=true asked=[(9, false)] -> write cancel=[]
+state queued=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] end_game=false 0:-[0, 1, 3] 1:-[0, 1, 2, 3] 2:-[0, 1, 3] 3:-[0, 1, 2, 3] 4:-[0, 1, 2, 3] 5:-[2, 3] 6:-[2, 3] 7:-[0, 2] 8:-[0, 1, 2, 3] 9:-[0, 1, 2, 3]
+arrive p1 8.1 room=true asked=[(8, false)] -> write cancel=[]
+look p4
+acquire p1 avg=None rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.0 0.1 0.3]
+acquire p2 avg=None rev=false parole=false out=0 admit=[2] -> reserved 2 ask=[2.0 2.1 2.3]
+arrive p2 2.1 room=true asked=[(2, true)] -> write cancel=[]
+mark p1 5.2 -> Some(NotCompleted)
+write_failed p2 2.1
+mark p3 6.2 -> Some(NotCompleted)
+arrive p3 6.3 room=true asked=[(6, false)] -> write cancel=[]
+snub p4 released=None requeued=[]
+look p2 2:[2.0 2.1 2.3]
+arrive p3 5.1 room=true asked=[] -> discard
+mark p1 0.0 -> Some(NotCompleted)
+arrive p4 8.3 room=true asked=[(8, false)] -> write cancel=[]
+mark p4 3.0 -> Some(NotCompleted)
+arrive p3 6.2 room=true asked=[] -> discard
+mark p2 7.2 -> Some(NotCompleted)
+arrive p1 5.0 room=true asked=[] -> discard
+acquire p4 avg=Some(1ms) rev=true parole=false out=0 admit=[3] -> reserved 3 ask=[3.1 3.2 3.3]
+snub p4 released=Some(3) requeued=[3]
+state queued=[1, 3, 4, 5, 6, 7, 8, 9] end_game=false 0:p1[1, 3] 1:-[0, 1, 2, 3] 2:p2[0, 1, 3] 3:-[1, 2, 3] 4:-[0, 1, 2, 3] 5:-[3] 6:-[3] 7:-[0] 8:-[0, 1, 2, 3] 9:-[0, 1, 2, 3]
+look p2 2:[2.0 2.1 2.3]
+mark p1 8.1 -> Some(NotCompleted)
+look p2 2:[2.0 2.1 2.3]
+mark p3 6.3 -> Some(Completed) take time=None senders=[p4,p3,p3,p3]
+mark p2 9.0 -> Some(NotCompleted)
+look p2 2:[2.0 2.1 2.3]
+arrive p3 7.1 room=true asked=[] -> discard
+arrive p1 2.0 room=true asked=[] -> write cancel=[p2]
+arrive p2 2.3 room=true asked=[] -> write cancel=[]
+arrive p2 1.3 room=true asked=[(1, false)] -> write cancel=[]
+look p1 0:[0.1 0.3]
+look p1 0:[0.1 0.3]
+gone p1 released=1 requeued=[0]
+mark p4 8.3 -> Some(NotCompleted)
+write_failed p3 0.3
+mark p2 2.3 -> Some(NotCompleted)
+look p2 2:[2.0 2.1]
+acquire p1 avg=None rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.1 0.3]
+look p2 2:[2.0 2.1]
+mark p1 5.3 -> Some(Completed) take time=None senders=[p3,p3,p1,p1]
+state queued=[1, 3, 4, 7, 8, 9] end_game=false 0:p1[1, 3] 1:-[0, 1, 2, 3] 2:p2[0, 1] 3:-[1, 2, 3] 4:-[0, 1, 2, 3] 5:-[] 6:-[] 7:-[0] 8:-[0, 2] 9:-[1, 2, 3]
+look p1 0:[0.1 0.3]
+look p4
+arrive p3 5.2 room=true asked=[] -> discard
+acquire p3 avg=Some(2ms) rev=true parole=false out=0 admit=[7] -> reserved 7 ask=[7.0]
+room_wait p1 released=1 requeued=[0]
+mark p2 7.0 -> Some(Completed) take time=Some(2ms) senders=[p2,p2,p2,p2]
+snub p3 released=None requeued=[]
+mark p2 1.3 -> Some(NotCompleted)
+look p2 2:[2.0 2.1]
+mark p2 4.3 -> Some(NotCompleted)
+mark p1 2.0 -> Some(NotCompleted)
+look p1
+look p2 2:[2.1]
+acquire p4 avg=Some(2ms) rev=true parole=false out=3 admit=[0] -> reserved 0 ask=[0.1 0.3]
+acquire p1 avg=None rev=false parole=true out=2 admit=[] -> none
+snub p3 released=None requeued=[]
+arrive p3 7.0 room=false asked=[] -> discard
+idle
+look p4 0:[0.1 0.3]
+acquire p3 avg=None rev=true parole=false out=0 admit=[4] -> reserved 4 ask=[4.0 4.1 4.2]
+state queued=[1, 3, 8, 9] end_game=true 0:p4[1, 3] 1:-[0, 1, 2] 2:p2[1] 3:-[1, 2, 3] 4:p3[0, 1, 2] 5:-[] 6:-[] 7:-[] 8:-[0, 2] 9:-[1, 2, 3]
+look p2 2:[2.1]
+look p4 0:[0.1 0.3]
+gone p4 released=1 requeued=[0]
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.1 0.3]
+arrive p1 0.1 room=true asked=[(0, false)] -> write cancel=[p4]
+arrive p1 0.3 room=true asked=[] -> write cancel=[p4]
+arrive p3 4.0 room=true asked=[(4, true)] -> write cancel=[]
+look p2 2:[2.1]
+snub p1 released=None requeued=[]
+look p2 2:[2.1]
+acquire p1 avg=Some(2ms) rev=false parole=true out=0 admit=[] -> none
+look p4 0:[0.1 0.3]
+look p2 2:[2.1]
+arrive p4 1.3 room=true asked=[] -> discard
+mark p3 4.0 -> Some(NotCompleted)
+gone p3 released=1 requeued=[4]
+arrive p1 3.3 room=false asked=[(3, false)] -> no_room
+arrive p1 7.1 room=false asked=[] -> discard
+look p4 0:[0.1 0.3]
+arrive p4 4.0 room=false asked=[] -> discard
+state queued=[1, 3, 4, 8, 9] end_game=true 0:p4[1, 3] 1:-[0, 1, 2] 2:p2[1] 3:-[1, 2, 3] 4:-[1, 2] 5:-[] 6:-[] 7:-[] 8:-[0, 2] 9:-[1, 2, 3]
+gone p1 released=0 requeued=[]
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[4] -> reserved 4 ask=[4.1 4.2]
+mark p1 0.3 -> Some(NotCompleted)
+arrive p2 5.2 room=true asked=[] -> discard
+arrive p3 4.1 room=true asked=[(4, true)] -> write cancel=[]
+write_failed p1 0.1
+mark p3 4.1 -> Some(NotCompleted)
+arrive p1 8.2 room=true asked=[(8, false)] -> write cancel=[]
+look p2 2:[2.1]
+acquire p1 avg=None rev=false parole=false out=0 admit=[1] -> reserved 1 ask=[1.0 1.1 1.2]
+check 6 passed=true
+arrive p2 9.3 room=true asked=[(9, false)] -> write cancel=[]
+look p3 4:[4.2]
+arrive p4 3.3 room=true asked=[(3, false)] -> write cancel=[]
+arrive p1 1.0 room=true asked=[(1, true)] -> write cancel=[]
+arrive p3 4.2 room=true asked=[] -> write cancel=[]
+arrive p4 4.0 room=false asked=[] -> discard
+mark p1 8.2 -> Some(NotCompleted)
+arrive p2 1.0 room=false asked=[] -> discard
+snub p1 released=Some(1) requeued=[1]
+state queued=[1, 3, 8, 9] end_game=true 0:p4[1] 1:-[0, 1, 2] 2:p2[1] 3:-[1, 2, 3] 4:p3[2] 5:-[] 6:H-[] 7:-[] 8:-[0] 9:-[1, 2, 3]
+look p2 2:[2.1]
+check 5 passed=true
+arrive p1 1.2 room=true asked=[(1, false)] -> write cancel=[]
+arrive p1 1.1 room=true asked=[(1, false)] -> write cancel=[]
+arrive p2 4.3 room=true asked=[] -> discard
+gone p4 released=1 requeued=[0]
+look p1
+arrive p3 9.0 room=true asked=[] -> discard
+look p4
+arrive p1 9.0 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.1]
+snub p2 released=None requeued=[]
+look p1 0:[0.1]
+arrive p2 8.0 room=true asked=[(8, false)] -> write cancel=[]
+arrive p2 8.3 room=true asked=[] -> discard
+look p1 0:[0.1]
+arrive p1 0.1 room=false asked=[(0, true)] -> no_room
+write_failed p2 8.0
+arrive p4 1.3 room=true asked=[] -> discard
+look p2 2:[2.1]
+state queued=[1, 3, 8, 9] end_game=true 0:p1[1] 1:-[0, 1, 2] 2:p2[1] 3:-[1, 2, 3] 4:p3[2] 5:H-[] 6:H-[] 7:-[] 8:-[0] 9:-[1, 2, 3]
+look p2 2:[2.1]
+acquire p4 avg=None rev=true parole=false out=0 admit=[1] -> reserved 1 ask=[1.0 1.1 1.2]
+mark p3 4.2 -> Some(Completed) take time=Some(41ms) senders=[p3,p3,p3,p2]
+mark p1 1.2 -> Some(NotCompleted)
+arrive p4 1.2 room=true asked=[] -> discard
+look p1 0:[0.1]
+mark p2 9.3 -> Some(NotCompleted)
+look p4 1:[1.0 1.1]
+mark p1 1.0 -> Some(NotCompleted)
+arrive p4 1.1 room=true asked=[] -> discard
+arrive p4 9.2 room=false asked=[(9, false)] -> no_room
+look p1 0:[0.1]
+look p2 2:[2.1]
+mark p4 3.3 -> Some(NotCompleted)
+snub p1 released=None requeued=[]
+look p1 0:[0.1]
+look p1 0:[0.1]
+look p4 1:[1.1]
+mark p1 1.1 -> Some(Completed) take time=Some(17ms) senders=[p1,p1,p1,p2]
+look p2 2:[2.1]
+state queued=[3, 8, 9] end_game=true 0:p1[1] 1:-[] 2:p2[1] 3:-[1, 2] 4:-[] 5:H-[] 6:H-[] 7:-[] 8:-[0] 9:-[1, 2]
+look p2 2:[2.1]
+idle
+gone p1 released=1 requeued=[0]
+acquire p1 avg=None rev=false parole=false out=0 admit=[0] -> doubled 2 2.1 ask=[2.1]
+idle
+acquire p1 avg=None rev=false parole=false out=1 admit=[0] -> reserved 0 ask=[0.1]
+arrive p3 7.2 room=true asked=[] -> discard
+idle
+arrive p1 2.1 room=true asked=[] -> write cancel=[p2]
+look p1 0:[0.1]
+look p1 0:[0.1]
+arrive p4 1.0 room=true asked=[] -> discard
+acquire p4 avg=None rev=false parole=true out=0 admit=[] -> none
+mark p1 2.1 -> Some(Completed) take time=Some(150ms) senders=[p1,p1,p3,p2]
+idle
+arrive p4 3.3 room=true asked=[] -> discard
+gone p1 released=1 requeued=[0]
+snub p1 released=None requeued=[]
+check 7 passed=true
+idle
+state queued=[0, 3, 8, 9] end_game=true 0:-[1] 1:-[] 2:-[] 3:-[1, 2] 4:-[] 5:H-[] 6:H-[] 7:H-[] 8:-[0] 9:-[1, 2]
+acquire p1 avg=Some(2ms) rev=false parole=true out=0 admit=[] -> none
+idle
+idle
+arrive p2 2.2 room=true asked=[] -> discard
+look p2
+acquire p4 avg=None rev=false parole=false out=0 admit=[0] -> no_room
+acquire p1 avg=None rev=false parole=false out=0 admit=[0] -> reserved 0 ask=[0.1]
+snub p1 released=Some(0) requeued=[0]
+acquire p4 avg=None rev=true parole=true out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=true out=0 admit=[] -> none
+gone p3 released=0 requeued=[]
+arrive p2 4.3 room=true asked=[] -> discard
+arrive p4 4.1 room=true asked=[] -> discard
+check 4 passed=true
+idle
+arrive p4 3.3 room=true asked=[] -> discard
+arrive p4 5.3 room=true asked=[] -> discard
+acquire p4 avg=None rev=false parole=false out=0 admit=[3] -> reserved 3 ask=[3.1 3.2]
+arrive p4 3.1 room=true asked=[(3, true)] -> write cancel=[]
+arrive p2 2.1 room=true asked=[] -> discard
+state queued=[0, 8, 9] end_game=true 0:-[1] 1:-[] 2:-[] 3:p4[1, 2] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:-[0] 9:-[1, 2]
+look p3
+mark p4 3.1 -> Some(NotCompleted)
+acquire p2 avg=None rev=true parole=false out=0 admit=[0] -> reserved 0 ask=[0.1]
+idle
+arrive p2 0.1 room=true asked=[(0, true)] -> write cancel=[]
+room_wait p1 released=0 requeued=[]
+mark p2 0.1 -> Some(Completed) take time=Some(4ms) senders=[p1,p2,p3,p1]
+arrive p1 0.1 room=true asked=[] -> discard
+arrive p1 5.3 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=0 admit=[8] -> reserved 8 ask=[8.0]
+idle
+check 1 passed=true
+room_wait p2 released=0 requeued=[]
+gone p1 released=1 requeued=[8]
+gone p2 released=0 requeued=[]
+arrive p2 9.0 room=true asked=[] -> discard
+look p4 3:[3.2]
+idle
+arrive p3 7.3 room=true asked=[] -> discard
+idle
+state queued=[8, 9] end_game=true 0:-[] 1:H-[] 2:-[] 3:p4[2] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:-[0] 9:-[1, 2]
+arrive p1 7.2 room=true asked=[] -> discard
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[8] -> reserved 8 ask=[8.0]
+look p4 3:[3.2]
+look p4 3:[3.2]
+arrive p2 8.0 room=true asked=[(8, true)] -> write cancel=[]
+look p2 8:[8.0]
+arrive p1 8.1 room=true asked=[] -> discard
+arrive p4 3.2 room=true asked=[] -> write cancel=[]
+write_failed p4 3.2
+gone p2 released=1 requeued=[8]
+mark p2 8.0 -> Some(Completed) take time=None senders=[p2,p1,p1,p4]
+arrive p4 2.0 room=false asked=[] -> discard
+gone p2 released=0 requeued=[]
+arrive p2 5.3 room=true asked=[] -> discard
+look p4 3:[3.2]
+snub p2 released=None requeued=[]
+arrive p4 7.0 room=true asked=[] -> discard
+arrive p1 9.1 room=true asked=[(9, false)] -> write cancel=[]
+acquire p3 avg=None rev=true parole=false out=0 admit=[9] -> reserved 9 ask=[9.1 9.2]
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> stolen 3 from p4 ask=[3.2]
+state queued=[] end_game=true 0:-[] 1:H-[] 2:-[] 3:p1[2] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:-[] 9:p3[1, 2]
+gone p1 released=1 requeued=[3]
+mark p1 9.1 -> Some(NotCompleted)
+idle
+look p3 9:[9.2]
+snub p2 released=None requeued=[]
+acquire p4 avg=None rev=false parole=false out=0 admit=[3] -> reserved 3 ask=[3.2]
+gone p1 released=0 requeued=[]
+idle
+arrive p4 3.2 room=true asked=[(3, true)] -> write cancel=[]
+look p4 3:[3.2]
+arrive p3 9.1 room=true asked=[] -> discard
+arrive p2 8.2 room=true asked=[] -> discard
+write_failed p4 3.2
+check 2 passed=true
+idle
+idle
+snub p2 released=None requeued=[]
+idle
+look p3 9:[9.2]
+look p3 9:[9.2]
+state queued=[] end_game=true 0:-[] 1:H-[] 2:H-[] 3:p4[2] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:-[] 9:p3[2]
+check 0 passed=true
+check 8 passed=true
+idle
+arrive p2 5.2 room=true asked=[] -> discard
+idle
+look p3 9:[9.2]
+arrive p3 9.2 room=true asked=[(9, true)] -> write cancel=[]
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> doubled 3 3.2 ask=[3.2]
+mark p3 9.2 -> Some(Completed) take time=Some(30ms) senders=[p2,p1,p3,p2]
+check 9 passed=true
+idle
+idle
+idle
+acquire p2 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+idle
+idle
+arrive p2 0.1 room=true asked=[] -> discard
+look p4 3:[3.2]
+acquire p1 avg=Some(2ms) rev=false parole=false out=1 admit=[] -> none
+gone p1 released=0 requeued=[]
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:p4[2] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+acquire p2 avg=None rev=true parole=false out=0 admit=[] -> none
+snub p2 released=None requeued=[]
+idle
+arrive p2 9.2 room=true asked=[] -> discard
+idle
+look p3
+idle
+arrive p1 4.1 room=true asked=[] -> discard
+snub p4 released=None requeued=[]
+snub p3 released=None requeued=[]
+look p2
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+snub p3 released=None requeued=[]
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p1 3.3 room=true asked=[] -> discard
+arrive p2 9.1 room=true asked=[] -> discard
+idle
+look p3
+look p4 3:[3.2]
+look p3
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:p4[2] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+acquire p3 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> doubled 3 3.2 ask=[3.2]
+look p4 3:[3.2]
+idle
+acquire p3 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+arrive p2 1.2 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=1 admit=[] -> none
+idle
+arrive p3 2.2 room=true asked=[] -> discard
+arrive p3 4.0 room=true asked=[] -> discard
+look p2
+snub p2 released=None requeued=[]
+look p4 3:[3.2]
+arrive p2 8.3 room=true asked=[] -> discard
+idle
+idle
+snub p1 released=None requeued=[]
+acquire p3 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=Some(2ms) rev=true parole=false out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:p4[2] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+arrive p1 3.2 room=true asked=[] -> write cancel=[p4]
+arrive p3 6.3 room=true asked=[] -> discard
+arrive p2 2.2 room=true asked=[] -> discard
+look p3
+acquire p1 avg=None rev=true parole=false out=0 admit=[] -> none
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+arrive p2 9.2 room=true asked=[] -> discard
+mark p1 3.2 -> Some(Completed) take time=Some(82ms) senders=[p4,p4,p1,p4]
+snub p4 released=None requeued=[]
+idle
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p1 3.3 room=true asked=[] -> discard
+idle
+check 3 passed=true
+look p3
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p1 3.2 room=true asked=[] -> discard
+snub p2 released=None requeued=[]
+idle
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+look p3
+idle
+acquire p3 avg=None rev=true parole=false out=0 admit=[] -> none
+acquire p4 avg=Some(1ms) rev=false parole=true out=0 admit=[] -> none
+snub p4 released=None requeued=[]
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+idle
+arrive p1 9.3 room=true asked=[] -> discard
+idle
+idle
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+arrive p2 9.2 room=false asked=[] -> discard
+idle
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+idle
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+look p3
+acquire p2 avg=None rev=false parole=true out=0 admit=[] -> none
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+arrive p3 7.2 room=true asked=[] -> discard
+arrive p4 8.3 room=true asked=[] -> discard
+idle
+idle
+idle
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p1 2.3 room=false asked=[] -> discard
+idle
+idle
+arrive p4 5.1 room=true asked=[] -> discard
+arrive p1 8.1 room=true asked=[] -> discard
+idle
+idle
+acquire p1 avg=None rev=true parole=false out=0 admit=[] -> none
+room_wait p1 released=0 requeued=[]
+arrive p1 7.0 room=true asked=[] -> discard
+idle
+arrive p1 5.2 room=false asked=[] -> discard
+arrive p3 2.2 room=true asked=[] -> discard
+arrive p3 2.2 room=true asked=[] -> discard
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+acquire p4 avg=None rev=true parole=true out=0 admit=[] -> none
+arrive p1 5.3 room=true asked=[] -> discard
+acquire p3 avg=None rev=true parole=false out=0 admit=[] -> none
+idle
+acquire p1 avg=Some(2ms) rev=false parole=true out=0 admit=[] -> none
+acquire p3 avg=None rev=true parole=true out=0 admit=[] -> none
+snub p4 released=None requeued=[]
+acquire p1 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+room_wait p3 released=0 requeued=[]
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p1 4.3 room=true asked=[] -> discard
+idle
+acquire p4 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p3 9.2 room=true asked=[] -> discard
+gone p1 released=0 requeued=[]
+arrive p3 7.1 room=true asked=[] -> discard
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+idle
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+snub p2 released=None requeued=[]
+arrive p1 3.3 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p3 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+snub p4 released=None requeued=[]
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+arrive p3 9.0 room=true asked=[] -> discard
+look p3
+arrive p3 6.2 room=true asked=[] -> discard
+idle
+look p3
+idle
+arrive p2 4.2 room=true asked=[] -> discard
+gone p3 released=0 requeued=[]
+acquire p1 avg=None rev=false parole=true out=0 admit=[] -> none
+look p2
+look p3
+look p2
+look p3
+acquire p2 avg=None rev=false parole=false out=0 admit=[] -> none
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+idle
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+arrive p4 4.1 room=true asked=[] -> discard
+look p3
+arrive p1 4.3 room=false asked=[] -> discard
+arrive p4 4.2 room=true asked=[] -> discard
+arrive p4 2.0 room=true asked=[] -> discard
+acquire p4 avg=Some(2ms) rev=true parole=false out=0 admit=[] -> none
+arrive p4 6.2 room=true asked=[] -> discard
+idle
+idle
+arrive p4 9.2 room=true asked=[] -> discard
+idle
+acquire p1 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+idle
+look p4
+acquire p2 avg=Some(1ms) rev=false parole=false out=0 admit=[] -> none
+arrive p2 5.2 room=false asked=[] -> discard
+arrive p2 0.0 room=false asked=[] -> discard
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+gone p4 released=0 requeued=[]
+acquire p4 avg=Some(1ms) rev=false parole=true out=0 admit=[] -> none
+idle
+look p2
+acquire p3 avg=None rev=false parole=false out=0 admit=[] -> none
+idle
+idle
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+idle
+arrive p4 8.2 room=true asked=[] -> discard
+arrive p4 7.3 room=true asked=[] -> discard
+acquire p1 avg=None rev=false parole=false out=0 admit=[] -> none
+acquire p3 avg=None rev=true parole=false out=0 admit=[] -> none
+arrive p4 1.0 room=true asked=[] -> discard
+acquire p4 avg=Some(2ms) rev=false parole=false out=0 admit=[] -> none
+arrive p3 4.0 room=true asked=[] -> discard
+idle
+arrive p2 1.2 room=true asked=[] -> discard
+arrive p4 0.1 room=true asked=[] -> discard
+arrive p2 2.1 room=true asked=[] -> discard
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]
+state queued=[] end_game=true 0:H-[] 1:H-[] 2:H-[] 3:H-[] 4:H-[] 5:H-[] 6:H-[] 7:H-[] 8:H-[] 9:H-[]

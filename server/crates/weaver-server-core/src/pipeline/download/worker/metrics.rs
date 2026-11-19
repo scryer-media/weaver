@@ -67,8 +67,9 @@ impl Pipeline {
     // articles other than a probe hold — or the soft byte-pressure delay every job shares. A job
     // whose articles are being built, or all of whose queued download work
     // waits on a fill server refusing the login
-    // ([`Self::job_login_refusal_wait`]), waits until now, so the stall
-    // counts from now while that lasts; a job with other queued work that
+    // ([`Self::job_login_refusal_wait`]), or any job while a health probe
+    // batch answers on the lanes it was yielded, waits until now, so the
+    // stall counts from now while that lasts; a job with other queued work that
     // does not wait on the login is not explained by it. A
     // stalled job with none of these is waiting
     // on nothing anyone scheduled, and the stall is unexplained: `None`.
@@ -118,6 +119,7 @@ impl Pipeline {
         // the clock restarts while it lasts and the ordinary windows run
         // from when it ends.
         let login_refusals = self.login_refusal_view();
+        let probe_answering = self.post_probes.answering(now);
         let mut waits = HashMap::new();
         for job_id in self.download_scheduler_eligible_jobs() {
             // A job whose articles are being built waits on that, which has
@@ -135,6 +137,16 @@ impl Pipeline {
             // which has no deadline either: a slow or hung disk restarts
             // the clock and never has the job's articles called unservable.
             if self.volume_holds_budget(job_id) {
+                waits.insert(job_id, now);
+                continue;
+            }
+            // A health probe batch answering on the lanes holds the seats
+            // every job's articles would take, so it explains every stalled
+            // job's wait, not only its own job's. Like a read it has no
+            // deadline here: the clock restarts while a batch answers, and
+            // a round whose batches stop answering explains nothing (see
+            // `Probes::answering`).
+            if probe_answering {
                 waits.insert(job_id, now);
                 continue;
             }
@@ -566,6 +578,15 @@ impl Pipeline {
                 now.saturating_duration_since(last) < DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL
             })
         {
+            return;
+        }
+        // The lanes were yielded to a health probe batch that is answering
+        // on them: the connections are busy with it, which is no stall. The
+        // clock starts over, so a stall left once the round stops answering
+        // is reported a whole interval later. Asked only when the line is
+        // due, not on every pass.
+        if self.post_probes.answering(now) {
+            self.download_dispatch_liveness_since = Some(now);
             return;
         }
 

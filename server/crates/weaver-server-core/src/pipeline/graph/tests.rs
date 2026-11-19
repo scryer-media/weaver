@@ -1480,6 +1480,7 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
                 delivered("echo-1.mkv", 1, true),
                 delivered("lantern.dat", 0, false),
             ],
+            password_given: false,
         })
     );
     assert_eq!(

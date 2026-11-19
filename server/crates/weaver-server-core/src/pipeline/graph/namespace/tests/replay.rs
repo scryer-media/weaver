@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use std::sync::atomic::Ordering;
 
 const REPAIRED_FRONT: &[u8] = &{
     let mut bytes = [0x71; FIRST_BYTES];
@@ -340,7 +339,7 @@ fn a_refused_replay_write_stops_reading_and_removes_the_copy_at_once() {
     let replayed = replay.run_with(&Default::default(), || {
         chunks += 1;
         if chunks == 2 {
-            stop.store(true, Ordering::Relaxed);
+            stop.raise();
         }
     });
     let two_chunks = counting::so_far().0 - from;
@@ -395,7 +394,7 @@ fn cancelled_replay_keeps_original_coverage_and_backing() {
     let (mut job, _, node, expected) = staged_job();
     let before = job.tree.record(node).unwrap();
     let replay = job.writer.take_replay(&job.tree).unwrap().unwrap();
-    replay.stop.store(true, Ordering::Relaxed);
+    replay.stop.raise();
     let replayed = replay.run(&Default::default());
     assert!(replayed.chunk_lengths().is_empty());
     apply(&mut job, replayed);
@@ -409,7 +408,7 @@ fn cancellation_between_replay_chunks_discards_the_whole_staging() {
     let before = job.tree.record(node).unwrap();
     let replay = job.writer.take_replay(&job.tree).unwrap().unwrap();
     let stop = Arc::clone(&replay.stop);
-    let replayed = replay.run_with(&Default::default(), || stop.store(true, Ordering::Relaxed));
+    let replayed = replay.run_with(&Default::default(), || stop.raise());
     assert_eq!(replayed.chunk_lengths(), vec![READ_BACK]);
     apply(&mut job, replayed);
     assert_eq!(job.tree.record(node).unwrap(), before);

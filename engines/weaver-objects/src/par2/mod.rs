@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use par2_rs::FileId;
 use par2_rs::packet::{HEADER_SIZE, MAGIC};
-use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
+use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling, Unbound, UnboundReason};
 use weaver_graph::{
     ByteRange, Claim, Delivery, Emit, Extent, Kind, Located, MemberId, Namespace, Object, ObjectId,
     Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
@@ -1027,6 +1027,18 @@ impl Packets for SetPackets<'_> {
 }
 
 impl Recovery for Par2 {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
         if self.shown.bind(namespace, self.id) {
             self.damage_shown();
@@ -1505,6 +1517,30 @@ impl Recovery for Par2 {
                 outcome: short.or(last.map(|last| last.outcome)),
                 read: short.is_none() && last.is_some_and(|last| last.read),
             });
+        }
+    }
+
+    // An object with no set kept none for one of three reasons: it passed
+    // its packet or set limits, it read a volume through and found no set in
+    // it, or no volume arrived whole to carry an index. Each set it keeps
+    // says why it bound nothing.
+    fn unbound(&self, out: &mut Vec<Unbound>) {
+        if self.sets.is_empty() {
+            let reason = match self.refused {
+                true => UnboundReason::TooLarge,
+                false if self.unread_through() => UnboundReason::Undescribed,
+                false => UnboundReason::NoSet,
+            };
+            out.push(Unbound { id: None, reason });
+            return;
+        }
+        for &key in self.ordered() {
+            if let Some(reason) = self.sets[&key].unbound() {
+                out.push(Unbound {
+                    id: Some(par2_rs::RecoverySetId::from_bytes(key).to_string()),
+                    reason,
+                });
+            }
         }
     }
 }

@@ -6,6 +6,10 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+mod received;
+pub(crate) use received::Received;
 
 use crate::buffers::ByteBuf;
 use crate::core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
@@ -330,7 +334,9 @@ pub struct ChunkTracker {
 
     // This has a bit set per each chunk (block) that we have written to the output file.
     // It doesn't mean it's valid yet. Used to track how much is left in each piece.
-    chunk_status: BF,
+    // Shared with the piece slots, which mark the blocks of a piece in
+    // flight under its piece lock (`Received`).
+    chunk_status: Arc<Received>,
 
     // These are the pieces that we actually have, fully checked and downloaded,
     // and how many (libtorrent `m_num_have`).
@@ -517,8 +523,10 @@ impl ChunkTracker {
         let mut priority_counts = [0; PiecePriority::COUNT];
         priority_counts[PiecePriority::Normal as usize] = total_pieces;
         let mut ct = Self {
-            chunk_status: compute_chunk_have_status(&lengths, have_pieces.as_slice())
-                .context("error computing chunk status")?,
+            chunk_status: Arc::new(Received::from_bits(
+                &compute_chunk_have_status(&lengths, have_pieces.as_slice())
+                    .context("error computing chunk status")?,
+            )),
             queue_pieces: needed_pieces,
             taken: BF::from_boxed_slice(
                 vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice(),
@@ -567,7 +575,7 @@ impl ChunkTracker {
     /// fetched again, and none is recorded that the files do not hold.
     pub(crate) fn checkpoint(&self, files: &dyn TorrentStorage, file_count: usize) -> Checkpoint {
         let have = self.have.as_slice().to_bitvec().into_boxed_bitslice();
-        let blocks = self.chunk_status.clone();
+        let blocks = self.chunk_status.to_bits();
         Checkpoint {
             have,
             blocks: Some(blocks),
@@ -591,6 +599,11 @@ impl ChunkTracker {
                 })
                 .sum();
         }
+    }
+
+    /// The received bit of every block, shared with the piece slots.
+    pub(crate) fn received(&self) -> &Arc<Received> {
+        &self.chunk_status
     }
 
     pub fn get_lengths(&self) -> &Lengths {
@@ -777,8 +790,8 @@ impl ChunkTracker {
                 u32::try_from(*id)
                     .ok()
                     .and_then(|id| lengths.validate_piece_index(id))
-                    .and_then(|piece| chunk_status.get(lengths.chunk_range(piece)))
-                    .is_some_and(|chunks| chunks.any())
+                    .and_then(|piece| chunk_status.any(lengths.chunk_range(piece)))
+                    .is_some_and(|any| any)
             })
             .map(|id| u32::try_from(id).expect("piece indexes fit in u32"))
             .collect();
@@ -827,9 +840,7 @@ impl ChunkTracker {
 
     /// How many chunks of `piece` were received.
     pub(crate) fn received_chunks(&self, piece: ValidPieceIndex) -> usize {
-        self.chunk_status
-            .get(self.lengths.chunk_range(piece))
-            .map_or(0, |chunks| chunks.count_ones())
+        self.chunk_status.count(self.lengths.chunk_range(piece))
     }
 
     /// How many pieces we have.
@@ -893,9 +904,7 @@ impl ChunkTracker {
             return;
         }
         debug!("marking piece={} as broken", index);
-        if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
-            s.fill(false);
-        }
+        self.chunk_status.clear(self.lengths.chunk_range(index));
         self.taken.set(index.get_usize(), false);
         self.set_queued(index, true);
     }
@@ -917,9 +926,7 @@ impl ChunkTracker {
 
     /// Whether `chunk` was received.
     pub(crate) fn is_chunk_received(&self, chunk: &ChunkInfo) -> bool {
-        self.chunk_status
-            .get(chunk.absolute_index as usize)
-            .is_some_and(|received| *received)
+        self.chunk_status.get(chunk.absolute_index as usize)
     }
 
     /// The chunks of `piece` not yet received.
@@ -955,17 +962,14 @@ impl ChunkTracker {
             piece.len().try_into().unwrap(),
         )?;
         let chunk_range = self.lengths.chunk_range(chunk_info.piece_index);
-        let chunk_range = self.chunk_status.get_mut(chunk_range).unwrap();
-        if chunk_range.all() {
+        if self.chunk_status.all(chunk_range.clone()) != Some(false) {
             return Some(ChunkMarkingResult::PreviouslyCompleted);
         }
-        chunk_range.set(chunk_info.chunk_index as usize, true);
-        trace!(
-            "piece={}, chunk_info={:?}, bits={:?}",
-            piece.index, chunk_info, chunk_range,
-        );
+        self.chunk_status
+            .set(chunk_info.absolute_index as usize, true);
+        trace!("piece={}, chunk_info={:?}", piece.index, chunk_info);
 
-        let completed = chunk_range.all();
+        let completed = self.chunk_status.all(chunk_range) == Some(true);
         self.reposition(chunk_info.piece_index);
         if completed {
             return Some(ChunkMarkingResult::Completed);

@@ -60,13 +60,26 @@ impl TorrentStateLive {
     /// We have `piece` now: a peer we want it of may have nothing else we
     /// want (libtorrent `torrent::piece_passed` updates the interest of each
     /// interesting peer that has the piece).
+    ///
+    /// Every seeder has the same pieces, so the answer for one is the answer
+    /// for all: once a seeder is found still interesting the rest are left
+    /// as they are, and the torrent's lock is taken once for them, not once
+    /// each for every piece that passes. Leaving a peer alone writes
+    /// nothing, so it cannot undo what a later piece's pass tells it.
     pub(super) fn update_interest_of_holders(&self, piece: ValidPieceIndex) {
+        let mut seeders_interesting = false;
         self.peers.for_each_live_mut(|_, peer| {
             if let Some(live) = peer.get_live_mut()
                 && live.is_interesting()
                 && live.bitfield.get(piece.get_usize()).is_some_and(|b| *b)
             {
-                self.update_interest(live);
+                if live.seeder && seeders_interesting {
+                    return;
+                }
+                let interesting = self.update_interest(live);
+                if live.seeder {
+                    seeders_interesting = interesting;
+                }
             }
         });
     }
@@ -161,6 +174,19 @@ impl TorrentStateLive {
             if to_ban {
                 self.ban_for_bad_data(peer);
             }
+        }
+    }
+
+    /// The storage is told of every piece queued again since it was last
+    /// told: a piece that took room gives it back, and its blocks are
+    /// written block by block from then on.
+    pub(super) fn spill_requeued(&self) {
+        let requeued = match self.lock_write("requeued").get_pieces_mut() {
+            Ok(pieces) => pieces.take_requeued(),
+            Err(_) => return,
+        };
+        for piece in requeued {
+            self.files.on_piece_requeued(piece);
         }
     }
 

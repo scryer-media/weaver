@@ -5,6 +5,7 @@
 //! handler queues for the wire.
 
 mod admission;
+mod cancels;
 mod discovery;
 mod disk_jobs;
 mod lifecycle;
@@ -13,6 +14,8 @@ mod mapped_filter_tests;
 mod peer_messages;
 mod pieces;
 mod requests;
+mod room;
+mod slots;
 mod swarm_tests;
 mod upload;
 mod v2;

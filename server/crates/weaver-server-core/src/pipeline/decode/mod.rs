@@ -91,8 +91,9 @@ impl ActiveDecodes {
 
 use layout::{
     AuthoritativeLayoutError, ExpectedSegmentLayout, YencLayoutMismatch, declared_part_end,
-    expected_segment_layout, format_authoritative_layout_error, format_yenc_layout_mismatch,
-    placement_within_nzb_envelope, validate_yenc_layout,
+    expected_segment_layout, format_authoritative_layout_error, format_withdrawn_placement,
+    format_yenc_layout_conflict, format_yenc_layout_mismatch, placement_within_nzb_envelope,
+    validate_yenc_layout,
 };
 
 #[cfg(test)]

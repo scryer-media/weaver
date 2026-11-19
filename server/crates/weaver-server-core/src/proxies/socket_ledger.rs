@@ -12,11 +12,11 @@
 // bandwidth split in force: one class alone may take all of it, and classes
 // that both press get their shares.
 //
-// Usenet connections are set per server, so a save that asks more than the
-// tunnel can hold beside what it keeps for itself and its torrent sessions'
-// listeners and datagram sockets is refused. The torrent peer limit is one
-// setting for every route, so it is never refused: its TCP peers take what
-// the split gives torrents, and connect over uTP past it.
+// A save never refuses connections: the servers' connection counts and the
+// torrent peer limit save whatever they ask. The tunnel holds them to its
+// bytes when each socket opens: a usenet connection past what fits waits for
+// room, its leg warns with what usenet is held to, and torrent TCP peers take
+// what the split gives torrents, and connect over uTP past it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,7 +26,7 @@ use weaver_tunnel::pipe::{
 };
 
 use super::{
-    Consumer, Failover, LegPath, NetworkRefusal, ProxyKind, ProxyPool, ProxyProfile, Route, Rung,
+    Consumer, Failover, LegPath, ProxyKind, ProxyPool, ProxyProfile, Route, Rung,
     WIREGUARD_INSTANCE_BYTES,
 };
 
@@ -151,6 +151,13 @@ impl TunnelSockets {
 
     // The usenet connections the tunnel holds beside what it keeps, at most
     // what usenet asks.
+    //
+    // The usenet receive buffer each connection holds (1 MiB under the
+    // Balanced hardware profile, 2 MiB under Performance) was set by the
+    // operator on 2026-11-18, and so was the connection count per tunnel
+    // that follows from it here. Both are intended, and the count is
+    // enforced as each socket opens, not at save. Neither is a defect to
+    // report or a value to retune without the operator.
     pub fn nntp_held(&self) -> usize {
         let room = WIREGUARD_INSTANCE_BYTES.saturating_sub(self.kept());
         self.nntp
@@ -167,15 +174,20 @@ impl TunnelSockets {
         }
     }
 
-    pub fn refusal(&self) -> NetworkRefusal {
-        NetworkRefusal::WireGuardSocketBudget {
-            proxy: self.proxy,
-            egress: self.egress,
-            nntp: self.nntp,
-            nntp_bytes: self.nntp_bytes(),
-            kept_bytes: self.kept(),
-            limit_bytes: WIREGUARD_INSTANCE_BYTES,
-        }
+    // What a leg over the tunnel says while usenet asks more of it than it
+    // holds: the totals, and what usenet is held to as its sockets open.
+    pub fn over_budget_warning(&self) -> String {
+        const MIB: u64 = 1024 * 1024;
+        format!(
+            "Usenet servers ask {} connections of WireGuard proxy {} on egress {}, {} MiB, and the tunnel keeps {} MiB for itself, over the {} MiB it holds; usenet is held to {}.",
+            self.nntp,
+            self.proxy,
+            self.egress,
+            self.nntp_bytes().div_ceil(MIB),
+            self.kept().div_ceil(MIB),
+            WIREGUARD_INSTANCE_BYTES / MIB,
+            self.nntp_held(),
+        )
     }
 }
 
@@ -395,37 +407,6 @@ pub fn tunnel_mtu(profiles: &HashMap<u32, ProxyProfile>, proxy: u32) -> u16 {
     profiles
         .get(&proxy)
         .map_or(DEFAULT_MTU, |profile| profile.mtu)
-}
-
-// What the usenet servers ask of each tunnel in `ledger`.
-pub fn socket_asks(ledger: &HashMap<SessionPath, TunnelSockets>) -> HashMap<SessionPath, usize> {
-    ledger
-        .iter()
-        .map(|(path, tunnel)| (path.clone(), tunnel.nntp))
-        .collect()
-}
-
-// Refuse a change that raises what usenet asks of a tunnel it leaves over
-// budget, measured against `before`, what the servers asked before it. A
-// change that leaves a tunnel over budget without asking it for more, as
-// any does once the hardware profile raises usenet's buffers, is no reason
-// to refuse it: that tunnel's legs warn instead. The first refused tunnel, by egress
-// and path, is named.
-pub fn validate_socket_raise(
-    before: &HashMap<SessionPath, usize>,
-    after: HashMap<SessionPath, TunnelSockets>,
-) -> Result<(), NetworkRefusal> {
-    let mut over: Vec<_> = after
-        .into_iter()
-        .filter(|(path, tunnel)| {
-            tunnel.over_budget() && tunnel.nntp > before.get(path).copied().unwrap_or(0)
-        })
-        .collect();
-    over.sort_by(|a, b| a.0.cmp(&b.0));
-    match over.into_iter().next() {
-        Some((_, tunnel)) => Err(tunnel.refusal()),
-        None => Ok(()),
-    }
 }
 
 impl Consumer {

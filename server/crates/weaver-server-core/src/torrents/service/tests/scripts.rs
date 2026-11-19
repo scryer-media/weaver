@@ -171,7 +171,7 @@ async fn a_torrent_added_with_its_data_in_place_raises_its_download_event() {
     let save = rig.dir.path().join("placed-here");
     std::fs::create_dir_all(save.join("placed")).unwrap();
     std::fs::write(save.join("placed/a.bin"), &data).unwrap();
-    let (job_id, view, _) = completed_placed(
+    let (job_id, view) = completed_placed(
         &rig,
         metainfo,
         Placement {
@@ -218,7 +218,7 @@ async fn a_torrent_added_in_seed_mode_raises_no_download_event() {
     let save = rig.dir.path().join("seeded-here");
     std::fs::create_dir_all(save.join("placed")).unwrap();
     std::fs::write(save.join("placed/a.bin"), &data).unwrap();
-    let (job_id, _, _) = completed_placed(
+    let (job_id, _) = completed_placed(
         &rig,
         metainfo,
         Placement {

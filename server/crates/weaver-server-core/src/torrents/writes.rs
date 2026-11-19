@@ -110,6 +110,7 @@ impl TorrentDisk {
             state: Mutex::new(State {
                 dir: dir.to_path_buf(),
                 generation: None,
+                retired: false,
             }),
         });
         lock(&self.heard.keys).insert(key, Arc::downgrade(&current));
@@ -189,6 +190,9 @@ struct State {
     // writes to.
     dir: PathBuf,
     generation: Option<Arc<Generation>>,
+    // The torrent went away (`Writes::retire`): no generation is made for
+    // it again, so nothing, however late, writes to its files or makes one.
+    retired: bool,
 }
 
 impl Drop for Current {
@@ -372,14 +376,18 @@ pub(crate) enum VolumeRoom {
 
 impl Writes {
     // The generation writes go to now, made when there is none or the one
-    // there ended. Its volume joins the volumes sized as written to.
-    fn generation(&self) -> Arc<Generation> {
+    // there ended. Its volume joins the volumes sized as written to. None
+    // once the torrent went away: what would be written is not.
+    fn generation(&self) -> Option<Arc<Generation>> {
         let current = &self.current;
         let mut state = lock(&current.state);
+        if state.retired {
+            return None;
+        }
         if let Some(generation) = &state.generation
             && !generation.lost.ended()
         {
-            return Arc::clone(generation);
+            return Some(Arc::clone(generation));
         }
         let disk = &current.disk;
         let volume = disk.volume(&state.dir);
@@ -397,7 +405,7 @@ impl Writes {
         let replaced = state.generation.replace(Arc::clone(&generation));
         drop(state);
         drop(replaced);
-        generation
+        Some(generation)
     }
 
     // Count `bytes` on the volume the torrent writes to, for a piece about
@@ -406,7 +414,10 @@ impl Writes {
     // writes keep (`Volume::write_piece`); `room` is rung once the volume
     // has written enough for them.
     pub(crate) fn reserve(&self, bytes: u64, room: &Arc<Notify>) -> VolumeRoom {
-        let generation = self.generation();
+        // A torrent gone writes nothing, so nothing is counted for it.
+        let Some(generation) = self.generation() else {
+            return VolumeRoom::Unmetered;
+        };
         let volume = Arc::clone(generation.submitter.volume());
         let disk = &self.current.disk;
         loop {
@@ -434,7 +445,15 @@ impl Writes {
     // on the volume the torrent writes to; handed back when it is counted
     // on another, where its files were before they moved.
     pub(crate) fn pay(&self, paid: Option<Paid>) -> Result<Paying, Paid> {
-        let generation = self.generation();
+        // A torrent gone: what was paid goes back, and nothing is written.
+        let Some(generation) = self.generation() else {
+            drop(paid);
+            let dir = lock(&self.current.state).dir.clone();
+            return Ok(Paying {
+                generation: None,
+                reservation: Reservation::none(self.current.disk.volume(&dir)),
+            });
+        };
         let volume = generation.submitter.volume();
         let reservation = match paid {
             Some(mut paid) if Arc::ptr_eq(paid.reservation.volume(), volume) => {
@@ -444,7 +463,7 @@ impl Writes {
             None => Reservation::none(Arc::clone(volume)),
         };
         Ok(Paying {
-            generation,
+            generation: Some(generation),
             reservation,
         })
     }
@@ -462,10 +481,18 @@ impl Writes {
             generation,
             reservation,
         } = paying;
-        let mut open = lock(&generation.open);
+        let mut none = VecDeque::new();
+        let mut held;
+        let open = match &generation {
+            Some(generation) => {
+                held = lock(&generation.open);
+                &mut *held
+            }
+            None => &mut none,
+        };
         let mut batch = Batch {
-            generation: &generation,
-            open: &mut open,
+            generation: generation.as_ref(),
+            open,
             paid: Paid {
                 reservation,
                 disk: Arc::clone(&self.current.disk),
@@ -476,15 +503,11 @@ impl Writes {
 
     // Queue writes no reservation pays for: each is counted as it fits.
     pub(crate) fn queue<T>(&self, queue: impl FnOnce(&mut Batch<'_>) -> T) -> T {
-        let generation = self.generation();
-        let reservation = Reservation::none(Arc::clone(generation.submitter.volume()));
-        self.queue_paying(
-            Paying {
-                generation,
-                reservation,
-            },
-            queue,
-        )
+        let paying = match self.pay(None) {
+            Ok(paying) => paying,
+            Err(_) => unreachable!("nothing paid is counted nowhere"),
+        };
+        self.queue_paying(paying, queue)
     }
 
     // Wait until everything queued so far has been written, for a thread
@@ -553,10 +576,27 @@ impl Writes {
         Some(generation.abandon())
     }
 
-    // The writes given up, awaited until nothing of them can touch the
-    // disk again.
+    // The torrent goes away: its writes are given up as `abandon` gives them
+    // up, and none is made again, whoever asks and however late. A pause or
+    // a move abandons and writes again after; this is for a torrent gone.
+    pub(crate) fn retire(&self) -> Option<Barrier> {
+        let generation = {
+            let mut state = lock(&self.current.state);
+            state.retired = true;
+            state.generation.take()
+        }?;
+        Some(generation.abandon())
+    }
+
+    // Whether the torrent went away: nothing of it is written again.
+    pub(crate) fn retired(&self) -> bool {
+        lock(&self.current.state).retired
+    }
+
+    // The writes given up for a torrent gone, awaited until nothing of them
+    // can touch the disk again.
     pub(crate) async fn forget(&self) {
-        let Some(barrier) = self.abandon() else {
+        let Some(barrier) = self.retire() else {
             return;
         };
         let (told, passed) = tokio::sync::oneshot::channel();
@@ -585,7 +625,11 @@ impl Writes {
     // queued before: run on the writer, waited for here. For a thread that
     // may wait on a disk.
     pub(crate) fn grow(&self, place: Place, length: u64) -> io::Result<()> {
-        let generation = self.generation();
+        let Some(generation) = self.generation() else {
+            return Err(io::Error::other(
+                "the torrent's writes were given up before its file was made whole",
+            ));
+        };
         let (told, grown) = mpsc::sync_channel(1);
         let path = place.path.clone();
         generation.submitter.ask(path, move || {
@@ -618,7 +662,12 @@ impl Writes {
 
     #[cfg(test)]
     pub(crate) fn volume(&self) -> Arc<Volume> {
-        Arc::clone(self.generation().submitter.volume())
+        Arc::clone(
+            self.generation()
+                .expect("a test's torrent is live")
+                .submitter
+                .volume(),
+        )
     }
 
     #[cfg(test)]
@@ -630,13 +679,16 @@ impl Writes {
 // The room writes about to be queued are paid out of, on the volume they
 // go to.
 pub(crate) struct Paying {
-    generation: Arc<Generation>,
+    // None for a torrent gone: nothing is written.
+    generation: Option<Arc<Generation>>,
     reservation: Reservation,
 }
 
-// Writes being queued for one torrent, paid out of one reservation.
+// Writes being queued for one torrent, paid out of one reservation. For a
+// torrent gone, nothing queued is written and what follows is dropped
+// untold, as for writes given up.
 pub(crate) struct Batch<'a> {
-    generation: &'a Arc<Generation>,
+    generation: Option<&'a Arc<Generation>>,
     open: &'a mut VecDeque<u64>,
     paid: Paid,
 }
@@ -659,8 +711,11 @@ impl Batch<'_> {
         bytes: Bytes,
         place: impl FnOnce() -> Place,
     ) {
+        let Some(generation) = self.generation else {
+            return;
+        };
         let file = file as u64;
-        let submitter = &self.generation.submitter;
+        let submitter = &generation.submitter;
         // Open already: the writer holds its handle, and needs no path.
         let create = match self.open.iter().position(|open| *open == file) {
             Some(at) => {
@@ -694,19 +749,24 @@ impl Batch<'_> {
     // failed instead, `done` hears their error; when they were given up, it
     // is dropped.
     pub(crate) fn then(&mut self, done: Done, land: impl FnOnce(Done) + Send + 'static) {
+        let Some(generation) = self.generation else {
+            return;
+        };
         let landing = Landing {
             land: Some(land),
             done: Some(done),
-            lost: Arc::clone(&self.generation.lost),
+            lost: Arc::clone(&generation.lost),
         };
-        self.generation
+        generation
             .submitter
             .ask(PathBuf::new(), move || landing.run());
     }
 
-    // Everything queued in the batch so far.
-    pub(crate) fn barrier(&self) -> Barrier {
-        self.generation.submitter.barrier()
+    // Everything queued in the batch so far; None for a torrent gone, of
+    // which nothing was written.
+    pub(crate) fn barrier(&self) -> Option<Barrier> {
+        self.generation
+            .map(|generation| generation.submitter.barrier())
     }
 }
 

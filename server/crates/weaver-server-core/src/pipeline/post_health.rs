@@ -90,6 +90,14 @@ pub(crate) const DEAD_RELEASE_LANDED_DIVISOR: u64 = 4;
 const BATCH_SIZE: usize = 50;
 // Answers the mail holds before a lane waits for the pipeline to hear one.
 const MAIL_CAPACITY: usize = 64;
+// How long a batch seated on a lane is taken to be answering. A batch is
+// fifty STATs and at most fifty HEADs, each read bounded by its connection's
+// command timeout; at the half to three quarters of a second a reply takes
+// on a slow server, unpipelined, that is about seventy seconds. A round with
+// no batch seated within this window is not making progress, and the
+// dispatch stall it leaves is reported and escalated as any other.
+pub(crate) const SEATED_BATCH_ANSWERS_WITHIN: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60);
 
 // What a round found, once every batch in it is back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +293,10 @@ struct LaneRound {
     known: u64,
     tally: ProbeTally,
     left: usize,
+    // Batches seated on a lane and not yet heard back from.
+    on_lanes: usize,
+    // When the latest of them was seated.
+    seated_at: Option<std::time::Instant>,
 }
 
 // Where a job's probe stands between rounds.
@@ -394,6 +406,81 @@ impl Probes {
         self.retire(job_id);
         self.dead.remove(&job_id);
         self.verdicts.remove(&job_id);
+    }
+
+    // Whether a round has a batch out on the lanes that is still answering
+    // at `now`: seated, not heard back from, and the latest such batch
+    // seated within [`SEATED_BATCH_ANSWERS_WITHIN`]. While one is, the
+    // lanes a dispatch pass finds idle were yielded to it on purpose, and
+    // the connections it asks on are busy with it. A batch that never comes
+    // back stops answering once the window has passed since the last seat.
+    pub(crate) fn answering(&self, now: std::time::Instant) -> bool {
+        self.lane_rounds.values().any(|lane_round| {
+            lane_round.on_lanes > 0
+                && lane_round.seated_at.is_some_and(|seated_at| {
+                    now.saturating_duration_since(seated_at) < SEATED_BATCH_ANSWERS_WITHIN
+                })
+        })
+    }
+
+    // A batch of the round its job waits on was seated on a lane at `now`.
+    fn seated(&mut self, batch: &ProbeBatch, now: std::time::Instant) {
+        if let Some(lane_round) = self
+            .lane_rounds
+            .get_mut(&batch.job_id)
+            .filter(|lane_round| lane_round.round == batch.round)
+        {
+            lane_round.on_lanes += 1;
+            lane_round.seated_at = Some(now);
+        }
+    }
+
+    // A lane gave back a batch of the round its job waits on, answered or
+    // unasked.
+    fn heard_from_lane(&mut self, batch: &ProbeBatch) {
+        if let Some(lane_round) = self
+            .lane_rounds
+            .get_mut(&batch.job_id)
+            .filter(|lane_round| lane_round.round == batch.round)
+        {
+            lane_round.on_lanes = lane_round.on_lanes.saturating_sub(1);
+        }
+    }
+
+    // Batches seated on lanes that no worker started: they are off the
+    // lanes and wait for a seat again.
+    pub(crate) fn wait_again(&mut self, batches: Vec<ProbeBatch>) {
+        for batch in batches {
+            self.heard_from_lane(&batch);
+            self.waiting.push_back(batch);
+        }
+    }
+
+    // A round of `batches` batches out for the job, numbered `round`, every
+    // one seated on a lane at `seated_at`, as the dispatch pass seats them.
+    #[cfg(test)]
+    pub(crate) fn seat_round_for_test(
+        &mut self,
+        job_id: JobId,
+        round: u32,
+        batches: usize,
+        seated_at: std::time::Instant,
+    ) {
+        self.lane_rounds.insert(
+            job_id,
+            LaneRound {
+                round,
+                known: 0,
+                tally: ProbeTally::default(),
+                left: batches,
+                on_lanes: 0,
+                seated_at: None,
+            },
+        );
+        let batch = ProbeBatch::new(job_id, round, Vec::new());
+        for _ in 0..batches {
+            self.seated(&batch, seated_at);
+        }
     }
 
     // Whether `batch` belongs to the round its job is waiting on.
@@ -754,24 +841,28 @@ impl Pipeline {
     // take it there, the post has no verdict yet. Only a post the sample let
     // through is weighed by its health, at the failed bytes it lost or a
     // round projected it will, against its critical line: the recovery the
-    // names declare and the graph binds. A health verdict is held while a
-    // file nothing counts as recovery yet still has its first article to
-    // come and those files could still lift the post above the line, and
-    // given once each has arrived or been lost.
+    // names declare and the graph binds. The sample counts the same
+    // recovery: a named file by its name, any other by what the graph has
+    // bound. Either verdict is held while a file nothing counts as recovery
+    // yet still has its first article to come and those files could still
+    // save the post, and given once each has arrived or been lost.
     pub(in crate::pipeline) fn post_health_verdict(&mut self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) || !self.jobs.contains_key(&job_id) {
             return None;
         }
         let first_articles = self.read_first_articles(job_id)?;
         let spec = &self.jobs.get(&job_id)?.spec;
-        let verdict = match first_articles.gate() {
-            Gate::Undecided => None,
-            Gate::Dead { missing, total }
-                if first_articles.weighed().0 > first_articles.weighed().1 =>
-            {
-                Some(Some(first_article_verdict_error(missing, total)))
+        let verdict = match (first_articles.gate(), first_articles.dead()) {
+            (Gate::Undecided, _) => None,
+            // The gate is held as the line is: while a file nothing counts
+            // as recovery yet has its first article to come, and those
+            // files, were they all recovery, would keep the post alive.
+            (_, Some(_)) if first_articles.unresolved() > 0 && !first_articles.dead_at_reach() => {
+                self.post_probes.held.insert(job_id);
+                None
             }
-            Gate::Dead { .. } | Gate::Open => {
+            (_, Some((missing, total))) => Some(Some(first_article_verdict_error(missing, total))),
+            (Gate::Dead { .. } | Gate::Open, None) => {
                 match self.health_verdict(job_id, spec, first_articles.recovery()) {
                     Some(_)
                         if first_articles.unresolved() > 0
@@ -939,7 +1030,24 @@ impl Pipeline {
             .zip(0u32..)
             .map(|(file, index)| (index, file, self.first_article(job_id, index, file)))
             .collect();
-        let payload = heads.iter().filter(|(_, file, _)| !declares_recovery(file));
+        let graph = self.graph_jobs.get(&job_id);
+        // A file the names count is weighed by its name, any other by what
+        // the graph holds it as.
+        let gate_recovery = |index: u32, file: &FileSpec| {
+            if names_recovery(file) {
+                declares_recovery(file)
+            } else {
+                graph.is_some_and(|graph| graph.holds_as_recovery(index))
+            }
+        };
+        let unresolved_at = |index: u32, file: &FileSpec, head: Head| {
+            head == Head::Outstanding
+                && !names_recovery(file)
+                && !graph.is_some_and(|graph| graph.holds_as_recovery(index))
+        };
+        let payload = heads
+            .iter()
+            .filter(|(index, file, _)| !gate_recovery(*index, file));
         match first_article_gate(payload.clone().map(|head| head.2)) {
             Gate::Undecided => return None,
             Gate::Open => {}
@@ -951,28 +1059,46 @@ impl Pipeline {
                         .sum()
                 };
                 let lost: u64 = payload
+                    .clone()
                     .filter(|(_, _, head)| *head == Head::Lost)
                     .map(|(_, file, _)| bytes(file))
                     .sum();
                 let reachable: u64 = heads
                     .iter()
-                    .filter(|(_, file, head)| declares_recovery(file) && *head != Head::Lost)
+                    .filter(|(index, file, head)| {
+                        gate_recovery(*index, file) && *head != Head::Lost
+                    })
                     .map(|(_, file, _)| bytes(file))
                     .sum();
                 if lost > reachable {
-                    return Some(first_article_verdict_error(missing, total));
+                    let unresolved: Vec<(u32, u64)> = heads
+                        .iter()
+                        .filter(|(index, file, head)| unresolved_at(*index, file, *head))
+                        .map(|(index, file, _)| {
+                            (
+                                *index,
+                                bytes(file).saturating_sub(self.file_gone_bytes(job_id, *index)),
+                            )
+                        })
+                        .collect();
+                    let rest = payload
+                        .clone()
+                        .filter(|(index, file, head)| !unresolved_at(*index, file, *head))
+                        .map(|head| head.2);
+                    let reach: u64 = unresolved.iter().map(|(_, reach)| reach).sum();
+                    let reaching = matches!(first_article_gate(rest), Gate::Dead { .. })
+                        && lost > reachable + reach;
+                    if unresolved.is_empty() || reaching {
+                        return Some(first_article_verdict_error(missing, total));
+                    }
+                    return None;
                 }
             }
         }
-        let graph = self.graph_jobs.get(&job_id);
         let recovery = self.recovery_walked(job_id, spec);
         let unresolved: Vec<u64> = heads
             .iter()
-            .filter(|(index, file, head)| {
-                *head == Head::Outstanding
-                    && !names_recovery(file)
-                    && !graph.is_some_and(|graph| graph.holds_as_recovery(*index))
-            })
+            .filter(|(index, file, head)| unresolved_at(*index, file, *head))
             .map(|(index, file, _)| {
                 file.segments
                     .iter()
@@ -1132,6 +1258,8 @@ impl Pipeline {
                 known,
                 tally: ProbeTally::default(),
                 left: batches.len(),
+                on_lanes: 0,
+                seated_at: None,
             },
         );
         self.post_probes.waiting.extend(batches);
@@ -1153,6 +1281,7 @@ impl Pipeline {
         if !self.post_probes.current(&batch) {
             return;
         }
+        self.post_probes.heard_from_lane(&batch);
         batch.rebase(&self.pool_layouts, self.pool_generation);
         self.post_probes.waiting.push_back(batch);
         self.download_dispatch_wake = true;
@@ -1170,6 +1299,7 @@ impl Pipeline {
         if !self.post_probes.current(&batch) {
             return;
         }
+        self.post_probes.heard_from_lane(&batch);
         // An answer from a server of a pool since rebuilt names that server
         // as the old pool numbered it: it is folded in under the server's
         // current number, or not at all once the server is gone or changed.
@@ -1195,9 +1325,11 @@ impl Pipeline {
     // has not asked, that is not held back from new connections, and that
     // has a seat left in the pass's ledger. Each seat taken is entered in
     // the ledger, so no article lease takes it too. A batch every server it
-    // may go to has answered for is done; one that finds no seat waits.
+    // may go to has answered for is done; one that finds no seat waits. A
+    // batch handed to a lane is seated at `now`, the pass's instant.
     pub(in crate::pipeline) fn seat_waiting_probes(
         &mut self,
+        now: std::time::Instant,
         sent_this_pass: &mut HashMap<usize, usize>,
         headroom_at_pass_start: &mut HashMap<usize, usize>,
     ) {
@@ -1238,6 +1370,7 @@ impl Pipeline {
             *sent_this_pass.entry(server).or_default() += 1;
             let ids = batch.unfound();
             let unasked = ids.len();
+            self.post_probes.seated(&batch, now);
             // A pool that has stopped seats nothing: the batch is unsettled
             // on that server and goes on to the next.
             if let Err(mut batch) = self.owned_download_lane_pool.probe(
@@ -1247,6 +1380,7 @@ impl Pipeline {
                 batch,
                 self.post_probes.sender(),
             ) {
+                self.post_probes.heard_from_lane(&batch);
                 batch.fold(
                     server,
                     ProbeBatchResult {

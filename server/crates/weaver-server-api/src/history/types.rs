@@ -525,6 +525,8 @@ pub enum EventKind {
     ExtractionFailed,
     // An archive given up on as an archive for one of its members.
     ArchiveDemoted,
+    // A recovery set the job ended with that bound no file.
+    RecoverySetUnused,
     MoveToCompleteStarted,
     MoveToCompleteFinished,
     SegmentRetryScheduled,
@@ -582,6 +584,7 @@ impl std::str::FromStr for EventKind {
             "ExtractionComplete" => Ok(Self::ExtractionComplete),
             "ExtractionFailed" => Ok(Self::ExtractionFailed),
             "ArchiveDemoted" => Ok(Self::ArchiveDemoted),
+            "RecoverySetUnused" => Ok(Self::RecoverySetUnused),
             "MoveToCompleteStarted" => Ok(Self::MoveToCompleteStarted),
             "MoveToCompleteFinished" => Ok(Self::MoveToCompleteFinished),
             "SegmentRetryScheduled" => Ok(Self::SegmentRetryScheduled),

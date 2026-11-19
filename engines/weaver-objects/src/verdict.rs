@@ -16,6 +16,18 @@ use std::io;
 use ::zip::result::ZipError;
 use weaver_graph::{Emit, Why};
 
+// The text of the error that ended a run, as `Emit::Failed` carries it to
+// the job's log: at most `FAILED_TEXT` bytes, cut at a character.
+const FAILED_TEXT: usize = 512;
+
+pub(crate) fn failed(text: &str) -> String {
+    let mut end = text.len().min(FAILED_TEXT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 const PASSWORD: Emit = Emit::NeedsPassword;
 const DAMAGED: Emit = Emit::Refuse(Why::Unrepairable);
 const TERMINAL: Emit = Emit::Refuse(Why::Unsupported);

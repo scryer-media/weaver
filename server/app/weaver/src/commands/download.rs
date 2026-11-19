@@ -209,9 +209,9 @@ pub(crate) async fn run(
         terminal = wait_for_job_terminal(&mut completion_rx, &handle, job_id) => {
             let completed_at = timestamp_now();
             let report_result = match terminal {
-                Ok(()) => {
+                Ok(ended) => {
                     if let Some(report_path) = report_path {
-                        match write_report(report_path, job_id, &queued_at, &completed_at) {
+                        match write_report(report_path, job_id, &queued_at, &completed_at, ended) {
                             Ok(()) => match report_ack_path {
                                 Some(report_ack_path) => wait_for_report_ack(report_ack_path).await,
                                 None => Ok(()),
@@ -289,18 +289,46 @@ fn timestamp_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+// How a job the command waited on ended, short of failing: whole, or
+// with only part of what it was asked for delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    Complete,
+    Partial,
+}
+
+impl Ended {
+    // The ending a job's status states, while it states one short of failing.
+    fn of(status: &JobStatus) -> Option<Self> {
+        match status {
+            JobStatus::Complete => Some(Self::Complete),
+            JobStatus::Partial => Some(Self::Partial),
+            _ => None,
+        }
+    }
+
+    // The report's word for it, as the job's status names it.
+    fn status(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
 fn write_report(
     path: &Path,
     job_id: JobId,
     queued_at: &str,
     completion_at: &str,
+    ended: Ended,
 ) -> std::io::Result<()> {
     let report = DownloadReport {
         schema_version: 1,
         job_id: job_id.0,
         queued_at,
         completion_at,
-        status: "complete",
+        status: ended.status(),
     };
     let contents = serde_json::to_vec_pretty(&report).map_err(std::io::Error::other)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -349,12 +377,19 @@ async fn wait_for_job_terminal(
     events: &mut broadcast::Receiver<PipelineEvent>,
     handle: &SchedulerHandle,
     job_id: JobId,
-) -> Result<(), String> {
+) -> Result<Ended, String> {
     let mut status_tick = tokio::time::interval(std::time::Duration::from_millis(250));
     loop {
         tokio::select! {
             event = events.recv() => match event {
-                Ok(PipelineEvent::JobCompleted { job_id: completed }) if completed == job_id => return Ok(()),
+                // The pipeline announces a partial delivery as completed too, so
+                // the job's status says which it was. One not yet stating its
+                // ending is read again on the next tick.
+                Ok(PipelineEvent::JobCompleted { job_id: completed }) if completed == job_id => {
+                    if let Some(ended) = handle.get_job(job_id).ok().and_then(|job| Ended::of(&job.status)) {
+                        return Ok(ended);
+                    }
+                }
                 Ok(PipelineEvent::JobFailed { job_id: failed, error }) if failed == job_id => return Err(error),
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(count)) => {
@@ -364,10 +399,10 @@ async fn wait_for_job_terminal(
             },
             _ = status_tick.tick() => match handle.get_job(job_id) {
                 Ok(job) => match &job.status {
-                    // The pipeline announces a partial delivery as completed.
-                    JobStatus::Complete | JobStatus::Partial => return Ok(()),
                     JobStatus::Failed { error } => return Err(error.clone()),
-                    _ => {}
+                    status => if let Some(ended) = Ended::of(status) {
+                        return Ok(ended);
+                    },
                 },
                 Err(error) => return Err(format!("could not read standalone job status: {error}")),
             },
@@ -399,7 +434,7 @@ async fn flush_writer_queue_on_exit(db: &Database) {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobId, wait_for_report_ack, write_report};
+    use super::{Ended, JobId, JobStatus, wait_for_report_ack, write_report};
 
     #[test]
     fn report_is_complete_and_never_overwrites_existing_evidence() {
@@ -411,13 +446,27 @@ mod tests {
             JobId(42),
             "2026-08-03T00:00:00.000000000Z",
             "2026-08-03T00:00:01.000000000Z",
+            Ended::Complete,
         )
         .expect("write report");
         let contents = std::fs::read_to_string(&path).expect("read report");
         assert!(contents.contains("\"schema_version\": 1"));
         assert!(contents.contains("\"job_id\": 42"));
         assert!(contents.contains("\"status\": \"complete\""));
-        assert!(write_report(&path, JobId(43), "a", "b").is_err());
+        assert!(write_report(&path, JobId(43), "a", "b", Ended::Complete).is_err());
+    }
+
+    #[test]
+    fn report_states_a_partial_job_as_partial() {
+        let directory = tempfile::tempdir().expect("temporary report directory");
+        let path = directory.path().join("result.json");
+        let ended = Ended::of(&JobStatus::Partial).expect("a partial job has ended");
+
+        write_report(&path, JobId(44), "a", "b", ended).expect("write report");
+        let contents = std::fs::read_to_string(&path).expect("read report");
+        assert!(contents.contains("\"status\": \"partial\""), "{contents}");
+        assert_eq!(Ended::of(&JobStatus::Complete), Some(Ended::Complete));
+        assert_eq!(Ended::of(&JobStatus::Downloading), None);
     }
 
     #[tokio::test]

@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
 
-use crate::operations::disk::reader::VolumeReads;
 use crate::operations::disk::volume::Volume;
 use crate::operations::disk::writer::Barrier;
 use crate::pipeline::graph::decoding::Decoding;
@@ -120,7 +119,7 @@ impl RunVolumes {
         // The shelf's lock is held here, and a read takes the files' lock
         // before the shelf's, so it is only tried: when it is held, a drain
         // holds it and lets the turn go itself, or the run's other thread
-        // reads in it.
+        // takes or gives back the turn for its read.
         match self.files.try_lock() {
             Ok(mut files) => files.reading.let_go(),
             Err(std::sync::TryLockError::Poisoned(files)) => files.into_inner().reading.let_go(),
@@ -137,10 +136,13 @@ impl RunVolumes {
 
     // The run's owner stops it where it stands: its next read fails, and
     // nothing it says from here on is heard. Set under the shelf's lock, so
-    // a run between a look at the shelf and its wait on it is woken too.
+    // a run between a look at the shelf and its wait on it is woken too, and
+    // raised on its files, so a read waiting for a turn is woken as well.
     pub(crate) fn stop(&self) {
-        self.shelf
-            .update(|_| self.stopped.store(true, Ordering::Release));
+        self.shelf.update(|_| {
+            self.stopped.store(true, Ordering::Release);
+            self.files.stop.raise();
+        });
     }
 
     fn stopped(&self) -> bool {
@@ -183,6 +185,20 @@ impl RunVolumes {
             .unwrap_or_else(PoisonError::into_inner)
             .open
             .len()
+    }
+
+    // The run's next read stops inside its disk call until the test lets it.
+    #[cfg(test)]
+    pub(super) fn hang_next_read(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.files.hang_next_read()
+    }
+
+    // Returns once `waiters` of the run's reads wait for a turn.
+    #[cfg(test)]
+    pub(super) fn await_turn_waiters(&self, waiters: usize) {
+        self.files.stop.await_waiters(waiters);
     }
 
     // Whether the run holds a read turn.
@@ -249,6 +265,8 @@ impl RunVolumes {
                 return Ok((0, None));
             }
             match kept {
+                // No byte of a volume is read while its place may move.
+                Some(kept) if kept.open => {}
                 Some(kept) if kept.coverage.verified(want) => {
                     kept.reached = kept.reached.max(want.end);
                     return Ok((
@@ -291,9 +309,14 @@ impl Volumes for RunVolumes {
             // No index lies between `after` and `from`, so only a gap past
             // `from` can still fill, and only while a volume can still join
             // there. Past the last volume bound, one joins only from a member
-            // beside them still deciding its owner.
+            // beside them still deciding its owner. A volume its object holds
+            // at a place still open is handed on once the place settles: the
+            // volume there then may be another.
             match state.volumes.range(from..).next() {
-                Some(&next) if next == from || state.complete => {
+                Some(&next)
+                    if (next == from || state.complete)
+                        && !state.kept.get(&next).is_some_and(|kept| kept.open) =>
+                {
                     return Ok(Some(VolumeIndex(next)));
                 }
                 None if !state.deciding => return Ok(None),
@@ -308,7 +331,7 @@ impl Volumes for RunVolumes {
         if state.generation != self.generation || self.stopped() {
             return None;
         }
-        let kept = state.kept.get_mut(&volume.0)?;
+        let kept = state.kept.get_mut(&volume.0).filter(|kept| !kept.open)?;
         let length = kept.closed?;
         kept.length_read = Some(length);
         Some(length)
@@ -338,6 +361,7 @@ impl Volumes for RunVolumes {
             let known = state.volumes.contains(&volume.0);
             let complete = state.complete;
             if let Some(kept) = state.kept.get_mut(&volume.0)
+                && !kept.open
                 && let Some(length) = kept.closed.or(kept.sized)
             {
                 kept.length_read = Some(length);
@@ -351,12 +375,15 @@ impl Volumes for RunVolumes {
     }
 
     // A volume with bytes nothing will bring is not settled: a read of them
-    // fails, and work on the pool reads only what is all in.
+    // fails, and work on the pool reads only what is all in. Nor is one at a
+    // place still open.
     fn settled(&self, volume: VolumeIndex) -> bool {
         let state = self.shelf.lock();
         state.kept.get(&volume.0).is_some_and(|kept| {
-            kept.closed
-                .is_some_and(|length| kept.coverage.verified(ByteRange::new(0, length)))
+            !kept.open
+                && kept
+                    .closed
+                    .is_some_and(|length| kept.coverage.verified(ByteRange::new(0, length)))
         })
     }
 
@@ -385,11 +412,24 @@ impl Volumes for RunVolumes {
         let len = usize::try_from(len).expect("a read fits the buffer it fills");
         // The read is made in a turn of the envelopes' volume. A spinning
         // one's single turn is taken for this read alone, before the
-        // files' lock; any other's is the one the run holds.
+        // files' lock; any other's is the one the run holds. A wait for
+        // either ends when the run is stopped or drained.
         let reads = self.volume.as_deref().map(Volume::read_turns);
-        let _one = reads
-            .filter(|reads| reads.whole_pieces())
-            .map(VolumeReads::one_here);
+        let stopped = || -> io::Error { Unreadable::Stopped.into() };
+        let _one = match reads.filter(|reads| reads.whole_pieces()) {
+            Some(reads) => Some(
+                reads
+                    .one_here_unless(&self.files.stop)
+                    .ok_or_else(stopped)?,
+            ),
+            None => None,
+        };
+        // The run's reads go one at a time; a drain never takes this lock.
+        let _disk = self
+            .files
+            .disk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(reads) = reads.filter(|reads| !reads.whole_pieces())
             && !files.reading.holds(reads)
@@ -398,23 +438,56 @@ impl Volumes for RunVolumes {
             // and the turn may be another reader's for a while.
             files.reading.let_go();
             drop(files);
-            let turn = reads.owned_here();
+            let turn = reads
+                .owned_here_unless(&self.files.stop)
+                .ok_or_else(stopped)?;
             files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
             files.reading.keep(turn);
         }
         // The owner can revoke access after wait_for returns. Check again
-        // while holding the cache lock, so draining it waits for this read
-        // and a late reader cannot reopen a file after the drain.
+        // while holding the cache lock: a drain clears the cache under it
+        // after the generation moves, so a read that passes here took its
+        // handle before the drain, and one after it opens nothing.
         if !self.current() {
             files.reading.let_go();
-            return Err(Unreadable::Stopped.into());
+            return Err(stopped());
         }
-        let file = match files.open.entry(volume.0) {
-            std::collections::btree_map::Entry::Occupied(found) => found.into_mut(),
-            std::collections::btree_map::Entry::Vacant(slot) => slot.insert(File::open(path)?),
+        // The read is made outside the cache lock, with the read's own
+        // handle and turn, so a drain is never held behind a read that
+        // hangs, and the turn goes on to no other reader until the read
+        // ends. Both go back to the run once it has, unless it was stopped
+        // or drained meanwhile: a drain raises the stop before it takes the
+        // cache lock, so what goes back after it is cleared by it.
+        let cached = files.open.get(&volume.0).cloned();
+        let turn = files.reading.lend();
+        drop(files);
+        let read = || -> io::Result<Option<Arc<File>>> {
+            let (file, opened) = match cached {
+                Some(file) => (file, None),
+                None => {
+                    let file = Arc::new(File::open(&path)?);
+                    (Arc::clone(&file), Some(file))
+                }
+            };
+            #[cfg(test)]
+            self.files.in_read();
+            read_exact_at(&file, offset, &mut into[..len])?;
+            Ok(opened)
         };
-        read_exact_at(file, offset, &mut into[..len])?;
-        Ok(len)
+        let read = read();
+        let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.files.stop.raised() {
+            if let Some(turn) = turn {
+                files.reading.keep(turn);
+            }
+            if let Ok(Some(opened)) = &read {
+                files
+                    .open
+                    .entry(volume.0)
+                    .or_insert_with(|| Arc::clone(opened));
+            }
+        }
+        read.map(|_| len)
     }
 }
 

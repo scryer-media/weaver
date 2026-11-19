@@ -246,19 +246,24 @@ fn archive_seeded(db: &Database, id: u64, name: &str, metadata: Option<String>) 
     .expect("archive job");
 }
 
-// Reads the table sources off the runtime, as the handler does.
-async fn stored_names(db: &Database) -> Result<sanitize::StoredNames, String> {
+// Runs `read` over `db` off the runtime to its end, and takes what it read.
+async fn run_read(db: &Database, read: stored_read::NameRead) -> stored_read::ReadState {
     let db = db.clone();
-    tokio::task::spawn_blocking(move || sanitize::read_stored_names(&db))
+    let read = Arc::new(read);
+    let reader = read.clone();
+    tokio::task::spawn_blocking(move || stored_read::read_stored_names(&db, &reader))
         .await
-        .expect("the read runs")
+        .expect("the read runs");
+    read.finish()
 }
 
-// A table read as the endpoint reads it: an error is a failed read.
-fn as_read(
-    stored: Result<sanitize::StoredNames, String>,
-) -> Result<sanitize::StoredNames, bounded::ReadRefused> {
-    stored.map_err(bounded::ReadRefused::read_failed)
+// Reads the table sources off the runtime, as the handler does, to the end,
+// with nothing in memory.
+async fn stored_names(db: &Database) -> stored_read::TableNames {
+    stored_read::TableNames::from_read(
+        run_read(db, stored_read::NameRead::new()).await,
+        stored_read::MemoryNames::default(),
+    )
 }
 
 fn plain_local() -> sanitize::LocalNames {
@@ -390,8 +395,10 @@ async fn a_package_takes_its_names_from_one_read() {
         hostname: Some("olafhost".to_string()),
         ..plain_local()
     };
-    let (components, sanitized) =
-        sanitize_components(components, as_read(stored_names(&db).await), local).await;
+    let names = stored_names(&db).await;
+    assert!(names.manifest.complete, "{:?}", names.manifest);
+    assert!(names.guard.is_none());
+    let (components, sanitized) = sanitize_components(components, names, local).await;
     assert!(sanitized.stand_ins >= 10, "{}", sanitized.stand_ins);
     let archive =
         archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
@@ -439,14 +446,12 @@ async fn a_package_takes_its_names_from_one_read() {
     assert_eq!(manifest.sanitized.history_jobs_total, Some(1));
 }
 
-// The persisted NZBs are read a page at a time, past the first page, for
-// the active jobs and the finished ones the read takes.
+// The persisted NZBs are read in batches, past the first, for the active
+// jobs and the finished ones the read takes.
 #[tokio::test]
-async fn persisted_nzbs_are_read_a_page_at_a_time() {
-    use weaver_server_core::jobs::diagnostic_names::DIAGNOSTIC_NZB_PAGE;
-
+async fn persisted_nzbs_are_read_in_batches() {
     let db = Database::open_in_memory().expect("database");
-    let jobs = u64::try_from(DIAGNOSTIC_NZB_PAGE).expect("page") + 6;
+    let jobs = u64::try_from(stored_read::NZB_BATCH * 2).expect("batch") + 6;
     for id in 1..=jobs {
         db.create_active_job(&seeded_job(
             id,
@@ -460,7 +465,9 @@ async fn persisted_nzbs_are_read_a_page_at_a_time() {
     }
     archive_seeded(&db, jobs, &format!("Job.{jobs}"), None);
 
-    let stored = stored_names(&db).await.expect("names read");
+    let names = stored_names(&db).await;
+    assert!(names.manifest.complete, "{:?}", names.manifest);
+    let stored = names.stored;
     for id in 1..=jobs {
         assert_eq!(
             stored.posted[&id].file_names,
@@ -471,9 +478,10 @@ async fn persisted_nzbs_are_read_a_page_at_a_time() {
     assert_eq!(stored.history_total, 1);
 }
 
-// An NZB the read cannot parse fails the table, naming its job.
+// An NZB the read cannot parse costs only that job's posted names: its step
+// is partial and names the job, and the job is under the guard.
 #[tokio::test]
-async fn an_unreadable_nzb_fails_the_table_and_names_its_job() {
+async fn an_unreadable_nzb_costs_only_its_own_job() {
     let db = Database::open_in_memory().expect("database");
     let mut broken = vec![0x28, 0xB5, 0x2F, 0xFD];
     broken.extend_from_slice(b"not a zstd frame at all");
@@ -487,23 +495,30 @@ async fn an_unreadable_nzb_fails_the_table_and_names_its_job() {
     ))
     .expect("active job");
 
-    let error = stored_names(&db).await.expect_err("the table fails");
+    seed_report_job(&db, 32);
+    let names = stored_names(&db).await;
+    let step = names
+        .manifest
+        .steps
+        .iter()
+        .find(|step| step.step == stored_read::STEP_ACTIVE_NZBS)
+        .expect("the step is listed");
+    assert_eq!(step.state, stored_read::STATE_PARTIAL, "{step:?}");
+    assert_eq!((step.read, step.of), (Some(1), Some(2)), "{step:?}");
+    let error = step.error.as_deref().expect("an error");
     assert!(error.contains("the NZB of job 31"), "{error}");
+    assert!(names.stored.posted.contains_key(&32));
+    let guard = names.guard.expect("a guard");
+    assert_eq!(guard.jobs, Some(std::collections::BTreeSet::from([31])));
 }
 
-// A database the table cannot read leaves every component out, and the
-// manifest names them through the host's own names: a log named after the
-// host leaves as `weaver.log`.
-#[tokio::test]
-async fn a_database_the_table_cannot_read_leaves_every_component_out() {
-    let dir = tempfile::tempdir().expect("dir");
-    let path = dir.path().join("weaver.db");
-    let db = Database::open(&path).expect("database");
-    // Overwritten in place, never truncated: Windows refuses to truncate a
-    // file the open database has mapped. The shared-memory index is left
-    // whole, since Windows also refuses writes to the bytes SQLite holds
-    // locked there; it still points every read into the garbage.
-    for entry in std::fs::read_dir(dir.path()).expect("dir") {
+// Corrupts every file of an open database in place, so every read of it
+// fails. Overwritten, never truncated: Windows refuses to truncate a file the
+// open database has mapped. The shared-memory index is left whole, since
+// Windows also refuses writes to the bytes SQLite holds locked there; it
+// still points every read into the garbage.
+fn corrupt_database(dir: &Path) {
+    for entry in std::fs::read_dir(dir).expect("dir") {
         let file = entry.expect("entry").path();
         if file.to_string_lossy().ends_with("-shm") {
             continue;
@@ -516,32 +531,203 @@ async fn a_database_the_table_cannot_read_leaves_every_component_out() {
         std::io::Write::write_all(&mut handle, &vec![0x5a; len.max(64 * 1024) as usize])
             .expect("corrupt the database");
     }
+}
 
-    let stored = stored_names(&db).await;
-    let error = stored.as_ref().expect_err("the read fails");
-    assert!(error.contains("the servers"), "{error}");
+// The files a package holds whatever the database does, each naming a seeded
+// job, file, server, host, user or category as the real ones would.
+fn package_without_the_database() -> Vec<Component> {
+    vec![
+        Component::bytes(
+            "olafhost.log",
+            b"INFO job_id=41 wrote Olaf.Seeded.Job.S01E01.part01.rar\n\
+              INFO job_id=41 extracted Olaf.Seeded.Member.mkv\n\
+              INFO connected to news.olaf-provider.example:563 as olaf-user\n\
+              INFO queued Olaf.Seeded.Job.S01E01\n\
+              INFO pipeline turn took 12 ms\n"
+                .to_vec(),
+        ),
+        Component::text(
+            "metrics-1.txt",
+            "weaver_job_bytes{job=\"Olaf.Seeded.Job.S01E01\"} 5\nweaver_turns_total 9\n",
+        ),
+        Component::json(
+            "settings.json",
+            &serde_json::json!({ "settings": { "completeDir": "/srv/olaf-complete", "maxRetries": 3 } }),
+        ),
+        Component::json(
+            "queue.json",
+            &serde_json::json!({ "queueSnapshot": { "jobs": [
+                { "id": 41, "name": "Olaf.Seeded.Job.S01E01", "category": "olaf-films",
+                  "error": "Olaf.Seeded.Member.mkv failed its CRC" }
+            ] } }),
+        ),
+        Component::json(
+            "servers.json",
+            &serde_json::json!({ "servers": [ { "id": 3, "host": "news.olaf-provider.example" } ] }),
+        ),
+        Component::json(
+            "pipeline-internals.json",
+            &serde_json::json!({ "answered": true, "jobs": [ { "job_id": 41, "files": 3 } ] }),
+        ),
+    ]
+}
 
-    let local = sanitize::LocalNames {
+const PACKAGE_FILES: [&str; 6] = [
+    "weaver.log",
+    "metrics-1.txt",
+    "settings.json",
+    "queue.json",
+    "servers.json",
+    "pipeline-internals.json",
+];
+
+fn host_with_names() -> sanitize::LocalNames {
+    sanitize::LocalNames {
         log_file: Some(PathBuf::from("/srv/olafhost/olafhost.log")),
         hostname: Some("olafhost".to_string()),
+        user: Some("olaf-user".to_string()),
         ..plain_local()
-    };
-    let components = vec![Component::bytes(
-        "olafhost.log",
-        b"INFO Olaf.Secret.Name done\n".to_vec(),
-    )];
-    let (components, sanitized) = sanitize_components(components, as_read(stored), local).await;
-    assert_eq!(sanitized.stand_ins, 0);
+    }
+}
+
+// Every package file is there, and no seeded name is anywhere in it.
+fn assert_every_file_and_no_name(members: &[(String, Vec<u8>)]) -> archive::Manifest {
+    let manifest = manifest_of(members);
+    for name in PACKAGE_FILES {
+        assert!(
+            members.iter().any(|(member, _)| member == name),
+            "{name} is missing: {:?}",
+            manifest.errors
+        );
+    }
+    let everything = package_text(members).to_lowercase();
+    assert!(
+        !everything.contains("olaf"),
+        "a name left the host:\n{everything}"
+    );
+    manifest
+}
+
+// Every database read fails: the package still comes back with every file
+// that does not come from the database, the steps say each failed, and no
+// seeded name is in it.
+#[tokio::test]
+async fn a_database_every_read_of_which_fails_still_ships_every_other_file() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db = Database::open(&dir.path().join("weaver.db")).expect("database");
+    corrupt_database(dir.path());
+
+    let names = stored_names(&db).await;
+    assert!(!names.manifest.complete);
+    let (components, sanitized) =
+        sanitize_components(package_without_the_database(), names, host_with_names()).await;
     assert_eq!(sanitized.history_jobs_total, None);
     let archive =
         archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
             .expect("archive builds");
     let members = unpack_package(&archive);
-    let manifest = member_text(&members, archive::MANIFEST_NAME);
-    assert!(!manifest.to_lowercase().contains("olaf"), "{manifest}");
-    assert!(manifest.contains("\"weaver.log\""), "{manifest}");
-    assert!(manifest.contains("the servers"), "{manifest}");
-    assert_eq!(members.len(), 1, "only the manifest is carried");
+    let manifest = assert_every_file_and_no_name(&members);
+    let failed: Vec<&str> = manifest
+        .sanitized
+        .table
+        .steps
+        .iter()
+        .filter(|step| step.state == stored_read::STATE_FAILED)
+        .map(|step| step.step.as_str())
+        .collect();
+    assert!(failed.contains(&stored_read::STEP_SERVERS), "{manifest:#?}");
+    assert!(
+        failed.contains(&stored_read::STEP_ACTIVE_NAMES),
+        "{manifest:#?}"
+    );
+    let log = manifest
+        .files
+        .iter()
+        .find(|file| file.name == "weaver.log")
+        .expect("the log ships");
+    assert!(log.partial.is_some(), "{log:?}");
+    assert!(member_text(&members, "weaver.log").contains("INFO pipeline turn took 12 ms\n"));
+}
+
+// A database that never answers: the read is stuck in its first statement.
+// The package is still built, with every file, from memory and the guard,
+// and no seeded name is in it.
+#[tokio::test]
+async fn a_database_that_never_answers_still_ships_every_file_and_no_name() {
+    use weaver_server_core::JobStatus;
+
+    let db = Database::open_in_memory().expect("database");
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let entered_tx = std::sync::Mutex::new(entered_tx);
+    let read = Arc::new(stored_read::NameRead::with_cut(move |_, _| {
+        let _ = entered_tx.lock().expect("lock").send(());
+        // Blocks until the test ends: a statement that never returns.
+        let _ = release_rx.lock().expect("lock").recv();
+        None
+    }));
+    let reader = read.clone();
+    let reading = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || stored_read::read_stored_names(&db, &reader))
+    };
+    tokio::task::spawn_blocking(move || entered_rx.recv().expect("the read starts"))
+        .await
+        .expect("the read starts");
+    let state = read.finish();
+    assert!(
+        state
+            .steps
+            .iter()
+            .all(|step| step.state == stored_read::STATE_NOT_REACHED)
+    );
+
+    let mut job = queued_info(41, JobStatus::Downloading);
+    job.name = "Olaf.Seeded.Job.S01E01".to_string();
+    job.category = Some("olaf-films".to_string());
+    let handle = queue_handle(vec![job]);
+    let config: SharedConfig = Arc::new(tokio::sync::RwLock::new(
+        weaver_server_core::settings::model::Config {
+            servers: vec![from_json(serde_json::json!({
+                "id": 3, "host": "news.olaf-provider.example", "port": 563, "tls": true,
+                "username": null, "password": null, "connections": 8
+            }))],
+            categories: vec![weaver_server_core::categories::CategoryConfig {
+                id: 5,
+                name: "olaf-films".to_string(),
+                dest_dir: None,
+                aliases: String::new(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
+                upload_cap: Default::default(),
+            }],
+            ..empty_config("/srv/olaf-data")
+        },
+    ));
+    let memory = stored_read::MemoryNames::current(&handle, &config).await;
+    let names = stored_read::TableNames::from_read(state, memory);
+    assert_eq!(names.manifest.jobs_from_memory, 1);
+    let (components, sanitized) =
+        sanitize_components(package_without_the_database(), names, host_with_names()).await;
+    let archive =
+        archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
+            .expect("archive builds");
+    let members = unpack_package(&archive);
+    let manifest = assert_every_file_and_no_name(&members);
+    assert!(!manifest.sanitized.table.complete);
+    assert_eq!(manifest.sanitized.table.jobs_not_fully_read, 1);
+    assert!(manifest.sanitized.table.fallback.is_some());
+    // The job memory names keeps its stand-in where a field names it.
+    let queue = member_text(&members, "queue.json");
+    assert!(queue.contains("\"job-41\""), "{queue}");
+    assert!(queue.contains("\"category-5\""), "{queue}");
+    let servers = member_text(&members, "servers.json");
+    assert!(servers.contains("provider-3"), "{servers}");
+
+    drop(release_tx);
+    reading.await.expect("the read ends once released");
 }
 
 // The names a job's file identities and graph members hold reach the table.
@@ -572,10 +758,11 @@ async fn file_identity_and_graph_member_names_go_through_the_filter() {
     )
     .expect("file identity");
 
-    let mut stored = stored_names(&db).await.expect("names read");
+    let mut names = stored_names(&db).await;
     // The engine alone writes graph members; the read's own test covers
     // that table.
-    stored
+    names
+        .stored
         .jobs
         .get_mut(&9)
         .expect("the job is read")
@@ -591,7 +778,7 @@ async fn file_identity_and_graph_member_names_go_through_the_filter() {
           INFO member Olaf.Graph.Member.mkv wrote Olaf.Graph.Output.mkv\n"
             .to_vec(),
     )];
-    let (components, _) = sanitize_components(components, Ok(stored), plain_local()).await;
+    let (components, _) = sanitize_components(components, names, plain_local()).await;
     let log = String::from_utf8(components[0].outcome.clone().expect("sanitized")).expect("utf-8");
     assert_eq!(
         log,
@@ -658,6 +845,34 @@ fn queued_info(id: u64, status: weaver_server_core::JobStatus) -> weaver_server_
         output_dir: None,
         created_at_epoch_ms: 0.0,
         server_attribution: Vec::new(),
+    }
+}
+
+// A configuration with nothing set but its data directory.
+fn empty_config(data_dir: &str) -> weaver_server_core::settings::model::Config {
+    weaver_server_core::settings::model::Config {
+        data_dir: data_dir.to_string(),
+        hardware_profile: None,
+        intermediate_dir: None,
+        complete_dir: None,
+        servers: vec![],
+        categories: vec![],
+        retry: None,
+        bandwidth: Default::default(),
+        seeding: None,
+        torrent: Default::default(),
+        upload_cap: None,
+        cleanup_after_extract: None,
+        delete_failed_job_files: None,
+        history_retention_days: None,
+        propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
+        watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
+        direct_store: None,
+        delivery_naming: None,
+        metrics: Default::default(),
+        config_path: None,
     }
 }
 
@@ -829,6 +1044,7 @@ async fn an_unreadable_nzb_gets_an_entry_and_the_package_still_builds() {
             stand_ins: 0,
             history_jobs_total: None,
             note: String::new(),
+            table: Default::default(),
         },
     )
     .expect("archive builds");
@@ -869,8 +1085,10 @@ fn package_member_json(members: &[(String, Vec<u8>)], name: &str) -> serde_json:
 // Archives `components` as the endpoint does, through the stand-in pass.
 async fn archive_through_the_pass(components: Vec<Component>) -> Vec<(String, Vec<u8>)> {
     let db = Database::open_in_memory().expect("database");
-    let (components, sanitized) =
-        sanitize_components(components, as_read(stored_names(&db).await), plain_local()).await;
+    let mut names = stored_names(&db).await;
+    // The read's own duration is the one figure two runs do not share.
+    names.manifest.read_ms = 0;
+    let (components, sanitized) = sanitize_components(components, names, plain_local()).await;
     let archive =
         archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
             .expect("archive builds");
@@ -960,32 +1178,9 @@ async fn an_unanswered_pipeline_leaves_what_could_be_read_without_it() {
 #[tokio::test]
 async fn an_answering_pipeline_writes_its_own_snapshot() {
     let root = tempfile::tempdir().expect("temporary directory");
-    let config: SharedConfig = Arc::new(tokio::sync::RwLock::new(
-        weaver_server_core::settings::model::Config {
-            data_dir: root.path().to_string_lossy().into_owned(),
-            hardware_profile: None,
-            intermediate_dir: None,
-            complete_dir: None,
-            servers: vec![],
-            categories: vec![],
-            retry: None,
-            bandwidth: Default::default(),
-            seeding: None,
-            torrent: Default::default(),
-            upload_cap: None,
-            cleanup_after_extract: None,
-            delete_failed_job_files: None,
-            history_retention_days: None,
-            propagation_delay_secs: None,
-            max_concurrent_nzbs: None,
-            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
-            duplicate_policy: Default::default(),
-            direct_store: None,
-            delivery_naming: None,
-            metrics: Default::default(),
-            config_path: None,
-        },
-    ));
+    let config: SharedConfig = Arc::new(tokio::sync::RwLock::new(empty_config(
+        &root.path().to_string_lossy(),
+    )));
     let (mut pipeline, handle, _) = weaver_server_core::pipeline::test_support::idle_pipeline(
         Database::open_in_memory().expect("database"),
         config,
@@ -1257,65 +1452,14 @@ async fn graphql_fields_that_do_not_answer_in_time_are_recorded_as_timed_out() {
     }
 }
 
-// A stand-in table that cannot be read in time is treated as one that cannot
-// be read at all: every component is left out, none ships with less
-// sanitizing, each carries `timed_out`, and the package is still built.
-#[tokio::test]
-async fn a_stand_in_table_that_does_not_answer_in_time_leaves_every_component_out() {
-    let stored = bounded::within(tokio::time::Instant::now(), std::future::pending()).await;
-    let components = vec![
-        Component::bytes("weaver.log", b"INFO Olaf.Secret.Name done\n".to_vec()),
-        Component::json(
-            "queue.json",
-            &serde_json::json!({ "name": "Olaf.Secret.Name" }),
-        ),
-    ];
-    let (components, sanitized) = sanitize_components(components, stored, plain_local()).await;
-    assert_eq!(sanitized.stand_ins, 0);
-    assert_eq!(sanitized.history_jobs_total, None);
-    let archive =
-        archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
-            .expect("archive builds");
-    let members = unpack_package(&archive);
-
-    let manifest = manifest_of(&members);
-    assert!(
-        manifest
-            .files
-            .iter()
-            .all(|file| file.name == archive::MANIFEST_NAME),
-        "{:?}",
-        manifest.files
-    );
-    let mut left_out: Vec<&str> = manifest
-        .errors
-        .iter()
-        .map(|error| error.name.as_str())
-        .collect();
-    left_out.sort_unstable();
-    assert_eq!(left_out, ["queue.json", "stand-in-table", "weaver.log"]);
-    assert!(
-        manifest
-            .errors
-            .iter()
-            .all(|error| error.reason.as_deref() == Some(bounded::REASON_TIMED_OUT)),
-        "{:?}",
-        manifest.errors
-    );
-    for (_, data) in &members {
-        assert!(!String::from_utf8_lossy(data).contains("Olaf"));
-    }
-}
-
-// Archives `components` as the endpoint does when the stand-in table did not
-// answer in time.
+// Archives `components` as the endpoint does when the stand-in read did not
+// reach a single step and memory holds nothing.
 async fn archive_without_the_table(components: Vec<Component>) -> Vec<(String, Vec<u8>)> {
-    let (components, sanitized) = sanitize_components(
-        components,
-        Err(bounded::ReadRefused::timed_out()),
-        plain_local(),
-    )
-    .await;
+    let names = stored_read::TableNames::from_read(
+        stored_read::NameRead::new().finish(),
+        stored_read::MemoryNames::default(),
+    );
+    let (components, sanitized) = sanitize_components(components, names, plain_local()).await;
     let archive =
         archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
             .expect("archive builds");
@@ -1334,7 +1478,9 @@ fn named_components() -> Vec<Component> {
     ]
 }
 
-fn assert_left_out_with_their_reasons(
+// Every component ships through the guard: the named ones, `shipped` with
+// only `own_reasons` in the manifest's errors, and the planted name nowhere.
+fn assert_shipped_under_the_guard(
     members: &[(String, Vec<u8>)],
     shipped: &str,
     own_reasons: &[&str],
@@ -1346,24 +1492,17 @@ fn assert_left_out_with_their_reasons(
         .map(|file| file.name.as_str())
         .collect();
     files.sort_unstable();
-    let mut expected = [archive::MANIFEST_NAME, shipped];
+    let mut expected = [archive::MANIFEST_NAME, "queue.json", "weaver.log", shipped];
     expected.sort_unstable();
     assert_eq!(files, expected);
-    let timed_out = Some(bounded::REASON_TIMED_OUT.to_string());
-    for name in ["queue.json", "weaver.log", "stand-in-table"] {
-        let entries: Vec<_> = manifest
-            .errors
-            .iter()
-            .filter(|error| error.name == name)
-            .collect();
-        assert_eq!(entries.len(), 1, "{name}: {:?}", manifest.errors);
-        assert_eq!(entries[0].reason, timed_out, "{name}");
-    }
+    assert!(!manifest.sanitized.table.complete);
     let mut shipped_reasons: Vec<String> = manifest
         .errors
         .iter()
-        .filter(|error| error.name == shipped)
-        .map(|error| error.reason.clone().expect("a reason code"))
+        .map(|error| {
+            assert_eq!(error.name, shipped, "{:?}", manifest.errors);
+            error.reason.clone().expect("a reason code")
+        })
         .collect();
     shipped_reasons.sort_unstable();
     let mut own_reasons: Vec<String> = own_reasons
@@ -1380,10 +1519,9 @@ fn assert_left_out_with_their_reasons(
     }
 }
 
-// With no stand-in table, `database.json` still ships with its numbers and
-// codes; the OS and database error text, which can hold a path, is replaced
-// by a fixed sentence per reason; every other component is left out with
-// `timed_out`.
+// With a read that reached nothing, `database.json` still ships with its
+// numbers and codes, its error text through the guard, and every other
+// component ships beside it.
 #[tokio::test]
 async fn database_facts_ship_without_the_table_and_drop_error_text() {
     use weaver_server_core::persistence::connection::{
@@ -1432,7 +1570,7 @@ async fn database_facts_ship_without_the_table_and_drop_error_text() {
             ),
         ]
     );
-    assert_left_out_with_their_reasons(
+    assert_shipped_under_the_guard(
         &members,
         database_facts::FILE,
         &[
@@ -1442,8 +1580,8 @@ async fn database_facts_ship_without_the_table_and_drop_error_text() {
     );
 }
 
-// A journal mode SQLite does not define is database text, so without the
-// table it is not shipped; it is null and named as unread in the file.
+// A journal mode SQLite does not define is database text, so with a read
+// that reached nothing, the guard keeps it out of the file.
 #[tokio::test]
 async fn an_unknown_journal_mode_does_not_ship_without_the_table() {
     use weaver_server_core::persistence::connection::SqlitePageFacts;
@@ -1463,33 +1601,18 @@ async fn an_unknown_journal_mode_does_not_ship_without_the_table() {
     let members = archive_without_the_table(components).await;
 
     let database = package_member_json(&members, database_facts::FILE);
-    assert!(database["journal_mode"].is_null());
+    assert_eq!(database["journal_mode"], "name-1");
     assert_eq!(database["page_count"], 2000);
-    // Named in the file's own errors; the manifest keeps the entries the
-    // file has with the table.
-    assert_eq!(
-        database_value_errors(&database),
-        [
-            (
-                "shm_bytes".to_string(),
-                database_facts::REASON_UNREADABLE.to_string()
-            ),
-            (
-                "journal_mode".to_string(),
-                bounded::REASON_READ_FAILED.to_string()
-            ),
-        ]
-    );
-    assert_left_out_with_their_reasons(
+    assert_shipped_under_the_guard(
         &members,
         database_facts::FILE,
         &[database_facts::REASON_UNREADABLE],
     );
 }
 
-// With no stand-in table, the unanswered pipeline fallback still ships as it
-// was written, its manifest entry says only what its code says, and every
-// other component is left out.
+// With a read that reached nothing, the unanswered pipeline fallback still
+// ships with what it says, its manifest entry says only what its code says,
+// and every other component ships beside it.
 #[tokio::test]
 async fn the_unanswered_pipeline_fallback_ships_without_the_table() {
     use weaver_server_core::{JobStatus, PipelineMetrics, SharedPipelineState};
@@ -1518,14 +1641,12 @@ async fn the_unanswered_pipeline_fallback_ships_without_the_table() {
     components.extend(fallback);
     let members = archive_without_the_table(components).await;
 
-    assert_eq!(
-        member_text(&members, pipeline_internals::FILE).as_bytes(),
-        written
-    );
+    let written: serde_json::Value = serde_json::from_slice(&written).expect("JSON");
     let internals = package_member_json(&members, pipeline_internals::FILE);
+    assert_eq!(internals, written);
     assert_eq!(internals["answered"], false);
     assert_eq!(internals["queue"]["jobs"], 2);
-    assert_left_out_with_their_reasons(
+    assert_shipped_under_the_guard(
         &members,
         pipeline_internals::FILE,
         &[bounded::REASON_TIMED_OUT],
@@ -1571,4 +1692,657 @@ async fn a_healthy_table_leaves_database_facts_unchanged() {
     let unmarked = archive_through_the_pass(unmarked).await;
     assert_eq!(marked, unmarked);
     assert!(member_text(&marked, database_facts::FILE).contains("permission denied"));
+}
+
+// The read as it was before it was staged, kept for comparison: every job's
+// names in one snapshot, the stored NZBs a page at a time, each opened with
+// a new zstd decoder, one after another.
+fn old_stored_names(db: &Database) -> sanitize::StoredNames {
+    use weaver_server_core::jobs::diagnostic_names::reference::DiagnosticNzbSource;
+
+    let mut posted = std::collections::BTreeMap::new();
+    for source in [DiagnosticNzbSource::Active, DiagnosticNzbSource::History] {
+        let mut after = 0;
+        loop {
+            let page = db.diagnostic_persisted_nzbs(source, after).expect("page");
+            let Some(last) = page.last().map(|nzb| nzb.job_id) else {
+                break;
+            };
+            for nzb in page {
+                if let Some(document) = nzb.nzb.filter(|document| !document.is_empty()) {
+                    posted.insert(nzb.job_id, old_posted_names(&document));
+                }
+            }
+            after = last;
+        }
+    }
+    let script_dir = db.diagnostic_script_directory().expect("scripts");
+    let mut scripts = Vec::new();
+    for instance in db.script_instances().expect("instances") {
+        scripts.push(instance.script.as_str().to_string());
+        scripts.push(instance.name);
+    }
+    sanitize::StoredNames {
+        jobs: db.diagnostic_job_names_whole().expect("names"),
+        posted,
+        history_total: db.diagnostic_history_total().expect("total"),
+        categories: db.list_categories().expect("categories"),
+        logins: db
+            .get_auth_credentials()
+            .expect("login")
+            .map(|credentials| credentials.username)
+            .into_iter()
+            .collect(),
+        servers: db.list_servers().expect("servers"),
+        schedules: db.list_schedules().expect("schedules"),
+        proxies: db.list_proxy_profiles().expect("proxies"),
+        egress: db.list_egress_interfaces().expect("egress"),
+        pools: db.list_proxy_pools().expect("pools"),
+        dns_lists: db.list_dns_server_lists().expect("lists"),
+        dns_profiles: db.list_dns_profiles().expect("profiles"),
+        feeds: db.list_rss_feeds().expect("feeds"),
+        script_dirs: script_dir.into_iter().collect(),
+        scripts,
+    }
+}
+
+fn old_posted_names(nzb: &[u8]) -> weaver_nzb::NzbNames {
+    if nzb.starts_with(&stored_read::ZSTD_MAGIC) {
+        let decoder = zstd::stream::read::Decoder::new(nzb).expect("decoder");
+        weaver_nzb::parse_nzb_names_reader(std::io::BufReader::new(decoder)).expect("names")
+    } else {
+        weaver_nzb::parse_nzb_names_reader(nzb).expect("names")
+    }
+}
+
+// A seeded instance: `active` active jobs (even ids), `history` finished
+// ones (odd ids), `files` file rows per job in each file table, a stored
+// NZB for every job, a server, a category and a login.
+fn seeded_instance(active: u64, history: u64, files: u64) -> Database {
+    use weaver_server_core::jobs::diagnostic_names::reference::diagnostic_seed_script;
+
+    let db = Database::open_in_memory().expect("database");
+    db.diagnostic_seed_sql(diagnostic_seed_script(active, history, files))
+        .expect("seed");
+    let nzbs = (1..=(active * 2).max(history * 2))
+        .filter(|id| {
+            if id % 2 == 0 {
+                *id <= active * 2
+            } else {
+                *id < history * 2
+            }
+        })
+        .map(|id| {
+            (
+                id,
+                seeded_nzb(
+                    &format!("Seed Title {id}"),
+                    &format!("Seed.Posted.{id}.mkv"),
+                ),
+            )
+        })
+        .collect();
+    db.diagnostic_seed_nzbs(nzbs).expect("nzbs");
+    db.insert_server(&from_json(serde_json::json!({
+        "id": 3, "host": "news.seed-provider.example", "port": 563, "tls": true,
+        "username": "seed-account", "password": null, "connections": 8
+    })))
+    .expect("server");
+    db.insert_category(&weaver_server_core::categories::CategoryConfig {
+        id: 5,
+        name: "seedcat".to_string(),
+        dest_dir: Some("/mnt/seed-films".to_string()),
+        aliases: String::new(),
+        seeding: None,
+        torrent_route: false,
+        unpack: None,
+        upload_cap: Default::default(),
+    })
+    .expect("category");
+    db.set_auth_credentials("seed-admin", "not-a-real-hash")
+        .expect("login");
+    db
+}
+
+// A package naming seeded jobs of the first page, of a later page and of
+// the history, in fields and in running text.
+fn seeded_package(late: u64) -> Vec<Component> {
+    vec![
+        Component::bytes(
+            "weaver.log",
+            format!(
+                "INFO job_id=2 wrote Seed.Job.2.part0.rar\n\
+                 INFO job_id={late} wrote Seed.Job.{late}.part0.rar and Seed.Posted.{late}.mkv\n\
+                 INFO finished Seed.History.4199 into Seed.Posted.4199.mkv\n\
+                 INFO connected to news.seed-provider.example:563 as seed-account\n\
+                 INFO pipeline turn took 12 ms\n"
+            )
+            .into_bytes(),
+        ),
+        Component::text("metrics-1.txt", "weaver_turns_total 9\n"),
+        Component::json(
+            "settings.json",
+            &serde_json::json!({ "settings": { "completeDir": "/srv/seed-complete" } }),
+        ),
+        Component::json(
+            "queue.json",
+            &serde_json::json!({ "jobs": [
+                { "id": 2, "name": "Seed.Job.2", "category": "seedcat" },
+                { "id": late, "name": format!("Seed.Job.{late}"), "category": "seedcat" },
+            ] }),
+        ),
+        Component::json(
+            "servers.json",
+            &serde_json::json!({ "servers": [ { "host": "news.seed-provider.example" } ] }),
+        ),
+        Component::json(
+            "pipeline-internals.json",
+            &serde_json::json!({ "answered": true, "turns": 4 }),
+        ),
+    ]
+}
+
+async fn package_of(
+    components: Vec<Component>,
+    mut names: stored_read::TableNames,
+) -> (Vec<(String, Vec<u8>)>, archive::Manifest) {
+    names.manifest.read_ms = 0;
+    let (components, sanitized) = sanitize_components(components, names, plain_local()).await;
+    let archive =
+        archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
+            .expect("archive builds");
+    let members = unpack_package(&archive);
+    let manifest = manifest_of(&members);
+    let members = members
+        .into_iter()
+        .filter(|(name, _)| name != archive::MANIFEST_NAME)
+        .collect();
+    (members, manifest)
+}
+
+// The staged read reads what the old read read, over a seeded queue and
+// history, and the package it builds is the old package byte for byte.
+#[tokio::test]
+async fn the_staged_read_builds_the_package_the_old_read_built() {
+    let db = seeded_instance(1_200, 2_100, 3);
+    let old = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || old_stored_names(&db))
+            .await
+            .expect("the old read runs")
+    };
+    let new = stored_names(&db).await;
+    assert!(new.manifest.complete, "{:#?}", new.manifest.steps);
+    assert!(new.guard.is_none());
+    assert_eq!(new.stored.jobs, old.jobs);
+    assert_eq!(new.stored.posted, old.posted);
+    assert_eq!(format!("{:?}", new.stored), format!("{old:?}"));
+    assert_eq!(new.stored.jobs.len(), 1_200 + 2_000);
+
+    let (new_members, new_manifest) = package_of(seeded_package(2_200), new).await;
+    let (old_members, old_manifest) =
+        package_of(seeded_package(2_200), stored_read::TableNames::whole(old)).await;
+    assert_eq!(new_members, old_members);
+    assert_eq!(
+        new_manifest.sanitized.stand_ins,
+        old_manifest.sanitized.stand_ins
+    );
+    let listed = |manifest: &archive::Manifest| {
+        serde_json::to_value(
+            manifest
+                .files
+                .iter()
+                .filter(|file| file.name != archive::MANIFEST_NAME)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    assert_eq!(listed(&new_manifest), listed(&old_manifest));
+    assert_eq!(
+        serde_json::to_value(&new_manifest.errors).unwrap(),
+        serde_json::to_value(&old_manifest.errors).unwrap()
+    );
+    let log = member_text(&new_members, "weaver.log");
+    assert!(
+        log.contains(
+            "INFO job_id=2 wrote job-2.part0.rar
+"
+        ) && !log.contains("Seed."),
+        "{log}"
+    );
+}
+
+// A read cut after its first page of active jobs keeps that page: those jobs
+// keep the stand-ins a whole read gives them, the jobs of later pages are
+// nowhere in the package, and the manifest says how far the read got.
+#[tokio::test]
+async fn a_read_cut_after_its_first_page_keeps_that_page() {
+    let db = seeded_instance(1_200, 10, 1);
+    let late = 2 * 1_100;
+    let cut = run_read(
+        &db,
+        stored_read::NameRead::with_cut(|step, ran| {
+            (step == stored_read::STEP_ACTIVE_NAMES && ran > 0).then_some(stored_read::Cut::Stop)
+        }),
+    )
+    .await;
+    let cut = stored_read::TableNames::from_read(cut, stored_read::MemoryNames::default());
+    let step = |name: &str| {
+        cut.manifest
+            .steps
+            .iter()
+            .find(|step| step.step == name)
+            .cloned()
+            .expect("listed")
+    };
+    let active = step(stored_read::STEP_ACTIVE_NAMES);
+    assert_eq!(active.state, stored_read::STATE_PARTIAL, "{active:?}");
+    assert_eq!(active.read, Some(500));
+    assert_eq!(active.reason.as_deref(), Some("stopped"));
+    for later in [
+        stored_read::STEP_HISTORY_NAMES,
+        stored_read::STEP_ACTIVE_NZBS,
+        stored_read::STEP_HISTORY_NZBS,
+    ] {
+        assert_eq!(step(later).state, stored_read::STATE_NOT_REACHED, "{later}");
+    }
+    assert_eq!(
+        step(stored_read::STEP_SERVERS).state,
+        stored_read::STATE_COMPLETE
+    );
+    assert!(!cut.manifest.complete);
+    assert_eq!(cut.manifest.jobs_not_fully_read, 500 + 10);
+
+    let (cut_members, cut_manifest) = package_of(seeded_package(late), cut).await;
+    let (whole_members, _) = package_of(seeded_package(late), stored_names(&db).await).await;
+    for name in PACKAGE_FILES {
+        assert!(
+            cut_members.iter().any(|(member, _)| member == name),
+            "{name}: {:?}",
+            cut_manifest.errors
+        );
+    }
+    let cut_text = package_text(&cut_members);
+    for real in [
+        format!("Seed.Job.{late}"),
+        format!("Seed.Posted.{late}"),
+        "seed-".into(),
+    ] {
+        assert!(
+            !cut_text.contains(&real),
+            "{real} left the host:\n{cut_text}"
+        );
+    }
+    // A page-one job keeps its stand-in where a field names it.
+    let cut_queue = package_member_json(&cut_members, "queue.json");
+    let whole_queue = package_member_json(&whole_members, "queue.json");
+    assert_eq!(cut_queue["jobs"][0], whole_queue["jobs"][0]);
+    assert_eq!(cut_queue["jobs"][0]["name"], "job-2");
+    // Lines naming a job not read whole are left out, and the log says so.
+    let log = member_text(&cut_members, "weaver.log");
+    assert!(log.contains(sanitize::GUARDED_LINE), "{log}");
+    assert!(log.contains("INFO pipeline turn took 12 ms\n"), "{log}");
+    let log_entry = cut_manifest
+        .files
+        .iter()
+        .find(|file| file.name == "weaver.log")
+        .expect("the log ships");
+    assert!(log_entry.partial.is_some(), "{log_entry:?}");
+    assert!(!cut_manifest.sanitized.table.complete);
+}
+
+// Each step of the read failed in turn: every other step completes, the
+// manifest names only that one as failed, and every file ships.
+#[tokio::test]
+async fn each_failed_step_costs_only_its_own_names() {
+    let db = seeded_instance(30, 10, 1);
+    for failing in stored_read::STEPS {
+        let state = run_read(
+            &db,
+            stored_read::NameRead::with_cut(move |step, _| {
+                (step == failing).then_some(stored_read::Cut::Fail("planted failure"))
+            }),
+        )
+        .await;
+        let names = stored_read::TableNames::from_read(state, stored_read::MemoryNames::default());
+        let states: Vec<(&str, &str)> = names
+            .manifest
+            .steps
+            .iter()
+            .map(|step| (step.step.as_str(), step.state.as_str()))
+            .collect();
+        let expected: Vec<(&str, &str)> = stored_read::STEPS
+            .iter()
+            .map(|step| {
+                (
+                    *step,
+                    if *step == failing {
+                        stored_read::STATE_FAILED
+                    } else {
+                        stored_read::STATE_COMPLETE
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(states, expected, "{failing}");
+        let (members, manifest) = package_of(seeded_package(60), names).await;
+        for name in PACKAGE_FILES {
+            assert!(
+                members.iter().any(|(member, _)| member == name),
+                "{failing}: {name} is missing: {:?}",
+                manifest.errors
+            );
+        }
+        assert!(
+            manifest.errors.is_empty(),
+            "{failing}: {:?}",
+            manifest.errors
+        );
+        let text = package_text(&members).to_lowercase();
+        assert!(
+            !text.contains("seed."),
+            "{failing}: a name left the host:\n{text}"
+        );
+    }
+}
+
+// Each collected file failed in turn: every other file ships, and the
+// manifest names only that one.
+#[tokio::test]
+async fn each_failed_file_costs_only_itself() {
+    let db = seeded_instance(30, 10, 1);
+    for failing in PACKAGE_FILES {
+        let components: Vec<Component> = seeded_package(60)
+            .into_iter()
+            .map(|component| {
+                if component.name == failing {
+                    Component::failed(failing, "planted failure")
+                } else {
+                    component
+                }
+            })
+            .collect();
+        let (members, manifest) = package_of(components, stored_names(&db).await).await;
+        let shipped: Vec<&str> = members.iter().map(|(name, _)| name.as_str()).collect();
+        let expected: Vec<&str> = PACKAGE_FILES
+            .iter()
+            .copied()
+            .filter(|name| *name != failing)
+            .collect();
+        assert_eq!(shipped, expected, "{failing}");
+        let errors: Vec<&str> = manifest
+            .errors
+            .iter()
+            .map(|error| error.name.as_str())
+            .collect();
+        assert_eq!(errors, [failing]);
+    }
+}
+
+// An NZB of `files` files of `segments` segments each, named after job `id`.
+// About 95 bytes of XML per segment: 60,000 segments make a 5.7 MB document.
+fn sized_nzb(id: u64, files: u64, segments: u64) -> Vec<u8> {
+    use std::fmt::Write as _;
+
+    let mut nzb = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n\
+         <head><meta type=\"title\">Seed Title {id}</meta></head>\n"
+    );
+    for file in 0..files {
+        write!(
+            nzb,
+            "<file poster=\"poster@example.org\" date=\"1\" \
+             subject=\"&quot;Seed.Posted.{id}.part{file:03}.rar&quot; yEnc (1/{segments})\">\n\
+             <groups><group>alt.binaries.test</group></groups>\n<segments>\n"
+        )
+        .expect("write");
+        for number in 1..=segments {
+            writeln!(
+                nzb,
+                "<segment bytes=\"768000\" number=\"{number}\">\
+                 part{number}of{segments}.{id}.{file}@seed-poster.example.org</segment>"
+            )
+            .expect("write");
+        }
+        nzb.push_str("</segments>\n</file>\n");
+    }
+    nzb.push_str("</nzb>\n");
+    weaver_server_core::ingest::compress_nzb_bytes(nzb.as_bytes()).expect("compress nzb")
+}
+
+// The jobs whose stored NZBs are real-size, and the segments per file each
+// one gets (100 files each): about 5.7, 8.6 and 11.4 MB of XML.
+const LARGE_NZBS: [(u64, u64); 3] = [(2, 600), (20_000, 900), (4_999, 1_200)];
+
+// 20,000 active jobs (even ids) of 20 files, 2,500 finished ones (odd ids),
+// a stored NZB for each (20 files of 4 segments, three of them real-size),
+// a server, a category and a login.
+fn queue_of_20000() -> Database {
+    use weaver_server_core::jobs::diagnostic_names::reference::diagnostic_seed_script;
+
+    let db = Database::open_in_memory().expect("database");
+    db.diagnostic_seed_sql(diagnostic_seed_script(20_000, 2_500, 20))
+        .expect("seed");
+    let ids: Vec<u64> = (1..=40_000)
+        .filter(|id| id % 2 == 0 || *id < 5_000)
+        .collect();
+    for chunk in ids.chunks(2_000) {
+        let nzbs = chunk
+            .iter()
+            .map(|id| {
+                let segments = LARGE_NZBS
+                    .iter()
+                    .find(|(large, _)| large == id)
+                    .map(|(_, segments)| *segments);
+                match segments {
+                    Some(segments) => (*id, sized_nzb(*id, 100, segments)),
+                    None => (*id, sized_nzb(*id, 20, 4)),
+                }
+            })
+            .collect();
+        db.diagnostic_seed_nzbs(nzbs).expect("nzbs");
+    }
+    db
+}
+
+// The most statements a whole read may run over `active` active jobs and
+// `history` read finished ones: the fixed steps, one statement per side
+// table per page of names (and one empty page to end the active pages), one
+// size statement per page of ids, and one fetch per batch of NZBs (batches
+// are cut within a page of ids), plus one
+// per real-size NZB that fills a batch alone. Nothing in it grows with the
+// files of a job.
+fn statement_bound(active: u64, history: u64, per_page: u64, large: u64) -> u64 {
+    let page = weaver_server_core::jobs::diagnostic_names::DIAGNOSTIC_NAME_PAGE as u64;
+    let pages = active.div_ceil(page) + 1 + history.div_ceil(page);
+    let fixed = stored_read::STEPS.len() as u64;
+    let batch = stored_read::NZB_BATCH as u64;
+    let batches = |jobs: u64| (jobs / page) * page.div_ceil(batch) + (jobs % page).div_ceil(batch);
+    fixed
+        + pages * per_page
+        + active.div_ceil(page)
+        + history.div_ceil(page)
+        + batches(active)
+        + batches(history)
+        + 2 * large
+}
+
+// The statements one page of names runs, read from a single seeded job.
+async fn statements_per_page() -> u64 {
+    use weaver_server_core::jobs::diagnostic_names::reference::diagnostic_seed_script;
+
+    let db = Database::open_in_memory().expect("database");
+    db.diagnostic_seed_sql(diagnostic_seed_script(1, 0, 1))
+        .expect("seed");
+    let page = tokio::task::spawn_blocking(move || {
+        db.diagnostic_job_names_page(
+            weaver_server_core::jobs::diagnostic_names::DiagnosticJobs::ActiveAfter(0),
+        )
+    })
+    .await
+    .expect("the page runs")
+    .expect("the page reads");
+    page.statements.len() as u64
+}
+
+// A queue of 20,000 jobs reads whole: every job named, every stored NZB
+// opened, in a number of statements set by pages, not by jobs or files.
+#[tokio::test]
+async fn a_queue_of_20000_jobs_reads_whole_in_bounded_statements() {
+    let db = queue_of_20000();
+    let state = run_read(&db, stored_read::NameRead::new()).await;
+    let per_page = statements_per_page().await;
+    let bound = statement_bound(20_000, 2_000, per_page, LARGE_NZBS.len() as u64);
+    assert!(
+        state.statements <= bound,
+        "{} statements, bound {bound}",
+        state.statements
+    );
+    assert_eq!(state.stored.jobs.len(), 22_000);
+    assert_eq!(state.stored.posted.len(), 22_000);
+    let large = &state.stored.posted[&4_999];
+    assert_eq!(large.file_names.len(), 100, "{large:?}");
+    let names = stored_read::TableNames::from_read(state, stored_read::MemoryNames::default());
+    assert!(names.manifest.complete, "{:#?}", names.manifest.steps);
+    assert_eq!(names.manifest.names_from_table, 0, "counted at sanitizing");
+    assert!(names.guard.is_none());
+}
+
+// Measures the old read and the staged read over the 20,000-job queue, a
+// step at a time, and checks they read the same names. Run by hand:
+// cargo nextest run --locked -p weaver --cargo-profile matrix --run-ignored only \
+//   http::diagnostics::tests::measure_the_read_of_20000_jobs --no-capture
+#[tokio::test]
+#[ignore = "a measurement, run by hand"]
+async fn measure_the_read_of_20000_jobs() {
+    use std::time::Instant;
+    use weaver_server_core::jobs::diagnostic_names::reference::DiagnosticNzbSource;
+
+    let seeded = Instant::now();
+    let db = queue_of_20000();
+    eprintln!("seed: {} ms", seeded.elapsed().as_millis());
+
+    let measured = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let db = measured;
+        let names = Instant::now();
+        let whole = db.diagnostic_job_names_whole().expect("names");
+        eprintln!(
+            "old names, one snapshot of whole tables: {} ms, {} jobs",
+            names.elapsed().as_millis(),
+            whole.len()
+        );
+
+        let fetched = Instant::now();
+        let mut blobs = Vec::new();
+        for source in [DiagnosticNzbSource::Active, DiagnosticNzbSource::History] {
+            let mut after = 0;
+            loop {
+                let page = db.diagnostic_persisted_nzbs(source, after).expect("page");
+                let Some(last) = page.last().map(|nzb| nzb.job_id) else {
+                    break;
+                };
+                blobs.extend(page.into_iter().filter_map(|nzb| nzb.nzb));
+                after = last;
+            }
+        }
+        let stored: usize = blobs.iter().map(Vec::len).sum();
+        eprintln!(
+            "old NZB fetch: {} ms, {} NZBs, {} stored bytes",
+            fetched.elapsed().as_millis(),
+            blobs.len(),
+            stored
+        );
+
+        let decoded = Instant::now();
+        let mut documents = Vec::with_capacity(blobs.len());
+        for blob in &blobs {
+            let mut out = Vec::new();
+            let mut decoder = zstd::stream::read::Decoder::new(blob.as_slice()).expect("decoder");
+            std::io::copy(&mut decoder, &mut out).expect("decode");
+            documents.push(out);
+        }
+        let xml: usize = documents.iter().map(Vec::len).sum();
+        eprintln!(
+            "decode, a new decoder per NZB: {} ms, {} bytes of XML",
+            decoded.elapsed().as_millis(),
+            xml
+        );
+
+        let reused = Instant::now();
+        let mut context = zstd::zstd_safe::DCtx::create();
+        let mut out = Vec::new();
+        for blob in &blobs {
+            out.clear();
+            let mut decoder =
+                zstd::stream::read::Decoder::with_context(blob.as_slice(), &mut context);
+            std::io::copy(&mut decoder, &mut out).expect("decode");
+        }
+        eprintln!(
+            "decode, one reused context: {} ms",
+            reused.elapsed().as_millis()
+        );
+
+        let parsed = Instant::now();
+        for document in &documents {
+            weaver_nzb::parse_nzb_names_reader(document.as_slice()).expect("names");
+        }
+        eprintln!(
+            "parse of decoded XML, one thread: {} ms",
+            parsed.elapsed().as_millis()
+        );
+
+        let serial = Instant::now();
+        let mut context = zstd::zstd_safe::DCtx::create();
+        for blob in &blobs {
+            stored_read::posted_names_with(blob, &mut context).expect("names");
+        }
+        eprintln!(
+            "decode and parse, one thread, reused context: {} ms",
+            serial.elapsed().as_millis()
+        );
+
+        let old = Instant::now();
+        let old_names = old_stored_names(&db);
+        eprintln!("old read, whole: {} ms", old.elapsed().as_millis());
+        old_names
+    })
+    .await
+    .map(|old_names| {
+        let db = db.clone();
+        async move {
+            let new = std::time::Instant::now();
+            let state = run_read(&db, stored_read::NameRead::new()).await;
+            eprintln!(
+                "staged read: {} ms wall ({} ms in the read), {} statements, {} rows, \
+                 {} stored bytes, {} decoded bytes, {} parse workers",
+                new.elapsed().as_millis(),
+                state.read_ms,
+                state.statements,
+                state.rows,
+                state.nzb_bytes,
+                state.decoded_bytes,
+                stored_read::parse_workers()
+            );
+            assert_eq!(state.stored.jobs, old_names.jobs);
+            assert_eq!(state.stored.posted, old_names.posted);
+            let names_only = std::time::Instant::now();
+            let names = run_read(
+                &db,
+                stored_read::NameRead::with_cut(|step, _| {
+                    (step == stored_read::STEP_ACTIVE_NZBS).then_some(stored_read::Cut::Stop)
+                }),
+            )
+            .await;
+            eprintln!(
+                "staged read, names steps only: {} ms, {} statements, {} rows",
+                names_only.elapsed().as_millis(),
+                names.statements,
+                names.rows
+            );
+        }
+    })
+    .expect("the old read runs")
+    .await;
 }

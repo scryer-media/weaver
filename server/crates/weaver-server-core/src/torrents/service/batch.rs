@@ -26,6 +26,16 @@ use std::sync::atomic::Ordering;
 
 pub(super) type Outcome = BTreeMap<JobId, Result<(), ActionError>>;
 
+/// How many removed torrents a batch takes out before it writes their
+/// history rows, in one transaction, and lets them go. It bounds how long
+/// that transaction holds the database's one writer, whatever the batch's
+/// size, and how many removals a crash before it commits leaves to be
+/// rebuilt from their retiring marks, with less than their history rows
+/// would have said. At 32, a request naming thousands of torrents still
+/// writes about thirty times fewer transactions than one at a time does,
+/// and each holds the writer for a few dozen rows and their files.
+pub const HISTORY_CHUNK: usize = 32;
+
 /// One change to a torrent's own settings, as its own action makes it.
 #[derive(Debug, Clone, Copy)]
 pub enum TorrentSetting {
@@ -654,19 +664,32 @@ impl TorrentService {
                 .unwrap_or_default(),
         };
         // Each shows its end, and gives up its slot and rank, by the one
-        // publish and the one pass after the last.
+        // publish and the one pass after the last. Their history rows are
+        // one write for each chunk, once the chunk's last is out.
         let any = !begun.is_empty();
-        for (job_id, delete_files) in begun {
-            let removed = self
-                .remove_marked(
-                    job_id,
-                    delete_files,
-                    Ending::Asked,
-                    Shown::ByBatch,
-                    made.remove(&job_id),
-                )
-                .await;
-            outcome.insert(job_id, removed);
+        for chunk in begun.chunks(HISTORY_CHUNK) {
+            let mut retired = Vec::with_capacity(chunk.len());
+            for &(job_id, delete_files) in chunk {
+                let taken = self
+                    .take_out(
+                        job_id,
+                        delete_files,
+                        Ending::Asked,
+                        Shown::ByBatch,
+                        made.remove(&job_id),
+                    )
+                    .await;
+                match taken {
+                    Ok(one) => {
+                        retired.push(one);
+                        outcome.insert(job_id, Ok(()));
+                    }
+                    Err(error) => {
+                        outcome.insert(job_id, Err(error));
+                    }
+                }
+            }
+            self.to_history(retired).await;
         }
         if any {
             self.inner.signal.want_pass();

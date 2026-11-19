@@ -443,6 +443,10 @@ impl Pieces for Intake {
         self.inner.stop_writes();
     }
 
+    fn retired(&self) -> bool {
+        self.inner.retired()
+    }
+
     // A block is booked on the disk's ledger as a piece is, and its write
     // heard the same way when it fails. One that landed changes nothing
     // the torrent has: the piece is had, and heard, once it is sealed.
@@ -477,16 +481,16 @@ impl Pieces for Intake {
         self.inner.writes_blocks()
     }
 
-    fn block_room(&self, piece_length: u64) -> u64 {
-        self.inner.block_room(piece_length)
-    }
-
     fn read_turns(&self) -> weaver_torrent::storage::ReadTurns {
         self.inner.read_turns()
     }
 
     fn room_returned(&self) {
         self.inner.room_returned();
+    }
+
+    fn aside(&self, run: Box<dyn FnOnce() + Send>) {
+        self.inner.aside(run);
     }
 
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use par2_rs::checksum::md5;
 use par2_rs::{FileId, Packet, Par2FileSet};
 use serde::{Deserialize, Serialize};
-use weaver_graph::recovery::RepairOutcome;
+use weaver_graph::recovery::{RepairOutcome, UnboundReason};
 use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Weight};
 
 use super::facts::Packets;
@@ -189,6 +189,29 @@ impl SetState {
 
     pub(super) fn members(&self) -> &BTreeMap<FileId, MemberId> {
         &self.members
+    }
+
+    // Why the set bound no member, when it bound none. With no index, a
+    // main packet among its packets is an index that did not build, and
+    // none is an index that never came.
+    pub(super) fn unbound(&self) -> Option<UnboundReason> {
+        if !self.members.is_empty() {
+            return None;
+        }
+        Some(match &self.index {
+            Some(_) if self.described => UnboundReason::Unmatched,
+            Some(_) => UnboundReason::Undescribed,
+            None if self
+                .packets
+                .get()
+                .0
+                .iter()
+                .any(|packet| matches!(packet, Packet::Main(_))) =>
+            {
+                UnboundReason::Unreadable
+            }
+            None => UnboundReason::Undescribed,
+        })
     }
 
     // A verdict was on the members bound then and the unnamed ones it read;

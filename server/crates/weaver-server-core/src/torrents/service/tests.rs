@@ -1097,14 +1097,16 @@ async fn seeding_placed(
     (job_id, view)
 }
 
-// The torrent's view once `holds` holds of it, read as the queue publishes
-// it.
+// The torrent's view once `holds` holds of it, read as the service's rows
+// move. Not as the queue publishes: its row carries the job's status and
+// bytes, not when it completed, where its files are or why it waits, so a
+// change to those alone moves nothing there.
 async fn view_once(
     service: &TorrentService,
-    changes: &mut watch::Receiver<u64>,
     job_id: JobId,
     holds: impl Fn(&TorrentView) -> bool,
 ) -> TorrentView {
+    let mut changes = service.snapshot().subscribe();
     loop {
         changes.borrow_and_update();
         let view = service.torrent(job_id).await.unwrap();
@@ -1115,16 +1117,14 @@ async fn view_once(
     }
 }
 
-// The torrent added with `placement`, its view once its job is done and it
-// seeds, and the queue's changes from then on.
+// The torrent added with `placement`, and its view once its job is done and
+// it seeds.
 async fn completed_placed(
     rig: &Rig,
     metainfo: Vec<u8>,
     placement: Placement,
-) -> (JobId, TorrentView, watch::Receiver<u64>) {
-    let handle = queue();
-    let mut changes = handle.state().subscribe_job_changes();
-    rig.service.publish_to(handle);
+) -> (JobId, TorrentView) {
+    rig.service.publish_to(queue());
     let job_id = rig
         .service
         .add_opened(AddRequest {
@@ -1133,11 +1133,11 @@ async fn completed_placed(
         })
         .await
         .unwrap();
-    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+    let view = view_once(&rig.service, job_id, |view| {
         view.state == TorrentState::Seeding && view.completed_at_ms.is_some()
     })
     .await;
-    (job_id, view, changes)
+    (job_id, view)
 }
 
 fn values(values: &[&str]) -> Vec<String> {

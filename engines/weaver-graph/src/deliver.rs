@@ -327,6 +327,13 @@ pub enum Emit {
         member: MemberId,
         crc32: u32,
     },
+    // "Member M ends at `length`, short of the length I announced it with:
+    // its checksum proved its bytes whole there." Said just before its
+    // close, which takes it as the member's length.
+    Ends {
+        member: MemberId,
+        length: u64,
+    },
     // "Member M is complete."
     MemberClosed(MemberId),
     // "What I said about member M was built on bytes that were wrong; forget
@@ -397,6 +404,10 @@ pub enum Emit {
     // and taken by no object then, is offered to me again. Said once per
     // thing learned, never per delivery.
     Learned,
+    // "My run ended on this error": its text, for the job's log, said just
+    // before what the error means. It changes nothing in the tree. The text
+    // names no path outside the job and no secret.
+    Failed(String),
 }
 
 #[cfg(test)]

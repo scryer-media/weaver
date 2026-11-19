@@ -899,6 +899,18 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 file_id: None,
                 message: archive_demoted_message(member, container, reason),
             },
+            PipelineEvent::RecoverySetUnused {
+                job_id,
+                set,
+                reason,
+            } => Self {
+                kind: EventKind::RecoverySetUnused,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: weaver_server_core::events::model::recovery_set_unused_message(
+                    set, reason,
+                ),
+            },
             PipelineEvent::MoveToCompleteStarted { job_id } => Self {
                 kind: EventKind::MoveToCompleteStarted,
                 job_id: Some(job_id.0),

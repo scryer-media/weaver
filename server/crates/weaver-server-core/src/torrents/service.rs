@@ -101,6 +101,8 @@ pub use views::{
 // Why a magnet with no trackers is turned away on a route with no DHT.
 const NEEDS_DHT: &str = "a magnet with no trackers needs DHT, which this route does not carry";
 
+pub use batch::HISTORY_CHUNK;
+
 /// How often torrents are read and their routes checked.
 pub const TICK: Duration = Duration::from_secs(10);
 
@@ -982,6 +984,10 @@ struct Inner {
     // How many views were built.
     #[cfg(any(test, feature = "test-support"))]
     views_built: std::sync::atomic::AtomicUsize,
+    // Held by a test that counts what its own calls build: the tick's loop
+    // takes it for each tick, so none runs while it is held.
+    #[cfg(any(test, feature = "test-support"))]
+    tick_hold: Arc<tokio::sync::Mutex<()>>,
     // The torrents waiting for room on their disks, each by the wait every
     // kind of job shares for its refusal, and how many times a wait began
     // or ended, or a torrent's disk became known.
@@ -1095,6 +1101,8 @@ impl TorrentService {
                 snapshot: snapshot::Snapshot::default(),
                 #[cfg(any(test, feature = "test-support"))]
                 views_built: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                tick_hold: Arc::default(),
                 disk_waits: Mutex::default(),
                 disk_waits_moved: watch::channel(0).0,
                 #[cfg(test)]
@@ -1308,6 +1316,13 @@ impl TorrentService {
     #[cfg(any(test, feature = "test-support"))]
     pub fn views_built(&self) -> usize {
         self.inner.views_built.load(Ordering::Relaxed)
+    }
+
+    /// Holds the background tick, once one running ends, until the guard
+    /// is dropped: what a test's own calls build is then all it counts.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn hold_tick(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.inner.tick_hold).lock_owned().await
     }
 
     /// Counts the ticks run so far.

@@ -6,6 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::collections::VecDeque;
+use std::io::IoSlice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -1575,6 +1576,38 @@ impl<'a> FileOps<'a> {
         chunk_info: &ChunkInfo,
     ) -> anyhow::Result<()> {
         self.on_disk();
+        self.write_chunk_by(who_sent, data, chunk_info, |file_idx, offset, slices| {
+            self.files.pwrite_all_vectored(file_idx, offset, slices)?;
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
+    /// [`Self::write_chunk`] into memory the storage holds, on a thread that
+    /// must not wait on a disk: false when the storage would write the block
+    /// to a file, for the caller to write it where it may wait. A block
+    /// across two files may have written its first part to memory then: the
+    /// write in its place writes it whole.
+    pub fn write_chunk_held(
+        &self,
+        who_sent: PeerHandle,
+        data: &Piece<ByteBuf<'a>>,
+        chunk_info: &ChunkInfo,
+    ) -> anyhow::Result<bool> {
+        self.write_chunk_by(who_sent, data, chunk_info, |file_idx, offset, slices| {
+            self.files.pwrite_held(file_idx, offset, slices)
+        })
+    }
+
+    // The block written a file's part at a time by `write`, which says
+    // whether it wrote it: false stops at that part.
+    fn write_chunk_by(
+        &self,
+        who_sent: PeerHandle,
+        data: &Piece<ByteBuf<'a>>,
+        chunk_info: &ChunkInfo,
+        write: impl Fn(usize, u64, [IoSlice<'_>; 2]) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<bool> {
         let (first, mut absolute_offset) =
             self.file_at(self.torrent.lengths().chunk_absolute_offset(chunk_info));
         let mut data = DoubleBufHelper::new(data.data().0, data.data().1);
@@ -1598,16 +1631,15 @@ impl<'a> FileOps<'a> {
             let slices = data.as_ioslices(to_write);
             debug_assert_eq!(slices[0].len() + slices[1].len(), to_write);
             if !file_info.attrs.padding {
-                let written = self
-                    .files
-                    .pwrite_all_vectored(file_idx, absolute_offset, slices)
-                    .with_context(|| {
-                        format!(
-                            "error writing to file {file_idx} (\"{:?}\")",
-                            file_info.relative_filename
-                        )
-                    })?;
-                debug_assert_eq!(written, to_write);
+                let written = write(file_idx, absolute_offset, slices).with_context(|| {
+                    format!(
+                        "error writing to file {file_idx} (\"{:?}\")",
+                        file_info.relative_filename
+                    )
+                })?;
+                if !written {
+                    return Ok(false);
+                }
             }
             data.advance(to_write);
             if data.is_empty() {
@@ -1617,7 +1649,7 @@ impl<'a> FileOps<'a> {
             absolute_offset = 0;
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 

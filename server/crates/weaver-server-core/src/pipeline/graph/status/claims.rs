@@ -169,6 +169,10 @@ pub(crate) struct Delivery {
     pub(crate) removed: Vec<String>,
     // Every file delivered, whole or as it stands, as the walk met it.
     pub(crate) files: Vec<Delivered>,
+    // The job was given a password to try, as its candidates say
+    // (`GraphJob::has_passwords`): a member withheld for a password then
+    // needs one that none given opens, not one never given.
+    pub(crate) password_given: bool,
 }
 
 // What the recovery sets of a member's namespace say of it, the one answer
@@ -433,7 +437,7 @@ impl Delivery {
         };
         let mut reasons: Vec<(String, Vec<&str>)> = Vec::new();
         for (name, why) in &self.withheld {
-            let reason = withheld_because(name, *why);
+            let reason = withheld_because(name, *why, self.password_given);
             match reasons.iter_mut().find(|(seen, _)| *seen == reason) {
                 Some((_, names)) => names.push(name),
                 None => reasons.push((reason, vec![name])),
@@ -688,11 +692,15 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
 
 // Why a member was withheld, as a job's error words it after its names. A
 // password the object needed is one reason, whether it shut the member's
-// bytes or the headers naming them. A set short of a volume names the one
+// bytes or the headers naming them: none was given, or `given` says the job
+// had some and none of them opened it. A set short of a volume names the one
 // it lacks in the numbering of `name`, a volume of the set, as SABnzbd's
 // "unable to find" does, or its number where the name does not number it.
-fn withheld_because(name: &str, why: Why) -> String {
+fn withheld_because(name: &str, why: Why, given: bool) -> String {
     let said = match why {
+        Why::Encrypted | Why::EncryptedHeader if given => {
+            "needs a password and no password given opens it"
+        }
         Why::Encrypted | Why::EncryptedHeader => "needs a password and none was given",
         Why::Compressed => "is compressed and no engine reads it",
         Why::Unmapped => "never placed every member it named",

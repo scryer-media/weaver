@@ -198,6 +198,7 @@ impl TorrentStateLive {
                     live.cancel_all_requests();
                 }
             });
+            self.spill_requeued();
         } else {
             // The seeds let go while we only uploaded are due again now,
             // not a reconnect time after they were let go.
