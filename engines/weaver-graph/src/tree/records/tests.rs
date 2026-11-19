@@ -134,8 +134,10 @@ pub(crate) struct Objects;
 
 impl Builder for Objects {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
+        // The member inside the root's archive has a name that says an
+        // archive, so it opens as its bytes come (`Tree::opens_as_layer`).
         let inner = match kind {
-            Kind::Xz => "inner.gz",
+            Kind::Xz => "inner.tar",
             Kind::Gzip => "leaf.bin",
             _ => return None,
         };

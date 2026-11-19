@@ -544,6 +544,8 @@ fn kind_named(name: &str) -> Option<(Kind, Claims)> {
 //   .pima  an Adobe package: a zip
 //   .cbz .cbr .cb7 .cbt   comic books, which readers open whole: a zip, a
 //          RAR, a 7z, a tar of pages
+//   .box .supercab .thu .riglib   application data files built on a zip,
+//          which their programs read whole
 //
 // Not here, because no signature the sniffer knows opens them, so their
 // bytes already make them leaves and any archive signature under their
@@ -585,6 +587,10 @@ const END_FILES: &[(&str, &[Kind])] = &[
     (".cbr", &[Kind::RarStore]),
     (".cb7", &[Kind::SevenZipStore]),
     (".cbt", &[Kind::Tar]),
+    (".box", ZIP),
+    (".supercab", ZIP),
+    (".thu", ZIP),
+    (".riglib", ZIP),
 ];
 
 // Whether a name is an end file's that is built on this kind.
@@ -700,53 +706,164 @@ pub enum Listed {
 // or an SFV. A short name with a letter and digits for an extension, a
 // `.s16` or a `.p12`, is a plain file when no set of its stem is listed.
 pub fn listed(names: &[&str]) -> Vec<Listed> {
-    let lower: Vec<String> = names
-        .iter()
-        .map(|name| trimmed(name).to_ascii_lowercase())
-        .collect();
-    let has = |stem: &str, extension: &str| {
-        lower.iter().any(|name| {
-            name.strip_suffix(extension)
-                .and_then(|named| named.strip_suffix('.'))
-                .is_some_and(|named| named == stem)
-        })
+    let listing = Listing::new(names.iter().copied());
+    names.iter().map(|name| listing.told(name)).collect()
+}
+
+// The names of a listing, each once, trimmed and lower case: what telling
+// one of them asks of the names beside it is a lookup, so telling every
+// name of a listing is linear in its length.
+pub(crate) struct Listing {
+    names: std::collections::HashSet<String>,
+}
+
+// A name's last extension, split into its first letter and the rest, and
+// whether the rest is a number.
+fn numbering(extension: &str) -> (&str, &str, bool) {
+    let (letter, digits) = extension.split_at(extension.chars().next().map_or(0, char::len_utf8));
+    let numbered = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
+    (letter, digits, numbered)
+}
+
+// The old RAR numbering of the volumes after a set's `.rar`: `.r00` …
+// `.r99`, then `.s00` onward, to `.y99`.
+fn rar_numbered(letter: &str, digits: &str, numbered: bool) -> bool {
+    numbered && digits.len() == 2 && matches!(letter, "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y")
+}
+
+// A split zip's parts before its `.zip`: `.z01` onward.
+fn zip_numbered(letter: &str, digits: &str, numbered: bool) -> bool {
+    numbered && (2..=3).contains(&digits.len()) && letter == "z"
+}
+
+// The extensions that are an archive's whatever is beside them.
+fn archive_extension(extension: &str) -> bool {
+    matches!(extension, "rar" | "7z")
+}
+
+impl Listing {
+    pub(crate) fn new<'a>(names: impl Iterator<Item = &'a str>) -> Self {
+        Self {
+            names: names
+                .map(|name| trimmed(name).to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    fn has(&self, stem: &str, extension: &str) -> bool {
+        self.names.contains(&format!("{stem}.{extension}"))
+    }
+
+    // `split_piece_among`, of a trimmed lower-case name, asked of the
+    // listing.
+    fn piece(&self, name: &str) -> bool {
+        let Some((stem, digits)) = split_piece(name) else {
+            return false;
+        };
+        if digits.len() >= PIECE_DIGITS {
+            return true;
+        }
+        let [zero, one, two] = ["00", "01", "02"].map(|number| self.has(stem, number));
+        (zero && one) || (one && two)
+    }
+
+    // What `listed` tells of one name of the listing.
+    pub(crate) fn told(&self, name: &str) -> Listed {
+        let name = trimmed(name).to_ascii_lowercase();
+        let Some((stem, extension)) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())
+        else {
+            return Listed::Plain;
+        };
+        let (letter, digits, numbered) = numbering(extension);
+        let container = archive_extension(extension)
+            || names_container(&name)
+            || self.piece(&name)
+            || (rar_numbered(letter, digits, numbered) && self.has(stem, "rar"))
+            || (zip_numbered(letter, digits, numbered) && self.has(stem, "zip"));
+        if container {
+            return Listed::Container;
+        }
+        let recovery = match extension {
+            "rev" | "par2" | "par3" | "sfv" => true,
+            _ => names_recovery(&name) && (self.has(stem, "par") || self.has(stem, "par2")),
+        };
+        if recovery {
+            Listed::Recovery
+        } else {
+            Listed::Plain
+        }
+    }
+}
+
+// Whether a member that founds an object of `kind` is an archive by its own
+// name, as SABnzbd unpacks by name: a RAR volume (`.rar`, `.partN.rar`, and
+// the old `.r00` … `.y99` numbering, on a volume whose bytes are a RAR's), a
+// 7z, a zip and its `.z01` parts (on bytes that are a zip's), a tar, or a
+// numbered piece of a split file (`.001` onward, `.7z.001` among them, and a
+// two-digit one founding read as a piece of the set beside it). A
+// single-stream compressor's name (`.gz`, `.bz2`, `.xz`, `.zst`, `.br`,
+// `.deflate`) names a compressed file, not an archive, and so does no name
+// of an end file (`END_FILES`), whose member is a leaf before this is asked.
+pub fn names_an_archive(name: &str, kind: Kind) -> bool {
+    let name = trimmed(name);
+    let lower = name.to_ascii_lowercase();
+    let Some((_, extension)) = lower.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) else {
+        return false;
     };
-    lower
-        .iter()
-        .map(|name| {
-            let Some((stem, extension)) =
-                name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())
-            else {
-                return Listed::Plain;
-            };
-            let (letter, digits) =
-                extension.split_at(extension.chars().next().map_or(0, char::len_utf8));
-            let numbered = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
-            let container = matches!(extension, "rar" | "7z")
-                || names_container(name)
-                || split_piece_among(name, lower.iter().map(String::as_str))
-                || (numbered
-                    && digits.len() == 2
-                    && matches!(letter, "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y")
-                    && has(stem, "rar"))
-                || (numbered
-                    && (2..=3).contains(&digits.len())
-                    && letter == "z"
-                    && has(stem, "zip"));
-            if container {
-                return Listed::Container;
-            }
-            let recovery = match extension {
-                "rev" | "par2" | "par3" | "sfv" => true,
-                _ => names_recovery(name) && (has(stem, "par") || has(stem, "par2")),
-            };
-            if recovery {
-                Listed::Recovery
-            } else {
-                Listed::Plain
-            }
-        })
-        .collect()
+    let (letter, digits, numbered) = numbering(extension);
+    archive_extension(extension)
+        || matches!(kind_named(name), Some((Kind::Zip | Kind::Tar, _)))
+        || numbered_piece(name)
+        || kind == Kind::Split
+        || (kind == Kind::RarStore && rar_numbered(letter, digits, numbered))
+        || (kind == Kind::Zip && zip_numbered(letter, digits, numbered))
+}
+
+// What a member of a namespace below the root is to the layer test
+// (`Tree::layers`): a piece of an archive set, by its name among the names
+// beside it or by the container its bytes open; furniture, recovery data or
+// a listing, text posted beside a payload (`known::furniture`) or a sample;
+// or a file of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layered {
+    Piece,
+    Furniture,
+    Own,
+}
+
+impl Listing {
+    pub(crate) fn layered(&self, name: &str, front: &[u8], length: Option<u64>) -> Layered {
+        let opens = match signed(front, length) {
+            Sniff::Object(kind) => Some(kind),
+            Sniff::Leaf | Sniff::Pending => None,
+        };
+        if let Some(kind) = opens
+            && matches!(
+                kind,
+                Kind::Par2 | Kind::Par3 | Kind::Sfv | Kind::RarRecovery | Kind::RarRecord
+            )
+        {
+            return Layered::Furniture;
+        }
+        if let Some(kind) = opens
+            && end_file_built_on(trimmed(name), kind)
+        {
+            return Layered::Own;
+        }
+        match self.told(name) {
+            Listed::Container => return Layered::Piece,
+            Listed::Recovery => return Layered::Furniture,
+            Listed::Plain => {}
+        }
+        if opens.is_some() {
+            return Layered::Piece;
+        }
+        if crate::known::furniture(name) {
+            Layered::Furniture
+        } else {
+            Layered::Own
+        }
+    }
 }
 
 // The digits a piece's number has at the least: two, as 7-Zip numbers a set
@@ -1282,6 +1399,10 @@ mod tests {
             (".cbr", RAR5.to_vec(), Kind::RarStore),
             (".cb7", seven_z(), Kind::SevenZipStore),
             (".cbt", cbt, Kind::Tar),
+            zipped(".box"),
+            zipped(".supercab"),
+            zipped(".thu"),
+            zipped(".riglib"),
         ]
     }
 
@@ -1298,6 +1419,88 @@ mod tests {
             (b"BZh91AY&SY".to_vec(), Kind::Bzip2),
             (ustar(0), Kind::Tar),
         ]
+    }
+
+    // A container's own name says an archive for the RAR family, 7z, zip,
+    // tar and numbered pieces; a compressor's or any other name does not.
+    #[test]
+    fn a_name_says_an_archive_only_for_an_archive_kind() {
+        for (name, kind) in [
+            ("ember.rar", Kind::RarStore),
+            ("ember.part02.RAR", Kind::RarStore),
+            ("ember.r00", Kind::RarStore),
+            ("ember.s12", Kind::RarStore),
+            ("ember.7z", Kind::SevenZipStore),
+            ("ember.7z.001", Kind::Split),
+            ("ember.zip", Kind::Zip),
+            ("ember.z01", Kind::Zip),
+            ("ember.tar", Kind::Tar),
+            ("ember.001", Kind::Split),
+            ("ember.01", Kind::Split),
+            ("CD1/ember.rar\"", Kind::RarStore),
+        ] {
+            assert!(names_an_archive(name, kind), "{name}");
+        }
+        for (name, kind) in [
+            ("ember.gz", Kind::Gzip),
+            ("ember.tar.gz", Kind::Gzip),
+            ("ember.tgz", Kind::Gzip),
+            ("ember.bz2", Kind::Bzip2),
+            ("ember.xz", Kind::Xz),
+            ("ember.zst", Kind::Zstd),
+            ("ember.br", Kind::Brotli),
+            ("ember.deflate", Kind::Deflate),
+            ("libde265.dat", Kind::Zip),
+            ("ember.r00", Kind::Zip),
+            ("ember.z01", Kind::RarStore),
+            ("a9f3c1e0", Kind::RarStore),
+            (".rar", Kind::RarStore),
+        ] {
+            assert!(!names_an_archive(name, kind), "{name}");
+        }
+    }
+
+    // Each member of a namespace below the root is told a piece, furniture
+    // or a file of its own, by its name among the names beside it and by
+    // its front.
+    #[test]
+    fn a_listing_tells_pieces_furniture_and_files_of_their_own() {
+        let zip = b"PK\x03\x04\x14\x00\x08\x00";
+        let names = ["CD1/ember.r00", "CD1/ember.rar", "ember.nfo", "x.par2"];
+        let listing = Listing::new(names.iter().copied());
+        for (name, front, layered) in [
+            ("CD1/ember.r00", &b""[..], Layered::Piece),
+            ("CD1/ember.rar", b"", Layered::Piece),
+            ("a9f3c1e0", RAR5, Layered::Piece),
+            ("table.gz", b"", Layered::Piece),
+            ("ember.nfo", b"", Layered::Furniture),
+            ("x.par2", b"", Layered::Furniture),
+            ("ember.sfv", b"", Layered::Furniture),
+            ("Sample/ember.mkv", b"", Layered::Furniture),
+            ("ember.mkv", b"", Layered::Own),
+            ("a.box", zip, Layered::Own),
+            ("ember.epub", zip, Layered::Own),
+        ] {
+            assert_eq!(listing.layered(name, front, None), layered, "{name}");
+        }
+    }
+
+    // `listed` told by lookups answers as the scan it replaced: two-digit
+    // pieces only beside their set, old RAR numbering only beside its `.rar`.
+    #[test]
+    fn a_listing_tells_two_digit_pieces_and_old_numbering_by_what_is_beside() {
+        assert_eq!(
+            listed(&["e.01", "e.02", "f.01", "g.r00", "g.rar", "h.r00", "i.z01"]),
+            [
+                Listed::Container,
+                Listed::Container,
+                Listed::Plain,
+                Listed::Container,
+                Listed::Container,
+                Listed::Plain,
+                Listed::Plain,
+            ]
+        );
     }
 
     // An end file's name and the signature it is built on make a leaf; the

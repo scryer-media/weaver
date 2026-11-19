@@ -26,6 +26,35 @@ pub fn usable_type(name: &str) -> bool {
             .is_none_or(|extension| BESIDE.binary_search(&extension.as_str()).is_err())
 }
 
+// Furniture a release posts beside its payload: text (`BESIDE`) or a sample,
+// a file whose name, its extension off, is `sample` or ends in `-sample`,
+// `.sample` or `_sample`, or one under a folder named `sample`, in any case.
+// Recovery data and listings are the sniffer's to tell.
+pub fn furniture(name: &str) -> bool {
+    let beside =
+        extension(name).is_some_and(|extension| BESIDE.binary_search(&extension.as_str()).is_ok());
+    beside || sample(name)
+}
+
+fn sample(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let mut parts: Vec<&str> = lower
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(base) = parts.pop() else {
+        return false;
+    };
+    if parts.contains(&"sample") {
+        return true;
+    }
+    let stem = base.rsplit_once('.').map_or(base, |(stem, _)| stem);
+    stem == "sample"
+        || ["-sample", ".sample", "_sample"]
+            .iter()
+            .any(|suffix| stem.ends_with(suffix))
+}
+
 fn extension(name: &str) -> Option<String> {
     let base = name.rsplit('/').next().unwrap_or(name);
     let (_, extension) = base.rsplit_once('.')?;
@@ -826,7 +855,35 @@ const KNOWN_TYPES: &[&[&str]] = &[
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{BESIDE, KNOWN_TYPES, known_type, usable_type};
+    use super::{BESIDE, KNOWN_TYPES, furniture, known_type, usable_type};
+
+    #[test]
+    fn furniture_is_text_beside_a_payload_or_a_sample() {
+        for name in [
+            "ember.nfo",
+            "disc/file_id.DIZ",
+            "Sample/ember.mkv",
+            "ember/SAMPLE/clip.mkv",
+            "ember-sample.mkv",
+            "ember.sample.mkv",
+            "ember_Sample.mkv",
+            "sample.mkv",
+            "CD1\\Sample\\ember.mkv",
+        ] {
+            assert!(furniture(name), "{name}");
+        }
+        for name in [
+            "ember.mkv",
+            "samples/ember.mkv",
+            "ember.samplepack",
+            "examples.mkv",
+            "ember.rar",
+            "ember.par2",
+            "sampler.mkv",
+        ] {
+            assert!(!furniture(name), "{name}");
+        }
+    }
 
     // Furniture is a known type, never a usable one; every other known type
     // is usable, an archive Weaver does not unpack among them.

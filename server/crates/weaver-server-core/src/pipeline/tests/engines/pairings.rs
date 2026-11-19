@@ -503,7 +503,8 @@ async fn a_truncated_xz_inside_a_store_ends_the_job_without_its_file_whole() {
 }
 
 // An xz member of a compressed 7z: the stream binds out of the engine's
-// output and decodes beside the member next to it.
+// output and decodes beside the member next to it. That member is text
+// posted beside it, so the stream is a layer of the release, and opens.
 #[tokio::test]
 async fn an_xz_member_of_a_compressed_7z_decodes_and_lands() {
     let first = payload(3 * ARTICLE + 2, 82);
@@ -511,7 +512,7 @@ async fn an_xz_member_of_a_compressed_7z_decodes_and_lands() {
     let stream = xz(&held);
     let outer = sevenz(
         &[
-            Entry::File("first.bin", &first),
+            Entry::File("first.nfo", &first),
             Entry::File("inner.xz", &stream),
         ],
         lzma2(),
@@ -519,6 +520,6 @@ async fn an_xz_member_of_a_compressed_7z_decodes_and_lands() {
         false,
     );
     let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", outer)])).await;
-    assert_whole(&graph, &[("first.bin", &first), ("inner", &held)]);
+    assert_whole(&graph, &[("first.nfo", &first), ("inner", &held)]);
     assert!(kinds(&graph).contains(&"stream_xz"), "{:?}", kinds(&graph));
 }

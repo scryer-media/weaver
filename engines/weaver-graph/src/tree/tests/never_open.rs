@@ -149,10 +149,14 @@ fn a_listed_member_inside_a_store_stays_a_leaf() {
 
 #[test]
 fn an_unlisted_member_inside_a_store_is_opened() {
-    let (tree, outer) = rooted("show.rar", signed(&signed(b"hello")), None);
+    let (mut tree, outer) = rooted("show.rar", signed(&signed(b"hello")), None);
     let (child, _) = tree
         .child_of(NodeId::ROOT, outer)
         .expect("the outer store opens");
+    // Its name says no archive, so it waits for the quiet, where the only
+    // member of its namespace makes it a layer (`Tree::decide_layers`).
+    assert!(tree.layers_pending());
+    tree.decide_layers(&mut Stores, &mut Vec::new());
     assert!(tree.child_of(child, MemberId(0)).is_some());
 }
 

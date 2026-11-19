@@ -1034,7 +1034,8 @@ mod unwanted {
     // `setup.exe` holds a RAR's bytes. Listed, it is never opened: the fail
     // action fails the job by its name, and the delete action removes it
     // whole, at the root and inside an outer RAR. Off the list it is
-    // unpacked as any RAR is.
+    // unpacked at the root as any RAR is, and kept packed inside, where its
+    // name says no archive and a file of the release's own sits beside it.
     #[tokio::test]
     async fn a_listed_name_with_archive_bytes_is_never_opened() {
         let at_root = || {
@@ -1082,14 +1083,23 @@ mod unwanted {
                 kinds(&graph)
             );
         }
-        for posts in [at_root(), inside()] {
+        // Off the list, at the root it is unpacked as any RAR is. Inside the
+        // outer RAR, beside a file of the release's own under a name that
+        // says no archive, it is no layer of the release: it is delivered as
+        // posted, still packed.
+        for (posts, opened) in [(at_root(), true), (inside(), false)] {
             let graph = run(&Scenario::new(posts).unacceptable(&["iso"])).await;
             assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+            let (name, held) = if opened {
+                ("/candle.mkv", candle())
+            } else {
+                ("/setup.exe", setup())
+            };
             assert!(
                 graph
                     .files
                     .iter()
-                    .any(|(path, bytes)| path.ends_with("/candle.mkv") && *bytes == candle()),
+                    .any(|(path, bytes)| path.ends_with(name) && *bytes == held),
                 "{:?}",
                 graph.files.keys()
             );

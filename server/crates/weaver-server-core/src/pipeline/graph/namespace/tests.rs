@@ -71,10 +71,12 @@ const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
 const HEADER: u64 = SIGNATURE.len() as u64;
 
 // A pretend store with one volume: a seven-byte header kept as envelope 0,
-// then one member, "inner.bin", of the length it is built with, to the end.
-// The word RETRACT anywhere in a delivery takes the member back.
+// then one member, "inner.bin" unless built with another name, of the
+// length it is built with, to the end. The word RETRACT anywhere in a
+// delivery takes the member back.
 struct Store {
     announced: bool,
+    name: &'static str,
     length: u64,
     checksum_on_repair: Option<u32>,
 }
@@ -106,7 +108,7 @@ impl Object for Store {
             self.announced = true;
             out.push(Emit::Member {
                 member: MemberId(0),
-                name: "inner.bin".into(),
+                name: self.name.into(),
                 length: Some(self.length),
             });
         }
@@ -300,6 +302,7 @@ struct Build {
     par: Arc<Mutex<Seen>>,
     fix: Option<Fix>,
     inner: u64,
+    inner_name: &'static str,
     checksum_on_repair: Option<u32>,
     heard: Arc<Mutex<Vec<u64>>>,
 }
@@ -309,6 +312,7 @@ impl Builder for Build {
         match kind {
             Kind::RarStore => Some(Box::new(Store {
                 announced: false,
+                name: self.inner_name,
                 length: self.inner,
                 checksum_on_repair: self.checksum_on_repair,
             })),
@@ -598,8 +602,9 @@ struct Job {
     accountant: Arc<HoldsAccountant>,
     par: Arc<Mutex<Seen>>,
     fix: Option<Fix>,
-    // The length of the member the pretend store holds.
+    // The length and name of the member the pretend store holds.
     inner: u64,
+    inner_name: &'static str,
     checksum_on_repair: Option<u32>,
     // What every pretend stream had been delivered each time it heard its
     // volume closed.
@@ -625,6 +630,7 @@ impl Job {
             par: Arc::new(Mutex::new(Seen::default())),
             fix: None,
             inner: 5,
+            inner_name: "inner.bin",
             checksum_on_repair: None,
             heard: Arc::default(),
             out: Vec::new(),
@@ -699,6 +705,7 @@ impl Job {
             par: Arc::clone(&self.par),
             fix: self.fix,
             inner: self.inner,
+            inner_name: self.inner_name,
             checksum_on_repair: self.checksum_on_repair,
             heard: Arc::clone(&self.heard),
         }
@@ -3682,6 +3689,8 @@ fn dropping_the_writer_gives_its_holds_back() {
 fn bytes_held_below_the_root_reach_their_member_once_its_store_knows_its_map() {
     let mut job = Job::new(PLENTY);
     job.inner = map_at().end;
+    // Named as the 7z it is, so it opens below the root as it streams.
+    job.inner_name = "inner.7z";
     let member = job.member("pack.bin", Some(HEADER + map_at().end));
     let mut front = SIGNATURE.to_vec();
     front.extend_from_slice(&seven_z());

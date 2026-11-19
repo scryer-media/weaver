@@ -209,6 +209,10 @@ pub enum Why {
     // The object would sit deeper than a job's namespaces may nest. What
     // the member holds is the container, delivered as it is.
     TooDeep,
+    // A container below the root that is no layer of the release: its name
+    // says no archive, and files of their own stand beside it. It is a file
+    // of what the release holds, delivered as posted (`Tree::layers`).
+    Packed,
     // Recognised container rejected by structural or security validation.
     // Its posted bytes are not a usable substitute for its members.
     InvalidArchive,
@@ -256,7 +260,8 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unsupported
-            | Why::TooDeep => false,
+            | Why::TooDeep
+            | Why::Packed => false,
         }
     }
 
@@ -281,7 +286,7 @@ impl Why {
     // member, which is delivered as it stands, never whole.
     pub fn disclaims(self) -> bool {
         match self {
-            Why::Unsupported | Why::TooDeep => true,
+            Why::Unsupported | Why::TooDeep | Why::Packed => true,
             Why::Compressed
             | Why::TailUnreachable
             | Why::EncryptedHeader
@@ -442,6 +447,7 @@ mod tests {
             Why::HoldsBreached,
             Why::Unsupported,
             Why::TooDeep,
+            Why::Packed,
         ];
         for why in withheld {
             assert!(why.withholds(), "{why:?}");
@@ -449,13 +455,14 @@ mod tests {
         for why in delivered {
             assert!(!why.withholds(), "{why:?}");
         }
-        // Only a shape the object does not implement, or an object the job
-        // never opens for its depth, leaves the member the posted file;
-        // every other refusal is its set failing.
+        // Only a shape the object does not implement, an object the job
+        // never opens for its depth, or a container below the root that is
+        // no layer, leaves the member the posted file; every other refusal
+        // is its set failing.
         for why in withheld.into_iter().chain(delivered) {
             assert_eq!(
                 why.disclaims(),
-                matches!(why, Why::Unsupported | Why::TooDeep),
+                matches!(why, Why::Unsupported | Why::TooDeep | Why::Packed),
                 "{why:?}"
             );
         }

@@ -100,6 +100,10 @@ impl RootPhase {
 // done, unless a run of it is still reading, which the job reads off its
 // runs.
 pub(crate) fn extracting(tree: &Tree) -> bool {
+    // A container below the root waiting to learn whether it is a layer.
+    if tree.layers_pending() {
+        return true;
+    }
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return false;
     };
