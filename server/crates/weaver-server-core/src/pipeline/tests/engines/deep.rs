@@ -135,15 +135,7 @@ fn assert_broad_whole(graph: &Outcome) {
     );
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        [
-            "beacon.bin",
-            "candle.mkv",
-            "ember.mkv",
-            "inner.par2",
-            "inner.vol0+4.par2",
-            "quill.mkv"
-        ]
-        .map(delivered),
+        ["beacon.bin", "candle.mkv", "ember.mkv", "quill.mkv"].map(delivered),
         "graph: delivered names"
     );
     assert!(
@@ -380,7 +372,6 @@ async fn a_damaged_7z_two_deep_is_repaired_by_the_par3_set_beside_it() {
     let mut names: Vec<String> = sevenz_members()
         .iter()
         .map(|(name, _)| delivered(name))
-        .chain(set.iter().map(|post| delivered(&post.name)))
         .collect();
     names.sort();
     assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), names);
@@ -600,8 +591,8 @@ async fn a_par2_index_two_deep_lost_before_its_packets_were_walked_comes_again_a
 
 // A stored RAR5 set of four volumes two deep, its second never posted,
 // beside the `.rev` that rebuilds it: the set is rebuilt at depth and the
-// member delivered whole. The `.rev` is delivered beside it, as recovery
-// files below the root are.
+// member delivered whole. The `.rev` is spent, as recovery files at the
+// root are.
 #[tokio::test]
 async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev() {
     let body = rev_body();
@@ -627,7 +618,7 @@ async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev() {
     );
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        ["beacon.bin", "silver.horizon.part1.rev"].map(delivered)
+        ["beacon.bin"].map(delivered)
     );
     assert!(graph.files[&delivered("beacon.bin")] == body, "beacon.bin");
     assert!(
@@ -716,7 +707,7 @@ fn named_by_par2(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
 // `lantern.7z`, each shaped by `shape`: the namespace two deep binds,
 // claims, moves and gives back as the root's does, so the member comes out
 // whole at both, the repairs come out the same, and nothing is asked for
-// twice. Recovery files below the root are delivered beside the member.
+// twice. Recovery files below the root are spent, as at the root.
 async fn assert_two_deep_as_at_the_root(posts: fn() -> Vec<Post>, shape: fn(Scenario) -> Scenario) {
     let root = run(&shape(Scenario::new(posts()))).await;
     assert!(
@@ -739,14 +730,14 @@ async fn assert_two_deep_as_at_the_root(posts: fn() -> Vec<Post>, shape: fn(Scen
         deep.status,
         deep.failure
     );
-    let mut names: Vec<String> = posted
-        .iter()
-        .filter(|post| post.name.ends_with(".par2"))
-        .map(|post| delivered(&post.name))
-        .chain([delivered("beacon.bin")])
-        .collect();
-    names.sort();
-    assert_eq!(deep.files.keys().cloned().collect::<Vec<_>>(), names);
+    assert_eq!(
+        deep.files.keys().cloned().collect::<Vec<_>>(),
+        root.files.keys().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        deep.files.keys().cloned().collect::<Vec<_>>(),
+        [delivered("beacon.bin")]
+    );
     assert!(deep.files[&delivered("beacon.bin")] == spread(), "two deep");
     assert_eq!(deep.graph().outcomes, root.graph().outcomes);
     assert!(root.refetched().is_empty(), "root: {:?}", root.refetched());
@@ -1257,4 +1248,86 @@ async fn a_set_inside_a_stored_rar_proves_the_member_beside_it_as_it_lands() {
     assert!(graph.files.get(&delivered("ember.bin")) == Some(&ember));
     assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
     assert_eq!(graph.reads, 0, "a slice was read back");
+}
+
+// The names a run delivered, without the job's folder, sorted.
+fn delivered_names(graph: &Outcome) -> Vec<String> {
+    graph
+        .files
+        .keys()
+        .map(|path| path.rsplit('/').next().unwrap_or(path).to_string())
+        .collect()
+}
+
+// A two-volume RAR set holding `beacon.bin`, the PAR2 set over its volumes,
+// and `stray.par2`, which no set reads: posted at the root, and stored in
+// one RAR volume posted as `lantern.rar`. One article inside the second
+// volume is damaged, and the set rebuilds it. Below the root the volumes
+// and the set are spent as they are at the root, and the stray recovery
+// file is spent by its name in both: neither delivery holds a recovery
+// file or a volume.
+#[tokio::test]
+async fn an_archive_holding_a_par2_set_and_volumes_delivers_no_recovery_file() {
+    let body = payload(6 * ARTICLE + 17, 57);
+    let volumes = single_member_store_set("beacon.bin", &body, 2);
+    let covered: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut entries: Vec<(String, Vec<u8>)> = volumes.clone();
+    entries.extend(
+        par2_set("inner", &covered, 2)
+            .into_iter()
+            .map(|post| (post.name, post.bytes)),
+    );
+    entries.push(("stray.par2".to_string(), payload(ARTICLE / 2, 58)));
+
+    let root: Vec<Post> = entries
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    let at = root
+        .iter()
+        .position(|post| post.name == volumes[1].0)
+        .unwrap();
+    let at_root = run(&Scenario::new(root).damaged(at as u32, 1)).await;
+    assert!(
+        at_root.completed(),
+        "{:?} {:?}",
+        at_root.status,
+        at_root.failure
+    );
+
+    let named: Vec<(&str, Vec<u8>)> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    let outer = rar(&named);
+    let inside = articles_inside(&outer, &volumes[1].1);
+    let nested =
+        run(&Scenario::new(vec![Post::plain("lantern.rar", outer)]).damaged(0, inside[0])).await;
+    assert!(
+        nested.completed(),
+        "{:?} {:?}",
+        nested.status,
+        nested.failure
+    );
+
+    for graph in [&at_root, &nested] {
+        assert_eq!(
+            delivered_names(graph),
+            ["beacon.bin"],
+            "{:?}",
+            graph.files.keys()
+        );
+        assert!(graph.files.values().any(|bytes| *bytes == body));
+        assert!(
+            matches!(
+                graph.graph().outcomes[..],
+                [Some(RepairOutcome::Repaired { .. })]
+            ),
+            "{:?}",
+            graph.graph().outcomes
+        );
+    }
 }

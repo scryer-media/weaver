@@ -1873,7 +1873,7 @@ async fn a_retiring_job_stays_in_the_queue_until_its_history_commits() {
         .into_iter()
         .find(|job| job.job_id == JOB)
         .expect("the retiring job is in the queue");
-    assert_eq!(queued.status, JobStatus::Complete);
+    assert_eq!(queued.status, JobStatus::PostProcessing);
 
     drop(release);
     wait_for_job_event(
@@ -1884,6 +1884,81 @@ async fn a_retiring_job_stays_in_the_queue_until_its_history_commits() {
     assert!(!handle.queue_jobs().iter().any(|job| job.job_id == JOB));
     assert!(!handle.queued_job_ids().contains(&JOB));
     assert!(pipeline.db.get_job_history(JOB.0).unwrap().is_some());
+}
+
+// What a polling client reads of the job, by id and in the job list, and
+// whether that shows it finished.
+fn shown_finished(handle: &SchedulerHandle) -> bool {
+    let by_id = handle
+        .get_job(JOB)
+        .is_ok_and(|job| is_terminal_status(&job.status));
+    let listed = handle
+        .list_jobs()
+        .iter()
+        .any(|job| job.job_id == JOB && is_terminal_status(&job.status));
+    by_id || listed
+}
+
+// A job shown finished is one history can remove: its history row is
+// written and the queue no longer holds it, so neither history delete
+// answers that the job is still active.
+fn removable(pipeline: &Pipeline, handle: &SchedulerHandle) -> bool {
+    !handle.queued_job_ids().contains(&JOB) && pipeline.db.get_job_history(JOB.0).unwrap().is_some()
+}
+
+// Every read a polling client makes through the terminal sequence: while the
+// history archive is held the job reads as being finished, never finished,
+// and history refuses it; once the archive commits it reads finished, and
+// NZBGet's HistoryDelete and HistoryFinalDelete both take it.
+#[tokio::test]
+async fn a_job_shown_finished_can_be_removed_from_history() {
+    let scenario = delivered();
+    let (_temp_dir, mut pipeline, _) = at_the_move(&scenario).await;
+    let handle = handle(&pipeline);
+    let mut events = handle.subscribe_events();
+    let release = hold_database_writer(&pipeline);
+    settle_inflight_moves(&mut pipeline).await;
+
+    // Retiring, the archive queued and not committed.
+    assert!(pipeline.shared_state.queue.read(|inner| {
+        inner
+            .jobs
+            .iter()
+            .any(|row| row.id == JOB && row.report.retiring)
+    }));
+    assert!(!shown_finished(&handle), "finished before history holds it");
+    assert_eq!(
+        handle.get_job(JOB).unwrap().status,
+        JobStatus::PostProcessing
+    );
+    assert!(matches!(
+        handle.delete_history(JOB, false).await,
+        Err(SchedulerError::Conflict(_))
+    ));
+
+    // The archive commits. The queue's write that follows may or may not
+    // have run when the flush answers; either way what is read holds.
+    drop(release);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert!(!shown_finished(&handle) || removable(&pipeline, &handle));
+
+    // The terminal event is sent from the write that lists the job finished.
+    wait_for_job_event(
+        &mut events,
+        |event| matches!(event, PipelineEvent::JobCompleted { job_id } if *job_id == JOB),
+    )
+    .await;
+    assert!(shown_finished(&handle));
+    assert_eq!(handle.get_job(JOB).unwrap().status, JobStatus::Complete);
+    assert!(removable(&pipeline, &handle));
+
+    // NZBGet's HistoryDelete hides the row it archives; HistoryFinalDelete
+    // erases it.
+    assert_eq!(pipeline.db.archive_nzbget_history(&[JOB.0]).unwrap(), 1);
+    handle
+        .delete_history(JOB, false)
+        .await
+        .expect("HistoryFinalDelete removes the finished job");
 }
 
 // The final move cannot be made: the job fails with the move's reason, and

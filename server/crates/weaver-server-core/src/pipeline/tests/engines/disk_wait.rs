@@ -3879,8 +3879,10 @@ async fn an_archive_the_database_has_no_room_for_waits_and_is_written_when_room_
 
     let room = Arc::new(AtomicU64::new(PLENTY));
     let (_temp_dir, mut pipeline, mut events) = kept_job(&room, 3).await;
+    // The row stays, still being finished: history cannot remove the job
+    // until its archive is written, so no reader is told it ended.
     let shown = pipeline.shared_state.get_job(JOB).expect("the row stays");
-    assert_eq!(shown.status, JobStatus::Complete);
+    assert_eq!(shown.status, JobStatus::PostProcessing);
     assert_eq!(shown.download_wait_reason.as_deref(), disk_space);
     assert!(retiring(&pipeline));
     assert!(pipeline.waits_for_disk_room());

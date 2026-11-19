@@ -85,6 +85,7 @@ impl JobRow {
                 nzb_admitted: self.report.nzb_admitted,
                 seen_intent_seq: self.report.seen_intent_seq,
                 retiring: self.report.retiring,
+                finished_status: self.report.finished_status.clone(),
                 restoring: self.report.restoring,
                 on_disk: self.report.on_disk,
                 post_processing_cancellable: self.report.post_processing_cancellable,

@@ -814,6 +814,16 @@ impl NamespaceWriter {
             .map(|(member, leaf)| (*member, leaf.path()))
     }
 
+    // Every namespace that holds a file of its own, in node order.
+    pub(crate) fn file_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.files.keys().copied()
+    }
+
+    // Every object that kept a file of a volume, in node order.
+    pub(crate) fn kept_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.envelopes.nodes()
+    }
+
     // The file an object at `node` keeps of its volume, at the volume's own
     // offsets, if it kept any of it.
     pub(crate) fn kept_file(&self, node: NodeId, volume: VolumeIndex) -> Option<PathBuf> {

@@ -113,13 +113,13 @@ fn nested(depth: usize) -> Scenario {
 }
 
 // Graph repairs the inner volumes with the set beside them, one slice, and
-// delivers the innermost members whole beside the set's own files, asking
-// for nothing twice.
+// delivers the innermost members whole, the set spent as at the root,
+// asking for nothing twice.
 fn assert_repaired_below(graph: &Outcome) {
     assert!(graph.completed(), "graph: {:?}", graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        ["ember.mkv", "inner.par2", "inner.vol0+4.par2", "quill.mkv"].map(delivered),
+        ["ember.mkv", "quill.mkv"].map(delivered),
         "graph: delivered names"
     );
     assert!(members_whole(graph), "graph: the members are rebuilt whole");

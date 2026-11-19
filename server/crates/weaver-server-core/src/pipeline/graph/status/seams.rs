@@ -166,13 +166,49 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
     }
 }
 
-// Every recovery set's ruling, said once, when the root is done and no set
-// will rule again.
+// Every recovery object's ruling, said once, when the root is done and no
+// object will rule again: one line a set for an object that reports its
+// sets, and one from the object's own outcome for an object that reports
+// none (a RAR recovery record, a `.rev` set, an SFV).
 fn log_set_rulings(job_id: JobId, job: &GraphJob) {
+    // The words a ruling is logged in, `None` for one not made.
+    fn words(outcome: RepairOutcome, read: bool) -> Option<(&'static str, u64, &'static str)> {
+        match outcome {
+            RepairOutcome::Waiting | RepairOutcome::Unread => None,
+            RepairOutcome::Clean if read => Some(("clean", 0, "read")),
+            RepairOutcome::Clean => Some(("clean", 0, "grid")),
+            RepairOutcome::Repaired { slices } => Some(("repaired", slices, "")),
+            RepairOutcome::Impossible { .. } => Some(("impossible", 0, "")),
+        }
+    }
     let mut rulings = Vec::new();
     for object in RootJob::recovery_summary(job).sets {
         rulings.clear();
         job.writer().rulings(job.tree(), object.node, &mut rulings);
+        if rulings.is_empty() {
+            let Some(outcome) = object.outcome else {
+                continue;
+            };
+            let Some((said, slices_repaired, _)) = words(outcome, false) else {
+                continue;
+            };
+            let (damaged_slices, blocks_reachable) = match outcome {
+                RepairOutcome::Impossible { damaged, reachable } => (damaged, reachable),
+                _ => (0, 0),
+            };
+            info!(
+                job_id = job_id.0,
+                node = object.node.0,
+                kind = %object.kind,
+                set = %object.name,
+                blocks_reachable = blocks_reachable,
+                damaged_slices = damaged_slices,
+                outcome = %said,
+                slices_repaired = slices_repaired,
+                "recovery set ruled"
+            );
+            continue;
+        }
         for ruling in &rulings {
             let SetRuling {
                 outcome: Some(outcome),
@@ -181,12 +217,9 @@ fn log_set_rulings(job_id: JobId, job: &GraphJob) {
             else {
                 continue;
             };
-            let (outcome, slices_repaired, verification) = match *outcome {
-                RepairOutcome::Waiting | RepairOutcome::Unread => continue,
-                RepairOutcome::Clean if ruling.read => ("clean", 0, "read"),
-                RepairOutcome::Clean => ("clean", 0, "grid"),
-                RepairOutcome::Repaired { slices } => ("repaired", slices, ""),
-                RepairOutcome::Impossible { .. } => ("impossible", 0, ""),
+            let Some((outcome, slices_repaired, verification)) = words(*outcome, ruling.read)
+            else {
+                continue;
             };
             info!(
                 job_id = job_id.0,
@@ -907,7 +940,7 @@ impl Pipeline {
             return;
         };
         metrics::phase(phase);
-        let mut stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
+        let mut stage = stage_events(job_id, before, phase, &*graph);
         if phase == RootPhase::Done {
             self.post_probes.retire(job_id);
             log_set_rulings(job_id, graph);
@@ -1057,14 +1090,17 @@ impl Pipeline {
 
 // The stage events a change of the job's phase says: the stage it left
 // ends, and the one it entered starts. Verification passed when it led to
-// no repair and every set vouched; a repair failed when a set it left
-// behind could not be rebuilt.
-fn stage_events(
+// no repair and every set vouched; a repair failed when the job's own
+// failure names a set that could not rebuild what it found. A set that
+// ruled so where another set of its namespace vouched and left it clean is
+// not a failure of the job, and says none.
+pub(super) fn stage_events(
     job_id: JobId,
     before: Option<RootPhase>,
     phase: RootPhase,
-    summary: &RecoverySummary,
+    job: &dyn RootJob,
 ) -> Vec<PipelineEvent> {
+    let summary = job.recovery_summary();
     let mut events = Vec::new();
     match before {
         Some(RootPhase::Verifying) => events.push(PipelineEvent::JobVerificationComplete {
@@ -1072,12 +1108,19 @@ fn stage_events(
             passed: phase != RootPhase::Repairing && summary.settled(),
         }),
         Some(RootPhase::Repairing) => {
+            let outcomes = summary.outcomes();
+            let failed = failure(&summary, &outcomes, job)
+                .map(|failure| failure.objects)
+                .unwrap_or_default();
             if let Some((damaged, reachable)) =
                 summary
-                    .outcomes()
-                    .into_iter()
-                    .find_map(|outcome| match outcome {
-                        RepairOutcome::Impossible { damaged, reachable } => {
+                    .sets
+                    .iter()
+                    .zip(outcomes)
+                    .find_map(|(set, outcome)| match outcome {
+                        RepairOutcome::Impossible { damaged, reachable }
+                            if failed.contains(&set.node) =>
+                        {
                             Some((damaged, reachable))
                         }
                         _ => None,

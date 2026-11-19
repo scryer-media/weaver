@@ -491,6 +491,71 @@ fn a_repair_of_one_set_never_excuses_another() {
     );
 }
 
+// The repair failures the job says as it leaves repair.
+fn repair_failures(job: &Prepared) -> Vec<String> {
+    super::seams::stage_events(JobId(7), Some(RootPhase::Repairing), RootPhase::Done, job)
+        .into_iter()
+        .filter_map(|event| match event {
+            PipelineEvent::RepairFailed { error, .. } => Some(error),
+            _ => None,
+        })
+        .collect()
+}
+
+// A listing that ruled past repair beside a PAR2 set that repaired the
+// member whole: the namespace is clean, the job's failure names no set, and
+// leaving repair says no failure.
+#[test]
+fn an_impossible_ruling_outdone_in_its_namespace_says_no_repair_failure() {
+    let names = namespace(&[("ember.bin", 100, &[(0, 100, Provenance::Repaired)])]);
+    let mut listing = ruled(
+        set(Kind::Sfv, "ember.sfv"),
+        RepairOutcome::Impossible {
+            damaged: 1,
+            reachable: 0,
+        },
+    );
+    listing.node = NodeId(2);
+    let job = Prepared::new(
+        names,
+        summary(vec![
+            listing,
+            ruled(
+                set(Kind::Par2, "ember.par2"),
+                RepairOutcome::Repaired { slices: 1 },
+            ),
+        ]),
+    );
+    let summary = job.recovery_summary();
+    assert!(failure(&summary, &summary.outcomes(), &job).is_none());
+    assert!(repair_failures(&job).is_empty());
+}
+
+// A PAR2 set that could not rebuild what it found, nothing in its namespace
+// vouching: the job fails on it, and leaving repair says so.
+#[test]
+fn an_impossible_ruling_the_job_fails_on_says_repair_failed() {
+    let names = namespace(&[(
+        "ember.bin",
+        100,
+        &[(0, 40, Provenance::Damaged), (40, 100, Provenance::Fresh)],
+    )]);
+    let job = Prepared::new(
+        names,
+        summary(vec![ruled(
+            set(Kind::Par2, "ember.par2"),
+            RepairOutcome::Impossible {
+                damaged: 2,
+                reachable: 1,
+            },
+        )]),
+    );
+    assert_eq!(
+        repair_failures(&job),
+        ["not repairable: 2 damaged slices, only 1 recovery blocks reachable"]
+    );
+}
+
 // The one derivation a job with nothing left to wait for ends by: nothing
 // short, short beside whole, or nothing whole.
 #[test]

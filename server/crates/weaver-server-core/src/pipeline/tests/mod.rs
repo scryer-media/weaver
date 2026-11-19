@@ -2218,10 +2218,19 @@ pub(in crate::pipeline) fn job_status_for_assert(
     pipeline: &Pipeline,
     job_id: JobId,
 ) -> Option<JobStatus> {
+    // A job retiring into history ended with the status kept beside its
+    // row; readers see it only once history holds the job.
     pipeline
         .jobs
         .get(&job_id)
         .map(|state| state.status.clone())
+        .or_else(|| {
+            pipeline.shared_state.queue.read(|inner| {
+                inner
+                    .job(job_id)
+                    .and_then(|row| row.report.finished_status.clone())
+            })
+        })
         .or_else(|| pipeline.shared_state.get_job(job_id).map(|job| job.status))
 }
 
