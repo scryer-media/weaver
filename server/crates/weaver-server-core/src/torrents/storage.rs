@@ -167,12 +167,10 @@ enum Flight {
     Writing(Arc<Writing>, Option<Paid>),
     Verified(Bytes),
     // A piece written block by block: its blocks are on disk as they land,
-    // one at a time under its lock, and it holds the room it was started
-    // with until it verified or failed: a block's where every piece is
-    // written so, none where pieces are held in memory. The lock holds what
-    // became of the blocks it held in memory when it was given back, written
-    // aside.
-    Blocks(Arc<Mutex<Lost>>, u64),
+    // one at a time under its lock, each holding its own room while it is
+    // written; the piece holds none. The lock holds what became of the
+    // blocks it held in memory when it was given back, written aside.
+    Blocks(Arc<Mutex<Lost>>),
 }
 
 // A write of blocks a piece given back held that failed: the kind of its
@@ -360,7 +358,7 @@ impl Flight {
         match self {
             Self::Writing(writing, _) => writing.len as u64,
             Self::Verified(_) => 0,
-            Self::Blocks(_, room) => *room,
+            Self::Blocks(_) => 0,
         }
     }
 
@@ -556,7 +554,7 @@ impl Inner {
             let held = std::mem::take(&mut *bytes);
             let landed = std::mem::take(&mut *writing.landed());
             writing.spilled.store(true, Ordering::Release);
-            let paid = match std::mem::replace(entry, Flight::Blocks(Arc::clone(&one), 0)) {
+            let paid = match std::mem::replace(entry, Flight::Blocks(Arc::clone(&one))) {
                 Flight::Writing(_, paid) => paid,
                 _ => None,
             };
@@ -747,7 +745,7 @@ impl PieceStorage {
         loop {
             let landing = match self.flight_read().get(&piece) {
                 Some(Flight::Writing(writing, _)) => Ok(Arc::clone(writing)),
-                Some(Flight::Blocks(one, _)) => Err(Arc::clone(one)),
+                Some(Flight::Blocks(one)) => Err(Arc::clone(one)),
                 _ => bail!("piece {piece} is written while the session holds no room for it"),
             };
             let held = match landing {
@@ -790,7 +788,7 @@ impl PieceStorage {
             // What reads it back for the tee asks the budget itself.
             self.flight()
                 .entry(index)
-                .or_insert_with(|| Flight::Blocks(Arc::default(), 0));
+                .or_insert_with(|| Flight::Blocks(Arc::default()));
             return true;
         }
         // Refused, it may have started meanwhile, from a block on a disk
@@ -1019,7 +1017,7 @@ impl TorrentStorage for PieceStorage {
     // the writes of the blocks it held, under way aside.
     fn piece_written(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let one = match self.flight().get(&piece.get()) {
-            Some(Flight::Blocks(one, _)) => Arc::clone(one),
+            Some(Flight::Blocks(one)) => Arc::clone(one),
             _ => return Ok(()),
         };
         let lost = one.lock().unwrap_or_else(PoisonError::into_inner).clone();
@@ -1225,8 +1223,8 @@ impl TorrentStorage for PieceStorage {
                         (held, None, released)
                     }
                     // Sealed above: it writes to its files.
-                    Flight::Blocks(one, room) => {
-                        *entry = Flight::Blocks(one, room);
+                    Flight::Blocks(one) => {
+                        *entry = Flight::Blocks(one);
                         (Bytes::new(), None, 0)
                     }
                 }
@@ -1261,7 +1259,7 @@ impl TorrentStorage for PieceStorage {
         let held = match self.flight().get(&piece.get()) {
             Some(Flight::Writing(writing, _)) => Ok(Arc::clone(writing)),
             Some(Flight::Verified(bytes)) => Err(Ok(bytes.clone())),
-            Some(Flight::Blocks(one, _)) => Err(Err(Arc::clone(one))),
+            Some(Flight::Blocks(one)) => Err(Err(Arc::clone(one))),
             None => return false,
         };
         let writing = match held {
@@ -1284,7 +1282,7 @@ impl TorrentStorage for PieceStorage {
         if bytes.len() != writing.len {
             drop(bytes);
             let spilled = match self.flight().get(&piece.get()) {
-                Some(Flight::Blocks(one, _)) => Some(Arc::clone(one)),
+                Some(Flight::Blocks(one)) => Some(Arc::clone(one)),
                 _ => None,
             };
             if let Some(one) = spilled {
