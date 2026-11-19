@@ -164,6 +164,7 @@ mod unlisted_data;
 mod unlisted_par2;
 mod unnamed_index;
 mod unnamed_recovery;
+mod unused_sets;
 mod volume_order;
 mod waiting_sets;
 mod withheld_par2;

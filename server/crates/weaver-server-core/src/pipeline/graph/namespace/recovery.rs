@@ -16,7 +16,7 @@ use std::collections::binary_heap::{BinaryHeap, PeekMut};
 use std::collections::{BTreeSet, HashSet};
 
 use bytes::Bytes;
-use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
+use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling, Unbound};
 use weaver_graph::{
     Algorithm, Builder, ByteRange, Effect, Handed, Kind, MemberId, Namespace, NodeId, Provenance,
     RecoveryKind, Restore, Segment, Tree, VolumeIndex,
@@ -300,6 +300,23 @@ impl NamespaceWriter {
         if let Some(recovery) = tree.recovery(set) {
             recovery.sets(out);
         }
+    }
+
+    // Each standing set of every namespace that bound no member, with its
+    // object's node and kind and why, as its object says. Asked once, when
+    // the job is done.
+    pub(crate) fn unbound(&self, tree: &Tree) -> Vec<(NodeId, Kind, Unbound)> {
+        let mut found = Vec::new();
+        let mut said = Vec::new();
+        for (_, set) in self.sets(tree) {
+            let (Some(kind), Some(recovery)) = (tree.kind(set), tree.recovery(set)) else {
+                continue;
+            };
+            said.clear();
+            recovery.unbound(&mut said);
+            found.extend(said.drain(..).map(|unbound| (set, kind, unbound)));
+        }
+        found
     }
 
     // What a set is called: what the file that carries it is.
