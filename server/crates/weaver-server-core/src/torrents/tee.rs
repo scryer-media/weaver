@@ -6,8 +6,8 @@
 // torrent with a container volume among its files has one; a torrent of
 // plain files never reaches the graph.
 //
-// The job's root members are the archive files, container volumes and the
-// recovery files and SFVs beside them, in torrent order; a member's articles
+// The job's root members are the torrent's files but padding, in torrent
+// order, as a post's are its files; a member's articles
 // are its shares of the pieces it lies in, numbered from its first piece.
 // A share goes to the job as a decoded article does, from the buffer its
 // piece was hashed from: the piece check vouched for it, so it arrives
@@ -50,9 +50,9 @@ mod outputs_tests;
 #[cfg(test)]
 mod tests;
 
-// Which of a torrent's files go to the graph, by name alone, as the
-// volumes they are; none when no file is a container volume, as for most
-// torrents.
+// The torrent's files that go to the graph: every one but padding, as a
+// post's files all go, once a name says a file is a container volume; none
+// otherwise, as for most torrents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
     volumes: Vec<Option<VolumeIndex>>,
@@ -155,7 +155,7 @@ impl Plan {
         let volumes = listed
             .into_iter()
             .map(|listed| {
-                matches!(listed, Some(Listed::Container | Listed::Recovery)).then(|| {
+                listed.is_some().then(|| {
                     next += 1;
                     VolumeIndex(next - 1)
                 })
@@ -1359,9 +1359,10 @@ impl Tee {
 
     // What the job hands over, read as a post's job's delivery is: its
     // root members are the torrent's files that went to it, in torrent
-    // order; one is recovery as its name lists it, and lost whole when the
-    // torrent does not want it, as no share of it ever comes. No post was
-    // given up, as a feed gives one up.
+    // order; one counts toward health by the role its name gives it, as a
+    // posted file's does, and is lost whole when the torrent does not want
+    // it, as no share of it ever comes. No post was given up, as a feed
+    // gives one up.
     pub(crate) fn delivery(&self, wanted: impl Fn(usize) -> bool) -> (Delivery, Option<Failure>) {
         let files: Vec<(usize, &str)> = self
             .layout
@@ -1370,8 +1371,6 @@ impl Tee {
             .filter(|(index, _)| self.plan.volume(*index).is_some())
             .map(|(index, file)| (index, file.name.as_str()))
             .collect();
-        let names: Vec<&str> = files.iter().map(|(_, name)| *name).collect();
-        let listed = weaver_graph::listed(&names);
         let ignore = configured_par2_ignore_extensions();
         let job = self.locked();
         delivery_of(
@@ -1379,9 +1378,9 @@ impl Tee {
             Posted {
                 files: files.len() as u32,
                 payload: &|member| {
-                    listed
-                        .get(member.0 as usize)
-                        .is_none_or(|listed| *listed != Listed::Recovery)
+                    files.get(member.0 as usize).is_none_or(|(_, name)| {
+                        weaver_model::files::FileRole::from_filename(name).counts_toward_health()
+                    })
                 },
                 lost: &|member| {
                     let (file, name) = files.get(member.0 as usize)?;

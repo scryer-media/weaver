@@ -112,10 +112,9 @@ fn settled(tee: &Tee, piece: u32) -> bool {
 }
 
 // Only a torrent with a container volume among its files has a tee, and
-// only its archive files, the volumes with the recovery files beside them,
-// go to it: a video and its notes never do.
+// then every one of its files goes to it, as a post's files all go.
 #[test]
-fn only_archive_files_go_to_the_graph() {
+fn only_a_torrent_with_an_archive_goes_to_the_graph_and_all_its_files_with_it() {
     let plain = PieceLayout::new(
         1024,
         vec![
@@ -141,21 +140,16 @@ fn only_archive_files_go_to_the_graph() {
     let plan = Plan::of(&archive).unwrap();
     assert_eq!(
         (0..6).map(|file| plan.volume(file)).collect::<Vec<_>>(),
-        [
-            Some(VolumeIndex(0)),
-            Some(VolumeIndex(1)),
-            None,
-            Some(VolumeIndex(2)),
-            Some(VolumeIndex(3)),
-            None,
-        ]
+        (0..6)
+            .map(|file| Some(VolumeIndex(file)))
+            .collect::<Vec<_>>()
     );
 }
 
 // A piece's share of an archive file goes to the job as a view of the
 // buffer the piece was hashed in: the same memory, at the share's place in
 // the piece, vouched for by the piece check and so not checked again. A
-// share of a plain file in the same piece does not go at all.
+// share of a plain file in the same piece goes the same way.
 #[tokio::test]
 async fn an_archive_share_goes_to_the_job_as_a_view_of_the_hashed_buffer() {
     let dir = tempfile::tempdir().unwrap();
@@ -166,7 +160,11 @@ async fn an_archive_share_goes_to_the_job_as_a_view_of_the_hashed_buffer() {
     let torrent: Vec<u8> = (0..150).map(|at| at as u8).collect();
     let held = piece(&layout, &torrent, 1);
     let shares = tee.with(|job| tee.unsettled(job, 1));
-    assert_eq!(shares.len(), 1);
+    assert_eq!(shares.len(), 2);
+    let plain = tee.decoded(&shares[1], held.slice(36..64));
+    assert_eq!((plain.volume, plain.ordinal), (VolumeIndex(1), 0));
+    assert_eq!(plain.bytes.as_ptr(), held[36..].as_ptr());
+    assert_eq!(&plain.bytes[..], &torrent[100..128]);
     let at = shares[0].span.at as usize;
     let len = shares[0].span.range.len() as usize;
     let decoded = tee.decoded(&shares[0], held.slice(at..at + len));

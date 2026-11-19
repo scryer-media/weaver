@@ -692,9 +692,9 @@ fn torrent_parity(files: &[(&str, &[u8])], blocks: u32) -> Vec<(String, Vec<u8>)
 }
 
 // A torrent of an archive and a plain file under one recovery set: the
-// plain file never goes to the graph, the set's word on it notwithstanding.
-// Every piece whole, the archive unpacks, the torrent completes, and no
-// repair is tried over the file the graph never had.
+// plain file goes to the graph, as a post's does, and the set finds it
+// whole. Every piece whole, the archive unpacks, the torrent completes, and
+// the torrent's own files stay as they came.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_and_a_plain_file_under_one_recovery_set_unpack_and_complete() {
     let archive: &[u8] = include_bytes!(concat!(
@@ -739,7 +739,7 @@ async fn an_archive_and_a_plain_file_under_one_recovery_set_unpack_and_complete(
         .files()
         .position(|file| file.name.ends_with("notes.txt"))
         .unwrap();
-    assert_eq!(plan.volume(notes_at), None);
+    assert!(plan.volume(notes_at).is_some());
     let mut published = rig.service.inner.published.subscribe();
     let storage = PieceStorage::new(
         Arc::clone(&layout),
@@ -792,6 +792,8 @@ async fn an_archive_and_a_plain_file_under_one_recovery_set_unpack_and_complete(
     assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), member);
     assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), notes);
     assert_eq!(std::fs::read(dir.join("set.rar")).unwrap(), archive);
+    // The graph's copies of the torrent's files went with its folder.
+    assert!(!rig.service.unpacking_dir(job_id).exists());
     rig.service.stop().await;
 }
 
@@ -1078,10 +1080,11 @@ fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 // An archive and a plain file, the plain file ignored: the archive unpacks
-// whole and the torrent completes with no history row. The plain file
-// wanted again reopens the torrent, which downloads it and completes again
-// with no tee: its unpacking does not run again, its outputs and the names
-// its row keeps stay, and no history row is written.
+// whole, and the unpacking ends in part for the plain file the graph never
+// had, as a post's does. The plain file wanted again reopens the torrent,
+// which downloads it and completes again with no tee: its unpacking does not
+// run again, and its outputs, the names its row keeps and its one history
+// row stay as they were.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unpacked_torrent_reopened_for_a_plain_file_completes_without_unpacking_again() {
     reopened_for_a_plain_file(false).await;
@@ -1126,8 +1129,22 @@ async fn reopened_for_a_plain_file(restart: bool) {
     assert_eq!(outputs, ["small.txt"]);
     let placed = contents(&dir);
     assert!(placed.contains(&("small.txt".to_owned(), SMALL_TXT.to_vec())));
-    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    // The plain file left out is lost to the graph, as a posted file no
+    // article of which came: the unpacking ends in part, with its row.
+    let ended = rig
+        .db
+        .get_job_history(job_id.0)
+        .unwrap()
+        .map(|row| (row.status, row.error_message));
+    assert_eq!(
+        ended,
+        Some((
+            "partial".to_owned(),
+            Some("delivered in part; damaged: extra.bin".to_owned())
+        ))
+    );
     assert!(rig.db.get_torrent(job_id).unwrap().unwrap().unpack_over);
+    let retirements = *retired.borrow_and_update();
 
     rig.service
         .set_file_priorities(job_id, &[(1, Normal)])
@@ -1182,8 +1199,14 @@ async fn reopened_for_a_plain_file(restart: bool) {
         expected.contains(&("extra.bin".to_owned(), plain.clone())),
         "{expected:?}"
     );
-    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
-    assert_eq!(*retired.borrow_and_update(), 0);
+    assert_eq!(
+        rig.db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .map(|row| (row.status, row.error_message)),
+        ended
+    );
+    assert_eq!(*retired.borrow_and_update(), retirements);
     service.stop().await;
 }
 
@@ -1438,6 +1461,8 @@ async fn made_complete_and_reopened(restart: bool) {
         &made
     };
     let placed = contents(&dir);
+    let unpacking = service.unpacking_dir(job_id);
+    let held = unpacking.exists().then(|| contents(&unpacking));
     let rest: Vec<u32> = pieces_of(service, job_id, |file| file == 1)
         .await
         .into_iter()
@@ -1451,7 +1476,8 @@ async fn made_complete_and_reopened(restart: bool) {
         PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
         "no placing runs"
     );
-    assert!(!service.unpacking_dir(job_id).exists());
+    // No unpacking ran: its folder is as the first end left it.
+    assert_eq!(unpacking.exists().then(|| contents(&unpacking)), held);
     let mut expected = placed;
     expected.retain(|(name, _)| name != "extra.bin");
     expected.push(("extra.bin".to_owned(), plain.clone()));
@@ -1658,23 +1684,27 @@ async fn a_torrent_that_leaves_out_its_recovery_with_its_data_whole_completes() 
     rig.service.stop().await;
 }
 
-// An archive and a plain file under one recovery set, the plain file left
-// out: the torrent never holds it, and the graph's ruling over the set
-// stands as it falls. Pinned as it is, for the operator's ruling.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_archive_beside_an_ignored_plain_file_under_one_recovery_set_ends_as_the_graph_rules() {
+// A single-volume archive and a plain file, with a recovery set of two
+// blocks over both, by name.
+fn archive_notes_and_parity() -> Vec<(String, Vec<u8>)> {
     let archive = fixtures("rar5", std::iter::once("rar5_store.rar".to_owned()))
         .remove(0)
         .1;
     let notes: Vec<u8> = (0..1500u32).map(|at| (at * 7 % 251) as u8).collect();
+    let parity = torrent_parity(&[("set.rar", &archive), ("notes.txt", &notes)], 2);
     let mut parts = vec![
-        ("set.rar".to_owned(), archive.clone()),
-        ("notes.txt".to_owned(), notes.clone()),
+        ("set.rar".to_owned(), archive),
+        ("notes.txt".to_owned(), notes),
     ];
-    parts.extend(torrent_parity(
-        &[("set.rar", &archive), ("notes.txt", &notes)],
-        2,
-    ));
+    parts.extend(parity);
+    parts
+}
+
+// The plain file left out: no share of it comes, as no article of a posted
+// file the feed gave up comes, and the shared ruling over the set stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_beside_an_ignored_plain_file_under_one_recovery_set_ends_as_the_graph_rules() {
+    let parts = archive_notes_and_parity();
     let (rig, job_id, _, _) = ignoring(parts.clone(), &[1], 256).await;
     let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
     assert_eq!(status, "partial");
@@ -1682,6 +1712,19 @@ async fn an_archive_beside_an_ignored_plain_file_under_one_recovery_set_ends_as_
         error.as_deref(),
         Some("delivered in part; unrepaired: notes.txt")
     );
+    assert_eq!(outputs, vec!["small.txt".to_owned()]);
+    assert_eq!(beside, outputs);
+    rig.service.stop().await;
+}
+
+// The archive left out: the set rebuilds it from the plain file's bytes and
+// its recovery, the archive unpacks, and the torrent completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ignored_volume_the_set_rebuilds_from_a_plain_files_bytes_completes() {
+    let parts = archive_notes_and_parity();
+    let (rig, job_id, _, _) = ignoring(parts.clone(), &[0], 256).await;
+    let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
+    assert_eq!((status.as_str(), error), ("none", None));
     assert_eq!(outputs, vec!["small.txt".to_owned()]);
     assert_eq!(beside, outputs);
     rig.service.stop().await;
