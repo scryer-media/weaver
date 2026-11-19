@@ -409,13 +409,17 @@ impl GraphJob {
                 return Ok(Some(changed));
             };
             let mut effects = Vec::new();
+            let placed = self.tree.placement(node);
             let mut placing = self.writer.placing(&mut *self.builder);
             if quiet {
                 self.tree.quiet(node, &mut placing, &mut effects);
             } else {
                 self.tree.tell_lost(node, &mut placing, &mut effects);
             }
-            if effects.is_empty() {
+            // An object that placed its volumes anew changed the job though
+            // the tree said nothing: the bytes held for it go down now, as
+            // after any write, and it hears quiet again once they have.
+            if effects.is_empty() && self.tree.placement(node) == placed {
                 continue;
             }
             quieting.changed = true;

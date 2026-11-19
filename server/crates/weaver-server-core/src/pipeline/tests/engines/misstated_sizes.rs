@@ -18,10 +18,15 @@
 // written (extract.cpp, ValidCRC). So the member is delivered whole when
 // its bytes give that CRC, and the job fails when they do not.
 
-use super::harness::{Outcome, Post, Scenario, kinds, par2_volumes_sliced, payload, run};
+use super::harness::{
+    Outcome, Post, Scenario, Stall, kinds, par2_volumes_sliced, payload, run, try_run,
+};
 use super::rar::delivered;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::tests::{rar4_misstated_set, rar5_misstated_set};
+use crate::pipeline::tests::{
+    build_test_rar_end_header, build_test_rar_file_header, build_test_rar4_file_header,
+    rar4_misstated_set, rar5_misstated_set,
+};
 use par2_rs::checksum;
 
 const MEMBER: &str = "final.girl.x264-ulshd.mkv";
@@ -420,4 +425,168 @@ async fn a_rar5_set_whose_first_part_overstates_its_size_restarted_midway_delive
 async fn a_set_stating_its_size_truly_delivers_it_unchanged() {
     let body = body();
     assert_whole(&run(&stating(&body, |_, size| size)).await, &body, "true");
+}
+
+// The overstating sets with nothing to mend them: no PAR2 set is posted, so
+// a fault in the member's bytes is never undone. Each volume is a post of
+// its own, in set order; `beside` adds a second, whole member to the last
+// volume after the member's last part.
+const SAMPLE: &str = "final.girl.sample.mkv";
+
+fn sample() -> Vec<u8> {
+    payload(FRAME / 2 + 311, 29)
+}
+
+fn bare(set: Vec<(String, Vec<u8>)>) -> Scenario {
+    let posts = set
+        .into_iter()
+        .map(|(name, bytes)| Post::plain(&name, bytes))
+        .collect();
+    Scenario::new(posts).framed(FRAME)
+}
+
+fn rar4_bare(body: &[u8], shape: &str, beside: bool) -> Scenario {
+    let size = body.len() as u32;
+    let mut set = rar4_misstated_set(
+        TRUE_BASE,
+        MEMBER,
+        body,
+        VOLUMES,
+        |volume| match (shape, volume) {
+            ("every part", _) | (_, 0) => size + OVERSTATED,
+            _ => size,
+        },
+        checksum::crc32(body),
+    );
+    if beside {
+        let sample = sample();
+        let last = &mut set[VOLUMES - 1].1;
+        last.extend_from_slice(&build_test_rar4_file_header(
+            SAMPLE,
+            0,
+            sample.len() as u32,
+            sample.len() as u32,
+            checksum::crc32(&sample),
+        ));
+        last.extend_from_slice(&sample);
+    }
+    bare(set)
+}
+
+fn rar5_bare(body: &[u8], shape: &str, beside: bool) -> Scenario {
+    let size = body.len() as u64;
+    let over = size + u64::from(OVERSTATED);
+    let mut set = rar5_misstated_set(
+        RAR5_BASE,
+        body,
+        VOLUMES,
+        |volume| match (shape, volume) {
+            ("every part", _) | (_, 0) => (MEMBER, over),
+            _ => (MEMBER, size),
+        },
+        checksum::crc32(body),
+    );
+    if beside {
+        let sample = sample();
+        let last = &mut set[VOLUMES - 1].1;
+        let end = build_test_rar_end_header(false);
+        last.truncate(last.len() - end.len());
+        last.extend_from_slice(&build_test_rar_file_header(
+            SAMPLE,
+            0,
+            sample.len() as u64,
+            sample.len() as u64,
+            Some(checksum::crc32(&sample)),
+        ));
+        last.extend_from_slice(&sample);
+        last.extend_from_slice(&end);
+    }
+    bare(set)
+}
+
+// Every overstating set, RAR4 and RAR5, both shapes, alone or beside a whole
+// member, with `fault` applied to the member's bytes.
+fn faulted(fault: impl Fn(Scenario) -> Scenario) -> Vec<(String, bool, Scenario)> {
+    let body = body();
+    let mut cases = Vec::new();
+    for shape in SHAPES {
+        for beside in [false, true] {
+            let case = |format: &str| format!("{format} {shape} beside {beside}");
+            cases.push((case("RAR4"), beside, fault(rar4_bare(&body, shape, beside))));
+            cases.push((case("RAR5"), beside, fault(rar5_bare(&body, shape, beside))));
+        }
+    }
+    cases
+}
+
+// What a faulted set must come to: it ends, the member is not whole, and the
+// job is Partial with the whole member delivered beside it, else Failed.
+fn assert_ends(outcome: Result<Outcome, Stall>, beside: bool, case: &str) {
+    let outcome = outcome
+        .unwrap_or_else(|stall| panic!("{case}: stalled at {:?}: {}", stall.status, stall.state));
+    let delivery = &outcome.graph().delivery;
+    assert!(
+        delivery.whole.iter().all(|name| name != MEMBER),
+        "{case}: {}",
+        describe(&outcome)
+    );
+    if beside {
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Partial),
+            "{case}: {}",
+            describe(&outcome)
+        );
+        assert_eq!(
+            outcome.files.get(&delivered(SAMPLE)).map(Vec::as_slice),
+            Some(sample().as_slice()),
+            "{case}: delivered {:?}",
+            outcome.files.keys().collect::<Vec<_>>()
+        );
+    } else {
+        assert!(
+            matches!(outcome.status, Some(JobStatus::Failed { .. })),
+            "{case}: {}",
+            describe(&outcome)
+        );
+    }
+}
+
+// An article of the member's never arrives and nothing can rebuild it: no
+// CRC verdict can come, so the member fails at its stated size.
+#[tokio::test]
+async fn a_set_whose_first_part_overstates_its_size_and_that_loses_an_article_ends() {
+    for (case, beside, scenario) in faulted(|scenario| scenario.lost(2, 1)) {
+        assert_ends(try_run(&scenario).await, beside, &case);
+    }
+}
+
+// An article of the member's arrives failing its yEnc CRC, with nothing to
+// rebuild it: the member fails as it does for a lost one.
+#[tokio::test]
+async fn a_set_whose_first_part_overstates_its_size_and_whose_article_fails_its_yenc_crc_ends() {
+    for (case, beside, scenario) in faulted(|scenario| scenario.crc_wrong(2, 1)) {
+        assert_ends(try_run(&scenario).await, beside, &case);
+    }
+}
+
+// The lost article, the pipeline going down after every article: the job
+// ends as one never restarted does.
+#[tokio::test]
+async fn a_set_whose_first_part_overstates_its_size_and_that_loses_an_article_restarted_ends_the_same()
+ {
+    let body = body();
+    for (case, scenario) in [
+        ("RAR4", rar4_bare(&body, "every part", false).lost(2, 1)),
+        ("RAR5", rar5_bare(&body, "the first part", false).lost(2, 1)),
+    ] {
+        let restarted = super::restart::run_restarting(&scenario, &mut |_| {}).await;
+        assert!(restarted.restarts > 0, "{case}");
+        assert!(
+            matches!(restarted.status, Some(JobStatus::Failed { .. })),
+            "{case}: {:?}",
+            restarted.status
+        );
+        assert!(!restarted.files.contains_key(&delivered(MEMBER)), "{case}");
+    }
 }
