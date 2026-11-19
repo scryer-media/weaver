@@ -1,22 +1,48 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The file types people open. A whole file whose name ends in one of these
-// is a usable delivery; any other whole file ships but is not one. Archive
+// The file types people open. A whole file whose name ends in one of these,
+// furniture beside the payload aside (`usable_type`), is a usable delivery;
+// any other whole file ships but is not one. Archive
 // volumes, split parts, recovery and check data, and bare `.bin` are not on
 // it: they exist to make something else, or say nothing of what they are.
 
 // A file name's extension, after its last dot, is a type people open.
 pub fn known_type(name: &str) -> bool {
-    let base = name.rsplit('/').next().unwrap_or(name);
-    let Some((_, extension)) = base.rsplit_once('.') else {
-        return false;
-    };
-    let extension = extension.to_ascii_lowercase();
-    KNOWN_TYPES
-        .iter()
-        .any(|group| group.binary_search(&extension.as_str()).is_ok())
+    extension(name).is_some_and(|extension| {
+        KNOWN_TYPES
+            .iter()
+            .any(|group| group.binary_search(&extension.as_str()).is_ok())
+    })
 }
+
+// A whole file of this name can stand for a delivery made in part: a type
+// people open that is not furniture, text posted beside a payload
+// (`BESIDE`), wherever it came from. Archives Weaver does not unpack, such
+// as an `.apk` or an `.iso`, are files people open and stand.
+pub fn usable_type(name: &str) -> bool {
+    known_type(name)
+        && extension(name)
+            .is_none_or(|extension| BESIDE.binary_search(&extension.as_str()).is_err())
+}
+
+fn extension(name: &str) -> Option<String> {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let (_, extension) = base.rsplit_once('.')?;
+    Some(extension.to_ascii_lowercase())
+}
+
+// Text posted beside a payload.
+#[rustfmt::skip]
+const BESIDE: &[&str] = &[
+    "diz",
+    "edl",
+    "info",
+    "log",
+    "nfo",
+    "releaseinfo",
+    "url",
+];
 
 #[rustfmt::skip]
 const KNOWN_TYPES: &[&[&str]] = &[
@@ -607,16 +633,7 @@ const KNOWN_TYPES: &[&[&str]] = &[
         "xlsx",
         "xps",
     ],
-    // Text posted beside a payload.
-    &[
-        "diz",
-        "edl",
-        "info",
-        "log",
-        "nfo",
-        "releaseinfo",
-        "url",
-    ],
+    BESIDE,
     // Disc, disk and firmware images.
     &[
         "2mg",
@@ -809,7 +826,32 @@ const KNOWN_TYPES: &[&[&str]] = &[
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{KNOWN_TYPES, known_type};
+    use super::{BESIDE, KNOWN_TYPES, known_type, usable_type};
+
+    // Furniture is a known type, never a usable one; every other known type
+    // is usable, an archive Weaver does not unpack among them.
+    #[test]
+    fn furniture_beside_a_payload_is_known_but_not_usable() {
+        for extension in BESIDE {
+            let name = format!("disc/ember.{}", extension.to_ascii_uppercase());
+            assert!(known_type(&name), "{name}");
+            assert!(!usable_type(&name), "{name}");
+        }
+        assert!(BESIDE.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in [
+            "ember.mkv",
+            "ember.apk",
+            "ember.iso",
+            "ember.cbz",
+            "ember.epub",
+            "ember.txt",
+        ] {
+            assert!(usable_type(name), "{name}");
+        }
+        for name in ["ember.bin", "ember.r03", "ember.par2", "ember.sfv", "ember"] {
+            assert!(!usable_type(name), "{name}");
+        }
+    }
 
     #[test]
     fn known_types_are_sorted_lower_case_unique_and_bare() {

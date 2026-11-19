@@ -54,7 +54,7 @@ pub use facts::{
     Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
     decode_parts, encode_parts, encode_since,
 };
-pub use known::known_type;
+pub use known::{known_type, usable_type};
 pub use marks::{Marked, Marks};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;

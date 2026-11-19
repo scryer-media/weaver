@@ -815,12 +815,19 @@ impl Pending {
     pub(crate) fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
         let mut slot = self.slot();
         let first = *slot.stepped.get_or_insert_with(tokio::time::Instant::now);
+        // A change that waits too long joins the steps since, so its write
+        // carries them, but only when that write can go now: while one is
+        // out, or waits for the disk, a checkpoint per step would read the
+        // job again for every step and write nothing sooner. The steps
+        // then wait for their own age, as they do while nothing waits.
+        let writable = !(slot.enqueued || (slot.queued.is_none() && !slot.gated.is_empty()));
         let due = slot.held.is_none()
             || slot.dirty_bytes >= CHECKPOINT_BYTES
             || first.elapsed() >= CHECKPOINT_AGE
-            || slot
-                .oldest
-                .is_some_and(|oldest| oldest.elapsed() >= CHECKPOINT_AGE);
+            || (writable
+                && slot
+                    .oldest
+                    .is_some_and(|oldest| oldest.elapsed() >= CHECKPOINT_AGE));
         if !due && slot.due.is_none() {
             let mail = mail.clone();
             let control = slot.control.clone();

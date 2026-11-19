@@ -6,6 +6,10 @@
 
 use super::*;
 
+// A torrent removed while the database's disk has no room for its history
+// row is not lost: its row is kept by the owner that keeps an NZB job's
+// archive, the torrent's row with it, and the job reaches history once a
+// pass writes it, the torrent leaving the torrents in the same write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_history_row_the_disk_has_no_room_for_waits_and_is_written() {
     use crate::persistence::ArchiveNews;
