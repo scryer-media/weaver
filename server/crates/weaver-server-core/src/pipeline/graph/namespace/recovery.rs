@@ -251,10 +251,66 @@ impl NamespaceWriter {
 
     // Every set of every namespace has ruled on something other than
     // waiting.
+    #[cfg(test)]
     pub(crate) fn all_ruled(&self, tree: &Tree, coming: &Coming) -> bool {
         tree.live()
             .into_iter()
             .all(|node| self.ruled(tree, node, coming))
+    }
+
+    // Every set of every namespace has ruled, as `all_ruled` asks, or waits
+    // only on the job's quiet: what the job waits for before its data
+    // objects hear it. `reading` says which namespaces' sources may still
+    // announce members.
+    pub(crate) fn ruled_but_for_quiet(
+        &self,
+        tree: &Tree,
+        coming: &Coming,
+        reading: &dyn Fn(NodeId) -> bool,
+    ) -> bool {
+        tree.live().into_iter().all(|node| {
+            self.ruled(tree, node, coming) || self.waits_on_quiet(tree, node, coming, reading(node))
+        })
+    }
+
+    // Below the root, a set that has yet to rule may wait on nothing but
+    // the quiet. Its namespace has every member it will get, nothing above
+    // can bring back what those members lost, and every set above has
+    // ruled; it is not due, as a member it covers is open short of bytes.
+    // Its object holds the rest of that member until it hears the losses of
+    // its volumes, which it hears only once the job is quiet, and the member
+    // closes only then. Waiting for such a set before the quiet waits for
+    // ever: once its object has heard, the member closes and the set rules.
+    fn waits_on_quiet(&self, tree: &Tree, node: NodeId, coming: &Coming, reading: bool) -> bool {
+        if node == NodeId::ROOT
+            || !members_known(tree, node, reading)
+            || !self.lost_for_good(tree, node, coming)
+        {
+            return false;
+        }
+        let Some(namespace) = tree.namespace(node) else {
+            return false;
+        };
+        let sets = tree.recovery_nodes(node);
+        let aside = Aside::of(tree, &sets);
+        let due = self.due(tree, node, reading);
+        sets.iter().copied().all(|set| {
+            if aside.yields(set) {
+                return true;
+            }
+            if tree.lent(set) || coming.sets.contains(&set) || due.contains(&set) {
+                return false;
+            }
+            let Some(recovery) = tree.recovery(set) else {
+                return true;
+            };
+            match recovery.outcome() {
+                Some(outcome) => outcome != RepairOutcome::Waiting,
+                None => namespace.members().any(|member| {
+                    recovery.covers(member.id) && !member.closed && !member.is_complete()
+                }),
+            }
+        })
     }
 
     // What each set last ruled, parents first; `None` for one that has not.
