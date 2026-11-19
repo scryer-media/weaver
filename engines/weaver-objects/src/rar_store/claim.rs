@@ -484,13 +484,28 @@ impl RarStore {
         };
         let placing = self.placing_front(name, front, facts);
         let held = Bound(&self.volumes);
-        placing.stated == Some(index)
+        let stated = placing.stated == Some(index)
             && (!settled(index, holder)
                 || facts
                     .zip(holder.stated())
                     .is_some_and(|(claimant, holder)| {
                         breaks(holder, index.0, &held) && !breaks(claimant, index.0, &held)
-                    }))
+                    }));
+        stated
+            || (placing.stated.is_none()
+                && placing.placed == Some(index)
+                && on_links(index, holder)
+                && self::held(index, holder).is_some_and(|holding| {
+                    let claimant = Held {
+                        facts,
+                        successor: given.and_then(|given| given.walk.successor()),
+                    };
+                    let filed = Filed {
+                        bound: Bound(&self.volumes),
+                        beside: &self.beside,
+                    };
+                    makes_way(index.0, holding, claimant, &filed)
+                }))
     }
 
     // The place a volume's headers and name give it in this set. Headers
@@ -892,6 +907,18 @@ pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
             || named == Some(true))
 }
 
+// Whether only its links hold a volume at `index`: its headers state no
+// position, its name does not number it there, and the set's order did not
+// put it there. A walk read to an end that states no number is no more.
+fn on_links(index: VolumeIndex, volume: &Volume) -> bool {
+    !volume.stated().is_some_and(states_position)
+        && volume
+            .numbered
+            .as_ref()
+            .is_none_or(|name| name.index() != index.0)
+        && volume.ordered() != Some(index)
+}
+
 // The position a volume's headers give it beside the volumes held, by
 // index. One that states its number is at that number, when the held
 // volumes beside it agree: the one before carries on into it, the one after
@@ -970,5 +997,64 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Places) -> Option<Volume
     match (again.next(), again.next()) {
         (Some(only), None) => Some(VolumeIndex(only)),
         _ => None,
+    }
+}
+
+// Whether `holder`, held at `index` by its links alone, makes way there for
+// `claimant`, which links alone place there and at no free place: the holder
+// says no volume follows it, the claimant does not, and the holder, with the
+// claimant at `index`, fits a free place beside the volumes held. A set's
+// last volume posted first is held after the first volume, where its links
+// fit while the middle has not come; the middle that comes then fits only
+// there, and the last goes after it.
+//
+// It never runs back: a claimant that makes a holder move does not say it
+// ends the set, so nothing moves it by this rule, and the holder, which
+// does, moves nothing. Each move places a claimant that stays, so a set of
+// `n` volumes moves at most `n` times.
+pub(crate) fn makes_way(
+    index: u32,
+    holder: Held<'_>,
+    claimant: Held<'_>,
+    held: &impl Places,
+) -> bool {
+    let (Some(facts), Some(_)) = (holder.facts, claimant.facts) else {
+        return false;
+    };
+    let instead = Instead {
+        held,
+        index,
+        claimant,
+    };
+    holder.successor == Some(false)
+        && claimant.successor != Some(false)
+        && !states_position(facts)
+        && place(facts, &instead).is_some_and(|at| held.at(at.0).is_none())
+}
+
+// The volumes held, with `claimant` at `index` in place of its holder.
+struct Instead<'a, P> {
+    held: &'a P,
+    index: u32,
+    claimant: Held<'a>,
+}
+
+impl<P: Places> Holds for Instead<'_, P> {
+    fn at(&self, index: u32) -> Option<Held<'_>> {
+        match index == self.index {
+            true => Some(self.claimant),
+            false => self.held.at(index),
+        }
+    }
+}
+
+// The places held stay the ones held: `index` is held by the claimant.
+impl<P: Places> Places for Instead<'_, P> {
+    fn beside(&self) -> impl Iterator<Item = u32> + '_ {
+        self.held.beside()
+    }
+
+    fn held(&self) -> impl Iterator<Item = u32> + '_ {
+        self.held.held()
     }
 }

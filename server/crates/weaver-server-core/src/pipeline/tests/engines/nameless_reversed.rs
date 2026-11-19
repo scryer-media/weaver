@@ -2,23 +2,24 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A RAR set posted under names that number nothing, its last volume posted
-// first, with no recovery set and beside a PAR2 set that names its volumes:
-// every volume arrives whole, so the job completes with the member as
-// written.
+// first or in any other order, with no recovery set and beside a PAR2 set
+// that names its volumes: every volume arrives whole, so the job completes
+// with the member as written.
 //
-// Run on 2026-11-18, each volume's articles served in order:
-// - the stored three-volume set, no PAR2: Failed, "never placed every member
-//   it named". The last volume, given back from the store it founded, is
-//   offered first to the store the first volume founds, and the lowest free
-//   place its links fit is the second; the middle volume then fits no place.
-// - the compressed four-volume set, whose end records state each volume's
-//   number, no PAR2: Failed, "no file was delivered whole". The tree alone
-//   places all four in one engine; in the server the first and last volumes
-//   end damaged, though every article arrived whole.
-// - the compressed set beside PAR2: Failed, "unable to find
-//   silver.horizon.part5.rar".
-// The stored set beside PAR2, and every case served last article first,
-// complete.
+// Each case fails without the two rules it reads. A stored three-volume set
+// whose headers state no number: its last volume, offered first to the
+// store its first volume founds, is held after the first by its links; the
+// middle volume then fits only there, and the last makes way for it
+// (`claim::makes_way`). The compressed four-volume set, whose end records
+// state each volume's number: the store hands its last volume, held after
+// the first by its links, to the engine before its end record is read, and
+// the engine's holder makes way for the volume whose front states that place
+// (`EngineObject::provisional`). Before it, the run read the first and last
+// volumes as the first two, found the member's checksum wrong and said both
+// damaged; beside PAR2, the renames moved the volumes, the run that read
+// again found the second place empty, and the set asked for a fifth volume.
+
+use sha2::Digest;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run};
 use super::rar_rev::lz_four;
@@ -29,37 +30,54 @@ fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
 }
 
+// A set: its label, its volumes as RAR named them, its one member, and the
+// SHA-256 of that member as written.
+struct Set {
+    label: &'static str,
+    volumes: Vec<(String, Vec<u8>)>,
+    member: &'static str,
+    sha256: String,
+}
+
 // A stored three-volume RAR4 set of one member whose headers state no
-// volume number, and the compressed four-volume set, each with its member
-// and that member's bytes where the test knows them.
-fn sets() -> Vec<(
-    &'static str,
-    Vec<(String, Vec<u8>)>,
-    &'static str,
-    Option<Vec<u8>>,
-)> {
+// volume number, and the compressed four-volume set.
+fn sets() -> Vec<Set> {
     let body = payload(9 * ARTICLE, 83);
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/expected.json"
+    )))
+    .unwrap();
     vec![
-        (
-            "stored",
-            single_member_rar4_old_numbering_set("silver.horizon", "beacon.bin", &body, 3),
-            "beacon.bin",
-            Some(body),
-        ),
-        ("lz_four", lz_four(), "compressible.txt", None),
+        Set {
+            label: "stored",
+            volumes: single_member_rar4_old_numbering_set("silver.horizon", "beacon.bin", &body, 3),
+            member: "beacon.bin",
+            sha256: hex::encode(sha2::Sha256::digest(&body)),
+        },
+        Set {
+            label: "lz_four",
+            volumes: lz_four(),
+            member: "compressible.txt",
+            sha256: oracle["archives"]["rar4_lz_four"]["compressible.txt"]["sha256"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        },
     ]
 }
 
-// The set's volumes posted last first, each under a name that numbers
+// The set's volumes posted in `order`, each under a name that numbers
 // nothing, beside a PAR2 set over the volumes as named when `par2`; each
 // batch the queue hands out served last article first when `backwards`.
-fn reversed(volumes: &[(String, Vec<u8>)], par2: bool, backwards: bool) -> Scenario {
-    let mut posts: Vec<Post> = volumes
+fn posted(volumes: &[(String, Vec<u8>)], order: &[usize], par2: bool, backwards: bool) -> Scenario {
+    let mut posts: Vec<Post> = order
         .iter()
-        .enumerate()
-        .rev()
-        .map(|(volume, (_, bytes))| {
-            Post::plain(&format!("{:032x}", 0x0b5c_0000 + volume), bytes.clone())
+        .map(|volume| {
+            Post::plain(
+                &format!("{:032x}", 0x0b5c_0000 + volume),
+                volumes[*volume].1.clone(),
+            )
         })
         .collect();
     if par2 {
@@ -77,36 +95,79 @@ fn reversed(volumes: &[(String, Vec<u8>)], par2: bool, backwards: bool) -> Scena
     }
 }
 
-fn said(case: &str, outcome: &Outcome) {
-    eprintln!(
-        "CASE {case}: status {:?} kind {:?} failure {:?} files {:?} claims {:?}",
-        outcome.status,
-        outcome.failure_kind,
-        outcome.failure,
-        outcome.files.keys().collect::<Vec<_>>(),
-        outcome.graph.claims,
-    );
+// The case, when the job did not complete with the member as written.
+fn failed(case: String, set: &Set, outcome: &Outcome) -> Option<String> {
+    let whole = outcome
+        .files
+        .get(&delivered(set.member))
+        .is_some_and(|bytes| hex::encode(sha2::Sha256::digest(bytes)) == set.sha256);
+    (outcome.status != Some(JobStatus::Complete) || !whole).then(|| {
+        format!(
+            "{case}: {:?} {:?} {:?}",
+            outcome.status,
+            outcome.files.keys().collect::<Vec<_>>(),
+            outcome.graph.claims
+        )
+    })
 }
 
 #[tokio::test]
-#[ignore = "a nameless RAR set posted last volume first fails: stored without PAR2, compressed with and without"]
 async fn a_nameless_rar_set_posted_last_volume_first_completes() {
-    let mut failed = Vec::new();
-    for (label, volumes, member, body) in sets() {
+    let mut failures = Vec::new();
+    for set in sets() {
+        let order: Vec<usize> = (0..set.volumes.len()).rev().collect();
         for par2 in [false, true] {
             for backwards in [false, true] {
-                let case = format!("{label} par2 {par2} backwards {backwards}");
-                let outcome = run(&reversed(&volumes, par2, backwards)).await;
-                said(&case, &outcome);
-                let whole = outcome
-                    .files
-                    .get(&delivered(member))
-                    .is_some_and(|bytes| body.as_ref().is_none_or(|body| bytes == body));
-                if outcome.status != Some(JobStatus::Complete) || !whole {
-                    failed.push(case);
-                }
+                let case = format!("{} par2 {par2} backwards {backwards}", set.label);
+                let outcome = run(&posted(&set.volumes, &order, par2, backwards)).await;
+                failures.extend(failed(case, &set, &outcome));
             }
         }
     }
-    assert!(failed.is_empty(), "{failed:?}");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// Every order of `0..n`, each once.
+fn orders(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for order in orders(n - 1) {
+        for at in 0..=order.len() {
+            let mut next = order.clone();
+            next.insert(at, n - 1);
+            out.push(next);
+        }
+    }
+    out
+}
+
+// Both sets with no recovery set, posted in every order of their volumes:
+// the stored set's 6 and the compressed set's 24, each served forward and
+// backwards.
+//
+// Run on 2026-11-18, the compressed set fails in six orders served forward,
+// those with its third volume posted before its second: [2, 1, 0, 3],
+// [2, 3, 0, 1], [2, 0, 3, 1], [2, 0, 1, 3], [0, 2, 3, 1], [0, 2, 1, 3]. The
+// two middle volumes each only carry the member on, so their links place
+// them in the order they come; the store asks for an engine at the first
+// volume's front and hands them over so, and the engine places by fronts
+// that stop short of the end records, which state each one's number. Its
+// run reads them out of order, the member's checksum is wrong, and every
+// volume is said damaged, whole as each arrived.
+#[tokio::test]
+#[ignore = "a compressed nameless RAR4 set whose middle volumes come out of order: no owner reads the end records' numbers before the engine's run"]
+async fn a_nameless_rar_set_posted_in_any_order_completes() {
+    let mut failures = Vec::new();
+    for set in sets() {
+        for order in orders(set.volumes.len()) {
+            for backwards in [false, true] {
+                let case = format!("{} order {order:?} backwards {backwards}", set.label);
+                let outcome = run(&posted(&set.volumes, &order, false, backwards)).await;
+                failures.extend(failed(case, &set, &outcome));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
