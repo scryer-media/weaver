@@ -1638,3 +1638,63 @@ fn placing_by_the_places_filed_beside_held_volumes_matches_the_walk_over_them() 
         }
     }
 }
+
+// Every order of `0..n`, each once.
+fn orders(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for order in orders(n - 1) {
+        for at in 0..=order.len() {
+            let mut next = order.clone();
+            next.insert(at, n - 1);
+            out.push(next);
+        }
+    }
+    out
+}
+
+// A stored four-volume RAR4 set whose end records state no number, posted
+// under names that number nothing, each volume whole as it comes, in every
+// one of the 24 orders: the links place each volume, a set's last volume
+// that came before the ones it follows makes way for each of them, and
+// every order ends with each volume of one store at its true place. A
+// volume moves a bounded number of times: the run hands over no more than
+// four times per volume. Two members, so each volume's headers link it to
+// its neighbours alone: one ends in the second volume, the other starts
+// there and ends in the last.
+#[test]
+fn a_nameless_set_offered_in_every_order_ends_at_its_true_places() {
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(5_000);
+    let set = write(
+        &[
+            Item::File("lantern.bin", payload(3, 7_000)),
+            Item::File("beacon.bin", payload(5, 11_500)),
+        ],
+        &options,
+    );
+    assert_eq!(set.len(), 4);
+    let orders = orders(set.len());
+    assert_eq!(orders.len(), 24);
+    for order in orders {
+        let mut run = Run::new();
+        run.enough = 4 * set.len();
+        let members: Vec<MemberId> = (0..set.len())
+            .map(|volume| {
+                run.announce(
+                    &format!("{:032x}", 0x0b5c_0000 + volume as u64),
+                    set[volume].len(),
+                )
+            })
+            .collect();
+        for volume in &order {
+            run.deliver(members[*volume], 0, &set[*volume]);
+            run.close(members[*volume]);
+        }
+        let case = format!("order {order:?}");
+        assert!(run.handed < run.enough, "{case}: never settled");
+        at_true_places(&run.places(&members), &case);
+    }
+}

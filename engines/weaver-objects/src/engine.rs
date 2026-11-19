@@ -370,6 +370,38 @@ impl<F: Format> EngineObject<F> {
         }
     }
 
+    // Whether the posted name of the volume held at `volume` numbers it
+    // there: what holds it, beside its links.
+    fn named_at(&self, volume: u32) -> bool {
+        self.names
+            .get(&volume)
+            .is_some_and(|name| name.slot(&self.names) == Some(volume))
+    }
+
+    // Whether a claimant's front, the one it carries or the one it opens
+    // on, states the place `volume`, beside the volumes bound but the one
+    // there.
+    fn states(
+        &self,
+        volume: VolumeIndex,
+        first_bytes: &[u8],
+        carried: Option<&CarriedVolume<F::Front>>,
+    ) -> bool {
+        let read;
+        let front = match carried.and_then(|carried| carried.front.as_ref()) {
+            Some(front) => Some(front),
+            None => {
+                read = F::front(first_bytes);
+                read.as_ref()
+            }
+        };
+        let length = carried.and_then(|carried| carried.length);
+        front.is_some_and(|front| {
+            F::states_place(front)
+                && F::place(&self.holdings(Some(volume.0)), Some(front), length) == Some(volume)
+        })
+    }
+
     // Which of the set's numberings a name is in: the one its recovery set
     // gave, which outranks the posted one, or the posted one.
     fn numbering(&self, candidate: &F::Name) -> Numbering {
@@ -711,20 +743,30 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // A volume held by its posted name or its links alone, where the member
     // claiming its place holds it by the recovery's numbering, which
     // outranks both. A front that states the holder's place outranks names.
+    // One held by its links alone, as a set's last volume handed on from a
+    // store before its end record was read sits beside the first, also
+    // yields to a claimant whose front states the place, as the RAR store's
+    // holder does (`RarStore::yields`): the holder states no place, so it
+    // never takes one back from a claimant that does.
     fn provisional(
         &self,
         volume: VolumeIndex,
         name: &str,
-        _first_bytes: &[u8],
-        _carried: Option<&weaver_graph::Carried>,
+        first_bytes: &[u8],
+        carried: Option<&weaver_graph::Carried>,
     ) -> bool {
-        self.bound.contains(&volume.0)
-            && !self.recovered.contains_key(&volume.0)
-            && !self.fronts.get(&volume.0).is_some_and(F::states_place)
-            && F::parse(name).is_some_and(|claimant| {
-                self.numbering(&claimant) == Numbering::Recovered
-                    && claimant.slot(&self.recovered) == Some(volume.0)
-            })
+        if !self.bound.contains(&volume.0)
+            || self.recovered.contains_key(&volume.0)
+            || self.fronts.get(&volume.0).is_some_and(F::states_place)
+        {
+            return false;
+        }
+        let recovered = F::parse(name).is_some_and(|claimant| {
+            self.numbering(&claimant) == Numbering::Recovered
+                && claimant.slot(&self.recovered) == Some(volume.0)
+        });
+        let carried = carried.and_then(|carried| carried.downcast_ref::<CarriedVolume<F::Front>>());
+        recovered || (!self.named_at(volume.0) && self.states(volume, first_bytes, carried))
     }
 
     // The place the volume's facts give it, held or not: whether it takes
