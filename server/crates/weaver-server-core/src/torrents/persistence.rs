@@ -229,18 +229,67 @@ impl crate::persistence::DatabaseWriterExecutor {
             SqlRuntime::run_in_transaction(&datastore, "write_torrent_history", |tx| {
                 let entry = entry.clone();
                 let files = files.clone();
+                Box::pin(async move { torrent_history_tx(tx, id, &entry, retires, &files).await })
+            })
+            .await
+        })
+        .inspect(|()| self.count_history_write())
+    }
+
+    // The history rows of a batch of torrents' jobs (`write_torrent_history`
+    // of each, in order), in one transaction: all of them are written, or
+    // none is.
+    pub(crate) fn write_torrent_histories(
+        &self,
+        entries: Vec<TorrentHistoryWrite>,
+    ) -> Result<(), StateError> {
+        for entry in &entries {
+            stored(entry.0.job_id)?;
+        }
+        let entries = std::sync::Arc::new(entries);
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "write_torrent_histories", |tx| {
+                let entries = std::sync::Arc::clone(&entries);
                 Box::pin(async move {
-                    crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
-                    write_history_files_tx(tx, id, &files).await?;
-                    if retires {
-                        delete_torrent_tx(tx, id).await?;
+                    for (entry, retires, files) in entries.iter() {
+                        let id = stored(entry.job_id)?;
+                        torrent_history_tx(tx, id, entry, *retires, files).await?;
+                    }
+                    // The seam refuses the whole transaction once its rows
+                    // are in it, so none of them may be left.
+                    #[cfg(test)]
+                    if HISTORIES_REFUSED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return Err(StateError::OutOfSpace("database or disk is full".into()));
                     }
                     Ok(())
                 })
             })
             .await
         })
+        .inspect(|()| self.count_history_write())
     }
+}
+
+// One torrent's job's history row in a batch's write: the row, whether the
+// torrent `retires` with it, and the files it lists.
+pub(crate) type TorrentHistoryWrite = (JobHistoryRow, bool, std::sync::Arc<[HistoryFile]>);
+
+// A torrent's job's history row in `tx`, the files it lists beside it, and
+// the torrent gone when it `retires`.
+async fn torrent_history_tx(
+    tx: &mut SqlTx<'_>,
+    id: i64,
+    entry: &JobHistoryRow,
+    retires: bool,
+    files: &[HistoryFile],
+) -> Result<(), StateError> {
+    crate::history::persistence::insert_job_history_tx(tx, entry).await?;
+    write_history_files_tx(tx, id, files).await?;
+    if retires {
+        delete_torrent_tx(tx, id).await?;
+    }
+    Ok(())
 }
 
 impl Database {
@@ -435,6 +484,12 @@ impl Database {
 #[cfg(test)]
 pub(crate) static RETIRING_REFUSED: std::sync::Mutex<Vec<JobId>> =
     std::sync::Mutex::new(Vec::new());
+
+// Test seam: the next batch of torrent history rows is refused for want of
+// room, as one transaction, after its rows are written in it.
+#[cfg(test)]
+pub(crate) static HISTORIES_REFUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: a removal's mark is refused, 1 for want of room, 2 otherwise.
 #[cfg(test)]
