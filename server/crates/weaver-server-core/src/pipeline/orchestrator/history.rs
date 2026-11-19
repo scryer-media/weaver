@@ -277,16 +277,32 @@ impl Pipeline {
             elapsed_ms = archive_started.elapsed().as_millis(),
             "queued job history archival"
         );
-        // Purge and republish before arming the deferred event: the runtime
-        // snapshot must already list the job as finished when a subscriber
-        // reacts, or the history facade rejects the lookup as a still-live job.
+        // A job listed as finished must be one history can already remove.
+        // Until the archive commits, the row is retiring and says the job is
+        // being finished, with its final figures and folder; the status it
+        // ended with is kept beside it for the pipeline alone. The write that
+        // removes the row and lists the job in history publishes the finished
+        // status, and the event is sent from inside that write, so a
+        // subscriber reacting to it finds the job finished in history and
+        // gone from the queue.
         self.shared_state.queue.write(|inner| {
             let index = inner.job_position(job_id).unwrap_or_else(|| {
                 inner.push_job(crate::pipeline::queue::JobRow::new(finished.clone()));
                 inner.jobs.len() - 1
             });
             let mut row = inner.row_mut_at(index);
-            row.report.job = finished.clone();
+            let finishing = JobStatus::PostProcessing;
+            let (download_state, post_state, run_state) =
+                crate::jobs::model::runtime_lanes_from_status_snapshot(&finishing);
+            row.report.job = JobInfo {
+                status: finishing,
+                download_state,
+                post_state,
+                run_state,
+                error: None,
+                ..finished.clone()
+            };
+            row.report.finished_status = Some(finished.status.clone());
             row.report.retiring = true;
             crate::pipeline::queue::Change::changed(())
         });

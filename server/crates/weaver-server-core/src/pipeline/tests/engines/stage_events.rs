@@ -138,6 +138,22 @@ async fn a_coded_7z_says_its_extraction() {
     assert_eq!(lanes(&graph), (0, 0, 0));
 }
 
+// One plain file damaged in two slices beside one PAR2 set of a single
+// recovery block: the set cannot rebuild it, the job does not end
+// complete, and it says the repair failed.
+#[tokio::test]
+async fn a_repair_the_job_fails_on_says_it_failed() {
+    let body = payload(6 * ARTICLE + 11, 74);
+    let files: [(&str, &[u8]); 1] = [("ember.bin", &body)];
+    let mut all = vec![Post::plain("ember.bin", body.clone())];
+    all.extend(par2_set("ember", &files, 1));
+    let scenario = Scenario::new(all).damaged(0, 1).damaged(0, 4);
+    let graph = run(&scenario).await;
+    assert!(!graph.completed(), "{:?}", graph.status);
+    let said = stages(&graph);
+    assert!(said.contains(&"RepairFailed".to_string()), "{said:?}");
+}
+
 // Two plain files, one of which every server failed an article of: only the
 // file whose every article arrived is said to land. The one that lost an
 // article is closed short and never raises a file downloaded.

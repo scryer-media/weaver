@@ -1052,13 +1052,6 @@ impl GraphJob {
             .collect()
     }
 
-    // Seam for status: whether the job spends the root member rather than
-    // hand it over, as the tree rules: recovery data, bound or named so, and
-    // the volumes an object consumed to make what it hands over.
-    pub(crate) fn spends(&self, member: MemberId) -> bool {
-        self.tree.spends(NodeId::ROOT, member)
-    }
-
     // Hand storage to completion. The graph only classifies what was
     // consumed; its adapter releases every handle before returning paths
     // completion may remove. A logical volume close is not an OS close.
@@ -1066,18 +1059,37 @@ impl GraphJob {
         if self.work_pending() || self.runs.live() || self.moves_waiting() {
             return Err("graph storage is still in use before delivery");
         }
-        let mut files: Vec<PathBuf> = self
-            .writer
-            .files(NodeId::ROOT)
-            .filter(|(member, _)| self.spends(*member))
-            .map(|(_, path)| path.to_path_buf())
-            .collect();
-        files.extend(self.namespace().records().filter_map(|record| {
-            let (child, volume) = self.tree.child_of(NodeId::ROOT, record.id)?;
-            self.spends(record.id)
-                .then(|| self.writer.kept_file(child, volume))
-                .flatten()
-        }));
+        // The spent rule holds in every namespace, not the root's alone: a
+        // recovery set an archive held, or a volume an object below the root
+        // consumed, is spent where it sits. Each namespace that holds a file
+        // of its own, or one an object bound in it kept of a volume, is read
+        // once.
+        let mut homes: std::collections::BTreeSet<NodeId> = self.writer.file_nodes().collect();
+        homes.insert(NodeId::ROOT);
+        homes.extend(
+            self.writer
+                .kept_nodes()
+                .filter_map(|kept| self.tree.home(kept)),
+        );
+        let mut files: Vec<PathBuf> = Vec::new();
+        for home in homes {
+            files.extend(
+                self.writer
+                    .files(home)
+                    .filter(|(member, _)| self.tree.spends(home, *member))
+                    .map(|(_, path)| path.to_path_buf()),
+            );
+            let Some(namespace) = self.tree.namespace(home) else {
+                continue;
+            };
+            files.extend(namespace.records().filter_map(|record| {
+                let (child, volume) = self.tree.child_of(home, record.id)?;
+                self.tree
+                    .spends(home, record.id)
+                    .then(|| self.writer.kept_file(child, volume))
+                    .flatten()
+            }));
+        }
         self.writer.release_handles();
         files.sort();
         files.dedup();

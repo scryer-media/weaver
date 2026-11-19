@@ -576,7 +576,16 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
             Some((child, _)) if tree.recovers(child) => {}
             Some((child, _)) => self.namespace(child, short, vouched),
             None => {
-                if !(node == NodeId::ROOT && (self.furniture)(&member.output_name)) {
+                // Below the root, a member no object holds whose name says it
+                // is recovery data is spent, as a posted recovery file at the
+                // root is no payload: no file of the delivery, whole or short,
+                // unless an object that is not a recovery object refused it.
+                let spent = node != NodeId::ROOT
+                    && weaver_graph::sniff::names_recovery(&member.name)
+                    && tree
+                        .refused_by(node, member.id)
+                        .is_none_or(|owner| tree.recovers(owner));
+                if !spent && !(node == NodeId::ROOT && (self.furniture)(&member.output_name)) {
                     self.leaf(node, member, short, vouched);
                 }
                 for kept in tree.kept(node, member.id) {

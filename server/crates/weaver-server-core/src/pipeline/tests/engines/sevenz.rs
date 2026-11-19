@@ -273,8 +273,8 @@ async fn a_split_7z_under_hash_names_named_by_par2_last_delivers_its_members() {
 
 // The same set one level down: its pieces and its PAR2 set are the members
 // of one stored RAR, and the names the PAR2 set gives are claimed in that
-// namespace as they are at the top. The PAR2 files are members of the
-// archive like any other, so they are delivered beside the 7z's members.
+// namespace as they are at the top. The PAR2 files are spent there as they
+// are at the top, so only the 7z's members are delivered.
 #[tokio::test]
 async fn a_split_7z_under_hash_names_inside_a_stored_rar_named_by_par2_last_delivers() {
     let inner = hashed_with_par2_last();
@@ -287,12 +287,6 @@ async fn a_split_7z_under_hash_names_inside_a_stored_rar_named_by_par2_last_deli
     let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
     let mut expected: Vec<String> = members().iter().map(|(name, _)| delivered(name)).collect();
-    expected.extend(
-        inner
-            .iter()
-            .filter(|post| post.name.ends_with(".par2"))
-            .map(|post| delivered(&post.name)),
-    );
     expected.sort();
     assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), expected);
     for (name, bytes) in members() {

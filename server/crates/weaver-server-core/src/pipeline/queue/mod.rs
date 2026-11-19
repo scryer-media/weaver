@@ -288,6 +288,10 @@ pub struct Report {
     pub nzb_admitted: bool,
     pub seen_intent_seq: u64,
     pub retiring: bool,
+    // The status a retiring job ended with, kept off `job` until history
+    // holds the job: no reader sees it finished while history would refuse
+    // to remove it. The pipeline's own record of its verdict.
+    pub(crate) finished_status: Option<crate::JobStatus>,
     pub restoring: bool,
     pub post_processing_cancellable: bool,
     pub moving: bool,
@@ -354,6 +358,7 @@ impl JobRow {
                 job,
                 seen_intent_seq: 0,
                 retiring: false,
+                finished_status: None,
                 restoring: false,
                 post_processing_cancellable: false,
                 moving: false,
