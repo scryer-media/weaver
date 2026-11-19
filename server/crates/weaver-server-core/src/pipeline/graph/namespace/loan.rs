@@ -985,6 +985,8 @@ impl Source for Lent {
         let Some(path) = &taken.path else {
             return range.is_empty();
         };
+        // The file is read where the lent coverage tiles the range with runs
+        // of any provenance, lost included: a lost run does not stop it.
         taken.coverage.covered(range) && self.read_file((node, member), path, range, into)
     }
 

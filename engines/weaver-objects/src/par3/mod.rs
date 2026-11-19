@@ -38,7 +38,7 @@ use par3_rs::{
     Par3Set, ScanLimits,
 };
 use serde::{Deserialize, Serialize};
-use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
+use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling, Unbound, UnboundReason};
 use weaver_graph::{
     ByteRange, Claim, Coverage, Delivery, Emit, Extent, Kind, Located, Member, MemberId, Namespace,
     Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
@@ -1424,5 +1424,18 @@ impl Recovery for Par3 {
             outcome: ruled.outcome.filter(|_| current),
             ..ruled.clone()
         }));
+    }
+
+    // A repair that read no set whole, and has no volume left that may
+    // describe one, bound nothing: what it describes never arrived whole.
+    fn unbound(&self, out: &mut Vec<Unbound>) {
+        if self.bound.is_empty()
+            && matches!(self.last, Some(Ruling::Undescribed { waiting: false, .. }))
+        {
+            out.push(Unbound {
+                id: None,
+                reason: UnboundReason::Undescribed,
+            });
+        }
     }
 }

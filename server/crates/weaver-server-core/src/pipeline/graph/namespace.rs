@@ -3539,7 +3539,9 @@ pub(crate) trait Source {
     // Where a range of the volume of the object at `child` lies in the
     // member it is bound to; `None` past the window it is bound to.
     fn in_member(&self, child: NodeId, range: ByteRange) -> Option<ByteRange>;
-    // The member's own file, for a range its coverage says was written.
+    // The member's own file, for a range its coverage tiles: runs of any
+    // provenance, lost included, so a lost range reads what the file holds
+    // there.
     fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
     // The parts of a range still held for the member, in offset order and
     // left held, and where each is kept: a member whose object has not
@@ -3902,6 +3904,8 @@ impl Source for Access<'_> {
         self.writer.envelopes.read(child, envelope, range, into)
     }
 
+    // The file is read where the member's coverage tiles the range with
+    // runs of any provenance, lost included: a lost run does not stop it.
     fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
         let written = self
             .tree

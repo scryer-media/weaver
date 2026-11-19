@@ -313,6 +313,15 @@ pub enum PipelineEvent {
         reason: String,
     },
 
+    // A recovery set the job ended with that bound no file, said once when
+    // the job is done. `set` is what carries it; `reason` is the reason's
+    // stable label, such as `undescribed`.
+    RecoverySetUnused {
+        job_id: JobId,
+        set: String,
+        reason: String,
+    },
+
     // ---- File classification (discovered during download) ----
     // A file's role was identified or updated.
     FileClassified {
@@ -334,6 +343,20 @@ pub enum PipelineEvent {
     PhaseProgressUpdated {
         job_id: JobId,
     },
+}
+
+// What a job's history and its log say of a recovery set that bound no
+// file, from its name and the reason's label.
+pub fn recovery_set_unused_message(set: &str, reason: &str) -> String {
+    let why = match reason {
+        "no_set" => "no recovery set was found in it",
+        "undescribed" => "its index never arrived whole",
+        "unreadable" => "its index could not be read",
+        "too_large" => "too many packets to read",
+        "unmatched" => "no file fits its descriptions",
+        _ => "of an unnamed reason",
+    };
+    format!("recovery set {set} was not used: {why}")
 }
 
 // Result of verifying a file against PAR2 checksums.

@@ -199,6 +199,39 @@ fn log_set_rulings(job_id: JobId, job: &GraphJob) {
     }
 }
 
+// Every recovery set the job ends with that bound no file, said once, when
+// the root is done, as its object gives the reason: a line of the log and
+// an event of the job's each.
+fn unused_sets(job_id: JobId, job: &GraphJob) -> Vec<PipelineEvent> {
+    let tree = job.tree();
+    job.writer()
+        .unbound(tree)
+        .into_iter()
+        .map(|(node, kind, unbound)| {
+            let set = job
+                .writer()
+                .set_name(tree, node)
+                .map_or_else(|| kind.to_string(), str::to_owned);
+            let reason = unbound.reason.label();
+            info!(
+                job_id = job_id.0,
+                node = node.0,
+                kind = %kind,
+                set = %set,
+                recovery_set_id = unbound.id.as_deref().unwrap_or(""),
+                reason = reason,
+                "{}",
+                crate::events::model::recovery_set_unused_message(&set, reason)
+            );
+            PipelineEvent::RecoverySetUnused {
+                job_id,
+                set,
+                reason: reason.to_owned(),
+            }
+        })
+        .collect()
+}
+
 fn asker(job_id: JobId) -> AskerId {
     AskerId(job_id.0)
 }
@@ -814,10 +847,11 @@ impl Pipeline {
             return;
         };
         metrics::phase(phase);
-        let stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
+        let mut stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
         if phase == RootPhase::Done {
             self.post_probes.retire(job_id);
             log_set_rulings(job_id, graph);
+            stage.extend(unused_sets(job_id, graph));
             let summary = RootJob::recovery_summary(&*graph);
             metrics::repaired(&summary, &summary.outcomes());
         }
