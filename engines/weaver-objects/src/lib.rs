@@ -6,6 +6,7 @@
 // faces; nothing outside a format's own module knows its fields. The graph
 // asks for an object by kind through `build`.
 
+mod beside;
 pub mod crypt;
 mod elimination;
 pub mod engine;

@@ -18,7 +18,9 @@ use crate::engine::SetName;
 // the `.rar`.
 const OLD_LETTERS: RangeInclusive<u8> = b'r'..=b'z';
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 enum Scheme {
     Part,
     Old,
@@ -30,6 +32,22 @@ pub struct VolumeName {
     scheme: Scheme,
     // The volume this name is, counted from zero.
     index: u32,
+}
+
+// The numbering a name is in: what `same_set` compares, as a key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SetKey {
+    stem: String,
+    scheme: Scheme,
+}
+
+impl VolumeName {
+    pub(crate) fn set_key(&self) -> SetKey {
+        SetKey {
+            stem: self.stem.clone(),
+            scheme: self.scheme,
+        }
+    }
 }
 
 impl SetName for VolumeName {

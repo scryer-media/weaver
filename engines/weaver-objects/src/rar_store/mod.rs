@@ -38,6 +38,7 @@ use weaver_graph::{
 };
 use zeroize::Zeroizing;
 
+use crate::beside::Beside;
 use crate::crypt::{Cbc, Chain, Padding};
 use crate::engine::SetName;
 use crate::grid::crc32;
@@ -155,6 +156,58 @@ impl Volume {
     }
 }
 
+// The numberings the names of the volumes held carry, each with how many
+// names carry it: filed as a volume's names change, so a claim asks whether
+// any volume is numbered, and whether its name is in a numbering held, by
+// lookup.
+#[derive(Default)]
+struct Numberings {
+    filed: BTreeMap<VolumeIndex, Vec<naming::VolumeName>>,
+    sets: BTreeMap<naming::SetKey, usize>,
+}
+
+impl Numberings {
+    // File the names `found` carries at `index` now, or none for a volume
+    // no longer held.
+    fn file(&mut self, index: VolumeIndex, found: Option<&Volume>) {
+        let now = || found.into_iter().flat_map(Volume::numberings);
+        if self
+            .filed
+            .get(&index)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .eq(now())
+        {
+            return;
+        }
+        for name in self.filed.remove(&index).unwrap_or_default() {
+            if let btree_map::Entry::Occupied(mut held) = self.sets.entry(name.set_key()) {
+                *held.get_mut() -= 1;
+                if *held.get() == 0 {
+                    held.remove();
+                }
+            }
+        }
+        let now: Vec<naming::VolumeName> = now().cloned().collect();
+        for name in &now {
+            *self.sets.entry(name.set_key()).or_default() += 1;
+        }
+        if !now.is_empty() {
+            self.filed.insert(index, now);
+        }
+    }
+
+    // Whether any volume held carries a numbered name.
+    fn any(&self) -> bool {
+        !self.sets.is_empty()
+    }
+
+    // Whether a volume held carries a name of `wanted`'s numbering.
+    fn holds(&self, wanted: &naming::VolumeName) -> bool {
+        self.sets.contains_key(&wanted.set_key())
+    }
+}
+
 // A name's place in its set's numbering.
 fn numbering(name: &str) -> Option<naming::VolumeName> {
     #[cfg(test)]
@@ -194,6 +247,9 @@ mod counts {
         pub(crate) cut: usize,
         // Runs of volumes held on trust laid in their headers' order.
         pub(crate) orders: usize,
+        // Places a placement by links read of those filed beside the
+        // volumes held.
+        pub(crate) beside: usize,
     }
 
     thread_local! {
@@ -357,6 +413,11 @@ pub struct RarStore {
     // nothing was held there: each said once, so siblings are asked once.
     wanted: BTreeSet<VolumeIndex>,
     formats: [BTreeSet<VolumeIndex>; 3],
+    // Where the volumes held stand as they place the next, and the
+    // numberings their names carry: filed as a volume is walked, named,
+    // comes or goes, so a claim reads neither off every volume held.
+    beside: Beside,
+    numberings: Numberings,
     // The layout kept: extended past its tail as volumes are read, laid
     // afresh only where a volume it holds changed what it said.
     layout: Option<layout::Laid>,
@@ -428,6 +489,8 @@ impl RarStore {
             lasts: BTreeSet::new(),
             wanted: BTreeSet::new(),
             formats: Default::default(),
+            beside: Beside::default(),
+            numberings: Numberings::default(),
             layout: None,
             refuted: None,
             inversions: BTreeSet::new(),
@@ -489,14 +552,26 @@ impl RarStore {
         if let Some(found) = self.volumes.get_mut(&volume) {
             found.invalidate_facts();
         }
+        self.file_place(volume);
         self.dirty.insert(volume);
         self.moved();
+    }
+
+    // File what places a volume beside the others, as it stands now:
+    // whether it is held there for the next to go beside, and the
+    // numberings its names carry. A volume no longer held places nothing.
+    fn file_place(&mut self, volume: VolumeIndex) {
+        let found = self.volumes.get(&volume);
+        let held = found.is_some_and(|found| claim::holds(volume, found));
+        self.beside.file(volume.0, held);
+        self.numberings.file(volume, found);
     }
 
     // File what a volume's walk says of the set, as it stands now: whether
     // no volume follows it, and the format its headers were read in. A
     // volume no longer held says nothing.
     fn file(&mut self, volume: VolumeIndex) {
+        self.file_place(volume);
         let walk = self.volumes.get(&volume).map(|found| &found.walk);
         match walk.is_some_and(Walk::is_last) {
             true => self.lasts.insert(volume),
