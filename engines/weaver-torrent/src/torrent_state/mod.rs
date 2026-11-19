@@ -1099,6 +1099,20 @@ impl ManagedTorrent {
                             spawn_untracked_drop(&live, trackers.subscribe());
                         }
                         g.trackers = peer_rx.trackers;
+                        // Its task was made with the trackers as they were
+                        // then (a check may have run since): an edit made
+                        // meanwhile reached the last run's table, not this
+                        // one. Read under the lock that `replace_trackers`
+                        // reads the table under, after it saved the tiers:
+                        // an edit is here, or finds this table. libtorrent
+                        // keeps one list, edited while it checks, and
+                        // `start_announcing` announces to it as it stands
+                        // (torrent.cpp:6004, :8884, :10346, v2.0.15).
+                        if let Some(trackers) = &g.trackers {
+                            trackers.catch_up(
+                                session.announce_tiers(t.shared.tracker_tiers(), t.is_private()),
+                            );
+                        }
                     }
                     Ok(())
                 }

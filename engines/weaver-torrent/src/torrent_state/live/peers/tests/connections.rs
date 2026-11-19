@@ -482,6 +482,59 @@ async fn a_pause_starts_no_reconnect_wait_for_the_peers_it_disconnects() {
     assert_eq!(idle_wait, Some(t0 + MIN_RECONNECT_TIME * 2));
 }
 
+// A close the run's end made settles as the end's on either side of the
+// let-go (`close_all`): before it, as a dial the cancel dropped settles
+// first, or after it, before the list is taken. A failure and a close the
+// peer made keep their wait, whenever they settle.
+#[tokio::test(start_paused = true)]
+async fn a_close_the_runs_end_made_starts_no_wait_on_either_side_of_the_let_go() {
+    use crate::torrent_state::peer::Close;
+    let peers = make_peer_states();
+    let t0 = Instant::now();
+    let (before, after, refused, closed) = (peer_addr(1), peer_addr(2), peer_addr(3), peer_addr(4));
+    for addr in [before, after, refused, closed] {
+        peers.add_peer(addr, PeerSourceFlag::Tracker);
+    }
+    let mut dials = Vec::new();
+    while let Some(dial) = peers.connect_next(t0) {
+        dials.push(dial);
+    }
+    assert_eq!(dials.len(), 4);
+    let settle = |addr: SocketAddr, error: Option<crate::Error>| {
+        peers
+            .with_peer_mut(addr.into(), "test", |peer| {
+                let close = Close::of(true, error.as_ref());
+                let needed = peer.connection_closing(t0, close, false, &peers);
+                peers.settle_closed(peer, needed);
+            })
+            .unwrap();
+    };
+    settle(before, None);
+    settle(
+        refused,
+        Some(crate::Error::TcpConnect(
+            std::io::ErrorKind::ConnectionRefused.into(),
+        )),
+    );
+    settle(closed, Some(crate::Error::PeerDisconnected));
+    peers.close_all(t0);
+    settle(after, None);
+
+    let next = PeerStates::founded_on(
+        peers.idle_list(),
+        Default::default(),
+        u32::try_from(TOTAL_PIECES).unwrap(),
+    );
+    let wait = |addr: SocketAddr| {
+        next.with_peer(addr.into(), |p| (p.reconnect_at(), p.failcount()))
+            .unwrap()
+    };
+    assert_eq!(wait(before), (Some(t0), 0));
+    assert_eq!(wait(after), (Some(t0), 0));
+    assert_eq!(wait(refused), (Some(t0 + MIN_RECONNECT_TIME * 2), 1));
+    assert_eq!(wait(closed), (Some(t0 + MIN_RECONNECT_TIME), 0));
+}
+
 // A pause of a finished torrent lets every peer it disconnects go
 // without the wait to reconnect, seed and leecher alike. A run that
 // resumes finished does not connect to the seeds.

@@ -136,26 +136,30 @@ async fn test_peers_listing_shows_the_peer_and_a_ban_refuses_it() -> anyhow::Res
 /// A memory storage whose reads wait while the gate is held, and whose
 /// writes fail when `writes_fail` holds.
 #[derive(Clone, Default)]
-struct GatedStorageFactory {
+pub(super) struct GatedStorageFactory {
     inner: MemoryStorageFactory,
-    gate: Arc<Gate>,
+    pub(super) gate: Arc<Gate>,
     writes_fail: bool,
 }
 
 #[derive(Default)]
-struct Gate {
+pub(super) struct Gate {
     held: Mutex<bool>,
     opened: Condvar,
     // A read came to the gate.
-    reached: tokio::sync::Notify,
+    pub(super) reached: tokio::sync::Notify,
 }
 
 impl Gate {
-    fn hold(&self) {
+    pub(super) fn hold(&self) {
         *self.held.lock().unwrap() = true;
     }
 
-    fn open(&self) {
+    pub(super) fn is_held(&self) -> bool {
+        *self.held.lock().unwrap()
+    }
+
+    pub(super) fn open(&self) {
         *self.held.lock().unwrap() = false;
         self.opened.notify_all();
     }
@@ -167,7 +171,7 @@ impl Gate {
     }
 }
 
-struct GatedStorage {
+pub(super) struct GatedStorage {
     inner: Box<dyn TorrentStorage>,
     gate: Arc<Gate>,
     writes_fail: bool,
