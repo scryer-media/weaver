@@ -331,7 +331,7 @@ opt-level = 3
 debug-assertions = false
 overflow-checks = false
 codegen-units = 2
-lto = "thin"
+lto = false
 
 # Rarpar crates normally use crates.io; the PAR2 revision above is a temporary
 # pin to the authenticated-scanner and source-change fixes.
