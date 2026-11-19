@@ -2236,10 +2236,12 @@ impl TorrentService {
                 // kept lack, as a change of levels stored while its copy was
                 // out leaves it when its reopen was not: short of complete
                 // again, past every stored torrent at the load's end, as a
-                // change of levels would have left it. The same rule as a
-                // change of levels made now (`Live::reopens`).
+                // change of levels would have left it, its unpacking over.
+                // The same rule as a change of levels made now
+                // (`Live::reopens`, `save_levels`).
                 if read.torrent.reopens(&read.torrent.levels) {
                     read.torrent.record.completed_at_ms = None;
+                    read.torrent.record.unpack_over = true;
                     // A read that outlasted the load places it now, every
                     // stored place being known.
                     if self.loading() {

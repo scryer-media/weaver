@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::checkpoints::{Ledger, Resume};
+use super::checkpoints::{Ledger, OwedRow, Resume};
 use super::disk_room::DiskHeld;
 use super::intake::{About, Resolving};
 use super::moves::Moving;
@@ -193,6 +193,7 @@ impl Live {
                 peers_at_ms: now,
                 times_at_ms,
                 lost: Arc::default(),
+                row_owed: Arc::default(),
             },
             resume,
             names: Vec::new(),
@@ -404,6 +405,21 @@ impl Live {
 
     pub(super) fn resumed(&self) -> bool {
         self.record.intent() == TorrentIntent::Resumed
+    }
+
+    // A write of how many times its download ended, or that its unpacking
+    // is over, failed: its checkpoints write both again until one lands.
+    pub(super) fn owe_row(&self) {
+        self.ledger.row_owed.fetch_add(1, Ordering::AcqRel);
+    }
+
+    // What its row lacks of memory, while a failed write left it owed.
+    pub(super) fn owed_row(&self) -> Option<OwedRow> {
+        OwedRow::taken(
+            self.record.download_ends,
+            self.record.unpack_over,
+            &self.ledger.row_owed,
+        )
     }
 
     // Whether a start of the torrent's run now would wait on a move of its

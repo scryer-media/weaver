@@ -1562,22 +1562,25 @@ impl Database {
         self.set_torrent_column("unpack_over", args)
     }
 
-    // The torrent's files' levels, when it completed and its place in the
-    // download queue, in one write: a complete torrent that now wants a file
-    // it lacks downloads again, short of complete at the end of the queue,
-    // and one whose change of levels did not land is put back as it was.
-    // Returns whether the torrent exists.
+    // The torrent's files' levels, when it completed, its place in the
+    // download queue and whether its unpacking is over, in one write: a
+    // complete torrent that now wants a file it lacks downloads again, short
+    // of complete at the end of the queue, with its unpacking over, and one
+    // whose change of levels did not land is put back as it was. Returns
+    // whether the torrent exists.
     pub fn set_torrent_levels_and_completion(
         &self,
         job_id: JobId,
         levels: &[FilePriority],
         completed_at_ms: Option<i64>,
         queue_position: i64,
+        unpack_over: bool,
     ) -> Result<bool, StateError> {
         let args = vec![
             SqlArg::OptText(file_priorities_str(levels)),
             SqlArg::OptI64(completed_at_ms),
             SqlArg::I64(queue_position),
+            SqlArg::Bool(unpack_over),
             SqlArg::I64(stored(job_id.0)?),
         ];
         let datastore = self.datastore();
@@ -1585,7 +1588,7 @@ impl Database {
             let changed = SqlRuntime::execute(
                 datastore.write_exec(),
                 "UPDATE torrents SET file_priorities = {}, completed_at_ms = {}, \
-                 queue_position = {} WHERE job_id = {}",
+                 queue_position = {}, unpack_over = {} WHERE job_id = {}",
                 &args,
             )
             .await?;
@@ -1638,7 +1641,10 @@ impl Database {
     // bans it begins with as they stood with them, each written only when
     // given, in one transaction: a crash recovers the pieces, the times and
     // the counters of one moment. A file with no usable time has its row
-    // removed, so the next start judges it by its size alone.
+    // removed, so the next start judges it by its size alone. `row`, when
+    // given, is how many times its download ended and whether its
+    // unpacking is over, as their own writes failed to keep them: both only
+    // go up, so neither takes the row back below what it holds.
     pub(crate) fn save_torrent_checkpoint(
         &self,
         job_id: JobId,
@@ -1646,8 +1652,12 @@ impl Database {
         stamps: &[(u32, Option<i64>)],
         counters: Option<&TorrentCounters>,
         peers: Option<&ResumePeers>,
+        row: Option<(u64, bool)>,
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
+        let row = row
+            .map(|(ends, over)| Ok::<_, StateError>((stored(ends)?, over)))
+            .transpose()?;
         let resume = resume_update(job_id, counters, peers)?;
         let pieces = pieces.map(|kept| {
             vec![
@@ -1665,7 +1675,7 @@ impl Database {
             .filter(|(_, time)| time.is_none())
             .map(|(file, _)| i64::from(*file))
             .collect();
-        if pieces.is_none() && resume.is_none() && stamps.is_empty() {
+        if pieces.is_none() && resume.is_none() && stamps.is_empty() && row.is_none() {
             return Ok(());
         }
         let datastore = self.datastore();
@@ -1686,6 +1696,21 @@ impl Database {
                     save_file_stamps(tx, id, &timed, &untimed).await?;
                     if let Some((sql, args)) = &resume {
                         tx.execute(sql, args).await?;
+                    }
+                    if let Some((ends, over)) = row {
+                        tx.execute(
+                            "UPDATE torrents SET download_ends = CASE WHEN download_ends < {} \
+                             THEN {} ELSE download_ends END WHERE job_id = {}",
+                            &[SqlArg::I64(ends), SqlArg::I64(ends), SqlArg::I64(id)],
+                        )
+                        .await?;
+                        if over {
+                            tx.execute(
+                                "UPDATE torrents SET unpack_over = {} WHERE job_id = {}",
+                                &[SqlArg::Bool(true), SqlArg::I64(id)],
+                            )
+                            .await?;
+                        }
                     }
                     Ok(())
                 })

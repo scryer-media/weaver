@@ -924,8 +924,28 @@ async fn a_reopen_with_a_copy_that_cannot_be_stored_changes_nothing() {
 // second set aside, and a second torrent added after it: the first, the
 // second, and the second file's bytes.
 async fn complete_with_one_aside(rig: &Rig) -> (JobId, JobId, Vec<u8>) {
-    use FilePriority::*;
     rig.service.open().await.unwrap();
+    let (job_id, bytes) = two_with_one_aside(rig).await;
+    first_file_had(rig, job_id, &bytes, |stored| {
+        stored.completed_at_ms.is_some()
+    })
+    .await;
+    let after = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("after", 9)))
+        })
+        .await
+        .unwrap();
+    rig.service.save_checkpoints([job_id].into()).await;
+    (job_id, after, bytes[2048..].to_vec())
+}
+
+// A paused torrent of two files that share no piece, its second set aside,
+// and the bytes of both.
+async fn two_with_one_aside(rig: &Rig) -> (JobId, Vec<u8>) {
+    use FilePriority::*;
     let bytes: Vec<u8> = (0..4096u32).map(|at| (at * 7 % 251) as u8).collect();
     let meta = metainfo(
         "two",
@@ -945,6 +965,17 @@ async fn complete_with_one_aside(rig: &Rig) -> (JobId, JobId, Vec<u8>) {
         .set_file_priorities(job_id, &[(1, Ignored)])
         .await
         .unwrap();
+    (job_id, bytes)
+}
+
+// The first file's pieces of `two_with_one_aside`'s torrent had, and its
+// settle told: waits until its row is as `done` asks.
+async fn first_file_had(
+    rig: &Rig,
+    job_id: JobId,
+    bytes: &[u8],
+    done: impl Fn(&crate::torrents::model::TorrentRecord) -> bool,
+) {
     let store = rig.service.inner.live.lock().await[&job_id]
         .store
         .clone()
@@ -961,26 +992,9 @@ async fn complete_with_one_aside(rig: &Rig) -> (JobId, JobId, Vec<u8>) {
     let mut settles = rig.service.inner.settled.subscribe();
     rig.service.inner.signal.look(job_id);
     settles
-        .wait_for(|_| {
-            rig.db
-                .get_torrent(job_id)
-                .unwrap()
-                .unwrap()
-                .completed_at_ms
-                .is_some()
-        })
+        .wait_for(|_| done(&rig.db.get_torrent(job_id).unwrap().unwrap()))
         .await
         .unwrap();
-    let after = rig
-        .service
-        .add_opened(AddRequest {
-            paused: true,
-            ..request(AddSource::Metainfo(plain("after", 9)))
-        })
-        .await
-        .unwrap();
-    rig.service.save_checkpoints([job_id].into()).await;
-    (job_id, after, bytes[2048..].to_vec())
 }
 
 // A torrent's completion and queue place, in memory and as stored.
@@ -1415,4 +1429,116 @@ async fn a_reopened_torrent_that_completes_again_runs_its_download_end_again() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_reopened_then_restarted_runs_its_download_end_once_more() {
     completes_again_and_ends_again(true).await;
+}
+
+// A completion whose own write failed leaves memory ahead of the row: the
+// count of its download's ends stays owed, and the checkpoint the
+// completion made due writes it. Reopened and restarted, the torrent
+// completes again and its end is numbered past the first, so it runs; with
+// the row left at the old count it would be taken as the first, and
+// dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completion_whose_write_failed_keeps_its_count_through_its_checkpoint() {
+    use FilePriority::*;
+    use std::sync::atomic::Ordering::{AcqRel, Release};
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    rig.service.open().await.unwrap();
+    let (job_id, bytes) = two_with_one_aside(&rig).await;
+    super::super::COMPLETION_FAILS.store(true, Release);
+    first_file_had(&rig, job_id, &bytes, |stored| stored.download_ends == 1).await;
+    assert!(
+        !super::super::COMPLETION_FAILS.swap(false, AcqRel),
+        "the completion's own write was refused"
+    );
+    // Its time is not written again: a reopen's write may have gone since.
+    assert!(
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .completed_at_ms
+            .is_none()
+    );
+    assert!(rig.service.inner.live.lock().await[&job_id].complete());
+    rig.db.admitted_so_far().await;
+    let first = download_ends(&rig.db, job_id);
+    assert!(first.iter().all(|(_, occurrence)| *occurrence == 0));
+    rig.service
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert!(!again.inner.live.lock().await[&job_id].complete());
+    completes_again(&again, &rig.db, job_id, &bytes[2048..]).await;
+    rig.db.admitted_so_far().await;
+    let ended = download_ends(&rig.db, job_id);
+    for (first, ended) in first.iter().zip(&ended) {
+        assert_ne!(first.0, ended.0);
+        assert_eq!(ended.1, 1);
+    }
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().download_ends,
+        2
+    );
+    again.stop().await;
+}
+
+// A torrent in seed mode is finished from its add: its first finish runs
+// no program, as qBittorrent's (`handleTorrentFinished` returns,
+// torrentimpl.cpp:2194-2198), but its count goes up. Reopened, it finishes
+// again and runs its program once (`prioritizeFiles` clears its finished
+// state, torrentimpl.cpp:3045-3057).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seed_mode_torrent_runs_no_end_at_its_first_finish_and_one_at_its_reopen() {
+    use crate::post_processing::model::QueueEvent;
+    use FilePriority::*;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    rig.service.open().await.unwrap();
+    let (job_id, bytes) = two_with_one_aside(&rig).await;
+    // In seed mode, as an add in seed mode leaves it, with no completion
+    // stored (`TorrentService::record`): its first finish is the settle's.
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&job_id)
+        .unwrap()
+        .record
+        .seed_mode = true;
+    first_file_had(&rig, job_id, &bytes, |stored| {
+        stored.completed_at_ms.is_some()
+    })
+    .await;
+    rig.db.admitted_so_far().await;
+    for event in [QueueEvent::TorrentDownloaded, QueueEvent::JobDownloaded] {
+        assert!(
+            rig.db
+                .latest_download_end(job_id.0, event)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().download_ends,
+        1
+    );
+    rig.service
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    completes_again(&rig.service, &rig.db, job_id, &bytes[2048..]).await;
+    rig.db.admitted_so_far().await;
+    for (_, occurrence) in download_ends(&rig.db, job_id) {
+        assert_eq!(occurrence, 1);
+    }
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().download_ends,
+        2
+    );
+    rig.service.stop().await;
 }

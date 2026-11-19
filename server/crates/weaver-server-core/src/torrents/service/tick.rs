@@ -191,9 +191,9 @@ impl TorrentService {
             self.files_downloaded(job_id, made_whole).await;
             let wanted = |file: usize| levels.get(file).copied().unwrap_or_default().wanted();
             let whole = store.has_files(wanted);
-            // A store keeps its tee after its unpacking is over; one that
-            // downloads again in the same run takes no tee branch, so its
-            // unpacking does not run again (`Live::unpacking`).
+            // A store lets go of its tee once its unpacking is over
+            // (`let_go_of_tee`), so one that downloads again takes no tee
+            // branch and its unpacking does not run again (`Live::unpacking`).
             let Some(tee) = store.tee().filter(|_| unpacking) else {
                 if whole {
                     self.completed(job_id).await;
@@ -230,10 +230,10 @@ impl TorrentService {
                 continue;
             }
             if tee.with(|job| job.awaits_commit() || job.moves_waiting()) {
-                self.checkpoint_tee(job_id, Arc::clone(tee), false).await;
+                self.checkpoint_tee(job_id, Arc::clone(&tee), false).await;
             }
             if whole && tee.done() {
-                match self.unpacked(job_id, &store, tee).await {
+                match self.unpacked(job_id, &store, &tee).await {
                     Placing::Waits => {}
                     Placing::Placed => self.completed(job_id).await,
                     Placing::Short { why, placed } => {
@@ -823,9 +823,12 @@ impl TorrentService {
     // download queue, the place it is to take returned (qBittorrent
     // `TorrentImpl::prioritizeFiles`, torrentimpl.cpp:3045-3057; libtorrent
     // `torrent::resume_download` clears `m_completed_time` and takes
-    // `last_pos`, torrent.cpp:8653-8676 at v2.0.15). A write that fails
-    // stores nothing, and gives its place back unless another torrent took
-    // the next one since.
+    // `last_pos`, torrent.cpp:8653-8676 at v2.0.15). Its unpacking is
+    // stored over in the same write: a complete torrent unpacked already,
+    // or never made a tee, its store made complete, and a reopen does not
+    // start one, in this run or after a restart. A write that fails stores
+    // nothing, and gives its place back unless another torrent took the
+    // next one since.
     fn save_levels(
         &self,
         torrent: &super::live::Live,
@@ -844,7 +847,7 @@ impl TorrentService {
         if let Err(error) = self
             .inner
             .db
-            .set_torrent_levels_and_completion(job_id, asked, None, place)
+            .set_torrent_levels_and_completion(job_id, asked, None, place, true)
         {
             self.give_back_place(place);
             return Err(error);
@@ -884,6 +887,7 @@ impl TorrentService {
             torrent.settle(now);
             torrent.record.completed_at_ms = None;
             torrent.record.queue_position = place;
+            torrent.record.unpack_over = true;
             self.inner.signal.want_pass();
         }
         torrent.levels = held;
@@ -919,6 +923,7 @@ impl TorrentService {
                 &asked,
                 torrent.record.completed_at_ms,
                 torrent.record.queue_position,
+                torrent.record.unpack_over,
             )
         } else {
             self.inner.db.set_torrent_file_priorities(job_id, &asked)

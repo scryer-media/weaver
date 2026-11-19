@@ -631,7 +631,7 @@ async fn a_stop_waiting_on_an_unpacking_job_holds_no_other_torrent_up() {
         .unwrap();
     let tee = {
         let live = rig.service.inner.live.lock().await;
-        Arc::clone(live[&job_id].store.as_ref().unwrap().tee().unwrap())
+        live[&job_id].store.as_ref().unwrap().tee().unwrap()
     };
     let tee_asked = Arc::clone(&tee);
     let tee_asked = &tee_asked.asked;
@@ -1195,15 +1195,23 @@ async fn reopened_for_a_plain_file(restart: bool) {
 // run and across a restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_short_unpacked_torrent_reopened_for_a_plain_file_keeps_one_history_row() {
-    reopened_after_ending_short(false).await;
+    reopened_after_ending_short(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_short_unpacked_torrent_reopened_across_a_restart_keeps_one_history_row() {
-    reopened_after_ending_short(true).await;
+    reopened_after_ending_short(true, false).await;
 }
 
-async fn reopened_after_ending_short(restart: bool) {
+// The same across a restart when the mark's own write fails: it stays owed,
+// and the checkpoint its failure made due writes it, so the store made
+// after the restart has no tee and nothing unpacks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_unpacking_mark_whose_write_failed_is_kept_by_its_checkpoint() {
+    reopened_after_ending_short(true, true).await;
+}
+
+async fn reopened_after_ending_short(restart: bool, mark_fails: bool) {
     use FilePriority::*;
     let archive: &[u8] = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
@@ -1235,9 +1243,23 @@ async fn reopened_after_ending_short(restart: bool) {
         .unwrap();
     let mut retired = rig.service.retired();
     let first = pieces_of(&rig.service, job_id, |file| file == 0).await;
+    if mark_fails {
+        UNPACK_OVER_FAILS.store(true, std::sync::atomic::Ordering::Release);
+    }
     fetch_pieces(&rig.service, job_id, &whole, Some(&first), |_| {}).await;
     retired.wait_for(|retired| *retired >= 1).await.unwrap();
     stored_complete(&rig.service, &rig.db, job_id).await;
+    if mark_fails {
+        assert!(
+            !UNPACK_OVER_FAILS.load(std::sync::atomic::Ordering::Acquire),
+            "the mark's own write was refused"
+        );
+        let mut settles = rig.service.inner.settled.subscribe();
+        settles
+            .wait_for(|_| rig.db.get_torrent(job_id).unwrap().unwrap().unpack_over)
+            .await
+            .unwrap();
+    }
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
     assert!(history.error_message.as_deref().unwrap().contains("txt"));
     let ended = (
@@ -1251,7 +1273,8 @@ async fn reopened_after_ending_short(restart: bool) {
     let placed = contents(&dir);
     let failed = rig.service.inner.live.lock().await[&job_id].failed.clone();
     assert!(failed.is_some());
-    // Kept by a write of its own: no placing was written for it.
+    // Kept by a write of its own, or its checkpoint when that failed: no
+    // placing was written for it.
     assert!(rig.db.get_torrent(job_id).unwrap().unwrap().unpack_over);
 
     rig.service
@@ -1315,11 +1338,135 @@ async fn reopened_after_ending_short(restart: bool) {
     service.stop().await;
 }
 
-// A torrent unpacking a five-volume RAR set whose third volume it does not
-// want completes: the set's give-up runs to its end, a volume a turn, and
-// the torrent seeds on as one unpacking nothing would.
+// A torrent whose store was made complete with its unpacking on and never
+// run, as a row kept complete without the mark leaves it, has no tee.
+// Reopened for a plain file, it completes with no first unpacking, in the
+// run it was reopened in and across a restart before it completes: the
+// reopen stores its unpacking over, so a store made after it has no tee
+// either. A restart does not change the outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unpacking_torrent_that_ignores_a_volume_of_its_set_completes() {
+async fn a_torrent_made_complete_and_reopened_completes_without_a_first_unpack() {
+    made_complete_and_reopened(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_made_complete_reopened_and_restarted_completes_without_a_first_unpack() {
+    made_complete_and_reopened(true).await;
+}
+
+async fn made_complete_and_reopened(restart: bool) {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    use FilePriority::*;
+    let archive: &[u8] = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let plain: Vec<u8> = (0..1024u32).map(|at| (at * 7 % 251) as u8).collect();
+    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("extra.bin", &plain)];
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "set", &files, 128, false,
+        ))))
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(1, Ignored)])
+        .await
+        .unwrap();
+    let first = pieces_of(&rig.service, job_id, |file| file == 0).await;
+    fetch_pieces(&rig.service, job_id, &whole, Some(&first), |_| {}).await;
+    stored_complete(&rig.service, &rig.db, job_id).await;
+    let dir = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
+    rig.service.stop().await;
+    // Its row complete, its unpacking never marked over.
+    let datastore = rig.db.datastore();
+    let id = job_id.0;
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                &format!("UPDATE torrents SET unpack_over = FALSE WHERE job_id = {id}"),
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+    let restarted =
+        |rig: &Rig| service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let made = restarted(&rig);
+    made.open().await.unwrap();
+    made.tick().await;
+    made.restored().await;
+    {
+        let live = made.inner.live.lock().await;
+        assert!(live[&job_id].complete());
+        assert!(live[&job_id].unpacking());
+        assert!(live[&job_id].store.as_ref().unwrap().tee().is_none());
+    }
+    made.set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert!(stored.completed_at_ms.is_none() && stored.unpack_over);
+    let again;
+    let service = if restart {
+        made.stop().await;
+        rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+        again = restarted(&rig);
+        again.open().await.unwrap();
+        again.tick().await;
+        again.restored().await;
+        let live = again.inner.live.lock().await;
+        assert!(!live[&job_id].complete());
+        assert!(live[&job_id].store.as_ref().unwrap().tee().is_none());
+        drop(live);
+        &again
+    } else {
+        &made
+    };
+    let placed = contents(&dir);
+    let rest: Vec<u32> = pieces_of(service, job_id, |file| file == 1)
+        .await
+        .into_iter()
+        .filter(|piece| !first.contains(piece))
+        .collect();
+    // A placing run would panic, and end the torrent short.
+    PLACE_PANICS.store(true, std::sync::atomic::Ordering::Release);
+    fetch_pieces(service, job_id, &whole, Some(&rest), |_| {}).await;
+    stored_complete(service, &rig.db, job_id).await;
+    assert!(
+        PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "no placing runs"
+    );
+    assert!(!service.unpacking_dir(job_id).exists());
+    let mut expected = placed;
+    expected.retain(|(name, _)| name != "extra.bin");
+    expected.push(("extra.bin".to_owned(), plain.clone()));
+    expected.sort();
+    assert_eq!(contents(&dir), expected);
+    service.stop().await;
+}
+
+// A torrent unpacking the five volumes of a RAR set, `ignored` among them
+// left out, done: it completes, the set's give-up run to its end, a volume
+// a turn. Returns the rig, the job, every volume's bytes end to end, and the
+// tee its store held, which it holds no more: its unpacking is over.
+async fn ignoring_a_volume(
+    ignored: usize,
+) -> (Rig, JobId, Vec<u8>, Arc<crate::torrents::tee::Tee>) {
     use FilePriority::*;
     let parts: Vec<(String, Vec<u8>)> = (1..=5)
         .map(|n| {
@@ -1349,19 +1496,90 @@ async fn an_unpacking_torrent_that_ignores_a_volume_of_its_set_completes() {
         .await
         .unwrap();
     rig.service
-        .set_file_priorities(job_id, &[(2, Ignored)])
+        .set_file_priorities(job_id, &[(ignored as u32, Ignored)])
         .await
         .unwrap();
-    let wanted = pieces_of(&rig.service, job_id, |file| file != 2).await;
+    let tee = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .as_ref()
+        .unwrap()
+        .tee()
+        .unwrap();
+    let wanted = pieces_of(&rig.service, job_id, |file| file != ignored).await;
     fetch_pieces(&rig.service, job_id, &whole, Some(&wanted), |_| {}).await;
     stored_complete(&rig.service, &rig.db, job_id).await;
-    let live = rig.service.inner.live.lock().await;
-    let tee = live[&job_id].store.as_ref().unwrap().tee().unwrap().clone();
-    drop(live);
     assert!(!tee.with(|job| job.giving_up()));
+    assert!(rig.db.get_torrent(job_id).unwrap().unwrap().unpack_over);
+    assert!(
+        rig.service.inner.live.lock().await[&job_id]
+            .store
+            .as_ref()
+            .unwrap()
+            .tee()
+            .is_none()
+    );
+    (rig, job_id, whole, tee)
+}
+
+// A torrent unpacking a five-volume RAR set whose third volume it does not
+// want completes: the set's give-up runs to its end, a volume a turn, and
+// the torrent seeds on as one unpacking nothing would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacking_torrent_that_ignores_a_volume_of_its_set_completes() {
+    let (rig, job_id, _, _) = ignoring_a_volume(2).await;
     assert_eq!(
         rig.service.torrent(job_id).await.unwrap().state,
         TorrentState::Seeding
     );
+    rig.service.stop().await;
+}
+
+// The volume it ignored, wanted again once its unpacking is over, is
+// fetched and the torrent completes again with no tee: the store let go
+// of the one it held, so nothing it fetches goes to the job, nothing is
+// written to its unpacking directory and nothing is placed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_volume_wanted_again_after_unpacking_is_over_goes_to_no_tee() {
+    use FilePriority::*;
+    let (rig, job_id, whole, tee) = ignoring_a_volume(2).await;
+    let dir = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
+    let outputs = rig.db.torrent_outputs(job_id).unwrap();
+    let placed = contents(&dir);
+    rig.service
+        .set_file_priorities(job_id, &[(2, Normal)])
+        .await
+        .unwrap();
+    let rest = pieces_of(&rig.service, job_id, |file| file == 2).await;
+    // A placing run again would panic, and end the torrent short.
+    PLACE_PANICS.store(true, std::sync::atomic::Ordering::Release);
+    fetch_pieces(&rig.service, job_id, &whole, Some(&rest), |_| {}).await;
+    stored_complete(&rig.service, &rig.db, job_id).await;
+    assert!(
+        PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "no placing runs again"
+    );
+    // Nothing but this test holds the tee the store let go of.
+    assert_eq!(Arc::strong_count(&tee), 1);
+    assert!(!rig.service.unpacking_dir(job_id).exists());
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), outputs);
+    let names = |found: Vec<(String, Vec<u8>)>| -> Vec<String> {
+        found.into_iter().map(|(name, _)| name).collect()
+    };
+    let mut expected = names(placed);
+    if !expected
+        .iter()
+        .any(|name| name == "rar5_enc_mv_video.part3.rar")
+    {
+        expected.push("rar5_enc_mv_video.part3.rar".to_owned());
+        expected.sort();
+    }
+    assert_eq!(names(contents(&dir)), expected);
     rig.service.stop().await;
 }

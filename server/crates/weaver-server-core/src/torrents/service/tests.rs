@@ -649,7 +649,7 @@ async fn sharing(
 async fn tee_of(service: &TorrentService, job_id: JobId) -> Arc<crate::torrents::tee::Tee> {
     let live = service.inner.live.lock().await;
     let store = live[&job_id].store.as_ref().unwrap();
-    Arc::clone(store.tee().unwrap())
+    store.tee().unwrap()
 }
 
 // The torrent's checkpoint written now, its tee's queued at once first,
@@ -658,7 +658,7 @@ async fn save_with_tee(service: &TorrentService, job_id: JobId) {
     let tee = {
         let live = service.inner.live.lock().await;
         live.get(&job_id)
-            .and_then(|torrent| Some(Arc::clone(torrent.store.as_ref()?.tee()?)))
+            .and_then(|torrent| torrent.store.as_ref()?.tee())
     };
     if let Some(tee) = tee {
         service.checkpoint_tee(job_id, tee, true).await;

@@ -12,7 +12,7 @@ use crate::torrents::store::{Kept, TorrentStore};
 use crate::torrents::tee::Tee;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use weaver_torrent::ResumePeers;
 
@@ -28,6 +28,44 @@ pub(super) struct Ledger {
     pub(super) times_at_ms: i64,
     // Set by a write that failed, so the next one writes all of it.
     pub(super) lost: Arc<AtomicBool>,
+    // Moved by a write of how many times its download ended, or that its
+    // unpacking is over, that failed: memory holds both ahead of the row,
+    // and each checkpoint writes them again until one lands with no
+    // failure since it was taken.
+    pub(super) row_owed: Arc<AtomicU64>,
+}
+
+// What the torrent's row lacks of memory, as a write that failed left it:
+// how many times its download ended and whether its unpacking is over,
+// both of which only go up, so a write of them never takes the row back.
+pub(super) struct OwedRow {
+    download_ends: u64,
+    unpack_over: bool,
+    // The failures it covers: it settles them only if no other came since.
+    seen: u64,
+    owed: Arc<AtomicU64>,
+}
+
+impl OwedRow {
+    pub(super) fn taken(
+        download_ends: u64,
+        unpack_over: bool,
+        owed: &Arc<AtomicU64>,
+    ) -> Option<Self> {
+        let seen = owed.load(Ordering::Acquire);
+        (seen > 0).then(|| Self {
+            download_ends,
+            unpack_over,
+            seen,
+            owed: Arc::clone(owed),
+        })
+    }
+
+    fn landed(&self) {
+        let _ = self
+            .owed
+            .compare_exchange(self.seen, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
 }
 
 // A write of what changed in a torrent's ledger and peers.
@@ -45,6 +83,8 @@ pub(super) struct CheckpointSave {
     lost: Option<Arc<AtomicBool>>,
     // The store whose pieces went with it, told when the write failed.
     pieces: Option<Arc<TorrentStore>>,
+    // What it wrote again of the torrent's row, settled when it landed.
+    row: Option<OwedRow>,
 }
 
 // A torrent's checkpoint as taken, to be queued before `live` is let go:
@@ -56,6 +96,7 @@ pub(super) struct CheckpointTaken {
     // The files whose times go with them, taken on the database's lane.
     stamping: Option<Stamping>,
     resume: Option<Resume>,
+    row: Option<OwedRow>,
 }
 
 // The torrent's checkpoint, taken: none when it has no store.
@@ -66,12 +107,14 @@ pub(super) fn take_checkpoint(torrent: &mut Live, now: i64) -> Option<Checkpoint
     let stamping = store.stamping();
     torrent.settle(now);
     let resume = torrent.take_resume(now, false);
+    let row = torrent.owed_row();
     Some(CheckpointTaken {
         job_id,
         store,
         pieces,
         stamping,
         resume,
+        row,
     })
 }
 
@@ -206,20 +249,23 @@ impl TorrentService {
             pieces,
             stamping,
             resume,
+            row,
         } = taken;
         // Nothing changed since the last write: none is queued.
-        if pieces.is_none() && stamping.is_none() && resume.is_none() {
+        if pieces.is_none() && stamping.is_none() && resume.is_none() && row.is_none() {
             return CheckpointSave {
                 job_id,
                 landed: None,
                 lost: None,
                 pieces: None,
+                row: None,
             };
         }
         let (counters, peers, lost) = resume.map_or((None, None, None), |resume| {
             (resume.counters, resume.peers, Some(resume.lost))
         });
         let wrote = (pieces.is_some() || stamping.is_some()).then(|| Arc::clone(&store));
+        let owed = row.as_ref().map(|row| (row.download_ends, row.unpack_over));
         let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
             // The files are looked at here, on the lane's own thread, not
             // the runtime's: one look each, just before the write.
@@ -230,6 +276,7 @@ impl TorrentService {
                 &stamps,
                 counters.as_ref(),
                 peers.as_ref(),
+                owed,
             )
         });
         CheckpointSave {
@@ -237,6 +284,7 @@ impl TorrentService {
             landed: Some(landed),
             lost,
             pieces: wrote,
+            row,
         }
     }
 
@@ -267,6 +315,7 @@ impl TorrentService {
             landed,
             lost,
             pieces,
+            row,
         } = save;
         let failed = match landed {
             None => None,
@@ -276,6 +325,11 @@ impl TorrentService {
                 Err(error) => Some(error.to_string()),
             },
         };
+        if failed.is_none()
+            && let Some(row) = &row
+        {
+            row.landed();
+        }
         match (failed, lost) {
             (Some(error), lost) => {
                 if let Some(lost) = lost {
@@ -283,6 +337,10 @@ impl TorrentService {
                 }
                 if let Some(store) = pieces {
                     store.lost_saved();
+                }
+                // What the row lacks stays owed, to the next checkpoint.
+                if row.is_some() {
+                    self.inner.signal.checkpoint_due(job_id);
                 }
                 tracing::warn!(job_id = job_id.0, %error, "could not checkpoint a torrent");
             }

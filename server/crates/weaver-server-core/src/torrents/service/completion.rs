@@ -5,7 +5,7 @@ use super::moves::Moving;
 use super::policy::goal_met;
 use super::retire::{held_tops, resolved};
 #[cfg(test)]
-use super::{KEEP_FAILS, OUTPUT_MEETS, PLACE_PANICS, locked};
+use super::{COMPLETION_FAILS, KEEP_FAILS, OUTPUT_MEETS, PLACE_PANICS, UNPACK_OVER_FAILS, locked};
 use super::{
     MemoryRelease, TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced,
 };
@@ -311,6 +311,27 @@ impl TorrentService {
                 Ok(())
             })
             .await;
+        self.let_go_of_tee(job_id).await;
+    }
+
+    // Its unpacking is over, so its store lets go of its tee: a piece it
+    // has after, as a reopen fetches, goes to no job, in this run as after
+    // a restart, which makes its store with none. The tee's runs are
+    // stopped and waited on, and it gives back what it holds.
+    async fn let_go_of_tee(&self, job_id: JobId) {
+        let tee = self
+            .with_torrent(job_id, |torrent| {
+                Ok(torrent
+                    .store
+                    .as_ref()
+                    .and_then(|store| store.let_go_of_tee()))
+            })
+            .await;
+        if let Ok(Some(tee)) = tee {
+            tee.stop().await;
+            tee.stop_checkpoints();
+            tee.forget();
+        }
     }
 
     // The directory a torrent's unpacking works in, marked the torrent's
@@ -411,13 +432,29 @@ impl TorrentService {
                 self.inner.signal.want_pass();
             }
             self.inner.counters.event(TorrentEvent::Completed);
-            if let Err(error) =
-                self.inner
-                    .db
-                    .set_torrent_completed(job_id, now, torrent.record.download_ends)
-            {
+            #[cfg(test)]
+            let refused = COMPLETION_FAILS
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+                .then(|| StateError::Database("refused".to_owned()));
+            #[cfg(not(test))]
+            let refused = None;
+            let written = match refused {
+                Some(error) => Err(error),
+                None => {
+                    self.inner
+                        .db
+                        .set_torrent_completed(job_id, now, torrent.record.download_ends)
+                }
+            };
+            if let Err(error) = written {
+                // The count stays owed to its checkpoints, which write it
+                // until one lands: a row left with the count before this
+                // end would number a later end as this one, after a
+                // restart, and the script queue would take it as had.
+                torrent.owe_row();
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
             }
+            // Due now: its checkpoint goes in this settle.
             self.inner.signal.checkpoint_due(job_id);
             (
                 (
@@ -461,30 +498,43 @@ impl TorrentService {
     // Its unpacking is over, short: one whose placing was not written, as
     // when the tee refused, keeps the mark in a write of its own, so a
     // reopen of it in this run or after a restart does not unpack again.
+    // A mark whose write failed stays owed to the torrent's checkpoints,
+    // which write it until one lands. Its store lets go of its tee.
     async fn ended_short(&self, job_id: JobId) {
         let marks = self
             .with_torrent(job_id, |torrent| {
                 Ok(!std::mem::replace(&mut torrent.record.unpack_over, true))
             })
             .await;
-        if !matches!(marks, Ok(true)) {
-            return;
-        }
-        let marked = self.queue_save(job_id, "torrent_unpack_over", move |db| {
-            db.set_torrent_unpack_over(job_id).map(|_| ())
-        });
-        match marked.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not record that a torrent's unpacking is over");
-            }
-            Err(_) => {
+        if matches!(marks, Ok(true)) {
+            let marked = self.queue_save(job_id, "torrent_unpack_over", move |db| {
+                #[cfg(test)]
+                if UNPACK_OVER_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    return Err(StateError::Database("refused".to_owned()));
+                }
+                db.set_torrent_unpack_over(job_id).map(|_| ())
+            });
+            let failed = match marked.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("its write was dropped".to_owned()),
+            };
+            if let Some(error) = failed {
                 tracing::warn!(
                     job_id = job_id.0,
-                    "that a torrent's unpacking is over was not recorded"
+                    error,
+                    "could not record that a torrent's unpacking is over"
                 );
+                let _ = self
+                    .with_torrent(job_id, |torrent| {
+                        torrent.owe_row();
+                        Ok(())
+                    })
+                    .await;
+                self.inner.signal.checkpoint_due(job_id);
             }
         }
+        self.let_go_of_tee(job_id).await;
     }
 
     // Unpacking ended short of what it would deliver, on a torrent with

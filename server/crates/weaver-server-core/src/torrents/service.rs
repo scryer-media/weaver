@@ -1230,9 +1230,7 @@ impl TorrentService {
         let tees: Vec<(JobId, Arc<Tee>)> = {
             let live = self.inner.live.lock().await;
             live.iter()
-                .filter_map(|(&job_id, torrent)| {
-                    Some((job_id, Arc::clone(torrent.store.as_ref()?.tee()?)))
-                })
+                .filter_map(|(&job_id, torrent)| Some((job_id, torrent.store.as_ref()?.tee()?)))
                 .collect()
         };
         for (job_id, tee) in tees {
@@ -1677,6 +1675,17 @@ pub(crate) static PLACE_PANICS: std::sync::atomic::AtomicBool =
 // refused.
 #[cfg(test)]
 pub(crate) static KEEP_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: the next write of a torrent's completion is refused.
+#[cfg(test)]
+pub(crate) static COMPLETION_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: the next write of the mark that a torrent's unpacking ended
+// short is refused.
+#[cfg(test)]
+pub(crate) static UNPACK_OVER_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: run once a move of a torrent's placed files has moved them,
