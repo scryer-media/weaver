@@ -1100,3 +1100,63 @@ mod numbered_outputs {
         );
     }
 }
+
+// The five volumes of an encrypted RAR set, as one torrent's files.
+fn volumes() -> Vec<(String, Vec<u8>)> {
+    (1..=5)
+        .map(|n| {
+            let name = format!("rar5_enc_mv_video.part{n}.rar");
+            let path = format!("{}/tests/fixtures/rar5/{name}", env!("CARGO_MANIFEST_DIR"));
+            (name, std::fs::read(path).unwrap())
+        })
+        .collect()
+}
+
+// The shares of a volume the torrent does not want are ruled lost, every
+// one, so the job waits on none of its pieces, and the pieces of the
+// volumes it wants are left as they were.
+#[tokio::test]
+async fn lose_unwanted_rules_every_share_of_an_unwanted_volume_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let mail = RunMail::default();
+    let volumes = volumes();
+    let layout = Arc::new(
+        PieceLayout::new(
+            16384,
+            volumes
+                .iter()
+                .map(|(name, bytes)| file(name, bytes.len() as u64))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let torrent: Vec<u8> = volumes
+        .iter()
+        .flat_map(|(_, bytes)| bytes.clone())
+        .collect();
+    let mut kept = storage(&dir.path().join("work"), &mail, CapacityReader::unknown());
+    kept.passwords = vec![crate::jobs::ArchivePasswordCandidate::new(
+        crate::jobs::ArchivePasswordSource::Explicit,
+        "testpass123".to_owned(),
+    )];
+    let tee = Tee::fresh(
+        parts(&layout, &dir.path().join("work"), &mail, Arc::default()),
+        kept,
+    );
+    let unwanted = |file: usize| file == 2;
+    let of = |piece: u32, keep: &dyn Fn(usize) -> bool| {
+        layout.spans(piece).iter().any(|span| keep(span.file))
+    };
+    for index in (0..layout.piece_count()).filter(|&index| of(index, &|file| !unwanted(file))) {
+        tee.deliver(index, &piece(&layout, &torrent, index));
+    }
+    let lost: Vec<u32> = (0..layout.piece_count())
+        .filter(|&index| of(index, &unwanted))
+        .collect();
+    assert!(!lost.is_empty());
+    assert!(lost.iter().all(|&index| !settled(&tee, index)));
+
+    tee.lose_unwanted(|file| !unwanted(file)).unwrap();
+    assert!(lost.iter().all(|&index| settled(&tee, index)));
+    tee.stop().await;
+}

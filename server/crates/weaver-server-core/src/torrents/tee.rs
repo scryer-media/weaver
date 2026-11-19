@@ -865,6 +865,20 @@ impl Tee {
         {
             self.checkpointed(job, false);
         }
+        // A give-up with volumes left goes on at the job's next turn, as a
+        // job of the pipeline's does (`after_graph_result`): the wake is a
+        // word on the job's own task, which reads the next volume back.
+        if job.ring_give_up() {
+            let _ = self.words.send(Word::Said(
+                Said {
+                    scope: self.job_id.0,
+                    node: weaver_graph::NodeId::ROOT,
+                    generation: 0,
+                    heard: Heard::GivingUp,
+                },
+                self.limit,
+            ));
+        }
     }
 
     // The wake a step armed: the job's checkpoint is due. One of a writer

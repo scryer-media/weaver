@@ -1314,3 +1314,54 @@ async fn reopened_after_ending_short(restart: bool) {
     }
     service.stop().await;
 }
+
+// A torrent unpacking a five-volume RAR set whose third volume it does not
+// want completes: the set's give-up runs to its end, a volume a turn, and
+// the torrent seeds on as one unpacking nothing would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacking_torrent_that_ignores_a_volume_of_its_set_completes() {
+    use FilePriority::*;
+    let parts: Vec<(String, Vec<u8>)> = (1..=5)
+        .map(|n| {
+            let name = format!("rar5_enc_mv_video.part{n}.rar");
+            let path = format!(
+                "{}/tests/fixtures/rar5/{name}",
+                std::env!("CARGO_MANIFEST_DIR")
+            );
+            (name, std::fs::read(path).unwrap())
+        })
+        .collect();
+    let files: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), &bytes[..]))
+        .collect();
+    let whole: Vec<u8> = parts.iter().flat_map(|(_, bytes)| bytes.clone()).collect();
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.db
+        .save_archive_password_settings(Some(vec!["testpass123".into()]), None)
+        .unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "set", &files, 16384, false,
+        ))))
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(2, Ignored)])
+        .await
+        .unwrap();
+    let wanted = pieces_of(&rig.service, job_id, |file| file != 2).await;
+    fetch_pieces(&rig.service, job_id, &whole, Some(&wanted), |_| {}).await;
+    stored_complete(&rig.service, &rig.db, job_id).await;
+    let live = rig.service.inner.live.lock().await;
+    let tee = live[&job_id].store.as_ref().unwrap().tee().unwrap().clone();
+    drop(live);
+    assert!(!tee.with(|job| job.giving_up()));
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().state,
+        TorrentState::Seeding
+    );
+    rig.service.stop().await;
+}
