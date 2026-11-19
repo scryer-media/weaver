@@ -791,3 +791,120 @@ async fn the_nesting_limit_counts_where_a_lifted_volume_came_from() {
     // The limit falls between the two depths, so both sides of it are read.
     assert_eq!(unpacked, vec![true, false], "the limit falls between them");
 }
+
+// A scene "CORE" release: five zips at the root, each holding small text
+// files and one volume of a RAR set whose one member is itself an archive
+// an engine reads (a deflated zip, or an xz), with a clean PAR2 set over
+// the zips when `recovery` says so. The first zip is deflated, as the
+// release packs it, so the zip engine reads it. Its namespace holds only
+// the set's first volume, so the run there ends short of the set and leaves
+// the member it was writing open, with nothing lost; the set is lifted to
+// the root at quiet and read there whole. A clean set over the zip that
+// lost nothing cannot bring the rest of the member, so the run reading it
+// is told it holds all it will and the job goes quiet. It ends Complete
+// with the file inside the member delivered whole; it never sits waiting.
+const CORE: &str = "MacGourmet-Deluxe-3.2.6";
+const SET: &str = "Mariner.Software.MacGourmet.Deluxe.v3.2.6.MacOSX.Incl.Keymaker-CORE";
+
+fn deflated_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let options = ::zip::write::SimpleFileOptions::default()
+        .compression_method(::zip::CompressionMethod::Deflated);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, bytes) in entries {
+        writer.start_file(*name, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+const INNER: &str = "MacGourmet Deluxe.bin";
+
+fn inner() -> Vec<u8> {
+    payload(12 * ARTICLE + 41, 83)
+}
+
+fn nested_core(member: (&str, Vec<u8>), outer_deflated: bool, recovery: bool) -> Scenario {
+    let files: Vec<(String, Vec<u8>)> = single_member_store_set(member.0, &member.1, 5)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, volume))| {
+            let name = format!("{CORE}.part{}.rar", index + 1);
+            let entries = [
+                ("core.nfo", format!("core volume {index}\r\n").into_bytes()),
+                ("file_id.diz", diz(char::from(b'b' + index as u8))),
+                (name.as_str(), volume),
+            ];
+            let bytes = if outer_deflated && index == 0 {
+                deflated_zip(&entries)
+            } else {
+                zip(&entries)
+            };
+            (format!("cr-tbl{:02}.zip", index + 1), bytes)
+        })
+        .collect();
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = files
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    if recovery {
+        posts.extend(super::harness::par2_volumes(SET, &described, 4, 3));
+    }
+    Scenario::new(posts)
+}
+
+#[tokio::test]
+async fn a_core_release_with_an_archive_inside_its_set_ends_complete() {
+    let zipped_inner = || (format!("{CORE}.zip"), deflated_zip(&[(INNER, inner())]));
+    let xz_inner = || (format!("{INNER}.xz"), super::streams::xz(&inner()));
+    let zip_xz_inner = || {
+        (
+            format!("{CORE}.zip.xz"),
+            super::streams::xz(&deflated_zip(&[(INNER, inner())])),
+        )
+    };
+    for (case, member, outer_deflated, recovery) in [
+        ("zip inside, clean recovery", zipped_inner(), true, true),
+        (
+            "zip in xz inside, clean recovery",
+            zip_xz_inner(),
+            false,
+            true,
+        ),
+        ("xz inside, clean recovery", xz_inner(), false, true),
+        ("zip inside, no recovery", zipped_inner(), true, false),
+        ("xz inside, no recovery", xz_inner(), false, false),
+    ] {
+        let (name, bytes) = member;
+        let scenario = nested_core((name.as_str(), bytes), outer_deflated, recovery);
+        let (lines, guard) = Lines::capture();
+        let outcome = super::harness::try_run(&scenario).await;
+        drop(guard);
+        let outcome = outcome.unwrap_or_else(|stall| {
+            panic!(
+                "{case}: stalled at {:?}: {}\nbound {:#?}\nrefused {:#?}",
+                stall.status,
+                stall.state,
+                lines.of("object bound"),
+                lines.of("object refused")
+            )
+        });
+        assert!(
+            outcome.completed() && outcome.files.get(&delivered(INNER)) == Some(&inner()),
+            "{case}: {:?} {:?} files {:?}\ndelivery {:#?}\nrefused {:#?}",
+            outcome.status,
+            outcome.failure,
+            outcome.files.keys().collect::<Vec<_>>(),
+            outcome.graph().delivery,
+            [
+                lines.of("object refused"),
+                lines.of("recovery bound"),
+                lines.of("recovery set ruled"),
+                lines.of("object bound")
+            ]
+        );
+    }
+}
