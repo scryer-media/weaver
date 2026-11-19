@@ -87,6 +87,17 @@ pub trait Format: Send + Sync {
     fn linked(_bound: &Holdings<'_, Self::Front>, _front: &Self::Front, _index: u32) -> bool {
         false
     }
+
+    // Where a volume of `length` states its place when its front does not:
+    // the bytes at its end that `told` reads. `None` where nothing past the
+    // front states it, or the front cannot say where that is.
+    fn tail(_front: &Self::Front, _length: u64) -> Option<ByteRange> {
+        None
+    }
+
+    // What the bytes of `tail` state of the volume's place, filed into its
+    // front. Whatever they say, they are all there is: nothing more is read.
+    fn told(_front: &mut Self::Front, _tail: &[u8]) {}
     fn run(password: Option<String>) -> Box<dyn Extraction>;
 
     // The least a run of this format holds resident, whatever its volumes'
@@ -264,6 +275,10 @@ pub struct EngineObject<F: Format> {
     // the object that handed it on said.
     #[serde(default)]
     windows: BTreeMap<u32, u64>,
+    // The volumes held by links alone whose tails may yet state their
+    // places (`Format::tail`), until they are read or never will be.
+    #[serde(default)]
+    tails: BTreeSet<u32>,
     bound: BTreeSet<u32>,
     // The places held where a front does not say its volume is not, and
     // the free places beside them (`Beside`), filed as a volume is bound,
@@ -292,7 +307,8 @@ impl<F: Format> Durable for EngineObject<F> {
             .chain(self.recovered.keys())
             .chain(self.fronts.keys())
             .chain(self.lengths.keys())
-            .chain(self.windows.keys());
+            .chain(self.windows.keys())
+            .chain(self.tails.iter());
         let named = known.into_iter().all(|volume| self.bound.contains(volume));
         (!named).then_some("a volume named that is not bound")
     }
@@ -308,6 +324,7 @@ impl<F: Format> Default for EngineObject<F> {
             fronts: BTreeMap::new(),
             lengths: BTreeMap::new(),
             windows: BTreeMap::new(),
+            tails: BTreeSet::new(),
             bound: BTreeSet::new(),
             beside: OnceLock::new(),
             password: None,
@@ -376,6 +393,86 @@ impl<F: Format> EngineObject<F> {
         self.names
             .get(&volume)
             .is_some_and(|name| name.slot(&self.names) == Some(volume))
+    }
+
+    // Where the volume bound at `volume` states its place, while its links
+    // alone hold it there: its front states none, and no name, posted or
+    // recovered, numbers it there.
+    fn tail(&self, volume: u32) -> Option<ByteRange> {
+        let front = self.fronts.get(&volume)?;
+        let alone = !F::states_place(front)
+            && !self.named_at(volume)
+            && !self.recovered.contains_key(&volume);
+        F::tail(front, *self.lengths.get(&volume)?).filter(|_| alone)
+    }
+
+    // A volume just bound, or whose front just came, waits for its tail
+    // where that states its place.
+    fn await_tail(&mut self, volume: u32) {
+        match self.bound.contains(&volume) && self.tail(volume).is_some() {
+            true => self.tails.insert(volume),
+            false => self.tails.remove(&volume),
+        };
+    }
+
+    // The tail of a volume waiting for it, once a clean delivery brings the
+    // last of it: the rest read back from where its bytes went. What it
+    // states is filed with the volume's front, and a volume it says is not
+    // where its links hold it goes back to be claimed where it is.
+    fn read_tail(
+        &mut self,
+        delivery: &Delivery<'_>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
+        let volume = delivery.volume.0;
+        if !self.tails.contains(&volume) || delivery.provenance.is_damaged() {
+            return;
+        }
+        let Some(tail) = self.tail(volume) else {
+            self.tails.remove(&volume);
+            return;
+        };
+        let Some(here) = tail.intersect(delivery.range()) else {
+            return;
+        };
+        let mut bytes = Vec::with_capacity(tail.len() as usize);
+        let before = ByteRange::new(tail.start, here.start);
+        if !before.is_empty()
+            && !read(
+                &Placement::Envelope {
+                    envelope: volume,
+                    range: before,
+                },
+                &mut bytes,
+            )
+        {
+            return;
+        }
+        let from = (here.start - delivery.offset) as usize;
+        bytes.extend_from_slice(&delivery.bytes[from..from + here.len() as usize]);
+        let after = ByteRange::new(here.end, tail.end);
+        if !after.is_empty()
+            && !read(
+                &Placement::Envelope {
+                    envelope: volume,
+                    range: after,
+                },
+                &mut bytes,
+            )
+        {
+            return;
+        }
+        self.tails.remove(&volume);
+        let Some(front) = self.fronts.get_mut(&volume) else {
+            return;
+        };
+        F::told(front, &bytes);
+        let misplaced = F::misplaced(front, volume);
+        self.file(volume);
+        if misplaced {
+            out.push(Emit::GiveBack(delivery.volume));
+        }
     }
 
     // Whether a claimant's front, the one it carries or the one it opens
@@ -527,27 +624,39 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // way there say nothing the run does not read itself, but a volume's
     // front. A volume can be bound before its front comes, as a restored
     // volume fetched again is: what its front states of its place is the
-    // engine's when it does.
+    // engine's when it does. So is what a volume's tail states of it, for
+    // one its links alone hold (`read_tail`).
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,
-        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
-        _out: &mut Vec<Emit>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
     ) {
         let volume = delivery.volume.0;
-        if delivery.offset != 0 || !self.bound.contains(&volume) {
+        if !self.bound.contains(&volume) {
             return;
         }
-        if let Some(front) = F::front(delivery.bytes) {
-            self.fronts.entry(volume).or_insert(front);
-            self.file(volume);
+        if delivery.offset == 0 {
+            if let Some(front) = F::front(delivery.bytes)
+                && !self.fronts.contains_key(&volume)
+            {
+                self.fronts.insert(volume, front);
+                self.file(volume);
+                self.await_tail(volume);
+            }
+            if let Some(window) = F::window(delivery.bytes) {
+                self.windows.entry(volume).or_insert(window);
+            }
         }
-        if let Some(window) = F::window(delivery.bytes) {
-            self.windows.entry(volume).or_insert(window);
-        }
+        self.read_tail(&delivery, read, out);
     }
 
-    fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {}
+    // A closed volume was handed every byte it has, its tail with them: one
+    // whose tail stated nothing by then, or that a restore closes again
+    // without them, stays where its links hold it.
+    fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
+        self.tails.remove(&volume.0);
+    }
 
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
@@ -583,10 +692,26 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         out.extend(why.map(Emit::Refuse));
     }
 
-    // It wants nothing of itself: what it bids for follows its run.
-    fn wants(&self, _out: &mut Vec<Seek>) {}
+    // What it bids for of itself is the tails of the first volumes its links
+    // alone hold, as many as the RAR store bids ahead; the rest of what it
+    // bids for follows its run.
+    fn wants(&self, out: &mut Vec<Seek>) {
+        let ahead = self.tails.iter().take(crate::rar_store::WINDOW as usize);
+        for (weight, &volume) in (0..).zip(ahead) {
+            if let Some(tail) = self.tail(volume) {
+                out.push(Seek::data(VolumeIndex(volume), tail, Weight(weight)));
+            }
+        }
+    }
 
-    fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
+    // A tail nothing will bring, or that comes only in the normal order,
+    // states nothing ahead of it: the volume stays where its links hold it.
+    fn pulled(&mut self, seek: Seek, pull: Pull, _out: &mut Vec<Emit>) {
+        let volume = seek.volume.0;
+        if matches!(pull, Pull::Lost | Pull::Unseekable) && self.tail(volume) == Some(seek.range) {
+            self.tails.remove(&volume);
+        }
+    }
 
     // The fronts it copies out are in its facts, which a restart keeps, and
     // its run reads the volumes themselves: it says nothing of the posted bytes.
@@ -640,6 +765,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         }
         self.bound.insert(volume.0);
         self.file(volume.0);
+        self.await_tail(volume.0);
     }
 
     // The name a recovery set gave the volume is the set's numbering now.
@@ -685,6 +811,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
         let given = self.bound.remove(&volume.0).then(|| {
+            self.tails.remove(&volume.0);
             self.names.remove(&volume.0);
             self.recovered.remove(&volume.0);
             Box::new(CarriedVolume {
@@ -734,6 +861,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         if let Some(front) = carried.front {
             self.fronts.insert(volume.0, front);
             self.file(volume.0);
+            self.await_tail(volume.0);
         }
         if let Some(window) = carried.window {
             self.windows.insert(volume.0, window);
