@@ -255,6 +255,50 @@ fn quick_open_cross_check(
     QuickOpenCrossCheck::Mismatch
 }
 
+// Where a walk ran short, as the volume's length judges it. Over an image
+// that states no end, as the store's does, unrar-rs answers a walk short
+// inside a header whose size it read with that header's end. A header that
+// crosses the volume's length would then end the volume once its size is
+// read, with bytes before the length still on their way, and say every byte
+// to the header's end damaged. Over an image that states its length, a
+// header past it is answered one byte past where the bytes stop, and that
+// is the answer the length judges: a walk short past the length, on headers
+// placing no data past it, is asked again over the image stating the length.
+fn past_length(
+    walk: &RarVolumeFactsWalk,
+    kept: &Kept,
+    length: Option<u64>,
+    password: Option<&str>,
+    kdf: &Arc<KdfCache>,
+    closed: bool,
+) -> Option<u64> {
+    let short_at = walk.short_at?;
+    let Some(length) =
+        length.filter(|length| short_at > *length && data_end(&walk.facts) <= *length)
+    else {
+        return Some(short_at);
+    };
+    let stated = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+        SparseImage::of(kept, closed).ending_at(length),
+        password,
+        Arc::clone(kdf),
+    );
+    // Stating the length changes where the walk says it ran short, and
+    // nothing it read.
+    #[cfg(test)]
+    assert_eq!(
+        stated.as_ref().ok().map(|stated| &stated.facts),
+        Some(&walk.facts),
+        "a walk over the image stating its length reads the same headers"
+    );
+    Some(
+        stated
+            .ok()
+            .and_then(|stated| stated.short_at)
+            .unwrap_or(short_at),
+    )
+}
+
 impl Walk {
     // Facts read before, as a checkpoint kept them.
     pub(super) fn restore(&mut self, facts: Option<RarVolumeFacts>) {
@@ -476,17 +520,18 @@ impl Walk {
         kdf: &Arc<KdfCache>,
         closed: bool,
     ) -> Step {
+        let past = past_length(&walk, kept, length, password, kdf, closed);
         let facts = walk.facts;
         #[cfg(test)]
         super::counts::bump(|counts| counts.read_members += facts.members.len());
         let reach = data_end(&facts);
-        let ended = match (walk.short_at, length) {
+        let ended = match (past, length) {
             (None, _) => true,
             (Some(short_at), Some(length)) => short_at > length,
             (Some(_), None) => false,
         };
         let mut damaged = None;
-        if let (true, Some(short_at), Some(length)) = (ended, walk.short_at, length) {
+        if let (true, Some(short_at), Some(length)) = (ended, past, length) {
             // Data that runs past the volume's length is judged only at its
             // close: until then that length is its producer's word for now
             // and may yet move.
@@ -573,6 +618,8 @@ impl Walk {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use weaver_graph::Provenance;
 
     use super::*;
@@ -627,6 +674,82 @@ mod tests {
             .into_iter()
             .find(|(range, _, provenance)| provenance.is_damaged() && range.contains(at))
             .map(|(range, _, _)| range)
+    }
+
+    // A volume said to end inside a header, past its size field, with a
+    // byte of the header before that length still missing: the walk waits
+    // for the byte, and only then ends the volume and says the one byte past
+    // its length damaged, as when unrar-rs answered a walk short inside a
+    // header one byte past where its bytes stop. unrar-rs now answers the
+    // header's end, past the length.
+    #[test]
+    fn a_header_across_the_volume_length_ends_it_once_the_bytes_before_are_in() {
+        use super::super::tests::writer::{Item, Options, Version, write};
+
+        let volume = write(
+            &[
+                Item::File("alpha.bin", crate::testing::payload(1, 3_000)),
+                Item::File("beta.bin", crate::testing::payload(2, 3_000)),
+            ],
+            &Options::new(Version::Rar5),
+        )
+        .remove(0);
+        let whole =
+            RarArchive::parse_volume_facts(Cursor::new(volume.clone()), None).expect("the volume");
+        let alpha = &whole.members[0];
+        let beta = &whole.members[1];
+        // Beta's header runs from alpha's data end to beta's data.
+        let header = alpha.data_offset + alpha.data_size;
+        assert!(beta.data_offset > header + 20);
+        let length = header + 16;
+        let missing = ByteRange::new(header + 8, header + 10);
+        let mut kept = Kept::default();
+        kept.want(ByteRange::new(0, length));
+        for range in [
+            ByteRange::new(0, missing.start),
+            ByteRange::new(missing.end, length),
+        ] {
+            kept.absorb(
+                range,
+                &volume[range.start as usize..range.end as usize],
+                Provenance::Fresh,
+            );
+        }
+        let kdf = Arc::new(KdfCache::new());
+        // unrar-rs, over the image as the store builds it, asks for the
+        // header's end.
+        let raw = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+            SparseImage::of(&kept, false),
+            None,
+            Arc::clone(&kdf),
+        )
+        .expect("a walk");
+        assert_eq!(raw.short_at, Some(beta.data_offset));
+        let mut walk = Walk::default();
+        let step = walk.step(&mut kept, Some(length), None, &kdf, false);
+        assert!(!walk.ended, "{step:?}");
+        assert!(
+            matches!(step, Step::Walked { damaged: None, .. }),
+            "{step:?}"
+        );
+        kept.absorb(
+            missing,
+            &volume[missing.start as usize..missing.end as usize],
+            Provenance::Fresh,
+        );
+        let step = walk.step(&mut kept, Some(length), None, &kdf, false);
+        assert!(walk.ended, "{step:?}");
+        assert!(
+            matches!(
+                step,
+                Step::Walked { damaged: Some(range), .. } if range == ByteRange::new(length, length + 1)
+            ),
+            "{step:?}"
+        );
+        assert_eq!(
+            walk.facts.as_ref().map(|facts| facts.members.len()),
+            Some(1)
+        );
     }
 
     // Read from the runs about an offset, the walk's questions answer as
