@@ -243,6 +243,15 @@ pub trait Engine {
     // keeps nothing of it.
     fn bid(&self, _reached: VolumeIndex, _out: &mut Vec<Seek>) {}
 
+    // Whether the place the object holds `volume` at is settled: no byte it
+    // is still owed may yet say the volume belongs elsewhere. The owner hands
+    // a run no byte of a volume whose place is open, and asks again when the
+    // volume is delivered, pulled, closed or given back. Every place is
+    // settled for an object that never moves a volume it holds.
+    fn placed(&self, _volume: VolumeIndex) -> bool {
+        true
+    }
+
     // The bytes a run holds resident while it runs: a decoder's window, read
     // from the first bytes the object was delivered. The owner reserves it
     // before it starts the run, and a run never holds more, so a reservation

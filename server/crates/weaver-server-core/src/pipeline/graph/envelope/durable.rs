@@ -95,6 +95,9 @@ impl Envelopes {
                     // first to read one starts from its recorded length.
                     closed_at: record.closed,
                     settled: record.settled,
+                    // Whether its place is open is fed again too, from the
+                    // object, which keeps the tails it awaits.
+                    open: false,
                     reached: 0,
                     length_read: None,
                 },

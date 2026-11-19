@@ -265,6 +265,8 @@ impl RunVolumes {
                 return Ok((0, None));
             }
             match kept {
+                // No byte of a volume is read while its place may move.
+                Some(kept) if kept.open => {}
                 Some(kept) if kept.coverage.verified(want) => {
                     kept.reached = kept.reached.max(want.end);
                     return Ok((
@@ -307,9 +309,14 @@ impl Volumes for RunVolumes {
             // No index lies between `after` and `from`, so only a gap past
             // `from` can still fill, and only while a volume can still join
             // there. Past the last volume bound, one joins only from a member
-            // beside them still deciding its owner.
+            // beside them still deciding its owner. A volume its object holds
+            // at a place still open is handed on once the place settles: the
+            // volume there then may be another.
             match state.volumes.range(from..).next() {
-                Some(&next) if next == from || state.complete => {
+                Some(&next)
+                    if (next == from || state.complete)
+                        && !state.kept.get(&next).is_some_and(|kept| kept.open) =>
+                {
                     return Ok(Some(VolumeIndex(next)));
                 }
                 None if !state.deciding => return Ok(None),
@@ -324,7 +331,7 @@ impl Volumes for RunVolumes {
         if state.generation != self.generation || self.stopped() {
             return None;
         }
-        let kept = state.kept.get_mut(&volume.0)?;
+        let kept = state.kept.get_mut(&volume.0).filter(|kept| !kept.open)?;
         let length = kept.closed?;
         kept.length_read = Some(length);
         Some(length)
@@ -354,6 +361,7 @@ impl Volumes for RunVolumes {
             let known = state.volumes.contains(&volume.0);
             let complete = state.complete;
             if let Some(kept) = state.kept.get_mut(&volume.0)
+                && !kept.open
                 && let Some(length) = kept.closed.or(kept.sized)
             {
                 kept.length_read = Some(length);
@@ -367,12 +375,15 @@ impl Volumes for RunVolumes {
     }
 
     // A volume with bytes nothing will bring is not settled: a read of them
-    // fails, and work on the pool reads only what is all in.
+    // fails, and work on the pool reads only what is all in. Nor is one at a
+    // place still open.
     fn settled(&self, volume: VolumeIndex) -> bool {
         let state = self.shelf.lock();
         state.kept.get(&volume.0).is_some_and(|kept| {
-            kept.closed
-                .is_some_and(|length| kept.coverage.verified(ByteRange::new(0, length)))
+            !kept.open
+                && kept
+                    .closed
+                    .is_some_and(|length| kept.coverage.verified(ByteRange::new(0, length)))
         })
     }
 
@@ -406,7 +417,11 @@ impl Volumes for RunVolumes {
         let reads = self.volume.as_deref().map(Volume::read_turns);
         let stopped = || -> io::Error { Unreadable::Stopped.into() };
         let _one = match reads.filter(|reads| reads.whole_pieces()) {
-            Some(reads) => Some(reads.one_here_unless(&self.files.stop).ok_or_else(stopped)?),
+            Some(reads) => Some(
+                reads
+                    .one_here_unless(&self.files.stop)
+                    .ok_or_else(stopped)?,
+            ),
             None => None,
         };
         // The run's reads go one at a time; a drain never takes this lock.
@@ -466,7 +481,10 @@ impl Volumes for RunVolumes {
                 files.reading.keep(turn);
             }
             if let Ok(Some(opened)) = &read {
-                files.open.entry(volume.0).or_insert_with(|| Arc::clone(opened));
+                files
+                    .open
+                    .entry(volume.0)
+                    .or_insert_with(|| Arc::clone(opened));
             }
         }
         read.map(|_| len)

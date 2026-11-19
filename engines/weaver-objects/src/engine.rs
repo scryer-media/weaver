@@ -938,6 +938,12 @@ impl<F: Format + 'static> Engine for EngineObject<F> {
         F::lends()
     }
 
+    // A volume its links alone hold is not placed while its tail may yet
+    // say it belongs elsewhere.
+    fn placed(&self, volume: VolumeIndex) -> bool {
+        !self.tails.contains(&volume.0)
+    }
+
     // The volumes after the one the run is on, the nearest first: weighed
     // by how many bound volumes lie between, since an index orders the
     // volumes and need not be dense.
