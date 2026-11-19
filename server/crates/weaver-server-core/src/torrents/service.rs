@@ -1762,11 +1762,6 @@ fn short_status(own: &[String], unpacked: &[String], why: &str) -> JobStatus {
     Delivery::of_whole_files(own.iter().cloned(), unpacked.iter().cloned()).status(Some(&failure))
 }
 
-// Whether the torrent's job unpacks, as its metainfo fixed it.
-fn unpacks(torrent: &Live) -> bool {
-    torrent.record.unpack_in_force.unwrap_or_default()
-}
-
 // The bytes in hand of the files that go to disk: the progress over the
 // torrent's total, which leaves padding out as the session's own does
 // (libtorrent `file_progress::total_on_disk`).

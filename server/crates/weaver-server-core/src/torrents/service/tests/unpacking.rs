@@ -1030,3 +1030,287 @@ async fn a_seed_mode_archive_with_a_bad_file_is_fetched_again_and_unpacks_whole(
     rig.service.stop().await;
     seeding.stop().await;
 }
+
+// The pieces of the torrent that hold a byte of a file `of` picks.
+async fn pieces_of(
+    service: &TorrentService,
+    job_id: JobId,
+    of: impl Fn(usize) -> bool,
+) -> Vec<u32> {
+    let layout = service.inner.live.lock().await[&job_id]
+        .layout
+        .clone()
+        .unwrap();
+    (0..layout.piece_count())
+        .filter(|&piece| layout.spans(piece).iter().any(|span| of(span.file)))
+        .collect()
+}
+
+// Waits for the torrent's completion as stored: every settle publishes what
+// it did, completion among it.
+async fn stored_complete(service: &TorrentService, db: &Database, job_id: JobId) {
+    let mut settles = service.inner.settled.subscribe();
+    service.inner.signal.look(job_id);
+    settles
+        .wait_for(|_| {
+            db.get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+}
+
+// The names under `dir`, sorted, with what each holds.
+fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let bytes = std::fs::read(entry.path()).unwrap_or_default();
+            (entry.file_name().to_string_lossy().into_owned(), bytes)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+// An archive and a plain file, the plain file ignored: the archive unpacks
+// whole and the torrent completes with no history row. The plain file
+// wanted again reopens the torrent, which downloads it and completes again
+// with no tee: its unpacking does not run again, its outputs and the names
+// its row keeps stay, and no history row is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacked_torrent_reopened_for_a_plain_file_completes_without_unpacking_again() {
+    reopened_for_a_plain_file(false).await;
+}
+
+// The same with a restart while it is reopened: the store made after it
+// has no tee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpacked_torrent_reopened_across_a_restart_completes_without_unpacking_again() {
+    reopened_for_a_plain_file(true).await;
+}
+
+async fn reopened_for_a_plain_file(restart: bool) {
+    use FilePriority::*;
+    let archive: &[u8] = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let plain: Vec<u8> = (0..1024u32).map(|at| (at * 7 % 251) as u8).collect();
+    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("extra.bin", &plain)];
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "set", &files, 128, false,
+        ))))
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(1, Ignored)])
+        .await
+        .unwrap();
+    let mut retired = rig.service.retired();
+    let first = pieces_of(&rig.service, job_id, |file| file == 0).await;
+    fetch_pieces(&rig.service, job_id, &whole, Some(&first), |_| {}).await;
+    stored_complete(&rig.service, &rig.db, job_id).await;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    let dir = PathBuf::from(view.storage_dir.unwrap());
+    let outputs = rig.db.torrent_outputs(job_id).unwrap();
+    assert_eq!(outputs, ["small.txt"]);
+    let placed = contents(&dir);
+    assert!(placed.contains(&("small.txt".to_owned(), SMALL_TXT.to_vec())));
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    assert!(rig.db.get_torrent(job_id).unwrap().unwrap().unpack_over);
+
+    rig.service
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    assert!(
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .completed_at_ms
+            .is_none()
+    );
+    let again;
+    let service = if restart {
+        rig.service.stop().await;
+        rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+        again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+        again.open().await.unwrap();
+        again.tick().await;
+        again.restored().await;
+        let live = again.inner.live.lock().await;
+        assert!(live[&job_id].store.as_ref().unwrap().tee().is_none());
+        assert!(!live[&job_id].complete());
+        drop(live);
+        &again
+    } else {
+        &rig.service
+    };
+    let rest: Vec<u32> = pieces_of(service, job_id, |file| file == 1)
+        .await
+        .into_iter()
+        .filter(|piece| !first.contains(piece))
+        .collect();
+    // A placing run again would panic, and end the torrent short.
+    PLACE_PANICS.store(true, std::sync::atomic::Ordering::Release);
+    fetch_pieces(service, job_id, &whole, Some(&rest), |_| {}).await;
+    stored_complete(service, &rig.db, job_id).await;
+    assert!(
+        PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "no placing runs again"
+    );
+
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), outputs);
+    let mut expected = placed.clone();
+    if !expected.iter().any(|(name, _)| name == "extra.bin") {
+        expected.push(("extra.bin".to_owned(), plain.clone()));
+        expected.sort();
+    }
+    assert_eq!(contents(&dir), expected);
+    assert!(
+        expected.contains(&("extra.bin".to_owned(), plain.clone())),
+        "{expected:?}"
+    );
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    assert_eq!(*retired.borrow_and_update(), 0);
+    service.stop().await;
+}
+
+// Unpacking that ends short with no placing written, its archive refused,
+// beside a plain file ignored: the torrent completes with one history row,
+// its unpacking over. The plain file wanted again reopens it, and it
+// downloads the file and completes again with no tee: no second unpacking,
+// and its history row, outputs and failure stay as they were, in the same
+// run and across a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_unpacked_torrent_reopened_for_a_plain_file_keeps_one_history_row() {
+    reopened_after_ending_short(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_unpacked_torrent_reopened_across_a_restart_keeps_one_history_row() {
+    reopened_after_ending_short(true).await;
+}
+
+async fn reopened_after_ending_short(restart: bool) {
+    use FilePriority::*;
+    let archive: &[u8] = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let plain: Vec<u8> = (0..1024u32).map(|at| (at * 7 % 251) as u8).collect();
+    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("extra.bin", &plain)];
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.db
+        .save_post_processing_settings(&PostProcessingSettings {
+            unacceptable_extensions: vec!["txt".into()],
+            unwanted_extension_action:
+                crate::post_processing::model::UnwantedExtensionAction::FailJob,
+            ..PostProcessingSettings::default()
+        })
+        .unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "set", &files, 128, false,
+        ))))
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(1, Ignored)])
+        .await
+        .unwrap();
+    let mut retired = rig.service.retired();
+    let first = pieces_of(&rig.service, job_id, |file| file == 0).await;
+    fetch_pieces(&rig.service, job_id, &whole, Some(&first), |_| {}).await;
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    stored_complete(&rig.service, &rig.db, job_id).await;
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert!(history.error_message.as_deref().unwrap().contains("txt"));
+    let ended = (
+        history.status.clone(),
+        history.error_message.clone(),
+        history.completed_at,
+    );
+    let view = rig.service.torrent(job_id).await.unwrap();
+    let dir = PathBuf::from(view.storage_dir.unwrap());
+    let outputs = rig.db.torrent_outputs(job_id).unwrap();
+    let placed = contents(&dir);
+    let failed = rig.service.inner.live.lock().await[&job_id].failed.clone();
+    assert!(failed.is_some());
+    // Kept by a write of its own: no placing was written for it.
+    assert!(rig.db.get_torrent(job_id).unwrap().unwrap().unpack_over);
+
+    rig.service
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    assert!(
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .completed_at_ms
+            .is_none()
+    );
+    let again;
+    let service = if restart {
+        rig.service.stop().await;
+        rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+        again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+        again.open().await.unwrap();
+        again.tick().await;
+        again.restored().await;
+        let live = again.inner.live.lock().await;
+        assert!(live[&job_id].store.as_ref().unwrap().tee().is_none());
+        drop(live);
+        &again
+    } else {
+        &rig.service
+    };
+    let mut retired = service.retired();
+    let before = *retired.borrow_and_update();
+    let rest: Vec<u32> = pieces_of(service, job_id, |file| file == 1)
+        .await
+        .into_iter()
+        .filter(|piece| !first.contains(piece))
+        .collect();
+    // A placing run again would panic, and end the torrent short.
+    PLACE_PANICS.store(true, std::sync::atomic::Ordering::Release);
+    fetch_pieces(service, job_id, &whole, Some(&rest), |_| {}).await;
+    stored_complete(service, &rig.db, job_id).await;
+    assert!(
+        PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "no placing runs again"
+    );
+
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(
+        (history.status, history.error_message, history.completed_at),
+        ended
+    );
+    assert_eq!(*retired.borrow_and_update(), before);
+    assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), outputs);
+    let mut expected = placed.clone();
+    expected.retain(|(name, _)| name != "extra.bin");
+    expected.push(("extra.bin".to_owned(), plain.clone()));
+    expected.sort();
+    assert_eq!(contents(&dir), expected);
+    if !restart {
+        assert_eq!(service.inner.live.lock().await[&job_id].failed, failed);
+    }
+    service.stop().await;
+}

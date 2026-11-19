@@ -167,10 +167,10 @@ impl TorrentService {
                 live.get(&job_id).and_then(|torrent| {
                     let store = Arc::clone(torrent.store.as_ref()?);
                     let levels = torrent.levels.clone();
-                    Some((store, levels, torrent.complete()))
+                    Some((store, levels, torrent.complete(), torrent.unpacking()))
                 })
             };
-            let Some((store, levels, complete)) = found else {
+            let Some((store, levels, complete, unpacking)) = found else {
                 self.inner.signal.forget_writes(job_id);
                 continue;
             };
@@ -191,7 +191,10 @@ impl TorrentService {
             self.files_downloaded(job_id, made_whole).await;
             let wanted = |file: usize| levels.get(file).copied().unwrap_or_default().wanted();
             let whole = store.has_files(wanted);
-            let Some(tee) = store.tee() else {
+            // A store keeps its tee after its unpacking is over; one that
+            // downloads again in the same run takes no tee branch, so its
+            // unpacking does not run again (`Live::unpacking`).
+            let Some(tee) = store.tee().filter(|_| unpacking) else {
                 if whole {
                     self.completed(job_id).await;
                 }

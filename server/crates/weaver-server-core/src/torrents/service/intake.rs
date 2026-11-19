@@ -979,6 +979,7 @@ impl TorrentService {
             policy_override: SeedingPolicy::kept(request.policy_override),
             unpack: request.unpack,
             unpack_in_force: None,
+            unpack_over: false,
             metadata: request.metadata.clone(),
             upload_limit: request.upload_limit,
             download_limit: request.download_limit,

@@ -305,6 +305,10 @@ pub struct TorrentRecord {
     // from the override chain then, so a restart builds the same tree;
     // `None` until then.
     pub unpack_in_force: Option<bool>,
+    // Whether its unpacking is over, whole or short: kept so a torrent
+    // reopened after it, in this run or after a restart, does not unpack
+    // again.
+    pub unpack_over: bool,
     // The attributes its job was added with.
     pub metadata: Vec<(String, String)>,
     // Its own upload and download limits in bytes per second: None is

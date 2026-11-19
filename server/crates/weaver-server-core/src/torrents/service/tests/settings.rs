@@ -760,6 +760,7 @@ async fn a_wound_down_seed_whose_goal_is_met_stays_stopped_when_torrents_are_on(
 fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
     let mut record = TorrentRecord {
         unpack_in_force: None,
+        unpack_over: false,
         job_id: JobId(1),
         infohash_v1: Some([1; 20]),
         infohash_v2: None,

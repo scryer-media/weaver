@@ -216,6 +216,7 @@ impl TorrentService {
             .unwrap_or_default();
             return self.not_placed(job_id, &work, &error, gone, there).await;
         }
+        self.unpack_over(job_id).await;
         self.unclaim_outputs(job_id).await;
         // What the policy left out, worded as the job's reason; a file it
         // could not remove stays where unpacking made it, and says why.
@@ -269,7 +270,9 @@ impl TorrentService {
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
             db.finish_torrent_unpack(job_id, &[], &dropped, &[])
         });
-        self.recorded(job_id, recorded.await);
+        if self.recorded(job_id, recorded.await) {
+            self.unpack_over(job_id).await;
+        }
         self.unclaim_outputs(job_id).await;
         Placing::Short {
             why: unplaced(work, &error),
@@ -277,23 +280,37 @@ impl TorrentService {
         }
     }
 
+    // Whether the placing was written.
     fn recorded(
         &self,
         job_id: JobId,
         recorded: Result<Result<(), StateError>, oneshot::error::RecvError>,
-    ) {
+    ) -> bool {
         match recorded {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => true,
             Ok(Err(error)) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record what a torrent unpacked");
+                false
             }
             Err(_) => {
                 tracing::warn!(
                     job_id = job_id.0,
                     "what a torrent unpacked was not recorded"
                 );
+                false
             }
         }
+    }
+
+    // Its unpacking is over, as the placing written for it keeps on its
+    // row (`finish_torrent_unpack`).
+    async fn unpack_over(&self, job_id: JobId) {
+        let _ = self
+            .with_torrent(job_id, |torrent| {
+                torrent.record.unpack_over = true;
+                Ok(())
+            })
+            .await;
     }
 
     // The directory a torrent's unpacking works in, marked the torrent's
@@ -432,6 +449,35 @@ impl TorrentService {
         }
     }
 
+    // Its unpacking is over, short: one whose placing was not written, as
+    // when the tee refused, keeps the mark in a write of its own, so a
+    // reopen of it in this run or after a restart does not unpack again.
+    async fn ended_short(&self, job_id: JobId) {
+        let marks = self
+            .with_torrent(job_id, |torrent| {
+                Ok(!std::mem::replace(&mut torrent.record.unpack_over, true))
+            })
+            .await;
+        if !matches!(marks, Ok(true)) {
+            return;
+        }
+        let marked = self.queue_save(job_id, "torrent_unpack_over", move |db| {
+            db.set_torrent_unpack_over(job_id).map(|_| ())
+        });
+        match marked.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not record that a torrent's unpacking is over");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    "that a torrent's unpacking is over was not recorded"
+                );
+            }
+        }
+    }
+
     // Unpacking ended short of what it would deliver, on a torrent with
     // every file it wants: the torrent completes and seeds on to its goal,
     // saying `why`, and its job goes to history as what it delivered says
@@ -444,6 +490,7 @@ impl TorrentService {
         why: String,
         placed: &[String],
     ) {
+        self.ended_short(job_id).await;
         self.completed(job_id).await;
         let status = short_status(&store.whole_names(), placed, &why);
         let settings = self.settings();

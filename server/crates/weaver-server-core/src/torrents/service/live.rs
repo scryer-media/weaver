@@ -270,8 +270,7 @@ impl Live {
     // its store's, or, before its store is open, the pieces it kept; one
     // that kept none, or is in seed mode, which has every piece as added,
     // is taken as whole until its store says otherwise. One whose
-    // unpacking runs over archives stays complete: whether its unpacking
-    // runs again when it completes again is not settled.
+    // unpacking is over reopens with no tee, and does not unpack again.
     pub(super) fn reopens(&self, held: &[FilePriority]) -> bool {
         let wanted = |file: usize| held.get(file).copied().unwrap_or_default().wanted();
         let whole = match (&self.store, &self.layout) {
@@ -283,17 +282,16 @@ impl Live {
             }
             (None, _) => true,
         };
-        self.complete() && !self.unpacks_archives() && !whole
+        self.complete() && !whole
     }
 
-    // Whether its unpacking is in force over archive files: a tee is made
-    // for it whenever it is short of complete.
-    fn unpacks_archives(&self) -> bool {
-        self.record.unpack_in_force.unwrap_or_default()
-            && self
-                .layout
-                .as_deref()
-                .is_some_and(|layout| crate::torrents::tee::Plan::of(layout).is_some())
+    // Whether its job unpacks, as its metainfo fixed it, and its unpacking
+    // is not over: the one owner of whether it makes a tee and takes the
+    // tee's branch. One whose unpacking ended, whole or short, and that
+    // downloads again, as when a file it ignored is wanted, makes none: its
+    // unpacking does not run again, and its outputs and history stay.
+    pub(super) fn unpacking(&self) -> bool {
+        self.record.unpack_in_force.unwrap_or_default() && !self.record.unpack_over
     }
 
     // Complete, or with every piece it wants had as the session last said.

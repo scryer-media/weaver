@@ -10,7 +10,7 @@ use super::tick::Leveling;
 use super::{
     Asked, Load, PeerTerms, RESTORES_AT_ONCE, Restores, Signal, TorrentService, certificate_of,
     fetch_levels, files_dir, held_by, identity_of, ignored_of, in_table_order, load_of, locked,
-    placed, queued, ratelimits_of, ssl_identity, state_error, tracker_tiers, unpacks,
+    placed, queued, ratelimits_of, ssl_identity, state_error, tracker_tiers,
 };
 use tokio::sync::watch;
 
@@ -496,7 +496,7 @@ impl TorrentService {
         Some(Making {
             files: files_dir(torrent),
             layout: Arc::clone(torrent.layout.as_ref()?),
-            tee: unpacks(torrent) && !torrent.complete(),
+            tee: torrent.unpacking() && !torrent.complete(),
             passwords: self.archive_passwords(torrent, global),
             seeded: torrent.record.seed_mode,
             side: self.side_store(torrent.record.job_id),

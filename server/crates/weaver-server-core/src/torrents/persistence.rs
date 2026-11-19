@@ -1290,6 +1290,7 @@ fn torrent_args(
         SqlArg::I64(torrent.queue_position),
         SqlArg::OptI64(torrent.pool_member.map(i64::from)),
         SqlArg::Bool(torrent.private),
+        SqlArg::Bool(torrent.unpack_over),
     ])
 }
 
@@ -1533,6 +1534,14 @@ impl Database {
         self.set_torrent_column("completed_at_ms", args)
     }
 
+    // The torrent's unpacking is over: the mark an unpacking that ended
+    // short, with no placing written, keeps. Returns whether the torrent
+    // exists.
+    pub fn set_torrent_unpack_over(&self, job_id: JobId) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(true), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("unpack_over", args)
+    }
+
     // The torrent's files' levels, when it completed and its place in the
     // download queue, in one write: a complete torrent that now wants a file
     // it lacks downloads again, short of complete at the end of the queue,
@@ -1742,8 +1751,12 @@ impl Database {
                 let (outputs, held) = (outputs.clone(), held.clone());
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE torrents SET outputs = {} WHERE job_id = {}",
-                        &[SqlArg::OptText(outputs), SqlArg::I64(id)],
+                        "UPDATE torrents SET outputs = {}, unpack_over = {} WHERE job_id = {}",
+                        &[
+                            SqlArg::OptText(outputs),
+                            SqlArg::Bool(true),
+                            SqlArg::I64(id),
+                        ],
                     )
                     .await?;
                     insert_held_tx(tx, id, &held).await?;
