@@ -246,6 +246,217 @@ fn many_members_count(shape: &str, size: usize, split: Option<usize>) {
     );
 }
 
+// Streaming a set of stored members, the volume being read takes each new
+// header into the layout it keeps, which is never laid afresh: each member
+// costs a few walks and looks, and is compared and visited about once.
+// What the layout is handed still grows with the square of one volume's
+// members: unrar-rs is handed the volume's whole headers each time, as many
+// times as it lists another member.
+#[test]
+fn many_members_cost_grows_with_the_set() {
+    const WALKS_PER_MEMBER: usize = 3;
+    const VISITS_PER_MEMBER: usize = 2;
+    for (shape, size, split) in [
+        ("small, one volume", 200, None),
+        ("large, one volume", 20_000, None),
+        ("small, many volumes", 200, Some(50_000)),
+        ("large, many volumes", 20_000, Some(1_000_000)),
+    ] {
+        for members in [200, 800] {
+            let c = streamed_many(members, size, split);
+            eprintln!(
+                "{shape} M={members}: syncs {} walks {} layouts {} asked {} laid_members {} \
+                 compared {} visited {} read_members {}",
+                c.syncs,
+                c.walks,
+                c.layouts,
+                c.asked.len(),
+                c.laid_members,
+                c.compared,
+                c.visited,
+                c.read_members,
+            );
+            let at = format!("{shape} M={members}: {c:?}");
+            assert!(c.walks <= WALKS_PER_MEMBER * members, "{at}");
+            assert!(c.syncs <= WALKS_PER_MEMBER * members, "{at}");
+            assert_eq!(c.layouts, 1, "{at}");
+            assert!(c.asked.len() <= 2 * members, "{at}");
+            assert!(c.compared <= members, "{at}");
+            assert!(c.visited <= VISITS_PER_MEMBER * members, "{at}");
+            assert!(c.laid_members <= members * (members + 1) / 2, "{at}");
+        }
+    }
+}
+
+// Which way a set's articles arrive.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    Forward,
+    Backward,
+    Shuffled,
+}
+
+// Every article of a set, `article` bytes each, in `order`: from the first
+// volume's front, from the last volume's tail, or shuffled the same way
+// every run.
+fn articles(volumes: &[Vec<u8>], article: u64, order: Order) -> Vec<(usize, ByteRange)> {
+    let mut all: Vec<(usize, ByteRange)> = volumes
+        .iter()
+        .enumerate()
+        .flat_map(|(volume, bytes)| {
+            let length = bytes.len() as u64;
+            (0..length.div_ceil(article)).map(move |at| {
+                let start = at * article;
+                (volume, ByteRange::new(start, (start + article).min(length)))
+            })
+        })
+        .collect();
+    match order {
+        Order::Forward => {}
+        Order::Backward => all.reverse(),
+        Order::Shuffled => {
+            let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+            for at in (1..all.len()).rev() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                all.swap(at, (state >> 33) as usize % (at + 1));
+            }
+        }
+    }
+    all
+}
+
+// A set delivered article by article in `order`, then closed.
+fn grown(volumes: &[Vec<u8>], article: u64, order: Order, password: Option<&str>) -> Owner {
+    let mut owner = Owner::named(store(), volumes.to_vec());
+    if let Some(password) = password {
+        owner.offer(password);
+    }
+    for (volume, range) in articles(volumes, article, order) {
+        owner.deliver(volume, range);
+    }
+    for volume in 0..volumes.len() {
+        owner.close(volume);
+    }
+    owner
+}
+
+// A set's volumes growing header by header, in every order, say what they
+// said when the layout was laid afresh each time one listed another member,
+// and the layout kept answers as one laid in one go on the final headers.
+fn grows_as_laid_in_one_go(name: &str, volumes: &[Vec<u8>], article: u64, password: Option<&str>) {
+    for order in [Order::Forward, Order::Backward, Order::Shuffled] {
+        counts::set_old(true);
+        let old = grown(volumes, article, order, password);
+        counts::set_old(false);
+        counts::take();
+        let new = grown(volumes, article, order, password);
+        let counted = counts::take();
+        let at = format!("{name}, {order:?}");
+        no_trouble(&new);
+        assert!(!new.log.is_empty(), "{at}");
+        assert_eq!(old.log.len(), new.log.len(), "{at}");
+        for (emit, (old, new)) in old.log.iter().zip(&new.log).enumerate() {
+            assert_eq!(old, new, "{at}: emit {emit}");
+        }
+        assert_eq!(
+            old.members.keys().collect::<Vec<_>>(),
+            new.members.keys().collect::<Vec<_>>(),
+            "{at}"
+        );
+        for (id, got) in &new.members {
+            let was = &old.members[id];
+            assert_eq!(
+                (&was.name, was.length, &was.bytes, was.closed),
+                (&got.name, got.length, &got.bytes, got.closed),
+                "{at}: member {id}"
+            );
+            assert!(got.closed, "{at}: member {id}");
+        }
+        assert_eq!(new.held(), 0, "{at}");
+        assert!(counted.layouts <= 1, "{at}: {counted:?}");
+        new.object.assert_laid_as_in_one_go();
+        old.object.assert_laid_as_in_one_go();
+    }
+}
+
+// A set by name: its volumes, the article size it arrives in, and the
+// password it is offered.
+type Set = (&'static str, Vec<Vec<u8>>, u64, Option<&'static str>);
+
+#[test]
+fn growing_volumes_lay_as_in_one_go_fixtures() {
+    let sets: [Set; 6] = [
+        (
+            "one volume",
+            write(&many_items(40, 300, None), &options(None, None)),
+            97,
+            None,
+        ),
+        (
+            "members spanning volumes",
+            write(&many_items(30, 3_000, None), &options(Some(7_000), None)),
+            1_000,
+            None,
+        ),
+        (
+            "encrypted",
+            write(
+                &many_items(20, 2_000, None),
+                &options(Some(9_000), Some(PASSWORD)),
+            ),
+            700,
+            Some(PASSWORD),
+        ),
+        (
+            "out of order",
+            write(&many_items(30, 2_500, None), &options(Some(8_000), None)),
+            900,
+            None,
+        ),
+        ("fifty RAR5", fifty(Version::Rar5).1, 300, None),
+        ("fifty RAR4", fifty(Version::Rar4).1, 300, None),
+    ];
+    for (name, volumes, article, password) in &sets {
+        grows_as_laid_in_one_go(name, volumes, *article, *password);
+    }
+}
+
+// The sets the counting tests stream, at the sizes they compare.
+fn many_grow(size: usize, split: Option<usize>) {
+    for members in SIZES {
+        let items: Vec<Item> = (0..members)
+            .map(|at| {
+                let name: &'static str = Box::leak(format!("m{at:05}.bin").into_boxed_str());
+                Item::File(name, payload(at as u64, size))
+            })
+            .collect();
+        let volumes = write(&items, &options(split, None));
+        grows_as_laid_in_one_go(&format!("{members} of {size}"), &volumes, 16 * 1024, None);
+    }
+}
+
+#[test]
+fn growing_volumes_lay_as_in_one_go_small_one_volume() {
+    many_grow(200, None);
+}
+
+#[test]
+fn growing_volumes_lay_as_in_one_go_large_one_volume() {
+    many_grow(20_000, None);
+}
+
+#[test]
+fn growing_volumes_lay_as_in_one_go_small_many_volumes() {
+    many_grow(200, Some(50_000));
+}
+
+#[test]
+fn growing_volumes_lay_as_in_one_go_large_many_volumes() {
+    many_grow(20_000, Some(1_000_000));
+}
+
 // A layout is asked to take a volume again only on facts it was not asked
 // on before: once on the very facts it took a volume on, its answer is
 // known, and every such answer is the one it gives when asked.

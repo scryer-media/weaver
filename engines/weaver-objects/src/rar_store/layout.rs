@@ -208,6 +208,9 @@ pub(super) struct Laid {
     tails: BTreeMap<u32, RarVolumeMemberFacts>,
     names: HashMap<String, usize>,
     low: Option<usize>,
+    // Whether a volume it held was taken again on more headers since it was
+    // last asked.
+    grew: bool,
 }
 
 impl std::ops::Deref for Laid {
@@ -226,12 +229,19 @@ impl Laid {
             tails: BTreeMap::new(),
             names: HashMap::new(),
             low: None,
+            grew: false,
         }
     }
 
     // The first member a volume taken since the last ask names, or none.
     fn take_low(&mut self) -> Option<usize> {
         self.low.take()
+    }
+
+    // Whether a volume it held was taken again on more headers since the
+    // last ask.
+    fn take_grew(&mut self) -> bool {
+        std::mem::take(&mut self.grew)
     }
 
     // A volume's facts as the layout takes them. The builder links a
@@ -257,18 +267,25 @@ impl Laid {
     }
 
     // Add a volume on its walk's facts, or say the layout refuses them.
-    // unrar-rs takes a volume it holds again only on headers whose member
-    // snapshots, one per member and drawn from the members and the format
-    // alone, equal the ones it took it on. So it takes it again unchanged
-    // on the very facts it took it on, and refuses facts listing another
-    // number of members, without either being asked.
+    // unrar-rs takes a volume it holds again unchanged on the very facts it
+    // took it on, without being asked. Any other facts for it are the
+    // builder's to judge: it takes the volume it added last again on the
+    // headers it took it on followed by more, learning only those, and
+    // refuses the rest without changing the layout.
     fn add(&mut self, index: u32, walk: &Walk) -> bool {
         let Some(facts) = walk.facts.as_ref() else {
             return false;
         };
-        let known = match self.added.get(&index) {
-            Some(&(stamp, _)) if stamp == walk.stamp => Some(true),
-            Some(&(_, members)) if members != facts.members.len() => Some(false),
+        let held = self.added.get(&index).copied();
+        // The way the store looked before: a volume it held, on headers
+        // listing another number of members, was refused unasked, and the
+        // layout laid afresh.
+        #[cfg(test)]
+        if super::counts::old() && held.is_some_and(|(_, members)| members != facts.members.len()) {
+            return false;
+        }
+        let known = match held {
+            Some((stamp, _)) if stamp == walk.stamp => Some(true),
             _ => None,
         };
         let added = match known {
@@ -307,8 +324,13 @@ impl Laid {
                     for (at, member) in members.iter().enumerate().skip(self.names.len()) {
                         self.names.insert(member.name.clone(), at);
                     }
-                    let low = joined
-                        .members
+                    // A volume it held taken on more headers changes only
+                    // the members those name: the builder learns only them.
+                    let grown = held
+                        .map(|(_, members)| members)
+                        .filter(|members| *members < joined.members.len());
+                    self.grew |= grown.is_some();
+                    let low = joined.members[grown.unwrap_or(0)..]
                         .iter()
                         .filter_map(|member| self.names.get(&member.name).copied())
                         .min();
@@ -330,10 +352,10 @@ fn laid(layout: &StoredLayoutBuilder) -> u32 {
 }
 
 // Whether a layout still stands after the volumes in `touched` changed:
-// every one it holds is still laid on headers listing the members they
-// did, and, short of its tail, still reads on. Adding a volume again on the
-// same headers changes nothing; on others it is refused, and the layout is
-// laid afresh.
+// every one it holds is still laid on headers the layout takes, and, short
+// of its tail, still reads on. Adding a volume again on the same headers
+// changes nothing, and the tail on those followed by more learns only
+// those; on others it is refused, and the layout is laid afresh.
 fn stands(
     volumes: &BTreeMap<VolumeIndex, Volume>,
     layout: &mut Laid,
@@ -433,6 +455,38 @@ impl RarStore {
         layout
     }
 
+    // Every answer the kept layout gives is the one a layout laid in one go
+    // gives, over the headers each volume it holds has now.
+    #[cfg(test)]
+    pub(super) fn assert_laid_as_in_one_go(&self) {
+        let Some(layout) = self.layout.as_ref() else {
+            return;
+        };
+        let through = laid(layout);
+        let once = self.laid_afresh(layout.format(), through);
+        assert_eq!(laid(&once), through, "the volumes laid");
+        assert_eq!(layout.members(), once.members(), "the members");
+        for (index, found) in self.volumes.range(..VolumeIndex(through)) {
+            let volume = index.0;
+            assert_eq!(
+                layout.has_volume(volume),
+                once.has_volume(volume),
+                "{index:?}"
+            );
+            assert_eq!(
+                layout.split_evidence(volume),
+                once.split_evidence(volume),
+                "{index:?}"
+            );
+            let length = found.length.unwrap_or(0);
+            assert_eq!(
+                layout.map_physical_range(volume, 0, length),
+                once.map_physical_range(volume, 0, length),
+                "{index:?}"
+            );
+        }
+    }
+
     // Hold the layout to the volumes touched and extend it past its tail;
     // lay it afresh where a volume it holds changed what it says.
     pub(super) fn sync(&mut self, touched: &BTreeSet<VolumeIndex>, out: &mut Vec<Emit>) {
@@ -441,11 +495,14 @@ impl RarStore {
         };
         #[cfg(test)]
         super::counts::bump(|counts| counts.syncs += 1);
-        let kept = self
+        let mut kept = self
             .layout
             .take_if(|layout| layout.format() == format && stands(&self.volumes, layout, touched));
         let afresh = kept.is_none();
-        if afresh {
+        // A volume taken again on more headers is what laying the layout
+        // afresh once took it on: the volume refuted is looked at again.
+        let grew = kept.as_mut().is_some_and(Laid::take_grew);
+        if afresh || grew {
             self.refuted = None;
         }
         let mut layout = kept.unwrap_or_else(|| {

@@ -15,6 +15,8 @@ use crate::kept::Kept;
 pub(super) struct SparseImage {
     runs: Vec<(u64, Bytes)>,
     position: u64,
+    // Where the image says it ends, when it is asked to state an end.
+    end: Option<u64>,
 }
 
 // Whether the walk may read a run: one that arrived damaged once the volume
@@ -42,7 +44,14 @@ impl SparseImage {
                 .map(|(range, bytes, _)| (range.start, Bytes::copy_from_slice(bytes)))
                 .collect(),
             position: 0,
+            end: None,
         }
+    }
+
+    // The same image stating that it ends at `end`, the volume's length.
+    pub(super) fn ending_at(mut self, end: u64) -> Self {
+        self.end = Some(end);
+        self
     }
 }
 
@@ -73,14 +82,18 @@ impl Seek for SparseImage {
         self.position = match from {
             SeekFrom::Start(offset) => offset,
             SeekFrom::Current(offset) => self.position.saturating_add_signed(offset),
-            // The image has no end: its last run ends wherever the last
-            // delivery reached, which is not the volume's length.
-            SeekFrom::End(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "a sparse volume image has no end to seek from",
-                ));
-            }
+            // The image has no end unless it was given one: its last run
+            // ends wherever the last delivery reached, which is not the
+            // volume's length.
+            SeekFrom::End(offset) => match self.end {
+                Some(end) => end.saturating_add_signed(offset),
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "a sparse volume image has no end to seek from",
+                    ));
+                }
+            },
         };
         Ok(self.position)
     }
