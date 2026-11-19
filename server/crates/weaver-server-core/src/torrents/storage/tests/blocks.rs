@@ -649,6 +649,7 @@ async fn a_block_written_block_by_block_waits_for_room_and_is_never_thrown_away(
         gate: Arc::default(),
         refused: Arc::new(refused),
         granted: Arc::default(),
+        landing: Arc::default(),
     };
     assert!(factory.factory.writes_blocks());
     let leecher = session(&fetch_dir.path().join("session"), None).await;
@@ -664,7 +665,6 @@ async fn a_block_written_block_by_block_waits_for_room_and_is_never_thrown_away(
             original
         );
     }
-    eprintln!("DBG {:?} refusals {}", torrent.totals(), *refusals.borrow());
     assert_eq!(torrent.totals().redundant_bytes, 0);
     leecher.stop().await;
     seeded.seeder.stop().await;

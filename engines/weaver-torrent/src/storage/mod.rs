@@ -540,6 +540,15 @@ pub trait TorrentStorage: Send + Sync {
     /// Default implementation does nothing.
     fn on_piece_requeued(&self, _piece_index: ValidPieceIndex) {}
 
+    /// The operator paused the torrent: its run has ended, and it keeps the blocks it received.
+    /// The storage writes the pieces it holds in memory unfinished to their files, as it does a
+    /// piece given back, and gives back the room they held; one it held whole for a check
+    /// that will not run is fetched again, and gives back its room too. Not told when the
+    /// torrent is removed or the session stops. Must not wait for the disk (libtorrent
+    /// `torrent::do_pause` flushes the torrent's write cache, `async_stop_torrent`). Default
+    /// implementation does nothing.
+    fn on_paused(&self) {}
+
     /// Asked before a downloaded piece is checked, on a thread that may wait on a disk:
     /// whether every block of it the storage took is where the check reads it. An error is a
     /// write of a block taken earlier that failed, as of a piece given back whose blocks went
@@ -727,6 +736,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_requeued(&self, piece_id: ValidPieceIndex) {
         (**self).on_piece_requeued(piece_id)
+    }
+
+    fn on_paused(&self) {
+        (**self).on_paused()
     }
 
     fn piece_written(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {

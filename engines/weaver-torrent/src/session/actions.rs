@@ -111,6 +111,14 @@ impl Session {
 
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
         handle.pause()?;
+        // Paused by the operator, not removed or stopped: the storage writes
+        // out the pieces it holds in memory unfinished, and gives back their
+        // room, so a paused torrent holds none.
+        handle.with_state(|state| {
+            if let ManagedTorrentState::Paused(paused) = state {
+                paused.files.on_paused();
+            }
+        });
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }

@@ -788,7 +788,9 @@ impl PieceStorage {
             // of its own write, taken where its connection can wait, so it
             // is never refused on a disk thread, where its block cannot.
             // What reads it back for the tee asks the budget itself.
-            self.flight().entry(index).or_insert_with(|| Flight::Blocks(Arc::default(), 0));
+            self.flight()
+                .entry(index)
+                .or_insert_with(|| Flight::Blocks(Arc::default(), 0));
             return true;
         }
         // Refused, it may have started meanwhile, from a block on a disk
@@ -1130,6 +1132,36 @@ impl TorrentStorage for PieceStorage {
         self.inner
             .pieces
             .aside(Box::new(move || inner.spill(index, &writing)));
+    }
+
+    // Paused by the operator: each piece held in memory unfinished is
+    // written to its files aside, as a piece given back is, and gives back
+    // its room; the session keeps its blocks, and the next run takes the
+    // rest of it block by block. One held whole for a check its run ended
+    // before is fetched again, so it goes now with its room. A paused
+    // torrent holds no resident room another job waits for.
+    fn on_paused(&self) {
+        let mut spills = Vec::new();
+        let mut whole = 0;
+        self.flight().retain(|index, entry| match entry {
+            Flight::Writing(writing, _) if writing.whole() => {
+                whole += writing.len as u64;
+                false
+            }
+            Flight::Writing(writing, _) => {
+                spills.push((*index, Arc::clone(writing)));
+                true
+            }
+            Flight::Verified(_) | Flight::Blocks(..) => true,
+        });
+        // Outside the map's lock: room let go rings whoever waits on it.
+        self.inner.release(whole);
+        for (index, writing) in spills {
+            let inner = Arc::clone(&self.inner);
+            self.inner
+                .pieces
+                .aside(Box::new(move || inner.spill(index, &writing)));
+        }
     }
 
     // The piece goes to the store, and only then does it stop being read

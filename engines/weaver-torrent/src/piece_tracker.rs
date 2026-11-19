@@ -272,9 +272,15 @@ impl PieceTracker {
     /// gone and changes nothing.
     pub fn into_chunks(mut self) -> ChunkTracker {
         // No piece holds a slot past here: a block of it found later goes
-        // to the tracker, which is gone.
-        for piece in self.inflight.keys() {
-            self.slots.lock_also(*piece).take();
+        // to the tracker, which is gone. A piece in flight goes back to the
+        // queue with the blocks it received, which the storage holds, so the
+        // next run asks only for the rest (libtorrent's picker keeps a
+        // paused torrent's finished blocks); a block being written was not
+        // received, and is asked again.
+        let inflight: Vec<_> = self.inflight.keys().copied().collect();
+        for piece in inflight {
+            self.slots.lock_also(piece).take();
+            self.chunks.requeue_piece_if_not_have(piece);
         }
         self.chunks.release_taken();
         self.chunks

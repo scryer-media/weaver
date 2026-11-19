@@ -34,6 +34,7 @@ mod bench;
 mod blocks;
 #[cfg(unix)]
 mod memory;
+mod pause;
 
 fn accountant(resident_limit: u64) -> Arc<HoldsAccountant> {
     Arc::new(HoldsAccountant::new(HoldBudgets {
@@ -1389,6 +1390,8 @@ struct Watched {
     whole: watch::Sender<bool>,
     handed: watch::Sender<u32>,
     stored_on: std::sync::Mutex<Vec<(std::thread::ThreadId, Option<String>)>>,
+    // The blocks of pieces given back or paused written to the files.
+    blocks: std::sync::atomic::AtomicUsize,
 }
 
 impl Watched {
@@ -1478,6 +1481,8 @@ impl Pieces for Watched {
         at: u64,
         bytes: &[u8],
     ) -> anyhow::Result<()> {
+        self.blocks
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.store.write_block(piece, file, offset, at, bytes)
     }
 
@@ -1625,6 +1630,7 @@ fn watched(store: Arc<TorrentStore>) -> (Arc<Watched>, watch::Receiver<bool>) {
             whole,
             handed: watch::channel(0).0,
             stored_on: std::sync::Mutex::default(),
+            blocks: std::sync::atomic::AtomicUsize::new(0),
         }),
         in_hand,
     )
@@ -2007,7 +2013,8 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_its_files_and_seeds_fro
 }
 
 // The piece storage as the session sees it, with the first verified piece
-// held back until the test lets it go, and every refusal of room counted.
+// held back until the test lets it go, every refusal of room counted, and
+// the blocks it is handed watched.
 #[derive(Clone)]
 struct Gated {
     storage: PieceStorage,
@@ -2015,6 +2022,34 @@ struct Gated {
     refused: Arc<watch::Sender<usize>>,
     // The pieces granted room, in order.
     granted: Arc<std::sync::Mutex<Vec<u32>>>,
+    landing: Arc<std::sync::Mutex<Landing>>,
+}
+
+// The blocks the session hands the storage: the pieces each was of, in the
+// order the session asked where to put them, and, once `recording`, every
+// write it made, as file, offset and length.
+#[derive(Default)]
+struct Landing {
+    pieces: Vec<u32>,
+    // The block at this place in `pieces`, counted from one, held by its
+    // connection before it lands, until the test lets it go: its piece is
+    // said as it is held.
+    hold: Option<(
+        usize,
+        std::sync::mpsc::Sender<u32>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    recording: bool,
+    written: Vec<(usize, u64, u64)>,
+}
+
+impl Gated {
+    fn wrote(&self, file_id: usize, offset: u64, len: u64) {
+        let mut landing = self.landing.lock().unwrap();
+        if landing.recording {
+            landing.written.push((file_id, offset, len));
+        }
+    }
 }
 
 impl TorrentStorage for Gated {
@@ -2031,6 +2066,7 @@ impl TorrentStorage for Gated {
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.wrote(file_id, offset, buf.len() as u64);
         self.storage.pwrite_all(file_id, offset, buf)
     }
 
@@ -2046,7 +2082,9 @@ impl TorrentStorage for Gated {
         self.storage.ensure_file_length(file_id, length)
     }
 
+    // The piece storage ends its run as it does for the session itself.
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        self.storage.take()?;
         Ok(Box::new(self.clone()))
     }
 
@@ -2088,6 +2126,10 @@ impl TorrentStorage for Gated {
         self.storage.on_piece_requeued(piece);
     }
 
+    fn on_paused(&self) {
+        self.storage.on_paused();
+    }
+
     fn piece_written(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         self.storage.piece_written(piece)
     }
@@ -2113,6 +2155,11 @@ impl TorrentStorage for Gated {
         offset: u64,
         bufs: [std::io::IoSlice<'_>; 2],
     ) -> anyhow::Result<usize> {
+        self.wrote(
+            file_id,
+            offset,
+            bufs.iter().map(|buf| buf.len() as u64).sum(),
+        );
         self.storage.pwrite_all_vectored(file_id, offset, bufs)
     }
 
@@ -2122,6 +2169,11 @@ impl TorrentStorage for Gated {
         offset: u64,
         bufs: [std::io::IoSlice<'_>; 2],
     ) -> anyhow::Result<bool> {
+        self.wrote(
+            file_id,
+            offset,
+            bufs.iter().map(|buf| buf.len() as u64).sum(),
+        );
         self.storage.pwrite_held(file_id, offset, bufs)
     }
 
@@ -2137,7 +2189,22 @@ impl TorrentStorage for Gated {
         self.storage.writes_to_memory()
     }
 
+    // Asked as each block arrives, before it lands, with no turn of the
+    // storage held: the block `hold` names waits here.
     fn writes_piece_to_memory(&self, piece: ValidPieceIndex) -> bool {
+        let held = {
+            let mut landing = self.landing.lock().unwrap();
+            landing.pieces.push(piece.get());
+            let at = landing.pieces.len();
+            match &landing.hold {
+                Some((hold, ..)) if *hold == at => landing.hold.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, held, go)) = held {
+            held.send(piece.get()).unwrap();
+            go.recv().unwrap();
+        }
         self.storage.writes_piece_to_memory(piece)
     }
 
@@ -2194,6 +2261,7 @@ struct GatedFactory {
     refused: Arc<watch::Sender<usize>>,
     // The pieces granted room, in order.
     granted: Arc<std::sync::Mutex<Vec<u32>>>,
+    landing: Arc<std::sync::Mutex<Landing>>,
 }
 
 impl StorageFactory for GatedFactory {
@@ -2209,6 +2277,7 @@ impl StorageFactory for GatedFactory {
             gate: Arc::clone(&self.gate),
             refused: Arc::clone(&self.refused),
             granted: Arc::clone(&self.granted),
+            landing: Arc::clone(&self.landing),
         })
     }
 
@@ -2241,6 +2310,7 @@ async fn a_session_at_its_budget_waits_for_room_and_resumes_when_a_piece_lets_go
         gate: Arc::new(std::sync::Mutex::new(Some(gate))),
         refused: Arc::new(refused),
         granted: Arc::clone(&granted),
+        landing: Arc::default(),
     };
     let leecher = fetch(&seeded, fetch_dir.path(), Some(1), factory.boxed()).await;
 
