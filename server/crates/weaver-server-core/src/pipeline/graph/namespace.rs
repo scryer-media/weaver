@@ -1574,6 +1574,17 @@ impl NamespaceWriter {
         self.envelopes.shelf(node)
     }
 
+    #[cfg(test)]
+    pub(crate) fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
+        self.envelopes.shelf_of(node)
+    }
+
+    // What rings as a run begins to wait on one of the shelves.
+    #[cfg(test)]
+    pub(crate) fn blocked(&self) -> Arc<tokio::sync::Notify> {
+        self.envelopes.blocked()
+    }
+
     // Change the node's envelopes as `change` says it did: what the shelf
     // keeps of them is a checkpoint's, so a change goes through here.
     pub(crate) fn update_shelf<E>(

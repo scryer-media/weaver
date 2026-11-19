@@ -37,6 +37,9 @@ pub(crate) struct Envelopes {
     // latest change: every way to change what a checkpoint says of them
     // marks the node.
     marks: Marks<NodeId>,
+    // Rung as a run begins to wait on any of the job's shelves.
+    #[cfg(test)]
+    blocked: Arc<tokio::sync::Notify>,
 }
 
 // One node's envelopes, shared with the run that reads them.
@@ -49,6 +52,8 @@ pub(crate) struct Shelf {
     state: Mutex<Shelved>,
     changed: Condvar,
     readers: Mutex<Vec<Weak<ReadFiles>>>,
+    #[cfg(test)]
+    blocked: Arc<tokio::sync::Notify>,
 }
 
 // What a run reads its envelopes with, which a drain reaches.
@@ -128,6 +133,12 @@ pub(crate) struct Shelved {
     // Which run may read. Moving it on stops the one reading: a repair
     // behind what it read, or the node going away.
     pub(crate) generation: u64,
+    // How many times the shelf woke its waiters, and the count a run last
+    // began to wait at: a run waits for good while the two agree.
+    #[cfg(test)]
+    pub(crate) woken: u64,
+    #[cfg(test)]
+    pub(crate) waits_since: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -144,6 +155,9 @@ pub(crate) struct Kept {
     // that read past the volume built on it until it closes at another.
     pub(crate) closed_at: Option<u64>,
     pub(crate) settled: bool,
+    // Its object holds it at a place a byte still owed may move it from
+    // (`Engine::placed`): the run reads none of it until the place settles.
+    pub(crate) open: bool,
     // How far the run has read, which a repair behind it invalidates.
     pub(crate) reached: u64,
     // The closed length the run read, a dependency even before any payload
@@ -170,6 +184,7 @@ impl Kept {
             sized: None,
             closed_at: None,
             settled: false,
+            open: false,
             reached: 0,
             length_read: None,
         }
@@ -198,7 +213,15 @@ impl Envelopes {
             given: Given::default(),
             shelves: BTreeMap::new(),
             marks: Marks::default(),
+            #[cfg(test)]
+            blocked: Arc::default(),
         }
+    }
+
+    // What rings as a run begins to wait on one of the shelves.
+    #[cfg(test)]
+    pub(crate) fn blocked(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.blocked)
     }
 
     // Envelopes made from here on are written through `to`. Set before
@@ -222,6 +245,8 @@ impl Envelopes {
         let dir = &self.working_dir;
         let to = &self.to;
         let given = &self.given;
+        #[cfg(test)]
+        let blocked = &self.blocked;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
             Arc::new(Shelf {
                 dir: dir.clone(),
@@ -231,6 +256,8 @@ impl Envelopes {
                 state: Mutex::default(),
                 changed: Condvar::new(),
                 readers: Mutex::default(),
+                #[cfg(test)]
+                blocked: Arc::clone(blocked),
             })
         }))
     }
@@ -535,7 +562,13 @@ impl Shelf {
 
     // Change the shelf and wake whoever waits on it.
     pub(crate) fn update<R>(&self, change: impl FnOnce(&mut Shelved) -> R) -> R {
-        let result = change(&mut self.lock());
+        let mut state = self.lock();
+        let result = change(&mut state);
+        #[cfg(test)]
+        {
+            state.woken += 1;
+        }
+        drop(state);
         self.changed.notify_all();
         result
     }
@@ -547,18 +580,47 @@ impl Shelf {
         &self,
         change: impl FnOnce(&mut Shelved) -> Result<bool, E>,
     ) -> Result<(), E> {
-        let result = change(&mut self.lock());
-        if !matches!(result, Ok(false)) {
+        let mut state = self.lock();
+        let result = change(&mut state);
+        let wakes = !matches!(result, Ok(false));
+        #[cfg(test)]
+        if wakes {
+            state.woken += 1;
+        }
+        drop(state);
+        if wakes {
             self.changed.notify_all();
         }
         result.map(|_| ())
     }
 
     // Wait for the shelf to change; the guard is given back once it did.
-    pub(crate) fn wait<'a>(&self, state: MutexGuard<'a, Shelved>) -> MutexGuard<'a, Shelved> {
-        self.changed
+    pub(crate) fn wait<'a>(
+        &self,
+        #[cfg_attr(not(test), expect(unused_mut))] mut state: MutexGuard<'a, Shelved>,
+    ) -> MutexGuard<'a, Shelved> {
+        #[cfg(test)]
+        {
+            state.waits_since = Some(state.woken);
+            self.blocked.notify_one();
+        }
+        #[cfg_attr(not(test), expect(unused_mut))]
+        let mut state = self
+            .changed
             .wait(state)
-            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        {
+            state.waits_since = None;
+        }
+        state
+    }
+
+    // Whether a run waits on the shelf for a change that has not come.
+    #[cfg(test)]
+    pub(crate) fn blocked(&self) -> bool {
+        let state = self.lock();
+        state.waits_since == Some(state.woken)
     }
 
     // A volume's entry, made the first time anything is said of it.

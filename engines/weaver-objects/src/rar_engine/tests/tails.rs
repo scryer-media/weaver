@@ -319,3 +319,93 @@ fn a_tail_that_states_nothing_leaves_the_volume_on_its_links() {
     }
     assert!(wanted(&engine).is_empty(), "closed");
 }
+
+// The places of `places` the engine holds open: where a tail still due may
+// yet say the volume there belongs elsewhere.
+fn open(engine: &RarEngine, places: u32) -> Vec<u32> {
+    (0..places)
+        .filter(|place| !weaver_graph::Engine::placed(engine, VolumeIndex(*place)))
+        .collect()
+}
+
+// A volume its links alone hold is at an open place until its tail is read,
+// or until nothing more will state it: lost, unseekable, stating no number,
+// closed, or given back. The first volume's front states its place, and a
+// place a front or name states is settled from the start.
+#[test]
+fn a_place_is_open_only_while_its_tail_may_move_the_volume() {
+    let numbered = set(Version::Rar4, 4, true);
+    let kept = BTreeMap::new();
+    let tail = |engine: &mut RarEngine, place: u32, bytes: &[u8]| {
+        deliver(
+            engine,
+            place,
+            bytes,
+            last(bytes, 64),
+            Provenance::Fresh,
+            &kept,
+        )
+    };
+
+    let mut engine = handed(&numbered, &[0, 1, 2, 3]);
+    assert_eq!(open(&engine, 4), vec![1, 2, 3]);
+    assert!(tail(&mut engine, 1, &numbered[1]).is_empty());
+    assert_eq!(open(&engine, 4), vec![2, 3], "read, and where it says");
+
+    let mut engine = handed(&numbered, &[0, 2, 1, 3]);
+    let out = tail(&mut engine, 1, &numbered[2]);
+    assert_eq!(out, vec![Emit::GiveBack(VolumeIndex(1))]);
+    assert_eq!(open(&engine, 4), vec![2, 3], "read, and elsewhere");
+    engine.give_back(VolumeIndex(2)).unwrap();
+    assert_eq!(open(&engine, 4), vec![3], "given back unread");
+
+    for pull in [Pull::Lost, Pull::Unseekable] {
+        let mut engine = handed(&numbered, &[0, 1, 2, 3]);
+        let seeks = wanted(&engine);
+        assert!(!seeks.is_empty());
+        for seek in seeks {
+            engine.pulled(seek, pull, &mut Vec::new());
+        }
+        assert!(open(&engine, 4).is_empty(), "{pull:?}");
+    }
+
+    let mut engine = handed(&numbered, &[0, 1, 2, 3]);
+    for seek in wanted(&engine) {
+        engine.pulled(seek, Pull::Moved(1), &mut Vec::new());
+    }
+    assert_eq!(
+        open(&engine, 4),
+        vec![1, 2, 3],
+        "brought forward, still due"
+    );
+    engine.volume_closed(VolumeIndex(2), &mut Vec::new());
+    assert_eq!(open(&engine, 4), vec![1, 3], "closed unread");
+
+    let unnumbered = set(Version::Rar4, 4, false);
+    let mut engine = handed(&unnumbered, &[0, 1, 2, 3]);
+    assert_eq!(open(&engine, 4), vec![1, 2, 3]);
+    for place in 1..4 {
+        assert!(tail(&mut engine, place, &unnumbered[place as usize]).is_empty());
+    }
+    assert!(open(&engine, 4).is_empty(), "no number stated");
+}
+
+// A RAR5 volume states its number in its main header, and a posted name
+// that numbers a volume states its place: neither place is ever open.
+#[test]
+fn no_place_is_open_where_the_front_or_name_states_it() {
+    let rar5 = set(Version::Rar5, 4, false);
+    assert!(open(&handed(&rar5, &[0, 1, 2, 3]), 4).is_empty(), "RAR5");
+
+    let rar4 = set(Version::Rar4, 4, true);
+    let mut named = RarEngine::new();
+    for (place, bytes) in rar4.iter().enumerate() {
+        named.bound(
+            VolumeIndex(place as u32),
+            &format!("long.part{}.rar", place + 1),
+            &bytes[..FRONT],
+            Some(bytes.len() as u64),
+        );
+    }
+    assert!(open(&named, 4).is_empty(), "names that number the volumes");
+}

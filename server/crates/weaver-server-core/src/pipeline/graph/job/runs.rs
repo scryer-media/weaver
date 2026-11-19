@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use weaver_graph::tree::Mark;
-use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
+use weaver_graph::{Emit, Engine, MemberId, NodeId, VolumeIndex, Why};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
@@ -691,7 +691,8 @@ impl GraphJob {
     // Bring the node's shelf up to what the tree knows of its volumes: how
     // many there are, how long each was declared, which are closed and how
     // long, which will receive
-    // nothing more, and whether any more can join, as its parent's `facts`
+    // nothing more, which its object holds at a place still open
+    // (`Engine::placed`), and whether any more can join, as its parent's `facts`
     // say. A shelf already there is left as it is, and its run is not woken
     // to find nothing new.
     fn feed(&mut self, node: NodeId, facts: Facts) -> Result<(), GraphError> {
@@ -708,6 +709,7 @@ impl GraphJob {
         } = facts;
         let complete = ended && !deciding;
         let bound = volumes.keys().map(|volume| volume.0);
+        let engine = self.tree.engine(node);
         self.writer
             .update_shelf(node, |shelf, state| {
                 let mut changed = state.complete != complete || state.deciding != deciding;
@@ -730,12 +732,17 @@ impl GraphJob {
                     let shut = record.closed || held;
                     let closed = shut.then(|| record.length.unwrap_or(0));
                     let settled = shut && ended;
+                    // A volume that holds all it will has no byte left to
+                    // move it: its place is as settled as it gets.
+                    let open = !shut && engine.is_some_and(|engine| !engine.placed(*volume));
                     changed |= !state.kept.contains_key(&volume.0);
                     let kept = shelf.kept(state, volume.0)?;
                     changed |= kept.closed != closed
                         || kept.settled != settled
-                        || kept.sized != record.length;
+                        || kept.sized != record.length
+                        || kept.open != open;
                     kept.sized = record.length;
+                    kept.open = open;
                     // A volume that closed again at another length moves
                     // every byte after it: a run that read it, or read on
                     // past it, built on the wrong offsets and starts over,
@@ -775,6 +782,33 @@ impl GraphJob {
                 Ok(changed)
             })
             .map_err(|error| GraphError::Write(WriteError::Leaf(error)))
+    }
+
+    // Whether the node's object holds `volume` at a settled place.
+    pub(super) fn placed(&self, node: NodeId, volume: VolumeIndex) -> bool {
+        self.tree
+            .engine(node)
+            .is_none_or(|engine| engine.placed(volume))
+    }
+
+    // A pull settled the place the node's object holds `volume` at, as
+    // nothing will bring the byte it waited on: the run waiting there reads
+    // on. Nothing else of the shelf changes, so no step is owed.
+    pub(super) fn place_settled(
+        &mut self,
+        node: NodeId,
+        volume: VolumeIndex,
+    ) -> Result<(), GraphError> {
+        self.writer
+            .update_shelf(node, |_, state| {
+                Ok::<_, std::convert::Infallible>(
+                    state
+                        .kept
+                        .get_mut(&volume.0)
+                        .is_some_and(|kept| std::mem::take(&mut kept.open)),
+                )
+            })
+            .map_err(|never| match never {})
     }
 }
 
