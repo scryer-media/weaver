@@ -611,6 +611,101 @@ async fn a_torrent_unpack_held_for_room_is_woken_when_room_returns() {
     tee.forget();
 }
 
+// A recovery set over `set.rar`: its index and recovery files, by name.
+fn parity_of(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
+    use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path().join("protected");
+    let output = directory.path().join("out");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(base.join("set.rar"), archive).unwrap();
+    let mut options = Par2CreatorOptions::with_output(
+        output.join("set.par2"),
+        Some(base.clone()),
+        vec![base.join("set.rar")],
+    );
+    options.block_sizing = BlockSizing::Bytes(512);
+    options.recovery_amount = RecoveryAmount::Count(1);
+    let creator = Par2Creator::new(options);
+    let created = creator.create(&creator.plan().unwrap()).unwrap();
+    created
+        .output_paths
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_str().unwrap().to_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+// The names under `dir`, sorted.
+fn listing(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+// A remove with delete stops the job, then deletes what it wrote. A repair
+// the job made due before the stop, and every run, stays in once it is
+// stopped, whatever word steps the job after: a disk wake's resume, a slot
+// handed to it, a lend owed. Nothing goes out and the job's folder is left
+// as the stop left it.
+#[tokio::test]
+async fn nothing_of_a_stopped_job_goes_out_whatever_steps_it_after() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mail = RunMail::default();
+    let mut files = vec![("set.rar".to_owned(), ARCHIVE.to_vec())];
+    files.extend(parity_of(ARCHIVE));
+    let torrent: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.clone()).collect();
+    let layout = Arc::new(
+        PieceLayout::new(
+            128,
+            files
+                .iter()
+                .map(|(name, bytes)| file(name, bytes.len() as u64))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let work = dir.path().join("work");
+    let tee = tee(&layout, &work, &mail);
+    // Paused while it is set up, the job takes no slot: what it is given
+    // makes work due and sends none out.
+    tee.paused.store(true, Ordering::Release);
+    let lost = tee.with(|job| tee.unsettled(job, 0));
+    assert!(!lost.is_empty() && lost.iter().all(|share| share.volume == VolumeIndex(0)));
+    for index in 1..layout.piece_count() {
+        tee.deliver(index, &piece(&layout, &torrent, index));
+    }
+    tee.step(tee.limit, |job, repairs, limit| {
+        lost.iter()
+            .try_for_each(|share| job.lost(share.volume, share.ordinal, repairs, limit))
+    })
+    .unwrap();
+    assert!(!tee.with(|job| job.workers_out() || job.working()));
+
+    tee.stop().await;
+    let stopped = listing(&work);
+    tee.paused.store(false, Ordering::Release);
+    tee.resume().unwrap();
+    tee.owes_lend.store(true, Ordering::Release);
+    tee.lend_handed().unwrap();
+    tee.lend_free().unwrap();
+    assert!(
+        !tee.with(|job| job.workers_out() || job.working()),
+        "nothing of the stopped job went out"
+    );
+    assert_eq!(listing(&work), stopped, "its folder is as the stop left it");
+    tee.forget();
+}
+
 mod read_back;
 
 // Operator ruling, 2026-11-16 (PR 129 question 10): an unpacked file whose

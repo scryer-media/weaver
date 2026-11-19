@@ -1719,7 +1719,13 @@ async fn answer_503_until_spent(pipeline: &mut Pipeline, server: usize) -> u32 {
             .metrics
             .segments_downloaded
             .fetch_add(1, Ordering::Relaxed);
-        answer_nntp(pipeline, server, work, body_reply(503, "service unavailable")).await;
+        answer_nntp(
+            pipeline,
+            server,
+            work,
+            body_reply(503, "service unavailable"),
+        )
+        .await;
         answers += 1;
         if pipeline.infrastructure_retries.next_deadline().is_some() {
             requeue_infrastructure_retry(pipeline);
@@ -1738,7 +1744,10 @@ async fn an_article_a_fill_server_keeps_answering_503_for_moves_to_backfill() {
     let payload = b"the article the fill server would not serve";
     one_payload_job(&mut pipeline, job_id, payload).await;
 
-    assert!(ask(&mut pipeline, 1, 1).is_empty(), "backfill waits at first");
+    assert!(
+        ask(&mut pipeline, 1, 1).is_empty(),
+        "backfill waits at first"
+    );
     let answers = answer_503_until_spent(&mut pipeline, 0).await;
     assert!(answers > MAX_SEGMENT_RETRIES, "{answers} answers");
 
@@ -1836,7 +1845,13 @@ async fn a_503_from_one_fill_server_rotates_the_article_to_the_other_fill_server
     one_article_job(&mut pipeline, job_id).await;
 
     let work = ask(&mut pipeline, 0, 1).pop().unwrap();
-    answer_nntp(&mut pipeline, 0, work, body_reply(503, "service unavailable")).await;
+    answer_nntp(
+        &mut pipeline,
+        0,
+        work,
+        body_reply(503, "service unavailable"),
+    )
+    .await;
     requeue_infrastructure_retry(&mut pipeline);
     assert!(ask(&mut pipeline, 0, 1).is_empty(), "server 0 is avoided");
     let moved = ask(&mut pipeline, 1, 1)

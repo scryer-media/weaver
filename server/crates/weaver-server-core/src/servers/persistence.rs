@@ -110,12 +110,8 @@ impl Database {
                         &args,
                     )
                     .await?;
-                    crate::proxies::persistence::write_routing(
-                        tx,
-                        consumer,
-                        routing.as_ref(),
-                    )
-                    .await?;
+                    crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
+                        .await?;
                     Ok(())
                 })
             })

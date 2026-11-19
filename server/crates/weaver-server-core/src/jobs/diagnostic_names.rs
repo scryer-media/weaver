@@ -873,7 +873,7 @@ mod tests {
                 .unwrap()
                 .statements,
         );
-        let list = vec!["{}"; 3].join(", ");
+        let list = ["{}"; 3].join(", ");
         statements.push(format!(
             "SELECT job_id FROM job_history
               ORDER BY completed_at DESC, job_id DESC LIMIT {DIAGNOSTIC_RECENT_HISTORY}"

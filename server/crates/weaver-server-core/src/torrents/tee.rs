@@ -611,9 +611,14 @@ impl Tee {
     }
 
     // The slots the job may take of `offered`: none while the torrent is
-    // paused on its own.
+    // paused on its own, and none once its runs were stopped for the
+    // torrent going away, so no run or repair goes out and no work is done
+    // in its directory after, whatever word steps it. Read under the job's
+    // lock, where a stop sets it.
     fn slots(&self, offered: usize) -> usize {
-        if self.paused.load(std::sync::atomic::Ordering::Acquire) {
+        if self.paused.load(std::sync::atomic::Ordering::Acquire)
+            || self.stopped.load(std::sync::atomic::Ordering::Acquire)
+        {
             0
         } else {
             offered
@@ -838,8 +843,9 @@ impl Tee {
         step: impl FnOnce(&mut GraphJob, &mut RepairSlots, usize) -> Result<T, GraphError>,
     ) -> Result<T, GraphError> {
         let _job = JobScope::enter(self.job_id);
-        let limit = self.slots(limit);
         let mut job = self.locked();
+        // Under the job's lock: a stop that took it first is seen.
+        let limit = self.slots(limit);
         let mut repairs = self.repairs.lock().unwrap_or_else(PoisonError::into_inner);
         let result = step(&mut job, &mut repairs, limit);
         drop(job);
@@ -1433,14 +1439,16 @@ impl Tee {
     }
 
     // The job's runs and repairs stopped, and waited on until each has said
-    // it ended, and no share taken in after: nothing of the job's writes in
-    // its directory after.
+    // it ended; after, no share is taken in, no run or repair goes out (no
+    // slot, `slots`), and no checkpoint is taken, so no move it would commit
+    // runs: nothing of the job's writes in its directory after.
     pub(crate) async fn stop(&self) {
         let mut heard = self.heard.subscribe();
         {
             let mut job = self.locked();
             self.stopped
                 .store(true, std::sync::atomic::Ordering::Release);
+            job.pending().control().cancel();
             job.stop_runs(self.limit);
         }
         loop {

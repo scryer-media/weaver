@@ -469,9 +469,12 @@ fn header_spoiled(mut volume: Vec<u8>) -> Vec<u8> {
     volume
 }
 
+// One RAR4 set as `rar4_sets` writes it.
+type Rar4Set = (&'static str, Vec<(String, Vec<u8>)>, Vec<u8>, &'static str);
+
 // A stored two-volume RAR4 set of one member, and the compressed four-volume
 // set, as written.
-fn rar4_sets() -> Vec<(&'static str, Vec<(String, Vec<u8>)>, Vec<u8>, &'static str)> {
+fn rar4_sets() -> Vec<Rar4Set> {
     use crate::pipeline::tests::{single_member_rar4_old_numbering_set, with_rar4_header_crcs};
     let body = super::harness::payload(9 * ARTICLE, 71);
     let stored: Vec<(String, Vec<u8>)> =
