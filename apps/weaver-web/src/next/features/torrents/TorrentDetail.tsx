@@ -17,6 +17,7 @@ import {
   SET_TORRENT_SEQUENTIAL_MUTATION,
   SET_TORRENT_UPLOAD_LIMIT_MUTATION,
   TORRENT_PEERS_QUERY,
+  TORRENT_UNPACKED_FILES_QUERY,
   TORRENT_UPDATES_SUBSCRIPTION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
@@ -31,6 +32,8 @@ import {
   type TorrentFilePriority,
   type TorrentPeerData,
   type TorrentTrackerData,
+  type TorrentUnpackedFileData,
+  type TorrentUnpackResult,
 } from "@/lib/torrents";
 import { DetailBlock, Field } from "@/next/components/chrome";
 import { BulkCluster, BulkMenu } from "@/next/components/BulkBar";
@@ -574,6 +577,7 @@ function FilesBlock({
   ];
 
   const heading = "truncate font-wv-mono text-[10.5px] uppercase tracking-[0.12em] text-wv-note";
+  const unpacked = useUnpackedFiles(torrent);
 
   return (
     <DetailBlock
@@ -587,6 +591,22 @@ function FilesBlock({
           <Toggle label={toggle.label} checked={toggle.checked} disabled={toggle.busy} onChange={toggle.set} />
         </GridRow>
       ))}
+      {torrent.unpacking ? (
+        <GridRow
+          testId={torrentIds.unpacking}
+          columns={LIMIT_COLUMNS}
+          gap={14}
+          className="min-h-[46px] border-t border-wv-hairline"
+          title={torrent.unpacking.reason ?? undefined}
+        >
+          <span className="min-w-0 truncate text-[12.5px] text-wv-fg">{t("next.torrent.unpacking")}</span>
+          <span className="min-w-0 truncate text-right text-[12.5px] text-wv-muted">
+            {torrent.unpacking.reason
+              ? `${t(UNPACK_KEYS[torrent.unpacking.result])}: ${torrent.unpacking.reason}`
+              : t(UNPACK_KEYS[torrent.unpacking.result])}
+          </span>
+        </GridRow>
+      ) : null}
       {torrent.files.length === 0 ? (
         <span className="border-t border-wv-hairline pt-3 text-[12.5px] text-wv-muted">{EM_DASH}</span>
       ) : (
@@ -649,10 +669,60 @@ function FilesBlock({
               />
             </GridRow>
           ))}
+          {unpacked.map((file) => (
+            <GridRow
+              key={`unpacked:${file.path}`}
+              testId={torrentIds.unpackedFile}
+              columns={FILE_COLUMNS}
+              gap={14}
+              className="h-[38px] border-t border-wv-hairline"
+              title={file.path}
+            >
+              <span />
+              <span data-testid={torrentIds.filePath} className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">
+                {file.path}
+              </span>
+              <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                {formatSize(file.length)}
+              </span>
+              <span data-testid={torrentIds.fileProgress} className="text-right font-wv-mono text-[12px] text-wv-muted">
+                100.0%
+              </span>
+              <span className="truncate text-[12.5px] text-wv-muted">{t("next.torrent.unpacked")}</span>
+            </GridRow>
+          ))}
         </>
       )}
     </DetailBlock>
   );
+}
+
+const UNPACK_KEYS: Record<TorrentUnpackResult, string> = {
+  WHOLE: "next.torrent.unpackWhole",
+  PART: "next.torrent.unpackPart",
+  FAILED: "next.torrent.unpackFailed",
+  REFUSED: "next.torrent.unpackRefused",
+};
+
+/**
+ * The files a torrent's unpacking placed beside its own, read only once its
+ * unpacking is over and again when how it came out changes.
+ */
+function useUnpackedFiles(torrent: TorrentData): TorrentUnpackedFileData[] {
+  const result = torrent.unpacking?.result ?? null;
+  const [{ data }, reread] = useQuery<{
+    torrent: { id: number; unpacking: { files: TorrentUnpackedFileData[] } | null } | null;
+  }>({
+    query: TORRENT_UNPACKED_FILES_QUERY,
+    variables: { id: torrent.id },
+    pause: result === null,
+    requestPolicy: "network-only",
+  });
+  useEffect(() => {
+    if (result !== null) reread({ requestPolicy: "network-only" });
+  }, [result, reread]);
+  if (result === null) return [];
+  return data?.torrent?.unpacking?.files ?? [];
 }
 
 /** A torrent job's own blocks on the job's screen: its transfer, its limits, its information, how it seeds, its trackers, its peers and its files. */
