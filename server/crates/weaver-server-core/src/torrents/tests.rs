@@ -13,6 +13,7 @@ pub(crate) fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -
     TorrentRecord {
         unpack_in_force: None,
         unpack_over: false,
+        download_ends: 0,
         job_id: JobId(job_id),
         infohash_v1: v1,
         infohash_v2: v2,
@@ -181,7 +182,7 @@ fn intent_and_counters_update_in_place() {
     db.insert_torrent(&torrent(3, Some([3; 20]), None), &[])
         .unwrap();
 
-    assert!(db.set_torrent_completed(JobId(3), 9_000).unwrap());
+    assert!(db.set_torrent_completed(JobId(3), 9_000, 1).unwrap());
     // An intent written after, or racing, the completion keeps it: the two
     // are apart.
     assert!(
@@ -230,7 +231,7 @@ fn intent_and_counters_update_in_place() {
         !db.update_torrent_intent(JobId(4), TorrentIntent::Paused)
             .unwrap()
     );
-    assert!(!db.set_torrent_completed(JobId(4), 1).unwrap());
+    assert!(!db.set_torrent_completed(JobId(4), 1, 1).unwrap());
     assert!(!db.update_torrent_counters(JobId(4), &counters).unwrap());
 }
 

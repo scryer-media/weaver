@@ -43,7 +43,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 131;
+const CURRENT_SCHEMA_VERSION: i64 = 132;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1496,7 +1496,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 131);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 132);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)

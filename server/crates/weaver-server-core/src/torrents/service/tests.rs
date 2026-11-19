@@ -988,6 +988,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
     let record = TorrentRecord {
         unpack_in_force: None,
         unpack_over: false,
+        download_ends: 0,
         job_id: JobId(1),
         infohash_v1: Some([1; 20]),
         infohash_v2: None,

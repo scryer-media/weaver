@@ -980,6 +980,7 @@ impl TorrentService {
             unpack: request.unpack,
             unpack_in_force: None,
             unpack_over: false,
+            download_ends: 0,
             metadata: request.metadata.clone(),
             upload_limit: request.upload_limit,
             download_limit: request.download_limit,

@@ -1291,6 +1291,7 @@ fn torrent_args(
         SqlArg::OptI64(torrent.pool_member.map(i64::from)),
         SqlArg::Bool(torrent.private),
         SqlArg::Bool(torrent.unpack_over),
+        SqlArg::I64(stored(torrent.download_ends)?),
     ])
 }
 
@@ -1528,10 +1529,29 @@ impl Database {
         })
     }
 
-    // When the torrent completed. Returns whether the torrent exists.
-    pub fn set_torrent_completed(&self, job_id: JobId, at_ms: i64) -> Result<bool, StateError> {
-        let args = vec![SqlArg::I64(at_ms), SqlArg::I64(stored(job_id.0)?)];
-        self.set_torrent_column("completed_at_ms", args)
+    // When the torrent completed, and how many times its download has
+    // ended, in one write. Returns whether the torrent exists.
+    pub fn set_torrent_completed(
+        &self,
+        job_id: JobId,
+        at_ms: i64,
+        download_ends: u64,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::I64(at_ms),
+            SqlArg::I64(stored(download_ends)?),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET completed_at_ms = {}, download_ends = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
     }
 
     // The torrent's unpacking is over: the mark an unpacking that ended

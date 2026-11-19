@@ -309,6 +309,10 @@ pub struct TorrentRecord {
     // reopened after it, in this run or after a restart, does not unpack
     // again.
     pub unpack_over: bool,
+    // How many times its download has ended: the occurrence of its next
+    // end, kept so a restart numbers that end on and its script runs once
+    // for it.
+    pub download_ends: u64,
     // The attributes its job was added with.
     pub metadata: Vec<(String, String)>,
     // Its own upload and download limits in bytes per second: None is

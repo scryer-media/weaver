@@ -1353,3 +1353,66 @@ async fn a_checkpoint_its_taker_dropped_before_writing_is_written_at_stop() {
         "the first file's time went with its pieces"
     );
 }
+
+// The run ids of the latest TORRENT_DOWNLOADED and JOB_DOWNLOADED queued
+// for the job, and the occurrence of each.
+fn download_ends(db: &Database, job_id: JobId) -> [(String, u64); 2] {
+    use crate::post_processing::model::QueueEvent;
+    [QueueEvent::TorrentDownloaded, QueueEvent::JobDownloaded]
+        .map(|event| db.latest_download_end(job_id.0, event).unwrap().unwrap())
+}
+
+// A reopened torrent that completes again is finished again and runs its
+// program a second time, as qBittorrent does (`prioritizeFiles` clears its
+// finished state, torrentimpl.cpp:3045-3057), with or without a restart
+// between the reopen and the completion: once more, and only once.
+async fn completes_again_and_ends_again(restart: bool) {
+    use FilePriority::*;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    let (job_id, _, b) = complete_with_one_aside(&rig).await;
+    rig.db.admitted_so_far().await;
+    let first = download_ends(&rig.db, job_id);
+    assert!(first.iter().all(|(_, occurrence)| *occurrence == 0));
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().download_ends,
+        1
+    );
+    rig.service
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    let service = if restart {
+        rig.service.stop().await;
+        let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+        reopen(&again).await;
+        assert!(!again.inner.live.lock().await[&job_id].complete());
+        again
+    } else {
+        rig.service.clone()
+    };
+    completes_again(&service, &rig.db, job_id, &b).await;
+    // Raised within the settle that wrote the completion `completes_again`
+    // waited for.
+    rig.db.admitted_so_far().await;
+    let again = download_ends(&rig.db, job_id);
+    for (first, again) in first.iter().zip(&again) {
+        assert_ne!(first.0, again.0);
+        assert_eq!(again.1, 1);
+    }
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().download_ends,
+        2
+    );
+    service.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopened_torrent_that_completes_again_runs_its_download_end_again() {
+    completes_again_and_ends_again(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_reopened_then_restarted_runs_its_download_end_once_more() {
+    completes_again_and_ends_again(true).await;
+}

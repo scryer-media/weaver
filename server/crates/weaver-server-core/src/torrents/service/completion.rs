@@ -394,11 +394,16 @@ impl TorrentService {
             // (qBittorrent `SessionImpl::initLoadTorrentParams`,
             // sessionimpl.cpp:2844, and `TorrentImpl::handleTorrentFinished`,
             // torrentimpl.cpp:2194-2198). One restored complete never gets
-            // here. One reopened finishes again in qBittorrent
-            // (`prioritizeFiles`, torrentimpl.cpp:3045-3057), but the script
-            // queue admits one end of a job's download and no second
-            // (`drain_admissions`), so its second finish is not run.
-            let finished = !torrent.record.seed_mode;
+            // here. One reopened finishes again, as in qBittorrent
+            // (`prioritizeFiles` clears its finished state,
+            // torrentimpl.cpp:3045-3057), seed mode or not: each end of its
+            // download is numbered, its count written with its completion,
+            // and the script queue admits an end past the last it holds for
+            // the job (`drain_admissions`), so one reopened, or reopened and
+            // restarted, runs its program once more.
+            let occurrence = torrent.record.download_ends;
+            let finished = !torrent.record.seed_mode || occurrence > 0;
+            torrent.record.download_ends = occurrence.saturating_add(1);
             torrent.record.completed_at_ms = Some(now);
             // It seeds now: its slot and rank go to the torrents after it.
             // One that seeded already, as a seed-mode add does, held none.
@@ -406,7 +411,11 @@ impl TorrentService {
                 self.inner.signal.want_pass();
             }
             self.inner.counters.event(TorrentEvent::Completed);
-            if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
+            if let Err(error) =
+                self.inner
+                    .db
+                    .set_torrent_completed(job_id, now, torrent.record.download_ends)
+            {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
             }
             self.inner.signal.checkpoint_due(job_id);
@@ -416,7 +425,7 @@ impl TorrentService {
                     torrent.record.move_to.take(),
                 ),
                 downloaded,
-                finished,
+                finished.then_some(occurrence),
             )
         };
         let (landing, move_to) = landing;
@@ -441,10 +450,10 @@ impl TorrentService {
             }
         }
         // Raised where its files now are, once any move is over.
-        if finished {
+        if let Some(occurrence) = finished {
             let live = self.inner.live.lock().await;
             if let Some(torrent) = live.get(&job_id) {
-                self.raise_script_event(torrent, QueueEvent::TorrentDownloaded, &[]);
+                self.raise_download_end(torrent, occurrence);
             }
         }
     }
