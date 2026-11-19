@@ -1368,3 +1368,134 @@ fn a_set_named_one_place_on_is_held_where_its_names_put_it() {
         }
     }
 }
+
+// A long compressed RAR4 set, its end records stating no number, posted in
+// order under names that number nothing. The engine places each volume by
+// its links alone, and a placement reads the volumes bound beside it by
+// index: the set is walked a bounded number of times, however long it is,
+// not once per volume placed.
+//
+// Measured on 2026-11-18: 4,950 volumes walked and 14,949 looked up for 100
+// volumes, 44,850 and 134,849 for 300, which is N(N-1)/2 walked, nine times
+// the work for three times the set.
+#[test]
+#[ignore = "claim::place walks every bound volume once per volume placed by links (quadratic)"]
+fn a_long_nameless_compressed_set_walks_its_volumes_a_bounded_number_of_times() {
+    for volumes in [100, 300] {
+        let mut options = super::split(Version::Rar4);
+        options.split = Some(5_000);
+        options.compressed = Some(0);
+        let set = write(
+            &[Item::File("track.flac", payload(9, volumes * 5_000 - 700))],
+            &options,
+        );
+        assert_eq!(set.len(), volumes);
+        let mut run = Run::new();
+        run.enough = 4 * volumes;
+        let members: Vec<MemberId> = set
+            .iter()
+            .enumerate()
+            .map(|(volume, bytes)| {
+                run.announce(&format!("{:032x}", 0x5eed_0000 + volume as u64), bytes.len())
+            })
+            .collect();
+        crate::engine::counts::take();
+        for (member, bytes) in members.iter().zip(&set) {
+            run.deliver(*member, 0, bytes);
+            run.close(*member);
+        }
+        let counted = crate::engine::counts::take();
+        let places = run.places(&members);
+        let engine = places[0].map(|(node, _)| node);
+        assert_eq!(
+            engine.and_then(|node| run.tree.kind(node)),
+            Some(Kind::RarEngine)
+        );
+        for (volume, place) in places.iter().enumerate() {
+            assert_eq!(
+                *place,
+                engine.map(|node| (node, VolumeIndex(volume as u32))),
+                "volume {volume}"
+            );
+        }
+        assert!(
+            counted.walked <= 4 * volumes,
+            "{volumes} volumes: {counted:?}"
+        );
+    }
+}
+
+// The held volumes of a stored set as `claim::place` reads them on the
+// store path, counting each index its walk over them yields.
+struct Walked<'a> {
+    held: &'a std::collections::BTreeMap<u32, super::super::claim::Held<'a>>,
+    walked: &'a std::cell::Cell<usize>,
+}
+
+impl super::super::claim::Holds for Walked<'_> {
+    fn at(&self, index: u32) -> Option<super::super::claim::Held<'_>> {
+        self.held.get(&index).copied()
+    }
+
+    fn indices(&self) -> impl Iterator<Item = u32> + '_ {
+        self.held
+            .keys()
+            .copied()
+            .inspect(|_| self.walked.set(self.walked.get() + 1))
+    }
+}
+
+// A long stored RAR4 set, its end records stating no number, its fronts
+// placed by their headers alone, in order, as a store claims each one under
+// a name that numbers nothing (`RarStore::claim_by_headers` asks
+// `claim::place` once per claim, over every volume bound). The walks over
+// the held volumes stay bounded, however long the set.
+//
+// Measured on 2026-11-18: 4,950 indices walked for 100 volumes, 44,850 for
+// 300: once over every held volume per volume placed.
+#[test]
+#[ignore = "claim::place walks every held volume once per volume placed by links (quadratic)"]
+fn a_long_nameless_stored_set_placed_by_headers_walks_its_volumes_a_bounded_number_of_times() {
+    for volumes in [100, 300] {
+        let set = long_set(volumes);
+        let fronts: Vec<unrar_rs::RarVolumeFacts> = set
+            .iter()
+            .map(|bytes| {
+                super::super::claim::front_facts(
+                    front(bytes),
+                    None,
+                    std::sync::Arc::new(unrar_rs::KdfCache::new()),
+                )
+                .expect("a volume's front")
+            })
+            .collect();
+        let walked = std::cell::Cell::new(0);
+        let mut held = std::collections::BTreeMap::new();
+        for (volume, facts) in fronts.iter().enumerate() {
+            let placed = if held.is_empty() {
+                Some(VolumeIndex(0))
+            } else {
+                super::super::claim::place(
+                    facts,
+                    &Walked {
+                        held: &held,
+                        walked: &walked,
+                    },
+                )
+            };
+            assert_eq!(placed, Some(VolumeIndex(volume as u32)), "volume {volume}");
+            held.insert(
+                volume as u32,
+                super::super::claim::Held {
+                    facts: Some(facts),
+                    successor: None,
+                },
+            );
+        }
+        assert!(
+            walked.get() <= 4 * volumes,
+            "{volumes} volumes: {} walked",
+            walked.get()
+        );
+    }
+}
